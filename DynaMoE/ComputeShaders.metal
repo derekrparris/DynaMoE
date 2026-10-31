@@ -1520,15 +1520,23 @@ kernel void bf16_gemv(
     constant uint64_t& weightOffset [[buffer(3)]],
     constant uint32_t& inDim [[buffer(4)]],
     constant uint32_t& outDim [[buffer(5)]],
+    // A block-diagonal projection reads ONE group's columns out of a row wider than
+    // the group and writes one group's rows into a vector wider than the group, so a
+    // caller batching several positions binds the row strides. Zero means the row is
+    // exactly the dimension, which is what every other caller wants.
+    constant uint32_t& inputRowStride [[buffer(6)]],
+    constant uint32_t& outputRowStride [[buffer(7)]],
     uint2 pos [[thread_position_in_grid]]
 ) {
     uint row = pos.x;
     uint tokenIdx = pos.y;
     if (row >= outDim) return;
 
+    uint32_t inStride = inputRowStride != 0u ? inputRowStride : inDim;
+    uint32_t outStride = outputRowStride != 0u ? outputRowStride : outDim;
     uint64_t rowWeightStart = (weightOffset / 2) + ((uint64_t)row * inDim);
     device const ushort* wRow = rawWeightBuffer + rowWeightStart;
-    device const float* inPtr = inputVector + ((uint64_t)tokenIdx * inDim);
+    device const float* inPtr = inputVector + ((uint64_t)tokenIdx * inStride);
 
     float dot0 = 0.0f;
     float dot1 = 0.0f;
@@ -1541,8 +1549,341 @@ kernel void bf16_gemv(
         dot1 += (bf16_to_fp32(w4.z) * in4.z) + (bf16_to_fp32(w4.w) * in4.w);
     }
 
-    outputVector[((uint64_t)tokenIdx * outDim) + row] = dot0 + dot1;
+    outputVector[((uint64_t)tokenIdx * outStride) + row] = dot0 + dot1;
 }
+
+/// MSL Kernel: BF16 GEMV with the reduction spread across a threadgroup.
+///
+/// `bf16_gemv` gives one thread a whole output row, so the reduction is a serial
+/// loop and the grid is only `outDim * rows` threads tall. That is fine where the
+/// row count is large — `attn.wq_b` is 73,728 rows and reaches a few hundred GB/s —
+/// and it starves the machine where the row count is small and the reduction is
+/// wide: `attn.wo_a` splits into eight groups of 128 rows over 8,192 columns, so a
+/// block of eight positions is 1,024 threads in total (`Benchmarks/PERF_FINDINGS.md`,
+/// "DSV4.1 #10"). Striding the reduction across lanes also makes a lane's load
+/// adjacent to its neighbours' instead of 16 KB away, which is what the one-thread
+/// form pays for a scattered warp.
+///
+/// Grid: (outDim * rows, 1, 1) flat, `row = groupIdx % outDim` and the token is
+/// `groupIdx / outDim`. Strides match `bf16_gemv`: zero means the row is exactly
+/// the dimension, so a caller batching rows out of a wider layout binds them.
+/// `[[threadgroup(0)]]` needs one float per 32 lanes.
+kernel void bf16_gemv_rows(
+    device const ushort* rawWeightBuffer [[buffer(0)]],
+    device const float* inputVector [[buffer(1)]],
+    device float* outputVector [[buffer(2)]],
+    constant uint64_t& weightOffset [[buffer(3)]],
+    constant uint32_t& inDim [[buffer(4)]],
+    constant uint32_t& outDim [[buffer(5)]],
+    constant uint32_t& inputRowStride [[buffer(6)]],
+    constant uint32_t& outputRowStride [[buffer(7)]],
+    threadgroup float* partials [[threadgroup(0)]],
+    uint groupIdx [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
+) {
+    if (inDim == 0u || outDim == 0u) return;
+
+    uint32_t row = groupIdx % outDim;
+    uint32_t tokenIdx = groupIdx / outDim;
+    uint32_t inStride = inputRowStride != 0u ? inputRowStride : inDim;
+    uint32_t outStride = outputRowStride != 0u ? outputRowStride : outDim;
+    device const ushort* wRow = rawWeightBuffer + (weightOffset / 2) + ((uint64_t)row * inDim);
+    device const float* inPtr = inputVector + ((uint64_t)tokenIdx * inStride);
+
+    float dot0 = 0.0f;
+    float dot1 = 0.0f;
+    uint32_t num4 = inDim / 4;
+    for (uint32_t i = lane; i < num4; i += laneCount) {
+        uint32_t base = i * 4;
+        ushort4 w4 = load_ushort4_unaligned(wRow + base);
+        float4 in4 = *(device const float4*)(inPtr + base);
+        dot0 += (bf16_to_fp32(w4.x) * in4.x) + (bf16_to_fp32(w4.y) * in4.y);
+        dot1 += (bf16_to_fp32(w4.z) * in4.z) + (bf16_to_fp32(w4.w) * in4.w);
+    }
+    for (uint32_t i = num4 * 4 + lane; i < inDim; i += laneCount) {
+        dot0 += bf16_to_fp32(wRow[i]) * inPtr[i];
+    }
+
+    // Two accumulators above already buy the loop some independence; what is left
+    // is one number per row, so the lanes reduce it in the width of the group.
+    float warpTotal = simd_sum(dot0 + dot1);
+    if (laneInSimd == 0u) partials[simdIdx] = warpTotal;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) {
+        uint32_t simdCount = (laneCount + 31u) / 32u;
+        float total = 0.0f;
+        for (uint32_t group = 0; group < simdCount; ++group) {
+            total += partials[group];
+        }
+        outputVector[((uint64_t)tokenIdx * outStride) + row] = total;
+    }
+}
+
+/// MSL Kernel: BF16 GEMV for a full block of eight positions, reusing every
+/// loaded weight value across them.
+///
+/// `bf16_gemv_rows` gives a threadgroup one (row, token) pair, so a block of eight
+/// positions loads the same weight row eight times — 134 MB of loads for a band whose
+/// weight is 16.8 MB — and the stage settles at the request rate rather than the
+/// memory bandwidth (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #12"). Here a threadgroup
+/// owns one output row and streams it ONCE, keeping one accumulator per position, so
+/// the weight is read exactly as often as it changes.
+///
+/// Eight is `DeepSeekV41DevicePlan.chunkSlots`' ceiling, and the accumulators are
+/// named rather than indexed because an array indexed by a runtime bound does not stay
+/// in registers. A block shorter than eight positions uses `bf16_gemv_rows`.
+///
+/// Grid: (outDim, 1, 1), one threadgroup per output row. `[[threadgroup(0)]]` needs
+/// eight floats per 32 lanes, laid out warp-major.
+kernel void bf16_gemv_rows8(
+    device const ushort* rawWeightBuffer [[buffer(0)]],
+    device const float* inputVector [[buffer(1)]],
+    device float* outputVector [[buffer(2)]],
+    constant uint64_t& weightOffset [[buffer(3)]],
+    constant uint32_t& inDim [[buffer(4)]],
+    constant uint32_t& outDim [[buffer(5)]],
+    constant uint32_t& inputRowStride [[buffer(6)]],
+    constant uint32_t& outputRowStride [[buffer(7)]],
+    threadgroup float* partials [[threadgroup(0)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
+) {
+    if (inDim == 0u || outDim == 0u || row >= outDim) return;
+
+    uint32_t inStride = inputRowStride != 0u ? inputRowStride : inDim;
+    uint32_t outStride = outputRowStride != 0u ? outputRowStride : outDim;
+    device const ushort* wRow = rawWeightBuffer + (weightOffset / 2) + ((uint64_t)row * inDim);
+    // The lane offset comes in through `i`, which starts at `lane`; adding it here as
+    // well would shift every load by one lane and still produce plausible numbers.
+    device const float* inPtr = inputVector;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    float acc4 = 0.0f;
+    float acc5 = 0.0f;
+    float acc6 = 0.0f;
+    float acc7 = 0.0f;
+    uint32_t num4 = inDim / 4;
+    for (uint32_t i = lane; i < num4; i += laneCount) {
+        uint32_t base = i * 4;
+        ushort4 w4 = load_ushort4_unaligned(wRow + base);
+        float w0 = bf16_to_fp32(w4.x);
+        float w1 = bf16_to_fp32(w4.y);
+        float w2 = bf16_to_fp32(w4.z);
+        float w3 = bf16_to_fp32(w4.w);
+        device const float* p = inPtr + base;
+        float4 a0 = *(device const float4*)(p);
+        float4 a1 = *(device const float4*)(p + inStride);
+        float4 a2 = *(device const float4*)(p + 2 * inStride);
+        float4 a3 = *(device const float4*)(p + 3 * inStride);
+        float4 a4 = *(device const float4*)(p + 4 * inStride);
+        float4 a5 = *(device const float4*)(p + 5 * inStride);
+        float4 a6 = *(device const float4*)(p + 6 * inStride);
+        float4 a7 = *(device const float4*)(p + 7 * inStride);
+        acc0 += w0 * a0.x + w1 * a0.y + w2 * a0.z + w3 * a0.w;
+        acc1 += w0 * a1.x + w1 * a1.y + w2 * a1.z + w3 * a1.w;
+        acc2 += w0 * a2.x + w1 * a2.y + w2 * a2.z + w3 * a2.w;
+        acc3 += w0 * a3.x + w1 * a3.y + w2 * a3.z + w3 * a3.w;
+        acc4 += w0 * a4.x + w1 * a4.y + w2 * a4.z + w3 * a4.w;
+        acc5 += w0 * a5.x + w1 * a5.y + w2 * a5.z + w3 * a5.w;
+        acc6 += w0 * a6.x + w1 * a6.y + w2 * a6.z + w3 * a6.w;
+        acc7 += w0 * a7.x + w1 * a7.y + w2 * a7.z + w3 * a7.w;
+    }
+
+    // One warp sum per position, then a lane-0 pass over the partials. The layout is
+    // warp-major so a warp's eight writes are contiguous.
+    float sum0 = simd_sum(acc0);
+    float sum1 = simd_sum(acc1);
+    float sum2 = simd_sum(acc2);
+    float sum3 = simd_sum(acc3);
+    float sum4 = simd_sum(acc4);
+    float sum5 = simd_sum(acc5);
+    float sum6 = simd_sum(acc6);
+    float sum7 = simd_sum(acc7);
+    if (laneInSimd == 0u) {
+        uint32_t base = simdIdx * 8u;
+        partials[base + 0u] = sum0;
+        partials[base + 1u] = sum1;
+        partials[base + 2u] = sum2;
+        partials[base + 3u] = sum3;
+        partials[base + 4u] = sum4;
+        partials[base + 5u] = sum5;
+        partials[base + 6u] = sum6;
+        partials[base + 7u] = sum7;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) {
+        uint32_t simdCount = (laneCount + 31u) / 32u;
+        float total0 = 0.0f;
+        float total1 = 0.0f;
+        float total2 = 0.0f;
+        float total3 = 0.0f;
+        float total4 = 0.0f;
+        float total5 = 0.0f;
+        float total6 = 0.0f;
+        float total7 = 0.0f;
+        for (uint32_t group = 0; group < simdCount; ++group) {
+            uint32_t base = group * 8u;
+            total0 += partials[base + 0u];
+            total1 += partials[base + 1u];
+            total2 += partials[base + 2u];
+            total3 += partials[base + 3u];
+            total4 += partials[base + 4u];
+            total5 += partials[base + 5u];
+            total6 += partials[base + 6u];
+            total7 += partials[base + 7u];
+        }
+        uint64_t blockOut = row;
+        outputVector[blockOut + 0 * outStride] = total0;
+        outputVector[blockOut + 1 * outStride] = total1;
+        outputVector[blockOut + 2 * outStride] = total2;
+        outputVector[blockOut + 3 * outStride] = total3;
+        outputVector[blockOut + 4 * outStride] = total4;
+        outputVector[blockOut + 5 * outStride] = total5;
+        outputVector[blockOut + 6 * outStride] = total6;
+        outputVector[blockOut + 7 * outStride] = total7;
+    }
+}
+
+
+/// MSL Kernel: `bf16_gemv_rows8` over TWO output rows per threadgroup.
+///
+/// The block-width A/B (`testWhatAWiderBlockSavesOnAWeightRead`) showed that
+/// widening a block from eight positions to sixteen makes these projections WORSE
+/// per position — 0.97x, 0.63x, 0.55x — which rules out the weight read as the
+/// binding cost, because a wider block reads the same weight bytes for twice the
+/// positions. What doubles instead is the INPUT: a threadgroup reading one output
+/// row loads every position's vector for the length of that row, so the block's
+/// `2 * heads`-wide activations are re-read once per output row, and there are tens
+/// of thousands of rows.
+///
+/// This form shares one input load between two output rows. Same weight bytes, same
+/// block width, same total arithmetic; half the input traffic and sixteen
+/// accumulators instead of eight. If the input re-read is what the stage pays for,
+/// this halves it; if it changes nothing, the input was never the limit and the
+/// remaining cost is issue rate.
+kernel void bf16_gemv_rows8x2(
+    device const ushort* rawWeightBuffer [[buffer(0)]],
+    device const float* inputVector [[buffer(1)]],
+    device float* outputVector [[buffer(2)]],
+    constant uint64_t& weightOffset [[buffer(3)]],
+    constant uint32_t& inDim [[buffer(4)]],
+    constant uint32_t& outDim [[buffer(5)]],
+    constant uint32_t& inputRowStride [[buffer(6)]],
+    constant uint32_t& outputRowStride [[buffer(7)]],
+    threadgroup float* partials [[threadgroup(0)]],
+    uint tile [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
+) {
+    if (inDim == 0u || outDim == 0u) return;
+
+    uint32_t inStride = inputRowStride != 0u ? inputRowStride : inDim;
+    uint32_t outStride = outputRowStride != 0u ? outputRowStride : outDim;
+    uint32_t row0 = tile * 2u;
+    if (row0 >= outDim) return;
+    uint32_t row1 = row0 + 1u;
+    bool hasSecond = row1 < outDim;
+
+    device const ushort* wBase =
+        rawWeightBuffer + (weightOffset / 2) + ((uint64_t)row0 * inDim);
+    device const float* inPtr = inputVector;
+
+    float a00 = 0.0f, a01 = 0.0f, a02 = 0.0f, a03 = 0.0f;
+    float a04 = 0.0f, a05 = 0.0f, a06 = 0.0f, a07 = 0.0f;
+    float a10 = 0.0f, a11 = 0.0f, a12 = 0.0f, a13 = 0.0f;
+    float a14 = 0.0f, a15 = 0.0f, a16 = 0.0f, a17 = 0.0f;
+    uint32_t num4 = inDim / 4;
+    for (uint32_t i = lane; i < num4; i += laneCount) {
+        uint32_t base = i * 4;
+        // The input load is shared by both rows: that is the whole point of the form.
+        device const float* p = inPtr + base;
+        float4 i0 = *(device const float4*)(p);
+        float4 i1 = *(device const float4*)(p + inStride);
+        float4 i2 = *(device const float4*)(p + 2 * inStride);
+        float4 i3 = *(device const float4*)(p + 3 * inStride);
+        float4 i4 = *(device const float4*)(p + 4 * inStride);
+        float4 i5 = *(device const float4*)(p + 5 * inStride);
+        float4 i6 = *(device const float4*)(p + 6 * inStride);
+        float4 i7 = *(device const float4*)(p + 7 * inStride);
+
+        ushort4 w0 = load_ushort4_unaligned(wBase + base);
+        float x0 = bf16_to_fp32(w0.x);
+        float x1 = bf16_to_fp32(w0.y);
+        float x2 = bf16_to_fp32(w0.z);
+        float x3 = bf16_to_fp32(w0.w);
+        a00 += x0 * i0.x + x1 * i0.y + x2 * i0.z + x3 * i0.w;
+        a01 += x0 * i1.x + x1 * i1.y + x2 * i1.z + x3 * i1.w;
+        a02 += x0 * i2.x + x1 * i2.y + x2 * i2.z + x3 * i2.w;
+        a03 += x0 * i3.x + x1 * i3.y + x2 * i3.z + x3 * i3.w;
+        a04 += x0 * i4.x + x1 * i4.y + x2 * i4.z + x3 * i4.w;
+        a05 += x0 * i5.x + x1 * i5.y + x2 * i5.z + x3 * i5.w;
+        a06 += x0 * i6.x + x1 * i6.y + x2 * i6.z + x3 * i6.w;
+        a07 += x0 * i7.x + x1 * i7.y + x2 * i7.z + x3 * i7.w;
+
+        if (!hasSecond) continue;
+        ushort4 w1 = load_ushort4_unaligned(wBase + inDim + base);
+        float y0 = bf16_to_fp32(w1.x);
+        float y1 = bf16_to_fp32(w1.y);
+        float y2 = bf16_to_fp32(w1.z);
+        float y3 = bf16_to_fp32(w1.w);
+        a10 += y0 * i0.x + y1 * i0.y + y2 * i0.z + y3 * i0.w;
+        a11 += y0 * i1.x + y1 * i1.y + y2 * i1.z + y3 * i1.w;
+        a12 += y0 * i2.x + y1 * i2.y + y2 * i2.z + y3 * i2.w;
+        a13 += y0 * i3.x + y1 * i3.y + y2 * i3.z + y3 * i3.w;
+        a14 += y0 * i4.x + y1 * i4.y + y2 * i4.z + y3 * i4.w;
+        a15 += y0 * i5.x + y1 * i5.y + y2 * i5.z + y3 * i5.w;
+        a16 += y0 * i6.x + y1 * i6.y + y2 * i6.z + y3 * i6.w;
+        a17 += y0 * i7.x + y1 * i7.y + y2 * i7.z + y3 * i7.w;
+    }
+
+    // Row-major over (row, position), so a warp's writes stay contiguous.
+    float acc[16] = {
+        a00, a01, a02, a03, a04, a05, a06, a07,
+        a10, a11, a12, a13, a14, a15, a16, a17
+    };
+    float sums[16];
+    for (uint32_t index = 0; index < 16u; ++index) {
+        sums[index] = simd_sum(acc[index]);
+    }
+    if (laneInSimd == 0u) {
+        uint32_t base = simdIdx * 16u;
+        for (uint32_t index = 0; index < 16u; ++index) {
+            partials[base + index] = sums[index];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) {
+        uint32_t simdCount = (laneCount + 31u) / 32u;
+        float total[16];
+        for (uint32_t index = 0; index < 16u; ++index) {
+            float sum = 0.0f;
+            for (uint32_t group = 0; group < simdCount; ++group) {
+                sum += partials[group * 16u + index];
+            }
+            total[index] = sum;
+        }
+        for (uint32_t position = 0; position < 8u; ++position) {
+            outputVector[row0 + position * outStride] = total[position];
+        }
+        if (hasSecond) {
+            for (uint32_t position = 0; position < 8u; ++position) {
+                outputVector[row1 + position * outStride] = total[8u + position];
+            }
+        }
+    }
+}
+
 
 /// MSL Kernel: Per-Head RMSNorm for Attention Heads (32-Thread SIMDgroup Cooperative, 2D Grid Aware)
 kernel void per_head_rmsnorm_bf16(
@@ -8384,6 +8725,8 @@ kernel void dsv41_fp8_block32_gemv(
     constant uint64_t& scaleOffset [[buffer(5)]],
     constant uint32_t& inDim [[buffer(6)]],
     constant uint32_t& outDim [[buffer(7)]],
+    constant uint32_t& inputRowStride [[buffer(8)]],
+    constant uint32_t& outputRowStride [[buffer(9)]],
     uint2 pos [[thread_position_in_grid]]
 ) {
     uint row = pos.x;
@@ -8392,8 +8735,10 @@ kernel void dsv41_fp8_block32_gemv(
 
     const uint32_t blockCount = inDim / 32u;
     const uint32_t scaleRowBase = (row / 32u) * blockCount;
+    uint32_t inStride = inputRowStride != 0u ? inputRowStride : inDim;
+    uint32_t outStride = outputRowStride != 0u ? outputRowStride : outDim;
     device const uchar* wPtr = rawWeightBuffer + weightOffset + ((uint64_t)row * inDim);
-    device const float* xPtr = inputVector + ((uint64_t)tokenIdx * inDim);
+    device const float* xPtr = inputVector + ((uint64_t)tokenIdx * inStride);
 
     float total = 0.0f;
     for (uint32_t block = 0; block < blockCount; ++block) {
@@ -8411,7 +8756,7 @@ kernel void dsv41_fp8_block32_gemv(
         }
         total += blockDot * blockScale;
     }
-    outputVector[((uint64_t)tokenIdx * outDim) + row] = total;
+    outputVector[((uint64_t)tokenIdx * outStride) + row] = total;
 }
 
 /// MSL Kernel: MXFP4 GEMV (y = W_e2m1 * x, one E8M0 scale per 32 values).
@@ -8426,6 +8771,8 @@ kernel void dsv41_mxfp4_gemv(
     constant uint64_t& scaleOffset [[buffer(5)]],
     constant uint32_t& inDim [[buffer(6)]],
     constant uint32_t& outDim [[buffer(7)]],
+    constant uint32_t& inputRowStride [[buffer(8)]],
+    constant uint32_t& outputRowStride [[buffer(9)]],
     uint2 pos [[thread_position_in_grid]]
 ) {
     uint row = pos.x;
@@ -8434,9 +8781,11 @@ kernel void dsv41_mxfp4_gemv(
 
     const uint32_t byteCount = inDim / 2u;
     const uint32_t scaleCount = inDim / 32u;
+    uint32_t inStride = inputRowStride != 0u ? inputRowStride : inDim;
+    uint32_t outStride = outputRowStride != 0u ? outputRowStride : outDim;
     device const uchar* wPtr = rawWeightBuffer + weightOffset + ((uint64_t)row * byteCount);
     device const uchar* sPtr = rawScaleBuffer + scaleOffset + ((uint64_t)row * scaleCount);
-    device const float* xPtr = inputVector + ((uint64_t)tokenIdx * inDim);
+    device const float* xPtr = inputVector + ((uint64_t)tokenIdx * inStride);
 
     float total = 0.0f;
     for (uint32_t block = 0; block < scaleCount; ++block) {
@@ -8451,7 +8800,7 @@ kernel void dsv41_mxfp4_gemv(
         }
         total += blockDot * blockScale;
     }
-    outputVector[((uint64_t)tokenIdx * outDim) + row] = total;
+    outputVector[((uint64_t)tokenIdx * outStride) + row] = total;
 }
 
 /// MSL Kernel: fused MXFP4 SwiGLU gate+up with the checkpoint's `swiglu_limit`.
@@ -8580,12 +8929,139 @@ kernel void dsv41_engram_dequant_rows(
     outputRows[(uint64_t)row * headDim + dim] = unpack_e4m3(rowPtr[dim]) * scale;
 }
 
-/// MSL Kernel: Sinkhorn normalization for the mHC mixing matrix.
-/// `logits` is an n x n block; the kernel exponentiates it and alternates row
-/// and column normalization `iterations` times, leaving a doubly-stochastic
-/// matrix (rows and columns each sum to 1). One thread runs the whole block:
-/// n is at most `hc_mult` (4 on the published checkpoint), so the serial loop
-/// is cheaper than the coordination a parallel version would need.
+/// MSL Kernel: the Engram write, `Engram.forward`'s gate and residual add.
+///
+/// The retrieved rows have already become one key per hyper-connection copy
+/// followed by one shared value (`kv = wkv(rows.flatten(-2))`). Each copy of the
+/// residual stream is gated by how well it matches its OWN key and the gate
+/// multiplies the value every copy shares:
+///
+///   score = dot(stream, key * w) * rstd(stream) * rstd(key) * dim^-0.5
+///   gate  = sigmoid(copysign(sqrt(max(|score|, 1e-6)), score))
+///   stream += gate * value
+///
+/// The signed square root before the sigmoid is the training kernel's, not a
+/// plain sigmoid of the score: it compresses the magnitude and keeps the sign,
+/// so a stream that matches its key in the wrong direction is not gated in.
+///
+/// One threadgroup per copy, because the score is a reduction over `dim` before
+/// the write pass can run. `streamBuffer` is updated in place: the residual is
+/// the layer's, and nothing else reads the copy being written.
+kernel void dsv41_engram_gate_f32(
+    device float* streamBuffer [[buffer(0)]],           // [mult * dim], in place
+    device const float* kvBuffer [[buffer(1)]],        // [(mult + 1) * dim]
+    device const float* queryWeight [[buffer(2)]],     // [mult * dim] or null
+    device const float* keyWeight [[buffer(3)]],       // [mult * dim] or null
+    device float* gateBuffer [[buffer(4)]],            // [mult] or null
+    constant uint32_t& dim [[buffer(5)]],
+    constant uint32_t& mult [[buffer(6)]],
+    constant float& eps [[buffer(7)]],
+    threadgroup float* sharedWarpSums [[threadgroup(0)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgSize [[threads_per_threadgroup]],
+    uint copy [[threadgroup_position_in_grid]]
+) {
+    if (dim == 0 || mult == 0 || copy >= mult) return;
+
+    device float* stream = streamBuffer + (uint64_t)copy * (uint64_t)dim;
+    device const float* key = kvBuffer + (uint64_t)copy * (uint64_t)dim;
+    device const float* value = kvBuffer + (uint64_t)mult * (uint64_t)dim;
+    uint64_t weightBase = (uint64_t)copy * (uint64_t)dim;
+    bool hasWeight = queryWeight != nullptr && keyWeight != nullptr;
+
+    // Normalized per (token, copy) over `dim`, never jointly over the copies.
+    float localStream = 0.0f;
+    float localKey = 0.0f;
+    float localDot = 0.0f;
+    for (uint32_t i = tid; i < dim; i += tgSize) {
+        float hidden = stream[i];
+        float k = key[i];
+        float weight = hasWeight ? queryWeight[weightBase + i] * keyWeight[weightBase + i] : 1.0f;
+        localStream += hidden * hidden;
+        localKey += k * k;
+        localDot += hidden * weight * k;
+    }
+    float streamSquares = threadgroup_reduce_sum(localStream, sharedWarpSums, tid, tgSize);
+    float keySquares = threadgroup_reduce_sum(localKey, sharedWarpSums, tid, tgSize);
+    float dot = threadgroup_reduce_sum(localDot, sharedWarpSums, tid, tgSize);
+
+    float streamRstd = rsqrt(streamSquares / (float)dim + eps);
+    float keyRstd = rsqrt(keySquares / (float)dim + eps);
+    float score = dot * streamRstd * keyRstd * rsqrt((float)dim);
+    float magnitude = max(fabs(score), 1e-6f);
+    float gate = 1.0f / (1.0f + exp(-copysign(sqrt(magnitude), score)));
+    if (gateBuffer != nullptr) gateBuffer[copy] = gate;
+
+    for (uint32_t i = tid; i < dim; i += tgSize) {
+        stream[i] += gate * value[i];
+    }
+}
+
+/// MSL Kernel: `destination = source` over `count` FP32 values. Used to carry a
+/// sub-layer's `pre` mix forward without a second dispatch shape per sub-layer.
+kernel void dsv41_copy_f32(
+    device const float* source [[buffer(0)]],
+    device float* destination [[buffer(1)]],
+    constant uint32_t& count [[buffer(2)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < count) destination[i] = source[i];
+}
+
+/// The Sinkhorn schedule, in place, exactly as `hc_split_sinkhorn_kernel` runs it:
+/// one row softmax, `+eps`, ONE column normalization, then `iterations - 1` rounds
+/// of row-then-column, every divisor `(sum + eps)`. Shared by the kernel that
+/// normalizes a matrix the caller already has and the one that splits the mHC
+/// logits, so the schedule exists once.
+inline void dsv41_hc_sinkhorn_into(
+    device float* matrix,
+    uint n,
+    uint iterations,
+    float epsilon
+) {
+    // Row softmax. The max is subtracted per ROW so a large logit cannot overflow
+    // to infinity (every later sum would be `inf`), and so a row far below the
+    // block's max does not underflow to a zero sum.
+    for (uint r = 0; r < n; ++r) {
+        float rowMax = -1e30f;
+        for (uint c = 0; c < n; ++c) rowMax = max(rowMax, matrix[r * n + c]);
+        float sum = 0.0f;
+        for (uint c = 0; c < n; ++c) {
+            float value = exp(matrix[r * n + c] - rowMax);
+            matrix[r * n + c] = value;
+            sum += value;
+        }
+        float inverse = sum > 0.0f ? 1.0f / sum : 0.0f;
+        for (uint c = 0; c < n; ++c) matrix[r * n + c] *= inverse;
+    }
+    for (uint i = 0; i < n * n; ++i) matrix[i] += epsilon;
+    if (iterations == 0) return;
+
+    for (uint c = 0; c < n; ++c) {
+        float sum = 0.0f;
+        for (uint r = 0; r < n; ++r) sum += matrix[r * n + c];
+        float inverse = 1.0f / (sum + epsilon);
+        for (uint r = 0; r < n; ++r) matrix[r * n + c] *= inverse;
+    }
+    for (uint iteration = 1; iteration < iterations; ++iteration) {
+        for (uint r = 0; r < n; ++r) {
+            float sum = 0.0f;
+            for (uint c = 0; c < n; ++c) sum += matrix[r * n + c];
+            float inverse = 1.0f / (sum + epsilon);
+            for (uint c = 0; c < n; ++c) matrix[r * n + c] *= inverse;
+        }
+        for (uint c = 0; c < n; ++c) {
+            float sum = 0.0f;
+            for (uint r = 0; r < n; ++r) sum += matrix[r * n + c];
+            float inverse = 1.0f / (sum + epsilon);
+            for (uint r = 0; r < n; ++r) matrix[r * n + c] *= inverse;
+        }
+    }
+}
+
+/// MSL Kernel: Sinkhorn normalization of an existing `n x n` block, in place on
+/// `outputMatrix` (which is seeded from `logits` first). Same schedule as the
+/// split above; see `dsv41_hc_sinkhorn_into`.
 kernel void dsv41_hc_sinkhorn(
     device const float* logits [[buffer(0)]],
     device float* outputMatrix [[buffer(1)]],
@@ -8597,31 +9073,202 @@ kernel void dsv41_hc_sinkhorn(
     if (tid != 0) return;
     uint n = dimension;
     if (n == 0 || n > 16) return;
+    for (uint i = 0; i < n * n; ++i) outputMatrix[i] = logits[i];
+    dsv41_hc_sinkhorn_into(outputMatrix, n, iterations, epsilon);
+}
 
-    // Exponentiate once; Sinkhorn only rescales from here on. The max is
-    // subtracted first so a large logit cannot overflow to infinity, which would
-    // make every later row/column sum `inf` and the normalization a no-op of NaNs.
-    float maxLogit = -1e30f;
-    for (uint i = 0; i < n * n; ++i) {
-        maxLogit = max(maxLogit, logits[i]);
+/// MSL Kernel: the mHC coefficient projection.
+///
+/// `hc_*_fn` is `[outDim][mult * dim]` FP32 (24 x 20480 on the published
+/// checkpoint), applied to the FLATTENED stack and scaled by
+/// `rsqrt(mean(x^2) + norm_eps)` — one statistic per position, over the whole
+/// stack. The RMS is recomputed per row rather than staged: `outDim` is 24, so the
+/// extra pass costs less than the barrier a shared reduction would need.
+/// Grid: (outDim, 1, 1).
+///
+/// The weight arrives as raw BYTES and is cast here: `weightOffset` is the tensor's
+/// byte offset inside its shard, and advancing a `float*` by it reads four times
+/// too far. Every other projection kernel takes a `uchar*` for exactly this reason,
+/// and a test that binds the weight at offset 0 cannot see the difference.
+/// Grid: (outDim, slots, 1) — one row of the projection per thread, and one SLOT
+/// per grid row. A block of positions projects every slot in one dispatch instead
+/// of one dispatch per position; `slots` is 1 for a decode step, so the walk is the
+/// same kernel with a grid one row tall.
+kernel void dsv41_hc_project_f32(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const float* streamBuffer [[buffer(1)]],
+    device float* logitsBuffer [[buffer(2)]],
+    constant uint64_t& weightOffset [[buffer(3)]],
+    constant float& normEpsilon [[buffer(4)]],
+    constant uint32_t& width [[buffer(5)]],
+    constant uint32_t& outDim [[buffer(6)]],
+    constant uint32_t& slotCount [[buffer(7)]],
+    threadgroup float* partials [[threadgroup(0)]],  // [32] squares, then [32] dots
+    // The grid is flat because the built-in attributes of a kernel are either all
+    // scalar or all vector, and the lane indices below are scalars.
+    uint groupIdx [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
+) {
+    if (outDim == 0 || width == 0) return;
+    uint row = groupIdx % outDim;
+    uint slot = groupIdx / outDim;
+    if (slot >= slotCount) return;
+    device const float* wPtr = (device const float*)(rawWeightBuffer + weightOffset)
+        + (uint64_t)row * width;
+    // Every per-slot vector is `width` wide, so the slot is an offset rather than a
+    // separate binding.
+    device const float* stream = streamBuffer + (uint64_t)slot * width;
+    device float* logits = logitsBuffer + (uint64_t)slot * outDim;
+
+    // One pass over the stream for both operands: the RMS statistic and the dot
+    // product want the same values, and the reduction is what there is to
+    // parallelize — the row count is `(2 + mult) * mult`, 24 on the published
+    // checkpoint, so a thread per row left every position on one warp.
+    float sumSquares = 0.0f;
+    float total = 0.0f;
+    for (uint32_t i = lane; i < width; i += laneCount) {
+        float value = stream[i];
+        sumSquares += value * value;
+        total += wPtr[i] * value;
     }
-    for (uint i = 0; i < n * n; ++i) {
-        outputMatrix[i] = exp(logits[i] - maxLogit);
+    float warpSquares = simd_sum(sumSquares);
+    float warpTotal = simd_sum(total);
+    if (laneInSimd == 0) {
+        partials[simdIdx] = warpSquares;
+        partials[32 + simdIdx] = warpTotal;
     }
-    for (uint iteration = 0; iteration < iterations; ++iteration) {
-        for (uint r = 0; r < n; ++r) {
-            float rowSum = 0.0f;
-            for (uint c = 0; c < n; ++c) rowSum += outputMatrix[r * n + c];
-            float inv = 1.0f / max(rowSum, epsilon);
-            for (uint c = 0; c < n; ++c) outputMatrix[r * n + c] *= inv;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        uint32_t simdCount = (laneCount + 31u) / 32u;
+        float squares = 0.0f;
+        float sum = 0.0f;
+        for (uint32_t group = 0; group < simdCount; ++group) {
+            squares += partials[group];
+            sum += partials[32 + group];
         }
-        for (uint c = 0; c < n; ++c) {
-            float colSum = 0.0f;
-            for (uint r = 0; r < n; ++r) colSum += outputMatrix[r * n + c];
-            float inv = 1.0f / max(colSum, epsilon);
-            for (uint r = 0; r < n; ++r) outputMatrix[r * n + c] *= inv;
-        }
+        logits[row] = sum * rsqrt(squares / (float)width + normEpsilon);
     }
+}
+
+/// MSL Kernel: the mHC split — `(2 + mult) * mult` logits to `pre`, `post` and
+/// `comb`.
+///
+/// One thread runs the whole split: `mult` is at most `hc_mult` (4 on the published
+/// checkpoint) and the Sinkhorn schedule is serial, so the coordination a parallel
+/// version would need costs more than the loop.
+/// Grid: (slots, 1, 1) — one thread per position, each running its own Sinkhorn.
+///
+/// The schedule is serial and `mult` is at most 16, so a thread's chain cannot be
+/// split, but a BLOCK of positions can run its chains side by side instead of one
+/// dispatch per position: the chains are independent, and the grid is what makes
+/// them concurrent.
+kernel void dsv41_hc_split_f32(
+    device const float* logits [[buffer(0)]],
+    device const float* scaleBuffer [[buffer(1)]],   // [3]
+    device const float* baseBuffer [[buffer(2)]],    // [(2 + mult) * mult]
+    device float* preBuffer [[buffer(3)]],           // [slots][mult]
+    device float* postBuffer [[buffer(4)]],          // [slots][mult]
+    device float* combBuffer [[buffer(5)]],          // [slots][mult * mult]
+    constant uint32_t& mult [[buffer(6)]],
+    constant uint32_t& iterations [[buffer(7)]],
+    constant float& epsilon [[buffer(8)]],
+    constant uint32_t& slotCount [[buffer(9)]],
+    uint slot [[thread_position_in_grid]]
+) {
+    if (slot >= slotCount) return;
+    uint n = mult;
+    if (n == 0 || n > 16) return;
+    uint mixCount = (2 + n) * n;
+    device const float* slotLogits = logits + (uint64_t)slot * mixCount;
+    device float* pre = preBuffer + (uint64_t)slot * n;
+    device float* post = postBuffer + (uint64_t)slot * n;
+    device float* comb = combBuffer + (uint64_t)slot * n * n;
+
+    for (uint copy = 0; copy < n; ++copy) {
+        float preValue = slotLogits[copy] * scaleBuffer[0] + baseBuffer[copy];
+        pre[copy] = 1.0f / (1.0f + exp(-preValue)) + epsilon;
+        float postValue = slotLogits[n + copy] * scaleBuffer[1] + baseBuffer[n + copy];
+        post[copy] = 2.0f * (1.0f / (1.0f + exp(-postValue)));
+    }
+    uint base = 2 * n;
+    for (uint i = 0; i < n * n; ++i) {
+        comb[i] = slotLogits[base + i] * scaleBuffer[2] + baseBuffer[base + i];
+    }
+    dsv41_hc_sinkhorn_into(comb, n, iterations, epsilon);
+}
+
+/// MSL Kernel: `hc_pre` — collapse the copies into the one vector a sub-layer
+/// reads, optionally snapshotting the stack first.
+///
+/// The snapshot is why this kernel exists rather than a separate copy: `hc_post`
+/// needs the block input that the collapse consumed, and taking it here is one
+/// pass instead of two. `snapshot` gates the write rather than a null buffer:
+/// an unbound buffer slot is undefined in Metal, not null, so the caller binds
+/// `residualOut` on every call and asks for the copy it actually reads back.
+/// Grid: (width, 1, 1).
+kernel void dsv41_hc_pre_f32(
+    device const float* streamBuffer [[buffer(0)]],   // [mult][width]
+    device const float* mixBuffer [[buffer(1)]],      // [mult]
+    device float* outputBuffer [[buffer(2)]],         // [width]
+    device float* residualOut [[buffer(3)]],          // [mult][width], written when snapshot
+    constant uint32_t& width [[buffer(4)]],
+    constant uint32_t& mult [[buffer(5)]],
+    constant uint32_t& snapshot [[buffer(6)]],
+    uint dim [[thread_position_in_grid]]
+) {
+    if (dim >= width) return;
+    float accumulator = 0.0f;
+    for (uint32_t copy = 0; copy < mult; ++copy) {
+        float value = streamBuffer[(uint64_t)copy * width + dim];
+        accumulator += mixBuffer[copy] * value;
+        if (snapshot != 0) residualOut[(uint64_t)copy * width + dim] = value;
+    }
+    outputBuffer[dim] = accumulator;
+}
+
+/// MSL Kernel: `hc_post` — expand a sub-layer's output back to every copy and mix
+/// the block's input in through `comb`.
+///
+/// `residual` must not alias `streams`: every thread reads all copies of its
+/// dimension, so writing them in place would race with the reads of the copies a
+/// neighbouring thread is about to use. `dsv41_hc_pre_f32` is what fills the
+/// separate buffer.
+/// Grid: (width, mult, 1).
+kernel void dsv41_hc_post_f32(
+    device const float* outputBuffer [[buffer(0)]],   // [width]
+    device const float* residualBuffer [[buffer(1)]], // [mult][width]
+    device const float* gainsBuffer [[buffer(2)]],    // [mult]
+    device const float* combBuffer [[buffer(3)]],     // [mult][mult]
+    device float* streamBuffer [[buffer(4)]],         // [mult][width]
+    constant uint32_t& width [[buffer(5)]],
+    constant uint32_t& mult [[buffer(6)]],
+    uint2 pos [[thread_position_in_grid]]
+) {
+    uint dim = pos.x;
+    uint copy = pos.y;
+    if (dim >= width || copy >= mult) return;
+    float total = gainsBuffer[copy] * outputBuffer[dim];
+    // The mixing matrix is indexed source-first (`Block.hc_post` sums
+    // `comb.unsqueeze(-1) * residual.unsqueeze(-2)` over its middle axis), so an
+    // output copy reads a COLUMN of it.
+    for (uint32_t source = 0; source < mult; ++source) {
+        total += combBuffer[source * mult + copy] * residualBuffer[(uint64_t)source * width + dim];
+    }
+    streamBuffer[(uint64_t)copy * width + dim] = total;
+}
+
+/// MSL Kernel: the mix a forward pass starts from — copy 0 only
+/// (`make_identity_pre_mix`). One thread.
+kernel void dsv41_hc_identity_mix_f32(
+    device float* mixBuffer [[buffer(0)]],
+    constant uint32_t& mult [[buffer(1)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= mult) return;
+    mixBuffer[tid] = (tid == 0) ? 1.0f : 0.0f;
 }
 
 // ============================================================================
@@ -8633,10 +9280,12 @@ kernel void dsv41_hc_sinkhorn(
 // indexer selected). Gathering first is what keeps one attention kernel serving
 // both halves of CSA2 instead of two kernels with different row addressing.
 //
-// The cache is resident at FP16 here (`dsv41_store_latent_f16`). The checkpoint's
-// designed form is E4M3 with a per-32 E8M0 footer; that path lands once its
-// quantize/dequantize pair is checked against the reference, and until then the
-// load log says which one is in use rather than pretending they are equivalent.
+// The cache is resident at FP16 here (`dsv41_store_latent_f16`), and the gathered
+// block is a copy of it (`dsv41_gather_latents_f16`), so the attention reads FP16
+// records (`dsv41_attention_csa2_f16`). The checkpoint's designed form is E4M3 with
+// a per-32 E8M0 footer; that path lands once its quantize/dequantize pair is
+// checked against the reference, and until then the load log says which one is in
+// use rather than pretending they are equivalent.
 // ============================================================================
 
 /// MSL Kernel: rotary embedding over a batch of vectors, with the inverse
@@ -8702,13 +9351,18 @@ kernel void dsv41_store_latent_f16(
     cacheBuffer[destination] = half(latentBuffer[dim]);
 }
 
-/// MSL Kernel: gathers cache rows into a dense FP32 block so one attention pass
-/// can read window and compressed rows without per-row branching.
+/// MSL Kernel: gathers cache rows into a dense block so one attention pass can
+/// read window and compressed rows without per-row branching.
 /// `rowIndices` holds CACHE rows (already ring-mapped) in attention order.
+///
+/// Both sides are FP16, so this is a pure copy: the cache is resident at FP16 and
+/// the attention reads the block at FP16 (`dsv41_attention_csa2_f16`). It used to
+/// widen every record to FP32 on the way out, which the attention then read back,
+/// doubling both the block's size and the bytes every head read from it.
 kernel void dsv41_gather_latents_f16(
     device const half* cacheBuffer [[buffer(0)]],
     device const uint32_t* rowIndices [[buffer(1)]],
-    device float* denseBuffer [[buffer(2)]],
+    device half* denseBuffer [[buffer(2)]],
     constant uint64_t& cacheOffset [[buffer(3)]],
     constant uint32_t& width [[buffer(4)]],
     constant uint32_t& rowCount [[buffer(5)]],
@@ -8720,76 +9374,301 @@ kernel void dsv41_gather_latents_f16(
     if (row >= rowCount || dim >= width) return;
     uint32_t source = rowIndices[row];
     uint64_t destination = (destinationRowOffset + (uint64_t)row) * (uint64_t)width + dim;
-    denseBuffer[destination] =
-        float(cacheBuffer[cacheOffset + ((uint64_t)source * width) + dim]);
+    denseBuffer[destination] = cacheBuffer[cacheOffset + ((uint64_t)source * width) + dim];
 }
 
 /// MSL Kernel: CSA2 attention for one query position over a dense latent block.
 ///
 /// The sink is an extra logit in the denominator with no value row, so a head can
 /// attend to nothing and emit zeros. It is per head and comes from `attn_sink`.
+///
+/// One THREADGROUP per head, `threads_per_threadgroup` lanes wide, because the
+/// shipped shape is the opposite of a wide grid: a compressed layer reads
+/// `window + index_topk` rows (128 + 512 on the published checkpoint) of a 512-wide
+/// record, and the loop over those rows is serial, so a one-thread-per-head grid is
+/// only as wide as the head count and leaves the rest of the die idle while 1.3
+/// million multiply-adds run in a single lane. A thread owns whole rows for the dot
+/// products and every `laneCount`-th output dimension for the accumulation, and the
+/// row scores are kept in threadgroup memory so the three passes share ONE dot
+/// product per row instead of recomputing it. The head's maximum and denominator
+/// are reductions across the threadgroup, kept in the scratch tail of `scores`.
+///
+/// `slotPlan` batches several query positions into ONE launch. With a `slotCount`
+/// above one the grid is `slotCount * headCount` threadgroups, `slot = groupIdx /
+/// headCount` and `head = groupIdx % headCount`, so the slot-major query and output
+/// offsets stay `groupIdx * qkHeadDim` and `groupIdx * valueDim`, and the head part
+/// of the index is what selects its sink.
+/// Slot `s` reads its gathered block at row `s * keyRowStride`, and `slotRowCounts`
+/// carries one row count per slot because a block's positions do not all read the
+/// same number of rows (the first position of a prompt sees one window row, the
+/// eighth sees eight). Leaving `slotPlan` unbound is the single-position form: one
+/// dispatch per position, `rowCount` rows, the gathered block at row 0, which is
+/// what every caller dispatched before this existed.
+struct Dsv41AttentionSlotPlan {
+    uint32_t slotCount;
+    uint32_t keyRowStride;
+};
+
 kernel void dsv41_attention_csa2_f32(
-    device const float* queryBuffer [[buffer(0)]],   // [heads * qkHeadDim]
-    device const float* keyBuffer [[buffer(1)]],     // [rowCount * width]
+    device const float* queryBuffer [[buffer(0)]],   // [slots * heads * qkHeadDim]
+    device const float* keyBuffer [[buffer(1)]],     // [slots * keyRowStride * width]
     device const float* sinkBuffer [[buffer(2)]],    // [heads] or null
-    device float* outputBuffer [[buffer(3)]],        // [heads * vHeadDim]
+    device float* outputBuffer [[buffer(3)]],        // [slots * heads * vHeadDim]
     constant uint32_t& rowCount [[buffer(4)]],
     constant uint32_t& headCount [[buffer(5)]],
     constant uint32_t& qkHeadDim [[buffer(6)]],
     constant uint32_t& valueDim [[buffer(7)]],
     constant uint32_t& width [[buffer(8)]],
-    uint headIdx [[thread_position_in_grid]]
+    constant Dsv41AttentionSlotPlan* slotPlan [[buffer(9)]],
+    device const uint32_t* slotRowCounts [[buffer(10)]],
+    threadgroup float* scores [[threadgroup(0)]],    // [max rows + one per SIMD group]
+    uint groupIdx [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
 ) {
-    if (headIdx >= headCount) return;
+    uint32_t slotCount = (slotPlan != nullptr && slotPlan->slotCount > 1u)
+        ? slotPlan->slotCount
+        : 1u;
+    if (groupIdx >= headCount * slotCount) return;
+    uint32_t slot = groupIdx / headCount;
+    uint32_t headIdx = groupIdx - slot * headCount;
+    uint32_t rows = (slotCount > 1u && slotRowCounts != nullptr)
+        ? slotRowCounts[slot]
+        : rowCount;
+    if (rows == 0u) return;
+    uint64_t keyRowBase = (slotCount > 1u)
+        ? (uint64_t)slot * (uint64_t)slotPlan->keyRowStride
+        : 0u;
 
     float invSqrt = rsqrt((float)qkHeadDim);
-    uint32_t queryBase = headIdx * qkHeadDim;
+    uint32_t queryBase = groupIdx * qkHeadDim;
     uint32_t queryWidth = min(qkHeadDim, width);
+    uint32_t simdCount = (laneCount + 31u) / 32u;
+    threadgroup float* partials = scores + rows;
 
-    // Online softmax over the gathered rows, then the sink as a value-free entry.
-    float maxScore = -1e30f;
-    for (uint32_t row = 0; row < rowCount; ++row) {
-        uint64_t keyBase = (uint64_t)row * width;
-        float dot = 0.0f;
-        for (uint32_t dim = 0; dim < queryWidth; ++dim) {
-            dot += queryBuffer[queryBase + dim] * keyBuffer[keyBase + dim];
-        }
-        maxScore = max(maxScore, dot * invSqrt);
-    }
+    // The sink is an extra logit with no value row, so it enters the maximum and
+    // the denominator and contributes nothing to the output.
     float sinkLogit = (sinkBuffer != nullptr) ? sinkBuffer[headIdx] : -1e30f;
-    maxScore = max(maxScore, sinkLogit);
 
-    float denominator = 0.0f;
-    for (uint32_t row = 0; row < rowCount; ++row) {
-        uint64_t keyBase = (uint64_t)row * width;
+    // Pass 1: one row per thread, the whole dot product in that thread. A row is a
+    // contiguous record, so this walks memory forward instead of gathering it.
+    float localMax = -1e30f;
+    for (uint32_t row = lane; row < rows; row += laneCount) {
+        uint64_t keyBase = (keyRowBase + (uint64_t)row) * width;
         float dot = 0.0f;
         for (uint32_t dim = 0; dim < queryWidth; ++dim) {
             dot += queryBuffer[queryBase + dim] * keyBuffer[keyBase + dim];
         }
-        denominator += exp(dot * invSqrt - maxScore);
+        float score = dot * invSqrt;
+        scores[row] = score;
+        localMax = max(localMax, score);
     }
-    if (sinkBuffer != nullptr) denominator += exp(sinkLogit - maxScore);
+    float warpMax = simd_max(localMax);
+    if (laneInSimd == 0) partials[simdIdx] = warpMax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float maxScore = sinkLogit;
+    for (uint32_t group = 0; group < simdCount; ++group) {
+        maxScore = max(maxScore, partials[group]);
+    }
 
+    // Pass 2: the weights replace the scores in place, so the output pass reads
+    // them and pays for `exp` once.
+    float localSum = 0.0f;
+    for (uint32_t row = lane; row < rows; row += laneCount) {
+        float weight = exp(scores[row] - maxScore);
+        scores[row] = weight;
+        localSum += weight;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float warpSum = simd_sum(localSum);
+    if (laneInSimd == 0) partials[simdIdx] = warpSum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float denominator = (sinkBuffer != nullptr) ? exp(sinkLogit - maxScore) : 0.0f;
+    for (uint32_t group = 0; group < simdCount; ++group) {
+        denominator += partials[group];
+    }
     float inverse = denominator > 0.0f ? (1.0f / denominator) : 0.0f;
-    uint32_t valueWidth = min(valueDim, width);
 
-    // Accumulate in a second pass so the weights are normalized by the full set.
-    uint32_t outputBase = headIdx * valueDim;
-    for (uint32_t dim = 0; dim < valueWidth; ++dim) {
+    // Pass 3: one thread per output dimension, so this is an accumulator rather
+    // than a reduction: threads own disjoint dimensions and never collide.
+    uint32_t valueWidth = min(valueDim, width);
+    uint32_t outputBase = groupIdx * valueDim;
+    for (uint32_t dim = lane; dim < valueWidth; dim += laneCount) {
+        float accumulator = 0.0f;
+        for (uint32_t row = 0; row < rows; ++row) {
+            accumulator += scores[row] * keyBuffer[(keyRowBase + (uint64_t)row) * width + dim];
+        }
+        outputBuffer[outputBase + dim] = accumulator * inverse;
+    }
+    // A record narrower than the value head leaves a tail that no row fills.
+    for (uint32_t dim = valueWidth + lane; dim < valueDim; dim += laneCount) {
         outputBuffer[outputBase + dim] = 0.0f;
     }
-    for (uint32_t row = 0; row < rowCount; ++row) {
-        uint64_t keyBase = (uint64_t)row * width;
-        float dot = 0.0f;
-        for (uint32_t dim = 0; dim < queryWidth; ++dim) {
-            dot += queryBuffer[queryBase + dim] * keyBuffer[keyBase + dim];
+}
+
+/// MSL Kernel: `dsv41_attention_csa2_f32` over an FP16 gathered block, with four
+/// independent accumulators.
+///
+/// Same rule, same addressing, same slot dimension, same threadgroup shape. Two
+/// things differ, and the measurement is what separated them:
+///
+/// 1. The key records arrive as `half`, because the block is a copy of cache rows
+///    and the cache is resident at FP16 (`dsv41_store_latent_f16`). Widening each
+///    record to FP32 on the way into the block and reading it back doubled the
+///    bytes moved for no information at all. `float(key)` is exact, so the values
+///    the arithmetic sees are the cache's own.
+/// 2. The dot product and the value sum run on four accumulators. `dot += q * k`
+///    is a `width`-long dependent chain of FMAs, and that chain, not bandwidth, is
+///    what the stage was paying: halving the record left the cost unchanged at
+///    every published row count, while breaking the chain into four took the same
+///    kernel 2.7x faster (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #17"). The two are
+///    not additive in the way they look — once the chain is broken the byte saving
+///    is worth about a tenth, because the reads were never the limit.
+///
+/// The summation ORDER therefore differs from the FP32 kernel, so the two agree to
+/// float rounding rather than to the bit. Anything that needs the exact serial
+/// order is a numerical question about the reference, not about this kernel; the
+/// parity tests pin the rule against `DeepSeekV41CPUForward` at their own bars
+/// (`DeepSeekV41DeviceGraphParityTests`).
+///
+/// The FP32 kernel is kept as the baseline this A/B measured against, and it is
+/// what `#5`-`#16` recorded; every timing case now reads the FP16 form above, so
+/// even those numbers describe the shipped kernel.
+kernel void dsv41_attention_csa2_f16(
+    device const float* queryBuffer [[buffer(0)]],   // [slots * heads * qkHeadDim]
+    device const half* keyBuffer [[buffer(1)]],      // [slots * keyRowStride * width]
+    device const float* sinkBuffer [[buffer(2)]],    // [heads] or null
+    device float* outputBuffer [[buffer(3)]],        // [slots * heads * vHeadDim]
+    constant uint32_t& rowCount [[buffer(4)]],
+    constant uint32_t& headCount [[buffer(5)]],
+    constant uint32_t& qkHeadDim [[buffer(6)]],
+    constant uint32_t& valueDim [[buffer(7)]],
+    constant uint32_t& width [[buffer(8)]],
+    constant Dsv41AttentionSlotPlan* slotPlan [[buffer(9)]],
+    device const uint32_t* slotRowCounts [[buffer(10)]],
+    threadgroup float* scores [[threadgroup(0)]],    // [max rows + one per SIMD group]
+    uint groupIdx [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
+) {
+    uint32_t slotCount = (slotPlan != nullptr && slotPlan->slotCount > 1u)
+        ? slotPlan->slotCount
+        : 1u;
+    if (groupIdx >= headCount * slotCount) return;
+    uint32_t slot = groupIdx / headCount;
+    uint32_t headIdx = groupIdx - slot * headCount;
+    uint32_t rows = (slotCount > 1u && slotRowCounts != nullptr)
+        ? slotRowCounts[slot]
+        : rowCount;
+    if (rows == 0u) return;
+    uint64_t keyRowBase = (slotCount > 1u)
+        ? (uint64_t)slot * (uint64_t)slotPlan->keyRowStride
+        : 0u;
+
+    float invSqrt = rsqrt((float)qkHeadDim);
+    uint32_t queryBase = groupIdx * qkHeadDim;
+    uint32_t queryWidth = min(qkHeadDim, width);
+    uint32_t simdCount = (laneCount + 31u) / 32u;
+    threadgroup float* partials = scores + rows;
+    float sinkLogit = (sinkBuffer != nullptr) ? sinkBuffer[headIdx] : -1e30f;
+
+    // Pass 1: one row per thread, the whole dot product in that thread, FOUR
+    // independent accumulators. A single `dot +=` is a 512-long dependent chain of
+    // FMAs, and the measurement that built this kernel showed the stage is limited
+    // by that chain rather than by the bytes it reads: halving the record from FP32
+    // to FP16 left the cost unchanged at every published row count
+    // (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #17"). Four chains shorten it 4x.
+    float localMax = -1e30f;
+    for (uint32_t row = lane; row < rows; row += laneCount) {
+        uint64_t keyBase = (keyRowBase + (uint64_t)row) * width;
+        float dot0 = 0.0f;
+        float dot1 = 0.0f;
+        float dot2 = 0.0f;
+        float dot3 = 0.0f;
+        uint32_t dim = 0;
+        if (width % 4u == 0u && queryWidth % 4u == 0u) {
+            // A row is contiguous and `width` is a multiple of four, so the record
+            // can be walked four halves at a time off one 8-byte load.
+            device const half4* keyRow = (device const half4*)(keyBuffer + keyBase);
+            for (uint32_t group = 0; group < queryWidth / 4u; ++group) {
+                half4 record = keyRow[group];
+                dot0 += queryBuffer[queryBase + 4u * group] * float(record.x);
+                dot1 += queryBuffer[queryBase + 4u * group + 1u] * float(record.y);
+                dot2 += queryBuffer[queryBase + 4u * group + 2u] * float(record.z);
+                dot3 += queryBuffer[queryBase + 4u * group + 3u] * float(record.w);
+            }
+        } else {
+            for (; dim + 4u <= queryWidth; dim += 4u) {
+                dot0 += queryBuffer[queryBase + dim] * float(keyBuffer[keyBase + dim]);
+                dot1 += queryBuffer[queryBase + dim + 1u] * float(keyBuffer[keyBase + dim + 1u]);
+                dot2 += queryBuffer[queryBase + dim + 2u] * float(keyBuffer[keyBase + dim + 2u]);
+                dot3 += queryBuffer[queryBase + dim + 3u] * float(keyBuffer[keyBase + dim + 3u]);
+            }
+            for (; dim < queryWidth; ++dim) {
+                dot0 += queryBuffer[queryBase + dim] * float(keyBuffer[keyBase + dim]);
+            }
         }
-        float weight = exp(dot * invSqrt - maxScore) * inverse;
-        for (uint32_t dim = 0; dim < valueWidth; ++dim) {
-            outputBuffer[outputBase + dim] += weight * keyBuffer[keyBase + dim];
-        }
+        float score = ((dot0 + dot1) + (dot2 + dot3)) * invSqrt;
+        scores[row] = score;
+        localMax = max(localMax, score);
     }
-    for (uint32_t dim = valueWidth; dim < valueDim; ++dim) {
+    float warpMax = simd_max(localMax);
+    if (laneInSimd == 0) partials[simdIdx] = warpMax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float maxScore = sinkLogit;
+    for (uint32_t group = 0; group < simdCount; ++group) {
+        maxScore = max(maxScore, partials[group]);
+    }
+
+    // Pass 2: the weights replace the scores in place.
+    float localSum = 0.0f;
+    for (uint32_t row = lane; row < rows; row += laneCount) {
+        float weight = exp(scores[row] - maxScore);
+        scores[row] = weight;
+        localSum += weight;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float warpSum = simd_sum(localSum);
+    if (laneInSimd == 0) partials[simdIdx] = warpSum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float denominator = (sinkBuffer != nullptr) ? exp(sinkLogit - maxScore) : 0.0f;
+    for (uint32_t group = 0; group < simdCount; ++group) {
+        denominator += partials[group];
+    }
+    float inverse = denominator > 0.0f ? (1.0f / denominator) : 0.0f;
+
+    // Pass 3: one thread per output dimension, four independent accumulators over
+    // the rows for the same reason pass 1 has four: the weight-times-value sum is
+    // a dependent chain as long as the row count, and consecutive rows are a
+    // `width`-wide stride apart, so the four loads are independent.
+    uint32_t valueWidth = min(valueDim, width);
+    uint32_t outputBase = groupIdx * valueDim;
+    for (uint32_t dim = lane; dim < valueWidth; dim += laneCount) {
+        float part0 = 0.0f;
+        float part1 = 0.0f;
+        float part2 = 0.0f;
+        float part3 = 0.0f;
+        uint32_t row = 0;
+        for (; row + 4u <= rows; row += 4u) {
+            part0 += scores[row] * float(keyBuffer[(keyRowBase + (uint64_t)row) * width + dim]);
+            part1 += scores[row + 1u]
+                * float(keyBuffer[(keyRowBase + (uint64_t)(row + 1u)) * width + dim]);
+            part2 += scores[row + 2u]
+                * float(keyBuffer[(keyRowBase + (uint64_t)(row + 2u)) * width + dim]);
+            part3 += scores[row + 3u]
+                * float(keyBuffer[(keyRowBase + (uint64_t)(row + 3u)) * width + dim]);
+        }
+        for (; row < rows; ++row) {
+            part0 += scores[row] * float(keyBuffer[(keyRowBase + (uint64_t)row) * width + dim]);
+        }
+        outputBuffer[outputBase + dim] =
+            ((part0 + part1) + (part2 + part3)) * inverse;
+    }
+    for (uint32_t dim = valueWidth + lane; dim < valueDim; dim += laneCount) {
         outputBuffer[outputBase + dim] = 0.0f;
     }
 }
@@ -8876,6 +9755,13 @@ kernel void dsv41_indexer_scores_f32(
 /// `scoringFunction` is 0 = sigmoid, 1 = sqrtsoftplus. Softmax (2) is a
 /// distribution over all experts and needs a second pass over them, so the
 /// executor refuses it rather than computing it one expert at a time.
+/// Grid: (slots, 1, 1) — one thread per position.
+///
+/// The scan and its insertion sort are serial over the experts, which is one
+/// thread's worth of work, so a block runs its positions as concurrent threads in
+/// one dispatch instead of one dispatch per position. `slots` is 1 for a decode
+/// step. `indexStride` is the readback buffer's per-slot stride in UINT32s (the
+/// caller pads it to at least four entries per slot, so it is not `topK`).
 kernel void dsv41_router_topk(
     device const float* logits [[buffer(0)]],
     device const float* biasBuffer [[buffer(1)]],     // may be null
@@ -8887,17 +9773,22 @@ kernel void dsv41_router_topk(
     constant uint32_t& normalise [[buffer(7)]],
     constant uint32_t& scoringFunction [[buffer(8)]],
     constant float& gateTemp [[buffer(9)]],
-    uint tid [[thread_position_in_grid]]
+    constant uint32_t& indexStride [[buffer(10)]],
+    constant uint32_t& slotCount [[buffer(11)]],
+    uint slot [[thread_position_in_grid]]
 ) {
-    if (tid != 0 || expertCount == 0 || topK == 0) return;
+    if (slot >= slotCount || expertCount == 0 || topK == 0) return;
+    device const float* slotLogits = logits + (uint64_t)slot * expertCount;
+    device uint32_t* slotIndices = expertIndices + (uint64_t)slot * indexStride;
+    device float* slotWeights = expertWeights + (uint64_t)slot * topK;
     uint32_t count = min(topK, expertCount);
     // Leaving here would keep the previous token's routing in the readback buffer,
     // so an impossible top-k fails by being visibly wrong rather than silently
     // stale. The published checkpoint's top-k is ~6.
     if (count > 64u || expertCount > 65536u) {
         for (uint32_t rank = 0; rank < count && rank < 64u; ++rank) {
-            expertIndices[rank] = 0u;
-            expertWeights[rank] = 0.0f;
+            slotIndices[rank] = 0u;
+            slotWeights[rank] = 0.0f;
         }
         return;
     }
@@ -8912,7 +9803,7 @@ kernel void dsv41_router_topk(
 
     float temperature = gateTemp > 0.0f ? gateTemp : 1.0f;
     for (uint32_t expert = 0; expert < expertCount; ++expert) {
-        float logit = logits[expert] / temperature;
+        float logit = slotLogits[expert] / temperature;
         // The weight is the UNBIASED score; the bias only moves the ranking.
         float weight = (scoringFunction == 0u)
             ? (logit >= 0.0f ? (1.0f / (1.0f + exp(-logit)))
@@ -8960,49 +9851,9 @@ kernel void dsv41_router_topk(
         float mixWeight = topWeight[rank];
         if (normalise != 0u && total > 0.0f) mixWeight /= total;
         if (scalingFactor > 0.0f) mixWeight *= scalingFactor;
-        expertIndices[rank] = topIndex[rank];
-        expertWeights[rank] = mixWeight;
+        slotIndices[rank] = topIndex[rank];
+        slotWeights[rank] = mixWeight;
     }
-}
-
-/// MSL Kernel: the mHC read — combines the hyper-connection streams with a mixing
-/// matrix row, then applies the per-stream `hc_*_scale` and the per-dimension
-/// `hc_*_base` bias.
-kernel void dsv41_hc_mix_f32(
-    device const float* streamBuffer [[buffer(0)]],   // [mult * width]
-    device const float* readWeights [[buffer(1)]],   // [mult]
-    device const float* scaleBuffer [[buffer(2)]],   // [mult] or null
-    device const float* biasBuffer [[buffer(3)]],    // [width] or null
-    device float* outputBuffer [[buffer(4)]],        // [width]
-    constant uint32_t& width [[buffer(5)]],
-    constant uint32_t& mult [[buffer(6)]],
-    uint dim [[thread_position_in_grid]]
-) {
-    if (dim >= width) return;
-    float accumulator = 0.0f;
-    for (uint32_t stream = 0; stream < mult; ++stream) {
-        float scale = (scaleBuffer != nullptr) ? scaleBuffer[stream] : 1.0f;
-        float bias = (biasBuffer != nullptr) ? biasBuffer[dim] : 0.0f;
-        accumulator += readWeights[stream] * (streamBuffer[(uint64_t)stream * width + dim] * scale + bias);
-    }
-    outputBuffer[dim] = accumulator;
-}
-
-/// MSL Kernel: the mHC write — accumulates a sub-layer's contribution into every
-/// stream with that stream's own write scale.
-kernel void dsv41_hc_write_f32(
-    device float* streamBuffer [[buffer(0)]],         // [mult * width]
-    device const float* contribution [[buffer(1)]],  // [width]
-    device const float* writeScales [[buffer(2)]],   // [mult] or null
-    constant uint32_t& width [[buffer(3)]],
-    constant uint32_t& mult [[buffer(4)]],
-    uint2 pos [[thread_position_in_grid]]
-) {
-    uint dim = pos.x;
-    uint stream = pos.y;
-    if (dim >= width || stream >= mult) return;
-    float scale = (writeScales != nullptr) ? writeScales[stream] : 1.0f;
-    streamBuffer[(uint64_t)stream * width + dim] += scale * contribution[dim];
 }
 
 // ============================================================================

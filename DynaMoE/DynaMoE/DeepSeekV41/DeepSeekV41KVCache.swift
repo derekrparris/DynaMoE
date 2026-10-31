@@ -307,6 +307,74 @@ nonisolated public enum DeepSeekV41CacheAddressing {
         return base + block * MemoryLayout<Float>.stride
     }
 
+    // MARK: Compressor group
+
+    /// Which block of compressor slots each compressed-KV owner fills.
+    ///
+    /// `Compressor` keeps `kv_state` and `score_state` per module instance, so the
+    /// slots one layer fills are never the slots another layer fills. Addressing a
+    /// shared block by `position % ratio` alone does not give that: owners run in
+    /// index order at every position, so the earlier slots of a block were last
+    /// written by whichever owner ran latest at the previous position (layer 20,
+    /// ratio 1, writes slot 0 every position), and a ratio-2 owner then pooled its
+    /// own latent together with that other layer's. One block per owner is what
+    /// the reference has, and it also makes a group survive a turn boundary
+    /// without a separate state machine.
+    public static func compressorOwnerSlots(plan: [DeepSeekV41LayerPlan]) -> [Int: Int] {
+        var out: [Int: Int] = [:]
+        var ordinal = 0
+        for layer in plan.sorted(by: { $0.index < $1.index }) where layer.ownsCompressedKV {
+            out[layer.index] = ordinal
+            ordinal += 1
+        }
+        return out
+    }
+
+    /// Byte offset of one slot in one owner's compressor group.
+    ///
+    /// `groupWidth` is one owner's block in slots (the widest ratio the checkpoint
+    /// declares), so a narrow owner leaves its spare slots unused instead of
+    /// reaching into the next owner's block.
+    public static func compressorSlotByteOffset(
+        owner: Int,
+        slot: Int,
+        groupWidth: Int,
+        width: Int
+    ) -> Int? {
+        guard owner >= 0, slot >= 0, width > 0, groupWidth > 0, slot < groupWidth else {
+            return nil
+        }
+        return (owner * groupWidth + slot) * width * MemoryLayout<Float>.stride
+    }
+
+    /// Which slot of its own group a decode position fills.
+    ///
+    /// `Compressor.forward`'s decode branch stores the position's latent at
+    /// `kv_state[:, start_pos % ratio]`, so the slot is the position's offset inside
+    /// the group, not a counter the caller advances. Tracking it as a counter is how
+    /// a resumed turn (which starts at a position the caller did not count to) ends
+    /// up overwriting the wrong slot.
+    ///
+    /// A ratio of 1 is one position per group, and that owner's slot 0 is rewritten
+    /// on every position, which is the reference's behaviour for a plain projection.
+    public static func compressorSlot(position: Int, ratio: Int) -> Int? {
+        guard position >= 0, ratio >= 1 else { return nil }
+        return position % ratio
+    }
+
+    /// Whether this position completes a group, i.e. whether a compressed row comes
+    /// out of it.
+    ///
+    /// `Compressor.forward` pools when `(start_pos + 1) % ratio == 0`. Pooling on
+    /// any later position would append the same row again, which is why this is a
+    /// rule rather than a convenience: a port that pooled whenever the state looked
+    /// full grows the compressed cache with the context instead of with the context
+    /// divided by the ratio.
+    public static func compressorCompletesGroup(position: Int, ratio: Int) -> Bool {
+        guard position >= 0, ratio >= 1 else { return false }
+        return (position + 1) % ratio == 0
+    }
+
     /// The compressed rows a position's compressed attentions may read: every
     /// row produced so far, capped to the fewest the token budget allows.
     ///
@@ -340,22 +408,60 @@ nonisolated public enum DeepSeekV41CacheAddressing {
         return start..<(position + 1)
     }
 
-    /// Whether a cache holding `storedPositions` positions can serve a prefix of
-    /// `prefixCount` positions.
+    /// The prefix a turn may actually skip: the pin's common prefix, cut to what the
+    /// cache holds.
     ///
-    /// Two bounds apply. The count must be stored at all, and it must fit inside the
-    /// window ring: past `windowRows` positions the oldest window rows have been
-    /// overwritten, so a prefix that "exists" by count would still attend stale
-    /// rows even though its compressed rows are intact.
-    public static func prefixIsReusable(
-        prefixCount: Int,
+    /// The cache has to hold exactly the positions being skipped. A resident
+    /// sequence longer than the common prefix means its rows past the point of
+    /// divergence belong to tokens this prompt does not contain, and resuming there
+    /// would keep compressed rows of blocks the new sequence never wrote. So a short
+    /// match is no reuse at all rather than a partial one, and the caller re-prefills
+    /// the prompt in full. The last prompt token is never skipped: its logits are
+    /// what the first sampled token comes from.
+    ///
+    /// The window ring is not a bound, and it is worth saying why, because it looks
+    /// like it should: a resumed turn never replays the positions it skips, so rows
+    /// the ring has overwritten are rows nothing reads again. What a position after
+    /// the prefix reads is the trailing window rows, which the ring always holds
+    /// because they are the newest ones written, plus every compressed row of every
+    /// completed block, which are retained for the whole context rather than ringed.
+    public static func reusablePrefix(
+        proposed: Int,
         storedPositions: Int,
-        windowRows: Int
-    ) -> Bool {
-        guard prefixCount > 0 else { return true }
-        guard storedPositions <= max(0, windowRows) else { return false }
-        guard prefixCount <= storedPositions else { return false }
-        return prefixCount <= max(0, windowRows)
+        promptTokens: Int
+    ) -> Int {
+        guard proposed > 0, storedPositions > 0, promptTokens > 1 else { return 0 }
+        guard storedPositions <= proposed else { return 0 }
+        guard storedPositions <= promptTokens - 1 else { return 0 }
+        return storedPositions
+    }
+
+    /// The same decision, with the tokens checked.
+    ///
+    /// A length is not identity. The pin that proposes one belongs to the app rather
+    /// than to any cache, so its length can fit a sequence this cache never held: a
+    /// turn of another model, or an older turn of this one, leaves one behind.
+    /// Continuing such a sequence teaches the model that two different conversations
+    /// are one, and nothing downstream reports it, so the resident tokens are
+    /// compared and any divergence is a full prefill.
+    public static func reusablePrefix(
+        proposed: Int,
+        storedPositions: Int,
+        promptTokenIds: [Int],
+        residentTokens: [Int32]
+    ) -> Int {
+        guard storedPositions == residentTokens.count else { return 0 }
+        let cut = reusablePrefix(
+            proposed: proposed,
+            storedPositions: storedPositions,
+            promptTokens: promptTokenIds.count
+        )
+        guard cut > 0 else { return 0 }
+        for position in 0..<cut
+        where residentTokens[position] != Int32(truncatingIfNeeded: promptTokenIds[position]) {
+            return 0
+        }
+        return cut
     }
 }
 
@@ -492,20 +598,5 @@ nonisolated public final class DeepSeekV41KVCache: @unchecked Sendable {
         stateLock.lock()
         storedValue = 0
         stateLock.unlock()
-    }
-
-    /// Whether the cache still holds every position up to `prefixCount` intact.
-    ///
-    /// Two bounds apply, not one. The compressed rows survive for the whole
-    /// context, but the window rings keep only the newest `windowRows` positions:
-    /// once the sequence is longer than the ring, the oldest window rows have been
-    /// overwritten by later positions, so a "hit" there would attend stale rows
-    /// even though the position count says otherwise.
-    public func canReuse(prefixCount: Int) -> Bool {
-        DeepSeekV41CacheAddressing.prefixIsReusable(
-            prefixCount: prefixCount,
-            storedPositions: storedPositions,
-            windowRows: layout.geometry.windowRows
-        )
     }
 }

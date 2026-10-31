@@ -621,6 +621,44 @@ nonisolated public enum DeepSeekV41WeightError: Error, Equatable, CustomStringCo
 
 extension DeepSeekV41WeightCatalog {
 
+    /// Which indexer tensors a layer has to publish.
+    ///
+    /// The reference builds an `Indexer` only on an index-source layer
+    /// (`Attention.__init__`: `if self.is_index_source: self.indexer = Indexer(...)`),
+    /// and inside one only a layer that compresses its own KV can produce index
+    /// keys (`Indexer.owns_k = layer_id in kv_source_layers`). Every layer in
+    /// between reuses the source's `topk_idxs` (`_compress_topk_idxs` returns
+    /// `shared_attn.topk_idxs`) and publishes no indexer tensors at all.
+    ///
+    /// The rule lives here so it can be asserted without a checkpoint: demanding
+    /// the full set on every compressed layer rejects the real 384-expert
+    /// checkpoint, which publishes exactly this split (2/8/14/20 own the
+    /// compressed KV and the index keys, 24/28/32/36 own index keys only, every
+    /// other compressed layer owns neither).
+    static func requiredIndexerRoles(
+        layer: DeepSeekV41LayerPlan,
+        config: DeepSeekV41Config
+    ) -> [DeepSeekV41TensorRole] {
+        guard layer.ownsCompressedIndex else { return [] }
+        var roles: [DeepSeekV41TensorRole] = [.indexerWqB, .indexerWeights]
+        if config.kvSourceLayerIDs.contains(layer.index) {
+            // `Indexer.forward` normalises the projected key before rotating it.
+            roles.append(contentsOf: [.indexerWk, .indexerKNorm])
+        }
+        return roles
+    }
+
+    /// The checkpoint's spelling for an indexer role, for the missing-tensor line.
+    static func indexerLabel(_ role: DeepSeekV41TensorRole) -> String {
+        switch role {
+        case .indexerWqB: return "attn.indexer.wq_b.weight"
+        case .indexerWk: return "attn.indexer.wk.weight"
+        case .indexerWeights: return "attn.indexer.weights_proj.weight"
+        case .indexerKNorm: return "attn.indexer.k_norm.weight"
+        default: return role.rawValue
+        }
+    }
+
     /// Every requirement the plan imposes on the checkpoint, checked against the
     /// catalog. Returns human-readable problems; empty means the checkpoint can
     /// be run.
@@ -681,6 +719,11 @@ extension DeepSeekV41WeightCatalog {
                     (.hcFfnFn, "hc_ffn_fn"),
                     (.hcFfnBase, "hc_ffn_base")
                 ])
+                problems.append(
+                    contentsOf: hyperConnectionProblems(
+                        config: config, scope: .backbone, layer: l
+                    )
+                )
             }
             // Only the four `kv_source_layer_ids` layers publish compressor
             // weights: the other compressed layers read the rows their source
@@ -693,16 +736,8 @@ extension DeepSeekV41WeightCatalog {
                 }
                 required.append((.compressorNorm, "attn.compressor.norm.weight"))
             }
-            if layer.flavor == .compressed && (layer.ownsCompressedIndex || config.indexTopK > 0) {
-                required.append(contentsOf: [
-                    (.indexerWqB, "attn.indexer.wq_b.weight"),
-                    (.indexerWk, "attn.indexer.wk.weight"),
-                    (.indexerWeights, "attn.indexer.weights_proj.weight")
-                ])
-            }
-            if layer.ownsCompressedIndex {
-                // `Indexer.forward` normalises the projected key before rotating it.
-                required.append((.indexerKNorm, "attn.indexer.k_norm.weight"))
+            for role in Self.requiredIndexerRoles(layer: layer, config: config) {
+                required.append((role, Self.indexerLabel(role)))
             }
             if layer.engramTable != nil {
                 required.append(contentsOf: [
@@ -768,6 +803,11 @@ extension DeepSeekV41WeightCatalog {
                     (.hcFfnFn, "hc_ffn_fn"),
                     (.hcFfnBase, "hc_ffn_base")
                 ])
+                problems.append(
+                    contentsOf: hyperConnectionProblems(
+                        config: config, scope: .draft, layer: block
+                    )
+                )
             }
             if block == 0 {
                 required.append(contentsOf: [
@@ -809,6 +849,55 @@ extension DeepSeekV41WeightCatalog {
         // reads is either a new architecture feature or a corrupted manifest.
         if !unconsumed.isEmpty {
             problems.append(contentsOf: unconsumed.map { "unconsumed tensor: \($0)" })
+        }
+        return problems
+    }
+
+    /// The `hc_*` shapes, checked because they are load-bearing.
+    ///
+    /// `Block.hc_mixes` projects the FLATTENED `hc_mult * hidden` stack onto
+    /// `(2 + mult) * mult` logits and splits them three ways, so `hc_*_fn` is
+    /// `[(2 + mult) * mult][mult * hidden]` (24 x 20480 on the published checkpoint,
+    /// F32), `hc_*_base` carries `(2 + mult) * mult` values and `hc_*_scale` three.
+    /// A checkpoint whose `hc_*_fn` is a per-copy vector — which is what this port
+    /// used to read — now fails at load instead of degenerating to the identity
+    /// coefficient set at run time.
+    private func hyperConnectionProblems(
+        config: DeepSeekV41Config,
+        scope: DeepSeekV41TensorScope = .backbone,
+        layer: Int
+    ) -> [String] {
+        let mult = max(1, config.hcMult)
+        let mixCount = (2 + mult) * mult
+        let columns = mult * config.hiddenSize
+        var problems: [String] = []
+
+        for (function, bias, scale) in [
+            (DeepSeekV41TensorRole.hcAttnFn, DeepSeekV41TensorRole.hcAttnBase,
+             DeepSeekV41TensorRole.hcAttnScale),
+            (DeepSeekV41TensorRole.hcFfnFn, DeepSeekV41TensorRole.hcFfnBase,
+             DeepSeekV41TensorRole.hcFfnScale)
+        ] {
+            let prefix = scope == .draft ? "mtp.\(layer)" : "layers.\(layer)"
+            if let ref = tensor(function, scope: scope, layer: layer),
+               ref.shape != [mixCount, columns] {
+                problems.append(
+                    "\(prefix): \(ref.name) is \(ref.shape), expected "
+                        + "[\(mixCount), \(columns)] for hc_mult \(mult)"
+                )
+            }
+            if let ref = tensor(bias, scope: scope, layer: layer), ref.shape != [mixCount] {
+                problems.append(
+                    "\(prefix): \(ref.name) is \(ref.shape), expected [\(mixCount)]"
+                )
+            }
+            // `hc_*_scale` classifies with the scale flag, so the plain lookup misses
+            // it and the scale slot has to be asked.
+            let scaleRef = tensor(scale, scope: scope, layer: layer)
+                ?? tensor(scale, scope: scope, layer: layer, scale: true)
+            if let scaleRef, scaleRef.shape != [3] {
+                problems.append("\(prefix): \(scaleRef.name) is \(scaleRef.shape), expected [3]")
+            }
         }
         return problems
     }

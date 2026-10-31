@@ -113,6 +113,58 @@ nonisolated public struct DeepSeekV41VisionSpec: Sendable, Equatable {
             ropeTheta: number("rope_theta", "vision_rope_theta") ?? 10_000
         )
     }
+
+    /// Decodes the flat `inference/config.json`, which flattens the tower into
+    /// `vision_`-prefixed root keys instead of nesting a `vision_config`.
+    ///
+    /// Reading only the nested shape is not "a config without a tower": the flat
+    /// config publishes 32 tower layers and the tower it describes is the same
+    /// ViT. A nil spec turns off image prompting entirely, so the prefix is mapped
+    /// back to the canonical spellings rather than silently dropping the tower.
+    public static func decodeFlat(_ root: [String: Any]) -> DeepSeekV41VisionSpec? {
+        let canonical: [String: String] = [
+            "vision_n_layers": "num_hidden_layers",
+            "vision_dim": "hidden_size",
+            "vision_n_heads": "num_attention_heads",
+            "vision_inter_dim": "intermediate_size",
+            "vision_patch_size": "patch_size",
+            "vision_downsample_ratio": "downsample_ratio",
+            "vision_max_n_token": "max_image_tokens",
+            "vision_min_pixels": "min_pixels",
+            "vision_max_wh_ratio": "max_wh_ratio",
+            "vision_rope_theta": "rope_theta"
+        ]
+        var object: [String: Any] = [:]
+        for (flat, nested) in canonical {
+            guard let value = root[flat], !(value is NSNull) else { continue }
+            object[nested] = value
+        }
+        return decode(object)
+    }
+
+    /// The same spec with `imageTokenID` filled in.
+    ///
+    /// Both config shapes keep `image_token_id` at the root, beside the tower
+    /// rather than inside it, so a spec decoded from the block alone reports -1 and
+    /// the tower cannot say which id it expects. Nothing downstream reads -1 as a
+    /// real id, but a spec that disagrees with the config it came from is a trap
+    /// for the prompt builder.
+    public func fillingImageTokenID(_ id: Int) -> DeepSeekV41VisionSpec {
+        guard imageTokenID < 0, id >= 0 else { return self }
+        return DeepSeekV41VisionSpec(
+            patchSize: patchSize,
+            downsampleRatio: downsampleRatio,
+            minPixels: minPixels,
+            maxImageTokens: maxImageTokens,
+            numHiddenLayers: numHiddenLayers,
+            hiddenSize: hiddenSize,
+            numAttentionHeads: numAttentionHeads,
+            intermediateSize: intermediateSize,
+            imageTokenID: id,
+            maxWidthHeightRatio: maxWidthHeightRatio,
+            ropeTheta: ropeTheta
+        )
+    }
 }
 
 // MARK: - Layout
@@ -533,9 +585,7 @@ nonisolated public enum DeepSeekV41VisionPreprocess {
 /// How an image occupies the prompt. An image becomes one run of the image token,
 /// once per span position; there are no distinct wrapper tokens, because the
 /// checkpoint writes `image_token_id` everywhere in the span and keeps the
-/// start/image/newline/end distinction in a parallel type array. The spelling of
-/// the token is what `DeepSeekV41Conformance.visionPatching` tracks until a probe
-/// confirms it against the checkpoint's tokenizer.
+/// start/image/newline/end distinction in a parallel type array.
 nonisolated public struct DeepSeekV41VisionMarkers: Sendable, Equatable {
     /// What the chat UI/API writes where an image belongs.
     public let imagePlaceholder: String
@@ -547,11 +597,22 @@ nonisolated public struct DeepSeekV41VisionMarkers: Sendable, Equatable {
         self.imageToken = imageToken
     }
 
-    /// DeepSeek's published multimodal form. Built from unicode escapes rather than
-    /// retyped (AGENTS.md: never retype tag-bearing strings).
+    /// The checkpoint's own spelling, which is not a guess: `encoding/encoding.py`
+    /// defines `IMAGE_PLACEHOLDER`, the tokenizer lists that exact string as added
+    /// token 129,264, and `config.json`'s `image_token_id` is that id.
+    /// `image_processor.prepare_vl_inputs` asserts the last two agree before it
+    /// builds a span, so a port that spells the marker differently renders prompt
+    /// text the model has never seen.
+    ///
+    /// Both fields hold the same string on purpose: every position of a span carries
+    /// the same token id, and `DeepSeekV41VisionLayout.span(columns:rows:)` is what
+    /// tells the positions apart.
+    ///
+    /// Built from unicode escapes rather than retyped (AGENTS.md: never retype
+    /// tag-bearing strings).
     public static let familyDefault = DeepSeekV41VisionMarkers(
-        imagePlaceholder: "<" + "\u{FF5C}" + "image" + "\u{2581}" + "placeholder" + "\u{FF5C}" + ">",
-        imageToken: "<" + "\u{FF5C}" + "image" + "\u{FF5C}" + ">"
+        imagePlaceholder: "<" + "\u{FF5C}" + "deepseek" + "_" + "image" + "\u{FF5C}" + ">",
+        imageToken: "<" + "\u{FF5C}" + "deepseek" + "_" + "image" + "\u{FF5C}" + ">"
     )
 }
 

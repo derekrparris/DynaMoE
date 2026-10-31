@@ -20,6 +20,9 @@
 //
 
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 nonisolated public struct DeepSeekV41Preflight: Sendable, Equatable {
     public struct ShardIssue: Sendable, Equatable {
@@ -103,12 +106,14 @@ nonisolated public struct DeepSeekV41Preflight: Sendable, Equatable {
         var bytes: Int64 = 0
         for name in ordered {
             let url = snapshotDir.appendingPathComponent(name)
-            guard let attributes = try? fileManager.attributesOfItem(atPath: url.path),
-                  let size = attributes[.size] as? NSNumber else {
+            // `attributesOfItem` does NOT follow a symlink, and a Hugging Face
+            // cache is a directory of symlinks into `blobs/`: every shard then
+            // reported the 76-byte length of the link's target path and a complete
+            // 510 GB download read as "48/48 shards, 4 KB (0%)".
+            guard let actual = fileSizeFollowingSymlinks(at: url) else {
                 issues.append(ShardIssue(name: name, expectedBytes: nil, actualBytes: nil))
                 continue
             }
-            let actual = size.int64Value
             present += 1
             bytes += actual
             guard let expected = expectedShardBytes(at: url) else {
@@ -138,6 +143,20 @@ nonisolated public struct DeepSeekV41Preflight: Sendable, Equatable {
             issues: issues,
             isComplete: issues.isEmpty && ordered.count > 0
         )
+    }
+
+    /// Bytes of the file a shard path resolves to, following symlinks. `stat(2)`
+    /// resolves the link, which is what a Hugging Face snapshot needs.
+    static func fileSizeFollowingSymlinks(at url: URL) -> Int64? {
+        #if canImport(Darwin)
+        var info = stat()
+        guard stat(url.path, &info) == 0 else { return nil }
+        return Int64(info.st_size)
+        #else
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber else { return nil }
+        return size.int64Value
+        #endif
     }
 
     /// Bytes a shard file must have according to the safetensors header it starts

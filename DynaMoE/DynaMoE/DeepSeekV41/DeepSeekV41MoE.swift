@@ -258,9 +258,23 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
     /// `pairs.count <= capacity` (top-k times one arena slot per layer is the
     /// intended use).
     public func acquire(_ pairs: [(layer: Int, expert: Int)]) -> [Int] {
+        acquireDetailed(pairs).map(\.slot)
+    }
+
+    /// The same placement as `acquire`, reporting whether each pair was already
+    /// resident.
+    ///
+    /// A caller that fills slots from disk needs the distinction: a hit means the
+    /// slot already holds this pair's bytes, and a miss means the slot has to be
+    /// written before any kernel reads it. Re-deriving it from
+    /// `slot(forLayer:expert:)` before the call would race the placement the arena
+    /// itself just made.
+    public func acquireDetailed(
+        _ pairs: [(layer: Int, expert: Int)]
+    ) -> [(slot: Int, isHit: Bool)] {
         lock.lock()
         defer { lock.unlock() }
-        var out: [Int] = []
+        var out: [(slot: Int, isHit: Bool)] = []
         out.reserveCapacity(pairs.count)
         for pair in pairs {
             acquisitions += 1
@@ -268,7 +282,7 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
                 hits += 1
                 counter += 1
                 slots[existing] = Slot(layer: pair.layer, expert: pair.expert, lastUsed: counter)
-                out.append(existing)
+                out.append((slot: existing, isHit: true))
                 continue
             }
             let free = slots.firstIndex(where: { $0 == nil })
@@ -278,7 +292,7 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
             } else {
                 // Evict the least recently used pair.
                 guard let lru = slots.indices.min(by: { (slots[$0]?.lastUsed ?? 0) < (slots[$1]?.lastUsed ?? 0) }) else {
-                    out.append(0)
+                    out.append((slot: 0, isHit: false))
                     continue
                 }
                 index = lru
@@ -286,9 +300,22 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
             }
             counter += 1
             slots[index] = Slot(layer: pair.layer, expert: pair.expert, lastUsed: counter)
-            out.append(index)
+            out.append((slot: index, isHit: false))
         }
         return out
+    }
+
+    /// Forgets what a slot holds, so the next `acquire` for that pair is a miss.
+    ///
+    /// Needed by the streaming path: a read that fails part way leaves a slot whose
+    /// identity claims bytes it does not have, and `acquire` would serve it as a hit
+    /// forever. The bytes are left alone; the identity is what decides whether they
+    /// are ever read.
+    public func vacate(slot: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard slot >= 0, slot < slots.count else { return }
+        slots[slot] = nil
     }
 
     /// Slot index currently holding a pair, or nil when it is not resident.
@@ -321,26 +348,125 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
 
 /// The mHC residual streams.
 ///
-/// Instead of one residual vector, the block carries `hc_mult` copies. Each
-/// sub-layer reads a mixing row (from `hc_*_fn`, biased by `hc_*_base` and scaled
-/// by `hc_*_scale`) and combines the streams with it; the sub-layer's output is
-/// added back into every stream with that stream's `hc_*_scale`. The block's
-/// "hidden state" for the next sub-layer is stream 0.
+/// Instead of one residual vector the block carries `hc_mult` copies of it. A
+/// sub-layer does not read a fixed stream: `hc_*_fn` projects the FLATTENED copies
+/// (normalized by their own RMS) onto `(2 + mult) * mult` logits, and those split
+/// into three coefficient sets — `pre` (how the copies collapse into the
+/// sub-layer's input), `post` (how much of the sub-layer's output each copy takes)
+/// and `comb` (a doubly-stochastic matrix mixing the copies back in).
 ///
-/// The reference describes Sinkhorn normalization of the mixing matrix before it
-/// is used, and `sinkhorn` below implements it, but the reference's own forward is
-/// not verified to apply it and both backends currently read the matrix row as
-/// published. That makes `sinkhorn` dormant rather than wrong; it stays here (and
-/// as `dsv41_hc_sinkhorn`) so wiring it is a one-line change once a reference
-/// vector settles the question.
+/// Two details here are easy to get wrong and produce plausible text when you do.
+/// The coefficients a sub-layer computes are consumed by the NEXT one, not by the
+/// sub-layer that computed them (`Block.forward` derives attention's `pre`/`post`/
+/// `comb` from the block input, then collapses that same input with the `pre` the
+/// previous sub-layer produced), and the block's output is `hc_pre(h, pre_mix)` — a
+/// weighted mix of the copies, not one of them.
 nonisolated public enum DeepSeekV41HyperConnections {
 
-    /// Sinkhorn normalization of a `dimension × dimension` matrix.
+    /// What one `hc_*_fn` projection splits into.
+    public struct Coefficients: Sendable, Equatable {
+        /// `mult` weights: how the copies collapse into the sub-layer's input.
+        public let pre: [Float]
+        /// `mult` gains on the sub-layer's output, one per copy.
+        public let post: [Float]
+        /// `mult × mult`, row-major and in the reference's own orientation:
+        /// `comb[j][k]` is how much of copy `j`'s residual copy `k`'s output takes.
+        /// The FIRST index is the residual the entry reads, not the copy it writes,
+        /// because `hc_post` sums `comb.unsqueeze(-1) * residual.unsqueeze(-2)` over
+        /// its middle axis. Reading a row as one copy's mixing weights is the
+        /// transpose, and with two copies a nearly symmetric Sinkhorn matrix hides
+        /// it.
+        public let comb: [Float]
+        /// The `(2 + mult) * mult` raw logits before the split. Kept because a
+        /// probe run compares against them; nothing in the forward reads them.
+        public let logits: [Float]
+
+        public init(pre: [Float], post: [Float], comb: [Float], logits: [Float] = []) {
+            self.pre = pre
+            self.post = post
+            self.comb = comb
+            self.logits = logits
+        }
+    }
+
+    /// `Block.hc_mixes`: one projection of the flattened stack, split three ways.
     ///
-    /// Exponentiates once and then alternates row and column normalization
-    /// `iterations` times, leaving rows and columns each summing to 1. Serial by
-    /// design: `dimension` is `hc_mult` (4 on the published checkpoint), so the
-    /// coordination a parallel version needs costs more than the loop.
+    /// The RMS normalization is over the WHOLE flattened stack, one statistic per
+    /// token, which is what keeps the projection's scale independent of how many
+    /// copies the checkpoint carries.
+    public static func coefficients(
+        streams: [[Float]],
+        projection: DeepSeekV41Matrix?,
+        scale: [Float],
+        base: [Float],
+        normalizationEpsilon: Float,
+        epsilon: Float,
+        iterations: Int
+    ) -> Coefficients {
+        let mult = max(1, streams.count)
+        let width = streams.first?.count ?? 0
+        let mixCount = (2 + mult) * mult
+        guard width > 0,
+              let projection,
+              projection.rows >= mixCount,
+              projection.columns == mult * width,
+              scale.count >= 3,
+              base.count >= mixCount else {
+            // A checkpoint without usable `hc_*` tensors degenerates to a single
+            // stream rather than a guess at coefficients: `pre` picks copy 0 and
+            // `post`/`comb` keep every copy's own residual.
+            return degenerate(mult: mult)
+        }
+
+        var flattened = [Float]()
+        flattened.reserveCapacity(mult * width)
+        for stream in streams {
+            flattened.append(contentsOf: stream.prefix(width))
+        }
+        var sumSquares: Float = 0
+        for value in flattened {
+            sumSquares += value * value
+        }
+        let rstd = 1 / sqrt(sumSquares / Float(flattened.count) + normalizationEpsilon)
+        let logits = projection.apply(flattened).prefix(mixCount).map { $0 * rstd }
+
+        var pre = [Float](repeating: 0, count: mult)
+        var post = [Float](repeating: 0, count: mult)
+        for copy in 0..<mult {
+            // `sigmoid(...) + eps`: the floor is what keeps a collapsed copy from
+            // dropping out of the residual path entirely.
+            pre[copy] = sigmoid(logits[copy] * scale[0] + base[copy]) + epsilon
+            post[copy] = 2 * sigmoid(logits[mult + copy] * scale[1] + base[mult + copy])
+        }
+        var rawComb = [Float](repeating: 0, count: mult * mult)
+        for source in 0..<mult {
+            for target in 0..<mult {
+                let at = 2 * mult + source * mult + target
+                rawComb[source * mult + target] = logits[at] * scale[2] + base[at]
+            }
+        }
+        return Coefficients(
+            pre: pre,
+            post: post,
+            comb: sinkhorn(
+                logits: rawComb,
+                dimension: mult,
+                iterations: iterations,
+                epsilon: epsilon
+            ),
+            logits: logits
+        )
+    }
+
+    /// `hc_split_sinkhorn`: one row softmax, then one column normalization, then
+    /// `iterations - 1` rounds of row-then-column normalization.
+    ///
+    /// The epsilons are ADDED to the divisor rather than flooring it, and the
+    /// softmax carries no epsilon at all: the first round therefore leaves the
+    /// matrix's columns summing to 1 and its rows only approximately so, which is
+    /// why the schedule (and not just the eventual convergence) is what the golden
+    /// test pins. Serial by design — `dimension` is `hc_mult`, four on the
+    /// published checkpoint.
     public static func sinkhorn(
         logits: [Float],
         dimension: Int,
@@ -349,83 +475,135 @@ nonisolated public enum DeepSeekV41HyperConnections {
     ) -> [Float] {
         let n = dimension
         guard n > 0, logits.count >= n * n else { return [] }
-        // Subtract the max first: a large logit would otherwise exponentiate to
-        // infinity and every later row/column sum would be `inf`.
-        let shift = logits.prefix(n * n).max() ?? 0
-        var matrix = (0..<(n * n)).map { exp(logits[$0] - shift) }
-        let floor = max(epsilon, 1e-12)
-        for _ in 0..<max(0, iterations) {
-            for row in 0..<n {
-                let base = row * n
-                var sum: Float = 0
-                for column in 0..<n { sum += matrix[base + column] }
-                let inverse = 1 / max(sum, floor)
-                for column in 0..<n { matrix[base + column] *= inverse }
-            }
+        // Per-row max, exactly like the reference: a row whose entries are far
+        // below the global max would otherwise underflow to zeros and divide by a
+        // zero sum.
+        var matrix = [Float](repeating: 0, count: n * n)
+        for row in 0..<n {
+            let base = row * n
+            var rowMax = -Float.greatestFiniteMagnitude
             for column in 0..<n {
-                var sum: Float = 0
-                for row in 0..<n { sum += matrix[row * n + column] }
-                let inverse = 1 / max(sum, floor)
-                for row in 0..<n { matrix[row * n + column] *= inverse }
+                rowMax = max(rowMax, logits[base + column])
             }
+            var sum: Float = 0
+            for column in 0..<n {
+                let value = exp(logits[base + column] - rowMax)
+                matrix[base + column] = value
+                sum += value
+            }
+            let inverse = sum > 0 ? 1 / sum : 0
+            for column in 0..<n {
+                matrix[base + column] *= inverse
+            }
+        }
+        for index in matrix.indices {
+            matrix[index] += epsilon
+        }
+        columnNormalize(&matrix, n, epsilon)
+        for _ in 0..<max(0, iterations - 1) {
+            rowNormalize(&matrix, n, epsilon)
+            columnNormalize(&matrix, n, epsilon)
         }
         return matrix
     }
 
-    /// Per-stream read weights departing from a mixing matrix.
-    ///
-    /// The matrix mixes streams; the sub-layer only consumes one vector, so the
-    /// pre-mix collapses to one weighted sum per input and only the mixing matrix
-    /// row matters. Written out because "take row 0" is not obvious from the
-    /// matrix alone and getting it wrong silently drops half the residual path.
-    public static func readWeights(matrix: [Float], streams: Int, row: Int = 0) -> [Float] {
-        guard streams > 0, matrix.count >= streams * streams else {
-            return [Float](repeating: 1 / Float(max(1, streams)), count: max(0, streams))
-        }
-        let base = max(0, min(row, streams - 1)) * streams
-        return Array(matrix[base..<(base + streams)])
-    }
-
-    /// Combines the input streams with per-stream read weights, then applies the
-    /// per-stream `scale` and the shared `base` bias. This is the vector a
-    /// sub-layer sees.
-    public static func mix(
-        streams: [[Float]],
-        readWeights: [Float],
-        scale: [Float]?,
-        bias: [Float]?
-    ) -> [Float] {
+    /// `hc_pre`: collapse the copies into the one vector a sub-layer reads.
+    public static func pre(streams: [[Float]], mix: [Float]) -> [Float] {
         guard let first = streams.first else { return [] }
-        let width = first.count
-        var out = [Float](repeating: 0, count: width)
-        for (index, stream) in streams.enumerated() {
-            let weight = index < readWeights.count ? readWeights[index] : 0
-            let streamScale = (scale?.count ?? 0) == streams.count ? scale![index] : 1
-            let streamBias = (bias?.count ?? 0) == width ? bias! : nil
-            let count = min(width, stream.count)
+        var out = [Float](repeating: 0, count: first.count)
+        for (copy, stream) in streams.enumerated() {
+            let weight = copy < mix.count ? mix[copy] : 0
+            guard weight != 0 else { continue }
+            let count = min(out.count, stream.count)
             for dim in 0..<count {
-                let biasValue = streamBias?[dim] ?? 0
-                out[dim] += weight * (stream[dim] * streamScale + biasValue)
+                out[dim] += weight * stream[dim]
             }
         }
         return out
     }
 
-    /// Writes a sub-layer's output back into the streams without mixing them
-    /// together: each stream keeps its own identity and only accumulates the
-    /// sub-layer's contribution. `scale` is the write scale (`hc_*_scale`), which
-    /// is what keeps a deep stack of sub-layers from amplifying one another.
-    public static func write(
-        streams: inout [[Float]],
-        contribution: [Float],
-        writeScales: [Float]?
-    ) {
-        guard !streams.isEmpty else { return }
-        for index in streams.indices {
-            let scale = (writeScales?.count ?? 0) == streams.count ? writeScales![index] : 1
-            let count = min(streams[index].count, contribution.count)
-            for dim in 0..<count {
-                streams[index][dim] += scale * contribution[dim]
+    /// `hc_post`: expand a sub-layer's output back to every copy and mix the
+    /// residual in through `comb`. Returns the new streams.
+    public static func post(
+        output: [Float],
+        residual: [[Float]],
+        gains: [Float],
+        comb: [Float]
+    ) -> [[Float]] {
+        let mult = residual.count
+        guard mult > 0 else { return residual }
+        var streams = residual
+        for copy in 0..<mult {
+            var row = [Float](repeating: 0, count: streams[copy].count)
+            // `comb[source * mult + copy]`: the matrix is indexed source-first, so
+            // copy `copy`'s output reads a COLUMN of it. Walking a row instead mixes
+            // every copy with the wrong neighbours, which two copies can hide and
+            // four cannot.
+            for source in 0..<mult where source * mult + copy < comb.count {
+                let weight = comb[source * mult + copy]
+                let stream = residual[source]
+                for dim in 0..<min(row.count, stream.count) {
+                    row[dim] += weight * stream[dim]
+                }
+            }
+            let gain = copy < gains.count ? gains[copy] : 0
+            for dim in 0..<min(row.count, output.count) {
+                row[dim] += gain * output[dim]
+            }
+            streams[copy] = row
+        }
+        return streams
+    }
+
+    /// The mix a stack starts from: copy 0 only, so the first sub-layer reads the
+    /// embedding and nothing else (`make_identity_pre_mix`).
+    public static func identityMix(copies: Int) -> [Float] {
+        var mix = [Float](repeating: 0, count: max(1, copies))
+        mix[0] = 1
+        return mix
+    }
+
+    private static func degenerate(mult: Int) -> Coefficients {
+        var comb = [Float](repeating: 0, count: mult * mult)
+        for copy in 0..<mult {
+            comb[copy * mult + copy] = 1
+        }
+        return Coefficients(
+            pre: identityMix(copies: mult),
+            post: [Float](repeating: 1, count: mult),
+            comb: comb
+        )
+    }
+
+    private static func sigmoid(_ value: Float) -> Float {
+        1 / (1 + exp(-value))
+    }
+
+    private static func rowNormalize(_ matrix: inout [Float], _ n: Int, _ epsilon: Float) {
+        for row in 0..<n {
+            let base = row * n
+            var sum: Float = 0
+            for column in 0..<n {
+                sum += matrix[base + column]
+            }
+            let inverse = 1 / (sum + epsilon)
+            for column in 0..<n {
+                matrix[base + column] *= inverse
+            }
+        }
+    }
+
+    /// Sums along the ROWS (`dim=0` in the reference), so each entry is divided by
+    /// its own column's total plus epsilon.
+    private static func columnNormalize(_ matrix: inout [Float], _ n: Int, _ epsilon: Float) {
+        for column in 0..<n {
+            var sum: Float = 0
+            for row in 0..<n {
+                sum += matrix[row * n + column]
+            }
+            let inverse = 1 / (sum + epsilon)
+            for row in 0..<n {
+                matrix[row * n + column] *= inverse
             }
         }
     }

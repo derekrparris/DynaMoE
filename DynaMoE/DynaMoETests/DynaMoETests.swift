@@ -1131,6 +1131,14 @@ final class DynaMoETests: XCTestCase {
             print("Ornith FP8 snapshot not found, skipping repack test.")
             return
         }
+        // Repacking writes ~121 GB INTO a downloaded checkpoint, and an interrupted
+        // run leaves a partial packed model that the app then prefers over the
+        // safetensors index (which is how a Qwen FP8 load became an unresponsive
+        // window). Destructive work against the developer's model cache is opt-in.
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["DYNAMOE_ALLOW_INPLACE_REPACK"] == "1",
+            "in-place repack of a real checkpoint is opt-in: set DYNAMOE_ALLOW_INPLACE_REPACK=1"
+        )
         let srcUrl = URL(fileURLWithPath: snapshotDir)
         let repacker = ExpertRepacker.shared
         print("🚀 Starting ExpertRepacker on Ornith 1.5 35B A3B FP8...")
@@ -1439,30 +1447,169 @@ final class DynaMoETests: XCTestCase {
         print("🎉 [DIAGNOSTIC] Ornith FlashMoE FP8 diagnostic run complete. Report saved to /tmp/dynamoe_ornith_flashmoe_benchmark.log")
     }
 
-    func testRepackQwen38FP8() throws {
-        let snapshotDir = "/Users/derekparris/.cache/huggingface/hub/models--Qwen--Qwen3.8-Flash-Next-FP8/snapshots/236dfdf285828023ca3bcd3f37366c58a3469b13"
-        guard FileManager.default.fileExists(atPath: snapshotDir) else {
-            print("Qwen 3.8 Flash Next FP8 snapshot not found, skipping.")
-            return
+    /// The FlashMoE repack, against a synthetic checkpoint.
+    ///
+    /// This used to repack the REAL Qwen 3.8 Flash Next FP8 snapshot in place: it
+    /// hardcoded the developer's HF cache path and passed `outputDir: srcUrl`. A run
+    /// that was interrupted mid-repack left a 9.2 GB `model_weights.bin`, a
+    /// `model_weights.json` and 111 GB of `packed_experts/` with a zero-byte layer 0
+    /// inside a downloaded model. `LocalModelManager` prefers `model_weights.json`
+    /// over `model.safetensors.index.json`, so the app then loaded the half-written
+    /// packed model instead of the checkpoint and hung on load. A unit test must never
+    /// write into the user's model directory, and a repack of 121 GB is a manual job
+    /// rather than a test, so this builds its own two-expert checkpoint in a temp
+    /// directory and asserts the bytes land where the format says.
+    func testRepackWritesThePackedLayout() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("dynamoe-repack-\(UUID().uuidString)")
+        let source = root.appendingPathComponent("checkpoint")
+        let output = root.appendingPathComponent("packed")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // Two layers, two experts, one dense tensor. Every tensor gets a distinct
+        // byte value so a component written from the wrong offset is visible.
+        let width = 4
+        let elements = width * width
+        let valueBytes = elements * 2  // bf16
+        var tensors: [(name: String, fill: UInt8)] = [
+            ("model.embed_tokens.weight", 0x10)
+        ]
+        for layer in 0..<2 {
+            for expert in 0..<2 {
+                for component in ["gate_proj", "down_proj"] {
+                    let fill = UInt8(0x20 + layer * 16 + expert * 4 + (component == "gate_proj" ? 1 : 2))
+                    tensors.append((
+                        "model.layers.\(layer).mlp.experts.\(expert).\(component).weight",
+                        fill
+                    ))
+                }
+            }
         }
-        // Require at least 130 GB free space before attempting full model repack
-        if let attrs = try? FileManager.default.attributesOfFileSystem(forPath: snapshotDir),
-           let freeBytes = attrs[.systemFreeSize] as? Int64,
-           freeBytes < 130 * 1024 * 1024 * 1024 {
-            print("⚠️ Insufficient disk space for full 121 GB Qwen 3.8 repack (\(freeBytes / (1024*1024*1024)) GB available, 130 GB required). Skipping.")
-            return
+
+        // safetensors: 8-byte little-endian header length, the JSON header, then the
+        // data section in header order with contiguous offsets.
+        var header: [String: Any] = [:]
+        var offset = 0
+        for tensor in tensors {
+            header[tensor.name] = [
+                "dtype": "BF16",
+                "shape": [width, width],
+                "data_offsets": [offset, offset + valueBytes]
+            ]
+            offset += valueBytes
         }
-        let srcUrl = URL(fileURLWithPath: snapshotDir)
+        let headerData = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
+        var file = Data()
+        var headerLength = UInt64(headerData.count)
+        withUnsafeBytes(of: &headerLength) { file.append(contentsOf: $0) }
+        file.append(headerData)
+        for tensor in tensors {
+            file.append(Data(repeating: tensor.fill, count: valueBytes))
+        }
+        try file.write(to: source.appendingPathComponent("model.safetensors"))
+
         let repacker = ExpertRepacker.shared
-        print("🚀 Starting ExpertRepacker on Qwen 3.8 Flash Next FP8...")
-        let t0 = CFAbsoluteTimeGetCurrent()
-        try repacker.repackSafetensors(sourceDir: srcUrl, outputDir: srcUrl) { p, msg in
-            print(String(format: "[REPACK PROGRESS] %.0f%%: %@", p * 100, msg))
+        try repacker.repackSafetensors(sourceDir: source, outputDir: output) { _, _ in }
+
+        // The dense half: one tensor, byte-identical, and the manifest points at it.
+        let weights = try Data(contentsOf: output.appendingPathComponent("model_weights.bin"))
+        XCTAssertEqual(weights, Data(repeating: 0x10, count: valueBytes))
+        let manifestJSON = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: Data(contentsOf: output.appendingPathComponent("model_weights.json"))
+            ) as? [String: Any]
+        )
+        let manifestTensors = try XCTUnwrap(manifestJSON["tensors"] as? [String: Any])
+        XCTAssertEqual(manifestTensors.count, 1)
+        let entry = try XCTUnwrap(manifestTensors["model.embed_tokens.weight"] as? [String: Any])
+        XCTAssertEqual(entry["offset"] as? Int, 0)
+        XCTAssertEqual(entry["size"] as? Int, valueBytes)
+
+        // The expert half: per-layer files in expert-major, component order, and a
+        // layout that describes one expert.
+        let layoutJSON = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: Data(contentsOf: output.appendingPathComponent("packed_experts/layout.json"))
+            ) as? [String: Any]
+        )
+        XCTAssertEqual(layoutJSON["num_layers"] as? Int, 2)
+        XCTAssertEqual(layoutJSON["num_experts"] as? Int, 2)
+        XCTAssertEqual(layoutJSON["expert_size"] as? Int, 2 * valueBytes)
+
+        for layer in 0..<2 {
+            let layerURL = output.appendingPathComponent(String(format: "packed_experts/layer_%02d.bin", layer))
+            let packed = try Data(contentsOf: layerURL)
+            XCTAssertEqual(packed.count, 2 * 2 * valueBytes)
+            for expert in 0..<2 {
+                for (componentIndex, component) in ["gate_proj", "down_proj"].enumerated() {
+                    let fill = UInt8(0x20 + layer * 16 + expert * 4 + (component == "gate_proj" ? 1 : 2))
+                    let start = (expert * 2 + componentIndex) * valueBytes
+                    XCTAssertEqual(
+                        packed.subdata(in: start..<(start + valueBytes)),
+                        Data(repeating: fill, count: valueBytes),
+                        "layer \(layer) expert \(expert) \(component)"
+                    )
+                }
+            }
         }
-        let elapsed = CFAbsoluteTimeGetCurrent() - t0
-        print(String(format: "🎉 Repacking completed in %.2f s!", elapsed))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: srcUrl.appendingPathComponent("model_weights.bin").path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: srcUrl.appendingPathComponent("packed_experts/layout.json").path))
+    }
+
+    /// An interrupted repack must not be treated as a loadable packed model.
+    ///
+    /// The loader indexes experts at `expert * expert_size` inside each layer file, so
+    /// a zero-length or truncated layer is read past its end rather than failing. That
+    /// is how a half-written repack (an empty `layer_00.bin` beside 111 GB of finished
+    /// ones) turned into an unresponsive load instead of an error.
+    func testPackedFormatRequiresCompleteLayerFiles() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("dynamoe-packed-check-\(UUID().uuidString)")
+        let packedDir = root.appendingPathComponent("packed_experts")
+        try FileManager.default.createDirectory(at: packedDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // `isPackedFormat` rejects a backbone under 1 MB, so the manifest file has to
+        // be a real size even though nothing reads it here.
+        try Data(repeating: 0, count: 2 * 1024 * 1024)
+            .write(to: root.appendingPathComponent("model_weights.bin"))
+        try Data("{}".utf8).write(to: root.appendingPathComponent("model_weights.json"))
+
+        let expertSize = 1024
+        let numExperts = 4
+        let layout: [String: Any] = [
+            "expert_size": expertSize,
+            "num_layers": 2,
+            "num_experts": numExperts,
+            "components": [[
+                "name": "gate_proj.weight",
+                "offset": 0,
+                "size": expertSize,
+                "dtype": "BF16",
+                "shape": [16, 16]
+            ]]
+        ]
+        try JSONSerialization.data(withJSONObject: layout)
+            .write(to: packedDir.appendingPathComponent("layout.json"))
+
+        let complete = Data(repeating: 7, count: expertSize * numExperts)
+        let layer0 = packedDir.appendingPathComponent("layer_00.bin")
+        let layer1 = packedDir.appendingPathComponent("layer_01.bin")
+        try complete.write(to: layer0)
+        try complete.write(to: layer1)
+        XCTAssertTrue(ExpertRepacker.isPackedFormat(dir: root))
+
+        // A repack killed while opening a layer leaves it empty.
+        try Data().write(to: layer1)
+        XCTAssertFalse(ExpertRepacker.isPackedFormat(dir: root), "a zero-length layer must not load as packed")
+
+        // A repack killed mid-write leaves the last layer short of its expert grid.
+        try Data(repeating: 7, count: expertSize).write(to: layer1)
+        XCTAssertFalse(ExpertRepacker.isPackedFormat(dir: root), "a truncated layer must not load as packed")
+
+        // Restoring the file restores the claim.
+        try complete.write(to: layer1)
+        XCTAssertTrue(ExpertRepacker.isPackedFormat(dir: root))
     }
 
     func testQwen38FlashNextForward() throws {
@@ -13008,6 +13155,14 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
             return
         }
         let url = URL(fileURLWithPath: snapshotDir)
+        // Repacking writes ~121 GB INTO a downloaded checkpoint, and an interrupted
+        // run leaves a partial packed model that the app then prefers over the
+        // safetensors index (which is how a Qwen FP8 load became an unresponsive
+        // window). Destructive work against the developer's model cache is opt-in.
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["DYNAMOE_ALLOW_INPLACE_REPACK"] == "1",
+            "in-place repack of a real checkpoint is opt-in: set DYNAMOE_ALLOW_INPLACE_REPACK=1"
+        )
 
         print("🔍 Testing Ling-3.0 FlashMoE repacking...")
         let repacker = ExpertRepacker.shared

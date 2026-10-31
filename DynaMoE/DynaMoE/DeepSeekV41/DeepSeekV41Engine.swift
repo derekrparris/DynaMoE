@@ -77,6 +77,10 @@ nonisolated public final class DeepSeekV41DeviceWeights: @unchecked Sendable {
     public let problems: [String]
     /// One reader per Engram table, keyed by layer.
     public let engramReaders: [Int: DeepSeekV41EngramReader]
+    /// Why a table has no reader, keyed by layer, in the words of the thing that
+    /// refused it. A missing shard, an offset past the file end and a wrong scale
+    /// shape all read as "could not be opened" without this.
+    public let engramReaderProblems: [Int: String]
     public let engramLayouts: [Int: DeepSeekV41EngramLayout]
 
     private var tensors: [String: DeepSeekV41DeviceTensor]
@@ -141,30 +145,74 @@ nonisolated public final class DeepSeekV41DeviceWeights: @unchecked Sendable {
         // Engram tables are opened here so a truncated download fails at load rather
         // than mid-generation. They are never mapped: the reader preads single rows.
         var readers: [Int: DeepSeekV41EngramReader] = [:]
+        // Why a table could not be opened, keyed by layer. The readiness report
+        // prints this instead of a generic "could not be opened": a missing shard,
+        // a wrong offset and a refused descriptor are different downloads.
+        var readerProblems: [Int: String] = [:]
         // The primes are drawn once across every Engram layer, so the layouts are
         // built together; one table in isolation would address the wrong rows.
         let layouts = (try? DeepSeekV41EngramLayout.make(specs: config.engramTables)) ?? [:]
         if let snapshotDir {
             for spec in config.engramTables {
-                guard let slot = catalog.tensor(.engramTable, layer: spec.layer),
-                      let tensor = summary.tensors.first(where: { $0.name == slot.name }) else {
+                let layer = spec.layer
+                guard let valuesRef = catalog.tensor(.engramTable, layer: layer),
+                      let values = summary.tensors.first(where: { $0.name == valuesRef.name }) else {
+                    readerProblems[layer] = "layers.\(layer): the Engram table tensor is missing "
+                        + "from the catalog"
                     continue
                 }
-                let shardName = summary.shards.first(where: { $0.index == tensor.shardIndex })?.filename
-                    ?? "model-\(tensor.shardIndex).safetensors"
-                let tableURL = snapshotDir.appendingPathComponent(shardName)
-                // Requests are table-relative; the tensor's own offset inside the
-                // shard is the base the reader adds before every pread.
-                if let reader = try? DeepSeekV41EngramReader(
-                    fileURL: tableURL,
-                    spec: spec,
-                    baseOffset: Int(tensor.offsetStart)
-                ) {
-                    readers[spec.layer] = reader
+                // `engram.embed.scale` is a SEPARATE tensor in the checkpoint, so the
+                // reader has to be told where its block starts. Its absence is not
+                // fatal only when the table stores each row's scales inline, which no
+                // published Engram table does; a table whose rows carry block scales
+                // without a companion tensor is refused rather than read as garbage.
+                let scaleRef = catalog.tensor(.engramTable, layer: layer, scale: true)
+                let scale = scaleRef.flatMap { ref in
+                    summary.tensors.first(where: { $0.name == ref.name })
+                }
+                guard let scale else {
+                    // The reference stores the block scales in their own tensor
+                    // (`ParallelEngramEmbedding.scale`). Assuming they are inline
+                    // would read the next row's values as this row's exponents, which
+                    // decodes to plausible garbage, so a table without them is
+                    // refused instead.
+                    readerProblems[layer] = "layers.\(layer): the table has no "
+                        + "engram.embed.scale companion, so its rows' block scales "
+                        + "are not addressable"
+                    continue
+                }
+                let shape = DeepSeekV41WeightCatalog.shape(from: scale.shapeDisplay)
+                let expected = [spec.rowCount, spec.rowBytes - spec.headDimension]
+                if shape != expected {
+                    readerProblems[layer] = "layers.\(layer): \(scale.name) is \(shape), "
+                        + "but the table's \(spec.rowCount) rows carry \(expected.last ?? 0) "
+                        + "block scales each"
+                    continue
+                }
+                guard let filename = DeepSeekV41EngramTableLocator.shardFilename(
+                    forTensorNamed: valuesRef.name,
+                    in: snapshotDir
+                ) else {
+                    readerProblems[layer] = "layers.\(layer): no shard in the snapshot publishes "
+                        + "\(valuesRef.name) (looked in the index and in every header)"
+                    continue
+                }
+                do {
+                    readers[layer] = try DeepSeekV41EngramReader(
+                        fileURL: snapshotDir.appendingPathComponent(filename),
+                        spec: spec,
+                        valuesOffset: Int(values.offsetStart),
+                        // Streamed tensors are passed through segmentation untouched,
+                        // so their offsets stay relative to the whole FILE.
+                        scalesOffset: Int(scale.offsetStart)
+                    )
+                } catch {
+                    readerProblems[layer] = "layers.\(layer): \(error)"
                 }
             }
         }
         self.engramReaders = readers
+        self.engramReaderProblems = readerProblems
         self.engramLayouts = layouts
     }
 
@@ -205,17 +253,28 @@ nonisolated public struct DeepSeekV41Pipelines {
     public let mxfp4SwiGLU: MTLComputePipelineState
     public let mxfp4DownAccumulate: MTLComputePipelineState
     public let engramDequantRows: MTLComputePipelineState
+    /// The Engram gate and residual add, one threadgroup per hyper-connection copy.
+    public let engramGate: MTLComputePipelineState
     public let hcSinkhorn: MTLComputePipelineState
+    /// The mHC rule: project the flattened stack, split the logits, collapse with a
+    /// mix, expand back through `comb`.
+    public let hcProject: MTLComputePipelineState
+    public let hcSplit: MTLComputePipelineState
+    public let hcPre: MTLComputePipelineState
+    public let hcPost: MTLComputePipelineState
+    public let hcIdentityMix: MTLComputePipelineState
     public let rope: MTLComputePipelineState
     public let storeLatent: MTLComputePipelineState
     public let gatherLatents: MTLComputePipelineState
+    /// CSA2 attention over the gathered block. The block is FP16, so this is the
+    /// half-key kernel; the FP32 form is kept in the shader library as the baseline
+    /// the measurement A/Bs against (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #17").
     public let attention: MTLComputePipelineState
     public let poolLatents: MTLComputePipelineState
     public let indexerScores: MTLComputePipelineState
     public let router: MTLComputePipelineState
-    public let hcMix: MTLComputePipelineState
-    public let hcWrite: MTLComputePipelineState
     public let clear: MTLComputePipelineState
+    public let copy: MTLComputePipelineState
     public let vectorAdd: MTLComputePipelineState
     /// Gain-vector RMSNorm the executor binds (the shard-offset `rmsnorm_bf16`
     /// assumes a bf16 gain, and the executor resolves every gain to FP32 once).
@@ -227,6 +286,10 @@ nonisolated public struct DeepSeekV41Pipelines {
     public let fp8DownAccumulate: MTLComputePipelineState
     /// BF16 fallback for a checkpoint whose FFN was not quantized.
     public let bf16Gemv: MTLComputePipelineState
+    public let bf16GemvRows: MTLComputePipelineState
+    public let bf16GemvBlock: MTLComputePipelineState
+    /// The block form over two output rows per threadgroup (`attn.wo_a`, `attn.wo_b`).
+    public let bf16GemvBlockPair: MTLComputePipelineState
     public let bf16SwiGLU: MTLComputePipelineState
     public let bf16DownAccumulate: MTLComputePipelineState
     public let embeddingBF16: MTLComputePipelineState
@@ -244,22 +307,30 @@ nonisolated public struct DeepSeekV41Pipelines {
         self.mxfp4SwiGLU = try make("dsv41_mxfp4_swiglu_gate_up")
         self.mxfp4DownAccumulate = try make("dsv41_mxfp4_down_accumulate")
         self.engramDequantRows = try make("dsv41_engram_dequant_rows")
+        self.engramGate = try make("dsv41_engram_gate_f32")
         self.hcSinkhorn = try make("dsv41_hc_sinkhorn")
+        self.hcProject = try make("dsv41_hc_project_f32")
+        self.hcSplit = try make("dsv41_hc_split_f32")
+        self.hcPre = try make("dsv41_hc_pre_f32")
+        self.hcPost = try make("dsv41_hc_post_f32")
+        self.hcIdentityMix = try make("dsv41_hc_identity_mix_f32")
         self.rope = try make("dsv41_rope_latent")
         self.storeLatent = try make("dsv41_store_latent_f16")
         self.gatherLatents = try make("dsv41_gather_latents_f16")
-        self.attention = try make("dsv41_attention_csa2_f32")
+        self.attention = try make("dsv41_attention_csa2_f16")
         self.poolLatents = try make("dsv41_pool_latents_f32")
         self.indexerScores = try make("dsv41_indexer_scores_f32")
         self.router = try make("dsv41_router_topk")
-        self.hcMix = try make("dsv41_hc_mix_f32")
-        self.hcWrite = try make("dsv41_hc_write_f32")
         self.clear = try make("clear_vector_f32")
+        self.copy = try make("dsv41_copy_f32")
         self.vectorAdd = try make("vector_add_f32")
         self.rmsNormGain = try make("dsv41_rmsnorm_f32_gain")
         self.fp8SwiGLU = try make("dsv41_fp8_block32_swiglu_gate_up")
         self.fp8DownAccumulate = try make("dsv41_fp8_block32_down_accumulate")
         self.bf16Gemv = try make("bf16_gemv")
+        self.bf16GemvRows = try make("bf16_gemv_rows")
+        self.bf16GemvBlock = try make("bf16_gemv_rows8")
+        self.bf16GemvBlockPair = try make("bf16_gemv_rows8x2")
         self.bf16SwiGLU = try make("bf16_swiglu_gate_up")
         self.bf16DownAccumulate = try make("bf16_down_proj_accumulate")
         self.embeddingBF16 = try make("lookup_embeddings_bf16")
@@ -277,6 +348,8 @@ nonisolated public enum DeepSeekV41EngineError: Error, CustomStringConvertible {
     case unsupportedDtype(String, String)
     case contextTooLong(Int, Int)
     case outOfOrderPosition(Int, Int)
+    /// A resumed turn found resident state that is not this prompt's.
+    case prefixStateMismatch(position: Int)
     case unsupportedStage(String)
     case commandFailed(String)
 
@@ -298,6 +371,8 @@ nonisolated public enum DeepSeekV41EngineError: Error, CustomStringConvertible {
             return "DeepSeek V4.1 turn needs \(requested) positions but the cache was provisioned for \(maximum)"
         case let .outOfOrderPosition(requested, stored):
             return "DeepSeek V4.1 forward was asked for position \(requested) while the cache holds \(stored)"
+        case .prefixStateMismatch(let position):
+            return "DeepSeek V4.1 cannot continue the cached sequence: its token history diverges at position \(position)"
         case .unsupportedStage(let stage):
             return "DeepSeek V4.1 stage '\(stage)' has no device implementation"
         case .commandFailed(let detail):
@@ -339,12 +414,36 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
     public let cache: DeepSeekV41KVCache
     public let memoryPlan: DeepSeekV41MemoryPlan
     public let arena: DeepSeekV41ExpertArena
+    /// Fills the arena slots from the shard files. Nil means the routed experts are
+    /// bound through the zero-copy shard mappings instead, which is correct and
+    /// several times slower: every expert matrix is a page-fault walk.
+    public let expertStreamer: DeepSeekV41ExpertStreamer?
+    /// Why there is no streamer, so the readiness line names a reason instead of
+    /// leaving "no streaming" to be read as "streaming is fine here".
+    public let expertStreamerProblem: String?
     public let dspark: DeepSeekV41DSparkPlan
     public let contextLength: Int
     /// The precision the KV cache is actually allocated at. The checkpoint's
     /// design is FP8; the runtime runs FP16 until the FP8 quantize/dequantize
     /// pair is checked against the reference, and reports the difference.
     public let cachePrecision: DeepSeekV41CachePrecision
+
+    /// Debug-only: let the two Engram layers run with no memory read at all
+    /// instead of reading their tables. The opt-out is deliberate (a wrong
+    /// combination reads the right rows and mixes them wrongly, which looks like
+    /// "the memory model does nothing"), so this is off unless the user opts in
+    /// with `dynamoe_dsv41_engram_off`, and the load log and readiness report say
+    /// so every time. It exists to exercise the other 38 layers on a machine that
+    /// has already paid for the 510 GB download.
+    public let allowEngramSkip: Bool
+
+    /// The compressed vocabulary the Engram hashes are drawn from, built from the
+    /// checkpoint's tokenizer at load. Nil when the checkpoint has no Engram table
+    /// or no tokenizer could be read, in which case `engramProblem` says why.
+    public let engramTokenMap: DeepSeekV41EngramTokenMap?
+    /// Why the token map is missing. The device executor turns it into a wiring
+    /// problem rather than reading rows through a stand-in map.
+    public let engramProblem: String?
 
     public let device: MTLDevice
     public let commandQueue: MTLCommandQueue
@@ -365,6 +464,18 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
     /// missing kernel, a missing Metal device and a failed allocation is lost.
     public static var lastInitializationError: String? { initializationError.stored }
 
+    /// `defaults write DRP.DynaMoE dynamoe_dsv41_engram_off -bool YES`
+    ///
+    /// Debug-only opt-out: run the Engram layers with no memory read instead of
+    /// refusing the turn. Off by default, and the readiness report names every
+    /// layer it applies to, because the whole point of the refusal is that a
+    /// missing or miscombined memory reads as "the model is fine, just worse".
+    public static let engramOffDefaultKey = "dynamoe_dsv41_engram_off"
+
+    public static var engramSkipRequested: Bool {
+        UserDefaults.standard.bool(forKey: engramOffDefaultKey)
+    }
+
     private static let initializationError = InitErrorBox()
 
     static func record(_ reason: String) {
@@ -377,7 +488,8 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         config: DeepSeekV41Config,
         shardBuffers: [UInt32: MTLBuffer],
         contextLength: Int,
-        cachePrecision: DeepSeekV41CachePrecision = .fp16
+        cachePrecision: DeepSeekV41CachePrecision = .fp16,
+        allowEngramSkip: Bool = false
     ) {
         guard let plan = try? config.makeLayerPlan() else {
             DeepSeekV41Runtime.record("the per-layer plan could not be built from config.json")
@@ -423,9 +535,67 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
             return nil
         }
         let shapes = DeepSeekV41TensorShapes(config: config)
-        guard let workspace = DeepSeekV41Workspace(device: device, shapes: shapes, config: config) else {
+        guard let workspace = DeepSeekV41Workspace(
+                  device: device,
+                  shapes: shapes,
+                  config: config,
+                  compressedOwners: plan.filter(\.ownsCompressedKV).count,
+                  // Prefill runs a block of positions per dispatch, so every
+                  // per-position vector is replicated for the block. The ring
+                  // caps the block: it holds `window` rows, and a wider block
+                  // would write a row before the query that needs it attended.
+                  slots: DeepSeekV41DevicePlan.chunkSlots(
+                      config: config, contextLength: max(1, contextLength)
+                  )
+              ) else {
             DeepSeekV41Runtime.record("the per-token workspace could not be allocated")
             return nil
+        }
+
+        // One arena slot holds one whole `(layer, expert)` pair, so sizing it from
+        // RAM is what turns a cold cache on every token into a working set: an
+        // active expert is ~19 MB of MXFP4, and a 128 GB machine can hold a few
+        // thousand of the 15,360 pairs that exist. Twelve slots (top-k x 2) was a
+        // placeholder that guaranteed every expert was a miss.
+        let memoryPlan = DeepSeekV41MemoryPlan.make(
+            config: config,
+            plan: plan,
+            catalog: weights.catalog,
+            contextLength: contextLength,
+            recordBytesOverride: cachePrecision.recordBytes(width: config.cacheRecordWidth)
+        )
+        let physicalGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        let slotCount = min(
+            DeepSeekV41MemoryPlan.affordableExpertSlots(plan: memoryPlan, physicalGB: physicalGB),
+            max(1, config.numRoutedExperts * max(1, config.numHiddenLayers))
+        )
+        let arena = DeepSeekV41ExpertArena(slotCount: slotCount)
+
+        // The routed mixture is a working set this machine reads, not a weight it
+        // holds: 15,360 whole-expert pairs at ~19 MB each. Filling the arena from
+        // the shards with pread is what makes a token's expert traffic a linear read
+        // instead of one page fault per 16 KB, so the streamer is built here rather
+        // than lazily. It is optional on purpose: a checkpoint whose experts do not
+        // resolve to one slot layout still runs through the shard mappings, just
+        // slowly, and the readiness line says which path is in use.
+        var streamer: DeepSeekV41ExpertStreamer?
+        var streamerProblem: String?
+        if let snapshotDir {
+            do {
+                streamer = try DeepSeekV41ExpertStreamer(
+                    device: device,
+                    weights: weights,
+                    summary: summary,
+                    snapshotDir: snapshotDir,
+                    arena: arena,
+                    config: config,
+                    plan: plan
+                )
+            } catch {
+                streamerProblem = "\(error)"
+            }
+        } else {
+            streamerProblem = "the snapshot directory is unknown, so the expert shards cannot be read"
         }
 
         self.config = config
@@ -433,17 +603,37 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         self.catalog = weights.catalog
         self.weights = weights
         self.cache = cache
-        self.memoryPlan = DeepSeekV41MemoryPlan.make(
-            config: config,
-            plan: plan,
-            catalog: weights.catalog,
-            contextLength: contextLength,
-            recordBytesOverride: cachePrecision.recordBytes(width: config.cacheRecordWidth)
-        )
-        self.arena = DeepSeekV41ExpertArena(slotCount: max(1, config.numActivatedExperts * 2))
+        self.memoryPlan = memoryPlan
+        self.arena = arena
+        self.expertStreamer = streamer
+        self.expertStreamerProblem = streamerProblem
         self.dspark = DeepSeekV41DSparkPlan.make(config: config)
         self.contextLength = contextLength
         self.cachePrecision = cachePrecision
+        self.allowEngramSkip = allowEngramSkip
+        // The Engram hash reads the checkpoint's compressed vocabulary, so the map
+        // is compiled from the shipped tokenizer once, at load. A checkpoint with no
+        // table needs neither the parse nor the map.
+        if !config.engramTables.isEmpty, !allowEngramSkip {
+            if let snapshotDir {
+                do {
+                    let map = try DeepSeekV41EngramTokenMap.make(
+                        snapshotDir: snapshotDir, config: config
+                    )
+                    self.engramTokenMap = map
+                    self.engramProblem = nil
+                } catch {
+                    self.engramTokenMap = nil
+                    self.engramProblem = "the Engram token map could not be built: \(error)"
+                }
+            } else {
+                self.engramTokenMap = nil
+                self.engramProblem = "the snapshot directory is unknown, so the Engram token map is unavailable"
+            }
+        } else {
+            self.engramTokenMap = nil
+            self.engramProblem = nil
+        }
         self.device = device
         self.commandQueue = commandQueue
         self.pipelines = pipelines
@@ -462,11 +652,30 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         return built
     }
 
+    /// Releases the descriptors and slot buffers this runtime owns.
+    ///
+    /// Called when a new runtime replaces it (a different checkpoint, or a turn that
+    /// needs more context). Without it the Engram tables and the 48 expert shards
+    /// stay open for the life of the process.
+    public func shutdown() {
+        cachedForward = nil
+        weights.close()
+        expertStreamer?.close()
+        arena.reset()
+    }
+
     /// One-line readiness report for the load log.
     public func describe() -> String {
         var lines: [String] = []
         lines.append("cache: \(cache.layout.describe()) at \(cachePrecision.rawValue)")
         lines.append("memory: \(memoryPlan.describe(expertSlots: arena.capacity))")
+        if let expertStreamer {
+            lines.append(expertStreamer.describe())
+        } else {
+            lines.append(
+                "experts: read through the shard mappings (\(expertStreamerProblem ?? "no streamer"))"
+            )
+        }
         lines.append(
             "dspark: " + (dspark.isEnabled
                 ? "block \(dspark.blockSize) over layers \(dspark.targetLayerIDs)"
@@ -480,6 +689,111 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
             lines.append("not runnable: \(DeepSeekV41EngineError.modelNotRunnable(weights.problems))")
         }
         return lines.joined(separator: "\n")
+    }
+}
+
+// MARK: - Engram staging
+
+/// Where one Engram table's rows are staged for the device path.
+///
+/// The table itself is never a buffer (~100 GB is past every `maxBufferLength`),
+/// so one position's rows are preaded into `engramRaw` and dequantized into
+/// `engramValues`. Both buffers carry one block PER TABLE rather than one shared
+/// block, which is the double buffering the memory plan prices: the two Engram
+/// layers are far apart in the stack, and giving each its own block means a
+/// read for one table can never land under a kernel still reading the other.
+nonisolated public struct DeepSeekV41EngramSlot: Sendable, Equatable {
+    /// Layer that owns the table.
+    public let layer: Int
+    /// Index into `config.engramTables`, which is what `layer.engramTable` holds.
+    public let table: Int
+    /// `(max_ngram_size - 1) * n_heads` rows: the hash columns of one position.
+    public let columns: Int
+    public let headDimension: Int
+    /// E4M3 values plus one E8M0 scale per 32.
+    public let rowBytes: Int
+    /// Byte offset of this table's raw row block in `engramRaw`.
+    public let rawByteOffset: Int
+    /// Element offset of this table's decoded rows in `engramValues`.
+    public let valueOffset: Int
+    /// Positions this table's staging block is replicated for.
+    ///
+    /// A prefilled block reads every position's rows BEFORE the layer's command
+    /// buffer exists, so one shared block left every position of the block with the
+    /// LAST position's n-gram memory. One block per position is ~6 KB of raw rows
+    /// and ~24 KB decoded at the published table, which is nothing against the
+    /// workspace around it.
+    public let positionSlots: Int
+
+    public var rawByteCount: Int { columns * rowBytes }
+    public var valueCount: Int { columns * headDimension }
+    public var valueByteOffset: Int { valueOffset * MemoryLayout<Float>.stride }
+    /// Width of the concatenated rows the `wkv` projection reads.
+    public var flatWidth: Int { columns * headDimension }
+
+    /// Bytes this table owns in `engramRaw`, every position included.
+    public var rawByteStride: Int { rawByteCount * positionSlots }
+    /// Elements this table owns in `engramValues`, every position included.
+    public var valueStride: Int { valueCount * positionSlots }
+
+    /// Where one position's raw rows start inside `engramRaw`.
+    public func rawBytes(atPositionSlot slot: Int) -> Int {
+        rawByteOffset + min(max(slot, 0), max(0, positionSlots - 1)) * rawByteCount
+    }
+
+    /// Where one position's decoded rows start inside `engramValues`, in BYTES.
+    public func valueBytes(atPositionSlot slot: Int) -> Int {
+        (valueOffset + min(max(slot, 0), max(0, positionSlots - 1)) * valueCount)
+            * MemoryLayout<Float>.stride
+    }
+
+    /// One slot per Engram table, in `config.engramTables` order so the index is
+    /// `layer.engramTable`. A table with no hash columns gets an empty slot rather
+    /// than being dropped: the caller looks slots up by index, and shifting the
+    /// array would hand a layer its neighbour's rows.
+    public static func slots(
+        config: DeepSeekV41Config,
+        positions: Int = 1
+    ) -> [DeepSeekV41EngramSlot] {
+        let positionSlots = max(1, positions)
+        var rawCursor = 0
+        var valueCursor = 0
+        return config.engramTables.enumerated().map { table, spec in
+            let columns = max(1, spec.maxNgramSize - 1) * spec.headCount
+            let slot = DeepSeekV41EngramSlot(
+                layer: spec.layer,
+                table: table,
+                columns: columns,
+                headDimension: spec.headDimension,
+                rowBytes: spec.rowBytes,
+                rawByteOffset: rawCursor,
+                valueOffset: valueCursor,
+                positionSlots: positionSlots
+            )
+            rawCursor += slot.rawByteStride
+            valueCursor += slot.valueStride
+            return slot
+        }
+    }
+
+    public init(
+        layer: Int,
+        table: Int,
+        columns: Int,
+        headDimension: Int,
+        rowBytes: Int,
+        rawByteOffset: Int,
+        valueOffset: Int,
+        positionSlots: Int = 1
+    ) {
+        self.layer = layer
+        self.table = table
+        self.columns = columns
+        self.headDimension = headDimension
+        self.rowBytes = rowBytes
+        self.rawByteOffset = rawByteOffset
+        self.valueOffset = valueOffset
+        self.positionSlots = max(1, positionSlots)
     }
 }
 
@@ -504,56 +818,162 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
     /// One pooled compressed row, before it is written to the cache.
     public let pooled: MTLBuffer
     /// The compressor's per-position `wkv(x)` results for the group being filled,
-    /// `maxRatio * latentWidth` floats. The compressor projects the layer input, so
-    /// these are not the same rows the window cache holds.
+    /// one block per compressed-KV owner, `groupCount * maxRatio * latentWidth`
+    /// floats. The compressor projects the layer input, so these are not the same
+    /// rows the window cache holds, and the state is per layer rather than shared:
+    /// two owners pooling out of one block mixed their latents.
     public let compressorLatents: MTLBuffer
     /// The compressor's per-position `wgate(x)` scores, the same geometry. The
     /// softmax that pools them runs per DIMENSION over the group.
     public let compressorScores: MTLBuffer
+    /// How many compressed-KV owners the compressor scratch is split across.
+    public let compressorGroups: Int
+    /// Slots one owner's compressor block holds, i.e. the widest compress ratio.
+    public let compressorGroupWidth: Int
     /// The `wq_a` / `wo_a` rank-width scratch.
     public let reduced: MTLBuffer
     public let moeOut: MTLBuffer
     public let streams: MTLBuffer
+    /// The `hc_*_fn` logits for the sub-layer being computed, `(2 + mult) * mult`.
+    public let hcLogits: MTLBuffer
+    /// The collapse weight the NEXT sub-layer reads. Reset to the identity mix at
+    /// the start of every forward pass (`make_identity_pre_mix`).
+    public let hcMix: MTLBuffer
+    public let hcAttentionPre: MTLBuffer
+    public let hcAttentionPost: MTLBuffer
+    public let hcAttentionComb: MTLBuffer
+    public let hcFFNPre: MTLBuffer
+    public let hcFFNPost: MTLBuffer
+    public let hcFFNComb: MTLBuffer
+    /// The block input `hc_post` mixes back in. `hc_pre` writes it in the same pass
+    /// that collapses the stack, because `hc_post` cannot read the streams in place.
+    public let hcResidual: MTLBuffer
     public let logits: MTLBuffer
     public let rowIndices: MTLBuffer
     public let tokenIDs: MTLBuffer
+    /// One staging block per Engram table: this position's raw rows, preaded.
+    public let engramRaw: MTLBuffer
+    /// The same rows dequantized to FP32, which is what the `wkv` projection reads.
+    public let engramValues: MTLBuffer
+    /// The `wkv` output for one Engram layer: one key per hyper-connection copy,
+    /// followed by the one value every copy shares.
+    public let engramKV: MTLBuffer
+    /// The gate each copy's residual was mixed with, kept for a probe readback.
+    public let engramGates: MTLBuffer
+    /// Where each Engram table's rows stage. Empty when the checkpoint has none.
+    public let engramSlots: [DeepSeekV41EngramSlot]
     /// Rows the gather allocates for one layer's attention: window + compressed.
     public let gatherRows: Int
+    /// Positions the vectors are replicated for.
+    ///
+    /// A decode step uses slot 0 only. A prefilled chunk runs its dense stages for
+    /// several positions per dispatch — the kernels index the token from
+    /// `thread_position_in_grid.y` — so every per-position vector lives in `slots`
+    /// consecutive copies and a stage binds the copy it is working on. The
+    /// per-position scratch (`intermediate`, the compressor block, the Engram
+    /// staging) stays single: those are used one position at a time no matter how
+    /// wide the dispatch is. `gathered` and `rowIndices` do NOT: both are per
+    /// position, because the gather's row list is a host fill and a host fill is not
+    /// ordered against a dispatch that has not executed yet.
+    public let slots: Int
 
-    public init?(device: MTLDevice, shapes: DeepSeekV41TensorShapes, config: DeepSeekV41Config) {
+    /// Byte offset of one position's copy of a `width`-wide vector.
+    public func slotOffset(_ slot: Int, width: Int) -> Int {
+        min(max(slot, 0), max(0, slots - 1)) * width * MemoryLayout<Float>.stride
+    }
+
+    /// First row of one position's gathered block, and of its row list.
+    ///
+    /// `gathered` holds one `gatherRows`-row block per position, so this is the row
+    /// offset to gather into; `rowIndices` holds one `gatherRows`-long list per
+    /// position, so it is also the element offset to write that list at.
+    public func gatheredRowOffset(_ slot: Int) -> Int {
+        min(max(slot, 0), max(0, slots - 1)) * gatherRows
+    }
+
+    public init?(
+        device: MTLDevice,
+        shapes: DeepSeekV41TensorShapes,
+        config: DeepSeekV41Config,
+        compressedOwners: Int,
+        slots: Int = 1
+    ) {
         let mult = max(1, config.hcMult)
+        let slots = max(1, slots)
         let maxCompressed = max(1, config.compressRatios.max() ?? 1)
+        // `Compressor` keeps one group per module instance, so a layer's slots are
+        // its own. The block is the widest ratio wide; a narrow owner leaves the
+        // remaining slots unused rather than pooling another layer's latents.
+        let compressorGroups = max(1, compressedOwners)
         // Rows one position gathers: its window plus whatever the addressing rule
         // may select. `index_topk == 0` would mean "the whole compressed cache", so
         // the candidate-block budget bounds it and the executor reports a cache
         // provisioned wider than this.
         let gather = DeepSeekV41DevicePlan.gatherRowBudget(config: config)
         let float4: (Int) -> Int = { $0 * MemoryLayout<Float>.stride }
+        // The gathered block holds the cache's own records, so its values are two
+        // bytes and not four: the block is a copy of cache rows, and the executor
+        // refuses any cache that is not FP16 (`DeepSeekV41DevicePlan.problems`), so
+        // widening each record on the way out doubled both the block and every
+        // head's read of it (`dsv41_attention_csa2_f16`).
+        let gatheredValueBytes = MemoryLayout<UInt16>.stride
+        // Engram staging is sized for exactly the rows one position reads, which is
+        // well under the 64-row block the memory plan prices, so the allocation can
+        // never outgrow the budget the load log reports.
+        let engramSlots = DeepSeekV41EngramSlot.slots(config: config, positions: slots)
+        let engramRawBytes = engramSlots.reduce(0) { $0 + $1.rawByteStride }
+        let engramValueCount = engramSlots.reduce(0) { $0 + $1.valueStride }
+        let engramKVCount = (mult + 1) * shapes.hidden
 
         func make(_ bytes: Int) -> MTLBuffer? {
             device.makeBuffer(length: max(bytes, 16), options: .storageModeShared)
         }
-        guard let hidden = make(float4(shapes.hidden)),
-              let normed = make(float4(shapes.hidden)),
-              let query = make(float4(shapes.queryWidth)),
-              let latent = make(float4(shapes.latentWidth)),
-              let gathered = make(float4(gather * shapes.latentWidth)),
-              let attentionOut = make(float4(shapes.attentionOutputWidth)),
-              let output = make(float4(shapes.hidden)),
-              let routerLogits = make(float4(config.numRoutedExperts)),
-              let expertIndices = make(max(4 * config.numActivatedExperts, 16)),
-              let expertWeights = make(float4(config.numActivatedExperts)),
+        func slotBytes(_ width: Int) -> Int {
+            float4(max(1, width)) * slots
+        }
+        guard let hidden = make(slotBytes(shapes.hidden)),
+              let normed = make(slotBytes(shapes.hidden)),
+              let query = make(slotBytes(shapes.queryWidth)),
+              let latent = make(slotBytes(shapes.latentWidth)),
+              let gathered = make(gather * shapes.latentWidth * slots * gatheredValueBytes),
+              let attentionOut = make(slotBytes(shapes.attentionOutputWidth)),
+              let output = make(slotBytes(shapes.hidden)),
+              let routerLogits = make(slotBytes(config.numRoutedExperts)),
+              let expertIndices = make(max(4 * config.numActivatedExperts, 16) * slots),
+              let expertWeights = make(slotBytes(config.numActivatedExperts)),
               let intermediate = make(float4(shapes.expertIntermediate)),
               let sharedIntermediate = make(float4(shapes.sharedIntermediate)),
               let pooled = make(float4(shapes.latentWidth)),
-              let compressorLatents = make(float4(maxCompressed * shapes.latentWidth)),
-              let compressorScores = make(float4(maxCompressed * shapes.latentWidth)),
-              let reduced = make(float4(max(1, max(shapes.qLoraRank, shapes.outputReducedWidth)))),
-              let moeOut = make(float4(shapes.hidden)),
-              let streams = make(float4(mult * shapes.hidden)),
+              let compressorLatents = make(
+                  float4(maxCompressed * compressorGroups * shapes.latentWidth)
+              ),
+              let compressorScores = make(
+                  float4(maxCompressed * compressorGroups * shapes.latentWidth)
+              ),
+              let reduced = make(slotBytes(max(1, max(shapes.qLoraRank, shapes.outputReducedWidth)))),
+              let moeOut = make(slotBytes(shapes.hidden)),
+              let streams = make(slotBytes(mult * shapes.hidden)),
+              let hcLogits = make(slotBytes((2 + mult) * mult)),
+              let hcMix = make(slotBytes(mult)),
+              let hcAttentionPre = make(slotBytes(mult)),
+              let hcAttentionPost = make(slotBytes(mult)),
+              let hcAttentionComb = make(slotBytes(mult * mult)),
+              let hcFFNPre = make(slotBytes(mult)),
+              let hcFFNPost = make(slotBytes(mult)),
+              let hcFFNComb = make(slotBytes(mult * mult)),
+              let hcResidual = make(slotBytes(mult * shapes.hidden)),
               let logits = make(float4(config.vocabSize)),
-              let rowIndices = make(4 * gather),
-              let tokenIDs = make(4) else {
+              let rowIndices = make(4 * gather * slots),
+              // One token id per position: a prefilled block writes its whole
+              // prompt slice here and binds one id per embedding dispatch, so a
+              // single entry overruns the buffer at position 4 of 8.
+              let tokenIDs = make(slotBytes(1)),
+              let engramRaw = make(engramRawBytes),
+              // One decoded block per position: `engramValueCount` already counts
+              // every position of the block.
+              let engramValues = make(float4(engramValueCount)),
+              let engramKV = make(slotBytes(engramKVCount)),
+              let engramGates = make(slotBytes(mult)) else {
             return nil
         }
 
@@ -572,12 +992,29 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
         self.pooled = pooled
         self.compressorLatents = compressorLatents
         self.compressorScores = compressorScores
+        self.compressorGroups = compressorGroups
+        self.compressorGroupWidth = maxCompressed
         self.reduced = reduced
         self.moeOut = moeOut
         self.streams = streams
+        self.hcLogits = hcLogits
+        self.hcMix = hcMix
+        self.hcAttentionPre = hcAttentionPre
+        self.hcAttentionPost = hcAttentionPost
+        self.hcAttentionComb = hcAttentionComb
+        self.hcFFNPre = hcFFNPre
+        self.hcFFNPost = hcFFNPost
+        self.hcFFNComb = hcFFNComb
+        self.hcResidual = hcResidual
         self.logits = logits
         self.rowIndices = rowIndices
         self.tokenIDs = tokenIDs
+        self.engramRaw = engramRaw
+        self.engramValues = engramValues
+        self.engramKV = engramKV
+        self.engramGates = engramGates
+        self.engramSlots = engramSlots
         self.gatherRows = gather
+        self.slots = slots
     }
 }

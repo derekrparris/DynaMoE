@@ -3502,3 +3502,1544 @@ larger than any other path on the machine. New coverage:
 `testCapacityMessageNamesACappedReserve`,
 `testCapacityMessageRendersUnboundedCapacityAndChatRemedy`, and the server test
 now builds its message through the real builder.
+
+## DSV4.1 #1: BLOCK PREFILL VS THE WALK (MEASURED, NOT YET WORTH BATCHING MORE)
+
+**Why this entry exists before any more work on the path.** `prefillChunk` now
+runs a prompt as blocks of positions: the dense stages (norms, linears, rope)
+dispatch once over the whole block, while the cache write, the attention that
+reads it, the mHC coefficients, the Engram rows and the routed mixture stay per
+position. That is a claim about cost. This journal already records
+optimizations shipped on the strength of such a claim and reverted once
+somebody measured them (Fix #6a, Fix #7), so the claim got a number first.
+
+**Setup.** `DeepSeekV41SyntheticCheckpoint` is the only runnable model in the
+repo — the local DeepSeek-V4.1 shards are 14 MB header-only stubs of a ~510 GB
+checkpoint, so nothing runs at published widths. Synthetic shape: hidden 64,
+head_dim 48, 2 layers, 2 heads in 2 output groups, 4 routed experts taking 2,
+no compressed layers, no Engram tables, FP16 KV cache. Prompt 32 positions,
+best of 3 runs after 1 warmup, one `reset()` per run. Machine: **M5 Max, 128 GB,
+macOS 27.2** (not the M1 Pro the budgets are tuned for). Reproduce with:
+
+```bash
+touch /tmp/dynamoe_dsv41_prefill_measure
+xcodebuild test-without-building -project DynaMoE.xcodeproj -scheme DynaMoE \
+  -destination 'platform=macOS,arch=arm64' -parallel-testing-enabled NO \
+  -only-testing:DynaMoETests/DeepSeekV41PrefillMeasurementTests
+```
+
+| window | slots | walk ms | chunk ms | speedup | walk ms/pos | chunk ms/pos |
+|-------:|------:|--------:|---------:|--------:|------------:|-------------:|
+| 2 | 2 | 31.10 | 24.72 | 1.26x | 0.972 | 0.773 |
+| 4 | 4 | 21.17 | 21.20 | 1.00x | 0.662 | 0.663 |
+| 8 | 8 | 23.46 | 21.27 | 1.10x | 0.733 | 0.665 |
+| 16 | 8 | 25.91 | 25.11 | 1.03x | 0.810 | 0.785 |
+
+(An earlier run of the same build gave 1.41x / 1.05x / 1.10x / 1.08x, so
+anything under ~1.15x is inside this harness's noise.)
+
+**Attribution.** A block costs 0.346 ms/position at one layer and 0.680 at two:
+**0.334 ms per position per layer**, linear in the layer count. A block of one
+position costs 0.934 ms, which is two layers of that plus the embedding block
+and the head. Scaling with layers means the cost is work the block still does
+per position; the block's fixed cost is gone. What remains per position per
+layer is one command buffer, one submission and one `waitUntilCompleted` for
+the expert arena — the mixture cannot batch because `ensureResident` may only
+refill a slot after the kernels reading it have finished
+(`DeepSeekV41MetalForward.runBlockLayer`).
+
+**Conclusion.** The dense batching is real but small at these widths: it removes
+dispatches that were never the floor. **The floor is the per-position mixture
+round trip**, roughly 85% of a block's per-position time. On a checkpoint whose
+arithmetic is 7,168-wide that round trip is a smaller share, so the real
+speedup at published widths is *larger* than these numbers and still not
+knowable here. Two honest consequences:
+
+- Do not flip the `batchedDevicePrefill` conformance gate on the strength of
+  this: it is port-against-port parity, not a number from real weights.
+- The next lever on this path is batching the **mixture** — an arena that holds
+  a block's expert union (or deduplicates residency across the block's
+  routings), so one submission covers the block instead of one per position.
+  That is an arena-size and streaming question, not a wider grid, and it is
+  worth ~0.33 ms/position/layer here before any real weights are involved.
+
+**Caveats worth keeping in mind.** The walk pays a per-position logits readback
+(`forwardToken` finishes a block of one each time) and the chunk reads logits
+only at the end; that difference is part of the measured win and is included
+rather than netted out. Varying the window changes the ring, so a row's
+walk-vs-chunk ratio is the only comparison valid within this table. The
+synthetic model has no compressed layers, no Engram and no DSpark stages, so
+none of their per-position costs are in these numbers.
+
+Tests: `DeepSeekV41PrefillMeasurementTests` (three opt-in cases: the width
+sweep, the per-layer attribution, and block-of-one versus block-of-N). They
+skip unless `/tmp/dynamoe_dsv41_prefill_measure` exists or
+`DYNAMOE_DSV41_PREFILL_MEASURE=1`, because `xcodebuild` does not forward the
+shell environment into an app-hosted test, and they assert only the correctness
+invariant (the block returns the walk's logits) rather than a timing threshold.
+
+## DSV4.1 #2: BATCHING THE MIXTURE, AND WHAT THE ROUND TRIP REALLY COST
+
+**What changed.** `DSV4.1 #1` measured the block prefill and named the
+per-position mixture round trip as the floor: `runBlockLayer` created one
+command buffer per position, submitted it, and waited, because
+`DeepSeekV41ExpertStreamer.ensureResident` may only refill an arena slot after
+the kernels reading it have finished. `DeepSeekV41MetalForward.runBlockLayer`
+now fills the arena once for the block's deduplicated expert union and encodes
+every position's mixture stages into **one** command buffer with no wait
+between positions. The wait moves to the block boundary: the half is committed
+unordered, and the next layer's front-half wait drains it — the same ordering a
+single decode position already relies on. When the union does not fit the arena
+(a deliberately small one), the layer keeps the old per-position fill-and-wait,
+because a slot overwritten under a running kernel is a wrong answer with no
+error.
+
+**Setup.** Unchanged from `DSV4.1 #1`: synthetic checkpoint (hidden 64, 2
+layers, 4 routed experts taking 2, FP16 KV, no compressed layers / Engram /
+DSpark), 32 positions, best of 3 after 1 warmup, one `reset()` per run. Machine
+**M5 Max, 128 GB, macOS 27.2**. Same reproduce command
+(`DeepSeekV41PrefillMeasurementTests`, opt-in via
+`/tmp/dynamoe_dsv41_prefill_measure`).
+
+**Before → after, same synthetic model.**
+
+| window | slots | walk ms | chunk ms | speedup | chunk ms/pos before | chunk ms/pos after |
+|-------:|------:|--------:|---------:|--------:|--------------------:|-------------------:|
+| 2 | 2 | 27.56 | 13.36 | 2.06x | 0.773 | 0.418 |
+| 4 | 4 | 20.57 | 10.24 | 2.01x | 0.663 | 0.320 |
+| 8 | 8 | 21.85 | 11.12 | 1.97x | 0.665 | 0.347 |
+| 16 | 8 | 25.22 | 14.04 | 1.80x | 0.785 | 0.439 |
+
+Two further runs of the same build: 2.08x / 1.99x / 2.00x / 1.80x and 2.11x /
+2.04x / 2.02x / 1.77x. The walk times moved by ~2% between sessions, so the
+walk column is stable enough for the ratio to be read; the spread inside the
+after column is under 2%.
+
+Per-layer attribution, same case: a block of 32 positions costs **0.185
+ms/position at 1 layer and 0.317 at 2** (three runs: 0.181/0.319, 0.181/0.324),
+so **~0.138 ms per position per layer**, down from 0.334. A block of one
+position costs 0.551-0.751 ms, down from 0.934.
+
+**Correction to `DSV4.1 #1`.** That entry inferred the round trip was "roughly
+85%" of a block's per-position cost, from the layer slope plus the block-of-one
+number. The direct before/after says **~50-60%**: at window 4 the block went
+from 0.663 to 0.320 ms/position (52% removed), and per layer from 0.334 to
+0.138 (59% removed). The inference was directionally right and numerically
+optimistic; this entry's number is the one to quote.
+
+**What is still per position** (~0.138 ms/position/layer here): the dense
+half's per-slot stages (`hcAttentionCoefficients`, the mHC pre-mix, the
+compressor writes, the gathered rows, the cache write, and the attention that
+reads it are all encoded per slot inside one command buffer), plus the
+mixture itself, which is still encoded per position: a clear, two dispatches
+per routed expert, the shared expert, and the hyper-connection write and
+collapse. Those are *dispatches*, not round trips: batching them further would
+need the kernels to take a position index where they currently take a slot
+pointer (`DeepSeekV41DevicePlan.chunkSlots` stays the ceiling at 8). Not
+measured separately, so not recommended yet — the next step on this path is
+another measurement, not another rewrite.
+
+**Caveats.**
+
+- This run had **no streamer**: the synthetic runtime is built with
+  `snapshotDir: nil`, so the experts come from the shard mapping and the
+  measurement isolates the round trip and the command-buffer count. On real
+  weights the same change also replaces `count` fills of top-k experts with one
+  fill of the block's union, which is a hit-rate question this harness cannot
+  see (at 384 experts and top-k 6 the union of 8 positions is up to 48, and the
+  arena the memory plan sizes holds hundreds, so it fits).
+- The arena-union path itself is unexercised by any test: the synthetic arena is
+  8 slots for 4 experts *and* the test runtime has no streamer, so the union
+  always fits and the fallback never runs. The fallback is the old code path,
+  kept verbatim.
+- The `batchedDevicePrefill` conformance gate still stays `.unverified`: this is
+  port-against-port parity on a synthetic model, with no real-weight number
+  anywhere on the machine.
+- Everything from `#1` about the walk paying a per-position logits readback,
+  window rows not being comparable to each other, and the absent compressed /
+  Engram / DSpark stages still holds.
+
+Tests: `DeepSeekV41DeviceGraphParityTests.testTheChunkSeamReturnsTheWalksLogits`
+is the guard — it walks `2 * window - 1` tokens and requires the block path to
+return bit-identical logits (worst delta 0, asserted at 1e-6), and every parity
+case asserts its tolerance through the same batched path. Full DeepSeek suite
+after the change: 399 tests, 73 classes, 0 failures.
+
+## DSV4.1 #3: WHERE THE BLOCK'S REMAINING TIME ACTUALLY GOES
+
+**Why another measurement.** `DSV4.1 #2` batched the mixture and halved a
+block's per-position cost to ~0.14 ms/position/layer, then left the remainder
+unattributed. Two explanations were on the table and they want opposite fixes:
+host time spent encoding dispatches (fewer and wider dispatches), or device
+time spent running them (fewer or cheaper kernels). Guessing here is what this
+journal exists to prevent, so the executor grew a switch.
+
+**Method.** `DeepSeekV41MetalForward.recordsBlockTiming` marks four points per
+layer — layer start, dense half encoded, dense half waited on, mixture encoded
+— and accumulates host nanoseconds per bucket. That split still cannot say
+which HALF the device time belongs to, because the dense half's wait also
+absorbs whatever the queue had not finished (the previous layer's mixture), so
+`DeepSeekV41BlockTiming` also sums the command buffers' own
+`gpuStartTime`/`gpuEndTime`. Then `recordsStageTiming` changes the LAYOUT, not
+the work: each dense stage is committed in its own command buffer (the queue's
+submission order and every hazard it protects are unchanged), so every stage
+reports its own device window. Finally a `calibration` stage dispatches `count`
+trivial clears, which is what turn "device window" into "overhead" versus
+"work".
+
+Both switches are off in every production path; the cases that use them are
+opt-in like the rest of this file's measurements. Machine **M5 Max, 128 GB,
+macOS 27.2**, synthetic checkpoint (hidden 64, 2 layers, window 4, block width
+4), prompt 32 positions, best of `1 + 3` runs.
+
+**Host split, ms per position per layer** (three runs):
+
+| bucket | run 1 | run 2 | run 3 |
+|---|---:|---:|---:|
+| dense half encoded (host) | 0.0237 | 0.0235 | 0.0241 |
+| dense half waited on | 0.2064 | 0.2101 | 0.1480 |
+| mixture encoded (host) | 0.0186 | 0.0188 | 0.0181 |
+
+Host encode is ~17-22% of that total. The rest is blocked on the device.
+
+**Device time, ms per position per layer** (same runs):
+
+| half | run 1 | run 2 | run 3 |
+|---|---:|---:|---:|
+| dense | 0.1709 | 0.1707 | 0.1187 |
+| mixture | 0.0307 | 0.0303 | 0.0215 |
+
+**The dense half is 85% of the device time**, in every run. So the mixture is
+no longer the lever — it is ~15% — and batching more of it would buy little.
+
+**Inside the dense half** (instrumented layout, two runs, share of dense device
+time):
+
+| stage | ms/position | share |
+|---|---:|---:|
+| `writeLatent` (cache write + pool + gather + attention) | 0.155-0.166 | 42% |
+| `hcFFNCoefficients` (mHC project + split) | 0.060-0.067 | 16.5% |
+| `hcAttentionCoefficients` (the same pair) | 0.060-0.064 | 16.4% |
+| `outputDown` (block-diagonal projection) | 0.017 | 4.6% |
+| `router` | 0.013 | 3.4% |
+| everything else (norms, GEMVs, rope, mHC pre/post) | ≤0.006 each | ≤1.7% each |
+
+Two honesty notes about that table. The per-stage layout inflates absolute
+numbers: the same dense half measured 0.17 ms/position in one buffer and 0.36-
+0.39 spread over 22 buffers, so read the shares, not the milliseconds. And
+`calibration` — four trivial dispatches in one buffer — costs 0.004
+ms/position (16 µs per layer-block, ~4 µs per dispatch), which means dispatch
+overhead alone does NOT explain the mHC stages: each of those two stages costs
+~30x the calibration for two dispatches that compute a handful of numbers.
+
+**What that points at.** `dsv41_hc_split_f32` returns immediately for every
+thread except `tid == 0` — the whole split and its Sinkhorn schedule run on one
+GPU thread, and the block pays that serial chain `2 * count` times per layer.
+`hc_project` is `mixCount` (8) threads doing two 128-element passes each, which
+is the same shape of problem. The fix is not a wider grid over one position; it
+is a slot dimension, so the block's positions run their serial chains in
+parallel. `writeLatent` is the largest stage and the least tractable: the cache
+write, the gather and the attention are interleaved because the ring tears if a
+position's successor writes before its query reads (see
+`DeepSeekV41Conformance.batchedDevicePrefill`), so it needs its own reasoning
+before it is touched.
+
+**Caveats.** The synthetic widths make fixed per-dispatch cost dominate the
+arithmetic, so this ranking is a ranking of per-position WORK ITEMS, not a
+prediction at 7,168 hidden: `outputDown` and the mHC projections both grow with
+hidden, while their dispatch counts do not. Nothing here is measured at real
+weights, because the local shards are header-only stubs.
+
+Tests: `DeepSeekV41PrefillMeasurementTests.testWhereABlocksRemainingTimeGoes`
+(the three host buckets and the two device halves) and
+`DeepSeekV41PrefillMeasurementTests.testWhichDenseStageHoldsTheDeviceTime` (the
+stage table plus the calibration), both opt-in and both asserting the
+correctness invariant — the block must still return the walk's logits through
+the instrumented paths — rather than a timing threshold.
+
+## DSV4.1 #4: A SLOT DIMENSION ON THE mHC PAIR AND THE ROUTER
+
+**What changed, and why it was the next thing.** `DSV4.1 #3` split a block's
+remaining cost and found the dense half holding 85% of the device time, with
+the two mHC coefficient stages at 33% of it. The reason is visible in the
+kernels: `dsv41_hc_split_f32` returns immediately for every thread except
+`tid == 0`, so a block paid the whole Sinkhorn schedule once per position per
+sub-layer, and `dsv41_router_topk` is the same shape (one thread scans every
+expert). `dsv41_hc_project_f32` was a `mixCount`-wide grid at one position.
+
+All three now take a slot dimension — `thread_position_in_grid.y` for the
+projection, `.x` for the split and the router — and the executor dispatches
+them once per layer instead of once per position, with the slot applied as an
+offset inside the kernel. The arithmetic, the Sinkhorn schedule and the router
+rule are untouched; only the grid and the addressing changed. A decode step
+passes one slot, so the walk runs the same kernels it always did.
+
+**Before → after, same harness** (synthetic checkpoint, 32 positions, best of
+3 after a warmup, block widths from the ring; three runs after the change):
+
+| window | slots | speedup before | speedup after | chunk ms/pos before | chunk ms/pos after |
+|-------:|------:|---------------:|--------------:|--------------------:|-------------------:|
+| 2 | 2 | 2.06x | 1.91-1.99x | 0.418 | 0.442-0.458 |
+| 4 | 4 | 2.01x | 2.39-2.44x | 0.320 | 0.273-0.282 |
+| 8 | 8 | 1.97x | 2.50-2.56x | 0.347 | 0.284-0.293 |
+| 16 | 8 | 1.80x | 2.10-2.15x | 0.439 | 0.377-0.389 |
+
+Per position per layer the block went from 0.133-0.143 ms to 0.117-0.121 ms.
+Blocks wider than two positions gained 15-25%; **width 2 is slightly WORSE**,
+which is what a two-wide grid should do — there is almost nothing to
+parallelize, and the kernels pay one more constant to read.
+
+**The attribution moved a long way, and not only where expected.**
+
+| measure (ms per position per layer) | before | after |
+|---|---:|---:|
+| dense half encoded (host) | 0.0237 | 0.0174 |
+| dense half waited on | 0.2064 | 0.0879 |
+| mixture encoded (host) | 0.0186 | 0.0127 |
+| dense device | 0.1709 | 0.0646 |
+| mixture device | 0.0307 | 0.0159 |
+| `hc{Attn,FFN}Coefficients` (per-stage layout) | 0.060-0.067 each | 0.009 each |
+| `router` | 0.013 | 0.004 |
+| `writeLatent` | 0.155-0.166 | 0.079 |
+
+The dense half's device time fell 2.6x, which is more than the 33% the mHC pair
+held before. The explanation is that a single-thread dispatch is not only slow
+itself, it stalls everything queued behind it: `writeLatent` was never touched
+and still halved, and the host wait fell further than the device work did. So
+the honest reading is "removing one-thread dispatches unblocks the queue", and
+a per-stage table measured around such a stage attributes its neighbours' lost
+time to them. Read each table as a ranking, and the whole-block wall as the
+result.
+
+**What is left.** `writeLatent` — the cache write, the row gather and the
+attention — is now 54% of a dense half that is itself 2.6x cheaper, at 0.079
+ms/position/layer. It cannot be batched the same way: the ring tears if a
+position's successor writes before its predecessor's query reads, and the row
+plan (which rows a position attends to) is resolved on the host per position.
+It needs its own reasoning, so it stays the open item.
+
+**Caveats.** Synthetic widths again: at hidden 64 the mHC projections are a
+handful of multiplies, so part of what this change removed is fixed per-dispatch
+cost that a 7,168-wide model would amortize on its own. What transfers is the
+serialization — a one-thread Sinkhorn per position and a one-thread expert scan
+per position are the same cost at any width. Nothing here is measured at real
+weights.
+
+Tests: the existing mHC kernel and graph parity cases, plus
+`DeepSeekV41DeviceGraphParityTests.testTheHyperConnectionCoefficientsDispatchOneSlotPerPosition`,
+which drives two slots with different stacks through the project and split
+kernels and compares each against `DeepSeekV41HyperConnections.coefficients` —
+the failure mode a slot grid introduces is a slot reading its neighbour's
+stack. `testTheChunkSeamReturnsTheWalksLogits` still requires bit-identical
+logits from the batched path. Full DeepSeek suite: 402 tests, 0 failures.
+
+## DSV4.1 #5: THE ATTENTION KERNEL WAS AS WIDE AS THE HEAD COUNT
+
+**What changed, and why the harness had to leave the synthetic model.** `DSV4.1 #4`
+left `writeLatent` as the largest per-position stage of a block, at 0.079
+ms/position/layer. Reading it says the cost is not distributed the way the other
+stages are: `dsv41_attention_csa2_f32` was dispatched with
+`MTLSize(width: shape.numHeads)` and one thread per head, and that thread walked
+every gathered row THREE times (maximum, denominator, output) over a 512-wide latent
+record. On the published checkpoint a compressed layer reads `window + index_topk` =
+128 + 512 rows, so a head was a serial chain of roughly 1.3 million multiply-adds and
+the entire kernel was 128 threads wide.
+
+That shape cannot be timed by the synthetic checkpoint, which is two heads over at
+most a handful of rows: its attention is a dispatch, and a dispatch is what the
+harness already spends most of its budget on. So this slice added a case that times
+the kernel alone, at the geometry `config.json` publishes — 128 heads, `head_dim`
+512, `v_head_dim` 512, a 512-wide cache record (`kv_lora_rank` is absent from the
+checkpoint, so the record is the head) — for the three row counts a position can
+have: the 128-row window, a window with a few compressed rows, and the 640-row
+worst case of a full compressed cache.
+
+The case is self-validating the same way the block cases are: before it prints a
+number it compares two heads' outputs with `DeepSeekV41AttentionReference.attend` at
+1e-4 relative, so the timing is never reported for a different computation.
+
+**What a single dispatch cost, before** (one command buffer, `gpuStartTime` /
+`gpuEndTime`, best of 5-20 dispatches; M5 Max, 128 GB, macOS 27.2):
+
+| rows | ms/dispatch | µs per head |
+|---:|---:|---:|
+| 128 | 13.479 | 105.3 |
+| 136 | 14.326 | 111.9 |
+| 640 | 68.308 | 533.7 |
+
+One position of one compressed layer, on an idle GPU, in a kernel that is 0.2% of
+the die. The arithmetic does not explain 68 ms — 1.3 million multiply-adds is a
+microsecond at any lane — and that is the point: there were 128 of them in flight,
+each paying a strided scalar load per multiply-add.
+
+**What it costs now.** One threadgroup per head, one thread per row for the dot
+products, and the row scores kept in threadgroup memory so the three passes share ONE
+dot product per row instead of recomputing it:
+
+| rows | before | after (128-thread threadgroup) | speedup |
+|---:|---:|---:|---:|
+| 128 | 13.479 | 0.092-0.095 | ~145x |
+| 136 | 14.326 | 0.120-0.124 | ~118x |
+| 640 | 68.308 | 0.453-0.466 | ~148x |
+
+The threadgroup width is a measured choice rather than a guess; the three widths
+tried, same case, same machine:
+
+| rows | 128 threads | 256 threads | 512 threads |
+|---:|---:|---:|---:|
+| 128 | 0.095 | 0.087 | 0.318 |
+| 136 | 0.124 | 0.097 | 0.092 |
+| 640 | 0.466 | 0.489 | 0.450 |
+
+512 buys 3% on the worst case and loses 3.4x on the 128-row one (128 heads' worth of
+idle threads still occupy warp slots), and 256 is inside the run-to-run noise of 128
+on both ends. 128 threads per head is four SIMD groups, which covers a 640-row
+attention's rows and a 512-wide record's dimensions with room to spare, and it is
+what ships.
+
+**What the block pass made of it** (same harness as `#2`-`#4`: synthetic checkpoint,
+32 positions, best of 3 after a warmup, block widths from the ring):
+
+| window | slots | speedup before | speedup after | chunk ms/pos before | chunk ms/pos after |
+|-------:|------:|---------------:|--------------:|--------------------:|-------------------:|
+| 2 | 2 | 1.91-1.99x | 1.62-2.68x | 0.442-0.458 | 0.291-0.352 |
+| 4 | 4 | 2.39-2.44x | 2.44-2.96x | 0.273-0.282 | 0.193-0.205 |
+| 8 | 8 | 2.50-2.56x | 3.14-3.93x | 0.284-0.293 | 0.149-0.154 |
+| 16 | 8 | 2.10-2.15x | 3.11-3.73x | 0.377-0.389 | 0.150-0.160 |
+
+The synthetic model is two heads wide, so this is the effect of giving each head a
+threadgroup at a width where the rows are nearly free: the win is the parallelism,
+not the arithmetic, and it is the same win at 7,168 hidden. Widths 8 and 16 are
+steady across every run; widths 2 and 4 move with the machine's state (one run of
+the same binary reported a 97.89 ms walk for window 4 while the other runs reported
+15-19 ms, so the spread above is the honest range rather than the best number).
+
+**The stage table moved again, and is now close to its own floor.**
+
+| stage (ms/position, per-stage layout) | before `#5` | after `#5` |
+|---|---:|---:|
+| `writeLatent` | 0.079 | 0.041 |
+| `outputDown` | — | 0.026 |
+| `hc{Attn,FFN}Coefficients` | 0.009 each | 0.015 each |
+| `calibration(4 dispatch)` | 0.004 | 0.011 |
+| `router`, the norms, the mHC pre/post mixes | 0.003-0.006 | 0.003-0.012 |
+
+Read that as a ranking only, and note what happened to the calibration row: the
+trivial four-dispatch buffer used to cost 0.004 ms/position and now costs 0.011, and
+every norm and every mHC pre/post mix lands on exactly 0.011. The per-stage layout
+commits one command buffer per stage, and with the work below it collapsed that
+per-buffer cost IS the measurement. The honest reading is that `writeLatent` (0.041)
+and `outputDown` (0.026) are the two stages still measurably above the floor; the
+`hc*Coefficients` rows rising from 0.009 to 0.015 in a table that measures less work
+than before is the floor moving, not the stages getting slower.
+
+**What is left.** The per-position remainder of a block: the cache write, the row
+gather and the mHC pre/post mix, each still one dispatch per position inside the
+block; `outputDown`, which loops `encodeBlockDiagonalProjection` over slots; and the
+`writeLatent` interleave itself, which cannot be batched without either a staging
+copy of the block's own rows or a wider ring, because writing position `p + 1` evicts
+a row a query at `p` still needs. None of it is measured at real weights, because the
+local shards are header-only stubs.
+
+**Caveats.** The attention numbers are device time from one command buffer, so they
+exclude the per-dispatch latency a block pays in a real submission; they are the part
+of the cost that does not change with how the buffer is built. The block numbers
+above are the synthetic widths and the machine was contended during part of the run
+(a clean run and a loaded run disagree by 2.4x on the walk), which is why the table
+carries ranges. And the kernel's row loop is memory bound at 640 rows: 168 MB of key
+records are read per dispatch across the heads, so the remaining headroom there is
+about how many heads share a loaded row, not about arithmetic.
+
+Tests: `DeepSeekV41PrefillMeasurementTests.testWhatOneAttentionDispatchCostsAtThePublishedWidths`
+(the timing above, opt-in, gated on the marker file and asserting the host rule
+first), `DeepSeekV41AttentionKernelTests.testTheAttentionKernelMatchesTheHostRuleAcrossItsWholeThreadgroup`
+(200 rows across four SIMD groups with a value head wider than the record, so the
+cross-group reduction and the tail zeroing are both exercised),
+`DeepSeekV41AttentionKernelTests.testASingleRowAttentionIsThatRow` (a row count far
+below the threadgroup width), `DeepSeekV41DeviceGraphParityTests.testTheChunkSeamReturnsTheWalksLogits`
+(bit-identical logits from the batched path) and
+`testTheDeviceAndTheHostAgreeStageByStage`. Full DeepSeek suite: 405 tests, 6
+skipped, 0 failures.
+
+## DSV4.1 #6: SHARING A GATHERED ROW ACROSS HEADS MADE ATTENTION SLOWER
+
+**The idea, and why it looked free.** `#5` left the attention kernel with one
+threadgroup per head and recorded, as its remaining headroom, "how many heads share
+a loaded row". The rows are there to be shared: `workspace.gathered` is ONE dense
+block that every head reads, so at the published geometry a dispatch reads 640 rows
+of 512 floats — 1.3 MB of distinct rows — once per head, 168 MB in total. A
+threadgroup carrying `g` heads, with one thread holding `g` dot products through a
+single pass over the row and `g` accumulators through a single pass over a value
+dimension, divides that traffic by `g` and leaves the arithmetic per head identical
+(it still sums over dimensions in order, so the result is bit-identical).
+
+That was implemented, measured at the same published geometry as `#5`, and
+reverted. The measurement is below because the premise — that those 168 MB are
+memory traffic worth removing — is the part that turned out to be wrong, and the
+next person to read "how many heads share a loaded row" should know that.
+
+**What it cost** (same case as `#5`: one command buffer, `gpuStartTime`/
+`gpuEndTime`, best of 5-20 dispatches, M5 Max 128 GB macOS 27.2; `G` is the heads
+per threadgroup, and the register depth is how wide the unrolled accumulator loop
+compiles):
+
+| rows | shipped `#5` kernel | rewrite, G=1, depth 8 | rewrite, G=1, depth 2 | rewrite, G=2, depth 2 | rewrite, G=4, depth 8 |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 0.092-0.095 | 0.240 | 0.117 | 0.137 | 0.292 |
+| 136 | 0.120-0.124 | 0.348 | 0.158 | 0.187 | 0.428 |
+| 640 | 0.453-0.466 | 1.189 | 0.755 | 0.683 | 1.455 |
+
+Two things are in there, and the second is the interesting one.
+
+**The register state cost 2.5x before the group did anything.** The first rewrite
+carried a fixed eight-deep unrolled accumulator loop (so the per-head accumulators
+stay in registers rather than local memory), and `G=1` — the shipped behavior — came
+out 2.5x SLOWER than the kernel it replaced: 0.240 ms at 128 rows against 0.095,
+1.189 at 640 against 0.466. Eight live accumulators, eight maximums, eight
+denominators and eight inverses per thread is a register bill that costs resident
+threads, and attention at this shape is latency-bound enough that occupancy shows up
+directly. Narrowing the unroll to two brought `G=1` back to 0.117 / 0.158 / 0.755,
+still slower than shipped because a two-wide predicated inner loop does two loads
+and two multiply-adds per dimension where the shipped kernel does one.
+
+**The traffic did not matter.** After paying that overhead, `G=2` at the narrowed
+depth was 17% WORSE at 128 rows (0.137 against 0.117) and only 10% better at 640
+(0.683 against 0.755). Halving the record traffic moved the 640-row time by 10%,
+which is the answer: those 168 MB were never DRAM traffic, they were served from the
+cache hierarchy, so removing half of them bought a tenth of the kernel. The group
+also divides the threadgroup COUNT by `g` — 64 threadgroups at `G=2` — and that
+costs occupancy at exactly the widths where the kernel was already fast.
+
+A kernel templated on a compile-time group width would remove the predication and
+project to about 0.41 ms at 640 rows (9% better than shipped) and 0.111 ms at 128
+(17% worse), for the price of template entry points, more than one pipeline and a
+dispatch-side choice. Nine percent on the worst row count against seventeen on the
+common one is not a trade worth a second kernel, so the rewrite was reverted and
+the shipped kernel stands.
+
+**What this closes.** The "share a loaded row" branch of the `#5` follow-up. The
+remaining per-position cost of a block is the ring-interleaved `writeLatent` (cache
+write + pool + gather + attention, 0.041 ms/position), which cannot be batched
+without a staging copy of the block's own rows or a wider ring, and `outputDown`
+(0.026), whose eight head-group projections cannot be merged into fewer dispatches
+because each group reads different weight bytes. Neither is a traffic problem of the
+kind measured here.
+
+**Caveats.** The numbers come from the rewrite, which is no longer in the tree: the
+published-geometry case in the tree measures the shipped kernel, and reproducing a
+`G` row of the table means re-applying the change. Same instrument caveats as `#5`:
+device time from one command buffer, so submission latency is excluded, and the
+machine was contended during part of the run.
+
+Tests: unchanged from `#5` — 405 tests, 6 skipped, 0 failures. The rewrite was
+verified before it was timed (`DeepSeekV41AttentionKernelTests` extended to dispatch
+the kernel with G=1, 2, 4 and 8 against the host rule, partial tail group included),
+so the table above is a timing of a correct kernel, not of a broken one.
+
+## DSV4.1 #7: THE STAGE TABLE WAS RANKING A TWO-HEAD MODEL
+
+**Why the ranking had to be re-taken.** `#5` and `#6` both closed with the same two
+names — `writeLatent` at 0.041 ms/position and `outputDown` at 0.026 — and both
+numbers came from a synthetic checkpoint that is TWO heads wide over a four-row
+window at hidden 64. A ranking of per-position stages taken from that model is a
+ranking of a different model: it has no 512-wide record to re-read, no 65,536-wide
+attention output to project down, and no four-copy residual stack to mix.
+
+So the harness got a second shape, `DeepSeekV41SyntheticShape.publishedWidths`:
+7,168 hidden, 128 heads of 512 (448 nope + 64 rope, so the cache record is the head
+width the published config derives), 8 output groups with `o_lora_rank` 1,024,
+`q_lora_rank` 1,536, `hc_mult` 4 with 20 Sinkhorn iterations, and a 640-row window so
+the ring hands attention the same row count a compressed layer sees. One layer, a
+128-token vocabulary, `moe_intermediate_size` 32 and four routed experts keep it
+holdable — the mixture was batched in `#2` and is not what this table ranks. That
+makes the DENSE half the shipped half down to the byte, which is what a per-stage
+ranking needs.
+
+**What one position of one layer costs at those widths** (`testWhereABlocksRemainingTimeGoesAtThePublishedWidths`,
+640-position prompt, block of 8, per-stage command buffers, M5 Max 128 GB macOS 27.2,
+wall 3.22 ms/position of which 3.24 ms is dense device time and 0.42 mixture):
+
+| stage | ms/position | share |
+|---|---:|---:|
+| `outputDown` | 1.864 | 57.6% |
+| `hcAttentionCoefficients` | 0.391 | 12.1% |
+| `hcFFNCoefficients` | 0.350 | 10.8% |
+| `writeLatent` | 0.249 | 7.7% |
+| `queryUp` | 0.097 | 3.0% |
+| `latentNorm` | 0.083 | 2.6% |
+| `outputUp` | 0.081 | 2.5% |
+| `queryDown`, `latentProject`, `router` | 0.024 each | 0.7% each |
+| the norms, ropes, mHC mixes, calibration | 0.001-0.011 | below 0.3% |
+
+**The finding.** `outputDown` is 57.6% of the dense half, and it was ranked seventh
+at 0.026 ms/position on the synthetic model — wrong by a factor of about seventy.
+The cause is a shape the synthetic model cannot express: `wo_a` is
+`o_lora_rank=1,024` by `attentionOutputWidth=65,536`, split into eight head groups,
+and `encodeBlockDiagonalProjection` is dispatched inside `eachSlot`, so each of a
+block's eight positions re-reads the entire 134 MB weight matrix in BF16 through 64
+GEMV dispatches (eight groups by eight slots). 1.864 ms for 134 MB per position is
+about 72 GB/s of weight traffic, and the weights are identical for every position of
+the block.
+
+**Why that is the next lever, and why the earlier arithmetic was wrong.** `#6`'s
+close-out said `outputDown` "cannot be merged into fewer dispatches because each
+group reads different weight bytes". That is true and it was the wrong measure: the
+cost is not the dispatch, it is the weight BYTES, and those are re-read once per
+POSITION rather than once per BLOCK. The fix is not fewer dispatches — it is a grid
+height of `count` on each of the eight per-group GEMVs, which reads every weight byte
+once per block instead of eight times. `queryUp` shows what that is worth on the same
+table: `wq_b` is 201 MB and already takes a `rows:` height, so it reads 25 MB per
+position and costs 0.097 ms — 258 GB/s of effective weight traffic, 3.5x the
+per-slot path's.
+
+The one thing the batched form needs is a ROW STRIDE on the GEMV kernels: within a
+block the input rows are contiguous at `attentionOutputWidth` stride while a group
+reads `perGroupIn` = 8,192 of those columns, so the kernel has to be told the stride
+rather than deriving it from `inDim`.
+
+**Caveats.** The synthetic weights are BF16; the published checkpoint's attention
+projections are quantised, so the real byte count per position is smaller — at FP8
+`outputDown` would be about 0.93 ms/position, at MXFP4 about 0.47, both still the
+largest term by a wide margin, and the 8x re-read factor is independent of dtype.
+The `hc*Coefficients` rows are each one FP32 GEMV of 24 rows by 28,672 columns, and
+were never measured at these widths before either: 0.74 ms/position between them is
+the second-largest term. They are already batched over the block — the projection
+takes a grid height of `slots` — so their cost is not repeated weight traffic: 2.75 MB
+of weights per block arriving in 0.39 ms is about 1 GB/s, which says the grid, not
+memory, is the limit. `hc_mult` 4 makes the output width 24, so the kernel dispatches
+24 threads and each one walks a 28,672-wide reduction serially. That is the same
+class of defect `#5` fixed in attention: a grid as wide as a small output dimension,
+with the whole reduction in one lane.
+
+Attention reads the window half of its row budget here (no compressed layers in the
+synthetic config), which is why `writeLatent` is 0.249 and the compressed-row half is
+measured separately by `#5`/`#6`. The case takes ~40 s because
+the synthetic blob is 190M values; it is opt-in like the rest. Device time is one
+command buffer per stage, so submission cost is excluded.
+
+Tests: `testWhereABlocksRemainingTimeGoesAtThePublishedWidths` (the table above,
+opt-in, so it is the seventh skipped case in a default run) plus the
+`publishedWidths` shape preset it runs on; every pre-existing case unchanged — 406
+tests, 7 skipped, 0 failures.
+
+## DSV4.1 #8: ONE DISPATCH PER HEAD GROUP PER BLOCK, NOT PER POSITION
+
+**What the published-widths table said.** `#7` ranked the dense half at the widths
+the checkpoint runs and found `outputDown` at 1.864 ms/position — 57.6% of it —
+because `encodeBlockDiagonalProjection` was dispatched inside the per-slot loop:
+eight head groups by eight positions, each dispatch reading that group's whole weight
+slab, so every position re-read all 134 MB of BF16 `attn.wo_a`.
+
+**The change.** Each group's projection now runs ONCE for the block, with the grid's
+height carrying the positions. The GEMV kernels gained two row strides
+(`bf16_gemv` at buffers 6 and 7, `dsv41_fp8_block32_gemv` and `dsv41_mxfp4_gemv` at 8
+and 9), because a band of a block-diagonal projection reads `perGroupIn` = 8,192 of a
+row that is `attentionOutputWidth` = 65,536 wide and writes `perGroupOut` = 1,024 of
+an `outputReducedWidth` = 8,192 vector: `inDim`/`outDim` no longer describe the row
+layout the way they do for a dense projection. A stride of zero means "the dimension",
+so every other caller of those kernels is unchanged — including the generic engine
+path in `ContentView`, which now binds the two strides explicitly rather than relying
+on that fallback.
+
+**What it cost before and after** (same case, same machine, 640-position prompt,
+block of 8, per-stage command buffers):
+
+| stage | before | after | change |
+|---|---:|---:|---:|
+| `outputDown` | 1.864 | 0.214 | 8.7x |
+| whole block, ms/position | 3.22 | 1.57 | 2.05x |
+| dense device, ms/position | 3.236 | 1.581 | 2.05x |
+
+`outputDown` is now 13.5% of the dense half instead of 57.6%, and a block's per
+position cost halved. The 8.7x matches the eightfold traffic reduction the change was
+made for, which is the check that the cost really was the re-read and not something
+else that moved with it.
+
+**The table it leaves** (ms/position, published widths):
+
+| stage | ms/pos | share |
+|---|---:|---:|
+| `hcAttentionCoefficients` | 0.393 | 24.8% |
+| `hcFFNCoefficients` | 0.350 | 22.1% |
+| `writeLatent` | 0.248 | 15.7% |
+| `outputDown` | 0.214 | 13.5% |
+| `queryUp` | 0.095 | 6.0% |
+| `latentNorm` | 0.081 | 5.1% |
+| `outputUp` | 0.079 | 5.0% |
+
+The mHC coefficient projections are now the largest term between them, at 0.74
+ms/position — 47% of the dense half — and `#7` already described why: `hc_mult` 4
+makes the output 24 wide, so `dsv41_hc_project_f32` dispatches 24 threads and each
+walks a 28,672-wide reduction serially. That is a grid shape, not a traffic problem,
+and the fix is the one `#5` applied to attention: make the reduction parallel across
+a threadgroup and keep the partials in threadgroup memory.
+
+**Caveats.** The synthetic weights are BF16, so the absolute `outputDown` numbers are
+larger than the checkpoint's own (its attention projections are quantised): the win
+is the eightfold re-read that the change removes, and the fraction of a block it
+represents scales with the dtype. `writeLatent` reads only the window half of its row
+budget here (no compressed layers), so its 0.248 is a floor rather than the guarantee.
+The case is opt-in and takes ~40 s to build the 190M-value blob. Device time is one
+command buffer per stage.
+
+Tests: the batched path is pinned by `DeepSeekV41DeviceGraphParityTests` —
+`testTheDeviceAndTheHostAgreeStageByStage` and
+`testTheChunkSeamReturnsTheWalksLogits` (bit-identical) — and the whole DeepSeek suite
+is green: 406 tests, 7 skipped, 0 failures.
+
+## DSV4.1 #9: THE mHC PROJECTION KEPT ITS REDUCTION IN ONE LANE
+
+**The shape of the defect.** `#7` left the two hyper-connection coefficient
+projections as the largest term of a block's dense half — 0.74 ms/position between
+them, 47% of it — and `dsv41_hc_project_f32` showed why in its dispatch rather than
+its traffic. The projection is `(2 + mult) * mult` logits over the flattened residual
+stack, which at `hc_mult` 4 is 24 logits over `mult * hidden` = 28,672 values per
+position. It ran one THREAD per logit, and each thread walked that reduction twice:
+once for the RMS statistic and once for the dot product. So a position was 24 lanes,
+against 2.75 MB of weight rows to read, and the block already handed it a grid height
+of `slots` — the parallelism that was missing was inside the reduction, not across
+positions.
+
+**The change.** One THREADGROUP per (slot, logit). Lanes stride the reduction,
+accumulate both operands in ONE pass over the stream, `simd_sum` in each warp, and the
+partials meet in threadgroup memory for a serial finish by lane 0. The grid is flat
+(`mixCount * slots` threadgroups, row-major) because a kernel's built-in position
+attributes are either all scalar or all vector, and the lane indices are scalars — a
+`uint2` threadgroup position next to a `uint` thread id does not compile.
+
+**The kernel alone** (`testWhatOneHyperConnectionProjectionCostsAtThePublishedWidths`,
+2.75 MB of weights over 8 slots, one command buffer, best of 20, self-checking three
+logits against the host rule before it prints):
+
+| threadgroup | ms/dispatch | ms/position |
+|---:|---:|---:|
+| 24 (one thread per logit) | 2.253 | 0.282 |
+| 32 | 0.188 | 0.023 |
+| 64 | 0.088 | 0.011 |
+| 128 | 0.045 | 0.006 |
+| **256** | **0.031** | **0.004** |
+| 512 | 0.034 | 0.004 |
+
+73x on the dispatch at 256 threads, which is what the checkpoint's shape affords:
+28,672 values over 256 lanes is 112 each, and the accumulators are two floats, so the
+width costs nothing until the threadgroup outgrows the reduction. 512 is 10% worse and
+250 wider for no gain.
+
+**What it did to the table** (published widths, `#7`'s case, same machine):
+
+| stage | `#8` | now |
+|---|---:|---:|
+| `hcAttentionCoefficients` | 0.393 | 0.011 |
+| `hcFFNCoefficients` | 0.350 | 0.012 |
+| dense device, ms/position | 1.581 | 0.775 |
+| whole block, ms/position | 1.57 | 1.22 |
+
+The dense half of a block is now 2.04x cheaper than before this slice, and the whole
+block — dense plus a mixture that is deliberately tiny in the synthetic model — is
+1.22 ms/position against 3.22 two slices ago.
+
+**The table it leaves** (ms/position): `writeLatent` 0.246 (30.3%), `outputDown` 0.213
+(26.1%), `queryUp` 0.096 (11.8%), `outputUp` 0.078 (9.7%), the calibration buffer
+0.038, `router`/`queryDown`/`latentProject` 0.024 each, then everything else at or
+under the floor. Note the calibration row: it is a buffer of eight no-op dispatches and
+it read 0.001 before this slice and 0.038 after, which is what a per-stage layout costs
+in submission latency once the work around it is gone. Anything at or below that row in
+this table is the instrument, not the stage.
+
+**What is left, and it is all one defect.** `outputDown` (0.213) now reads its 134 MB
+of weights once per block, which is right, but at 79 GB/s it is still three times off
+what `queryUp` gets from the same kind of traffic (262 GB/s at 0.096 ms/position over a
+201 MB matrix). Both are single-thread-per-output-row GEMVs whose reduction runs in one
+lane, which is exactly what this slice fixed in the mHC projection — `wq_b` is 65,536
+output rows over a 1,536-wide reduction, so its lanes are the output and the serial part
+is short, while `wo_a`'s bands are 1,024 rows over 8,192, where it is not. Widening the
+GEMV reduction is therefore the next slice, and it touches `bf16_gemv` — which the
+generic engine path also uses — rather than a DeepSeek-only kernel.
+
+**Caveats.** Same as `#7`/`#8`: BF16 synthetic weights (the checkpoint's attention
+projections are quantised, so the real mixture of costs differs while the ranking holds),
+no compressed layers so attention reads the window half of its row budget, one layer, and
+the mixture's 0.417 ms/position is dispatch overhead rather than expert arithmetic because
+the synthetic intermediate is 32. Device time is one command buffer per stage. The case is
+opt-in and takes ~40 s.
+
+Tests: `testWhatOneHyperConnectionProjectionCostsAtThePublishedWidths` (the kernel table
+above, opt-in) and the three direct kernel dispatches of `dsv41_hc_project_f32` in
+`DeepSeekV41HyperConnectionKernelTests` / `DeepSeekV41DeviceParityTests` now dispatch
+threadgroups with 256 threads and the reduction scratch. Whole DeepSeek suite: 407
+tests, 8 skipped, 0 failures — including `testTheDeviceAndTheHostAgreeStageByStage` and
+the bit-identical chunk seam, so the reordered reduction produces the same coefficients.
+
+## DSV4.1 #10: THE GEMV PUT ONE THREAD ON A WHOLE OUTPUT ROW
+
+`bf16_gemv` gives a thread an output row and the reduction is a serial loop, so the grid
+is `outDim * rows` threads and nothing else. That is the right shape when there are a
+lot of rows — `attn.wq_b` is 73,728 of them over a 1,536-wide reduction, and its lanes
+are the output, so the machine is covered. It is the wrong shape when there are very few
+and the reduction is wide: `attn.wo_a` is eight bands of 128 rows over 8,192 columns, so
+a block of eight positions is **1,024 threads in total** on a 40-core GPU, and `attn.wkv`
+is 448 rows, which is 3,584. `#9` had just shown what one lane per reduction costs in the
+mHC projection (73x). This is the same defect in five stages.
+
+**The two forms.** `bf16_gemv_rows` (new) gives an output row a threadgroup: lanes stride
+the reduction, `simd_sum` per warp, partials in `[[threadgroup(0)]]`, lane 0 finishes. The
+grid is flat (`outDim * rows`) so `row = groupIdx % outDim` and the token is
+`groupIdx / outDim` — the same flat-grid constraint `dsv41_hc_project_f32` ran into,
+where a `threadgroup` buffer cannot be declared beside vector grid attributes. Striding
+the reduction across lanes also makes a lane's load adjacent to its neighbours' instead
+of 16 KB away, which is part of what the one-thread form pays for. Both kernels take the
+same two row strides, so a band-driven caller binds them and every other caller leaves
+them zero. The choice is `DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim:rows:)` — a
+plan rule, not a constant — and the shipped `bf16_gemv` is untouched, because the app's
+generic decode path dispatches it and no measurement here covers that path.
+
+**Kernel alone, published shapes, one block of eight positions** (`testWhatOneProjection
+CostsAtThePublishedWidths`, self-validated against a host dot product at 1e-4 before
+timing). Weights are hammered 20x per window, so these are cache-warm:
+
+| stage | shape | one thread per row | threadgroup per row | |
+|---|---|---:|---:|---:|
+| `latentProject` (`attn.wkv`) | 448 x 7,168 | 0.0340 | **0.0065** | 5.2x |
+| `outputDown`, one band (`attn.wo_a`) | 128 x 8,192 | 0.1416 | **0.0132** | 10.7x |
+| `queryDown` (`attn.wq_a`) | 1,536 x 7,168 | 0.0419 | **0.0227** | 1.8x |
+| `outputUp` (`attn.wo_b`) | 7,168 x 1,024 | **0.0080** | 0.0145 | 0.6x |
+| `queryUp` (`attn.wq_b`) | 73,728 x 1,536 | **0.1637** | 0.3911 | 0.4x |
+
+and at a batch height of one, every shape prefers the threadgroup form, because a grid
+one row tall never has a second position to amortize a row's bytes over: 20.2x on
+`latentProject`, 22.1x on `outputDown`'s band, 6.2x on `queryDown`, 1.6x on `outputUp`,
+1.4x on `queryUp`. So the rule has two clauses — a decode step takes the wide grid at any
+row count, and a block takes it up to 8,192 threads.
+
+**The crossover, measured rather than guessed** (8,192-column reduction, eight
+positions, so the row count is the only variable):
+
+| rows | threads | one thread per row | threadgroup per row | |
+|---:|---:|---:|---:|---:|
+| 96 | 768 | 0.0182 | **0.0013** | 13.9x |
+| 192 | 1,536 | 0.0183 | **0.0022** | 8.3x |
+| 384 | 3,072 | 0.0184 | **0.0034** | 5.4x |
+| 768 | 6,144 | 0.0226 | **0.0099** | 2.3x |
+| 1,536 | 12,288 | **0.0230** | 0.0252 | 0.9x |
+| 3,072 | 24,576 | **0.0281** | 0.0567 | 0.5x |
+| 6,144 | 49,152 | **0.0676** | 0.1654 | 0.4x |
+
+The threshold sits at 8,192 threads: between a 2.3x win and a 10% loss. A 64-lane
+threadgroup with only a few float4 loads each spends more time at its barrier than on the
+reduction, which is why the tall shapes lose.
+
+**Lane width** at the same shapes: 64 and 128 are within noise of each other, 32 costs
+the narrow bands up to 11%, 256 up to 50%. 64 shipped.
+
+**What it did to the table** (published widths, `#7`'s case, same machine):
+
+| stage | `#9` | now |
+|---|---:|---:|
+| `outputDown` | 0.213 | 0.145 |
+| `latentProject` | 0.024 | 0.012 |
+| `queryDown` | 0.024 | 0.025 |
+| `queryUp` | 0.096 | 0.096 |
+| `outputUp` | 0.078 | 0.079 |
+| dense device, ms/position | 0.775 | 0.674 |
+| whole block, ms/position | 1.22 | 1.12 |
+
+The in-situ gain is far smaller than the kernel table suggests, and the reason is worth
+writing down: the isolated case hammers one warm weight 20 times, while a stage inside a
+block reads weights that fell out of cache since the last block, and each stage's number
+in the block table includes the tail of its predecessor (they run back to back in one
+command buffer). `outputUp` reads 0.008 alone and 0.079 in place, which is not the stage
+being slow — it is the stage waiting. Treat the isolated table as a ranking of the two
+kernel forms and the block table as the authority on what a stage costs.
+
+`queryDown` and `queryUp` did not move because they kept the shipped kernel by the rule
+above, so the 0.9x crossover row is what protects them.
+
+**The table it leaves** (ms/position): `writeLatent` 0.246 (34.4%), `outputDown` 0.145
+(20.3%), `queryUp` 0.096 (13.4%), `outputUp` 0.079 (11.0%), the calibration buffer 0.042,
+`queryDown` 0.025, `latentProject` 0.012, then `hcFFNCoefficients`/`hcAttentionCoefficients`
+/`ffnNorm`/`attnNorm` 0.011 each, which is the floor. Dense device 0.674, mixture 0.416 —
+the mixture is now 38% of device time on a model whose expert arithmetic is fake.
+
+**What is left.** Two things, and both are visible in this table. `outputDown` is still
+14.5 GB/s of weight traffic even after the fix, because it is **eight dispatches** of one
+band each and the calibration row says eight dispatches cost 0.042 ms/position on their
+own; a single flat grid over all eight bands would remove seven launches, and the
+threadgroup-per-row form makes that a small change rather than a redesign (the band
+becomes arithmetic on the flat index, exactly as the slot does in `dsv41_hc_project_f32`).
+`writeLatent` at 34.4% is still the ring's serialization and still needs a design
+decision before it can be touched.
+
+**Caveats.** Same as `#7`-`#9`: BF16 synthetic weights, no compressed layers, one layer,
+a synthetic mixture that is dispatch overhead. Plus one new one — the isolated kernel
+numbers are cache-warm and are not additive into the block table. Device time is one
+command buffer per stage. The case is opt-in and takes ~25 s, and it now sweeps both
+batch heights and the crossover, so it is self-validating at every configuration it
+times.
+
+Tests: `testWhatOneProjectionCostsAtThePublishedWidths` (both tables above, opt-in),
+`testTheWideGemvGridIsChosenByHowMuchWorkTheProjectionHas` (the plan rule, pure logic)
+and `testTheWideGemvGridKeepsTheTokenAndTheRowStrides` (the batched flat grid and the two
+row strides, against a host block-diagonal product). Whole DeepSeek suite: 410 tests, 9
+skipped, 0 failures — including `testTheDeviceAndTheHostAgreeStageByStage` and the
+bit-identical chunk seam, so the stages that moved to the second kernel produce the same
+logits.
+
+## DSV4.1 #11: ONE GRID FOR EVERY BAND DID NOT BUY ANYTHING
+
+`#10` left `outputDown` at 0.145 ms/position in a table whose calibration row — eight
+no-op dispatches — was 0.040. The projection is eight band dispatches of `attn.wo_a`, so
+the obvious next move was to collapse them: `bf16_gemv_rows` already derives the row and
+the token from a flat index, so a third term (`band = withinToken / rowCount`) makes the
+whole block-diagonal projection one grid, and eight launches become one. It was
+implemented, self-validated against the host block-diagonal product, measured, and
+**reverted**.
+
+**What it measured.** Isolated, published shapes, one block of eight positions:
+
+| form | ms/position | weight traffic |
+|---|---:|---:|
+| eight wide-grid dispatches, one per band | **0.0133** | 158 GB/s |
+| one grid over all eight bands | 0.0172 | 123 GB/s |
+
+The single grid is 29% SLOWER. At a batch height of one it is the other way round and by
+more: 0.0518 against **0.0231**, 2.24x better, because eight launches of 1,024
+threadgroups each cannot overlap their ramp with each other the way one 8,192-threadgroup
+grid can. So the form is a trade, block against decode — and blocks are what this table
+ranks.
+
+**What it did not measure.** In place, in the published-widths table, the projection went
+from 0.145 to **0.146 ms/position** and the whole block stayed at 1.12. Eight launches
+collapsed into one and nothing moved. That is the finding worth keeping: `outputDown`'s
+0.145 is not launch count.
+
+**Which means the calibration row is not a floor you can subtract.** It reads 0.040 for
+eight dispatches that do nothing, and the tempting arithmetic is "eight launches cost
+0.040, so collapsing them saves a third of the stage". A stage with real work hides its
+launches under that work. The calibration row prices the per-stage command-buffer layout
+for a stage that has no work to overlap with, and nothing else.
+
+**What the stage is actually made of.** The same projection reads 16.8 MB of weights and
+costs 0.0133 isolated against 0.145 in place — a factor of eleven that neither kernel form
+touches. The whole dense half of a block moves 286 MB in 5.39 ms, which is 53 GB/s, while
+the isolated kernels reach 150-300 GB/s on the same bytes. Whatever that gap is — cold
+weights, DRAM latency rather than bandwidth, the shared-storage buffer being read through
+the same path as its writes — it is not the dispatch shape, and it is bigger than every
+remaining dispatch-level item in the table combined.
+
+**Caveats.** Same warnings as `#10`: the isolated numbers are cache-warm (20 dispatches
+over one weight in one command buffer) and are not additive into the block table; the
+synthetic weights are BF16; the mixture is fake. The banded form's grid was
+self-validated before it was timed, so neither number is measuring the wrong computation.
+
+**What this closes.** "Collapse the eight band launches" is off the remaining-work list,
+and with it the idea that the calibration row is recoverable time. `#10`'s eight-band loop
+is what ships. What is left in the dense half is `writeLatent` 0.246 (34.4%, still the
+ring's serialization) and the eleven-fold gap between isolated and in-place projection
+cost, which needs a measurement of its own before it needs a change.
+
+Tests: unchanged from `#10` — the experiment touched `bf16_gemv_rows`,
+`encodeBlockDiagonalProjection` and two test files, and all four were reverted with
+`git checkout --`; only this entry is committed. Whole DeepSeek suite: 410 tests, 9
+skipped, 0 failures.
+
+## DSV4.1 #12: THE PROJECTION WAS NOT ELEVEN TIMES ITS ISOLATED COST, IT WAS 2.2
+
+`#11` ended on an anomaly: the attention output projection measured 0.0133 ms/position in
+isolation and 0.145 inside the block, and the whole dense half appeared to move its
+weights at 53 GB/s against 150-300 GB/s for the isolated kernels. Both numbers were
+wrong, and they were wrong in a way a fixture can be wrong: the isolated case priced
+"eight bands" by timing one 2.1 MB band EIGHT TIMES.
+
+Fixed, with the geometry held still and only the number of distinct bands growing, so the
+two throughputs separate — requests per second, which a warm working set can serve from
+cache, against distinct bytes per second, which the memory system actually has to deliver:
+
+| bands | distinct | ms/position | GB/s unique | GB/s requested |
+|---:|---:|---:|---:|---:|
+| 1 | 2.0 MB | 0.0087 | 30 | 242 |
+| 2 | 4.0 MB | 0.0167 | 31 | 251 |
+| 4 | 8.0 MB | 0.0314 | 33 | 268 |
+| **8** | **16.0 MB** | **0.0660** | **32** | **254** |
+| 16 | 32.0 MB | 0.1381 | 30 | 243 |
+| 32 | 64.0 MB | 0.1204 | 70 | 557 |
+| 64 | 128.0 MB | 0.2447 | 69 | 549 |
+
+So the real isolated cost of the projection is **0.0660**, not 0.0133, and the in-place
+figure is **2.2x** that rather than 11x. The cost is linear in the number of bands (eight
+bands is 7.6x one band, for 8x the work) and it does not care about the footprint: 30-33
+GB/s unique holds from 2 MB to 32 MB with no cliff, which rules out the cache story `#11`
+reached for. The jump at 32 bands is the loop being long enough to amortize the dispatch
+ramp, not a memory effect.
+
+**What the stage is actually limited by.** Every position re-reads the same weight row:
+eight positions over one band is 16.8 MB of requests for 2.1 MB of weight, and that is
+where the 254 GB/s goes. The kernel is request-bound, not DRAM-bound — 30 GB/s of unique
+bytes is what 254 GB/s of requests buys when eight of them are the same row served from
+L2 rather than L1, because the eight threadgroups that want a row land on different cores.
+
+Per stage, in place, as distinct bytes per second (`weights / (8 x msPerPosition)`):
+`queryUp` 294 GB/s, `queryDown` 110, `latentProject` 67, `outputUp` 23, `outputDown` 14.5.
+The spread is not a rank of kernel quality — it is what fraction of each stage's traffic a
+row re-read inflates. `queryUp` reads 226 MB of weight per block, so its eight-fold
+redundancy is a small multiple of a big number and it lands near peak DRAM; `outputDown`
+reads 16.8 MB and its redundancy is the whole cost. So `#11`'s "the dense half runs at 53
+GB/s" is also withdrawn: pooled over the stages that dominate, the dense half moves
+254 MB at 240 GB/s, and the two small stages are slow for their own reason.
+
+**What it opens.** The re-read is removable and the shape of the reuse is the opposite of
+`#6`'s: there, sharing a loaded record row across heads needed eight deep accumulators and
+cost 2.5x in occupancy. Here the shared operand is the WEIGHT and the per-position state is
+one float — a threadgroup could take one output row for every position of the block, load
+each weight value once, and keep `slots` accumulators, cutting the request traffic eight
+times for eight registers. That is the next slice, and it is measurable the same way.
+
+**Caveats.** Cache-warm repetitions again; BF16 synthetic weights; one layer; a 32-wide
+synthetic mixture. The footprint rows 32 and 64 use a 134 MB buffer and are the only ones
+whose working set exceeds what the part can cache, and they are the FASTEST per byte,
+which is the strongest evidence that the footprint is not the variable.
+
+Tests: `testHowAStagesCostScalesWithTheWeightItReads` (the table above, opt-in, ~2 s).
+Whole DeepSeek suite: 411 tests, 10 skipped, 0 failures.
+
+## DSV4.1 #13: A BLOCK'S PROJECTIONS NOW READ EACH WEIGHT ROW ONCE
+
+`#12` ended on a description of the defect rather than a fix: every position of a block
+re-reads the same weight row, so `attn.wo_a`'s eight bands ask for 134 MB of loads to
+read 16.8 MB, and the stage settles at the request rate. The reuse it suggested is the
+opposite register trade to `#6`'s: there, sharing a loaded record row across heads needed
+eight deep per-head accumulator state and cost 2.5x in occupancy; here the shared operand
+is the weight and the per-position state is ONE float.
+
+`bf16_gemv_rows8` gives a threadgroup one output row and streams it once, keeping eight
+named accumulators — named because an array indexed by a runtime bound does not stay in
+registers, and eight is `chunkSlots`' ceiling. `DeepSeekV41DevicePlan.bf16GemvForm` picks
+between it, `bf16_gemv_rows` and `bf16_gemv`: an eight-position block always takes the
+block form, a shorter batch has no block kernel and falls back to `#10`'s two-way rule
+(decode prefers the wide grid at any row count).
+
+**Isolated, published shapes, one block of eight positions** (self-validated against a host
+dot at 1e-4 for all three forms before timing):
+
+| stage | shape | one thread per row | threadgroup per (row, position) | threadgroup per row |
+|---|---|---:|---:|---:|
+| `latentProject` | 448 x 7,168 | 0.0264 | 0.0038 | **0.0023** |
+| `queryDown` | 1,536 x 7,168 | 0.0222 | 0.0220 | **0.0058** |
+| `queryUp` | 73,728 x 1,536 | 0.1119 | 0.3833 | **0.0486** |
+| `outputUp` | 7,168 x 1,024 | 0.0080 | 0.0146 | **0.0029** |
+| `outputDown`, one band | 128 x 8,192 | 0.1462 | 0.0154 | **0.0095** |
+| `crossover` | 6,144 x 8,192 | 0.0688 | 0.1668 | **0.0369** |
+| `crossover` | 96 x 8,192 | 0.0182 | 0.0014 | **0.0012** |
+
+The block form wins at every shape measured, from 96 rows to 73,728, which is why it needs
+no threshold: 1.6x to 3.8x over whichever form shipped before it. The row-count crossover
+that `#10` had to find disappears at an eight-position batch, because the weight is read
+once whatever the row count is.
+
+**What it did to the table** (published widths, same case):
+| stage | `#10` | now |
+|---|---:|---:|
+| `queryUp` | 0.096 | 0.046 |
+| `outputDown` | 0.145 | 0.046 |
+| `outputUp` | 0.079 | 0.044 |
+| `queryDown` | 0.025 | 0.013 |
+| `latentProject` | 0.012 | 0.014 |
+| `writeLatent` | 0.246 | 0.247 |
+| dense device, ms/position | 0.674 | 0.480 |
+| whole block, ms/position | 1.12 | **0.93** |
+
+Dense device time is 1.40x cheaper and the whole block 1.20x, because the dense half is no
+longer most of it: the mixture is 0.417 against 0.480 now, so the deliberately-tiny
+synthetic mixture is 46% of device time and further dense wins buy little until it stops
+being fake.
+
+**The table it leaves.** `writeLatent` is **0.247 ms/position and 51.2% of the dense half**
+— it was 34.4% before this slice purely because the stages around it got cheaper. Every
+other dense stage is now at or near the floor, `queryUp`/`outputDown`/`outputUp` at 0.044-0.046
+having been 0.079-0.145.
+
+A note on the floor: the calibration row read 0.040 in `#10`'s table and reads 0.003 here,
+with no change to the calibration dispatch. It is a per-stage layout cost, and it moves with
+whatever else is in flight, so it has to be read off the same table as the stages rather than
+carried between them.
+
+**Caveats.** The isolated numbers are cache-warm, and one fixture quirk survives: the
+`outputDown` row times one band eight times, so its absolute figures are optimistic for both
+forms — the ratio is still measured like for like. BF16 synthetic weights (the checkpoint
+quantises its attention projections), one layer, no compressed layers, a 32-wide synthetic
+mixture.
+
+Tests: `testTheBlockGemvSharesOneLoadAcrossEightPositions` (all eight positions of all rows
+of a banded projection against the host product, with the group offsets a block-diagonal
+caller binds), `testTheWideGemvGridIsChosenByHowMuchWorkTheProjectionHas` extended to the
+three-way choice, and `testWhatOneProjectionCostsAtThePublishedWidths` grown a third column.
+Whole DeepSeek suite: 412 tests, 10 skipped, 0 failures — including
+`testTheDeviceAndTheHostAgreeStageByStage` and the bit-identical chunk seam.
+
+## DSV4.1 #14: THE CACHE LOOP IS THE ATTENTION, AND NOTHING ELSE SHOWS UP
+
+After `#13` the published-widths table reads `writeLatent` 0.247 ms/position, **51.2% of
+the dense half**, with everything else at or near the floor. `writeLatent` is one loop per
+position doing four things — store the latent row into the ring, pool it into the
+compressed cache when its group completes, gather the row budget, run attention — and
+until now nobody had said which of them the 0.247 belongs to.
+
+**Answered without new code, from a number that already existed.** `#5`'s
+`testWhatOneAttentionDispatchCostsAtThePublishedWidths` times this kernel alone at the
+published geometry (128 heads, head_dim 512, record 512):
+
+| window rows | ms/dispatch | us/head |
+|---:|---:|---:|
+| 128 | 0.092 | 0.72 |
+| 136 | 0.126 | 0.99 |
+| 640 | 0.453 | 3.54 |
+
+A 640-position prompt's window is `min(position + 1, 640)` rows, which averages ~320, and
+between 136 and 640 rows the cost is ~0.65 us/row. So one position's attention is about
+**0.245 ms**, eight of them are 1.96 ms per block, and `writeLatent` is 1.976. The store
+(448 halves), the gather (at most 640 rows of 512) and the loop's own bookkeeping are
+inside the noise floor of that comparison.
+
+**One of the four costs nothing at all, here.** `encodePoolIfComplete` returns
+immediately when the layer does not own a compressed KV cache, and the synthetic
+published-widths checkpoint has no compressed layers. That is a caveat with teeth: on a
+real compressed layer the pool runs TWO GEMVs per position inside the loop
+(`attn.compressor.wkv` and `attn.compressor.wgate`, 7,168 wide by 448), so this table
+understates `writeLatent` for exactly the layers the checkpoint's second half is made of.
+The synthetic model cannot price that, and no change here should be justified by this
+table's pool term being invisible.
+
+**So the lever is the attention's SHAPE, not the loop's plumbing.** One position is one
+dispatch of 128 threadgroups — 16,384 threads, a fifth of what the part can hold — and
+eight of them run back to back in one command buffer with a gather in front of each. The
+gathers cannot be hoisted: a gather for position p must follow the store for p (a causal
+query reads its own row) and precede the store for p + 1 (which evicts the oldest row p
+still needs), so the only way to launch the block's eight attends at once is eight gathered
+buffers, 5.2 MB at 640 rows of 512 half-precision values.
+
+**What to measure before building that.** The whole premise is that more threadgroups per
+launch is cheaper than more launches, and that is a two-line test on the existing case:
+time one dispatch at 8x the heads against eight dispatches at 1x, with the same rows and
+the same total work. If the batched launch is not clearly cheaper, eight gathered buffers
+and a slot dimension on the attention kernel buy nothing.
+
+**Caveats.** The attention numbers are cache-warm repetitions of one 640-row key block;
+the in-situ row counts differ per position and the estimate above interpolates between two
+measured row counts rather than measuring an average window. Same synthetic-weight and
+one-layer caveats as `#13`. Device time is one command buffer per stage.
+
+Tests: none added — the table above is `#5`'s existing opt-in case, re-read against the
+current table. Whole DeepSeek suite: 412 tests, 10 skipped, 0 failures.
+
+## DSV4.1 #15: ONE ATTENTION LAUNCH PER BLOCK, AND THE ROW LIST IT EXPOSED
+
+`#14` priced `writeLatent` at 0.247 ms/position — 51.2% of a block's dense half — and
+attributed nearly all of it to the attention, then named the next measurement: one
+dispatch at 8x the grid against eight dispatches at 1x, same rows, same total work. The
+premise was that a position is 128 threadgroups, "a fifth of the machine", and a block
+runs eight of those back to back.
+
+**The measurement first, and it could not be done without the kernel.** The kernel returns
+early when its threadgroup index is past the head count, so widening the grid measures
+nothing. So `dsv41_attention_csa2_f32` grew a slot dimension before anything was wired:
+with `slotPlan` bound (buffer 9) the grid is `slotCount * headCount`, `slot = groupIdx /
+headCount`, `head = groupIdx % headCount`, and slot `s` reads its gathered block at row
+`s * keyRowStride`. The slot-major query and output offsets are then still `groupIdx *
+qkHeadDim` and `groupIdx * valueDim`, and the head part of the index selects the sink.
+Buffer 10 holds one row count per slot, because a block's positions do not read the same
+number of rows. Leaving `slotPlan` unbound is the old form, so nothing else changed.
+
+**The A/B** (`testWhetherOneBatchedAttentionLaunchBeatsEight`, opt-in): published geometry,
+8 slots with ramping row counts (128, 192, … 576 — 2,816 rows, 352 per position), eight
+DISTINCT gathered blocks in both arms, both arms validated against
+`DeepSeekV41AttentionReference.attend` at 1e-4 before anything is printed.
+
+| form | ms/block | ms/position | |
+|---|---:|---:|---:|
+| 8 launches of 128 threadgroups | 2.118 | 0.265 | |
+| 1 launch of 1,024 threadgroups | **0.964** | **0.120** | **2.20x** |
+
+0.265 ms/position is also the first direct confirmation of `#14`'s 0.245: the arithmetic
+that interpolated ~0.65 us/row over an average 320-row window lands within 8%.
+
+**The bug the slot dimension could not avoid.** A gather's row list is a host fill into
+`workspace.rowIndices`, and a host fill is not ordered against a dispatch that has not
+executed yet: every gather in a stage is encoded, and only then is the command buffer
+committed. While that buffer had ONE region for the whole block, every gather in a block
+read the list written for the block's LAST position. It is invisible in everything
+normally looked at — attention writes only that position's own stream, and
+`prefillChunk` samples only the last position's logits — and it is invisible even to a
+parity test for two more reasons: with the synthetic default (window 4, block 4) the
+blocks are window-aligned, so a successor's list is a permutation of the rows its
+predecessor needs and attention does not care about row order, and the probe that would
+have shown it was wired only by the walk, never by the block path. So the block path now
+writes the row list into its own per-position slice of `rowIndices` and gathers into its
+own per-position block of `gathered` (both `workspace.gatheredRowOffset(slot)` apart), and
+the block path's `.writeAttentionStreams` now honours `parityProbes.afterAttention` for
+slot 0.
+
+`testEveryPositionOfABlockAttendsOverItsOwnRows` pins it with a ring WIDER than the block
+(10 over 8, the checkpoint's own ratio is 128 over 8), three blocks, and a comparison of
+the last block's slot 0 against the walk at that position. With the row list temporarily
+put back on one shared region the case fails at 2.1e-3 against a 1e-5 bar; with the
+per-position region it passes. 2.1e-3 is small because the wrong rows are neighbours of
+the right ones and the softmax barely moves — the reason this needs a test rather than a
+number.
+
+**What it did to the table** (published widths, same case as `#13`/`#14`, same machine):
+
+| stage | `#13` | now | change |
+|---|---:|---:|---:|
+| `writeLatent` | 0.247 | **0.112** | 2.2x |
+| dense device, ms/position | 0.480 | **0.345** | 1.39x |
+| whole block, ms/position | 0.93 | **0.79** | 1.18x |
+
+`writeLatent` is 2.2x cheaper, which is the isolated A/B's own factor — the check that the
+in-situ win is the launch shape and not something that moved with it. It is now 30.4% of
+the block instead of 51.2%, and the mixture (0.416, unchanged) is 55% of the device half.
+
+**The table it leaves** (ms/position, whole block 0.79; dense device 0.3448, mixture
+0.4163): `writeLatent` 0.112 (30.4%), `queryUp` 0.047 (12.7%), `outputDown` 0.045 (12.3%),
+`outputUp` 0.044 (12.0%), the calibration buffer 0.024, `latentProject` 0.014, `queryDown`
+0.012, then `hcFFNCoefficients`/`hcAttentionCoefficients`/`ffnNorm`/`attnNorm` 0.011 each
+and everything else at 0.005 or under. The calibration row moved 0.003 → 0.024 with no
+change to its dispatch, which is `#11`'s warning repeating: it is an instrument, not a
+stage.
+
+Host split: dense encode 0.0699, front wait 0.2624, mixture encode 0.0114 — encode is now
+24% of accounted time.
+
+**What is left in the cache loop.** The gathers are still one dispatch each, and by `#14`'s
+constraint they cannot be hoisted past a store: gather for p must follow store p and
+precede store p + 1. Nothing measured says eight gather launches cost anything — they are
+512-wide by `rowCount` threads each — but the same argument that made the attention worth
+batching has not been tested on them, and now that each gather owns its own destination
+block in `gathered`, one slot-aware gather would be a strict drop-in if it did.
+
+**Caveats.** Same as `#13`/`#14`: BF16 synthetic weights (the checkpoint's attention
+projections are quantised, so absolute numbers differ while rankings hold), no compressed
+layers so the pool term is invisible and the positive margin is real but unmeasured, one
+layer, and the mixture's 0.416 ms/position is dispatch overhead because the synthetic
+intermediate is 32. The isolated A/B is cache-warm and its two arms share one key buffer
+allocation, so it ranks the two forms and is not additive into the block table. Device
+time is one command buffer per stage. Both cases are opt-in (~7 s and ~37 s).
+
+Tests: `testWhetherOneBatchedAttentionLaunchBeatsEight` (the table above, opt-in) and
+`testEveryPositionOfABlockAttendsOverItsOwnRows` (the regression). Whole DeepSeek suite:
+414 tests, 11 skipped, 0 failures, including `testTheChunkSeamReturnsTheWalksLogits` at
+bit-identical logits and `testTheDeviceAndTheHostAgreeStageByStage`.
+## DSV4.1 #16: THE COMPRESSED HALF, WHICH EVERY TABLE UP TO HERE LEFT OUT
+
+`#15` closed with one caveat it could not retire: the synthetic checkpoint declares
+`compress_ratios` all zeros, so attention reads the window half of its row budget, the
+compressor's two per-position projections never run, and `writeLatent` carries no pool
+term. Every figure in `#13`-`#15` is therefore a LOWER bound for a compressed layer, and
+the stage those entries promote may not be the stage the checkpoint pays for.
+
+This retires the caveat. A compressed fixture now exists, the graph it drives is compared
+against the host, and the stage table is taken with the compressed half switched on.
+
+**The fixture** (`DeepSeekV41SyntheticShape.compressedPublishedWidths`): 7,168 hidden, 128
+heads of 512, window 640, `index_topk` 512, so the gather budget is 1,152 rows — the
+checkpoint's own bound — over a 1,024-position context (at ratio 2 the last positions keep
+the full 512 compressed rows). Two layers, one window-only and one compressed at ratio 2,
+i.e. the 40-layer checkpoint's 50/50 encoder/decoder split at depth 2. The indexer's
+`index_n_heads`/`index_head_dim` are deliberately tiny: no backend reads those weights,
+because row selection is a function of the position and the ratio, so they only size a
+cache region nothing attends over. `index_topk` is NOT tiny, because it is the row count.
+
+A second, cheap shape (`.compressedSmall`, the default widths plus two compressed layers)
+exists because `compressedPublishedWidths` costs about a minute just to build its weight
+blob, and a default-suite test cannot pay that.
+
+**The graph, checked before anything was timed.** No parity fixture before this could run
+a compressed layer at all, so four separate rules had never been compared with the
+reference: the compressor's two projections over the post-`attn_norm` input, the pool that
+emits a row only when a group closes, the rope rotation applied at the group's FIRST
+position rather than at the pooling position, and the gather that mixes pooled rows in
+with the live window. `testTheDeviceAndTheHostAgreeOnCompressedRows` walks six positions
+on the small compressed model and compares logits with `DeepSeekV41CPUForward` at the
+standard decode tolerance, and `testACompressedBlockPrefillsLikeTheWalk` runs the same
+tokens as one block and compares against the walk at 1e-5.
+
+Sensitivity was checked in the usual direction: pointing the device's pooled-row rotation
+at `position` instead of `(rows - 1) * ratio` — i.e. rotating a compressed row at the
+position that closed its group rather than at its first position — fails both cases (5
+assertions). That is the failure this fixture exists to catch, and the first positions
+still match, which is why it needs a test rather than an eyeball.
+
+**The A/B** (`testWhatTheCompressedHalfCostsOverTheWindowOnlyHalf`, opt-in): one layer
+each, same 1,024 positions, same window, same context, identical weights everywhere except
+`compress_ratios`. The compressed layer is an OWNER at ratio 2, so it runs the compressor
+and pools rows, and it reads `window + index_topk` rows where the window-only arm reads the
+window.
+
+| stage | window-only | compressed | change |
+|---|---:|---:|---:|
+| `writeLatent`, ms/pos | 0.149 | **0.271** | +0.122 (1.82x) |
+| dense device, ms/pos | 0.382 | **0.504** | +0.123 |
+| whole block, ms/pos | 0.83 | **0.97** | +17% |
+| gather rows | 641 | 1,152 | |
+
+So the compressed half costs 17% of a block, all of it inside `writeLatent`.
+
+**Where that 0.122 goes, and what it says the stage IS.** Over 1,024 positions the
+window-only arm averages 440.3 window rows (the ramp to 640, then 384 full ones: 450,880
+rows in total) and the compressed arm averages 440.3 plus 256.0 compressed rows
+(`min(512, (p + 1) / 2)` over the same span), i.e. +58% rows.
+
+An attention head reads every gathered row at the record width, so the stage's traffic is
+`heads * rows * record * 2` bytes: 57.7 MB per position for the window-only arm and 91.3 MB
+for the compressed one. 57.7 MB in the measured 0.149 ms is **387 GB/s**, and 91.3 MB at
+that same rate predicts 0.236 ms against 0.271 measured. So `writeLatent` is, to first
+order, a pure key-read bandwidth cost, and the residual 0.035 is the compressor's two
+448-wide projections (cf. `latentProject`'s one 512-wide row at 0.014) plus pool, norm,
+rope and store, which run once per group.
+
+That reframes the stage more than the split does. The compressor is a quarter of the
+delta and it is not the lever: **the cost is 128 heads each reading the whole gathered
+block**, so it comes down by reading fewer BYTES per row, or by serving one row read to
+several heads. The second was tried and reverted (`#6`: one threadgroup sharing a loaded
+row across heads lost 17% at 128 rows once occupancy was paid for), so any retry has to
+be a different shape rather than the same idea with fewer registers.
+
+**The model-shaped table** (`testWhereABlocksRemainingTimeGoesWithCompressedLayers`, opt-in,
+1,024 positions, two layers, 0.88 ms/position/layer = **1.75 ms/position whole block**;
+dense device 0.4535, mixture 0.4119):
+
+| stage | ms/pos/layer | share |
+|---|---:|---:|
+| `writeLatent` | **0.211** | 45.5% |
+| `outputDown` | 0.047 | 10.1% |
+| `queryUp` | 0.046 | 9.9% |
+| `outputUp` | 0.044 | 9.6% |
+| `queryDown` | 0.018 | 3.9% |
+| `latentProject` | 0.017 | 3.7% |
+| `hcFFNCoefficients`, `hcAttentionCoefficients`, `ffnNorm`, `attnNorm` | 0.011-0.012 each | ~2.5% |
+| `calibration(8 dispatch)` | 0.010 | 2.1% |
+| everything else | 0.005 and below | |
+
+`writeLatent` is 45.5% of the dense half here, against 30.4% in `#15` — the compressed
+layer is what moved it, and it is once again the stage to attack. `compressPool` and
+`attention` both print 0.000 because they run INSIDE `writeLatent`; the two are separated
+only by the A/B above.
+
+**Caveats.** Same synthetic-weight caveat as before: the checkpoint's attention and
+compressor projections are quantised, so absolute numbers differ while rankings hold. The
+fixture's compressed layer is an owner at ratio 2 with no reading layers, so the "a
+compressed layer reads its owner's rows" case is priced by the host/device parity only, not
+by this table. The synthetic mixture is still `moe_intermediate` 32, so its 0.41
+ms/position is dispatch overhead and is 52% of device time. One command buffer per stage;
+the isolated tables are cache-warm and are not additive into the block table. Both cases
+are opt-in (`testWhereABlocksRemainingTimeGoesWithCompressedLayers` ~1 min, mostly building
+the two-layer blob; `testWhatTheCompressedHalfCostsOverTheWindowOnlyHalf` ~1 min for the
+same reason).
+
+Tests: `testTheCompressedFixturePublishesWhatThePlanDemands` (the catalog accepts the
+compressed table: three compressor tensors on the owner, the indexer's weights on the
+index source, and the gather budget is `window + index_topk`),
+`testTheDeviceAndTheHostAgreeOnCompressedRows`, `testACompressedBlockPrefillsLikeTheWalk`,
+and the two opt-in tables above. Whole DeepSeek suite: 419 tests, 13 skipped, 0 failures.
+
+## DSV4.1 #17: THE ATTENTION WAS CHAIN-BOUND, NOT BANDWIDTH-BOUND
+
+`#16` closed by naming the lever: `writeLatent` is 128 heads each reading the whole
+gathered block, so it comes down "by reading fewer BYTES per row". That was a model, not a
+measurement — 57.7 MB over the measured 0.149 ms is 387 GB/s, which is a believable number
+for this machine, and believable is not the same as checked. The check was cheap: halve the
+record and change nothing else.
+
+Halving the record did nothing. That falsified the model, and the stage turned out to be
+bound by something the arithmetic had hidden.
+
+**The A/B** (`testWhatAnFP16KeyBlockSavesOverAnFP32One`, opt-in, published geometry: 128
+heads, 512-wide record, sink on). Both arms are fed the SAME key values: the block is
+sampled as `half` and the FP32 arm reads those values widened, which is exactly what the
+gather did to a cache row. Row counts 136 (one window plus the first compressed row), 640
+(`window + index_topk`) and 1,152 (what a block's late positions read). The arms INTERLEAVE
+inside each attempt and every number is a minimum of six attempts, because GPU clocks ramp
+across a sweep and a first-timed arm reads slow for reasons that have nothing to do with its
+code; without interleaving, the first row count read 14% slow purely for being first.
+
+| form | 136 rows | 640 rows | 1,152 rows |
+|---|---:|---:|---:|
+| FP32 records, one accumulator (what `#16` shipped) | 0.121 | 0.456 | **0.820** |
+| FP16 records, one accumulator | 0.094 | 0.531 | 0.808 |
+| FP32 records, four accumulators | 0.045 | 0.339 | 0.299 |
+| FP16 records, four accumulators | 0.040 | 0.314 | 0.274 |
+| FP16, four accumulators, `half4` score pass (shipped) | **0.038** | **0.149** | **0.265** |
+
+All in ms per dispatch. The 1,152 row is the one to read: it is stable to 0.001 across four
+runs, where the 640 row moves up to 50% between runs. As a ratio, the shipped form is
+roughly 3.2x / 3.1x / 3.1x faster than the form `#16` measured.
+
+**Reading the table.** Row 2 against row 1 is the byte hypothesis alone: 0.820 → 0.808, i.e.
+1.01x, at every row count. Halving the bytes moved by the dominant read bought nothing, so
+the stage was not paying for bandwidth. Row 3 against row 1 is the thing it WAS paying for:
+the same FP32 records, with the dot product and the value sum split across four independent
+accumulators, are 2.74x faster at 1,152 rows. `dot += q * k` is a `width`-long chain of
+dependent FMAs — 512 of them, ~4 cycles each, in one lane per row — and that chain, not the
+memory system, set the cost. Row 4 against row 3 says the bytes are worth 9% once the chain
+is gone, so both changes are real but they are not additive in the way the byte model
+implied, and the byte half only pays because the chain was fixed first.
+
+The last row is the shipped kernel. `half4` vectorisation of the score pass — a row is
+contiguous and the record width is a multiple of four, so it is one 8-byte load per four
+values instead of four 2-byte loads — is worth a further 3-4%, measured at both large row
+counts.
+
+Both arms are validated against `DeepSeekV41AttentionReference.attend` before any number is
+printed, and against each other at a float-rounding bar: the two kernels can sum in
+different orders, so they agree to rounding rather than to the bit. Correctness of the
+graph is unaffected because the rule, the addressing, the slot dimension and the threadgroup
+shape are all unchanged.
+
+**What shipped.** `dsv41_attention_csa2_f16`: FP16 key records, four accumulators in both
+passes, `half4` score pass. The gather now writes the cache's own 2-byte records instead of
+widening them to FP32 (`dsv41_gather_latents_f16` is a plain copy), which also halves the
+gathered block — 10 MB to 5 MB at eight slots of a 1,152-row budget — and the executor
+dispatches the FP16 kernel. The FP32 kernel stays in the library untouched, as the baseline
+this A/B measured against.
+
+**In situ** (the two opt-in tables from `#16`, re-taken, 1,024 positions):
+
+| stage | window-only `#16` | window-only `#17` | compressed `#16` | compressed `#17` |
+|---|---:|---:|---:|---:|
+| `writeLatent`, ms/pos | 0.149 | **0.070** | 0.271 | **0.136** |
+| dense device, ms/pos | 0.382 | **0.303** | 0.504 | **0.370** |
+| whole block, ms/pos | 0.83 | **0.75** | 0.97 | **0.84** |
+
+2.13x on the window-only `writeLatent` and 1.99x on the compressed one, and the compressed
+penalty over its window-only arm falls from +0.122 to +0.066 ms/pos (+17% → +12% on the
+block). The model-shaped table (two layers, 0.77 ms/position/layer) goes from 1.75 to
+**1.54 ms/position whole block**, with `writeLatent` 0.211 → **0.103** — 45.5% of the dense
+half down to 29.4%.
+
+In situ is 2.0x where the isolated A/B is 3.1x, and the gap is not noise: `writeLatent`
+carries the store, the pool, the gather and the latent rope as well, and the surrounding
+dispatches evict the block, so the in-situ arm is not the cache-warm one the isolated table
+measures. Neither number is the other's prediction; the isolated table ranks kernel FORMS,
+the block table measures the stage.
+
+**The ranking it leaves.** `writeLatent` is still first at 29.4%, but it is no longer in a
+class of its own: `queryUp` 0.046, `outputDown` 0.045 and `outputUp` 0.044 are ~13% each,
+i.e. three weight-read GEMV stages that together are 39% of the dense half. Those are now
+what the attention was before this entry — the biggest single thing left, and worth a
+measurement of their own rather than an inference from the attention's.
+
+**Caveats.** Synthetic weights, as always: the checkpoint's attention and compressor
+projections are quantised, so absolute numbers differ while rankings hold, and the synthetic
+mixture (`moe_intermediate` 32) is still dispatch overhead at 0.41 ms/position, which caps
+how far a 12% block reduction can look. The isolated table is cache-warm and is not additive
+into the block table. The published-geometry timing case
+(`testWhatOneAttentionDispatchCostsAtThePublishedWidths`) reads the shipped kernel too now,
+but its harness averages two attempts of five dispatches and spreads far wider than the
+interleaved A/B — it says 0.061 / 0.056 / 0.426 ms at 128 / 136 / 640 rows — so treat the
+A/B above as the decision instrument and that case as a coarse cross-check.
+
+**Tests.** The kernels that ship are the kernels that are pinned:
+`DeepSeekV41AttentionKernelTests` (both cases, including the 200-row threadgroup reduction
+and the value head wider than the record) and `DeepSeekV41GatherKernelTests` now read FP16
+records. Sensitivity was checked in the usual direction: transposing one lane of the
+`half4` load (`record.w` → `record.z`) fails 3 of the 5 attention and parity cases it was
+run against. The parity suite that matters for the graph —
+`testTheDeviceAndTheHostAgreeStageByStage`, `testTheChunkSeamReturnsTheWalksLogits`,
+`testEveryPositionOfABlockAttendsOverItsOwnRows`, `testTheDeviceAndTheHostAgreeOnCompressedRows`,
+`testACompressedBlockPrefillsLikeTheWalk` — passes unchanged at its existing bars. Whole
+DeepSeek suite: 420 tests, 14 skipped, 0 failures.
+
+## DSV4.1 #18: THE DENSE PROJECTIONS ARE INPUT-BOUND, AND A WIDER BLOCK IS NOT FREE
+
+`#17` closed with three stages level with each other — `queryUp` 0.046, `outputDown`
+0.045, `outputUp` 0.044 ms/pos/layer — reading 201, 134 and 117 MB of weights apiece, i.e.
+at 580, 408 and 342 GB/s. Those are plausible streaming rates, so the reading was that the
+stages buy bytes and that the only way to buy fewer per position is to amortize one weight
+read over more positions. `bf16_gemv_rows8` already amortizes over the eight positions of a
+block. The obvious next step was sixteen.
+
+Sixteen is worse. That was the whole of this entry's first result, and it inverted the
+model.
+
+**Block width** (`bf16_gemv_rows16`, since removed), same matrices, same band structure,
+same caller layout, only the block width differing:
+
+| projection | weight | block 8 | block 16 | per position |
+|---|---:|---:|---:|---:|
+| `queryUp` (1,536 -> 65,536) | 192 MB | 0.346 ms | 0.715 ms | 0.97x |
+| `outputDown` (8 x 8,192 -> 1,024) | 128 MB | 0.330 ms | 1.053 ms | 0.63x |
+| `outputUp` (8,192 -> 7,168) | 112 MB | 0.343 ms | 1.269 ms | 0.54x |
+
+A wider block reads the SAME weight bytes for twice the positions, so if the weight read
+were the binding cost the per-position figure would halve. Instead the cost grew, and grew
+most where the row is longest. What doubles with the block is the INPUT: a threadgroup
+reading one output row loads every position's vector for the length of that row, once per
+row, over tens of thousands of rows — 1.9 GB of activation reads per block for `outputUp`
+against 112 MB of weights. The stage is not streaming weights at the memory limit; it is
+re-reading activations out of cache, and the weight stream rides along.
+
+**Rows per threadgroup** is the lever that follows, because it divides that input traffic
+without touching the weight read. Two rows per threadgroup (`bf16_gemv_rows8x2`, shipped)
+halves it; four (`bf16_gemv_rows8x4`, removed) quarters it but costs thirty-two
+accumulators:
+
+| projection | rows8 | rows8x2 | rows8x4 |
+|---|---:|---:|---:|
+| `queryUp` | 0.347 | 0.353 (0.98x) | 0.422 (0.82x) |
+| `outputDown` | 0.329 | 0.275 (**1.20x**) | 0.399 (0.82x) |
+| `outputUp` | 0.344 | 0.256 (**1.34x**) | 0.264 (1.30x) |
+
+So the answer to "how many" is two, and it depends only on the LENGTH of the row. Sweeping
+input width at a fixed 7,168-row output:
+
+| inDim | 1,024 | 1,536 | 2,048 | 3,072 | 4,096 | 6,144 | 8,192 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| rows8x2 vs rows8, run A | 0.94x | 1.00x | 1.06x | 1.05x | 0.97x | 1.20x | 1.20x |
+| rows8x2 vs rows8, run B | 0.95x | 1.03x | 1.11x | 1.22x | 1.32x | 1.08x | 1.26-1.31x |
+
+The two runs agree at both ends and disagree in the middle, so `rowSharingWidth` is set to
+6,144: below it the pair form is neutral to 6% worse, and above it every measurement wins
+by 20-34%. The published attention stack lands on the right side of that line without
+being asked to — `attn.wq_b` is 1,536 wide and keeps the one-row form, `attn.wo_a`,
+`attn.wo_b` and `attn.wq_a` are 7,168-8,192 wide and take the pair.
+
+**In situ** (`testWhereABlocksRemainingTimeGoesWithCompressedLayers`, two layers, 1,024
+positions):
+
+| stage | `#17` | `#18` | change |
+|---|---:|---:|---:|
+| `outputDown` | 0.045 | **0.037** | 1.22x |
+| `outputUp` | 0.044 | **0.033** | 1.33x |
+| `queryDown` | 0.019 | **0.013** | 1.46x |
+| `queryUp` | 0.046 | 0.046 | unchanged |
+| dense device | 0.3457 | **0.3179** | 8% |
+| whole block | 1.54 | **1.50** | 2.6% |
+
+Close to what the isolated A/B predicted, which is the point of taking both. `queryDown` is
+the pleasant one: it was not in the A/B's three named geometries, and it took the pair form
+because its input is `hidden` (7,168), so a rule keyed on the measured quantity picked up a
+stage nobody aimed at.
+
+**What is left of the dense half, and the question it opens.** `writeLatent` is 30.9%,
+then `queryUp` at 14.0% — unchanged by everything above, at 65,536 output rows of a 1,536
+input. By this entry's own model it should have been the BEST candidate for row sharing
+(small input, huge output) and it measured 0.98x. Something else dominates there, and the
+shape of it is the next thing to measure rather than assume: 65,536 threadgroups of 384
+iterations each is a grid a fifth of a millisecond wide, so per-row scheduling and the
+`outDim`-threadgroups-per-SM tail are the suspects.
+
+**Caveats.** Same synthetic-weight caveat. The absolute times in the two crossover runs
+differ by 1.65x (0.347 vs 0.574 ms for the same `queryUp` dispatch on the same fixtures),
+which is why every decision here is a ratio taken from interleaved arms inside one run and
+why the crossover itself is reported as a pair of runs rather than one line. Four rows per
+threadgroup was measured once; two was measured twice. The M5 Max was carrying other work
+during at least one of these runs, and the isolated table is cache-warm and is not additive
+into the block table.
+
+**Tests.** The pair kernel's contract is pinned by
+`testThePairGemvFillsBothRowsOfItsTile`, which deliberately uses an ODD output count so the
+last tile carries one row: the published projections are all even, so nothing else exercises
+the guard that stops a threadgroup reading past the end of the matrix. Sensitivity checked
+in the usual direction — pointing the second row's weight read at the first row's bytes
+fails it with 14 assertion failures. `testTheWideGemvGridIsChosenByHowMuchWorkTheProjectionHas`
+now asserts the form rule's new parameter: a 1,536-wide block stays `.block`, an 8,192-wide
+block takes `.blockPair`, and a short batch still falls back to the two-way rule. Whole
+DeepSeek suite: 422 tests, 15 skipped, 0 failures.

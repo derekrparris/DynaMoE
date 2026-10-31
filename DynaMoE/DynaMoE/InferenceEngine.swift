@@ -1177,10 +1177,18 @@ extension TensorMetadata {
     /// DeepSeek V4.1's Engram tables are each ~100 GB in a single tensor, past
     /// every Apple GPU's `maxBufferLength`. They are read row by row with pread
     /// instead, so segmentation passes them through and the loader must not
-    /// expect a buffer for them. The Rust core marks them by category rather
-    /// than by a separate flag so the FFI record stays unchanged.
+    /// expect a buffer for them.
+    ///
+    /// The test is the ROLE, not the Rust category. The category is a display
+    /// string and every tensor under `.engram.` shares it, so a prefix rule also
+    /// un-mapped `engram.wkv` (157 MB, read by the block-scaled GEMV) and the two
+    /// `q_weight`/`k_weight` vectors (decoded into gain buffers). The Engram
+    /// shards hold nothing else, so that rule left both of them with ZERO
+    /// segments: no buffer for those three tensors, and no shard entry left to
+    /// name the table's own file either. Only the table and its scale companion
+    /// stay unmapped.
     var isStreamedTensor: Bool {
-        category.hasPrefix("Engram") || DeepSeekV41WeightCatalog.isStreamedName(name)
+        DeepSeekV41WeightCatalog.isStreamedName(name)
     }
 }
 

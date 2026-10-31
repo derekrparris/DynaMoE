@@ -222,6 +222,85 @@ final class KVCacheProvisioningLogicTests: XCTestCase {
         XCTAssertEqual(budget, 0.25)
     }
 
+    /// A streamed checkpoint is charged for what it holds, not for its file size.
+    /// Qwen 3.8 Flash Next FP8 is 121 GB on disk and dense backbone + hot experts
+    /// are ~12 GB resident on a 128 GB Mac; charging the file size left the KV
+    /// budget at its 0.25 GB floor, so every turn was refused as prompt-too-long
+    /// in Auto and SSD modes alike.
+    func testStreamedFootprintIsChargedByResidentWeightsOnly() {
+        let onDisk = 121.0
+        let chargedInFull = KVCacheProvisioning.budgetGB(
+            physicalGB: 128, modelFootprintGB: onDisk, budgetMode: .unrestricted
+        )
+        XCTAssertLessThan(chargedInFull, 1.0, "the whole-file charge is what refused the turn")
+
+        let streamed = KVCacheProvisioning.budgetGB(
+            physicalGB: 128,
+            modelFootprintGB: onDisk,
+            budgetMode: .unrestricted,
+            residentFootprintGB: 12.0
+        )
+        XCTAssertEqual(streamed, 128 * 0.75 - 12.0 - 2.5, accuracy: 0.0001)
+        XCTAssertGreaterThan(streamed, 64, "a 128 GB Mac must be able to price a real context")
+
+        // A resident figure larger than the checkpoint is clamped, so a bogus
+        // estimate can neither inflate nor deflate the charge.
+        XCTAssertEqual(
+            KVCacheProvisioning.budgetGB(
+                physicalGB: 128,
+                modelFootprintGB: onDisk,
+                budgetMode: .unrestricted,
+                residentFootprintGB: 500
+            ),
+            chargedInFull,
+            accuracy: 0.0001
+        )
+    }
+
+    /// The streamed footprint is the dense tensors plus whatever experts the
+    /// working set holds. Routed experts on disk are not resident, and counting
+    /// them is what made a 121 GB streamed checkpoint look like it filled a 128 GB
+    /// Mac.
+    func testStreamedFootprintCountsDenseWeightsAndResidentExpertsOnly() {
+        func tensor(_ name: String, _ bytes: UInt64, expert: UInt32?) -> TensorMetadata {
+            TensorMetadata(
+                name: name,
+                shapeDisplay: "[1]",
+                dtype: "BF16",
+                sizeMb: 0,
+                shardIndex: 0,
+                offsetStart: 0,
+                offsetEnd: bytes,
+                category: "test",
+                layerIndex: 0,
+                expertId: expert
+            )
+        }
+        let summary = ModelSummary(
+            sizeGb: 121,
+            tensorCount: 3,
+            layerCount: 1,
+            maxExpertId: 1,
+            shards: [],
+            tensors: [
+                tensor("embed.weight", 1 << 30, expert: nil),
+                tensor("layers.0.ffn.experts.0.w1.weight", 3 << 30, expert: 0),
+                tensor("layers.0.ffn.experts.1.w1.weight", 2 << 30, expert: 1)
+            ],
+            layers: []
+        )
+        XCTAssertEqual(
+            streamedResidentFootprintGB(summary: summary, residentExpertBytes: 0),
+            1,
+            accuracy: 0.0001
+        )
+        XCTAssertEqual(
+            streamedResidentFootprintGB(summary: summary, residentExpertBytes: 5 << 30),
+            6,
+            accuracy: 0.0001
+        )
+    }
+
     // MARK: - Geometry derivation
 
     func testGeometryMirrorsTheAllocationLayout() {

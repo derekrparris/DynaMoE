@@ -246,8 +246,10 @@ final class DeepSeekV41DevicePlanTests: XCTestCase {
     func testGatherBudgetCoversTheWindowAndTheCompressedSelection() throws {
         let config = try DeepSeekV41TestFixtures.config()
         let budget = DeepSeekV41DevicePlan.gatherRowBudget(config: config)
-        let compressed = max(config.indexTopK, config.candidateTopKBlocks * config.candidateBlockSize)
-        XCTAssertEqual(budget, config.windowSize + compressed)
+        // A layer with an indexer keeps `min(index_topk, produced)` compressed
+        // rows, so the buffer is the window plus that selection, not plus the
+        // candidate-block mask.
+        XCTAssertEqual(budget, config.windowSize + config.indexTopK)
     }
 
     func testAWiderCompressRatioThanTheRingIsReported() throws {
@@ -262,7 +264,11 @@ final class DeepSeekV41DevicePlanTests: XCTestCase {
         )
     }
 
-    func testAnEngramLayerIsReportedRatherThanGuessed() throws {
+    /// An Engram layer is served rather than refused: the rows it reads are a host
+    /// batch, the `wkv` projection and the gate are kernels, and nothing about the
+    /// wiring is a guess. What the conformance gate still records is that the
+    /// combination rule has no numeric reference vector behind it yet.
+    func testAnEngramLayerIsServedRatherThanRefused() throws {
         let json = DeepSeekV41TestFixtures.json
             .replacingOccurrences(of: "\"engram_layer_ids\": []", with: "\"engram_layer_ids\": [1]")
             .replacingOccurrences(of: "\"engram_num_embeddings\": []", with:
@@ -272,9 +278,89 @@ final class DeepSeekV41DevicePlanTests: XCTestCase {
         let config = try DeepSeekV41Config.decode(jsonData: Data(json.utf8))
         let plan = try config.makeLayerPlan()
         let problems = DeepSeekV41DevicePlan.problems(config: config, plan: plan)
+        XCTAssertFalse(
+            problems.contains { $0.contains("Engram") },
+            "an Engram layer must not be refused: \(problems)"
+        )
+        XCTAssertEqual(
+            plan[1].engramTable, 0,
+            "the plan must bind the table the config names"
+        )
+    }
+
+    /// The rig can only be enabled from the device plan, so it has to be honest
+    /// about the wiring: a table index the config does not describe is reported
+    /// instead of being read from the wrong rows.
+    func testAnEngramTableIndexOutsideTheConfigIsReported() throws {
+        let json = DeepSeekV41TestFixtures.json
+            .replacingOccurrences(of: "\"engram_layer_ids\": []", with: "\"engram_layer_ids\": [1]")
+            .replacingOccurrences(of: "\"engram_num_embeddings\": []", with:
+                "\"engram_num_embeddings\": [4096], \"engram_max_ngram_size\": 3, "
+                    + "\"engram_vocab_size\": 512, \"engram_n_heads\": 2, \"engram_head_dim\": 4, "
+                    + "\"engram_compressed_vocab_size\": 128")
+        let config = try DeepSeekV41Config.decode(jsonData: Data(json.utf8))
+        var plan = try config.makeLayerPlan()
+        // A plan that names a table the config never published is the shape of a
+        // stale plan, and it must not fall back to table 0.
+        let original = plan[1]
+        plan[1] = DeepSeekV41LayerPlan(
+            index: original.index,
+            flavor: original.flavor,
+            compressRatio: original.compressRatio,
+            compressedKVSource: original.compressedKVSource,
+            compressedIndexSource: original.compressedIndexSource,
+            isCandidateSource: original.isCandidateSource,
+            engramTable: 7,
+            ropeTable: original.ropeTable
+        )
+        let problems = DeepSeekV41DevicePlan.problems(config: config, plan: plan)
         XCTAssertTrue(
-            problems.contains { $0.contains("Engram") && $0.contains("layers.1") },
-            "expected the Engram problem, got \(problems)"
+            problems.contains { $0.contains("Engram table index 7") },
+            "expected the table-index problem, got \(problems)"
+        )
+    }
+
+    /// The staging slots are addressed by `layer.engramTable`, so their order has to
+    /// stay `config.engramTables` order: a reordered array hands a layer its
+    /// neighbour's rows and every numeric check still passes.
+    func testEngramSlotsAreLaidOutInTableOrder() throws {
+        let json = DeepSeekV41TestFixtures.json
+            .replacingOccurrences(of: "\"engram_layer_ids\": []", with: "\"engram_layer_ids\": [1, 2]")
+            .replacingOccurrences(of: "\"engram_num_embeddings\": []", with:
+                "\"engram_num_embeddings\": [4096, 4096], \"engram_max_ngram_size\": 3, "
+                    + "\"engram_vocab_size\": 512, \"engram_n_heads\": 2, \"engram_head_dim\": 4, "
+                    + "\"engram_compressed_vocab_size\": 128")
+        let config = try DeepSeekV41Config.decode(jsonData: Data(json.utf8))
+        let slots = DeepSeekV41EngramSlot.slots(config: config)
+        XCTAssertEqual(slots.count, 2)
+        XCTAssertEqual(slots.map(\.layer), [1, 2])
+        XCTAssertEqual(slots.map(\.table), [0, 1])
+        // Two hash columns per head (a 3-gram table has bigrams and trigrams) times
+        // two heads, and 4-wide heads with no scale block past the first 32.
+        XCTAssertEqual(slots[0].columns, 4)
+        XCTAssertEqual(slots[0].flatWidth, 16)
+        XCTAssertEqual(slots[0].rowBytes, 4 + 1)
+        // The blocks are disjoint and in order, in both the raw and the decoded
+        // buffer: sharing them would let one table's read land under the other's
+        // dequantize.
+        XCTAssertEqual(slots[0].rawByteOffset, 0)
+        XCTAssertEqual(slots[1].rawByteOffset, slots[0].rawByteCount)
+        XCTAssertEqual(slots[0].valueOffset, 0)
+        XCTAssertEqual(slots[1].valueOffset, slots[0].valueCount)
+
+        // A prefilled block stages every position before its command buffer exists,
+        // so the block is replicated per position and the tables stay disjoint.
+        let wide = DeepSeekV41EngramSlot.slots(config: config, positions: 8)
+        XCTAssertEqual(wide[0].rawByteStride, wide[0].rawByteCount * 8)
+        XCTAssertEqual(wide[1].rawByteOffset, wide[0].rawByteStride)
+        XCTAssertEqual(wide[0].rawBytes(atPositionSlot: 3), wide[0].rawByteCount * 3)
+        XCTAssertEqual(
+            wide[1].rawBytes(atPositionSlot: 7),
+            wide[0].rawByteStride + wide[1].rawByteCount * 7
+        )
+        XCTAssertEqual(
+            wide[1].valueBytes(atPositionSlot: 2),
+            (wide[0].valueStride + wide[1].valueCount * 2) * MemoryLayout<Float>.stride
         )
     }
 
@@ -321,6 +407,69 @@ final class DeepSeekV41DevicePlanTests: XCTestCase {
         // term on every layer.
         XCTAssertEqual(DeepSeekV41DevicePlan.backHalf, [.routedExperts, .sharedExpert, .writeFFNStreams, .collapseStreams])
         XCTAssertEqual(Array(DeepSeekV41DevicePlan.frontHalf) + DeepSeekV41DevicePlan.backHalf, pipeline)
+    }
+
+    /// Which BF16 GEMV form a projection gets, at the shapes the checkpoint publishes.
+    ///
+    /// The two kernels differ only in where the parallelism sits, so the choice is a
+    /// cost decision and not a correctness one — but it is a decision, and it was
+    /// made against a measured crossover rather than a guess. These are the five
+    /// dense projections of a block of eight positions, plus the decode step, which
+    /// takes the threadgroup form at every size because a grid one row tall cannot
+    /// amortize a row's bytes across positions.
+    func testTheWideGemvGridIsChosenByHowMuchWorkTheProjectionHas() {
+        // attn.wkv: 448 rows. attn.wo_a's band: 128 rows over 8,192 columns, the
+        // projection that motivated the second kernel.
+        XCTAssertTrue(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 448, rows: 8))
+        XCTAssertTrue(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 128, rows: 8))
+        // 6,144 threads still measured 2.3x faster; 12,288 measured 10% slower.
+        XCTAssertTrue(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 768, rows: 8))
+        XCTAssertFalse(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 1_536, rows: 8))
+        // attn.wq_b: 73,728 rows, where one thread per row measured 2.4x faster.
+        XCTAssertFalse(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 73_728, rows: 8))
+        XCTAssertFalse(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 7_168, rows: 8))
+        // A decode step is one position, so every row count takes the wide grid.
+        XCTAssertTrue(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 7_168, rows: 1))
+        XCTAssertTrue(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 73_728, rows: 1))
+        XCTAssertTrue(DeepSeekV41DevicePlan.bf16GemvWantsWideGrid(outDim: 448, rows: 0))
+
+        // A full block of eight positions takes a kernel that streams an output row
+        // once for every position, and it does so at every row count: it measured
+        // faster than both other forms from 448 rows to 73,728, so there is no
+        // threshold on the ROW count to get wrong.
+        for outDim in [128, 448, 1_536, 7_168, 73_728] {
+            XCTAssertEqual(
+                DeepSeekV41DevicePlan.bf16GemvForm(outDim: outDim, inDim: 1_536, rows: 8),
+                .block,
+                "an eight-position block at \(outDim) rows and a short input row"
+            )
+        }
+        // Which block form, though, turns on the INPUT width: a row long enough that
+        // its eight position vectors dominate the stage shares one load between two
+        // output rows, and a short one does not (1,536 measured 1.00x, 8,192 measured
+        // 1.20-1.34x). The published attention projections are exactly that split.
+        XCTAssertEqual(
+            DeepSeekV41DevicePlan.bf16GemvForm(outDim: 65_536, inDim: 1_536, rows: 8), .block
+        )
+        XCTAssertEqual(
+            DeepSeekV41DevicePlan.bf16GemvForm(outDim: 8_192, inDim: 8_192, rows: 8), .blockPair
+        )
+        XCTAssertEqual(
+            DeepSeekV41DevicePlan.bf16GemvForm(outDim: 7_168, inDim: 8_192, rows: 8), .blockPair
+        )
+        // A shorter batch has no block kernel at all, and falls back to the two-way rule.
+        XCTAssertEqual(
+            DeepSeekV41DevicePlan.bf16GemvForm(outDim: 128, inDim: 8_192, rows: 1), .wideGrid
+        )
+        XCTAssertEqual(
+            DeepSeekV41DevicePlan.bf16GemvForm(outDim: 448, inDim: 8_192, rows: 3), .wideGrid
+        )
+        XCTAssertEqual(
+            DeepSeekV41DevicePlan.bf16GemvForm(outDim: 7_168, inDim: 8_192, rows: 3), .perRow
+        )
+        XCTAssertEqual(
+            DeepSeekV41DevicePlan.bf16GemvForm(outDim: 73_728, inDim: 8_192, rows: 7), .perRow
+        )
     }
 }
 
@@ -430,7 +579,7 @@ final class DeepSeekV41NormDispatchTests: XCTestCase {
         encoder.setBytes(&dim, length: 4, index: 3)
         encoder.setBytes(&eps, length: 4, index: 4)
         let lanes = 256
-        encoder.setThreadgroupMemoryLength((lanes / 32) * MemoryLayout<Float>.stride, index: 0)
+        encoder.setThreadgroupMemoryLength(max(16, ((lanes / 32) * 4 + 15) & ~15), index: 0)
         let grid = DeepSeekV41DevicePlan.normDispatch(width: width, lanes: lanes)
         encoder.dispatchThreadgroups(grid.threadgroups, threadsPerThreadgroup: grid.threadsPerThreadgroup)
         encoder.endEncoding()
@@ -489,7 +638,7 @@ final class DeepSeekV41GatherKernelTests: XCTestCase {
                   length: indices.count * MemoryLayout<UInt32>.stride,
                   options: .storageModeShared),
               let dense = device.makeBuffer(
-                  length: 2 * width * MemoryLayout<Float>.stride,
+                  length: 2 * width * MemoryLayout<UInt16>.stride,
                   options: .storageModeShared),
               let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
@@ -522,10 +671,260 @@ final class DeepSeekV41GatherKernelTests: XCTestCase {
         commandBuffer.waitUntilCompleted()
         XCTAssertNil(commandBuffer.error)
 
-        let out = dense.contents().assumingMemoryBound(to: Float.self)
+        // The destination is the cache's own width, so this is a copy of FP16 rows
+        // rather than a widening of them.
+        let out = dense.contents().assumingMemoryBound(to: UInt16.self)
+        func row(_ index: Int) -> [Float] {
+            Array(UnsafeBufferPointer(start: out + index * width, count: width))
+                .map { Float(Float16(bitPattern: $0)) }
+        }
         // Bound at offset 0 this would read rows 77 and 77 (out of the buffer).
-        XCTAssertEqual(Array(UnsafeBufferPointer(start: out, count: 4)), [30, 31, 32, 33])
-        XCTAssertEqual(Array(UnsafeBufferPointer(start: out + 4, count: 4)), [10, 11, 12, 13])
+        XCTAssertEqual(row(0), [30, 31, 32, 33])
+        XCTAssertEqual(row(1), [10, 11, 12, 13])
+    }
+}
+
+// MARK: - Attention kernel
+
+final class DeepSeekV41AttentionKernelTests: XCTestCase {
+
+    /// The kernel production dispatches. The FP32 form is still in the library as
+    /// the A/B baseline for `Benchmarks/PERF_FINDINGS.md` "DSV4.1 #17", but the
+    /// contract that has to hold is the one the executor binds.
+    private func makePipeline() throws -> (MTLDevice, MTLComputePipelineState, MTLCommandQueue) {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        guard let library = device.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "dsv41_attention_csa2_f16"),
+              let pipeline = try? device.makeComputePipelineState(function: function),
+              let queue = device.makeCommandQueue() else {
+            XCTFail("Could not build the attention pipeline")
+            throw XCTSkip("no attention pipeline")
+        }
+        return (device, pipeline, queue)
+    }
+
+    private func values(_ count: Int, seed: Int) -> [Float] {
+        (0..<count).map { index in
+            Float((index &* 37 &+ seed &* 13) % 23 - 11) / 8
+        }
+    }
+
+    private func floats(_ buffer: MTLBuffer, count: Int) -> [Float] {
+        Array(UnsafeBufferPointer(
+            start: buffer.contents().assumingMemoryBound(to: Float.self),
+            count: count
+        ))
+    }
+
+    /// The kernel details a head's rows and dimensions to its threadgroup, so the
+    /// head's maximum and denominator are a reduction ACROSS SIMD groups. A row set
+    /// wider than one group is the case that goes wrong if only the first group's
+    /// partial is read, and it is the case the published checkpoint always has: 128
+    /// window rows plus `index_topk` compressed ones against a 128-thread threadgroup.
+    ///
+    /// The value head is also wider than the record here, so the tail that no row
+    /// fills has to be zeroed rather than left over from the last position.
+    func testTheAttentionKernelMatchesTheHostRuleAcrossItsWholeThreadgroup() throws {
+        let (device, pipeline, queue) = try makePipeline()
+
+        let heads = 3
+        let qkHeadDim = 8
+        let vHeadDim = 12
+        let width = 10
+        let rows = 200
+        let shape = DeepSeekV41AttentionShape(
+            numHeads: heads,
+            headsPerGroup: 1,
+            qkHeadDim: qkHeadDim,
+            vHeadDim: vHeadDim,
+            latentWidth: width,
+            qLoraRank: 0,
+            oLoraRank: 0,
+            isCompressed: false,
+            compressRatio: 1,
+            ropeTheta: 10000,
+            rotaryDim: 0
+        )
+        let query = values(heads * qkHeadDim, seed: 1)
+        // Records arrive at the cache's width. `values` produces eighths, which are
+        // exact in FP16, so widening them back for the host rule is lossless.
+        let keys = values(rows * width, seed: 2).map { Float16($0) }
+        let widenedKeys = keys.map { Float($0) }
+        let sink = values(heads, seed: 3)
+
+        guard let queryBuffer = device.makeBuffer(
+                  bytes: query,
+                  length: query.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let keyBuffer = device.makeBuffer(
+                  bytes: keys,
+                  length: keys.count * MemoryLayout<Float16>.stride,
+                  options: .storageModeShared),
+              let sinkBuffer = device.makeBuffer(
+                  bytes: sink,
+                  length: sink.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let outputBuffer = device.makeBuffer(
+                  length: heads * vHeadDim * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("Could not allocate the attention buffers")
+            return
+        }
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(queryBuffer, offset: 0, index: 0)
+        encoder.setBuffer(keyBuffer, offset: 0, index: 1)
+        encoder.setBuffer(sinkBuffer, offset: 0, index: 2)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 3)
+        var rowCount = UInt32(rows)
+        var headCount = UInt32(heads)
+        var headWidth = UInt32(qkHeadDim)
+        var headValue = UInt32(vHeadDim)
+        var recordWidth = UInt32(width)
+        encoder.setBytes(&rowCount, length: 4, index: 4)
+        encoder.setBytes(&headCount, length: 4, index: 5)
+        encoder.setBytes(&headWidth, length: 4, index: 6)
+        encoder.setBytes(&headValue, length: 4, index: 7)
+        encoder.setBytes(&recordWidth, length: 4, index: 8)
+        // The dispatch sizes its scores block the way the executor does: rounded up
+        // to a 16-byte multiple, which Metal requires and a short row count does not
+        // give on its own (1 row is 132 bytes).
+        let scoreBytes = (
+            (rows + 32) * MemoryLayout<Float>.stride + 15
+        ) & ~15
+        encoder.setThreadgroupMemoryLength(scoreBytes, index: 0)
+        // Bound even for one position: the kernel takes the single-position path
+        // either way, and an unbound `constant` pointer fails validation.
+        var plan = DeepSeekV41AttentionSlotPlan(slotCount: 1, keyRowStride: UInt32(rows))
+        encoder.setBytes(
+            &plan, length: MemoryLayout<DeepSeekV41AttentionSlotPlan>.stride, index: 9
+        )
+        var slotRows = UInt32(rows)
+        encoder.setBytes(&slotRows, length: 4, index: 10)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: heads, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        var reference = DeepSeekV41AttentionReference.attend(
+            query: query,
+            keys: (0..<rows).map {
+                Array(widenedKeys[($0 * width)..<(($0 + 1) * width)])
+            },
+            shape: shape,
+            sink: sink
+        )
+        // No row fills the two dimensions past the record width, so they are zero by
+        // construction rather than whatever the softmax produced.
+        for head in 0..<heads {
+            for dim in width..<vHeadDim {
+                reference[head * vHeadDim + dim] = 0
+            }
+        }
+
+        let output = floats(outputBuffer, count: heads * vHeadDim)
+        let scale = reference.map(abs).max() ?? 1
+        for index in 0..<output.count {
+            XCTAssertEqual(
+                output[index],
+                reference[index],
+                accuracy: max(scale, 1) * 1e-5,
+                "the attention kernel disagrees with the host rule at \(index)"
+            )
+        }
+    }
+
+    /// A head whose row count is far below its threadgroup width: every idle thread
+    /// must still take part in the reduction, and a softmax over one row is that row.
+    func testASingleRowAttentionIsThatRow() throws {
+        let (device, pipeline, queue) = try makePipeline()
+
+        let heads = 2
+        let qkHeadDim = 4
+        let vHeadDim = 4
+        let width = 4
+        let rows = 1
+        let query: [Float] = [1, 0, 0, 0, 0, 1, 0, 0]
+        let keys: [Float16] = [0.5, -0.25, 1.5, -2]
+        // The sink is disabled, not absent: an unbound `constant` pointer fails
+        // Metal's validation even though the kernel tests it against nullptr.
+        let sink = [Float](repeating: -1e30, count: heads)
+
+        guard let queryBuffer = device.makeBuffer(
+                  bytes: query,
+                  length: query.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let keyBuffer = device.makeBuffer(
+                  bytes: keys,
+                  length: keys.count * MemoryLayout<Float16>.stride,
+                  options: .storageModeShared),
+              let sinkBuffer = device.makeBuffer(
+                  bytes: sink,
+                  length: sink.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let outputBuffer = device.makeBuffer(
+                  length: heads * vHeadDim * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("Could not allocate the attention buffers")
+            return
+        }
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(queryBuffer, offset: 0, index: 0)
+        encoder.setBuffer(keyBuffer, offset: 0, index: 1)
+        encoder.setBuffer(sinkBuffer, offset: 0, index: 2)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 3)
+        var rowCount = UInt32(rows)
+        var headCount = UInt32(heads)
+        var headWidth = UInt32(qkHeadDim)
+        var headValue = UInt32(vHeadDim)
+        var recordWidth = UInt32(width)
+        encoder.setBytes(&rowCount, length: 4, index: 4)
+        encoder.setBytes(&headCount, length: 4, index: 5)
+        encoder.setBytes(&headWidth, length: 4, index: 6)
+        encoder.setBytes(&headValue, length: 4, index: 7)
+        encoder.setBytes(&recordWidth, length: 4, index: 8)
+        // The dispatch sizes its scores block the way the executor does: rounded up
+        // to a 16-byte multiple, which Metal requires and a short row count does not
+        // give on its own (1 row is 132 bytes).
+        let scoreBytes = (
+            (rows + 32) * MemoryLayout<Float>.stride + 15
+        ) & ~15
+        encoder.setThreadgroupMemoryLength(scoreBytes, index: 0)
+        // Bound even for one position: the kernel takes the single-position path
+        // either way, and an unbound `constant` pointer fails validation.
+        var plan = DeepSeekV41AttentionSlotPlan(slotCount: 1, keyRowStride: UInt32(rows))
+        encoder.setBytes(
+            &plan, length: MemoryLayout<DeepSeekV41AttentionSlotPlan>.stride, index: 9
+        )
+        var slotRows = UInt32(rows)
+        encoder.setBytes(&slotRows, length: 4, index: 10)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: heads, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        // With one row and no sink the softmax is 1, for both heads: the head's own
+        // query only scales the score, and a single weight normalizes away.
+        let output = floats(outputBuffer, count: heads * vHeadDim)
+        for dim in 0..<vHeadDim {
+            XCTAssertEqual(output[dim], Float(keys[dim]), accuracy: 1e-6)
+            XCTAssertEqual(output[vHeadDim + dim], Float(keys[dim]), accuracy: 1e-6)
+        }
     }
 }
 
@@ -582,12 +981,18 @@ final class DeepSeekV41RouterKernelTests: XCTestCase {
         var normalise: UInt32 = 1
         var scoring: UInt32 = 0  // sigmoid
         var temperature: Float = 1
+        // The readback buffer is a single slot here, so the stride only has to be
+        // large enough for the top-k this case asks for.
+        var indexStride = UInt32(4)
+        var slotCount: UInt32 = 1
         encoder.setBytes(&expertCount, length: 4, index: 4)
         encoder.setBytes(&top, length: 4, index: 5)
         encoder.setBytes(&scale, length: 4, index: 6)
         encoder.setBytes(&normalise, length: 4, index: 7)
         encoder.setBytes(&scoring, length: 4, index: 8)
         encoder.setBytes(&temperature, length: 4, index: 9)
+        encoder.setBytes(&indexStride, length: 4, index: 10)
+        encoder.setBytes(&slotCount, length: 4, index: 11)
         encoder.dispatchThreads(
             MTLSize(width: 1, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
@@ -811,5 +1216,569 @@ final class DeepSeekV41PoolKernelTests: XCTestCase {
         )
         XCTAssertEqual(out[0], reference[0], accuracy: 1e-4)
         XCTAssertEqual(out[1], reference[1], accuracy: 1e-4)
+    }
+}
+
+// MARK: - Engram gate kernel
+
+final class DeepSeekV41EngramGateKernelTests: XCTestCase {
+
+    /// The kernel is the GPU half of `DeepSeekV41EngramCombination.contribution`, so
+    /// its expected numbers are the literals that suite pins from the checkpoint's
+    /// `Engram.forward` — not a second run of the same arithmetic.
+    ///
+    /// `kv` here is what the identity projection `DeepSeekV41EngramCombinationTests`
+    /// builds produces from the rows `[[1, 0], [0, 1]]`: the flattened rows repeated
+    /// once per key and once for the value.
+    func testKernelMatchesTheCheckpointGate() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+        guard let library = device.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "dsv41_engram_gate_f32"),
+              let pipeline = try? device.makeComputePipelineState(function: function),
+              let queue = device.makeCommandQueue() else {
+            XCTFail("Could not build the Engram gate pipeline")
+            return
+        }
+
+        let dim = 4
+        let mult = 2
+        let streams: [Float] = [1, 2, 3, 4, 0, 1, 0, 1]
+        // key 0, key 1, then the value every copy shares.
+        let kv: [Float] = [1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1]
+        let weights = [Float](repeating: 1, count: mult * dim)
+
+        guard let streamBuffer = device.makeBuffer(
+                  bytes: streams, length: streams.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let kvBuffer = device.makeBuffer(
+                  bytes: kv, length: kv.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let weightBuffer = device.makeBuffer(
+                  bytes: weights, length: weights.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let gateBuffer = device.makeBuffer(
+                  length: mult * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("Could not allocate the Engram gate buffers")
+            return
+        }
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(streamBuffer, offset: 0, index: 0)
+        encoder.setBuffer(kvBuffer, offset: 0, index: 1)
+        encoder.setBuffer(weightBuffer, offset: 0, index: 2)
+        encoder.setBuffer(weightBuffer, offset: 0, index: 3)
+        encoder.setBuffer(gateBuffer, offset: 0, index: 4)
+        var width = UInt32(dim)
+        var copies = UInt32(mult)
+        var epsilon: Float = 1e-6
+        encoder.setBytes(&width, length: 4, index: 5)
+        encoder.setBytes(&copies, length: 4, index: 6)
+        encoder.setBytes(&epsilon, length: 4, index: 7)
+        let lanes = 64
+        encoder.setThreadgroupMemoryLength(max(16, ((lanes / 32) * 4 + 15) & ~15), index: 0)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: mult, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        let gate = gateBuffer.contents().assumingMemoryBound(to: Float.self)
+        XCTAssertEqual(gate[0], 0.756985, accuracy: 1e-5)
+        XCTAssertEqual(gate[1], 0.731058, accuracy: 1e-5)
+
+        let out = streamBuffer.contents().assumingMemoryBound(to: Float.self)
+        XCTAssertEqual(out[0], 1.756985, accuracy: 1e-4)
+        XCTAssertEqual(out[1], 2, accuracy: 1e-5)
+        XCTAssertEqual(out[2], 3, accuracy: 1e-5)
+        XCTAssertEqual(out[3], 4.756985, accuracy: 1e-4)
+        XCTAssertEqual(out[4], 0.731058, accuracy: 1e-5)
+        XCTAssertEqual(out[5], 1, accuracy: 1e-5)
+        XCTAssertEqual(out[6], 0, accuracy: 1e-5)
+        XCTAssertEqual(out[7], 1.731058, accuracy: 1e-4)
+    }
+
+    /// `q_weight * k_weight` is the per-copy reweighting, and the checkpoint
+    /// publishes both. The kernel is checked against the reference rule on a
+    /// NON-ones pair, because ones cannot tell a reweighted dot from a plain one.
+    func testKernelAppliesThePerCopyWeightPair() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            XCTFail("No Metal GPU device")
+            return
+        }
+        guard let library = device.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "dsv41_engram_gate_f32"),
+              let pipeline = try? device.makeComputePipelineState(function: function),
+              let queue = device.makeCommandQueue() else {
+            XCTFail("Could not build the Engram gate pipeline")
+            return
+        }
+
+        let dim = 4
+        let mult = 2
+        let residual: [[Float]] = [[1, 2, 3, 4], [0, 1, 0, 1]]
+        let streams = residual.flatMap { $0 }
+        // `[[1, 0], [0, 1]]` through an identity projection, as in the CPU suite.
+        let kv: [Float] = [1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1]
+        let query = [Float](repeating: 1, count: mult * dim)
+        let key: [Float] = [2, 2, 0.5, 1, 1, 4, 1, 1]
+
+        guard let streamBuffer = device.makeBuffer(
+                  bytes: streams, length: streams.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let kvBuffer = device.makeBuffer(
+                  bytes: kv, length: kv.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let queryBuffer = device.makeBuffer(
+                  bytes: query, length: query.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let keyBuffer = device.makeBuffer(
+                  bytes: key, length: key.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let gateBuffer = device.makeBuffer(
+                  length: mult * MemoryLayout<Float>.stride, options: .storageModeShared),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("Could not allocate the Engram gate buffers")
+            return
+        }
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(streamBuffer, offset: 0, index: 0)
+        encoder.setBuffer(kvBuffer, offset: 0, index: 1)
+        encoder.setBuffer(queryBuffer, offset: 0, index: 2)
+        encoder.setBuffer(keyBuffer, offset: 0, index: 3)
+        encoder.setBuffer(gateBuffer, offset: 0, index: 4)
+        var width = UInt32(dim)
+        var copies = UInt32(mult)
+        var epsilon: Float = 1e-6
+        encoder.setBytes(&width, length: 4, index: 5)
+        encoder.setBytes(&copies, length: 4, index: 6)
+        encoder.setBytes(&epsilon, length: 4, index: 7)
+        let lanes = 64
+        encoder.setThreadgroupMemoryLength(max(16, ((lanes / 32) * 4 + 15) & ~15), index: 0)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: mult, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        // One-hot rows, so `wkv` is reproducible here without pulling the CPU
+        // matrix helper in: every row reads one flattened value.
+        var values = [Float](repeating: 0, count: dim * (mult + 1) * dim)
+        for row in 0..<(dim * (mult + 1)) { values[row * dim + row % dim] = 1 }
+        let reference = try XCTUnwrap(
+            DeepSeekV41EngramCombination.contribution(
+                residual: residual,
+                rows: [[1, 0], [0, 1]],
+                wkv: DeepSeekV41Matrix(rows: dim * (mult + 1), columns: dim, values: values),
+                queryWeight: query,
+                keyWeight: key,
+                epsilon: epsilon
+            )
+        )
+
+        let gate = gateBuffer.contents().assumingMemoryBound(to: Float.self)
+        for copy in 0..<mult {
+            XCTAssertEqual(gate[copy], reference.gates[copy], accuracy: 1e-4, "gate \(copy)")
+        }
+        let out = streamBuffer.contents().assumingMemoryBound(to: Float.self)
+        for index in 0..<(mult * dim) {
+            XCTAssertEqual(out[index], reference.streams[index / dim][index % dim], accuracy: 1e-4)
+        }
+    }
+}
+
+/// The GPU half of the mHC split. The host rule is
+/// `DeepSeekV41HyperConnections.sinkhorn`, pinned against the checkpoint's
+/// `hc_split_sinkhorn` by `DeepSeekV41HyperConnectionGoldenTests`; this suite runs
+/// the kernel on the same inputs and over the same schedule.
+final class DeepSeekV41SinkhornKernelTests: XCTestCase {
+
+    private func run(
+        logits: [Float],
+        dimension: Int,
+        iterations: Int,
+        epsilon: Float
+    ) throws -> [Float] {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        let library = try XCTUnwrap(device.makeDefaultLibrary())
+        let function = try XCTUnwrap(library.makeFunction(name: "dsv41_hc_sinkhorn"))
+        let pipeline = try device.makeComputePipelineState(function: function)
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+        let logitsBuffer = try XCTUnwrap(
+            device.makeBuffer(
+                bytes: logits, length: logits.count * MemoryLayout<Float>.stride,
+                options: .storageModeShared
+            )
+        )
+        let outputBuffer = try XCTUnwrap(
+            device.makeBuffer(
+                length: dimension * dimension * MemoryLayout<Float>.stride,
+                options: .storageModeShared
+            )
+        )
+        let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+        let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(logitsBuffer, offset: 0, index: 0)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 1)
+        var n = UInt32(dimension)
+        var rounds = UInt32(iterations)
+        var eps = epsilon
+        encoder.setBytes(&n, length: 4, index: 2)
+        encoder.setBytes(&rounds, length: 4, index: 3)
+        encoder.setBytes(&eps, length: 4, index: 4)
+        encoder.dispatchThreads(
+            MTLSize(width: 32, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+        let pointer = outputBuffer.contents().assumingMemoryBound(to: Float.self)
+        return (0..<(dimension * dimension)).map { pointer[$0] }
+    }
+
+    /// A single round leaves the COLUMNS exact and the rows off by the amount the
+    /// hand-computed [`[1, 0], [0.5, 0.5]`] case shows, so a kernel that normalizes
+    /// rows first cannot pass.
+    func testOneRoundNormalizesTheColumnsOnly() throws {
+        let matrix = try run(
+            logits: [1, 0, 0.5, 0.5], dimension: 2, iterations: 1, epsilon: 1e-6
+        )
+        XCTAssertEqual(matrix[0], 0.593845, accuracy: 1e-5)
+        XCTAssertEqual(matrix[1], 0.349755, accuracy: 1e-5)
+        XCTAssertEqual(matrix[2], 0.406155, accuracy: 1e-5)
+        XCTAssertEqual(matrix[3], 0.650245, accuracy: 1e-5)
+    }
+
+    func testConvergedRoundsMatchTheHostRule() throws {
+        let logits: [Float] = [0.5, -0.2, 0.1, 1.0, -0.7, 0.3, 0.9, 0.2, -0.4]
+        let kernel = try run(logits: logits, dimension: 3, iterations: 20, epsilon: 1e-6)
+        let host = DeepSeekV41HyperConnections.sinkhorn(
+            logits: logits, dimension: 3, iterations: 20, epsilon: 1e-6
+        )
+        for index in 0..<9 {
+            XCTAssertEqual(kernel[index], host[index], accuracy: 1e-6, "entry \(index)")
+        }
+    }
+}
+
+/// The GPU half of the mHC rule. The host side is pinned against the checkpoint by
+/// `DeepSeekV41HyperConnectionGoldenTests`, so these compare the kernels with
+/// `DeepSeekV41HyperConnections` on the same inputs: a disagreement is a kernel bug
+/// rather than a second derivation of the rule.
+final class DeepSeekV41HyperConnectionKernelTests: XCTestCase {
+
+    private let copies = 2
+    private let dim = 3
+    private var width: Int { copies * dim }
+    private var mixCount: Int { (2 + copies) * copies }
+
+    private let streams: [Float] = [0.2, -0.4, 0.6, 0.1, 0.3, -0.5]
+    private let scale: [Float] = [0.7, -0.3, 0.5]
+    private let base: [Float] = [0.05, -0.1, 0.2, 0.0, -0.05, 0.1, 0.15, -0.2]
+    private let projection: [Float] = [
+        0.4, -0.2, 0.1, 0.3, -0.5, 0.2,
+        -0.1, 0.6, 0.2, -0.3, 0.1, 0.4,
+        0.2, 0.1, -0.4, 0.5, 0.3, -0.2,
+        -0.3, 0.2, 0.5, 0.1, -0.6, 0.2,
+        0.1, -0.5, 0.3, 0.2, 0.4, -0.1,
+        0.5, 0.3, -0.1, -0.2, 0.2, 0.6,
+        -0.2, 0.4, 0.6, 0.1, -0.3, 0.3,
+        0.3, -0.1, 0.2, 0.6, 0.1, -0.4,
+    ]
+
+    private var stack: [[Float]] {
+        (0..<copies).map { copy in
+            (0..<dim).map { streams[copy * dim + $0] }
+        }
+    }
+
+    private func hostCoefficients() -> DeepSeekV41HyperConnections.Coefficients {
+        DeepSeekV41HyperConnections.coefficients(
+            streams: stack,
+            projection: DeepSeekV41Matrix(
+                rows: mixCount, columns: width, values: projection
+            ),
+            scale: scale,
+            base: base,
+            normalizationEpsilon: 1e-6,
+            epsilon: 1e-6,
+            iterations: 3
+        )
+    }
+
+    private func environment() throws -> (
+        MTLDevice, MTLLibrary, MTLCommandQueue
+    ) {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        let library = try XCTUnwrap(device.makeDefaultLibrary())
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+        return (device, library, queue)
+    }
+
+    private func pipeline(_ name: String, _ library: MTLLibrary, _ device: MTLDevice) throws
+        -> MTLComputePipelineState {
+        let function = try XCTUnwrap(library.makeFunction(name: name))
+        return try device.makeComputePipelineState(function: function)
+    }
+
+    private func buffer(_ device: MTLDevice, _ values: [Float]) throws -> MTLBuffer {
+        try XCTUnwrap(
+            device.makeBuffer(
+                bytes: values, length: values.count * MemoryLayout<Float>.stride,
+                options: .storageModeShared
+            )
+        )
+    }
+
+    func testProjectionAndSplitMatchTheHostRule() throws {
+        let (device, library, queue) = try environment()
+        let project = try pipeline("dsv41_hc_project_f32", library, device)
+        let split = try pipeline("dsv41_hc_split_f32", library, device)
+
+        let weightBuffer = try buffer(device, projection)
+        let streamBuffer = try buffer(device, streams)
+        let logitsBuffer = try XCTUnwrap(
+            device.makeBuffer(
+                length: mixCount * MemoryLayout<Float>.stride, options: .storageModeShared
+            )
+        )
+        let preBuffer = try XCTUnwrap(
+            device.makeBuffer(
+                length: copies * MemoryLayout<Float>.stride, options: .storageModeShared
+            )
+        )
+        let postBuffer = try XCTUnwrap(
+            device.makeBuffer(
+                length: copies * MemoryLayout<Float>.stride, options: .storageModeShared
+            )
+        )
+        let combBuffer = try XCTUnwrap(
+            device.makeBuffer(
+                length: copies * copies * MemoryLayout<Float>.stride, options: .storageModeShared
+            )
+        )
+        let scaleBuffer = try buffer(device, scale)
+        let baseBuffer = try buffer(device, base)
+
+        let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+        let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(project)
+        encoder.setBuffer(weightBuffer, offset: 0, index: 0)
+        encoder.setBuffer(streamBuffer, offset: 0, index: 1)
+        encoder.setBuffer(logitsBuffer, offset: 0, index: 2)
+        var weightOffset = UInt64(0)
+        var normEpsilon: Float = 1e-6
+        var widthDimension = UInt32(width)
+        var outDimension = UInt32(mixCount)
+        // One slot: this case drives the kernel the way a decode step does.
+        var slotCount: UInt32 = 1
+        encoder.setBytes(&weightOffset, length: 8, index: 3)
+        encoder.setBytes(&normEpsilon, length: 4, index: 4)
+        encoder.setBytes(&widthDimension, length: 4, index: 5)
+        encoder.setBytes(&outDimension, length: 4, index: 6)
+        encoder.setBytes(&slotCount, length: 4, index: 7)
+        encoder.setThreadgroupMemoryLength(64 * MemoryLayout<Float>.stride, index: 0)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: mixCount, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1)
+        )
+        encoder.memoryBarrier(scope: .buffers)
+
+        encoder.setComputePipelineState(split)
+        encoder.setBuffer(logitsBuffer, offset: 0, index: 0)
+        encoder.setBuffer(scaleBuffer, offset: 0, index: 1)
+        encoder.setBuffer(baseBuffer, offset: 0, index: 2)
+        encoder.setBuffer(preBuffer, offset: 0, index: 3)
+        encoder.setBuffer(postBuffer, offset: 0, index: 4)
+        encoder.setBuffer(combBuffer, offset: 0, index: 5)
+        var copiesDimension = UInt32(copies)
+        var iterations = UInt32(3)
+        var epsilon: Float = 1e-6
+        encoder.setBytes(&copiesDimension, length: 4, index: 6)
+        encoder.setBytes(&iterations, length: 4, index: 7)
+        encoder.setBytes(&epsilon, length: 4, index: 8)
+        encoder.setBytes(&slotCount, length: 4, index: 9)
+        encoder.dispatchThreads(
+            MTLSize(width: 32, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        let host = hostCoefficients()
+        let logits = logitsBuffer.contents().assumingMemoryBound(to: Float.self)
+        for index in 0..<mixCount {
+            XCTAssertEqual(logits[index], host.logits[index], accuracy: 1e-5, "logit \(index)")
+        }
+        let pre = preBuffer.contents().assumingMemoryBound(to: Float.self)
+        let post = postBuffer.contents().assumingMemoryBound(to: Float.self)
+        let comb = combBuffer.contents().assumingMemoryBound(to: Float.self)
+        for copy in 0..<copies {
+            XCTAssertEqual(pre[copy], host.pre[copy], accuracy: 1e-6, "pre \(copy)")
+            XCTAssertEqual(post[copy], host.post[copy], accuracy: 1e-6, "post \(copy)")
+        }
+        for index in 0..<(copies * copies) {
+            XCTAssertEqual(comb[index], host.comb[index], accuracy: 1e-6, "comb \(index)")
+        }
+    }
+
+    func testCollapseAndExpansionMatchTheHostRule() throws {
+        let (device, library, queue) = try environment()
+        let prePipeline = try pipeline("dsv41_hc_pre_f32", library, device)
+        let postPipeline = try pipeline("dsv41_hc_post_f32", library, device)
+
+        let mix: [Float] = [0.6, 0.4]
+        let sublayerOutput: [Float] = [0.5, -0.25, 1.0]
+        let host = hostCoefficients()
+
+        let streamBuffer = try buffer(device, streams)
+        let residualBuffer = try XCTUnwrap(
+            device.makeBuffer(
+                length: streams.count * MemoryLayout<Float>.stride, options: .storageModeShared
+            )
+        )
+        let collapsedBuffer = try XCTUnwrap(
+            device.makeBuffer(
+                length: dim * MemoryLayout<Float>.stride, options: .storageModeShared
+            )
+        )
+        let mixBuffer = try buffer(device, mix)
+        let outputBuffer = try buffer(device, sublayerOutput)
+        let gainsBuffer = try buffer(device, host.post)
+        let combBuffer = try buffer(device, host.comb)
+        let descaledStreams = try buffer(device, streams)
+
+        let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+        let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(prePipeline)
+        encoder.setBuffer(streamBuffer, offset: 0, index: 0)
+        encoder.setBuffer(mixBuffer, offset: 0, index: 1)
+        encoder.setBuffer(collapsedBuffer, offset: 0, index: 2)
+        encoder.setBuffer(residualBuffer, offset: 0, index: 3)
+        var widthDimension = UInt32(dim)
+        var copiesDimension = UInt32(copies)
+        var snapshot = UInt32(1)
+        encoder.setBytes(&widthDimension, length: 4, index: 4)
+        encoder.setBytes(&copiesDimension, length: 4, index: 5)
+        encoder.setBytes(&snapshot, length: 4, index: 6)
+        encoder.dispatchThreads(
+            MTLSize(width: dim, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+        encoder.memoryBarrier(scope: .buffers)
+
+        encoder.setComputePipelineState(postPipeline)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(residualBuffer, offset: 0, index: 1)
+        encoder.setBuffer(gainsBuffer, offset: 0, index: 2)
+        encoder.setBuffer(combBuffer, offset: 0, index: 3)
+        encoder.setBuffer(descaledStreams, offset: 0, index: 4)
+        var streamWidth = UInt32(dim)
+        var streamCopies = UInt32(copies)
+        encoder.setBytes(&streamWidth, length: 4, index: 5)
+        encoder.setBytes(&streamCopies, length: 4, index: 6)
+        encoder.dispatchThreads(
+            MTLSize(width: dim, height: copies, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        let collapsed = DeepSeekV41HyperConnections.pre(streams: stack, mix: mix)
+        let collapsedOut = collapsedBuffer.contents().assumingMemoryBound(to: Float.self)
+        let residual = residualBuffer.contents().assumingMemoryBound(to: Float.self)
+        for index in 0..<dim {
+            XCTAssertEqual(collapsedOut[index], collapsed[index], accuracy: 1e-6, "collapse \(index)")
+            // The snapshot `hc_post` mixes back in is the block input, unchanged.
+            XCTAssertEqual(residual[index], streams[index], accuracy: 1e-6, "residual \(index)")
+        }
+
+        let expanded = DeepSeekV41HyperConnections.post(
+            output: sublayerOutput, residual: stack, gains: host.post, comb: host.comb
+        )
+        let expandedOut = descaledStreams.contents().assumingMemoryBound(to: Float.self)
+        for copy in 0..<copies {
+            for index in 0..<dim {
+                XCTAssertEqual(
+                    expandedOut[copy * dim + index],
+                    expanded[copy][index],
+                    accuracy: 1e-6,
+                    "copy \(copy) dim \(index)"
+                )
+            }
+        }
+    }
+
+    /// The final collapse has no `hc_post` after it, so it asks for no snapshot.
+    /// The flag is what says so, since the buffer is bound either way.
+    func testTheCollapseLeavesTheResidualAloneWhenNotSnapshotting() throws {
+        let (device, library, queue) = try environment()
+        let prePipeline = try pipeline("dsv41_hc_pre_f32", library, device)
+
+        let mix: [Float] = [0.6, 0.4]
+        let sentinel = [Float](repeating: -99, count: streams.count)
+        let streamBuffer = try buffer(device, streams)
+        let residualBuffer = try buffer(device, sentinel)
+        let collapsedBuffer = try XCTUnwrap(
+            device.makeBuffer(
+                length: dim * MemoryLayout<Float>.stride, options: .storageModeShared
+            )
+        )
+        let mixBuffer = try buffer(device, mix)
+
+        let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+        let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(prePipeline)
+        encoder.setBuffer(streamBuffer, offset: 0, index: 0)
+        encoder.setBuffer(mixBuffer, offset: 0, index: 1)
+        encoder.setBuffer(collapsedBuffer, offset: 0, index: 2)
+        encoder.setBuffer(residualBuffer, offset: 0, index: 3)
+        var widthDimension = UInt32(dim)
+        var copiesDimension = UInt32(copies)
+        var snapshot = UInt32(0)
+        encoder.setBytes(&widthDimension, length: 4, index: 4)
+        encoder.setBytes(&copiesDimension, length: 4, index: 5)
+        encoder.setBytes(&snapshot, length: 4, index: 6)
+        encoder.dispatchThreads(
+            MTLSize(width: dim, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+
+        let collapsed = DeepSeekV41HyperConnections.pre(streams: stack, mix: mix)
+        let collapsedOut = collapsedBuffer.contents().assumingMemoryBound(to: Float.self)
+        let residual = residualBuffer.contents().assumingMemoryBound(to: Float.self)
+        for index in 0..<dim {
+            XCTAssertEqual(collapsedOut[index], collapsed[index], accuracy: 1e-6, "collapse \(index)")
+        }
+        for index in 0..<streams.count {
+            XCTAssertEqual(residual[index], sentinel[index], "residual \(index)")
+        }
     }
 }

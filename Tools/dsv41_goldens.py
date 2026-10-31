@@ -1,0 +1,1561 @@
+#!/usr/bin/env python3
+"""DeepSeek-V4.1 reference vectors, produced by the checkpoint's own modules.
+
+The port's conformance gates (`DeepSeekV41Conformance`) stay `.unverified` until a
+numeric vector from the reference implementation is checked in. That used to read
+as "someone with a torch box has to send us numbers". It does not: the checkpoint
+repository ships its reference source under `inference/`, and the modules can be
+instantiated at a tiny config and run on CPU. No weights are needed -- 510 GB is
+irrelevant to the question "does this rule compute what their rule computes".
+
+So this script is the other half of the gates. It imports
+`inference/model.py` from a downloaded snapshot, builds the module under test
+with deterministic parameters, runs one forward pass, and prints the inputs
+alongside the reference output. `DeepSeekV41GoldensTests` carries those floats as
+literals and asserts the Swift rule reproduces them; flipping a gate is then a
+one-line change that is actually backed by a comparison.
+
+What is deliberately NOT exercised here:
+
+  * the fused GPU kernels in `inference/kernel.py` (tilelang). They are stubbed
+    out, so every `Linear` is built as a dense FP32 matrix and `linear()` takes
+    the plain `F.linear` path. A golden that ran through their fused kernel would
+    validate *their* kernel against *our* kernel, not the rule against the rule.
+    Dense FP32 is also what makes the vectors cheap to read: the numbers here are
+    the rule, not a quantization accident.
+  * the real weights. Parameters are filled from a seeded generator, so the run
+    needs the snapshot's `inference/` directory and nothing else.
+
+Usage:
+
+    python3 Tools/dsv41_goldens.py                 # every case, newest snapshot
+    python3 Tools/dsv41_goldens.py engram          # one case
+    python3 Tools/dsv41_goldens.py all --json out.json
+    python3 Tools/dsv41_goldens.py all --snapshot <snapshot dir>
+
+Cases: `engram` (Engram.forward), `compressor` (Compressor.forward, one block),
+`compressor_state` (Compressor.forward over a decode sequence: which slot a
+position fills and when a row comes out), `chunk` (which window slots each query
+of a prefill chunk reads, `get_window_topk_idxs` for both of its branches, plus
+the chunk branch of `Compressor.forward` against its decode branch), `hc`
+(`Block.hc_mixes` and the `hc_pre` / `hc_post` pair: the mHC coefficient split and
+the collapse it feeds), `router` (Gate.forward, under both per-logit scorings),
+`dspark` (`DSparkBlock`'s
+`forward_embed` seed plus its `forward_head` chain: the Markov bias, the
+per-step draw, and the confidence ordering), and `vision` (`ViT.forward` +
+`Aligner.forward` over a given patch grid, plus the spelling and id of the token
+that addresses an image span).
+
+One gate deliberately has no case yet: `candidateSelection` needs live cache
+state.
+
+`hc` is the one case that transcribes a reference rule rather than executing it.
+`Block.hc_mixes`, `hc_pre` and `hc_post` run as the reference wrote them, against a
+duck-typed `self` so the block's attention and MoE (which need fused kernels) never
+run; but the split those methods call, `hc_split_sinkhorn`, is a tilelang kernel
+with no torch twin in `model.py`, so its body is transcribed from `kernel.py`. The
+transcription is 20 lines of elementwise arithmetic with an explicit order, and the
+port pins that order separately (one round leaves the columns exact and the rows
+only approximately so), which keeps the unverified surface to the schedule itself.
+
+`dspark` covers the half of the drafter that decides which tokens a chain
+contains. What it cannot cover, and what therefore keeps the gate open, is the
+draft block's own attention and MoE: those run only through `forward_spec`, which
+nothing in the checkpoint's own generator calls, so there is no reference output
+for a draft block forward over a real prefix.
+
+`chunk` exists because a batched prefill is the first place the port would run
+more than one position through a layer, and the two rules that decide whether that
+pass sees what a per-position walk sees are positional: the sliding-window mask
+over a chunk, and the compressor splitting a chunk into complete groups plus a
+trailing remainder. `get_window_topk_idxs` is pure torch, so the mask is asked
+rather than restated; the attention that consumes it is not, which is why this
+case pins the row lists and not attended values.
+
+`vision` starts from a patch grid rather than an image: `load_image`'s PIL
+bicubic resample is preprocessing, and pinning it here would pin Pillow instead
+of the tower. Everything the tower and the aligner do to patches is covered,
+including the resize-free half of `plan_image_grid` that `DeepSeekV41VisionLayout`
+implements separately.
+
+torch and numpy are required. `brew install pytorch` puts the Python package
+inside the formula's venv rather than on `sys.path`, so point PYTHONPATH at it:
+
+    PYTHONPATH=$(brew --prefix pytorch)/libexec/lib/python3.*/site-packages \
+        python3 Tools/dsv41_goldens.py
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import sys
+import types
+
+# ---------------------------------------------------------------------------
+# Import shims
+# ---------------------------------------------------------------------------
+#
+# `inference/model.py` imports four things a CPU goldens run cannot have: the
+# fused-kernel DSL (tilelang), the image helpers (Pillow), a primality library
+# (sympy, used by the Engram bucket layout) and the vision tower. Each is
+# replaced by the smallest honest stand-in rather than by installing a stack the
+# goldens do not need.
+
+
+def _isprime(value: int) -> bool:
+    """Trial division, the same test `engram.find_next_prime` asks for."""
+    if value < 2:
+        return False
+    if value % 2 == 0:
+        return value == 2
+    if value % 3 == 0:
+        return value == 3
+    factor = 5
+    while factor * factor <= value:
+        if value % factor == 0 or value % (factor + 2) == 0:
+            return False
+        factor += 6
+    return True
+
+
+def install_shims() -> None:
+    if "sympy" not in sys.modules:
+        sympy = types.ModuleType("sympy")
+        sympy.isprime = _isprime
+        sys.modules["sympy"] = sympy
+
+    # `image_processor.py` needs Pillow at module scope for the marker constants
+    # the model imports; nothing here reads an image.
+    for name in ("PIL", "PIL.Image", "PIL.ImageOps"):
+        if name not in sys.modules:
+            module = types.ModuleType(name)
+            module.Image = module
+            module.ImageOps = module
+            sys.modules[name] = module
+
+    def unavailable(name: str):
+        def _refuse(*_args, **_kwargs):
+            raise RuntimeError(
+                f"{name} is a fused GPU kernel; the goldens run the dense path "
+                "so the rule is under test rather than two kernels"
+            )
+
+        return _refuse
+
+    if "kernel" not in sys.modules:
+        kernel = types.ModuleType("kernel")
+        for name in (
+            "act_quant",
+            "fp4_act_quant",
+            "fp4_gemm",
+            "fp8_gemm",
+            "hc_split_sinkhorn",
+            "sparse_attn",
+        ):
+            setattr(kernel, name, unavailable(name))
+        sys.modules["kernel"] = kernel
+
+
+# ---------------------------------------------------------------------------
+# Snapshot and module setup
+# ---------------------------------------------------------------------------
+
+
+def find_snapshot(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    pattern = os.path.expanduser(
+        "~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/*"
+    )
+    candidates = [path for path in glob.glob(pattern) if os.path.isfile(
+        os.path.join(path, "inference", "model.py")
+    )]
+    if not candidates:
+        raise SystemExit(
+            "no snapshot with inference/model.py found; pass --snapshot <dir> "
+            "(the reference source is what these goldens come from)"
+        )
+    return sorted(candidates)[-1]
+
+
+def load_reference(snapshot: str):
+    """Imports the checkpoint's own `model` module with dense FP32 linears."""
+    inference = os.path.join(snapshot, "inference")
+    if not os.path.isfile(os.path.join(inference, "model.py")):
+        raise SystemExit(f"{snapshot}: no inference/model.py")
+    install_shims()
+    if inference not in sys.path:
+        sys.path.insert(0, inference)
+    import torch
+
+    import model as reference
+
+    # One rank: the sharded imports are all `world_size`-parameterised and 1
+    # makes them the identity.
+    reference.world_size = 1
+    reference.rank = 0
+    # Dense FP32 rather than the checkpoint's fp8: see the module docstring.
+    reference.default_dtype = torch.float32
+    return torch, reference
+
+
+def fill(module, torch, seed: int = 20251017, scale: float = 0.35):
+    """Deterministic parameters, so the vectors are a property of the rule.
+
+    A norm gain is filled around 1 rather than around 0 (a zero gain would make
+    every normed output zero and hide a wrong reduction), and an E8M0 scale is
+    filled with a power of two, which is the only kind of value it can hold.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for name, parameter in module.named_parameters():
+            if parameter.dtype == torch.float8_e8m0fnu:
+                parameter.copy_(torch.full(parameter.shape, 2.0**-2).to(parameter.dtype))
+            elif name.endswith("weight") and parameter.dim() == 1:
+                parameter.copy_(
+                    (1 + scale * torch.randn(parameter.shape, generator=generator)).to(parameter.dtype)
+                )
+            else:
+                parameter.copy_(
+                    (scale * torch.randn(parameter.shape, generator=generator)).to(parameter.dtype)
+                )
+    return module
+
+
+class _UpcastRows:
+    """Wraps the Engram table so its rows leave as FP32.
+
+    `ParallelEngramEmbedding` returns bf16 because the table's storage is fp8 and
+    the checkpoint's fused GEMM takes bf16 activations directly. That quantization
+    belongs to the kernel path, not to the rule: `Engram.forward` is fp32 from the
+    projection's split onward. Upcasting the row keeps the golden about the rule,
+    and bf16 to fp32 is lossless, so nothing about the reference's numbers moves.
+    """
+
+    def __new__(cls, torch, inner):
+        class _Wrapper(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.inner = inner
+
+            def forward(self, indices):
+                return self.inner(indices).float()
+
+        return _Wrapper()
+
+
+def rows_of(tensor) -> list:
+    """A tensor as nested Python floats."""
+    return tensor.detach().float().cpu().tolist()
+
+
+# ---------------------------------------------------------------------------
+# Cases
+# ---------------------------------------------------------------------------
+
+
+def engram_case(torch, reference) -> dict:
+    """`Engram.forward`: retrieved rows to a gated residual write.
+
+    Small enough to read: dim 8, two hyper-connection copies, two hash columns
+    (a bigram table with two heads), one 32-wide block per row (the table's fp8
+    scale block size, so the dequantize is exercised), two positions.
+    """
+    from engram import EngramLayout
+
+    args = reference.ModelArgs(
+        dim=8,
+        hc_mult=2,
+        norm_eps=1e-6,
+        engram_layer_ids=(1,),
+        engram_num_embeddings=(4096,),
+        engram_max_ngram_size=2,
+        engram_vocab_size=512,
+        engram_n_heads=2,
+        engram_head_dim=32,
+    )
+    layout = EngramLayout.from_args(args)
+    module = fill(reference.Engram(args, 1, layout), torch)
+    module.embed = _UpcastRows(torch, module.embed)
+
+    n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
+    # Two positions, each with its own n_hash_cols row indices into the table.
+    hash_ids = torch.tensor([[[5, 3000], [17, 4095]]], dtype=torch.long)
+    # [B, L, hc_mult, dim], the residual the memory is written into.
+    x = torch.tensor(
+        [[
+            [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+             [0.5, -1.0, 2.0, -3.0, 0.25, -0.75, 1.5, -2.0]],
+            [[-1.0, 0.5, 1.25, -2.5, 3.0, -0.125, 2.0, 1.0],
+             [2.0, 2.0, -2.0, -2.0, 1.0, 1.0, -1.0, -1.0]],
+        ]],
+        dtype=torch.float32,
+    )
+
+    with torch.no_grad():
+        out = module(x, hash_ids)
+        rows = module.embed(hash_ids)
+        kv = module.wkv(rows.flatten(-2))
+        key, value = kv.split([module.hc_mult * module.dim, module.dim], dim=-1)
+        key = key.float().unflatten(-1, (module.hc_mult, module.dim))
+        weight = module.q_weight.float() * module.k_weight.float()
+        h = x.float()
+        rstd = torch.rsqrt(h.square().mean(-1) + module.eps) * torch.rsqrt(
+            key.square().mean(-1) + module.eps
+        )
+        dot = (h * weight * key).sum(-1) * rstd * module.dim**-0.5
+        gates = torch.sigmoid(
+            torch.copysign(dot.abs().clamp_min(module.clamp_value).sqrt(), dot)
+        )
+
+    return {
+        "gate": "engramCombination",
+        "reference": f"inference/model.py Engram.forward ({snapshot_note()})",
+        "config": {
+            "dim": module.dim,
+            "hc_mult": module.hc_mult,
+            "head_dim": layout.head_dim,
+            "n_heads": layout.n_heads,
+            "max_ngram_size": layout.max_ngram_size,
+            "n_hash_cols": n_hash_cols,
+            "eps": module.eps,
+        },
+        "input": {
+            "residual": rows_of(x),
+            "hash_ids": rows_of(hash_ids),
+            "rows": rows_of(rows),
+            "wkv": rows_of(module.wkv.weight),
+            "q_weight": rows_of(module.q_weight),
+            "k_weight": rows_of(module.k_weight),
+        },
+        "expected": {
+            # [L][hc][dim]: the residual with the gated value added.
+            "streams": rows_of(out),
+            # [L][hc]: the gate each copy was mixed with.
+            "gates": rows_of(gates),
+        },
+    }
+
+
+def compressor_case(torch, reference) -> dict:
+    """`Compressor.forward`: one block of positions to one compressed latent.
+
+    The softmax is over the group axis PER DIMENSION, which is the whole point of
+    the gate: a kernel that shared one weight per row would produce the group
+    mean instead. The four positions below disagree about which one should
+    dominate, so a wrong axis is visible in every component.
+    """
+    args = reference.ModelArgs(
+        dim=8,
+        head_dim=4,
+        norm_eps=1e-6,
+        compress_ratios=[0, 2],
+        max_batch_size=1,
+    )
+    module = fill(reference.Compressor(args, 1), torch)
+    # Two groups of two positions: [B, L, dim].
+    x = torch.tensor(
+        [[
+            [1.0, 0.0, 2.0, -1.0, 0.5, 1.5, -0.5, 3.0],
+            [0.0, 1.0, -1.0, 2.0, 4.0, -2.0, 1.0, 0.25],
+            [2.0, -3.0, 0.5, 1.0, -1.5, 0.75, 2.5, -0.25],
+            [-1.0, 2.0, 3.0, 0.5, 1.0, -4.0, -2.0, 1.5],
+        ]],
+        dtype=torch.float32,
+    )
+
+    with torch.no_grad():
+        post_norm = module(x, start_pos=0)
+        # The same forward with the norm removed: this is what isolates the
+        # pooling rule, since `RMSNorm` is pinned by its own tests.
+        original_norm = module.norm
+        module.norm = torch.nn.Identity()
+        pooled = module(x, start_pos=0)
+        module.norm = original_norm
+
+    return {
+        "gate": "compressorPooling",
+        "reference": f"inference/model.py Compressor.forward ({snapshot_note()})",
+        "config": {
+            "dim": args.dim,
+            "head_dim": args.head_dim,
+            "compress_ratio": module.compress_ratio,
+            "norm_eps": args.norm_eps,
+        },
+        "input": {
+            "positions": rows_of(x),
+            "wkv": rows_of(module.wkv.weight),
+            "wgate": rows_of(module.wgate.weight),
+            "norm_gain": rows_of(module.norm.weight),
+        },
+        "expected": {
+            # [groups][head_dim], still un-normalised: `pooledLatent`'s output.
+            "pooled": rows_of(pooled),
+            # [groups][head_dim], the module's own return value.
+            "post_norm": rows_of(post_norm),
+        },
+    }
+
+
+def router_case(torch, reference) -> dict:
+    """`Gate.forward`: logits to selected experts and their mixture weights.
+
+    Two scorings over the SAME weights, because they are not rescalings of each
+    other: `sqrtsoftplus` (what the checkpoint ships) and `sigmoid` rank experts
+    differently, and a port that picks the wrong one runs the wrong experts while
+    every number still looks plausible.
+
+    `gate_temp` is not 1 on purpose: the divide happens before the scoring
+    function, so a port that divided after it would agree on a temperature of 1.
+    """
+    import copy
+
+    args = reference.ModelArgs(
+        dim=8,
+        n_layers=1,
+        n_routed_experts=6,
+        n_activated_experts=2,
+        score_func="sqrtsoftplus",
+        gate_temp=0.7,
+        norm_topk_prob=True,
+        route_scale=2.5,
+    )
+    gate = fill(reference.Gate(1, args), torch)
+    # [tokens, dim]: three tokens that disagree about which expert should win.
+    x = torch.tensor(
+        [
+            [1.0, 0.5, -2.0, 1.5, 0.0, 2.0, -1.0, 0.25],
+            [-1.0, 2.0, 1.0, -0.5, 1.5, -2.0, 0.5, 1.0],
+            [0.25, -0.75, 0.5, 2.0, -1.5, 1.0, 1.0, -1.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    cases = []
+    with torch.no_grad():
+        for scoring in ("sqrtsoftplus", "sigmoid"):
+            module = copy.deepcopy(gate)
+            module.score_func = scoring
+            weights, indices = module(x)
+            cases.append(
+                {
+                    "scoring": scoring,
+                    "indices": rows_of(indices),
+                    "weights": rows_of(weights),
+                }
+            )
+
+    return {
+        "gate": "routerScoring",
+        "reference": f"inference/model.py Gate.forward ({snapshot_note()})",
+        "config": {
+            "dim": args.dim,
+            "experts": args.n_routed_experts,
+            "topk": args.n_activated_experts,
+            "gate_temp": args.gate_temp,
+            "route_scale": args.route_scale,
+            "norm_topk_prob": args.norm_topk_prob,
+        },
+        "input": {
+            "tokens": rows_of(x),
+            "weight": rows_of(gate.weight),
+            "bias": rows_of(gate.bias),
+        },
+        "cases": cases,
+    }
+
+
+def dspark_case(torch, reference) -> dict:
+    """`DSparkBlock`: the target-state projection, then the draft chain.
+
+    Two halves, because they fail differently. `forward_embed` turns the target
+    model's concatenated hidden states into the draft block's conditioning row and
+    seeds the chain's inputs with `[last token, noise, noise, ...]`. `forward_head`
+    then walks the block, adds the Markov head's FULL-VOCAB bias for the token
+    before each draft, draws one token per step, and scores each step's confidence.
+
+    The chain below is written out here rather than taken from `forward_head`'s
+    return value for one reason: `forward_head` draws with torch's global RNG, and
+    a vector pinned to that RNG cannot be replayed by any other implementation. So
+    the draws here come from a fixed uniform table that travels with the vectors,
+    using the same rule the reference's `sample` implements — `argmax(p / -log u)`,
+    i.e. Gumbel-max, since `-log(Exponential(1))` is Gumbel.
+    """
+    args = reference.ModelArgs(
+        dim=8,
+        head_dim=4,
+        norm_eps=1e-6,
+        hc_mult=2,
+        max_batch_size=1,
+        vocab_size=16,
+        n_layers=1,
+        n_mtp_layers=1,
+        n_heads=2,
+        rope_head_dim=2,
+        q_lora_rank=4,
+        o_lora_rank=4,
+        o_groups=2,
+        moe_inter_dim=16,
+        n_routed_experts=4,
+        n_activated_experts=2,
+        window_size=8,
+        compress_ratios=(0, 0),
+        dspark_block_size=3,
+        dspark_noise_token_id=1,
+        dspark_target_layer_ids=(0,),
+        dspark_markov_rank=4,
+        # The draft block's MoE is never run here, and an fp4 expert weight cannot
+        # be seeded by a generator, so the dense path is the only one that works.
+        expert_dtype=None,
+    )
+    block = fill(reference.DSparkBlock(args.n_layers, args), torch)
+    # A Transformer hands the stage the backbone's embedding and head; this case
+    # builds them itself so the vectors do not depend on a whole model.
+    block.embed = fill(reference.ParallelEmbedding(args.vocab_size, args.dim), torch, seed=7)
+    block.head = fill(
+        reference.ParallelHead(args.vocab_size, args.dim, args.norm_eps, args.hc_eps), torch, seed=8
+    )
+    # `wo_a` is stored bf16 in the reference and cast up by the FP8 activation
+    # quantiser that precedes it; with that step an identity the cast has to happen
+    # here, and fp32 is what the rest of these vectors are in.
+    block.float()
+
+    vocab = args.vocab_size
+    block_size = args.dspark_block_size
+    seed_token = 11
+    uniforms = torch.rand(
+        (block_size, vocab), generator=torch.Generator().manual_seed(20251017), dtype=torch.float32
+    )
+
+    with torch.no_grad():
+        main_hidden = torch.arange(
+            1.0, 1.0 + args.dim * len(args.dspark_target_layer_ids)
+        ).view(1, 1, -1)
+        input_ids = torch.tensor([[seed_token]], dtype=torch.long)
+        draft_input_ids = input_ids.new_full([1, block_size], args.dspark_noise_token_id)
+        draft_input_ids[:, 0] = input_ids
+
+        x, main_x = block.forward_embed(main_hidden, input_ids)
+        collapsed = block.hc_pre(x, reference.make_identity_pre_mix(x, args.hc_mult))
+        # What the block's own head would produce per draft position, before the
+        # Markov bias: the chain's only dependence on the block forward.
+        base_logits = block.head(block.norm(collapsed), full_logits=True)
+
+        # The chain, with the draws driven by `uniforms` instead of torch's RNG.
+        markov_logits, markov_embeds = [], []
+        chosen = [seed_token]
+        for step in range(block_size):
+            # `output_ids[:, i]` is 1-D in the reference, which is what keeps the
+            # bias [b, vocab] and the embedding [b, markov_rank].
+            bias, embed = block.markov_head(torch.tensor([chosen[step]], dtype=torch.long))
+            markov_logits.append(bias[0])
+            markov_embeds.append(embed)
+            step_logits = base_logits[0, step] + bias[0]
+            probs = torch.softmax(step_logits / max(args.temperature, 1e-5), dim=-1, dtype=torch.float32)
+            chosen.append(int(torch.argmax(probs / -torch.log(uniforms[step]))))
+        confidence = block.confidence_head(
+            collapsed, torch.stack(markov_embeds, dim=1)
+        )
+
+        # The same chain with the reference's own `sample` at temperature 0
+        # (argmax), which is the shape a greedy port has to reproduce.
+        greedy = [seed_token]
+        for step in range(block_size):
+            bias, _ = block.markov_head(torch.tensor([greedy[step]], dtype=torch.long))
+            greedy.append(int(torch.argmax(base_logits[0, step] + bias[0])))
+
+    return {
+        "gate": "dsparkDrafting",
+        "reference": f"inference/model.py DSparkBlock.forward_embed/forward_head ({snapshot_note()})",
+        "config": {
+            "dim": args.dim,
+            "hc_mult": args.hc_mult,
+            "vocab_size": vocab,
+            "block_size": block_size,
+            "noise_token_id": args.dspark_noise_token_id,
+            "markov_rank": args.dspark_markov_rank,
+            "temperature": args.temperature,
+            "norm_eps": args.norm_eps,
+        },
+        "input": {
+            "main_hidden": rows_of(main_hidden),
+            "input_ids": seed_token,
+            "main_proj": rows_of(block.main_proj.weight),
+            "main_norm_gain": rows_of(block.main_norm.weight),
+            "markov_embed": rows_of(block.markov_head.embed.weight),
+            "markov_head": rows_of(block.markov_head.head.weight),
+            "confidence_proj": rows_of(block.confidence_head.proj.weight),
+            "uniforms": rows_of(uniforms),
+            # The chain's block half: per draft position, the head's logits before
+            # any Markov contribution.
+            "base_logits": rows_of(base_logits[0]),
+            "collapsed": rows_of(collapsed),
+        },
+        "expected": {
+            "main_x": rows_of(main_x[0, 0]),
+            "markov_logits": rows_of(torch.stack(markov_logits)),
+            "confidence": rows_of(confidence[0]),
+            "chained_ids": chosen,
+            "greedy_ids": greedy,
+            "mixed_logits": rows_of(
+                torch.stack([base_logits[0, step] + markov_logits[step] for step in range(block_size)])
+            ),
+        },
+    }
+
+
+def _act_quant_identity():
+    """`act_quant` as the goldens run it: no quantization.
+
+    The kernel quantizes an activation to FP8, rounds its per-block scale and then
+    dequantizes back (`inplace=True`), so what the block forward sees afterwards is
+    the same tensor carrying quantisation noise. These vectors are FP32 throughout
+    — the same reason every `Linear` here is dense — so the faithful version of that
+    step is the identity, and the noise stays out of the comparison.
+    """
+
+    def quantize(x, block_size=128, scale_fmt=None, scale_dtype=None, inplace=False):
+        return x
+
+    return quantize
+
+
+def _sparse_attn_for_goldens(torch, record):
+    """A torch transcription of `kernel.py`'s `sparse_attn`.
+
+    The draft block's attention is the one part of `DSparkBlock.forward` that cannot
+    be executed: `sparse_attn` is a tilelang kernel, and the torch function around
+    it only launches that kernel. The body below is transcribed from
+    `sparse_attn_kernel` — gather the listed rows, score, mask the pad index,
+    online-softmax, fold the sink into the DENOMINATOR, then a second gemm — with
+    its two BF16 casts dropped because these vectors are FP32.
+
+    Two details are carried over literally, because they decide the output rather
+    than its precision:
+
+      * a masked row scores `-inf`, while the running maximum starts at the FINITE
+        `-1e30`. A position whose indices are all masked therefore divides zero by
+        `exp(sink + 1e30) = inf` and comes back all zeros instead of NaN.
+      * `attn_sink` is a per-head bias on the denominator alone. It has no value
+        row, so it can only remove probability mass; treating it as an extra key
+        with a zero value row would look identical in the output, which is exactly
+        why the rule is worth pinning.
+    """
+
+    def attend(q, kv, attn_sink, topk_idxs, softmax_scale):
+        b, m, h, d = q.size()
+        topk = topk_idxs.size(-1)
+        valid = topk_idxs != -1
+        rows = torch.gather(
+            kv.unsqueeze(1).expand(b, m, kv.size(1), d),
+            2,
+            topk_idxs.clamp(min=0).unsqueeze(-1).expand(b, m, topk, d),
+        )
+        rows = torch.where(valid.unsqueeze(-1), rows, torch.zeros_like(rows))
+        scores = torch.einsum("bmhd,bmkd->bmhk", q, rows) * softmax_scale
+        scores = torch.where(valid.unsqueeze(2), scores, torch.full_like(scores, -torch.inf))
+        peak = scores.amax(dim=-1, keepdim=True).clamp(min=-1e30)
+        weights = torch.exp(scores - peak)
+        denominator = weights.sum(-1) + torch.exp(attn_sink.view(1, 1, h) - peak.squeeze(-1))
+        out = torch.einsum("bmhk,bmkd->bmhd", weights, rows) / denominator.unsqueeze(-1)
+        record.append({"q": q.detach().clone(), "out": out.detach().clone()})
+        return out
+
+    return attend
+
+
+def dspark_block_case(torch, reference) -> dict:
+    """`DSparkBlock.forward`: the draft block itself, not the chain it feeds.
+
+    `dspark` pins the projection that conditions the block and the head that walks
+    it, with the block's own logits handed to it as an input. What that case could
+    not see is everything between: `DSparkAttention` (a window cache the PREFILL
+    call seeds and the draft call appends one row to), the hyper-connection
+    bookkeeping around it, the MoE, and the collapse the head reads. That is the
+    wiring a port cannot invent, and this case asks the reference for it.
+
+    Four calls, in the order `Transformer.forward_spec` makes them:
+
+      1. `main_x` — the target layers' stacked attention inputs through stage 0's
+         `main_proj`/`main_norm`. Run over a prefix of `window + 2` positions so it
+         is a chunk rather than one row.
+      2. the seed. `start_pos == 0` writes the prefix's `wkv(main_x)` rows into each
+         stage's window ring and returns, which is why a seed that stored the wrong
+         rows is invisible until the next call. The prefix is LONGER than the
+         window, so this takes the rotation branch; a second module at the same
+         seeded weights takes the fitting branch, and both rings are recorded.
+      3. the draft. `start_pos = prefix_len`, one `main_x` row for the token being
+         drafted from, and `block_size` draft positions through EACH stage in one
+         pass. A stage's own rows are appended to the keys it gathers, so a draft
+         position attends over the window PLUS its siblings — the block is not
+         causal within itself.
+      4. the head, off the last stage's collapse.
+
+    Two stages, like the checkpoint's three, because the responsibilities are split
+    between them: only stage 0 carries `main_proj`/`main_norm` and only the last
+    stage carries `norm`, the Markov head and the confidence head.
+    """
+    args = reference.ModelArgs(
+        max_batch_size=1,
+        max_seq_len=16,
+        # Greedy, so `forward_head`'s draws are argmax and replay off any runtime.
+        temperature=0,
+        dtype="bf16",
+        # An fp4 expert weight cannot be seeded from a generator; see the docstring.
+        expert_dtype=None,
+        vocab_size=16,
+        dim=8,
+        moe_inter_dim=4,
+        n_layers=2,
+        n_mtp_layers=2,
+        n_heads=2,
+        n_routed_experts=3,
+        n_shared_experts=1,
+        n_activated_experts=2,
+        q_lora_rank=4,
+        head_dim=8,
+        rope_head_dim=4,
+        norm_eps=1e-6,
+        o_groups=2,
+        o_lora_rank=4,
+        window_size=3,
+        compress_ratios=(0, 0, 0, 0),
+        kv_source_layers=(),
+        index_source_layers=(),
+        swiglu_limit=2.0,
+        hc_mult=2,
+        hc_sinkhorn_iters=3,
+        hc_eps=1e-6,
+        dspark_block_size=4,
+        dspark_noise_token_id=15,
+        dspark_target_layer_ids=(0, 1),
+        dspark_markov_rank=3,
+        dspark_n_routed_experts=3,
+        dspark_n_activated_experts=2,
+    )
+    # A Transformer hands every stage the backbone's embedding and head; this case
+    # builds them itself so the vectors do not depend on a whole model.
+    embedding = fill(reference.ParallelEmbedding(args.vocab_size, args.dim), torch, seed=7)
+    head = fill(
+        reference.ParallelHead(args.vocab_size, args.dim, args.norm_eps, args.hc_eps), torch, seed=8
+    )
+    # Distinct seeds per stage, so a port that ran one stage's weights twice cannot
+    # reproduce the chained output.
+    stages = []
+    for index in range(args.n_mtp_layers):
+        stage = fill(reference.DSparkBlock(args.n_layers + index, args), torch, seed=20 + index)
+        stage.embed = embedding
+        stage.head = head
+        # `wo_a` is stored bf16 in the reference and cast up by the FP8 activation
+        # quantiser in front of it; with that step an identity the cast has to happen
+        # here, and fp32 is what the rest of these vectors are in.
+        stage.float()
+        stages.append(stage)
+    # The fitting-seed branch, at stage 0's weights (same seed, so not recorded twice).
+    short = fill(reference.DSparkBlock(args.n_layers, args), torch, seed=20).float()
+    short.embed = embedding
+
+    dim = args.dim
+    copies = args.hc_mult
+    targets = len(args.dspark_target_layer_ids)
+    block_size = args.dspark_block_size
+    window = args.window_size
+    prefix_len = window + 2
+    start_pos = prefix_len
+    seed_token = 7
+
+    generator = torch.Generator().manual_seed(11)
+    main_hidden_prefix = 0.3 * torch.randn(
+        1, prefix_len, dim * targets, generator=generator, dtype=torch.float32
+    )
+    main_hidden_step = 0.3 * torch.randn(
+        1, 1, dim * targets, generator=generator, dtype=torch.float32
+    )
+    input_ids = torch.tensor([[seed_token]], dtype=torch.long)
+
+    attended = []
+    norms = []
+    projected = []
+    ffn_in = []
+    ffn_out = []
+    collapses = []
+    original_sparse = reference.sparse_attn
+    original_quant = reference.act_quant
+    original_split = reference.hc_split_sinkhorn
+    original_attention_norm = stages[0].attn_norm
+    original_final_norm = stages[-1].norm
+    original_wo_b = stages[0].attn.wo_b
+    original_ffn = stages[0].ffn
+    original_ffn_norm = stages[0].ffn_norm
+    original_head = stages[-1].head
+    head_logits = []
+
+    class _Recording(torch.nn.Module):
+        """Passes a module through and keeps one of its tensors on the way.
+
+        The collapse the head reads is `hc_pre`'s output, and `hc_pre` is a method
+        rather than a module, so it cannot be wrapped; `norm` runs on exactly that
+        tensor, and its INPUT is recorded instead.
+        """
+
+        def __init__(self, inner, sink, keep):
+            super().__init__()
+            self.inner = inner
+            self.sink = sink
+            self.keep = keep
+
+        def forward(self, *inputs, **kwargs):
+            if self.keep == "input":
+                self.sink.append(inputs[0].detach().clone())
+            out = self.inner(*inputs, **kwargs)
+            if self.keep == "output":
+                self.sink.append(out.detach().clone())
+            return out
+
+    reference.sparse_attn = _sparse_attn_for_goldens(torch, attended)
+    reference.act_quant = _act_quant_identity()
+    reference.hc_split_sinkhorn = _hc_split_sinkhorn_for_goldens(torch, [])
+    stages[0].attn_norm = _Recording(original_attention_norm, norms, "output")
+    stages[-1].norm = _Recording(original_final_norm, collapses, "input")
+    stages[0].attn.wo_b = _Recording(original_wo_b, projected, "output")
+    stages[0].ffn_norm = _Recording(original_ffn_norm, ffn_in, "output")
+    stages[0].ffn = _Recording(original_ffn, ffn_out, "output")
+    stages[-1].head = _Recording(original_head, head_logits, "output")
+
+    try:
+        with torch.no_grad():
+            main_x_prefix = stages[0].main_norm(stages[0].main_proj(main_hidden_prefix))
+            main_x_step = stages[0].main_norm(stages[0].main_proj(main_hidden_step))
+            seed_stack, _ = stages[0].forward_embed(main_hidden_step, input_ids)
+
+            seed_mix = reference.make_identity_pre_mix(seed_stack, copies)
+            for stage in stages:
+                stage(seed_stack, 0, seed_mix, main_x_prefix)
+            seeded = [stage.attn.window_kv_cache[0].clone() for stage in stages]
+
+            # The same stage-0 weights, a prefix that FITS: the other branch of the
+            # seed (`cache[: len] = rows`, no rotation).
+            short_stack = short.embed(input_ids).unsqueeze(2).repeat(1, 1, copies, 1)
+            short(
+                short_stack,
+                0,
+                reference.make_identity_pre_mix(short_stack, copies),
+                main_x_prefix[:, : window - 1],
+            )
+
+            stack = seed_stack
+            pre_mix = reference.make_identity_pre_mix(stack, copies)
+            block_input = stack.clone()
+            through = []
+            for stage in stages:
+                stack, pre_mix = stage(stack, start_pos, pre_mix, main_x_step)
+                through.append(stack[0].clone())
+            drafted_window = [stage.attn.window_kv_cache[0].clone() for stage in stages]
+            out_ids, logits, confidence = stages[-1].forward_head(stack, pre_mix, input_ids)
+            # The stack after stage 0's attention sub-layer, composed from the
+            # reference's own `hc_mixes` / `hc_post` rather than re-derived.
+            _, attn_post, attn_comb = stages[0].hc_mixes(
+                block_input,
+                stages[0].hc_attn_fn,
+                stages[0].hc_attn_scale,
+                stages[0].hc_attn_base,
+            )
+            post_attention = reference.Block.hc_post(
+                stages[0], projected[0], block_input, attn_post, attn_comb
+            )
+    finally:
+        reference.sparse_attn = original_sparse
+        reference.act_quant = original_quant
+        reference.hc_split_sinkhorn = original_split
+        stages[0].attn_norm = original_attention_norm
+        stages[-1].norm = original_final_norm
+        stages[0].attn.wo_b = original_wo_b
+        stages[0].ffn = original_ffn
+        stages[0].ffn_norm = original_ffn_norm
+        stages[-1].head = original_head
+
+    # The seed call never attends (it only writes), so the recorded attention calls
+    # are the draft pass: one query tensor and one output per position.
+    queries = [entry["q"] for entry in attended]
+    attended_out = [entry["out"] for entry in attended]
+
+    def stage_weights(stage):
+        return {
+            "attn_norm": rows_of(stage.attn_norm.weight),
+            "wq_a": rows_of(stage.attn.wq_a.weight),
+            "q_norm": rows_of(stage.attn.q_norm.weight),
+            "wq_b": rows_of(stage.attn.wq_b.weight),
+            "wkv": rows_of(stage.attn.wkv.weight),
+            "kv_norm": rows_of(stage.attn.kv_norm.weight),
+            "wo_a": rows_of(stage.attn.wo_a.weight),
+            "wo_b": rows_of(stage.attn.wo_b.weight),
+            "attn_sink": rows_of(stage.attn.attn_sink),
+            "ffn_norm": rows_of(stage.ffn_norm.weight),
+            "hc_attn_fn": rows_of(stage.hc_attn_fn),
+            "hc_attn_base": rows_of(stage.hc_attn_base),
+            "hc_attn_scale": rows_of(stage.hc_attn_scale),
+            "hc_ffn_fn": rows_of(stage.hc_ffn_fn),
+            "hc_ffn_base": rows_of(stage.hc_ffn_base),
+            "hc_ffn_scale": rows_of(stage.hc_ffn_scale),
+            "router": rows_of(stage.ffn.gate.weight),
+            "router_bias": rows_of(stage.ffn.gate.bias),
+            "experts": [
+                {
+                    "w1": rows_of(expert.w1.weight),
+                    "w3": rows_of(expert.w3.weight),
+                    "w2": rows_of(expert.w2.weight),
+                }
+                for expert in stage.ffn.experts
+            ],
+            "shared": {
+                "w1": rows_of(stage.ffn.shared_experts.w1.weight),
+                "w3": rows_of(stage.ffn.shared_experts.w3.weight),
+                "w2": rows_of(stage.ffn.shared_experts.w2.weight),
+            },
+        }
+
+    return {
+        "gate": "dsparkDrafting",
+        "reference": (
+            "inference/model.py DSparkBlock.forward over DSparkAttention and Block.forward, "
+            "with sparse_attn transcribed from inference/kernel.py "
+            f"({snapshot_note()})"
+        ),
+        "config": {
+            "dim": dim,
+            "hc_mult": copies,
+            "sinkhorn_iters": args.hc_sinkhorn_iters,
+            "hc_eps": args.hc_eps,
+            "norm_eps": args.norm_eps,
+            "vocab_size": args.vocab_size,
+            "n_heads": args.n_heads,
+            "head_dim": args.head_dim,
+            "rope_head_dim": args.rope_head_dim,
+            "q_lora_rank": args.q_lora_rank,
+            "o_lora_rank": args.o_lora_rank,
+            "o_groups": args.o_groups,
+            "window_size": window,
+            "block_size": block_size,
+            "noise_token_id": args.dspark_noise_token_id,
+            "markov_rank": args.dspark_markov_rank,
+            "target_count": targets,
+            "stage_count": args.n_mtp_layers,
+            "prefix_len": prefix_len,
+            "start_pos": start_pos,
+            "routed_experts": args.dspark_n_routed_experts,
+            "activated_experts": args.dspark_n_activated_experts,
+            "swiglu_limit": args.swiglu_limit,
+            "temperature": args.temperature,
+        },
+        "input": {
+            "main_hidden_prefix": rows_of(main_hidden_prefix[0]),
+            "main_hidden_step": rows_of(main_hidden_step[0]),
+            "token": seed_token,
+        },
+        "weights": {
+            "embed": rows_of(embedding.weight),
+            "head": rows_of(head.weight),
+            # Stage 0 carries the target-layer projection, the last stage the norm
+            # and the two output heads; each stage carries a whole block.
+            "main_proj": rows_of(stages[0].main_proj.weight),
+            "main_norm": rows_of(stages[0].main_norm.weight),
+            "norm": rows_of(stages[-1].norm.weight),
+            "markov_embed": rows_of(stages[-1].markov_head.embed.weight),
+            "markov_head": rows_of(stages[-1].markov_head.head.weight),
+            "confidence": rows_of(stages[-1].confidence_head.proj.weight),
+            "stages": [stage_weights(stage) for stage in stages],
+        },
+        "expected": {
+            # [prefix][dim] and [1][dim]: the conditioning rows, before the block.
+            "main_x_prefix": rows_of(main_x_prefix[0]),
+            "main_x_step": rows_of(main_x_step[0]),
+            # [block][dim]: `forward_embed`'s stack, one copy (they are identical).
+            "draft_embedding": rows_of(seed_stack[0][:, 0]),
+            # [stage][window][head_dim]: the ring after each call. The short seed must
+            # land in slot order; the long one rotates so slot `len % window` is first.
+            "window_after_seed": [rows_of(ring) for ring in seeded],
+            "window_after_short_seed": rows_of(short.attn.window_kv_cache[0]),
+            "window_after_draft": [rows_of(ring) for ring in drafted_window],
+            # [block][dim]: `attn_norm(hc_pre(x, pre_mix))`, what stage 0's queries and
+            # latents are built from, and [block][n_heads][head_dim] out of
+            # `sparse_attn` before the output's rope payload is conjugated back out.
+            "attention_input": rows_of(norms[0][0]),
+            "attention_query": rows_of(queries[0][0].flatten(1)),
+            "attention_out": rows_of(attended_out[0][0].flatten(1)),
+            # [block][dim]: the attention sub-layer's output after the grouped
+            # `wo_a` and `wo_b`, and [block][dim]: the MoE's own output.
+            "attention_projected": rows_of(projected[0][0]),
+            "ffn_input": rows_of(ffn_in[0][0]),
+            "post_attention": rows_of(post_attention[0]),
+            "ffn_out": rows_of(ffn_out[0][0]),
+            # [stage][block][hc][dim]: the residual stream after each stage's
+            # attention AND ffn, so the chain is pinned stage by stage.
+            "stage_out": [rows_of(out) for out in through],
+            # [block][hc]: the mix the head collapses the last stage with.
+            "pre_mix": rows_of(pre_mix),
+            # [block][dim]: the collapse `forward_head` normalizes and projects.
+            "head_input": rows_of(collapses[0][0]),
+            # [block][vocab]: the draft head's own logits, before any Markov bias.
+            # Taken from the head itself, because `forward_head` adds the bias INTO
+            # `logits` in place and its return value is already mixed.
+            "block_logits": rows_of(head_logits[0][0]),
+            "output_ids": out_ids[0].tolist(),
+            "confidence": rows_of(confidence[0]),
+        },
+    }
+
+
+
+def compressor_state_case(torch, reference) -> dict:
+    """`Compressor.forward` across a decode sequence: the accumulator lifecycle.
+
+    `compressor` pins one block's pooling arithmetic. This pins what the SAME module
+    does when positions arrive one at a time, which is where a real bug lived: the
+    state is per module instance (`kv_state` / `score_state` are buffers), a position
+    fills slot `start_pos % ratio`, and a row comes out only when
+    `(start_pos + 1) % ratio == 0`. A port that shares one per-position block across
+    the owners, or that counts slots instead of taking the position modulo the ratio,
+    pools one layer's latent together with another's and produces plausible text.
+
+    The norm is replaced by `Identity` so the returned rows are the pooled latent
+    itself — the normalisation is pinned by the `compressor` case, and comparing
+    against `pooledLatent` requires the raw form.
+
+    What makes this suite discriminating is `kv_state` at the end: it holds one row
+    per slot, each the projection of a DIFFERENT position, so a port that shares one
+    block between owners, or that advances a slot counter instead of taking the
+    position modulo the ratio, cannot reproduce it.
+    """
+    args = reference.ModelArgs(
+        dim=8,
+        head_dim=4,
+        norm_eps=1e-6,
+        compress_ratios=[0, 3],
+        max_batch_size=1,
+    )
+    module = fill(reference.Compressor(args, 1), torch)
+    module.norm = torch.nn.Identity()
+    ratio = module.compress_ratio
+    positions = 7
+
+    # One distinct row per position, so a slot written twice or by the wrong
+    # position is visible in `kv_state` rather than merely in the pooled output.
+    x = (
+        torch.arange(1.0, 1.0 + positions * args.dim, dtype=torch.float32).view(1, positions, args.dim)
+        * 0.25
+    )
+
+    with torch.no_grad():
+        outputs = []
+        for position in range(positions):
+            out = module(x[:, position : position + 1], position)
+            outputs.append(None if out is None else rows_of(out[0, 0]))
+        state = rows_of(module.kv_state[0])
+
+    return {
+        "gate": "compressorAccumulation",
+        "reference": f"inference/model.py Compressor.forward, decode branch ({snapshot_note()})",
+        "config": {
+            "dim": args.dim,
+            "head_dim": args.head_dim,
+            "compress_ratio": ratio,
+            "positions": positions,
+            "norm_eps": args.norm_eps,
+        },
+        "input": {
+            "positions": rows_of(x[0]),
+            "wkv": rows_of(module.wkv.weight),
+            "wgate": rows_of(module.wgate.weight),
+        },
+        "expected": {
+            # One entry per position: null while the group is still filling.
+            "outputs": outputs,
+            # [ratio][head_dim]: the slots the sequence left behind. Slot i must hold
+            # `wkv(x[p])` for the last p with `p % ratio == i`.
+            "kv_state": state,
+        },
+    }
+
+
+def chunk_case(torch, reference) -> dict:
+    """What a batch of positions reads, and what it pools: the prefill-chunk rules.
+
+    The port walks a prompt one position at a time today and is about to take the
+    checkpoint's own shape, where a chunk of positions goes through the block in one
+    pass. Two rules decide whether that pass sees what the walk sees, and both are
+    positional rather than numeric:
+
+      * the sliding-window mask. In a chunk every query attends over its own causal
+        window, which `get_window_topk_idxs` lists as chunk positions, with -1 where
+        a position has not been written yet. A decode step reuses the same ring but
+        has to rotate it, oldest slot first, and report the slots still unwritten at
+        the start of a sequence.
+      * the compressor's group split. `Compressor.forward` at `start_pos=0` pools the
+        chunk's complete groups and leaves the trailing remainder in its state, so a
+        chunk whose length is not a multiple of the ratio produces `len // ratio`
+        rows. Running the SAME module position by position through its decode branch
+        has to produce the same rows, and that equality is what a batched port claims
+        when it stops calling the module once per position.
+
+    Both halves are asked of the reference rather than restated: the slot lists come
+    from `get_window_topk_idxs` and the rows from `Compressor.forward` under both of
+    its branches. `chunk_state` is recorded because the remainder the chunk did not
+    pool is visible there.
+    """
+    window = 3
+    positions = 5
+    ratio = 2
+    args = reference.ModelArgs(
+        dim=8,
+        head_dim=4,
+        norm_eps=1e-6,
+        window_size=window,
+        compress_ratios=[0, ratio],
+        max_batch_size=1,
+    )
+
+    chunk_slots = rows_of(reference.get_window_topk_idxs(window, 1, positions, 0))[0]
+    decode = [
+        {
+            "start_pos": start_pos,
+            "slots": rows_of(reference.get_window_topk_idxs(window, 1, 1, start_pos))[0][0],
+        }
+        for start_pos in (0, 1, 3, 7)
+    ]
+
+    # One distinct row per position, so a group pooled from the wrong positions is
+    # visible in its values rather than only in the row count.
+    x = (
+        torch.arange(1.0, 1.0 + positions * args.dim, dtype=torch.float32).view(1, positions, args.dim)
+        * 0.25
+    )
+    chunk_module = fill(reference.Compressor(args, 1), torch)
+    chunk_module.norm = torch.nn.Identity()
+    step_module = fill(reference.Compressor(args, 1), torch)
+    step_module.norm = torch.nn.Identity()
+
+    with torch.no_grad():
+        chunk_rows = rows_of(chunk_module(x, 0)[0])
+        step_rows = []
+        produced_at = []
+        for position in range(positions):
+            out = step_module(x[:, position : position + 1], position)
+            produced_at.append(out is not None)
+            if out is not None:
+                step_rows.append(rows_of(out[0, 0]))
+        chunk_state = rows_of(chunk_module.kv_state[0])
+
+    return {
+        "gate": "chunkAddressing",
+        "reference": (
+            "inference/model.py get_window_topk_idxs and Compressor.forward, both branches "
+            f"({snapshot_note()})"
+        ),
+        "config": {
+            "window_size": window,
+            "positions": positions,
+            "compress_ratio": ratio,
+            "dim": args.dim,
+            "head_dim": args.head_dim,
+        },
+        "input": {
+            "positions": rows_of(x[0]),
+            "wkv": rows_of(chunk_module.wkv.weight),
+            "wgate": rows_of(chunk_module.wgate.weight),
+        },
+        "expected": {
+            # [positions][min(positions, window)]: the chunk positions each query reads,
+            # -1 where that query has not reached the slot yet.
+            "chunk_window_slots": chunk_slots,
+            # Ring SLOTS, not positions: where a query's window sits once the ring has
+            # been written. Rotated oldest first, -1 where a slot is still unwritten.
+            "decode_window_slots": decode,
+            # [positions // ratio][head_dim], pooled by the chunk branch.
+            "chunk_rows": chunk_rows,
+            # The same rows from the decode branch, one position at a time.
+            "step_rows": step_rows,
+            # One entry per position: whether that position completed a group.
+            "step_produced_at": produced_at,
+            # [ratio][head_dim]: the trailing remainder the chunk left unpooled.
+            "chunk_state": chunk_state,
+        },
+    }
+
+
+def _hc_split_sinkhorn_for_goldens(torch, record):
+    """A torch transcription of `kernel.py`'s `hc_split_sinkhorn_kernel` body.
+
+    This is the one place in this script where the reference rule is transcribed
+    rather than executed. `hc_split_sinkhorn` is a tilelang kernel, so it cannot run
+    on CPU (the module's `kernel` import is refused above), and unlike `sparse_attn`
+    it has no readable torch twin in `model.py`. Its body is 40 lines of elementwise
+    arithmetic with an explicit order, so the transcription is checked against a
+    hand-computed one-round case in `DeepSeekV41HyperConnectionTests`; everything
+    AROUND the split — the projection of the flattened stack, the RMS scaling, the
+    sigmoid pre/post, the collapse and the expansion — is the reference's own code.
+
+    The split's arithmetic, from that kernel:
+
+      * `pre = sigmoid(mix * scale[0] + base) + eps`,
+      * `post = 2 * sigmoid(mix * scale[1] + base)`,
+      * `comb = mix * scale[2] + base`, then `softmax(comb, dim=-1)`, then `+eps`,
+        then ONE column normalization, then `sinkhorn_iters - 1` rounds of
+        row-then-column normalization, every divisor `+eps`.
+    """
+
+    def split(mixes, hc_scale, hc_base, hc_mult=4, sinkhorn_iters=20, eps=1e-6):
+        flat = mixes.reshape(-1, (2 + hc_mult) * hc_mult)
+        record.append(mixes.detach().clone())
+        pre = torch.empty(flat.size(0), hc_mult, dtype=torch.float32)
+        post = torch.empty(flat.size(0), hc_mult, dtype=torch.float32)
+        comb = []
+        for index in range(flat.size(0)):
+            row = flat[index]
+            pre[index] = torch.sigmoid(row[:hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + eps
+            post[index] = 2 * torch.sigmoid(
+                row[hc_mult : 2 * hc_mult] * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult]
+            )
+            tail = row[2 * hc_mult :].reshape(hc_mult, hc_mult)
+            bias = hc_base[2 * hc_mult :].reshape(hc_mult, hc_mult)
+            matrix = torch.softmax(tail * hc_scale[2] + bias, dim=-1) + eps
+            matrix = matrix / (matrix.sum(dim=0, keepdim=True) + eps)
+            for _ in range(sinkhorn_iters - 1):
+                matrix = matrix / (matrix.sum(dim=-1, keepdim=True) + eps)
+                matrix = matrix / (matrix.sum(dim=0, keepdim=True) + eps)
+            comb.append(matrix)
+        return pre, post, torch.stack(comb)
+
+    return split
+
+
+def hc_case(torch, reference) -> dict:
+    """`Block.hc_mixes` then `hc_pre` / `hc_post`: the mHC residual rule.
+
+    The block keeps `hc_mult` copies of the residual instead of one vector, and the
+    coefficients that decide how they mix are computed by projecting the WHOLE
+    flattened stack. `Block.hc_mixes`, `Block.hc_pre` and `Block.hc_post` are run
+    here as the reference wrote them, against a duck-typed `self` so the block's
+    attention and MoE — which need fused kernels — never run. Only the split itself
+    is transcribed (`_hc_split_sinkhorn_for_goldens`), because it is a tilelang
+    kernel.
+
+    Two positions with different mixes, so a collapse that ignores its mix is
+    visible in the numbers rather than only in a shape.
+    """
+    copies = 2
+    dim = 3
+    positions = 2
+    iterations = 3
+    norm_eps = 1e-6
+    eps = 1e-6
+    mix_count = (2 + copies) * copies
+
+    class _BlockSelf:
+        pass
+
+    block = _BlockSelf()
+    block.hc_mult = copies
+    block.hc_sinkhorn_iters = iterations
+    block.hc_eps = eps
+    block.norm_eps = norm_eps
+
+    generator = torch.Generator().manual_seed(20251017)
+    streams = (0.4 * torch.randn(1, positions, copies, dim, generator=generator)).float()
+    projection = (0.4 * torch.randn(mix_count, copies * dim, generator=generator)).float()
+    scale = torch.tensor([0.7, -0.3, 0.5], dtype=torch.float32)
+    base = (0.1 * torch.randn(mix_count, generator=generator)).float()
+    pre_mix = torch.tensor([[0.6, 0.4], [0.2, 0.8]], dtype=torch.float32).view(1, positions, copies)
+    sublayer = (0.5 * torch.randn(1, positions, dim, generator=generator)).float()
+
+    mixes_log: list = []
+    original = reference.hc_split_sinkhorn
+    reference.hc_split_sinkhorn = _hc_split_sinkhorn_for_goldens(torch, mixes_log)
+    try:
+        with torch.no_grad():
+            pre, post, comb = reference.Block.hc_mixes(block, streams, projection, scale, base)
+            collapse = reference.Block.hc_pre(block, streams, pre_mix)
+            expanded = reference.Block.hc_post(block, sublayer, streams, post, comb)
+    finally:
+        reference.hc_split_sinkhorn = original
+
+    return {
+        "gate": "hyperConnections",
+        "reference": (
+            "inference/model.py Block.hc_mixes, Block.hc_pre and Block.hc_post, with "
+            "hc_split_sinkhorn transcribed from inference/kernel.py "
+            f"({snapshot_note()})"
+        ),
+        "config": {
+            "hc_mult": copies,
+            "dim": dim,
+            "positions": positions,
+            "sinkhorn_iters": iterations,
+            "hc_eps": eps,
+            "norm_eps": norm_eps,
+            "mix_count": mix_count,
+        },
+        "input": {
+            "streams": rows_of(streams[0]),
+            "projection": rows_of(projection),
+            "scale": rows_of(scale),
+            "base": rows_of(base),
+            "pre_mix": rows_of(pre_mix[0]),
+            "sublayer_output": rows_of(sublayer[0]),
+        },
+        "expected": {
+            # [positions][mix_count]: the projection of the flattened stack, scaled by
+            # `rsqrt(mean(x^2) + norm_eps)`.
+            "mixes": rows_of(mixes_log[0][0]),
+            # [positions][hc_mult], both from the first `hc_mult` sections.
+            "pre": rows_of(pre),
+            "post": rows_of(post),
+            # [positions][hc_mult][hc_mult], the Sinkhorn-normalized mixing matrix.
+            "comb": rows_of(comb),
+            # [positions][dim]: the stack collapsed with `pre_mix`, not with one copy.
+            "collapse": rows_of(collapse[0]),
+            # [positions][hc_mult][dim]: the sub-layer output expanded back out and
+            # mixed with the residual through `comb`.
+            "expanded": rows_of(expanded[0]),
+        },
+    }
+
+
+def _vision_identifier(snapshot: str) -> dict:
+    """What token an image span is spelled with, from the checkpoint's own files.
+
+    The port renders an image span as a run of one marker string, so the marker's
+    spelling IS the position's token id. Three files agree about it and none of them
+    is the port's source: `encoding/encoding.py` defines `IMAGE_PLACEHOLDER`, the
+    tokenizer lists that spelling among its added tokens, and the config's
+    `image_token_id` is the id it was added under. `image_processor.prepare_vl_inputs`
+    cross-checks the last two at runtime and raises when they disagree.
+    """
+    with open(os.path.join(snapshot, "config.json"), "r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    with open(os.path.join(snapshot, "tokenizer.json"), "r", encoding="utf-8") as handle:
+        tokenizer = json.load(handle)
+    with open(os.path.join(snapshot, "encoding", "encoding.py"), "r", encoding="utf-8") as handle:
+        encoding_source = handle.read()
+
+    match = re.search(r'^IMAGE_PLACEHOLDER = "([^"]*)"', encoding_source, re.MULTILINE)
+    if match is None:
+        raise SystemExit("encoding/encoding.py no longer defines IMAGE_PLACEHOLDER")
+    placeholder = match.group(1)
+
+    added = {entry["content"]: entry.get("id") for entry in tokenizer.get("added_tokens") or []}
+    image_token_id = config.get("image_token_id")
+    if image_token_id is None:
+        image_token_id = (config.get("text_config") or {}).get("image_token_id")
+    spelled_at_config_id = next(
+        (text for text, ident in added.items() if ident == image_token_id), None
+    )
+
+    return {
+        "placeholder": placeholder,
+        "placeholder_codepoints": [ord(character) for character in placeholder],
+        "placeholder_token_id": added.get(placeholder),
+        "config_image_token_id": image_token_id,
+        "token_spelled_at_config_id": spelled_at_config_id,
+        "token_spelled_at_config_id_codepoints": (
+            [ord(character) for character in spelled_at_config_id] if spelled_at_config_id else None
+        ),
+    }
+
+
+def vision_case(torch, reference) -> dict:
+    """`ViT.forward` then `Aligner.forward`: patch grid to language-width rows.
+
+    Small enough to read and wide enough to be discriminating: hidden 8 with two
+    heads (so the 2D rotary has a real frequency vector and is shared across heads),
+    a 2x3 patch grid of 2x2 pixels (an ODD patch-column count, so the aligner's
+    padding to the next multiple of the ratio is exercised), one block, and a
+    downsample ratio of 2 (two aligner rows of two cells over hidden*4-wide cells).
+
+    The patches are given, not resized from an image: `load_image`'s PIL bicubic
+    resample is preprocessing, and pinning it would pin Pillow. Everything the tower
+    does to a patch grid is here.
+
+    Stage outputs come from forward hooks on the reference's own modules rather than
+    from a re-implementation of `Block.forward`, so a failing vector names the stage
+    that broke without this script restating the rule it is checking.
+
+    The identifier half is here too, because the gate has two reasons: the tower's
+    arithmetic (below) and the spelling of the token that addresses an image span.
+    """
+    args = reference.ModelArgs(
+        dim=5,
+        hc_mult=1,
+        max_batch_size=1,
+        vision_n_layers=1,
+        vision_dim=8,
+        vision_n_heads=2,
+        vision_inter_dim=4,
+        vision_patch_size=2,
+        vision_rope_theta=100.0,
+        vision_downsample_ratio=2,
+        vision_max_n_token=1024,
+        vision_min_pixels=0,
+    )
+    vit = fill(reference.ViT(args), torch)
+    aligner = fill(reference.Aligner(args), torch)
+
+    patch_size = args.vision_patch_size
+    n_h, n_w = 2, 3
+    # One row per patch of `3 * patchSize^2` values, channel-major, as
+    # `load_image`'s `reshape(3, n_h, p, n_w, p).permute(1, 3, 0, 2, 4)` emits them.
+    patches = torch.tensor(
+        [
+            ((token * 7 + dimension * 3) % 5 - 2) * 0.25
+            for token in range(n_h * n_w)
+            for dimension in range(3 * patch_size * patch_size)
+        ],
+        dtype=torch.float32,
+    ).view(n_h * n_w, 3, patch_size, patch_size)
+
+    stages = {}
+    handles = []
+    for name, module in (
+        ("patch_embed", vit.patch_embed),
+        ("attn", vit.blocks[0].attn),
+        ("mlp", vit.blocks[0].mlp),
+        ("block", vit.blocks[0]),
+        ("norm", vit.norm),
+    ):
+
+        def capture(_module, _inputs, output, name=name):
+            stages[name] = output.detach().float()
+
+        handles.append(module.register_forward_hook(capture))
+
+    with torch.no_grad():
+        # `ViT.forward(patches, n_h, n_w)` builds the rotary table itself; the aligner
+        # then unshuffles the tower's output on the SAME patch grid.
+        tower = vit(patches, n_h, n_w)
+        aligned = aligner(tower, n_h, n_w)
+
+    for handle in handles:
+        handle.remove()
+    if set(stages) != {"patch_embed", "attn", "mlp", "block", "norm"}:
+        raise SystemExit(f"vision hooks did not all fire: {sorted(stages)}")
+    if not torch.equal(stages["norm"], tower):
+        raise SystemExit("the final-norm hook and the tower's return value disagree")
+
+    block = vit.blocks[0]
+    return {
+        "gate": "visionPatching",
+        "reference": (
+            f"inference/vision.py ViT.forward + Aligner.forward ({snapshot_note()})"
+        ),
+        "config": {
+            "hidden": args.vision_dim,
+            "heads": args.vision_n_heads,
+            "intermediate": args.vision_inter_dim,
+            "patch_size": patch_size,
+            "downsample_ratio": args.vision_downsample_ratio,
+            "rope_theta": args.vision_rope_theta,
+            "rope_dim": vit.rope_dim,
+            "text_hidden": args.dim,
+            "rows": n_h,
+            "columns": n_w,
+            "norm_eps": 1e-6,
+        },
+        "input": {
+            "patches": rows_of(patches.view(n_h * n_w, -1)),
+            "patch_embed_weight": rows_of(vit.patch_embed.proj.weight),
+            "patch_embed_bias": rows_of(vit.patch_embed.proj.bias),
+            "block_norm1_gain": rows_of(block.norm1.weight),
+            "block_wqkv_weight": rows_of(block.attn.wqkv.weight),
+            "block_wqkv_bias": rows_of(block.attn.wqkv.bias),
+            "block_wo_weight": rows_of(block.attn.wo.weight),
+            "block_wo_bias": rows_of(block.attn.wo.bias),
+            "block_norm2_gain": rows_of(block.norm2.weight),
+            "block_w1_weight": rows_of(block.mlp.w1.weight),
+            "block_w2_weight": rows_of(block.mlp.w2.weight),
+            "final_norm_gain": rows_of(vit.norm.weight),
+            "aligner_w1_weight": rows_of(aligner.w1.weight),
+            "aligner_w1_bias": rows_of(aligner.w1.bias),
+            "aligner_w2_weight": rows_of(aligner.w2.weight),
+            "aligner_w2_bias": rows_of(aligner.w2.bias),
+        },
+        "expected": {
+            # [tokens][hidden]: the patch projection, before any block.
+            "patch_embed": rows_of(stages["patch_embed"]),
+            # [tokens][hidden]: attention's output after `wo`, rotary included.
+            "attn": rows_of(stages["attn"]),
+            # [tokens][hidden]: the MLP branch alone, after `w2`.
+            "mlp": rows_of(stages["mlp"]),
+            # [tokens][hidden]: the residual stream after the block.
+            "block": rows_of(stages["block"]),
+            # [tokens][hidden]: `ViT.forward`'s return value, i.e. the final norm.
+            "normalized": rows_of(stages["norm"]),
+            # [cells][text_hidden]: one language-width row per aligner cell.
+            "aligner": rows_of(aligned),
+        },
+        "identifier": _vision_identifier(_SNAPSHOT),
+    }
+
+
+CASES = {
+    "engram": engram_case,
+    "compressor": compressor_case,
+    "compressor_state": compressor_state_case,
+    "chunk": chunk_case,
+    "hc": hc_case,
+    "router": router_case,
+    "dspark": dspark_case,
+    "dspark_block": dspark_block_case,
+    "vision": vision_case,
+}
+
+_SNAPSHOT = ""
+
+
+def snapshot_note() -> str:
+    return _SNAPSHOT or "unknown snapshot"
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "case", nargs="?", default="all", choices=["all", *CASES], help="which vectors to emit"
+    )
+    parser.add_argument("--snapshot", help="snapshot directory holding inference/")
+    parser.add_argument("--json", help="write the vectors here instead of stdout")
+    options = parser.parse_args(argv)
+
+    global _SNAPSHOT
+    snapshot = find_snapshot(options.snapshot)
+    _SNAPSHOT = snapshot
+    torch, reference = load_reference(snapshot)
+
+    names = list(CASES) if options.case == "all" else [options.case]
+    payload = {
+        "meta": {
+            "torch": torch.__version__,
+            "snapshot": snapshot,
+            "note": (
+                "Dense FP32 module weights and one rank. Generated by "
+                "Tools/dsv41_goldens.py from the checkpoint's own inference/ "
+                "source; no checkpoint weights were read."
+            ),
+        }
+    }
+    for name in names:
+        payload[name] = CASES[name](torch, reference)
+
+    text = json.dumps(payload, indent=2)
+    if options.json:
+        with open(options.json, "w", encoding="utf-8") as handle:
+            handle.write(text + "\n")
+        print(f"wrote {options.json}", file=sys.stderr)
+    else:
+        print(text)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

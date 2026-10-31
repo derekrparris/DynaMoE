@@ -14,14 +14,20 @@
 //  `n_heads = 8`, the bucket arithmetic must address exactly
 //  `engram_num_embeddings[0] = 384_006_168` rows of the published checkpoint.
 //
+//  The fixtures in `DeepSeekV41ConfigTests` are SYNTHETIC: they exercise decoding
+//  branches, and their widths are not the model's. Anything asserted as a fact
+//  about the checkpoint belongs in `DeepSeekV41PublishedConfigTests`, which decodes
+//  the two config files the checkpoint actually ships.
+//
 
 import XCTest
 @testable import DynaMoE
 
 final class DeepSeekV41ConfigTests: XCTestCase {
 
-    /// The multimodal wrapper shape: text tower under `text_config`, vision
-    /// tower beside it, token ids at the root.
+    /// The multimodal wrapper SHAPE, at synthetic widths: text tower under
+    /// `text_config`, vision tower beside it, token ids at the root. The published
+    /// file is `DeepSeekV41PublishedConfigTests.publishedWrapperJSON`.
     static let wrapperJSON = """
     {
       "architectures": ["DeepseekV41ForCausalLM"],
@@ -115,6 +121,33 @@ final class DeepSeekV41ConfigTests: XCTestCase {
         XCTAssertEqual(config.engramRowCounts, [384_006_168, 384_016_682])
     }
 
+    /// The multimodal wrapper spells the sliding window `sliding_window`; the flat
+    /// `inference/config.json` spells it `window_size`. Reading only one of them
+    /// left every layer's ring zero rows wide, which reads as "no window" and
+    /// refused the checkpoint with a compress-ratio problem on every layer.
+    func testTheWrapperSlidingWindowDecodes() throws {
+        let json = Self.wrapperJSON.replacingOccurrences(
+            of: "\"window_size\": 128,",
+            with: "\"sliding_window\": 128,"
+        )
+        let config = try DeepSeekV41Config.decode(jsonData: Data(json.utf8))
+        XCTAssertEqual(config.windowSize, 128)
+        XCTAssertEqual(DeepSeekV41DevicePlan.gatherRowBudget(config: config), 128 + 512)
+    }
+
+    /// A CSA2 checkpoint always has a window ring, so a config that declares
+    /// `compress_ratios` with no window is broken rather than window-less. This is
+    /// the failure the alias above would otherwise hide as a note in the log.
+    func testACSA2ConfigWithoutAWindowIsRejected() {
+        let json = Self.wrapperJSON.replacingOccurrences(of: "\"window_size\": 128,", with: "")
+        XCTAssertThrowsError(try DeepSeekV41Config.decode(jsonData: Data(json.utf8))) { error in
+            guard case DeepSeekV41ConfigError.invalidField(let field, _)? = error as? DeepSeekV41ConfigError else {
+                return XCTFail("expected an invalid window field, got \(error)")
+            }
+            XCTAssertEqual(field, "window_size")
+        }
+    }
+
     /// The latent cache widths the reference documents: 512 E4M3 values plus
     /// one E8M0 scale per 32 is 528 bytes; the designed FP4 record is 288.
     func testCacheRecordWidths() throws {
@@ -155,19 +188,24 @@ final class DeepSeekV41ConfigTests: XCTestCase {
 
     func testCompressedCacheIsSmallEvenAtFullContext() throws {
         let config = try config()
-        // 2 owners x 288 bytes x 1M tokens is ~576 MB of main cache; the window
-        // rings are bounded by window_size and cost nothing per token.
+        // This fixture declares two owners, so 2 x 288 bytes x 1M tokens is ~576 MB
+        // of main cache; the published checkpoint has four (see
+        // `DeepSeekV41PublishedConfigTests.testTheCacheCostsWhatFourOwnersCost`).
+        // The window rings are bounded by window_size and cost nothing per token.
         XCTAssertEqual(config.cacheBytesPerToken(useFP4Main: true), 576)
         XCTAssertEqual(config.cacheBytesPerToken(useFP4Main: false), 1056)
         let mainCache = config.cacheBytesPerToken(useFP4Main: true) * 1_048_576
         XCTAssertLessThan(Double(mainCache) / 1_073_741_824.0, 1.0)
     }
 
+    /// The flat shape at synthetic widths, narrowed to the fields this test needs.
+    /// The published file is `DeepSeekV41PublishedConfigTests.publishedFlatJSON`.
     func testFlatInferenceConfigDecodes() throws {
         let flat = """
         {"model_type": "deepseek_v41", "n_layers": 40, "dim": 7168, "n_heads": 128,
          "vocab_size": 129280, "n_routed_experts": 384, "n_activated_experts": 6,
          "qk_nope_head_dim": 512, "v_head_dim": 512, "o_groups": 8,
+         "window_size": 128,
          "compress_ratios": [0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
          1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
          "engram_layer_ids": [1, 14], "engram_num_embeddings": [384006168, 384016682],
@@ -472,11 +510,11 @@ final class DeepSeekV41EngramTests: XCTestCase {
     }
 
     /// The hash ids are pinned against the reference in
-    /// `DeepSeekV41EngramTokenMapTests`, which is what this gate records. The
-    /// combination rule next to it has no vectors, so it stays open.
+    /// `DeepSeekV41EngramTokenMapTests`, and the combination rule next to it in
+    /// `DeepSeekV41EngramGoldenTests`. Both are what these gates record.
     func testHashConformanceFollowsTheCheckedInVectors() {
         XCTAssertEqual(DeepSeekV41EngramHasher.conformance, .verifiedAgainstReference)
-        XCTAssertEqual(DeepSeekV41Conformance.engramCombination, .unverified)
+        XCTAssertEqual(DeepSeekV41Conformance.engramCombination, .verifiedAgainstReference)
     }
 
     func testSyntheticTokenMapCompression() throws {
@@ -685,6 +723,35 @@ final class DeepSeekV41WeightCatalogTests: XCTestCase {
         }
     }
 
+    /// Indexer weights follow the reference's ownership split: only an index-source
+    /// layer publishes them, and inside one only a layer that compresses its own KV
+    /// owns the keys. Demanding the whole set on every compressed layer rejected the
+    /// real checkpoint, which publishes no indexer tensors on its 30 reader layers
+    /// and no `wk`/`k_norm` on the four index sources that are not KV sources.
+    func testIndexerRolesFollowTheSources() throws {
+        let json = DeepSeekV41ConfigTests.wrapperJSON
+            .replacingOccurrences(
+                of: "\"index_source_layer_ids\": [2, 20],",
+                with: "\"index_source_layer_ids\": [2, 20, 24],"
+            )
+        let config = try DeepSeekV41Config.decode(jsonData: Data(json.utf8))
+        let plan = try config.makeLayerPlan()
+        let byIndex = Dictionary(uniqueKeysWithValues: plan.map { ($0.index, $0) })
+
+        XCTAssertEqual(
+            DeepSeekV41WeightCatalog.requiredIndexerRoles(layer: byIndex[20]!, config: config),
+            [.indexerWqB, .indexerWeights, .indexerWk, .indexerKNorm]
+        )
+        XCTAssertEqual(
+            DeepSeekV41WeightCatalog.requiredIndexerRoles(layer: byIndex[24]!, config: config),
+            [.indexerWqB, .indexerWeights]
+        )
+        XCTAssertEqual(
+            DeepSeekV41WeightCatalog.requiredIndexerRoles(layer: byIndex[3]!, config: config),
+            []
+        )
+    }
+
     func testDraftBlockTensorsClassify() {
         let catalog = DeepSeekV41WeightCatalog(
             named: [
@@ -702,6 +769,44 @@ final class DeepSeekV41WeightCatalogTests: XCTestCase {
         XCTAssertNotNil(catalog.tensor(.draftConfidence, scope: .draft, layer: 0))
         XCTAssertNotNil(catalog.tensor(.expertW3, scope: .draft, layer: 1, expert: 5))
         XCTAssertTrue(catalog.unconsumed.isEmpty)
+    }
+
+    /// `hc_*_fn` is one projection of the FLATTENED stack, not a per-copy vector.
+    /// The published checkpoint publishes `layers.N.hc_attn_fn` as `F32`
+    /// `[24, 20480]` (hc_mult 4 over a 5120-wide hidden state), so a catalog
+    /// carrying the shape the port used to read has to fail at load rather than run
+    /// a graph with the wrong coefficients.
+    func testHyperConnectionTensorsMustCarryTheProjectionShape() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let copies = max(1, config.hcMult)
+        let mixCount = (2 + copies) * copies
+        let columns = copies * DeepSeekV41TensorShapes(config: config).hidden
+
+        func problems(fnShape: [Int]) -> [String] {
+            var named: [DeepSeekV41TensorRef] = []
+            for layer in plan {
+                let l = layer.index
+                named.append(contentsOf: [
+                    tensor("layers.\(l).hc_attn_fn", "F32", fnShape),
+                    tensor("layers.\(l).hc_attn_base", "F32", [mixCount]),
+                    tensor("layers.\(l).hc_attn_scale", "F32", [3]),
+                    tensor("layers.\(l).hc_ffn_fn", "F32", [mixCount, columns]),
+                    tensor("layers.\(l).hc_ffn_base", "F32", [mixCount]),
+                    tensor("layers.\(l).hc_ffn_scale", "F32", [3])
+                ])
+            }
+            let catalog = DeepSeekV41WeightCatalog(named: named, layerCount: plan.count)
+            return catalog.validate(config: config, plan: plan).filter { $0.contains("hc_") }
+        }
+
+        XCTAssertEqual(problems(fnShape: [mixCount, columns]), [])
+        let wrong = problems(fnShape: [1, copies])
+        XCTAssertEqual(wrong.count, plan.count, "\(wrong)")
+        XCTAssertTrue(
+            wrong.allSatisfy { $0.contains("hc_attn_fn is [1, \(copies)], expected [\(mixCount), \(columns)]") },
+            "\(wrong)"
+        )
     }
 
     func testUnknownTensorIsReportedAsUnconsumed() {
@@ -781,7 +886,8 @@ final class DeepSeekV41WeightCatalogTests: XCTestCase {
                 tensor("mtp.0.attn.wkv.scale", "F8_E8M0", [16, 160]),
                 tensor("mtp.0.attn.wq_b.weight", "F8_E4M3", [32768, 1280]),
                 tensor("mtp.0.ffn.gate.bias", "F32", [384]),
-                tensor("mtp.0.hc_attn_fn", "BF16", [4, 4])
+                // The published draft block publishes `hc_attn_fn` as F32 [24, 20480].
+                tensor("mtp.0.hc_attn_fn", "F32", [24, 20480])
             ],
             layerCount: 40
         )
@@ -863,18 +969,38 @@ final class DeepSeekV41WeightCatalogTests: XCTestCase {
 /// update would otherwise be invisible: the load log is the only place it shows.
 final class DeepSeekV41ConformanceGateTests: XCTestCase {
 
-    func testEveryNumericRuleIsStillUnverified() {
-        // Engram indexing is the one rule with checked-in reference vectors.
+    func testOnlyTheRulesWithReferenceVectorsAreVerified() {
+        // Checked-in vectors, from `Tools/dsv41_goldens.py` and its test suites:
+        // Engram indexing, the Engram combination, the compressor's pooling and
+        // accumulation, the cache rows a prefill chunk reads, the hyper-connection
+        // coefficient split, the router's scoring, and the vision tower together
+        // with the spelling of the token that addresses an image span.
         XCTAssertEqual(DeepSeekV41EngramHasher.conformance, .verifiedAgainstReference)
-        XCTAssertEqual(DeepSeekV41Conformance.compressorPooling, .unverified)
-        XCTAssertEqual(DeepSeekV41Conformance.routerScoring, .unverified)
+        XCTAssertEqual(DeepSeekV41Conformance.engramCombination, .verifiedAgainstReference)
+        XCTAssertEqual(DeepSeekV41Conformance.compressorPooling, .verifiedAgainstReference)
+        XCTAssertEqual(DeepSeekV41Conformance.compressorAccumulation, .verifiedAgainstReference)
+        XCTAssertEqual(DeepSeekV41Conformance.chunkAddressing, .verifiedAgainstReference)
+        XCTAssertEqual(DeepSeekV41Conformance.hyperConnections, .verifiedAgainstReference)
+        XCTAssertEqual(DeepSeekV41Conformance.routerScoring, .verifiedAgainstReference)
+        XCTAssertEqual(DeepSeekV41Conformance.visionPatching, .verifiedAgainstReference)
+        // Still open: `candidateSelection` needs live cache state, and the batched
+        // device prefill's addressing rule is verified while the multi-position
+        // device graph that would consume it cannot be compared against a walk
+        // without real weights.
         XCTAssertEqual(DeepSeekV41Conformance.candidateSelection, .unverified)
-        XCTAssertEqual(DeepSeekV41Conformance.engramCombination, .unverified)
-        XCTAssertEqual(DeepSeekV41Conformance.hyperConnections, .unverified)
-        XCTAssertEqual(DeepSeekV41Conformance.dsparkDrafting, .unverified)
-        XCTAssertEqual(DeepSeekV41Conformance.visionPatching, .unverified)
-        XCTAssertEqual(DeepSeekV41Conformance.unverifiedSummary.count, 7)
+        XCTAssertEqual(DeepSeekV41Conformance.dsparkDrafting, .verifiedAgainstReference)
+        XCTAssertEqual(DeepSeekV41Conformance.batchedDevicePrefill, .unverified)
+        XCTAssertEqual(DeepSeekV41Conformance.unverifiedSummary.count, 2)
         XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("Engram hashing"))
+        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("Engram combination"))
+        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("compressor pooling"))
+        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("compressor accumulation"))
+        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("chunk addressing"))
+        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("hyper-connections"))
+        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("router scoring"))
+        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("vision patching"))
+        XCTAssertTrue(DeepSeekV41Conformance.unverifiedSummary.contains("batched device prefill"))
+        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("DSpark drafting"))
     }
 }
 
@@ -1019,6 +1145,26 @@ final class DeepSeekV41MemoryPlanTests: XCTestCase {
         XCTAssertEqual(memory.engramStagingBytes, 64 * (264 + 264) * 2)
     }
 
+    /// The arena is a cache, not a requirement: what matters is that a big machine
+    /// holds a working set rather than the `numActivatedExperts * 2` placeholder.
+    func testAffordableExpertSlotsScaleWithRam() throws {
+        let config = try wrapperConfig()
+        let plan = try config.makeLayerPlan()
+        let memory = DeepSeekV41MemoryPlan.make(
+            config: config, plan: plan, catalog: nil, contextLength: 4_096
+        )
+        let slots = DeepSeekV41MemoryPlan.affordableExpertSlots(plan: memory, physicalGB: 128)
+        // 0.6 * 128 GB over a ~23 MB expert is a few thousand pairs, and the
+        // checkpoint publishes 384 * 40 = 15,360 of them.
+        XCTAssertGreaterThan(slots, 1_000, "128 GB must hold a working set")
+        XCTAssertLessThan(slots, config.numRoutedExperts * config.numHiddenLayers)
+        XCTAssertLessThan(
+            DeepSeekV41MemoryPlan.affordableExpertSlots(plan: memory, physicalGB: 16),
+            slots
+        )
+        XCTAssertEqual(DeepSeekV41MemoryPlan.affordableExpertSlots(plan: memory, physicalGB: 0), 1)
+    }
+
     func testRequiredBytesGrowsWithResidentExperts() throws {
         let config = try wrapperConfig()
         let plan = try config.makeLayerPlan()
@@ -1142,7 +1288,7 @@ final class DeepSeekV41EngramReaderTests: XCTestCase {
         try shard.write(to: url)
         defer { try? FileManager.default.removeItem(at: url) }
 
-        let reader = try DeepSeekV41EngramReader(fileURL: url, spec: spec, baseOffset: base)
+        let reader = try DeepSeekV41EngramReader(fileURL: url, spec: spec, valuesOffset: base)
         defer { reader.closeNow() }
         let buffer = UnsafeMutableRawPointer.allocate(byteCount: spec.rowBytes, alignment: 8)
         defer { buffer.deallocate() }
@@ -1166,6 +1312,245 @@ final class DeepSeekV41EngramReaderTests: XCTestCase {
         let url = try makeTable(rows: 8, rowBytes: spec.rowBytes)
         defer { try? FileManager.default.removeItem(at: url) }
         XCTAssertThrowsError(try DeepSeekV41EngramReader(fileURL: url, spec: spec))
+    }
+
+    /// The checkpoint publishes a row as TWO tensors: `engram.embed.weight` holds
+    /// every row's E4M3 values and `engram.embed.scale` holds every row's E8M0
+    /// block scales, in two blocks that are gigabytes apart. A reader that assumes
+    /// one contiguous `head_dim + head_dim/32` row takes the next row's values as
+    /// this row's exponents, which decodes to finite garbage instead of failing.
+    func testReadsASplitTablesScaleBlock() throws {
+        let spec = spec(rowCount: 64)
+        let scaleBytes = spec.rowBytes - spec.headDimension
+        XCTAssertEqual(scaleBytes, 1)
+
+        var shard = Data(repeating: 0xEE, count: 32)
+        let valuesOffset = shard.count
+        for row in 0..<spec.rowCount {
+            shard.append(contentsOf: [UInt8](repeating: UInt8(row & 0xFF), count: spec.headDimension))
+        }
+        shard.append(contentsOf: [UInt8](repeating: 0xEE, count: 16))
+        let scalesOffset = shard.count
+        for row in 0..<spec.rowCount {
+            shard.append(UInt8(0x40 + row))
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dsv41-engram-split-\(UUID().uuidString).bin")
+        try shard.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let reader = try DeepSeekV41EngramReader(
+            fileURL: url, spec: spec, valuesOffset: valuesOffset, scalesOffset: scalesOffset
+        )
+        defer { reader.closeNow() }
+
+        let rows = [3, 17, 63]
+        let requests = rows.enumerated().map { column, row in
+            DeepSeekV41EngramRowRequest(
+                layer: 1, column: column, bucket: 0, row: row,
+                byteOffset: row * spec.rowBytes, byteCount: spec.rowBytes
+            )
+        }
+        let buffer = UnsafeMutableRawPointer.allocate(
+            byteCount: requests.count * spec.rowBytes, alignment: 8
+        )
+        defer { buffer.deallocate() }
+        _ = try reader.readRows(requests, into: buffer)
+
+        for (index, row) in rows.enumerated() {
+            let slice = buffer.advanced(by: index * spec.rowBytes)
+                .assumingMemoryBound(to: UInt8.self)
+            for value in 0..<spec.headDimension {
+                XCTAssertEqual(slice[value], UInt8(row & 0xFF), "row \(row) value \(value)")
+            }
+            XCTAssertEqual(
+                slice[spec.headDimension], UInt8(0x40 + row),
+                "row \(row) took another row's block scale"
+            )
+        }
+    }
+
+    /// The published table itself, which no fixture can stand in for: its rows are
+    /// two tensors 98 GB apart, and its shard is the one segmentation renumbers.
+    /// Skips when the checkpoint is not downloaded.
+    func testThePublishedTableOpensAndDecodesSaneRows() throws {
+        let hub = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(
+                ".cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots"
+            )
+        guard let entries = try? FileManager.default.contentsOfDirectory(
+            at: hub, includingPropertiesForKeys: nil
+        ), let snapshot = entries.first(where: {
+            FileManager.default.fileExists(
+                atPath: $0.appendingPathComponent("model.safetensors.index.json").path
+            )
+        }) else {
+            throw XCTSkip("DeepSeek-V4.1 snapshot not downloaded")
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let summary = try engine.getSummary()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let catalog = DeepSeekV41WeightCatalog.from(
+            summary: summary, layerCount: config.numHiddenLayers
+        )
+        XCTAssertFalse(config.engramTables.isEmpty)
+
+        for spec in config.engramTables {
+            let valuesRef = try XCTUnwrap(catalog.tensor(.engramTable, layer: spec.layer))
+            let scaleRef = try XCTUnwrap(
+                catalog.tensor(.engramTable, layer: spec.layer, scale: true),
+                "layer \(spec.layer) publishes no scale companion"
+            )
+            let values = try XCTUnwrap(summary.tensors.first { $0.name == valuesRef.name })
+            let scale = try XCTUnwrap(summary.tensors.first { $0.name == scaleRef.name })
+            // The scale block must be a DIFFERENT span of the same file, or this
+            // test would pass on an interleaved table that no checkpoint ships.
+            XCTAssertNotEqual(values.offsetStart, scale.offsetStart)
+            // The readiness check in `DeepSeekV41DeviceWeights` refuses a table
+            // whose scale companion is not one entry per row per block.
+            XCTAssertEqual(
+                DeepSeekV41WeightCatalog.shape(from: scale.shapeDisplay),
+                [spec.rowCount, spec.rowBytes - spec.headDimension]
+            )
+
+            let filename = try XCTUnwrap(
+                DeepSeekV41EngramTableLocator.shardFilename(
+                    forTensorNamed: valuesRef.name, in: snapshot
+                ),
+                "layer \(spec.layer)'s table shard could not be located"
+            )
+            let reader = try DeepSeekV41EngramReader(
+                fileURL: snapshot.appendingPathComponent(filename),
+                spec: spec,
+                valuesOffset: Int(values.offsetStart),
+                scalesOffset: Int(scale.offsetStart)
+            )
+            defer { reader.closeNow() }
+
+            let rows = [0, 1, 7, spec.rowCount / 2, spec.rowCount - 1]
+            let requests = rows.enumerated().map { column, row in
+                DeepSeekV41EngramRowRequest(
+                    layer: spec.layer, column: column, bucket: 0, row: row,
+                    byteOffset: row * spec.rowBytes, byteCount: spec.rowBytes
+                )
+            }
+            let buffer = UnsafeMutableRawPointer.allocate(
+                byteCount: requests.count * spec.rowBytes, alignment: 8
+            )
+            defer { buffer.deallocate() }
+            _ = try reader.readRows(requests, into: buffer)
+
+            for (index, row) in rows.enumerated() {
+                let raw = UnsafeBufferPointer(
+                    start: buffer.advanced(by: index * spec.rowBytes)
+                        .assumingMemoryBound(to: UInt8.self),
+                    count: spec.rowBytes
+                )
+                let decoded = DeepSeekV41EngramRowDequantizer.row(
+                    Array(raw), headDimension: spec.headDimension
+                )
+                XCTAssertEqual(decoded.count, spec.headDimension)
+                // A dequantized embedding row is a few units wide. Reading the next
+                // row's values as this row's block scales puts exponents in the
+                // 1e-5..1e+30 range, which this catches.
+                let largest = decoded.map { abs($0) }.max() ?? 0
+                XCTAssertTrue(largest.isFinite, "row \(row) decoded to \(largest)")
+                XCTAssertLessThan(largest, 64, "row \(row) decoded to \(largest)")
+                XCTAssertFalse(decoded.allSatisfy { $0 == 0 }, "row \(row) decoded to zeros")
+            }
+        }
+    }
+
+    /// A split table whose scale block is missing must be refused at open rather
+    /// than read short.
+    func testSplitTableWithoutItsScaleBlockIsRefused() throws {
+        let spec = spec(rowCount: 64)
+        var shard = Data()
+        for row in 0..<spec.rowCount {
+            shard.append(contentsOf: [UInt8](repeating: UInt8(row & 0xFF), count: spec.headDimension))
+        }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dsv41-engram-noscale-\(UUID().uuidString).bin")
+        try shard.write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        XCTAssertThrowsError(
+            try DeepSeekV41EngramReader(
+                fileURL: url, spec: spec, valuesOffset: 0, scalesOffset: shard.count + 1
+            )
+        )
+    }
+
+    /// A layer's table is addressed by NAME, and the segmented summary cannot be
+    /// trusted to name its file: a streamed table's shard is renumbered into
+    /// segments (or dropped when it holds nothing else). The checkpoint's own
+    /// manifest supplies the filename.
+    func testTheTableFileComesFromTheManifest() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dsv41-locate-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let map: [String: Any] = [
+            "weight_map": [
+                "layers.1.engram.embed.weight": "model-00047-of-00048.safetensors",
+                "layers.1.attn.wkv.weight": "model-00001-of-00048.safetensors"
+            ]
+        ]
+        try JSONSerialization.data(withJSONObject: map)
+            .write(to: dir.appendingPathComponent("model.safetensors.index.json"))
+
+        XCTAssertEqual(
+            DeepSeekV41EngramTableLocator.shardFilename(
+                forTensorNamed: "layers.1.engram.embed.weight", in: dir
+            ),
+            "model-00047-of-00048.safetensors"
+        )
+        XCTAssertNil(
+            DeepSeekV41EngramTableLocator.shardFilename(
+                forTensorNamed: "layers.14.engram.embed.weight", in: dir
+            )
+        )
+    }
+
+    /// Without an index the shards' own headers have to answer, because a
+    /// directory of safetensors carries no other manifest.
+    func testTheTableFileFallsBackToTheShardHeaders() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dsv41-headers-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        func writeShard(_ name: String, tensors: [String]) throws {
+            let header: [String: Any] = Dictionary(
+                uniqueKeysWithValues: tensors.map { ($0, ["dtype": "BF16", "shape": [2], "data_offsets": [0, 4]]) }
+            )
+            let json = try JSONSerialization.data(withJSONObject: header)
+            var file = Data()
+            var length = UInt64(json.count)
+            withUnsafeBytes(of: &length) { file.append(contentsOf: $0) }
+            file.append(json)
+            file.append(contentsOf: [0, 0, 0, 0])
+            try file.write(to: dir.appendingPathComponent(name))
+        }
+
+        try writeShard("model-00001-of-00002.safetensors", tensors: ["layers.7.attn.wkv.weight"])
+        try writeShard("model-00002-of-00002.safetensors", tensors: ["layers.14.engram.embed.weight"])
+
+        XCTAssertEqual(
+            DeepSeekV41EngramTableLocator.shardFilename(
+                forTensorNamed: "layers.14.engram.embed.weight", in: dir
+            ),
+            "model-00002-of-00002.safetensors"
+        )
+        XCTAssertNil(
+            DeepSeekV41EngramTableLocator.shardFilename(
+                forTensorNamed: "layers.99.present.nowhere", in: dir
+            )
+        )
     }
 
     func testRowFromAnotherLayerIsRefused() throws {
@@ -1200,6 +1585,98 @@ final class DeepSeekV41EngramReaderTests: XCTestCase {
             byteOffset: spec.totalBytes, byteCount: spec.rowBytes
         )
         XCTAssertThrowsError(try reader.readRows([request], into: buffer))
+    }
+}
+
+// MARK: - Streamed shard segmentation
+
+final class DeepSeekV41StreamedSegmentationTests: XCTestCase {
+
+    /// The published Engram shards hold a ~98 GB table plus a few hundred megabytes
+    /// of dense projections, and the table's 3 GB scale companion. Treating every
+    /// `.engram.` tensor as unmappable left those shards with NOTHING to segment:
+    /// no buffer for `engram.wkv`/`q_weight`/`k_weight`, and no shard entry left to
+    /// name the table's own file. Only the table and its scale stay unmapped, so
+    /// the shard keeps a segment and the rest of its tensors land in it.
+    func testAnEngramShardKeepsTheTensorsThatMustBeMapped() throws {
+        let limit: UInt64 = 1 << 30
+        let tableBytes = UInt64(4) << 30
+        let summary = ModelSummary(
+            sizeGb: 5,
+            tensorCount: 5,
+            layerCount: 2,
+            maxExpertId: 0,
+            shards: [
+                ShardMetadata(
+                    index: 0, filename: "model-00001-of-00002.safetensors",
+                    baseAddress: 0x1000_0000, length: 1 << 16
+                ),
+                ShardMetadata(
+                    index: 1, filename: "model-00002-of-00002.safetensors",
+                    baseAddress: 0x2000_0000, length: tableBytes + (1 << 20)
+                )
+            ],
+            tensors: [
+                TensorMetadata(
+                    name: "layers.0.attn_norm.weight", shapeDisplay: "[64]", dtype: "BF16",
+                    sizeMb: 0.001, shardIndex: 0, offsetStart: 0, offsetEnd: 128,
+                    category: "Multi-Head Latent Attention (MLA)", layerIndex: 0, expertId: nil
+                ),
+                TensorMetadata(
+                    name: "layers.1.engram.embed.weight", shapeDisplay: "[1024, 256]",
+                    dtype: "F8_E4M3", sizeMb: 0.25, shardIndex: 1,
+                    offsetStart: 0, offsetEnd: tableBytes,
+                    category: "Engram (n-gram memory)", layerIndex: 1, expertId: nil
+                ),
+                TensorMetadata(
+                    name: "layers.1.engram.embed.scale", shapeDisplay: "[1024, 8]",
+                    dtype: "F8_E8M0", sizeMb: 0.008, shardIndex: 1,
+                    offsetStart: tableBytes, offsetEnd: tableBytes + 8_192,
+                    category: "Engram (n-gram memory)", layerIndex: 1, expertId: nil
+                ),
+                TensorMetadata(
+                    name: "layers.1.engram.q_weight", shapeDisplay: "[4, 5120]", dtype: "BF16",
+                    sizeMb: 0.04, shardIndex: 1,
+                    offsetStart: tableBytes + 8_192, offsetEnd: tableBytes + 49_152,
+                    category: "Engram (n-gram memory)", layerIndex: 1, expertId: nil
+                ),
+                TensorMetadata(
+                    name: "layers.1.engram.wkv.weight", shapeDisplay: "[25600, 6144]",
+                    dtype: "F8_E4M3", sizeMb: 150.0, shardIndex: 1,
+                    offsetStart: tableBytes + 49_152,
+                    offsetEnd: tableBytes + 49_152 + (1 << 19),
+                    category: "Engram (n-gram memory)", layerIndex: 1, expertId: nil
+                )
+            ],
+            layers: []
+        )
+
+        let split = try InferenceEngine.segmentShardsForMetal(summary, maxBufferLength: limit)
+
+        // The Engram shard must still be addressable: one segment holding the
+        // dense projections, since the table itself is streamed.
+        XCTAssertGreaterThan(split.shards.count, summary.shards.count - 1)
+        let mapped = try XCTUnwrap(
+            split.tensors.first { $0.name == "layers.1.engram.wkv.weight" }
+        )
+        let segment = try XCTUnwrap(
+            split.shards.first { $0.index == mapped.shardIndex },
+            "the shard holding engram.wkv produced no segment at all"
+        )
+        XCTAssertLessThanOrEqual(segment.length, limit)
+        XCTAssertLessThanOrEqual(
+            mapped.offsetEnd, segment.length,
+            "the mapped tensor must address inside its segment"
+        )
+        XCTAssertEqual(mapped.offsetEnd - mapped.offsetStart, 1 << 19)
+
+        // The table and its scale are passed through untouched, keeping the
+        // whole-file shard index the reader's locator no longer depends on.
+        for name in ["layers.1.engram.embed.weight", "layers.1.engram.embed.scale"] {
+            let tensor = try XCTUnwrap(split.tensors.first { $0.name == name })
+            XCTAssertEqual(tensor.shardIndex, 1, "\(name) must stay file-addressed")
+            XCTAssertEqual(tensor.offsetStart, name.contains("scale") ? tableBytes : 0)
+        }
     }
 }
 
@@ -1271,6 +1748,33 @@ final class DeepSeekV41PreflightSizeTests: XCTestCase {
         XCTAssertTrue(issue.humanDescription.contains("header unreadable"), issue.humanDescription)
     }
 
+    /// A Hugging Face snapshot is a directory of symlinks into `blobs/`. The
+    /// preflight used `attributesOfItem`, which does not follow the link, so a
+    /// complete 510 GB download reported "48/48 shards, 4 KB (0%)".
+    func testSymlinkedShardIsMeasuredThroughTheLink() throws {
+        let dir = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let name = "model-00001-of-00001.safetensors"
+        let blob = dir.appendingPathComponent("blob.safetensors")
+        try writeShard(at: blob, declaredDataBytes: 1_000, actualDataBytes: 1_000)
+        try FileManager.default.createSymbolicLink(
+            at: dir.appendingPathComponent(name),
+            withDestinationURL: blob
+        )
+        try """
+        {"metadata": {"total_size": 1008}, "weight_map": {"a": "\(name)"}}
+        """.write(
+            to: dir.appendingPathComponent("model.safetensors.index.json"),
+            atomically: true, encoding: .utf8
+        )
+
+        let report = try XCTUnwrap(DeepSeekV41Preflight.inspect(snapshotDir: dir))
+        XCTAssertTrue(report.isComplete, "a link to a complete blob is complete: \(report.issues)")
+        XCTAssertEqual(report.presentShardCount, 1)
+        // The link is 21ish bytes; the measurement must be the blob's own size.
+        XCTAssertGreaterThan(report.bytesPresent, 1_000, report.humanSummary)
+    }
+
     func testShardMatchingItsHeaderIsComplete() throws {
         let dir = try makeDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -1312,45 +1816,189 @@ final class DeepSeekV41PreflightSizeTests: XCTestCase {
     }
 }
 
+// MARK: - Compressor group
+
+/// The compressor's per-position state is per OWNER, not shared.
+///
+/// It used to be one block addressed by `position % ratio` alone. Owners run in
+/// index order at every position, so the earlier slots of a block were last
+/// written by whichever owner ran latest at the previous position, and a ratio-2
+/// owner pooled its own latent together with another layer's.
+final class DeepSeekV41CompressorGroupTests: XCTestCase {
+
+    private func plan(owners: [Int], ratio: Int) -> [DeepSeekV41LayerPlan] {
+        let source = owners.first ?? -1
+        return (0..<8).map { index in
+            let isOwner = owners.contains(index)
+            return DeepSeekV41LayerPlan(
+                index: index,
+                flavor: isOwner ? .compressed : .windowOnly,
+                compressRatio: isOwner ? ratio : 0,
+                compressedKVSource: isOwner ? index : source,
+                compressedIndexSource: -1,
+                isCandidateSource: false,
+                engramTable: nil,
+                ropeTable: .compress
+            )
+        }
+    }
+
+    func testEachOwnerGetsItsOwnBlockInIndexOrder() {
+        let slots = DeepSeekV41CacheAddressing.compressorOwnerSlots(
+            plan: plan(owners: [5, 1, 3], ratio: 2)
+        )
+        XCTAssertEqual(slots, [1: 0, 3: 1, 5: 2])
+        XCTAssertNil(slots[0], "a layer that owns no compressed rows fills no block")
+        XCTAssertNil(slots[2])
+    }
+
+    func testTwoOwnersNeverShareASlot() throws {
+        let width = 4
+        let groupWidth = 2
+        let first = try XCTUnwrap(
+            DeepSeekV41CacheAddressing.compressorSlotByteOffset(
+                owner: 0, slot: 1, groupWidth: groupWidth, width: width
+            )
+        )
+        let second = try XCTUnwrap(
+            DeepSeekV41CacheAddressing.compressorSlotByteOffset(
+                owner: 1, slot: 0, groupWidth: groupWidth, width: width
+            )
+        )
+        XCTAssertEqual(first, width * MemoryLayout<Float>.stride)
+        XCTAssertEqual(second, groupWidth * width * MemoryLayout<Float>.stride)
+        XCTAssertNotEqual(first, second, "an owner's block must not overlap the next one's")
+    }
+
+    /// A narrow owner's unused slots are the difference between the group width and
+    /// its own ratio, and they stay inside its own block.
+    func testANarrowOwnerLeavesItsSpareSlotsUnused() {
+        XCTAssertNil(
+            DeepSeekV41CacheAddressing.compressorSlotByteOffset(
+                owner: 0, slot: 2, groupWidth: 2, width: 4
+            )
+        )
+        XCTAssertNotNil(
+            DeepSeekV41CacheAddressing.compressorSlotByteOffset(
+                owner: 1, slot: 1, groupWidth: 2, width: 4
+            )
+        )
+    }
+}
+
 // MARK: - Cache reuse
 
 final class DeepSeekV41CacheReuseTests: XCTestCase {
 
-    func testPrefixInsideTheWindowRingIsReusable() {
-        XCTAssertTrue(
-            DeepSeekV41CacheAddressing.prefixIsReusable(
-                prefixCount: 64, storedPositions: 100, windowRows: 128
-            )
+    /// The window ring is not a bound, because a resumed turn never replays what it
+    /// skips. Every window row a later position reads is one the ring still holds,
+    /// and the compressed rows are retained rather than ringed. A count past the
+    /// window size is therefore skipped like any other.
+    func testAPrefixPastTheWindowRingIsReusable() {
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 600, storedPositions: 300, promptTokens: 1_000
+            ),
+            300
         )
-    }
-
-    func testPrefixPastTheWindowRingIsNotReusable() {
-        // The position count says every row exists, but the ring has overwritten the
-        // oldest window rows, so a hit would attend stale context.
-        XCTAssertFalse(
-            DeepSeekV41CacheAddressing.prefixIsReusable(
-                prefixCount: 200, storedPositions: 300, windowRows: 128
-            )
-        )
-        // The prefix itself fits in the ring, but the ring has already wrapped:
-        // rows 0...3 now hold positions 128...131, not the prefix's positions.
-        XCTAssertFalse(
-            DeepSeekV41CacheAddressing.prefixIsReusable(
-                prefixCount: 4, storedPositions: 300, windowRows: 128
-            )
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 300, storedPositions: 300, promptTokens: 1_000
+            ),
+            300
         )
     }
 
     func testPrefixPastWhatIsStoredIsNotReusable() {
-        XCTAssertFalse(
-            DeepSeekV41CacheAddressing.prefixIsReusable(
-                prefixCount: 40, storedPositions: 20, windowRows: 128
-            )
+        // The pin claims twice what the cache holds, so only the resident count is
+        // skipped and the rest of the prompt is prefilled.
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 40, storedPositions: 20, promptTokens: 100
+            ),
+            20
         )
-        XCTAssertTrue(
-            DeepSeekV41CacheAddressing.prefixIsReusable(
-                prefixCount: 0, storedPositions: 20, windowRows: 128
-            )
+        // An empty cache has nothing to reuse whatever the pin claims.
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 0, storedPositions: 0, promptTokens: 100
+            ),
+            0
+        )
+    }
+
+    /// The pin and the cache can disagree in both directions, and only exact
+    /// agreement is a skip.
+    func testTheReusablePrefixIsTheResidentSequenceExactly() {
+        // The pin leads the cache: a stop sequence ended the last turn on a token
+        // that never went through the block. The cache's own count wins.
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 500, storedPositions: 300, promptTokens: 1_000
+            ),
+            300
+        )
+        // The prompt diverged inside the resident sequence, so its rows past that
+        // point belong to tokens this prompt does not contain: no reuse, full prefill.
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 100, storedPositions: 300, promptTokens: 1_000
+            ),
+            0
+        )
+        // The last prompt token always runs: its logits are the first sample.
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 300, storedPositions: 300, promptTokens: 300
+            ),
+            0
+        )
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 0, storedPositions: 300, promptTokens: 1_000
+            ),
+            0
+        )
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 10, storedPositions: 0, promptTokens: 1_000
+            ),
+            0
+        )
+    }
+
+    /// A length is not identity: a pin left by another model's turn can propose a
+    /// prefix whose length fits a sequence this cache never held.
+    func testAResidentSequenceOfOtherTokensIsNotReused() {
+        let prompt: [Int] = [10, 11, 12, 13, 14]
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 3,
+                storedPositions: 3,
+                promptTokenIds: prompt,
+                residentTokens: [10, 11, 12]
+            ),
+            3
+        )
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 3,
+                storedPositions: 3,
+                promptTokenIds: prompt,
+                residentTokens: [10, 99, 12]
+            ),
+            0,
+            "a resident position holding a different token is not this prompt"
+        )
+        // The history has to describe every position the cache claims.
+        XCTAssertEqual(
+            DeepSeekV41CacheAddressing.reusablePrefix(
+                proposed: 3,
+                storedPositions: 3,
+                promptTokenIds: prompt,
+                residentTokens: [10, 11]
+            ),
+            0
         )
     }
 
@@ -1557,7 +2205,7 @@ final class DeepSeekV41ConfigEdgeTests: XCTestCase {
     func testHyperConnectionScaleResolvesAsAPlainVector() {
         let catalog = DeepSeekV41WeightCatalog(
             named: [
-                DeepSeekV41TensorRef(name: "layers.0.hc_attn_scale", dtype: "BF16", shape: [4])
+                DeepSeekV41TensorRef(name: "layers.0.hc_attn_scale", dtype: "F32", shape: [3])
             ],
             layerCount: 1
         )
@@ -1570,6 +2218,12 @@ final class DeepSeekV41ConfigEdgeTests: XCTestCase {
         XCTAssertTrue(DeepSeekV41WeightCatalog.isStreamedName("layers.1.engram.embed.weight"))
         XCTAssertTrue(DeepSeekV41WeightCatalog.isStreamedName("layers.14.engram.embed.scale"))
         XCTAssertFalse(DeepSeekV41WeightCatalog.isStreamedName("layers.1.attn.wkv.weight"))
+        // The table's neighbours in the same shard are hundreds of megabytes, not
+        // a hundred gigabytes, and the graph reads them from mapped buffers.
+        XCTAssertFalse(DeepSeekV41WeightCatalog.isStreamedName("layers.1.engram.wkv.weight"))
+        XCTAssertFalse(DeepSeekV41WeightCatalog.isStreamedName("layers.1.engram.q_weight"))
+        XCTAssertFalse(DeepSeekV41WeightCatalog.isStreamedName("layers.1.engram.k_weight"))
+        XCTAssertFalse(DeepSeekV41WeightCatalog.isStreamedName("layers.1.engram.wkv.scale"))
     }
 
     /// `layerCount` was accepted and never read, so a manifest placing a
@@ -1641,5 +2295,389 @@ final class DeepSeekV41VisionExpandTests: XCTestCase {
         )
         XCTAssertEqual(expansion.text, String(repeating: "x", count: 8) + "<img>")
         XCTAssertEqual(expansion.report.unfilledPlaceholderCount, 1)
+    }
+}
+
+/// The two config files the checkpoint actually ships, embedded verbatim so the
+/// decoder is measured against the model rather than against a fixture: the
+/// published `config.json` (multimodal wrapper) and `inference/config.json`
+/// (flat). Both are copied from snapshot `1bae0e1088993b9b82de08f59de5be5a34e42170`.
+///
+/// The fixtures elsewhere in this file are synthetic, and one of them used
+/// `hidden_size` 7168 with 128 heads, which no checkpoint has. A synthetic shape
+/// is fine for exercising decoding branches; it is not evidence about the model,
+/// so the numbers that describe the checkpoint are asserted here.
+final class DeepSeekV41PublishedConfigTests: XCTestCase {
+
+    static let publishedWrapperJSON = """
+    {
+      "architectures": ["DeepseekV41ForCausalLM"],
+      "model_type": "deepseek_v41",
+      "dtype": "bfloat16",
+      "transformers_version": "5.6.0",
+      "bos_token_id": 0,
+      "eos_token_id": 1,
+      "pad_token_id": 2,
+      "image_token_id": 129264,
+      "quantization_config":       {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [32, 32],
+        "scale_fmt": "ue8m0",
+        "expert_dtype": "fp4"
+      },
+      "text_config":       {
+        "model_type": "deepseek_v41_text",
+        "vocab_size": 129280,
+        "hidden_size": 5120,
+        "moe_intermediate_size": 2304,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 1,
+        "head_dim": 512,
+        "qk_rope_head_dim": 64,
+        "q_lora_rank": 1280,
+        "o_lora_rank": 1024,
+        "o_groups": 8,
+        "hidden_act": "silu",
+        "swiglu_limit": 10.0,
+        "rms_norm_eps": 1e-20,
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "initializer_range": 0.02,
+        "use_cache": true,
+        "tie_word_embeddings": false,
+        "max_position_embeddings": 1048576,
+        "rope_theta": 10000,
+        "rope_scaling":         {
+          "rope_type": "yarn",
+          "factor": 16,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        },
+        "n_routed_experts": 384,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 6,
+        "scoring_func": "sqrtsoftplus",
+        "topk_method": "noaux_tc",
+        "norm_topk_prob": true,
+        "routed_scaling_factor": 1.5,
+        "sliding_window": 128,
+        "compress_ratios": [0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
+        "compress_rope_theta": 160000,
+        "kv_source_layer_ids": [2, 8, 14, 20],
+        "index_source_layer_ids": [2, 8, 14, 20, 24, 28, 32, 36],
+        "index_n_heads": 32,
+        "index_head_dim": 128,
+        "index_topk": 512,
+        "candidate_source_layer_id": 20,
+        "candidate_topk_blocks": 2048,
+        "candidate_block_size": 8,
+        "hc_mult": 4,
+        "hc_sinkhorn_iters": 20,
+        "hc_eps": 1e-06,
+        "engram_layer_ids": [1, 14],
+        "engram_num_embeddings": [384006168, 384016682],
+        "engram_max_ngram_size": 4,
+        "engram_vocab_size": 16000000,
+        "engram_n_heads": 8,
+        "engram_head_dim": 256,
+        "engram_pad_token_id": 2,
+        "engram_compressed_vocab_size": 99092,
+        "num_nextn_predict_layers": 3,
+        "dspark_block_size": 5,
+        "dspark_noise_token_id": 128799,
+        "dspark_target_layer_ids": [37, 38, 39],
+        "dspark_markov_rank": 256,
+        "dspark_n_routed_experts": 128,
+        "dspark_num_experts_per_tok": 3
+      },
+      "vision_config":       {
+        "model_type": "deepseek_v41_vision",
+        "num_hidden_layers": 32,
+        "hidden_size": 1024,
+        "num_attention_heads": 16,
+        "intermediate_size": 2816,
+        "patch_size": 14,
+        "rope_theta": 10000,
+        "downsample_ratio": 3,
+        "max_image_tokens": 1024,
+        "min_pixels": 295936,
+        "max_wh_ratio": null
+      }
+    }
+    """
+
+    static let publishedFlatJSON = """
+    {
+      "vocab_size": 129280,
+      "dim": 5120,
+      "moe_inter_dim": 2304,
+      "n_layers": 40,
+      "n_mtp_layers": 3,
+      "dspark_block_size": 5,
+      "dspark_noise_token_id": 128799,
+      "dspark_target_layer_ids": [37, 38, 39],
+      "dspark_markov_rank": 256,
+      "dspark_n_routed_experts": 128,
+      "dspark_n_activated_experts": 3,
+      "n_heads": 64,
+      "n_routed_experts": 384,
+      "n_shared_experts": 1,
+      "n_activated_experts": 6,
+      "score_func": "sqrtsoftplus",
+      "route_scale": 1.5,
+      "swiglu_limit": 10.0,
+      "q_lora_rank": 1280,
+      "head_dim": 512,
+      "rope_head_dim": 64,
+      "norm_eps": 1e-20,
+      "o_groups": 8,
+      "o_lora_rank": 1024,
+      "window_size": 128,
+      "kv_source_layers": [2, 8, 14, 20],
+      "index_source_layers": [2, 8, 14, 20, 24, 28, 32, 36],
+      "original_seq_len": 65536,
+      "rope_theta": 10000,
+      "rope_factor": 16,
+      "beta_fast": 32,
+      "beta_slow": 1,
+      "index_n_heads": 32,
+      "index_head_dim": 128,
+      "index_topk": 512,
+      "candidate_source_layer": 20,
+      "candidate_topk_blocks": 2048,
+      "candidate_block_size": 8,
+      "hc_mult": 4,
+      "hc_sinkhorn_iters": 20,
+      "hc_eps": 1e-06,
+      "engram_layer_ids": [1, 14],
+      "engram_vocab_size": 16000000,
+      "engram_num_embeddings": [384006168, 384016682],
+      "engram_max_ngram_size": 4,
+      "engram_pad_id": 2,
+      "engram_compressed_vocab_size": 99092,
+      "dtype": "fp8",
+      "expert_dtype": "fp4",
+      "compress_rope_theta": 160000,
+      "compress_ratios": [0, 0, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0],
+      "vision_n_layers": 32,
+      "vision_dim": 1024,
+      "vision_n_heads": 16,
+      "vision_inter_dim": 2816,
+      "vision_patch_size": 14,
+      "vision_downsample_ratio": 3,
+      "vision_max_n_token": 1024,
+      "vision_min_pixels": 295936,
+      "vision_max_wh_ratio": null,
+      "image_token_id": 129264,
+      "engram_n_heads": 8,
+      "engram_head_dim": 256,
+      "vision_rope_theta": 10000
+    }
+    """
+
+    func wrapper() throws -> DeepSeekV41Config {
+        try DeepSeekV41Config.decode(jsonData: Data(Self.publishedWrapperJSON.utf8))
+    }
+
+    func flat() throws -> DeepSeekV41Config {
+        try DeepSeekV41Config.decode(jsonData: Data(Self.publishedFlatJSON.utf8))
+    }
+
+    func testTheWrapperDecodesThePublishedShape() throws {
+        let config = try wrapper()
+        XCTAssertEqual(config.modelType, "deepseek_v41")
+        XCTAssertEqual(config.hiddenSize, 5120)
+        XCTAssertEqual(config.numHiddenLayers, 40)
+        XCTAssertEqual(config.numAttentionHeads, 64)
+        XCTAssertEqual(config.numKeyValueHeads, 1)
+        XCTAssertEqual(config.vocabSize, 129280)
+        XCTAssertEqual(config.moeIntermediateSize, 2304)
+        // The checkpoint has no dense `intermediate_size`; the shared expert's width
+        // is `moe_inter_dim * n_shared_experts`, which the shard headers confirm
+        // (`ffn.shared_experts.w1` is [2304, 5120]).
+        XCTAssertEqual(config.intermediateSize, 0)
+        XCTAssertEqual(config.sharedExpertCount, 1)
+        XCTAssertEqual(config.qLoraRank, 1280)
+        XCTAssertEqual(config.oGroups, 8)
+        XCTAssertEqual(config.oLoraRank, 1024)
+        XCTAssertEqual(config.rmsNormEps, 1e-20)
+        XCTAssertEqual(config.routedScalingFactor, 1.5)
+        XCTAssertEqual(config.swigluLimit, 10)
+        XCTAssertEqual(config.normalizeTopKProb, true)
+        XCTAssertEqual(config.scoringFunction, .sqrtsoftplus)
+        XCTAssertEqual(config.kvLoraRank, 0)
+    }
+
+    /// `head_dim` 512 with a 64-wide rope payload leaves 448 non-rope values, and
+    /// the cache record is the 512-wide head: 528 bytes in FP8, 288 in FP4.
+    func testTheHeadAndCacheWidthsAreThePublishedOnes() throws {
+        let config = try wrapper()
+        XCTAssertEqual(config.qkRopeHeadDim, 64)
+        XCTAssertEqual(config.qkNopeHeadDim, 448)
+        XCTAssertEqual(config.qkHeadDim, 512)
+        XCTAssertEqual(config.vHeadDim, 512)
+        XCTAssertEqual(config.cacheRecordWidth, 512)
+        XCTAssertEqual(config.fp8CacheRecordBytes, 528)
+        XCTAssertEqual(config.fp4CacheRecordBytes, 288)
+    }
+
+    /// The flat config spells the rope width `rope_head_dim` and keeps the scaling
+    /// factors at the root. Reading only the wrapper's spelling left the rope width
+    /// at 0, which passes validation and then rotates nothing.
+    func testTheFlatConfigReadsTheRopeWidthAndTheScaling() throws {
+        let config = try flat()
+        XCTAssertEqual(config.qkRopeHeadDim, 64)
+        XCTAssertEqual(config.qkNopeHeadDim, 448)
+        XCTAssertEqual(config.qkHeadDim, 512)
+        XCTAssertEqual(config.cacheRecordWidth, 512)
+        XCTAssertEqual(config.rmsNormEps, 1e-20)
+        XCTAssertEqual(config.ropeFactor, 16)
+        XCTAssertEqual(config.ropeOriginalLength, 65536)
+        XCTAssertEqual(config.ropeBetaFast, 32)
+        XCTAssertEqual(config.ropeBetaSlow, 1)
+        XCTAssertEqual(config.compressRopeTheta, 160000)
+        XCTAssertEqual(config.windowSize, 128)
+        XCTAssertEqual(config.hiddenSize, 5120)
+        XCTAssertEqual(config.moeIntermediateSize, 2304)
+    }
+
+    /// The flat config has no `model_type` and no `architectures`, so identity has
+    /// to come from the layout: this is the file discovery sees on a real load.
+    func testTheFlatConfigIdentifiesItselfWithoutAName() {
+        let object = (try? JSONSerialization.jsonObject(with: Data(Self.publishedFlatJSON.utf8)))
+            as? [String: Any]
+        guard let object else { return XCTFail("the embedded flat config is not JSON") }
+        XCTAssertTrue(DeepSeekV41Config.identifies(object))
+    }
+
+    /// A config that names no family and carries none of this architecture's
+    /// layout fields stays another family's, so discovery keeps looking.
+    func testAnUnnamedConfigWithoutTheLayoutIsRefused() {
+        XCTAssertFalse(
+            DeepSeekV41Config.identifies([
+                "hidden_size": 4096,
+                "num_hidden_layers": 32,
+                "intermediate_size": 14336,
+                "num_attention_heads": 32
+            ])
+        )
+    }
+
+    /// `n_mtp_layers` is the flat spelling of the draft-head count. Missing it drops
+    /// the DSpark chain and leaves every `mtp.*` tensor unconsumed.
+    func testTheFlatConfigKeepsTheDraftHeads() throws {
+        let config = try flat()
+        XCTAssertEqual(config.numNextNPredictLayers, 3)
+        XCTAssertEqual(config.dsparkBlockSize, 5)
+        XCTAssertEqual(config.dsparkTargetLayerIDs, [37, 38, 39])
+        XCTAssertEqual(config.dsparkRoutedExperts, 128)
+        XCTAssertEqual(config.dsparkActivatedExperts, 3)
+    }
+
+    /// The flat config flattens the tower into `vision_`-prefixed root keys, so a
+    /// decoder that only reads a nested `vision_config` reports no tower at all.
+    func testBothShapesDescribeTheSameTower() throws {
+        let wrapper = try wrapper()
+        let flat = try flat()
+        for config in [wrapper, flat] {
+            guard let vision = config.vision else {
+                return XCTFail("no tower decoded")
+            }
+            XCTAssertEqual(vision.numHiddenLayers, 32)
+            XCTAssertEqual(vision.hiddenSize, 1024)
+            XCTAssertEqual(vision.numAttentionHeads, 16)
+            XCTAssertEqual(vision.intermediateSize, 2816)
+            XCTAssertEqual(vision.patchSize, 14)
+            XCTAssertEqual(vision.downsampleRatio, 3)
+            XCTAssertEqual(vision.maxImageTokens, 1024)
+            XCTAssertEqual(vision.minPixels, 295936)
+            XCTAssertEqual(vision.imageTokenID, 129264)
+            XCTAssertEqual(vision.ropeTheta, 10_000)
+            XCTAssertEqual(config.imageTokenID, 129264)
+        }
+        XCTAssertEqual(wrapper.vision, flat.vision)
+    }
+
+    /// Four layers own a compressed cache, not one: `kv_source_layers` is
+    /// [2, 8, 14, 20], and every compressed layer reads the most recent owner at or
+    /// before it. The reference hands each layer the one shared slot the previous
+    /// source wrote, which is the same rule.
+    func testFourLayersOwnACompressedCache() throws {
+        let config = try wrapper()
+        XCTAssertEqual(config.kvSourceLayerIDs, [2, 8, 14, 20])
+        XCTAssertEqual(config.indexSourceLayerIDs, [2, 8, 14, 20, 24, 28, 32, 36])
+        XCTAssertEqual(config.compressedKVOwnerLayerIndices, [2, 8, 14, 20])
+        // 43 ratios: the 40 backbone layers plus the three MTP layers.
+        XCTAssertEqual(config.compressRatios.count, 43)
+
+        let plan = try config.makeLayerPlan()
+        XCTAssertEqual(plan.count, 40)
+        XCTAssertEqual(plan[3].compressedKVSource, 2)
+        XCTAssertEqual(plan[9].compressedKVSource, 8)
+        XCTAssertEqual(plan[15].compressedKVSource, 14)
+        XCTAssertEqual(plan[19].compressedKVSource, 14)
+        XCTAssertEqual(plan[25].compressedKVSource, 20)
+        XCTAssertEqual(plan[39].compressedKVSource, 20)
+        XCTAssertEqual(plan[3].compressedIndexSource, 2)
+        XCTAssertEqual(plan[15].compressedIndexSource, 14)
+        XCTAssertEqual(plan[25].compressedIndexSource, 24)
+        XCTAssertEqual(plan[0].compressedKVSource, -1)
+    }
+
+    /// The cache is priced per owner, so the published four is twice the two the
+    /// synthetic fixtures used to describe.
+    func testTheCacheCostsWhatFourOwnersCost() throws {
+        let config = try wrapper()
+        XCTAssertEqual(config.cacheBytesPerToken(useFP4Main: true), 1152)
+        XCTAssertEqual(config.cacheBytesPerToken(useFP4Main: false), 2112)
+        let fp4AtFullContext = config.cacheBytesPerToken(useFP4Main: true) * 1_048_576
+        XCTAssertLessThan(Double(fp4AtFullContext) / 1_073_741_824.0, 1.2)
+    }
+
+    /// Engram, hyper-connections and the router settings are the same in both
+    /// shapes, and they are the checkpoint's own values.
+    func testTheSharedSettingsMatchTheCheckpoint() throws {
+        for config in [try wrapper(), try flat()] {
+            XCTAssertEqual(config.engramLayerIDs, [1, 14])
+            XCTAssertEqual(config.engramRowCounts, [384_006_168, 384_016_682])
+            XCTAssertEqual(config.engramMaxNgramSize, 4)
+            XCTAssertEqual(config.engramHeadCount, 8)
+            XCTAssertEqual(config.engramHeadDimension, 256)
+            XCTAssertEqual(config.engramVocabSize, 16_000_000)
+            XCTAssertEqual(config.engramCompressedVocabSize, 99092)
+            XCTAssertEqual(config.engramPadTokenID, 2)
+            XCTAssertEqual(config.hcMult, 4)
+            XCTAssertEqual(config.hcSinkhornIterations, 20)
+            XCTAssertEqual(config.hcEps, 1e-6)
+            XCTAssertEqual(config.numRoutedExperts, 384)
+            XCTAssertEqual(config.numActivatedExperts, 6)
+            XCTAssertEqual(config.indexNHeads, 32)
+            XCTAssertEqual(config.indexHeadDim, 128)
+            XCTAssertEqual(config.indexTopK, 512)
+            XCTAssertEqual(config.candidateSourceLayerID, 20)
+            XCTAssertEqual(config.candidateBlockSize, 8)
+            XCTAssertEqual(config.candidateTopKBlocks, 2048)
+            XCTAssertEqual(config.maxPositionEmbeddings, 1_048_576)
+            XCTAssertEqual(config.eosTokenIDs, [1])
+            XCTAssertEqual(config.bosTokenID, 0)
+            XCTAssertEqual(config.padTokenID, 2)
+            XCTAssertFalse(config.tieWordEmbeddings)
+        }
+        // The wrapper declares the scheme in `quantization_config`; the flat config
+        // has no such block and states the weight dtype directly.
+        XCTAssertEqual(try wrapper().quantizationMethod, "fp8")
+        XCTAssertEqual(try flat().quantizationMethod, nil)
+        XCTAssertEqual(try flat().dtype, "fp8")
+    }
+
+    func testNeitherPublishedShapeRaisesAWarning() throws {
+        for config in [try wrapper(), try flat()] {
+            let plan = try config.makeLayerPlan()
+            let warnings = config.warnings(layerPlan: plan)
+            XCTAssertTrue(warnings.isEmpty, "unexpected warnings: \(warnings)")
+        }
     }
 }

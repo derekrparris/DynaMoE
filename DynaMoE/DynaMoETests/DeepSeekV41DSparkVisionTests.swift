@@ -52,27 +52,20 @@ final class DeepSeekV41DSparkTests: XCTestCase {
         XCTAssertEqual(plan(blockSize: 0).verificationWindow(verifiedCount: 5), 0..<0)
     }
 
-    func testCombineLogitsInterpolatesBetweenTheTwoHeads() {
-        let draft: [Float] = [2, 0]
-        let markov: [Float] = [0, 4]
-        XCTAssertEqual(DeepSeekV41DSpark.combineLogits(draftLogits: draft, markovLogits: markov, weight: 0), draft)
-        XCTAssertEqual(DeepSeekV41DSpark.combineLogits(draftLogits: draft, markovLogits: markov, weight: 1), markov)
-        XCTAssertEqual(
-            DeepSeekV41DSpark.combineLogits(draftLogits: draft, markovLogits: markov, weight: 0.5),
-            [1, 2]
-        )
-        // Out-of-range weights are clamped, not trusted.
-        XCTAssertEqual(DeepSeekV41DSpark.combineLogits(draftLogits: draft, markovLogits: markov, weight: 9), markov)
-        XCTAssertEqual(DeepSeekV41DSpark.combineLogits(draftLogits: draft, markovLogits: markov, weight: -9), draft)
+    func testTheMarkovHeadIsAnAdditiveBiasNotAMixture() {
+        // `DSparkBlock.forward_head` does `logits[:, i].add_(logits_bias)`. A
+        // convex blend is the tempting reading and it is wrong: it scales the draft
+        // block's own logits by (1 - w), which reorders tokens the bias never meant
+        // to touch.
+        let draft: [Float] = [2, 0, -1]
+        let bias: [Float] = [0, 4, 3]
+        XCTAssertEqual(DeepSeekV41DSpark.applyMarkovBias(draft, bias: bias), [2, 4, 2])
     }
 
     func testMismatchedWidthsLeaveTheDraftHeadAlone() {
         let draft: [Float] = [1, 2, 3]
-        XCTAssertEqual(
-            DeepSeekV41DSpark.combineLogits(draftLogits: draft, markovLogits: [0, 0], weight: 1),
-            draft
-        )
-        XCTAssertTrue(DeepSeekV41DSpark.combineLogits(draftLogits: [], markovLogits: [], weight: 1).isEmpty)
+        XCTAssertEqual(DeepSeekV41DSpark.applyMarkovBias(draft, bias: [0, 0]), draft)
+        XCTAssertTrue(DeepSeekV41DSpark.applyMarkovBias([], bias: []).isEmpty)
     }
 
     func testPickBreaksTiesTowardTheLowestTokenID() {
@@ -81,16 +74,48 @@ final class DeepSeekV41DSparkTests: XCTestCase {
         XCTAssertNil(DeepSeekV41DSpark.pick([]))
     }
 
+    func testTemperatureZeroDrawsGreedilyWithoutAskingForUniforms() {
+        var draws = 0
+        let token = DeepSeekV41DSpark.sample(logits: [0.5, 2, 1], temperature: 0) {
+            draws += 1
+            return 0.5
+        }
+        XCTAssertEqual(token, 1)
+        XCTAssertEqual(draws, 0, "a greedy draw consumes no randomness")
+    }
+
+    /// Gumbel-max: each logit is offset by `-log(-log u)`, so a slightly weaker
+    /// logit with a much better uniform can still win. The reference's
+    /// `probs.div_(exponential_(1)).argmax()` is the same rule, which is what makes
+    /// a recorded uniform table replayable off a torch box.
+    func testSamplingFollowsTheGumbelDraw() {
+        // A poor uniform on the strongest logit (-log(-log 0.1) = -0.83) against a
+        // good one on the middle logit (+2.25) is what flips the draw.
+        let table: [Float] = [0.1, 0.9, 0.1]
+        func draw() -> Int? {
+            var cursor = 0
+            return DeepSeekV41DSpark.sample(logits: [1.0, 0.9, 0.0], temperature: 1) {
+                defer { cursor += 1 }
+                return table[cursor]
+            }
+        }
+        XCTAssertEqual(draw(), 1)
+        // Deterministic in the uniforms: the same table always gives the same draw.
+        XCTAssertEqual(draw(), 1)
+        // Greedy would have taken the first logit instead.
+        XCTAssertEqual(DeepSeekV41DSpark.pick([1.0, 0.9, 0.0]), 0)
+    }
+
     func testChainConditionsOnItsOwnTokensNotTheTargets() {
         // A step closure that echoes the token it was handed back as the argmax, so
         // the chain's second step can only see the first draft token if the chain
         // really feeds its own output back.
         var seen: [Int] = []
-        let draft = DeepSeekV41DSpark.runChain(steps: 3, seedToken: 42, markovWeight: 0) { _, previous in
+        let draft = DeepSeekV41DSpark.runChain(steps: 3, seedToken: 42) { _, previous in
             seen.append(previous)
             var logits = [Float](repeating: 0, count: 8)
             logits[(previous + 1) % 8] = 5
-            return (draftLogits: logits, markovLogits: logits, confidence: 0.9)
+            return (draftLogits: logits, markovBias: [Float](repeating: 0, count: 8), confidence: 0.9)
         }
         XCTAssertEqual(seen.first, 42)
         XCTAssertEqual(draft.tokens, [3, 4, 5])
@@ -100,10 +125,10 @@ final class DeepSeekV41DSparkTests: XCTestCase {
 
     func testChainStopsWhenAStepProducesNothing() {
         var calls = 0
-        let draft = DeepSeekV41DSpark.runChain(steps: 5, seedToken: 1, markovWeight: 0) { index, _ in
+        let draft = DeepSeekV41DSpark.runChain(steps: 5, seedToken: 1) { index, _ in
             calls += 1
             guard index < 2 else { return nil }
-            return (draftLogits: [1], markovLogits: [1], confidence: 0.9)
+            return (draftLogits: [1], markovBias: [1], confidence: 0.9)
         }
         XCTAssertEqual(calls, 3)
         XCTAssertEqual(draft.tokens.count, 2)
@@ -281,16 +306,16 @@ final class DeepSeekV41VisionLayoutTests: XCTestCase {
             spec: spec(),
             markers: markers
         )
-        XCTAssertFalse(expanded.contains(markers.imagePlaceholder))
-        XCTAssertTrue(expanded.hasPrefix("look "))
-        XCTAssertTrue(expanded.contains(" then "))
-        // The first image costs its span, the second (upscaled to the pixel floor)
-        // costs its own.
+        // The marker and the image token are the same string, because the checkpoint
+        // writes one token id at every span position. So the expansion is asserted by
+        // its shape: the two markers became the two spans, in reading order, and
+        // nothing between them moved.
         let first = DeepSeekV41VisionLayout.fit(width: 480, height: 480, spec: spec()).tokens
         let second = DeepSeekV41VisionLayout.fit(width: 48, height: 48, spec: spec()).tokens
         XCTAssertEqual(
-            expanded.components(separatedBy: markers.imageToken).count - 1,
-            first + second
+            expanded,
+            "look " + String(repeating: markers.imageToken, count: first)
+                + " then " + String(repeating: markers.imageToken, count: second)
         )
     }
 

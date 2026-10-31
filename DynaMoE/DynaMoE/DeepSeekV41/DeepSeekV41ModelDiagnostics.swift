@@ -98,7 +98,15 @@ public enum DeepSeekV41LoadDiagnostics {
             catalog: catalog,
             contextLength: max(1, contextLength)
         )
-        lines.append("memory: \(memory.describe(expertSlots: 32))")
+        // Priced at the arena the runtime will actually build. A fixed placeholder
+        // count read as if the mixture could not be cached at all, which is the
+        // opposite of what a 128 GB machine does with it.
+        let physicalGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
+        let expertSlots = min(
+            DeepSeekV41MemoryPlan.affordableExpertSlots(plan: memory, physicalGB: physicalGB),
+            max(1, config.numRoutedExperts * max(1, config.numHiddenLayers))
+        )
+        lines.append("memory: \(memory.describe(expertSlots: expertSlots))")
 
         // The prompt dialect: which marker set the checkpoint's own template asked
         // for. A repacked checkpoint silently falls back, and a wrong marker set

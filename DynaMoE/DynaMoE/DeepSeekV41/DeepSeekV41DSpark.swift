@@ -12,23 +12,41 @@
 //  build, so verification is a straight longest-prefix match against the target's
 //  own choices.
 //
+//  The chain itself is the reference's, not a design of ours. `DSparkBlock` in the
+//  checkpoint's `inference/model.py` does:
+//
+//    1. `main_x = main_norm(main_proj(main_hidden))`, where `main_hidden` is the
+//       mean over the hyper-connection copies of the ATTENTION INPUT at each of
+//       `dspark_target_layer_ids`, concatenated.
+//    2. Seed the draft block with `[last token, noise, noise, ...]`.
+//    3. Per step i: `logits[i] += markov_head(output_ids[i])` — the Markov head is
+//       an ADDITIVE full-vocab bias, not a mixture — then draw one token with
+//       Gumbel-max at `temperature` (argmax at 0), and that drawn token, not the
+//       target's, is what step i+1 conditions on.
+//    4. `confidence[i] = confidence_head([x_i, markov_embed(output_ids[i])])`,
+//       with `x_i` the block's own pre-norm collapsed stream at step i.
+//
 //  Two details decide whether this is a speedup or a slowdown:
 //
-//    * WHICH token a draft step consumes. The draft block's input is the target
-//      model's hidden state at the verified position, but the token it conditions
-//      on is the one the draft chain produced itself, not the target's. Feeding the
-//      target's token back would make the chain a copy of the target and every
-//      draft would "verify", reporting an acceptance rate that is a lie.
+//    * WHICH token a draft step consumes. Feeding the target's token back would
+//      make the chain a copy of the target and every draft would "verify",
+//      reporting an acceptance rate that is a lie.
 //
 //    * WHEN to submit. `confidence_head.proj` gives a per-step confidence, and a
 //      chain whose leading steps are confident is worth verifying even when its
 //      tail is not: the cost of a failed verification is one extra target forward,
 //      and the cost of not drafting is one target forward per token anyway. So the
-//      gate is on the whole chain's leading confidence, not on every step.
+//      gate is on the whole chain's leading confidence, not on every step. That
+//      gate, and the acceptance/emission rule below, are this port's: the
+//      reference defines the drafter but nothing in its generator calls
+//      `forward_spec`, so there is no reference speculative loop to match.
 //
-//  The block/target layer ids come from `dspark_block_size` and
-//  `dspark_target_layer_ids`; the exact conditioning rule is gated by
-//  `DeepSeekV41Conformance.dsparkDrafting` until the probe settles it.
+//  The draft block's own attention and MoE are not implemented here, and until a
+//  BATCHED multi-position verify exists they would not pay for themselves even if
+//  they were: `DeepSeekV41MetalForward` forwards one position per call, so
+//  verifying a chain of n drafts costs n target forwards — more work than
+//  decoding n tokens. That is why the turn loop still reports `jetSpecActive:
+//  false` for this family.
 //
 
 import Foundation
@@ -98,28 +116,24 @@ nonisolated public enum DeepSeekV41DSpark {
         public static let empty = Draft(tokens: [], confidences: [])
     }
 
-    /// Mixes the draft block's own head with the Markov head's contribution.
+    /// Adds the Markov head's bias to a step's draft logits.
     ///
-    /// `weight` is the Markov weight in [0, 1]: 0 leaves the draft block's logits
-    /// untouched, 1 is the Markov head alone. Out of range is clamped rather than
-    /// trusted, because a bad weight silently turns the chain into noise.
-    public static func combineLogits(
-        draftLogits: [Float],
-        markovLogits: [Float],
-        weight: Float
-    ) -> [Float] {
-        guard !draftLogits.isEmpty else { return [] }
-        guard draftLogits.count == markovLogits.count else { return draftLogits }
-        let clamped = min(max(weight, 0), 1)
-        guard clamped > 0 else { return draftLogits }
-        var out = [Float](repeating: 0, count: draftLogits.count)
+    /// The reference writes `logits[:, i].add_(logits_bias)` over the full vocab,
+    /// so this is a sum and not a mixture: a convex blend would scale the draft
+    /// block's own logits down and change which token wins, which is a quiet way to
+    /// make every draft worse. Widths that disagree mean the caller handed over a
+    /// different head's row; the draft logits are returned untouched rather than
+    /// truncated, because a partial bias would be just as wrong and harder to see.
+    public static func applyMarkovBias(_ draftLogits: [Float], bias: [Float]) -> [Float] {
+        guard draftLogits.count == bias.count else { return draftLogits }
+        var out = draftLogits
         for index in out.indices {
-            out[index] = (1 - clamped) * draftLogits[index] + clamped * markovLogits[index]
+            out[index] += bias[index]
         }
         return out
     }
 
-    /// Greedy choice from mixed logits, with ties broken by lowest token id so a
+    /// Greedy choice from biased logits, with ties broken by lowest token id so a
     /// draft is deterministic and reproducible.
     public static func pick(_ logits: [Float]) -> Int? {
         guard let best = logits.indices.max(by: { lhs, rhs in
@@ -128,6 +142,49 @@ nonisolated public enum DeepSeekV41DSpark {
             return nil
         }
         return best
+    }
+
+    /// A uniform draw for the sampler, kept out of `(0, 1)` so `log` stays finite.
+    public static func randomUniform() -> Float {
+        Float.random(in: 0.000_001...0.999_999)
+    }
+
+    /// Gumbel noise from one uniform draw: `-log(-log u)`.
+    ///
+    /// `-log(Exp(1))` is Gumbel, so this is the same distribution the reference's
+    /// `probs.div_(empty_like(probs).exponential_(1)).argmax()` draws from — but
+    /// driven by an injected uniform, which is what makes a reference vector
+    /// replayable off a torch box.
+    public static func gumbel(_ uniform: Float) -> Float {
+        let clamped = min(max(uniform, 1e-6), 1 - 1e-6)
+        return -log(-log(clamped))
+    }
+
+    /// One draft draw: greedy at temperature 0, otherwise Gumbel-max.
+    ///
+    /// The reference's `sample` is `argmax` at `temperature == 0` and otherwise
+    /// `argmax(p / -log u)`, i.e. `argmax(logits / max(temperature, 1e-5) +
+    /// gumbel(u))` — the same rule, written to stay finite. `nextUniform` is called
+    /// once per vocabulary entry, in index order, so a caller that replays a
+    /// recorded uniform table reproduces the draw exactly.
+    public static func sample(
+        logits: [Float],
+        temperature: Float,
+        nextUniform: () -> Float
+    ) -> Int? {
+        guard !logits.isEmpty else { return nil }
+        guard temperature > 0 else { return pick(logits) }
+        let scale = max(temperature, 1e-5)
+        var bestIndex = 0
+        var bestScore = -Float.infinity
+        for (index, logit) in logits.enumerated() {
+            let score = logit / scale + gumbel(nextUniform())
+            if score > bestScore {
+                bestScore = score
+                bestIndex = index
+            }
+        }
+        return bestIndex
     }
 
     /// Whether a chain should be submitted for verification.
@@ -165,15 +222,16 @@ nonisolated public enum DeepSeekV41DSpark {
     /// Runs one drafting round.
     ///
     /// `step` is supplied by the runtime so this stays pure: the runtime runs the
-    /// draft block for one step and returns `(draftLogits, markovLogits,
+    /// draft block for one step and returns `(draftLogits, markovBias,
     /// confidence)`, and the chain machinery below is what is left to get wrong.
-    /// The draft's own chosen token — not the target's — is what `prevToken` is set
+    /// The draft's own chosen token — not the target's — is what `previous` is set
     /// to for the next step.
     public static func runChain(
         steps: Int,
         seedToken: Int,
-        markovWeight: Float,
-        step: (Int, Int) -> (draftLogits: [Float], markovLogits: [Float], confidence: Float)?
+        temperature: Float = 0,
+        nextUniform: @escaping () -> Float = DeepSeekV41DSpark.randomUniform,
+        step: (Int, Int) -> (draftLogits: [Float], markovBias: [Float], confidence: Float)?
     ) -> Draft {
         guard steps > 0 else { return .empty }
         var tokens: [Int] = []
@@ -183,14 +241,12 @@ nonisolated public enum DeepSeekV41DSpark {
         var previous = seedToken
         for index in 0..<steps {
             guard let result = step(index, previous) else { break }
-            let mixed = combineLogits(
-                draftLogits: result.draftLogits,
-                markovLogits: result.markovLogits,
-                weight: markovWeight
-            )
+            let biased = applyMarkovBias(result.draftLogits, bias: result.markovBias)
             // A step that produced nothing usable ends the chain: continuing would
             // condition the rest of it on a token that does not exist.
-            guard let token = pick(mixed) else { break }
+            guard let token = sample(
+                logits: biased, temperature: temperature, nextUniform: nextUniform
+            ) else { break }
             tokens.append(token)
             confidences.append(result.confidence)
             previous = token

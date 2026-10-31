@@ -32,11 +32,12 @@
 //      `(buffer, byte offset)` pair is a host decision and the mixture needs the
 //      weights as dispatch constants. One wait per layer, the same shape the
 //      generic MoE loop already uses.
-//    * the Engram stage. Its combination rule is
-//      `DeepSeekV41Conformance.engramCombination` (unverified), its rows are a
-//      ~100 GB pread stream, and a wrong combination reads the right rows and
-//      mixes them wrongly, which looks like "the memory model does nothing". It
-//      therefore reports rather than guesses.
+//    * the Engram rows. The table is a ~100 GB pread stream, not a buffer, and the
+//      hash ids for a position are known before its layer runs, so the rows are
+//      read host-side into a per-table staging block and everything after that
+//      (`wkv`, the gate, the residual add) is a kernel. The stage order puts it
+//      first in the layer because `Engram.forward` writes into the residual stream
+//      ahead of the attention sub-layer.
 //
 //  Synchronization follows from that: the only point in a token where the CPU has
 //  to see device output is the routing readback, so a layer commits its back half
@@ -97,11 +98,40 @@ nonisolated public enum DeepSeekV41Kernels {
     public static let mxfp4SwiGLU = "dsv41_mxfp4_swiglu_gate_up"
     public static let mxfp4DownAccumulate = "dsv41_mxfp4_down_accumulate"
     public static let bf16Gemv = "bf16_gemv"
+    public static let bf16GemvRows = "bf16_gemv_rows"
+    public static let bf16GemvBlock = "bf16_gemv_rows8"
+    /// The same block form over two output rows per threadgroup.
+    public static let bf16GemvBlockPair = "bf16_gemv_rows8x2"
     public static let bf16SwiGLU = "bf16_swiglu_gate_up"
     public static let bf16DownAccumulate = "bf16_down_proj_accumulate"
     public static let bf16Embedding = "lookup_embeddings_bf16"
     public static let mxfp8Embedding = "lookup_embeddings_mxfp8"
     public static let rmsNorm = "dsv41_rmsnorm_f32_gain"
+}
+
+/// The shapes of one BF16 dot product: one thread per output row, one threadgroup
+/// per (row, position), one threadgroup per row covering a whole block, or one
+/// threadgroup per PAIR of rows covering a whole block.
+nonisolated public enum DeepSeekV41BF16GemvForm: Equatable, Sendable {
+    case perRow
+    case wideGrid
+    case block
+    case blockPair
+}
+
+/// Swift mirror of `Dsv41AttentionSlotPlan` in `ComputeShaders.metal`, bound at buffer
+/// 9 of `dsv41_attention_csa2_f32`. One launch covers `slotCount` positions of a
+/// block: slot `s` reads its gathered rows at `s * keyRowStride`, and the per-slot row
+/// counts are bound separately at buffer 10 because the positions of a block do not
+/// all read the same number of rows.
+nonisolated public struct DeepSeekV41AttentionSlotPlan: Equatable, Sendable {
+    public var slotCount: UInt32
+    public var keyRowStride: UInt32
+
+    public init(slotCount: UInt32, keyRowStride: UInt32) {
+        self.slotCount = slotCount
+        self.keyRowStride = keyRowStride
+    }
 }
 
 /// The pure half of the executor: tensor format to kernel, and the planning rules
@@ -115,6 +145,17 @@ nonisolated public enum DeepSeekV41DevicePlan {
     /// bf16 scale belongs to the 128x128 V3 grid, which has no kernel here. Both
     /// would "work" if mis-dispatched and produce plausible numbers, so the
     /// mismatch is a load-time problem instead.
+    ///
+    /// A quantized weight can also be published as RAW BYTES rather than as a typed
+    /// float format. This checkpoint's routed experts are exactly that: the
+    /// safetensors header says `I8` and the row width is already packed, so the
+    /// dtype alone cannot say whether a row holds one value per byte (E4M3) or two
+    /// (E2M1). The published row width against the scale row does say it, because
+    /// both are derived from the same logical input width: a packed MXFP4 row is
+    /// `in/2` bytes and its scale row `in/32` entries, i.e. exactly 16 scale entries
+    /// per weight byte, while an E4M3 row is `in` bytes, i.e. 32. Reading that ratio
+    /// is what keeps the MXFP4 kernels from being dispatched on an int8 matrix (a
+    /// factor-of-two error in every row) and the reverse.
     public static func linearFormat(
         tensor: DeepSeekV41DeviceTensor?,
         scale: DeepSeekV41DeviceTensor?
@@ -131,6 +172,15 @@ nonisolated public enum DeepSeekV41DevicePlan {
             return .fp8Block32
         }
         if tensor.isBF16 { return .bf16 }
+        // Unannotated bytes with a block scale are a quantized weight whose dtype the
+        // writer did not spell out.
+        let isRawByte = dtype == "I8" || dtype == "U8" || dtype == "INT8"
+            || dtype.contains("UINT8")
+        if isRawByte, let scale, scale.isScaleCompanion, !scale.isBF16, !scale.isF16,
+           scale.columns > 0 {
+            if tensor.columns == scale.columns * 16 { return .mxfp4 }
+            if tensor.columns == scale.columns * 32 { return .fp8Block32 }
+        }
         return .unsupported
     }
 
@@ -141,6 +191,74 @@ nonisolated public enum DeepSeekV41DevicePlan {
         case .bf16: return DeepSeekV41Kernels.bf16Gemv
         case .unsupported: return nil
         }
+    }
+
+    /// Whether a BF16 projection should spread one output row over a threadgroup.
+    ///
+    /// Two kernels compute the same dot product with the parallelism in different
+    /// places. `bf16_gemv` gives a thread a whole row and keeps the grid at
+    /// `outDim * rows` threads; `bf16_gemv_rows` gives a row a threadgroup. Neither
+    /// dominates, and which wins is decided by how much work the grid has
+    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #10"):
+    ///
+    /// - A hundred-odd rows of a wide reduction starve the first form. `attn.wo_a`
+    ///   is eight bands of 128 rows over 8,192 columns, so a block of eight
+    ///   positions is 1,024 threads; the row-per-threadgroup form is 10.7x faster
+    ///   there and 5.2x faster on `attn.wkv` (448 rows).
+    /// - A tall, narrow projection has plenty of rows and the reverse holds: at
+    ///   73,728 rows the first form is 2.4x faster, because a 64-lane threadgroup
+    ///   with three float4 loads each spends more time at its barrier than on the
+    ///   reduction.
+    ///
+    /// The threshold is where the measured crossover sits: the row-per-threadgroup
+    /// form still wins by 2.3x at 6,144 threads and loses by 10% at 12,288. A decode
+    /// step is the exception and takes the row-per-threadgroup form at any row
+    /// count, because with one row there is no second position to reuse a row's
+    /// bytes and the one-thread form was slower at every shape measured (1.4x to
+    /// 22x).
+    public static func bf16GemvWantsWideGrid(outDim: Int, rows: Int) -> Bool {
+        let height = max(1, rows)
+        guard height > 1 else { return true }
+        return outDim * height <= 8_192
+    }
+
+    /// Input width at which one output row stops being the cheapest unit of work.
+    ///
+    /// A threadgroup reading one output row loads every position's vector for the
+    /// length of that row, so a block of eight re-reads its activations once per row
+    /// and there are tens of thousands of rows. Sharing that load between two rows
+    /// halves it, and whether that beats the extra accumulators depends only on how
+    /// long the row is: swept across input widths at a fixed 7,168-row output the
+    /// pair form measured 0.94x at 1,024, 1.00x at 1,536, 1.06x at 2,048, 1.05x at
+    /// 3,072, 0.97x at 4,096, 1.20x at 6,144 and 1.20-1.34x at 8,192. A second run
+    /// put 3,072 and 4,096 at 1.22x and 1.32x, so the crossover is somewhere between
+    /// 2,048 and 6,144 and this line errs to the conservative side of it. The
+    /// published `attn.wq_b` (1,536 wide) keeps the one-row form either way and
+    /// `attn.wo_a`, `attn.wo_b` and `attn.wq_a` (7,168-8,192) take the pair
+    /// (`DeepSeekV41PrefillMeasurementTests.testWhatAWiderBlockSavesOnAWeightRead`).
+    /// Four rows per threadgroup was measured too and lost everywhere (0.82x, 0.82x,
+    /// 1.30x), because thirty-two accumulators cost more than the input they save.
+    public static let rowSharingWidth = 6_144
+
+    /// Which BF16 GEMV kernel a projection gets.
+    ///
+    /// A full block of eight positions — `chunkSlots`' ceiling — takes
+    /// `bf16_gemv_rows8`, which gives a threadgroup one output row and streams it once
+    /// for every position, so the weight is read as often as it changes instead of once
+    /// per position. It measured faster than both other forms at every published shape,
+    /// from 448 rows to 73,728, so there is no threshold to pick: an eight-position
+    /// block always wants a block form. Which of the two, `rowSharingWidth` decides. A
+    /// shorter batch has neither and falls back to the two-way rule in
+    /// `bf16GemvWantsWideGrid`.
+    public static func bf16GemvForm(
+        outDim: Int,
+        inDim: Int,
+        rows: Int
+    ) -> DeepSeekV41BF16GemvForm {
+        if max(1, rows) == 8 {
+            return max(1, inDim) >= rowSharingWidth ? .blockPair : .block
+        }
+        return bf16GemvWantsWideGrid(outDim: outDim, rows: rows) ? .wideGrid : .perRow
     }
 
     /// The fused gate+up kernel, or nil when the format's kernel cannot apply the
@@ -199,15 +317,40 @@ nonisolated public enum DeepSeekV41DevicePlan {
     }
 
     /// Rows one position may gather: its window plus the compressed rows the
-    /// addressing rule reads. `index_topk == 0` means "every compressed row",
-    /// which grows with the context, so the candidate-block budget bounds it and a
-    /// plan that provisions wider is reported instead of overflowing the buffer.
+    /// addressing rule reads.
+    ///
+    /// A layer that runs an indexer keeps `min(index_topk, produced)` compressed
+    /// rows, so `index_topk` is the bound there — it is not "0 means every row".
+    /// A compressed layer with no indexer (`index_topk == 0`) falls back to the
+    /// "all rows the candidate mask can expose" rule, which the block counts
+    /// bound; pricing the indexed case off those counts instead allocated ~25×
+    /// the buffer this checkpoint needs (16,512 rows for what is really 640) and
+    /// made the readiness line misleading.
+    ///
+    /// This bounds the attention as well as the gather: the kernel keeps one score
+    /// per gathered row in threadgroup memory, so a budget past
+    /// `device.maxThreadgroupMemoryLength` / 4 is refused when the first position
+    /// decodes rather than gathered into a buffer nothing can read.
     public static func gatherRowBudget(config: DeepSeekV41Config) -> Int {
-        let compressed = max(
-            config.indexTopK,
-            config.candidateTopKBlocks * max(1, config.candidateBlockSize)
-        )
-        return max(1, config.windowSize) + max(0, compressed)
+        let window = max(1, config.windowSize)
+        if config.indexTopK > 0 { return window + config.indexTopK }
+        let candidates = max(1, config.candidateTopKBlocks) * max(1, config.candidateBlockSize)
+        return window + candidates
+    }
+
+    /// How many positions one prefilled block runs at once.
+    ///
+    /// Bounded three ways. By the window, because the ring holds exactly `window`
+    /// rows: writing position `p + 1` evicts `p + 1 - window`, which a query at `p`
+    /// still needs, so a block wider than the window would read a row its own
+    /// successors had overwritten. By the context, which may be shorter. And by a
+    /// ceiling, because every per-position vector is replicated: at the published
+    /// widths a slot is a few hundred kilobytes, so eight of them cost a couple of
+    /// megabytes against a checkpoint that streams hundreds of gigabytes.
+    public static func chunkSlots(config: DeepSeekV41Config, contextLength: Int) -> Int {
+        let window = max(1, config.windowSize)
+        let ceiling = 8
+        return max(1, min(ceiling, min(window, max(1, contextLength))))
     }
 
     /// Wiring problems the executor can see without touching a weight: a dimension
@@ -238,10 +381,34 @@ nonisolated public enum DeepSeekV41DevicePlan {
             }
         }
         for layer in plan where layer.engramTable != nil {
-            problems.append(
-                "layers.\(layer.index): Engram memory is not served on device yet "
-                    + "(its combination rule is \(DeepSeekV41Conformance.engramCombination.rawValue))"
-            )
+            let table = layer.engramTable ?? -1
+            guard table >= 0, table < config.engramTables.count else {
+                problems.append(
+                    "layers.\(layer.index): Engram table index \(table) has no entry in "
+                        + "engram_layer_ids (\(config.engramTables.count) tables)"
+                )
+                continue
+            }
+            let spec = config.engramTables[table]
+            if spec.maxNgramSize < 2 || spec.headCount <= 0 {
+                problems.append(
+                    "layers.\(layer.index): Engram table \(table) has no hash columns to read "
+                        + "(max_ngram_size \(spec.maxNgramSize), n_heads \(spec.headCount))"
+                )
+            }
+            if spec.headDimension <= 0 {
+                problems.append(
+                    "layers.\(layer.index): Engram table \(table) publishes no head dimension"
+                )
+            }
+            if spec.rowCount <= 0 {
+                problems.append("layers.\(layer.index): Engram table \(table) publishes no rows")
+            }
+            if spec.layer != layer.index {
+                problems.append(
+                    "layers.\(layer.index): Engram table \(table) belongs to layer \(spec.layer)"
+                )
+            }
         }
         let widest = max(
             config.hiddenSize,
@@ -274,6 +441,8 @@ nonisolated public enum DeepSeekV41DevicePlan {
     /// this set exists purely so a test can assert full coverage of the shared
     /// layer pipeline.
     public static let encodedStages: Set<DeepSeekV41ForwardStages.Stage> = [
+        .engram,
+        .hcAttentionCoefficients,
         .mixAttentionStreams,
         .attnNorm,
         .queryDown,
@@ -290,9 +459,9 @@ nonisolated public enum DeepSeekV41DevicePlan {
         .outputDown,
         .outputUp,
         .writeAttentionStreams,
+        .hcFFNCoefficients,
         .mixFFNStreams,
         .ffnNorm,
-        .engram,
         .router,
         .sharedExpert,
         .routedExperts,
@@ -418,7 +587,93 @@ nonisolated final class DeepSeekV41VectorBank: @unchecked Sendable {
     }
 }
 
+// MARK: - Parity probes
+
+/// Buffers the device writes its intermediates into, so a parity harness can read
+/// what a stage computed after the workspace has reused the buffer.
+///
+/// Every field is nil in production, and a nil probe is skipped rather than bound:
+/// the copy is one dispatch per set field and nothing reads the result.
+nonisolated public struct DeepSeekV41ParityProbes {
+    /// The stack the attention coefficients are projected from (`mult * hidden`).
+    public var beforeAttention: MTLBuffer?
+    /// `(2 + mult) * mult` logits for each sub-layer's projection.
+    public var attentionLogits: MTLBuffer?
+    public var feedForwardLogits: MTLBuffer?
+    /// The stack after the attention sub-layer's `hc_post` (`mult * hidden`).
+    public var afterAttention: MTLBuffer?
+
+    public init(
+        beforeAttention: MTLBuffer? = nil,
+        attentionLogits: MTLBuffer? = nil,
+        feedForwardLogits: MTLBuffer? = nil,
+        afterAttention: MTLBuffer? = nil
+    ) {
+        self.beforeAttention = beforeAttention
+        self.attentionLogits = attentionLogits
+        self.feedForwardLogits = feedForwardLogits
+        self.afterAttention = afterAttention
+    }
+}
+
 // MARK: - Executor
+
+/// Where a block's per-layer time goes, in nanoseconds.
+///
+/// Three buckets rather than a profiler because the question is narrow: after the
+/// mixture was batched, a block still costs ~0.14 ms/position/layer, and the fix
+/// depends on whether that is host encode (fewer dispatches over more positions),
+/// device time (fewer or cheaper kernels), or the mixture's own encode. Zero unless
+/// `DeepSeekV41MetalForward.recordsBlockTiming` is on.
+nonisolated public struct DeepSeekV41BlockTiming: Sendable, Equatable {
+    /// Host time encoding every stage of the dense half, batched and per slot.
+    public var denseEncodeNanoseconds: UInt64 = 0
+    /// Host time blocked on the dense half, which is the routing readback's wait:
+    /// device time plus the commit — INCLUDING whatever the queue had not finished,
+    /// which is the previous layer's mixture. That is why the two device fields
+    /// below exist rather than trusting this one.
+    public var frontWaitNanoseconds: UInt64 = 0
+    /// Host time encoding the mixture half.
+    public var mixtureEncodeNanoseconds: UInt64 = 0
+    /// Device time the dense half's command buffers actually occupied, summed from
+    /// their own `gpuStartTime`/`gpuEndTime`. A previous half still running on the
+    /// queue is not counted here, so this and `mixtureDeviceNanoseconds` are the
+    /// split that says which half to work on.
+    public var denseDeviceNanoseconds: UInt64 = 0
+    /// The same for the mixture half.
+    public var mixtureDeviceNanoseconds: UInt64 = 0
+    /// Layers measured, so a caller divides by layers rather than by blocks.
+    public var layers: Int = 0
+    /// Positions measured, i.e. the sum of every measured block's width.
+    public var positions: Int = 0
+
+    public init() {}
+
+    public var encodedNanoseconds: UInt64 { denseEncodeNanoseconds + mixtureEncodeNanoseconds }
+
+    /// Per-position, per-layer cost of each bucket, in milliseconds. `positions`
+    /// already counts every measured block's width, so this is `layers * block
+    /// width` and dividing by it needs no further factor.
+    public func millisecondsPerPositionLayer() -> (
+        denseEncode: Double,
+        wait: Double,
+        mixtureEncode: Double,
+        denseDevice: Double,
+        mixtureDevice: Double
+    ) {
+        let divisor = Double(max(1, positions))
+        func milliseconds(_ nanoseconds: UInt64) -> Double {
+            Double(nanoseconds) / divisor / 1_000_000
+        }
+        return (
+            milliseconds(denseEncodeNanoseconds),
+            milliseconds(frontWaitNanoseconds),
+            milliseconds(mixtureEncodeNanoseconds),
+            milliseconds(denseDeviceNanoseconds),
+            milliseconds(mixtureDeviceNanoseconds)
+        )
+    }
+}
 
 /// One loaded DeepSeek-V4.1 checkpoint, driven one position at a time.
 ///
@@ -427,7 +682,7 @@ nonisolated final class DeepSeekV41VectorBank: @unchecked Sendable {
 /// `prefill` walks a prompt through it. Both are synchronous: the caller is
 /// already inside the engine's detached turn task, and the only waits are the
 /// per-layer routing readback and the final logits readback.
-nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
+nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForward, @unchecked Sendable {
 
     public let config: DeepSeekV41Config
     public let plan: [DeepSeekV41LayerPlan]
@@ -453,18 +708,100 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
     /// identity value rather than an unbound buffer. Metal leaves an unbound slot
     /// undefined; the kernels test for `nullptr`, which an unbound buffer is not.
     private let zeros: MTLBuffer?
-    /// `hc_*_scale` absent means a scale of 1, so its identity is ones, not zeros.
+    /// The identity for a multiplicative slot, which is ones rather than zeros.
     private let ones: MTLBuffer?
     /// `attn_sink` absent means "no sink entry", which the kernel spells `-1e30`.
     private let sinkDisabled: MTLBuffer?
     private let mult: Int
+    /// `(2 + mult) * mult`: how many logits `hc_*_fn` produces per position.
+    private let mixCount: Int
     private let recordElements: Int
     private let swigluLimit: Float
     private let gatherRows: Int
     private let contextLength: Int
+    /// Debug opt-out: run an Engram layer with no memory read instead of reading it.
+    private let skipEngram: Bool
+    /// Where each Engram table stages one position's rows. Indexed by
+    /// `layer.engramTable`, which is `config.engramTables` order.
+    private let engramSlots: [DeepSeekV41EngramSlot]
+    private let engramReaders: [Int: DeepSeekV41EngramReader]
+    private let engramLayouts: [Int: DeepSeekV41EngramLayout]
+    /// The compressed vocabulary the hashes are drawn from, built at load.
+    private let engramTokenMap: DeepSeekV41EngramTokenMap?
+    /// Why the map is missing, so the readiness line names a reason.
+    private let engramProblem: String?
+    /// The token stream ending at the position being run, oldest first. The Engram
+    /// hash reads look-backs from it, so the executor keeps it the way the
+    /// reference forward does.
+    private var tokenHistory: [Int32] = []
+    /// One dead flag per history entry. A dead position (an image span) takes no
+    /// part in an n-gram and its gate is zero.
+    private var deadTokens: [Bool] = []
+    private var pendingDead = false
+    /// Which block of the compressor scratch each owner fills. Divided from the
+    /// plan at load, because the block a layer writes is a property of the layer
+    /// rather than of the position being run.
+    private let compressorOwnerSlots: [Int: Int]
+    /// Fills the arena slots from the shards. Nil means the routed experts are read
+    /// through the zero-copy shard mappings, which is correct but pays a page fault
+    /// per 16 KB and collapses to ~0.065 GB/s once it interleaves with GPU work.
+    private let streamer: DeepSeekV41ExpertStreamer?
     /// Committed command buffers whose results the host has not needed yet. Drained
     /// by `settlePending` at every readback and at the end of a token.
     private var pending: [(buffer: MTLCommandBuffer, stage: String)] = []
+
+    /// Command buffers whose device time `recordDeviceTiming` still has to read, with
+    /// the half they belong to (0 dense, 1 mixture). Only filled while
+    /// `recordsBlockTiming` is on, and only in the block path.
+    private var timingBuffers: [(buffer: MTLCommandBuffer, bucket: Int)] = []
+    /// One front-half buffer per stage, filled only while `recordsStageTiming` is on.
+    private var stageBuffers: [(stage: String, buffer: MTLCommandBuffer)] = []
+    /// Measurement-only scratch the calibration stage dispatches into.
+    private var calibrationScratch: MTLBuffer?
+
+    /// Diagnostic readback, off in every production path.
+    ///
+    /// The intermediates a layer derives live in buffers a later stage of the SAME
+    /// layer reuses: the feed-forward's coefficient projection overwrites the
+    /// attention's logits, and the collapse overwrites the stack. A parity harness
+    /// that compares this port with its host reference needs to see what the device
+    /// computed and what it computed FROM; without that a disagreement can only be
+    /// reported, not attributed to a stage.
+    public var parityProbes = DeepSeekV41ParityProbes()
+
+    /// Where a block's per-layer time goes, accumulated while `recordsBlockTiming`
+    /// is on. Off in every production path.
+    ///
+    /// The split is deliberately coarse: host time encoding the dense half, host
+    /// time blocked on the dense half's wait, and host time encoding the mixture.
+    /// Those three want opposite fixes — a per-slot kernel turned into a grid over
+    /// positions only helps if encode time is what dominates, and it costs nothing
+    /// if the wait is — so the number decides the next change instead of a dispatch
+    /// census (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #3").
+    public var recordsBlockTiming = false
+    public private(set) var blockTiming = DeepSeekV41BlockTiming()
+
+    /// Device time per dense-half stage, in nanoseconds, by stage name.
+    ///
+    /// Off unless `recordsStageTiming` is on, which changes the LAYOUT rather than
+    /// the work: each stage is committed in its own command buffer (submission order
+    /// on the queue is unchanged, and Metal tracks the buffers) so every stage
+    /// reports its own `gpuStartTime`/`gpuEndTime`. That is the only way to say which
+    /// stage holds the dense half's device time, which after the mixture was batched
+    /// is the largest single block of a block's cost.
+    public var recordsStageTiming = false
+    public private(set) var stageTiming: [String: UInt64] = [:]
+
+    /// Clears the accumulated timing, so a measurement times one prompt rather than
+    /// everything the executor has ever run.
+    public func resetBlockTiming() {
+        blockTiming = DeepSeekV41BlockTiming()
+    }
+
+    /// Clears the per-stage accumulation.
+    public func resetStageTiming() {
+        stageTiming.removeAll(keepingCapacity: true)
+    }
 
     public init(runtime: DeepSeekV41Runtime, shardBuffers: [UInt32: MTLBuffer]) {
         self.config = runtime.config
@@ -479,6 +816,7 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         self.workspace = runtime.workspace
         self.shardBuffers = shardBuffers
         self.mult = max(1, runtime.config.hcMult)
+        self.mixCount = (2 + self.mult) * self.mult
         self.recordElements = max(
             1,
             runtime.cache.layout.geometry.recordBytes
@@ -486,9 +824,71 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         )
         self.swigluLimit = runtime.config.swigluLimit ?? 0
         self.gatherRows = runtime.workspace.gatherRows
+        self.compressorOwnerSlots = DeepSeekV41CacheAddressing.compressorOwnerSlots(
+            plan: runtime.plan
+        )
         self.contextLength = runtime.contextLength
+        self.skipEngram = runtime.allowEngramSkip
+        self.streamer = runtime.expertStreamer
+        self.engramSlots = runtime.workspace.engramSlots
+        self.engramReaders = runtime.weights.engramReaders
+        self.engramLayouts = runtime.weights.engramLayouts
+        self.engramTokenMap = runtime.engramTokenMap
+        self.engramProblem = runtime.engramProblem
 
-        var problems = DeepSeekV41DevicePlan.problems(config: runtime.config, plan: runtime.plan)
+        var problems = DeepSeekV41DevicePlan.problems(
+            config: runtime.config,
+            plan: runtime.plan
+        )
+        // An Engram layer needs four pieces before it can serve a position: the
+        // table file (a reader), the bucket arithmetic (a layout), the compressed
+        // vocabulary (the token map) and the `wkv` projection. Each missing piece
+        // is named, because the failure mode of guessing is text that reads fine.
+        for layer in runtime.plan where layer.engramTable != nil && !runtime.allowEngramSkip {
+            let table = layer.engramTable ?? -1
+            guard table >= 0, table < runtime.workspace.engramSlots.count else {
+                problems.append(
+                    "layers.\(layer.index): Engram table index \(table) is outside "
+                        + "the \(runtime.workspace.engramSlots.count) tables the plan carries"
+                )
+                continue
+            }
+            let slot = runtime.workspace.engramSlots[table]
+            if runtime.engramTokenMap == nil {
+                problems.append(
+                    "layers.\(layer.index): "
+                        + (runtime.engramProblem ?? "the Engram token map is unavailable")
+                )
+            }
+            if runtime.weights.engramReaders[layer.index] == nil {
+                problems.append(
+                    runtime.weights.engramReaderProblems[layer.index]
+                        ?? "layers.\(layer.index): the Engram table file could not be opened, "
+                        + "so its rows cannot be read"
+                )
+            }
+            if runtime.weights.engramLayouts[layer.index] == nil {
+                problems.append(
+                    "layers.\(layer.index): the Engram bucket layout could not be resolved"
+                )
+            }
+            if slot.flatWidth % 32 != 0 {
+                problems.append(
+                    "layers.\(layer.index): the Engram rows flatten to \(slot.flatWidth) values, "
+                        + "which is not the multiple of 32 the block-scaled projections read"
+                )
+            }
+            if let wkv = runtime.weights.tensor(.engramWkv, layer: layer.index) {
+                let expectedRows = runtime.config.hiddenSize * (max(1, runtime.config.hcMult) + 1)
+                if wkv.rows != expectedRows || wkv.columns != slot.flatWidth {
+                    problems.append(
+                        "layers.\(layer.index): engram.wkv is \(wkv.rows)x\(wkv.columns), "
+                            + "but the gate needs \(expectedRows)x\(slot.flatWidth) "
+                            + "((hc_mult + 1) * hidden by columns * head_dim)"
+                    )
+                }
+            }
+        }
         if runtime.cachePrecision != .fp16 {
             problems.append(
                 "the cache is allocated at \(runtime.cachePrecision.rawValue), but the store/gather "
@@ -535,8 +935,8 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         self.latentFrequencies = latents
 
         // Identity buffers for the optional kernel slots, sized for every place one
-        // is substituted: router bias (one per expert), hc scale/base (one per
-        // stream or dimension), and the attention sink (one per head).
+        // is substituted: router bias (one per expert), the engram per-copy weights
+        // (one per copy and dimension), and the attention sink (one per head).
         let zeroCount = max(
             16,
             max(
@@ -590,12 +990,23 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             store(.compressorNorm, l)
             store(.indexerKNorm, l)
             store(.routerBias, l)
-            store(.hcAttnFn, l, resizeTo: max(1, runtime.config.hcMult))
-            store(.hcAttnScale, l, resizeTo: max(1, runtime.config.hcMult))
+            // The projection itself is read from the shard bytes by
+            // `encodeHyperConnectionCoefficients` (it is FP32, which the quantized
+            // GEMV kernels do not cover), so only the two small companions are
+            // staged here. `hc_*_scale` keeps all three values: they scale the
+            // pre, post and comb sections, not the copies.
+            store(.hcAttnScale, l)
             store(.hcAttnBase, l)
-            store(.hcFfnFn, l, resizeTo: max(1, runtime.config.hcMult))
-            store(.hcFfnScale, l, resizeTo: max(1, runtime.config.hcMult))
+            store(.hcFfnScale, l)
             store(.hcFfnBase, l)
+            // `q_weight` and `k_weight` are ones-initialized per-copy parameters
+            // that only ever appear multiplied together (`Engram.forward`), so they
+            // are resolved to one FP32 vector instead of being read per token.
+            if layer.engramTable != nil && !runtime.allowEngramSkip {
+                let width = max(1, runtime.config.hcMult) * runtime.config.hiddenSize
+                store(.engramQuery, l, resizeTo: width)
+                store(.engramKey, l, resizeTo: width)
+            }
         }
         self.vectors = bank
 
@@ -617,19 +1028,108 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
 
     public var isRunnable: Bool { problems.isEmpty }
 
+    /// Positions the cache was provisioned for. The turn loop sizes its token cap
+    /// from this so the last position cannot land past the cache.
+    public var positionLimit: Int { contextLength }
+
     /// One-line readiness report for the load log.
     public func describe() -> String {
         var lines = [
             "device forward: \(isRunnable ? "ready" : "not runnable") at "
                 + "\(DeepSeekV41DevicePlan.gatherRowBudget(config: config)) gathered rows/position"
         ]
+        if skipEngram {
+            let skipped = plan.filter { $0.engramTable != nil }.map(\.index)
+            if !skipped.isEmpty {
+                lines.append(
+                    "  ENGRAM SKIPPED on layers \(skipped.map(String.init).joined(separator: ", ")): "
+                        + "they run with no memory read at all (\(DeepSeekV41Runtime.engramOffDefaultKey))"
+                )
+            }
+        } else {
+            let served = plan.filter { $0.engramTable != nil }
+            if !served.isEmpty {
+                let rows = served.map { layer -> String in
+                    let table = layer.engramTable ?? -1
+                    let columns = table >= 0 && table < engramSlots.count
+                        ? engramSlots[table].columns : 0
+                    return "\(layer.index):\(columns)"
+                }
+                lines.append(
+                    "  ENGRAM rows/position on layers " + rows.joined(separator: ", ")
+                )
+            }
+        }
         lines.append(contentsOf: problems.map { "  \($0)" })
         return lines.joined(separator: "\n")
     }
 
     /// Drops the sequence so the next `forwardToken` starts at position 0.
+    ///
+    /// The token history goes with the cache: an n-gram must never span the seam
+    /// between two prompts. A resumed turn skips this, which is why `resume` checks
+    /// that the history it keeps really is the prompt's.
     public func reset() {
         cache.reset()
+        tokenHistory.removeAll(keepingCapacity: true)
+        deadTokens.removeAll(keepingCapacity: true)
+        pendingDead = false
+    }
+
+    /// Positions the cache already holds.
+    public var storedPositions: Int { cache.storedPositions }
+
+    /// How much of `promptTokenIds` this cache can skip.
+    ///
+    /// The count arithmetic is `reusablePrefix`'s; what the count cannot say is
+    /// whether the resident positions are these tokens. The pin that proposed the
+    /// length belongs to the app, not to this cache: another model's turn, or an
+    /// older turn of this one, can leave a pin whose length happens to fit a sequence
+    /// this cache never saw. So the history is compared, and a mismatch is a full
+    /// prefill rather than a wrong one.
+    public func reusablePrefix(proposedPrefix: Int, promptTokenIds: [Int]) -> Int {
+        let stored = cache.storedPositions
+        guard deadTokens.count == stored else { return 0 }
+        return DeepSeekV41CacheAddressing.reusablePrefix(
+            proposed: proposedPrefix,
+            storedPositions: stored,
+            promptTokenIds: promptTokenIds,
+            residentTokens: tokenHistory
+        )
+    }
+
+    /// Keeps the resident sequence so the next `forwardToken` may continue it.
+    ///
+    /// Nothing is cleared: the window ring, the compressed rows, every owner's
+    /// half-filled compressor group and the token stream the Engram layers hash are
+    /// all addressed by position, so they describe exactly the sequence that produced
+    /// them. What this does is refuse to pretend: if the resident history is not this
+    /// prompt's tokens, continuing would mix two conversations inside an n-gram, and
+    /// an idle cache has nothing to continue from.
+    public func resume(prefixTokenIds: [Int]) throws {
+        let stored = cache.storedPositions
+        guard prefixTokenIds.count == stored else {
+            throw DeepSeekV41EngineError.outOfOrderPosition(prefixTokenIds.count, stored)
+        }
+        guard tokenHistory.count == stored, deadTokens.count == stored else {
+            throw DeepSeekV41EngineError.prefixStateMismatch(
+                position: min(tokenHistory.count, stored)
+            )
+        }
+        for (position, token) in prefixTokenIds.enumerated() {
+            guard tokenHistory[position] == Int32(truncatingIfNeeded: token) else {
+                throw DeepSeekV41EngineError.prefixStateMismatch(position: position)
+            }
+        }
+        // A dead marker the last turn left pending belongs to that turn.
+        pendingDead = false
+    }
+
+    /// Marks the next position as taking no part in an n-gram, so an Engram lookup
+    /// cannot span it and contributes nothing there. An image span is the caller
+    /// that needs this.
+    public func markNextTokenDead() {
+        pendingDead = true
     }
 
     /// Runs a prompt and returns the logits after the last position.
@@ -639,6 +1139,746 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             logits = try forwardToken(token, position: offset)
         }
         return logits
+    }
+
+    /// Runs a whole prompt as one chunk.
+    ///
+    /// The prompt is run in blocks of `workspace.slots` positions, each block as one
+    /// pass: the dense stages dispatch over every position at once (the kernels read
+    /// the token from `thread_position_in_grid.y`), and the stages that cannot —
+    /// the cache write, the attention that reads it, the routed mixture, whose
+    /// experts are streamed into an arena that holds a handful — run per position
+    /// inside the same command buffer. The mix of the two is the block's contract:
+    /// it must return exactly what the walk returns, which
+    /// `DeepSeekV41DeviceGraphParityTests` checks against the host reference.
+    public func prefillChunk(_ tokens: [Int]) throws -> DeepSeekV41ChunkLogits {
+        guard !tokens.isEmpty else { return DeepSeekV41ChunkLogits(last: []) }
+        var last: [Float] = []
+        let width = max(1, workspace.slots)
+        var offset = 0
+        while offset < tokens.count {
+            let end = min(offset + width, tokens.count)
+            let block = Array(tokens[offset..<end])
+            last = try runBlock(block, startPosition: offset)
+            offset = end
+        }
+        return DeepSeekV41ChunkLogits(last: last)
+    }
+
+    // MARK: One block
+
+    /// One block of consecutive positions, appended to the cache and the history.
+    ///
+    /// The block is `workspace.slots` wide at most (see
+    /// `DeepSeekV41DevicePlan.chunkSlots`), and its positions are consecutive, which
+    /// is what lets the rope and norm kernels address them with a grid height.
+    private func runBlock(_ tokens: [Int], startPosition: Int) throws -> [Float] {
+        guard problems.isEmpty else {
+            throw DeepSeekV41EngineError.modelNotRunnable(problems)
+        }
+        guard startPosition >= 0, startPosition + tokens.count <= contextLength else {
+            throw DeepSeekV41EngineError.contextTooLong(startPosition + tokens.count, contextLength)
+        }
+        guard cache.storedPositions == startPosition else {
+            throw DeepSeekV41EngineError.outOfOrderPosition(startPosition, cache.storedPositions)
+        }
+
+        for (index, token) in tokens.enumerated() {
+            tokenHistory.append(Int32(truncatingIfNeeded: token))
+            // A dead flag belongs to one position, so a block inherits it on its
+            // first position only; an image span marks every token it expands to and
+            // therefore still goes through the walk.
+            deadTokens.append(index == 0 ? pendingDead : false)
+        }
+        pendingDead = false
+
+        try encodeEmbeddingBlock(tokens, startPosition: startPosition)
+        for layer in plan {
+            try runBlockLayer(layer, startPosition: startPosition, count: tokens.count)
+        }
+        // Only the last position's logits are read.
+        try finishBlock(slot: tokens.count - 1)
+        try settlePending()
+        if recordsBlockTiming { recordDeviceTiming() }
+        cache.noteStored(startPosition + tokens.count)
+
+        var logits = [Float](repeating: 0, count: config.vocabSize)
+        let count = min(config.vocabSize, workspace.logits.length / MemoryLayout<Float>.stride)
+        let pointer = workspace.logits.contents().assumingMemoryBound(to: Float.self)
+        logits.withUnsafeMutableBufferPointer { destination in
+            destination.baseAddress?.update(from: pointer, count: count)
+        }
+        return logits
+    }
+
+    /// One layer over a block: the dense half as one pass, then the mixture as one
+    /// pass when the block's experts are all resident at once.
+    private func runBlockLayer(
+        _ layer: DeepSeekV41LayerPlan,
+        startPosition: Int,
+        count: Int
+    ) throws {
+        // Measurement only (`recordsBlockTiming`): four marks — layer start, dense
+        // half encoded, front half waited on, mixture encoded. The split is the one
+        // that matters, because host encode time and device time want opposite
+        // fixes: fewer dispatches over more positions, or fewer kernels.
+        let measuring = recordsBlockTiming
+        var marks: [UInt64] = measuring ? [DispatchTime.now().uptimeNanoseconds] : []
+
+        // Engram rows are host reads, one position at a time, and each goes into the
+        // table's staging block before the layer's command buffer exists.
+        if layer.engramTable != nil {
+            for index in 0..<count {
+                try readEngramRows(
+                    layer: layer, position: startPosition + index, positionSlot: index
+                )
+            }
+        }
+
+        // The routing readback needs this half finished, for every position of the
+        // block at once: one wait instead of one per position. `recordsStageTiming`
+        // keeps that single wait but gives each stage its own command buffer, so the
+        // queue's submission order (and every hazard it protects) is unchanged while
+        // each stage reports its own device window.
+        if recordsStageTiming {
+            var frontBuffers: [MTLCommandBuffer] = []
+            for stage in DeepSeekV41DevicePlan.frontHalf {
+                let buffer = try makeCommandBuffer()
+                let encoder = try makeEncoder(buffer)
+                try encodeBlockStage(
+                    stage,
+                    layer: layer,
+                    startPosition: startPosition,
+                    count: count,
+                    encoder: encoder
+                )
+                encoder.endEncoding()
+                buffer.commit()
+                pending.append((
+                    buffer: buffer,
+                    stage: "layer \(layer.index) \(stage.rawValue) (block \(count))"
+                ))
+                stageBuffers.append((stage: stage.rawValue, buffer: buffer))
+                frontBuffers.append(buffer)
+            }
+            // Calibration: what `count` trivial dispatches cost with nothing to
+            // compute, so the stage table can be read as dispatch overhead against
+            // real work instead of guessed at. The scratch buffer is measurement-only
+            // and one dispatch writes 16 bytes.
+            if calibrationScratch == nil {
+                calibrationScratch = device.makeBuffer(length: 1024, options: .storageModeShared)
+            }
+            if let scratch = calibrationScratch {
+                let calibration = try makeCommandBuffer()
+                let calibrationEncoder = try makeEncoder(calibration)
+                for _ in 0..<count {
+                    try encodeClear(calibrationEncoder, buffer: scratch, count: 4)
+                }
+                calibrationEncoder.endEncoding()
+                calibration.commit()
+                pending.append((buffer: calibration, stage: "layer \(layer.index) calibration"))
+                stageBuffers.append((
+                    stage: "calibration(\(count) dispatch)",
+                    buffer: calibration
+                ))
+            }
+            if measuring { marks.append(DispatchTime.now().uptimeNanoseconds) }
+            try settlePending()
+            recordStageTiming()
+            if measuring {
+                marks.append(DispatchTime.now().uptimeNanoseconds)
+                for buffer in frontBuffers {
+                    timingBuffers.append((buffer: buffer, bucket: 0))
+                }
+            }
+        } else {
+            let commandBuffer = try makeCommandBuffer()
+            let encoder = try makeEncoder(commandBuffer)
+            for stage in DeepSeekV41DevicePlan.frontHalf {
+                try encodeBlockStage(
+                    stage,
+                    layer: layer,
+                    startPosition: startPosition,
+                    count: count,
+                    encoder: encoder
+                )
+            }
+            encoder.endEncoding()
+            if measuring { marks.append(DispatchTime.now().uptimeNanoseconds) }
+            try commit(commandBuffer, stage: "layer \(layer.index) attention (block \(count))")
+            if measuring {
+                marks.append(DispatchTime.now().uptimeNanoseconds)
+                timingBuffers.append((buffer: commandBuffer, bucket: 0))
+            }
+        }
+
+        let routings = (0..<count).map { readRouting(slot: $0) }
+
+        // The mixture as one submission, which is what makes a block cheaper than a
+        // walk: one arena fill for the block's expert union instead of one per
+        // position, one command buffer, and no round trip between positions. The
+        // fill is safe here because the front half above was just waited on, so the
+        // GPU is idle and no kernel is reading the slots about to be overwritten.
+        if let residents = try blockResidents(layer: layer, routings: routings) {
+            let expertCommand = try makeCommandBuffer()
+            let expertEncoder = try makeEncoder(expertCommand)
+            for index in 0..<count {
+                for stage in DeepSeekV41DevicePlan.backHalf {
+                    try encodeBlockExpertStage(
+                        stage,
+                        layer: layer,
+                        slot: index,
+                        encoder: expertEncoder,
+                        routing: routings[index],
+                        residents: residents[index]
+                    )
+                }
+            }
+            expertEncoder.endEncoding()
+            // Nothing of this half is read back on the host, so it is ordered rather
+            // than waited for: the next layer's front half commits behind it, and
+            // that wait drains this one (`runLayer` orders its experts half the same
+            // way). The last layer lands in `settlePending` before the logits.
+            try commit(
+                expertCommand,
+                stage: "layer \(layer.index) experts (block \(count))",
+                waiting: false
+            )
+            if measuring {
+                marks.append(DispatchTime.now().uptimeNanoseconds)
+                timingBuffers.append((buffer: expertCommand, bucket: 1))
+            }
+            recordLayerTiming(marks, positions: count)
+            return
+        }
+
+        // A union too large for the arena stays per position: fill the slots this
+        // position routes, submit, and wait, because the next position's fill
+        // would otherwise land under a kernel still reading them.
+        for index in 0..<count {
+            let routing = routings[index]
+            var residents: [DeepSeekV41ResidentExpert]?
+            if let streamer, !routing.expertIDs.isEmpty {
+                residents = try streamer.ensureResident(
+                    layer: layer.index, experts: routing.expertIDs
+                )
+            }
+            let expertCommand = try makeCommandBuffer()
+            let expertEncoder = try makeEncoder(expertCommand)
+            for stage in DeepSeekV41DevicePlan.backHalf {
+                try encodeBlockExpertStage(
+                    stage,
+                    layer: layer,
+                    slot: index,
+                    encoder: expertEncoder,
+                    routing: routing,
+                    residents: residents
+                )
+            }
+            expertEncoder.endEncoding()
+            try commit(expertCommand, stage: "layer \(layer.index) experts", waiting: true)
+            if measuring { timingBuffers.append((buffer: expertCommand, bucket: 1)) }
+        }
+        if measuring { marks.append(DispatchTime.now().uptimeNanoseconds) }
+        recordLayerTiming(marks, positions: count)
+    }
+
+    /// Folds one layer's four measurement marks into `blockTiming`.
+    private func recordLayerTiming(_ marks: [UInt64], positions: Int) {
+        guard marks.count == 4 else { return }
+        blockTiming.denseEncodeNanoseconds += marks[1] - marks[0]
+        blockTiming.frontWaitNanoseconds += marks[2] - marks[1]
+        blockTiming.mixtureEncodeNanoseconds += marks[3] - marks[2]
+        blockTiming.layers += 1
+        blockTiming.positions += positions
+    }
+
+    /// Reads the device time of every command buffer the measured layers committed.
+    ///
+    /// `gpuStartTime`/`gpuEndTime` are only meaningful once a buffer has finished, so
+    /// this runs after the block's `settlePending`. The windows overlap nothing —
+    /// a buffer that started early because the queue was still draining the previous
+    /// layer reports its own window, which is exactly the attribution a host-side
+    /// wait cannot give.
+    private func recordDeviceTiming() {
+        for entry in timingBuffers {
+            let start = entry.buffer.gpuStartTime
+            let end = entry.buffer.gpuEndTime
+            guard end > start else { continue }
+            let nanoseconds = UInt64((end - start) * 1_000_000_000)
+            if entry.bucket == 0 {
+                blockTiming.denseDeviceNanoseconds += nanoseconds
+            } else {
+                blockTiming.mixtureDeviceNanoseconds += nanoseconds
+            }
+        }
+        timingBuffers.removeAll(keepingCapacity: true)
+    }
+
+    /// Reads each front-half stage's own device window, after the wait that covered
+    /// them all. Called only from the `recordsStageTiming` layout.
+    private func recordStageTiming() {
+        for entry in stageBuffers {
+            let start = entry.buffer.gpuStartTime
+            let end = entry.buffer.gpuEndTime
+            guard end > start else { continue }
+            stageTiming[entry.stage, default: 0] += UInt64((end - start) * 1_000_000_000)
+        }
+        stageBuffers.removeAll(keepingCapacity: true)
+    }
+
+    /// Every position's routed experts resident at the same time, or nil when that
+    /// does not fit and the block has to be streamed per position.
+    ///
+    /// A block routes at most `count * topK` experts before deduplication, which is
+    /// well under the arena the memory plan sizes for this checkpoint (hundreds of
+    /// slots even on 16 GB) but not under an arena that was deliberately kept small.
+    /// The distinction is not cosmetic: a slot filled while a kernel is still reading
+    /// it is a wrong answer with no error, so "does not fit" has to be a different
+    /// layout rather than a bigger grid.
+    ///
+    /// No streamer is not a failure either — the experts are then read through the
+    /// shard mappings, nothing is refilled, and the block still batches.
+    private func blockResidents(
+        layer: DeepSeekV41LayerPlan,
+        routings: [DeepSeekV41Routing]
+    ) throws -> [[DeepSeekV41ResidentExpert]?]? {
+        guard let streamer else {
+            return Array(repeating: nil, count: routings.count)
+        }
+        var union: [Int] = []
+        var seen: Set<Int> = []
+        for routing in routings {
+            for expert in routing.expertIDs where seen.insert(expert).inserted {
+                union.append(expert)
+            }
+        }
+        guard !union.isEmpty else { return Array(repeating: nil, count: routings.count) }
+        guard union.count <= streamer.capacity else { return nil }
+
+        let filled = try streamer.ensureResident(layer: layer.index, experts: union)
+        var byExpert: [Int: DeepSeekV41ResidentExpert] = [:]
+        byExpert.reserveCapacity(union.count)
+        for (position, expert) in union.enumerated() {
+            byExpert[expert] = filled[position]
+        }
+        // The bindings are indexed by rank within a position's routing, so this has
+        // to keep `expertIDs` order rather than follow the union's.
+        var residents: [[DeepSeekV41ResidentExpert]?] = Array(
+            repeating: nil, count: routings.count
+        )
+        for (slot, routing) in routings.enumerated() where !routing.expertIDs.isEmpty {
+            var ranked: [DeepSeekV41ResidentExpert] = []
+            ranked.reserveCapacity(routing.expertIDs.count)
+            for expert in routing.expertIDs {
+                guard let resident = byExpert[expert] else {
+                    throw DeepSeekV41EngineError.missingTensor(
+                        "layers.\(layer.index).ffn.experts.\(expert) in the arena"
+                    )
+                }
+                ranked.append(resident)
+            }
+            residents[slot] = ranked
+        }
+        return residents
+    }
+
+    /// One stage of a block's dense half.
+    ///
+    /// A stage is either ONE dispatch over every position — the kernels that read
+    /// the token from `thread_position_in_grid.y`, or a grid height of rows — or a
+    /// loop over the positions' slots, for the stages whose input or output is a
+    /// single-position buffer (the mHC logits, the Engram staging, the compressor's
+    /// group state, the gathered rows).
+    private func encodeBlockStage(
+        _ stage: DeepSeekV41ForwardStages.Stage,
+        layer: DeepSeekV41LayerPlan,
+        startPosition: Int,
+        count: Int,
+        encoder: MTLComputeCommandEncoder
+    ) throws {
+        let index = layer.index
+        let shape = DeepSeekV41AttentionShape.make(config: config, layer: layer)
+
+        func eachSlot(_ body: (Int) throws -> Void) rethrows {
+            for slot in 0..<count { try body(slot) }
+        }
+
+        switch stage {
+        case .hcAttentionCoefficients:
+            try encodeHyperConnectionCoefficients(
+                encoder,
+                layer: index,
+                function: .hcAttnFn,
+                base: .hcAttnBase,
+                scale: .hcAttnScale,
+                pre: workspace.hcAttentionPre,
+                post: workspace.hcAttentionPost,
+                comb: workspace.hcAttentionComb,
+                count: count
+            )
+
+        case .mixAttentionStreams:
+            try eachSlot { slot in
+                try encodeHyperConnectionPre(
+                    encoder,
+                    mix: workspace.hcMix,
+                    output: workspace.normed,
+                    snapshotting: true,
+                    slot: slot
+                )
+            }
+
+        case .attnNorm:
+            try encodeNorm(
+                encoder,
+                input: workspace.normed,
+                gain: vectors.gain(.attnNorm, layer: index, width: shapes.hidden),
+                output: workspace.normed,
+                width: shapes.hidden,
+                rows: count
+            )
+
+        case .queryDown:
+            if config.qLoraRank > 0, let down = weights.tensor(.attnWqA, layer: index) {
+                try encodeGemv(
+                    encoder,
+                    weight: down,
+                    scale: weights.scaleTensor(.attnWqA, layer: index),
+                    inDim: shapes.hidden,
+                    outDim: max(1, config.qLoraRank),
+                    input: workspace.normed,
+                    output: workspace.reduced,
+                    rows: count
+                )
+            }
+
+        case .queryNorm:
+            if config.qLoraRank > 0 {
+                let hasDown = weights.tensor(.attnWqA, layer: index) != nil
+                let width = hasDown ? max(1, config.qLoraRank) : shapes.hidden
+                try encodeNorm(
+                    encoder,
+                    input: hasDown ? workspace.reduced : workspace.normed,
+                    gain: vectors.gain(.attnWqANorm, layer: index, width: width),
+                    output: hasDown ? workspace.reduced : workspace.normed,
+                    width: width,
+                    rows: count
+                )
+            }
+
+        case .queryUp:
+            let hasDown = config.qLoraRank > 0 && weights.tensor(.attnWqA, layer: index) != nil
+            guard let up = weights.tensor(.attnWqB, layer: index) else {
+                throw DeepSeekV41EngineError.missingTensor("attn.wq_b")
+            }
+            try encodeGemv(
+                encoder,
+                weight: up,
+                scale: weights.scaleTensor(.attnWqB, layer: index),
+                inDim: hasDown ? max(1, config.qLoraRank) : shapes.hidden,
+                outDim: shapes.queryWidth,
+                input: hasDown ? workspace.reduced : workspace.normed,
+                output: workspace.query,
+                rows: count
+            )
+
+        case .ropeQuery:
+            try encodeRope(
+                encoder,
+                vector: workspace.query,
+                rowWidth: shapes.queryWidth,
+                headDim: shape.qkHeadDim,
+                sliceStart: shape.queryRopeStart,
+                sliceLength: shape.queryRopeWidth,
+                table: layer.ropeTable,
+                latent: false,
+                position: startPosition,
+                batch: count
+            )
+
+        case .latentProject:
+            guard let wkv = weights.tensor(.attnWkv, layer: index) else {
+                throw DeepSeekV41EngineError.missingTensor("attn.wkv")
+            }
+            try encodeGemv(
+                encoder,
+                weight: wkv,
+                scale: weights.scaleTensor(.attnWkv, layer: index),
+                inDim: shapes.hidden,
+                outDim: shapes.latentWidth,
+                input: workspace.normed,
+                output: workspace.latent,
+                rows: count
+            )
+
+        case .latentNorm:
+            try encodeNorm(
+                encoder,
+                input: workspace.latent,
+                gain: vectors.gain(.attnKvNorm, layer: index, width: shapes.latentWidth),
+                output: workspace.latent,
+                width: shapes.latentWidth,
+                rows: count
+            )
+
+        case .ropeLatent:
+            try encodeRope(
+                encoder,
+                vector: workspace.latent,
+                rowWidth: shapes.latentWidth,
+                headDim: 0,
+                sliceStart: shape.latentRopeStart,
+                sliceLength: shape.latentRopeWidth,
+                table: layer.ropeTable,
+                latent: true,
+                position: startPosition,
+                batch: count
+            )
+
+        case .writeLatent:
+            // The ring is why the cache write, the pool and the gather stay in one
+            // loop: writing position `p + 1` evicts `p + 1 - window`, which a query
+            // at `p` still needs, so each position must gather before its successor
+            // writes. Only the attention itself is hoisted out of the loop: it reads
+            // the gathered blocks and nothing else, so the whole block attends in ONE
+            // dispatch of `count * heads` threadgroups instead of `count` dispatches
+            // of `heads` — each of which is a fifth of the machine
+            // (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #14" and "#15").
+            var attentionRows: [Int] = []
+            attentionRows.reserveCapacity(count)
+            try eachSlot { slot in
+                try encodeStore(
+                    encoder,
+                    latent: workspace.latent,
+                    latentOffset: workspace.slotOffset(slot, width: shapes.latentWidth),
+                    cacheBuffer: cache.windowBuffer,
+                    byteOffset: DeepSeekV41CacheAddressing.windowByteOffset(
+                        layer: index,
+                        position: startPosition + slot,
+                        layout: cache.layout
+                    ) ?? -1,
+                    physicalRow: 0
+                )
+                try encodePoolIfComplete(
+                    layer: layer,
+                    position: startPosition + slot,
+                    encoder: encoder,
+                    shape: shape,
+                    slotIndex: slot
+                )
+                attentionRows.append(
+                    try encodeAttentionGather(
+                        layer: layer,
+                        position: startPosition + slot,
+                        encoder: encoder,
+                        shape: shape,
+                        slotIndex: slot
+                    )
+                )
+            }
+            try encodeAttentionDispatch(
+                encoder: encoder,
+                shape: shape,
+                layerIndex: index,
+                slots: Array(0..<count),
+                rowCounts: attentionRows
+            )
+
+        case .compressPool, .attention:
+            // Both run inside `.writeLatent`: the ring forces the interleave.
+            break
+
+        case .ropeOutput:
+            if shape.outputCarriesRope {
+                try encodeRope(
+                    encoder,
+                    vector: workspace.attentionOut,
+                    rowWidth: shapes.attentionOutputWidth,
+                    headDim: shape.vHeadDim,
+                    sliceStart: shape.outputRopeStart,
+                    sliceLength: shape.latentRopeWidth,
+                    table: layer.ropeTable,
+                    latent: true,
+                    position: startPosition,
+                    inverse: true,
+                    batch: count
+                )
+            }
+
+        case .outputDown:
+            if config.oLoraRank > 0, let down = weights.tensor(.attnWoA, layer: index) {
+                // One dispatch per head group for the WHOLE block, not one per group per
+                // position: `attn.wo_a` is 65,536 columns wide and every position of a
+                // block reads the same bytes, so the per-slot loop this replaces read
+                // all of it once per position (`Benchmarks/PERF_FINDINGS.md`,
+                // "DSV4.1 #7"). The block's rows are contiguous at the full widths,
+                // which is what the row strides say.
+                try encodeBlockDiagonalProjection(
+                    encoder,
+                    weight: down,
+                    scale: weights.scaleTensor(.attnWoA, layer: index),
+                    groups: shape.outputGroups,
+                    inDim: shapes.attentionOutputWidth,
+                    outDim: shapes.outputReducedWidth,
+                    input: workspace.attentionOut,
+                    output: workspace.reduced,
+                    rows: count
+                )
+            }
+
+        case .outputUp:
+            guard let up = weights.tensor(.attnWoB, layer: index) else {
+                throw DeepSeekV41EngineError.missingTensor("attn.wo_b")
+            }
+            let hasDown = config.oLoraRank > 0 && weights.tensor(.attnWoA, layer: index) != nil
+            try encodeGemv(
+                encoder,
+                weight: up,
+                scale: weights.scaleTensor(.attnWoB, layer: index),
+                inDim: hasDown ? shapes.outputReducedWidth : shapes.attentionOutputWidth,
+                outDim: shapes.hidden,
+                input: hasDown ? workspace.reduced : workspace.attentionOut,
+                output: workspace.output,
+                rows: count
+            )
+
+        case .writeAttentionStreams:
+            try eachSlot { slot in
+                try encodeHyperConnectionPost(
+                    encoder,
+                    output: workspace.output,
+                    gains: workspace.hcAttentionPost,
+                    comb: workspace.hcAttentionComb,
+                    slot: slot
+                )
+            }
+            // Slot 0's copy, which is the position a block is most likely to get wrong:
+            // its attention dispatch is not the last one in the block. Without this the
+            // probe is written only by the walk, so a parity check over a block reads a
+            // buffer nothing filled.
+            if let probe = parityProbes.afterAttention {
+                try encodeCopy(
+                    encoder, from: workspace.streams, to: probe, count: mult * shapes.hidden
+                )
+            }
+
+        case .hcFFNCoefficients:
+            try encodeHyperConnectionCoefficients(
+                encoder,
+                layer: index,
+                function: .hcFfnFn,
+                base: .hcFfnBase,
+                scale: .hcFfnScale,
+                pre: workspace.hcFFNPre,
+                post: workspace.hcFFNPost,
+                comb: workspace.hcFFNComb,
+                count: count
+            )
+
+        case .mixFFNStreams:
+            try eachSlot { slot in
+                try encodeHyperConnectionPre(
+                    encoder,
+                    mix: workspace.hcAttentionPre,
+                    output: workspace.normed,
+                    snapshotting: true,
+                    slot: slot
+                )
+            }
+
+        case .ffnNorm:
+            try encodeNorm(
+                encoder,
+                input: workspace.normed,
+                gain: vectors.gain(.ffnNorm, layer: index, width: shapes.hidden),
+                output: workspace.normed,
+                width: shapes.hidden,
+                rows: count
+            )
+
+        case .engram:
+            try eachSlot { slot in
+                try encodeEngram(encoder, layer: layer, slot: slot)
+            }
+
+        case .router:
+            guard let gate = weights.tensor(.routerWeight, layer: index) else {
+                throw DeepSeekV41EngineError.missingTensor("ffn.gate")
+            }
+            try encodeGemv(
+                encoder,
+                weight: gate,
+                scale: weights.scaleTensor(.routerWeight, layer: index),
+                inDim: shapes.hidden,
+                outDim: config.numRoutedExperts,
+                input: workspace.normed,
+                output: workspace.routerLogits,
+                rows: count
+            )
+            encoder.memoryBarrier(scope: .buffers)
+            try encodeRouter(encoder, layer: index, count: count)
+
+        case .sharedExpert, .routedExperts, .writeFFNStreams, .collapseStreams:
+            throw DeepSeekV41EngineError.unsupportedStage(
+                "\(stage.rawValue) is a mixture stage, not a dense one"
+            )
+        }
+    }
+
+    /// One stage of a block's mixture, for one position.
+    private func encodeBlockExpertStage(
+        _ stage: DeepSeekV41ForwardStages.Stage,
+        layer: DeepSeekV41LayerPlan,
+        slot: Int,
+        encoder: MTLComputeCommandEncoder,
+        routing: DeepSeekV41Routing,
+        residents: [DeepSeekV41ResidentExpert]?
+    ) throws {
+        switch stage {
+        case .routedExperts:
+            try encodeRoutedExperts(
+                layer: layer,
+                encoder: encoder,
+                routing: routing,
+                residents: residents,
+                slot: slot
+            )
+        case .sharedExpert:
+            try encodeSharedExpert(layer: layer, encoder: encoder, slot: slot)
+        case .writeFFNStreams:
+            try encodeHyperConnectionPost(
+                encoder,
+                output: workspace.moeOut,
+                gains: workspace.hcFFNPost,
+                comb: workspace.hcFFNComb,
+                slot: slot
+            )
+            // The mix the NEXT layer's attention collapse uses is this FFN's `pre`,
+            // which is `hc_mult` wide per position: `Block.forward` returns
+            // `ffn_pre`, not the split. `mixCount` is the projection's ROW count
+            // (pre + post + comb), so copying that many floats per position both
+            // overran `hcMix` (which holds `mult` per position) and wrote several
+            // positions' worth into one.
+            try encodeCopy(
+                encoder,
+                from: workspace.hcFFNPre,
+                to: workspace.hcMix,
+                count: mult,
+                sourceByteOffset: workspace.slotOffset(slot, width: mult),
+                destinationByteOffset: workspace.slotOffset(slot, width: mult)
+            )
+        case .collapseStreams:
+            try encodeHyperConnectionPre(
+                encoder,
+                mix: workspace.hcMix,
+                output: workspace.hidden,
+                snapshotting: false,
+                slot: slot
+            )
+        default:
+            throw DeepSeekV41EngineError.unsupportedStage("stage \(stage.rawValue) in a mixture")
+        }
     }
 
     // MARK: One position
@@ -654,6 +1894,13 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         guard cache.storedPositions == position else {
             throw DeepSeekV41EngineError.outOfOrderPosition(position, cache.storedPositions)
         }
+
+        // The Engram layers hash the token stream, so the history is appended here
+        // rather than recomputed per layer. It is cleared by `reset`, which is what
+        // keeps one turn's n-grams out of the next one's.
+        tokenHistory.append(Int32(truncatingIfNeeded: token))
+        deadTokens.append(pendingDead)
+        pendingDead = false
 
         try encodeEmbedding(token)
         for layer in plan {
@@ -678,6 +1925,117 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
 
     /// Embedding into `hidden`, then every hyper-connection stream starts as a copy
     /// of it (the reference's `Array(repeating: hidden, count: mult)`).
+    /// Every position's embedding into its own slot, in one pass.
+    ///
+    /// `lookup_embeddings_bf16` already addresses a block: it reads
+    /// `tokenIds[id / hiddenDim]`, so a grid `count` rows tall embeds a whole block
+    /// with one dispatch.
+    private func encodeEmbeddingBlock(_ tokens: [Int], startPosition: Int) throws {
+        let count = tokens.count
+        // Every position's id goes into one entry of `tokenIDs`, and each dispatch
+        // binds its own entry, so a block wider than the workspace would both write
+        // past the buffer and bind an offset outside it (Metal refuses the second,
+        // the first would corrupt the neighbouring allocation).
+        let tokenCapacity = workspace.tokenIDs.length / MemoryLayout<UInt32>.stride
+        guard count <= tokenCapacity else {
+            throw DeepSeekV41EngineError.unsupportedStage(
+                "embedding a \(count)-position block into the \(tokenCapacity) token ids "
+                    + "the workspace holds"
+            )
+        }
+        let commandBuffer = try makeCommandBuffer()
+        let encoder = try makeEncoder(commandBuffer)
+
+        let tokenPointer = workspace.tokenIDs.contents().assumingMemoryBound(to: UInt32.self)
+        for (index, token) in tokens.enumerated() {
+            tokenPointer[index] = UInt32(max(0, token))
+        }
+
+        guard let embed = weights.tensor(.tokenEmbedding),
+              let kernel = DeepSeekV41DevicePlan.embeddingKernel(
+                tensor: embed,
+                scale: weights.scaleTensor(.tokenEmbedding)
+              ),
+              let embedBuffer = shardBuffer(embed) else {
+            throw DeepSeekV41EngineError.missingTensor("embed.weight")
+        }
+        var weightOffset = UInt64(embed.byteOffset)
+        var hiddenDim = UInt32(shapes.hidden)
+
+        for index in 0..<count {
+            let hiddenOffset = workspace.slotOffset(index, width: shapes.hidden)
+            if kernel == DeepSeekV41Kernels.bf16Embedding {
+                encoder.setComputePipelineState(pipelines.embeddingBF16)
+                encoder.setBuffer(embedBuffer, offset: 0, index: 0)
+                encoder.setBuffer(
+                    workspace.tokenIDs, offset: index * MemoryLayout<UInt32>.stride, index: 1
+                )
+                encoder.setBuffer(workspace.hidden, offset: hiddenOffset, index: 2)
+                encoder.setBytes(&weightOffset, length: 8, index: 3)
+                encoder.setBytes(&hiddenDim, length: 4, index: 4)
+            } else {
+                guard let scale = weights.scaleTensor(.tokenEmbedding),
+                      let scaleBuffer = shardBuffer(scale) else {
+                    throw DeepSeekV41EngineError.missingTensor("embed.weight scale")
+                }
+                var scaleOffset = UInt64(scale.byteOffset)
+                encoder.setComputePipelineState(pipelines.embeddingMXFP8)
+                encoder.setBuffer(embedBuffer, offset: 0, index: 0)
+                encoder.setBuffer(
+                    workspace.tokenIDs, offset: index * MemoryLayout<UInt32>.stride, index: 1
+                )
+                encoder.setBuffer(workspace.hidden, offset: hiddenOffset, index: 2)
+                encoder.setBuffer(scaleBuffer, offset: 0, index: 3)
+                encoder.setBytes(&weightOffset, length: 8, index: 4)
+                encoder.setBytes(&scaleOffset, length: 8, index: 5)
+                encoder.setBytes(&hiddenDim, length: 4, index: 6)
+            }
+            encoder.dispatchThreads(
+                MTLSize(width: shapes.hidden, height: 1, depth: 1),
+                threadsPerThreadgroup: threadgroup(shapes.hidden)
+            )
+        }
+        encoder.memoryBarrier(scope: .buffers)
+
+        // Every hyper-connection copy of every position starts as that position's
+        // embedding (`Array(repeating: hidden, count: mult)`), and the stack's first
+        // collapse is the identity mix (`make_identity_pre_mix`).
+        try encodeClear(encoder, buffer: workspace.streams, count: count * mult * shapes.hidden)
+        for index in 0..<count {
+            for copy in 0..<mult {
+                try encodeCopy(
+                    encoder,
+                    from: workspace.hidden,
+                    to: workspace.streams,
+                    count: shapes.hidden,
+                    sourceByteOffset: workspace.slotOffset(index, width: shapes.hidden),
+                    destinationByteOffset: workspace.slotOffset(
+                        index, width: mult * shapes.hidden
+                    ) + copy * shapes.hidden * MemoryLayout<Float>.stride
+                )
+            }
+        }
+        // `dsv41_hc_identity_mix_f32` is one scalar thread, so each slot gets its
+        // own dispatch rather than a grid height it would ignore.
+        encoder.setComputePipelineState(pipelines.hcIdentityMix)
+        var copies = UInt32(mult)
+        for index in 0..<count {
+            encoder.setBuffer(
+                workspace.hcMix,
+                offset: workspace.slotOffset(index, width: mult),
+                index: 0
+            )
+            encoder.setBytes(&copies, length: 4, index: 1)
+            encoder.dispatchThreads(
+                MTLSize(width: mult, height: 1, depth: 1),
+                threadsPerThreadgroup: threadgroup(mult)
+            )
+        }
+        encoder.memoryBarrier(scope: .buffers)
+        encoder.endEncoding()
+        try commit(commandBuffer, stage: "embedding (block \(count))", waiting: false)
+    }
+
     private func encodeEmbedding(_ token: Int) throws {
         let commandBuffer = try makeCommandBuffer()
         let encoder = try makeEncoder(commandBuffer)
@@ -724,12 +2082,29 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         )
         encoder.memoryBarrier(scope: .buffers)
 
+        // Every hyper-connection copy starts as this position's embedding
+        // (`Array(repeating: hidden, count: mult)`), and the stack's first collapse
+        // is the identity mix (`make_identity_pre_mix`), so the mix a forward pass
+        // carries is reset here beside the streams it belongs to.
         try encodeClear(encoder, buffer: workspace.streams, count: mult * shapes.hidden)
-        try encodeStreamWrite(
-            encoder,
-            contribution: workspace.hidden,
-            writeScales: nil
+        for copy in 0..<mult {
+            try encodeCopy(
+                encoder,
+                from: workspace.hidden,
+                to: workspace.streams,
+                count: shapes.hidden,
+                destinationByteOffset: copy * shapes.hidden * MemoryLayout<Float>.stride
+            )
+        }
+        encoder.setComputePipelineState(pipelines.hcIdentityMix)
+        encoder.setBuffer(workspace.hcMix, offset: 0, index: 0)
+        var copies = UInt32(mult)
+        encoder.setBytes(&copies, length: 4, index: 1)
+        encoder.dispatchThreads(
+            MTLSize(width: mult, height: 1, depth: 1),
+            threadsPerThreadgroup: threadgroup(mult)
         )
+        encoder.memoryBarrier(scope: .buffers)
         encoder.endEncoding()
         // Nothing reads the embedding on the host, so this does not wait: the first
         // layer's front half is ordered behind it on the same queue.
@@ -737,18 +2112,23 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
     }
 
     /// The block's output: collapse the streams, final norm, head.
-    private func finishBlock() throws {
+    private func finishBlock(slot: Int = 0) throws {
         let commandBuffer = try makeCommandBuffer()
         let encoder = try makeEncoder(commandBuffer)
 
-        // The collapsed stream is stream 0, exactly like the reference's `collapse`.
-        // It sits at byte 0 of the stream buffer, so no copy is needed.
+        // `.collapseStreams` already collapsed the stack with the mix the last
+        // block produced (`layer.hc_pre(h, pre_mix)`), and it wrote that vector into
+        // `hidden`; this normalizes it and projects the head. A block only reads the
+        // last position's logits, so the head runs for that slot alone.
+        let hiddenOffset = workspace.slotOffset(slot, width: shapes.hidden)
         try encodeNorm(
             encoder,
-            input: workspace.streams,
+            input: workspace.hidden,
             gain: vectors.gain(.finalNorm, layer: nil, width: shapes.hidden),
-            output: workspace.hidden,
-            width: shapes.hidden
+            output: workspace.output,
+            width: shapes.hidden,
+            inputByteOffset: hiddenOffset,
+            outputByteOffset: hiddenOffset
         )
         encoder.memoryBarrier(scope: .buffers)
 
@@ -761,8 +2141,9 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             scale: weights.scaleTensor(.lmHead),
             inDim: shapes.hidden,
             outDim: config.vocabSize,
-            input: workspace.hidden,
-            output: workspace.logits
+            input: workspace.output,
+            output: workspace.logits,
+            inputByteOffset: hiddenOffset
         )
         encoder.endEncoding()
         // The caller reads the logits, so this is where the token's queue catches up.
@@ -772,6 +2153,14 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
     // MARK: One layer
 
     private func runLayer(_ layer: DeepSeekV41LayerPlan, at position: Int) throws {
+        // Engram rows are host reads, so they are issued before the layer's command
+        // buffer exists rather than in the middle of an encode. Each table has its
+        // own staging block, so this read cannot land under a kernel that is still
+        // reading another table's rows.
+        if layer.engramTable != nil {
+            try readEngramRows(layer: layer)
+        }
+
         let commandBuffer = try makeCommandBuffer()
         let encoder = try makeEncoder(commandBuffer)
 
@@ -784,11 +2173,24 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             )
         }
         encoder.endEncoding()
-        // The routing readback below needs this half finished on the host.
+        // The routing readback below needs this half finished on the host. It also
+        // drains the previous layer's expert half, which is what makes the arena
+        // slots free to overwrite: a pread here can never land under a kernel that
+        // is still reading the slot it replaces.
         try commit(commandBuffer, stage: "layer \(layer.index) attention")
 
         // The mixture binds per-expert byte offsets, which are host values.
         let routing = readRouting()
+
+        // Filled from disk before the expert half is encoded, so the kernels read
+        // the slots rather than faulting the shard mapping a page at a time.
+        var residents: [DeepSeekV41ResidentExpert]?
+        if let streamer, !routing.expertIDs.isEmpty {
+            residents = try streamer.ensureResident(
+                layer: layer.index,
+                experts: routing.expertIDs
+            )
+        }
 
         let expertCommand = try makeCommandBuffer()
         let expertEncoder = try makeEncoder(expertCommand)
@@ -798,7 +2200,8 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
                 layer: layer,
                 position: position,
                 encoder: expertEncoder,
-                routing: routing
+                routing: routing,
+                residents: residents
             )
         }
         expertEncoder.endEncoding()
@@ -815,20 +2218,39 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         layer: DeepSeekV41LayerPlan,
         position: Int,
         encoder: MTLComputeCommandEncoder,
-        routing: DeepSeekV41Routing? = nil
+        routing: DeepSeekV41Routing? = nil,
+        residents: [DeepSeekV41ResidentExpert]? = nil
     ) throws {
         let index = layer.index
         let shape = DeepSeekV41AttentionShape.make(config: config, layer: layer)
 
         switch stage {
-        case .mixAttentionStreams:
-            try encodeStreamMix(
+        case .hcAttentionCoefficients:
+            if let probe = parityProbes.beforeAttention {
+                try encodeCopy(
+                    encoder, from: workspace.streams, to: probe, count: mult * shapes.hidden
+                )
+            }
+            try encodeHyperConnectionCoefficients(
                 encoder,
-                readWeights: vectors.buffer(.hcAttnFn, layer: index)
-                    ?? vectors.constant(1 / Float(mult), count: mult),
-                scale: vectors.buffer(.hcAttnScale, layer: index),
-                bias: vectors.buffer(.hcAttnBase, layer: index),
-                output: workspace.normed
+                layer: index,
+                function: .hcAttnFn,
+                base: .hcAttnBase,
+                scale: .hcAttnScale,
+                pre: workspace.hcAttentionPre,
+                post: workspace.hcAttentionPost,
+                comb: workspace.hcAttentionComb
+            )
+
+        case .mixAttentionStreams:
+            // The sub-layer reads the stack collapsed with the mix the PREVIOUS
+            // sub-layer produced. `hc_pre` also snapshots the block input, because
+            // `hc_post` mixes it back in and cannot read the streams in place.
+            try encodeHyperConnectionPre(
+                encoder,
+                mix: workspace.hcMix,
+                output: workspace.normed,
+                snapshotting: true
             )
 
         case .attnNorm:
@@ -984,7 +2406,14 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
                     scale: weights.scaleTensor(.attnWoA, layer: index),
                     groups: shape.outputGroups,
                     inDim: shapes.attentionOutputWidth,
-                    outDim: max(1, config.oLoraRank),
+                    // `outDim` is the CONCATENATED total, `groups * o_lora_rank`,
+                    // and `inDim` is the width of all the heads: the published
+                    // matrix is `groups` blocks stacked along the rows, each
+                    // `heads * head_dim / groups` columns wide. Passing the
+                    // per-group rank here splits the rows a second time, so every
+                    // group reads a quarter of its own rows and writes them at a
+                    // quarter of the stride.
+                    outDim: shapes.outputReducedWidth,
                     input: workspace.attentionOut,
                     output: workspace.reduced
                 )
@@ -1009,20 +2438,37 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             )
 
         case .writeAttentionStreams:
-            try encodeStreamWrite(
+            try encodeHyperConnectionPost(
                 encoder,
-                contribution: workspace.output,
-                writeScales: vectors.buffer(.hcAttnScale, layer: index)
+                output: workspace.output,
+                gains: workspace.hcAttentionPost,
+                comb: workspace.hcAttentionComb
+            )
+            if let probe = parityProbes.afterAttention {
+                try encodeCopy(
+                    encoder, from: workspace.streams, to: probe, count: mult * shapes.hidden
+                )
+            }
+
+        case .hcFFNCoefficients:
+            try encodeHyperConnectionCoefficients(
+                encoder,
+                layer: index,
+                function: .hcFfnFn,
+                base: .hcFfnBase,
+                scale: .hcFfnScale,
+                pre: workspace.hcFFNPre,
+                post: workspace.hcFFNPost,
+                comb: workspace.hcFFNComb
             )
 
         case .mixFFNStreams:
-            try encodeStreamMix(
+            // The feed-forward reads its stack collapsed with ATTENTION's `pre`.
+            try encodeHyperConnectionPre(
                 encoder,
-                readWeights: vectors.buffer(.hcFfnFn, layer: index)
-                    ?? vectors.constant(1 / Float(mult), count: mult),
-                scale: vectors.buffer(.hcFfnScale, layer: index),
-                bias: vectors.buffer(.hcFfnBase, layer: index),
-                output: workspace.normed
+                mix: workspace.hcAttentionPre,
+                output: workspace.normed,
+                snapshotting: true
             )
 
         case .ffnNorm:
@@ -1035,11 +2481,7 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             )
 
         case .engram:
-            // Reported at load for any layer that carries a table, so reaching here
-            // with one configured means the plan was bypassed.
-            if layer.engramTable != nil {
-                throw DeepSeekV41EngineError.unsupportedStage("engram")
-            }
+            try encodeEngram(encoder, layer: layer)
 
         case .router:
             guard let gate = weights.tensor(.routerWeight, layer: index) else {
@@ -1061,21 +2503,220 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             try encodeSharedExpert(layer: layer, encoder: encoder)
 
         case .routedExperts:
-            try encodeRoutedExperts(layer: layer, encoder: encoder, routing: routing)
+            try encodeRoutedExperts(
+                layer: layer, encoder: encoder, routing: routing, residents: residents
+            )
 
         case .writeFFNStreams:
-            try encodeStreamWrite(
+            try encodeHyperConnectionPost(
                 encoder,
-                contribution: workspace.moeOut,
-                writeScales: vectors.buffer(.hcFfnScale, layer: index)
+                output: workspace.moeOut,
+                gains: workspace.hcFFNPost,
+                comb: workspace.hcFFNComb
+            )
+            // Whatever this feed-forward decided is what the NEXT layer's attention
+            // collapses with, and after the last layer what the head collapses with
+            // (`Transformer.forward` returns `ffn_pre` up the stack). That is one
+            // coefficient per copy, which is all `hcMix` holds; copying `mixCount`
+            // floats read past the split's `pre` section and into `hcMix`'s other
+            // positions.
+            try encodeCopy(
+                encoder, from: workspace.hcFFNPre, to: workspace.hcMix, count: mult
             )
 
         case .collapseStreams:
             // The block collapses once, after the last layer, so a later stage can
-            // never observe a half-collapsed state. The stage stays in the list
-            // because both backends order their work by it.
-            break
+            // never observe a half-collapsed state; `finishBlock` then normalizes and
+            // projects this vector.
+            try encodeHyperConnectionPre(
+                encoder,
+                mix: workspace.hcMix,
+                output: workspace.hidden,
+                snapshotting: false
+            )
         }
+    }
+
+    // MARK: Engram stage
+
+    /// Preads one position's Engram rows into the owning table's staging block.
+    ///
+    /// A position reads `(max_ngram_size - 1) * n_heads` rows of ~264 bytes, which
+    /// is why the whole batch goes out at once: 24 serial small reads would spend
+    /// the decode step waiting on seek latency instead of using queue depth.
+    ///
+    /// A dead position reads nothing: `Engram.forward` zeroes the gate wherever
+    /// `token_mask` is false, so the residual passes through untouched rather than
+    /// taking pad rows into the stream.
+    private func readEngramRows(
+        layer: DeepSeekV41LayerPlan,
+        position: Int? = nil,
+        positionSlot: Int = 0
+    ) throws {
+        guard !skipEngram, let table = layer.engramTable else { return }
+        // A walk reads the newest position; a block names the one it is on, because
+        // the whole block's tokens are already in the history.
+        let end = position.map { min($0 + 1, tokenHistory.count) } ?? tokenHistory.count
+        guard end > 0 else { return }
+        guard deadTokens[..<end].last != true else { return }
+        guard table >= 0, table < engramSlots.count else {
+            throw DeepSeekV41EngineError.unsupportedStage("engram table \(table)")
+        }
+        let slot = engramSlots[table]
+        guard let reader = engramReaders[layer.index],
+              let layout = engramLayouts[layer.index],
+              let tokenMap = engramTokenMap else {
+            throw DeepSeekV41EngineError.missingTensor("engram.embed (layer \(layer.index))")
+        }
+        let requests = DeepSeekV41Engram.rowRequests(
+            layer: layer.index,
+            history: Array(tokenHistory[0..<end]),
+            dead: Array(deadTokens[0..<end]),
+            tokenMap: tokenMap,
+            layout: layout
+        )
+        // The staging block is exactly one position's rows, so a request set of any
+        // other size would write past it. That can only mean the plan and the
+        // layout disagree about the table, which is a load-time defect the caller
+        // must not discover as a heap overflow.
+        guard requests.count == slot.columns else {
+            throw DeepSeekV41EngineError.unsupportedStage(
+                "engram rows for layer \(layer.index): \(requests.count) of \(slot.columns) columns"
+            )
+        }
+        let destination = workspace.engramRaw.contents()
+            .advanced(by: slot.rawBytes(atPositionSlot: positionSlot))
+        try reader.readRows(requests, into: destination)
+    }
+
+    /// The Engram write: `wkv` over the retrieved rows, then the gate into the
+    /// residual.
+    ///
+    /// This is `Engram.forward` end to end. The rows concatenate into one
+    /// `columns * head_dim` vector, `engram.wkv` turns it into one key per
+    /// hyper-connection copy followed by the one value every copy shares, and the
+    /// gate kernel mixes the value into each copy by how well that copy matches its
+    /// own key.
+    ///
+    /// No output projection follows, because the value is already `hidden` wide.
+    /// The stage runs at the TOP of the layer (first in the pipeline), before the
+    /// attention sub-layer reads the residual, which is where `Model.forward` calls
+    /// `layer.engram(h, ...)`.
+    private func encodeEngram(
+        _ encoder: MTLComputeCommandEncoder,
+        layer: DeepSeekV41LayerPlan,
+        slot: Int = 0
+    ) throws {
+        guard !skipEngram, let table = layer.engramTable else { return }
+        guard deadTokens.last != true else { return }
+        guard table >= 0, table < engramSlots.count else {
+            throw DeepSeekV41EngineError.unsupportedStage("engram table \(table)")
+        }
+        // The staging block is the TABLE's, not this position's slot index: the two
+        // Engram layers are far apart in the stack and each owns its own block.
+        let staging = engramSlots[table]
+        guard staging.columns > 0, staging.headDimension > 0 else { return }
+        guard let wkv = weights.tensor(.engramWkv, layer: layer.index) else {
+            throw DeepSeekV41EngineError.missingTensor("engram.wkv")
+        }
+
+        var rowCount = UInt32(staging.columns)
+        var headDimension = UInt32(staging.headDimension)
+        encoder.setComputePipelineState(pipelines.engramDequantRows)
+        encoder.setBuffer(
+            workspace.engramRaw, offset: staging.rawBytes(atPositionSlot: slot), index: 0
+        )
+        encoder.setBuffer(
+            workspace.engramValues, offset: staging.valueBytes(atPositionSlot: slot), index: 1
+        )
+        encoder.setBytes(&rowCount, length: 4, index: 2)
+        encoder.setBytes(&headDimension, length: 4, index: 3)
+        encoder.dispatchThreads(
+            MTLSize(width: staging.headDimension, height: staging.columns, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: threadgroup(staging.headDimension).width, height: 1, depth: 1
+            )
+        )
+        encoder.memoryBarrier(scope: .buffers)
+
+        // `kv.split([hc_mult * dim, dim])` is the GEMV's own row order, so the one
+        // projection covers both halves.
+        try encodeGemv(
+            encoder,
+            weight: wkv,
+            scale: weights.scaleTensor(.engramWkv, layer: layer.index),
+            inDim: staging.flatWidth,
+            outDim: shapes.hidden * (mult + 1),
+            input: workspace.engramValues,
+            output: workspace.engramKV,
+            inputByteOffset: staging.valueBytes(atPositionSlot: slot),
+            outputByteOffset: workspace.slotOffset(slot, width: shapes.hidden * (mult + 1))
+        )
+
+        // `q_weight * k_weight`, elementwise per copy. Both are ones-initialized
+        // parameters in the checkpoint and the reference treats an absent pair as
+        // "no reweighting", so a missing one binds an explicit ones vector rather
+        // than leaving the slot unbound: Metal leaves an unbound slot undefined,
+        // and the kernel's `nullptr` test would not catch that.
+        let weightWidth = shapes.hidden * mult
+        let query: MTLBuffer
+        let key: MTLBuffer
+        if let storedQuery = vectors.buffer(.engramQuery, layer: layer.index),
+           let storedKey = vectors.buffer(.engramKey, layer: layer.index) {
+            query = storedQuery
+            key = storedKey
+        } else {
+            guard let identity = vectors.constant(1, count: weightWidth) else {
+                throw DeepSeekV41EngineError.allocationFailed("the Engram weight identity")
+            }
+            query = identity
+            key = identity
+        }
+        try dispatchEngramGate(encoder, dim: shapes.hidden, query: query, key: key, slot: slot)
+    }
+
+    /// One threadgroup per hyper-connection copy: the score is a reduction over the
+    /// whole stream before the value can be written back.
+    private func dispatchEngramGate(
+        _ encoder: MTLComputeCommandEncoder,
+        dim: Int,
+        query: MTLBuffer,
+        key: MTLBuffer,
+        slot: Int = 0
+    ) throws {
+        guard dim > 0 else { return }
+        var width = UInt32(dim)
+        var streams = UInt32(mult)
+        var epsilon = config.rmsNormEps
+        encoder.setComputePipelineState(pipelines.engramGate)
+        encoder.setBuffer(
+            workspace.streams,
+            offset: workspace.slotOffset(slot, width: mult * dim),
+            index: 0
+        )
+        encoder.setBuffer(
+            workspace.engramKV,
+            offset: workspace.slotOffset(slot, width: dim * (mult + 1)),
+            index: 1
+        )
+        encoder.setBuffer(query, offset: 0, index: 2)
+        encoder.setBuffer(key, offset: 0, index: 3)
+        encoder.setBuffer(
+            workspace.engramGates, offset: workspace.slotOffset(slot, width: mult), index: 4
+        )
+        encoder.setBytes(&width, length: 4, index: 5)
+        encoder.setBytes(&streams, length: 4, index: 6)
+        encoder.setBytes(&epsilon, length: 4, index: 7)
+        let lanes = max(32, min(256, pipelines.engramGate.maxTotalThreadsPerThreadgroup))
+        // One float per SIMD group, rounded up to Metal's 16-byte granularity: a
+        // 64-thread threadgroup asks for 8 bytes and is refused outright.
+        let gatePartials = (lanes / 32) * MemoryLayout<Float>.stride
+        encoder.setThreadgroupMemoryLength((gatePartials + 15) & ~15, index: 0)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: mult, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+        )
+        encoder.memoryBarrier(scope: .buffers)
     }
 
     // MARK: Attention stages
@@ -1101,14 +2742,34 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         layer: DeepSeekV41LayerPlan,
         position: Int,
         encoder: MTLComputeCommandEncoder,
-        shape: DeepSeekV41AttentionShape
+        shape: DeepSeekV41AttentionShape,
+        slotIndex: Int = 0
     ) throws {
         guard layer.ownsCompressedKV else { return }
         let ratio = max(1, layer.compressRatio)
-        let slot = position % ratio
+        // The slot is the position's offset inside its own group, exactly as
+        // `Compressor.forward` addresses `kv_state[:, start_pos % ratio]`.
+        guard let slot = DeepSeekV41CacheAddressing.compressorSlot(
+            position: position, ratio: ratio
+        ) else { return }
         let width = shapes.latentWidth
         guard slot < ratio else { return }
-        let slotByteOffset = slot * width * MemoryLayout<Float>.stride
+        guard let owner = compressorOwnerSlots[layer.index] else {
+            throw DeepSeekV41EngineError.allocationFailed(
+                "layers.\(layer.index): no compressor slot block was allocated for this owner"
+            )
+        }
+        let groupWidth = workspace.compressorGroupWidth
+        guard let groupByteOffset = DeepSeekV41CacheAddressing.compressorSlotByteOffset(
+                  owner: owner, slot: 0, groupWidth: groupWidth, width: width
+              ),
+              let slotByteOffset = DeepSeekV41CacheAddressing.compressorSlotByteOffset(
+                  owner: owner, slot: slot, groupWidth: groupWidth, width: width
+              ) else {
+            throw DeepSeekV41EngineError.allocationFailed(
+                "layers.\(layer.index): the compressor group is \(groupWidth) slots wide"
+            )
+        }
 
         guard let kvWeight = weights.tensor(.compressorWkv, layer: layer.index) else {
             throw DeepSeekV41EngineError.missingTensor("attn.compressor.wkv")
@@ -1121,6 +2782,7 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             outDim: width,
             input: workspace.normed,
             output: workspace.compressorLatents,
+            inputByteOffset: workspace.slotOffset(slotIndex, width: shapes.hidden),
             outputByteOffset: slotByteOffset
         )
         // A ratio of 1 is a plain projection: nothing to pool, and the checkpoint
@@ -1137,11 +2799,14 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
                 outDim: width,
                 input: workspace.normed,
                 output: workspace.compressorScores,
+                inputByteOffset: workspace.slotOffset(slotIndex, width: shapes.hidden),
                 outputByteOffset: slotByteOffset
             )
         }
 
-        guard (position + 1) % ratio == 0 else { return }
+        guard DeepSeekV41CacheAddressing.compressorCompletesGroup(
+            position: position, ratio: ratio
+        ) else { return }
         let rows = DeepSeekV41CacheAddressing.compressedRowCount(afterPosition: position, ratio: ratio)
         guard rows > 0 else { return }
         let block = DeepSeekV41CacheAddressing.poolRange(row: rows - 1, ratio: ratio)
@@ -1156,8 +2821,10 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         }
 
         encoder.setComputePipelineState(pipelines.poolLatents)
-        encoder.setBuffer(workspace.compressorLatents, offset: 0, index: 0)
-        encoder.setBuffer(workspace.compressorScores, offset: 0, index: 1)
+        // Bound at this owner's block: the pool reads the group from row 0 of the
+        // buffers it is given, and another owner's block is not part of it.
+        encoder.setBuffer(workspace.compressorLatents, offset: groupByteOffset, index: 0)
+        encoder.setBuffer(workspace.compressorScores, offset: groupByteOffset, index: 1)
         encoder.setBuffer(workspace.pooled, offset: 0, index: 2)
         var poolWidth = UInt32(width)
         var blockSize = UInt32(ratio)
@@ -1206,8 +2873,42 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         layer: DeepSeekV41LayerPlan,
         position: Int,
         encoder: MTLComputeCommandEncoder,
-        shape: DeepSeekV41AttentionShape
+        shape: DeepSeekV41AttentionShape,
+        slotIndex: Int = 0
     ) throws {
+        let rowCount = try encodeAttentionGather(
+            layer: layer,
+            position: position,
+            encoder: encoder,
+            shape: shape,
+            slotIndex: slotIndex
+        )
+        try encodeAttentionDispatch(
+            encoder: encoder,
+            shape: shape,
+            layerIndex: layer.index,
+            slots: [slotIndex],
+            rowCounts: [rowCount]
+        )
+    }
+
+    /// Gathers one position's window and compressed rows into ITS block of the
+    /// gathered buffer, and writes its row list into its own slice of `rowIndices`.
+    ///
+    /// Both are per position rather than shared, and the row list is why: it is a
+    /// host fill, and a host fill is not ordered against a dispatch that has not
+    /// executed yet. One shared list meant every gather in a block read the list of
+    /// the block's LAST position, so a chunk's intermediate positions attended over
+    /// their successors' rows (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #15").
+    ///
+    /// Returns the number of rows the position attends over.
+    private func encodeAttentionGather(
+        layer: DeepSeekV41LayerPlan,
+        position: Int,
+        encoder: MTLComputeCommandEncoder,
+        shape: DeepSeekV41AttentionShape,
+        slotIndex: Int = 0
+    ) throws -> Int {
         let rowPlan = DeepSeekV41CacheAddressing.attentionRowPlan(
             layer: layer,
             position: position,
@@ -1233,23 +2934,23 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             throw DeepSeekV41EngineError.allocationFailed("the window ring")
         }
 
-        var cursor = 0
-        try encodeRowIndices(rowPlan.windowRows, into: workspace.rowIndices, at: 0)
-        cursor += windowCount
+        let rowOffset = workspace.gatheredRowOffset(slotIndex)
+        try encodeRowIndices(rowPlan.windowRows, into: workspace.rowIndices, at: rowOffset)
         try encodeGather(
             encoder,
             cacheBuffer: windowBuffer,
             byteOffset: windowBase,
             rowIndices: workspace.rowIndices,
-            rowIndexOffset: 0,
+            rowIndexOffset: rowOffset,
             rowCount: windowCount,
-            destinationRowOffset: 0
+            destinationRowOffset: rowOffset
         )
         if compressedCount > 0 {
             guard let compressedBuffer = cache.compressedBuffer,
                   let compressedBase = cache.layout.compressedBase[layer.compressedKVSource] else {
                 throw DeepSeekV41EngineError.allocationFailed("the compressed cache")
             }
+            let cursor = rowOffset + windowCount
             try encodeRowIndices(rowPlan.compressedRows, into: workspace.rowIndices, at: cursor)
             try encodeGather(
                 encoder,
@@ -1258,17 +2959,46 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
                 rowIndices: workspace.rowIndices,
                 rowIndexOffset: cursor,
                 rowCount: compressedCount,
-                destinationRowOffset: windowCount
+                destinationRowOffset: cursor
             )
         }
         encoder.memoryBarrier(scope: .buffers)
+        return rowCount
+    }
+
+    /// One attention dispatch over `slots` already-gathered positions.
+    ///
+    /// Each slot's query and output are its own copy of the per-position vectors, and
+    /// slot `s` reads its gathered rows at `s * workspace.gatherRows`; the per-slot row
+    /// counts travel in the same buffer shape the kernel reads. A single slot is the
+    /// per-position form every caller used before the slot dimension existed.
+    private func encodeAttentionDispatch(
+        encoder: MTLComputeCommandEncoder,
+        shape: DeepSeekV41AttentionShape,
+        layerIndex: Int,
+        slots: [Int],
+        rowCounts: [Int]
+    ) throws {
+        guard let first = slots.first, let maxRows = rowCounts.max() else { return }
+        guard slots.count == rowCounts.count else {
+            throw DeepSeekV41EngineError.allocationFailed(
+                "\(slots.count) attention slots against \(rowCounts.count) row counts"
+            )
+        }
 
         encoder.setComputePipelineState(pipelines.attention)
-        encoder.setBuffer(workspace.query, offset: 0, index: 0)
+        encoder.setBuffer(
+            workspace.query,
+            offset: workspace.slotOffset(first, width: shape.queryWidth),
+            index: 0
+        )
+        // The gathered block holds FP16 records, the cache's own width, so the
+        // kernel that reads it is the half-key form. The row strides below are in
+        // rows, which is why nothing else about the dispatch changed.
         encoder.setBuffer(workspace.gathered, offset: 0, index: 1)
         // The slot is always bound: an absent sink becomes a buffer of `-1e30`, the
         // kernel's own "disabled" spelling, instead of an undefined slot.
-        let sink = vectors.buffer(.attnSink, layer: layer.index)
+        let sink = vectors.buffer(.attnSink, layer: layerIndex)
             .flatMap { $0.length >= shape.numHeads * MemoryLayout<Float>.stride ? $0 : nil }
             ?? sinkDisabled
         if let sink {
@@ -1276,8 +3006,12 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         } else {
             throw DeepSeekV41EngineError.allocationFailed("the attention sink placeholder")
         }
-        encoder.setBuffer(workspace.attentionOut, offset: 0, index: 3)
-        var rows = UInt32(rowCount)
+        encoder.setBuffer(
+            workspace.attentionOut,
+            offset: workspace.slotOffset(first, width: shape.outputWidth),
+            index: 3
+        )
+        var rows = UInt32(rowCounts[0])
         var heads = UInt32(shape.numHeads)
         var qkHeadDim = UInt32(shape.qkHeadDim)
         var valueDim = UInt32(shape.vHeadDim)
@@ -1287,18 +3021,101 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         encoder.setBytes(&qkHeadDim, length: 4, index: 6)
         encoder.setBytes(&valueDim, length: 4, index: 7)
         encoder.setBytes(&width, length: 4, index: 8)
-        encoder.dispatchThreads(
-            MTLSize(width: shape.numHeads, height: 1, depth: 1),
-            threadsPerThreadgroup: threadgroup(shape.numHeads)
+        // One threadgroup per head, wide enough to fill the die: the row loop is a
+        // serial chain over `window + index_topk` records, so a grid as wide as the
+        // head count leaves most of the GPU idle while one lane per head walks 1.3
+        // million multiply-adds. The scores live in threadgroup memory, one float
+        // per gathered row, which is the same bound the gather buffer already
+        // enforces, plus the tail the threadgroup reduction writes its partials to.
+        let scoreBytes = (
+            (maxRows + Self.attentionReductionSlots) * MemoryLayout<Float>.stride + 15
+        ) & ~15
+        guard scoreBytes <= device.maxThreadgroupMemoryLength else {
+            throw DeepSeekV41EngineError.allocationFailed(
+                "\(maxRows) rows of attention scores need \(scoreBytes) bytes of "
+                    + "threadgroup memory against a \(device.maxThreadgroupMemoryLength)-byte limit"
+            )
+        }
+        encoder.setThreadgroupMemoryLength(scoreBytes, index: 0)
+        if slots.count > 1 {
+            // The slot-major layout the kernel derives from its threadgroup index
+            // only holds when the slots are a contiguous run starting at slot 0 of
+            // the workspace, which is the only form the block loop asks for.
+            guard slots.enumerated().allSatisfy({ $0.element == $0.offset }) else {
+                throw DeepSeekV41EngineError.allocationFailed(
+                    "batched attention needs the block's slots in order from 0"
+                )
+            }
+        }
+        // The plan is bound even for ONE position, where the kernel takes the
+        // single-position path anyway: a `constant Dsv41AttentionSlotPlan*` left
+        // unbound is a binding error under Metal's validation layer, and a decode
+        // step would trip it on every token.
+        var plan = DeepSeekV41AttentionSlotPlan(
+            slotCount: UInt32(slots.count),
+            keyRowStride: UInt32(gatherRows)
+        )
+        encoder.setBytes(
+            &plan, length: MemoryLayout<DeepSeekV41AttentionSlotPlan>.stride, index: 9
+        )
+        let counts = rowCounts.map { UInt32($0) }
+        counts.withUnsafeBytes { bytes in
+            encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: 10)
+        }
+        encoder.dispatchThreadgroups(
+            MTLSize(width: shape.numHeads * slots.count, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: Self.attentionThreadgroupWidth, height: 1, depth: 1
+            )
         )
         encoder.memoryBarrier(scope: .buffers)
     }
+
+    /// Threads one head's attention runs on.
+    ///
+    /// The kernel gives one thread a whole row for its dot products and strides the
+    /// output dimensions by `threads_per_threadgroup`, so this is the parallelism
+    /// one head gets; the reduction across the threadgroup is what the scratch tail
+    /// of the score block is for. Four SIMD groups is enough to cover a 640-row
+    /// attention's rows and a 512-wide record's dimensions with room to spare,
+    /// without costing a wide threadgroup that a two-head model would idle.
+    private static let attentionThreadgroupWidth = 128
+
+    /// Floats reserved after the score block for the threadgroup reduction, one per
+    /// SIMD group in the widest threadgroup `attentionThreadgroupWidth` could
+    /// become.
+    private static let attentionReductionSlots = 32
+
+    /// Threads the mHC coefficient projection's reduction runs on.
+    ///
+    /// The kernel gives a threadgroup one (slot, logit) pair and strides the
+    /// `mult * hidden` reduction across its lanes, so this is the parallelism one
+    /// logit gets. The published reduction is 28,672 wide, which leaves every lane
+    /// eight values at 256 threads, and the accumulators are two floats.
+    private static let hyperConnectionThreadgroupWidth = 256
+
+    /// Partials the mHC projection's reduction writes: one slot per SIMD group, for
+    /// the squares and for the dot product.
+    private static let hyperConnectionReductionSlots = 32
+
+    /// Lanes one output row of a BF16 projection's reduction runs on, when the row
+    /// is a threadgroup.
+    ///
+    /// The widest band the checkpoint asks for is 8,192 values over these lanes,
+    /// which is 32 float4 loads each. Measured at the published shapes: 64 and 128
+    /// lanes are within noise of each other, 32 lanes costs the narrow bands up to
+    /// 11%, and 256 lanes up to 50% (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #10").
+    private static let gemvLaneWidth = 64
+
+    /// Partials a BF16 projection's reduction writes: one slot per SIMD group.
+    private static let gemvReductionSlots = 32
 
     // MARK: Feed-forward stages
 
     private func encodeSharedExpert(
         layer: DeepSeekV41LayerPlan,
-        encoder: MTLComputeCommandEncoder
+        encoder: MTLComputeCommandEncoder,
+        slot: Int = 0
     ) throws {
         // The shared expert runs for every token, unscaled, and accumulates into the
         // same vector the routed experts do. A checkpoint that declares no shared
@@ -1326,7 +3143,8 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             inDim: shapes.hidden,
             outDim: width,
             input: workspace.normed,
-            output: buffer
+            output: buffer,
+            inputByteOffset: workspace.slotOffset(slot, width: shapes.hidden)
         )
         try encodeDown(
             encoder,
@@ -1336,23 +3154,36 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             outDim: shapes.hidden,
             activation: buffer,
             output: workspace.moeOut,
-            weightToAdd: 1
+            weightToAdd: 1,
+            byteOffset: workspace.slotOffset(slot, width: shapes.hidden)
         )
     }
 
+    /// The routed mixture.
+    ///
+    /// `residents` is aligned with `routing.expertIDs` and non-nil only when the
+    /// expert streamer is running: each entry is the arena slot holding that
+    /// expert's bytes, already filled. Without it the weights are read through the
+    /// shard mappings, which is correct and much slower (`PERF_FINDINGS.md`).
     private func encodeRoutedExperts(
         layer: DeepSeekV41LayerPlan,
         encoder: MTLComputeCommandEncoder,
-        routing: DeepSeekV41Routing?
+        routing: DeepSeekV41Routing?,
+        residents: [DeepSeekV41ResidentExpert]?,
+        slot: Int = 0
     ) throws {
+        let outputOffset = workspace.slotOffset(slot, width: shapes.hidden)
         // The mixture always starts from zero: every expert accumulates into the
         // same vector.
-        try encodeClear(encoder, buffer: workspace.moeOut, count: shapes.hidden)
+        try encodeClear(
+            encoder, buffer: workspace.moeOut, count: shapes.hidden, byteOffset: outputOffset
+        )
         guard let routing, !routing.expertIDs.isEmpty else { return }
         let buffer = workspace.intermediate
         for (rank, expert) in routing.expertIDs.enumerated() {
             let weight = rank < routing.weights.count ? routing.weights[rank] : 0
             if weight == 0 { continue }
+            let resident = residents.flatMap { rank < $0.count ? $0[rank] : nil }
             guard let w1 = weights.tensor(.expertW1, layer: layer.index, expert: expert),
                   let w3 = weights.tensor(.expertW3, layer: layer.index, expert: expert),
                   let w2 = weights.tensor(.expertW2, layer: layer.index, expert: expert) else {
@@ -1369,7 +3200,9 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
                 inDim: shapes.hidden,
                 outDim: shapes.expertIntermediate,
                 input: workspace.normed,
-                output: buffer
+                output: buffer,
+                resident: resident,
+                inputByteOffset: workspace.slotOffset(slot, width: shapes.hidden)
             )
             try encodeDown(
                 encoder,
@@ -1379,7 +3212,9 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
                 outDim: shapes.hidden,
                 activation: buffer,
                 output: workspace.moeOut,
-                weightToAdd: weight
+                weightToAdd: weight,
+                resident: resident,
+                byteOffset: outputOffset
             )
         }
     }
@@ -1387,9 +3222,13 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
     /// The router's top-k, read back so the mixture can bind each expert's byte
     /// offset. `normalise` is on: the checkpoint scales the normalized scores by
     /// `routed_scaling_factor`, which the kernel applies after normalizing.
+    ///
+    /// One thread per position: the expert scan and its insertion sort are serial,
+    /// so a block runs its positions as grid rows rather than one dispatch each.
     private func encodeRouter(
         _ encoder: MTLComputeCommandEncoder,
-        layer: Int
+        layer: Int,
+        count: Int = 1
     ) throws {
         guard config.scoringFunction != .softmax else {
             // `softmax` normalizes over every expert, so it cannot be evaluated one
@@ -1399,6 +3238,10 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
                 "scoring_func softmax (the kernel implements sigmoid and sqrtsoftplus)"
             )
         }
+        let slots = max(1, count)
+        // The readback buffer pads each slot to at least four entries, so the kernel
+        // is told that stride rather than assuming `topK`.
+        let indexStride = max(4 * config.numActivatedExperts, 16)  // bytes per slot
         encoder.setComputePipelineState(pipelines.router)
         encoder.setBuffer(workspace.routerLogits, offset: 0, index: 0)
         // An absent bias is a bound zero vector, not an unbound slot: the kernel
@@ -1425,18 +3268,26 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         encoder.setBytes(&normalise, length: 4, index: 7)
         encoder.setBytes(&scoring, length: 4, index: 8)
         encoder.setBytes(&temperature, length: 4, index: 9)
+        var strideInIndices = UInt32(indexStride / MemoryLayout<UInt32>.stride)  // bytes -> entries
+        var slotCount = UInt32(slots)
+        encoder.setBytes(&strideInIndices, length: 4, index: 10)
+        encoder.setBytes(&slotCount, length: 4, index: 11)
         encoder.dispatchThreads(
-            MTLSize(width: 1, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
+            MTLSize(width: slots, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: max(1, min(32, slots)), height: 1, depth: 1)
         )
     }
 
     /// The routing the router kernel wrote. `bias` is per layer, so it is bound from
     /// the layer's slot by the caller before this runs.
-    private func readRouting() -> DeepSeekV41Routing {
+    private func readRouting(slot: Int = 0) -> DeepSeekV41Routing {
         let count = max(0, min(config.numActivatedExperts, workspace.expertIndices.length / 4))
-        let indexPointer = workspace.expertIndices.contents().assumingMemoryBound(to: UInt32.self)
-        let weightPointer = workspace.expertWeights.contents().assumingMemoryBound(to: Float.self)
+        let indexPointer = workspace.expertIndices.contents()
+            .advanced(by: slot * max(4 * config.numActivatedExperts, 16))
+            .assumingMemoryBound(to: UInt32.self)
+        let weightPointer = workspace.expertWeights.contents()
+            .advanced(by: workspace.slotOffset(slot, width: config.numActivatedExperts))
+            .assumingMemoryBound(to: Float.self)
         var ids: [Int] = []
         var weights: [Float] = []
         ids.reserveCapacity(count)
@@ -1501,11 +3352,12 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
     private func encodeClear(
         _ encoder: MTLComputeCommandEncoder,
         buffer: MTLBuffer,
-        count: Int
+        count: Int,
+        byteOffset: Int = 0
     ) throws {
         guard count > 0 else { return }
         encoder.setComputePipelineState(pipelines.clear)
-        encoder.setBuffer(buffer, offset: 0, index: 0)
+        encoder.setBuffer(buffer, offset: byteOffset, index: 0)
         encoder.dispatchThreads(
             MTLSize(width: count, height: 1, depth: 1),
             threadsPerThreadgroup: threadgroup(count)
@@ -1513,35 +3365,44 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         encoder.memoryBarrier(scope: .buffers)
     }
 
+    /// One row, or a block of rows: `dsv41_rmsnorm_f32_gain` reads
+    /// `threadgroup_position_in_grid` as the row index and rows are `width` apart,
+    /// so a block of consecutive slots is a grid height rather than a loop.
     private func encodeNorm(
         _ encoder: MTLComputeCommandEncoder,
         input: MTLBuffer,
         gain: MTLBuffer?,
         output: MTLBuffer,
-        width: Int
+        width: Int,
+        rows: Int = 1,
+        inputByteOffset: Int = 0,
+        outputByteOffset: Int = 0
     ) throws {
-        guard width > 0 else { return }
+        guard width > 0, rows > 0 else { return }
         guard let gain else {
             throw DeepSeekV41EngineError.allocationFailed("a \(width)-wide norm gain")
         }
-        encoder.setComputePipelineState(pipelines.rmsNormGain)
-        encoder.setBuffer(input, offset: 0, index: 0)
-        encoder.setBuffer(gain, offset: 0, index: 1)
-        encoder.setBuffer(output, offset: 0, index: 2)
+        let lanes = max(32, min(256, pipelines.rmsNormGain.maxTotalThreadsPerThreadgroup))
+        // One threadgroup per row, and one dispatch per row: `tgIdx` is a SCALAR
+        // `threadgroup_position_in_grid`, which MSL takes from the grid's X axis
+        // alone, so a taller grid would normalize row 0 once per row.
+        let grid = DeepSeekV41DevicePlan.normDispatch(width: width, lanes: lanes)
         var dim = UInt32(width)
         var epsilon = config.rmsNormEps
-        encoder.setBytes(&dim, length: 4, index: 3)
-        encoder.setBytes(&epsilon, length: 4, index: 4)
-        let lanes = max(32, min(256, pipelines.rmsNormGain.maxTotalThreadsPerThreadgroup))
+        let stride = width * MemoryLayout<Float>.stride
         encoder.setThreadgroupMemoryLength((lanes / 32) * MemoryLayout<Float>.stride, index: 0)
-        // One threadgroup per row: `tgIdx` is the row index in the kernel, so a grid
-        // of `width` threads would let Metal split a wide row across threadgroups and
-        // every `tgIdx >= 1` would read and write outside the row it was given.
-        let grid = DeepSeekV41DevicePlan.normDispatch(width: width, lanes: lanes)
-        encoder.dispatchThreadgroups(
-            grid.threadgroups,
-            threadsPerThreadgroup: grid.threadsPerThreadgroup
-        )
+        for row in 0..<max(1, rows) {
+            encoder.setComputePipelineState(pipelines.rmsNormGain)
+            encoder.setBuffer(input, offset: inputByteOffset + row * stride, index: 0)
+            encoder.setBuffer(gain, offset: 0, index: 1)
+            encoder.setBuffer(output, offset: outputByteOffset + row * stride, index: 2)
+            encoder.setBytes(&dim, length: 4, index: 3)
+            encoder.setBytes(&epsilon, length: 4, index: 4)
+            encoder.dispatchThreadgroups(
+                grid.threadgroups,
+                threadsPerThreadgroup: grid.threadsPerThreadgroup
+            )
+        }
         encoder.memoryBarrier(scope: .buffers)
     }
 
@@ -1556,7 +3417,10 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         weightByteOffset: UInt64 = 0,
         scaleByteOffset: UInt64 = 0,
         inputByteOffset: Int = 0,
-        outputByteOffset: Int = 0
+        outputByteOffset: Int = 0,
+        rows: Int = 1,
+        inputRowStride: Int = 0,
+        outputRowStride: Int = 0
     ) throws {
         guard inDim > 0, outDim > 0 else {
             throw DeepSeekV41EngineError.allocationFailed("a \(outDim)x\(inDim) projection")
@@ -1585,24 +3449,78 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             encoder.setBuffer(output, offset: outputByteOffset, index: 3)
             var weightOffset = UInt64(weight.byteOffset) + weightByteOffset
             var scaleOffset = UInt64(scale.byteOffset) + scaleByteOffset
+            var inStride = UInt32(inputRowStride)
+            var outStride = UInt32(outputRowStride)
             encoder.setBytes(&weightOffset, length: 8, index: 4)
             encoder.setBytes(&scaleOffset, length: 8, index: 5)
             encoder.setBytes(&inDimension, length: 4, index: 6)
             encoder.setBytes(&outDimension, length: 4, index: 7)
+            // Zero lets the kernel use the dimension, so only a caller batching rows
+            // out of a wider row layout has to think about these.
+            encoder.setBytes(&inStride, length: 4, index: 8)
+            encoder.setBytes(&outStride, length: 4, index: 9)
         case .bf16:
-            encoder.setComputePipelineState(pipelines.bf16Gemv)
+            // Three shapes of the same dot product, and which one is cheaper depends
+            // on how much work the grid has and on whether a whole block is running, so
+            // the choice is a plan rule rather than a constant.
+            let form = DeepSeekV41DevicePlan.bf16GemvForm(
+                outDim: outDim, inDim: inDim, rows: max(1, rows)
+            )
+            let wideGrid = form != .perRow
+            switch form {
+            case .block: encoder.setComputePipelineState(pipelines.bf16GemvBlock)
+            case .blockPair: encoder.setComputePipelineState(pipelines.bf16GemvBlockPair)
+            case .wideGrid: encoder.setComputePipelineState(pipelines.bf16GemvRows)
+            case .perRow: encoder.setComputePipelineState(pipelines.bf16Gemv)
+            }
             encoder.setBuffer(weightBuffer, offset: 0, index: 0)
             encoder.setBuffer(input, offset: inputByteOffset, index: 1)
             encoder.setBuffer(output, offset: outputByteOffset, index: 2)
             var weightOffset = UInt64(weight.byteOffset) + weightByteOffset
+            var inStride = UInt32(inputRowStride)
+            var outStride = UInt32(outputRowStride)
             encoder.setBytes(&weightOffset, length: 8, index: 3)
             encoder.setBytes(&inDimension, length: 4, index: 4)
             encoder.setBytes(&outDimension, length: 4, index: 5)
+            encoder.setBytes(&inStride, length: 4, index: 6)
+            encoder.setBytes(&outStride, length: 4, index: 7)
+            if form == .block || form == .blockPair {
+                // One threadgroup per output row (or per pair of rows), each streaming
+                // its rows once for all eight positions: the partials are eight floats
+                // per warp, or sixteen when the threadgroup carries two rows.
+                let rowsPerGroup = form == .blockPair ? 2 : 1
+                encoder.setThreadgroupMemoryLength(
+                    32 * 8 * rowsPerGroup * MemoryLayout<Float>.stride, index: 0
+                )
+                encoder.dispatchThreadgroups(
+                    MTLSize(
+                        width: (outDim + rowsPerGroup - 1) / rowsPerGroup, height: 1, depth: 1
+                    ),
+                    threadsPerThreadgroup: MTLSize(
+                        width: Self.gemvLaneWidth, height: 1, depth: 1
+                    )
+                )
+                encoder.memoryBarrier(scope: .buffers)
+                return
+            }
+            if wideGrid {
+                encoder.setThreadgroupMemoryLength(
+                    Self.gemvReductionSlots * MemoryLayout<Float>.stride, index: 0
+                )
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: outDim * max(1, rows), height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(
+                        width: Self.gemvLaneWidth, height: 1, depth: 1
+                    )
+                )
+                encoder.memoryBarrier(scope: .buffers)
+                return
+            }
         case .unsupported:
             throw DeepSeekV41EngineError.unsupportedDtype("a projection", weight.dtype)
         }
         encoder.dispatchThreads(
-            MTLSize(width: outDim, height: 1, depth: 1),
+            MTLSize(width: outDim, height: max(1, rows), depth: 1),
             threadsPerThreadgroup: threadgroup(outDim)
         )
         encoder.memoryBarrier(scope: .buffers)
@@ -1616,6 +3534,12 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
     /// over it would read every column, which is a different matrix. Each group is
     /// therefore its own dispatch, offset into the weight, its scale, the input and
     /// the output; a single group degenerates to the ordinary GEMV.
+    ///
+    /// `inDim` and `outDim` are both TOTALS. The column count the checkpoint
+    /// publishes is one group's share of the input, and the row count is every
+    /// group's share summed, so only the two quotients are per group — dividing
+    /// `outDim` a second time by `groups` at the call site reads a quarter of each
+    /// block and writes it at a quarter of the stride.
     private func encodeBlockDiagonalProjection(
         _ encoder: MTLComputeCommandEncoder,
         weight: DeepSeekV41DeviceTensor,
@@ -1624,13 +3548,18 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         inDim: Int,
         outDim: Int,
         input: MTLBuffer,
-        output: MTLBuffer
+        output: MTLBuffer,
+        inputByteOffset: Int = 0,
+        outputByteOffset: Int = 0,
+        rows: Int = 1
     ) throws {
         let groupCount = max(1, groups)
         guard groupCount > 1 else {
             try encodeGemv(
                 encoder, weight: weight, scale: scale, inDim: inDim, outDim: outDim,
-                input: input, output: output
+                input: input, output: output,
+                inputByteOffset: inputByteOffset, outputByteOffset: outputByteOffset,
+                rows: rows, inputRowStride: inDim, outputRowStride: outDim
             )
             return
         }
@@ -1658,12 +3587,27 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
                 output: output,
                 weightByteOffset: UInt64(weightStride * Double(group)),
                 scaleByteOffset: UInt64(scaleStride * Double(group)),
-                inputByteOffset: group * perGroupIn * MemoryLayout<Float>.stride,
-                outputByteOffset: group * perGroupOut * MemoryLayout<Float>.stride
+                inputByteOffset: inputByteOffset
+                    + group * perGroupIn * MemoryLayout<Float>.stride,
+                outputByteOffset: outputByteOffset
+                    + group * perGroupOut * MemoryLayout<Float>.stride,
+                rows: rows,
+                // A band reads `perGroupIn` of the caller's `inDim` columns and writes
+                // `perGroupOut` of its `outDim` rows, so one dispatch can carry every
+                // row of the batch when the caller lays those rows out at the full
+                // widths.
+                inputRowStride: inDim,
+                outputRowStride: outDim
             )
         }
     }
 
+    /// Fused gate+up projection.
+    ///
+    /// `resident` binds a streamed expert's slot instead of the shard mapping: one
+    /// buffer holds the pair, and the six byte offsets come from its slot geometry,
+    /// so the weights are read from the bytes `pread` just wrote rather than by
+    /// faulting the shard in page by page.
     private func encodeSwiGLU(
         _ encoder: MTLComputeCommandEncoder,
         gate: DeepSeekV41DeviceTensor,
@@ -1673,13 +3617,17 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         inDim: Int,
         outDim: Int,
         input: MTLBuffer,
-        output: MTLBuffer
+        output: MTLBuffer,
+        resident: DeepSeekV41ResidentExpert? = nil,
+        inputByteOffset: Int = 0
     ) throws {
         let format = DeepSeekV41DevicePlan.linearFormat(tensor: gate, scale: gateScale)
         guard DeepSeekV41DevicePlan.swigluKernel(format, swigluLimit: swigluLimit) != nil else {
             throw DeepSeekV41EngineError.unsupportedDtype("a feed-forward gate", gate.dtype)
         }
-        guard let gateBuffer = shardBuffer(gate), let upBuffer = shardBuffer(up) else {
+        let gateBuffer = resident?.buffer ?? shardBuffer(gate)
+        let upBuffer = resident?.buffer ?? shardBuffer(up)
+        guard let gateBuffer, let upBuffer else {
             throw DeepSeekV41EngineError.missingTensor("a feed-forward gate")
         }
         var inDimension = UInt32(inDim)
@@ -1687,9 +3635,12 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
 
         switch format {
         case .fp8Block32, .mxfp4:
-            guard let gateScale, let upScale,
-                  let gateScaleBuffer = shardBuffer(gateScale),
-                  let upScaleBuffer = shardBuffer(upScale) else {
+            guard let gateScale, let upScale else {
+                throw DeepSeekV41EngineError.missingTensor("a feed-forward scale companion")
+            }
+            let gateScaleBuffer = resident?.buffer ?? shardBuffer(gateScale)
+            let upScaleBuffer = resident?.buffer ?? shardBuffer(upScale)
+            guard let gateScaleBuffer, let upScaleBuffer else {
                 throw DeepSeekV41EngineError.missingTensor("a feed-forward scale companion")
             }
             encoder.setComputePipelineState(
@@ -1699,12 +3650,12 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             encoder.setBuffer(gateScaleBuffer, offset: 0, index: 1)
             encoder.setBuffer(upBuffer, offset: 0, index: 2)
             encoder.setBuffer(upScaleBuffer, offset: 0, index: 3)
-            encoder.setBuffer(input, offset: 0, index: 4)
+            encoder.setBuffer(input, offset: inputByteOffset, index: 4)
             encoder.setBuffer(output, offset: 0, index: 5)
-            var gateWeightOffset = UInt64(gate.byteOffset)
-            var gateScaleOffset = UInt64(gateScale.byteOffset)
-            var upWeightOffset = UInt64(up.byteOffset)
-            var upScaleOffset = UInt64(upScale.byteOffset)
+            var gateWeightOffset = resident?.gateWeightOffset ?? UInt64(gate.byteOffset)
+            var gateScaleOffset = resident?.gateScaleOffset ?? UInt64(gateScale.byteOffset)
+            var upWeightOffset = resident?.upWeightOffset ?? UInt64(up.byteOffset)
+            var upScaleOffset = resident?.upScaleOffset ?? UInt64(upScale.byteOffset)
             var limit = swigluLimit
             encoder.setBytes(&gateWeightOffset, length: 8, index: 6)
             encoder.setBytes(&gateScaleOffset, length: 8, index: 7)
@@ -1717,10 +3668,10 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             encoder.setComputePipelineState(pipelines.bf16SwiGLU)
             encoder.setBuffer(gateBuffer, offset: 0, index: 0)
             encoder.setBuffer(upBuffer, offset: 0, index: 1)
-            encoder.setBuffer(input, offset: 0, index: 2)
+            encoder.setBuffer(input, offset: inputByteOffset, index: 2)
             encoder.setBuffer(output, offset: 0, index: 3)
-            var gateWeightOffset = UInt64(gate.byteOffset)
-            var upWeightOffset = UInt64(up.byteOffset)
+            var gateWeightOffset = resident?.gateWeightOffset ?? UInt64(gate.byteOffset)
+            var upWeightOffset = resident?.upWeightOffset ?? UInt64(up.byteOffset)
             encoder.setBytes(&gateWeightOffset, length: 8, index: 4)
             encoder.setBytes(&upWeightOffset, length: 8, index: 5)
             encoder.setBytes(&inDimension, length: 4, index: 6)
@@ -1735,6 +3686,8 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         encoder.memoryBarrier(scope: .buffers)
     }
 
+    /// Weighted down-projection accumulate. `resident` binds a streamed expert's
+    /// slot, exactly as `encodeSwiGLU` does.
     private func encodeDown(
         _ encoder: MTLComputeCommandEncoder,
         weight: DeepSeekV41DeviceTensor,
@@ -1743,13 +3696,16 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         outDim: Int,
         activation: MTLBuffer,
         output: MTLBuffer,
-        weightToAdd: Float
+        weightToAdd: Float,
+        resident: DeepSeekV41ResidentExpert? = nil,
+        byteOffset: Int = 0
     ) throws {
         let format = DeepSeekV41DevicePlan.linearFormat(tensor: weight, scale: scale)
         guard DeepSeekV41DevicePlan.downKernel(format) != nil else {
             throw DeepSeekV41EngineError.unsupportedDtype("a feed-forward down projection", weight.dtype)
         }
-        guard let weightBuffer = shardBuffer(weight) else {
+        let weightBuffer = resident?.buffer ?? shardBuffer(weight)
+        guard let weightBuffer else {
             throw DeepSeekV41EngineError.missingTensor("a feed-forward down projection")
         }
         var inDimension = UInt32(inDim)
@@ -1758,7 +3714,11 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
 
         switch format {
         case .fp8Block32, .mxfp4:
-            guard let scale, let scaleBuffer = shardBuffer(scale) else {
+            guard let scale else {
+                throw DeepSeekV41EngineError.missingTensor("a down projection's scale companion")
+            }
+            let scaleBuffer = resident?.buffer ?? shardBuffer(scale)
+            guard let scaleBuffer else {
                 throw DeepSeekV41EngineError.missingTensor("a down projection's scale companion")
             }
             encoder.setComputePipelineState(
@@ -1767,9 +3727,9 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             encoder.setBuffer(weightBuffer, offset: 0, index: 0)
             encoder.setBuffer(scaleBuffer, offset: 0, index: 1)
             encoder.setBuffer(activation, offset: 0, index: 2)
-            encoder.setBuffer(output, offset: 0, index: 3)
-            var weightOffset = UInt64(weight.byteOffset)
-            var scaleOffset = UInt64(scale.byteOffset)
+            encoder.setBuffer(output, offset: byteOffset, index: 3)
+            var weightOffset = resident?.downWeightOffset ?? UInt64(weight.byteOffset)
+            var scaleOffset = resident?.downScaleOffset ?? UInt64(scale.byteOffset)
             encoder.setBytes(&weightOffset, length: 8, index: 4)
             encoder.setBytes(&scaleOffset, length: 8, index: 5)
             encoder.setBytes(&inDimension, length: 4, index: 6)
@@ -1779,8 +3739,8 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
             encoder.setComputePipelineState(pipelines.bf16DownAccumulate)
             encoder.setBuffer(weightBuffer, offset: 0, index: 0)
             encoder.setBuffer(activation, offset: 0, index: 1)
-            encoder.setBuffer(output, offset: 0, index: 2)
-            var weightOffset = UInt64(weight.byteOffset)
+            encoder.setBuffer(output, offset: byteOffset, index: 2)
+            var weightOffset = resident?.downWeightOffset ?? UInt64(weight.byteOffset)
             encoder.setBytes(&weightOffset, length: 8, index: 3)
             encoder.setBytes(&inDimension, length: 4, index: 4)
             encoder.setBytes(&outDimension, length: 4, index: 5)
@@ -1795,32 +3755,132 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         encoder.memoryBarrier(scope: .buffers)
     }
 
-    private func encodeStreamMix(
+    /// `hc_*_fn` applied to the FLATTENED stack, split into the three coefficient
+    /// sets.
+    ///
+    /// The projection is FP32 in the checkpoint — `layers.N.hc_attn_fn` is published
+    /// as `[24, 20480]` — so it reads the shard bytes directly instead of going
+    /// through the quantized GEMV kernels, and a checkpoint that published it at a
+    /// quantized or bf16 width is refused rather than read at the wrong stride.
+    private func encodeHyperConnectionCoefficients(
         _ encoder: MTLComputeCommandEncoder,
-        readWeights: MTLBuffer?,
-        scale: MTLBuffer?,
-        bias: MTLBuffer?,
-        output: MTLBuffer
+        layer: Int,
+        function: DeepSeekV41TensorRole,
+        base: DeepSeekV41TensorRole,
+        scale: DeepSeekV41TensorRole,
+        pre: MTLBuffer,
+        post: MTLBuffer,
+        comb: MTLBuffer,
+        count: Int = 1
     ) throws {
-        guard let readWeights else {
-            throw DeepSeekV41EngineError.allocationFailed("a hyper-connection read vector")
+        // Slots are an offset INSIDE the kernel, not a binding, so a block of
+        // positions is one dispatch for the projection and one for the split. The
+        // split's Sinkhorn is serial per position, which is exactly why the block
+        // runs its positions side by side as grid rows instead of one chain after
+        // another.
+        let slots = max(1, count)
+        guard let projection = weights.tensor(function, layer: layer),
+              let buffer = shardBuffer(projection) else {
+            throw DeepSeekV41EngineError.missingTensor(function.rawValue)
         }
-        encoder.setComputePipelineState(pipelines.hcMix)
-        encoder.setBuffer(workspace.streams, offset: 0, index: 0)
-        encoder.setBuffer(readWeights, offset: 0, index: 1)
-        // Absent `hc_*_scale` means a scale of 1 and absent `hc_*_base` means a
-        // bias of 0, so each slot is bound to its own identity rather than left
-        // undefined for a kernel that dereferences it.
-        guard let scaleBuffer = scale ?? ones, let biasBuffer = bias ?? zeros else {
-            throw DeepSeekV41EngineError.allocationFailed("the hyper-connection identity vectors")
+        guard DeepSeekV41DtypeWidth.bytesPerValue(dtype: projection.dtype) == 4 else {
+            throw DeepSeekV41EngineError.unsupportedDtype(
+                "\(function.rawValue) (expected FP32)", projection.dtype
+            )
         }
-        encoder.setBuffer(scaleBuffer, offset: 0, index: 2)
-        encoder.setBuffer(biasBuffer, offset: 0, index: 3)
-        encoder.setBuffer(output, offset: 0, index: 4)
-        var width = UInt32(shapes.hidden)
-        var streams = UInt32(mult)
+        guard let baseBuffer = vectors.buffer(base, layer: layer),
+              let scaleBuffer = vectors.buffer(scale, layer: layer) else {
+            throw DeepSeekV41EngineError.missingTensor(base.rawValue)
+        }
+
+        encoder.setComputePipelineState(pipelines.hcProject)
+        encoder.setBuffer(buffer, offset: 0, index: 0)
+        encoder.setBuffer(workspace.streams, offset: 0, index: 1)
+        encoder.setBuffer(workspace.hcLogits, offset: 0, index: 2)
+        var weightOffset = UInt64(projection.byteOffset)
+        var normalizationEpsilon = config.rmsNormEps
+        var width = UInt32(mult * shapes.hidden)
+        var outDim = UInt32(mixCount)
+        var slotCount = UInt32(slots)
+        encoder.setBytes(&weightOffset, length: 8, index: 3)
+        encoder.setBytes(&normalizationEpsilon, length: 4, index: 4)
         encoder.setBytes(&width, length: 4, index: 5)
-        encoder.setBytes(&streams, length: 4, index: 6)
+        encoder.setBytes(&outDim, length: 4, index: 6)
+        encoder.setBytes(&slotCount, length: 4, index: 7)
+        // One threadgroup per (slot, logit), because the reduction is the work: the
+        // output is only `(2 + mult) * mult` rows, so a thread per row left each
+        // position on a single warp while it walked `mult * hidden` values twice
+        // (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #9").
+        encoder.setThreadgroupMemoryLength(
+            Self.hyperConnectionReductionSlots * 2 * MemoryLayout<Float>.stride, index: 0
+        )
+        encoder.dispatchThreadgroups(
+            MTLSize(width: mixCount * slots, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: Self.hyperConnectionThreadgroupWidth, height: 1, depth: 1
+            )
+        )
+        encoder.memoryBarrier(scope: .buffers)
+
+        encoder.setComputePipelineState(pipelines.hcSplit)
+        encoder.setBuffer(workspace.hcLogits, offset: 0, index: 0)
+        encoder.setBuffer(scaleBuffer, offset: 0, index: 1)
+        encoder.setBuffer(baseBuffer, offset: 0, index: 2)
+        encoder.setBuffer(pre, offset: 0, index: 3)
+        encoder.setBuffer(post, offset: 0, index: 4)
+        encoder.setBuffer(comb, offset: 0, index: 5)
+        var copies = UInt32(mult)
+        var iterations = UInt32(max(0, config.hcSinkhornIterations))
+        var epsilon = config.hcEps
+        encoder.setBytes(&copies, length: 4, index: 6)
+        encoder.setBytes(&iterations, length: 4, index: 7)
+        encoder.setBytes(&epsilon, length: 4, index: 8)
+        encoder.setBytes(&slotCount, length: 4, index: 9)
+        // One thread per position: `hc_mult` is 4 and the schedule is serial, so a
+        // slot's chain cannot be split, but a block's slots run concurrently.
+        encoder.dispatchThreads(
+            MTLSize(width: slots, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: max(1, min(32, slots)), height: 1, depth: 1)
+        )
+        encoder.memoryBarrier(scope: .buffers)
+
+        // The probe is a single-position diagnostic, so it reads the first slot.
+        if let probe = function == .hcAttnFn
+            ? parityProbes.attentionLogits
+            : parityProbes.feedForwardLogits {
+            try encodeCopy(encoder, from: workspace.hcLogits, to: probe, count: mixCount)
+        }
+    }
+
+    /// `hc_pre`: collapse the stack with `mix` into `output`, optionally snapshotting
+    /// the stack into `workspace.hcResidual` for the `hc_post` that follows.
+    private func encodeHyperConnectionPre(
+        _ encoder: MTLComputeCommandEncoder,
+        mix: MTLBuffer,
+        output: MTLBuffer,
+        snapshotting: Bool,
+        slot: Int = 0
+    ) throws {
+        let mixOffset = workspace.slotOffset(slot, width: mult)
+        encoder.setComputePipelineState(pipelines.hcPre)
+        encoder.setBuffer(
+            workspace.streams,
+            offset: workspace.slotOffset(slot, width: mult * shapes.hidden),
+            index: 0
+        )
+        encoder.setBuffer(mix, offset: mixOffset, index: 1)
+        encoder.setBuffer(output, offset: workspace.slotOffset(slot, width: shapes.hidden), index: 2)
+        encoder.setBuffer(
+            workspace.hcResidual,
+            offset: workspace.slotOffset(slot, width: mult * shapes.hidden),
+            index: 3
+        )
+        var width = UInt32(shapes.hidden)
+        var copies = UInt32(mult)
+        var snapshot = UInt32(snapshotting ? 1 : 0)
+        encoder.setBytes(&width, length: 4, index: 4)
+        encoder.setBytes(&copies, length: 4, index: 5)
+        encoder.setBytes(&snapshot, length: 4, index: 6)
         encoder.dispatchThreads(
             MTLSize(width: shapes.hidden, height: 1, depth: 1),
             threadsPerThreadgroup: threadgroup(shapes.hidden)
@@ -1828,25 +3888,56 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         encoder.memoryBarrier(scope: .buffers)
     }
 
-    private func encodeStreamWrite(
+    /// `hc_post`: expand `output` to every copy and mix the snapshotted block input
+    /// back in through `comb`.
+    private func encodeHyperConnectionPost(
         _ encoder: MTLComputeCommandEncoder,
-        contribution: MTLBuffer,
-        writeScales: MTLBuffer?
+        output: MTLBuffer,
+        gains: MTLBuffer,
+        comb: MTLBuffer,
+        slot: Int = 0
     ) throws {
-        encoder.setComputePipelineState(pipelines.hcWrite)
-        encoder.setBuffer(workspace.streams, offset: 0, index: 0)
-        encoder.setBuffer(contribution, offset: 0, index: 1)
-        guard let scales = writeScales ?? ones else {
-            throw DeepSeekV41EngineError.allocationFailed("the hyper-connection identity vectors")
-        }
-        encoder.setBuffer(scales, offset: 0, index: 2)
+        let stackOffset = workspace.slotOffset(slot, width: mult * shapes.hidden)
+        encoder.setComputePipelineState(pipelines.hcPost)
+        encoder.setBuffer(
+            output, offset: workspace.slotOffset(slot, width: shapes.hidden), index: 0
+        )
+        encoder.setBuffer(workspace.hcResidual, offset: stackOffset, index: 1)
+        encoder.setBuffer(gains, offset: workspace.slotOffset(slot, width: mult), index: 2)
+        encoder.setBuffer(
+            comb, offset: workspace.slotOffset(slot, width: mult * mult), index: 3
+        )
+        encoder.setBuffer(workspace.streams, offset: stackOffset, index: 4)
         var width = UInt32(shapes.hidden)
-        var streams = UInt32(mult)
-        encoder.setBytes(&width, length: 4, index: 3)
-        encoder.setBytes(&streams, length: 4, index: 4)
+        var copies = UInt32(mult)
+        encoder.setBytes(&width, length: 4, index: 5)
+        encoder.setBytes(&copies, length: 4, index: 6)
         encoder.dispatchThreads(
             MTLSize(width: shapes.hidden, height: mult, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: threadgroup(shapes.hidden).width, height: 1, depth: 1)
+            threadsPerThreadgroup: MTLSize(
+                width: threadgroup(shapes.hidden).width, height: 1, depth: 1
+            )
+        )
+        encoder.memoryBarrier(scope: .buffers)
+    }
+
+    private func encodeCopy(
+        _ encoder: MTLComputeCommandEncoder,
+        from source: MTLBuffer,
+        to destination: MTLBuffer,
+        count: Int,
+        sourceByteOffset: Int = 0,
+        destinationByteOffset: Int = 0
+    ) throws {
+        guard count > 0 else { return }
+        encoder.setComputePipelineState(pipelines.copy)
+        encoder.setBuffer(source, offset: sourceByteOffset, index: 0)
+        encoder.setBuffer(destination, offset: destinationByteOffset, index: 1)
+        var length = UInt32(count)
+        encoder.setBytes(&length, length: 4, index: 2)
+        encoder.dispatchThreads(
+            MTLSize(width: count, height: 1, depth: 1),
+            threadsPerThreadgroup: threadgroup(count)
         )
         encoder.memoryBarrier(scope: .buffers)
     }
@@ -1867,7 +3958,9 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         table: DeepSeekV41RopeTable,
         latent: Bool,
         position: Int,
-        inverse: Bool = false
+        inverse: Bool = false,
+        batch: Int = 1,
+        byteOffset: Int = 0
     ) throws {
         let tables = latent ? latentFrequencies : queryFrequencies
         guard let frequencies = tables[table] else {
@@ -1876,24 +3969,26 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         let pairCount = max(0, sliceLength) / 2
         guard pairCount > 0 else { return }
         encoder.setComputePipelineState(pipelines.rope)
-        encoder.setBuffer(vector, offset: 0, index: 0)
+        encoder.setBuffer(vector, offset: byteOffset, index: 0)
         encoder.setBuffer(frequencies, offset: 0, index: 1)
         var width = UInt32(rowWidth)
         var localHeadDim = UInt32(max(0, headDim))
         var pairs = UInt32(min(pairCount, frequencies.length / MemoryLayout<Float>.stride))
         var base = UInt32(max(0, position))
-        var batch: UInt32 = 1
+        // One row per consecutive position: the kernel reads the token from
+        // `thread_position_in_grid.y` and rotates at `basePosition + tokenIdx`.
+        var batchCount = UInt32(max(1, batch))
         var offset = UInt32(max(0, sliceStart))
         var conjugate: UInt32 = inverse ? 1 : 0
         encoder.setBytes(&width, length: 4, index: 2)
         encoder.setBytes(&localHeadDim, length: 4, index: 3)
         encoder.setBytes(&pairs, length: 4, index: 4)
         encoder.setBytes(&base, length: 4, index: 5)
-        encoder.setBytes(&batch, length: 4, index: 6)
+        encoder.setBytes(&batchCount, length: 4, index: 6)
         encoder.setBytes(&offset, length: 4, index: 7)
         encoder.setBytes(&conjugate, length: 4, index: 8)
         encoder.dispatchThreads(
-            MTLSize(width: Int(pairs), height: 1, depth: 1),
+            MTLSize(width: Int(pairs), height: max(1, batch), depth: 1),
             threadsPerThreadgroup: threadgroup(Int(pairs))
         )
         encoder.memoryBarrier(scope: .buffers)
@@ -1904,6 +3999,7 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
     private func encodeStore(
         _ encoder: MTLComputeCommandEncoder,
         latent: MTLBuffer,
+        latentOffset: Int = 0,
         cacheBuffer: MTLBuffer?,
         byteOffset: Int,
         physicalRow: Int
@@ -1913,7 +4009,7 @@ nonisolated public final class DeepSeekV41MetalForward: @unchecked Sendable {
         }
         let elementOffset = byteOffset / max(1, geometry.precision.valueBytesPerElement)
         encoder.setComputePipelineState(pipelines.storeLatent)
-        encoder.setBuffer(latent, offset: 0, index: 0)
+        encoder.setBuffer(latent, offset: latentOffset, index: 0)
         encoder.setBuffer(cacheBuffer, offset: 0, index: 1)
         var offset = UInt64(elementOffset)
         var width = UInt32(shapes.latentWidth)

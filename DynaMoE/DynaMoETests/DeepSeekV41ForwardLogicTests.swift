@@ -129,10 +129,18 @@ enum DeepSeekV41TestFixtures {
             source.set(generator.matrix(rows: shapes.sharedIntermediate, columns: shapes.hidden), role: .sharedExpertW1, layer: l)
             source.set(generator.matrix(rows: shapes.sharedIntermediate, columns: shapes.hidden), role: .sharedExpertW3, layer: l)
             source.set(generator.matrix(rows: shapes.hidden, columns: shapes.sharedIntermediate), role: .sharedExpertW2, layer: l)
-            source.set(generator.matrix(rows: 1, columns: max(1, config.hcMult)), role: .hcAttnFn, layer: l)
-            source.set(generator.matrix(rows: 1, columns: max(1, config.hcMult)), role: .hcFfnFn, layer: l)
-            source.set(generator.vector(max(1, config.hcMult), scale: 0.05), role: .hcAttnScale, layer: l)
-            source.set(generator.vector(max(1, config.hcMult), scale: 0.05), role: .hcFfnScale, layer: l)
+            // `hc_*_fn` projects the FLATTENED stack onto `(2 + mult) * mult`
+            // logits, and `hc_*_scale` is the three-element per-section scale, so
+            // these are the shapes `Block.hc_mixes` reads rather than per-stream
+            // vectors.
+            let copies = max(1, config.hcMult)
+            let mixCount = (2 + copies) * copies
+            source.set(generator.matrix(rows: mixCount, columns: copies * shapes.hidden), role: .hcAttnFn, layer: l)
+            source.set(generator.matrix(rows: mixCount, columns: copies * shapes.hidden), role: .hcFfnFn, layer: l)
+            source.set(generator.vector(3, scale: 0.05), role: .hcAttnScale, layer: l)
+            source.set(generator.vector(3, scale: 0.05), role: .hcFfnScale, layer: l)
+            source.set(generator.vector(mixCount, scale: 0.1), role: .hcAttnBase, layer: l)
+            source.set(generator.vector(mixCount, scale: 0.1), role: .hcFfnBase, layer: l)
             for expert in 0..<config.numRoutedExperts {
                 source.set(generator.matrix(rows: shapes.expertIntermediate, columns: shapes.hidden), role: .expertW1, layer: l, expert: expert)
                 source.set(generator.matrix(rows: shapes.expertIntermediate, columns: shapes.hidden), role: .expertW3, layer: l, expert: expert)
@@ -535,13 +543,19 @@ final class DeepSeekV41BlockDiagonalProjectionTests: XCTestCase {
     /// `attn.wo_a` is `groups` dense blocks stacked along the rows. Reading it as
     /// one dense matrix multiplies each group's rows into every other group's
     /// heads, so the grouped result must equal two independent GEMVs.
+    ///
+    /// The published tensor is `[o_groups * o_lora_rank, heads * head_dim /
+    /// o_groups]` — the COLUMNS are one group's share of the attention output, not
+    /// the whole of it. Dividing them by the group count a second time reads an
+    /// eighth of each group's inputs on the real checkpoint, which is why the
+    /// matrix below is 4 x 2 rather than 4 x 4.
     func testGroupsReadOnlyTheirOwnColumns() {
-        // 2 groups, 2 rows per group, 2 columns per group.
-        let weight = DeepSeekV41Matrix(rows: 4, columns: 4, values: [
-            1, 2, 999, 999,
-            3, 4, 999, 999,
-            999, 999, 5, 6,
-            999, 999, 7, 8
+        // 2 groups, 2 rows per group, 2 columns PER GROUP (4 input values total).
+        let weight = DeepSeekV41Matrix(rows: 4, columns: 2, values: [
+            1, 2,
+            3, 4,
+            5, 6,
+            7, 8
         ])
         let input: [Float] = [1, 1, 2, 1]
         let grouped = weight.applyBlockDiagonal(input, groups: 2)
@@ -552,7 +566,8 @@ final class DeepSeekV41BlockDiagonalProjectionTests: XCTestCase {
             .apply([2, 1])
         XCTAssertEqual(grouped, first + second)
 
-        // And it must differ from the dense read, which is the bug being fixed.
+        // And the dense read has to disagree: it sums each row over all four
+        // columns, which is the bug being fixed.
         let dense = weight.apply(input)
         XCTAssertNotEqual(grouped, dense)
     }
@@ -833,6 +848,28 @@ final class DeepSeekV41ExpertArenaTests: XCTestCase {
 
 final class DeepSeekV41HyperConnectionTests: XCTestCase {
 
+    /// `hc_*_fn` with row `r` one-hot at column `r % columns`, so the logits are the
+    /// flattened stack repeated and every coefficient is hand-checkable.
+    private func repeatingProjection(rows: Int, columns: Int) -> DeepSeekV41Matrix {
+        var values = [Float](repeating: 0, count: rows * columns)
+        for row in 0..<rows {
+            values[row * columns + row % columns] = 1
+        }
+        return DeepSeekV41Matrix(rows: rows, columns: columns, values: values)
+    }
+
+    private func columnSums(_ matrix: [Float], dimension: Int) -> [Float] {
+        (0..<dimension).map { column in
+            (0..<dimension).reduce(Float(0)) { $0 + matrix[$1 * dimension + column] }
+        }
+    }
+
+    private func rowSums(_ matrix: [Float], dimension: Int) -> [Float] {
+        (0..<dimension).map { row in
+            (0..<dimension).reduce(Float(0)) { $0 + matrix[row * dimension + $1] }
+        }
+    }
+
     func testSinkhornProducesADoublyStochasticMatrix() {
         let logits: [Float] = [0.5, -0.2, 1.0, 0.1]
         let matrix = DeepSeekV41HyperConnections.sinkhorn(
@@ -842,13 +879,32 @@ final class DeepSeekV41HyperConnectionTests: XCTestCase {
             epsilon: 1e-6
         )
         XCTAssertEqual(matrix.count, 4)
-        for row in 0..<2 {
-            XCTAssertEqual(matrix[row * 2] + matrix[row * 2 + 1], 1, accuracy: 1e-4)
+        for row in rowSums(matrix, dimension: 2) {
+            XCTAssertEqual(row, 1, accuracy: 1e-4)
         }
-        for column in 0..<2 {
-            XCTAssertEqual(matrix[column] + matrix[2 + column], 1, accuracy: 1e-4)
+        for column in columnSums(matrix, dimension: 2) {
+            XCTAssertEqual(column, 1, accuracy: 1e-4)
         }
         XCTAssertTrue(matrix.allSatisfy { $0 > 0 })
+    }
+
+    /// The reference's schedule is softmax, `+eps`, one COLUMN normalization, then
+    /// `iterations - 1` rounds of row-then-column. After a single iteration the
+    /// columns are exact and the rows are not, which is the asymmetry a symmetric
+    /// reimplementation normalizes away.
+    func testTheFirstRoundLeavesOnlyTheColumnsExact() {
+        let matrix = DeepSeekV41HyperConnections.sinkhorn(
+            logits: [1, 0, 0.5, 0.5],
+            dimension: 2,
+            iterations: 1,
+            epsilon: 1e-6
+        )
+        for column in columnSums(matrix, dimension: 2) {
+            XCTAssertEqual(column, 1, accuracy: 1e-5)
+        }
+        let rows = rowSums(matrix, dimension: 2)
+        XCTAssertEqual(rows[0], 0.943_601, accuracy: 1e-4)
+        XCTAssertEqual(rows[1], 1.056_399, accuracy: 1e-4)
     }
 
     func testUniformLogitsGiveTheBarycenter() {
@@ -873,45 +929,103 @@ final class DeepSeekV41HyperConnectionTests: XCTestCase {
             epsilon: 1e-6
         )
         XCTAssertTrue(matrix.allSatisfy { $0.isFinite }, "\(matrix)")
-        XCTAssertEqual(matrix[0] + matrix[1], 1, accuracy: 1e-4)
+        // The last round is a column normalization, so the columns are the ones
+        // that are exact; the `+eps` floor keeps the rows a little off the
+        // barycenter for a logit this extreme.
+        for column in columnSums(matrix, dimension: 2) {
+            XCTAssertEqual(column, 1, accuracy: 1e-4)
+        }
         XCTAssertTrue(matrix[0] > matrix[1])
     }
 
-    func testReadWeightsPickOneRow() {
-        let matrix: [Float] = [0.25, 0.75, 0.5, 0.5]
-        XCTAssertEqual(DeepSeekV41HyperConnections.readWeights(matrix: matrix, streams: 2, row: 0), [0.25, 0.75])
-        XCTAssertEqual(DeepSeekV41HyperConnections.readWeights(matrix: matrix, streams: 2, row: 1), [0.5, 0.5])
-    }
-
-    func testMixAppliesPerStreamScaleAndPerDimensionBias() {
-        let streams: [[Float]] = [
-            [1, 1],
-            [2, 2]
-        ]
-        // `scale` is per stream, `bias` is per hidden dimension: the streams are
-        // mixed with different gains, and each output dimension carries its own base.
-        let mixed = DeepSeekV41HyperConnections.mix(
+    /// One projection of the flattened stack splits into the three coefficient
+    /// sets: `pre` through a sigmoid floored at `eps`, `post` through twice a
+    /// sigmoid, and `comb` through the Sinkhorn normalization.
+    func testOneProjectionSplitsIntoTheThreeCoefficientSets() {
+        let streams: [[Float]] = [[1, 0], [0, 1]]
+        // `mean(x^2) = 0.5`, so every logit is scaled by `1 / sqrt(0.5 + 1e-6)`.
+        let rstd: Float = 1 / sqrt(0.5 + 1e-6)
+        let half: Float = rstd * 0.5
+        let pre0: Float = 1 / (1 + exp(-half)) + 1e-6
+        let post1: Float = 2 / (1 + exp(-half))
+        let coefficients = DeepSeekV41HyperConnections.coefficients(
             streams: streams,
-            readWeights: [0.5, 0.5],
-            scale: [2, 1],
-            bias: [0.25, -0.25]
+            projection: repeatingProjection(rows: 8, columns: 4),
+            scale: [0.5, 0.5, 0.5],
+            base: [Float](repeating: 0, count: 8),
+            normalizationEpsilon: 1e-6,
+            epsilon: 1e-6,
+            iterations: 20
         )
-        XCTAssertEqual(mixed[0], 0.5 * (1 * 2 + 0.25) + 0.5 * (2 * 1 + 0.25), accuracy: 1e-6)
-        XCTAssertEqual(mixed[1], 0.5 * (1 * 2 - 0.25) + 0.5 * (2 * 1 - 0.25), accuracy: 1e-6)
+        XCTAssertEqual(coefficients.logits.count, 8)
+        XCTAssertEqual(coefficients.logits[0], rstd, accuracy: 1e-5)
+        XCTAssertEqual(coefficients.logits[1], 0, accuracy: 1e-6)
+        XCTAssertEqual(coefficients.logits[3], rstd, accuracy: 1e-5)
+
+        XCTAssertEqual(coefficients.pre.count, 2)
+        XCTAssertEqual(coefficients.pre[0], pre0, accuracy: 1e-6)
+        XCTAssertEqual(coefficients.pre[1], 0.5 + 1e-6, accuracy: 1e-6)
+
+        XCTAssertEqual(coefficients.post.count, 2)
+        XCTAssertEqual(coefficients.post[0], 1, accuracy: 1e-6)
+        XCTAssertEqual(coefficients.post[1], post1, accuracy: 1e-5)
+
+        XCTAssertEqual(coefficients.comb.count, 4)
+        for column in columnSums(coefficients.comb, dimension: 2) {
+            XCTAssertEqual(column, 1, accuracy: 1e-4)
+        }
     }
 
-    func testWriteAccumulatesIntoEveryStream() {
-        var streams: [[Float]] = [
-            [0, 0],
-            [0, 0]
-        ]
-        DeepSeekV41HyperConnections.write(
-            streams: &streams,
-            contribution: [1, -1],
-            writeScales: [0.5, 2]
+    /// A checkpoint with no usable `hc_*` tensors degenerates to a single stream
+    /// rather than to a guess: copy 0 is what a sub-layer reads, and every copy
+    /// keeps its own residual.
+    func testAMissingProjectionCollapsesToCopyZero() {
+        let coefficients = DeepSeekV41HyperConnections.coefficients(
+            streams: [[1, 2], [3, 4]],
+            projection: nil,
+            scale: [1, 1, 1],
+            base: [Float](repeating: 0, count: 8),
+            normalizationEpsilon: 1e-6,
+            epsilon: 1e-6,
+            iterations: 4
         )
-        XCTAssertEqual(streams[0], [0.5, -0.5])
-        XCTAssertEqual(streams[1], [2, -2])
+        XCTAssertEqual(coefficients.pre, [1, 0])
+        XCTAssertEqual(coefficients.post, [1, 1])
+        XCTAssertEqual(coefficients.comb, [1, 0, 0, 1])
+    }
+
+    func testPreCollapsesTheCopiesWithTheMix() {
+        let streams: [[Float]] = [[1, 0], [0, 2]]
+        XCTAssertEqual(
+            DeepSeekV41HyperConnections.pre(streams: streams, mix: [0.25, 0.75]),
+            [0.25, 1.5]
+        )
+        XCTAssertEqual(
+            DeepSeekV41HyperConnections.pre(streams: streams, mix: [1, 0]),
+            [1, 0]
+        )
+    }
+
+    func testPostExpandsTheOutputAndMixesTheResidualThroughComb() {
+        // y[k] = post[k] * x + sum_j comb[j][k] * residual[j]
+        //
+        // The mixing matrix is SOURCE-first: `Block.hc_post` sums
+        // `comb.unsqueeze(-1) * residual.unsqueeze(-2)` over its middle axis, so an
+        // output copy reads a column. With this matrix and two distinct residuals
+        // the two readings cannot be confused.
+        let residual: [[Float]] = [[1, 0], [0, 1]]
+        let streams = DeepSeekV41HyperConnections.post(
+            output: [2, 2],
+            residual: residual,
+            gains: [0.5, 0],
+            comb: [0.25, 0.75, 0, 1]
+        )
+        // copy 0: 0.5 * (2, 2) + comb[0][0] * (1, 0) + comb[1][0] * (0, 1)
+        XCTAssertEqual(streams[0][0], 1.25, accuracy: 1e-6)
+        XCTAssertEqual(streams[0][1], 1.0, accuracy: 1e-6)
+        // copy 1: 0 * output + comb[0][1] * (1, 0) + comb[1][1] * (0, 1)
+        XCTAssertEqual(streams[1][0], 0.75, accuracy: 1e-6)
+        XCTAssertEqual(streams[1][1], 1.0, accuracy: 1e-6)
     }
 }
 
@@ -1386,7 +1500,12 @@ final class DeepSeekV41TensorShapeTests: XCTestCase {
     func testPipelineListsEveryStageOnce() {
         let stages = DeepSeekV41ForwardStages.layerPipeline
         XCTAssertEqual(Set(stages).count, stages.count)
-        XCTAssertEqual(stages.first, .mixAttentionStreams)
+        // Engram memory is written into the residual at the top of the layer, so it
+        // has to run before the stage that mixes the streams for attention, and that
+        // mix depends on the coefficients the `hc_*_fn` projection just produced.
+        XCTAssertEqual(stages.first, .engram)
+        XCTAssertEqual(stages.dropFirst().first, .hcAttentionCoefficients)
+        XCTAssertEqual(stages.dropFirst(2).first, .mixAttentionStreams)
         XCTAssertEqual(stages.last, .collapseStreams)
         // The attention stage must come after the latent is written.
         let write = stages.firstIndex(of: .writeLatent)
@@ -1394,5 +1513,272 @@ final class DeepSeekV41TensorShapeTests: XCTestCase {
         XCTAssertNotNil(write)
         XCTAssertNotNil(attend)
         XCTAssertLessThan(write!, attend!)
+    }
+}
+
+// MARK: - Chunk prefill
+
+/// A chunk prefill measured against the walk it replaces.
+///
+/// `prefillChunk` runs a prompt through each layer once, all positions at a time: the
+/// shape the checkpoint's own prefill uses, and the first step toward a device path
+/// that stops paying for six expert weight reads per token. What has to hold is that it
+/// agrees with the position-by-position walk, because a change in the order rows are
+/// written or groups are pooled moves numbers without failing anywhere. Every
+/// comparison here is therefore numeric and per position, and the cache the two passes
+/// leave behind is compared too: a following decode step reads it.
+final class DeepSeekV41ChunkForwardTests: XCTestCase {
+
+    private func assertRowsMatch(
+        _ chunked: [[Float]],
+        _ walked: [[Float]],
+        _ label: String
+    ) {
+        XCTAssertEqual(chunked.count, walked.count, "\(label) row count")
+        for (position, row) in chunked.enumerated() where walked.indices.contains(position) {
+            XCTAssertEqual(row.count, walked[position].count, "\(label) position \(position)")
+            for dimension in row.indices where walked[position].indices.contains(dimension) {
+                XCTAssertEqual(
+                    row[dimension],
+                    walked[position][dimension],
+                    accuracy: 1e-5,
+                    "\(label) position \(position) dim \(dimension)"
+                )
+            }
+        }
+    }
+
+    private func assertLogitsMatch(
+        _ chunked: [Float],
+        _ walked: [Float],
+        _ label: String
+    ) {
+        XCTAssertEqual(chunked.count, walked.count, "\(label) width")
+        for dimension in chunked.indices where walked.indices.contains(dimension) {
+            XCTAssertEqual(
+                chunked[dimension],
+                walked[dimension],
+                accuracy: 1e-5,
+                "\(label) logit \(dimension)"
+            )
+        }
+    }
+
+    /// Engram rows for every hash column, so the in-memory store can stand in for the
+    /// streaming lookup the way `DeepSeekV41EngramForwardTests` does.
+    private func engramSource(
+        config: DeepSeekV41Config,
+        plan: [DeepSeekV41LayerPlan]
+    ) -> DeepSeekV41DenseWeightSource {
+        let source = DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        guard let table = plan.first(where: { $0.engramTable != nil })?.engramTable else {
+            return source
+        }
+        let spec = config.engramTables[table]
+        let columns = max(1, spec.maxNgramSize - 1) * spec.headCount
+        for column in 0..<columns {
+            let row = (0..<spec.headDimension).map { Float($0 + column + 1) * 0.25 }
+            source.setEngramRow(row, layer: spec.layer, column: column)
+        }
+        return source
+    }
+
+    func testAChunkMatchesTheWalkAtEveryPosition() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let tokens = [3, 5, 7, 9, 11]
+
+        let walk = DeepSeekV41CPUForward(
+            config: config,
+            plan: plan,
+            weights: DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        )
+        var walked: [[Float]] = []
+        for (position, token) in tokens.enumerated() {
+            walked.append(walk.forwardToken(token, position: position))
+        }
+
+        let chunked = DeepSeekV41CPUForward(
+            config: config,
+            plan: plan,
+            weights: DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        )
+        let chunk = chunked.prefillChunk(tokens, capturingLogitsAt: Set(tokens.indices))
+
+        for position in tokens.indices {
+            let captured = try XCTUnwrap(chunk.captured[position], "position \(position)")
+            assertLogitsMatch(captured, walked[position], "position \(position)")
+        }
+        // The last position's logits are the ones the caller samples from.
+        XCTAssertEqual(chunk.last.count, config.vocabSize)
+        XCTAssertEqual(chunk.last, chunk.captured[tokens.count - 1])
+
+        // The cache has to be the same one, not merely a similar one: a decode step or a
+        // resumed turn reads these rows.
+        XCTAssertEqual(chunked.storedPositions, walk.storedPositions)
+        XCTAssertEqual(chunked.tokenHistory, walk.tokenHistory)
+        XCTAssertEqual(chunked.deadTokens, walk.deadTokens)
+        XCTAssertEqual(chunked.candidateScores.count, walk.candidateScores.count)
+        XCTAssertEqual(chunked.engramGates.keys.sorted(), walk.engramGates.keys.sorted())
+        XCTAssertEqual(chunked.compressed.keys.sorted(), walk.compressed.keys.sorted())
+        for (owner, rows) in walk.compressed {
+            let chunkedRows = try XCTUnwrap(chunked.compressed[owner], "owner \(owner)")
+            XCTAssertEqual(chunkedRows.count, rows.count, "owner \(owner) row count")
+            for (row, values) in chunkedRows.enumerated() where rows.indices.contains(row) {
+                for dimension in values.indices where rows[row].indices.contains(dimension) {
+                    XCTAssertEqual(
+                        values[dimension],
+                        rows[row][dimension],
+                        accuracy: 1e-5,
+                        "owner \(owner) row \(row) dim \(dimension)"
+                    )
+                }
+            }
+        }
+        for layer in plan {
+            assertRowsMatch(
+                chunked.latents[layer.index],
+                walk.latents[layer.index],
+                "layer \(layer.index) latent"
+            )
+            assertRowsMatch(
+                chunked.attentionInputs[layer.index],
+                walk.attentionInputs[layer.index],
+                "layer \(layer.index) attention input"
+            )
+        }
+    }
+
+    func testDecodeContinuesFromAChunk() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let tokens = [3, 5, 7]
+
+        let walk = DeepSeekV41CPUForward(
+            config: config,
+            plan: plan,
+            weights: DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        )
+        _ = walk.prefill(tokens: tokens)
+
+        let chunked = DeepSeekV41CPUForward(
+            config: config,
+            plan: plan,
+            weights: DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        )
+        _ = chunked.prefillChunk(tokens)
+        XCTAssertEqual(chunked.storedPositions, tokens.count)
+
+        // The position after the chunk reads the ring and the compressed rows the chunk
+        // wrote, so this is where a chunk that pooled or rotated differently shows up.
+        let next = 13
+        assertLogitsMatch(
+            chunked.forwardToken(next, position: tokens.count),
+            walk.forwardToken(next, position: tokens.count),
+            "decode after the chunk"
+        )
+    }
+
+    func testAChunkPoolsOnlyTheGroupsItCompletes() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let owner = try XCTUnwrap(plan.first { $0.ownsCompressedKV })
+        let ratio = max(1, owner.compressRatio)
+        // Five positions at ratio two: two rows, and the fifth position waits for the one
+        // that completes its group.
+        let tokens = [3, 5, 7, 9, 11]
+        let forward = DeepSeekV41CPUForward(
+            config: config,
+            plan: plan,
+            weights: DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        )
+        _ = forward.prefillChunk(tokens)
+        XCTAssertEqual(forward.compressed[owner.index]?.count, tokens.count / ratio)
+    }
+
+    func testTheHeadOnlyRunsForThePositionsAsked() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let source = DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+
+        let bare = DeepSeekV41CPUForward(config: config, plan: plan, weights: source)
+            .prefillChunk([3, 5, 7, 9])
+        XCTAssertTrue(bare.captured.isEmpty)
+        XCTAssertEqual(bare.last.count, config.vocabSize)
+
+        // 9 is past the end of a four-position chunk, so it is dropped rather than
+        // reported as an empty entry.
+        let kept = DeepSeekV41CPUForward(config: config, plan: plan, weights: source)
+            .prefillChunk([3, 5, 7, 9], capturingLogitsAt: [1, 9])
+        XCTAssertEqual(Set(kept.captured.keys), [1])
+        XCTAssertEqual(kept.last.count, config.vocabSize)
+    }
+
+    func testAChunkRefusesASequenceTheCacheAlreadyHolds() throws {
+        let config = try DeepSeekV41TestFixtures.config()
+        let plan = try config.makeLayerPlan()
+        let forward = DeepSeekV41CPUForward(
+            config: config,
+            plan: plan,
+            weights: DeepSeekV41TestFixtures.weights(config: config, plan: plan)
+        )
+        _ = forward.prefillChunk([3, 5])
+        // A resumed prefix is a walk: the reference has no chunked form of it, and a chunk
+        // that guessed would fill the ring and finish groups its own way.
+        let second = forward.prefillChunk([7])
+        XCTAssertTrue(second.last.isEmpty)
+        XCTAssertEqual(forward.storedPositions, 2)
+        XCTAssertEqual(forward.tokenHistory.count, 2)
+    }
+
+    /// The Engram layers hash the token stream, so a chunk has to hand each position the
+    /// history that ENDS at it. Handing over the whole chunk hashes every position as if
+    /// it were the last one, which reads different table rows and still produces text.
+    func testAnEngramChunkHashesTheSameNgramsAsTheWalk() throws {
+        let config = try DeepSeekV41TestFixtures.engramConfig()
+        let plan = try config.makeLayerPlan()
+        let tokens = [3, 5, 7, 9]
+        let layer = try XCTUnwrap(plan.first { $0.engramTable != nil }).index
+
+        let walkSource = engramSource(config: config, plan: plan)
+        let walk = DeepSeekV41CPUForward(
+            config: config,
+            plan: plan,
+            weights: walkSource,
+            engramLookup: walkSource
+        )
+        var walked: [[Float]] = []
+        for (position, token) in tokens.enumerated() {
+            walked.append(walk.forwardToken(token, position: position))
+        }
+
+        let chunkSource = engramSource(config: config, plan: plan)
+        let chunked = DeepSeekV41CPUForward(
+            config: config,
+            plan: plan,
+            weights: chunkSource,
+            engramLookup: chunkSource
+        )
+        let chunk = chunked.prefillChunk(tokens, capturingLogitsAt: Set(tokens.indices))
+
+        for position in tokens.indices {
+            let captured = try XCTUnwrap(chunk.captured[position], "position \(position)")
+            assertLogitsMatch(captured, walked[position], "position \(position)")
+        }
+        // The gates are recorded per lookup, so a chunk that hashed the wrong history is
+        // visible here even where the logits happen to be close.
+        let chunkGates = try XCTUnwrap(chunked.engramGates[layer])
+        let walkGates = try XCTUnwrap(walk.engramGates[layer])
+        XCTAssertEqual(chunkGates.count, walkGates.count)
+        for (position, gates) in chunkGates.enumerated() where walkGates.indices.contains(position) {
+            for dimension in gates.indices where walkGates[position].indices.contains(dimension) {
+                XCTAssertEqual(
+                    gates[dimension],
+                    walkGates[position][dimension],
+                    accuracy: 1e-5,
+                    "layer \(layer) position \(position) gate \(dimension)"
+                )
+            }
+        }
     }
 }
