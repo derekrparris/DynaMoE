@@ -5882,3 +5882,127 @@ worth 100 ms of the 155 and would be the first thing to fix if the drafter ships
 rewind for a rejected suffix. Both exist only to serve a verify, and a verify at the
 declared width loses ~30% against walking. Building them now would be building the losing
 half of a design the measurement has already rejected.
+
+## DSV4.1 #26: A TWO-WIDE DRAFT ACCEPTS 50-55%, AND STILL LOSES TO WALKING
+
+`#25` ended on a question the accept curve made: the chain dies at its second step, so a
+narrower block should accept a larger share of what it drafts. It does. It then loses to
+walking anyway, because a two-wide verify buys almost nothing and the drafter's own
+forward costs more than it buys. This slice measured both halves on the published
+checkpoint and the answer is a NO for every width, not just the declared one.
+
+### The acceptance, by width
+
+`testWhatANarrowerDraftBlockAcceptsOnThePublishedCheckpoint` runs `#25`'s protocol at
+widths 2, 3 and 5. Each width gets its OWN runtime, because the width sizes the draft key
+block, the head's logits buffer and every block workspace at construction: the config's
+`dspark_block_size` is overridden before the runtime is built, which is exactly the graph
+a checkpoint declaring that width produces. Width 5 is in the sweep as the control.
+
+| width | p0 | p1 | p0 per step | p1 per step | gated | draft ms/round |
+|---|---|---|---|---|---|---|
+| 2 | 10/20 (50%) | 11/20 (55%) | 70%, 30% | 60%, 50% | 67% of 12, 69% of 16 | 90, 56 |
+| 3 | 11/30 (37%) | 12/30 (40%) | 60%, 30%, 20% | 60%, 30%, 30% | 42% of 24, 50% of 24 | 73, 84 |
+| 5 | 14/50 (28%) | 17/50 (34%) | 80%, 30%, 10%, 10%, 10% | 80%, 60%, 30%, 0%, 0% | 35% of 40, 38% of 45 | 155, 154 |
+
+The width-5 row reproduces `#25` exactly, which is what makes the narrow rows comparable:
+same protocol, same prompts, same rounds, one variable.
+
+Two things in that table matter more than the totals:
+
+- **The first draft gets WORSE when the block narrows** — 70%/60% at width two against
+  80%/80% at width five. This is not noise; it is the graph. The block attends over its
+  own rows as well as the ring (it is not causal inside itself), so removing siblings
+  changes what position 0 sees. A narrow block is a different drafter, not a truncation
+  of the wide one.
+- **The aggregate still roughly doubles**, 31% to 50-55%, because the tail the curve dies
+  in no longer exists. The win is where the chain stops, not a better first token. The
+  second step is 30-50% at width two and 30-60% at width five — statistically the same
+  marginal draft.
+
+The confidence gate is much stronger here: it keeps 67-69% acceptance among the rounds it
+would submit, against 35-38% at width five. It still only submits 60-80% of rounds.
+
+### The verify, measured like-for-like
+
+`#25`'s width sweep printed width-2 and width-3 verify costs of 105.8 and 85.5 ms/position
+and invited the reading "a narrow verify is 2x cheaper than a walk". That reading was
+wrong, and `#26` shows why: those blocks ran over a 24-token list the arena already held
+after the first round, so they read no expert bytes at all, while the 153.3 ms/position
+baseline they were compared against was a realistic walk WITH misses. It is the trap `#22`
+recorded, and it cost a projection.
+
+`testWhatANarrowVerifyCostsAgainstAWalkInTheSameRuntime` fixes the procedure: every sample
+resets the executor and re-walks the same prefix, the arm order rotates, and each round
+times a one-position WALK so every width is reported as a ratio to a walk measured in the
+same state. Medians of six samples:
+
+| arm | ms/pos | ratio to walk | MB/pos |
+|---|---|---|---|
+| walk | 64.8 | 1.00 | 0 |
+| w2 | 53.5 | 0.83 | 0 |
+| w3 | 52.0 | 0.80 | 0 |
+
+That is the ZERO-MISS regime — the byte counter reads 0 in both arms, as it must, because
+the arm tokens repeat. A live turn never repeats a position, so
+`testWhatANarrowVerifyCostsWhenItsExpertsAreCold` prices the same two arms over DISTINCT
+two- and three-token runs (a fixed list, not a continuation the test just walked, which
+would pre-load exactly the experts the arms are supposed to miss), re-walking the same
+prompt and seed each sample so both arms start from identical cache and arena state:
+
+| arm | ms/pos | ratio to walk | MB/pos |
+|---|---|---|---|
+| walk | 194.8 | 1.00 | 645 |
+| w2 | 173.6 | 0.89 | 601 |
+| w3 | 211.0 | 1.08 | 998 |
+
+Both regimes agree on the ratio to within a few percent (0.83-0.89 at width two), which is
+the useful part: **a two-wide block is ~11-17% cheaper per position than walking it, not
+2.16x cheaper.** `#22`'s 2.16x is a property of width EIGHT, where one expert union
+replaces eight per-position sets and the block reads 7.6x fewer bytes. Width two has two
+positions to amortize one round trip over, and width three is actively worse than walking
+(1.08x, 55% MORE bytes per position) because the union it fills up front is wider than the
+per-position sets it replaces. The byte model in `#17` warned that the block's traffic is
+what to watch; here it goes the wrong way.
+
+### The economics, at last with both sides measured
+
+A round emits `1 + E[accepted]` tokens and costs `draft + width x verify`. Walking the same
+tokens costs `(1 + E[accepted]) x walk`.
+
+| width | emits/round | round cost | walking the same | result |
+|---|---|---|---|---|
+| 2 | 2.05 | 73 + 2x173.6 = 420 ms | 2.05 x 194.8 = 399 ms | 1.05x SLOWER |
+| 3 | 2.15 | 78.5 + 3x211.0 = 712 ms | 2.15 x 194.8 = 419 ms | 1.70x SLOWER |
+
+At the zero-miss walk (64.8 ms) width two is 1.4x slower. Break-even for width two needs a
+walk of ~270 ms/position — beyond any walk this port has measured (153.3 realistic at
+`#22`, 194.8 here, 263 at the very coldest) — and that is with the drafting cost as
+measured, which is itself the pessimistic one (see below).
+
+So the answer is not "the block is too wide". Narrowing the block DOES raise acceptance,
+roughly doubles it, and the round still loses, because the batching it gives up is worth
+more than the acceptance it gains. `#25`'s B=3 projection of 1.3-1.5x came from the
+mixed-regime verify number and is withdrawn.
+
+### What this means and what was NOT built
+
+The drafter would need BOTH of these to break even at width two, and neither is close:
+
+- The draft's own forward cut from 56-90 ms to under ~50 ms per round. Its mixture reads
+  experts through the shard mappings with `residents: nil` (the arena collides on
+  `(layer, expert)`, `#24c`), which is most of its cost; making that resident might reach
+  ~25-30 ms.
+- A walk slower than ~270 ms/position in the steady state, i.e. persistent arena misses.
+
+Even with both, the margin is single-digit percent, which is not worth per-position logits
+in `finishBlock` plus a cache rewind for a rejected suffix (`noteStored` only appends; ring
+position, `tokenHistory`, `deadTokens` and the compressor group phase would all have to
+rewind together). Those two pieces were already deliberately unbuilt at `#25`; the narrower
+block does not change that, it closes the question.
+
+What is now on record: DSpark's greedy chain verification is a NO at widths 2, 3 and 5 on
+an M5 Max with this SSD, and the reason is not acceptance (50-55% is fine) but that a
+narrow batch is the regime where batching stops paying. The drafter's remaining value would
+have to come from somewhere other than a linear chain's verify, and no such use is
+proposed here.

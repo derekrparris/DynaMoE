@@ -855,7 +855,101 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             allowEngramSkip: false
         )
         XCTAssertTrue(runtime.isRunnable, runtime.describe())
-        let report = try await Task.detached { [runtime] () -> String in
+        let report = try await dsparkAcceptance(
+            runtime: runtime, prompts: prompts, steps: steps, rounds: rounds
+        )
+        print("🔎 [dsv41 real] dspark acceptance: \(report)")
+        withExtendedLifetime(engine) {}
+    }
+
+    /// What a NARROWER draft block accepts — the shape the acceptance curve supports.
+    ///
+    /// `#25` measured 31% against a ~47% bar at the checkpoint's declared width of
+    /// five, and the per-step curve said why: step 0 agreed 80% of the time and
+    /// everything past the second step sat at the floor, so the loss was the chain
+    /// conditioning each draft on the ones before it. A shorter chain compounds fewer
+    /// of those errors.
+    ///
+    /// It is NOT a prefix of the wide graph, though: the block's own rows are in every
+    /// query's key list (the block is not causal inside itself), so a two-wide block is
+    /// a different attention than the first two positions of a five-wide one. This
+    /// measures that graph, not the truncated logits of the old one.
+    ///
+    /// Each width gets its own runtime, built and released before the next is built,
+    /// because the width sizes the key block, the head's logits buffer and every block
+    /// workspace at construction: overriding the config is exactly the graph a
+    /// checkpoint declaring that width builds. Width five is in the sweep as the
+    /// control and has to reproduce `#25`.
+    func testWhatANarrowerDraftBlockAcceptsOnThePublishedCheckpoint() async throws {
+        let snapshot = try snapshotDirectory()
+        let base = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        XCTAssertEqual(base.dsparkBlockSize, 5)
+        let prompts = [
+            [0, 128803, 21750, 2038, 15174, 943, 3939, 270, 15571, 344, 83779, 16],
+            [0, 128803, 1446, 369, 310, 13866, 353, 279, 4685, 327, 16665, 13, 128804]
+        ]
+        let rounds = 10
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        for width in [2, 3, 5] {
+            let report = try await dsparkAcceptanceAtWidth(
+                width,
+                base: base,
+                snapshot: snapshot,
+                engine: engine,
+                prompts: prompts,
+                rounds: rounds
+            )
+            print("🔎 [dsv41 real] dspark acceptance at width \(width): \(report)")
+        }
+        withExtendedLifetime(engine) {}
+    }
+
+    /// One width of the sweep: build a runtime for that block size, run the protocol,
+    /// and return while the runtime is still the only one alive.
+    ///
+    /// The width is a construction parameter, not a knob on a running executor, so a
+    /// sweep that shared one runtime would measure the wide graph three times.
+    private func dsparkAcceptanceAtWidth(
+        _ width: Int,
+        base: DeepSeekV41Config,
+        snapshot: URL,
+        engine: DynaMoeEngine,
+        prompts: [[Int]],
+        rounds: Int
+    ) async throws -> String {
+        var config = base
+        config.dsparkBlockSize = width
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: 24 + rounds * (width + 1) + 8,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        return try await dsparkAcceptance(
+            runtime: runtime, prompts: prompts, steps: width, rounds: rounds
+        )
+    }
+
+    /// The acceptance protocol, shared by every width so the sweep and `#25`'s number
+    /// cannot drift: the protocol IS the measurement, and a second copy with one
+    /// changed line would report something that cannot be compared.
+    ///
+    /// It drafts `steps` tokens from the target's last token, walks the TARGET
+    /// greedily over the same positions (each position consuming the token the target
+    /// itself produced one before), and counts the longest agreeing prefix. The
+    /// target's walk advances the cache by `steps` per round whatever the drafts did,
+    /// so every round starts from the same state the previous round's target left.
+    private func dsparkAcceptance(
+        runtime: DeepSeekV41Runtime,
+        prompts: [[Int]],
+        steps: Int,
+        rounds: Int
+    ) async throws -> String {
+        try await Task.detached { [runtime] () -> String in
             let executor = runtime.forward()
             var summaries: [String] = []
             for (which, prompt) in prompts.enumerated() {
@@ -947,8 +1041,6 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             }
             return summaries.joined(separator: " | ")
         }.value
-        print("🔎 [dsv41 real] dspark acceptance: \(report)")
-        withExtendedLifetime(engine) {}
     }
 
     /// What a verify costs at the widths a drafter might actually submit.
@@ -1018,6 +1110,237 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             return lines.joined(separator: ", ")
         }.value
         print("🔎 [dsv41 real] verify width sweep: \(report)")
+        withExtendedLifetime(engine) {}
+    }
+
+    /// What a narrow verify costs against a walk measured in the SAME runtime, round
+    /// by round.
+    ///
+    /// `#25`'s sweep reported width 2 at 105.8 ms/position in one run and 62.9 in
+    /// another — a spread larger than the effect it was chasing — because the arms
+    /// shared one runtime, ran in a fixed order, and each one advanced a cache the
+    /// next then read. `#26` makes width 2 the deciding number (a two-wide chain
+    /// accepts 50-55% against a five-wide chain's 31%, so this cost is what decides
+    /// whether verifying is a win), so it gets its own measurement with those
+    /// confounds removed:
+    ///
+    /// - Every sample RESETS the executor and re-prefills the same prefix, so every
+    ///   arm starts from the same position, the same ring and the same cache contents.
+    /// - The arm order rotates each round, so no width always inherits the previous
+    ///   arm's leftovers.
+    /// - Every round also times a ONE-position walk, and each width is reported as a
+    ///   ratio to that walk in the same round. The absolute level has moved 40%
+    ///   between runs; the ratio is the part that can be compared.
+    ///
+    /// The median is reported rather than the best, because the best of a handful of
+    /// samples on a warm arena is the number least likely to survive contact with a
+    /// real turn.
+    func testWhatANarrowVerifyCostsAgainstAWalkInTheSameRuntime() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let prefix = [0, 128803, 21750, 2038, 15174, 943, 3939, 270, 15571, 344, 83779, 16]
+        let arm = [128804, 128822, 1446, 369, 310, 13866, 353]
+        let widths = [2, 3]
+        let samples = 6
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: prefix.count + arm.count + 8,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let report = try await Task.detached { [runtime] () -> String in
+            let executor = runtime.forward()
+            // arm 0 is the walk; the rest are verify widths.
+            let arms = 1 + widths.count
+            var walkMs: [Double] = []
+            var verifyMs = [Int: [Double]]()
+            var walkMB: [Double] = []
+            var verifyMB = [Int: [Double]]()
+            for round in 0..<(samples + 1) {
+                for offset in 0..<arms {
+                    // Rotate so width 2 is not always the first or always the last.
+                    let slot = (offset + round) % arms
+                    executor.reset()
+                    for (position, token) in prefix.enumerated() {
+                        _ = try executor.forwardToken(token, position: position)
+                    }
+                    let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+                    let began = DispatchTime.now().uptimeNanoseconds
+                    var positions = 1
+                    if slot == 0 {
+                        _ = try executor.forwardToken(arm[0], position: prefix.count)
+                    } else {
+                        let width = widths[slot - 1]
+                        positions = width
+                        _ = try executor.prefillChunk(Array(arm.prefix(width)))
+                    }
+                    let elapsed = Double(DispatchTime.now().uptimeNanoseconds - began) / 1_000_000
+                    let megabytes = Double(
+                        (runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore
+                    ) / 1_048_576 / Double(positions)
+                    // The first round is the warm-up: pages, kernels and the arena.
+                    guard round > 0 else { continue }
+                    if slot == 0 {
+                        walkMs.append(elapsed / Double(positions))
+                        walkMB.append(megabytes)
+                    } else {
+                        verifyMs[widths[slot - 1], default: []]
+                            .append(elapsed / Double(positions))
+                        verifyMB[widths[slot - 1], default: []].append(megabytes)
+                    }
+                }
+            }
+            func median(_ values: [Double]) -> Double {
+                guard !values.isEmpty else { return 0 }
+                let sorted = values.sorted()
+                return sorted[sorted.count / 2]
+            }
+            let walk = median(walkMs)
+            let lines = widths.map { width -> String in
+                let values = verifyMs[width] ?? []
+                let scale = walk > 0 ? median(values) / walk : 0
+                let bytes = median(verifyMB[width] ?? [])
+                return String(
+                    format: "w%d %.1f ms/pos = %.2fx a walk (%.1f ms), %.0f MB/pos",
+                    width, median(values), scale, walk, bytes
+                )
+            }
+            let samplesLine = String(
+                format: "walk %.1f ms/pos over %d samples, %.0f MB/pos",
+                walk, walkMs.count, median(walkMB)
+            )
+            return lines.joined(separator: ", ") + "; " + samplesLine
+        }.value
+        print("🔎 [dsv41 real] narrow verify vs walk: \(report)")
+        withExtendedLifetime(engine) {}
+    }
+
+    /// The same narrow verify, priced where it will actually run: over tokens whose
+    /// experts the arena does NOT already hold.
+    ///
+    /// The zero-miss A/B above answers a different question. Its arm tokens are the
+    /// same every round, so after the first round the arena serves them and both arms
+    /// report 0 MB read; that measures kernel work only and it is the trap `#22`
+    /// recorded. A live turn never re-sees a position, so every position it verifies
+    /// pays the expert stream, and batching's whole prize is one expert UNION per
+    /// block instead of one set per position — which is where `#22`'s 2.16x at width
+    /// eight came from and which a width-two block has far less room to amortize.
+    ///
+    /// Every sample therefore uses a DIFFERENT two- (or three-) token run, taken from
+    /// a fixed list rather than from a continuation this test just walked (walking one
+    /// would load exactly the experts the arms are supposed to miss), and every sample
+    /// re-walks the same prompt and seed so both arms start from identical cache and
+    /// arena state. The seed's experts stay hot across samples, exactly as a live
+    /// session's context does; the arm's do not, because the arm is where the new
+    /// positions are.
+    func testWhatANarrowVerifyCostsWhenItsExpertsAreCold() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let prompt = [0, 128803, 21750, 2038, 15174, 943, 3939, 270, 15571, 344, 83779, 16]
+        let seedCount = 2
+        let armTokens = [
+            128804, 128822, 19, 16, 17289, 9372, 344, 10526, 44691, 305, 14, 1060,
+            15390, 294, 1737, 14, 1843, 5258, 20450, 377, 3155, 14, 30663, 32453,
+            19504, 46885, 965, 35868, 20012, 305, 32604, 965, 23418, 27124, 396, 7457,
+            1066, 304, 270, 8343, 603, 1943, 1943, 1239, 128822, 128804, 344, 4211,
+            3961, 573, 3413, 270, 15667, 198, 12694, 25
+        ]
+        let widths = [2, 3]
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: prompt.count + seedCount + armTokens.count + 8,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let report = try await Task.detached { [runtime] () -> String in
+            let executor = runtime.forward()
+
+            // Every sample starts the same way: reset, walk the prompt and the seed.
+            func seeded() throws {
+                executor.reset()
+                for (index, token) in prompt.enumerated() {
+                    _ = try executor.forwardToken(token, position: index)
+                }
+                for offset in 0..<seedCount {
+                    _ = try executor.forwardToken(
+                        armTokens[offset], position: prompt.count + offset
+                    )
+                }
+            }
+
+            let armOrder = [0] + Array(1...widths.count)
+            var walkMs: [Double] = []
+            var walkMB: [Double] = []
+            var verifyMs = [Int: [Double]]()
+            var verifyMB = [Int: [Double]]()
+            var cursor = seedCount
+            var sample = 0
+            while cursor + 3 <= armTokens.count {
+                let slot = (sample + 1) % armOrder.count
+                let width = slot == 0 ? 1 : widths[slot - 1]
+                guard cursor + width <= armTokens.count else { break }
+                let run = Array(armTokens[cursor..<(cursor + width)])
+                cursor += width
+                sample += 1
+                // The first sample is warm-up for whichever arm it happens to be.
+                let measuring = sample > 1
+                try seeded()
+                let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+                let began = DispatchTime.now().uptimeNanoseconds
+                if slot == 0 {
+                    for offset in 0..<width {
+                        _ = try executor.forwardToken(
+                            run[offset], position: prompt.count + seedCount + offset
+                        )
+                    }
+                } else {
+                    _ = try executor.prefillChunk(run)
+                }
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - began) / 1_000_000
+                let megabytes = Double(
+                    (runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore
+                ) / 1_048_576 / Double(width)
+                guard measuring else { continue }
+                if slot == 0 {
+                    walkMs.append(elapsed / Double(width))
+                    walkMB.append(megabytes)
+                } else {
+                    verifyMs[widths[slot - 1], default: []].append(elapsed / Double(width))
+                    verifyMB[widths[slot - 1], default: []].append(megabytes)
+                }
+            }
+
+            func median(_ values: [Double]) -> Double {
+                guard !values.isEmpty else { return 0 }
+                let sorted = values.sorted()
+                return sorted[sorted.count / 2]
+            }
+            let walk = median(walkMs)
+            let lines = widths.map { width -> String in
+                let values = verifyMs[width] ?? []
+                let scale = walk > 0 ? median(values) / walk : 0
+                return String(
+                    format: "w%d %.1f ms/pos = %.2fx a walk (%.1f ms), %.0f MB/pos vs %.0f",
+                    width, median(values), scale, walk,
+                    median(verifyMB[width] ?? []), median(walkMB)
+                )
+            }
+            let samplesLine = String(
+                format: "%d walk samples, %.0f MB/pos", walkMs.count, median(walkMB)
+            )
+            return lines.joined(separator: ", ") + "; " + samplesLine
+        }.value
+        print("🔎 [dsv41 real] cold narrow verify vs walk: \(report)")
         withExtendedLifetime(engine) {}
     }
 
