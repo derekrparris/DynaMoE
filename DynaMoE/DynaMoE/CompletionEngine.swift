@@ -473,19 +473,22 @@ public final class CompletionEngine: @unchecked Sendable {
                 let dsSessionId = request.sessionId
                 let dsAsOfDate = request.asOfDate
                 let dsEosIDs = dsConfig.eosTokenIDs.map { UInt32(clamping: $0) }
-                // Agent turns get the same two guards the generic loop installs: a
-                // grammar mask that makes a malformed tool call unsamplable, and the
-                // mid-stream freeze that stops generation on the token which closes
-                // the call. Both are the app-wide, Qwen-shaped components, so they
-                // only act once this checkpoint's tool dialect is understood;
-                // installed and idle is the intended state until then, because a
-                // mask keyed on markers the model never emits cannot corrupt it.
+                // The checkpoint's own markers, resolved once: the freeze test, the
+                // call rewrite and the result turn all use the same spelling.
+                let dsDialect = DeepSeekV41PromptDialect.resolve(snapshotDir: snapshotDir)
+                // Agent turns keep the mid-stream freeze, now keyed on this
+                // checkpoint's own call syntax (`#27` measured it: the DSML tags its
+                // agent-shaped prompt produces, not the vocabulary's `tool`-`call`
+                // special tokens, which it never emits). The grammar mask is NOT
+                // installed: its marker vocabulary is Qwen's, and it would force a
+                // `<function=>` shape this model was not post-trained to emit.
                 let dsRunAgentTools = request.agentToolsEnabled && !request.forceSynthesis
-                let dsGrammarMaskActive = dsRunAgentTools
-                    && (UserDefaults.standard.object(forKey: "dynamoe_agent_grammar_masking") == nil
-                        ? true
-                        : UserDefaults.standard.bool(forKey: "dynamoe_agent_grammar_masking"))
-                    && !UserDefaults.standard.bool(forKey: "dynamoe_disable_grammar")
+                // Deliberately OFF for this family. The mask's marker vocabulary is
+                // Qwen's and this checkpoint writes its own tags; activating it would
+                // force a `<function=>` shape the model was not post-trained to emit.
+                // Its own dialect is parsed by `DeepSeekV41ToolDialect` instead, and
+                // argument validation still happens at execution.
+                let dsGrammarMaskActive = false
                 let (stream, continuation) = AsyncStream.makeStream(
                     of: CompletionEvent.self, bufferingPolicy: .unbounded
                 )
@@ -553,10 +556,8 @@ public final class CompletionEngine: @unchecked Sendable {
                             },
                             shouldFreeze: { text in
                                 guard dsRunAgentTools else { return false }
-                                return StreamingToolParser.shared.shouldFreezeGeneration(
-                                    accumulatedText: text,
-                                    deltaText: "",
-                                    format: ToolCallFormat.forModel(isGemma4: false)
+                                return DeepSeekV41ToolDialect.shouldFreeze(
+                                    text, markers: dsDialect.markers
                                 )
                             },
                             decode: { ids in
@@ -643,6 +644,33 @@ public final class CompletionEngine: @unchecked Sendable {
                                 dsFormattedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
                             )
                         )
+                        // Agent calls arrive in this checkpoint's own dialect (DSML
+                        // for the agent prompt, plain tags for a schematic one).
+                        // Rewriting into the canonical block keeps the executor, HITL
+                        // gating, timeline and history on the one shared path.
+                        var dsParsedCalls: [ParsedToolCall] = []
+                        var dsGestureNotices: [Int: String] = [:]
+                        var dsActionable: [Int] = []
+                        var dsBroken: [String] = []
+                        if dsRunAgentTools {
+                            let canonical = DeepSeekV41ToolDialect.canonicalized(
+                                output.text, markers: dsDialect.markers
+                            )
+                            let parsed = StreamingToolParser.shared.parseStreamingToolCalls(
+                                from: canonical, format: .qwenXML
+                            )
+                            let gestures = AgentHarness.splitGestureCalls(parsed.calls)
+                            dsParsedCalls = parsed.calls
+                            dsGestureNotices = gestures.skipNotices
+                            dsActionable = gestures.actionableIndices
+                            dsBroken = parsed.brokenFragments
+                        }
+                        if !dsParsedCalls.isEmpty || !dsBroken.isEmpty {
+                            print(
+                                "🧰 [DSV41] parsed \(dsParsedCalls.map(\.name)) "
+                                    + "actionable=\(dsActionable) broken=\(dsBroken.count)"
+                            )
+                        }
                         let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
                         emit(.finished(TurnResult(
                             finishReason: output.finishReason,
@@ -668,10 +696,10 @@ public final class CompletionEngine: @unchecked Sendable {
                             prefetchEfficiencyPercent: 0,
                             pagingLatencyMs: 0,
                             prefixTokensReused: output.prefixTokensReused,
-                            parsedToolCalls: [],
-                            actionableCallIndices: [],
-                            gestureSkipNotices: [:],
-                            brokenFragments: [],
+                            parsedToolCalls: dsParsedCalls,
+                            actionableCallIndices: dsActionable,
+                            gestureSkipNotices: dsGestureNotices,
+                            brokenFragments: dsBroken,
                             matchedStopSequence: output.matchedStopSequence
                         )))
                     } catch {

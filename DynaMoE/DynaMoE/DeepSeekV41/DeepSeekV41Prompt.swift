@@ -42,6 +42,16 @@ nonisolated public struct DeepSeekV41PromptMarkers: Sendable, Equatable {
     public let toolCallsBegin: String
     public let toolCallSeparator: String
     public let toolCallsEnd: String
+    /// The per-call pair inside the container. The checkpoint's tokenizer carries
+    /// both (`128808`/`128809`), and a multi-call turn nests one pair per call.
+    public let toolCallBegin: String
+    public let toolCallEnd: String
+    /// A tool RESULT's pair, and the container a batch of them sits in. These are
+    /// the spellings the history renderer needs; the calls container is not one.
+    public let toolOutputBegin: String
+    public let toolOutputEnd: String
+    public let toolOutputsBegin: String
+    public let toolOutputsEnd: String
     /// The reasoning channel the template opens and closes. Defaults come from
     /// the checkpoint's declared special tokens, not from a renderer constant.
     public let reasoningOpen: String
@@ -59,13 +69,30 @@ nonisolated public struct DeepSeekV41PromptMarkers: Sendable, Equatable {
         endOfSentence: "<" + "\u{FF5C}" + "end" + "\u{2581}" + "of" + "\u{2581}" + "sentence" + "\u{FF5C}" + ">",
         user: "<" + "\u{FF5C}" + "User" + "\u{FF5C}" + ">",
         assistant: "<" + "\u{FF5C}" + "Assistant" + "\u{FF5C}" + ">",
-        toolCallsBegin: "<" + "\u{FF5C}" + "tool" + "\u{2581}" + "calls" + "\u{2581}" + "begin" + "\u{FF5C}" + ">",
-        toolCallSeparator: "<" + "\u{FF5C}" + "tool" + "\u{2581}" + "sep" + "\u{FF5C}" + ">",
-        toolCallsEnd: "<" + "\u{FF5C}" + "tool" + "\u{2581}" + "calls" + "\u{2581}" + "end" + "\u{FF5C}" + ">",
+        toolCallsBegin: DeepSeekV41PromptMarkers.marker("tool", "calls", "begin"),
+        toolCallSeparator: DeepSeekV41PromptMarkers.marker("tool", "sep"),
+        toolCallsEnd: DeepSeekV41PromptMarkers.marker("tool", "calls", "end"),
+        toolCallBegin: DeepSeekV41PromptMarkers.marker("tool", "call", "begin"),
+        toolCallEnd: DeepSeekV41PromptMarkers.marker("tool", "call", "end"),
+        toolOutputBegin: DeepSeekV41PromptMarkers.marker("tool", "output", "begin"),
+        toolOutputEnd: DeepSeekV41PromptMarkers.marker("tool", "output", "end"),
+        toolOutputsBegin: DeepSeekV41PromptMarkers.marker("tool", "outputs", "begin"),
+        toolOutputsEnd: DeepSeekV41PromptMarkers.marker("tool", "outputs", "end"),
         system: DeepSeekV41PromptMarkers.defaultSystem,
         reasoningOpen: DeepSeekV41PromptMarkers.defaultReasoningOpen,
         reasoningClose: DeepSeekV41PromptMarkers.defaultReasoningClose
     )
+
+    /// Builds a fullwidth-bar marker from its parts. Never spell one by hand in a
+    /// source file: a rendered view strips the bars, so the result looks right and
+    /// tokenizes wrong.
+    public static func marker(_ parts: String...) -> String {
+        marker(parts)
+    }
+
+    public static func marker(_ parts: [String]) -> String {
+        "<" + "\u{FF5C}" + parts.joined(separator: "\u{2581}") + "\u{FF5C}" + ">"
+    }
 
     public init(
         beginOfSentence: String,
@@ -75,6 +102,12 @@ nonisolated public struct DeepSeekV41PromptMarkers: Sendable, Equatable {
         toolCallsBegin: String,
         toolCallSeparator: String,
         toolCallsEnd: String,
+        toolCallBegin: String = DeepSeekV41PromptMarkers.familyDefault.toolCallBegin,
+        toolCallEnd: String = DeepSeekV41PromptMarkers.familyDefault.toolCallEnd,
+        toolOutputBegin: String = DeepSeekV41PromptMarkers.familyDefault.toolOutputBegin,
+        toolOutputEnd: String = DeepSeekV41PromptMarkers.familyDefault.toolOutputEnd,
+        toolOutputsBegin: String = DeepSeekV41PromptMarkers.familyDefault.toolOutputsBegin,
+        toolOutputsEnd: String = DeepSeekV41PromptMarkers.familyDefault.toolOutputsEnd,
         system: String = DeepSeekV41PromptMarkers.defaultSystem,
         reasoningOpen: String = DeepSeekV41PromptMarkers.defaultReasoningOpen,
         reasoningClose: String = DeepSeekV41PromptMarkers.defaultReasoningClose
@@ -87,6 +120,12 @@ nonisolated public struct DeepSeekV41PromptMarkers: Sendable, Equatable {
         self.toolCallsBegin = toolCallsBegin
         self.toolCallSeparator = toolCallSeparator
         self.toolCallsEnd = toolCallsEnd
+        self.toolCallBegin = toolCallBegin
+        self.toolCallEnd = toolCallEnd
+        self.toolOutputBegin = toolOutputBegin
+        self.toolOutputEnd = toolOutputEnd
+        self.toolOutputsBegin = toolOutputsBegin
+        self.toolOutputsEnd = toolOutputsEnd
         self.reasoningOpen = reasoningOpen
         self.reasoningClose = reasoningClose
     }
@@ -195,6 +234,12 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
         var toolBegin = DeepSeekV41PromptMarkers.familyDefault.toolCallsBegin
         var toolSep = DeepSeekV41PromptMarkers.familyDefault.toolCallSeparator
         var toolEnd = DeepSeekV41PromptMarkers.familyDefault.toolCallsEnd
+        var callBegin = DeepSeekV41PromptMarkers.familyDefault.toolCallBegin
+        var callEnd = DeepSeekV41PromptMarkers.familyDefault.toolCallEnd
+        var outputBegin = DeepSeekV41PromptMarkers.familyDefault.toolOutputBegin
+        var outputEnd = DeepSeekV41PromptMarkers.familyDefault.toolOutputEnd
+        var outputsBegin = DeepSeekV41PromptMarkers.familyDefault.toolOutputsBegin
+        var outputsEnd = DeepSeekV41PromptMarkers.familyDefault.toolOutputsEnd
         var reasoningOpen = DeepSeekV41PromptMarkers.defaultReasoningOpen
         var reasoningClose = DeepSeekV41PromptMarkers.defaultReasoningClose
         var matched = 0
@@ -214,10 +259,22 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
                     assistant = literal
                 case "toolcallsbegin", "toolcalls":
                     toolBegin = literal
+                case "toolcallbegin":
+                    callBegin = literal
+                case "toolcallend":
+                    callEnd = literal
                 case "toolsep", "toolseparator":
                     toolSep = literal
                 case "toolcallsend":
                     toolEnd = literal
+                case "tooloutputbegin":
+                    outputBegin = literal
+                case "tooloutputend":
+                    outputEnd = literal
+                case "tooloutputsbegin":
+                    outputsBegin = literal
+                case "tooloutputsend":
+                    outputsEnd = literal
                 default:
                     continue
                 }
@@ -245,6 +302,12 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
                 toolCallsBegin: toolBegin,
                 toolCallSeparator: toolSep,
                 toolCallsEnd: toolEnd,
+                toolCallBegin: callBegin,
+                toolCallEnd: callEnd,
+                toolOutputBegin: outputBegin,
+                toolOutputEnd: outputEnd,
+                toolOutputsBegin: outputsBegin,
+                toolOutputsEnd: outputsEnd,
                 system: system,
                 reasoningOpen: reasoningOpen,
                 reasoningClose: reasoningClose
@@ -492,7 +555,9 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
         let literals = [
             markers.beginOfSentence, markers.endOfSentence, markers.system,
             markers.user, markers.assistant, markers.toolCallsBegin,
-            markers.toolCallSeparator, markers.toolCallsEnd,
+            markers.toolCallSeparator, markers.toolCallsEnd, markers.toolCallBegin,
+            markers.toolCallEnd, markers.toolOutputBegin, markers.toolOutputEnd,
+            markers.toolOutputsBegin, markers.toolOutputsEnd,
             markers.reasoningOpen, markers.reasoningClose
         ]
         .filter { !$0.isEmpty }

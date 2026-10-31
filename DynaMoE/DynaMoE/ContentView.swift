@@ -2755,7 +2755,8 @@ struct ContentView: View {
                 modelName: sessionModelName,
                 currentDate: conversationDate,
                 isLingModel: modelConfig?.isLingModel == true,
-                isGemma4Model: modelConfig?.isGemma4Model == true
+                isGemma4Model: modelConfig?.isGemma4Model == true,
+                isDeepSeekV41Model: modelConfig?.isDeepSeekV41Model == true
             )
         }
 
@@ -6392,7 +6393,7 @@ struct ContentView: View {
                     }
                 }
                 if shouldForceSynthesis {
-                    let endTag = (modelConfig?.isGemma4Model == true) ? "<turn|>" : ((modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>") )
+                    let endTag = (modelConfig?.isGemma4Model == true) ? "<turn|>" : ((modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : ((modelConfig?.isDeepSeekV41Model == true) ? CompletionEngine.shared.promptDialect.markers.endOfSentence : "<|im_end|>")) )
                     let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
                     let synthesisDirective = """
                     \n\n<system>
@@ -6734,18 +6735,29 @@ struct ContentView: View {
                                 includeAssistantPrefix: true,
                                 thinkingEnabled: thinkingEnabled
                             )
+                        } else if modelConfig?.isDeepSeekV41Model == true {
+                            // The payload inside the checkpoint's own `tool▁output` pair. The
+                            // model answered the same from every container measured in `#27`,
+                            // so the family's own spelling is used and no assistant prefix is
+                            // added: `startAutoregressiveGeneration` re-renders the turn from
+                            // `nextPrompt` on the fallback path.
+                            toolResponseTurn = AgentHarness.shared.formatDeepSeekV41ToolResponseTurn(
+                                responses: allResponses
+                            )
                         } else {
                             toolResponseTurn = AgentHarness.shared.formatToolResponseTurn(
                                 responses: allResponses,
                                 includeThinkSuffix: thinkingEnabled
                             )
                         }
-                        let endTag = (modelConfig?.isGemma4Model == true) ? "<turn|>" : ((modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>") )
+                        let endTag = (modelConfig?.isGemma4Model == true) ? "<turn|>" : ((modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : ((modelConfig?.isDeepSeekV41Model == true) ? CompletionEngine.shared.promptDialect.markers.endOfSentence : "<|im_end|>")) )
                         // Gemma keeps the tool call and its response in one model turn (no
                         // <turn|> between them), so the assistant text is not closed here and
-                        // the response turn is appended with no separator.
+                        // the response turn is appended with no separator. DeepSeek V4.1
+                        // closes the call turn with its end-of-sentence marker and the result
+                        // follows it directly, which is the shape the published probe used.
                         let assistantEndTag = isGemma4Continuation ? "" : endTag
-                        let continuationSeparator = isGemma4Continuation ? "" : "\n"
+                        let continuationSeparator = (isGemma4Continuation || modelConfig?.isDeepSeekV41Model == true) ? "" : "\n"
                         let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: assistantEndTag)
                         let staleNextPrompt = formattedPrompt + assistantTurnText + continuationSeparator + toolResponseTurn
                         // tools_load/tools_unload may have changed the registry THIS step;

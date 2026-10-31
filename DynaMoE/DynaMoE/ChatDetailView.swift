@@ -1924,8 +1924,20 @@ struct ChatMessageView: View {
         clean = clean
             .replacingOccurrences(of: "<tool_call>[\\s\\S]*?</tool_call>", with: "", options: .regularExpression)
             .replacingOccurrences(of: "<tool_response>[\\s\\S]*?</tool_response>", with: "", options: .regularExpression)
+            // DeepSeek-V4.1's own call tags (`#27`): the call is executed from the raw
+            // text, so the bubble must not show it as prose.
+            .replacingOccurrences(of: "<tool_call_name>[\\s\\S]*?</tool_call_arguments>", with: "", options: .regularExpression)
         if let toolCallRange = clean.range(of: "<tool_call>") {
             clean = String(clean[..<toolCallRange.lowerBound])
+        }
+        if let deepSeekCall = clean.range(of: "<tool_call_name>") {
+            clean = String(clean[..<deepSeekCall.lowerBound])
+        }
+        // DSML (`#27`) is that same family's other call shape, and the one its agent
+        // prompt actually produces. The call container is the last thing in a tool
+        // turn, so everything from the first DSML tag on is machinery, not answer.
+        if let dsmlCall = clean.range(of: "<" + DeepSeekV41ToolDialect.dsmlTag) {
+            clean = String(clean[..<dsmlCall.lowerBound])
         }
         return clean.trimmingCharacters(in: .whitespacesAndNewlines)
     }
