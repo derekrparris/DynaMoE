@@ -538,6 +538,79 @@ final class DeepSeekV41CompressorTests: XCTestCase {
 
 // MARK: - Block-diagonal output projection
 
+/// Where each head group's weight and scale bytes start.
+///
+/// The published `attn.wo_a` is `[8192, 4096]` of E4M3 with `[256, 128]` E8M0
+/// scales: one scale row per THIRTY-TWO weight rows. A group's scales therefore
+/// start `1024 / 32` rows in, not `1024`, and advancing by whole weight rows ran
+/// off the end of the companion after the first group. Nothing could report it;
+/// groups 1..7 simply took the bytes that followed as exponents.
+final class DeepSeekV41BlockDiagonalStrideTests: XCTestCase {
+
+    func testThePublishedOutputProjectionAdvancesItsScalesByBlockRows() {
+        let strides = DeepSeekV41DevicePlan.blockDiagonalStrides(
+            outDim: 8192,
+            inDim: 32768,
+            scaleRows: 256,
+            groups: 8,
+            storedBytesPerValue: 1
+        )
+        XCTAssertEqual(strides.weight, 1024 * 4096)
+        XCTAssertEqual(strides.scale, 32 * 128)
+        // The last group's scales have to end at the companion's own end.
+        XCTAssertEqual(strides.scale * 8, 256 * 128)
+    }
+
+    /// An MXFP4 companion is one scale row per weight row, so a group's scales
+    /// still advance by the band's whole row count.
+    func testAPerRowCompanionKeepsOneScaleRowPerWeightRow() {
+        let strides = DeepSeekV41DevicePlan.blockDiagonalStrides(
+            outDim: 2304,
+            inDim: 5120,
+            scaleRows: 2304,
+            groups: 2,
+            storedBytesPerValue: 0.5
+        )
+        XCTAssertEqual(strides.weight, 1152 * 1280)
+        XCTAssertEqual(strides.scale, 1152 * 80)
+    }
+
+    /// The stride is an ADDRESS step, so it uses the stored width of a value. The
+    /// memory-priced width folds the one-E8M0-per-32 payload into the value
+    /// (1.03125 for E4M3); using it here started each band 32 rows late, which made
+    /// groups 1..7 multiply the wrong weights by the wrong scales.
+    func testTheStrideUsesTheStoredWidthNotThePricedOne() {
+        XCTAssertEqual(DeepSeekV41DevicePlan.storedBytesPerValue(.fp8Block32), 1)
+        XCTAssertEqual(DeepSeekV41DevicePlan.storedBytesPerValue(.mxfp4), 0.5)
+        XCTAssertEqual(DeepSeekV41DevicePlan.storedBytesPerValue(.bf16), 2)
+        let addressed = DeepSeekV41DevicePlan.blockDiagonalStrides(
+            outDim: 8192, inDim: 32768, scaleRows: 256, groups: 8,
+            storedBytesPerValue: DeepSeekV41DevicePlan.storedBytesPerValue(.fp8Block32)
+        )
+        let priced = DeepSeekV41DevicePlan.blockDiagonalStrides(
+            outDim: 8192, inDim: 32768, scaleRows: 256, groups: 8,
+            storedBytesPerValue: DeepSeekV41DtypeWidth.bytesPerValue(dtype: "F8_E4M3")
+        )
+        XCTAssertEqual(addressed.weight, 4_194_304)
+        XCTAssertNotEqual(priced.weight, addressed.weight)
+    }
+
+    /// A weight with no companion, or one whose rows do not divide, is read as
+    /// per-row: that is the layout whose stride is the band, so a misclassified
+    /// companion cannot silently shrink the stride instead.
+    func testAnUnknownCompanionIsTreatedAsPerRow() {
+        let strides = DeepSeekV41DevicePlan.blockDiagonalStrides(
+            outDim: 64,
+            inDim: 256,
+            scaleRows: nil,
+            groups: 2,
+            storedBytesPerValue: 2
+        )
+        XCTAssertEqual(strides.weight, 32 * 128 * 2)
+        XCTAssertEqual(strides.scale, 32 * 4)
+    }
+}
+
 final class DeepSeekV41BlockDiagonalProjectionTests: XCTestCase {
 
     /// `attn.wo_a` is `groups` dense blocks stacked along the rows. Reading it as

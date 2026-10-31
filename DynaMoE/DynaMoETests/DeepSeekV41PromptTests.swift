@@ -194,12 +194,18 @@ final class DeepSeekV41PromptEffortTests: XCTestCase {
     private let dialect = DeepSeekV41PromptDialect()
 
     func testEffortLineCarriesAnIntegerBudget() {
-        XCTAssertEqual(DeepSeekV41PromptDialect.effortInstruction(budget: 60), "Reasoning Effort: 60")
+        // The checkpoint's own sentence, not a terse label: `encoding.py` renders
+        // the budget together with the range note and a trailing blank line.
+        XCTAssertEqual(
+            DeepSeekV41PromptDialect.effortInstruction(budget: 60),
+            "Reasoning Effort: 60 "
+                + "(range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+        )
     }
 
     func testEffortBudgetIsClampedToThePublishedRange() {
-        XCTAssertEqual(DeepSeekV41PromptDialect.effortInstruction(budget: 0), "Reasoning Effort: 1")
-        XCTAssertEqual(DeepSeekV41PromptDialect.effortInstruction(budget: 1000), "Reasoning Effort: 100")
+        XCTAssertTrue(DeepSeekV41PromptDialect.effortInstruction(budget: 0).hasPrefix("Reasoning Effort: 1 "))
+        XCTAssertTrue(DeepSeekV41PromptDialect.effortInstruction(budget: 1000).hasPrefix("Reasoning Effort: 100 "))
     }
 
     func testLevelsMapOntoTheBudgetRange() {
@@ -228,10 +234,10 @@ final class DeepSeekV41PromptEffortTests: XCTestCase {
         XCTAssertNil(DeepSeekV41PromptDialect.effortBudget(from: nil))
     }
 
-    func testSystemBodyAppendsTheInstructionAfterTheSystemText() {
+    func testSystemBodyPutsTheInstructionBeforeTheSystemText() {
         let body = dialect.systemBody(cleanSystem: "You are terse.", thinkingEnabled: true, effort: .high)
-        XCTAssertTrue(body.hasPrefix("You are terse."))
-        XCTAssertTrue(body.hasSuffix(DeepSeekV41PromptDialect.effortInstruction(budget: 100)))
+        XCTAssertTrue(body.hasPrefix(DeepSeekV41PromptDialect.effortInstruction(budget: 100)))
+        XCTAssertTrue(body.hasSuffix("You are terse."))
         // An empty system prompt carries the instruction alone, with no stray newlines.
         XCTAssertEqual(
             dialect.systemBody(cleanSystem: "", thinkingEnabled: true, effort: .low),
@@ -256,7 +262,7 @@ final class DeepSeekV41PromptRenderTests: XCTestCase {
         )
         XCTAssertTrue(prompt.hasPrefix(markers.beginOfSentence))
         XCTAssertTrue(prompt.contains(markers.user + "hi"))
-        XCTAssertTrue(prompt.hasSuffix(markers.assistant + TurnTextSplitter.canonicalReasoningOpenTag + "\n"))
+        XCTAssertTrue(prompt.hasSuffix(markers.assistant + TurnTextSplitter.canonicalReasoningOpenTag))
         XCTAssertTrue(prompt.contains(DeepSeekV41PromptDialect.effortInstruction(budget: 100)))
     }
 
@@ -281,15 +287,19 @@ final class DeepSeekV41PromptRenderTests: XCTestCase {
         XCTAssertEqual(split.resp.trimmingCharacters(in: .whitespacesAndNewlines), "answer")
     }
 
-    func testThinkingOffLeavesTheChannelClosed() {
+    func testThinkingOffPreClosesTheChannel() {
         let prompt = dialect.render(
             turns: [.init(isUser: true, text: "hi")],
             cleanSystem: "",
             thinkingEnabled: false,
             effort: nil
         )
-        XCTAssertTrue(prompt.hasSuffix(markers.assistant))
-        XCTAssertFalse(prompt.hasSuffix(TurnTextSplitter.canonicalReasoningOpenTag + "\n"))
+        // `<|Assistant|></think>` is what the checkpoint's encoder writes before a
+        // chat-mode answer. A prompt that stops at the assistant marker asks a model
+        // trained to reason first for an answer it was never told to start.
+        XCTAssertTrue(
+            prompt.hasSuffix(markers.assistant + TurnTextSplitter.canonicalReasoningCloseTag)
+        )
     }
 
     func testCompletedTurnKeepsItsReasoningInsideTheChannel() throws {
@@ -304,14 +314,16 @@ final class DeepSeekV41PromptRenderTests: XCTestCase {
         )
         // The exact serialization, so nothing about the ordering has to be inferred
         // from offsets: the reasoning sits inside the channel, the answer after it,
-        // and the turn closes with the end-of-sentence marker.
+        // and the turn closes with the end-of-sentence marker. No padding is added
+        // around the reasoning, which is the checkpoint encoder's rendering.
         let expected = markers.assistant
-            + TurnTextSplitter.canonicalReasoningOpenTag + "\n"
+            + TurnTextSplitter.canonicalReasoningOpenTag
             + "two plus two is four"
-            + TurnTextSplitter.canonicalReasoningCloseTag + "\n\n"
+            + TurnTextSplitter.canonicalReasoningCloseTag
             + "4"
             + markers.endOfSentence
             + markers.assistant
+            + TurnTextSplitter.canonicalReasoningCloseTag
         XCTAssertEqual(prompt, markers.beginOfSentence + markers.user + "2+2?" + expected)
     }
 
@@ -375,6 +387,99 @@ final class DeepSeekV41PromptRenderTests: XCTestCase {
     func testStopSequencesEndTheTurn() {
         XCTAssertEqual(dialect.stopSequences, [markers.endOfSentence, markers.user])
     }
+
+    /// The renderer against the checkpoint's own encoder.
+    ///
+    /// These strings were produced by running `encoding/encoding.py` (the module
+    /// the checkpoint ships) on the same conversations, with every non-ASCII
+    /// codepoint escaped so a marker can never be retyped by hand. The whitespace
+    /// matters as much as the tokens: the encoder inserts none of its own, so a
+    /// renderer that pads the reasoning channel changes the prompt the model was
+    /// trained on and, worse, renders a pinned turn differently from the text its
+    /// prefix was built from.
+    func testRenderedPromptsMatchTheCheckpointEncoder() {
+        struct Golden {
+            let name: String
+            let turns: [DeepSeekV41PromptDialect.Turn]
+            let system: String
+            let thinking: Bool
+            let effort: ThinkingEffort?
+            let expected: String
+        }
+        let goldens: [Golden] = [
+            Golden(
+                name: "chat, no system",
+                turns: [.init(isUser: true, text: "hey")],
+                system: "", thinking: false, effort: nil,
+                expected: "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}>"
+                    + "<\u{FF5C}User\u{FF5C}>hey"
+                    + "<\u{FF5C}Assistant\u{FF5C}></think>"
+            ),
+            Golden(
+                name: "chat, system prompt",
+                turns: [.init(isUser: true, text: "hey")],
+                system: "You are terse.", thinking: false, effort: nil,
+                expected: "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}>"
+                    + "<\u{FF5C}System\u{FF5C}>You are terse."
+                    + "<\u{FF5C}User\u{FF5C}>hey"
+                    + "<\u{FF5C}Assistant\u{FF5C}></think>"
+            ),
+            Golden(
+                name: "thinking, effort 100",
+                turns: [.init(isUser: true, text: "hey")],
+                system: "", thinking: true, effort: .high,
+                expected: "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}>"
+                    + "<\u{FF5C}System\u{FF5C}>Reasoning Effort: 100 "
+                    + "(range 1-100, the higher the value, the more thorough the reasoning)"
+                    + "\u{A}\u{A}"
+                    + "<\u{FF5C}User\u{FF5C}>hey"
+                    + "<\u{FF5C}Assistant\u{FF5C}><think>"
+            ),
+            Golden(
+                name: "thinking, system, recorded reasoning",
+                turns: [
+                    .init(isUser: true, text: "2+2?"),
+                    .init(isUser: false, text: "4", reasoning: "two plus two"),
+                    .init(isUser: true, text: "and 3+3?")
+                ],
+                system: "You are terse.", thinking: true, effort: .high,
+                expected: "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}>"
+                    + "<\u{FF5C}System\u{FF5C}>Reasoning Effort: 100 "
+                    + "(range 1-100, the higher the value, the more thorough the reasoning)"
+                    + "\u{A}\u{A}You are terse."
+                    + "<\u{FF5C}User\u{FF5C}>2+2?"
+                    + "<\u{FF5C}Assistant\u{FF5C}><think>two plus two</think>4"
+                    + "<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>"
+                    + "<\u{FF5C}User\u{FF5C}>and 3+3?"
+                    + "<\u{FF5C}Assistant\u{FF5C}><think>"
+            ),
+            Golden(
+                name: "chat, history without reasoning",
+                turns: [
+                    .init(isUser: true, text: "2+2?"),
+                    .init(isUser: false, text: "4"),
+                    .init(isUser: true, text: "and 3+3?")
+                ],
+                system: "You are terse.", thinking: false, effort: nil,
+                expected: "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}>"
+                    + "<\u{FF5C}System\u{FF5C}>You are terse."
+                    + "<\u{FF5C}User\u{FF5C}>2+2?"
+                    + "<\u{FF5C}Assistant\u{FF5C}></think>4"
+                    + "<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>"
+                    + "<\u{FF5C}User\u{FF5C}>and 3+3?"
+                    + "<\u{FF5C}Assistant\u{FF5C}></think>"
+            )
+        ]
+        for golden in goldens {
+            let rendered = dialect.render(
+                turns: golden.turns,
+                cleanSystem: golden.system,
+                thinkingEnabled: golden.thinking,
+                effort: golden.effort
+            )
+            XCTAssertEqual(rendered, golden.expected, golden.name)
+        }
+    }
 }
 
 // MARK: - Formatter integration
@@ -404,7 +509,9 @@ final class DeepSeekV41ChatPromptFormatterTests: XCTestCase {
         let markers = DeepSeekV41PromptMarkers.familyDefault
         XCTAssertTrue(prompt.hasPrefix(markers.beginOfSentence))
         XCTAssertTrue(prompt.contains(markers.user + "hello"))
-        XCTAssertTrue(prompt.hasSuffix(markers.assistant))
+        XCTAssertTrue(
+            prompt.hasSuffix(markers.assistant + markers.reasoningClose)
+        )
     }
 
     /// The passthrough probe has to look for the markers the renderer would emit.
@@ -455,7 +562,9 @@ final class DeepSeekV41ChatPromptFormatterTests: XCTestCase {
             prompt.range(of: TurnTextSplitter.canonicalReasoningCloseTag)!.lowerBound,
             prompt.range(of: "answer")!.lowerBound
         )
-        XCTAssertTrue(prompt.hasSuffix(markers.assistant))
+        XCTAssertTrue(
+            prompt.hasSuffix(markers.assistant + markers.reasoningClose)
+        )
     }
 
     func testAssistantTurnCloseTagIsTheEndOfSentenceMarker() throws {

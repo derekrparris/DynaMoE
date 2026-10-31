@@ -319,9 +319,14 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
         return Self.effortInstruction(budget: budget)
     }
 
+    /// The checkpoint's own effort line, including the range note and the blank
+    /// line that separates it from the caller's system text. The encoder in
+    /// `encoding/encoding.py` writes exactly this string, and a prompt that leaves
+    /// the note out still names a budget the model was never shown that way.
     public static func effortInstruction(budget: Int) -> String {
         let clamped = min(max(budget, effortBounds.lowerBound), effortBounds.upperBound)
-        return "Reasoning Effort: \(clamped)"
+        return "Reasoning Effort: \(clamped) "
+            + "(range 1-100, the higher the value, the more thorough the reasoning)\n\n"
     }
 
     /// Parses an effort budget out of arbitrary client text so the API adapters
@@ -383,8 +388,13 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
         }
     }
 
-    /// The system turn body: the caller's system prompt, with the effort
-    /// instruction appended when thinking is on.
+    /// The system turn body: the effort instruction when thinking is on, then the
+    /// caller's system prompt.
+    ///
+    /// The order is the checkpoint encoder's, not a preference: the effort line is
+    /// the first thing after `<|System|>` and ends with a blank line, so a prompt
+    /// that appends it after the system text puts the budget where the model reads
+    /// it as part of the last instruction instead of ahead of everything.
     public func systemBody(
         cleanSystem: String,
         thinkingEnabled: Bool,
@@ -393,13 +403,14 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
         let instruction = effortInstruction(effort, thinkingEnabled: thinkingEnabled)
         let base = cleanSystem.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let instruction else { return base }
-        return base.isEmpty ? instruction : base + "\n\n" + instruction
+        return base.isEmpty ? instruction : instruction + base
     }
 
-    /// Renders a whole conversation. The trailing assistant marker leaves the
-    /// reasoning channel open only when thinking is on, which mirrors what the
-    /// template does: with thinking off the model emits the close marker itself,
-    /// so the prompt must not pre-open the channel.
+    /// Renders a whole conversation. The trailing assistant marker opens the
+    /// reasoning channel when thinking is on and closes it when thinking is off,
+    /// exactly as the checkpoint's encoder does: in chat mode the model is trained
+    /// to answer after `<|Assistant|> endslash think`, and leaving that token out
+    /// asks a thinking model for an answer it was never told to start.
     public func render(
         turns: [Turn],
         cleanSystem: String,
@@ -435,16 +446,21 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
         let m = markers
         var body = m.assistant
         if let reasoning = turn.reasoning, !reasoning.isEmpty {
-            body += m.reasoningOpen
-            body += "\n"
-            body += reasoning
-            body += m.reasoningClose
-            body += "\n\n"
+            // The channel's own content, exactly as it was generated. The
+            // checkpoint's encoder inserts no whitespace around it, and neither
+            // does this: a reasoning trace already begins and ends with what the
+            // model emitted, and padding it here would re-render a pinned turn
+            // differently from the text the cache was built on.
+            body += m.reasoningOpen + reasoning + m.reasoningClose
         } else if thinkingEnabled {
             // An earlier turn generated with thinking on but no recorded
             // reasoning still has to carry an empty channel: the marker belongs
             // to the turn, not to the setting that happens to be on now.
-            body += m.reasoningOpen + "\n\n" + m.reasoningClose + "\n\n"
+            body += m.reasoningOpen + m.reasoningClose
+        } else {
+            // Chat mode: the assistant turn opens closed, which is the token the
+            // encoder writes before every answer.
+            body += m.reasoningClose
         }
         body += turn.text
         body += m.endOfSentence
@@ -453,11 +469,7 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
 
     /// The prefix the next assistant turn starts from.
     func assistantPrefix(thinkingEnabled: Bool) -> String {
-        var out = markers.assistant
-        if thinkingEnabled {
-            out += markers.reasoningOpen + "\n"
-        }
-        return out
+        markers.assistant + (thinkingEnabled ? markers.reasoningOpen : markers.reasoningClose)
     }
 
     /// Re-renders a tool result for the history. DeepSeek takes tool output inside

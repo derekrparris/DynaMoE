@@ -316,6 +316,52 @@ nonisolated public enum DeepSeekV41DevicePlan {
         )
     }
 
+    /// Bytes one VALUE occupies in a stored weight, which is what an address needs.
+    ///
+    /// This is not `DeepSeekV41DtypeWidth.bytesPerValue`: that one prices memory and
+    /// folds the scale payload into the value (E4M3 -> 1 + 1/32). Using it to advance
+    /// a band inflated the stride by 3.125%, so each group started 32 weight rows
+    /// late and read the previous group's scales.
+    public static func storedBytesPerValue(_ format: DeepSeekV41LinearFormat) -> Double {
+        switch format {
+        case .fp8Block32: return 1
+        case .mxfp4: return 0.5
+        case .bf16: return 2
+        case .unsupported: return 0
+        }
+    }
+
+    /// Byte strides between the head groups of a block-diagonal projection.
+    ///
+    /// A block-diagonal matrix is one band per head group stacked along the output
+    /// rows, so band `g` starts `perGroupOut` rows into the weight. Its scale
+    /// companion is NOT necessarily one row per weight row: the block-scaled FP8
+    /// form stores one per 32, and `attn.wo_a` publishes `[256, 128]` scales for an
+    /// `[8192, 4096]` weight. Advancing the companion by weight rows then walked
+    /// past its end after the first group, so groups 1..7 read whatever bytes came
+    /// next in the shard as E8M0 exponents. That is a wrong answer with no error
+    /// anywhere: the model ran, and every prompt came out degraded.
+    ///
+    /// A per-row companion (the MXFP4 expert layout) keeps one scale row per weight
+    /// row, so the stride is the whole band. Both are derived from the companion's
+    /// own row count so a checkpoint cannot be read with the other one's rule.
+    public static func blockDiagonalStrides(
+        outDim: Int,
+        inDim: Int,
+        scaleRows: Int?,
+        groups: Int,
+        storedBytesPerValue: Double
+    ) -> (weight: Int, scale: Int) {
+        let groupCount = max(1, groups)
+        let perGroupOut = max(1, outDim / groupCount)
+        let perGroupIn = max(1, inDim / groupCount)
+        let scaleRowsPerWeightRow = max(1, outDim / max(1, scaleRows ?? outDim))
+        return (
+            Int((Double(perGroupOut * perGroupIn) * storedBytesPerValue).rounded()),
+            max(1, perGroupOut / scaleRowsPerWeightRow) * max(1, perGroupIn / 32)
+        )
+    }
+
     /// Rows one position may gather: its window plus the compressed rows the
     /// addressing rule reads.
     ///
@@ -3568,14 +3614,17 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 "attn.wo_a: \(outDim)x\(inDim) does not split into \(groupCount) head groups"
             )
         }
-        let valueBytes = DeepSeekV41DtypeWidth.bytesPerValue(dtype: weight.dtype)
         let perGroupIn = inDim / groupCount
         let perGroupOut = outDim / groupCount
-        // Both companions are contiguous by output row: the weight's rows are
-        // `perGroupIn` values wide and its scale rows `perGroupIn / 32` blocks, so
-        // group g starts after `g * perGroupOut` of each.
-        let weightStride = Double(perGroupOut * perGroupIn) * valueBytes
-        let scaleStride = Double(perGroupOut * max(1, perGroupIn / 32))
+        let strides = DeepSeekV41DevicePlan.blockDiagonalStrides(
+            outDim: outDim,
+            inDim: inDim,
+            scaleRows: scale?.rows,
+            groups: groupCount,
+            storedBytesPerValue: DeepSeekV41DevicePlan.storedBytesPerValue(
+                DeepSeekV41DevicePlan.linearFormat(tensor: weight, scale: scale)
+            )
+        )
         for group in 0..<groupCount {
             try encodeGemv(
                 encoder,
@@ -3585,8 +3634,8 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 outDim: perGroupOut,
                 input: input,
                 output: output,
-                weightByteOffset: UInt64(weightStride * Double(group)),
-                scaleByteOffset: UInt64(scaleStride * Double(group)),
+                weightByteOffset: UInt64(strides.weight * group),
+                scaleByteOffset: UInt64(strides.scale * group),
                 inputByteOffset: inputByteOffset
                     + group * perGroupIn * MemoryLayout<Float>.stride,
                 outputByteOffset: outputByteOffset

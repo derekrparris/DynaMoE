@@ -406,6 +406,9 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
     /// arena is sized sanely instead of guessing from wall time.
     public private(set) var expertsLoaded: Int = 0
     public private(set) var bytesRead: Int = 0
+    /// Wall time spent inside `pread` batches. Reported beside the byte count so a
+    /// slow turn can be told apart from a slow disk without a profiler.
+    private var secondsReading: Double = 0
 
     public init(
         device: MTLDevice,
@@ -541,7 +544,7 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
 
     /// One-line residency report for the load log.
     public func describe() -> String {
-        String(
+        let line = String(
             format: "experts: streamed into %d arena slots of %.1f MB (%@, %d loaded, %.2f GB read, %.0f%% hit rate)",
             capacity,
             Double(geometry.slotBytes) / 1_048_576,
@@ -550,6 +553,11 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
             Double(bytesRead) / 1_073_741_824,
             arena.hitRate * 100
         )
+        return secondsReading > 0
+            ? line + String(
+                format: " at %.0f MB/s", Double(bytesRead) / 1_048_576 / secondsReading
+            )
+            : line
     }
 
     /// Makes every requested expert resident and returns its bindings, in the order
@@ -630,6 +638,7 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
         }
 
         if !misses.isEmpty {
+            let readStarted = DispatchTime.now().uptimeNanoseconds
             let failures = DeepSeekV41ReadFailureBox()
             let context = DeepSeekV41ShardBatchContext(
                 batches: batches.map { (shard: $0.key, ranges: $0.value) },
@@ -645,6 +654,9 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
             lock.lock()
             expertsLoaded += misses.count
             bytesRead += misses.count * geometry.slotBytes
+            secondsReading += Double(
+                DispatchTime.now().uptimeNanoseconds - readStarted
+            ) / 1_000_000_000
             lock.unlock()
         }
 
