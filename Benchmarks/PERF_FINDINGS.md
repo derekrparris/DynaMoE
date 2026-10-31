@@ -5559,3 +5559,108 @@ bias and confidence head. The host route is not available at this size: the draf
 is 5,120 wide with a 129,280-row head, so its matrices do not fit the in-memory
 `DeepSeekV41DenseWeightSource` the host reference reads, and the host has no shard-backed
 source at all.
+
+## DSV4.1 #24: THE DRAFTER'S WINDOW RING IS SEEDED ON THE DEVICE, AND A TOKEN'S WORTH COSTS 0.46 ms
+
+#23 captured the row the drafter conditions on. This slice makes the row usable, and
+it turned up two collisions that would have made every draft silently wrong rather than
+slow.
+
+### What the checkpoint actually publishes under `mtp.N.*`
+
+The host block reads roles; the checkpoint publishes names. 2,401 `mtp.*` tensors, and
+the split is not uniform:
+
+| under `mtp.0` | count | under `mtp.2` | count |
+|---|---|---|---|
+| `attn.*` (wq_a/wq_b/wkv/wo_a/wo_b/sink/norms) | 13 | `attn.*` | 13 |
+| `ffn.experts.E.w1/w2/w3` (+ scales) | 768 | `ffn.experts.E.*` | 768 |
+| `ffn.gate.{weight,bias,bias_vl}` | 3 | `ffn.gate.*` | 3 |
+| `ffn.shared_experts.w1/w2/w3` | 6 | `ffn.shared_experts.*` | 6 |
+| `hc_attn_*`, `hc_ffn_*` | 6 | `hc_*` | 6 |
+| `attn_norm`, `ffn_norm` | 2 | `attn_norm`, `ffn_norm` | 2 |
+| `main_proj`, `main_norm` | 2 | `norm`, `markov_head.embed/head`, `confidence_head.proj` | 4 |
+
+That is `DSparkBlock.__init__`: stage 0 owns the target projection, the LAST stage owns
+the output norm and both heads, and `embed`/`head` are the backbone's own modules aliased
+into every stage (`self.mtp[-1].embed = self.embed`). The catalog already classified all
+of it — the names resolve, nothing was missing — so this was a mapping to confirm rather
+than a mapping to invent.
+
+### Two collisions, both silent
+
+`DeepSeekV41DeviceWeights.tensor(_:layer:expert:)` had no namespace. `mtp.0.attn.wkv`
+and `layers.0.attn.wkv` are two tensors under one `(role, layer)` pair, and every draft
+lookup would have resolved to the backbone's bytes: the same shape, no error, a draft
+conditioned on the wrong matrix.
+
+The vector bank keyed gains by `role|layer` as well, so `mtp.0.attn_norm` and
+`layers.0.attn_norm` shared one buffer — whichever was stored last won, and the norm
+before every draft attention would have used the backbone's gain.
+
+Both now carry a scope. The device lookup defaults to `.backbone`, so every existing call
+site is unchanged, and the bank's draft entries are staged from the CATALOG's stage list
+rather than the config's count, because the two disagree in exactly the case that
+matters (a checkpoint that publishes `mtp.N.*` without declaring the stages).
+
+### `main_x`, and a ring instead of a slot
+
+`main_x = main_norm(main_proj(main_hidden))` is one FP8 block-scaled GEMV (5,120 x 15,360
+on the published checkpoint) plus an RMSNorm, both already proven by the backbone. The
+input is the capture itself: `main_proj` reads the target layers' means laid end to end,
+which is how the capture stores them.
+
+`testTheDeviceProjectsTheDraftersConditioningRow` checks it against
+`DeepSeekV41DSparkBlock.mainX` on a two-stage synthetic checkpoint whose draft expert
+counts differ from the backbone's (3 routed / 2 active), and whose `mtp.0` tensors are
+byte-distinct from `layers.0`'s, so a lookup that ignored the namespace fails at the
+first position rather than at the first draft. Relative 5e-4, the same bar the capture
+uses.
+
+The capture itself had to change shape to serve the ring. It held one row per BLOCK
+slot; the seed needs the last `window_size` positions, which is 128 on the published
+checkpoint and far more than a block. It is now `[position % window][target][hidden]`
+(7.9 MB at the published widths), and `capturedDraftInput(atPosition:)` returns nil for a
+position the ring no longer holds rather than a row from an earlier turn.
+
+### The seed is one rule, not two
+
+`DSparkAttention.forward`'s `start_pos == 0` branch writes the prefix's latents and
+returns, and for a prefix longer than the window it splits the tail around a cut of
+`seqlen % window`. Written as a position walk, both cases are the same statement: ring
+slot `p % window` holds `kv_norm(wkv(main_x[p]))` with its trailing rope payload rotated
+at `p`. The rotation in the reference exists only because it fills the ring in one shot.
+
+A device run is therefore "for each position the rings do not hold, project and store",
+and a run that crosses the end of the ring becomes two runs because a run is contiguous
+in both the ring and the positions. `testTheDeviceSeedsTheDraftRingsFromTheTargetsLatents`
+seeds six positions over a four-row window — so the wrap is exercised, not assumed — and
+compares every slot of every stage against `DeepSeekV41DSparkBlock.seed`, relative 5e-4.
+
+### On the published checkpoint
+
+`testWhatTheDraftRingsHoldOnThePublishedCheckpoint` walks eight positions, seeds, and
+prints each stage's ring. The geometry checks itself: `mtp.0.main_proj` is [5120, 15360]
+for three 5,120-wide targets, `attn.wkv` is [512, 5120] with an E8M0 companion, so the
+seed takes the block-32 path the synthetic (bf16, 64 x 48) cannot reach.
+
+| stage | slot 0 \|x\| | slot 0 max | slot 7 \|x\| | slot 7 max |
+|---|---|---|---|---|
+| 0 | 10.08 | 2.94 | 11.06 | 4.09 |
+| 1 | 11.21 | 1.70 | 11.65 | 1.90 |
+| 2 | 10.82 | 1.85 | 12.22 | 1.82 |
+
+Over 512 values that is an RMS of 0.44-0.54, i.e. the latents of a normalized record —
+and unlike the conditioning row (#23, magnitudes to 906,452), these are uniform, which is
+what an RMSNorm applied before the rope should produce.
+
+Timing: the window is **128**, not the 640 the measurement fixtures use, so a ring is
+256 KB per stage and three stages hold 768 KB. A cold seed of 8 rows costs 14.76 ms
+(first dispatches, pipeline warm-up, first touch of every buffer); one WARM row costs
+**0.46 ms**, which is the number a live turn pays, because a decode step adds exactly one
+position. Against a ~150 ms decode step, maintaining the drafter's ring is free.
+
+**What is left.** The draft attention itself (the ring plus the block's own five rows,
+one shared index list for every query, not causal within the block), the MoE under the
+draft expert counts, and the last stage's head plus the Markov bias — then an acceptance
+rate, which is the number that decides whether any of this ships.

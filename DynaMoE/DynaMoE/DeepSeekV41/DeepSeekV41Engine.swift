@@ -235,12 +235,22 @@ nonisolated public final class DeepSeekV41DeviceWeights: @unchecked Sendable {
         self.engramLayouts = layouts
     }
 
+    /// A tensor by role.
+    ///
+    /// The namespace is a parameter for the same reason it is on the catalog: the
+    /// DSpark stages under `mtp.N.*` are full blocks with the same stage names and
+    /// their own layer indices, so `mtp.0.attn.wkv` and `layers.0.attn.wkv` are two
+    /// different tensors under one `(role, layer)` pair. The default is the backbone
+    /// because that is the graph every existing call site belongs to.
     public func tensor(
         _ role: DeepSeekV41TensorRole,
+        scope: DeepSeekV41TensorScope = .backbone,
         layer: Int? = nil,
         expert: Int? = nil
     ) -> DeepSeekV41DeviceTensor? {
-        guard let slot = catalog.tensor(role, layer: layer, expert: expert) else { return nil }
+        guard let slot = catalog.tensor(role, scope: scope, layer: layer, expert: expert) else {
+            return nil
+        }
         return tensors[slot.name]
     }
 

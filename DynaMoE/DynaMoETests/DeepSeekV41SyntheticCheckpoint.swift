@@ -92,6 +92,21 @@ nonisolated struct DeepSeekV41SyntheticShape {
     /// drafter. Empty by default, so a fixture that does not care about the draft
     /// path captures nothing and the executor allocates no capture buffer.
     var draftTargetLayers: [Int] = []
+    /// `num_nextn_predict_layers`: how many DSpark stages the checkpoint publishes
+    /// under `mtp.N.*`. Zero by default, so every fixture before the draft path
+    /// existed publishes none. The config requires the target list to have exactly
+    /// one entry per stage, so a fixture that sets this also sets
+    /// `draftTargetLayers`.
+    var draftStages: Int = 0
+    var draftBlockSize: Int = 3
+    var draftNoiseTokenID: Int = 3
+    /// Width of the Markov head's embedding, which only the last stage publishes.
+    var draftMarkovRank: Int = 8
+    /// `dspark_n_routed_experts` / `dspark_num_experts_per_tok`. Deliberately
+    /// different from the backbone's, so a stage that read the backbone's counts
+    /// routes a different number of experts and says so in its logits.
+    var draftRoutedExperts: Int = 3
+    var draftActivatedExperts: Int = 2
     /// Forces a role's every value to one constant. A bisecting aid: with the
     /// hyper-connection scale and base pinned, the split's `pre`/`post`/`comb` are a
     /// pure function of the projection's logits, so a disagreement has to be in the
@@ -244,6 +259,10 @@ nonisolated struct DeepSeekV41SyntheticTensor {
     let dtype: String
     let shape: [Int]
     let values: [Float]
+    /// Which namespace the tensor lives in. The DSpark stages under `mtp.N.*` share
+    /// their role names with the backbone layers of the same index, so the weight
+    /// source has to be told which one a tensor belongs to.
+    let scope: DeepSeekV41TensorScope
 
     var elementCount: Int { shape.reduce(1, *) }
     var isMatrix: Bool { shape.count == 2 }
@@ -323,7 +342,11 @@ nonisolated final class DeepSeekV41SyntheticCheckpoint {
             "scoring_func": "sqrtsoftplus",
             "norm_topk_prob": true,
             "routed_scaling_factor": 1.5,
-            "num_nextn_predict_layers": 0,
+            "num_nextn_predict_layers": shape.draftStages,
+            "dspark_block_size": shape.draftBlockSize,
+            "dspark_noise_token_id": shape.draftNoiseTokenID,
+            "dspark_n_routed_experts": shape.draftRoutedExperts,
+            "dspark_num_experts_per_tok": shape.draftActivatedExperts,
             "dspark_target_layer_ids": shape.draftTargetLayers,
             "max_position_embeddings": shape.contextLength,
             "tie_word_embeddings": false,
@@ -374,7 +397,10 @@ nonisolated final class DeepSeekV41SyntheticCheckpoint {
                         count: dims.reduce(1, *),
                         magnitude: magnitude ?? shape.weightMagnitude,
                         bf16: dtype == "BF16"
-                    )
+                    ),
+                    // The catalog decides the namespace from the name, so the
+                    // fixture does too: `mtp.N.*` is the draft side.
+                    scope: name.hasPrefix("mtp.") ? .draft : .backbone
                 )
             )
         }
@@ -540,6 +566,107 @@ nonisolated final class DeepSeekV41SyntheticCheckpoint {
                     shape: [3], magnitude: 0.5)
             }
         }
+
+        // DSpark draft stages. `DSparkBlock.__init__` gives stage 0 the target
+        // projection and the LAST stage the output norm and both heads, and
+        // `DSparkAttention` asserts `compress_ratio == 0`, so a stage publishes a
+        // window-only block: no compressor, no indexer, and no vision router bias
+        // (drafts are text). The routed experts are `dspark_n_routed_experts`, which
+        // this fixture sets apart from the backbone's on purpose.
+        if shape.draftStages > 0 {
+            let drafts = max(1, shape.draftRoutedExperts)
+            for stage in 0..<shape.draftStages {
+                let prefix = "mtp.\(stage)"
+                add("\(prefix).attn_norm.weight", .attnNorm, layer: stage,
+                    shape: [hidden], magnitude: gain)
+                add("\(prefix).ffn_norm.weight", .ffnNorm, layer: stage,
+                    shape: [hidden], magnitude: gain)
+                if shape.qLoraRank > 0 {
+                    add("\(prefix).attn.wq_a.weight", .attnWqA, layer: stage,
+                        shape: [shape.qLoraRank, hidden])
+                    add("\(prefix).attn.q_norm.weight", .attnWqANorm, layer: stage,
+                        shape: [shape.qLoraRank], magnitude: gain)
+                    add("\(prefix).attn.wq_b.weight", .attnWqB, layer: stage,
+                        shape: [shape.queryWidth, shape.qLoraRank])
+                } else {
+                    add("\(prefix).attn.wq_b.weight", .attnWqB, layer: stage,
+                        shape: [shape.queryWidth, hidden])
+                }
+                add("\(prefix).attn.wkv.weight", .attnWkv, layer: stage,
+                    shape: [shape.latentWidth, hidden])
+                add("\(prefix).attn.kv_norm.weight", .attnKvNorm, layer: stage,
+                    shape: [shape.latentWidth], magnitude: gain)
+                // `DSparkAttention.forward` passes `self.attn_sink` to `sparse_attn`,
+                // so a stage needs one even though the validation set does not ask.
+                add("\(prefix).attn.attn_sink", .attnSink, layer: stage,
+                    shape: [shape.heads])
+                if shape.oLoraRank > 0 {
+                    add("\(prefix).attn.wo_a.weight", .attnWoA, layer: stage,
+                        shape: [
+                            shape.outputReducedWidth,
+                            shape.attentionOutputWidth / shape.oGroups
+                        ])
+                    add("\(prefix).attn.wo_b.weight", .attnWoB, layer: stage,
+                        shape: [hidden, shape.outputReducedWidth])
+                } else {
+                    add("\(prefix).attn.wo_b.weight", .attnWoB, layer: stage,
+                        shape: [hidden, shape.attentionOutputWidth])
+                }
+                add("\(prefix).ffn.gate.weight", .routerWeight, layer: stage,
+                    shape: [drafts, hidden])
+                for expert in 0..<drafts {
+                    let base = "\(prefix).ffn.experts.\(expert)"
+                    add("\(base).w1.weight", .expertW1, layer: stage, expert: expert,
+                        shape: [shape.moeIntermediate, hidden])
+                    add("\(base).w3.weight", .expertW3, layer: stage, expert: expert,
+                        shape: [shape.moeIntermediate, hidden])
+                    add("\(base).w2.weight", .expertW2, layer: stage, expert: expert,
+                        shape: [hidden, shape.moeIntermediate])
+                }
+                for (suffix, base) in [
+                    ("hc_attn_fn", DeepSeekV41TensorRole.hcAttnFn),
+                    ("hc_ffn_fn", DeepSeekV41TensorRole.hcFfnFn)
+                ] {
+                    add("\(prefix).\(suffix)", base, layer: stage, dtype: "F32",
+                        shape: [mixCount, mult * hidden])
+                }
+                for (suffix, base) in [
+                    ("hc_attn_base", DeepSeekV41TensorRole.hcAttnBase),
+                    ("hc_ffn_base", DeepSeekV41TensorRole.hcFfnBase)
+                ] {
+                    add("\(prefix).\(suffix)", base, layer: stage, dtype: "F32",
+                        shape: [mixCount], magnitude: gain)
+                }
+                for (suffix, base) in [
+                    ("hc_attn_scale", DeepSeekV41TensorRole.hcAttnScale),
+                    ("hc_ffn_scale", DeepSeekV41TensorRole.hcFfnScale)
+                ] {
+                    add("\(prefix).\(suffix)", base, layer: stage, dtype: "F32",
+                        shape: [3], magnitude: 0.5)
+                }
+                if stage == 0 {
+                    // `main_proj` reads every target layer's mean end to end, so its
+                    // input is `targets * hidden` wide.
+                    add(
+                        "\(prefix).main_proj.weight", .draftMainProj, layer: stage,
+                        shape: [hidden, max(1, shape.draftTargetLayers.count) * hidden]
+                    )
+                    add("\(prefix).main_norm.weight", .draftMainNorm, layer: stage,
+                        shape: [hidden], magnitude: gain)
+                }
+                if stage == shape.draftStages - 1 {
+                    let rank = max(1, shape.draftMarkovRank)
+                    add("\(prefix).norm.weight", .draftNorm, layer: stage,
+                        shape: [hidden], magnitude: gain)
+                    add("\(prefix).markov_head.embed.weight", .draftMarkovEmbed,
+                        layer: stage, shape: [shape.vocab, rank])
+                    add("\(prefix).markov_head.head.weight", .draftMarkovHead,
+                        layer: stage, shape: [shape.vocab, rank])
+                    add("\(prefix).confidence_head.proj.weight", .draftConfidence,
+                        layer: stage, shape: [1, hidden + rank])
+                }
+            }
+        }
         return out
     }
 
@@ -687,28 +814,42 @@ nonisolated final class DeepSeekV41SyntheticCheckpoint {
     func weightSource() -> DeepSeekV41DenseWeightSource {
         let source = DeepSeekV41DenseWeightSource()
         for tensor in tensors {
-            if tensor.isMatrix {
-                let matrix = DeepSeekV41Matrix(
-                    rows: tensor.shape[0],
-                    columns: tensor.shape[1],
-                    values: tensor.values
-                )
-                source.set(matrix, role: tensor.role, layer: tensor.layer, expert: tensor.expert)
-                source.set(
-                    matrix,
-                    role: tensor.role,
-                    scope: .backbone,
-                    layer: tensor.layer,
-                    expert: tensor.expert
-                )
-            } else {
-                source.set(tensor.values, role: tensor.role, layer: tensor.layer)
-                source.set(
-                    tensor.values,
-                    role: tensor.role,
-                    scope: .backbone,
-                    layer: tensor.layer
-                )
+            // Backbone tensors answer both the scoped and the unscoped key, because
+            // that is what every fixture built before the draft namespace expects. A
+            // draft tensor answers ONLY its scoped key: a fallback there would let a
+            // draft stage read the backbone layer of the same index.
+            let scopes: [DeepSeekV41TensorScope] = tensor.scope == .backbone
+                ? [.backbone] : [tensor.scope]
+            for scope in scopes {
+                if tensor.isMatrix {
+                    let matrix = DeepSeekV41Matrix(
+                        rows: tensor.shape[0],
+                        columns: tensor.shape[1],
+                        values: tensor.values
+                    )
+                    source.set(
+                        matrix,
+                        role: tensor.role,
+                        scope: scope,
+                        layer: tensor.layer,
+                        expert: tensor.expert
+                    )
+                    if scope == .backbone {
+                        source.set(
+                            matrix,
+                            role: tensor.role,
+                            layer: tensor.layer,
+                            expert: tensor.expert
+                        )
+                    }
+                } else {
+                    source.set(
+                        tensor.values, role: tensor.role, scope: scope, layer: tensor.layer
+                    )
+                    if scope == .backbone {
+                        source.set(tensor.values, role: tensor.role, layer: tensor.layer)
+                    }
+                }
             }
         }
         return source

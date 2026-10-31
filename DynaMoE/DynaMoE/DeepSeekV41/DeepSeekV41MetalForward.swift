@@ -603,31 +603,46 @@ nonisolated final class DeepSeekV41VectorBank: @unchecked Sendable {
         self.buffers = buffers
     }
 
-    static func key(_ role: DeepSeekV41TensorRole, layer: Int?) -> String {
-        "\(role.rawValue)|\(layer.map(String.init) ?? "-")"
+    /// Keyed by namespace as well as role and layer: a draft stage's `attn_norm` is
+    /// `mtp.N.attn_norm`, not `layers.N.attn_norm`, and the two would otherwise share
+    /// one buffer.
+    static func key(_ role: DeepSeekV41TensorRole, scope: DeepSeekV41TensorScope, layer: Int?) -> String {
+        "\(scope.rawValue)|\(role.rawValue)|\(layer.map(String.init) ?? "-")"
     }
 
     func store(
         _ role: DeepSeekV41TensorRole,
+        scope: DeepSeekV41TensorScope = .backbone,
         layer: Int?,
         ref: DeepSeekV41TensorRef?,
         resizeTo count: Int? = nil
     ) -> Bool {
         guard let ref, let values = read(ref, resizeTo: count) else { return false }
         guard let buffer = makeBuffer(values) else { return false }
-        bank[Self.key(role, layer: layer)] = buffer
+        bank[Self.key(role, scope: scope, layer: layer)] = buffer
         return true
     }
 
-    func buffer(_ role: DeepSeekV41TensorRole, layer: Int?) -> MTLBuffer? {
-        bank[Self.key(role, layer: layer)]
+    func buffer(
+        _ role: DeepSeekV41TensorRole,
+        scope: DeepSeekV41TensorScope = .backbone,
+        layer: Int?
+    ) -> MTLBuffer? {
+        bank[Self.key(role, scope: scope, layer: layer)]
     }
 
     /// The gain for a norm, falling back to ones. The reference's `rmsNorm` treats
     /// a gain whose width disagrees with the input as "no gain", and a slot the
     /// checkpoint does not publish is the same case.
-    func gain(_ role: DeepSeekV41TensorRole, layer: Int?, width: Int) -> MTLBuffer? {
-        if let stored = buffer(role, layer: layer), stored.length >= width * 4 { return stored }
+    func gain(
+        _ role: DeepSeekV41TensorRole,
+        scope: DeepSeekV41TensorScope = .backbone,
+        layer: Int?,
+        width: Int
+    ) -> MTLBuffer? {
+        if let stored = buffer(role, scope: scope, layer: layer), stored.length >= width * 4 {
+            return stored
+        }
         return constant(1, count: width)
     }
 
@@ -1018,10 +1033,38 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// (one per target layer), and nothing reads the buffer until a draft runs.
     public var capturesDraftInput = false
 
-    /// `[slot][target][hidden]`, in the same target order `mainHidden` concatenates.
-    /// Allocated only when the checkpoint names target layers, and written only
-    /// while `capturesDraftInput` is on.
+    /// `[ring][target][hidden]`, in the same target order `mainHidden` concatenates.
+    /// Indexed by POSITION rather than by block slot: the drafter's ring cache is
+    /// seeded from the last `window_size` positions' block inputs, so the capture has
+    /// to keep a window's worth of them.
     private var draftInput: MTLBuffer?
+    /// `[ring][hidden]`: `main_norm(main_proj(captured row))`, which is the draft
+    /// stages' actual input. Wider than the capture in one direction only — the
+    /// projection reads all of `draftWidth` and writes `hidden`.
+    private var draftMain: MTLBuffer?
+    /// Width of one captured row, i.e. `main_proj`'s input dimension.
+    private let draftWidth: Int
+    /// Ring slots, i.e. `window_size`: how many positions the capture keeps.
+    private let draftRingSlots: Int
+    /// Positions written into the ring so far. A read of a slot older than the live
+    /// window returns nil rather than a row from a previous turn.
+    private var draftCapturedThrough = 0
+    /// Draft stages the checkpoint publishes, in `mtp.N.*` order. Taken from the
+    /// catalog rather than the config, so a checkpoint that publishes the stages
+    /// without declaring them still runs them.
+    private let draftStages: [Int]
+    /// The geometry every draft stage runs under: window-only, base theta, no YaRN.
+    private let draftShape: DeepSeekV41AttentionShape?
+    /// `[stage][ring][latentWidth]`: the TARGET's latents, seeded from its own
+    /// projections. This is what a draft round attends over, and it is the one piece
+    /// of draft state that survives between rounds.
+    private var draftRing: MTLBuffer?
+    /// `[ring][latentWidth]`: one stage's latents before they land in its ring. Shared
+    /// by every stage because the copy into the ring is the next dispatch.
+    private var draftLatent: MTLBuffer?
+    /// Prefix positions the draft rings hold, so a round only projects the positions
+    /// it has not seen. Monotonic; `reset()` clears it.
+    public private(set) var draftSeededPositions = 0
     /// `1 / hcMult` over `hcMult` entries: `hc_pre` with a uniform mix IS the mean
     /// over copies, so the capture is the same kernel the sub-layer uses.
     private var draftMeanMix: MTLBuffer?
@@ -1086,16 +1129,54 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         // enough for every target layer's mean laid end to end.
         let targets = runtime.config.dsparkTargetLayerIDs.sorted()
         self.draftTargets = targets
+        self.draftWidth = max(0, targets.count * runtime.config.hiddenSize)
+        self.draftRingSlots = max(1, runtime.config.windowSize)
+        self.draftStages = Set(
+            runtime.catalog.slots
+                .filter { $0.scope == .draft && $0.role == .attnNorm }
+                .compactMap(\.layer)
+        ).sorted()
+        self.draftShape = self.draftStages.isEmpty
+            ? nil
+            : DeepSeekV41AttentionShape.draftShape(config: runtime.config)
         var indices: [Int: Int] = [:]
         for (position, layer) in targets.enumerated() { indices[layer] = position }
         self.draftTargetIndex = indices
         if let first = targets.first, first >= 0, runtime.config.hiddenSize > 0 {
             let width = targets.count * runtime.config.hiddenSize
-            let capacity = max(1, runtime.workspace.slots) * width
+            let capacity = self.draftRingSlots * width
             self.draftInput = runtime.device.makeBuffer(
                 length: max(16, capacity * MemoryLayout<Float>.stride),
                 options: .storageModeShared
             )
+            self.draftMain = runtime.device.makeBuffer(
+                length: max(
+                    16,
+                    self.draftRingSlots * runtime.config.hiddenSize
+                        * MemoryLayout<Float>.stride
+                ),
+                options: .storageModeShared
+            )
+            // The rings only exist when there is something to seed them from and a
+            // stage to read them, and every slot is `window` rows of the record.
+            let latentWidth = runtime.config.cacheRecordWidth
+            if !self.draftStages.isEmpty, latentWidth > 0 {
+                self.draftRing = runtime.device.makeBuffer(
+                    length: max(
+                        16,
+                        self.draftStages.count * self.draftRingSlots * latentWidth
+                            * MemoryLayout<Float>.stride
+                    ),
+                    options: .storageModeShared
+                )
+                self.draftLatent = runtime.device.makeBuffer(
+                    length: max(
+                        16,
+                        self.draftRingSlots * latentWidth * MemoryLayout<Float>.stride
+                    ),
+                    options: .storageModeShared
+                )
+            }
             self.draftMeanMix = runtime.device.makeBuffer(
                 length: max(16, self.mult * MemoryLayout<Float>.stride),
                 options: .storageModeShared
@@ -1235,16 +1316,17 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         func store(
             _ role: DeepSeekV41TensorRole,
             _ layer: Int?,
+            scope: DeepSeekV41TensorScope = .backbone,
             resizeTo count: Int? = nil
         ) {
             // `hc_*_scale` and the quantized companions classify with `isScale`
             // set, so the plain lookup misses them. Try the scale slot too; a
             // scalar that exists but cannot be decoded is reported rather than
             // silently replaced by its identity value.
-            let ref = catalog.tensor(role, layer: layer)
-                ?? catalog.tensor(role, layer: layer, scale: true)
+            let ref = catalog.tensor(role, scope: scope, layer: layer)
+                ?? catalog.tensor(role, scope: scope, layer: layer, scale: true)
             guard let ref else { return }
-            if !bank.store(role, layer: layer, ref: ref, resizeTo: count) {
+            if !bank.store(role, scope: scope, layer: layer, ref: ref, resizeTo: count) {
                 problems.append(
                     "\(role.rawValue)\(layer.map { " layer \($0)" } ?? "") could not be decoded"
                 )
@@ -1278,6 +1360,25 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 store(.engramQuery, l, resizeTo: width)
                 store(.engramKey, l, resizeTo: width)
             }
+        }
+        // The DSpark stages are full blocks in their own namespace: `mtp.N.attn_norm`
+        // is a different tensor from `layers.N.attn_norm`, and a bank keyed only by
+        // role and layer would hand a draft stage the backbone's gain. Only stage 0
+        // carries `main_norm` and only the last carries the output `norm`, so both
+        // are asked for on every stage and the absent ones no-op.
+        for stage in self.draftStages {
+            store(.attnNorm, stage, scope: .draft)
+            store(.ffnNorm, stage, scope: .draft)
+            store(.attnWqANorm, stage, scope: .draft)
+            store(.attnKvNorm, stage, scope: .draft)
+            store(.attnSink, stage, scope: .draft)
+            store(.routerBias, stage, scope: .draft)
+            store(.hcAttnScale, stage, scope: .draft)
+            store(.hcAttnBase, stage, scope: .draft)
+            store(.hcFfnScale, stage, scope: .draft)
+            store(.hcFfnBase, stage, scope: .draft)
+            store(.draftMainNorm, stage, scope: .draft)
+            store(.draftNorm, stage, scope: .draft)
         }
         self.vectors = bank
 
@@ -1345,6 +1446,11 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         tokenHistory.removeAll(keepingCapacity: true)
         deadTokens.removeAll(keepingCapacity: true)
         pendingDead = false
+        // The captured rows describe positions the cache no longer holds, so they are
+        // stale in exactly the way a ring read cannot detect on its own. The seeded
+        // rings are stale with them: they are projections of those rows.
+        draftCapturedThrough = 0
+        draftSeededPositions = 0
     }
 
     /// Positions the cache already holds.
@@ -1798,7 +1904,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         switch stage {
         case .hcAttentionCoefficients:
             for slot in 0..<count {
-                try encodeDraftInput(encoder, layer: index, slot: slot)
+                try encodeDraftInput(
+                    encoder, layer: index, slot: slot, position: startPosition + slot
+                )
             }
             try encodeHyperConnectionCoefficients(
                 encoder,
@@ -2573,7 +2681,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                     encoder, from: workspace.streams, to: probe, count: mult * shapes.hidden
                 )
             }
-            try encodeDraftInput(encoder, layer: index)
+            try encodeDraftInput(encoder, layer: index, position: position)
             try encodeHyperConnectionCoefficients(
                 encoder,
                 layer: index,
@@ -4302,15 +4410,21 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     private func encodeDraftInput(
         _ encoder: MTLComputeCommandEncoder,
         layer: Int,
-        slot: Int = 0
+        slot: Int = 0,
+        position: Int
     ) throws {
         guard capturesDraftInput,
               let target = draftTargetIndex[layer],
               let buffer = draftInput,
               let mix = draftMeanMix,
+              draftWidth > 0,
               shapes.hidden > 0 else { return }
-        let width = draftTargets.count * shapes.hidden
-        let offset = (slot * width + target * shapes.hidden) * MemoryLayout<Float>.stride
+        // The streams are read at the BLOCK slot and the row is written at the
+        // POSITION's ring slot: a block's positions are consecutive but its slots
+        // are not the ring's.
+        let ringSlot = max(0, position) % draftRingSlots
+        let offset = (ringSlot * draftWidth + target * shapes.hidden)
+            * MemoryLayout<Float>.stride
         try encodeHyperConnectionPre(
             encoder,
             mix: mix,
@@ -4320,24 +4434,228 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             mixByteOffset: 0,
             outputByteOffset: offset
         )
+        draftCapturedThrough = max(draftCapturedThrough, position + 1)
     }
 
-    /// The captured row for one position slot, in `mainHidden`'s order.
+    /// The captured row for one POSITION, in `mainHidden`'s order.
     ///
-    /// Only meaningful once the token or block that wrote it has been settled, which
-    /// is where every caller reads it: `forwardToken` and `prefillChunk` both return
-    /// after `settlePending`.
-    public func capturedDraftInput(slot: Int = 0) -> [Float]? {
+    /// Nil for a position the ring no longer holds, which is every position more than
+    /// `window_size` behind the newest one. Only meaningful once the token or block
+    /// that wrote it has been settled, which is where every caller reads it:
+    /// `forwardToken` and `prefillChunk` both return after `settlePending`.
+    public func capturedDraftInput(atPosition position: Int) -> [Float]? {
         guard capturesDraftInput else { return nil }
-        guard let buffer = draftInput, !draftTargets.isEmpty, shapes.hidden > 0 else { return nil }
-        let width = draftTargets.count * shapes.hidden
-        guard slot >= 0, (slot + 1) * width * MemoryLayout<Float>.stride <= buffer.length else {
-            return nil
-        }
+        guard let buffer = draftInput, draftWidth > 0, shapes.hidden > 0,
+              position >= 0, position < draftCapturedThrough,
+              position >= draftCapturedThrough - draftRingSlots else { return nil }
+        let slot = position % draftRingSlots
         let pointer = buffer.contents()
-            .advanced(by: slot * width * MemoryLayout<Float>.stride)
+            .advanced(by: slot * draftWidth * MemoryLayout<Float>.stride)
             .assumingMemoryBound(to: Float.self)
-        return Array(UnsafeBufferPointer(start: pointer, count: width))
+        return Array(UnsafeBufferPointer(start: pointer, count: draftWidth))
+    }
+
+    /// Runs `main_x` for a run of captured rows and hands them back.
+    ///
+    /// The draft round reads `main_x` on the DEVICE (it is the input to the seeded
+    /// ring and the draft stack's attention), so this exists for a parity harness
+    /// rather than for the graph. `slots` rows are projected in one dispatch: the
+    /// capture is slot-major, so a run of slots is one GEMV with a `draftWidth`
+    /// input stride.
+    public func draftMainX(slots: Int = 1, firstSlot: Int = 0) throws -> [[Float]] {
+        guard slots > 0, firstSlot >= 0, draftWidth > 0,
+              let output = draftMain, shapes.hidden > 0 else { return [] }
+        let commandBuffer = try makeCommandBuffer()
+        let encoder = try makeEncoder(commandBuffer)
+        try encodeDraftMainX(encoder, slots: slots, firstSlot: firstSlot)
+        encoder.endEncoding()
+        try commit(commandBuffer, stage: "draftMainX")
+        let pointer = output.contents().assumingMemoryBound(to: Float.self)
+        return (0..<slots).map { slot in
+            Array(
+                UnsafeBufferPointer(
+                    start: pointer + (firstSlot + slot) * shapes.hidden,
+                    count: shapes.hidden
+                )
+            )
+        }
+    }
+
+    /// `DSparkBlock.forward_embed`'s `main_x = main_norm(main_proj(main_hidden))`.
+    ///
+    /// `main_proj` reads every target layer's mean laid end to end, which is exactly
+    /// how the capture stores them, and the published matrix is FP8 block-scaled
+    /// (5 120 x 15 360), so it goes through the same GEMV the backbone uses. The norm
+    /// that follows is `main_norm`, a plain RMSNorm over `hidden`, applied in place.
+    private func encodeDraftMainX(
+        _ encoder: MTLComputeCommandEncoder,
+        slots: Int,
+        firstSlot: Int = 0
+    ) throws {
+        guard slots > 0, firstSlot >= 0, draftWidth > 0,
+              let input = draftInput, let output = draftMain else { return }
+        guard let projection = weights.tensor(.draftMainProj, scope: .draft, layer: 0) else {
+            throw DeepSeekV41EngineError.missingTensor("mtp.0.main_proj")
+        }
+        let inputOffset = firstSlot * draftWidth * MemoryLayout<Float>.stride
+        let outputOffset = firstSlot * shapes.hidden * MemoryLayout<Float>.stride
+        try encodeGemv(
+            encoder,
+            weight: projection,
+            scale: weights.scaleTensor(.draftMainProj, scope: .draft, layer: 0),
+            inDim: draftWidth,
+            outDim: shapes.hidden,
+            input: input,
+            output: output,
+            inputByteOffset: inputOffset,
+            outputByteOffset: outputOffset,
+            rows: slots,
+            inputRowStride: draftWidth,
+            outputRowStride: shapes.hidden
+        )
+        try encodeNorm(
+            encoder,
+            input: output,
+            gain: vectors.gain(
+                .draftMainNorm, scope: .draft, layer: 0, width: shapes.hidden
+            ),
+            output: output,
+            width: shapes.hidden,
+            rows: slots,
+            inputByteOffset: outputOffset,
+            outputByteOffset: outputOffset
+        )
+    }
+
+    /// Seeds every stage's ring from the target's own latents.
+    ///
+    /// This is `DSparkAttention.forward`'s `start_pos == 0` branch, and it is all that
+    /// branch does: each ring row is `kv_norm(wkv(main_x))` with its trailing rope
+    /// payload rotated at its own position, stored at slot `position % window`. The
+    /// reference's `seqlen % window` rotation for an over-long prefix is the same rule
+    /// once positions are walked in order, so the wrap needs no case of its own — but
+    /// a run IS contiguous in both the ring and the positions, so a seed that crosses
+    /// the end of the ring is two runs.
+    ///
+    /// The result is the one piece of draft state that survives between rounds: a
+    /// draft attends over these rows plus its own, and it never reads the target's
+    /// cache directly (the ring is `wkv` of `main_x`, not the target's keys).
+    private func encodeDraftSeed(
+        _ encoder: MTLComputeCommandEncoder,
+        firstPosition: Int,
+        count: Int,
+        firstSlot: Int
+    ) throws {
+        guard count > 0, firstSlot >= 0, let shape = draftShape,
+              let latent = draftLatent, let ring = draftRing,
+              let main = draftMain, draftWidth > 0 else { return }
+        let latentWidth = shape.latentWidth
+        guard latentWidth > 0, firstSlot + count <= draftRingSlots else { return }
+        let floatBytes = MemoryLayout<Float>.stride
+        try encodeDraftMainX(encoder, slots: count, firstSlot: firstSlot)
+        let latentOffset = firstSlot * latentWidth * floatBytes
+        let mainOffset = firstSlot * shapes.hidden * floatBytes
+        for (index, stage) in draftStages.enumerated() {
+            guard let wkv = weights.tensor(.attnWkv, scope: .draft, layer: stage) else {
+                throw DeepSeekV41EngineError.missingTensor("mtp.\(stage).attn.wkv")
+            }
+            try encodeGemv(
+                encoder,
+                weight: wkv,
+                scale: weights.scaleTensor(.attnWkv, scope: .draft, layer: stage),
+                inDim: shapes.hidden,
+                outDim: latentWidth,
+                input: main,
+                output: latent,
+                inputByteOffset: mainOffset,
+                outputByteOffset: latentOffset,
+                rows: count
+            )
+            try encodeNorm(
+                encoder,
+                input: latent,
+                gain: vectors.gain(
+                    .attnKvNorm, scope: .draft, layer: stage, width: latentWidth
+                ),
+                output: latent,
+                width: latentWidth,
+                rows: count,
+                inputByteOffset: latentOffset,
+                outputByteOffset: latentOffset
+            )
+            try encodeRope(
+                encoder,
+                vector: latent,
+                rowWidth: latentWidth,
+                headDim: 0,
+                sliceStart: shape.latentRopeStart,
+                sliceLength: shape.latentRopeWidth,
+                table: .window,
+                latent: true,
+                position: firstPosition,
+                batch: count,
+                byteOffset: latentOffset
+            )
+            try encodeCopy(
+                encoder,
+                from: latent,
+                to: ring,
+                count: count * latentWidth,
+                sourceByteOffset: latentOffset,
+                destinationByteOffset: (index * draftRingSlots + firstSlot)
+                    * latentWidth * floatBytes
+            )
+        }
+    }
+
+    /// Brings the draft rings up to `positions` and returns how many rows it added.
+    ///
+    /// Only the positions the rings do not already hold are projected, so a live turn
+    /// adds one row per decoded token and a turn that starts with the drafter enabled
+    /// seeds the whole window once. `positions` is clamped to what the cache holds:
+    /// a ring row for a position the target never ran would be attended over as if it
+    /// were real.
+    @discardableResult
+    public func seedDraftRings(through positions: Int) throws -> Int {
+        guard capturesDraftInput else { return 0 }
+        guard draftShape != nil, !draftStages.isEmpty,
+              draftWidth > 0, draftRing != nil, draftLatent != nil else { return 0 }
+        let target = max(0, min(positions, cache.storedPositions, draftCapturedThrough))
+        let first = max(draftSeededPositions, max(0, target - draftRingSlots))
+        guard target > first else { return 0 }
+        let commandBuffer = try makeCommandBuffer()
+        let encoder = try makeEncoder(commandBuffer)
+        var position = first
+        while position < target {
+            let slot = position % draftRingSlots
+            let run = min(target - position, draftRingSlots - slot)
+            try encodeDraftSeed(
+                encoder, firstPosition: position, count: run, firstSlot: slot
+            )
+            position += run
+        }
+        encoder.endEncoding()
+        try commit(commandBuffer, stage: "draftSeed")
+        draftSeededPositions = target
+        return target - first
+    }
+
+    /// One stage's seeded ring, slot 0 first. For a parity harness: the graph reads
+    /// the ring on the device and never needs it back.
+    public func draftRing(index: Int) -> [[Float]] {
+        guard let shape = draftShape, let ring = draftRing,
+              draftStages.indices.contains(index) else { return [] }
+        let latentWidth = shape.latentWidth
+        guard latentWidth > 0 else { return [] }
+        let pointer = ring.contents().assumingMemoryBound(to: Float.self)
+        return (0..<draftRingSlots).map { slot in
+            Array(
+                UnsafeBufferPointer(
+                    start: pointer + (index * draftRingSlots + slot) * latentWidth,
+                    count: latentWidth
+                )
+            )
+        }
     }
 
     private func encodeHyperConnectionPre(

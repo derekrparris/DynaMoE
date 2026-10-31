@@ -678,7 +678,7 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
                 let started = DispatchTime.now().uptimeNanoseconds
                 let logits = try executor.forwardToken(token, position: position)
                 let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
-                guard let row = executor.capturedDraftInput() else {
+                guard let row = executor.capturedDraftInput(atPosition: position) else {
                     return "position \(position): the capture is empty"
                 }
                 guard row.count == targets.count * hidden else {
@@ -707,6 +707,89 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             return lines.joined(separator: " | ")
         }.value
         print("🔎 [dsv41 real] drafter conditioning row: \(report)")
+        withExtendedLifetime(engine) {}
+    }
+
+    /// The seeded draft rings on the real checkpoint.
+    ///
+    /// Everything the seed touches is published at a shape the synthetic fixture cannot
+    /// imitate: `mtp.N.attn.wkv` is FP8 block-scaled (512 x 5 120 with an E8M0 scale
+    /// companion, so it takes the block-32 GEMV rather than the bf16 one), `main_proj`
+    /// reads three 5 120-wide layers end to end, and the latent rope payload is a
+    /// trailing slice of a 512-wide record. This walks a short prefix and prints what
+    /// each stage's ring holds, which is the only way to see a mis-bound scale or a rope
+    /// slice applied to the wrong offsets before a draft round reads them.
+    func testWhatTheDraftRingsHoldOnThePublishedCheckpoint() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        XCTAssertEqual(config.dsparkTargetLayerIDs, [37, 38, 39])
+        XCTAssertEqual(config.numNextNPredictLayers, 3)
+        XCTAssertEqual(config.windowSize, 128, "the published window is the ring's size")
+        XCTAssertEqual(config.dsparkBlockSize, 5, "five drafts a round")
+        let tokens = [0, 128803, 21750, 2038, 15174, 943, 3939, 270]
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: 32,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let report = try await Task.detached { [runtime] () -> String in
+            let executor = runtime.forward()
+            executor.reset()
+            executor.capturesDraftInput = true
+            for (position, token) in tokens.enumerated() {
+                _ = try executor.forwardToken(token, position: position)
+            }
+            // A live turn seeds one row per decoded token, so this is the drafter's own
+            // per-turn overhead; a cold seed is the same dispatches over more rows.
+            let beforeSeed = DispatchTime.now().uptimeNanoseconds
+            let seeded = try executor.seedDraftRings(through: tokens.count)
+            let seedMilliseconds =
+                Double(DispatchTime.now().uptimeNanoseconds - beforeSeed) / 1_000_000
+            guard seeded == tokens.count else {
+                return "the seed wrote \(seeded) rows for \(tokens.count) positions"
+            }
+            // Then one warm row, which is what a live turn actually pays: a decode step
+            // adds a single position and the seed projects it alone.
+            _ = try executor.forwardToken(270, position: tokens.count)
+            let warmStart = DispatchTime.now().uptimeNanoseconds
+            let warmRows = try executor.seedDraftRings(through: tokens.count + 1)
+            let warmMilliseconds =
+                Double(DispatchTime.now().uptimeNanoseconds - warmStart) / 1_000_000
+            guard warmRows == 1 else { return "a warm seed wrote \(warmRows) rows" }
+            let stages = runtime.config.numNextNPredictLayers
+            var lines: [String] = []
+            for stage in 0..<stages {
+                let rows = executor.draftRing(index: stage)
+                guard rows.count == runtime.config.windowSize else {
+                    return "stage \(stage): the ring holds \(rows.count) slots"
+                }
+                // Only the first `tokens.count` slots are seeded; the rest hold
+                // whatever the allocation gave them.
+                for position in [0, tokens.count - 1] {
+                    let row = rows[position % rows.count]
+                    let finite = row.allSatisfy { $0.isFinite }
+                    let norm = (row.reduce(Float(0)) { $0 + $1 * $1 }).squareRoot()
+                    let peak = row.map(abs).max() ?? 0
+                    lines.append(
+                        String(
+                            format: "stage %d slot %d (%d values, %@): |x| %.2f max %.3f",
+                            stage, position % rows.count, row.count,
+                            finite ? "finite" : "NOT FINITE", norm, peak
+                        )
+                    )
+                }
+            }
+            return String(format: "%d rows in %.2f ms, then 1 warm row in %.2f ms; ",
+                          seeded, seedMilliseconds, warmMilliseconds)
+                + lines.joined(separator: " | ")
+        }.value
+        print("🔎 [dsv41 real] draft ring seed: \(report)")
         withExtendedLifetime(engine) {}
     }
 

@@ -530,6 +530,135 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         )
     }
 
+    /// `main_x = main_norm(main_proj(main_hidden))`, computed on the device from the
+    /// row the walk captured.
+    ///
+    /// This is the drafter's actual input and the first thing the device path reads
+    /// from the `mtp.*` namespace, which is why it is also the first place a lookup
+    /// that ignored the namespace would go wrong: `mtp.0.main_proj` is not
+    /// `layers.0.main_proj`, and the two have different shapes, so the substitution
+    /// is silent only when the shapes happen to agree.
+    func testTheDeviceProjectsTheDraftersConditioningRow() throws {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.layers = 2
+        // The config requires one target layer per stage, and the fixture's draft
+        // expert counts differ from the backbone's so a stage that routed with the
+        // wrong pair is visible downstream.
+        shape.draftTargetLayers = [1, 0]
+        shape.draftStages = 2
+        shape.contextLength = 16
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        XCTAssertEqual(checkpoint.catalogProblems(), [])
+        XCTAssertEqual(checkpoint.config.numNextNPredictLayers, 2)
+        XCTAssertEqual(checkpoint.config.draftExpertCounts.routed, 3)
+        XCTAssertEqual(checkpoint.config.draftExpertCounts.activated, 2)
+
+        let runtime = try makeRuntime(checkpoint)
+        // The draft namespace resolves to different bytes than the backbone's, which
+        // is what the scope argument is for.
+        let draftNorm = try XCTUnwrap(runtime.weights.tensor(.attnNorm, scope: .draft, layer: 0))
+        let backboneNorm = try XCTUnwrap(runtime.weights.tensor(.attnNorm, layer: 0))
+        XCTAssertNotEqual(draftNorm.byteOffset, backboneNorm.byteOffset)
+        XCTAssertNotEqual(
+            runtime.weights.tensor(.draftMainProj, scope: .draft, layer: 0)?.byteOffset,
+            runtime.weights.tensor(.attnWqA, layer: 0)?.byteOffset
+        )
+
+        let device = runtime.forward()
+        device.capturesDraftInput = true
+        let host = makeHost(checkpoint)
+        let drafter = DeepSeekV41DSparkBlock(forward: host)
+
+        let tokens = [3, 4, 5]
+        for (position, token) in tokens.enumerated() {
+            _ = try device.forwardToken(token, position: position)
+            _ = host.forwardToken(token, position: position)
+            let captured = try XCTUnwrap(host.mainHidden(position: position))
+            let expected = try XCTUnwrap(drafter.mainX([captured]).first)
+            let projected = try XCTUnwrap(
+                try device.draftMainX(
+                    slots: 1, firstSlot: position % shape.window
+                ).first,
+                "the device projected no row"
+            )
+            XCTAssertEqual(projected.count, expected.count)
+            let scale = max(expected.map(abs).max() ?? 1, 1e-6)
+            let delta = worstDelta(projected, expected)
+            XCTAssertLessThan(
+                delta / scale, 5e-4,
+                "position \(position): main_x is off the host by \(delta) "
+                    + "against a \(scale) scale"
+            )
+        }
+    }
+
+    /// The draft rings are seeded from the TARGET's own latents, which is what a draft
+    /// round attends over.
+    ///
+    /// `DSparkAttention`'s seed branch is easy to dismiss as bookkeeping: it writes
+    /// `kv_norm(wkv(main_x))` per prefix position and returns the residual untouched,
+    /// so a seed that stored the wrong rows or the wrong slots stays invisible until
+    /// the first draft reads them. Two rules are load-bearing and both are checked
+    /// here: the row is the target's projection (not the draft stack's), and a prefix
+    /// longer than the window keeps its LAST `window` rows, with slot
+    /// `position % window` holding the row for that position.
+    func testTheDeviceSeedsTheDraftRingsFromTheTargetsLatents() throws {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.layers = 2
+        shape.draftTargetLayers = [1, 0]
+        shape.draftStages = 2
+        shape.window = 4
+        shape.contextLength = 16
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        XCTAssertEqual(checkpoint.catalogProblems(), [])
+
+        let runtime = try makeRuntime(checkpoint)
+        let device = runtime.forward()
+        XCTAssertEqual(
+            try device.seedDraftRings(through: 4), 0,
+            "the seed is idle until the capture is on"
+        )
+        device.capturesDraftInput = true
+
+        // Six positions over a four-row window: the ring wraps during the seed, so the
+        // slot arithmetic is exercised rather than assumed.
+        let tokens = [3, 4, 5, 6, 7, 8]
+        let host = makeHost(checkpoint)
+        var rows: [[Float]] = []
+        for (position, token) in tokens.enumerated() {
+            _ = try device.forwardToken(token, position: position)
+            _ = host.forwardToken(token, position: position)
+            rows.append(try XCTUnwrap(host.mainHidden(position: position)))
+        }
+        let drafter = DeepSeekV41DSparkBlock(forward: host)
+        drafter.seed(drafter.mainX(rows))
+        XCTAssertEqual(drafter.windows.count, 2)
+
+        // Only the window's worth of rows is projected: positions before it are
+        // already gone from the ring, and projecting them would be work nobody reads.
+        XCTAssertEqual(try device.seedDraftRings(through: tokens.count), shape.window)
+        XCTAssertEqual(device.draftSeededPositions, tokens.count)
+        XCTAssertEqual(
+            try device.seedDraftRings(through: tokens.count), 0,
+            "a second seed has nothing left to project"
+        )
+
+        for stage in 0..<drafter.windows.count {
+            let expected = drafter.windows[stage]
+            let ring = device.draftRing(index: stage)
+            XCTAssertEqual(ring.count, expected.count)
+            for slot in expected.indices {
+                let scale = max(expected[slot].map(abs).max() ?? 1, 1e-6)
+                let delta = worstDelta(ring[slot], expected[slot])
+                XCTAssertLessThan(
+                    delta / scale, 5e-4,
+                    "stage \(stage) slot \(slot): the seeded row is off the host by "
+                        + "\(delta) against a \(scale) scale"
+                )
+            }
+        }
+    }
+
     /// The device captures exactly the row the host forward calls `mainHidden`.
     ///
     /// The DSpark drafter conditions on the mean over the hyper-connection copies of
@@ -551,7 +680,9 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
 
         let runtime = try makeRuntime(checkpoint)
         let device = runtime.forward()
-        XCTAssertNil(device.capturedDraftInput(), "capture is off until it is asked for")
+        XCTAssertNil(
+            device.capturedDraftInput(atPosition: 0), "capture is off until it is asked for"
+        )
         device.capturesDraftInput = true
 
         let host = makeHost(checkpoint)
@@ -560,7 +691,7 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         for (position, token) in tokens.enumerated() {
             walked = try device.forwardToken(token, position: position)
             _ = host.forwardToken(token, position: position)
-            let captured = try XCTUnwrap(device.capturedDraftInput())
+            let captured = try XCTUnwrap(device.capturedDraftInput(atPosition: position))
             let expected = try XCTUnwrap(host.mainHidden(position: position))
             XCTAssertEqual(captured.count, expected.count)
             // Relative, because these are activations rather than weights: the two
@@ -581,7 +712,7 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         }
         XCTAssertFalse(walked.isEmpty)
 
-        // The block path captures one row per position slot, and a block's slots are
+        // The block path captures one row per position, and the ring slots are
         // addressed independently: a capture that wrote every slot to offset 0 would
         // pass the walk above and leave the block holding its last position only.
         device.capturesDraftInput = true
@@ -590,7 +721,7 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         let blockedHost = makeHost(checkpoint)
         for (position, token) in tokens.enumerated() {
             _ = blockedHost.forwardToken(token, position: position)
-            let captured = try XCTUnwrap(device.capturedDraftInput(slot: position))
+            let captured = try XCTUnwrap(device.capturedDraftInput(atPosition: position))
             let expected = try XCTUnwrap(blockedHost.mainHidden(position: position))
             let scale = max(expected.map(abs).max() ?? 1, 1e-6)
             let delta = worstDelta(captured, expected)

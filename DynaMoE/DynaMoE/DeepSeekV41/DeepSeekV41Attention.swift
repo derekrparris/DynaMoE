@@ -159,6 +159,29 @@ nonisolated public struct DeepSeekV41AttentionShape: Sendable, Equatable {
         )
     }
 
+    /// The geometry a DSpark draft stage runs under.
+    ///
+    /// `DSparkAttention.forward` asserts `compress_ratio == 0`, and `Attention` takes
+    /// `original_seq_len = 0` there, so a stage is window-only: no compressor, no
+    /// indexer, the base theta and no YaRN. Both backends build it here so the two
+    /// cannot drift into different ropes.
+    public static func draftShape(config: DeepSeekV41Config) -> DeepSeekV41AttentionShape {
+        DeepSeekV41AttentionShape(
+            numHeads: config.numAttentionHeads,
+            headsPerGroup: max(1, config.numAttentionHeads / max(1, config.oGroups)),
+            qkHeadDim: config.qkHeadDim,
+            vHeadDim: config.vHeadDim,
+            latentWidth: config.cacheRecordWidth,
+            qLoraRank: config.qLoraRank,
+            oLoraRank: config.oLoraRank,
+            isCompressed: false,
+            compressRatio: 0,
+            ropeTheta: config.ropeTheta,
+            rotaryDim: config.qkRopeHeadDim,
+            ropeScaling: .none
+        )
+    }
+
     /// Softmax scale. Latent attention scores each head's dot product against the
     /// shared latent, so the scale is over `qkHeadDim`, not the latent width.
     public var scoreScale: Float { 1 / sqrt(Float(qkHeadDim == 0 ? 1 : qkHeadDim)) }

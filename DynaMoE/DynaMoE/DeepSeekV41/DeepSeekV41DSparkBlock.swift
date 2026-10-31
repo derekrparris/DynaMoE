@@ -110,7 +110,7 @@ nonisolated public final class DeepSeekV41DSparkBlock {
         let config = forward.config
         self.config = config
         self.plan = DeepSeekV41DSparkPlan.make(config: config)
-        self.shape = DeepSeekV41DSparkBlock.draftShape(config: config)
+        self.shape = DeepSeekV41AttentionShape.draftShape(config: config)
         self.forward = forward
         self.queryFrequencies = DeepSeekV41RoPE.queryFrequencies(for: shape)
         self.latentFrequencies = DeepSeekV41RoPE.latentFrequencies(for: shape)
@@ -526,20 +526,4 @@ nonisolated public final class DeepSeekV41DSparkBlock {
         forward.weights.matrix(role, scope: .draft, layer: stage, expert: nil)
     }
 
-    private static func draftShape(config: DeepSeekV41Config) -> DeepSeekV41AttentionShape {
-        DeepSeekV41AttentionShape(
-            numHeads: config.numAttentionHeads,
-            headsPerGroup: max(1, config.numAttentionHeads / max(1, config.oGroups)),
-            qkHeadDim: config.qkHeadDim,
-            vHeadDim: config.vHeadDim,
-            latentWidth: config.cacheRecordWidth,
-            qLoraRank: config.qLoraRank,
-            oLoraRank: config.oLoraRank,
-            isCompressed: false,
-            compressRatio: 0,
-            ropeTheta: config.ropeTheta,
-            rotaryDim: config.qkRopeHeadDim,
-            ropeScaling: .none
-        )
-    }
 }
