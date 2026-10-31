@@ -638,6 +638,102 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
+    /// What verifying a drafted run in ONE batched pass would save over walking it.
+    ///
+    /// Speculative decoding is the only structure that lets a decode step batch, and
+    /// the walk's per-layer routing round trip plus its arena fill are exactly what a
+    /// block amortizes: eight drafted positions cost one host round trip per layer
+    /// instead of eight, and one expert union instead of eight expert sets. This
+    /// prices both arms on the published checkpoint.
+    ///
+    /// Each arm runs on its own pair of token runs, and the runs are different from
+    /// the one before: the arena is shared by the whole runtime, so re-timing the same
+    /// tokens reads nothing at all and prices only kernel work. Every run is eight
+    /// prompt positions followed by eight drafted ones, the prompt untimed (it leaves
+    /// the arena holding what a real turn would have behind it) and the drafted run
+    /// timed. Each arm reports the faster of its two runs, because the first pass
+    /// over either path is slower for being first.
+    func testWhatABatchedVerifyWouldSaveOverAWalk() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let width = 8
+        let tokens = [
+            0, 128803, 21750, 2038, 15174, 943, 3939, 270, 15571, 344, 83779, 16, 128804, 128822,
+            19, 16, 17289, 9372, 344, 10526, 44691, 305, 14, 1060, 15390, 294, 1737, 14, 1843,
+            5258, 20450, 377, 3155, 14, 30663, 32453, 19504, 46885, 965, 35868, 20012, 305,
+            32604, 965, 23418, 27124, 396, 7457, 1066, 304, 270, 8343, 603
+        ]
+        let runs = (0..<4).map { run -> ([Int], [Int]) in
+            let base = run * width
+            return (
+                Array(tokens[base..<(base + width)]),
+                Array(tokens[(base + width)..<(base + width * 2)])
+            )
+        }
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: width * 2 + 1,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let report = try await Task.detached { [runtime] () -> String in
+            let executor = runtime.forward()
+
+            func walk(_ run: ([Int], [Int])) throws -> (milliseconds: Double, bytes: Int) {
+                executor.reset()
+                for (position, token) in run.0.enumerated() {
+                    _ = try executor.forwardToken(token, position: position)
+                }
+                let before = runtime.expertStreamer?.bytesRead ?? 0
+                let started = DispatchTime.now().uptimeNanoseconds
+                for (offset, token) in run.1.enumerated() {
+                    _ = try executor.forwardToken(token, position: width + offset)
+                }
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+                return (elapsed, (runtime.expertStreamer?.bytesRead ?? 0) - before)
+            }
+
+            func block(_ run: ([Int], [Int])) throws -> (milliseconds: Double, bytes: Int) {
+                executor.reset()
+                _ = try executor.prefillChunk(run.0)
+                let before = runtime.expertStreamer?.bytesRead ?? 0
+                let started = DispatchTime.now().uptimeNanoseconds
+                _ = try executor.prefillChunk(run.1)
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+                return (elapsed, (runtime.expertStreamer?.bytesRead ?? 0) - before)
+            }
+
+            let walked = [try walk(runs[0]), try walk(runs[1]), try walk(runs[2])]
+            let blocked = [try block(runs[1]), try block(runs[2]), try block(runs[3])]
+            let walkMilliseconds = walked.map(\.milliseconds).min() ?? 0
+            let blockMilliseconds = blocked.map(\.milliseconds).min() ?? 0
+            let walkMegabytes = walked.map { Double($0.bytes) / 1_048_576 }.reduce(0, +)
+                / Double(max(1, walked.count))
+            let blockMegabytes = blocked.map { Double($0.bytes) / 1_048_576 }.reduce(0, +)
+                / Double(max(1, blocked.count))
+            return String(
+                format: "batched verify vs walk, %d drafted positions: "
+                    + "walk %.1f ms (%.1f ms/position, %.0f MB read), "
+                    + "block %.1f ms (%.1f ms/position, %.0f MB read) -> %.2fx",
+                width,
+                walkMilliseconds,
+                walkMilliseconds / Double(width),
+                walkMegabytes,
+                blockMilliseconds,
+                blockMilliseconds / Double(width),
+                blockMegabytes,
+                walkMilliseconds / max(blockMilliseconds, 0.001)
+            )
+        }.value
+        print("🔎 [dsv41 real] \(report)")
+        withExtendedLifetime(engine) {}
+    }
+
     /// What one decoded position costs, and which bucket holds it.
     ///
     /// A turn's decode loop is the whole user-visible speed of this model, and it is

@@ -530,6 +530,54 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         )
     }
 
+    /// A chunk that CONTINUES the cache returns what walking the same positions returns.
+    ///
+    /// `prefillChunk` used to open a sequence and nothing else: it ran its blocks from
+    /// position 0 and refused a cache that already held anything. A speculative verify
+    /// needs the other shape — the drafted run appended to a turn that is already in
+    /// the cache — and the position decides everything that used to be implicit: the
+    /// ring slot, the compressor's group slot, and whether the group completes here.
+    ///
+    /// The continuation starts one position into a group (`compress_ratios` 2) on
+    /// purpose: a chunk that only ever started on a group boundary would fill slot 0
+    /// itself and never read a slot an earlier position left behind.
+    func testAChunkContinuesFromTheCacheLikeTheWalk() throws {
+        let compressed = compressedCheckpoint()
+        let blockWidth = DeepSeekV41DevicePlan.chunkSlots(
+            config: compressed.config,
+            contextLength: compressed.shape.contextLength
+        )
+        XCTAssertGreaterThan(blockWidth, 1, "a block of one is the walk")
+        let tokens = (0..<(compressed.shape.window * 2)).map { 3 + $0 }
+        let promptWidth = blockWidth + 1
+        let prompt = Array(tokens.prefix(promptWidth))
+        let rest = Array(tokens.dropFirst(promptWidth))
+        XCTAssertFalse(rest.isEmpty)
+        XCTAssertEqual(
+            promptWidth % 2, 1,
+            "the continuation has to start mid-group for the compressor slots to matter"
+        )
+
+        let chunked = try makeRuntime(compressed).forward()
+        _ = try chunked.prefillChunk(prompt)
+        XCTAssertEqual(chunked.storedPositions, promptWidth)
+        let continued = try chunked.prefillChunk(rest)
+
+        let walked = try makeRuntime(compressed).forward()
+        _ = try walked.prefillChunk(prompt)
+        var last: [Float] = []
+        for (offset, token) in rest.enumerated() {
+            last = try walked.forwardToken(token, position: promptWidth + offset)
+        }
+
+        XCTAssertEqual(continued.last.count, last.count)
+        let delta = worstDelta(continued.last, last)
+        XCTAssertLessThan(
+            delta, 1e-5 * max(last.map(abs).max() ?? 1, 1),
+            "the continued chunk is off the walk by \(delta)"
+        )
+    }
+
     // MARK: One layer, stage by stage
 
     /// One layer and one position, replayed here from the reference's own helpers,

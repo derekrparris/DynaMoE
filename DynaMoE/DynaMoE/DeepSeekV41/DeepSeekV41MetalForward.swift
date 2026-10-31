@@ -791,6 +791,32 @@ nonisolated public struct DeepSeekV41WalkTiming: Sendable, Equatable {
     public var frontDeviceNanoseconds: UInt64 = 0
     /// The same for the mixture halves.
     public var mixtureDeviceNanoseconds: UInt64 = 0
+    /// Wall time blocked inside `waitUntilCompleted` on a dense buffer.
+    ///
+    /// `frontWaitNanoseconds` is the whole routing round trip: it drains the
+    /// PREVIOUS layer's mixture and then this layer's dense half. Splitting the
+    /// two waits, and comparing each with the window of the buffer it waited on,
+    /// is what separates "the GPU was still working" from "the CPU and the GPU
+    /// spent the gap handing the queue back and forth".
+    public var frontDrainNanoseconds: UInt64 = 0
+    /// The same for a mixture buffer, which is drained by a later layer's commit.
+    public var mixtureDrainNanoseconds: UInt64 = 0
+    /// How long after the host began waiting a buffer's own device window started,
+    /// summed over the dense halves.
+    ///
+    /// A drain is `late start + device window + tail`. A large late start means the
+    /// queue had not begun the buffer when the host asked for it, which is either
+    /// prior work still running or the driver deferring the submission; the two
+    /// want different fixes, and only the clock separates them.
+    public var frontLateStartNanoseconds: UInt64 = 0
+    /// The same for the mixture halves.
+    public var mixtureLateStartNanoseconds: UInt64 = 0
+    /// Committed dense buffers whose device window came back empty. `gpuStartTime`
+    /// is documented as valid only after completion, so a non-zero count here means
+    /// `frontDeviceNanoseconds` is a floor rather than a measurement.
+    public var frontUnwindowedBuffers: Int = 0
+    /// The same for the mixture halves.
+    public var mixtureUnwindowedBuffers: Int = 0
     /// Layers measured, so a caller divides by layers rather than by tokens.
     public var layers: Int = 0
     /// Positions measured.
@@ -828,10 +854,14 @@ nonisolated public struct DeepSeekV41WalkTiming: Sendable, Equatable {
 
     public func describe() -> String {
         let per = millisecondsPerPosition()
+        let divisor = Double(max(1, positions)) * 1_000_000
+        let missing = frontUnwindowedBuffers + mixtureUnwindowedBuffers
         return String(
             format: "walk %.1f ms/position over %d position(s), %d layer(s): "
                 + "front encode %.1f, front wait %.1f, expert fill %.1f, mixture encode %.1f, "
-                + "front device %.1f, mixture device %.1f",
+                + "front device %.1f, mixture device %.1f; drained front %.1f, mixture %.1f, "
+                + "late start front %.1f, mixture %.1f"
+                + (missing > 0 ? " (%d/%d buffers with no window)" : ""),
             Double(hostNanoseconds) / Double(max(1, positions)) / 1_000_000,
             positions,
             layers,
@@ -840,7 +870,13 @@ nonisolated public struct DeepSeekV41WalkTiming: Sendable, Equatable {
             per.expertFill,
             per.mixtureEncode,
             per.frontDevice,
-            per.mixtureDevice
+            per.mixtureDevice,
+            Double(frontDrainNanoseconds) / divisor,
+            Double(mixtureDrainNanoseconds) / divisor,
+            Double(frontLateStartNanoseconds) / divisor,
+            Double(mixtureLateStartNanoseconds) / divisor,
+            missing,
+            frontUnwindowedBuffers
         )
     }
 }
@@ -918,7 +954,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     private let streamer: DeepSeekV41ExpertStreamer?
     /// Committed command buffers whose results the host has not needed yet. Drained
     /// by `settlePending` at every readback and at the end of a token.
-    private var pending: [(buffer: MTLCommandBuffer, stage: String)] = []
+    private var pending: [(buffer: MTLCommandBuffer, stage: String, isMixture: Bool)] = []
 
     /// Command buffers whose device time `recordDeviceTiming` still has to read, with
     /// the half they belong to (0 dense, 1 mixture). Only filled while
@@ -1326,9 +1362,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         return logits
     }
 
-    /// Runs a whole prompt as one chunk.
+    /// Runs `tokens` as blocks, appending them to whatever the cache already holds.
     ///
-    /// The prompt is run in blocks of `workspace.slots` positions, each block as one
+    /// The tokens are run in blocks of `workspace.slots` positions, each block as one
     /// pass: the dense stages dispatch over every position at once (the kernels read
     /// the token from `thread_position_in_grid.y`), and the stages that cannot —
     /// the cache write, the attention that reads it, the routed mixture, whose
@@ -1336,15 +1372,24 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// inside the same command buffer. The mix of the two is the block's contract:
     /// it must return exactly what the walk returns, which
     /// `DeepSeekV41DeviceGraphParityTests` checks against the host reference.
+    ///
+    /// The block starts at the cache's own position, so a chunk continues a sequence
+    /// rather than only opening one. That is the shape a speculative verify needs:
+    /// the drafted run is appended in one pass, and the position decides everything
+    /// the block would otherwise have to be told — the ring slot, the compressor's
+    /// group slot (`position % compressRatio`, filled by the positions that ran
+    /// before this call) and whether the group completes here. A fresh cache starts
+    /// the block at 0, which is the shape the reference's own prompt prefill takes.
     public func prefillChunk(_ tokens: [Int]) throws -> DeepSeekV41ChunkLogits {
         guard !tokens.isEmpty else { return DeepSeekV41ChunkLogits(last: []) }
         var last: [Float] = []
         let width = max(1, workspace.slots)
+        let startPosition = cache.storedPositions
         var offset = 0
         while offset < tokens.count {
             let end = min(offset + width, tokens.count)
             let block = Array(tokens[offset..<end])
-            last = try runBlock(block, startPosition: offset)
+            last = try runBlock(block, startPosition: startPosition + offset)
             offset = end
         }
         return DeepSeekV41ChunkLogits(last: last)
@@ -1441,7 +1486,8 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 buffer.commit()
                 pending.append((
                     buffer: buffer,
-                    stage: "layer \(layer.index) \(stage.rawValue) (block \(count))"
+                    stage: "layer \(layer.index) \(stage.rawValue) (block \(count))",
+                    isMixture: false
                 ))
                 stageBuffers.append((stage: stage.rawValue, buffer: buffer))
                 frontBuffers.append(buffer)
@@ -1461,7 +1507,11 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 }
                 calibrationEncoder.endEncoding()
                 calibration.commit()
-                pending.append((buffer: calibration, stage: "layer \(layer.index) calibration"))
+                pending.append((
+                    buffer: calibration,
+                    stage: "layer \(layer.index) calibration",
+                    isMixture: false
+                ))
                 stageBuffers.append((
                     stage: "calibration(\(count) dispatch)",
                     buffer: calibration
@@ -1527,7 +1577,8 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             try commit(
                 expertCommand,
                 stage: "layer \(layer.index) experts (block \(count))",
-                waiting: false
+                waiting: false,
+                mixture: true
             )
             if measuring {
                 marks.append(DispatchTime.now().uptimeNanoseconds)
@@ -1561,7 +1612,12 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 )
             }
             expertEncoder.endEncoding()
-            try commit(expertCommand, stage: "layer \(layer.index) experts", waiting: true)
+            try commit(
+                expertCommand,
+                stage: "layer \(layer.index) experts",
+                waiting: true,
+                mixture: true
+            )
             if measuring { timingBuffers.append((buffer: expertCommand, bucket: 1)) }
         }
         if measuring { marks.append(DispatchTime.now().uptimeNanoseconds) }
@@ -2402,7 +2458,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         let mixtureEncoded = measuring ? DispatchTime.now().uptimeNanoseconds : 0
         // No readback of this half exists, so it is only ordered: the next layer's
         // front half commits behind it on the same queue.
-        try commit(expertCommand, stage: "layer \(layer.index) experts", waiting: false)
+        try commit(expertCommand, stage: "layer \(layer.index) experts", waiting: false, mixture: true)
 
         if measuring {
             walkTiming.frontEncodeNanoseconds += frontEncoded - started
@@ -2425,7 +2481,14 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         for entry in walkBuffers {
             let start = entry.buffer.gpuStartTime
             let end = entry.buffer.gpuEndTime
-            guard end > start else { continue }
+            guard end > start else {
+                if entry.isMixture {
+                    walkTiming.mixtureUnwindowedBuffers += 1
+                } else {
+                    walkTiming.frontUnwindowedBuffers += 1
+                }
+                continue
+            }
             let nanoseconds = UInt64((end - start) * 1_000_000_000)
             if entry.isMixture {
                 walkTiming.mixtureDeviceNanoseconds += nanoseconds
@@ -3557,11 +3620,16 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         return encoder
     }
 
-    private func commit(_ commandBuffer: MTLCommandBuffer, stage: String, waiting: Bool = true) throws {
+    private func commit(
+        _ commandBuffer: MTLCommandBuffer,
+        stage: String,
+        waiting: Bool = true,
+        mixture: Bool = false
+    ) throws {
         commandBuffer.commit()
         // Held until it completes: the queue keeps a committed buffer alive, but ARC
         // would drop our reference and with it the error still to be reported.
-        pending.append((buffer: commandBuffer, stage: stage))
+        pending.append((buffer: commandBuffer, stage: stage, isMixture: mixture))
         guard waiting else { return }
         try settlePending()
     }
@@ -3575,7 +3643,22 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         let outstanding = pending
         pending.removeAll(keepingCapacity: true)
         for entry in outstanding {
+            let begin = recordsWalkTiming ? DispatchTime.now().uptimeNanoseconds : 0
             entry.buffer.waitUntilCompleted()
+            if recordsWalkTiming {
+                let end = DispatchTime.now().uptimeNanoseconds
+                // `gpuStartTime` shares mach's clock, which `DispatchTime` reads.
+                let windowStart = Double(entry.buffer.gpuStartTime) * 1_000_000_000
+                let lateStart = windowStart > Double(begin)
+                    ? UInt64(windowStart - Double(begin)) : 0
+                if entry.isMixture {
+                    walkTiming.mixtureDrainNanoseconds += end - begin
+                    walkTiming.mixtureLateStartNanoseconds += lateStart
+                } else {
+                    walkTiming.frontDrainNanoseconds += end - begin
+                    walkTiming.frontLateStartNanoseconds += lateStart
+                }
+            }
             if let error = entry.buffer.error {
                 throw DeepSeekV41EngineError.commandFailed("\(entry.stage): \(error)")
             }

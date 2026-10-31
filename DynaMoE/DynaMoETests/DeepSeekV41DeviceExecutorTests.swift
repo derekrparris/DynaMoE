@@ -2227,3 +2227,83 @@ final class DeepSeekV41FP8GemvKernelTests: XCTestCase {
         )
     }
 }
+
+/// What a committed command buffer costs to START once the queue has gone idle.
+///
+/// The walk's mixture drain is ~2.5 ms/layer against a ~0.7 ms device window, and
+/// the late start (the gap between the host beginning to wait and the buffer's own
+/// window opening) carries most of the difference. This separates the two possible
+/// causes: what the queue costs when it is already fed, and what an idle gap adds
+/// before the next buffer is picked up. No model, no metrics, just the driver.
+final class DeepSeekV41CommandStartCostTests: XCTestCase {
+
+    func testWhatAnIdleGapCostsACommandBuffer() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        guard let library = device.makeDefaultLibrary() else {
+            throw XCTSkip("no default library")
+        }
+        guard let function = library.makeFunction(name: "clear_vector_f32") else {
+            throw XCTSkip("clear_vector_f32 is missing")
+        }
+        guard let queue = device.makeCommandQueue() else {
+            throw XCTSkip("no compute queue")
+        }
+        let pipeline = try device.makeComputePipelineState(function: function)
+        guard let target = device.makeBuffer(length: 4096, options: .storageModeShared) else {
+            throw XCTSkip("no scratch buffer")
+        }
+
+        /// One buffer, committed after the queue has been idle for `idleMilliseconds`,
+        /// reporting how long after the wait began its window opened and how long the
+        /// wait itself took.
+        func measure(idleMilliseconds: Double, attempts: Int = 41) -> (start: Double, drain: Double) {
+            var starts: [Double] = []
+            var drains: [Double] = []
+            for _ in 0..<attempts {
+                guard let buffer = queue.makeCommandBuffer(),
+                      let encoder = buffer.makeComputeCommandEncoder() else { continue }
+                encoder.setComputePipelineState(pipeline)
+                encoder.setBuffer(target, offset: 0, index: 0)
+                encoder.dispatchThreads(
+                    MTLSize(width: 16, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 16, height: 1, depth: 1)
+                )
+                encoder.endEncoding()
+                if idleMilliseconds > 0 {
+                    Thread.sleep(forTimeInterval: idleMilliseconds / 1000)
+                }
+                buffer.commit()
+                let begin = DispatchTime.now().uptimeNanoseconds
+                buffer.waitUntilCompleted()
+                let end = DispatchTime.now().uptimeNanoseconds
+                let windowStart = Double(buffer.gpuStartTime) * 1_000_000_000
+                starts.append(max(0, (windowStart - Double(begin)) / 1_000_000))
+                drains.append(Double(end - begin) / 1_000_000)
+            }
+            func median(_ values: [Double]) -> Double {
+                let sorted = values.sorted()
+                return sorted.isEmpty ? 0 : sorted[sorted.count / 2]
+            }
+            return (median(starts), median(drains))
+        }
+
+        // Warm the pipeline up so the first arm is not paying for shader setup.
+        _ = measure(idleMilliseconds: 0, attempts: 5)
+
+        let fed = measure(idleMilliseconds: 0)
+        let shortGap = measure(idleMilliseconds: 2)
+        let longGap = measure(idleMilliseconds: 10)
+        print(
+            String(
+                format: "🔎 [dsv41 command start] fed: late start %.3f ms, drain %.3f ms; "
+                    + "2 ms gap: late start %.3f ms, drain %.3f ms; "
+                    + "10 ms gap: late start %.3f ms, drain %.3f ms",
+                fed.start, fed.drain,
+                shortGap.start, shortGap.drain,
+                longGap.start, longGap.drain
+            )
+        )
+    }
+}

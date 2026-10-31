@@ -5360,3 +5360,120 @@ work it waits for, and the fill cannot move off the critical path without either
 arena whose slots the previous layer's mixture is not reading, or a way to know layer N's
 routing before layer N's attention has run. Neither is a kernel change; both are a graph
 change and both need their own measurement.
+
+## DSV4.1 #22: THE DECODE STEP IS 72 ms OF WORK AND ~190 ms OF WAITING, AND A BATCHED VERIFY IS 2.16x CHEAPER
+
+#21 ranked the host round trip first and named two graph changes. This slice measured
+where the round trip actually goes before building either, and the answer moved the
+target: the walk's cost is not the wait as such, it is that a decode step cannot batch.
+
+### What the round trip is made of
+
+`DeepSeekV41WalkTiming` already split a position into encode, wait, fill and device
+windows. What it could not say is whether `front wait` (126-207 ms of a ~270 ms position)
+was the GPU still working or the CPU and GPU handing the queue back and forth. Three
+counters now answer it, all off unless `recordsWalkTiming` is on:
+
+- `frontDrainNanoseconds` / `mixtureDrainNanoseconds` — wall time inside each
+  `waitUntilCompleted`, split by the half the buffer belongs to.
+- `frontLateStartNanoseconds` / `mixtureLateStartNanoseconds` — how long after the host
+  began waiting the buffer's own `gpuStartTime` was stamped, i.e. a drain decomposed into
+  late start + device window + tail.
+- `frontUnwindowedBuffers` / `mixtureUnwindowedBuffers` — buffers Metal reported an empty
+  window for, so the device totals can be read as a floor rather than a measurement.
+
+One published 52-position walk, position 48 (`/tmp/walk_late.log`):
+
+| bucket | ms/position |
+|---|---|
+| front encode | 4.5 |
+| front wait | 100.6 |
+| — drained front | 29.5 |
+| — drained mixture | 78.5 |
+| — late start, front | **0.0** |
+| — late start, mixture | **49.0** |
+| expert fill | 69.2 |
+| mixture encode | 3.6 |
+| front device | 27.5 |
+| mixture device | 26.0 |
+
+The dense half's wait is its own device window: the host never catches that buffer
+unstarted. The mixture half's wait is 78.5 ms against a 26.0 ms window, and **49.0 ms of
+the difference is the buffer not having started when the host asked for it** — 1.2 ms per
+layer. That is the fill's shadow: the routing readback needs the dense half finished, the
+fill runs on the host for ~1.7 ms per layer with nothing on the GPU, and then the next
+commit is picked up late.
+
+A microbenchmark (`DeepSeekV41CommandStartCostTests`) prices that pickup on its own, with
+no model in the way — one trivial dispatch, committed after an idle gap:
+
+| queue state | late start | drain |
+|---|---|---|
+| fed | 0.09 ms | 0.17 ms |
+| idle 2 ms | 0.46 ms | 0.53 ms |
+| idle 10 ms | 0.59 ms | 0.68 ms |
+
+So a ~2 ms idle gap costs ~0.5 ms before the next buffer starts, and the walk's 1.2 ms is
+that same effect on a buffer that binds an arena, an index list and a dozen vectors. The
+number matters because it is **not** recoverable by rearranging dispatches: no kernel
+change can keep a queue fed across a readback that has to happen.
+
+### The walk with nothing to read
+
+The same walk, timed over tokens the arena already held (zero expert misses), costs
+**71.8 ms/position** against 263 ms with a realistic miss rate. Everything above the
+72 ms is the expert stream and the stalls it causes, so a decode step is ~72 ms of work
+and ~190 ms of paying for one position at a time. Per layer: one readback, one ~1.7 ms
+fill, one late commit.
+
+### What batching is worth
+
+Speculative decoding is the only structure that lets a decode step batch, and the block
+path it would verify through already exists (`prefillChunk`, compared with the walk on the
+published checkpoint). `testWhatABatchedVerifyWouldSaveOverAWalk` prices both arms on the
+published checkpoint over eight drafted positions, each arm on its own token runs so
+neither is served by what the other already read:
+
+```
+batched verify vs walk, 8 drafted positions:
+  walk  1226.6 ms (153.3 ms/position, 10256 MB read),
+  block  567.4 ms ( 70.9 ms/position,  1357 MB read) -> 2.16x
+```
+
+The block reads **7.6x fewer bytes**: one expert union per block instead of one set per
+position, which is the steady-state ~1 GB/token this model streams at a 70-78% arena hit
+rate. The wall-clock win is 2.16x rather than 7.6x because the block still pays the head
+and the same kernels.
+
+That ratio is also the acceptance bar: a verify of eight costs 567 ms, so it beats
+walking the same eight (1226 ms) once **more than ~3.7 of the eight are accepted**, i.e.
+above a ~47% acceptance rate. The number is what a draft head has to clear, and it is the
+first measured bar this port has for DSpark.
+
+Two earlier fixtures are worth recording as traps. A block/walk A/B over tokens the
+arena already held read **0 MB in both arms** and priced only kernel work: 47.7 vs
+71.8 ms/position, 1.51x, with the fill that batching actually amortizes absent. And the
+same test re-timed over the same tokens reads nothing at all, because the arena is shared
+by the whole runtime — hence one token run per arm per repetition.
+
+### What landed
+
+`prefillChunk` now starts at the cache's own position instead of 0, so a chunk CONTINUES a
+sequence rather than only opening one. That is the verify seam, and the position is what
+makes it correct: the ring slot, the compressor's group slot (`position % compress_ratio`,
+filled by the positions that ran before the call) and whether the group completes are all
+derived from the absolute position, so a mid-sequence chunk is the same graph as a
+mid-sequence walk. `testAChunkContinuesFromTheCacheLikeTheWalk` pins it on a fixture with
+a compressed layer, starting the continuation one position INTO a group so the chunk has
+to read a slot an earlier position left behind.
+
+Nothing else changed: the verify still needs the draft head on the device (the target
+layers' `mainHidden` capture), per-position logits capture in the block (`finishBlock`
+currently writes the last slot's), and cache rewind on rejection. This slice measured the
+prize and opened the seam.
+
+**What is left.** The batched verify, now with a bar to clear (~47% acceptance over eight
+drafts) and a measured multiplier (2.16x per position, 7.6x less I/O). The other two
+levers #21 named are dead ends for the same reason the numbers here show: the per-layer
+round trip is dominated by the idle gap the fill leaves, which only batching removes, and
+the arena's capacity has already been shown not to be the constraint.
