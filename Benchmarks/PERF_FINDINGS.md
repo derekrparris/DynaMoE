@@ -6006,3 +6006,116 @@ an M5 Max with this SSD, and the reason is not acceptance (50-55% is fine) but t
 narrow batch is the regime where batching stops paying. The drafter's remaining value would
 have to come from somewhere other than a linear chain's verify, and no such use is
 proposed here.
+
+## DSV4.1 #27: THE TOOL DIALECT IS MEASURED, AND IT IS NOT THE ONE THE VOCABULARY SUGGESTS
+
+The open item was "the tool dialect". Nothing in the checkpoint defines it: `tokenizer_config.json`
+carries no `chat_template`, `encoding/` has no tool path, and the README says nothing about tools.
+What the checkpoint DOES carry is a vocabulary: nine `tool`-joined special tokens (calls begin/end,
+call begin/end, sep, outputs begin/end, output begin/end, ids 128806-128814) and one bare DSML token
+(128825, U+FF5C "DSML" U+FF5C). Which of those the model actually uses, and what grammar surrounds
+them, is a question about weights, so it was answered by asking the model.
+
+### The outbound half: the PROMPT SHAPE picks the dialect
+
+`testWhatToolDialectTheCheckpointEmits` renders four prompts over one tool (`get_current_time`,
+`city` required) and runs a greedy turn on each. Three of them hand the model a call SCHEMATIC built
+from the marker strings; the fourth hands it the instruction block this app actually ships. Same
+catalogue, same `## Tools` header, same preamble, same question: only the call grammar differs.
+
+| variant | prompt tokens | finish | generated | emitted |
+|---|---|---|---|---|
+| schematic+chat | 168 | eos | 42 | plain `tool_call_name` / `tool_call_arguments` tags |
+| no-schematic | 86 | eos | 37 | `tool_call` tag around `{"name": …, "arguments": …}` |
+| schematic+think | 168 | eos | 51 | reasoning, then the plain tags |
+| **instructions-only** | 306 | eos | 38 | **the DSML tags** |
+
+The first three reproduce what they were shown, which is what a chat prompt with a template in it is
+supposed to do: a model shown a schematic copies the schematic. The fourth is the one that matters,
+because it is the prompt this app builds, and it answers in DSML. The generated pieces of that turn,
+one token each, are the proof of how the tag is assembled:
+
+```
+"\n\n" "<" "<bar>DSML<bar>" " calls" ">\n" "<" "<bar>DSML<bar>" " invoke" " name" "=\"" …
+```
+
+So an opening DSML tag is `<`, then ONE vocabulary id, then ordinary text with a LEADING SPACE
+(`" invoke name=\""`). The closer is `</`, the same id, then `" invoke>"`. The id is the whole tag
+machinery; everything else is spelled out as text, which means the tags cannot be matched by token
+id and must be matched as strings. (`<bar>` stands for U+FF5C, written that way here because a
+rendered view strips it.)
+
+### The discovery: an agent turn does not freeze on an eos
+
+`testAnAgentTurnFreezesOnAToolCall` runs the whole agent path (the harness-shaped system prompt, the
+turn runner, the engine's freeze hook, the call rewrite) on real weights. Before this slice the
+dialect knew only the plain-text form, and the turn came back `eos` after 41 tokens with zero calls
+parsed:
+
+```
+\n\n<calls>\n<invoke name="shell_run">\n<parameter name="command" string="true">ls -la /tmp</parameter>\n</invoke>\n</calls>
+```
+
+(also with the DSML id elided). It is a MULTI-CALL container: one `calls` wrapper holding one
+`invoke` per tool, each carrying `parameter` elements whose `name` is the argument's JSON name and
+whose `string="true"` marks a literal value (`string="false"` marks JSON, so a number stays a
+number). That is a richer grammar than the plain-text form: typed arguments, no JSON-in-text
+parsing, and a name that cannot be confused with prose.
+
+The failure is the reason the test exists. A parser that only parses its own fixture is a parser for
+the fixture: this one parsed every hand-written plain-text case and then dropped the generation it
+was written for.
+
+### The inbound half: not discriminating
+
+`testWhatToolResultShapeTheCheckpointReads` gives the same conversation the same payload
+(`{"local_time": "14:05"}`) inside five different containers: the vocabulary's `output` pair, its
+`outputs` pair, a plain `tool_call_output` tag, a `tool_response` tag, and bare JSON. All five
+produced the IDENTICAL answer, "It's currently **14:05 (2:05 PM)** in Paris.", in 16 tokens each.
+The checkpoint reads the payload wherever it is, so the container is free to be the one that costs
+least: the family's own `output` pair, one id on each side.
+
+Note what this does NOT support: an earlier note in `AGENTS.md` claimed the model's tool results are
+`<tool_result>…</tool_result>` inside a user turn. That spelling appears nowhere in the checkpoint's
+files (no `.py`, no `.md`), and the measurement above shows the model does not need it.
+
+### What was wired
+
+All of it is a daisy-chain into the canonical call block
+`<tool_call><function=NAME>JSON</function></tool_call>`, because that is the only shape every
+downstream consumer (executor, HITL gate, gesture split, timeline, history) understands.
+
+- `DeepSeekV41ToolDialect` grew the DSML grammar: `dsmlTag` / `dsmlCallsOpen` / `dsmlInvokeTag(name:)`
+  / `dsmlParameterTag(name:isString:)`, a `canonicalizeDSMLBlocks` scan that turns each `invoke` into
+  a canonical block and then drops the container tags, and a parameter reader that keeps
+  `string="false"` values as JSON. The tag constants are BUILDERS, never literals: a rendered view
+  strips U+FF5C, so a typed tag looks right and matches nothing.
+- Truncation still does not execute. An invoke with no closer, or a parameter with no closer, is left
+  as text: a call the model never finished asking for must not run with a half-built argument list.
+- `shouldFreeze` now stops on the `calls` closer, or on an `invoke` closer when the model wrote a
+  single call with no container. The container close is one token after the last invoke close, which
+  is the cheapest complete point (`#26`'s economics: a token costs ~263 ms).
+- `instructions()` now TEACHES DSML, built from the tag builders. Teaching a dialect the model was
+  not post-trained on is how a call becomes prose, and the measurement says which one it was
+  post-trained on.
+- The grammar mask stays OFF for this family. Its marker vocabulary is Qwen's, and forcing a
+  `<function=>` shape on a model that writes DSML tags is how a valid call becomes unsamplable.
+  Argument validation happens at execution instead.
+- The chat bubble truncates at the first DSML tag, beside the existing plain-tag strip.
+- The plain-text and JSON forms remain PARSEABLE (they are what the schematic prompt draws), they are
+  just no longer what the instructions ask for.
+
+After the change the same agent turn ends `toolFreeze` after 41 tokens and reports
+`shell_run["command": ls -la /tmp]`. The 41 tokens are unchanged: freezing on the container close
+costs nothing here because the container close IS the model's last token.
+
+### The numbers that are worth remembering
+
+| item | value |
+|---|---|
+| DSML token id | 128825, U+FF5C "DSML" U+FF5C, no word-joining space inside |
+| tool special tokens (unused by the model) | 128806-128814, one id each |
+| schematic prompt → | 42 tokens, plain-text tags (37 with no schematic) |
+| shipped instruction block → | 38 tokens, DSML |
+| inbound container | five shapes, all read, 16 tokens each |
+| agent turn after the fix | `toolFreeze`, 41 tokens, 1 call parsed |

@@ -1637,4 +1637,376 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         print("🔎 [dsv41 real] \(runtime.expertStreamer?.describe() ?? "no streamer")")
         withExtendedLifetime(engine) {}
     }
+
+    /// What dialect the checkpoint actually emits when it is asked to call a tool.
+    ///
+    /// Nothing in this repository defines the tool dialect from the checkpoint's own
+    /// files: it ships no chat template at all (`tokenizer_config.json` has no
+    /// `chat_template`, so `DeepSeekV41PromptDialect.resolve` falls back) and its
+    /// `encoding/` package has no tool path. The tokenizer DOES carry the special ids
+    /// the family uses (`tool▁calls▁begin`, `tool▁call▁begin`, `tool▁sep`,
+    /// `tool▁call▁end`, `tool▁calls▁end`, and the `output`/`outputs` pair), which
+    /// fixes the SPELLING but not the grammar around it: whether the body carries the
+    /// literal word "function", and whether the arguments are bare JSON or fenced.
+    ///
+    /// So this asks the model. It renders the published V3.1 tool block from the
+    /// marker strings (never retyped: a rendered view strips the fullwidth bars), runs
+    /// a short turn, and prints the raw text with every non-ASCII codepoint escaped,
+    /// plus each generated token's piece. A dialect the model does not emit is a
+    /// dialect a parser must not look for.
+    func testWhatToolDialectTheCheckpointEmits() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        guard let tokenizer = try? DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        ) else {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let dialect = DeepSeekV41PromptDialect.resolve(snapshotDir: snapshot)
+        let m = dialect.markers
+        let schematic = m.toolCallsBegin + m.toolCallBegin + "tool_call_name"
+            + m.toolCallSeparator + "tool_call_arguments" + m.toolCallEnd + m.toolCallsEnd
+        // The markers have to be SINGLE ids, or the model is being asked to copy a
+        // spelling it never sees as a token and its answer says nothing about the
+        // dialect it was trained on.
+        for (label, marker) in [
+            ("callsBegin", m.toolCallsBegin), ("callBegin", m.toolCallBegin),
+            ("sep", m.toolCallSeparator), ("callEnd", m.toolCallEnd),
+            ("callsEnd", m.toolCallsEnd), ("outputBegin", m.toolOutputBegin),
+            ("outputEnd", m.toolOutputEnd), ("outputsBegin", m.toolOutputsBegin),
+            ("outputsEnd", m.toolOutputsEnd), ("assistant", m.assistant)
+        ] {
+            let ids = (try? tokenizer.encode(text: marker)) ?? []
+            print("🔎 [dsv41 real] marker \(label): \(ids) \(marker.debugDescription)")
+        }
+        let schema = #"{"type": "object", "properties": {"city": {"type": "string", "description": "City name"}}, "required": ["city"]}"#
+        func toolBlock(withFormatInstruction: Bool) -> String {
+            var text = """
+            You are a helpful assistant.
+
+            ## Tools
+            You have access to the following tools:
+
+            ### get_current_time
+            Description: Returns the current local time for a city.
+
+            Parameters: \(schema)
+            """
+            guard withFormatInstruction else { return text }
+            text += """
+
+
+            IMPORTANT: ALWAYS adhere to this exact format for tool use:
+            \(schematic)
+
+            Where:
+            - `tool_call_name` must be an exact match to one of the available tools
+            - `tool_call_arguments` must be valid JSON that strictly follows the tool's Parameters Schema
+            - For multiple tool calls, chain them directly without separators or spaces
+            """
+            return text
+        }
+        // Four prompts, because one answer cannot separate "the model knows this
+        // dialect" from "the model copied the example it was handed". The fourth is
+        // the discriminator: the SAME catalogue with the SCHEMATIC swapped for the
+        // instruction block this app actually ships, which holds the preamble
+        // constant and changes only what the call grammar is taught with.
+        let instructionsOnly = toolBlock(withFormatInstruction: false) + "\n\n"
+            + DeepSeekV41ToolDialect.instructions()
+        let variants: [(label: String, system: String, thinking: Bool)] = [
+            ("schematic+chat", toolBlock(withFormatInstruction: true), false),
+            ("no-schematic", toolBlock(withFormatInstruction: false), false),
+            ("schematic+think", toolBlock(withFormatInstruction: true), true),
+            ("instructions-only", instructionsOnly, false)
+        ]
+        let ask = "What time is it in Paris right now? Use the tool."
+        let prompts = variants.map { variant in
+            dialect.render(
+                turns: [.init(isUser: true, text: ask)],
+                cleanSystem: variant.system,
+                thinkingEnabled: variant.thinking,
+                effort: nil
+            )
+        }
+        let encoded = try prompts.map { try tokenizer.encode(text: $0) }
+        for (index, ids) in encoded.enumerated() {
+            print("🔎 [dsv41 real] tool probe '\(variants[index].label)': \(ids.count) tokens")
+            XCTAssertFalse(ids.isEmpty)
+        }
+
+        let drawCount = 64
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: (encoded.map(\.count).max() ?? 0) + drawCount + 8,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let eos = config.eosTokenIDs.map { UInt32(clamping: $0) }
+        let settings = DeepSeekV41TurnRunner.Settings(
+            temperature: 0,
+            topP: 1,
+            minP: 0,
+            topK: 1,
+            repetitionPenalty: 1,
+            maxTokens: drawCount,
+            eosTokenIds: eos,
+            stopSequences: []
+        )
+        for (index, promptIds) in encoded.enumerated() {
+            let result = try await Task.detached { [runtime, promptIds] in
+                let forward = runtime.forward()
+                forward.reset()
+                return try DeepSeekV41TurnRunner.run(
+                    forward: forward,
+                    promptTokenIds: promptIds,
+                    settings: settings,
+                    sample: { logits, _ in Self.argmax(logits) },
+                    decode: { (try? tokenizer.decode(ids: $0)) ?? "" }
+                )
+            }.value
+            let label = variants[index].label
+            print(
+                "🔎 [dsv41 real] tool probe '\(label)': \(result.finishReason) after "
+                    + "\(result.tokensGenerated) token(s)"
+            )
+            print("🔎 [dsv41 real] tool probe '\(label)' text: \(result.text.debugDescription)")
+            let pieces = result.generatedTokenIds.map { id in
+                ((try? tokenizer.decode(ids: [id])) ?? "?").debugDescription
+            }
+            print("🔎 [dsv41 real] tool probe '\(label)' pieces: \(pieces.joined(separator: " "))")
+            XCTAssertGreaterThan(result.tokensGenerated, 0)
+        }
+        withExtendedLifetime(engine) {}
+    }
+
+    /// Which result shape the checkpoint can READ, once it has made a call.
+    ///
+    /// The call probe settled the outbound half: this checkpoint emits a plain-text
+    /// `<tool_call_name>name</tool_call_name>` plus a `<tool_call_arguments>` JSON
+    /// body, even when it is shown the vocabulary's own `tool▁call` special tokens
+    /// (all nine of which do tokenize as single ids). The inbound half is not
+    /// defined anywhere in the checkpoint, so the loop's choice of result container
+    /// is a guess unless it is measured: get it wrong and the model answers from the
+    /// pre-call context as if the tool had never run.
+    ///
+    /// Each variant is the same conversation with a DIFFERENT result container, and
+    /// the result carries a value the model could not know (`14:05`). A reply that
+    /// states it understood; a reply that ignores it did not.
+    func testWhatToolResultShapeTheCheckpointReads() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        guard let tokenizer = try? DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        ) else {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let dialect = DeepSeekV41PromptDialect.resolve(snapshotDir: snapshot)
+        let m = dialect.markers
+        let system = """
+        You are a helpful assistant.
+
+        ## Tools
+        You have access to the following tools:
+
+        ### get_current_time
+        Description: Returns the current local time for a city.
+
+        Parameters: {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+        """
+        let ask = "What time is it in Paris right now? Use the tool."
+        let call = "I'll check the current time in Paris for you.\n\n"
+            + "<tool_call_name>get_current_time</tool_call_name>\n"
+            + "<tool_call_arguments>{\"city\": \"Paris\"}</tool_call_arguments>"
+        let payload = "{\"city\": \"Paris\", \"local_time\": \"14:05\"}"
+        let variants: [(label: String, result: String)] = [
+            (
+                "output-special",
+                m.toolOutputBegin + payload + m.toolOutputEnd
+            ),
+            (
+                "outputs-special",
+                m.toolOutputsBegin + m.toolOutputBegin + payload + m.toolOutputEnd
+                    + m.toolOutputsEnd
+            ),
+            ("plain-tool-output", "<tool_call_output>" + payload + "</tool_call_output>"),
+            ("tool-response", "<tool_response>" + payload + "</tool_response>"),
+            ("bare-json", payload)
+        ]
+        // The continuation the app would build: the completed call turn, then the
+        // result, then a fresh assistant turn with the reasoning channel closed.
+        func continuation(_ result: String) -> String {
+            m.beginOfSentence
+                + m.system
+                + dialect.systemBody(cleanSystem: system, thinkingEnabled: false, effort: nil)
+                + m.user + ask
+                + m.assistant + m.reasoningClose + call + m.endOfSentence
+                + result
+                + m.assistant + m.reasoningClose
+        }
+        let encoded = try variants.map { try tokenizer.encode(text: continuation($0.result)) }
+        for (index, ids) in encoded.enumerated() {
+            print("🔎 [dsv41 real] result probe '\(variants[index].label)': \(ids.count) tokens")
+        }
+
+        let drawCount = 48
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: (encoded.map(\.count).max() ?? 0) + drawCount + 8,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let eos = config.eosTokenIDs.map { UInt32(clamping: $0) }
+        let settings = DeepSeekV41TurnRunner.Settings(
+            temperature: 0,
+            topP: 1,
+            minP: 0,
+            topK: 1,
+            repetitionPenalty: 1,
+            maxTokens: drawCount,
+            eosTokenIds: eos,
+            stopSequences: []
+        )
+        for (index, promptIds) in encoded.enumerated() {
+            let result = try await Task.detached { [runtime, promptIds] in
+                let forward = runtime.forward()
+                forward.reset()
+                return try DeepSeekV41TurnRunner.run(
+                    forward: forward,
+                    promptTokenIds: promptIds,
+                    settings: settings,
+                    sample: { logits, _ in Self.argmax(logits) },
+                    decode: { (try? tokenizer.decode(ids: $0)) ?? "" }
+                )
+            }.value
+            let label = variants[index].label
+            print(
+                "🔎 [dsv41 real] result probe '\(label)': \(result.finishReason) after "
+                    + "\(result.tokensGenerated) token(s), read=\(result.text.contains("14"))"
+            )
+            print("🔎 [dsv41 real] result probe '\(label)' text: \(result.text.debugDescription)")
+            XCTAssertGreaterThan(result.tokensGenerated, 0)
+        }
+        withExtendedLifetime(engine) {}
+    }
+
+    /// The whole agent path on real weights: a system prompt in this checkpoint's
+    /// tool dialect, a question that needs a tool, the freeze hook the engine
+    /// installs, and the call it produces.
+    ///
+    /// The probes above established the shape; this is the assertion that the shape
+    /// arrives in an actual turn, that generation stops ON the call rather than
+    /// narrating after it, and that `DeepSeekV41ToolDialect` turns what arrived into
+    /// an executable call. A dialect that parses a hand-written fixture but not a
+    /// generation is a parser for the fixture.
+    func testAnAgentTurnFreezesOnAToolCall() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        guard let tokenizer = try? DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        ) else {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let dialect = DeepSeekV41PromptDialect.resolve(snapshotDir: snapshot)
+        let system = """
+        You are an expert AI software engineering assistant with direct access to local macOS tools.
+
+        # Tools
+
+        ### shell_run
+        Description: Runs a shell command and returns its output.
+        Parameters: {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}
+
+        \(DeepSeekV41ToolDialect.instructions())
+        """
+        let prompt = dialect.render(
+            turns: [.init(isUser: true, text: "List the files in /tmp using the shell_run tool.")],
+            cleanSystem: system,
+            thinkingEnabled: false,
+            effort: nil
+        )
+        let promptIds = try tokenizer.encode(text: prompt)
+
+        let drawCount = 96
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: promptIds.count + drawCount + 8,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let eos = config.eosTokenIDs.map { UInt32(clamping: $0) }
+        let settings = DeepSeekV41TurnRunner.Settings(
+            temperature: 0,
+            topP: 1,
+            minP: 0,
+            topK: 1,
+            repetitionPenalty: 1,
+            maxTokens: drawCount,
+            eosTokenIds: eos,
+            stopSequences: []
+        )
+        let markers = dialect.markers
+        let output = try await Task.detached { [runtime, promptIds] in
+            let forward = runtime.forward()
+            forward.reset()
+            return try DeepSeekV41TurnRunner.run(
+                forward: forward,
+                promptTokenIds: promptIds,
+                settings: settings,
+                sample: { logits, _ in Self.argmax(logits) },
+                shouldFreeze: { text in
+                    DeepSeekV41ToolDialect.shouldFreeze(text, markers: markers)
+                },
+                decode: { (try? tokenizer.decode(ids: $0)) ?? "" }
+            )
+        }.value
+        print(
+            "🔎 [dsv41 real] agent turn: \(output.finishReason.rawValue) after "
+                + "\(output.tokensGenerated) token(s)"
+        )
+        print("🔎 [dsv41 real] agent turn text: \(output.text.debugDescription)")
+        XCTAssertEqual(
+            output.finishReason, .toolFreeze,
+            "the turn did not stop on a call: \(output.text.debugDescription)"
+        )
+        let canonical = DeepSeekV41ToolDialect.canonicalized(output.text, markers: markers)
+        let parsed = StreamingToolParser.shared.parseStreamingToolCalls(
+            from: canonical, format: .qwenXML
+        )
+        print(
+            "🔎 [dsv41 real] agent turn calls: "
+                + parsed.calls.map { "\($0.name)\($0.arguments)" }.joined(separator: ", ")
+        )
+        XCTAssertEqual(parsed.calls.count, 1)
+        XCTAssertEqual(parsed.calls.first?.name, "shell_run")
+        // The command itself is the model's own choice (`ls -la /tmp` when it ran),
+        // so the assertion is that a real command arrived, not which one.
+        let command = parsed.calls.first?.arguments["command"] as? String
+        XCTAssertEqual(command?.hasPrefix("ls"), true, "no shell command: \(command ?? "nil")")
+        // The result turn the loop appends is the family's one-token output pair
+        // around the payload, which is what keeps the continuation token-cheap.
+        let resultIds = try tokenizer.encode(
+            text: DeepSeekV41ToolDialect.resultTurn(
+                payload: "total 0\nfile_a.txt", markers: markers
+            )
+        )
+        XCTAssertEqual(resultIds.first, 128812)
+        XCTAssertEqual(resultIds.last, 128813)
+        XCTAssertGreaterThan(resultIds.count, 2)
+        withExtendedLifetime(engine) {}
+    }
 }
