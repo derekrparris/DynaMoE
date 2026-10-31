@@ -915,9 +915,18 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
     /// against the walk — and the attention kernel at these widths by
     /// `testWhatOneAttentionDispatchCostsAtThePublishedWidths`. This case only
     /// answers where a block's device time goes when the widths are the checkpoint's.
-    func testWhereABlocksRemainingTimeGoesAtThePublishedWidths() throws {
-        let positions = 640
-        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: .publishedWidths())
+    /// Times one prefill of `positions` tokens and prints the per-stage table.
+    ///
+    /// Two runs, fastest kept: the point is a ranking, and a ranking only needs the run
+    /// the machine was not busy during. Stage rows are divided by positions times
+    /// layers, so a table taken on a one-layer fixture and one taken on a two-layer
+    /// fixture are both "what one position pays through one layer", and the stage keys
+    /// are shared across layers (a compressed layer's pool lands inside `writeLatent`).
+    private func stageTable(
+        label: String,
+        checkpoint: DeepSeekV41SyntheticCheckpoint,
+        positions: Int
+    ) throws {
         let runtime = try makeRuntime(checkpoint)
         let device = runtime.forward()
         let slots = DeepSeekV41DevicePlan.chunkSlots(
@@ -927,9 +936,9 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
         let shape = checkpoint.shape
         let tokens = (0..<positions).map { $0 % checkpoint.config.vocabSize }
         print(
-            String(
-                format: "[dsv41 published] hidden=%d heads=%d head_dim=%d record=%d "
-                    + "window=%d slots=%d layers=%d hcMult=%d",
+            label + String(
+                format: " hidden=%d heads=%d head_dim=%d record=%d window=%d slots=%d "
+                    + "layers=%d hcMult=%d gatherRows=%d context=%d",
                 shape.hidden,
                 shape.heads,
                 shape.headDim,
@@ -937,12 +946,12 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
                 shape.window,
                 slots,
                 shape.layers,
-                shape.hcMult
+                shape.hcMult,
+                DeepSeekV41DevicePlan.gatherRowBudget(config: checkpoint.config),
+                shape.contextLength
             )
         )
 
-        // Two runs, fastest kept: the point is a ranking, and a ranking only needs the
-        // run the machine was not busy during.
         var fastest: (wall: Double, stages: [String: UInt64], timing: DeepSeekV41BlockTiming)?
         for _ in 0..<2 {
             device.reset()
@@ -971,25 +980,28 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
         let total = measured.stages.values.reduce(0, +)
 
         print(
-            String(
-                format: "[dsv41 published] positions=%d, %.2f ms/position whole block",
+            label + String(
+                format: " positions=%d layers=%d, %.2f ms/position whole block "
+                    + "(%.2f per position/layer)",
                 positions,
-                measured.wall / Double(positions)
+                shape.layers,
+                measured.wall / Double(positions),
+                measured.wall / Double(positions * max(1, shape.layers))
             )
         )
         print(
-            String(
-                format: "[dsv41 published] host per position/layer: dense encode %.4f  "
-                    + "front wait %.4f  mixture encode %.4f ms",
+            label + String(
+                format: " host per position/layer: dense encode %.4f  front wait %.4f  "
+                    + "mixture encode %.4f ms",
                 per.denseEncode,
                 per.wait,
                 per.mixtureEncode
             )
         )
         print(
-            String(
-                format: "[dsv41 published] DEVICE per position/layer: dense %.4f  mixture "
-                    + "%.4f ms (dense holds %.0f%%); encode is %.0f%% of accounted time",
+            label + String(
+                format: " DEVICE per position/layer: dense %.4f  mixture %.4f ms "
+                    + "(dense holds %.0f%%); encode is %.0f%% of accounted time",
                 per.denseDevice,
                 per.mixtureDevice,
                 denseShare * 100,
@@ -998,14 +1010,74 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
         )
         for (stage, nanoseconds) in measured.stages.sorted(by: { $0.value > $1.value }) {
             print(
-                String(
-                    format: "[dsv41 published] %-26@ %8.3f ms/pos  %5.1f%%",
+                label + String(
+                    format: " %-26@ %8.3f ms/pos/layer  %5.1f%%",
                     stage as NSString,
-                    Double(nanoseconds) / Double(positions) / 1_000_000,
+                    Double(nanoseconds) / Double(positions * max(1, shape.layers)) / 1_000_000,
                     Double(nanoseconds) / Double(max(1, total)) * 100
                 )
             )
         }
+    }
+
+    func testWhereABlocksRemainingTimeGoesAtThePublishedWidths() throws {
+        try stageTable(
+            label: "[dsv41 published]",
+            checkpoint: DeepSeekV41SyntheticCheckpoint(shape: .publishedWidths()),
+            positions: 640
+        )
+    }
+
+    /// The same table with the compressed half switched ON.
+    ///
+    /// `#15` closed with one load-bearing caveat: the fixture declares no
+    /// `compress_ratios > 0`, so attention reads the window half of its row budget
+    /// only, the compressor's two per-position projections never run, and
+    /// `writeLatent` carries no pool term. Every figure in the published table is
+    /// therefore a lower bound for a compressed layer, and the share that table puts on
+    /// `writeLatent` is a share of a cheaper stage than the checkpoint's.
+    ///
+    /// This runs the identical accounting on
+    /// `DeepSeekV41SyntheticShape.compressedPublishedWidths`: one window-only layer and
+    /// one compressed layer at the checkpoint's own 50/50 split, a 640-row window plus
+    /// `index_topk` 512 compressed rows, and a context long enough that the last
+    /// positions keep the full 512. The stage keys are shared across layers, so a stage
+    /// that only a compressed layer runs (`compressPool`'s two projections land inside
+    /// `writeLatent`) reads as the mix the model actually pays.
+    func testWhereABlocksRemainingTimeGoesWithCompressedLayers() throws {
+        try stageTable(
+            label: "[dsv41 compressed]",
+            checkpoint: DeepSeekV41SyntheticCheckpoint(shape: .compressedPublishedWidths()),
+            positions: 1_024
+        )
+    }
+
+    /// The compressed half's own cost, separated from the row budget it drags in.
+    ///
+    /// A compressed layer changes two things at once: it reads `window + index_topk`
+    /// rows where a window-only layer reads only the window, and it runs the
+    /// compressor's two projections plus the pool that emits a row. The mixed table
+    /// above cannot tell those apart, and they call for different work — one means the
+    /// gather or the attention kernel, the other means the compressor's GEMVs.
+    ///
+    /// Both arms here run ONE layer over the same 1,024 positions with the same window,
+    /// the same context and the same weights everywhere but `compress_ratios`, so the
+    /// per-stage difference is the compressed half alone.
+    func testWhatTheCompressedHalfCostsOverTheWindowOnlyHalf() throws {
+        try stageTable(
+            label: "[dsv41 window-only]",
+            checkpoint: DeepSeekV41SyntheticCheckpoint(
+                shape: .publishedWidths(contextLength: 1_024)
+            ),
+            positions: 1_024
+        )
+        try stageTable(
+            label: "[dsv41 compressed-1]",
+            checkpoint: DeepSeekV41SyntheticCheckpoint(
+                shape: .compressedPublishedWidths(layers: 1)
+            ),
+            positions: 1_024
+        )
     }
 
     /// What one mHC coefficient projection costs at the published widths.

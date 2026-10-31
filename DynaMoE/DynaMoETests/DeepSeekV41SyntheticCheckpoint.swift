@@ -24,10 +24,14 @@
 //    written anywhere, so the host reads the numbers the GPU reads. Comparing a
 //    full-precision float against its own truncation would put a floor under the
 //    error that has nothing to do with the graph.
-//  - The config declares no Engram tables, no compressed layers, no DSpark
-//    stages, and no shared expert. Each of those is a separate wiring question
-//    with its own hand-fed fixtures; a parity test that has to get all of them
-//    right at once says nothing about which one is wrong.
+//  - The DEFAULT config declares no Engram tables, no compressed layers, no DSpark
+//    stages, and no shared expert. Each of those is a separate wiring question with
+//    its own hand-fed fixtures; a parity test that has to get all of them right at
+//    once says nothing about which one is wrong. The compressed layers that are
+//    absent here have a fixture of their own
+//    (`DeepSeekV41SyntheticShape.compressedPublishedWidths`), which
+//    `DeepSeekV41DeviceGraphParityTests` compares against the host and against the
+//    walk, and the measurement uses to take a stage table the default cannot.
 //
 
 import Foundation
@@ -65,6 +69,20 @@ nonisolated struct DeepSeekV41SyntheticShape {
     var hcMult = 2
     var hcIterations = 3
     var contextLength = 48
+    /// Per-layer `compress_ratios`. Empty (the default) is every layer
+    /// window-only, which is what every parity fixture before this expected.
+    var compressRatios: [Int] = []
+    /// Layers that own a compressed cache. Empty lets the config resolve the
+    /// owner, which is the first compressed layer.
+    var kvSourceLayerIDs: [Int] = []
+    /// Layers that own the index keys. Empty lets the config resolve the owner.
+    var indexSourceLayerIDs: [Int] = []
+    /// `index_topk`: how many trailing compressed rows a query keeps. Zero with
+    /// no candidate blocks would make a compressed layer gather its whole cache,
+    /// which the device plan refuses.
+    var indexTopK = 0
+    var indexNHeads = 2
+    var indexHeadDim = 16
     /// Largest magnitude a weight is drawn from. Small enough that a two-layer
     /// residual stream stays in a range where a 1e-4 tolerance means something.
     var weightMagnitude: Float = 0.35
@@ -117,6 +135,9 @@ extension DeepSeekV41SyntheticShape {
     ///   of its row budget only, and the compressed half is measured directly, at the
     ///   published widths, by
     ///   `DeepSeekV41PrefillMeasurementTests.testWhatOneAttentionDispatchCostsAtThePublishedWidths`.
+    ///   `compressedPublishedWidths` below is this shape with that half switched on,
+    ///   and `testWhatTheCompressedHalfCostsOverTheWindowOnlyHalf` prices the
+    ///   difference.
     static func publishedWidths(
         layers: Int = 1,
         window: Int = 640,
@@ -141,6 +162,65 @@ extension DeepSeekV41SyntheticShape {
         shape.hcMult = 4
         shape.hcIterations = 20
         shape.contextLength = contextLength
+        return shape
+    }
+
+    /// A runnable compressed model at the DEFAULT (tiny) widths: two layers, one of
+    /// each flavor, the shallowest ratio that still pools (2), and an `index_topk`
+    /// smaller than the window so the row plan drops compressed rows too.
+    ///
+    /// Exists so a test in the default suite can run a compressed graph position by
+    /// position: `compressedPublishedWidths` is the same model at 7,168 hidden, which
+    /// takes about a minute just to build its weight blob.
+    static func compressedSmall() -> DeepSeekV41SyntheticShape {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.layers = 2
+        shape.compressRatios = [0, 2]
+        shape.kvSourceLayerIDs = [1]
+        shape.indexSourceLayerIDs = [1]
+        shape.indexTopK = 2
+        shape.contextLength = 16
+        return shape
+    }
+
+    /// The published geometry with the compressed half PRESENT.
+    ///
+    /// `publishedWidths` has no `compress_ratios > 0`, which every table taken on
+    /// it inherits: attention reads the window half of its row budget only, the
+    /// compressor's two per-position projections never run, and `writeLatent`
+    /// carries no pool term. This is the same model with that half switched on,
+    /// so a stage table taken on it is the one the checkpoint actually runs.
+    ///
+    /// What is real here: the row budget (`window` 640 + `index_topk` 512, which
+    /// is 1,152 gathered rows and the checkpoint's own bound), the compress ratio
+    /// (2, the encoder half's), and the 50/50 window-only / compressed split the
+    /// 40-layer checkpoint has. The context is long enough that a query at the end
+    /// of the sequence keeps the full `index_topk`: 1,024 positions at ratio 2
+    /// pool 512 rows.
+    ///
+    /// What is deliberately small: the indexer's `index_n_heads` /`index_head_dim`.
+    /// No backend reads those weights — row selection is a function of the
+    /// position and the ratio — so they size a cache region nothing attends over.
+    /// `index_topk` is NOT small, because it is the row count.
+    static func compressedPublishedWidths(
+        layers: Int = 2,
+        window: Int = 640,
+        contextLength: Int = 1_024,
+        compressRatio: Int = 2,
+        indexTopK: Int = 512
+    ) -> DeepSeekV41SyntheticShape {
+        var shape = publishedWidths(
+            layers: layers, window: window, contextLength: contextLength
+        )
+        // Layer 0 stays window-only so the fixture keeps both flavors, the way the
+        // checkpoint's two halves do.
+        let windowOnlyLayers = layers > 1 ? 1 : 0
+        shape.compressRatios = (0..<layers).map { $0 < windowOnlyLayers ? 0 : compressRatio }
+        shape.kvSourceLayerIDs = [windowOnlyLayers]
+        shape.indexSourceLayerIDs = [windowOnlyLayers]
+        shape.indexTopK = indexTopK
+        shape.indexNHeads = 2
+        shape.indexHeadDim = 16
         return shape
     }
 }
@@ -222,10 +302,17 @@ nonisolated final class DeepSeekV41SyntheticCheckpoint {
             "rms_norm_eps": 1e-6,
             "rope_theta": 10_000.0,
             "window_size": shape.window,
-            // Every layer window-only: a compressed layer brings the compressor,
-            // the indexer and the owner/addressing rules, each with its own
-            // fixtures.
-            "compress_ratios": [Int](repeating: 0, count: shape.layers),
+            // A compressed layer brings the compressor, the indexer and the
+            // owner/addressing rules. Empty is every layer window-only, which is
+            // what the fixtures that compare the graph stage by stage rely on.
+            "compress_ratios": shape.compressRatios.isEmpty
+                ? [Int](repeating: 0, count: shape.layers)
+                : shape.compressRatios,
+            "kv_source_layer_ids": shape.kvSourceLayerIDs,
+            "index_source_layer_ids": shape.indexSourceLayerIDs,
+            "index_n_heads": shape.indexNHeads,
+            "index_head_dim": shape.indexHeadDim,
+            "index_topk": shape.indexTopK,
             "hc_mult": shape.hcMult,
             "hc_sinkhorn_iters": shape.hcIterations,
             "hc_eps": 1e-6,
@@ -298,7 +385,8 @@ nonisolated final class DeepSeekV41SyntheticCheckpoint {
         let mult = max(1, shape.hcMult)
         let mixCount = (2 + mult) * mult
 
-        for layer in plan.map(\.index) {
+        for entry in plan {
+            let layer = entry.index
             let prefix = "layers.\(layer)"
             add("\(prefix).attn_norm.weight", .attnNorm, layer: layer, shape: [hidden], magnitude: gain)
             add("\(prefix).ffn_norm.weight", .ffnNorm, layer: layer, shape: [hidden], magnitude: gain)
@@ -352,6 +440,59 @@ nonisolated final class DeepSeekV41SyntheticCheckpoint {
                     "\(prefix).attn.wo_b.weight", .attnWoB, layer: layer,
                     shape: [hidden, shape.attentionOutputWidth]
                 )
+            }
+
+            // Compressor weights exist only on the layers that own the compressed
+            // cache: every other compressed layer reads the rows its source wrote.
+            // `wgate` is ratio-specific, because a ratio of 1 is a plain
+            // projection with no gate (`Compressor.forward`).
+            if entry.ownsCompressedKV {
+                add(
+                    "\(prefix).attn.compressor.wkv.weight", .compressorWkv, layer: layer,
+                    shape: [shape.latentWidth, hidden]
+                )
+                if entry.compressRatio > 1 {
+                    add(
+                        "\(prefix).attn.compressor.wgate.weight", .compressorWgate, layer: layer,
+                        shape: [shape.latentWidth, hidden]
+                    )
+                }
+                add(
+                    "\(prefix).attn.compressor.norm.weight", .compressorNorm, layer: layer,
+                    shape: [shape.latentWidth], magnitude: gain
+                )
+            }
+            // The indexer's weights are published but never read: the row plan is
+            // a function of the position and the ratio, so selection needs no
+            // scores (`DeepSeekV41CacheAddressing`, `candidateSelection` gate).
+            for role in DeepSeekV41WeightCatalog.requiredIndexerRoles(layer: entry, config: config) {
+                switch role {
+                case .indexerWqB:
+                    add(
+                        "\(prefix).attn.indexer.wq_b.weight", role, layer: layer,
+                        shape: [
+                            max(1, shape.indexNHeads * shape.indexHeadDim),
+                            shape.qLoraRank > 0 ? shape.qLoraRank : hidden
+                        ]
+                    )
+                case .indexerWk:
+                    add(
+                        "\(prefix).attn.indexer.wk.weight", role, layer: layer,
+                        shape: [max(1, shape.indexHeadDim), hidden]
+                    )
+                case .indexerWeights:
+                    add(
+                        "\(prefix).attn.indexer.weights_proj.weight", role, layer: layer,
+                        shape: [max(1, shape.indexNHeads), hidden]
+                    )
+                case .indexerKNorm:
+                    add(
+                        "\(prefix).attn.indexer.k_norm.weight", role, layer: layer,
+                        shape: [max(1, shape.indexHeadDim)], magnitude: gain
+                    )
+                default:
+                    break
+                }
             }
 
             // Router: `bias` selects but does not weight, and the kernel binds a

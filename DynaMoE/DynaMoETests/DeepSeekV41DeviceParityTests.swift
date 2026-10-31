@@ -28,6 +28,48 @@ final class DeepSeekV41SyntheticCheckpointTests: XCTestCase {
         XCTAssertEqual(checkpoint.catalogProblems(), [])
     }
 
+    /// The compressed fixture publishes exactly what the plan demands, at the row
+    /// budget the checkpoint has.
+    ///
+    /// This is the sibling of `testTheCatalogAcceptsTheSyntheticCheckpoint` for the
+    /// half that fixture leaves out: a compressed layer needs the compressor's three
+    /// tensors, and the indexer's weights only on the layer that owns the index keys.
+    /// A missing one is a load-time refusal, so the catalog is the cheapest place to
+    /// catch a table that drifted.
+    func testTheCompressedFixturePublishesWhatThePlanDemands() {
+        let shape = DeepSeekV41SyntheticShape.compressedSmall()
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+
+        XCTAssertEqual(checkpoint.catalogProblems(), [])
+        XCTAssertEqual(checkpoint.plan.map(\.flavor), [.windowOnly, .compressed])
+        let compressed = checkpoint.plan[1]
+        XCTAssertEqual(compressed.compressRatio, 2)
+        XCTAssertTrue(compressed.ownsCompressedKV, "the compressed layer must own its rows")
+        XCTAssertTrue(compressed.ownsCompressedIndex)
+
+        func layers(_ role: DeepSeekV41TensorRole) -> [Int] {
+            checkpoint.tensors.compactMap { $0.role == role ? $0.layer : nil }
+        }
+        XCTAssertEqual(layers(.compressorWkv), [1])
+        XCTAssertEqual(layers(.compressorWgate), [1])
+        XCTAssertEqual(layers(.compressorNorm), [1])
+        XCTAssertEqual(layers(.indexerWqB), [1])
+        XCTAssertEqual(layers(.indexerWk), [1])
+        XCTAssertEqual(layers(.indexerWeights), [1])
+        XCTAssertEqual(layers(.indexerKNorm), [1])
+
+        // The budget the attention is provisioned for is the checkpoint's own: the
+        // window plus `index_topk`, not the window alone.
+        XCTAssertEqual(
+            DeepSeekV41DevicePlan.gatherRowBudget(config: checkpoint.config),
+            shape.window + shape.indexTopK
+        )
+        XCTAssertEqual(
+            DeepSeekV41DevicePlan.problems(config: checkpoint.config, plan: checkpoint.plan),
+            []
+        )
+    }
+
     /// The formats the executor dispatches on, resolved the way a real load does.
     func testEveryProjectionResolvesToTheFormatItsDtypeSays() {
         let checkpoint = DeepSeekV41SyntheticCheckpoint()
@@ -191,6 +233,12 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         )
     }
 
+    /// A two-layer model: one window-only layer and one compressed layer, the way the
+    /// checkpoint splits its encoder and decoder halves.
+    private func compressedCheckpoint() -> DeepSeekV41SyntheticCheckpoint {
+        DeepSeekV41SyntheticCheckpoint(shape: .compressedSmall())
+    }
+
     func testTheSyntheticRuntimeBuilds() throws {
         let runtime = try makeRuntime(checkpoint)
         print(runtime.describe())
@@ -317,6 +365,77 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
                 + "after attention: it matches position "
                 + "\(deltas.firstIndex(where: { $0 < 1e-5 }).map(String.init) ?? "none") "
                 + "of the walk instead (\(deltas))"
+        )
+    }
+
+    /// A compressed layer's whole path, which no parity fixture before this could run.
+    ///
+    /// Every fixture up to here is window-only, so four separate rules have never
+    /// been compared with the reference: the compressor's two projections over the
+    /// post-`attn_norm` input, the pool that emits a row only when a group closes, the
+    /// rope rotation applied at the group's FIRST position rather than the pooling
+    /// position, and the gather that mixes pooled rows in with the live window. Each
+    /// is a way to produce a plausible model — pool the wrong block, rotate at the
+    /// wrong position, or read a compressed row as if it were a window row, and the
+    /// first positions still match.
+    func testTheDeviceAndTheHostAgreeOnCompressedRows() throws {
+        let compressed = compressedCheckpoint()
+        XCTAssertEqual(compressed.catalogProblems(), [])
+        XCTAssertEqual(compressed.plan.map(\.flavor), [.windowOnly, .compressed])
+        XCTAssertTrue(compressed.plan[1].ownsCompressedKV, "nothing would pool otherwise")
+
+        let runtime = try makeRuntime(compressed)
+        let device = runtime.forward()
+        let host = makeHost(compressed)
+
+        // Six positions is five closed groups at ratio 2, so the last few attend over
+        // compressed rows AND a window that has begun to rotate (`window` is four).
+        for position in 0..<6 {
+            let token = 5 + position
+            _ = try device.forwardToken(token, position: position)
+            let expected = host.forwardToken(token, position: position)
+            let logits = floats(runtime.workspace.logits, count: compressed.config.vocabSize)
+            XCTAssertEqual(logits.count, expected.count)
+            let scale = expected.map(abs).max() ?? 1
+            let delta = worstDelta(logits, expected)
+            XCTAssertLessThan(
+                delta / max(scale, 1e-6),
+                decodeTolerance,
+                "position \(position) is off by \(delta) against a \(scale) scale"
+            )
+        }
+    }
+
+    /// A compressed layer inside a BLOCK: the compressor runs per position, the pool
+    /// fires on the group the block closes, and a position attends over compressed rows
+    /// another position of the same block wrote.
+    ///
+    /// The block path pools per slot and then attends once over every slot, so this is
+    /// the ordering the per-slot gather exists to keep: a position's pool has to land
+    /// before the attention of any position that reads that row, and no slot may read
+    /// the slot list of its neighbour (`DSV4.1 #15`).
+    func testACompressedBlockPrefillsLikeTheWalk() throws {
+        let compressed = compressedCheckpoint()
+        let tokens = (0..<(compressed.shape.window * 2)).map { 3 + $0 }
+        let blockWidth = DeepSeekV41DevicePlan.chunkSlots(
+            config: compressed.config,
+            contextLength: compressed.shape.contextLength
+        )
+        XCTAssertGreaterThan(blockWidth, 1, "a block of one is the walk")
+
+        let chunk = try makeRuntime(compressed).forward()
+        let chunkLogits = try chunk.prefillChunk(tokens)
+        let walkedRuntime = try makeRuntime(compressed)
+        let walked = walkedRuntime.forward()
+        var last: [Float] = []
+        for (position, token) in tokens.enumerated() {
+            last = try walked.forwardToken(token, position: position)
+        }
+        XCTAssertEqual(chunkLogits.last.count, last.count)
+        let delta = worstDelta(chunkLogits.last, last)
+        XCTAssertLessThan(
+            delta, 1e-5 * max(last.map(abs).max() ?? 1, 1),
+            "the compressed chunk is off the walk by \(delta)"
         )
     }
 

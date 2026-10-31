@@ -4727,3 +4727,115 @@ Tests: `testWhetherOneBatchedAttentionLaunchBeatsEight` (the table above, opt-in
 `testEveryPositionOfABlockAttendsOverItsOwnRows` (the regression). Whole DeepSeek suite:
 414 tests, 11 skipped, 0 failures, including `testTheChunkSeamReturnsTheWalksLogits` at
 bit-identical logits and `testTheDeviceAndTheHostAgreeStageByStage`.
+## DSV4.1 #16: THE COMPRESSED HALF, WHICH EVERY TABLE UP TO HERE LEFT OUT
+
+`#15` closed with one caveat it could not retire: the synthetic checkpoint declares
+`compress_ratios` all zeros, so attention reads the window half of its row budget, the
+compressor's two per-position projections never run, and `writeLatent` carries no pool
+term. Every figure in `#13`-`#15` is therefore a LOWER bound for a compressed layer, and
+the stage those entries promote may not be the stage the checkpoint pays for.
+
+This retires the caveat. A compressed fixture now exists, the graph it drives is compared
+against the host, and the stage table is taken with the compressed half switched on.
+
+**The fixture** (`DeepSeekV41SyntheticShape.compressedPublishedWidths`): 7,168 hidden, 128
+heads of 512, window 640, `index_topk` 512, so the gather budget is 1,152 rows — the
+checkpoint's own bound — over a 1,024-position context (at ratio 2 the last positions keep
+the full 512 compressed rows). Two layers, one window-only and one compressed at ratio 2,
+i.e. the 40-layer checkpoint's 50/50 encoder/decoder split at depth 2. The indexer's
+`index_n_heads`/`index_head_dim` are deliberately tiny: no backend reads those weights,
+because row selection is a function of the position and the ratio, so they only size a
+cache region nothing attends over. `index_topk` is NOT tiny, because it is the row count.
+
+A second, cheap shape (`.compressedSmall`, the default widths plus two compressed layers)
+exists because `compressedPublishedWidths` costs about a minute just to build its weight
+blob, and a default-suite test cannot pay that.
+
+**The graph, checked before anything was timed.** No parity fixture before this could run
+a compressed layer at all, so four separate rules had never been compared with the
+reference: the compressor's two projections over the post-`attn_norm` input, the pool that
+emits a row only when a group closes, the rope rotation applied at the group's FIRST
+position rather than at the pooling position, and the gather that mixes pooled rows in
+with the live window. `testTheDeviceAndTheHostAgreeOnCompressedRows` walks six positions
+on the small compressed model and compares logits with `DeepSeekV41CPUForward` at the
+standard decode tolerance, and `testACompressedBlockPrefillsLikeTheWalk` runs the same
+tokens as one block and compares against the walk at 1e-5.
+
+Sensitivity was checked in the usual direction: pointing the device's pooled-row rotation
+at `position` instead of `(rows - 1) * ratio` — i.e. rotating a compressed row at the
+position that closed its group rather than at its first position — fails both cases (5
+assertions). That is the failure this fixture exists to catch, and the first positions
+still match, which is why it needs a test rather than an eyeball.
+
+**The A/B** (`testWhatTheCompressedHalfCostsOverTheWindowOnlyHalf`, opt-in): one layer
+each, same 1,024 positions, same window, same context, identical weights everywhere except
+`compress_ratios`. The compressed layer is an OWNER at ratio 2, so it runs the compressor
+and pools rows, and it reads `window + index_topk` rows where the window-only arm reads the
+window.
+
+| stage | window-only | compressed | change |
+|---|---:|---:|---:|
+| `writeLatent`, ms/pos | 0.149 | **0.271** | +0.122 (1.82x) |
+| dense device, ms/pos | 0.382 | **0.504** | +0.123 |
+| whole block, ms/pos | 0.83 | **0.97** | +17% |
+| gather rows | 641 | 1,152 | |
+
+So the compressed half costs 17% of a block, all of it inside `writeLatent`.
+
+**Where that 0.122 goes, and what it says the stage IS.** Over 1,024 positions the
+window-only arm averages 440.3 window rows (the ramp to 640, then 384 full ones: 450,880
+rows in total) and the compressed arm averages 440.3 plus 256.0 compressed rows
+(`min(512, (p + 1) / 2)` over the same span), i.e. +58% rows.
+
+An attention head reads every gathered row at the record width, so the stage's traffic is
+`heads * rows * record * 2` bytes: 57.7 MB per position for the window-only arm and 91.3 MB
+for the compressed one. 57.7 MB in the measured 0.149 ms is **387 GB/s**, and 91.3 MB at
+that same rate predicts 0.236 ms against 0.271 measured. So `writeLatent` is, to first
+order, a pure key-read bandwidth cost, and the residual 0.035 is the compressor's two
+448-wide projections (cf. `latentProject`'s one 512-wide row at 0.014) plus pool, norm,
+rope and store, which run once per group.
+
+That reframes the stage more than the split does. The compressor is a quarter of the
+delta and it is not the lever: **the cost is 128 heads each reading the whole gathered
+block**, so it comes down by reading fewer BYTES per row, or by serving one row read to
+several heads. The second was tried and reverted (`#6`: one threadgroup sharing a loaded
+row across heads lost 17% at 128 rows once occupancy was paid for), so any retry has to
+be a different shape rather than the same idea with fewer registers.
+
+**The model-shaped table** (`testWhereABlocksRemainingTimeGoesWithCompressedLayers`, opt-in,
+1,024 positions, two layers, 0.88 ms/position/layer = **1.75 ms/position whole block**;
+dense device 0.4535, mixture 0.4119):
+
+| stage | ms/pos/layer | share |
+|---|---:|---:|
+| `writeLatent` | **0.211** | 45.5% |
+| `outputDown` | 0.047 | 10.1% |
+| `queryUp` | 0.046 | 9.9% |
+| `outputUp` | 0.044 | 9.6% |
+| `queryDown` | 0.018 | 3.9% |
+| `latentProject` | 0.017 | 3.7% |
+| `hcFFNCoefficients`, `hcAttentionCoefficients`, `ffnNorm`, `attnNorm` | 0.011-0.012 each | ~2.5% |
+| `calibration(8 dispatch)` | 0.010 | 2.1% |
+| everything else | 0.005 and below | |
+
+`writeLatent` is 45.5% of the dense half here, against 30.4% in `#15` — the compressed
+layer is what moved it, and it is once again the stage to attack. `compressPool` and
+`attention` both print 0.000 because they run INSIDE `writeLatent`; the two are separated
+only by the A/B above.
+
+**Caveats.** Same synthetic-weight caveat as before: the checkpoint's attention and
+compressor projections are quantised, so absolute numbers differ while rankings hold. The
+fixture's compressed layer is an owner at ratio 2 with no reading layers, so the "a
+compressed layer reads its owner's rows" case is priced by the host/device parity only, not
+by this table. The synthetic mixture is still `moe_intermediate` 32, so its 0.41
+ms/position is dispatch overhead and is 52% of device time. One command buffer per stage;
+the isolated tables are cache-warm and are not additive into the block table. Both cases
+are opt-in (`testWhereABlocksRemainingTimeGoesWithCompressedLayers` ~1 min, mostly building
+the two-layer blob; `testWhatTheCompressedHalfCostsOverTheWindowOnlyHalf` ~1 min for the
+same reason).
+
+Tests: `testTheCompressedFixturePublishesWhatThePlanDemands` (the catalog accepts the
+compressed table: three compressor tensors on the owner, the indexer's weights on the
+index source, and the gather budget is `window + index_topk`),
+`testTheDeviceAndTheHostAgreeOnCompressedRows`, `testACompressedBlockPrefillsLikeTheWalk`,
+and the two opt-in tables above. Whole DeepSeek suite: 419 tests, 13 skipped, 0 failures.
