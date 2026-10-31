@@ -5477,3 +5477,85 @@ drafts) and a measured multiplier (2.16x per position, 7.6x less I/O). The other
 levers #21 named are dead ends for the same reason the numbers here show: the per-layer
 round trip is dominated by the idle gap the fill leaves, which only batching removes, and
 the arena's capacity has already been shown not to be the constraint.
+
+## DSV4.1 #23: THE DRAFTER'S CONDITIONING ROW, CAPTURED ON THE DEVICE
+
+#22 measured the prize a batched verify is playing for and left one question open:
+whether the checkpoint's own drafter clears the bar. Answering it needs the draft
+block's forward, and the first thing that forward consumes is `main_hidden` — the
+target layers' block inputs, means over the hyper-connection copies, concatenated in
+ascending layer order. That row did not exist anywhere but the host reference, so it is
+now captured as the walk runs.
+
+### What the row is, and why the capture point is the whole rule
+
+The reference appends to `Model.forward`'s `main_hiddens` between the Engram write and
+the layer's own work, so the row is the BLOCK INPUT of each of `dspark_target_layer_ids`
+(`[37, 38, 39]` on this checkpoint) and not the layer's output: an output-captured row
+conditions every draft on a state the target had already moved past, and nothing about
+the result looks wrong until an acceptance rate comes out near zero. The mean is over
+the hyper-connection copies (`h.mean(dim=2)`), which is a plain average and not the
+attention sub-layer's weighted collapse.
+
+On the device that average needs no new kernel: `dsv41_hc_pre_f32` computes
+`sum_copy mix[copy] * x[copy][dim]`, so a mix of `1 / hc_mult` IS the mean. The capture
+is one dispatch of that kernel per target layer per position, encoded at the top of
+`.hcAttentionCoefficients` — the first stage that reads the streams without writing
+them, i.e. the buffer still holds exactly the block input. It is off unless
+`capturesDraftInput` is set, and the buffer is `[slot][target][hidden]` (60 KB for
+3 x 5,120, times the block width), allocated at load only when the checkpoint names
+target layers.
+
+### Verified against the host, not against itself
+
+`testTheDeviceCapturesTheDraftersConditioningRow` runs the same tokens through
+`DeepSeekV41CPUForward` and the executor on a synthetic checkpoint whose target list is
+written DESCENDING (`[1, 0]`), so a capture that followed the config's spelling instead
+of the sorted order would come out swapped, and compares `mainHidden(position:)` with
+the captured row for every position of a walk and for every slot of a block. The block
+half is the one that catches a shared offset: one row written to slot 0 for all slots
+passes the walk and leaves the block holding its last position only.
+
+The bar is relative and 5e-4, which is where the measurement put the noise: 1.4e-4 at
+the first position and 6e-5 after, against the 2e-3 the walk's own logits are held to.
+Every way of getting this row WRONG is definitional — the output instead of the input, a
+weighted collapse instead of the mean, the config's order instead of the sorted one —
+and each of those is O(1), not O(1e-4).
+
+### On the published checkpoint
+
+`testWhatTheDraftersConditioningRowHoldsOnThePublishedCheckpoint` prints the row for 14
+prompt positions. Its width is `3 x 5,120 = 15,360`, which is exactly what
+`mtp.0.main_proj` is published as ([5120, 15360]), so the geometry agrees with the
+weights the drafter will actually read.
+
+The magnitudes are worth recording because they are NOT uniform, and a drafter fed the
+raw row has to cope with that:
+
+| position | layer 37 \|x\| | layer 37 max | top logit |
+|---|---|---|---|
+| 0 | 906,452 | 278,807 | 13.2 |
+| 1 | 148 | 7.98 | 23.1 |
+| 2 | 429,057 | 117,249 | 12.9 |
+| 3 | 156 | 12.97 | 21.5 |
+| 6 | 187 | 20.35 | 22.6 |
+
+A residual stream two to three orders of magnitude wider than its neighbours' is not a
+capture artifact — the synthetic fixture matches the host to 1e-4 — and it is not a
+broken graph either: the logits at those positions are in the same 13-24 range as
+everywhere else, which is what the per-sub-layer RMSNorm is for. The scale lives in the
+residual stream alone, each sub-layer normalizes it away, and the mHC mixes are
+Sinkhorn-normalized rows, so the graph is scale-robust by construction. The drafter is
+too: `main_proj` is linear and `main_norm` is an RMSNorm, so the row can be fed as-is.
+Anything that compares rows by magnitude (a similarity, a distance, a threshold) would
+not be, which is why this is written down.
+
+**What is left.** The draft block's forward, which is where the acceptance number comes
+from: `mtp.N.*` is a full `Block` with its own window-cache attention, and on the device
+that means a `main_proj`/`main_norm` stage, the draft attention (a seeded ring plus the
+block's own rows, one shared index list, not causal within the block), the MoE under the
+draft expert counts (128 routed, 3 active), and the last stage's head plus the Markov
+bias and confidence head. The host route is not available at this size: the draft stage
+is 5,120 wide with a 129,280-row head, so its matrices do not fit the in-memory
+`DeepSeekV41DenseWeightSource` the host reference reads, and the host has no shard-backed
+source at all.

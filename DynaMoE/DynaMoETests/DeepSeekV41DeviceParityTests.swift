@@ -530,6 +530,78 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         )
     }
 
+    /// The device captures exactly the row the host forward calls `mainHidden`.
+    ///
+    /// The DSpark drafter conditions on the mean over the hyper-connection copies of
+    /// the BLOCK INPUT at each target layer, concatenated in ascending layer order.
+    /// Every part of that is easy to get subtly wrong — the mean instead of a
+    /// weighted collapse, the block input instead of the layer's output, and the
+    /// config's order instead of the sorted one — and a wrong row does not fail, it
+    /// conditions every draft on a state the target had already moved past. So the
+    /// reference is the host forward, which records the same quantity.
+    func testTheDeviceCapturesTheDraftersConditioningRow() throws {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.layers = 2
+        // Descending on purpose: the concatenation order is the sorted one, so a
+        // capture that followed the config's spelling would write them swapped.
+        shape.draftTargetLayers = [1, 0]
+        shape.contextLength = 16
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        XCTAssertEqual(checkpoint.config.dsparkTargetLayerIDs, [1, 0])
+
+        let runtime = try makeRuntime(checkpoint)
+        let device = runtime.forward()
+        XCTAssertNil(device.capturedDraftInput(), "capture is off until it is asked for")
+        device.capturesDraftInput = true
+
+        let host = makeHost(checkpoint)
+        let tokens = [3, 4, 5]
+        var walked: [Float] = []
+        for (position, token) in tokens.enumerated() {
+            walked = try device.forwardToken(token, position: position)
+            _ = host.forwardToken(token, position: position)
+            let captured = try XCTUnwrap(device.capturedDraftInput())
+            let expected = try XCTUnwrap(host.mainHidden(position: position))
+            XCTAssertEqual(captured.count, expected.count)
+            // Relative, because these are activations rather than weights: the two
+            // backends accumulate the same sums in a different order, and the walk's
+            // own logits agree only to `decodeTolerance` (2e-3). Measured here it is
+            // 1.4e-4 at position 0 and 6e-5 after, so the bar sits between the two:
+            // every way of getting this row WRONG is a definitional error — the
+            // layer's output instead of its input, a weighted collapse instead of the
+            // mean, the config's order instead of the sorted one — and each of those
+            // is O(1), not O(1e-4).
+            let scale = max(expected.map(abs).max() ?? 1, 1e-6)
+            let delta = worstDelta(captured, expected)
+            XCTAssertLessThan(
+                delta / scale, 5e-4,
+                "position \(position): the captured row is off the host by \(delta) "
+                    + "against a \(scale) scale"
+            )
+        }
+        XCTAssertFalse(walked.isEmpty)
+
+        // The block path captures one row per position slot, and a block's slots are
+        // addressed independently: a capture that wrote every slot to offset 0 would
+        // pass the walk above and leave the block holding its last position only.
+        device.capturesDraftInput = true
+        device.reset()
+        _ = try device.prefillChunk(tokens)
+        let blockedHost = makeHost(checkpoint)
+        for (position, token) in tokens.enumerated() {
+            _ = blockedHost.forwardToken(token, position: position)
+            let captured = try XCTUnwrap(device.capturedDraftInput(slot: position))
+            let expected = try XCTUnwrap(blockedHost.mainHidden(position: position))
+            let scale = max(expected.map(abs).max() ?? 1, 1e-6)
+            let delta = worstDelta(captured, expected)
+            XCTAssertLessThan(
+                delta / scale, 5e-4,
+                "block slot \(position): the captured row is off the host by \(delta) "
+                    + "against a \(scale) scale"
+            )
+        }
+    }
+
     /// A chunk that CONTINUES the cache returns what walking the same positions returns.
     ///
     /// `prefillChunk` used to open a sequence and nothing else: it ran its blocks from

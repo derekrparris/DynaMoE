@@ -638,6 +638,78 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
+    /// The conditioning row a DSpark draft would start from, on the real checkpoint.
+    ///
+    /// The drafter reads `main_hidden` — the target layers' block inputs, means over
+    /// the hyper-connection copies, concatenated in ascending layer order — through
+    /// `main_proj`. This prints what the device actually captured for a few positions
+    /// so the row can be checked against the geometry the checkpoint publishes
+    /// (`mtp.0.main_proj` is [5120, 15360], i.e. three 5,120-wide layers end to end)
+    /// before anything is built on top of it. A capture that silently wrote zeros, or
+    /// one layer's row three times, would otherwise only show up as an acceptance
+    /// rate of zero much later.
+    func testWhatTheDraftersConditioningRowHoldsOnThePublishedCheckpoint() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        XCTAssertEqual(config.dsparkTargetLayerIDs, [37, 38, 39])
+        XCTAssertEqual(config.dsparkBlockSize, 5)
+        let tokens = [
+            0, 128803, 21750, 2038, 15174, 943, 3939, 270, 15571, 344, 83779, 16, 128804, 128822
+        ]
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: tokens.count,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let report = try await Task.detached { [runtime] () -> String in
+            let executor = runtime.forward()
+            executor.reset()
+            executor.capturesDraftInput = true
+            let targets = runtime.config.dsparkTargetLayerIDs.sorted()
+            let hidden = runtime.config.hiddenSize
+            var lines: [String] = []
+            for (position, token) in tokens.enumerated() {
+                let started = DispatchTime.now().uptimeNanoseconds
+                let logits = try executor.forwardToken(token, position: position)
+                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+                guard let row = executor.capturedDraftInput() else {
+                    return "position \(position): the capture is empty"
+                }
+                guard row.count == targets.count * hidden else {
+                    return "position \(position): captured \(row.count) values, "
+                        + "expected \(targets.count * hidden)"
+                }
+                guard row.allSatisfy({ $0.isFinite }) else {
+                    return "position \(position): the row holds a non-finite value"
+                }
+                var perLayer: [String] = []
+                for (index, layer) in targets.enumerated() {
+                    let slice = row[(index * hidden)..<((index + 1) * hidden)]
+                    let norm = (slice.reduce(Float(0)) { $0 + $1 * $1 }).squareRoot()
+                    let peak = slice.map(abs).max() ?? 0
+                    perLayer.append(
+                        String(format: "layer %d |x| %.2f max %.3f", layer, norm, peak)
+                    )
+                }
+                let peakLogit = logits.map(abs).max() ?? 0
+                let top = logits.indices.max { logits[$0] < logits[$1] } ?? -1
+                lines.append(
+                    String(format: "position %d: %.1f ms, top %d at %.1f, ", position, elapsed, top, peakLogit)
+                        + perLayer.joined(separator: ", ")
+                )
+            }
+            return lines.joined(separator: " | ")
+        }.value
+        print("🔎 [dsv41 real] drafter conditioning row: \(report)")
+        withExtendedLifetime(engine) {}
+    }
+
     /// What verifying a drafted run in ONE batched pass would save over walking it.
     ///
     /// Speculative decoding is the only structure that lets a decode step batch, and

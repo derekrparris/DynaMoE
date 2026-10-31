@@ -88,6 +88,10 @@ nonisolated struct DeepSeekV41SyntheticShape {
     var weightMagnitude: Float = 0.35
     /// Magnitude for norm gains, which want to be near one.
     var gainMagnitude: Float = 0.15
+    /// `dspark_target_layer_ids`: backbone layers whose block inputs feed a DSpark
+    /// drafter. Empty by default, so a fixture that does not care about the draft
+    /// path captures nothing and the executor allocates no capture buffer.
+    var draftTargetLayers: [Int] = []
     /// Forces a role's every value to one constant. A bisecting aid: with the
     /// hyper-connection scale and base pinned, the split's `pre`/`post`/`comb` are a
     /// pure function of the projection's logits, so a disagreement has to be in the
@@ -320,6 +324,7 @@ nonisolated final class DeepSeekV41SyntheticCheckpoint {
             "norm_topk_prob": true,
             "routed_scaling_factor": 1.5,
             "num_nextn_predict_layers": 0,
+            "dspark_target_layer_ids": shape.draftTargetLayers,
             "max_position_embeddings": shape.contextLength,
             "tie_word_embeddings": false,
             "engram_layer_ids": [Int](),

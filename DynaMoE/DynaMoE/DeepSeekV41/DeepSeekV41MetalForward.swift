@@ -1004,6 +1004,31 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         blockTiming = DeepSeekV41BlockTiming()
     }
 
+    /// Captures the DSpark conditioning row as the walk and the block run.
+    ///
+    /// `main_hidden` is the mean over the hyper-connection copies of the BLOCK INPUT
+    /// at each `dspark_target_layer_ids` layer, concatenated in ascending layer
+    /// order — `DSparkBlock.forward_embed` projects exactly that (`h.mean(dim=2)`).
+    /// The capture point is the whole rule: the block input is what the reference
+    /// appends to `main_hiddens` between the Engram write and the layer's own work,
+    /// so a capture from the layer's OUTPUT would condition every draft on a state
+    /// the target had already moved past.
+    ///
+    /// Off by default. Three dispatches per position on the published checkpoint
+    /// (one per target layer), and nothing reads the buffer until a draft runs.
+    public var capturesDraftInput = false
+
+    /// `[slot][target][hidden]`, in the same target order `mainHidden` concatenates.
+    /// Allocated only when the checkpoint names target layers, and written only
+    /// while `capturesDraftInput` is on.
+    private var draftInput: MTLBuffer?
+    /// `1 / hcMult` over `hcMult` entries: `hc_pre` with a uniform mix IS the mean
+    /// over copies, so the capture is the same kernel the sub-layer uses.
+    private var draftMeanMix: MTLBuffer?
+    /// Target layers, ascending, and where each one's row goes in the buffer.
+    private let draftTargets: [Int]
+    private let draftTargetIndex: [Int: Int]
+
     /// Where a decoded position's time went. Off by default: it reads the clock six
     /// times per layer and retains two command buffers per layer for their device
     /// windows, neither of which a turn should pay for.
@@ -1056,6 +1081,31 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         self.engramLayouts = runtime.weights.engramLayouts
         self.engramTokenMap = runtime.engramTokenMap
         self.engramProblem = runtime.engramProblem
+
+        // The drafter's conditioning row: one capture buffer per position slot, wide
+        // enough for every target layer's mean laid end to end.
+        let targets = runtime.config.dsparkTargetLayerIDs.sorted()
+        self.draftTargets = targets
+        var indices: [Int: Int] = [:]
+        for (position, layer) in targets.enumerated() { indices[layer] = position }
+        self.draftTargetIndex = indices
+        if let first = targets.first, first >= 0, runtime.config.hiddenSize > 0 {
+            let width = targets.count * runtime.config.hiddenSize
+            let capacity = max(1, runtime.workspace.slots) * width
+            self.draftInput = runtime.device.makeBuffer(
+                length: max(16, capacity * MemoryLayout<Float>.stride),
+                options: .storageModeShared
+            )
+            self.draftMeanMix = runtime.device.makeBuffer(
+                length: max(16, self.mult * MemoryLayout<Float>.stride),
+                options: .storageModeShared
+            )
+            if let mix = self.draftMeanMix {
+                let pointer = mix.contents().assumingMemoryBound(to: Float.self)
+                let share = 1 / Float(self.mult)
+                for copy in 0..<self.mult { pointer[copy] = share }
+            }
+        }
 
         var problems = DeepSeekV41DevicePlan.problems(
             config: runtime.config,
@@ -1747,6 +1797,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
 
         switch stage {
         case .hcAttentionCoefficients:
+            for slot in 0..<count {
+                try encodeDraftInput(encoder, layer: index, slot: slot)
+            }
             try encodeHyperConnectionCoefficients(
                 encoder,
                 layer: index,
@@ -2520,6 +2573,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                     encoder, from: workspace.streams, to: probe, count: mult * shapes.hidden
                 )
             }
+            try encodeDraftInput(encoder, layer: index)
             try encodeHyperConnectionCoefficients(
                 encoder,
                 layer: index,
@@ -4237,14 +4291,65 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
 
     /// `hc_pre`: collapse the stack with `mix` into `output`, optionally snapshotting
     /// the stack into `workspace.hcResidual` for the `hc_post` that follows.
+    /// Captures one position's DSpark conditioning row: the mean over the
+    /// hyper-connection copies of that layer's block input.
+    ///
+    /// Encoded at the top of `.hcAttentionCoefficients`, the first stage that READS
+    /// the streams without writing them, so the buffer still holds exactly what the
+    /// reference records — the block input, after the Engram write and before the
+    /// layer's own work. `hc_pre` with a uniform mix is the mean, so this is the
+    /// same kernel the attention sub-layer already runs.
+    private func encodeDraftInput(
+        _ encoder: MTLComputeCommandEncoder,
+        layer: Int,
+        slot: Int = 0
+    ) throws {
+        guard capturesDraftInput,
+              let target = draftTargetIndex[layer],
+              let buffer = draftInput,
+              let mix = draftMeanMix,
+              shapes.hidden > 0 else { return }
+        let width = draftTargets.count * shapes.hidden
+        let offset = (slot * width + target * shapes.hidden) * MemoryLayout<Float>.stride
+        try encodeHyperConnectionPre(
+            encoder,
+            mix: mix,
+            output: buffer,
+            snapshotting: false,
+            slot: slot,
+            mixByteOffset: 0,
+            outputByteOffset: offset
+        )
+    }
+
+    /// The captured row for one position slot, in `mainHidden`'s order.
+    ///
+    /// Only meaningful once the token or block that wrote it has been settled, which
+    /// is where every caller reads it: `forwardToken` and `prefillChunk` both return
+    /// after `settlePending`.
+    public func capturedDraftInput(slot: Int = 0) -> [Float]? {
+        guard capturesDraftInput else { return nil }
+        guard let buffer = draftInput, !draftTargets.isEmpty, shapes.hidden > 0 else { return nil }
+        let width = draftTargets.count * shapes.hidden
+        guard slot >= 0, (slot + 1) * width * MemoryLayout<Float>.stride <= buffer.length else {
+            return nil
+        }
+        let pointer = buffer.contents()
+            .advanced(by: slot * width * MemoryLayout<Float>.stride)
+            .assumingMemoryBound(to: Float.self)
+        return Array(UnsafeBufferPointer(start: pointer, count: width))
+    }
+
     private func encodeHyperConnectionPre(
         _ encoder: MTLComputeCommandEncoder,
         mix: MTLBuffer,
         output: MTLBuffer,
         snapshotting: Bool,
-        slot: Int = 0
+        slot: Int = 0,
+        mixByteOffset: Int? = nil,
+        outputByteOffset: Int? = nil
     ) throws {
-        let mixOffset = workspace.slotOffset(slot, width: mult)
+        let mixOffset = mixByteOffset ?? workspace.slotOffset(slot, width: mult)
         encoder.setComputePipelineState(pipelines.hcPre)
         encoder.setBuffer(
             workspace.streams,
@@ -4252,7 +4357,11 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             index: 0
         )
         encoder.setBuffer(mix, offset: mixOffset, index: 1)
-        encoder.setBuffer(output, offset: workspace.slotOffset(slot, width: shapes.hidden), index: 2)
+        encoder.setBuffer(
+            output,
+            offset: outputByteOffset ?? workspace.slotOffset(slot, width: shapes.hidden),
+            index: 2
+        )
         encoder.setBuffer(
             workspace.hcResidual,
             offset: workspace.slotOffset(slot, width: mult * shapes.hidden),
