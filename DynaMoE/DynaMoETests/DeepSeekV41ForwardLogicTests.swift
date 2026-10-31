@@ -915,6 +915,39 @@ final class DeepSeekV41ExpertArenaTests: XCTestCase {
         XCTAssertEqual(arena.acquisitions, 0)
         XCTAssertEqual(arena.hitRate, 0)
     }
+
+    /// The placement index is derived from the slot array, so every path that writes
+    /// one has to write the other. An evicted pair that still answered as resident
+    /// would be served stale bytes, and a vacated slot that did would be served
+    /// nothing at all.
+    func testEvictedAndVacatedPairsAreNoLongerResident() {
+        let arena = DeepSeekV41ExpertArena(slotCount: 2)
+        _ = arena.acquire([(layer: 0, expert: 0), (layer: 0, expert: 1)])
+
+        // Capacity two, both slots taken: the older pair (expert 0) is the victim.
+        let replacement = arena.acquireDetailed([(layer: 2, expert: 2)])
+        XCTAssertEqual(replacement[0].slot, 0)
+        XCTAssertFalse(replacement[0].isHit)
+        XCTAssertNil(arena.slot(forLayer: 0, expert: 0))
+        XCTAssertEqual(arena.slot(forLayer: 0, expert: 1), 1)
+        XCTAssertEqual(arena.residentCount, 2)
+
+        // A vacated slot is a miss the next time, and the pair it held is gone from
+        // the index rather than claiming the empty slot.
+        arena.vacate(slot: 1)
+        XCTAssertNil(arena.slot(forLayer: 0, expert: 1))
+        XCTAssertEqual(arena.residentCount, 1)
+        let refill = arena.acquireDetailed([(layer: 0, expert: 1)])
+        XCTAssertFalse(refill[0].isHit)
+        XCTAssertEqual(refill[0].slot, 1)
+        XCTAssertEqual(arena.residentCount, 2)
+        XCTAssertNotNil(arena.slot(forLayer: 0, expert: 1))
+
+        // And the pair that survived is still a hit on the slot it always had.
+        let resident = arena.acquireDetailed([(layer: 2, expert: 2)])
+        XCTAssertTrue(resident[0].isHit)
+        XCTAssertEqual(resident[0].slot, 0)
+    }
 }
 
 // MARK: - Hyper-connections

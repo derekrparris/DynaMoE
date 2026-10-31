@@ -2045,17 +2045,17 @@ final class DeepSeekV41FP8GemvKernelTests: XCTestCase {
         try check(outDim: 96, inDim: 1_024, tokens: 1)
     }
 
-    /// The rule that decides the dispatch: every published dense projection is wide
-    /// enough for the coalesced form, and a shape too short to amortize the reduction
-    /// barrier is not.
+    /// The rule that decides the dispatch: every published dense projection except
+    /// `attn.wq_b` is wide enough to amortize the reduction barrier, and the two
+    /// shapes that lose keep the one-thread form.
     func testTheFormRuleCoversThePublishedDenseShapes() {
         let published = [
-            ("attn.wq_b", 32_768, 1_280),
             ("attn.wo_b", 5_120, 8_192),
             ("attn.wo_a band", 1_024, 4_096),
             ("attn.wq_a", 1_280, 5_120),
             ("attn.wkv", 512, 5_120),
-            ("shared_experts.w1", 2_304, 5_120)
+            ("shared_experts.w1", 2_304, 5_120),
+            ("shared_experts.w2", 5_120, 2_304)
         ]
         for (name, outDim, inDim) in published {
             XCTAssertTrue(
@@ -2065,9 +2065,165 @@ final class DeepSeekV41FP8GemvKernelTests: XCTestCase {
                 "\(name) should take the coalesced form"
             )
         }
+        // 40 blocks against 64 lanes: the one-thread form measured 1.07-1.6x faster
+        // here, at one position and at a block of eight.
+        XCTAssertFalse(
+            DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(outDim: 32_768, inDim: 1_280, rows: 1),
+            "attn.wq_b has fewer blocks than lanes and keeps the one-thread form"
+        )
+        XCTAssertFalse(
+            DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(outDim: 32_768, inDim: 1_280, rows: 8),
+            "attn.wq_b loses the coalesced form at a block width too"
+        )
         XCTAssertFalse(
             DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(outDim: 16, inDim: 512, rows: 1),
             "16 rows over 512 columns is too little work to pay for a barrier"
+        )
+    }
+
+    // MARK: Two rows per threadgroup
+
+    /// One threadgroup per (row pair, token), which is the form that halves the
+    /// threadgroup count and the input reads per row.
+    private func dispatchPair(
+        pipeline: MTLComputePipelineState,
+        queue: MTLCommandQueue,
+        weight: MTLBuffer,
+        scale: MTLBuffer,
+        input: MTLBuffer,
+        output: MTLBuffer,
+        inDim: Int,
+        outDim: Int,
+        tokens: Int,
+        inputRowStride: Int,
+        outputRowStride: Int,
+        lanes: Int
+    ) throws {
+        guard let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("no command buffer")
+            return
+        }
+        var weightOffset = UInt64(0)
+        var scaleOffset = UInt64(0)
+        var inDimension = UInt32(inDim)
+        var outDimension = UInt32(outDim)
+        var inStride = UInt32(inputRowStride)
+        var outStride = UInt32(outputRowStride)
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(weight, offset: 0, index: 0)
+        encoder.setBuffer(scale, offset: 0, index: 1)
+        encoder.setBuffer(input, offset: 0, index: 2)
+        encoder.setBuffer(output, offset: 0, index: 3)
+        encoder.setBytes(&weightOffset, length: 8, index: 4)
+        encoder.setBytes(&scaleOffset, length: 8, index: 5)
+        encoder.setBytes(&inDimension, length: 4, index: 6)
+        encoder.setBytes(&outDimension, length: 4, index: 7)
+        encoder.setBytes(&inStride, length: 4, index: 8)
+        encoder.setBytes(&outStride, length: 4, index: 9)
+        // Two floats per SIMD group of partials, which is the most a 64-lane
+        // threadgroup can need.
+        encoder.setThreadgroupMemoryLength(
+            2 * 32 * MemoryLayout<Float>.stride, index: 0
+        )
+        encoder.dispatchThreadgroups(
+            MTLSize(width: ((outDim + 1) / 2) * tokens, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+    }
+
+    /// The pair form against the host rule at both lane shapes.
+    private func checkPair(
+        outDim: Int,
+        inDim: Int,
+        tokens: Int,
+        inputRowStride: Int? = nil,
+        outputRowStride: Int? = nil
+    ) throws {
+        let (device, library, queue) = try environment()
+        guard let pairFunction = library.makeFunction(name: DeepSeekV41Kernels.fp8GemvRows2),
+              let pair = try? device.makeComputePipelineState(function: pairFunction) else {
+            XCTFail("the pair FP8 GEMV kernel is not in the default library")
+            return
+        }
+        let inStride = inputRowStride ?? inDim
+        let outStride = outputRowStride ?? outDim
+        let blocks = inDim / 32
+        let weight = weightBytes(outDim * inDim)
+        // The checkpoint's scale grid is 32x32, so a row count that is not a multiple
+        // of 32 has a partial group whose scale row must exist for the host rule and
+        // the kernel to read. Every published shape is a multiple of 32; padding here
+        // is what lets the odd-row case run at all.
+        let scaleGroups = (outDim + 31) / 32
+        let scales = scaleBytes(scaleGroups * blocks)
+        let input = values(tokens * inStride)
+        guard let weightBuffer = device.makeBuffer(
+                  bytes: weight,
+                  length: weight.count * MemoryLayout<UInt8>.stride,
+                  options: .storageModeShared),
+              let scaleBuffer = device.makeBuffer(
+                  bytes: scales,
+                  length: scales.count * MemoryLayout<UInt8>.stride,
+                  options: .storageModeShared),
+              let inputBuffer = device.makeBuffer(
+                  bytes: input,
+                  length: input.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared) else {
+            XCTFail("the FP8 GEMV buffers did not allocate")
+            return
+        }
+
+        let expected = reference(
+            weight: weight, scales: scales, inDim: inDim, outDim: outDim, tokens: tokens,
+            input: input, inputRowStride: inStride, outputRowStride: outStride
+        )
+        let magnitude = max(1, expected.map { abs($0) }.max() ?? 1)
+
+        for lanes in [32, 64] {
+            guard let output = device.makeBuffer(
+                length: tokens * outStride * MemoryLayout<Float>.stride,
+                options: .storageModeShared) else {
+                XCTFail("no pair output buffer")
+                return
+            }
+            memset(output.contents(), 0, output.length)
+            try dispatchPair(
+                pipeline: pair, queue: queue, weight: weightBuffer, scale: scaleBuffer,
+                input: inputBuffer, output: output, inDim: inDim, outDim: outDim,
+                tokens: tokens, inputRowStride: inStride, outputRowStride: outStride,
+                lanes: lanes
+            )
+            let produced = floats(output, count: tokens * outStride)
+            for token in 0..<tokens {
+                for row in 0..<outDim {
+                    let at = token * outStride + row
+                    XCTAssertLessThan(
+                        abs(produced[at] - expected[at]), magnitude * 1e-4,
+                        "pair form (lanes \(lanes)) drifted at row \(row) of \(outDim)x\(inDim)"
+                    )
+                }
+            }
+        }
+    }
+
+    func testThePairFormMatchesTheHostRuleAtAPublishedWidth() throws {
+        try checkPair(outDim: 96, inDim: 1_280, tokens: 1)
+    }
+
+    /// An odd row count leaves the last pair with no second row: the form must write
+    /// that row once and not read material for a row past the buffer.
+    func testThePairFormHandlesAnOddRowCount() throws {
+        try checkPair(outDim: 2_305, inDim: 1_024, tokens: 2)
+    }
+
+    func testThePairFormHonoursPositionStrides() throws {
+        try checkPair(
+            outDim: 64, inDim: 2_304, tokens: 3,
+            inputRowStride: 2_560, outputRowStride: 96
         )
     }
 }

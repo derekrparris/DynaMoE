@@ -215,6 +215,14 @@ nonisolated public enum DeepSeekV41Activation {
 ///   * a slot is owned by exactly one (layer, expert), and
 ///   * eviction is LRU over the pairs, never over individual matrices, because a
 ///     half-resident expert is a wrong answer with no error.
+///
+/// Placement is a dictionary lookup rather than a scan. A decoded token acquires 240
+/// pairs against thousands of slots, so scanning the whole array per pair (twice for
+/// a miss, since it looked for a free slot and then for the LRU) put a measurable
+/// slice of the token loop on the host: 12,720 acquisitions spent 963 ms in placement
+/// over a 52-position run of the published checkpoint
+/// (`DeepSeekV41PublishedTurnTests.testWhatADecodePositionCosts`, a Debug test build,
+/// where 72 us per pair is what one full scan costs).
 nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
 
     public struct Slot: Sendable, Equatable {
@@ -224,9 +232,22 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
         public let lastUsed: UInt64
     }
 
+    /// The key a slot is owned by. `Hashable` so placement is a lookup instead of a
+    /// scan: the arena holds thousands of slots and a decoded token acquires 240
+    /// pairs, so `slots.firstIndex(where:)` per pair was O(slots) over the whole
+    /// array twice per miss.
+    private struct PairKey: Hashable {
+        let layer: Int
+        let expert: Int
+    }
+
     private let lock = NSLock()
     private let slotCount: Int
+    /// The truth: which pair each slot holds, and when it was last used.
     private var slots: [Slot?]
+    /// Derived from `slots`, and written by every path that writes it (hit, miss,
+    /// vacate, reset). It exists only so a lookup does not scan.
+    private var placement: [PairKey: Int] = [:]
     private var counter: UInt64 = 0
     /// Total acquisitions, hits and misses, so the load log can report whether the
     /// arena is sized sanely for the traffic.
@@ -244,7 +265,7 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
     public var residentCount: Int {
         lock.lock()
         defer { lock.unlock() }
-        return slots.compactMap { $0 }.count
+        return placement.count
     }
 
     /// Reserves slots for `(layer, expert)` pairs and returns the slot index of
@@ -278,31 +299,51 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
         out.reserveCapacity(pairs.count)
         for pair in pairs {
             acquisitions += 1
-            if let existing = slots.firstIndex(where: { $0?.layer == pair.layer && $0?.expert == pair.expert }) {
+            let key = PairKey(layer: pair.layer, expert: pair.expert)
+            if let existing = placement[key] {
                 hits += 1
                 counter += 1
                 slots[existing] = Slot(layer: pair.layer, expert: pair.expert, lastUsed: counter)
                 out.append((slot: existing, isHit: true))
                 continue
             }
-            let free = slots.firstIndex(where: { $0 == nil })
-            let index: Int
-            if let free {
-                index = free
-            } else {
-                // Evict the least recently used pair.
-                guard let lru = slots.indices.min(by: { (slots[$0]?.lastUsed ?? 0) < (slots[$1]?.lastUsed ?? 0) }) else {
-                    out.append((slot: 0, isHit: false))
-                    continue
-                }
-                index = lru
+            guard let slot = freeSlotOrVictim() else {
+                out.append((slot: 0, isHit: false))
+                continue
+            }
+            if let victim = slots[slot] {
+                // Evict the least recently used pair, and forget it in the index so a
+                // later acquire for it is a miss rather than a stale hit.
                 evictions += 1
+                placement.removeValue(forKey: PairKey(layer: victim.layer, expert: victim.expert))
             }
             counter += 1
-            slots[index] = Slot(layer: pair.layer, expert: pair.expert, lastUsed: counter)
-            out.append((slot: index, isHit: false))
+            slots[slot] = Slot(layer: pair.layer, expert: pair.expert, lastUsed: counter)
+            placement[key] = slot
+            out.append((slot: slot, isHit: false))
         }
         return out
+    }
+
+    /// A free slot if there is one, otherwise the least recently used.
+    ///
+    /// One pass over the array: a miss used to scan once for a free slot and, when
+    /// the arena was full, again for the LRU.
+    private func freeSlotOrVictim() -> Int? {
+        var free: Int?
+        var oldest: Int?
+        var oldestUsed = UInt64.max
+        for candidate in slots.indices {
+            guard let slot = slots[candidate] else {
+                if free == nil { free = candidate }
+                continue
+            }
+            if slot.lastUsed < oldestUsed {
+                oldestUsed = slot.lastUsed
+                oldest = candidate
+            }
+        }
+        return free ?? oldest
     }
 
     /// Forgets what a slot holds, so the next `acquire` for that pair is a miss.
@@ -315,6 +356,9 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard slot >= 0, slot < slots.count else { return }
+        if let vacated = slots[slot] {
+            placement.removeValue(forKey: PairKey(layer: vacated.layer, expert: vacated.expert))
+        }
         slots[slot] = nil
     }
 
@@ -322,12 +366,13 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
     public func slot(forLayer layer: Int, expert: Int) -> Int? {
         lock.lock()
         defer { lock.unlock() }
-        return slots.firstIndex { $0?.layer == layer && $0?.expert == expert }
+        return placement[PairKey(layer: layer, expert: expert)]
     }
 
     public func reset() {
         lock.lock()
         slots = Array(repeating: nil, count: slotCount)
+        placement.removeAll(keepingCapacity: true)
         acquisitions = 0
         hits = 0
         evictions = 0

@@ -708,14 +708,28 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             func mean(_ values: [Double]) -> Double {
                 values.reduce(0, +) / Double(max(1, values.count))
             }
+            let placement = runtime.expertStreamer?.placementTiming
+                ?? (seconds: 0, placements: 0)
+            let placementLine = String(
+                format: "arena placement %.2f ms over %d pair(s) (%.1f us each); "
+                    + "arena %d/%d resident, %.1f%% hit over %d acquisition(s)",
+                placement.seconds * 1000,
+                placement.placements,
+                placement.placements > 0
+                    ? placement.seconds / Double(placement.placements) * 1_000_000 : 0,
+                runtime.arena.residentCount,
+                runtime.arena.capacity,
+                runtime.arena.hitRate * 100,
+                runtime.arena.acquisitions
+            )
             return String(
                 format: "decode position over %d position(s): %.1f ms wall, %.1f ms host, "
-                    + "so %.1f ms is device and the head",
+                    + "so %.1f ms is device and the head; ",
                 measured.count,
                 mean(measured),
                 mean(host),
                 mean(measured) - mean(host)
-            )
+            ) + placementLine
         }.value
         print("🔎 [dsv41 real] \(carryOn)")
         withExtendedLifetime(engine) {}

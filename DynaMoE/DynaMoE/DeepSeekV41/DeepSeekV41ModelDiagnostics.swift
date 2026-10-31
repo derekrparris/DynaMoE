@@ -103,7 +103,11 @@ public enum DeepSeekV41LoadDiagnostics {
         // opposite of what a 128 GB machine does with it.
         let physicalGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
         let expertSlots = min(
-            DeepSeekV41MemoryPlan.affordableExpertSlots(plan: memory, physicalGB: physicalGB),
+            DeepSeekV41MemoryPlan.affordableExpertSlots(
+                plan: memory,
+                physicalGB: physicalGB,
+                fraction: DeepSeekV41Runtime.arenaFractionOverride ?? 0.6
+            ),
             max(1, config.numRoutedExperts * max(1, config.numHiddenLayers))
         )
         lines.append("memory: \(memory.describe(expertSlots: expertSlots))")

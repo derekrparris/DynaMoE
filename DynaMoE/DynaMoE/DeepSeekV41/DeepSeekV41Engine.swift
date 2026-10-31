@@ -596,6 +596,19 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         UserDefaults.standard.bool(forKey: densePinOffDefaultKey)
     }
 
+    /// `defaults write DRP.DynaMoE dynamoe_dsv41_arena_fraction -float 0.72`
+    ///
+    /// Debug-only seam for A/B-ing how much of RAM the expert arena may hold. The arena
+    /// is a cache, so a bigger one means fewer experts a token pays the SSD for; the
+    /// counterweight is memory pressure, which is exactly what a measurement has to
+    /// settle rather than assume. Not a shipped setting.
+    public static let arenaFractionDefaultKey = "dynamoe_dsv41_arena_fraction"
+
+    public static var arenaFractionOverride: Double? {
+        let value = UserDefaults.standard.double(forKey: arenaFractionDefaultKey)
+        return value > 0 ? value : nil
+    }
+
     private static let initializationError = InitErrorBox()
 
     static func record(_ reason: String) {
@@ -687,7 +700,11 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         )
         let physicalGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
         let slotCount = min(
-            DeepSeekV41MemoryPlan.affordableExpertSlots(plan: memoryPlan, physicalGB: physicalGB),
+            DeepSeekV41MemoryPlan.affordableExpertSlots(
+                plan: memoryPlan,
+                physicalGB: physicalGB,
+                fraction: DeepSeekV41Runtime.arenaFractionOverride ?? 0.6
+            ),
             max(1, config.numRoutedExperts * max(1, config.numHiddenLayers))
         )
         let arena = DeepSeekV41ExpertArena(slotCount: slotCount)

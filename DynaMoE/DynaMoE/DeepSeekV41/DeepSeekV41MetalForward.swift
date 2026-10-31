@@ -95,6 +95,11 @@ nonisolated public enum DeepSeekV41Kernels {
     /// The same dot product with one output row per threadgroup, so a warp's loads
     /// are adjacent instead of a row apart.
     public static let fp8GemvRows = "dsv41_fp8_block32_gemv_rows"
+    /// Two output rows per threadgroup, sharing one input load. Kept as the baseline
+    /// the FP8 form sweep A/Bs against: it measured a wash everywhere (0.85-1.10x of
+    /// the one-row form on the published shapes), so nothing dispatches it and it is
+    /// not in `DeepSeekV41Pipelines` (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #21").
+    public static let fp8GemvRows2 = "dsv41_fp8_block32_gemv_rows2"
     public static let fp8SwiGLU = "dsv41_fp8_block32_swiglu_gate_up"
     public static let fp8DownAccumulate = "dsv41_fp8_block32_down_accumulate"
     public static let mxfp4Gemv = "dsv41_mxfp4_gemv"
@@ -278,17 +283,17 @@ nonisolated public enum DeepSeekV41DevicePlan {
     /// contiguous 1 KB window per step, and pays for it with a reduction barrier per
     /// row.
     ///
-    /// The barrier is the whole cost, so what decides is how many blocks a lane gets:
-    /// at 64 lanes a 1,280-wide row is 40 blocks, i.e. one block for 40 of the 64
-    /// lanes, and the one-thread form never has to meet a barrier at all. The measured
-    /// crossover is in `DeepSeekV41PrefillMeasurementTests`'
-    /// `testWhatTheCoalescedFP8FormIsWorth`; the numbers are in
-    /// `Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #20".
+    /// The barrier is the whole cost, so what decides is how many blocks a lane gets.
+    /// At 64 lanes a row of 1,024-1,536 values is 32-48 blocks, i.e. fewer than one
+    /// block per lane; a row of 4,096 is 128 and wins 2-3.9x. The measured crossover
+    /// is `inDim` 2,048, exactly one block per lane, and
+    /// `testWhatTwoRowsPerThreadgroupSavesOnTheFP8Gemv` sweeps 1,024-4,096 at a fixed
+    /// row count. `attn.wq_b` is the published shape on the losing side: 32,768 rows
+    /// over 1,280 columns is 40 blocks, so the one-thread form is 1.07-1.6x faster
+    /// there (a block of positions included) and this rule sends it that way. The
+    /// numbers are in `Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #20" and "#21".
     public static func fp8GemvWantsWideGrid(outDim: Int, inDim: Int, rows: Int) -> Bool {
-        guard outDim >= 32, inDim >= 1_024 else { return false }
-        // A block of positions still gives the one-thread form `outDim * rows` threads;
-        // sharing nothing is what makes it scattered, and rows only widen the grid.
-        return true
+        outDim >= 32 && inDim >= 2_048
     }
 
     /// Which shape of the routed mixture's kernels a dispatch gets.

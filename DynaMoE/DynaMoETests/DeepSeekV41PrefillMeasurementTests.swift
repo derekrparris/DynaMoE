@@ -2502,8 +2502,11 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
                 })
             }
 
-            func gigabytesPerSecond(_ nanoseconds: Double) -> Double {
-                Double(weightBytes * dispatches) / (nanoseconds / 1e9) / 1e9
+            // `milliseconds` returns MILLISECONDS, so bytes per ms divided by 1e6 is
+            // GB/s. Dividing by 1e9 twice (as this line used to) printed a number a
+            // million times too large, which read as a plausible GB/s only by accident.
+            func gigabytesPerSecond(_ elapsedMilliseconds: Double) -> Double {
+                Double(weightBytes * dispatches) / (elapsedMilliseconds * 1e6)
             }
             var columns = String(
                 format: "[dsv41 fp8 form] %-22@ %6.1f MB  per-row %7.3f ms (%5.0f GB/s)",
@@ -2750,8 +2753,9 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
                            output: oldOutput, repeats: dispatches)
                 })
             }
-            func gigabytesPerSecond(_ nanoseconds: Double) -> Double {
-                Double(bytesPerDispatch * dispatches) / (nanoseconds / 1e9) / 1e9
+            // Milliseconds in, GB/s out: see the note in the FP8 form test.
+            func gigabytesPerSecond(_ elapsedMilliseconds: Double) -> Double {
+                Double(bytesPerDispatch * dispatches) / (elapsedMilliseconds * 1e6)
             }
             var line = String(
                 format: "[dsv41 mixture] %-18@ %6.1f MB  one-thread %7.3f ms (%5.0f GB/s)",
@@ -2780,6 +2784,258 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
         }
         for tokens in [1, 8] {
             measure(name: "expert down", outDim: 5_120, inDim: 2_304, tokens: tokens, isSwiGLU: false)
+        }
+    }
+
+    // MARK: Two rows per threadgroup
+
+    /// The one-row coalesced form against the two-row form, on the two shapes the
+    /// one-row form still loses on plus a control.
+    ///
+    /// `attn.wq_b` (32,768 rows over 1,280 columns) was the one published projection
+    /// that got WORSE with one row per threadgroup (0.78x of the one-thread form):
+    /// 40 blocks per row at 64 lanes leaves 24 lanes idle, and the grid is 32,768
+    /// threadgroups wide, a fifth of the machine at a time. The shared experts'
+    /// FFN projections are the other shape: a 2,304- or 5,120-wide row re-reads the
+    /// same input vector once per output row. `dsv41_fp8_block32_gemv_rows2` gives a
+    /// threadgroup two consecutive rows and one input load, the trade
+    /// `bf16_gemv_rows8x2` won on `attn.wo_a`/`wo_b` (1.20x/1.34x).
+    ///
+    /// `attn.wo_b` is the control: it is 8,192 wide, where the one-row form already
+    /// reads a full window per step, so pairing it should not help and must not hurt.
+    func testWhatTwoRowsPerThreadgroupSavesOnTheFP8Gemv() throws {
+        guard let metal = MTLCreateSystemDefaultDevice(),
+              let library = metal.makeDefaultLibrary(),
+              let perRowFunction = library.makeFunction(name: DeepSeekV41Kernels.fp8Gemv),
+              let rowsFunction = library.makeFunction(name: DeepSeekV41Kernels.fp8GemvRows),
+              let pairFunction = library.makeFunction(name: DeepSeekV41Kernels.fp8GemvRows2),
+              let perRowPipeline = try? metal.makeComputePipelineState(function: perRowFunction),
+              let rowsPipeline = try? metal.makeComputePipelineState(function: rowsFunction),
+              let pairPipeline = try? metal.makeComputePipelineState(function: pairFunction),
+              let queue = metal.makeCommandQueue() else {
+            XCTFail("the FP8 GEMV kernels are not in the default library")
+            return
+        }
+
+        let repetitions = 8
+        let weightTile: [UInt8] = (0..<4_096).map { index in
+            let sign: UInt8 = (index % 7 == 3) ? 0x80 : 0
+            return sign | (UInt8((index / 5) % 9) << 3) | UInt8(index % 8)
+        }
+        let scaleTile: [UInt8] = (0..<256).map { UInt8(124 + ($0 % 7)) }
+        let inputTile: [Float] = (0..<4_096).map { Float(($0 &* 29 &+ 7) % 17 - 8) / 16 }
+
+        func fill<T>(_ buffer: MTLBuffer, bytes: Int, tile: [T]) {
+            let valueStride = MemoryLayout<T>.stride
+            let destination = buffer.contents()
+            tile.withUnsafeBytes { source in
+                guard let base = source.baseAddress else { return }
+                var written = 0
+                while written < bytes {
+                    let chunk = min(tile.count * valueStride, bytes - written)
+                    memcpy(destination + written, base, chunk)
+                    written += chunk
+                }
+            }
+        }
+
+        func encode(
+            _ pipeline: MTLComputePipelineState,
+            form: Int,
+            lanes: Int,
+            weight: MTLBuffer,
+            scale: MTLBuffer,
+            input: MTLBuffer,
+            output: MTLBuffer,
+            inDim: Int,
+            outDim: Int,
+            tokens: Int,
+            weightBytes: Int,
+            repeats: Int
+        ) {
+            guard let commandBuffer = queue.makeCommandBuffer(),
+                  let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+            var scaleOffset = UInt64(0)
+            var inDimension = UInt32(inDim)
+            var outDimension = UInt32(outDim)
+            var zero = UInt32(0)
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(weight, offset: 0, index: 0)
+            encoder.setBuffer(scale, offset: 0, index: 1)
+            encoder.setBuffer(input, offset: 0, index: 2)
+            encoder.setBuffer(output, offset: 0, index: 3)
+            encoder.setBytes(&scaleOffset, length: 8, index: 5)
+            encoder.setBytes(&inDimension, length: 4, index: 6)
+            encoder.setBytes(&outDimension, length: 4, index: 7)
+            encoder.setBytes(&zero, length: 4, index: 8)
+            encoder.setBytes(&zero, length: 4, index: 9)
+            if form != 0 {
+                encoder.setThreadgroupMemoryLength(
+                    (form == 2 ? 2 * 32 : 32) * MemoryLayout<Float>.stride, index: 0
+                )
+            }
+            for repeatIndex in 0..<max(1, repeats) {
+                // A different region per dispatch, so the queue reads weight the
+                // previous dispatch did not just pull into the cache.
+                var weightOffset = UInt64(repeatIndex * weightBytes)
+                encoder.setBytes(&weightOffset, length: 8, index: 4)
+                if form == 0 {
+                    encoder.dispatchThreads(
+                        MTLSize(width: outDim, height: tokens, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+                    )
+                    continue
+                }
+                let rows = form == 2 ? (outDim + 1) / 2 : outDim
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: rows * tokens, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+                )
+            }
+            encoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+        }
+
+        func measure(
+            name: String,
+            outDim: Int,
+            inDim: Int,
+            tokens: Int,
+            dispatches: Int = 6,
+            laneWidths: [Int] = [32, 64]
+        ) {
+            let weightBytes = outDim * inDim
+            let blocks = inDim / 32
+            let scaleBytes = (outDim / 32) * blocks
+            guard let weight = metal.makeBuffer(
+                      length: weightBytes * dispatches, options: .storageModeShared
+                  ),
+                  let scale = metal.makeBuffer(length: scaleBytes, options: .storageModeShared),
+                  let input = metal.makeBuffer(
+                      length: tokens * inDim * MemoryLayout<Float>.stride,
+                      options: .storageModeShared
+                  ),
+                  let rowsOutput = metal.makeBuffer(
+                      length: tokens * outDim * MemoryLayout<Float>.stride,
+                      options: .storageModeShared
+                  ),
+                  let perRowOutput = metal.makeBuffer(
+                      length: tokens * outDim * MemoryLayout<Float>.stride,
+                      options: .storageModeShared
+                  ),
+                  let pairOutput = metal.makeBuffer(
+                      length: tokens * outDim * MemoryLayout<Float>.stride,
+                      options: .storageModeShared
+                  ) else {
+                XCTFail("\(name): buffers did not allocate")
+                return
+            }
+            fill(weight, bytes: weightBytes * dispatches, tile: weightTile)
+            fill(scale, bytes: scaleBytes, tile: scaleTile)
+            fill(input, bytes: tokens * inDim * MemoryLayout<Float>.stride, tile: inputTile)
+            memset(perRowOutput.contents(), 0, perRowOutput.length)
+            memset(rowsOutput.contents(), 0, rowsOutput.length)
+            memset(pairOutput.contents(), 0, pairOutput.length)
+
+            func run(
+                _ pipeline: MTLComputePipelineState,
+                form: Int,
+                lanes: Int,
+                output: MTLBuffer,
+                repeats: Int
+            ) {
+                encode(
+                    pipeline, form: form, lanes: lanes, weight: weight, scale: scale,
+                    input: input, output: output, inDim: inDim, outDim: outDim,
+                    tokens: tokens, weightBytes: weightBytes, repeats: repeats
+                )
+            }
+
+            // One dispatch each to compare the outputs before anything is timed. The
+            // three forms sum the same products, so the bar is a rounding bar.
+            run(perRowPipeline, form: 0, lanes: 64, output: perRowOutput, repeats: 1)
+            run(rowsPipeline, form: 1, lanes: 64, output: rowsOutput, repeats: 1)
+            run(pairPipeline, form: 2, lanes: 64, output: pairOutput, repeats: 1)
+            let threaded = floats(perRowOutput, count: tokens * outDim)
+            let single = floats(rowsOutput, count: tokens * outDim)
+            let paired = floats(pairOutput, count: tokens * outDim)
+            let magnitude = max(1, single.map { abs($0) }.max() ?? 1)
+            let drift = max(worstDelta(single, threaded), worstDelta(single, paired))
+            guard drift < magnitude * 1e-3 else {
+                print(
+                    String(
+                        format: "[dsv41 fp8 pair] %-20@ %5dx%-5d rows %d: forms disagree "
+                            + "(%.3g / %.3g), not timing it",
+                        name as NSString, outDim, inDim, tokens, drift, magnitude
+                    )
+                )
+                return
+            }
+
+            var threadedBest = Double.infinity
+            var rowsBest = Double.infinity
+            var pairBest: [Int: Double] = [:]
+            for lane in laneWidths { pairBest[lane] = Double.infinity }
+            for _ in 0..<repetitions {
+                // Interleaved inside each repetition, so a first-timed arm does not
+                // pay for being first (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #5").
+                for lane in laneWidths {
+                    pairBest[lane] = min(pairBest[lane] ?? .infinity, milliseconds {
+                        run(pairPipeline, form: 2, lanes: lane, output: pairOutput,
+                            repeats: dispatches)
+                    })
+                }
+                rowsBest = min(rowsBest, milliseconds {
+                    run(rowsPipeline, form: 1, lanes: 64, output: rowsOutput,
+                        repeats: dispatches)
+                })
+                threadedBest = min(threadedBest, milliseconds {
+                    run(perRowPipeline, form: 0, lanes: 64, output: perRowOutput,
+                        repeats: dispatches)
+                })
+            }
+
+            // Milliseconds in, GB/s out: see the note in the FP8 form test.
+            func gigabytesPerSecond(_ elapsedMilliseconds: Double) -> Double {
+                Double(weightBytes * dispatches) / (elapsedMilliseconds * 1e6)
+            }
+            var columns = String(
+                format: "[dsv41 fp8 pair] %-20@ %6.1f MB  one-thread %7.3f ms (%5.0f GB/s)"
+                    + "  one-row %7.3f ms %4.2fx",
+                name as NSString,
+                Double(weightBytes) / 1_048_576,
+                threadedBest / Double(dispatches),
+                gigabytesPerSecond(threadedBest),
+                rowsBest / Double(dispatches),
+                threadedBest / rowsBest
+            )
+            for lane in laneWidths {
+                guard let best = pairBest[lane] else { continue }
+                columns += String(
+                    format: "  pair %d %7.3f ms (%5.0f GB/s) %4.2fx",
+                    lane,
+                    best / Double(dispatches),
+                    gigabytesPerSecond(best),
+                    rowsBest / best
+                )
+            }
+            print(columns)
+        }
+
+        for tokens in [1, 8] {
+            measure(name: "attn.wq_b", outDim: 32_768, inDim: 1_280, tokens: tokens)
+            measure(name: "shared_experts.w1", outDim: 2_304, inDim: 5_120, tokens: tokens)
+            measure(name: "shared_experts.w2", outDim: 5_120, inDim: 2_304, tokens: tokens)
+            measure(name: "attn.wo_b", outDim: 5_120, inDim: 8_192, tokens: tokens)
+            // Where the wide-grid rule should sit: `wq_b`'s 1,280-wide row lost with
+            // one row per threadgroup (40 blocks against 64 lanes) and the 4,096-wide
+            // band won by 3.9x. These fill the gap between them, at a fixed row count.
+            for width in [1_024, 1_536, 2_048, 3_072, 4_096] {
+                measure(
+                    name: "row width \(width)", outDim: 5_120, inDim: width, tokens: tokens
+                )
+            }
         }
     }
 }

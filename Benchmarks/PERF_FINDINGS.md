@@ -5261,3 +5261,102 @@ turnaround at ~1.9 ms/layer is now larger than the work it is waiting for. Third
 shapes the rules deliberately left alone: `wq_b` (~12 ms/token) and the shared experts'
 FP8 swiglu and down (~21 ms/token), both of which want the same treatment with several rows
 per threadgroup rather than one.
+
+## DSV4.1 #21: THE TWO-ROW FP8 FORM IS A WASH, AND THE ARENA NEVER EVICTS
+
+#20 left two named candidates: the shapes the coalesced form still lost on (`attn.wq_b`
+and the shared experts' FFN), which looked like the `bf16_gemv_rows8x2` "several rows per
+threadgroup" fix, and the expert arena's hit rate, which looked like an eviction-policy
+problem. Both were measured. Neither was what it looked like, and the second question
+turned out to have no eviction in it at all.
+
+### Two rows per threadgroup, on FP8
+
+`dsv41_fp8_block32_gemv_rows2` gives a threadgroup two consecutive output rows and one
+input token: each lane reads its input floats once, then both rows' weight bytes and
+scales, and the grid halves from `outDim * tokens` to `ceil(outDim / 2) * tokens`. Same
+buffer indices as the one-row form, two floats per SIMD group of partials, the 32-lane
+fast path still returns without a barrier. `DeepSeekV41FP8GemvKernelTests` pins it against
+the host rule at both lane widths, on an odd row count (the last pair has no second row),
+and on a batch with input/output strides wider than the shape.
+
+The A/B runs three arms — one-thread, one-row, pair — interleaved inside each of eight
+repetitions, six distinct weight regions per command buffer, and refuses to time a pair
+whose outputs disagree. One decode position (ms):
+
+| shape | one-thread | one-row | pair 32 | pair 64 |
+|---|---:|---:|---:|---:|
+| `attn.wq_b` 32,768x1,280 | **0.140** | 0.151 (0.93x) | 0.148 | 0.146 |
+| `shared_experts.w1` 2,304x5,120 | 0.170 | **0.049 (3.48x)** | 0.051 | 0.055 |
+| `shared_experts.w2` 5,120x2,304 | 0.087 | **0.052 (1.67x)** | 0.061 | 0.059 |
+| `attn.wo_b` 5,120x8,192 | 0.279 | **0.108 (2.59x)** | 0.124 | 0.113 |
+
+and a block of eight positions:
+
+| shape | one-thread | one-row | pair 32 | pair 64 |
+|---|---:|---:|---:|---:|
+| `attn.wq_b` | **0.585** | 0.934 (0.63x) | 0.849 | 0.893 |
+| `shared_experts.w1` | 0.239 | **0.192 (1.24x)** | 0.190 | 0.196 |
+| `shared_experts.w2` | **0.205** | 0.238 (0.86x) | 0.230 | 0.234 |
+| `attn.wo_b` | 0.644 | **0.583 (1.10x)** | 0.585 | 0.584 |
+
+The pair form is between 0.85x and 1.10x of the one-row form everywhere, i.e. inside the
+noise of the thing it was meant to replace. The reason is the opposite of the BF16 result:
+there, a block of eight positions re-reads every position's activation once per output row
+(1.9 GB of READ requests per block on `outputUp`), so halving the input traffic halved the
+stage. Here the input is a single 5 KB vector that every threadgroup reads from cache; what
+the pair form adds instead is four more accumulators and twice the E4M3 unpack per lane. Do
+not wire it, and do not re-propose "more rows per threadgroup" for FP8 without a shape whose
+input traffic is the measured cost. It stays in the shader library as the baseline the
+sweep measures, and it is deliberately not in `DeepSeekV41Pipelines`.
+
+**The rule moved instead.** A width sweep at a fixed 5,120 rows puts the one-thread form
+ahead below 64 blocks (1,024 values: one-row still wins 1.42x at one position but loses at
+eight; 1,280 loses at both) and the coalesced form clearly ahead from 2,048 up. That is one
+32-value block per lane at 64 lanes, which is now the rule: `inDim >= 2_048` rather than
+`1_024`. The published shape this changes is `attn.wq_b` (40 blocks), the one projection
+where #20's own numbers already said the coalesced form was 0.78x — it now takes the
+one-thread form, worth 1.07x at one position and 1.6x at eight.
+
+The GB/s column in the measurement prints was also wrong by a factor of a million: it
+divided a MILLISECOND figure by 1e9 twice. Both helpers are fixed, so the printed number is
+now the number the journal quotes.
+
+### The arena has no evictions to tune
+
+#20 ranked the fill first and asked whether the arena's degradation was reclaim, and whether
+a smaller arena or a different eviction order would fill faster. Instrumenting
+`DeepSeekV41ExpertStreamer` answered the question before it was optimised: over a 53-position
+walk of the published checkpoint, 12,720 acquisitions at a 70.6% hit rate touched 3,739
+distinct pairs against a capacity of 3,760. **Every miss was a first touch and nothing was
+ever evicted.** Raising the budget from 0.6 to 0.72 of RAM (3,760 -> 4,637 slots) left the
+per-position read byte-for-byte identical (806.8 MB at position 52 in both arms) and the hit
+rate identical (70.6%), because the extra capacity was never needed. A 15-draw turn at 0.72
+ends at 1,790 of 4,637 resident.
+
+So the fill is cold-start bound, not capacity bound: a token routes six of 384 experts in
+each of forty layers, and after a few dozen tokens most of what it asks for is still new.
+The steady-state cost over these runs is 900-950 MB/token at 78% hit, which the disk serves
+at 10-13.7 GB/s (13.8 is the machine's measured ceiling), i.e. 70-90 ms of a ~270 ms
+position. The earlier "13.9 -> 8 GB/s as the arena filled" was machine state, not eviction:
+two runs of the same token list read exactly the same bytes and varied by 2x in wall time.
+
+Two changes came out of the investigation anyway. Placement is now a dictionary lookup
+(`(layer, expert) -> slot`) plus one pass for a free slot or the LRU victim, instead of
+`slots.firstIndex(where:)` twice per miss over 3,760 elements; the timings printed by the
+walk are 75.7 us per pair before and 72.0 after in a Debug test build, which says the scan
+was not the cost in that build (Release would be a fraction of a millisecond per token) —
+the instrument is what proves it rather than the optimisation being assumed. And
+`dynamoe_dsv41_arena_fraction` is the debug seam the A/B above used, alongside the existing
+`dynamoe_dsv41_pin_dense_off`.
+
+**What is left.** The two GPU halves are ~57 ms of a 270 ms position and read ~9.4 GB at
+190-230 GB/s, so their remaining headroom over the best measured GEMV rate (~370 GB/s) is
+tens of milliseconds at most, and the shapes that are left are single-percent slices. The
+host is the story: `front wait` is 2.4-3.2 ms per layer against ~1.4 ms of device work, and
+the fill is 70-90 ms that no kernel overlaps because the routing readback sits between the
+two halves. A decode step is 80 host round trips whose turnaround is now larger than the
+work it waits for, and the fill cannot move off the critical path without either a second
+arena whose slots the previous layer's mixture is not reading, or a way to know layer N's
+routing before layer N's attention has run. Neither is a kernel change; both are a graph
+change and both need their own measurement.

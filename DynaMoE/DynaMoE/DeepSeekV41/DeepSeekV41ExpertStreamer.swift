@@ -426,12 +426,24 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
     /// it is the one part of a fill that a bigger arena would not repeat.
     private var secondsAllocating: Double = 0
     private var slotsAllocated: Int = 0
+    /// Wall time spent inside the arena's placement call: a lookup per resident pair
+    /// plus one pass over the slot array for each miss. Exposed separately from the
+    /// read time so choosing slots is a number rather than an assumption.
+    private var secondsPlacing: Double = 0
+    public private(set) var placements: Int = 0
 
     /// Read and allocation time so far, for the walk instrumentation.
     public var timing: (reading: Double, allocating: Double, slotsAllocated: Int) {
         lock.lock()
         defer { lock.unlock() }
         return (secondsReading, secondsAllocating, slotsAllocated)
+    }
+
+    /// Time spent choosing slots, and how many (layer, expert) pairs that covered.
+    public var placementTiming: (seconds: Double, placements: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (secondsPlacing, placements)
     }
 
     public init(
@@ -600,9 +612,16 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
                 requested: experts.count, capacity: capacity
             )
         }
+        let placementStarted = DispatchTime.now().uptimeNanoseconds
         let reservations = arena.acquireDetailed(
             experts.map { (layer: layer, expert: $0) }
         )
+        lock.lock()
+        secondsPlacing += Double(
+            DispatchTime.now().uptimeNanoseconds - placementStarted
+        ) / 1_000_000_000
+        placements += reservations.count
+        lock.unlock()
 
         // Group the misses by shard so each file takes one batch of ranges, which is
         // the only way the reads reach queue depth.
