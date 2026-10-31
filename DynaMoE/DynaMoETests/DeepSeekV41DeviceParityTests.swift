@@ -80,7 +80,8 @@ final class DeepSeekV41SyntheticCheckpointTests: XCTestCase {
                 byteOffset: 0,
                 rows: tensor.shape[0],
                 columns: tensor.shape.count == 2 ? tensor.shape[1] : 1,
-                dtype: tensor.dtype
+                dtype: tensor.dtype,
+                byteLength: 0
             )
             let format = DeepSeekV41DevicePlan.linearFormat(
                 tensor: deviceTensor,
@@ -173,7 +174,9 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
     private let checkpoint = DeepSeekV41SyntheticCheckpoint()
 
     private func makeRuntime(
-        _ checkpoint: DeepSeekV41SyntheticCheckpoint
+        _ checkpoint: DeepSeekV41SyntheticCheckpoint,
+        snapshotDir: URL? = nil,
+        pinDenseWeights: Bool? = nil
     ) throws -> DeepSeekV41Runtime {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw XCTSkip("No Metal device")
@@ -183,12 +186,13 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
             throw XCTSkip("no shard buffer")
         }
         guard let runtime = DeepSeekV41Runtime(
-            snapshotDir: nil,
+            snapshotDir: snapshotDir,
             summary: checkpoint.summary(),
             config: checkpoint.config,
             shardBuffers: [0: buffer],
             contextLength: checkpoint.shape.contextLength,
-            cachePrecision: .fp16
+            cachePrecision: .fp16,
+            pinDenseWeights: pinDenseWeights
         ) else {
             XCTFail(
                 "the synthetic runtime did not build: "
@@ -243,6 +247,42 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         let runtime = try makeRuntime(checkpoint)
         print(runtime.describe())
         XCTAssertEqual(runtime.weights.problems, [])
+    }
+
+    /// The dense pin repoints every tensor it moves, so a pinned runtime has to
+    /// compute exactly what the mapped one does: same bytes, read from a buffer
+    /// the kernels were told about through a rewritten address.
+    ///
+    /// Both arms load the same shard file, so the only difference between them is
+    /// where the dense tensors live. A pin that dropped a tensor, forgot a
+    /// segment's start or misaligned a slot moves the logits by O(1).
+    func testAPinnedRuntimeComputesTheSameLogitsAsTheMappedOne() throws {
+        let checkpoint = DeepSeekV41SyntheticCheckpoint()
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dsv41-pin-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data(checkpoint.blob).write(
+            to: directory.appendingPathComponent("synthetic.safetensors")
+        )
+
+        let pinned = try makeRuntime(checkpoint, snapshotDir: directory, pinDenseWeights: true)
+        let mapped = try makeRuntime(checkpoint, snapshotDir: directory, pinDenseWeights: false)
+        let plan = try XCTUnwrap(pinned.densePin, pinned.describe())
+        XCTAssertNil(mapped.densePin)
+        // A plan that skipped every tensor would pass this test without ever
+        // exercising a rewritten address.
+        XCTAssertGreaterThan(plan.ranges.count, 0)
+        XCTAssertTrue(plan.skipped.isEmpty, "\(plan.skipped)")
+
+        for (position, token) in [5, 6, 7].enumerated() {
+            let pinnedLogits = try pinned.forward().forwardToken(token, position: position)
+            let mappedLogits = try mapped.forward().forwardToken(token, position: position)
+            XCTAssertEqual(
+                worstDelta(pinnedLogits, mappedLogits), 0,
+                "position \(position) differs between the pinned and mapped backbones"
+            )
+        }
     }
 
     // MARK: Whole model

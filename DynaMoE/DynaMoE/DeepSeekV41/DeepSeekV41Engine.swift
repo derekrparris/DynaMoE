@@ -44,6 +44,11 @@ nonisolated public struct DeepSeekV41DeviceTensor: Sendable, Equatable {
     public let rows: Int
     public let columns: Int
     public let dtype: String
+    /// Bytes this tensor occupies in its shard, which is what the dense pin reads
+    /// and what a range check needs. Not derivable from `rows * columns`: an
+    /// E4M3 tensor is one byte per value and a packed MXFP4 one is half, and the
+    /// scale companion is a separate tensor.
+    public let byteLength: Int
 
     public var isFP8: Bool {
         let upper = dtype.uppercased()
@@ -65,6 +70,19 @@ nonisolated public struct DeepSeekV41DeviceTensor: Sendable, Equatable {
     /// Elements in one matrix row, which is the count a `gemv` binds as `inDim`.
     public var inDimension: Int { columns }
     public var outDimension: Int { rows }
+
+    /// The same tensor, addressed somewhere else. Used by the dense pin, which
+    /// moves a tensor's bytes into a resident buffer and has to repoint it.
+    public func addressing(shardIndex: UInt32, byteOffset: Int) -> DeepSeekV41DeviceTensor {
+        DeepSeekV41DeviceTensor(
+            shardIndex: shardIndex,
+            byteOffset: byteOffset,
+            rows: rows,
+            columns: columns,
+            dtype: dtype,
+            byteLength: byteLength
+        )
+    }
 }
 
 // MARK: - Device weights
@@ -130,7 +148,8 @@ nonisolated public final class DeepSeekV41DeviceWeights: @unchecked Sendable {
                 byteOffset: Int(tensor.offsetStart),
                 rows: rows,
                 columns: columns,
-                dtype: tensor.dtype
+                dtype: tensor.dtype,
+                byteLength: Int(tensor.offsetEnd - tensor.offsetStart)
             )
             if tensor.name.contains("scale") || tensor.name.contains("scales") {
                 scales[tensor.name] = device
@@ -240,6 +259,78 @@ nonisolated public final class DeepSeekV41DeviceWeights: @unchecked Sendable {
 
     public func close() {
         for reader in engramReaders.values { reader.closeNow() }
+    }
+
+    /// The tensors the dense pin may move, in the catalog's own terms.
+    ///
+    /// The exclusions are the reason this is here rather than at the call site:
+    /// whether a tensor is streamed, an expert, or part of a graph nothing runs
+    /// is a property of its ROLE, and a name-prefix rule would get the Engram
+    /// table's neighbours wrong the way it did for the summary (`engram.wkv` is a
+    /// dense 157 MB matrix, not a table).
+    public func pinnableTensors() -> [DeepSeekV41DensePinCandidate] {
+        var slots: [String: DeepSeekV41TensorSlot] = [:]
+        for slot in catalog.slots { slots[slot.ref.name] = slot }
+        var candidates: [DeepSeekV41DensePinCandidate] = []
+        candidates.reserveCapacity(tensors.count + scales.count)
+        for (name, tensor) in tensors {
+            guard let slot = slots[name], Self.isPinnable(slot) else { continue }
+            candidates.append(Self.candidate(name: name, tensor: tensor))
+        }
+        for (name, tensor) in scales {
+            guard let slot = slots[name], Self.isPinnable(slot) else { continue }
+            candidates.append(Self.candidate(name: name, tensor: tensor))
+        }
+        return candidates
+    }
+
+    /// Repoints every pinned tensor at the buffer that now holds its bytes.
+    ///
+    /// Only the address changes: the shape, dtype and byte length stay what the
+    /// summary said, so every kernel binds the same offsets it did before.
+    @discardableResult
+    public func pin(_ plan: DeepSeekV41DensePinPlan) -> Int {
+        var moved = 0
+        for range in plan.ranges {
+            let index = plan.pinnedShardIndex(chunk: range.chunk)
+            if let tensor = tensors[range.tensorName] {
+                tensors[range.tensorName] = tensor.addressing(
+                    shardIndex: index, byteOffset: range.chunkOffset
+                )
+                moved += 1
+            } else if let tensor = scales[range.tensorName] {
+                scales[range.tensorName] = tensor.addressing(
+                    shardIndex: index, byteOffset: range.chunkOffset
+                )
+                moved += 1
+            }
+        }
+        return moved
+    }
+
+    private static func candidate(
+        name: String,
+        tensor: DeepSeekV41DeviceTensor
+    ) -> DeepSeekV41DensePinCandidate {
+        DeepSeekV41DensePinCandidate(
+            name: name,
+            shardIndex: tensor.shardIndex,
+            byteOffset: tensor.byteOffset,
+            byteLength: tensor.byteLength
+        )
+    }
+
+    private static func isPinnable(_ slot: DeepSeekV41TensorSlot) -> Bool {
+        // The Engram table is streamed row by row and never becomes a buffer.
+        guard !slot.role.isStreamed else { return false }
+        // Routed experts live in the arena, which the streamer fills.
+        guard slot.expert == nil else { return false }
+        // Nothing in the text graph reads the vision tower or the draft block.
+        guard !slot.role.isVision, !slot.role.isDraft else { return false }
+        // The embedding is read one row at a time, so pinning 1.3 GB to save two
+        // page faults per token is memory spent for nothing.
+        guard slot.role != .tokenEmbedding else { return false }
+        return true
     }
 }
 
@@ -421,6 +512,12 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
     /// Why there is no streamer, so the readiness line names a reason instead of
     /// leaving "no streaming" to be read as "streaming is fine here".
     public let expertStreamerProblem: String?
+    /// The dense backbone pread into resident buffers, or nil when those tensors
+    /// are still read through the shard mappings. See `DeepSeekV41DensePin`.
+    public let densePin: DeepSeekV41DensePinPlan?
+    /// Wall time the pin's reads took, and why there is no pin when there is none.
+    public let densePinSeconds: Double
+    public let densePinProblem: String?
     public let dspark: DeepSeekV41DSparkPlan
     public let contextLength: Int
     /// The precision the KV cache is actually allocated at. The checkpoint's
@@ -448,7 +545,9 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
     public let device: MTLDevice
     public let commandQueue: MTLCommandQueue
     public let pipelines: DeepSeekV41Pipelines
-    /// The zero-copy shard mappings the executor binds tensors through.
+    /// The zero-copy shard mappings the executor binds tensors through, plus one
+    /// entry per dense-pin chunk when the backbone was pinned. The pinned entries
+    /// live at `DeepSeekV41DensePinPlan.pinnedShardBase` and up.
     public let shardBuffers: [UInt32: MTLBuffer]
 
     /// The device executor, built on first use: resolving every norm gain and
@@ -476,6 +575,18 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         UserDefaults.standard.bool(forKey: engramOffDefaultKey)
     }
 
+    /// `defaults write DRP.DynaMoE dynamoe_dsv41_pin_dense_off -bool YES`
+    ///
+    /// Debug-only opt-out: read the dense backbone through the shard mappings
+    /// instead of pinning it. The pin is the difference between DRAM traffic and
+    /// a GPU page fault per 16 KB, so this exists to A/B it, not to be shipped
+    /// as a setting.
+    public static let densePinOffDefaultKey = "dynamoe_dsv41_pin_dense_off"
+
+    public static var densePinDisabled: Bool {
+        UserDefaults.standard.bool(forKey: densePinOffDefaultKey)
+    }
+
     private static let initializationError = InitErrorBox()
 
     static func record(_ reason: String) {
@@ -489,7 +600,8 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         shardBuffers: [UInt32: MTLBuffer],
         contextLength: Int,
         cachePrecision: DeepSeekV41CachePrecision = .fp16,
-        allowEngramSkip: Bool = false
+        allowEngramSkip: Bool = false,
+        pinDenseWeights: Bool? = nil
     ) {
         guard let plan = try? config.makeLayerPlan() else {
             DeepSeekV41Runtime.record("the per-layer plan could not be built from config.json")
@@ -571,6 +683,45 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         )
         let arena = DeepSeekV41ExpertArena(slotCount: slotCount)
 
+        // The dense backbone is read in full on every token. Through the shard
+        // mappings that is a GPU page fault per 16 KB, and the expert stream
+        // evicts those pages between tokens, so the same few gigabytes are
+        // re-faulted every step. Pinning it once makes it DRAM traffic. The
+        // budget is a third of RAM: the memory plan already prices these bytes as
+        // resident, so this is the same claim on memory expressed as a cap, and a
+        // machine too small to hold the whole backbone pins a prefix of it rather
+        // than refusing to load.
+        var buffers = shardBuffers
+        var densePin: DeepSeekV41DensePinPlan?
+        var densePinSeconds: Double = 0
+        var densePinProblem: String?
+        if pinDenseWeights ?? !DeepSeekV41Runtime.densePinDisabled {
+            if let snapshotDir {
+                let pinPlan = DeepSeekV41DensePinPlan.make(
+                    summary: summary,
+                    candidates: weights.pinnableTensors(),
+                    budgetBytes: Int(physicalGB * 0.3 * 1_073_741_824),
+                    chunkLimit: min(1 << 30, Int(device.maxBufferLength)),
+                    bufferLimit: Int(device.maxBufferLength)
+                )
+                do {
+                    let loaded = try DeepSeekV41DensePinLoader.load(
+                        plan: pinPlan, snapshotDir: snapshotDir, device: device
+                    )
+                    buffers.merge(loaded.buffers) { current, _ in current }
+                    weights.pin(pinPlan)
+                    densePin = pinPlan
+                    densePinSeconds = loaded.seconds
+                } catch {
+                    densePinProblem = "\(error)"
+                }
+            } else {
+                densePinProblem = "the snapshot directory is unknown, so the backbone cannot be read"
+            }
+        } else {
+            densePinProblem = "disabled by \(DeepSeekV41Runtime.densePinOffDefaultKey)"
+        }
+
         // The routed mixture is a working set this machine reads, not a weight it
         // holds: 15,360 whole-expert pairs at ~19 MB each. Filling the arena from
         // the shards with pread is what makes a token's expert traffic a linear read
@@ -607,6 +758,9 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         self.arena = arena
         self.expertStreamer = streamer
         self.expertStreamerProblem = streamerProblem
+        self.densePin = densePin
+        self.densePinSeconds = densePinSeconds
+        self.densePinProblem = densePinProblem
         self.dspark = DeepSeekV41DSparkPlan.make(config: config)
         self.contextLength = contextLength
         self.cachePrecision = cachePrecision
@@ -638,7 +792,7 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         self.commandQueue = commandQueue
         self.pipelines = pipelines
         self.workspace = workspace
-        self.shardBuffers = shardBuffers
+        self.shardBuffers = buffers
     }
 
     public var isRunnable: Bool { weights.problems.isEmpty }
@@ -675,6 +829,26 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
             lines.append(
                 "experts: read through the shard mappings (\(expertStreamerProblem ?? "no streamer"))"
             )
+        }
+        if let densePin {
+            let gb = String(format: "%.2f", Double(densePin.totalBytes) / 1_073_741_824)
+            let rate = densePinSeconds > 0
+                ? String(
+                    format: " at %.0f MB/s",
+                    Double(densePin.totalBytes) / 1_048_576 / densePinSeconds
+                )
+                : ""
+            let left = densePin.skipped.isEmpty
+                ? ""
+                : ", \(densePin.skipped.count) left on the mapping ("
+                    + densePin.skipped.prefix(3).joined(separator: "; ")
+                    + (densePin.skipped.count > 3 ? "; ..." : "") + ")"
+            lines.append(
+                "dense: pinned \(gb) GB into \(densePin.chunkLengths.count) buffer(s), "
+                    + "\(densePin.ranges.count) tensors\(rate)\(left)"
+            )
+        } else {
+            lines.append("dense: read through the shard mappings (\(densePinProblem ?? "no pin"))")
         }
         lines.append(
             "dspark: " + (dspark.isEnabled

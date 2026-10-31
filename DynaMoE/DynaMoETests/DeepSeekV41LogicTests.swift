@@ -2681,3 +2681,272 @@ final class DeepSeekV41PublishedConfigTests: XCTestCase {
         }
     }
 }
+
+// MARK: - Dense pin
+
+/// The dense pin moves a tensor's bytes into a resident buffer and repoints it,
+/// so the packing has to be exact: a range that crosses a chunk, an offset that
+/// forgets a segment's start, or a slot that is not aligned all read the wrong
+/// weight row and produce plausible text.
+final class DeepSeekV41DensePinPlanTests: XCTestCase {
+
+    private func summary(
+        shards: [ShardMetadata],
+        tensors: [(name: String, shardIndex: UInt32, start: UInt64, end: UInt64)]
+    ) -> ModelSummary {
+        ModelSummary(
+            sizeGb: 1,
+            tensorCount: UInt32(tensors.count),
+            layerCount: 1,
+            maxExpertId: 0,
+            shards: shards,
+            tensors: tensors.map { tensor in
+                TensorMetadata(
+                    name: tensor.name,
+                    shapeDisplay: "[2, 2]",
+                    dtype: "F8_E4M3",
+                    sizeMb: 0.001,
+                    shardIndex: tensor.shardIndex,
+                    offsetStart: tensor.start,
+                    offsetEnd: tensor.end,
+                    category: "attn",
+                    layerIndex: 0,
+                    expertId: nil
+                )
+            },
+            layers: []
+        )
+    }
+
+    private func candidate(
+        _ name: String,
+        shard: UInt32 = 0,
+        offset: Int,
+        length: Int
+    ) -> DeepSeekV41DensePinCandidate {
+        DeepSeekV41DensePinCandidate(
+            name: name, shardIndex: shard, byteOffset: offset, byteLength: length
+        )
+    }
+
+    func testPacksEveryTensorAndAlignsEachSlot() {
+        let summary = summary(
+            shards: [
+                ShardMetadata(index: 0, filename: "a.safetensors", baseAddress: 0, length: 1 << 20)
+            ],
+            tensors: [
+                ("layers.0.attn.wq_a.weight", 0, 0, 3),
+                ("layers.0.attn.wq_b.weight", 0, 8, 5)
+            ]
+        )
+        let plan = DeepSeekV41DensePinPlan.make(
+            summary: summary,
+            candidates: [
+                candidate("layers.0.attn.wq_a.weight", offset: 0, length: 3),
+                candidate("layers.0.attn.wq_b.weight", offset: 8, length: 5)
+            ],
+            budgetBytes: 1 << 20,
+            alignment: 4096
+        )
+        XCTAssertEqual(plan.ranges.count, 2)
+        XCTAssertEqual(plan.skipped, [])
+        XCTAssertEqual(plan.chunkLengths, [4096 + 5])
+        let first = plan.ranges[0]
+        let second = plan.ranges[1]
+        XCTAssertEqual(first.chunkOffset, 0)
+        XCTAssertEqual(second.chunkOffset, 4096)
+        XCTAssertEqual(first.fileOffset, 0)
+        XCTAssertEqual(second.fileOffset, 8)
+        XCTAssertEqual(plan.totalBytes, 8)
+    }
+
+    /// A segmented shard's `filename` carries a `#n` suffix and its base address
+    /// is the file's plus the segment's start, so the read has to add that start
+    /// back or every pinned tensor is read from the wrong place.
+    func testASegmentedShardIsAddressedByItsFileOffset() throws {
+        let summary = summary(
+            shards: [
+                ShardMetadata(
+                    index: 0, filename: "a.safetensors", baseAddress: 0x1000_0000,
+                    length: 1 << 20
+                ),
+                ShardMetadata(
+                    index: 1, filename: "a.safetensors#0", baseAddress: 0x1000_0000 + 65_536,
+                    length: 1 << 16
+                )
+            ],
+            tensors: [("layers.0.attn.wq_b.weight", 1, 0, 8)]
+        )
+        let plan = DeepSeekV41DensePinPlan.make(
+            summary: summary,
+            candidates: [candidate("layers.0.attn.wq_b.weight", shard: 1, offset: 0, length: 8)],
+            budgetBytes: 1 << 20
+        )
+        let range = try XCTUnwrap(plan.ranges.first)
+        XCTAssertEqual(range.filename, "a.safetensors")
+        XCTAssertEqual(range.fileOffset, 65_536)
+    }
+
+    func testNoTensorStraddlesAChunkBoundary() {
+        let summary = summary(
+            shards: [
+                ShardMetadata(index: 0, filename: "a.safetensors", baseAddress: 0, length: 1 << 20)
+            ],
+            tensors: [
+                ("layers.0.attn.wq_a.weight", 0, 0, 4096),
+                ("layers.0.attn.wq_b.weight", 0, 4096, 12_288)
+            ]
+        )
+        let plan = DeepSeekV41DensePinPlan.make(
+            summary: summary,
+            candidates: [
+                candidate("layers.0.attn.wq_a.weight", offset: 0, length: 4096),
+                candidate("layers.0.attn.wq_b.weight", offset: 4096, length: 8192)
+            ],
+            budgetBytes: 1 << 20,
+            alignment: 4096,
+            chunkLimit: 8192
+        )
+        XCTAssertEqual(plan.chunkLengths, [4096, 8192])
+        XCTAssertEqual(plan.ranges.map(\.chunk), [0, 1])
+        XCTAssertEqual(plan.ranges.map(\.chunkOffset), [0, 0])
+        XCTAssertNotEqual(
+            plan.pinnedShardIndex(chunk: plan.ranges[0].chunk),
+            plan.pinnedShardIndex(chunk: plan.ranges[1].chunk)
+        )
+    }
+
+    func testTheBudgetStopsThePlanAndNamesWhatWasLeft() {
+        let summary = summary(
+            shards: [
+                ShardMetadata(index: 0, filename: "a.safetensors", baseAddress: 0, length: 1 << 20)
+            ],
+            tensors: [
+                ("layers.0.attn.wq_a.weight", 0, 0, 4096),
+                ("layers.0.attn.wq_b.weight", 0, 4096, 8192)
+            ]
+        )
+        let plan = DeepSeekV41DensePinPlan.make(
+            summary: summary,
+            candidates: [
+                candidate("layers.0.attn.wq_a.weight", offset: 0, length: 4096),
+                candidate("layers.0.attn.wq_b.weight", offset: 4096, length: 4096)
+            ],
+            budgetBytes: 4096
+        )
+        XCTAssertEqual(plan.ranges.count, 1)
+        XCTAssertEqual(plan.ranges.first?.tensorName, "layers.0.attn.wq_a.weight")
+        XCTAssertEqual(plan.skipped.count, 1)
+        XCTAssertTrue(plan.skipped[0].contains("layers.0.attn.wq_b.weight"))
+        XCTAssertTrue(plan.skipped[0].contains("budget"))
+    }
+
+    /// The head is read in full once per token and is the largest single tensor
+    /// the graph touches, so a budget that cannot cover the backbone spends
+    /// itself there first.
+    func testTheOutputHeadIsPinnedFirst() {
+        let summary = summary(
+            shards: [
+                ShardMetadata(index: 0, filename: "a.safetensors", baseAddress: 0, length: 1 << 20)
+            ],
+            tensors: [
+                ("layers.0.attn.wq_b.weight", 0, 0, 4096),
+                ("head.weight", 0, 4096, 8192)
+            ]
+        )
+        let plan = DeepSeekV41DensePinPlan.make(
+            summary: summary,
+            candidates: [
+                candidate("layers.0.attn.wq_b.weight", offset: 0, length: 4096),
+                candidate("head.weight", offset: 4096, length: 4096)
+            ],
+            budgetBytes: 4096
+        )
+        XCTAssertEqual(plan.ranges.map(\.tensorName), ["head.weight"])
+    }
+
+    func testATensorPastTheBufferLimitIsSkipped() {
+        let summary = summary(
+            shards: [
+                ShardMetadata(index: 0, filename: "a.safetensors", baseAddress: 0, length: 1 << 20)
+            ],
+            tensors: [("layers.0.attn.wq_b.weight", 0, 0, 8192)]
+        )
+        let plan = DeepSeekV41DensePinPlan.make(
+            summary: summary,
+            candidates: [candidate("layers.0.attn.wq_b.weight", offset: 0, length: 8192)],
+            budgetBytes: 1 << 20,
+            alignment: 4096,
+            chunkLimit: 4096
+        )
+        XCTAssertTrue(plan.isEmpty)
+        XCTAssertEqual(plan.skipped.count, 1)
+        XCTAssertTrue(plan.skipped[0].contains("past what a single buffer"))
+    }
+
+    /// The output head is 1.3 GB, past a packing chunk, and it is the one tensor
+    /// every token reads in full. It gets a buffer of its own rather than being
+    /// refused for being wide.
+    func testATensorWiderThanAChunkGetsItsOwnBuffer() {
+        let summary = summary(
+            shards: [
+                ShardMetadata(index: 0, filename: "a.safetensors", baseAddress: 0, length: 1 << 20)
+            ],
+            tensors: [
+                ("layers.0.attn.wq_a.weight", 0, 0, 4096),
+                ("head.weight", 0, 4096, 16_384),
+                ("layers.0.attn.wq_b.weight", 0, 16_384, 20_480)
+            ]
+        )
+        let plan = DeepSeekV41DensePinPlan.make(
+            summary: summary,
+            candidates: [
+                candidate("layers.0.attn.wq_a.weight", offset: 0, length: 4096),
+                candidate("head.weight", offset: 4096, length: 12_288),
+                candidate("layers.0.attn.wq_b.weight", offset: 16_384, length: 4096)
+            ],
+            budgetBytes: 1 << 20,
+            alignment: 4096,
+            chunkLimit: 8192,
+            bufferLimit: 1 << 20
+        )
+        XCTAssertTrue(plan.skipped.isEmpty, "\(plan.skipped)")
+        // Head first, so its dedicated buffer is chunk 0, then the two small
+        // tensors pack into one chunk after it.
+        XCTAssertEqual(plan.ranges.map(\.tensorName), [
+            "head.weight", "layers.0.attn.wq_a.weight", "layers.0.attn.wq_b.weight"
+        ])
+        XCTAssertEqual(plan.ranges.map(\.chunk), [0, 1, 1])
+        XCTAssertEqual(plan.ranges.map(\.chunkOffset), [0, 0, 4096])
+        XCTAssertEqual(plan.chunkLengths, [12_288, 8192])
+    }
+
+    /// A tensor has to fit the segment it claims to live in; reading past it would
+    /// take the next shard's bytes.
+    func testATensorPastItsSegmentIsSkipped() {
+        let summary = summary(
+            shards: [
+                ShardMetadata(index: 0, filename: "a.safetensors", baseAddress: 0, length: 4096)
+            ],
+            tensors: [("layers.0.attn.wq_b.weight", 0, 0, 8192)]
+        )
+        let plan = DeepSeekV41DensePinPlan.make(
+            summary: summary,
+            candidates: [candidate("layers.0.attn.wq_b.weight", offset: 0, length: 8192)],
+            budgetBytes: 1 << 20
+        )
+        XCTAssertTrue(plan.isEmpty)
+        XCTAssertTrue(plan.skipped.first?.contains("past") ?? false)
+    }
+
+    func testPinnedShardIndicesSitFarAboveEveryRealOne() {
+        XCTAssertGreaterThan(DeepSeekV41DensePinPlan.pinnedShardBase, 1 << 20)
+        let plan = DeepSeekV41DensePinPlan(
+            ranges: [], chunkLengths: [16, 16], skipped: []
+        )
+        XCTAssertEqual(plan.pinnedShardIndex(chunk: 0), DeepSeekV41DensePinPlan.pinnedShardBase)
+        XCTAssertEqual(
+            plan.pinnedShardIndex(chunk: 1), DeepSeekV41DensePinPlan.pinnedShardBase + 1
+        )
+    }
+}

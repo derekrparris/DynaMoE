@@ -21,7 +21,9 @@ import XCTest
 final class DeepSeekV41LinearFormatTests: XCTestCase {
 
     private func tensor(_ dtype: String) -> DeepSeekV41DeviceTensor {
-        DeepSeekV41DeviceTensor(shardIndex: 0, byteOffset: 0, rows: 8, columns: 8, dtype: dtype)
+        DeepSeekV41DeviceTensor(
+            shardIndex: 0, byteOffset: 0, rows: 8, columns: 8, dtype: dtype, byteLength: 64
+        )
     }
 
     func testFP8WithAnE8M0ScaleIsThe32x32Grid() {

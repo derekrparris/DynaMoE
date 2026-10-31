@@ -5043,3 +5043,90 @@ fails it with 14 assertion failures. `testTheWideGemvGridIsChosenByHowMuchWorkTh
 now asserts the form rule's new parameter: a 1,536-wide block stays `.block`, an 8,192-wide
 block takes `.blockPair`, and a short batch still falls back to the two-way rule. Whole
 DeepSeek suite: 422 tests, 15 skipped, 0 failures.
+
+## DSV4.1 #19: THE DENSE BACKBONE WAS A PAGE-FAULT WALK, NOT A COMPUTE COST
+
+Every entry above measured the device graph on `DeepSeekV41SyntheticCheckpoint`, which
+publishes a whole model as one aligned blob. That is the right fixture for ranking kernels
+and the wrong one for asking where a real turn's seconds go: a synthetic blob is already
+resident, so no measurement in this journal had ever priced the *address* a tensor lives at.
+On the published checkpoint the dense backbone is ~170 MB per layer plus a 1.32 GB output
+head, mapped zero-copy out of 48 shards that are 99% routed experts, and those pages do not
+survive a token: the expert stream reads 23 GB of them in between.
+
+The first real turn (`#none`, before this entry) was 60.7 s of prefill and 348 s of decode
+for seven tokens — ~58 s/token, i.e. 1.45 s per layer for ~200 MB of dense reads, or
+~140 MB/s. That is the GPU page-fault path, not DRAM, and it is 160x off what the same
+weights cost once resident.
+
+**The fix** is the one the packed-format families already use, generalised:
+`DeepSeekV41DensePin` packs the non-expert, non-streamed backbone into 1 GiB resident
+`.storageModeShared` buffers at load (a tensor wider than a chunk gets its own), rewrites
+each tensor's `(shardIndex, byteOffset)` to address its new home, and merges the chunks into
+the buffer registry the executor binds through. Nothing in the graph changed: a GEMV still
+binds a buffer at offset 0 and passes its `byteOffset` as an argument, so a rewritten
+address is indistinguishable from a shard address.
+
+**What is pinned** (measured from the index, not assumed):
+
+| category | bytes | tensors | pinned |
+|---|---:|---:|---|
+| routed experts | 296.0 GB | 94,464 | no, the arena streams them |
+| Engram tables | 202.8 GB | 4 | no, read row by row |
+| dense layers (40) | 6.8 GB | 1,236 | yes |
+| output head | 1.32 GB | 1 | yes |
+| embedding | 1.32 GB | 1 | no, read as single rows |
+| vision tower + draft block | 1.68 GB | 360 | no, the text graph never reads them |
+
+**Load** (`testAPublishedPromptCompletesATurn`, "hey"):
+
+```
+dense: pinned 8.11 GB into 8 buffer(s), 1335 tensors at 27921 MB/s,
+       8 left on the mapping (layers.1.engram.k_weight: no shard names
+       model-00047-of-00048.safetensors at file offset 0; ...)
+```
+
+27.9 GB/s is the parallel pread of 8 files at once; the pin costs a few seconds of load and
+nothing afterwards. The eight tensors left on the mapping are the two Engram shards' dense
+half: those files are 94.56 GiB and `segmentShardsForMetal` collapses each to ONE segment
+(a ~100 GB streamed table plus a few hundred MB that maps), so the segment's start in the
+file is not in the summary. Recovering it needs the safetensors header, which is a follow-up
+worth ~314 MB of 8.4 GB, i.e. 3.7%.
+
+**The turn**, same prompt, same machine, only the address of the weights differing:
+
+| | mapping | pinned, head skipped | pinned, head included |
+|---|---:|---:|---:|
+| prefill (5 positions) | 60.7 s | 3.12 s | **1.18 s** |
+| decode (6 steps) | 348 s | 4.01 s | **2.19 s** |
+| whole test (load + turn) | ~700 s | 13.06 s | **8.43 s** |
+| answer | "Hey! How's it going?" | same | same |
+
+~58 s/token → 0.37 s/token. The middle column isolates the head: 1.32 GB read in full once
+per token cost 0.30 s/token on its own (4.4 GB/s, faster than the layer path because one
+contiguous gigabyte faults more sequentially), which is why it is pinned first in the plan's
+order and gets a dedicated chunk.
+
+**Why it was not the GPU.** `#13`-`#18` put the whole dense half of a block at 0.32
+ms/position on the synthetic fixture, i.e. 40 layers ≈ 13 ms/token. The real turn was 1,450
+ms/layer. The gap was never in the kernels, and no amount of block-width or row-sharing work
+would have found it: every table in this journal was taken on weights that were already in
+RAM.
+
+**Tests.** `DeepSeekV41DensePinPlanTests` pins the packing (alignment, no chunk straddle,
+segment file offsets, the budget, the head-first order, a dedicated buffer for a tensor
+wider than a chunk, refusal past the buffer limit). The end-to-end guarantee is
+`testAPinnedRuntimeComputesTheSameLogitsAsTheMappedOne`: two runtimes over the same
+synthetic shard file, one pinned and one mapped, must return BIT-IDENTICAL logits for three
+decode positions — a dropped tensor, a forgotten segment start or a misaligned slot moves
+them by O(1). Whole DeepSeek suite: 450 tests, 20 skipped, 0 failures.
+
+**Caveats.** The pinned bytes are dirty pages rather than clean file-backed ones, which is
+why the budget is a third of RAM and why the memory plan already prices them as resident; on
+a machine that cannot hold the whole backbone the plan pins a prefix (head first) instead of
+refusing to load. And the numbers above are one turn of seven tokens on an M5 Max, so they
+say the fault path is gone, not what the new steady state is. What is left is visible in the
+same log: the turn read 23.25 GB of experts at 8.6 GB/s with a 40.5% arena hit rate, i.e.
+~2.6 GB of expert misses per token, about 0.30 s of the 0.37 s/token. The dense half is no
+longer the cost; the arena's hit rate is, and that is the next measurement rather than
+another kernel.

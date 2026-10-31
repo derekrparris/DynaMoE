@@ -97,7 +97,8 @@ final class DeepSeekV41PackedExpertFormatTests: XCTestCase {
 
     private func tensor(_ dtype: String, rows: Int, columns: Int) -> DeepSeekV41DeviceTensor {
         DeepSeekV41DeviceTensor(
-            shardIndex: 0, byteOffset: 0, rows: rows, columns: columns, dtype: dtype
+            shardIndex: 0, byteOffset: 0, rows: rows, columns: columns, dtype: dtype,
+            byteLength: 0
         )
     }
 
