@@ -1072,6 +1072,20 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     private var draftKeys: MTLBuffer?
     /// Rows `draftKeys` holds: a full window plus one block.
     private let draftKeyRows: Int
+    /// `[block][hidden]`: the last stage's collapsed stream, which is what the head
+    /// normalizes AND what the confidence head reads next to the Markov embedding.
+    private var draftCollapsed: MTLBuffer?
+    /// `[block][vocab]`: the head's own logits, before any Markov bias.
+    private var draftHeadLogits: MTLBuffer?
+    /// `[vocab]`: one step's Markov bias.
+    private var draftMarkovBias: MTLBuffer?
+    /// `[hidden + rank]`: one step's confidence input, the collapse and the Markov
+    /// embedding laid end to end.
+    private var draftConfidenceInput: MTLBuffer?
+    /// `[rank]`: the Markov head's embedding of one token.
+    private var draftMarkovEmbedRow: MTLBuffer?
+    /// `[1]`: one step's confidence.
+    private var draftConfidenceOut: MTLBuffer?
     /// `1 / hcMult` over `hcMult` entries: `hc_pre` with a uniform mix IS the mean
     /// over copies, so the capture is the same kernel the sub-layer uses.
     private var draftMeanMix: MTLBuffer?
@@ -1192,6 +1206,40 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                     ),
                     options: .storageModeShared
                 )
+                // The head's buffers exist only where a head does: the last stage's
+                // `norm`, the Markov pair and the confidence projection.
+                let block = max(1, runtime.config.dsparkBlockSize)
+                let hidden = runtime.config.hiddenSize
+                let last = self.draftStages.last ?? 0
+                let rank = runtime.weights
+                    .tensor(.draftMarkovEmbed, scope: .draft, layer: last)?.columns ?? 0
+                if rank > 0, runtime.config.vocabSize > 0 {
+                    let floatBytes = MemoryLayout<Float>.stride
+                    self.draftCollapsed = runtime.device.makeBuffer(
+                        length: max(16, block * hidden * floatBytes),
+                        options: .storageModeShared
+                    )
+                    self.draftHeadLogits = runtime.device.makeBuffer(
+                        length: max(16, block * runtime.config.vocabSize * floatBytes),
+                        options: .storageModeShared
+                    )
+                    self.draftMarkovBias = runtime.device.makeBuffer(
+                        length: max(16, runtime.config.vocabSize * floatBytes),
+                        options: .storageModeShared
+                    )
+                    self.draftMarkovEmbedRow = runtime.device.makeBuffer(
+                        length: max(16, rank * floatBytes),
+                        options: .storageModeShared
+                    )
+                    self.draftConfidenceInput = runtime.device.makeBuffer(
+                        length: max(16, (hidden + rank) * floatBytes),
+                        options: .storageModeShared
+                    )
+                    self.draftConfidenceOut = runtime.device.makeBuffer(
+                        length: max(16, floatBytes),
+                        options: .storageModeShared
+                    )
+                }
             }
             self.draftMeanMix = runtime.device.makeBuffer(
                 length: max(16, self.mult * MemoryLayout<Float>.stride),
@@ -5194,14 +5242,41 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         token: Int,
         startPosition: Int
     ) throws -> [[[[Float]]]] {
+        try runDraftStages(token: token, startPosition: startPosition, collecting: true)
+    }
+
+    /// The stack every position left after the last stage, `[position][copy][hidden]`.
+    private func draftStackSnapshot(count: Int) -> [[[Float]]] {
+        let pointer = workspace.streams.contents().assumingMemoryBound(to: Float.self)
+        let stride = mult * shapes.hidden
+        return (0..<count).map { slot in
+            (0..<mult).map { copy in
+                Array(
+                    UnsafeBufferPointer(
+                        start: pointer + slot * stride + copy * shapes.hidden,
+                        count: shapes.hidden
+                    )
+                )
+            }
+        }
+    }
+
+    /// Runs every draft stage for the block and leaves `streams` and `hcMix` holding
+    /// what the last stage produced.
+    @discardableResult
+    private func runDraftStages(
+        token: Int,
+        startPosition: Int,
+        collecting: Bool = false
+    ) throws -> [[[[Float]]]] {
         guard !draftStages.isEmpty, draftShape != nil,
               draftSeededPositions >= startPosition + 1 else { return [] }
         let tokens = draftStackTokens(seed: token)
         let count = tokens.count
         try encodeEmbeddingBlock(tokens, startPosition: startPosition + 1)
         let activated = config.draftExpertCounts.activated
-
         var outputs: [[[[Float]]]] = []
+
         for stage in draftStages {
             var command = try makeCommandBuffer()
             var encoder = try makeEncoder(command)
@@ -5229,22 +5304,209 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.endEncoding()
             try commit(command, stage: "draft ffn (stage \(stage))")
 
-            let pointer = workspace.streams.contents().assumingMemoryBound(to: Float.self)
-            let stride = mult * shapes.hidden
-            outputs.append(
-                (0..<count).map { slot in
-                    (0..<mult).map { copy in
-                        Array(
-                            UnsafeBufferPointer(
-                                start: pointer + slot * stride + copy * shapes.hidden,
-                                count: shapes.hidden
-                            )
-                        )
-                    }
-                }
-            )
+            if collecting { outputs.append(draftStackSnapshot(count: count)) }
         }
         return outputs
+    }
+
+    /// The last draft stage's head: `hc_pre` with the final mix, `norm`, and the
+    /// model's own vocabulary projection.
+    ///
+    /// `DSparkBlock.forward_head` normalizes the COLLAPSE of the last stage's stack
+    /// with the mix that stage's feed-forward handed on, then projects with the shared
+    /// `head` — the backbone's module, aliased into every draft stage rather than
+    /// published under `mtp.N`. The logits are kept for every position here (a verify
+    /// needs all of them), unlike `finishBlock`, which only ever reads the last.
+    private func encodeDraftHead(
+        _ encoder: MTLComputeCommandEncoder,
+        stage: Int,
+        count: Int
+    ) throws {
+        guard count > 0, let collapsed = draftCollapsed, let logits = draftHeadLogits else {
+            return
+        }
+        for slot in 0..<count {
+            try encodeHyperConnectionPre(
+                encoder,
+                mix: workspace.hcMix,
+                output: collapsed,
+                snapshotting: false,
+                slot: slot
+            )
+        }
+        // NOT in place: `forward_head` scores the confidence head on the collapse
+        // BEFORE the norm, so the pre-norm vector has to survive.
+        try encodeNorm(
+            encoder,
+            input: collapsed,
+            gain: vectors.gain(.draftNorm, scope: .draft, layer: stage, width: shapes.hidden),
+            output: workspace.output,
+            width: shapes.hidden,
+            rows: count
+        )
+        let head = weights.tensor(.lmHead)
+            ?? (config.tieWordEmbeddings ? weights.tensor(.tokenEmbedding) : nil)
+        guard let head else { throw DeepSeekV41EngineError.missingTensor("head.weight") }
+        try encodeGemv(
+            encoder,
+            weight: head,
+            scale: weights.scaleTensor(.lmHead),
+            inDim: shapes.hidden,
+            outDim: config.vocabSize,
+            input: workspace.output,
+            output: logits,
+            rows: count
+        )
+    }
+
+    /// One row of the Markov head's embedding table, by token id.
+    ///
+    /// The same lookup kernel the model's own embedding uses: a table is a table, and
+    /// the Markov table is BF16 rows of `dspark_markov_rank` values.
+    private func encodeDraftMarkovRow(
+        _ encoder: MTLComputeCommandEncoder,
+        token: Int,
+        stage: Int
+    ) throws {
+        guard let output = draftMarkovEmbedRow else { return }
+        guard let table = weights.tensor(.draftMarkovEmbed, scope: .draft, layer: stage) else {
+            throw DeepSeekV41EngineError.missingTensor("mtp.\(stage).markov_head.embed")
+        }
+        let scale = weights.scaleTensor(.draftMarkovEmbed, scope: .draft, layer: stage)
+        guard let kernel = DeepSeekV41DevicePlan.embeddingKernel(tensor: table, scale: scale),
+              let buffer = shardBuffer(table) else {
+            throw DeepSeekV41EngineError.unsupportedDtype(
+                "mtp.\(stage).markov_head.embed", table.dtype
+            )
+        }
+        let pointer = workspace.tokenIDs.contents().assumingMemoryBound(to: UInt32.self)
+        pointer[0] = UInt32(max(0, min(token, table.rows - 1)))
+        var weightOffset = UInt64(table.byteOffset)
+        var width = UInt32(table.columns)
+        if kernel == DeepSeekV41Kernels.bf16Embedding {
+            encoder.setComputePipelineState(pipelines.embeddingBF16)
+            encoder.setBuffer(buffer, offset: 0, index: 0)
+            encoder.setBuffer(workspace.tokenIDs, offset: 0, index: 1)
+            encoder.setBuffer(output, offset: 0, index: 2)
+            encoder.setBytes(&weightOffset, length: 8, index: 3)
+            encoder.setBytes(&width, length: 4, index: 4)
+        } else {
+            guard let scale, let scaleBuffer = shardBuffer(scale) else {
+                throw DeepSeekV41EngineError.missingTensor(
+                    "mtp.\(stage).markov_head.embed scale"
+                )
+            }
+            var scaleOffset = UInt64(scale.byteOffset)
+            encoder.setComputePipelineState(pipelines.embeddingMXFP8)
+            encoder.setBuffer(buffer, offset: 0, index: 0)
+            encoder.setBuffer(workspace.tokenIDs, offset: 0, index: 1)
+            encoder.setBuffer(output, offset: 0, index: 2)
+            encoder.setBuffer(scaleBuffer, offset: 0, index: 3)
+            encoder.setBytes(&weightOffset, length: 8, index: 4)
+            encoder.setBytes(&scaleOffset, length: 8, index: 5)
+            encoder.setBytes(&width, length: 4, index: 6)
+        }
+        encoder.dispatchThreads(
+            MTLSize(width: table.columns, height: 1, depth: 1),
+            threadsPerThreadgroup: threadgroup(table.columns)
+        )
+        encoder.memoryBarrier(scope: .buffers)
+    }
+
+    /// One drafting round's head logits: every block position, unbiased.
+    ///
+    /// The Markov bias is NOT applied here because it depends on the token drawn at the
+    /// previous step, which is the caller's to decide (`draftStep`).
+    public func draftHeadLogits(
+        token: Int,
+        startPosition: Int
+    ) throws -> [[Float]] {
+        try runDraftStages(token: token, startPosition: startPosition)
+        guard let stage = draftStages.last, let logits = draftHeadLogits else { return [] }
+        let count = draftStackTokens(seed: token).count
+        let commandBuffer = try makeCommandBuffer()
+        let encoder = try makeEncoder(commandBuffer)
+        try encodeDraftHead(encoder, stage: stage, count: count)
+        encoder.endEncoding()
+        try commit(commandBuffer, stage: "draft head")
+        let pointer = logits.contents().assumingMemoryBound(to: Float.self)
+        return (0..<count).map { slot in
+            Array(
+                UnsafeBufferPointer(
+                    start: pointer + slot * config.vocabSize, count: config.vocabSize
+                )
+            )
+        }
+    }
+
+    /// One drafting step's Markov bias and confidence, for the token the chain is at.
+    ///
+    /// `DSparkBlock.forward_head` adds `markov_head(embed(token_i))` to step `i`'s draft
+    /// logits and scores `confidence_head([x_i, markov_embed(token_i)])`, where
+    /// `token_i` is the token the chain consumed at that step — the seed for step 0 and
+    /// the DRAFT's own choice afterwards. Both read the embedding of that one token, so
+    /// they cost one round trip, not two.
+    public func draftStep(
+        index: Int,
+        previousToken: Int
+    ) throws -> (bias: [Float], confidence: Float)? {
+        guard let stage = draftStages.last,
+              let bias = draftMarkovBias,
+              let embedRow = draftMarkovEmbedRow,
+              let confidenceInput = draftConfidenceInput,
+              let confidenceOut = draftConfidenceOut,
+              let collapsed = draftCollapsed,
+              index >= 0, index < max(1, config.dsparkBlockSize) else { return nil }
+        guard let head = weights.tensor(.draftMarkovHead, scope: .draft, layer: stage),
+              let projection = weights.tensor(.draftConfidence, scope: .draft, layer: stage) else {
+            throw DeepSeekV41EngineError.missingTensor("mtp.\(stage).markov_head.head")
+        }
+        let rank = embedRow.length / MemoryLayout<Float>.stride
+        let commandBuffer = try makeCommandBuffer()
+        let encoder = try makeEncoder(commandBuffer)
+        try encodeDraftMarkovRow(encoder, token: previousToken, stage: stage)
+        try encodeGemv(
+            encoder,
+            weight: head,
+            scale: weights.scaleTensor(.draftMarkovHead, scope: .draft, layer: stage),
+            inDim: rank,
+            outDim: config.vocabSize,
+            input: embedRow,
+            output: bias
+        )
+        // `cat([hidden, markov_embed])` then one row: the projection is [1][hidden + rank].
+        try encodeCopy(
+            encoder,
+            from: collapsed,
+            to: confidenceInput,
+            count: shapes.hidden,
+            sourceByteOffset: workspace.slotOffset(index, width: shapes.hidden)
+        )
+        try encodeCopy(
+            encoder,
+            from: embedRow,
+            to: confidenceInput,
+            count: rank,
+            destinationByteOffset: shapes.hidden * MemoryLayout<Float>.stride
+        )
+        encoder.memoryBarrier(scope: .buffers)
+        try encodeGemv(
+            encoder,
+            weight: projection,
+            scale: weights.scaleTensor(.draftConfidence, scope: .draft, layer: stage),
+            inDim: min(shapes.hidden + rank, projection.columns),
+            outDim: 1,
+            input: confidenceInput,
+            output: confidenceOut
+        )
+        encoder.endEncoding()
+        try commit(commandBuffer, stage: "draft step")
+        let biasPointer = bias.contents().assumingMemoryBound(to: Float.self)
+        let confidencePointer = confidenceOut.contents().assumingMemoryBound(to: Float.self)
+        return (
+            Array(UnsafeBufferPointer(start: biasPointer, count: config.vocabSize)),
+            confidencePointer[0]
+        )
     }
 
     private func encodeHyperConnectionPre(

@@ -807,6 +807,92 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         }
     }
 
+    /// The draft head and the chain that consumes it.
+    ///
+    /// `DSparkBlock.forward_head` is two things a port gets wrong separately: the head
+    /// itself (a collapse with the LAST mix, the stage's `norm`, and the backbone's own
+    /// 129,280-row projection — the drafter does not publish a head of its own), and the
+    /// chain on top of it, where the Markov bias is ADDED to the full vocabulary and
+    /// each step conditions on the token IT drew. This compares the logits against the
+    /// host's `Trace` and then the whole chain — tokens and confidences — against
+    /// `DeepSeekV41DSparkBlock.draft`.
+    func testTheDraftHeadAndItsChainMatchTheHostBlock() throws {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.layers = 2
+        shape.draftTargetLayers = [1, 0]
+        shape.draftStages = 2
+        shape.draftBlockSize = 3
+        shape.draftNoiseTokenID = 5
+        shape.draftMarkovRank = 8
+        shape.window = 4
+        shape.contextLength = 16
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        XCTAssertEqual(checkpoint.catalogProblems(), [])
+
+        let runtime = try makeRuntime(checkpoint)
+        let device = runtime.forward()
+        device.capturesDraftInput = true
+
+        let tokens = [3, 4, 5, 6, 7, 8]
+        let host = makeHost(checkpoint)
+        var rows: [[Float]] = []
+        for (position, token) in tokens.enumerated() {
+            _ = try device.forwardToken(token, position: position)
+            _ = host.forwardToken(token, position: position)
+            rows.append(try XCTUnwrap(host.mainHidden(position: position)))
+        }
+        let drafter = DeepSeekV41DSparkBlock(forward: host)
+        let mainX = drafter.mainX(rows)
+        drafter.seed(mainX)
+        _ = try device.seedDraftRings(through: tokens.count)
+
+        let startPosition = tokens.count - 1
+        let token = tokens[startPosition]
+        let hostDraft = drafter.draft(
+            token: token, mainX: mainX[startPosition], startPosition: startPosition
+        )
+        let trace = try XCTUnwrap(drafter.lastTrace)
+        XCTAssertEqual(trace.logits.count, shape.draftBlockSize)
+
+        let logits = try device.draftHeadLogits(
+            token: token, startPosition: startPosition
+        )
+        XCTAssertEqual(logits.count, trace.logits.count)
+        for position in trace.logits.indices {
+            let reference = trace.logits[position]
+            let scale = max(reference.map(abs).max() ?? 1, 1e-6)
+            let delta = worstDelta(logits[position], reference)
+            XCTAssertLessThan(
+                delta / scale, 5e-4,
+                "head position \(position): the draft logits are off the host by "
+                    + "\(delta) against a \(scale) scale"
+            )
+        }
+
+        // The chain, which is the only thing that can catch a bias applied to the wrong
+        // step: a bias from the target's token instead of the draft's own choice shows
+        // up as a token the host does not pick.
+        let chain = DeepSeekV41DSpark.runChain(
+            steps: shape.draftBlockSize,
+            seedToken: token,
+            temperature: 0
+        ) { index, previous in
+            guard let step = try? device.draftStep(index: index, previousToken: previous),
+                  logits.indices.contains(index) else { return nil }
+            return (logits[index], step.bias, step.confidence)
+        }
+        XCTAssertEqual(chain.tokens, hostDraft.tokens, "the drawn tokens")
+        XCTAssertEqual(chain.confidences.count, hostDraft.confidences.count)
+        for (index, expected) in hostDraft.confidences.enumerated() {
+            let scale = max(abs(expected), 1e-6)
+            XCTAssertLessThan(
+                abs(chain.confidences[index] - expected) / scale, 5e-3,
+                "confidence \(index) is off the host by "
+                    + "\(chain.confidences[index] - expected)"
+            )
+        }
+    }
+
     /// The device captures exactly the row the host forward calls `mainHidden`.
     ///
     /// The DSpark drafter conditions on the mean over the hyper-connection copies of

@@ -5779,3 +5779,75 @@ rounding rather than a rule difference.
 **What is left.** The last stage's head — `hc_pre` with the final mix, `norm`, the
 129,280-row projection (the backbone's own `head.weight`), the additive Markov bias at
 each step and the confidence head — and then the acceptance rate this was all for.
+
+## DSV4.1 #25: THE DRAFTER ACCEPTS 31%, AND THE BLOCK IS TOO WIDE FOR IT
+
+This was the number the last three slices were built to reach, and it is a NO for the
+drafter as the checkpoint declares it.
+
+### The full round is on the device and matches the reference
+
+Everything the acceptance number needed now runs on the GPU: the block's attention
+(#24b), its mixture and the three-stage chain (#24c), and — `#25` — the head. The head is
+two pieces a port gets wrong separately, and both are now pinned:
+
+- **It is the backbone's head.** `DSparkBlock.forward_head` normalizes the LAST stage's
+  collapse with the mix that stage's feed-forward handed on and projects with the shared
+  `head` module: nothing is published under `mtp.N.head`. The logits are kept for every
+  position (a verify needs all five), unlike `finishBlock`, which only reads the last.
+- **The collapse is scored BEFORE the norm.** `confidence_head` reads `x =
+  hc_pre(h, pre_mix)` — the pre-norm vector — so the head must normalize into a different
+  buffer. Normalizing in place passes the logits comparison and then reports every
+  confidence as ~0.7 off, which is how this was found.
+
+`testTheDraftHeadAndItsChainMatchTheHostBlock` compares the five logits rows against
+`Trace.logits` (relative 5e-4) and then the CHAIN — the drawn tokens and every confidence
+— against `DeepSeekV41DSparkBlock.draft`. The chain assertion is the one that catches a
+bias applied to the wrong step: a Markov bias from the target's token instead of the
+draft's own choice changes which token wins, and the tokens diverge.
+
+### The measurement
+
+`testWhatDSparkAcceptsOnThePublishedCheckpoint` drafts a round, walks the target greedily
+over the same five positions, and counts the agreeing prefix. Two continuations, ten
+rounds each, so 100 drafts:
+
+| continuation | accepted | per step (s0..s4) | gated | draft cost |
+|---|---|---|---|---|
+| p0 | 14/50 (28%) | 80%, 30%, 10%, 10%, 10% | 35% | 155 ms/round |
+| p1 | 17/50 (34%) | 80%, 60%, 30%, 0%, 0% | 38% | 158 ms/round |
+
+**31% overall against a ~47% bar.** The bar is `#22`'s: a batched verify costs 70.9
+ms/position against a walk's 153.3, so a round of five drafts needs ~2.3 accepted to pay
+for the verify alone — and 155 ms of drafting on top moves it further.
+
+Three things in that table matter more than the total:
+
+- **The first draft is accepted 80% of the time on BOTH continuations.** That is the one
+  content-independent number here, and it is high.
+- **The curve dies at step 2.** s1 is 30% on one continuation and 60% on the other, s2 is
+  10-30%, and s3/s4 are at the floor. A five-wide chain spends 60% of its drafting and
+  80% of its verification on positions that almost never land.
+- **The confidence gate helps but does not save it.** Restricting to rounds
+  `shouldSubmit` keeps moves 28% → 35% and 34% → 38%: the gate is selecting real signal
+  and still an order of magnitude short of the bar.
+
+### What the numbers say to do instead
+
+A two-wide chain is the shape this data supports. From the same curve, `E[accepted]` for
+B=2 is ~1.25 (0.80 + ~0.45), so a round emits ~2.25 tokens; the verify is 2 x 70.9 =
+142 ms and the drafting ~60 ms if the round scales with the positions' expert reads (9
+experts a position, 17.7 MB each, which is what the 155 ms for five positions is made
+of), against 2.25 x 153.3 = 345 ms of walking. That is a ~40% win — but it is a
+PROJECTION, not a measurement, and it changes the draft block's shape, so it needs its
+own test rather than an edit to this one.
+
+The drafting cost is also pessimistic as measured: the draft mixture reads experts
+through the shard mappings with `residents: nil` rather than from the arena, because the
+arena is keyed by `(layer, expert)` and collides with the backbone (see #24c). That is
+worth 100 ms of the 155 and would be the first thing to fix if the drafter ships.
+
+**What was deliberately NOT built.** Per-position logits in `finishBlock` and a cache
+rewind for a rejected suffix. Both exist only to serve a verify, and a verify at the
+declared width loses ~30% against walking. Building them now would be building the losing
+half of a design the measurement has already rejected.

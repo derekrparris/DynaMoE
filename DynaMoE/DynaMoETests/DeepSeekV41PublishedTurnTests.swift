@@ -821,6 +821,136 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
+    /// DSpark's accept rate on the published checkpoint — the number that decides
+    /// whether the drafter is worth verifying at all.
+    ///
+    /// `#22` priced a batched verify at 70.9 ms/position against a walk's 153.3, so a
+    /// round of `dspark_block_size` (5) drafts pays for itself once ~47% of them are
+    /// accepted, i.e. about 2.3 of 5. This drafts, walks the target greedily over the
+    /// same positions, and counts the longest agreeing prefix — the rule
+    /// `DeepSeekV41DSpark.acceptedCount` implements and the only one a linear chain
+    /// needs.
+    ///
+    /// Two continuations rather than one, and a per-STEP rate alongside the total: a
+    /// total is a product of a decay curve, and the step at which the curve dies is what
+    /// says whether the block is the right width.
+    func testWhatDSparkAcceptsOnThePublishedCheckpoint() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let steps = config.dsparkBlockSize
+        XCTAssertEqual(steps, 5)
+        let prompts = [
+            [0, 128803, 21750, 2038, 15174, 943, 3939, 270, 15571, 344, 83779, 16],
+            [0, 128803, 1446, 369, 310, 13866, 353, 279, 4685, 327, 16665, 13, 128804]
+        ]
+        let rounds = 10
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: 24 + rounds * (steps + 1) + 8,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let report = try await Task.detached { [runtime] () -> String in
+            let executor = runtime.forward()
+            var summaries: [String] = []
+            for (which, prompt) in prompts.enumerated() {
+                executor.reset()
+                executor.capturesDraftInput = true
+                var last = 0
+                for (position, token) in prompt.enumerated() {
+                    _ = try executor.forwardToken(token, position: position)
+                    last = token
+                }
+                _ = try executor.seedDraftRings(through: prompt.count)
+
+                var acceptedTotal = 0
+                var draftedTotal = 0
+                var agreedPerStep = [Int](repeating: 0, count: steps)
+                var gatedAccepted = 0
+                var gatedDrafted = 0
+                var draftMilliseconds: [Double] = []
+                for _ in 0..<rounds {
+                    let startPosition = executor.storedPositions - 1
+                    let draftStarted = DispatchTime.now().uptimeNanoseconds
+                    let logits = try executor.draftHeadLogits(
+                        token: last, startPosition: startPosition
+                    )
+                    guard logits.count == steps else {
+                        return "prompt \(which): the head produced \(logits.count) rows"
+                    }
+                    let chain = DeepSeekV41DSpark.runChain(
+                        steps: steps, seedToken: last, temperature: 0
+                    ) { index, previous in
+                        guard let step = try? executor.draftStep(
+                            index: index, previousToken: previous
+                        ), logits.indices.contains(index) else { return nil }
+                        return (logits[index], step.bias, step.confidence)
+                    }
+                    draftMilliseconds.append(
+                        Double(DispatchTime.now().uptimeNanoseconds - draftStarted) / 1_000_000
+                    )
+
+                    // The target's own greedy choices over the positions the drafts
+                    // claim. Each position consumes the token the TARGET produced at the
+                    // one before it, which is what a decoding turn does.
+                    var choices: [Int] = []
+                    var feed = last
+                    var position = executor.storedPositions
+                    while choices.count < steps {
+                        let tokenLogits = try executor.forwardToken(feed, position: position)
+                        var best = 0
+                        for index in 1..<tokenLogits.count
+                        where tokenLogits[index] > tokenLogits[best] {
+                            best = index
+                        }
+                        choices.append(best)
+                        feed = best
+                        position += 1
+                    }
+                    let accepted = DeepSeekV41DSpark.acceptedCount(
+                        draft: chain.tokens, targetChoices: choices
+                    )
+                    acceptedTotal += accepted
+                    draftedTotal += chain.tokens.count
+                    // A step only counts once every earlier step agreed: past a
+                    // disagreement the chain is conditioned on a token the target would
+                    // not have produced, so its "agreement" would mean nothing.
+                    for step in 0..<steps where accepted > step { agreedPerStep[step] += 1 }
+                    // What the confidence gate would have submitted anyway.
+                    if DeepSeekV41DSpark.shouldSubmit(chain) {
+                        gatedAccepted += accepted
+                        gatedDrafted += chain.tokens.count
+                    }
+                    last = feed
+                    _ = try executor.seedDraftRings(through: executor.storedPositions)
+                }
+                let rate = draftedTotal > 0
+                    ? Double(acceptedTotal) / Double(draftedTotal) * 100 : 0
+                let gatedRate = gatedDrafted > 0
+                    ? Double(gatedAccepted) / Double(gatedDrafted) * 100 : 0
+                let perStep = agreedPerStep.enumerated().map { index, count in
+                    String(format: "s%d %.0f%%", index, Double(count) / Double(rounds) * 100)
+                }
+                summaries.append(
+                    String(
+                        format: "p%d %d/%d (%.0f%%), gated %.0f%% of %d, %.0f ms/round, %@",
+                        which, acceptedTotal, draftedTotal, rate, gatedRate,
+                        gatedDrafted, draftMilliseconds.reduce(0, +) / Double(rounds),
+                        perStep.joined(separator: " ")
+                    )
+                )
+            }
+            return summaries.joined(separator: " | ")
+        }.value
+        print("🔎 [dsv41 real] dspark acceptance: \(report)")
+        withExtendedLifetime(engine) {}
+    }
+
     /// What verifying a drafted run in ONE batched pass would save over walking it.
     ///
     /// Speculative decoding is the only structure that lets a decode step batch, and
