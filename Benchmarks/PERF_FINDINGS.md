@@ -5834,13 +5834,44 @@ Three things in that table matter more than the total:
 
 ### What the numbers say to do instead
 
-A two-wide chain is the shape this data supports. From the same curve, `E[accepted]` for
-B=2 is ~1.25 (0.80 + ~0.45), so a round emits ~2.25 tokens; the verify is 2 x 70.9 =
-142 ms and the drafting ~60 ms if the round scales with the positions' expert reads (9
-experts a position, 17.7 MB each, which is what the 155 ms for five positions is made
-of), against 2.25 x 153.3 = 345 ms of walking. That is a ~40% win — but it is a
-PROJECTION, not a measurement, and it changes the draft block's shape, so it needs its
-own test rather than an edit to this one.
+The value is in the first one or two drafts, so the question is what a NARROW verify
+costs. `testWhatAVerifyCostsAtTheWidthsAChainWouldSubmit` prices `prefillChunk` at
+widths 1-8 on the same runtime, and it does not settle it — three runs of the same
+procedure, the last interleaved one-sample-per-arm:
+
+| run | w1 | w2 | w3 | w4 | w5 | w8 |
+|---|---|---|---|---|---|---|
+| sequential | — | 154.5 | 56.5 | — | 61.6 | 59.0 |
+| sequential | 147.9 | 62.9 | 56.6 | 58.9 | 59.1 | 57.5 |
+| interleaved | 111.3 | 105.8 | 85.5 | 88.4 | 86.2 | 79.2 |
+
+Two things are stable and one is not. Stable: width 1 gets NOTHING from batching (a
+one-position block is a walk with different bookkeeping — 111-148 ms/position), and
+width 3 and up sit on a roofline well under the walk's 153.3 (57-86 ms/position
+depending on the run). Not stable: width 2, which one run puts at 2.35x faster than
+width 1 and another at 5% faster. The absolute levels also move ~40% between runs, which
+is larger than the effect being chased, so the width-2 question needs better
+instrumentation before anyone acts on it - the arms have to be isolated (each on its own
+runtime, interleaved, several samples) rather than measured in one sequence against a
+shared arena.
+
+So the honest economics use the roofline and the acceptance curve, and both sides are
+now measured facts rather than projections:
+
+- B=3 costs 3 x 57-86 ms of verify plus ~93 ms of drafting and emits `E[accepted] + 1`
+  = ~2.45 tokens, against 2.45 x 153.3 = 376 ms of walking. That is 1.3-1.5x FASTER.
+- B=5 costs 5 x 59-86 ms plus 155 ms and emits ~2.55 tokens, against 391 ms. That is
+  between a wash and 15% slower, with the acceptance rate (31%) as the reason.
+- B=2 is the case the curve likes most and the case the verify measurement cannot
+  resolve.
+
+What is NOT in doubt is the direction: the drafter's declared block is wider than its
+acceptance curve can fill, and the useful configuration is one the checkpoint's own
+`dspark_block_size` does not describe. Running a 2- or 3-wide block is legal — the block
+size only decides how many positions the draft block runs — but it changes the graph
+(the block's own rows are part of every query's key list, so a narrower block attends
+over a shorter list and its acceptance is NOT the per-step rate measured at width 5).
+That measurement is the next step, not the verify.
 
 The drafting cost is also pessimistic as measured: the draft mixture reads experts
 through the shard mappings with `residents: nil` rather than from the arena, because the

@@ -951,6 +951,76 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
+    /// What a verify costs at the widths a drafter might actually submit.
+    ///
+    /// `#22` priced a batched verify at 70.9 ms/position against a walk's 153.3, but it
+    /// measured a block of EIGHT — the width a tree verify wants. `#25` found the
+    /// checkpoint's drafter accepts its first draft 80% of the time and its second
+    /// 30-60%, so the width a chain would actually submit is two or three, and the
+    /// batching that made eight cheap has only two positions to amortize a layer's round
+    /// trip and expert union over. This prices the same call at every width, so a narrow
+    /// chain's economics rest on a measurement rather than on a projection.
+    ///
+    /// The widths are INTERLEAVED, one sample each per round, and the first width
+    /// measured is not trusted: a first pass over the procedure reads several times slow
+    /// (an earlier version measured width 2 at 154.5 ms/position and width 3 at 56.5 in
+    /// the same run, which is ordering rather than batching).
+    func testWhatAVerifyCostsAtTheWidthsAChainWouldSubmit() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let widths = [1, 2, 3, 4, 5, 8]
+        let tokens = [
+            0, 128803, 21750, 2038, 15174, 943, 3939, 270, 15571, 344, 83779, 16,
+            128804, 128822, 1446, 369, 310, 13866, 353, 279, 4685, 327, 16665, 13
+        ]
+        let samples = 5
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            // One long continuation, every width drawing from it, so the ring and the
+            // arena are in the same state for every arm.
+            contextLength: tokens.count + samples * (widths.reduce(0, +) + widths.count),
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let report = try await Task.detached { [runtime] () -> String in
+            let executor = runtime.forward()
+            executor.reset()
+            for (position, token) in tokens.enumerated() {
+                _ = try executor.forwardToken(token, position: position)
+            }
+            var best = [Int: Double]()
+            var warm = false
+            for round in 0..<(samples + 1) {
+                for width in widths {
+                    let start = executor.storedPositions
+                    let block = (0..<width).map { tokens[($0 + start) % tokens.count] }
+                    let began = DispatchTime.now().uptimeNanoseconds
+                    _ = try executor.prefillChunk(block)
+                    let elapsed =
+                        Double(DispatchTime.now().uptimeNanoseconds - began) / 1_000_000
+                    // The first round warms every width's pages and kernels; taking the
+                    // best of the rest is what makes the arms comparable.
+                    if warm && (best[width].map { elapsed < $0 } ?? true) {
+                        best[width] = elapsed
+                    }
+                }
+                warm = true
+                _ = round
+            }
+            let lines = widths.map { width in
+                String(format: "w%d %.1f ms/pos", width, (best[width] ?? 0) / Double(width))
+            }
+            return lines.joined(separator: ", ")
+        }.value
+        print("🔎 [dsv41 real] verify width sweep: \(report)")
+        withExtendedLifetime(engine) {}
+    }
+
     /// What verifying a drafted run in ONE batched pass would save over walking it.
     ///
     /// Speculative decoding is the only structure that lets a decode step batch, and
