@@ -6843,3 +6843,135 @@ The image path exists end to end and is unusably slow. No `supportsVision` flag 
 no composer path was opened, no chat or API request can carry an image yet: the engine seam is
 proven, the serving cost is not. `vision_device` is now justified by a number rather than a
 premise, and the cheaper alternative (a host GEMM) is named above so it can be chosen first.
+**Updated in `#36`:** the host GEMM was chosen and shipped. The same harness measures the
+smallest image at 68.06 s (from ~10.4 h), the slope falls from 24.6 s to 20.8 ms per marginal
+patch token, and an isolated `-O` mirror prices the tower's arithmetic at 2.00 s, so what is
+left of the harness number is the `-Onone` widen. `vision_device` survives as an optimisation,
+not a prerequisite.
+
+## DSV4.1 #36: ONE GEMM PER BLOCK TURNS TEN HOURS INTO SECONDS, AND WHAT IS LEFT IS A `-Onone` ARTIFACT
+
+### The question
+
+`#35` priced the host vision tower at **~10.4 hours for the smallest image the checkpoint
+accepts** and named the shape rather than the CPU: `DeepSeekV41VisionForward.linear` re-read
+its whole matrix once per token and reduced it through bounds-checked scalar dots, which is a
+GEMM being done as `rows` dot products (24.6 s per marginal patch token). Two ways forward
+were named: give the host tower a real GEMM, or build the device tower. Routing put
+`vision_gemm` at 0.99 (confidence 0.99) and "GEMM before device" at 0.999, on the ground that
+the CPU tower already has an oracle (the checkpoint's own `ViT`, and the pinned aligner rows
+from `#34`) while the device tower has no device code at all.
+
+### What changed
+
+- **`linearBatched`**: one `cblas_sgemm` for the whole block of tokens,
+  `CblasRowMajor/NoTrans/Trans` because `DeepSeekV41Matrix` is row-major `[out][in]`, with the
+  bias folded into the copy-out. `linearRowByRow` keeps the definition beside it as the oracle.
+- **`attentionBatched`**: two GEMMs per head (`alpha` carries `1/sqrt(head_dim)` on the score
+  GEMM), and the 2D rotation sliced once per token instead of once per head per token.
+- **`softmaxRow`**: `vDSP_maxv` / `vDSP_vsadd` / `vvexpf` / `vDSP_sve` / `vDSP_vsmul` over one
+  flat row. `softmax` keeps its scalar form for the oracle.
+- **`rmsNorm`** through `vDSP_svesq` + `vDSP_vsmul` + `vDSP_vmul`: it was three bounds-checked
+  scalar passes over every patch, twice a layer.
+- **`DeepSeekV41VisionWeights.decode`** widens through a typed destination instead of two
+  bounds-checked byte loads per value.
+- `encode` still validates every row and now REFUSES a ragged one (`shapeMismatch`) instead of
+  zeroing it, because a GEMM cannot take a short row.
+
+The numeric contract is unchanged: `attention` and `softmax` are untouched, and the
+numpy-pinned aligner rows from `#34` still match at 1e-4. `cblas_sgemm` is deprecated in macOS
+13.3 in favour of the ILP64 interface (`-DACCELERATE_NEW_LAPACK`); the build warns twice, and
+the call is the same one every Accelerate consumer makes.
+
+### Evidence at real weights
+
+`testAnImageEntersAPublishedTurn`, published checkpoint, same harness and machine as `#35`:
+
+```
+🔎 [dsv41 real] image prompt: 12 tokens, image id 129264
+🔎 [dsv41 real] indexed 96085 tensors in 48 shard(s), 475.2508442029357 GB
+🔎 [dsv41 real] mapped 48/48 segment(s), 286.4 GB
+🔎 [dsv41 real] vision weights: 266 tensors
+🔎 [dsv41 real] tower: 4 patch tokens in 25.35 s, 16 in 25.60 s, 1521 in 68.06 s; span 4 rows for the 2x2 grid, prompt 12 -> 15 tokens
+🔎 [dsv41 real] tower floor: 20.3 ms per marginal patch token, smallest image 68.06 s (184 span positions)
+🔎 [dsv41 real] image turn: lengthCapped after 2 token(s), prompt 15, reused 0, prefill 2.53 s
+🔎 [dsv41 real] image turn text: This picture
+```
+
+| patch tokens | `#35` | `#36` |
+|---|---|---|
+| 4 (2x2) | 127.11 s | 25.35 s |
+| 16 (4x4) | 422.55 s | 25.60 s |
+| 1,521 (39x39, the smallest admissible image) | ~10.4 h, extrapolated | **68.06 s** |
+
+The slope between the two small grids falls from **24.6 s to 20.8 ms per marginal patch
+token** (1,180x). The 1,521-token point implies 28.2 ms/token rather than 20.8, which is the
+attention: its cost per token grows with the token count, so a slope measured at 16 tokens
+understates the picture. The whole smallest image goes from ~10.4 hours to **68 seconds** in
+the same harness, and the turn's prefill beside it from 4.07 s to 2.53 s.
+
+### What the remaining 68 seconds are made of
+
+Two constants, both measured in isolation rather than inferred from the slope, because the
+test bundle is a `-Onone` build: BLAS and vDSP are precompiled and their numbers are
+Build-settings-independent, while every Swift per-element loop pays the Debug penalty.
+
+**The fixed cost is the BF16 widen.** The same widening loop over 960 MB (480 million values),
+built both ways:
+
+| form | `-Onone` (the test bundle) | `-O` (the shipped build) |
+|---|---|---|
+| old: two bounds-checked byte loads per value | 27.35 s (35 MB/s) | 0.05 s (17 GB/s) |
+| new: typed destination + `loadUnaligned` | 23.93 s (40 MB/s) | **0.03 s (34 GB/s)** |
+
+So the ~25 s that does not move with patch count IS the widen, and at `-O` it is nothing.
+
+**The arithmetic is 2 seconds.** A standalone `-O` mirror of the tower at the shipped shapes
+(1,521 tokens, hidden 1,024, 16 heads of 64, intermediate 2,816, 32 layers):
+
+| stage | time |
+|---|---|
+| linear GEMMs (qkv, wo, w1, w2 per layer) | 0.86 s |
+| attention GEMMs (scores + context per head) | 0.49 s |
+| softmax (vDSP) | 0.53 s |
+| norms (vDSP) | 0.01 s |
+| glue (SiLU, copy-out, residual adds) | 0.11 s |
+| **total** | **2.00 s** |
+
+One `w1` GEMM at this shape runs at **1,608 GFLOP/s**, which is what a real GEMM buys: the
+same product that `#35` measured at ~17 MMAC/s.
+
+The rest of the harness's 68 s is `-Onone` per-element Swift: the q/k/v fill and copy-out
+(~200 million values per encode), the gate/up activation (~137 million), and the residual adds
+(~100 million) all run at the 40 MB/s the widen table shows, and the mirror measures the same
+work at 0.11 s when it is compiled.
+
+### What it means
+
+The scaling law is fixed, so the next slice is **`composer_image_attachment`**, not
+`vision_device`. At `-O` the smallest image is ~2 s of arithmetic plus one 970 MB read of the
+tower's shards per encode; a turn that already spends ~270 ms per backbone position can afford
+that. `vision_device` is now an optimisation with a named prize rather than a prerequisite:
+it would replace the per-encode read with a bind and the 2 s of CPU arithmetic with GPU
+dispatches, and it is the only way to serve the LARGEST admissible image, because the cap is
+1,024 aligner tokens, about 9,216 patch tokens, six times the floor, and attention is
+quadratic (0.49 s becomes ~18 s).
+
+Caching the widened weights is not justified either: 1.9 GB of pinned `Float` would buy 0.03 s.
+
+### What it does not mean
+
+Nothing was opened in the app: `supportsVision` is still false, the composer still refuses
+attachments, and no chat or API request can carry an image. The 2.00 s is a standalone `-O`
+mirror of the same shapes and the same calls, not a Release build of the app, whose own glue
+was not timed; the 68.06 s is the number the harness actually measured.
+
+Pure-logic pins: `DeepSeekV41VisionForwardTests.testTheBatchedLinearMatchesItsDefinition` (an
+odd 3x7x5 shape so a transposed matrix or a wrong `lda` cannot cancel out),
+`testTheBatchedLinearHandlesASingleToken`, `testTheBatchedAttentionMatchesItsDefinition`,
+`testTheBatchedAttentionWithoutRotationMatchesItsDefinition` (a missing table must not become a
+rotation by zero), `testARaggedPatchRowIsRefused`, and the new
+`DeepSeekV41VisionWeightDecodeTests` (BF16 is the high half of its float, the discarded low
+half is not reinvented, FP32 passes through bit for bit, a short buffer yields zeros, the dtype
+widths). The suite is **556 tests, 0 failures, 41 skipped**, and 0 Metal validation errors
+under `MTL_DEBUG_LAYER`.

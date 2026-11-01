@@ -290,6 +290,10 @@ nonisolated public final class DeepSeekV41VisionWeights: DeepSeekV41WeightSource
     /// BF16 and FP32 to host floats. Both are read as integer bits and reproduced
     /// exactly: a bfloat16 is the high half of the float it came from, so widening
     /// it is a shift and never a conversion.
+    ///
+    /// The widening runs over typed destinations rather than one byte-addressable
+    /// load per value, because the published tower is 485 million values and the
+    /// fixed cost of an encode is one full widen of all of them.
     static func decode(
         _ bytes: UnsafeRawBufferPointer,
         dtype: String,
@@ -297,16 +301,22 @@ nonisolated public final class DeepSeekV41VisionWeights: DeepSeekV41WeightSource
     ) -> [Float] {
         let width = bytesPerValue(dtype) ?? 2
         var values = [Float](repeating: 0, count: count)
-        guard bytes.count >= count * width, let base = bytes.baseAddress else { return values }
-        for index in 0..<count {
-            if width == 2 {
-                let high = UInt32(base.load(fromByteOffset: index * 2 + 1, as: UInt8.self))
-                let low = UInt32(base.load(fromByteOffset: index * 2, as: UInt8.self))
-                values[index] = Float(bitPattern: (high << 8 | low) << 16)
-            } else {
-                values[index] = Float(bitPattern: base.load(
-                    fromByteOffset: index * 4, as: UInt32.self
-                ))
+        guard count > 0, bytes.count >= count * width, let base = bytes.baseAddress else {
+            return values
+        }
+        values.withUnsafeMutableBufferPointer { destination in
+            guard let floats = destination.baseAddress else { return }
+            floats.withMemoryRebound(to: UInt32.self, capacity: count) { bits in
+                if width == 2 {
+                    for index in 0..<count {
+                        let half = base.loadUnaligned(fromByteOffset: index * 2, as: UInt16.self)
+                        bits[index] = UInt32(half) << 16
+                    }
+                } else {
+                    for index in 0..<count {
+                        bits[index] = base.loadUnaligned(fromByteOffset: index * 4, as: UInt32.self)
+                    }
+                }
             }
         }
         return values

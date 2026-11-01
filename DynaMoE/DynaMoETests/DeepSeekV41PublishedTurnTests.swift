@@ -2937,6 +2937,22 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         let fourCellsSeconds = CFAbsoluteTimeGetCurrent() - startWide
         XCTAssertEqual(wideRows.count, DeepSeekV41VisionLayout.imageTokenCount(columns: 2, rows: 2))
 
+        // The smallest image the checkpoint ACCEPTS: `min_pixels` 295,936 rounds up to
+        // 546x546, which at a patch size of 14 is a 39x39 grid, 1521 patch tokens. This
+        // is the number that decides whether vision can be served at all, so it is
+        // timed rather than extrapolated: the two small grids above measure the slope,
+        // this measures the picture.
+        let floorStart = CFAbsoluteTimeGetCurrent()
+        let floorRows = try tower.imageSpan(patches: patches(39), rows: 39, columns: 39)
+        let floorSeconds = CFAbsoluteTimeGetCurrent() - floorStart
+        XCTAssertEqual(
+            floorRows.count, DeepSeekV41VisionLayout.imageTokenCount(columns: 13, rows: 13)
+        )
+        for row in floorRows {
+            XCTAssertEqual(row.count, config.hiddenSize)
+            XCTAssertTrue(row.allSatisfy(\.isFinite), "the tower produced a non-finite row")
+        }
+
         let plan = try DeepSeekV41ImagePrompt.expand(
             tokenIds: promptIds,
             spans: [oneCellSpan],
@@ -2950,9 +2966,18 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         print(
             "🔎 [dsv41 real] tower: 4 patch tokens in "
                 + String(format: "%.2f s", oneCellSeconds) + ", 16 in "
-                + String(format: "%.2f s", fourCellsSeconds) + "; span "
+                + String(format: "%.2f s", fourCellsSeconds) + ", 1521 in "
+                + String(format: "%.2f s", floorSeconds) + "; span "
                 + "\(oneCellSpan.tokenCount) rows for the 2x2 grid, prompt "
                 + "\(promptIds.count) -> \(plan.promptTokens) tokens"
+        )
+        print(
+            "🔎 [dsv41 real] tower floor: "
+                + String(format: "%.1f ms per marginal patch token",
+                         1_000 * (fourCellsSeconds - oneCellSeconds) / 12)
+                + ", smallest image "
+                + String(format: "%.2f s", floorSeconds)
+                + " (184 span positions)"
         )
 
         let settings = DeepSeekV41TurnRunner.Settings(
