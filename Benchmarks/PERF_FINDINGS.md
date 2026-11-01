@@ -6360,9 +6360,12 @@ nothing else. Individual scores move much further (up to 1.9 relative) among row
 nearly cancel across heads, which is why a relative delta is the wrong statistic here
 and the row list is the right one. That range is the whole justification for the port
 skipping the quantization rather than a guess; a future slice that wants the last
-0.6-1% has a target and a test. The count moves between dumps because the activations
-move between runs -- the FP4 error lands on rows that are near the boundary, so which
-of them cross depends on the boundary's exact position.
+0.6-1% has a target and a test. The count moved between dumps because the activations
+moved between runs -- the FP4 error lands on rows that are near the boundary, so which
+of them cross depends on the boundary's exact position. **Updated in `#31` and `#32`:** the
+activations moved because of the reduction race, not the boundary. With it fixed two dumps
+are byte-identical and both move the SAME three rows, so the range above is 3 of 512 and
+the rows are 163 / 436 / 491 in for 289 / 305 / 464 out.
 
 ### The defect this found
 
@@ -6482,10 +6485,127 @@ score the same activations. What changes is what a LIVE run means. `#29`'s score
 moving between runs (cut score -2.2880 -> -2.2704 -> -2.2442, layer-24 newest-row rank
 464 -> 476 -> 483) was this race and not the checkpoint, so a single real-weight run is
 now a sample of a stable distribution. The FP4 row count in `#30` (3 of 512 on one dump,
-5 on another) still needs two dumps to be honest, because those rows sit on the cut.
+5 on another) was left here as a range because it still needed two dumps to be honest.
+`#32` took them: two dumps after the fix are byte-identical and both count 3.
 
 The validation layer's apparent determinism was a timing artefact, not a shield: making
 the racing thread consistently early or late makes the SAME wrong partial get picked
 every time, so the run looks correct and reproducible. That is the general lesson and the
 reason this entry exists -- a wrong threadgroup partial looks exactly like garbage memory,
 and a debug layer that changes timing will hide it rather than report it.
+
+## DSV4.1 #32: TWO DUMPS ARE ONE FILE NOW, AND THE FP4 COUNT IS ONE NUMBER
+
+**Question.** `#31` fixed the reduction race that made a long prefill unreproducible.
+`#30` had measured the reference's FP4 activation quantization at "3 of 512 rows on one
+dump, 5 on another" and left that range standing, because those rows sit on the cut and
+the boundary was moving. Now that it should not move: is the spread gone (i.e. was the
+range the race?), and are the real-weight numbers quotable as single values?
+
+**Answer: two dumps written by two separate processes are byte-identical, the FP4 arm
+moves exactly 3 of 512 rows on both, and `#29`'s census reproduces exactly.**
+
+### The dumps
+
+`testWhatTheIndexerWasGivenOnThePublishedCheckpoint` prefills the real checkpoint's 576
+positions and writes layer 20's activations. Run twice, in two processes, with
+`DSV41_INDEXER_INPUT_DUMP` pointed at two paths (through the xctestrun's
+`EnvironmentVariables`, since xcodebuild does not forward the shell's):
+
+| | value |
+|---|---|
+| size | 3,740,641 bytes, both |
+| sha256 | `08095c9e61871f07cdaf79fd6a722cece4adc3b302a305e7b7cadab0561581c1`, both |
+| `cmp` | identical |
+| cost | 93.7 s and 98.0 s, one prefill each |
+
+That is a stronger statement than `#31`'s: it is not the derived score vector that agrees
+but every byte, across 576 pooled latents plus the normed input and rank-normed query at
+the deepest position.
+
+### The reference on the deterministic dump
+
+`Tools/dsv41_goldens.py indexer_real` on either file gives one set of numbers:
+
+| | value |
+|---|---|
+| layer / position | 20 / 575, of 576 prefilled |
+| produced rows | 576 |
+| worst absolute score delta | **2.621e-6** (row 153: reference 1.778044701, port 1.778042080) |
+| rows over 1e-5 / over 1e-6 | **0** / 134 |
+| port score range | -3.330896 .. 3.801967 |
+| reference score range | -3.330895 .. 3.801969 |
+| selected rows | **512 vs 512, identical** |
+| cut score | -2.287968 (port) against -2.287969 (reference); the next row down is -2.290512 |
+| top row | 41: port 3.801966670 against 3.801968575 |
+
+### The FP4 count
+
+| arm | rows moved |
+|---|---|
+| identity quant (what the port implements) | 0 of 512 |
+| the reference's `fp4_act_quant` | **3 of 512**: selects 163 / 436 / 491, drops 289 / 305 / 464 |
+
+The same three rows on both dumps, which is the answer: `#30`'s 3-then-5 was the race
+changing the activations, not the boundary landing somewhere else.
+
+The mechanism is worth stating precisely, because `#30` described the affected rows as
+"sitting within 0.17 of the cut" and that understates what happens. The cut separates the
+kept rows from the dropped ones by 0.0025. Quantizing moves those six rows by 0.074 to
+0.206:
+
+| row | unquantized | quantized | moved | side of the cut |
+|---|---|---|---|---|
+| 289 | -2.173703 | -2.379647 | -0.206 | kept, 0.114 above |
+| 305 | -2.037593 | -2.171350 | -0.134 | kept, 0.250 above |
+| 464 | -2.207995 | -2.281592 | -0.074 | kept, 0.080 above |
+| 163 | -2.327516 | -2.213908 | +0.114 | dropped, 0.040 below |
+| 436 | -2.305418 | -2.151766 | +0.154 | dropped, 0.017 below |
+| 491 | -2.364699 | -2.177117 | +0.188 | dropped, 0.077 below |
+
+Across all 576 rows the quantization error has a median of 0.066 and a p90 of 0.161, so
+569 of 576 rows move by more than the 0.0025 the cut separates its neighbours by -- yet
+only three rows cross, because the error is correlated across rows (it perturbs the query
+and the keys, so scores shift together rather than independently). The deviation is
+therefore not a tie-break artifact: the frontier sits deep inside the quantization error,
+and only the rank correlation keeps the damage to three rows of 512.
+
+### The re-scare
+
+`#30` declined to check the reference's scores into the suite, because the activations were
+not reproducible and a literal would have pinned one sample of a moving quantity. They are
+reproducible now, so `DeepSeekV41RealIndexerReScareTests` carries the reference's 576
+rule-arm scores and the 64 rows it drops, and re-checks the port against them in 25 ms for
+all three cases. It skips when the dump is absent (producing it needs the checkpoint and
+the opt-in marker), and its doc comment says what a failure can mean: the scoring rule
+moved, or something upstream of the dump did. Two negative controls were run before it was
+committed -- a dump with one score moved by 0.01 fails it and names the row, and no dump at
+all skips it -- because an assertion that has never failed is not yet evidence.
+
+### The census, as one value
+
+`testWhatTheIndexerSelectsPastItsBudgetOnThePublishedCheckpoint`, run twice after the fix
+(96.9 s and 97.9 s), printed the same lines both times:
+
+| layer at position 575 | cut score | range | median | positive / negative | row 0 ranks | newest row ranks |
+|---|---|---|---|---|---|---|
+| 20 | -2.2880 | -3.331 .. 3.802 | -1.0109 | 135 / 441 | 43 | 62 |
+| 24 | -2.6140 | -3.073 .. 3.127 | -2.2484 | 59 / 517 | 39 | 464 |
+| 28 | -1.8919 | -2.360 .. 3.997 | -1.0060 | 130 / 446 | 47 | 94 |
+| 32 | -1.8990 | -2.677 .. 3.980 | -0.7575 | 175 / 401 | 46 | 110 |
+| 36 | -1.9725 | -3.059 .. 4.487 | -0.6498 | 190 / 386 | 62 | 66 |
+
+576 distinct scores at every source, 0 zero-score rows of 576, and 320 of 320
+budget-exceeding selections differ from the newest 512 rows. These are `#29`'s FIRST-run
+numbers exactly -- cut -2.2880, layer-24 newest rank 464, layer-20 row-0 rank 43 -- so the
+two runs that moved were corrupted by the race and the original census was the correct
+one. `#29`'s table can be quoted as it stands; the `+/-` range `#30` introduced is what is
+retired.
+
+### What it leaves
+
+Nothing numeric is open any more: the rule arm matches the reference to 2.6e-6, the cut is
+identical, the deviation the port accepts by skipping the activation quantization is three
+rows of 512 and pinned by name, and both a live prefill and the numbers derived from it
+are reproducible. `batchedDevicePrefill` remains the only unverified gate and it needs real
+weights, not another dump.

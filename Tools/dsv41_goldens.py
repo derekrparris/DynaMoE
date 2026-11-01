@@ -59,7 +59,12 @@ of the rule. So the activations are dumped by
 against that dump. It also reports the reference's FP4 activation quantization
 (emulated in torch, since `fp4_act_quant` is a tilelang kernel) as a second arm,
 which is what makes the port skipping that quantization a measured deviation rather
-than an assumption.
+than an assumption. That arm used to move 3 rows of 512 on one dump and 5 on another,
+which read as "the rows sit on the cut"; it was the forward's nondeterminism, and
+since the reduction race was fixed two dumps are byte-identical and both move the
+same 3 (163 / 436 / 491 in for 289 / 305 / 464 out, layer 20 position 575). The
+reference's rule-arm scores are checked into `DeepSeekV41GoldensTests` so the suite
+re-checks them without torch.
 
 `hc` is the one case that transcribes a reference rule rather than executing it.
 `Block.hc_mixes`, `hc_pre` and `hc_post` run as the reference wrote them, against a

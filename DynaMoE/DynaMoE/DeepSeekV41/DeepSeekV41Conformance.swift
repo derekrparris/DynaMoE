@@ -146,19 +146,23 @@ nonisolated public enum DeepSeekV41Conformance {
     /// `DeepSeekV41MetalForward.indexerInputRequest` and
     /// `Tools/dsv41_goldens.py indexer_real` runs `Indexer.forward` on those exact
     /// activations with the real `wq_b` / `weights_proj` / `wk` / `k_norm`. The
-    /// port's 576 scores differ from the reference's by at most 2.4e-6 in absolute
+    /// port's 576 scores differ from the reference's by at most 2.6e-6 in absolute
     /// terms -- float summation order, since the scale is folded into the weights in
     /// one and onto each term in the other -- and the 512 selected rows are
-    /// identical.
+    /// identical. `DeepSeekV41RealIndexerReScareTests` carries those numbers, which a
+    /// reproducible dump made worth checking in: two independently prefilled dumps are
+    /// byte-identical.
     ///
     /// What it does NOT cover, now measured rather than assumed: the FP4 activation
     /// quantization of the indexer's query and keys, which the dense path skips
     /// everywhere else too. Emulating the reference's own `fp4_act_quant` (E2M1, one
-    /// power-of-two E8M0 scale per 32-value block) moves 3 to 5 of the 512 selected
-    /// rows at that position and no others, so the deviation is real and bounded. The
-    /// order among exactly equal scores is also unspecified: a row every head votes
-    /// against scores zero, and the port breaks that tie to the lower row index
-    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #30").
+    /// power-of-two E8M0 scale per 32-value block) moves exactly 3 of the 512 selected
+    /// rows at that position and drops 3 others -- the same six on both dumps, and all
+    /// of them by less than a quarter of a score unit, against a cut that separates its
+    /// neighbours by 0.0025 -- so the deviation is real and bounded. The order among
+    /// exactly equal scores is also unspecified: a row every head votes against scores
+    /// zero, and the port breaks that tie to the lower row index
+    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #30" and "#32").
     public static let candidateSelection: Gate = .verifiedAgainstReference
 
     /// How retrieved Engram rows are combined into the layer's residual.
