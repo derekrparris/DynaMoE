@@ -1482,6 +1482,18 @@ struct ContentView: View {
                     thinkingEffort: levelCapable ? thinkingEffortForActiveSession : nil,
                     supportsThinkingLevels: levelCapable,
                     supportsVision: activeModelSupportsVision,
+                    visionCostLabel: { image in
+                        guard let estimate = ModelConfig.visionCostEstimate(
+                            modelPath: activeLoadedModelPath,
+                            width: image.pixelWidth,
+                            height: image.pixelHeight
+                        ) else { return nil }
+                        // An estimate, not a promise: the model behind it was
+                        // measured on this machine class, and the chip says so.
+                        return estimate.seconds < 10
+                            ? String(format: "about %.1f s", estimate.seconds)
+                            : "about \(Int(estimate.seconds.rounded())) s"
+                    },
                     isAgentToolsEnabled: isAgentToolsEnabledForActiveSession,
                     isModelLoaded: (tokenizer != nil && summary != nil) || isAppleFoundationModelActive || isCloudModelActive,
                     isAppleFoundationModelActive: isAppleFoundationModelActive,
@@ -2763,6 +2775,44 @@ struct ContentView: View {
         let isSpark = (modelConfig?.isSparkModel == true)
         let isLing = (modelConfig?.isLingModel == true)
         let isGemma4 = (modelConfig?.isGemma4Model == true)
+
+        // Pictures in the prompt. Only the family with a vision tower can read
+        // pixels this turn; every other local family keeps the metadata notice,
+        // because a marker there would expand to rows the model never receives.
+        // `turnImages` is what the engine encodes, in prompt order, so it must be
+        // filled by the same walk that writes the markers.
+        let visionMarkers: DeepSeekV41VisionMarkers? = {
+            guard modelConfig?.isDeepSeekV41Model == true,
+                  ModelConfig.supportsVision(modelPath: activeLoadedModelPath) else { return nil }
+            return DeepSeekV41VisionMarkers.familyDefault
+        }()
+        var turnImages: [TurnImage] = []
+        func attachmentFragment(for message: ChatMessage) -> String {
+            guard let refs = message.attachments, !refs.isEmpty else { return "" }
+            guard let visionMarkers else {
+                return Self.localAttachmentNotice(for: message)
+            }
+            var fragment = ""
+            for ref in refs {
+                guard let data = ImageAttachmentStore.shared.data(for: ref),
+                      let pixels = try? DeepSeekV41ImagePixels.decode(data) else { continue }
+                // The picture goes FIRST inside the turn, the way the reference's
+                // prompts place an image before the question about it.
+                fragment += visionMarkers.imagePlaceholder + "\n"
+                turnImages.append(
+                    TurnImage(
+                        rgb: pixels.rgb,
+                        width: pixels.width,
+                        height: pixels.height,
+                        sha256: ref.sha256
+                    )
+                )
+            }
+            // A decode failure leaves the notice rather than an empty turn: the
+            // turn still answers about something, and the user's picture is not
+            // silently claimed to have been seen.
+            return fragment.isEmpty ? Self.localAttachmentNotice(for: message) : fragment
+        }
         if isSpark {
             // Spark 2.5 DeepSeek-style dialect:
             // <｜start▁of▁sentence｜><|System|>\n...<｜end▁of▁sentence｜>
@@ -2991,7 +3041,7 @@ struct ContentView: View {
                 guard !cleanMsg.isEmpty || (msg.thinkingContent != nil && !msg.thinkingContent!.isEmpty) || hasTools || !attachmentNotice.isEmpty else { continue }
 
                 if msg.role == .user {
-                    promptString += "<|im_start|>user\n\(cleanMsg)\(attachmentNotice)<|im_end|>\n"
+                    promptString += "<|im_start|>user\n\(attachmentFragment(for: msg))\(cleanMsg)<|im_end|>\n"
                 } else if msg.role == .assistant {
                     var assistantBody = ""
                     if modelSupportsThinking {
@@ -3045,7 +3095,12 @@ struct ContentView: View {
                 promptString += "<|im_start|>assistant\n"
             }
         }
-        startAutoregressiveGeneration(customPrompt: promptString, sessionId: currentSessionId, messageId: assistantMsgId)
+        startAutoregressiveGeneration(
+            customPrompt: promptString,
+            images: turnImages,
+            sessionId: currentSessionId,
+            messageId: assistantMsgId
+        )
         return true
     }
 
@@ -5848,7 +5903,11 @@ struct ContentView: View {
     /// headless CompletionEngine turn, consumes its event stream to drive the
     /// historical UI writes, then runs the agent-orchestration phase (tool
     /// execution, HITL approvals, multi-step recursion) verbatim.
-    private func startAutoregressiveGeneration(customPrompt: String? = nil, promptTokens: [UInt32]? = nil, sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false) {
+    /// `images` are the turn's attachments, already decoded, in prompt order and
+    /// matching the image placeholders the caller wrote into `customPrompt`. Only a
+    /// family with a vision tower consumes them; the engine refuses a turn whose
+    /// placeholder count disagrees with this list rather than dropping pixels.
+    private func startAutoregressiveGeneration(customPrompt: String? = nil, promptTokens: [UInt32]? = nil, images: [TurnImage] = [], sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false) {
         guard let summary = summary,
               let tokenizer = tokenizer else {
             let err = "❌ Metal or Tokenizer not ready for text generation. Please load model and tokenizer in Settings."
@@ -5982,7 +6041,8 @@ struct ContentView: View {
             agentStep: agentStep,
             forceSynthesis: forceSynthesis,
             isSplicedContinuation: (promptTokens?.isEmpty == false),
-            asOfDate: generationDate
+            asOfDate: generationDate,
+            images: images
         )
 
         let launch: CompletionLaunch

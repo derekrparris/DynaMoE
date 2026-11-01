@@ -54,6 +54,10 @@ struct ChatDetailView: View {
     /// tower, and the composer refuses an attachment rather than sending pixels
     /// that would be silently dropped.
     var supportsVision: Bool = false
+    /// What the active model's vision tower will cost for a staged image, phrased
+    /// for the chip ("about 5 s"). `nil` when the backend prices nothing, which
+    /// keeps every non-local and non-vision model's chip exactly as it was.
+    var visionCostLabel: ((PreparedImage) -> String?)? = nil
     var isAgentToolsEnabled: Bool = true
     var isModelLoaded: Bool = true
     var isAppleFoundationModelActive: Bool = false
@@ -1355,6 +1359,15 @@ struct ChatDetailView: View {
         attachmentError = nil
     }
 
+    private func attachmentDetailLine(_ image: PreparedImage) -> String {
+        let size = "\(image.pixelWidth)×\(image.pixelHeight) · "
+            + ByteCountFormatter.string(fromByteCount: Int64(image.byteCount), countStyle: .file)
+        // Only a backend that can price an encode adds anything here, and the cost
+        // is measured per machine rather than fixed, so it reads as an estimate.
+        guard let cost = visionCostLabel?(image), !cost.isEmpty else { return size }
+        return size + " · " + cost
+    }
+
     private func attachmentChipsRow() -> some View {
         VStack(alignment: .leading, spacing: 4) {
             ScrollView(.horizontal, showsIndicators: false) {
@@ -1367,7 +1380,7 @@ struct ChatDetailView: View {
                                 Text(image.fileName)
                                     .font(.system(size: max(9, 10.5 * zoomManager.zoomScale), weight: .semibold))
                                     .lineLimit(1)
-                                Text("\(image.pixelWidth)×\(image.pixelHeight) · \(ByteCountFormatter.string(fromByteCount: Int64(image.byteCount), countStyle: .file))")
+                                Text(attachmentDetailLine(image))
                                     .font(.system(size: max(8, 9.5 * zoomManager.zoomScale), design: .monospaced))
                                     .foregroundColor(.secondary)
                                     .lineLimit(1)

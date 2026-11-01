@@ -1062,6 +1062,77 @@ public struct ModelConfig: Codable {
     /// safe across threads; `NSCache` is.
     nonisolated(unsafe) private static let thinkingLevelsCache = NSCache<NSString, NSNumber>()
 
+    /// Whether a local checkpoint can be sent images.
+    ///
+    /// Only DeepSeek V4.1 qualifies today, and only when its `config.json`
+    /// publishes a `vision_config` AND the tower's weights are actually in the
+    /// snapshot: the flag makes the composer offer an attachment button, so a
+    /// checkpoint whose vision shards are missing must not advertise it. This is
+    /// the same family sniff `supportsThinkingLevels` uses, with a config decode
+    /// instead of a template read, so both flags agree about what the family is.
+    nonisolated public static func supportsVision(modelPath: String?) -> Bool {
+        guard let path = modelPath, !path.isEmpty else { return false }
+        let key = path as NSString
+        if let cached = visionCache.object(forKey: key) {
+            return cached.boolValue
+        }
+        let directory = URL(fileURLWithPath: path)
+        var supported = false
+        if DeepSeekV41Availability.isRuntimeAvailable, isDeepSeekV41Directory(directory),
+           let config = try? DeepSeekV41Config.decode(
+               contentsOf: directory.appendingPathComponent("config.json")
+           ),
+           config.vision != nil {
+            // The config can promise a tower the snapshot does not ship, which is
+            // exactly the half-downloaded case the load path refuses for the
+            // backbone; here it must keep the composer closed instead.
+            supported = DeepSeekV41VisionWeights.directoryHasTower(directory)
+        }
+        visionCache.setObject(NSNumber(value: supported), forKey: key)
+        return supported
+    }
+
+    nonisolated(unsafe) private static let visionCache = NSCache<NSString, NSNumber>()
+
+    /// The checkpoint's own vision plan, decoded once per path.
+    ///
+    /// `nil` for a model with no tower. Kept because pricing an attachment must not
+    /// decode 970 MB of weights: the resize plan alone says what the prompt will
+    /// pay and what the encode is expected to cost.
+    nonisolated public static func visionSpec(modelPath: String?) -> DeepSeekV41VisionSpec? {
+        guard let path = modelPath, !path.isEmpty else { return nil }
+        let key = path as NSString
+        if let cached = visionSpecCache.object(forKey: key) { return cached.spec }
+        guard let config = try? DeepSeekV41Config.decode(
+                  contentsOf: URL(fileURLWithPath: path).appendingPathComponent("config.json")
+              ),
+              let spec = config.vision else { return nil }
+        visionSpecCache.setObject(VisionSpecBox(spec), forKey: key)
+        return spec
+    }
+
+    /// What an attachment of this pixel size is expected to cost the vision tower,
+    /// from the resize plan alone.
+    ///
+    /// The range across images the checkpoint accepts is wide (2.74 s for the
+    /// smallest, 41.71 s for the largest, measured), so the composer shows this
+    /// before the encode rather than letting a large photo look like a hang.
+    nonisolated public static func visionCostEstimate(
+        modelPath: String?,
+        width: Int,
+        height: Int
+    ) -> DeepSeekV41VisionPricing.Estimate? {
+        guard let spec = visionSpec(modelPath: modelPath) else { return nil }
+        return DeepSeekV41VisionPricing.estimate(width: width, height: height, spec: spec)
+    }
+
+    private final class VisionSpecBox: NSObject {
+        let spec: DeepSeekV41VisionSpec
+        init(_ spec: DeepSeekV41VisionSpec) { self.spec = spec }
+    }
+
+    nonisolated(unsafe) private static let visionSpecCache = NSCache<NSString, VisionSpecBox>()
+
     private nonisolated static func isSparkDirectory(_ directory: URL) -> Bool {
         let configUrl = directory.appendingPathComponent("config.json")
         guard let data = try? Data(contentsOf: configUrl),

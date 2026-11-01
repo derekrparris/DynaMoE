@@ -2860,6 +2860,235 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         XCTAssertTrue(report.isEmpty, "two identical prefills disagree")
     }
 
+    // MARK: - The composer's image path
+
+    /// The RGB path the composer uses, priced and bound against each other.
+    ///
+    /// `testAnImageEntersAPublishedTurn` hands the tower a patch grid it built
+    /// itself, so it never runs `DeepSeekV41VisionPreprocess.patches` or the
+    /// fit-from-pixels path an attachment takes. This one starts from pixels, and
+    /// pins the invariant the engine provisions its cache on: the prompt length the
+    /// resize plan prices is the length binding actually produces. A disagreement
+    /// there is a cache sized for one prompt and a turn run on another.
+    func testAnRGBImagePricesAndBindsOnThePublishedWeights() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let spec = try XCTUnwrap(config.vision)
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: 256,
+            allowEngramSkip: false
+        )
+        let source = try XCTUnwrap(
+            DeepSeekV41VisionWeights(snapshotDir: snapshot, catalog: runtime.catalog)
+        )
+        let tower = DeepSeekV41VisionForward(
+            spec: spec, weights: source, textHiddenSize: config.hiddenSize
+        )
+
+        // A 56x56 image, which `fit` scales up to the checkpoint's pixel floor, so
+        // this is the smallest admissible picture rather than a toy grid.
+        let side = 56
+        var rgb = [UInt8](repeating: 0, count: side * side * 3)
+        for y in 0..<side {
+            for x in 0..<side {
+                let offset = (y * side + x) * 3
+                rgb[offset] = UInt8(x * 255 / (side - 1))
+                rgb[offset + 1] = UInt8(y * 255 / (side - 1))
+                rgb[offset + 2] = 64
+            }
+        }
+        let image = DeepSeekV41ImageInput(
+            rgb: rgb, width: side, height: side, sha256: "pixels-test"
+        )
+        let marker = UInt32(spec.imageTokenID)
+        let tokenIds: [UInt32] = [1, 2, marker, 3]
+
+        let price = try DeepSeekV41TurnImages.price(
+            tokenIds: tokenIds, images: [image], spec: spec
+        )
+        let estimate = try XCTUnwrap(price.estimates.first)
+        XCTAssertEqual(estimate.patchTokens, 1_521, "the pixel floor is the smallest grid")
+        XCTAssertEqual(estimate.spanPositions, 184)
+
+        let start = CFAbsoluteTimeGetCurrent()
+        let bound = try DeepSeekV41TurnImages.bind(
+            tokenIds: tokenIds,
+            images: [image],
+            spec: spec,
+            rowWidth: config.hiddenSize,
+            encode: { input in
+                // The tower returns rows; the span's length comes from the same
+                // resize plan the price used.
+                let fitted = DeepSeekV41VisionLayout.fit(
+                    width: input.width, height: input.height, spec: spec
+                )
+                let rows = try tower.imageSpan(
+                    rgb: input.rgb, width: input.width, height: input.height
+                )
+                return DeepSeekV41ImagePrompt.ImageSpan(
+                    rows: rows, columns: fitted.columns, gridRows: fitted.rows
+                )
+            }
+        )
+        let seconds = CFAbsoluteTimeGetCurrent() - start
+        XCTAssertEqual(
+            bound.tokenIds.count, price.promptTokens,
+            "the cache is provisioned for the priced length, so the bind must produce it"
+        )
+        XCTAssertEqual(bound.rows.count, estimate.spanPositions)
+        XCTAssertEqual(bound.rows.keys.min(), 1 + 1)
+        for row in bound.rows.values {
+            XCTAssertEqual(row.count, config.hiddenSize)
+            XCTAssertTrue(row.allSatisfy { $0.isFinite }, "the tower produced a non-finite row")
+        }
+        print(
+            "🔎 [dsv41 real] rgb bind: \(side)x\(side) pixels -> \(estimate.patchTokens) patch "
+                + "tokens, \(estimate.spanPositions) span positions, priced "
+                + String(format: "%.2f s", estimate.seconds) + " against "
+                + String(format: "%.2f s", seconds) + " measured"
+        )
+        withExtendedLifetime(engine) {}
+    }
+
+
+    /// The app's OWN formatter, not the dialect on its own. A chat turn is
+    /// rendered by `ChatPromptFormatter.formatPrompt`, which picks the DeepSeek
+    /// branch from the model config and then calls `dialect.render`; `#35` proved
+    /// the placeholder survives `dialect.render` and binds a span, but not that it
+    /// survives the app's path. A marker that tokenized into pieces HERE would
+    /// leave literal text in the prompt and bind no rows, which looks exactly like
+    /// a model that ignores pictures.
+    ///
+    /// It needs the checkpoint's tokenizer and config, not its weights, so it runs
+    /// in milliseconds.
+    func testTheComposedPromptCarriesOneImageTokenPerAttachment() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let spec = try XCTUnwrap(
+            config.vision, "the published config.json must publish a vision_config"
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        // Decoded the way `LocalModelManager` decodes it, so the formatter takes
+        // the branch it takes in the app.
+        let modelConfig = try JSONDecoder().decode(
+            ModelConfig.self,
+            from: Data(contentsOf: snapshot.appendingPathComponent("config.json"))
+        )
+        XCTAssertTrue(
+            modelConfig.isDeepSeekV41Model,
+            "the formatter only takes the DeepSeek branch when the model config says so"
+        )
+        let markers = DeepSeekV41VisionMarkers.familyDefault
+        let dialect = DeepSeekV41PromptDialect.resolve(snapshotDir: snapshot)
+
+        func composed(_ text: String) -> String {
+            ChatPromptFormatter.formatPrompt(
+                prompt: text,
+                cleanSystem: "",
+                thinkingEnabled: false,
+                modelSupportsThinking: true,
+                modelConfig: modelConfig,
+                thinkingEffort: nil,
+                promptDialect: dialect
+            )
+        }
+
+        let question = "what is in this picture?"
+        let plain = composed(question)
+        let one = composed(markers.imagePlaceholder + "\n" + question)
+        let two = composed(
+            markers.imagePlaceholder + "\n" + markers.imagePlaceholder + "\n" + question
+        )
+        // Controls that put ONE ORDINARY TOKEN where each marker goes, with the
+        // whitespace unchanged, so the only difference between the two prompts is
+        // which token sits in the marker's place. Counting against the bare
+        // question instead gets this wrong: a newline is its own token, and two
+        // adjacent newlines are one.
+        let oneControl = composed("x\n" + question)
+        let twoControl = composed("x\nx\n" + question)
+        XCTAssertEqual(
+            one.components(separatedBy: markers.imagePlaceholder).count - 1, 1,
+            "the formatter must not escape or drop the placeholder"
+        )
+        XCTAssertEqual(
+            two.components(separatedBy: markers.imagePlaceholder).count - 1, 2,
+            "two attachments must stay two placeholders"
+        )
+
+        let markerOnly = try tokenizer.encode(text: markers.imagePlaceholder)
+        XCTAssertEqual(
+            markerOnly.map(Int.init), [spec.imageTokenID],
+            "the placeholder is one added token, not a run of text tokens"
+        )
+
+        let plainIds = try tokenizer.encode(text: plain)
+        let oneIds = try tokenizer.encode(text: one)
+        let twoIds = try tokenizer.encode(text: two)
+        let oneControlIds = try tokenizer.encode(text: oneControl)
+        let twoControlIds = try tokenizer.encode(text: twoControl)
+        XCTAssertEqual(
+            plainIds.filter { Int($0) == spec.imageTokenID }.count, 0,
+            "a prompt with no picture must carry no image token"
+        )
+        XCTAssertEqual(
+            oneIds.filter { Int($0) == spec.imageTokenID }.count, 1,
+            "one attachment must be one image token"
+        )
+        XCTAssertEqual(
+            twoIds.filter { Int($0) == spec.imageTokenID }.count, 2,
+            "two attachments must be two image tokens"
+        )
+        XCTAssertEqual(
+            oneIds.count, oneControlIds.count,
+            "the marker must cost exactly what one ordinary token costs"
+        )
+        XCTAssertEqual(twoIds.count, twoControlIds.count)
+
+        // Tokenizing is only half the contract: `expand` is what binds rows to
+        // positions, and it must find one placeholder per image and leave nothing
+        // unfilled.
+        let cell = [Float](repeating: 0.5, count: config.hiddenSize)
+        let span = DeepSeekV41ImagePrompt.ImageSpan(
+            rows: Array(
+                repeating: cell,
+                count: DeepSeekV41VisionLayout.imageTokenCount(columns: 1, rows: 1)
+            ),
+            columns: 1,
+            gridRows: 1
+        )
+        let plan = try DeepSeekV41ImagePrompt.expand(
+            tokenIds: twoIds,
+            spans: [span, span],
+            imageTokenID: spec.imageTokenID,
+            rowWidth: config.hiddenSize
+        )
+        XCTAssertEqual(plan.report.unusedImageCount, 0)
+        XCTAssertEqual(plan.report.unfilledPlaceholderCount, 0)
+        XCTAssertEqual(plan.rows.count, 2 * span.tokenCount)
+        XCTAssertEqual(plan.promptTokens, twoIds.count - 2 + 2 * span.tokenCount)
+        print(
+            "🔎 [dsv41 real] composer prompt: \(plainIds.count) tokens plain, "
+                + "\(oneIds.count) with one image, \(twoIds.count) with two; expand "
+                + "binds \(plan.rows.count) row(s), \(plan.report.unfilledPlaceholderCount) "
+                + "placeholder(s) unfilled, \(plan.report.unusedImageCount) image(s) unused"
+        )
+    }
+
     // MARK: - An image in a real turn
 
     /// The tower at the checkpoint's own weights, and its rows inside a real turn.

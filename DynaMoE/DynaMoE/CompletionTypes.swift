@@ -115,6 +115,11 @@ internal struct CompletionTurnRequest: Sendable {
     /// split the common token prefix and force a full re-prefill, which a
     /// hybrid (GDN) session cannot rewind.
     var asOfDate: Date?
+    /// Images the caller attached to this turn, in prompt order, already decoded
+    /// to the RGB a vision tower reads. The prompt text carries one placeholder
+    /// per image and the engine binds the tower's rows to them; a family without
+    /// a tower refuses the turn rather than dropping pixels.
+    var images: [TurnImage]
 
     init(
         promptTokenIds: [UInt32],
@@ -128,7 +133,8 @@ internal struct CompletionTurnRequest: Sendable {
         forceSynthesis: Bool = false,
         isSplicedContinuation: Bool = false,
         stopSequences: [String] = [],
-        asOfDate: Date? = nil
+        asOfDate: Date? = nil,
+        images: [TurnImage] = []
     ) {
         self.promptTokenIds = promptTokenIds
         self.formattedPrompt = formattedPrompt
@@ -142,6 +148,26 @@ internal struct CompletionTurnRequest: Sendable {
         self.isSplicedContinuation = isSplicedContinuation
         self.stopSequences = stopSequences
         self.asOfDate = asOfDate
+        self.images = images
+    }
+}
+
+/// One attached image, decoded to row-major 8-bit RGB.
+///
+/// Decoded by the caller rather than by the engine because a bad file has to fail
+/// while the composer still holds the attachment, so the draft and the chips
+/// survive. `isWellFormed` is what the engine checks: a buffer whose size does not
+/// match its dimensions is a decoder bug, not something to sample.
+internal struct TurnImage: Sendable, Equatable {
+    var rgb: [UInt8]
+    var width: Int
+    var height: Int
+    /// Content digest from the asset store, used to reuse an encoded span instead
+    /// of re-running the vision tower for a picture that is already in context.
+    var sha256: String = ""
+
+    var isWellFormed: Bool {
+        width > 0 && height > 0 && rgb.count == width * height * 3
     }
 }
 

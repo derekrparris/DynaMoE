@@ -434,6 +434,10 @@ public class LocalModelManager: ObservableObject {
         // Graded thinking levels (Spark X2.6 `reasoning_effort`): sniff the
         // model's own chat template, on this background scanning thread.
         let supportsThinkingLevels = ModelConfig.supportsThinkingLevels(modelPath: dirPath)
+        // Vision: only a family with a tower whose weights are actually present, so
+        // the composer's attachment button reflects this snapshot rather than a
+        // hardcoded family list.
+        let supportsVision = ModelConfig.supportsVision(modelPath: dirPath)
 
         return DiscoveredModel(
             id: repoId,
@@ -452,7 +456,8 @@ public class LocalModelManager: ObservableObject {
             quantization: quantization,
             rawModelType: rawModelType,
             supportsThinking: supportsThinking,
-            supportsThinkingLevels: supportsThinkingLevels
+            supportsThinkingLevels: supportsThinkingLevels,
+            supportsVision: supportsVision
         )
     }
 

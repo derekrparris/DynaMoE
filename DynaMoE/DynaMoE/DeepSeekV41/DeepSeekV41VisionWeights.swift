@@ -79,6 +79,41 @@ nonisolated public final class DeepSeekV41VisionWeights: DeepSeekV41WeightSource
     /// The text width the tower's rows are projected to, when the aligner says so.
     public let textHiddenSize: Int?
 
+    /// Whether a snapshot publishes the tower at all, decided from the shard index
+    /// (or the shard headers when there is no index) without building a catalog.
+    ///
+    /// This backs the scan-time `supportsVision` flag, so it has to be cheap AND
+    /// honest: a checkpoint whose config advertises a tower but whose vision shards
+    /// were never downloaded must not put an attachment button in the composer.
+    /// The sample names cover the three families the tower reads — a block, the
+    /// aligner, and the marker embeddings, which live in a DIFFERENT shard from the
+    /// blocks and are the part a partial download loses first.
+    public static func directoryHasTower(_ snapshotDir: URL) -> Bool {
+        let required = [
+            "vision.blocks.0.attn.wqkv.weight",
+            "vision.blocks.0.mlp.w2.weight",
+            "aligner.w2.weight",
+            "image_start",
+            "image_end",
+            "image_newline"
+        ]
+        let weightMap = DeepSeekV41EngramTableLocator.indexWeightMap(in: snapshotDir)
+        if !weightMap.isEmpty {
+            return required.allSatisfy { !(weightMap[$0] ?? "").isEmpty }
+        }
+        let shards = DeepSeekV41EngramTableLocator.shardFiles(in: snapshotDir)
+        guard !shards.isEmpty else { return false }
+        var names: Set<String> = []
+        for shard in shards {
+            names.formUnion(
+                DeepSeekV41EngramTableLocator.headerNames(
+                    in: snapshotDir.appendingPathComponent(shard)
+                )
+            )
+        }
+        return required.allSatisfy { names.contains($0) }
+    }
+
     public init?(snapshotDir: URL?, catalog: DeepSeekV41WeightCatalog) {
         guard let snapshotDir else { return nil }
         // Every vision-scope slot the catalog classified, minus the scale

@@ -27,11 +27,20 @@ nonisolated public struct DeepSeekV41ImageInput: Sendable, Equatable {
     public let rgb: [UInt8]
     public let width: Int
     public let height: Int
+    /// Content digest from the asset store, when the caller has one, so an encoded
+    /// span can be cached instead of re-running the tower for a picture already in
+    /// the conversation.
+    public let sha256: String
 
-    public init(rgb: [UInt8], width: Int, height: Int) {
+    public init(rgb: [UInt8], width: Int, height: Int, sha256: String = "") {
         self.rgb = rgb
         self.width = width
         self.height = height
+        self.sha256 = sha256
+    }
+
+    public var isWellFormed: Bool {
+        width > 0 && height > 0 && rgb.count == width * height * 3
     }
 }
 

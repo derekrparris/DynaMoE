@@ -7124,3 +7124,101 @@ validation errors under `MTL_DEBUG_LAYER` (`dsv41_validation43.xctestrun`). The 
 one: `-O` must not move the GEMM parity bars, and it does not. Production code was not touched
 in this slice, so those bars are `#36`'s.
 
+
+## DSV4.1 #38: THE COMPOSER CAN SEND A PICTURE, AND THE PATH IS FOUR SEAMS
+
+### The question
+
+`#37` measured what an image costs and left the composer as the next slice, on the ground that
+the cost objection was retired and the UI half of the seam already existed. Routing agreed
+(`composer_image_attachment` 0.993, confidence 0.99; "probe the app's own tokenizer path first"
+0.998; "price the attachment in the composer" 0.996). Four gaps stood between a staged
+`PreparedImage` and a turn the model can see: the request had no image field, the engine never
+called the tower, the app's prompt text carried no placeholder, and no local model reported
+`supportsVision`.
+
+### What changed
+
+- **The probe came first, and it was worth it.**
+  `testTheComposedPromptCarriesOneImageTokenPerAttachment` renders a user turn through
+  `ChatPromptFormatter.formatPrompt` (the app's path, not `dialect.render`), tokenizes it with
+  the checkpoint's own tokenizer, and expands it: **10 tokens plain, 12 with one image, 14 with
+  two**; the marker alone tokenizes to exactly `[129264]`; `expand` binds 8 rows with 0
+  unfilled and 0 unused. The first two fixtures were wrong in the same instructive way —
+  a newline is its own token, and *two adjacent newlines are one* — so the control is now one
+  ordinary token placed where the marker goes, which is the only comparison that isolates the
+  marker.
+- **`DeepSeekV41ImagePixels`** turns encoded bytes into the row-major RGB the tower samples:
+  ImageIO decode with EXIF orientation applied and a 4,096-pixel side cap (the token budget is
+  a 1,344-pixel box, so the cap refuses a 100-megapixel photo that would cost 300 MB of RGB to
+  end up as 31x31 cells). A 24-bit sRGB `CGContext` is refused by Core Graphics on this OS
+  (measured), so the draw goes through 32-bit RGBA and is compacted.
+- **`DeepSeekV41TurnImages`** splits the two halves the engine needs in that order: `price`
+  answers "how many prompt positions will this become" from `DeepSeekV41VisionLayout.fit` alone,
+  and `bind` runs the tower and places its rows. Both fail closed on no tower, an image with no
+  placeholder, a placeholder with no image, a malformed buffer, and a span whose row count
+  disagrees with its grid.
+- **The engine prices before provisioning and binds after.** The KV cache has to be sized for the
+  *expanded* prompt, which is why the price cannot wait for the tower; the bind then runs with
+  the runtime in hand and its length is asserted against the price, because a disagreement means
+  a cache sized for one sequence and a turn run on another. The expanded ids feed the prefix pin,
+  the prepared-length bookkeeping and the sampler's context. Any family without a tower now
+  refuses a turn that carries images instead of dropping them.
+- **`ModelConfig.supportsVision(modelPath:)`** is the composer's gate, backed by
+  `DeepSeekV41VisionWeights.directoryHasTower`, which reads the shard index for a block, the
+  aligner and the three marker embeddings — the markers live in a different shard from the
+  blocks, so a partial download fails this check rather than advertising a tower it cannot run.
+- **The composer prices the attachment.** `DeepSeekV41VisionPricing` turns the resize plan into
+  span positions and seconds on the model `#37` measured, and the chip reads
+  `546×546 · 12 KB · about 2.9 s`.
+- **One encode per attachment, not per turn.** A chat turn re-renders the whole conversation, so
+  a picture in context would re-run the tower every turn; the engine now caches encoded spans by
+  `snapshot path | sha256`, bounded to four, and drops them with the checkpoint.
+
+### Evidence at real weights
+
+`testAnRGBImagePricesAndBindsOnThePublishedWeights`, published checkpoint, `-Onone` harness:
+
+```
+🔎 [dsv41 real] rgb bind: 56x56 pixels -> 1521 patch tokens, 184 span positions, priced 2.91 s against 68.52 s measured
+```
+
+2.91 s is the estimate `#37`'s model gives for 1,521 patch tokens; 68.52 s is what the same grid
+costs in the debug harness, which `#37` measured at **2.74 s** when the app's own code is
+compiled `-O`. So the estimate is a release number, and the harness number is a debug one — said
+out loud because they differ by 25x.
+
+### What it means
+
+The composer's path is now measurable end to end: stage a picture, see what it will cost, send,
+and the tower runs once, the rows land at the placeholder's positions, and a follow-up turn
+reuses the cached span. **Vision is no longer blocked on anything numeric.**
+
+What it is still blocked on is a prompt renderer. For a DeepSeek V4.1 chat turn the app builds a
+chatml transcript and `formatPrompt` then wraps that transcript inside ONE V4.1 user turn, so an
+attachment's markers land inside a nested blob rather than in the checkpoint's own turn
+structure. The rows bind and the model sees the picture, but the surrounding text is not what the
+checkpoint was trained on. That is a pre-existing rendering gap (`#34` exercised the API path and
+the formatter, not `ContentView`'s builder), and it is the next slice: the family should render
+through `ChatPromptFormatter.formatConversation`, as the server path already does.
+
+### What it does not mean
+
+- The API server does not carry images. A stateless request re-renders its conversation, so it
+  would need the same span cache to avoid re-encoding per request; out of scope here.
+- Nothing was measured on a full-size photograph. The largest image the checkpoint accepts was
+  priced in `#37` (41.71 s at the cap) and is what the chip reports, but only the 56x56 smallest
+  admissible case was bound here.
+- A turn that carries a picture never resumes a prefix, by design; the cache saves the *encode*,
+  not the prefill.
+
+### Verification
+
+`DeepSeekV41TurnImagesTests` (9), `DeepSeekV41VisionCostTests` (5), `DeepSeekV41ImagePixelsTests`
+(5) and `DeepSeekV41VisionDirectoryTests` (1) are the new pure-logic pins: the price equals the
+bound length, a stray placeholder is refused, a span that disagrees with its grid is refused, the
+decoded buffer starts at the image's top-left (an off-diagonal white pixel, so a flip, a
+transpose and a BGR decode each fail differently), the cost model reproduces the measured points,
+the cap is 31x31 cells, and a snapshot without the marker shards is not vision-capable. The full
+suite is **578 tests, 0 failures, 43 skipped**, and 0 Metal validation errors under
+`MTL_DEBUG_LAYER`.

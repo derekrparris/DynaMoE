@@ -244,6 +244,17 @@ public final class CompletionEngine: @unchecked Sendable {
     /// a longer turn needs a larger cache.
     private var cachedDeepSeekRuntime: (path: String, contextLength: Int, runtime: DeepSeekV41Runtime)?
 
+    /// Encoded image spans, keyed by `snapshot path | image sha256`.
+    ///
+    /// A chat turn re-renders the whole conversation, so a picture that stays in
+    /// context would otherwise re-run the vision tower on every turn: 2.74 s for the
+    /// smallest image the checkpoint accepts and 41.71 s for the largest, measured
+    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #37"). The rows are the expensive
+    /// part (a smallest image's span is 3.8 MB of `Float`), so the cache is small
+    /// and drops everything once it outgrows it rather than growing without bound.
+    private var cachedImageSpans: [String: DeepSeekV41ImagePrompt.ImageSpan] = [:]
+    private static let imageSpanCacheLimit = 4
+
     private init() {}
 
     public var isActive: Bool {
@@ -367,11 +378,27 @@ public final class CompletionEngine: @unchecked Sendable {
                     "⚠️ DeepSeek V4.1 Flash config.json could not be decoded: \(error)"
                 )
             }
+            // Images are priced BEFORE the runtime is provisioned and encoded after
+            // it exists: the resize plan alone says how many prompt positions the
+            // spans will occupy, and the cache has to be sized for the expanded
+            // prompt, not for the placeholders. This also rejects the mismatches
+            // (no tower, an image with no placeholder, a placeholder with no image)
+            // while nothing has been allocated.
+            let turnImages = request.images.map {
+                DeepSeekV41ImageInput(
+                    rgb: $0.rgb, width: $0.width, height: $0.height, sha256: $0.sha256
+                )
+            }
+            let imagePrice = try DeepSeekV41TurnImages.price(
+                tokenIds: request.promptTokenIds,
+                images: turnImages,
+                spec: dsConfig.vision
+            )
             // The cache is provisioned for the prompt plus the turn's token budget,
             // capped at what the checkpoint says it can address.
             let contextLength = max(
                 1,
-                min(dsConfig.maxPositionEmbeddings, request.sampling.maxTokens + request.promptTokenIds.count)
+                min(dsConfig.maxPositionEmbeddings, request.sampling.maxTokens + imagePrice.promptTokens)
             )
             // Reuse the runtime a previous turn built when it was provisioned for at
             // least this much context. The engine is single-flight (checked at the
@@ -433,6 +460,60 @@ public final class CompletionEngine: @unchecked Sendable {
                     )
                 }
 
+                // Encode the attachments now that the tower can be reached, and bind
+                // its rows to the placeholders. This is the slow part of an image turn
+                // (2.74 s for the smallest image the checkpoint accepts, 41.71 s for
+                // the largest, measured), and it happens before the turn starts so the
+                // first streamed frame is still the first generated token. An
+                // attachment this engine already encoded is reused: a conversation
+                // that keeps a picture in context re-renders it every turn.
+                stateLock.lock()
+                let cachedSpans = cachedImageSpans
+                stateLock.unlock()
+                var freshSpans: [String: DeepSeekV41ImagePrompt.ImageSpan] = [:]
+                func spanKey(_ image: DeepSeekV41ImageInput) -> String {
+                    "\(snapshotDir.path)|\(image.sha256)"
+                }
+                func encodeImage(_ input: DeepSeekV41ImageInput) throws
+                    -> DeepSeekV41ImagePrompt.ImageSpan {
+                    let key = spanKey(input)
+                    if let hit = cachedSpans[key] { return hit }
+                    if let hit = freshSpans[key] { return hit }
+                    let span = try runtime.imageSpan(
+                        rgb: input.rgb, width: input.width, height: input.height
+                    )
+                    freshSpans[key] = span
+                    return span
+                }
+                let bound = try DeepSeekV41TurnImages.bind(
+                    tokenIds: request.promptTokenIds,
+                    images: turnImages,
+                    spec: dsConfig.vision,
+                    rowWidth: dsConfig.hiddenSize,
+                    encode: encodeImage
+                )
+                if !freshSpans.isEmpty {
+                    stateLock.lock()
+                    for (key, span) in freshSpans { cachedImageSpans[key] = span }
+                    if cachedImageSpans.count > Self.imageSpanCacheLimit {
+                        // Keep the most recent encodes: a conversation addresses the
+                        // same few pictures over and over, and an unbounded cache of
+                        // multi-megabyte row sets is a leak.
+                        cachedImageSpans = freshSpans
+                    }
+                    stateLock.unlock()
+                }
+                guard bound.tokenIds.count == imagePrice.promptTokens else {
+                    throw CompletionLaunchError.engineNotReady(
+                        "⚠️ Image expansion produced \(bound.tokenIds.count) prompt tokens, "
+                            + "but the resize plan priced \(imagePrice.promptTokens)."
+                    )
+                }
+                // Everything downstream — the prefix pin, the provisioned length, the
+                // sampler's context — has to see the EXPANDED ids: the placeholders are
+                // one token each and the rows live at the span's positions.
+                let expandedPromptIds = bound.tokenIds
+
                 // Same ordering as the generic loop: KV reset (in the turn loop) ->
                 // grammar token -> turn id. A superseded turn still holds its old
                 // token, so its late mask writes are dropped instead of corrupting
@@ -451,15 +532,15 @@ public final class CompletionEngine: @unchecked Sendable {
                 // sequence this cache never saw.
                 let reusablePrefix = forward.reusablePrefix(
                     proposedPrefix: PrefixCacheManager.shared.findCommonPrefix(
-                        promptTokenIds: request.promptTokenIds,
+                        promptTokenIds: expandedPromptIds,
                         sessionId: request.sessionId
                     ),
-                    promptTokenIds: request.promptTokenIds.map { Int($0) }
+                    promptTokenIds: expandedPromptIds.map { Int($0) }
                 )
 
                 let prep = TurnPrepInfo(
                     prefixTokensReused: reusablePrefix,
-                    promptTokenCount: request.promptTokenIds.count,
+                    promptTokenCount: expandedPromptIds.count,
                     effectiveKVPrecision: runtime.cachePrecision == .fp16 ? .fp16 : .fp8,
                     provisionedSequenceLength: runtime.contextLength
                 )
@@ -467,7 +548,7 @@ public final class CompletionEngine: @unchecked Sendable {
                 let engineSelf = self
                 let dsTokenizer = tokenizer
                 let dsSampling = request.sampling
-                let dsPromptIds = request.promptTokenIds
+                let dsPromptIds = expandedPromptIds
                 let dsFormattedPrompt = request.formattedPrompt
                 let dsStopSequences = request.stopSequences
                 let dsSessionId = request.sessionId
@@ -522,6 +603,7 @@ public final class CompletionEngine: @unchecked Sendable {
                             forward: forward,
                             promptTokenIds: dsPromptIds,
                             prefixTokens: reusablePrefix,
+                            imageEmbeddings: bound.rows,
                             settings: settings,
                             sample: { logits, generated in
                                 var scratch = logits
@@ -10809,8 +10891,12 @@ if layer.attnGateProjTensor != nil,
         self.cachedPromptDialect = nil
         // A model switch retires the DeepSeek runtime with the checkpoint it was
         // built for; its mapped shards and open tables must not outlive the load.
+        // The encoded image spans go with it: their keys carry the old snapshot's
+        // path, and holding a conversation's rows across a model switch buys
+        // nothing while costing tens of megabytes.
         let retired = cachedDeepSeekRuntime
         cachedDeepSeekRuntime = nil
+        cachedImageSpans.removeAll()
         stateLock.unlock()
         retired?.runtime.shutdown()
     }
