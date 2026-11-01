@@ -6192,3 +6192,99 @@ activation quantization in the dense path, and exactly equal scores break to the
 lower row index where `torch.topk` is unspecified. Neither was measured against real
 weights: the whole slice is synthetic-checkpoint coverage, and the published
 geometry's first real run has not happened.
+
+## DSV4.1 #29: THE INDEXER'S KEY CACHE WAS PRICED IN HALF THE WIDTH IT IS ADDRESSED IN
+
+**Question.** `#28` replaced the port's invented "the newest `index_topk` compressed
+rows" scorer with the checkpoint reference's two-level rule, and pinned that rule
+against `Indexer.forward` and `select_candidate_blocks`. Every vector behind it was
+generated at a six-wide config: `index_topk` 3 over 8 produced rows. Below the
+budget every reachable row is selected, so the scored cut is invisible there. Does
+the rule still change the answer at the published geometry, where `index_topk` is
+512 and a ratio-1 layer produces one row per position?
+
+**Answer: it does from position 512, and the first real-weight run found a cache bug
+that no synthetic fixture could see.**
+
+The probe prefills 576 positions of the real checkpoint through the block path and
+reads back, per index-source layer, the score vector and the row list the gather
+bound. The first run scored **exactly zero for 287 of the 576 rows, at all five
+ratio-1 sources, at the same rows** — and the number of *distinct* scores was 290 at
+every layer, which no learned arithmetic produces. That is a region with nothing
+written in it, not a rectifier.
+
+The cause is one number in two files. `DeepSeekV41CacheGeometry.indexerKeyBytes`
+priced an index key at `MemoryLayout<UInt16>.stride` while every access used four
+bytes: `dsv41_copy_f32` writes `k_norm(wk(latent))` as floats and
+`dsv41_indexer_scores_f32` reads the region as `device const float*`. So each key
+row overran its own 256-byte slot by half into the next row's, the last row of every
+owner wrote past the end of its region, and the score kernel read half-widths back as
+floats, which are denormals. `DeepSeekV41MemoryPlan` priced the same two bytes, so
+the load log agreed with the allocation and both disagreed with the traffic. The
+synthetic checkpoint never noticed because its rows still fit inside the region it
+was given.
+
+Fixed by pricing the cache at the width both kernels address, in both files, and
+pinned by `DeepSeekV41IndexerKeyLayoutTests`: one key is `index_head_dim` floats, the
+stride between rows is that width, the last row ends exactly at its owner's region
+boundary, and the memory plan's price equals the layout's allocation.
+
+**Where it bites.** Nothing on this model is optional about it: a compressed layer's
+gather binds the row list the scores produce, so before the fix the port was reading
+287 rows nobody had written plus aliased halves of written ones. On the twenty
+ratio-1 layers the whole history beyond row 288 was effectively invisible.
+
+**Numbers, after the fix** (576 positions, one prefill, `M5 Max`, 475 GB checkpoint):
+
+| | value |
+| --- | --- |
+| prefill of 576 positions | 105 s (~0.18 s/position) |
+| index sources recorded | 5 ratio-1 (`20, 24, 28, 32, 36`) of 8; total 8 with the ratio-2 half |
+| positions past the budget | 64 (position 512 onward) x 5 layers = 320 selections |
+| those that are not the newest 512 rows | **320 of 320** |
+| exact-zero scores per layer | 287 before the fix, **0** after |
+| distinct scores per layer | 290 before the fix, **576** after (no ties anywhere) |
+| score range, layer 20 at position 575 | -3.331 .. 3.802, median -1.011, 135 positive / 441 negative |
+| rank of the newest row, layer 20 / 24 at 575 | 62 / 464 (of 576) |
+| rank of row 0, layer 20 / 24 at 575 | 43 / 39 |
+| distinct selections at position 575 | 6 across 8 sources (the 3 ratio-2 sources keep every row) |
+| probe run | 1 test, 0 failures, 111.8 s |
+
+What the selection actually does at 576 rows is less dramatic than "it reads the
+oldest rows" and more useful: the cut keeps 512 of 576, the 64 it drops are the
+lowest-scoring rows wherever they sit, and the oldest rows survive on their scores
+(row 0 ranks 43rd, the newest row 62nd at layer 20). The set differs from a recency
+window at **every** budget-exceeding position, which is the property `#28` claimed and
+this run is the first evidence for.
+
+Level one is confirmed inert at this checkpoint rather than assumed inert: the
+candidate source's mask came back all-`true` at every position, because 2,048 blocks
+of 8 rows is 16,384 rows and the run reaches 576.
+
+**A second blind spot, in the fixture rather than the port.** With the stride fixed,
+the device/host parity case for compressed rows failed at position 5 of
+`compressedSmall` — the first position where `index_topk` 2 binds over 3 produced
+rows. The cause was the fixture: it published
+`layers.N.attn.indexer.wk.weight` as `[index_head_dim, hidden]`, where the checkpoint
+publishes `[128, 512]` and the reference builds `wk = Linear(head_dim,
+index_head_dim)` over the compressor's pooled LATENT. `DeepSeekV41Matrix.apply`
+returns zeros when the vector is narrower than the matrix row (deliberately, so a
+plan-level bug reads as a zero block rather than an out-of-range read), so the host's
+index keys were all zero and its scores were noise around 1e-4. Every fixture before
+this one had `index_topk` at or above the produced row count, so the cut never bound
+and a zero score vector selected exactly the rows a real one would. The fixture now
+publishes the latent width, and the parity case compares a binding cut, which is the
+comparison it always meant to make.
+
+**Two things the run now asserts that a fixture cannot.** The newest row is not
+preferred: it ranks 62nd of 576 at one source and 464th at another, so a query at
+position 575 does not weight its own newest compressed row above everything older.
+And two index sources over the same key cache choose different rows at the same
+position (6 distinct lists across 8 sources), so the selection depends on the query
+rather than on the row geometry.
+
+**Still open.** The indexer's FP4 query/key quantization is still skipped, exactly
+equal scores still break to the lower row index where `torch.topk` is unspecified
+(the real run has no ties to break), and `candidateSelection`'s golden vectors remain
+synthetic: this contribution is the rule and the cache it reads, not a comparison of
+the port's scores against the checkpoint's own `Indexer.forward` at real weights.

@@ -161,11 +161,15 @@ nonisolated public struct DeepSeekV41MemoryPlan: Sendable, Equatable {
         // `index_head_dim` values. That is the width the cache geometry
         // allocates, so pricing anything else (the wk matrix's first dimension
         // is `index_n_heads * index_head_dim`) makes the log disagree with the
-        // allocation. The candidate pass keeps one score per block per token.
+        // allocation. The values are FP32: the copy kernel writes them and the
+        // score kernel reads them as floats, so pricing them at the FP16 stride
+        // undercounts the cache by half and disagrees with the traffic
+        // (`DeepSeekV41CacheGeometry.indexerKeyBytes`). The candidate pass keeps
+        // one score per block per token.
         var indexerBytes = 0
         for layer in plan where layer.ownsCompressedIndex {
             let rows = max(0, contextLength) / max(1, layer.compressRatio) + 1
-            indexerBytes += rows * config.indexHeadDim * MemoryLayout<UInt16>.stride
+            indexerBytes += rows * config.indexHeadDim * MemoryLayout<Float>.stride
         }
         let blockSize = max(1, config.candidateBlockSize)
         let candidateBytes = config.candidateSourceLayerID >= 0

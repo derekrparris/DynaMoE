@@ -947,6 +947,214 @@ final class DeepSeekV41AttentionKernelTests: XCTestCase {
     }
 }
 
+// MARK: - Indexer score kernel
+
+/// The GPU half of the sparse-attention rule.
+///
+/// Every assertion about WHICH compressed rows a query reads rests on the score
+/// vector this kernel writes: the executor reads it back and hands it to
+/// `DeepSeekV41Indexer.selectedRows`, so a kernel that scored differently would
+/// silently select differently while the host rule's own tests kept passing. It is
+/// checked against `DeepSeekV41Indexer.positionScores`, which is the function the
+/// reference vectors pin.
+final class DeepSeekV41IndexerKernelTests: XCTestCase {
+
+    private func makePipeline() throws -> (MTLDevice, MTLComputePipelineState, MTLCommandQueue) {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        guard let library = device.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "dsv41_indexer_scores_f32"),
+              let pipeline = try? device.makeComputePipelineState(function: function),
+              let queue = device.makeCommandQueue() else {
+            XCTFail("Could not build the indexer score pipeline")
+            throw XCTSkip("no indexer score pipeline")
+        }
+        return (device, pipeline, queue)
+    }
+
+    private func floats(_ buffer: MTLBuffer, count: Int) -> [Float] {
+        Array(UnsafeBufferPointer(
+            start: buffer.contents().assumingMemoryBound(to: Float.self),
+            count: count
+        ))
+    }
+
+    /// Runs one dispatch and returns the score vector it wrote.
+    private func scores(
+        query: [Float],
+        keys: [Float],
+        weights: [Float],
+        headCount: Int,
+        headWidth: Int,
+        rowCount: Int,
+        visibleRows: Int,
+        weightScale: Float,
+        pipeline: MTLComputePipelineState,
+        device: MTLDevice,
+        queue: MTLCommandQueue
+    ) throws -> [Float] {
+        guard let queryBuffer = device.makeBuffer(
+                  bytes: query,
+                  length: query.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let keyBuffer = device.makeBuffer(
+                  bytes: keys,
+                  length: keys.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let weightBuffer = device.makeBuffer(
+                  bytes: weights,
+                  length: weights.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let scoreBuffer = device.makeBuffer(
+                  length: rowCount * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("Could not allocate the indexer score buffers")
+            return []
+        }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(queryBuffer, offset: 0, index: 0)
+        encoder.setBuffer(keyBuffer, offset: 0, index: 1)
+        encoder.setBuffer(weightBuffer, offset: 0, index: 2)
+        encoder.setBuffer(scoreBuffer, offset: 0, index: 3)
+        var heads = UInt32(headCount)
+        var width = UInt32(headWidth)
+        var rows = UInt32(rowCount)
+        var visible = UInt32(visibleRows)
+        var scale = weightScale
+        encoder.setBytes(&heads, length: 4, index: 4)
+        encoder.setBytes(&width, length: 4, index: 5)
+        encoder.setBytes(&rows, length: 4, index: 6)
+        encoder.setBytes(&visible, length: 4, index: 7)
+        encoder.setBytes(&scale, length: 4, index: 8)
+        encoder.dispatchThreads(
+            MTLSize(width: rowCount, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: min(rowCount, pipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+        return floats(scoreBuffer, count: rowCount)
+    }
+
+    /// The rectifier is PER HEAD and comes BEFORE the weight, so a head whose weight
+    /// is negative turns a positive dot negative and a head that votes against a row
+    /// contributes nothing rather than subtracting. Both halves of that sentence are
+    /// load-bearing and both are invisible to a fixture whose weights are all
+    /// positive: on the published checkpoint most rows score exactly zero and the
+    /// cut lands in the negative tail, which only happens if negative weights reach
+    /// the sum.
+    func testTheScoreKernelRanksLikeTheRuleWithNegativeWeights() throws {
+        let (device, pipeline, queue) = try makePipeline()
+        let heads = 5
+        // Ten wide on purpose: the published `index_head_dim` is 128, so the kernel's
+        // remainder loop never runs in production and only a width that is not a
+        // multiple of four exercises it.
+        let width = 10
+        let rows = 13
+        let query: [Float] = (0..<(heads * width)).map { index in
+            Float((index * 7) % 11 - 5) / 4
+        }
+        let keys: [Float] = (0..<(rows * width)).map { index in
+            // The last row is an all-zero key, so every head's dot with it is zero and
+            // the row lands on exactly 0.0 instead of a small number that might or
+            // might not survive the rectifier.
+            index >= (rows - 1) * width ? 0 : Float((index * 5) % 13 - 6) / 4
+        }
+        // A mix of signs, so some rows lose a head's contribution by rectification
+        // and others are pushed negative by a negative weight.
+        let weights: [Float] = [-0.75, 0.5, -0.25, 1.25, 0.0]
+
+        let got = try scores(
+            query: query, keys: keys, weights: weights,
+            headCount: heads, headWidth: width, rowCount: rows, visibleRows: rows,
+            weightScale: 0.5, pipeline: pipeline, device: device, queue: queue
+        )
+        let want = DeepSeekV41Indexer.positionScores(
+            queryHeads: (0..<heads).map { head in
+                Array(query[(head * width)..<((head + 1) * width)])
+            },
+            keys: (0..<rows).map { row in
+                Array(keys[(row * width)..<((row + 1) * width)])
+            },
+            headWeights: weights.map { $0 * 0.5 }
+        )
+        XCTAssertEqual(got.count, want.count)
+        let scale = want.map(abs).max() ?? 1
+        for index in 0..<want.count {
+            XCTAssertEqual(
+                got[index], want[index], accuracy: max(scale, 1) * 1e-5,
+                "the score kernel disagrees with the rule at row \(index)"
+            )
+        }
+        // The vectors are only evidence if they reach both states: a negative score
+        // proves a rectified dot met a negative weight, and a zero proves a head
+        // voting against a row removed only its own contribution.
+        XCTAssertTrue(want.contains { $0 < 0 }, "no row scored negative, so the sign mix is untested")
+        XCTAssertTrue(want.contains { $0 == 0 }, "no row scored exactly zero")
+    }
+
+    /// A row past the query's frontier is silenced rather than scored, because the
+    /// rule drops such rows AFTER the cut and a finite score would let one take a
+    /// slot the query cannot attend to. The rows the query can see are untouched by
+    /// that, and a visible row that scores zero keeps a zero rather than the
+    /// sentinel.
+    func testTheScoreKernelSilencesOnlyTheRowsPastTheFrontier() throws {
+        let (device, pipeline, queue) = try makePipeline()
+        let heads = 3
+        let width = 8
+        let rows = 20
+        let visible = 11
+        let query: [Float] = (0..<(heads * width)).map { index in
+            Float((index * 3) % 7 - 3) / 4
+        }
+        let keys: [Float] = (0..<(rows * width)).map { index in
+            Float((index * 11) % 17 - 8) / 8
+        }
+        let weights: [Float] = [0.5, -0.5, 0.25]
+
+        let got = try scores(
+            query: query, keys: keys, weights: weights,
+            headCount: heads, headWidth: width, rowCount: rows, visibleRows: visible,
+            weightScale: 1, pipeline: pipeline, device: device, queue: queue
+        )
+        let want = DeepSeekV41Indexer.positionScores(
+            queryHeads: (0..<heads).map { head in
+                Array(query[(head * width)..<((head + 1) * width)])
+            },
+            keys: (0..<rows).map { row in
+                Array(keys[(row * width)..<((row + 1) * width)])
+            },
+            headWeights: weights
+        )
+        let scale = want.map(abs).max() ?? 1
+        for row in 0..<visible {
+            XCTAssertEqual(
+                got[row], want[row], accuracy: max(scale, 1) * 1e-5,
+                "row \(row) is reachable but the kernel scored it differently"
+            )
+        }
+        for row in visible..<rows {
+            XCTAssertEqual(
+                got[row], -.infinity,
+                "row \(row) is past the frontier and must be silenced, not scored"
+            )
+        }
+        // The selection the executor then makes is the reason this matters: with the
+        // reachable half ranked, the silenced tail can never displace a visible row
+        // no matter how high its score came out.
+        let selected = DeepSeekV41Indexer.selectedRows(scores: got, visibleRows: visible, topK: 5)
+        XCTAssertEqual(selected.count, 5)
+        XCTAssertTrue(
+            selected.allSatisfy { $0 < visible },
+            "the cut selected a row past the frontier: \(selected)"
+        )
+    }
+}
+
 // MARK: - Router kernel
 
 final class DeepSeekV41RouterKernelTests: XCTestCase {

@@ -261,6 +261,19 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         return UInt32(clamping: best)
     }
 
+    /// A reproducible token stream for the probes, cycled from ids the checkpoint's
+    /// own tokenizer produces for ordinary text so routing is not degenerate.
+    private static func probeTokens(count: Int) -> [Int] {
+        let seed = [
+            0, 128803, 21750, 2038, 15174, 943, 3939, 270, 15571, 344, 83779, 16, 128804, 128822,
+            19, 16, 17289, 9372, 344, 10526, 44691, 305, 14, 1060, 15390, 294, 1737, 14, 1843,
+            5258, 20450, 377, 3155, 14, 30663, 32453, 19504, 46885, 965, 35868, 20012, 305,
+            32604, 965, 23418, 27124, 396, 7457, 1066, 304, 270, 8343, 603
+        ]
+        guard count > 0 else { return [] }
+        return (0..<count).map { seed[$0 % seed.count] }
+    }
+
     // MARK: - The turn
 
     /// Whether the graph's logits depend on the token it was given at all.
@@ -441,6 +454,297 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             Int(Self.argmax(probe.0)), Int(Self.argmax(probe.1)),
             "the block and the walk disagree on the next token"
         )
+        withExtendedLifetime(engine) {}
+    }
+
+    /// Does the sparse-attention rule bite at the published geometry?
+    ///
+    /// `#28` replaced the port's invented scorer with the checkpoint reference's
+    /// two-level rule, and every vector behind that change was generated at a
+    /// six-wide config: `index_topk` 3 over 8 produced rows. Those vectors say the
+    /// RULE is transcribed correctly; they say nothing about whether it still
+    /// changes the answer once the row count passes the budget at 512, which is the
+    /// only regime the checkpoint runs in. Below `index_topk` every reachable row is
+    /// selected and the scored cut is invisible, so a port that quietly kept reading
+    /// the newest rows — the bug `#28` fixed — would pass the entire golden suite.
+    ///
+    /// So this prefills past the budget on the real weights and asks the model what
+    /// it chose. Three things are checked, none of which a synthetic fixture can
+    /// decide: the selection at a budget-exceeding position is NOT the newest
+    /// `index_topk` reachable rows; it really is the top-k of the scores the device
+    /// produced, recomputed independently on the host; and the candidate-block cut
+    /// above it is inert at ordinary context, because 2,048 blocks of 8 rows is
+    /// 16,384 rows and the checkpoint never reaches them here.
+    func testWhatTheIndexerSelectsPastItsBudgetOnThePublishedCheckpoint() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let plan = try config.makeLayerPlan()
+
+        // Every compressed layer whose ratio is 1 produces one row per position, so
+        // it is the only half that can pass `index_topk` at a context a probe can
+        // afford: a ratio-2 layer arrives at the same row count twice as late.
+        let ratioOneSources = plan.filter {
+            $0.ownsCompressedIndex && $0.compressRatio == 1 && $0.compressedKVSource >= 0
+        }
+        try XCTSkipIf(
+            ratioOneSources.isEmpty,
+            "no ratio-1 index source in the layer plan, so nothing passes the budget here"
+        )
+        try XCTSkipIf(
+            config.indexTopK <= 0,
+            "no index_topk budget, so the scored cut never runs"
+        )
+
+        // Enough positions that the last few sit well past the budget: at 576 the
+        // final position ranks 576 reachable rows against a cut of 512.
+        let positionCount = min(config.indexTopK + 64, 576)
+        let tokens = Self.probeTokens(count: positionCount)
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: positionCount,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+
+        let sources = ratioOneSources.map(\.index)
+        let probe = try await Task.detached { [runtime, tokens] () -> (
+            [DeepSeekV41IndexSelectionRecord], Double
+        ) in
+            let executor = runtime.forward()
+            executor.reset()
+            executor.recordsIndexSelections = true
+            let started = DispatchTime.now().uptimeNanoseconds
+            _ = try executor.prefillChunk(tokens)
+            let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000_000
+            return (executor.indexSelectionRecords, elapsed)
+        }.value
+        let records = probe.0
+        let seconds = probe.1
+        print(
+            "🔎 [dsv41 real] prefilled \(tokens.count) positions in "
+                + String(format: "%.1f s", seconds)
+                + " over \(sources.count) ratio-1 index source(s) "
+                + "\(sources.map(String.init).joined(separator: ", ")), "
+                + "\(records.count) selection(s) recorded"
+        )
+        XCTAssertFalse(
+            records.isEmpty,
+            "the indexer read back no selection at the published geometry"
+        )
+
+        // The newest rows the old rule would have taken, as a set: the last `topK`
+        // rows under `visibleRows`. Below the budget this IS the whole reachable
+        // range, which is why the two rules cannot be told apart there.
+        func newestWindow(_ record: DeepSeekV41IndexSelectionRecord) -> Set<Int> {
+            let reachable = 0..<record.visibleRows
+            return Set(reachable.suffix(record.topK))
+        }
+
+        var beyondBudget = 0
+        var differsFromNewest = 0
+        var oldestAdmitted = Int.max
+        var newestSpans: [String] = []
+        for record in records where record.producedRows > record.topK {
+            beyondBudget += 1
+            let selected = Set(record.selected)
+            let newest = newestWindow(record)
+            if selected != newest {
+                differsFromNewest += 1
+                let outside = selected.subtracting(newest).sorted()
+                if let oldest = selected.min() {
+                    oldestAdmitted = min(oldestAdmitted, oldest)
+                }
+                // The rows a scored cut keeps that a recency cut would have dropped,
+                // and how far behind the frontier the deepest of them sits.
+                let frontier = record.visibleRows - 1
+                if newestSpans.count < 6 {
+                    newestSpans.append(
+                        "layer \(record.layer) position \(record.position): "
+                            + "\(record.producedRows)/\(record.visibleRows) rows, "
+                            + "topK \(record.topK), \(outside.count) row(s) outside the newest "
+                            + "window, the oldest of them "
+                            + "\(frontier - (outside.first ?? frontier)) behind the frontier"
+                            + (outside.isEmpty ? "" : " (rows \(outside.prefix(4)))")
+                    )
+                }
+            }
+        }
+        for line in newestSpans { print("🔎 [dsv41 real] \(line)") }
+        print(
+            "🔎 [dsv41 real] past the budget at \(beyondBudget) selection(s), "
+                + "\(differsFromNewest) of them are not the newest \(config.indexTopK) rows; "
+                + (oldestAdmitted == .max
+                    ? "no selection reached behind the newest window"
+                    : "the deepest admitted row is \(oldestAdmitted)")
+        )
+
+        // Which rows won, and why. A selection that differs from the newest window is
+        // only meaningful if the scores rank it there: rows admitted from behind the
+        // window because of a tie at the cut would mean the rule is decided by the
+        // tie-break rather than by the model, and rows admitted because the score
+        // decays with row index would mean the cut is a recency window with extra
+        // steps. Both are visible here and neither is visible in a golden.
+        let deepestPosition = tokens.count - 1
+        for record in records where record.position == deepestPosition {
+            guard record.producedRows > record.topK else { continue }
+            let ranked = record.scores.enumerated()
+                .sorted { $0.element == $1.element ? $0.offset < $1.offset : $0.element > $1.element }
+                .map(\.offset)
+            let cutScore = record.scores[ranked[record.topK - 1]]
+            let ties = record.scores.filter { $0 == cutScore }.count
+            let newest = record.visibleRows - 1
+            let newestRank = ranked.firstIndex(of: newest).map { $0 + 1 } ?? -1
+            let oldestRank = ranked.firstIndex(of: 0).map { $0 + 1 } ?? -1
+            let finite = record.scores.filter { $0.isFinite }.sorted()
+            let median = finite.isEmpty ? 0 : finite[finite.count / 2]
+            let positive = record.scores.filter { $0 > 0 }.count
+            let zero = record.scores.filter { $0 == 0 }.count
+            let distinct = Set(record.scores).count
+            print(
+                "🔎 [dsv41 real] layer \(record.layer) position \(record.position): "
+                    + "cut score \(String(format: "%.4f", cutScore)) held by \(ties) row(s), "
+                    + "median \(String(format: "%.4f", median)), "
+                    + "range \(String(format: "%.3f", finite.first ?? 0)).."
+                    + "\(String(format: "%.3f", finite.last ?? 0)), "
+                    + "\(positive) positive / \(zero) exactly zero / "
+                    + "\(record.producedRows - positive - zero) negative, "
+                    + "\(distinct) distinct score(s); "
+                    + "row 0 ranks \(oldestRank), the newest row \(newest) ranks \(newestRank)"
+            )
+            // WHICH rows scored exactly zero. The rule's rectifier gives a zero to a
+            // row no head votes for, which at 32 heads is a coincidence; a contiguous
+            // run of them is a region with nothing written in it, and that is a
+            // different finding entirely.
+            let zeroRows = record.scores.indices.filter { record.scores[$0] == 0 }
+            let contiguous = zeroRows.count > 1
+                && zeroRows.last! - zeroRows.first! == zeroRows.count - 1
+            print(
+                "🔎 [dsv41 real]   zero-score rows: \(zeroRows.count), "
+                    + (zeroRows.isEmpty ? "none"
+                        : "\(zeroRows.first!)..\(zeroRows.last!), "
+                            + (contiguous ? "contiguous" : "scattered"))
+            )
+            // A row scores exactly zero only when every head votes against it, which
+            // with 32 heads is a coincidence rather than a pattern. A large block of
+            // them is the signature of a key region with nothing written in it, which
+            // is exactly what the index-key cache did while it was priced at the FP16
+            // stride and addressed at the FP32 one.
+            if config.indexNHeads >= 8 {
+                XCTAssertLessThanOrEqual(
+                    zeroRows.count, record.producedRows / 8,
+                    "layer \(record.layer) position \(record.position) scored "
+                        + "\(zeroRows.count) of \(record.producedRows) rows exactly zero with "
+                        + "\(config.indexNHeads) heads, which does not happen to keys that were "
+                        + "written"
+                )
+            }
+        }
+
+        // Does the zero tail grow with the row count, or is it a fixed region? The
+        // same layer is compared at the first position past the budget and at the
+        // last: a fixed count means rows that were never written, a growing one means
+        // the rule is rejecting them.
+        let auditLayer = ratioOneSources[0].index
+        for record in records
+        where record.layer == auditLayer
+            && (record.position == config.indexTopK || record.position == deepestPosition) {
+            let zeros = record.scores.filter { $0 == 0 }.count
+            print(
+                "🔎 [dsv41 real] layer \(record.layer) position \(record.position): "
+                    + "\(zeros) zero-score row(s) of \(record.producedRows)"
+            )
+        }
+
+        XCTAssertGreaterThan(
+            beyondBudget, 0,
+            "no position reached past index_topk, so the scored cut never ran"
+        )
+        XCTAssertGreaterThan(
+            differsFromNewest, 0,
+            "every budget-exceeding selection was exactly the newest \(config.indexTopK) "
+                + "rows: the scored cut is not doing anything at the published geometry, "
+                + "which is the bug #28 fixed"
+        )
+
+        // The selection must be the top-k OF THE SCORES, not merely different from a
+        // recency window: a row list that arrived from anywhere else would still
+        // differ. Recomputing the cut on the host from the read-back scores is the
+        // only way to say the numbers the device produced are the ones the gather
+        // then bound.
+        for record in records {
+            XCTAssertEqual(
+                record.selected, record.selected.sorted(),
+                "layer \(record.layer) position \(record.position) selected rows out of order"
+            )
+            XCTAssertEqual(
+                Set(record.selected).count, record.selected.count,
+                "layer \(record.layer) position \(record.position) selected a row twice"
+            )
+            XCTAssertEqual(
+                record.selected.count, min(record.topK, record.visibleRows),
+                "layer \(record.layer) position \(record.position) kept "
+                    + "\(record.selected.count) of \(record.visibleRows) reachable rows "
+                    + "against a cut of \(record.topK)"
+            )
+            XCTAssertEqual(
+                record.scores.count, record.producedRows,
+                "layer \(record.layer) position \(record.position) read back "
+                    + "\(record.scores.count) scores for \(record.producedRows) rows"
+            )
+            // The reach filter runs AFTER the cut, so the host recomputation has to
+            // do the same to agree: rank every produced row, keep the top `topK`,
+            // then drop the rows past the frontier.
+            let ranked = record.scores.enumerated()
+                .sorted { $0.element == $1.element ? $0.offset < $1.offset : $0.element > $1.element }
+                .prefix(record.topK)
+                .map(\.offset)
+                .filter { $0 < record.visibleRows }
+                .sorted()
+            XCTAssertEqual(
+                record.selected, ranked,
+                "layer \(record.layer) position \(record.position) did not read the rows its "
+                    + "own scores ranked first"
+            )
+            // Level one above the top-k, at the rows this checkpoint actually has:
+            // 2,048 blocks of 8 rows is 16,384, so the candidate cut is inert here
+            // and says so rather than being assumed inert.
+            if record.layer == config.candidateSourceLayerID {
+                let blocks = DeepSeekV41Indexer.candidateBlocks(
+                    scores: record.scores,
+                    visibleRows: record.visibleRows,
+                    blockSize: max(1, config.candidateBlockSize),
+                    topKBlocks: max(0, config.candidateTopKBlocks)
+                )
+                XCTAssertTrue(
+                    blocks.allSatisfy { $0 },
+                    "the candidate cut dropped a block at position \(record.position), "
+                        + "which the published block budget was supposed to leave inert"
+                )
+            }
+        }
+
+        // Two layers with different queries over the same cache must not choose the
+        // same rows. Identical lists would mean the query never entered the scores,
+        // which no row-count assertion above can detect.
+        let lastPosition = tokens.count - 1
+        let samePosition = records.filter { $0.position == lastPosition }
+        if samePosition.count > 1 {
+            let distinct = Set(samePosition.map { $0.selected })
+            print(
+                "🔎 [dsv41 real] at position \(lastPosition): \(distinct.count) distinct "
+                    + "selection(s) across \(samePosition.count) source layer(s)"
+            )
+            XCTAssertGreaterThan(
+                distinct.count, 1,
+                "every index source chose the same rows at position \(lastPosition), "
+                    + "so the selection does not depend on the query"
+            )
+        }
         withExtendedLifetime(engine) {}
     }
 

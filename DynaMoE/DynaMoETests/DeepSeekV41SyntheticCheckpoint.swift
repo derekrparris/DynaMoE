@@ -512,9 +512,17 @@ nonisolated final class DeepSeekV41SyntheticCheckpoint {
                         ]
                     )
                 case .indexerWk:
+                    // `Indexer.wk = Linear(args.head_dim, index_head_dim)`, so its
+                    // input is the compressor's pooled LATENT, not the hidden state
+                    // (the checkpoint publishes `[128, 512]` for `head_dim` 512).
+                    // Publishing it at `hidden` width instead fails silently:
+                    // `DeepSeekV41Matrix.apply` yields zeros when the vector is
+                    // narrower than the row, so the host scored every compressed row
+                    // as zero, and only a fixture whose `index_topk` cut actually
+                    // binds can tell (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #29").
                     add(
                         "\(prefix).attn.indexer.wk.weight", role, layer: layer,
-                        shape: [max(1, shape.indexHeadDim), hidden]
+                        shape: [max(1, shape.indexHeadDim), shape.latentWidth]
                     )
                 case .indexerWeights:
                     add(

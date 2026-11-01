@@ -88,7 +88,19 @@ nonisolated public struct DeepSeekV41CacheGeometry: Sendable, Equatable {
     public var recordBytes: Int { precision.recordBytes(width: width) }
     public var windowBytesPerLayer: Int { windowRows * recordBytes }
     public var compressedBytesPerOwner: Int { compressedRows * recordBytes }
-    public var indexerKeyBytes: Int { indexerKeyWidth * MemoryLayout<UInt16>.stride }
+    /// One index key, at FP32.
+    ///
+    /// The indexer's side attention is the one place the port keeps an unquantized
+    /// vector per compressed row: `k_norm(wk(latent))` is written by `dsv41_copy_f32`
+    /// and read by `dsv41_indexer_scores_f32`, both of which address it as floats.
+    /// Sizing this at the FP16 stride, which it was, makes every row overrun its
+    /// own slot by half, so each write aliases the next row and the last one writes
+    /// past the end of the cache, while the score kernel reads the misaligned bytes
+    /// as floats and scores garbage. A synthetic checkpoint cannot see it because a
+    /// fixture's rows still fit in the region; a real 576-row run scores exactly zero
+    /// for every row whose slot has nothing written in it
+    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #29").
+    public var indexerKeyBytes: Int { indexerKeyWidth * MemoryLayout<Float>.stride }
 
     public init(
         width: Int,

@@ -1118,13 +1118,15 @@ final class DeepSeekV41MemoryPlanTests: XCTestCase {
         // which is the FP4 design width by default here.
         XCTAssertEqual(memory.windowRingBytes, 40 * 128 * config.fp4CacheRecordBytes)
         // Main caches (576 MB) plus one index key per compressed row (two
-        // owners x 128 FP16 values per row) stays well under 2 GB, which is
-        // what makes a 1M-token context affordable on this machine.
-        // Index keys are per COMPRESSED row, so the ratio-2 owner stores half
-        // as many as the ratio-1 owner.
+        // owners x 128 FP32 values per row) stays under 2 GB, which is what
+        // makes a 1M-token context affordable on this machine. Index keys are
+        // per COMPRESSED row, so the ratio-2 owner stores half as many as the
+        // ratio-1 owner. The width is FP32 because the copy kernel writes them
+        // and the score kernel reads them as floats: pricing them at two bytes
+        // undercounted the cache by half while every access used four.
         XCTAssertEqual(
             memory.indexerBytes,
-            (1_048_576 / 2 + 1) * 128 * 2 + (1_048_576 + 1) * 128 * 2
+            (1_048_576 / 2 + 1) * 128 * 4 + (1_048_576 + 1) * 128 * 4
         )
         XCTAssertLessThan(memory.cacheBytes, 2 * 1_073_741_824, "caches must fit in 2 GB")
     }
@@ -1883,6 +1885,108 @@ final class DeepSeekV41CompressorGroupTests: XCTestCase {
                 owner: 1, slot: 1, groupWidth: 2, width: 4
             )
         )
+    }
+}
+
+// MARK: - Indexer key layout
+
+/// The indexer's key cache is allocated in one file, written by one kernel and read
+/// by another, and all three have to agree on one number: the byte stride of a
+/// single key. They did not. The geometry priced a key at two bytes while
+/// `dsv41_copy_f32` wrote four and `dsv41_indexer_scores_f32` read four, so every
+/// write overran its own slot into the next row's and the last one ran past the end
+/// of the cache, while the score kernel read the misaligned bytes back as floats.
+///
+/// Nothing caught it because both halves are individually self-consistent: the
+/// memory plan agreed with the geometry (both priced two bytes) and the two kernels
+/// agreed with each other (both addressed four). A synthetic checkpoint could not
+/// see it either, because it never fills enough rows for the aliasing to reach
+/// unwritten memory. The real checkpoint did: at 576 rows the score vector came back
+/// with 287 exact zeros at every layer (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #29").
+final class DeepSeekV41IndexerKeyLayoutTests: XCTestCase {
+
+    private let contextLength = 576
+
+    private func fixture() throws -> (
+        config: DeepSeekV41Config,
+        plan: [DeepSeekV41LayerPlan],
+        geometry: DeepSeekV41CacheGeometry,
+        layout: DeepSeekV41CacheLayout
+    ) {
+        let config = try DeepSeekV41Config.decode(
+            jsonData: Data(DeepSeekV41ConfigTests.wrapperJSON.utf8)
+        )
+        let plan = try config.makeLayerPlan()
+        let geometry = DeepSeekV41CacheGeometry.make(
+            config: config, plan: plan, contextLength: contextLength
+        )
+        return (config, plan, geometry, DeepSeekV41CacheLayout(geometry: geometry, plan: plan))
+    }
+
+    /// The stride one key occupies is the width both kernels address it at. If this
+    /// is ever priced per element rather than per traffic, rows overlap.
+    func testAKeyOccupiesTheWidthTheScoreKernelReads() throws {
+        let (config, _, geometry, layout) = try fixture()
+        XCTAssertEqual(
+            geometry.indexerKeyBytes,
+            config.indexHeadDim * MemoryLayout<Float>.stride,
+            "one index key is index_head_dim floats, and both kernels address it at 4 bytes each"
+        )
+        let owner = try XCTUnwrap(
+            layout.indexerRowsByOwner.keys.sorted().first,
+            "no layer owns index keys"
+        )
+        let first = try XCTUnwrap(
+            DeepSeekV41CacheAddressing.indexerByteOffset(layer: owner, row: 0, layout: layout)
+        )
+        let second = try XCTUnwrap(
+            DeepSeekV41CacheAddressing.indexerByteOffset(layer: owner, row: 1, layout: layout)
+        )
+        XCTAssertEqual(
+            second - first, config.indexHeadDim * MemoryLayout<Float>.stride,
+            "consecutive index keys overlap"
+        )
+    }
+
+    /// The last key an owner can write ends exactly at the end of its own region, so
+    /// the final `dsv41_copy_f32` neither spills into the next owner nor past the
+    /// buffer.
+    func testTheLastKeyEndsWhereItsOwnersRegionEnds() throws {
+        let (config, _, geometry, layout) = try fixture()
+        for (owner, rows) in layout.indexerRowsByOwner {
+            let base = try XCTUnwrap(layout.indexerBase[owner])
+            let last = try XCTUnwrap(
+                DeepSeekV41CacheAddressing.indexerByteOffset(
+                    layer: owner, row: rows - 1, layout: layout
+                )
+            )
+            XCTAssertEqual(
+                last + config.indexHeadDim * MemoryLayout<Float>.stride,
+                base + rows * geometry.indexerKeyBytes,
+                "owner \(owner)'s last key does not end at its region boundary"
+            )
+            XCTAssertNil(
+                DeepSeekV41CacheAddressing.indexerByteOffset(layer: owner, row: rows, layout: layout),
+                "owner \(owner) addresses a row past its region"
+            )
+        }
+    }
+
+    /// The memory plan's price and the layout's allocation are the same cache. They
+    /// are computed in different files from the same config, which is exactly how
+    /// they drifted, so they are compared rather than each being checked against its
+    /// own arithmetic.
+    func testTheMemoryPlanPricesTheCacheTheLayoutAllocates() throws {
+        let (config, plan, _, layout) = try fixture()
+        let memory = DeepSeekV41MemoryPlan.make(
+            config: config, plan: plan, catalog: nil, contextLength: contextLength
+        )
+        XCTAssertEqual(
+            memory.indexerBytes, layout.indexerBytes,
+            "the load log prices \(memory.indexerBytes) bytes of index keys for a "
+                + "\(layout.indexerBytes)-byte allocation"
+        )
+        XCTAssertGreaterThan(memory.indexerBytes, 0)
     }
 }
 

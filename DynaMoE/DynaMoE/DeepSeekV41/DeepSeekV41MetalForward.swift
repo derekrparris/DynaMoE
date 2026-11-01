@@ -729,6 +729,42 @@ nonisolated public struct DeepSeekV41ParityProbes {
 
 // MARK: - Executor
 
+/// One index-source layer's sparse-attention choice, kept so a probe can read it.
+///
+/// `producedRows` is how many compressed rows exist behind the query, `visibleRows`
+/// how many of them the position may see, and `topK` how many the cut may keep. The
+/// three differ once the row count passes `index_topk`, which is the case the rule
+/// exists for: `selected` is then a SCORED subset of the reachable rows rather than
+/// the newest `topK` of them. `scores` is one value per produced row, in row order,
+/// carrying `-inf` for the rows past the frontier.
+nonisolated public struct DeepSeekV41IndexSelectionRecord: Sendable {
+    public var layer: Int
+    public var position: Int
+    public var producedRows: Int
+    public var visibleRows: Int
+    public var topK: Int
+    public var selected: [Int]
+    public var scores: [Float]
+
+    public init(
+        layer: Int,
+        position: Int,
+        producedRows: Int,
+        visibleRows: Int,
+        topK: Int,
+        selected: [Int],
+        scores: [Float]
+    ) {
+        self.layer = layer
+        self.position = position
+        self.producedRows = producedRows
+        self.visibleRows = visibleRows
+        self.topK = topK
+        self.selected = selected
+        self.scores = scores
+    }
+}
+
 /// Where a block's per-layer time goes, in nanoseconds.
 ///
 /// Three buckets rather than a profiler because the question is narrow: after the
@@ -997,6 +1033,20 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// computed and what it computed FROM; without that a disagreement can only be
     /// reported, not attributed to a stage.
     public var parityProbes = DeepSeekV41ParityProbes()
+
+    /// Diagnostic readback, off in every production path: what each index-source
+    /// layer's query scored and which compressed rows it took from those scores.
+    ///
+    /// Which rows a query reads is a top-k over numbers the device computed, so it
+    /// has no closed form on the host and cannot be checked from a config. The
+    /// selection is also the one piece of per-position state a gather binds from a
+    /// HOST value, which makes it the only place a device run can silently read a
+    /// different row set than the rule named. Keeping the scores beside the rows is
+    /// deliberate: a row list that is not the newest window is only evidence if the
+    /// scores say it should not be (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #28" and
+    /// "#29", which is the published-checkpoint run this readback exists for).
+    public var recordsIndexSelections = false
+    public private(set) var indexSelectionRecords: [DeepSeekV41IndexSelectionRecord] = []
 
     /// Where a block's per-layer time goes, accumulated while `recordsBlockTiming`
     /// is on. Off in every production path.
@@ -1517,6 +1567,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         cache.reset()
         indexSelectionsByPosition.removeAll(keepingCapacity: true)
         indexMasksByPosition.removeAll(keepingCapacity: true)
+        indexSelectionRecords.removeAll(keepingCapacity: true)
         tokenHistory.removeAll(keepingCapacity: true)
         deadTokens.removeAll(keepingCapacity: true)
         pendingDead = false
@@ -3679,6 +3730,19 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                     visibleRows: visible,
                     topK: topK,
                     candidates: published
+                )
+            }
+            if recordsIndexSelections {
+                indexSelectionRecords.append(
+                    DeepSeekV41IndexSelectionRecord(
+                        layer: layer.index,
+                        position: position,
+                        producedRows: produced,
+                        visibleRows: visible,
+                        topK: topK,
+                        selected: indexSelectionsByPosition[position] ?? [],
+                        scores: scores
+                    )
                 )
             }
         }
