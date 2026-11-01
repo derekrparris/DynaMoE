@@ -2737,6 +2737,116 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         return logits
     }
 
+    /// Appends one position whose residual input the caller supplies.
+    ///
+    /// The vision tower runs on the host, so an image span reaches this executor as
+    /// one `[Float]` per position: the row is uploaded into the workspace's embedding
+    /// slot and the streams are seeded from it, exactly where `encodeEmbedding` would
+    /// have written the token lookup. `Model.merge_image_embeddings` does the same
+    /// thing before the layers run, which is why a span position is a normal position
+    /// in every other respect.
+    ///
+    /// The position is recorded DEAD for the Engram hashes rather than live: the
+    /// reference excludes image positions from an n-gram, and a live one would hash
+    /// pad rows into the residual at both memory layers.
+    public func forwardEmbedding(
+        _ embedding: [Float],
+        token: Int,
+        position: Int
+    ) throws -> [Float] {
+        guard problems.isEmpty else {
+            throw DeepSeekV41EngineError.modelNotRunnable(problems)
+        }
+        guard position >= 0, position < contextLength else {
+            throw DeepSeekV41EngineError.contextTooLong(position + 1, contextLength)
+        }
+        guard cache.storedPositions == position else {
+            throw DeepSeekV41EngineError.outOfOrderPosition(position, cache.storedPositions)
+        }
+        guard embedding.count == shapes.hidden else {
+            throw DeepSeekV41EngineError.embeddingWidthMismatch(
+                expected: shapes.hidden, actual: embedding.count
+            )
+        }
+
+        tokenHistory.append(Int32(truncatingIfNeeded: token))
+        deadTokens.append(true)
+        pendingDead = false
+
+        let commandBuffer = try makeCommandBuffer()
+        let encoder = try makeEncoder(commandBuffer)
+        // A host write into a shared buffer is not ordered against Metal work that
+        // has not executed yet, so the upload goes first and the barrier after it is
+        // what the seeding reads.
+        embedding.withUnsafeBytes { source in
+            guard let base = source.baseAddress else { return }
+            workspace.hidden.contents().copyMemory(
+                from: base, byteCount: shapes.hidden * MemoryLayout<Float>.stride
+            )
+        }
+        encoder.memoryBarrier(scope: .buffers)
+        try encodeStreamSeeding(encoder: encoder, count: 1)
+        encoder.endEncoding()
+        // Nothing reads the embedding on the host, so this does not wait: the first
+        // layer's front half is ordered behind it on the same queue.
+        try commit(commandBuffer, stage: "embedding (supplied row)", waiting: false)
+
+        for layer in plan {
+            try runLayer(layer, at: position)
+        }
+        try finishBlock()
+        try settlePending()
+        if recordsWalkTiming {
+            recordWalkDeviceTiming()
+            walkTiming.positions += 1
+        }
+
+        var logits = [Float](repeating: 0, count: config.vocabSize)
+        let count = min(config.vocabSize, workspace.logits.length / MemoryLayout<Float>.stride)
+        let pointer = workspace.logits.contents().assumingMemoryBound(to: Float.self)
+        logits.withUnsafeMutableBufferPointer { destination in
+            destination.baseAddress?.update(from: pointer, count: count)
+        }
+        cache.noteStored(position + 1)
+        return logits
+    }
+
+    /// Every hyper-connection copy of a position starts as that position's embedding
+    /// (`Array(repeating: hidden, count: mult)`), and the stack's first collapse is
+    /// the identity mix (`make_identity_pre_mix`).
+    private func encodeStreamSeeding(encoder: MTLComputeCommandEncoder, count: Int) throws {
+        try encodeClear(encoder, buffer: workspace.streams, count: count * mult * shapes.hidden)
+        for index in 0..<count {
+            for copy in 0..<mult {
+                try encodeCopy(
+                    encoder,
+                    from: workspace.hidden,
+                    to: workspace.streams,
+                    count: shapes.hidden,
+                    sourceByteOffset: workspace.slotOffset(index, width: shapes.hidden),
+                    destinationByteOffset: workspace.slotOffset(
+                        index, width: mult * shapes.hidden
+                    ) + copy * shapes.hidden * MemoryLayout<Float>.stride
+                )
+            }
+        }
+        encoder.setComputePipelineState(pipelines.hcIdentityMix)
+        var copies = UInt32(mult)
+        encoder.setBytes(&copies, length: 4, index: 1)
+        for index in 0..<count {
+            encoder.setBuffer(
+                workspace.hcMix,
+                offset: workspace.slotOffset(index, width: mult),
+                index: 0
+            )
+            encoder.dispatchThreads(
+                MTLSize(width: mult, height: 1, depth: 1),
+                threadsPerThreadgroup: threadgroup(mult)
+            )
+        }
+        encoder.memoryBarrier(scope: .buffers)
+    }
+
     // MARK: Block
 
     /// Embedding into `hidden`, then every hyper-connection stream starts as a copy

@@ -725,7 +725,9 @@ nonisolated public final class DeepSeekV41CPUForward {
 
     /// Appends one position and returns the output logits.
     public func forwardToken(_ token: Int, position: Int) -> [Float] {
-        forwardEmbedding(embed(token), token: token, position: position)
+        let dead = pendingDead
+        pendingDead = false
+        return runPosition(embed(token), token: token, position: position, dead: dead)
     }
 
     /// Appends one position whose embedding the caller supplies, which is how an
@@ -734,19 +736,36 @@ nonisolated public final class DeepSeekV41CPUForward {
     /// come from the token embedding table.
     ///
     /// `token` is still recorded in the history because the n-gram hashes are built
-    /// from token ids; mark the position dead (`markNextTokenDead`) so an Engram
-    /// lookup cannot span it and contributes nothing there.
+    /// from token ids. The position is recorded DEAD rather than taking a pending
+    /// mark: every position of an image span is excluded from an n-gram, so a supplied
+    /// row is an image position by construction, and a mark left pending would leak
+    /// onto the token after the span.
     @discardableResult
     public func forwardEmbedding(
         _ embedding: [Float],
         token: Int,
         position: Int
     ) -> [Float] {
+        pendingDead = false
+        return runPosition(embedding, token: token, position: position, dead: true)
+    }
+
+    /// One position's walk, whether its input came from the embedding table or from a
+    /// supplied row.
+    ///
+    /// The two entry points differ only in that input and in the dead flag, so the
+    /// layer loop lives here once: a second copy could drift from this one and still
+    /// produce plausible numbers.
+    private func runPosition(
+        _ embedding: [Float],
+        token: Int,
+        position: Int,
+        dead: Bool
+    ) -> [Float] {
         // The hash inputs are the token stream itself, so the history is kept here
         // rather than recomputed by each Engram layer.
         tokenHistory.append(Int32(truncatingIfNeeded: token))
-        deadTokens.append(pendingDead)
-        pendingDead = false
+        deadTokens.append(dead)
 
         // One position is a chunk of one, so the walk and the batched pass run the same
         // graph. A second copy of it could drift from this one everywhere at once and

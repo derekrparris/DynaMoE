@@ -90,6 +90,24 @@ private final class ScriptedForward: DeepSeekV41PositionForward, @unchecked Send
         return [0, 1, 2, 3]
     }
 
+    /// What the loop supplied as an image position, in order.
+    private(set) var suppliedRows: [(position: Int, token: Int, width: Int)] = []
+
+    func forwardEmbedding(
+        _ embedding: [Float],
+        token: Int,
+        position: Int
+    ) throws -> [Float] {
+        if let failAtPosition, position == failAtPosition {
+            throw failure
+        }
+        suppliedRows.append((position, token, embedding.count))
+        forwardedTokens.append(token)
+        forwardedPositions.append(position)
+        residentTokens.append(token)
+        return [0, 1, 2, 3]
+    }
+
     /// Records that the loop asked for a chunk, and walks it the way the device
     /// executor does today: the same `forwardToken` path, so a chunk and a walk
     /// are interchangeable by construction.
@@ -129,6 +147,7 @@ final class DeepSeekV41TurnLoopTests: XCTestCase {
         forward: ScriptedForward,
         prompt: [UInt32],
         prefixTokens: Int = 0,
+        imageEmbeddings: [Int: [Float]] = [:],
         settings: DeepSeekV41TurnRunner.Settings,
         decode: @escaping ([UInt32]) -> String = { $0.map(String.init).joined(separator: " ") },
         prefill: @escaping (Int, Int) -> Void = { _, _ in },
@@ -139,6 +158,7 @@ final class DeepSeekV41TurnLoopTests: XCTestCase {
             forward: forward,
             promptTokenIds: prompt,
             prefixTokens: prefixTokens,
+            imageEmbeddings: imageEmbeddings,
             settings: settings,
             sample: { _, _ in
                 let value = forward.scripted[min(cursor, forward.scripted.count - 1)]
@@ -480,5 +500,140 @@ final class DeepSeekV41TurnLoopTests: XCTestCase {
         )
         XCTAssertEqual(output.finishReason, .toolFreeze)
         XCTAssertEqual(output.tokensGenerated, 1)
+    }
+
+    // MARK: - Image positions
+
+    /// An image row replaces the token embedding at ITS position and nowhere else,
+    /// and a prompt with one is walked rather than chunked.
+    ///
+    /// The chunk path wins positives as a rule (one command buffer per layer), and
+    /// that is exactly why it must not win here: it has no way to express a
+    /// position whose input did not come from the embedding table.
+    func testAnImageRowRunsOnlyAtItsOwnPosition() throws {
+        let forward = ScriptedForward(positionLimit: 64, scripted: [5])
+        let row = [Float](repeating: 0.25, count: 8)
+        let output = try run(
+            forward: forward,
+            prompt: [10, 11, 12, 13],
+            imageEmbeddings: [2: row],
+            settings: settings(maxTokens: 1)
+        )
+        XCTAssertEqual(output.promptTokens, 4)
+        XCTAssertTrue(forward.chunkedPrompts.isEmpty, "an image span must not go through the chunk path")
+        XCTAssertEqual(forward.forwardedPositions, [0, 1, 2, 3])
+        XCTAssertEqual(forward.suppliedRows.map(\.position), [2])
+        XCTAssertEqual(forward.suppliedRows.map(\.token), [12])
+        XCTAssertEqual(forward.suppliedRows.map(\.width), [8])
+    }
+
+    /// A resident prefix is not reused when the prompt carries an image row: the
+    /// app-wide pin is keyed on token ids, and two different pictures have identical
+    /// ids. Keeping the old rows would answer about the previous picture.
+    func testAnImageTurnDoesNotResumeEvenWhenThePrefixMatches() throws {
+        let forward = ScriptedForward(
+            positionLimit: 64, scripted: [5], resident: [10, 11]
+        )
+        let output = try run(
+            forward: forward,
+            prompt: [10, 11, 12, 13],
+            prefixTokens: 2,
+            imageEmbeddings: [2: [Float](repeating: 0.5, count: 8)],
+            settings: settings(maxTokens: 1)
+        )
+        XCTAssertEqual(output.prefixTokensReused, 0)
+        XCTAssertEqual(forward.resumedPrefixes, [])
+        XCTAssertEqual(forward.resetCount, 1)
+        XCTAssertEqual(forward.forwardedPositions, [0, 1, 2, 3])
+    }
+
+    /// A text-only prompt keeps both optimizations: this is the negative half of the
+    /// test above, so a rule that disabled resume for everyone would fail here.
+    func testATextOnlyTurnStillResumesAndChunks() throws {
+        let forward = ScriptedForward(positionLimit: 64, scripted: [5], resident: [10, 11])
+        _ = try run(
+            forward: forward,
+            prompt: [10, 11, 12],
+            prefixTokens: 2,
+            settings: settings(maxTokens: 1)
+        )
+        XCTAssertEqual(forward.resumedPrefixes, [[10, 11]])
+        XCTAssertEqual(forward.suppliedRows.count, 0)
+
+        let fresh = ScriptedForward(positionLimit: 64, scripted: [5])
+        _ = try run(forward: fresh, prompt: [10, 11, 12], settings: settings(maxTokens: 1))
+        XCTAssertEqual(fresh.chunkedPrompts, [[10, 11, 12]])
+    }
+
+    /// A row bound outside the prompt is a prompt-assembly bug, not something to
+    /// clamp: it would silently drop a position and shift the conversation.
+    func testAnImageRowOutsideThePromptIsRefused() throws {
+        let forward = ScriptedForward(positionLimit: 64, scripted: [5])
+        XCTAssertThrowsError(
+            try run(
+                forward: forward,
+                prompt: [10, 11],
+                imageEmbeddings: [2: [Float](repeating: 0, count: 8)],
+                settings: settings(maxTokens: 1)
+            )
+        ) { error in
+            guard case DeepSeekV41TurnError.imagePositionOutOfRange(let position, let count) = error else {
+                return XCTFail("unexpected error \(error)")
+            }
+            XCTAssertEqual(position, 2)
+            XCTAssertEqual(count, 2)
+        }
+        XCTAssertEqual(forward.forwardedPositions, [])
+    }
+
+    /// An executor with no supplied-row entry refuses instead of falling back to the
+    /// token embedding, which is what keeps a partial backend from answering about
+    /// nothing.
+    func testAnExecutorWithoutImageSupportRefusesARow() throws {
+        let forward = TextOnlyForward(positionLimit: 64)
+        XCTAssertThrowsError(
+            try DeepSeekV41TurnRunner.run(
+                forward: forward,
+                promptTokenIds: [10, 11],
+                imageEmbeddings: [1: [Float](repeating: 0, count: 4)],
+                settings: settings(maxTokens: 1),
+                sample: { _, _ in 5 },
+                decode: { _ in "" }
+            )
+        ) { error in
+            guard case DeepSeekV41TurnError.prefillFailed(let position, let underlying) = error else {
+                return XCTFail("unexpected error \(error)")
+            }
+            XCTAssertEqual(position, 1)
+            XCTAssertTrue(underlying.contains("cannot take a supplied embedding row"), underlying)
+        }
+        XCTAssertEqual(forward.walked, [10], "the text position before the image still runs")
+    }
+}
+
+/// The smallest possible executor: text positions only, no image entry point, so the
+/// protocol's default refusal is what a turn hits.
+private final class TextOnlyForward: DeepSeekV41PositionForward, @unchecked Sendable {
+    let positionLimit: Int
+    private(set) var walked: [Int] = []
+
+    init(positionLimit: Int) {
+        self.positionLimit = positionLimit
+    }
+
+    var storedPositions: Int { 0 }
+
+    func reusablePrefix(proposedPrefix: Int, promptTokenIds: [Int]) -> Int { 0 }
+    func reset() {}
+    func resume(prefixTokenIds: [Int]) throws {}
+
+    func forwardToken(_ token: Int, position: Int) throws -> [Float] {
+        walked.append(token)
+        return [0, 1, 2, 3]
+    }
+
+    func prefillChunk(_ tokens: [Int]) throws -> DeepSeekV41ChunkLogits {
+        XCTFail("an image prompt must be walked")
+        return DeepSeekV41ChunkLogits(last: [])
     }
 }

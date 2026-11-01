@@ -44,6 +44,8 @@ nonisolated public enum DeepSeekV41TurnError: Error, CustomStringConvertible {
     case prefillFailed(position: Int, underlying: String)
     /// The block forward refused a whole chunk.
     case prefillChunkFailed(positions: Int, underlying: String)
+    /// An image row was bound to a position the prompt does not have.
+    case imagePositionOutOfRange(position: Int, promptTokens: Int)
 
     public var description: String {
         switch self {
@@ -56,6 +58,9 @@ nonisolated public enum DeepSeekV41TurnError: Error, CustomStringConvertible {
             return "❌ DeepSeek V4.1 prefill failed at position \(position): \(underlying)"
         case let .prefillChunkFailed(positions, underlying):
             return "❌ DeepSeek V4.1 prefill failed on a chunk of \(positions) positions: \(underlying)"
+        case let .imagePositionOutOfRange(position, promptTokens):
+            return "❌ DeepSeek V4.1 was given an image row for position \(position) of a "
+                + "\(promptTokens)-token prompt."
         }
     }
 }
@@ -93,6 +98,18 @@ nonisolated public protocol DeepSeekV41PositionForward: AnyObject {
     func resume(prefixTokenIds: [Int]) throws
     /// Appends one position and returns its logits.
     func forwardToken(_ token: Int, position: Int) throws -> [Float]
+    /// Appends one position whose residual input the caller supplies.
+    ///
+    /// This is how an image span enters the stream: the tower runs on the host and
+    /// its row replaces what the token embedding table would have produced, the same
+    /// way `Model.merge_image_embeddings` overwrites a span's rows before the layers
+    /// run. The position takes no part in an n-gram (the reference excludes image
+    /// positions from Engram), so an executor that implements this owes the hash the
+    /// token id and a dead flag, not the row.
+    ///
+    /// The default refuses, which is what keeps a scripted or partial executor from
+    /// quietly dropping the picture and answering about nothing.
+    func forwardEmbedding(_ embedding: [Float], token: Int, position: Int) throws -> [Float]
     /// Runs a whole prompt as one chunk and returns the logits after its last
     /// position.
     ///
@@ -102,6 +119,18 @@ nonisolated public protocol DeepSeekV41PositionForward: AnyObject {
     /// batch answers by walking, which must produce the same logits, so this is a
     /// performance contract rather than a numeric one.
     func prefillChunk(_ tokens: [Int]) throws -> DeepSeekV41ChunkLogits
+}
+
+public extension DeepSeekV41PositionForward {
+    /// Executors that cannot take a supplied row say so instead of ignoring it.
+    /// Ignoring one is not a small error: the position would run on its token
+    /// embedding, the span would be off by an image, and the turn would answer
+    /// plausibly about nothing.
+    func forwardEmbedding(_ embedding: [Float], token: Int, position: Int) throws -> [Float] {
+        throw DeepSeekV41EngineError.unsupportedStage(
+            "this executor cannot take a supplied embedding row at position \(position)"
+        )
+    }
 }
 
 nonisolated public enum DeepSeekV41TurnRunner {
@@ -172,6 +201,10 @@ nonisolated public enum DeepSeekV41TurnRunner {
     ///   - prefixTokens: leading prompt positions the cache already holds, from
     ///     `DeepSeekV41CacheAddressing.reusablePrefix`. Zero means a turn from
     ///     position 0.
+    ///   - imageEmbeddings: prompt position -> the residual row an image span puts
+    ///     there, from `DeepSeekV41ImagePrompt.expand`. A non-empty map disables the
+    ///     chunked prefill and the prefix resume (see `run`'s body), because both
+    ///     are keyed on token ids and two different pictures have the same ids.
     ///   - settings: sampling and the turn's stop conditions.
     ///   - sample: draws one id from a position's logits.
     ///   - constrain: rewrites a position's logits in place before `sample` sees
@@ -191,6 +224,7 @@ nonisolated public enum DeepSeekV41TurnRunner {
         forward: any DeepSeekV41PositionForward,
         promptTokenIds: [UInt32],
         prefixTokens: Int = 0,
+        imageEmbeddings: [Int: [Float]] = [:],
         settings: Settings,
         sample: ([Float], [UInt32]) -> UInt32,
         constrain: (inout [Float], String) -> Void = { _, _ in },
@@ -207,13 +241,28 @@ nonisolated public enum DeepSeekV41TurnRunner {
                 promptTokens: promptTokenIds.count, limit: limit
             )
         }
+        if let stray = imageEmbeddings.keys
+            .filter({ $0 < 0 || $0 >= promptTokenIds.count })
+            .min() {
+            throw DeepSeekV41TurnError.imagePositionOutOfRange(
+                position: stray, promptTokens: promptTokenIds.count
+            )
+        }
 
         // A turn starts at position 0 unless the caller says a prefix of this prompt
         // is already resident. `reset` also drops any partial compressor group, which
         // is what keeps a cancelled turn from leaking a half-filled block into the
         // next one; a resumed turn must not reset, because the half-filled group is
         // this sequence's own and the skip is what the cache was kept for.
-        let resumeFrom = max(0, min(prefixTokens, promptTokenIds.count - 1))
+        //
+        // An image span is always walked from position 0. The app-wide pin is keyed on
+        // TOKEN IDS, and every position of an image carries the same id whatever the
+        // pixels were, so a resume would keep a previous picture's rows in the cache
+        // and answer about that one with no error anywhere. Re-prefilling is the price
+        // of not being able to tell those apart until the span is hashed into the pin.
+        let resumeFrom = imageEmbeddings.isEmpty
+            ? max(0, min(prefixTokens, promptTokenIds.count - 1))
+            : 0
         if resumeFrom > 0 {
             try forward.resume(prefixTokenIds: promptTokenIds.prefix(resumeFrom).map { Int($0) })
         } else {
@@ -224,7 +273,7 @@ nonisolated public enum DeepSeekV41TurnRunner {
         let prefillStart = CFAbsoluteTimeGetCurrent()
         let newPositions = promptTokenIds.count - resumeFrom
         var logits: [Float] = []
-        if resumeFrom == 0 {
+        if resumeFrom == 0 && imageEmbeddings.isEmpty {
             // A turn from position 0 is a whole prompt, which is the shape the
             // reference's single forward call takes: hand it over as one chunk so the
             // executor can batch it instead of paying a full layer pass per token. A
@@ -257,8 +306,16 @@ nonisolated public enum DeepSeekV41TurnRunner {
                         decodeSeconds: 0, firstToken: nil
                     )
                 }
+                let token = Int(promptTokenIds[offset])
                 do {
-                    logits = try forward.forwardToken(Int(promptTokenIds[offset]), position: offset)
+                    // An image position takes the supplied row instead of the token
+                    // embedding, which is the only difference between it and a text
+                    // position in this loop.
+                    if let row = imageEmbeddings[offset] {
+                        logits = try forward.forwardEmbedding(row, token: token, position: offset)
+                    } else {
+                        logits = try forward.forwardToken(token, position: offset)
+                    }
                 } catch {
                     throw DeepSeekV41TurnError.prefillFailed(
                         position: offset, underlying: "\(error)"

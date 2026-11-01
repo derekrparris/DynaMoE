@@ -312,6 +312,61 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         }
     }
 
+    /// A supplied residual row (how an image span arrives) computes exactly what the
+    /// same row computes on the host.
+    ///
+    /// This is the seam a picture enters the serving path through, and it is the one
+    /// place where the device path deviates from `forwardToken`: the embedding lookup
+    /// is replaced by an upload. A row that landed at the wrong offset, or seeded only
+    /// the first hyper-connection copy, still produces plausible logits, so the host's
+    /// own `forwardEmbedding` is the only thing that can say which is right.
+    func testASuppliedRowComputesTheSameLogitsAsTheHost() throws {
+        let runtime = try makeRuntime(checkpoint)
+        let device = runtime.forward()
+        let host = makeHost(checkpoint)
+        let row = (0..<checkpoint.config.hiddenSize).map { index in
+            Float((index * 7) % 11) / 11 - 0.5
+        }
+
+        let expectedFirst = host.forwardEmbedding(row, token: 9, position: 0)
+        let firstLogits = try device.forwardEmbedding(row, token: 9, position: 0)
+        XCTAssertEqual(firstLogits.count, expectedFirst.count)
+        let firstScale = expectedFirst.map(abs).max() ?? 1
+        XCTAssertLessThan(
+            worstDelta(firstLogits, expectedFirst) / max(firstScale, 1e-6),
+            decodeTolerance,
+            "the first supplied row disagrees with the host"
+        )
+
+        // A second position, one text and one supplied, so the walk after an image
+        // position is compared too: the position ring and the mix carried between
+        // sub-layers are where a seeding bug shows up next.
+        let expectedSecond = host.forwardToken(11, position: 1)
+        let secondLogits = try device.forwardToken(11, position: 1)
+        let secondScale = expectedSecond.map(abs).max() ?? 1
+        XCTAssertLessThan(
+            worstDelta(secondLogits, expectedSecond) / max(secondScale, 1e-6),
+            decodeTolerance,
+            "the text position after a supplied row disagrees with the host"
+        )
+    }
+
+    /// A checkpoint with no tower cannot be asked for pixels, and says which reason
+    /// applies rather than returning an empty span.
+    func testARuntimeWithoutAVisionConfigRefusesAnImage() throws {
+        let runtime = try makeRuntime(checkpoint)
+        XCTAssertNil(runtime.visionForward(), "the synthetic checkpoint publishes no tower")
+        XCTAssertNil(runtime.imageSpanPlan(width: 64, height: 64))
+        XCTAssertThrowsError(
+            try runtime.imageSpan(rgb: [], width: 0, height: 0)
+        ) { error in
+            guard case DeepSeekV41EngineError.visionUnavailable(let detail) = error else {
+                return XCTFail("unexpected error \(error)")
+            }
+            XCTAssertTrue(detail.contains("no vision_config"), detail)
+        }
+    }
+
     /// A block of one is a decode step: the same tokens, the same graph, and the
     /// same logits, wherever the block machinery differs from the walk's.
     func testABlockOfOneMatchesTheWalk() throws {

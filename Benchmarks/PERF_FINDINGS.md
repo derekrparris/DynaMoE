@@ -6741,6 +6741,105 @@ rendered prompt, and Spark's block is byte-identical to `sparkSystemBody`).
 ### What it does not mean
 
 Vision is still CPU-reference only: no device tower, no image span reaches a turn, and the
-composer refuses attachments for every local model. DSpark is still unwired, still a
-measured loss at every width (`#26`), and cache rewind is still unbuilt. The flag advertises
-the text path that exists, not every head the checkpoint publishes.
+composer refuses attachments for every local model. **Updated in `#35`:** an image span now
+DOES reach a real turn (`DeepSeekV41TurnRunner.run(imageEmbeddings:)`), and the host tower
+measures ~10.4 hours for the smallest image the checkpoint accepts, so the composer still
+refuses attachments — for a measured reason now, not an assumed one. DSpark is still unwired,
+still a measured loss at every width (`#26`), and cache rewind is still unbuilt. The flag
+advertises the text path that exists, not every head the checkpoint publishes.
+
+## DSV4.1 #35: AN IMAGE SPAN NOW REACHES A REAL TURN, AND THE HOST TOWER MEASURES AT TEN HOURS A PICTURE
+
+### The question
+
+`#34` advertised text turns and named vision as outside the promise. The remaining
+candidates were a second indexer source, the image path, the device vision tower, and the
+shelved drafter. `image_prefill` was chosen: the tower's CPU reference was already matched
+against the checkpoint's own `ViT`/`Aligner`, `imageSpan(rgb:width:height:)` was verified,
+and the image token was pinned to the tokenizer's own added token 129,264, so what was
+missing looked like plumbing. The open question was whether plumbing is all it is.
+
+### What changed
+
+- **The device executor takes a supplied residual row.** `DeepSeekV41MetalForward
+  .forwardEmbedding(_:token:position:)` uploads the row into the workspace's embedding slot,
+  seeds every hyper-connection copy from it, records the position DEAD for the Engram hashes,
+  and then walks exactly what `forwardToken` walks. This is the seam every future vision path
+  enters through, device tower or not.
+- **The turn loop carries rows.** `DeepSeekV41TurnRunner.run(imageEmbeddings:)` walks a
+  prompt that has any, and `DeepSeekV41PositionForward` grew the matching requirement with a
+  default that REFUSES: an executor that cannot take a row says so, because silently running
+  the token embedding would answer about nothing.
+- **An image prompt never resumes a prefix.** The app-wide pin is keyed on token ids, and
+  every position of an image carries the same id whatever the pixels were. A resumed span
+  would keep a previous picture's rows in the cache. This is a deliberate cost (a follow-up
+  turn re-prefills) until the span is hashed into the pin.
+- **`DeepSeekV41ImagePrompt`** expands one placeholder id into its span and binds a row to
+  each position, reporting an image with no placeholder and a placeholder with no image
+  instead of dropping either, because dropping one shifts every position after it.
+- **`DeepSeekV41VisionWeights`** reads the tower's 266 tensors (263 block tensors plus the
+  three markers) by name out of the shard headers, decodes BF16/FP32 on demand, and never
+  pins: one encode touches each tensor once.
+- **The CPU forward's two entry points now share one walk.** `forwardToken` used to delegate
+  to `forwardEmbedding`, so making a supplied row dead-by-construction made EVERY token dead
+  and 70 tests failed on Engram hashes. They now both call a private `runPosition(dead:)`.
+
+### Evidence at real weights
+
+The first time the tower has run on the published weights at all (every previous vision test
+is a synthetic fixture against a numpy mirror). `testAnImageEntersAPublishedTurn`, behind
+`/tmp/dynamoe_dsv41_real_turn`:
+
+```
+🔎 [dsv41 real] image prompt: 12 tokens, image id 129264
+🔎 [dsv41 real] vision weights: 266 tensors
+🔎 [dsv41 real] tower: 4 patch tokens in 127.11 s, 16 in 422.55 s; span 4 rows for the 2x2
+   grid, prompt 12 -> 15 tokens
+🔎 [dsv41 real] image turn: lengthCapped after 2 token(s), prompt 15, reused 0,
+   prefill 4.07 s
+🔎 [dsv41 real] image turn text: "This picture"
+```
+
+The placeholder tokenized to ONE token (id 129,264) out of 12, the span expanded the prompt
+from 12 to 15 tokens, the turn walked all 15 with the supplied row at its own position, and
+`reused 0` is the no-resume rule holding even though a 11-token prefix was proposed.
+
+### What the tower costs, and why this is the headline
+
+Two patch grids, same weights, same process:
+
+| patch tokens | encode |
+|---|---|
+| 4 (2x2) | 127.11 s |
+| 16 (4x4) | 422.55 s |
+
+That is **24.6 s per marginal patch token** and a fixed **~29 s** (the 970 MB of BF16 read
+and widened into 1.9 GB of `Float`, once per encode). The checkpoint's own floor is
+`min_pixels` 295,936, i.e. at least 544x544, which the patch grid rounds up to 546x546 =
+**1,521 patch tokens** for the smallest image it will accept: 28.6 + 1521 * 24.6 = **~10.4 hours** of host tower before the span's
+184 positions even reach the backbone (which then costs ~50 s at the measured ~270 ms a
+position). The shape is the problem, not the CPU: a projection re-reads its whole matrix per
+token through bounds-checked scalar dots, which is a GEMM being done as `rows` dot products.
+
+So `image_prefill` is DONE and vision is NOT shippable on it. Two ways forward, in order of
+cost: give the host tower a real GEMM (Accelerate is already linked; the same arithmetic at
+~100 GFLOP/s turns a picture into tens of seconds), or build the device tower (`vision_device`
+as originally scoped). The composer must keep refusing attachments until one of them lands;
+the `supportsVision` flag stays false.
+
+Pure logic pins the wiring: `DeepSeekV41ImagePromptTests` (span length is the grid plus its
+delimiters, one placeholder expands to its span and binds every row, two images keep their
+order, a placeholder with no image survives, an image with no placeholder is reported, a
+wrong span length and a wrong row width are refused, a text-only prompt is untouched), the
+five new `DeepSeekV41TurnLoopTests` cases (row runs only at its own position, an image turn
+does not resume even when the prefix matches, a text-only turn still resumes and chunks, an
+out-of-range row is refused, an executor without image support refuses the row), and
+`DeepSeekV41DeviceGraphParityTests.testASuppliedRowComputesTheSameLogitsAsTheHost` (the
+supplied row AND the text position after it, `2e-3` normalized).
+
+### What it does not mean
+
+The image path exists end to end and is unusably slow. No `supportsVision` flag was turned on,
+no composer path was opened, no chat or API request can carry an image yet: the engine seam is
+proven, the serving cost is not. `vision_device` is now justified by a number rather than a
+premise, and the cheaper alternative (a host GEMM) is named above so it can be chosen first.

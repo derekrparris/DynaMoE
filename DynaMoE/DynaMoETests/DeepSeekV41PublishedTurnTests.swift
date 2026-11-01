@@ -2830,4 +2830,162 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         for line in report { print("🔎 [dsv41 real] \(line)") }
         XCTAssertTrue(report.isEmpty, "two identical prefills disagree")
     }
+
+    // MARK: - An image in a real turn
+
+    /// The tower at the checkpoint's own weights, and its rows inside a real turn.
+    ///
+    /// This is the first time the tower runs on the published weights at all: every
+    /// other vision test is a synthetic fixture with an independent numpy mirror. What
+    /// it proves is the wiring, not the speed: a 2x2 patch grid instead of a
+    /// photograph, because `fit` scales any admissible image up to the checkpoint's
+    /// `min_pixels` (544x544, 1,521 patch tokens) and the tower is scalar host code.
+    /// The 4x4 grid timed beside it makes the per-token cost a slope rather than one
+    /// point, which is what says whether this path can ever serve.
+    func testAnImageEntersAPublishedTurn() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let spec = try XCTUnwrap(
+            config.vision, "the published config.json must publish a vision_config"
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+
+        // A prompt with one placeholder where a picture belongs. The placeholder is
+        // the checkpoint's own string and its id is the config's `image_token_id`, so
+        // it must survive tokenization as exactly ONE token: the expansion replaces
+        // that one id with the span, and a marker that tokenized into pieces would
+        // expand one piece and leave the rest as literal text.
+        let markers = DeepSeekV41VisionMarkers.familyDefault
+        let dialect = DeepSeekV41PromptDialect.resolve(snapshotDir: snapshot)
+        let prompt = dialect.render(
+            turns: [.init(isUser: true, text: "\(markers.imagePlaceholder)\nwhat is in this picture?")],
+            cleanSystem: "",
+            thinkingEnabled: false,
+            effort: nil
+        )
+        let promptIds = try tokenizer.encode(text: prompt)
+        XCTAssertFalse(promptIds.isEmpty)
+        let placeholderCount = promptIds.filter { Int($0) == spec.imageTokenID }.count
+        XCTAssertEqual(
+            placeholderCount, 1,
+            "the image placeholder must tokenize to exactly one image token; it produced "
+                + "\(placeholderCount) in \(promptIds.count) tokens"
+        )
+        print("🔎 [dsv41 real] image prompt: \(promptIds.count) tokens, image id \(spec.imageTokenID)")
+
+        // A 2x2 patch grid is one aligner cell, so the span is start + row + newline +
+        // end. A 4x4 grid is four, timed beside it for the per-token slope.
+        let patchVolume = 3 * spec.patchSize * spec.patchSize
+        func patches(_ side: Int) -> [[Float]] {
+            (0..<(side * side)).map { index in
+                (0..<patchVolume).map { dimension in
+                    Float((index * 3 + dimension) % 13) / 13 - 0.5
+                }
+            }
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let contextLength = promptIds.count + spec.maxImageTokens + 8
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: contextLength,
+            allowEngramSkip: false
+        )
+        let source = try XCTUnwrap(
+            DeepSeekV41VisionWeights(snapshotDir: snapshot, catalog: runtime.catalog),
+            "the tower's tensors could not be resolved from the published shards"
+        )
+        XCTAssertEqual(source.problems, [])
+        XCTAssertEqual(
+            source.textHiddenSize, config.hiddenSize,
+            "the aligner must project to the text width or a row cannot enter the residual"
+        )
+        print("🔎 [dsv41 real] vision weights: \(source.tensorCount) tensors")
+        let tower = DeepSeekV41VisionForward(
+            spec: spec, weights: source, textHiddenSize: config.hiddenSize
+        )
+
+        let start = CFAbsoluteTimeGetCurrent()
+        let spanRows = try tower.imageSpan(patches: patches(2), rows: 2, columns: 2)
+        let oneCellSeconds = CFAbsoluteTimeGetCurrent() - start
+        XCTAssertEqual(
+            spanRows.count, DeepSeekV41VisionLayout.imageTokenCount(columns: 1, rows: 1)
+        )
+        for row in spanRows {
+            XCTAssertEqual(row.count, config.hiddenSize)
+            XCTAssertTrue(row.allSatisfy(\.isFinite), "the tower produced a non-finite row")
+        }
+        let oneCellSpan = DeepSeekV41ImagePrompt.ImageSpan(
+            rows: spanRows, columns: 1, gridRows: 1
+        )
+
+        // The per-token slope. Four times the patch tokens at one aligner row per
+        // cell: 16 patch tokens -> a 2x2 grid -> 8 span positions.
+        let startWide = CFAbsoluteTimeGetCurrent()
+        let wideRows = try tower.imageSpan(patches: patches(4), rows: 4, columns: 4)
+        let fourCellsSeconds = CFAbsoluteTimeGetCurrent() - startWide
+        XCTAssertEqual(wideRows.count, DeepSeekV41VisionLayout.imageTokenCount(columns: 2, rows: 2))
+
+        let plan = try DeepSeekV41ImagePrompt.expand(
+            tokenIds: promptIds,
+            spans: [oneCellSpan],
+            imageTokenID: spec.imageTokenID,
+            rowWidth: config.hiddenSize
+        )
+        XCTAssertEqual(plan.report.unusedImageCount, 0)
+        XCTAssertEqual(plan.report.unfilledPlaceholderCount, 0)
+        XCTAssertEqual(plan.rows.count, oneCellSpan.tokenCount)
+        XCTAssertEqual(plan.spans.count, 1)
+        print(
+            "🔎 [dsv41 real] tower: 4 patch tokens in "
+                + String(format: "%.2f s", oneCellSeconds) + ", 16 in "
+                + String(format: "%.2f s", fourCellsSeconds) + "; span "
+                + "\(oneCellSpan.tokenCount) rows for the 2x2 grid, prompt "
+                + "\(promptIds.count) -> \(plan.promptTokens) tokens"
+        )
+
+        let settings = DeepSeekV41TurnRunner.Settings(
+            temperature: 0,
+            topP: 1,
+            minP: 0,
+            topK: 1,
+            repetitionPenalty: 1,
+            maxTokens: 2,
+            eosTokenIds: []
+        )
+        let draw = try await Task.detached { [runtime, plan] in
+            try DeepSeekV41TurnRunner.run(
+                forward: runtime.forward(),
+                promptTokenIds: plan.tokenIds,
+                // A prefix the pin might propose is refused by the loop when a prompt
+                // carries image rows, so proposing one here is the assertion.
+                prefixTokens: max(0, promptIds.count - 1),
+                imageEmbeddings: plan.rows,
+                settings: settings,
+                sample: { logits, _ in Self.argmax(logits) },
+                decode: { ids in (try? tokenizer.decode(ids: ids)) ?? "" }
+            )
+        }.value
+
+        print(
+            "🔎 [dsv41 real] image turn: \(draw.finishReason) after \(draw.tokensGenerated) "
+                + "token(s), prompt \(draw.promptTokens), reused \(draw.prefixTokensReused), "
+                + "prefill " + String(format: "%.2f s", draw.prefillSeconds)
+        )
+        print("🔎 [dsv41 real] image turn text: \(draw.text)")
+        XCTAssertEqual(draw.prefixTokensReused, 0, "an image prompt must not resume a prefix")
+        XCTAssertGreaterThan(draw.tokensGenerated, 0)
+        withExtendedLifetime(engine) {}
+    }
 }

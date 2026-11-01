@@ -464,8 +464,12 @@ nonisolated public enum DeepSeekV41EngineError: Error, CustomStringConvertible {
     case unsupportedDtype(String, String)
     case contextTooLong(Int, Int)
     case outOfOrderPosition(Int, Int)
+    /// A supplied residual row is not the model's hidden width.
+    case embeddingWidthMismatch(expected: Int, actual: Int)
     /// A resumed turn found resident state that is not this prompt's.
     case prefixStateMismatch(position: Int)
+    /// The checkpoint cannot turn pixels into residual rows.
+    case visionUnavailable(String)
     case unsupportedStage(String)
     case commandFailed(String)
 
@@ -487,8 +491,13 @@ nonisolated public enum DeepSeekV41EngineError: Error, CustomStringConvertible {
             return "DeepSeek V4.1 turn needs \(requested) positions but the cache was provisioned for \(maximum)"
         case let .outOfOrderPosition(requested, stored):
             return "DeepSeek V4.1 forward was asked for position \(requested) while the cache holds \(stored)"
+        case let .embeddingWidthMismatch(expected, actual):
+            return "DeepSeek V4.1 was given a \(actual)-wide residual row where the model is "
+                + "\(expected) wide"
         case .prefixStateMismatch(let position):
             return "DeepSeek V4.1 cannot continue the cached sequence: its token history diverges at position \(position)"
+        case .visionUnavailable(let detail):
+            return "DeepSeek V4.1 cannot see images here: \(detail)"
         case .unsupportedStage(let stage):
             return "DeepSeek V4.1 stage '\(stage)' has no device implementation"
         case .commandFailed(let detail):
@@ -578,6 +587,14 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
     /// The device executor, built on first use: resolving every norm gain and
     /// RoPE table is load work a turn needs and a pure diagnostic does not.
     private var cachedForward: DeepSeekV41MetalForward?
+
+    /// The host vision tower, built on first use. Kept only for its weight resolver:
+    /// the decode itself is per call and cache-free, because one encode reads each
+    /// tensor exactly once.
+    private var cachedVision: DeepSeekV41VisionForward?
+    /// The directory the shards were indexed from, which the tower's `pread` reads
+    /// need. Nil for a runtime built without one (a test fixture).
+    public let snapshotDir: URL?
 
     /// Reused per-token workspace, allocated once. Public because the device
     /// executor binds it directly rather than re-allocating per turn.
@@ -802,6 +819,7 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         self.plan = plan
         self.catalog = weights.catalog
         self.weights = weights
+        self.snapshotDir = snapshotDir
         self.cache = cache
         self.memoryPlan = memoryPlan
         self.arena = arena
@@ -855,6 +873,61 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         return built
     }
 
+    /// The vision tower over the checkpoint's own weights, built on first use.
+    ///
+    /// Nil when `config.json` publishes no `vision_config`, the snapshot directory is
+    /// unknown, or the tower's tensors could not be resolved from the shards. The
+    /// tower is a HOST reference by design (`DeepSeekV41VisionForward`): its weights
+    /// are read per encode and never mapped, so this costs one `pread` per tensor per
+    /// image and no GPU memory at all.
+    public func visionForward() -> DeepSeekV41VisionForward? {
+        if let cachedVision { return cachedVision }
+        guard let spec = config.vision, let snapshotDir else { return nil }
+        guard let source = DeepSeekV41VisionWeights(
+            snapshotDir: snapshotDir, catalog: catalog
+        ), let textHidden = source.textHiddenSize else { return nil }
+        let built = DeepSeekV41VisionForward(
+            spec: spec, weights: source, textHiddenSize: textHidden
+        )
+        cachedVision = built
+        return built
+    }
+
+    /// Pixels to the residual rows an image span puts in the prompt.
+    ///
+    /// The span's length is the prompt cost (`rows * (columns + 1) + 2`), and
+    /// `DeepSeekV41ImagePrompt.expand` is what binds those rows to positions.
+    public func imageSpan(
+        rgb: [UInt8],
+        width: Int,
+        height: Int
+    ) throws -> DeepSeekV41ImagePrompt.ImageSpan {
+        guard let tower = visionForward() else {
+            throw DeepSeekV41EngineError.visionUnavailable(
+                config.vision == nil
+                    ? "config.json publishes no vision_config"
+                    : "the tower's weights could not be read from the snapshot"
+            )
+        }
+        let fitted = DeepSeekV41VisionLayout.fit(width: width, height: height, spec: tower.spec)
+        let rows = try tower.imageSpan(rgb: rgb, width: width, height: height)
+        return DeepSeekV41ImagePrompt.ImageSpan(
+            rows: rows, columns: fitted.columns, gridRows: fitted.rows
+        )
+    }
+
+    /// What an image of this size would cost, without running the tower.
+    ///
+    /// The resize plan is the checkpoint's own (`plan_image_grid` then `safe_resize`),
+    /// so this is the number the prompt and the KV pricing must agree on. It is split
+    /// out because pricing an image must not require decoding 970 MB of weights.
+    public func imageSpanPlan(width: Int, height: Int) -> (
+        width: Int, height: Int, columns: Int, rows: Int, tokens: Int
+    )? {
+        guard let spec = config.vision else { return nil }
+        return DeepSeekV41VisionLayout.fit(width: width, height: height, spec: spec)
+    }
+
     /// Releases the descriptors and slot buffers this runtime owns.
     ///
     /// Called when a new runtime replaces it (a different checkpoint, or a turn that
@@ -862,6 +935,9 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
     /// stay open for the life of the process.
     public func shutdown() {
         cachedForward = nil
+        // The tower's resolver holds one descriptor per shard it reads from; dropping
+        // it here is what closes them with everything else this runtime owns.
+        cachedVision = nil
         weights.close()
         expertStreamer?.close()
         arena.reset()
