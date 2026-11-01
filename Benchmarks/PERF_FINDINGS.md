@@ -3557,6 +3557,8 @@ knowable here. Two honest consequences:
 
 - Do not flip the `batchedDevicePrefill` conformance gate on the strength of
   this: it is port-against-port parity, not a number from real weights.
+  **Updated in `#33`:** the gate was flipped on a real-weight comparison, not on
+  this synthetic one (`#33`, "The real-weight comparison").
 - The next lever on this path is batching the **mixture** — an arena that holds
   a block's expert union (or deduplicates residency across the block's
   routings), so one submission covers the block instead of one per position.
@@ -3655,6 +3657,8 @@ another measurement, not another rewrite.
 - The `batchedDevicePrefill` conformance gate still stays `.unverified`: this is
   port-against-port parity on a synthetic model, with no real-weight number
   anywhere on the machine.
+  **Updated in `#33`:** it is now `.verifiedAgainstReference`, on the published
+  checkpoint's own weights; this bullet describes the state before `#33`.
 - Everything from `#1` about the walk paying a per-position logits readback,
   window rows not being comparable to each other, and the absent compressed /
   Engram / DSpark stages still holds.
@@ -6609,3 +6613,66 @@ identical, the deviation the port accepts by skipping the activation quantizatio
 rows of 512 and pinned by name, and both a live prefill and the numbers derived from it
 are reproducible. `batchedDevicePrefill` remains the only unverified gate and it needs real
 weights, not another dump.
+
+## DSV4.1 #33: THE BATCHED PREFILL RUNS ON THE PUBLISHED CHECKPOINT, AND THE LAST GATE CLOSES
+
+The only conformance rule still open was `batchedDevicePrefill`, and its stated reason was
+not a rule: the block graph had been compared with the host on a synthetic checkpoint, but
+never on the real one, where the tensor shapes, the 128-row ring, the ratio-2 compressor and
+the expert arena are the checkpoint's own. `#26` had already closed the performance question
+(a narrow verify loses to walking at widths 2, 3 and 5), so this slice's target was the gate,
+not a faster decode.
+
+### What changed
+
+- `prefillChunk` gained `capturingLogitsAt:`, relative to the chunk like the CPU forward's
+  argument. It maps each named position into the block that owns it and returns the usual
+  `last` beside a `captured` dictionary. A chunk that continues the cache is the same path,
+  so a verify can ask for a drafted run in one pass.
+- `finishBlock(rows:)` now normalizes and projects a whole block in one grid instead of one
+  slot: the final norm loops its rows and the `vocabSize` head runs with a row stride. The
+  head is the one stage whose cost grows with the capture, and a per-position dispatch would
+  read its 1.3 GB matrix once per position; one row grid reads it once for the block.
+- `workspace.logits` is one vocabulary vector per position slot, so a block's logits sit
+  side by side and a decode step still reads slot 0.
+
+### The real-weight comparison
+
+`DeepSeekV41PublishedTurnTests.testABatchedPrefillMatchesTheWalkOnThePublishedCheckpoint`
+runs 16 positions as two consecutive blocks of eight, asks for every slot, and compares each
+position with a per-position walk. The second block continues a cache the first filled, so
+the ring slot and the compressor's group slot are derived from the absolute position.
+
+```
+batched prefill vs walk: 16 positions in two blocks of 8,
+  worst relative delta 1.701e-04 at position 12 (scale 20.184);
+  plain blocks (no capture) worst 1.147e-04 at position 12 (scale 20.184)
+```
+
+Under the full Metal validation layer the same case printed 1.500e-04 and 1.339e-04, so the
+delta is not a fixed offset: it is what a re-associated reduction costs at this dynamic
+range.
+
+The residual is float re-association, and the control says so: the capture-free block path,
+which keeps the walk's one-row head, is already at 1.15e-4, and the batched head moves it by
+another 0.55e-4 on the normal run (less when the validation layer changes the timing). Both
+are far below the 5e-4 bar, which is itself four times below the
+graph's 2e-3 decode tolerance; a wrong row list or a head that wrote every slot to slot 0
+would be orders of magnitude larger. The synthetic cases still carry the bit-exact contract
+(`1e-6` at the chunk seam) because their reductions are small enough for the orders to
+coincide.
+
+### What it means
+
+`batchedDevicePrefill` flips to `verifiedAgainstReference`; `unverifiedSummary` is empty for
+the first time. The port's conformance ledger now has no open rule: every gate is either a
+reference vector from `Tools/dsv41_goldens.py` or, for the batched graph, a real-checkpoint
+comparison against the path the turn loop already uses.
+
+What this does NOT mean: DSpark is not wired into the turn loop. `#26`'s economics still
+hold, and the two pieces a verify still needs are cache rewind for a rejected suffix and the
+accept/emit loop itself. The per-position logits are now the easy half; rewind (ring
+position, `tokenHistory`, `deadTokens` and the compressor group phase together) remains
+deliberately unbuilt because it buys a feature that loses to walking at every width measured.
+`DeepSeekV41Availability.isRuntimeAvailable` is also still false, and that is a separate
+question about what the flag promises, not about the graph.

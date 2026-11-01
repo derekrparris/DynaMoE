@@ -1841,6 +1841,154 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
+    /// Every position of a batched prefill is the logits the walk produces there.
+    ///
+    /// This is what `batchedDevicePrefill` was waiting for: the block graph has been
+    /// compared with the host on a synthetic checkpoint, but never on the published
+    /// one, where the tensor shapes, the 128-row window ring, the ratio-2 compressor
+    /// and the expert arena are the real ones. A block of eight is the widest pass a
+    /// verify could submit, and the capture asks for every slot, so this compares all
+    /// of them rather than only the last — which is where a head that wrote every row
+    /// to slot 0, or a block that mixed its positions, would show.
+    ///
+    /// Two blocks, not one, so the second continues a cache the first filled: a
+    /// verify appends to a live turn, and the ring slot and the compressor's group
+    /// slot are derived from the absolute position.
+    ///
+    /// The bar is relative float rounding, not bit equality. A block re-associates
+    /// every reduction (the head's rows are one grid, the mixture is one union per
+    /// block, the dense stages dispatch over a grid height), so on the published
+    /// weights the block and the walk land within ~2e-4 of each other at a logit
+    /// scale of ~20; the plain path, without the capture's batched head, is within
+    /// ~1.3e-4. A wrong row list or a head that wrote every slot to slot 0 is orders
+    /// of magnitude larger, and 5e-4 is still four times below the graph's own
+    /// decode tolerance (`DeepSeekV41DeviceGraphParityTests.decodeTolerance`).
+    func testABatchedPrefillMatchesTheWalkOnThePublishedCheckpoint() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let width = DeepSeekV41DevicePlan.chunkSlots(config: config, contextLength: 32)
+        XCTAssertGreaterThan(width, 1, "the published window has to allow a block")
+        let positions = width * 2
+        let tokens = [
+            0, 128803, 21750, 2038, 15174, 943, 3939, 270, 15571, 344, 83779, 16, 128804, 128822,
+            19, 16, 17289, 9372, 344, 10526
+        ]
+        XCTAssertGreaterThanOrEqual(tokens.count, positions)
+        let runTokens = Array(tokens.prefix(positions))
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: positions + 4,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let result = try await Task.detached { [runtime] () -> (
+            worst: Float, position: Int, scale: Float, compared: Int,
+            plainWorst: Float, plainPosition: Int, plainScale: Float
+        ) in
+            let executor = runtime.forward()
+            let capture = Set(0..<width)
+
+            executor.reset()
+            var walked: [[Float]] = []
+            for (position, token) in runTokens.enumerated() {
+                walked.append(try executor.forwardToken(token, position: position))
+            }
+
+            executor.reset()
+            let first = try executor.prefillChunk(
+                Array(runTokens.prefix(width)), capturingLogitsAt: capture
+            )
+            let second = try executor.prefillChunk(
+                Array(runTokens.dropFirst(width)), capturingLogitsAt: capture
+            )
+            var blocked: [[Float]] = []
+            for position in 0..<width {
+                blocked.append(
+                    try XCTUnwrap(first.captured[position], "first block slot \(position)")
+                )
+            }
+            for position in 0..<width {
+                blocked.append(
+                    try XCTUnwrap(second.captured[position], "second block slot \(position)")
+                )
+            }
+            XCTAssertEqual(blocked.count, walked.count)
+
+            var worst: Float = 0
+            var worstPosition = -1
+            var worstScale: Float = 1
+            for position in walked.indices {
+                let expected = walked[position]
+                let actual = blocked[position]
+                guard actual.count == expected.count else {
+                    return (.infinity, position, 1, walked.count, .infinity, position, 1)
+                }
+                let scale = max(expected.map(abs).max() ?? 1, 1e-6)
+                for index in expected.indices {
+                    let delta = abs(actual[index] - expected[index]) / scale
+                    if delta > worst {
+                        worst = delta
+                        worstPosition = position
+                        worstScale = scale
+                    }
+                }
+            }
+
+            // Control: the same block layers WITHOUT the batched head, so a delta
+            // that survives here is the block graph rather than the head's rows.
+            var plainWorst: Float = 0
+            var plainPosition = -1
+            var plainScale: Float = 1
+            for position in runTokens.indices {
+                executor.reset()
+                let plain = try executor.prefillChunk(
+                    Array(runTokens.prefix(position + 1))
+                ).last
+                let expected = walked[position]
+                let scale = max(expected.map(abs).max() ?? 1, 1e-6)
+                for index in expected.indices {
+                    let delta = abs(plain[index] - expected[index]) / scale
+                    if delta > plainWorst {
+                        plainWorst = delta
+                        plainPosition = position
+                        plainScale = scale
+                    }
+                }
+            }
+            return (
+                worst, worstPosition, worstScale, walked.count,
+                plainWorst, plainPosition, plainScale
+            )
+        }.value
+        print(
+            String(
+                format: "🔎 [dsv41 real] batched prefill vs walk: %d positions in two "
+                    + "blocks of %d, worst relative delta %.3e at position %d "
+                    + "(scale %.3f); plain blocks (no capture) worst %.3e at position "
+                    + "%d (scale %.3f)",
+                result.compared, width, result.worst, result.position, result.scale,
+                result.plainWorst, result.plainPosition, result.plainScale
+            )
+        )
+        XCTAssertLessThan(
+            result.worst, 5e-4,
+            "position \(result.position) of the batched prefill is off the walk by "
+                + "\(result.worst) relative to a \(result.scale) scale"
+        )
+        XCTAssertLessThan(
+            result.plainWorst, 5e-4,
+            "the capture-free block path is off the walk by \(result.plainWorst) at "
+                + "position \(result.plainPosition), so the delta is not the head"
+        )
+        withExtendedLifetime(engine) {}
+    }
+
     /// What one decoded position costs, and which bucket holds it.
     ///
     /// A turn's decode loop is the whole user-visible speed of this model, and it is

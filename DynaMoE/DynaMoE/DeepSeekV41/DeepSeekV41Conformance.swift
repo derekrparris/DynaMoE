@@ -16,8 +16,10 @@
 //  `Tools/dsv41_probe.py` dumps the checkpoint's own files (it does not compute
 //  reference outputs), and flipping a gate to `.verifiedAgainstReference` is a
 //  one-line change accompanied by a test that carries vectors produced by a real
-//  reference run. The gates are diagnostics rather than switches: a stage the port
-//  has implemented runs whether or not its rule has been matched against a numeric
+//  reference run -- or, for a gate about a PATH rather than a numeric rule, by a
+//  comparison against the walk on the published checkpoint (see
+//  `batchedDevicePrefill`). The gates are diagnostics rather than switches: a stage
+//  the port has implemented runs whether or not its rule has been matched against a
 //  reference, and the gate is how far to trust the numbers it produces.
 //
 
@@ -281,8 +283,7 @@ nonisolated public enum DeepSeekV41Conformance {
     /// arena kept below that falls back to one fill-and-wait per position instead of
     /// overwriting a slot a kernel is still reading.
     ///
-    /// What changed about the gate's own reasoning: the local shards are still
-    /// header-only stubs, but the device forward is no longer unrun.
+    /// The device forward was first checked without a checkpoint:
     /// `DeepSeekV41SyntheticCheckpoint` publishes the checkpoint's own tensor names at
     /// widths the config derives, feeds that graph and the host reference identical
     /// values, and `DeepSeekV41DeviceGraphParityTests` compares a block with the walk
@@ -291,39 +292,27 @@ nonisolated public enum DeepSeekV41Conformance {
     /// note predicted nothing could — a byte offset read as floats, a grouped output
     /// projection splitting its rows twice, and a RoPE batch rotating one row.
     ///
-    /// What stays open: no comparison against the checkpoint's own numbers at real
-    /// weights. The pass has been MEASURED four times, and each measurement narrowed
-    /// the remaining reason. The first showed a
-    /// block beating the walk by only 1.0-1.26x with the mixture's per-position round
-    /// trip as ~50-60% of a block's per-position cost; batching the mixture into one
-    /// submission per layer, with one arena fill for the block's union, took it to
-    /// ~2.0x at every width and halved the per-position cost (0.33 -> 0.14
-    /// ms/position/layer). The third split what is left: host encode is only ~20% of
-    /// it, the dense half holds 85% of the device time (the mixture 15%), and inside
-    /// the dense half the per-position stages dominate — `writeLatent` 42%, the two
-    /// mHC coefficient stages 33% — because `dsv41_hc_split_f32` runs its whole
-    /// Sinkhorn schedule on ONE thread, repeated per position. The mHC pair and the
-    /// router now take a slot dimension, so a block runs its positions as grid rows:
-    /// that took the pass to ~2.4x at block width 4 and halved the dense half's
-    /// device time again, leaving `writeLatent` (cache write, gather, attention) as
-    /// the largest remaining per-position stage. The fourth measurement left the
-    /// synthetic model entirely and timed THAT stage's kernel at the widths the
-    /// checkpoint publishes, where it is not a dispatch question at all:
-    /// `dsv41_attention_csa2_f32` ran one thread per head, and a head walks
-    /// `window + index_topk` (128 + 512) records three times over a 512-wide latent,
-    /// so one position of one layer cost 68 ms on an idle GPU. The kernel now gives a
-    /// head a whole threadgroup, keeps the row scores in threadgroup memory so the
-    /// three passes share one dot product, and dispatches one thread per row; the
-    /// same dispatch costs 0.47 ms, and the block pass measures 3.1-3.9x at block
-    /// widths 8-16 against 2.1-2.6x before. So the graph is no longer the question,
-    /// neither is the arena, and neither is the attention kernel: what is left is
-    /// per-position serial work in the cache write, the gather and the mHC pre/post
-    /// mix, and above all the fact that none of this has run against real weights.
-    /// The turn loop already routes a from-position-0 prompt through
-    /// `DeepSeekV41PositionForward.prefillChunk`, so nothing outside the executor has
-    /// to change either way (numbers and caveats in `Benchmarks/PERF_FINDINGS.md`,
-    /// "DSV4.1 #1" to "DSV4.1 #5").
-    public static let batchedDevicePrefill: Gate = .unverified
+    /// THE PUBLISHED CHECKPOINT, which is what closed the gate.
+    /// `DeepSeekV41PublishedTurnTests
+    /// .testABatchedPrefillMatchesTheWalkOnThePublishedCheckpoint` runs two
+    /// consecutive blocks of the real model and asks the head for EVERY slot, then
+    /// compares each position with a per-position walk. The synthetic fixture cannot
+    /// produce the published shapes, the 128-row ring, the ratio-2 compressor or the
+    /// real expert arena; that run does, and it covers a continuation (the second
+    /// block appends to a cache the first filled) rather than only a prompt from
+    /// position 0. The capture is also the shape a verify needs: the target's choice
+    /// for draft `p` comes from the logits at position `p - 1`, so one block returns
+    /// the whole run side by side, with the head projecting all slots in one grid.
+    ///
+    /// What this does NOT claim: that a batched verify is faster than walking. `#26`
+    /// measured the drafter's acceptance and the per-width costs, and a narrow verify
+    /// loses to the walk at the widths a chain actually submits. No drafter is wired
+    /// into the turn loop, and cache rewind for a rejected suffix is still unbuilt,
+    /// because those are costs in service of a negative result. The turn loop keeps
+    /// its one batching use — a from-position-0 prompt through
+    /// `DeepSeekV41PositionForward.prefillChunk` — while a decode step walks
+    /// (numbers in `Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #1" to "#5" and "#33").
+    public static let batchedDevicePrefill: Gate = .verifiedAgainstReference
 
     /// The vision tower's patch grid, image token layout, and the tower forward.
     ///

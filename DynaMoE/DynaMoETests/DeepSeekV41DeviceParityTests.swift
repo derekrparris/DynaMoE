@@ -342,6 +342,78 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         XCTAssertEqual(worstDelta(chunk.last, last), 0, accuracy: 1e-6)
     }
 
+    /// A capture keeps each position's own logits, not the block's last one.
+    ///
+    /// A verify checks draft `i` against the target's logits at position `i - 1`, so
+    /// it needs the whole run. The head is one grid over the block's slots, which is
+    /// a different dispatch from the walk's one-row projection: the point of this
+    /// case is that the batched form lands every row in its own slot AND computes
+    /// the same numbers.
+    func testACapturedBlockReturnsEveryPositionsLogits() throws {
+        let runtime = try makeRuntime(checkpoint)
+        let boundary = DeepSeekV41DevicePlan.chunkSlots(
+            config: checkpoint.config,
+            contextLength: checkpoint.shape.contextLength
+        )
+        XCTAssertGreaterThan(boundary, 1, "a block of one is the walk")
+        let tokens = (0..<boundary).map { 3 + $0 }
+        let chunk = try runtime.forward().prefillChunk(
+            tokens, capturingLogitsAt: Set(tokens.indices)
+        )
+        XCTAssertEqual(chunk.captured.count, tokens.count)
+
+        let walked = try makeRuntime(checkpoint).forward()
+        for (position, token) in tokens.enumerated() {
+            let expected = try walked.forwardToken(token, position: position)
+            let captured = try XCTUnwrap(chunk.captured[position], "position \(position)")
+            XCTAssertEqual(captured.count, expected.count)
+            let scale = max(expected.map(abs).max() ?? 1, 1e-6)
+            XCTAssertLessThan(
+                worstDelta(captured, expected) / scale,
+                1e-5,
+                "slot \(position) of the batched head is not that position's logits"
+            )
+        }
+        XCTAssertEqual(chunk.last, chunk.captured[tokens.count - 1])
+    }
+
+    /// A chunk wider than one block maps its capture positions into the right block.
+    ///
+    /// `prefillChunk` splits at `workspace.slots`, and a capture is expressed
+    /// relative to the WHOLE chunk. A mapping that forgot the block offset would
+    /// return a later block's slot under an earlier position, or drop the position
+    /// entirely, and a one-block test cannot see it.
+    func testACaptureMapsPositionsAcrossBlockBoundaries() throws {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.contextLength = max(shape.contextLength, 16)
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        let width = DeepSeekV41DevicePlan.chunkSlots(
+            config: checkpoint.config,
+            contextLength: checkpoint.shape.contextLength
+        )
+        XCTAssertGreaterThan(width, 1, "the fixture has to allow a block")
+        let tokens = (0..<(width * 2 + 1)).map { 3 + $0 }
+        XCTAssertGreaterThan(tokens.count, width * 2)
+        XCTAssertLessThanOrEqual(tokens.count, checkpoint.shape.contextLength)
+        let capture: Set<Int> = [0, width - 1, width, tokens.count - 1]
+        let chunk = try makeRuntime(checkpoint).forward().prefillChunk(
+            tokens, capturingLogitsAt: capture
+        )
+        XCTAssertEqual(Set(chunk.captured.keys), capture)
+
+        let walked = try makeRuntime(checkpoint).forward()
+        for (position, token) in tokens.enumerated() {
+            let expected = try walked.forwardToken(token, position: position)
+            guard let captured = chunk.captured[position] else { continue }
+            let scale = max(expected.map(abs).max() ?? 1, 1e-6)
+            XCTAssertLessThan(
+                worstDelta(captured, expected) / scale,
+                1e-5,
+                "position \(position) of a multi-block capture is the wrong slot"
+            )
+        }
+    }
+
     /// Every position of a block attends over its OWN gathered rows.
     ///
     /// The gather's row list is a host fill into a shared buffer, and a host fill is

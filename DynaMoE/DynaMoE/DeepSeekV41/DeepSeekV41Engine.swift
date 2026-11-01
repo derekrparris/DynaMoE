@@ -1208,7 +1208,10 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
               let hcFFNPost = make(slotBytes(mult)),
               let hcFFNComb = make(slotBytes(mult * mult)),
               let hcResidual = make(slotBytes(mult * shapes.hidden)),
-              let logits = make(float4(config.vocabSize)),
+              // One vocabulary vector per position, because a block that captures
+              // its logits runs the head over every slot at once and leaves them
+              // side by side. A decode step and a plain prefill only read slot 0.
+              let logits = make(float4(config.vocabSize * slots)),
               let rowIndices = make(4 * gather * slots),
               // One token id per position: a prefilled block writes its whole
               // prompt slice here and binds one id per embedding dispatch, so a

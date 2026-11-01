@@ -1853,18 +1853,49 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// before this call) and whether the group completes here. A fresh cache starts
     /// the block at 0, which is the shape the reference's own prompt prefill takes.
     public func prefillChunk(_ tokens: [Int]) throws -> DeepSeekV41ChunkLogits {
+        try prefillChunk(tokens, capturingLogitsAt: [])
+    }
+
+    /// The same pass, keeping the logits of named positions.
+    ///
+    /// A verify needs the target's choice at EVERY drafted position, not only after
+    /// the last one: the draft at position `p` is checked against the logits a token
+    /// earlier left. Those positions are relative to this chunk, like the CPU
+    /// forward's `capturingLogitsAt`, and a chunk that spans several blocks maps
+    /// them into the block that owns each one.
+    ///
+    /// The head is the one stage whose cost grows with this set, because it is a
+    /// `vocabSize` projection per position. A capture therefore runs the head as one
+    /// grid over every slot of the block, so the weight is read once for the block
+    /// rather than once per position; a plain prefill, which captures nothing, still
+    /// projects only the last slot.
+    public func prefillChunk(
+        _ tokens: [Int],
+        capturingLogitsAt capture: Set<Int>
+    ) throws -> DeepSeekV41ChunkLogits {
         guard !tokens.isEmpty else { return DeepSeekV41ChunkLogits(last: []) }
+        let keep = capture.filter { $0 >= 0 && $0 < tokens.count }
         var last: [Float] = []
+        var captured: [Int: [Float]] = [:]
         let width = max(1, workspace.slots)
         let startPosition = cache.storedPositions
         var offset = 0
         while offset < tokens.count {
             let end = min(offset + width, tokens.count)
             let block = Array(tokens[offset..<end])
-            last = try runBlock(block, startPosition: startPosition + offset)
+            let blockKeep = Set(keep.filter { $0 >= offset && $0 < end }.map { $0 - offset })
+            let result = try runBlock(
+                block,
+                startPosition: startPosition + offset,
+                capturingLogitsAt: blockKeep
+            )
+            last = result.last
+            for (position, logits) in result.captured {
+                captured[offset + position] = logits
+            }
             offset = end
         }
-        return DeepSeekV41ChunkLogits(last: last)
+        return DeepSeekV41ChunkLogits(last: last, captured: captured)
     }
 
     // MARK: One block
@@ -1874,7 +1905,11 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// The block is `workspace.slots` wide at most (see
     /// `DeepSeekV41DevicePlan.chunkSlots`), and its positions are consecutive, which
     /// is what lets the rope and norm kernels address them with a grid height.
-    private func runBlock(_ tokens: [Int], startPosition: Int) throws -> [Float] {
+    private func runBlock(
+        _ tokens: [Int],
+        startPosition: Int,
+        capturingLogitsAt capture: Set<Int> = []
+    ) throws -> DeepSeekV41ChunkLogits {
         guard problems.isEmpty else {
             throw DeepSeekV41EngineError.modelNotRunnable(problems)
         }
@@ -1902,19 +1937,38 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         for layer in plan {
             try runBlockLayer(layer, startPosition: startPosition, count: tokens.count)
         }
-        // Only the last position's logits are read.
-        try finishBlock(slot: tokens.count - 1)
+        // A plain prefill reads only the last position. A capture runs the head for
+        // every slot at once, so the weight is read once for the block rather than
+        // once per position; the rows that were not asked for are computed and
+        // dropped, which is cheaper than a second weight read.
+        let keep = capture.filter { $0 >= 0 && $0 < tokens.count }
+        if keep.isEmpty {
+            try finishBlock(firstSlot: tokens.count - 1)
+        } else {
+            try finishBlock(rows: tokens.count)
+        }
         try settlePending()
         if recordsBlockTiming { recordDeviceTiming() }
         cache.noteStored(startPosition + tokens.count)
 
-        var logits = [Float](repeating: 0, count: config.vocabSize)
-        let count = min(config.vocabSize, workspace.logits.length / MemoryLayout<Float>.stride)
-        let pointer = workspace.logits.contents().assumingMemoryBound(to: Float.self)
-        logits.withUnsafeMutableBufferPointer { destination in
-            destination.baseAddress?.update(from: pointer, count: count)
+        func logits(slot: Int) -> [Float] {
+            let available = workspace.logits.length / MemoryLayout<Float>.stride
+            let offset = slot * config.vocabSize
+            let count = max(0, min(config.vocabSize, available - offset))
+            let pointer = workspace.logits.contents()
+                .assumingMemoryBound(to: Float.self)
+                .advanced(by: offset)
+            return Array(UnsafeBufferPointer(start: pointer, count: count))
         }
-        return logits
+
+        var captured: [Int: [Float]] = [:]
+        for slot in keep {
+            captured[slot] = logits(slot: slot)
+        }
+        return DeepSeekV41ChunkLogits(
+            last: logits(slot: tokens.count - 1),
+            captured: captured
+        )
     }
 
     /// One layer over a block: the dense half as one pass, then the mixture as one
@@ -2874,21 +2928,31 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     }
 
     /// The block's output: collapse the streams, final norm, head.
-    private func finishBlock(slot: Int = 0) throws {
+    ///
+    /// `rows` runs the norm and the head over that many consecutive positions from
+    /// `firstSlot`. A decode step and a plain prefill want one row, the last
+    /// position; a capture wants every position of the block. The head is one
+    /// dispatch even when it is several rows, because it projects `vocabSize` outputs
+    /// per position and a per-position dispatch would read the same matrix once per
+    /// row.
+    private func finishBlock(firstSlot: Int = 0, rows: Int = 1) throws {
+        let count = max(1, rows)
+        let slot = max(0, firstSlot)
+        let hiddenOffset = workspace.slotOffset(slot, width: shapes.hidden)
+        let logitsOffset = workspace.slotOffset(slot, width: config.vocabSize)
         let commandBuffer = try makeCommandBuffer()
         let encoder = try makeEncoder(commandBuffer)
 
         // `.collapseStreams` already collapsed the stack with the mix the last
         // block produced (`layer.hc_pre(h, pre_mix)`), and it wrote that vector into
-        // `hidden`; this normalizes it and projects the head. A block only reads the
-        // last position's logits, so the head runs for that slot alone.
-        let hiddenOffset = workspace.slotOffset(slot, width: shapes.hidden)
+        // `hidden`; this normalizes it and projects the head.
         try encodeNorm(
             encoder,
             input: workspace.hidden,
             gain: vectors.gain(.finalNorm, layer: nil, width: shapes.hidden),
             output: workspace.output,
             width: shapes.hidden,
+            rows: count,
             inputByteOffset: hiddenOffset,
             outputByteOffset: hiddenOffset
         )
@@ -2905,7 +2969,11 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             outDim: config.vocabSize,
             input: workspace.output,
             output: workspace.logits,
-            inputByteOffset: hiddenOffset
+            inputByteOffset: hiddenOffset,
+            outputByteOffset: logitsOffset,
+            rows: count,
+            inputRowStride: shapes.hidden,
+            outputRowStride: config.vocabSize
         )
         encoder.endEncoding()
         // The caller reads the logits, so this is where the token's queue catches up.

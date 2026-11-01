@@ -969,7 +969,7 @@ final class DeepSeekV41WeightCatalogTests: XCTestCase {
 /// update would otherwise be invisible: the load log is the only place it shows.
 final class DeepSeekV41ConformanceGateTests: XCTestCase {
 
-    func testOnlyTheRulesWithReferenceVectorsAreVerified() {
+    func testEveryConformanceGateIsVerified() {
         // Checked-in vectors, from `Tools/dsv41_goldens.py` and its test suites:
         // Engram indexing, the Engram combination, the compressor's pooling and
         // accumulation, the cache rows a prefill chunk reads, the hyper-connection
@@ -983,24 +983,17 @@ final class DeepSeekV41ConformanceGateTests: XCTestCase {
         XCTAssertEqual(DeepSeekV41Conformance.hyperConnections, .verifiedAgainstReference)
         XCTAssertEqual(DeepSeekV41Conformance.routerScoring, .verifiedAgainstReference)
         XCTAssertEqual(DeepSeekV41Conformance.visionPatching, .verifiedAgainstReference)
-        // The compressed-row selection is now the indexer's own top-k, matched
-        // against `Indexer.forward`; the one rule left is the batched device graph,
-        // whose addressing rule is verified while the pass that would consume it
-        // cannot be compared against a walk without real weights.
+        // The compressed-row selection is the indexer's own top-k, matched against
+        // `Indexer.forward`. The batched device graph's addressing rule is verified
+        // against the reference and its positions are now compared with the walk on
+        // the published checkpoint, which is the last gate that was open.
         XCTAssertEqual(DeepSeekV41Conformance.candidateSelection, .verifiedAgainstReference)
         XCTAssertEqual(DeepSeekV41Conformance.dsparkDrafting, .verifiedAgainstReference)
-        XCTAssertEqual(DeepSeekV41Conformance.batchedDevicePrefill, .unverified)
-        XCTAssertEqual(DeepSeekV41Conformance.unverifiedSummary.count, 1)
-        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("Engram hashing"))
-        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("Engram combination"))
-        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("compressor pooling"))
-        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("compressor accumulation"))
-        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("chunk addressing"))
-        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("hyper-connections"))
-        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("router scoring"))
-        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("vision patching"))
-        XCTAssertTrue(DeepSeekV41Conformance.unverifiedSummary.contains("batched device prefill"))
-        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("DSpark drafting"))
+        XCTAssertEqual(DeepSeekV41Conformance.batchedDevicePrefill, .verifiedAgainstReference)
+        XCTAssertEqual(DeepSeekV41Conformance.unverifiedSummary, [])
+        for (name, gate) in DeepSeekV41Conformance.all {
+            XCTAssertEqual(gate, .verifiedAgainstReference, name)
+        }
     }
 }
 
