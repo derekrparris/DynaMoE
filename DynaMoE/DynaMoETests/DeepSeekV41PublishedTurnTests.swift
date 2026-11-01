@@ -3089,6 +3089,76 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         )
     }
 
+    /// The chat UI's history, at the checkpoint's own tokenizer.
+    ///
+    /// `DeepSeekV41ChatPromptFormatterTests` pins the rendered SHAPE. This pins the
+    /// property the engine's prefix pin actually needs: turn 2's token ids must
+    /// extend turn 1's prompt ids plus the turn's generation ids. A string prefix is
+    /// necessary but not sufficient — a BPE merge across the boundary would break the
+    /// pin while every string assertion still passed — and the boundary here is a
+    /// special token, which is why it holds.
+    func testAChatTurnsTokensExtendThePreviousPromptPlusGeneration() async throws {
+        let snapshot = try snapshotDirectory()
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let modelConfig = try JSONDecoder().decode(
+            ModelConfig.self,
+            from: Data(contentsOf: snapshot.appendingPathComponent("config.json"))
+        )
+        let dialect = DeepSeekV41PromptDialect.resolve(snapshotDir: snapshot)
+        let system = "You are a careful assistant."
+        for thinking in [false, true] {
+            let turn1 = ChatPromptFormatter.formatConversation(
+                turns: [.init(role: .user, text: "hello there")],
+                cleanSystem: system,
+                thinkingEnabled: thinking,
+                modelSupportsThinking: true,
+                modelConfig: modelConfig,
+                thinkingEffort: nil,
+                promptDialect: dialect
+            )
+            let generation = thinking
+                ? "weighing it" + TurnTextSplitter.canonicalReasoningCloseTag + "an answer"
+                : "an answer"
+            let turn2 = ChatPromptFormatter.formatConversation(
+                turns: [
+                    .init(role: .user, text: "hello there"),
+                    .init(role: .assistant, text: generation),
+                    .init(role: .user, text: "and again"),
+                ],
+                cleanSystem: system,
+                thinkingEnabled: thinking,
+                modelSupportsThinking: true,
+                modelConfig: modelConfig,
+                thinkingEffort: nil,
+                promptDialect: dialect
+            )
+            let promptIds = try tokenizer.encode(text: turn1)
+            let generationIds = try tokenizer.encode(text: generation)
+            let nextIds = try tokenizer.encode(text: turn2)
+            XCTAssertEqual(
+                Array(nextIds.prefix(promptIds.count)), promptIds,
+                "thinking=\(thinking): turn 2 must re-encode turn 1's prompt to the same ids"
+            )
+            XCTAssertEqual(
+                Array(nextIds.dropFirst(promptIds.count).prefix(generationIds.count)),
+                generationIds,
+                "thinking=\(thinking): turn 2 must carry the turn's generation ids unchanged"
+            )
+            XCTAssertGreaterThan(nextIds.count, promptIds.count + generationIds.count)
+            print(
+                "🔎 [dsv41 real] chat turn: \(promptIds.count) prompt ids + "
+                    + "\(generationIds.count) generated, turn 2 is \(nextIds.count)"
+            )
+        }
+    }
+
     // MARK: - An image in a real turn
 
     /// The tower at the checkpoint's own weights, and its rows inside a real turn.

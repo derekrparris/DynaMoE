@@ -2775,6 +2775,7 @@ struct ContentView: View {
         let isSpark = (modelConfig?.isSparkModel == true)
         let isLing = (modelConfig?.isLingModel == true)
         let isGemma4 = (modelConfig?.isGemma4Model == true)
+        let isDeepSeekV41 = (modelConfig?.isDeepSeekV41Model == true)
 
         // Pictures in the prompt. Only the family with a vision tower can read
         // pixels this turn; every other local family keeps the metadata notice,
@@ -2813,7 +2814,88 @@ struct ContentView: View {
             // silently claimed to have been seen.
             return fragment.isEmpty ? Self.localAttachmentNotice(for: message) : fragment
         }
-        if isSpark {
+        if isDeepSeekV41 {
+            // The checkpoint's own turn structure, rendered by the same function
+            // the API server uses. Building a chatml transcript here and letting
+            // `formatPrompt` wrap it (what the default branch does) hands the
+            // model ONE user turn holding its whole history as prose: it reads
+            // role markers that are not its own, and a tool result arrives as
+            // text instead of the output pair it was trained on.
+            let dialect = CompletionEngine.shared.promptDialect
+            let markers = dialect.markers
+            // Markers a stored turn may still carry from an older render. The
+            // dialect's own role and sentence markers are stripped for the same
+            // reason every other branch strips its own: the renderer re-emits
+            // them, and a stored copy would put a turn boundary inside a turn.
+            func storedTurnText(_ raw: String, isAssistant: Bool) -> String {
+                var text = raw
+                    .replacingOccurrences(of: "<|im_start|>", with: "")
+                    .replacingOccurrences(of: "<|im_end|>", with: "")
+                    .replacingOccurrences(of: "<|endoftext|>", with: "")
+                    .replacingOccurrences(of: markers.endOfSentence, with: "")
+                if isAssistant {
+                    text = text.replacingOccurrences(of: markers.assistant, with: "")
+                }
+                return text.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            var turns: [ChatPromptFormatter.ConversationTurn] = []
+            for msg in sessions[sessionIdx].messages.dropLast() {
+                let cleanMsg = storedTurnText(msg.content, isAssistant: msg.role == .assistant)
+                let hasTools = (msg.toolCalls != nil && !msg.toolCalls!.isEmpty)
+                let hasReasoning = !(msg.thinkingContent ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                let attachmentNotice = Self.localAttachmentNotice(for: msg)
+                guard !cleanMsg.isEmpty || hasReasoning || hasTools || !attachmentNotice.isEmpty else { continue }
+
+                if msg.role == .user {
+                    turns.append(.init(role: .user, text: attachmentFragment(for: msg) + cleanMsg))
+                } else if msg.role == .assistant {
+                    // The stored turn keeps its answer and its reasoning apart; the
+                    // renderer splits them back out of the flattened canonical form
+                    // the API path records, so a turn that carried reasoning keeps
+                    // the channel it was generated in.
+                    var body = cleanMsg
+                    if hasReasoning {
+                        let think = msg.thinkingContent!.trimmingCharacters(in: .whitespacesAndNewlines)
+                        body = think + TurnTextSplitter.canonicalReasoningCloseTag + body
+                    }
+                    // A call the stored content no longer carries is rebuilt from
+                    // its record, in the dialect the model actually emits. The raw
+                    // call survives in `content` for every turn this app produced,
+                    // so this only fires for a turn that came from somewhere else.
+                    if let calls = msg.toolCalls, !calls.isEmpty,
+                       !cleanMsg.contains(DeepSeekV41ToolDialect.dsmlTag),
+                       !cleanMsg.contains("<tool_call") {
+                        for call in calls {
+                            body += "\n" + DeepSeekV41ToolDialect.callBlock(
+                                name: call.name,
+                                arguments: call.arguments
+                            )
+                        }
+                    }
+                    turns.append(.init(role: .assistant, text: body))
+                    // One output pair per executed call, in transcript order. A
+                    // recorded output is already model-facing text, so it is used
+                    // as-is; the live loop applies the same rendering once.
+                    for call in msg.toolCalls ?? [] {
+                        guard let output = call.output ?? call.error, !output.isEmpty else { continue }
+                        turns.append(.init(
+                            role: .user,
+                            text: output,
+                            kind: .toolResult(name: call.name)
+                        ))
+                    }
+                }
+            }
+            promptString = ChatPromptFormatter.formatConversation(
+                turns: turns,
+                cleanSystem: effectiveSystem,
+                thinkingEnabled: thinkingEnabled,
+                modelSupportsThinking: modelSupportsThinking,
+                modelConfig: modelConfig,
+                thinkingEffort: thinkingEffortLevel,
+                promptDialect: dialect
+            )
+        } else if isSpark {
             // Spark 2.5 DeepSeek-style dialect:
             // <｜start▁of▁sentence｜><|System|>\n...<｜end▁of▁sentence｜>
             // <｜start▁of▁sentence｜><|User|>...<｜end▁of▁sentence｜>
@@ -6798,11 +6880,14 @@ struct ContentView: View {
                         } else if modelConfig?.isDeepSeekV41Model == true {
                             // The payload inside the checkpoint's own `tool▁output` pair. The
                             // model answered the same from every container measured in `#27`,
-                            // so the family's own spelling is used and no assistant prefix is
-                            // added: `startAutoregressiveGeneration` re-renders the turn from
-                            // `nextPrompt` on the fallback path.
+                            // so the family's own spelling is used. The turn it returns ends
+                            // by opening the next assistant turn: `formatPrompt` passes an
+                            // already-templated prompt through verbatim, so nothing
+                            // downstream would add that marker.
                             toolResponseTurn = AgentHarness.shared.formatDeepSeekV41ToolResponseTurn(
-                                responses: allResponses
+                                responses: allResponses,
+                                thinkingEnabled: thinkingEnabled,
+                                promptDialect: CompletionEngine.shared.promptDialect
                             )
                         } else {
                             toolResponseTurn = AgentHarness.shared.formatToolResponseTurn(

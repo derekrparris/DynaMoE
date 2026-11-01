@@ -443,11 +443,22 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
         public var text: String
         /// Reasoning text, when the turn carried any.
         public var reasoning: String?
+        /// The turn is a tool RESULT, not a role turn. The checkpoint places a
+        /// result in its own `tool▁output` pair directly after the call turn's
+        /// end-of-sentence marker, with no role marker of its own, so it is
+        /// rendered as a bare pair rather than as `<|User|>text`.
+        public var isToolOutput: Bool
 
-        public init(isUser: Bool, text: String, reasoning: String? = nil) {
+        public init(
+            isUser: Bool,
+            text: String,
+            reasoning: String? = nil,
+            isToolOutput: Bool = false
+        ) {
             self.isUser = isUser
             self.text = text
             self.reasoning = reasoning
+            self.isToolOutput = isToolOutput
         }
     }
 
@@ -491,7 +502,13 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
             out += m.system + system
         }
         for turn in turns {
-            if turn.isUser {
+            if turn.isToolOutput {
+                // A tool result rides the call turn's own closer, in the family's
+                // output pair: `<|end▁of▁sentence|>` then the payload. The role
+                // marker belongs to the NEXT assistant turn, which is what the
+                // agent loop appends after a result.
+                out += m.toolOutputBegin + escaped(turn.text) + m.toolOutputEnd
+            } else if turn.isUser {
                 out += m.user + escaped(turn.text)
             } else {
                 out += assistantBody(for: turn, thinkingEnabled: thinkingEnabled)

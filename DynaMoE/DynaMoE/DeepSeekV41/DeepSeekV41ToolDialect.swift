@@ -127,6 +127,42 @@ nonisolated public enum DeepSeekV41ToolDialect {
         """
     }
 
+    // MARK: - History reconstruction
+
+    /// A call block in the shape the model itself emits, for a stored turn whose
+    /// raw call text was lost (a message carried over from another dialect, an
+    /// edited turn, a reloaded session).
+    ///
+    /// The arguments are the records' string values, so each one is rendered as a
+    /// string parameter. A stored record has already lost the JSON type of its
+    /// values, and claiming a number was a string is the safer error: the tool
+    /// receives the same text either way, and `string="true"` is what the grammar
+    /// says a plain value is.
+    public static func callBlock(
+        name: String,
+        arguments: [String: String]
+    ) -> String {
+        var block = dsmlCallsOpen + "\n" + dsmlInvokeTag(name: name) + "\n"
+        for key in arguments.keys.sorted() {
+            let value = escapedParameterValue(arguments[key] ?? "")
+            block += dsmlParameterTag(name: key) + value + dsmlParameterClose + "\n"
+        }
+        block += dsmlInvokeClose + "\n" + dsmlCallsClose
+        return block
+    }
+
+    /// A parameter value cannot carry the parameter closer, or the call would
+    /// close early. The real grammar has no escape for it, so the literal is
+    /// broken with a zero-width no-break space, the same neutralization
+    /// `DeepSeekV41PromptDialect.escaped` applies to forged role markers.
+    static func escapedParameterValue(_ value: String) -> String {
+        guard value.contains(dsmlParameterClose) else { return value }
+        return value.replacingOccurrences(
+            of: dsmlParameterClose,
+            with: "</" + dsmlTag + "\u{FEFF} parameter>"
+        )
+    }
+
     // MARK: - Canonicalization
 
     /// Rewrites the model's own call syntax into canonical XML.

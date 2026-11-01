@@ -7222,3 +7222,115 @@ transpose and a BGR decode each fail differently), the cost model reproduces the
 the cap is 31x31 cells, and a snapshot without the marker shards is not vision-capable. The full
 suite is **578 tests, 0 failures, 43 skipped**, and 0 Metal validation errors under
 `MTL_DEBUG_LAYER`.
+
+## DSV4.1 #39: THE CHAT UI NOW RENDERS THE CHECKPOINT'S OWN TURNS, AND THE CONTINUATION WAS MISSING ITS ASSISTANT MARKER
+
+### The question
+
+`#38` closed the composer and named the next gap in its own journal section: for a DeepSeek V4.1
+chat turn, `ContentView.handleSendMessage` builds a chatml transcript (`<|im_start|>user\n…`) for
+every family in its `else` branch, and only then calls `formatPrompt`. The V4.1 branch of
+`formatPrompt` probes `isAlreadyDeepSeekTemplated` — does the prompt *begin* with one of the
+checkpoint's own role markers — and chatml begins with `<|im_start|>system`, so the probe is
+false and the entire transcript is wrapped inside ONE V4.1 user turn. The API server has always
+rendered through `ChatPromptFormatter.formatConversation` (`ServerController.swift:1107`), so the
+two entry paths disagreed about what the model reads. Routing was decisive (`chat_prompt_renderer`
+0.986, confidence 0.98; scope `full` 0.863/0.79; "does converting tool history risk regressing the
+measured tool loop" 0.44, i.e. not a reason to defer).
+
+### What changed
+
+- **The chat builder has a V4.1 branch.** It walks the session's messages into
+  `ChatPromptFormatter.ConversationTurn`s and calls `formatConversation`, the same function the
+  server calls, with the live dialect (`CompletionEngine.shared.promptDialect`, resolved from the
+  checkpoint's own `chat_template.jinja`). The rendered string begins with the checkpoint's
+  begin-of-sentence marker, so `formatPrompt`'s passthrough probe returns it untouched: the
+  prompt is templated exactly once.
+- **A completed turn is flattened the way the API path records it** —
+  `thinkingContent + canonicalReasoningCloseTag + content` — because the renderer's job is to
+  split reasoning back out. That is what makes the rebuild reproduce a turn that was generated
+  with thinking on even after thinking is switched off.
+- **A tool result is not a role turn.** The checkpoint has no tool role: a result is the family's
+  `tool▁output` pair, placed after the call turn's end-of-sentence marker, and the *next*
+  assistant turn opens after it. `ConversationTurn` therefore gained a `kind` (`.text` /
+  `.toolResult(name:)`) and `DeepSeekV41PromptDialect.Turn` gained `isToolOutput`; the other
+  families ignore both and keep rendering `role` + `text` exactly as before, which is why a tool
+  result still carries `role == .user`.
+- **A stored call the content no longer carries is rebuilt in DSML.**
+  `DeepSeekV41ToolDialect.callBlock(name:arguments:)` emits the container the model itself
+  writes, from the dialect's own tag builders, and neutralizes a parameter value that spells the
+  parameter closer. Every turn this app produced keeps its raw call in `content`, so this is the
+  reload/foreign-turn path.
+- **The live continuation was missing its assistant prefix — found while making the two paths
+  agree.** `#27`'s probe builds "the continuation the app would build" as
+  `…call + endOfSentence + result + <|Assistant|><|end|>`, and production emitted only the result
+  pair. The comment beside the call site claimed `startAutoregressiveGeneration` would re-render
+  the turn and add the marker; it does not, because the prompt already begins with the dialect's
+  marker and `formatPrompt` passes it through verbatim. So the loop was asking the model to
+  continue immediately after `</tool▁output>` with no assistant turn opened.
+  `formatDeepSeekV41ToolResponseTurn` now appends `assistantPrefix(thinkingEnabled:)` and takes
+  the live dialect, and the history rebuild ends a tool-using turn the same way — which is what
+  lets a post-tool chat turn extend its pin instead of re-prefilling.
+
+### Evidence
+
+Pure logic (`DeepSeekV41ChatPromptFormatterTests`, 7 new cases): no chatml reaches the checkpoint;
+a completed turn closes with the checkpoint's sentence marker; a tool result sits between the
+call turn's closer and the next assistant prefix and is never rendered as a user turn; a rebuilt
+`callBlock` parses back into the same call through `canonicalized` + `StreamingToolParser`; a
+rendered history is not wrapped a second time; and the live continuation's suffix is *identical*
+to the history render's, including a payload that spells a role marker (so the escaping half is
+compared too). `ChatPromptFormatterConversationTests`'s family list gained `deepseek_v41`, which
+immediately put it under the single-turn equivalence, prefix-extension and effort tests that every
+other family already had — and exposed one stale premise: `testNonSparkFamiliesIgnoreThinkingEffort`
+asserted that only Spark consumes the level, which was never true of V4.1 (it renders a graded
+budget), and had only passed because the family was absent from the list.
+
+At the checkpoint's own tokenizer (`testAChatTurnsTokensExtendThePreviousPromptPlusGeneration`,
+snapshot-gated):
+
+```
+🔎 [dsv41 real] chat turn: 13 prompt ids + 2 generated, turn 2 is 21
+🔎 [dsv41 real] chat turn: 13 prompt ids + 7 generated, turn 2 is 26
+```
+
+That is the property the prefix pin needs at the level it is actually used: turn 2's ids extend
+turn 1's prompt ids *plus the generation ids*, not merely the same string. The boundary is a
+special token, which is why no BPE merge crosses it.
+
+Suite: **542 passed, 0 failed, 44 skipped** (586 executed; the 8 new cases are 7 here plus the
+snapshot-gated one), and **0 Metal validation errors** under `MTL_DEBUG_LAYER` on the same run.
+
+### What it means
+
+An in-app DeepSeek V4.1 turn is now the same shape as an API turn: one system turn, one turn per
+message with the checkpoint's own markers, a per-turn reasoning channel, and tool results in the
+output pair. The model reads its own history instead of a foreign transcript nested inside a
+single request, and a second chat turn re-encodes to the same ids as the first prompt plus its
+generation, so the resident prefix is reusable.
+
+### What it does not mean
+
+- The continuation-after-a-tool-result shape was never run against the real model. It now matches
+  `#27`'s probe helper, which is the only reference for it, and it is pinned as a string and as a
+  token prefix; an end-to-end generated turn after a tool result is still unmeasured.
+- A `tools_load`/`tools_unload` result carries a `[TOOL_REGISTRATION]` line that the live loop
+  prepends from the raw JSON, and a recorded turn stores only the rendered output, so a rebuild
+  cannot reproduce that one line. The turn still carries the registration's schema as metadata;
+  the effect is a lost prefix on the next turn, and every family's history rebuild has the same
+  gap.
+- The two emergency injections (the tool-loop synthesis directive and the subagent relay
+  directive) still append a `<system>…</system>` block as plain text after the assistant turn.
+  They are fallback paths, they are chatml-flavoured, and they were left alone rather than
+  re-shaped without a measurement.
+- The API server still renders a client's tool result as a plain user turn
+  (`Function result (name): …`). That is a protocol-adapter choice, not this renderer's, and it
+  is unchanged.
+- The composer's image-only turn still survives on the marker keeping the prompt non-empty; the
+  guard at `startAutoregressiveGeneration` was not touched.
+
+### Verification
+
+`DeepSeekV41ChatPromptFormatterTests` (11), `ChatPromptFormatterConversationTests` (20),
+`DeepSeekV41ToolDialectTests` (28) pass; the full suite is 542/0/44 and the Metal-validation run
+is clean.

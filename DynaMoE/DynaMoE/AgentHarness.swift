@@ -3718,9 +3718,13 @@ public final class AgentHarness {
     /// half is not discriminating. The family's own spelling is used because it is
     /// one token each side, and the payload is escaped against forged role markers
     /// the same way a user turn is: a tool result is arbitrary file or web text.
-    public func formatDeepSeekV41ToolResponseTurn(responses: [String]) -> String {
+    public func formatDeepSeekV41ToolResponseTurn(
+        responses: [String],
+        thinkingEnabled: Bool = true,
+        promptDialect: DeepSeekV41PromptDialect = DeepSeekV41PromptDialect()
+    ) -> String {
         var turn = ""
-        let dialect = DeepSeekV41PromptDialect()
+        let dialect = promptDialect
         for r in responses {
             if let data = r.data(using: .utf8),
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -3737,6 +3741,13 @@ public final class AgentHarness {
                 markers: dialect.markers
             )
         }
+        // The result pair has no role marker of its own, so the next assistant
+        // turn has to be opened here: the checkpoint answers after
+        // `<|Assistant|>` plus the reasoning channel's state, and a prompt that
+        // stops at the output pair asks for a continuation the model was never
+        // told to start. `formatPrompt` passes an already-templated prompt
+        // through verbatim, so nothing downstream adds this marker.
+        turn += dialect.assistantPrefix(thinkingEnabled: thinkingEnabled)
         return turn
     }
 

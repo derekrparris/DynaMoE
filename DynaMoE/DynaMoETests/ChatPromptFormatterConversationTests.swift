@@ -27,6 +27,7 @@ final class ChatPromptFormatterConversationTests: XCTestCase {
             ("ling", try config("bailing")),
             ("spark", try config("spark")),
             ("gemma4", try config("gemma4")),
+            ("deepseek_v41", try config("deepseek_v41")),
         ]
     }
 
@@ -552,9 +553,10 @@ final class ChatPromptFormatterConversationTests: XCTestCase {
     }
 
     func testNonSparkFamiliesIgnoreThinkingEffort() throws {
-        // The level is only consumed by the Spark branch. Emitting it for
-        // another family's template would make the menu lie.
-        for (name, family) in try families() where name != "spark" {
+        // The level is consumed by the two graded-effort families: Spark renders
+        // it as a named line, DeepSeek V4.1 as a budget instruction. Emitting it
+        // for another family's template would make the menu lie.
+        for (name, family) in try families() where name != "spark" && name != "deepseek_v41" {
             for thinking in [true, false] {
                 let plain = ChatPromptFormatter.formatPrompt(
                     prompt: "hello",

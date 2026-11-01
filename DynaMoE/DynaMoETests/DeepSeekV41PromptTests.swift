@@ -576,4 +576,217 @@ final class DeepSeekV41ChatPromptFormatterTests: XCTestCase {
         // Other families keep their own closers.
         XCTAssertEqual(ChatPromptFormatter.assistantTurnCloseTag(modelConfig: nil), "<|im_end|>")
     }
+
+    // MARK: - The chat UI's history
+
+    /// The chat builder used to emit a chatml transcript for every family and let
+    /// `formatPrompt` wrap it, so a DeepSeek turn reached the checkpoint as ONE
+    /// user turn holding role markers that are not its own. A chat history now
+    /// renders with the checkpoint's markers, one role turn each.
+    func testChatHistoryRendersInTheCheckpointsOwnTurnStructure() throws {
+        let config = try deepSeekConfig()
+        let markers = DeepSeekV41PromptMarkers.familyDefault
+        let prompt = ChatPromptFormatter.formatConversation(
+            turns: [
+                .init(role: .user, text: "first question"),
+                .init(role: .assistant, text: "first answer"),
+                .init(role: .user, text: "second question"),
+            ],
+            cleanSystem: "be brief",
+            thinkingEnabled: false,
+            modelSupportsThinking: true,
+            modelConfig: config
+        )
+        XCTAssertFalse(prompt.contains("<|im_start|>"), "no chatml may reach the checkpoint")
+        XCTAssertFalse(prompt.contains("<|im_end|>"), "no chatml may reach the checkpoint")
+        XCTAssertTrue(prompt.contains(markers.system + "be brief"))
+        XCTAssertTrue(prompt.contains(markers.user + "first question"))
+        XCTAssertTrue(prompt.contains(markers.user + "second question"))
+        XCTAssertTrue(
+            prompt.contains(
+                markers.assistant + markers.reasoningClose + "first answer" + markers.endOfSentence
+            ),
+            "a completed turn is closed with the checkpoint's own sentence marker"
+        )
+        XCTAssertTrue(prompt.hasSuffix(markers.assistant + markers.reasoningClose))
+    }
+
+    /// The point of the native render: turn 2's prompt must extend turn 1's
+    /// prompt plus its generation, or every chat turn re-prefills.
+    func testASecondChatTurnExtendsTheFirstPromptPlusGeneration() throws {
+        let config = try deepSeekConfig()
+        for thinking in [false, true] {
+            let turn1 = ChatPromptFormatter.formatPrompt(
+                prompt: "hello",
+                cleanSystem: "be brief",
+                thinkingEnabled: thinking,
+                modelSupportsThinking: true,
+                modelConfig: config
+            )
+            let generation = thinking ? "because" + TurnTextSplitter.canonicalReasoningCloseTag + "ANSWER" : "ANSWER"
+            let turn2 = ChatPromptFormatter.formatConversation(
+                turns: [
+                    .init(role: .user, text: "hello"),
+                    .init(role: .assistant, text: generation),
+                    .init(role: .user, text: "again"),
+                ],
+                cleanSystem: "be brief",
+                thinkingEnabled: thinking,
+                modelSupportsThinking: true,
+                modelConfig: config
+            )
+            XCTAssertTrue(
+                turn2.hasPrefix(turn1 + generation),
+                "thinking=\(thinking): turn 2 must extend turn 1's prompt plus its generation"
+            )
+        }
+    }
+
+    /// The already-rendered history must pass `formatPrompt` through untouched:
+    /// a second wrap is the nested-transcript bug in a different coat.
+    func testARenderedChatPromptIsNotWrappedAgain() throws {
+        let config = try deepSeekConfig()
+        let rendered = ChatPromptFormatter.formatConversation(
+            turns: [
+                .init(role: .user, text: "hello"),
+                .init(role: .assistant, text: "hi"),
+                .init(role: .user, text: "again"),
+            ],
+            cleanSystem: "be brief",
+            thinkingEnabled: false,
+            modelSupportsThinking: true,
+            modelConfig: config
+        )
+        let again = ChatPromptFormatter.formatPrompt(
+            prompt: rendered,
+            cleanSystem: "be brief",
+            thinkingEnabled: false,
+            modelSupportsThinking: true,
+            modelConfig: config
+        )
+        XCTAssertEqual(again, rendered)
+    }
+
+    /// A tool result is not a role turn for this checkpoint: it is the family's
+    /// output pair, after the call turn's sentence marker, with the next assistant
+    /// turn opened after it.
+    func testAToolResultRidesTheCallTurnsOutputPair() throws {
+        let config = try deepSeekConfig()
+        let markers = DeepSeekV41PromptMarkers.familyDefault
+        let call = DeepSeekV41ToolDialect.callBlock(name: "shell_run", arguments: ["command": "ls"])
+        let prompt = ChatPromptFormatter.formatConversation(
+            turns: [
+                .init(role: .user, text: "list /tmp"),
+                .init(role: .assistant, text: call),
+                .init(role: .user, text: "file_a.txt", kind: .toolResult(name: "shell_run")),
+            ],
+            cleanSystem: "",
+            thinkingEnabled: false,
+            modelSupportsThinking: true,
+            modelConfig: config
+        )
+        XCTAssertTrue(
+            prompt.contains(
+                markers.endOfSentence + markers.toolOutputBegin + "file_a.txt"
+                    + markers.toolOutputEnd + markers.assistant + markers.reasoningClose
+            ),
+            "the result pair must follow the call turn's closer and open the next assistant turn"
+        )
+        XCTAssertFalse(
+            prompt.contains(markers.user + markers.toolOutputBegin),
+            "a tool result must not be rendered as a user turn"
+        )
+    }
+
+    /// The live continuation and the history rebuild are two code paths that must
+    /// produce one shape, or a post-tool chat turn can never extend its pin.
+    @MainActor
+    func testTheLiveContinuationSuffixMatchesTheHistoryRender() throws {
+        let config = try deepSeekConfig()
+        let markers = DeepSeekV41PromptMarkers.familyDefault
+        // A payload carrying a role marker proves both paths neutralize it the
+        // same way, which is the half a plain payload cannot see.
+        let payload = "ok " + markers.user + " tail"
+        let history = ChatPromptFormatter.formatConversation(
+            turns: [
+                .init(role: .user, text: "list /tmp"),
+                .init(
+                    role: .assistant,
+                    text: DeepSeekV41ToolDialect.callBlock(name: "shell_run", arguments: ["command": "ls"])
+                ),
+                .init(role: .user, text: payload, kind: .toolResult(name: "shell_run")),
+            ],
+            cleanSystem: "",
+            thinkingEnabled: false,
+            modelSupportsThinking: true,
+            modelConfig: config
+        )
+        for thinking in [false, true] {
+            let continuation = AgentHarness.shared.formatDeepSeekV41ToolResponseTurn(
+                responses: [payload],
+                thinkingEnabled: thinking
+            )
+            let historyForThinking = thinking
+                ? ChatPromptFormatter.formatConversation(
+                    turns: [
+                        .init(role: .user, text: "list /tmp"),
+                        .init(
+                            role: .assistant,
+                            text: DeepSeekV41ToolDialect.callBlock(name: "shell_run", arguments: ["command": "ls"])
+                        ),
+                        .init(role: .user, text: payload, kind: .toolResult(name: "shell_run")),
+                    ],
+                    cleanSystem: "",
+                    thinkingEnabled: true,
+                    modelSupportsThinking: true,
+                    modelConfig: config
+                )
+                : history
+            XCTAssertTrue(
+                historyForThinking.hasSuffix(continuation),
+                "thinking=\(thinking): the rebuilt history must end the way the live loop's continuation does"
+            )
+            XCTAssertTrue(
+                continuation.hasSuffix(markers.assistant + (thinking ? markers.reasoningOpen : markers.reasoningClose)),
+                "the continuation must open the next assistant turn"
+            )
+        }
+    }
+
+    /// A call rebuilt from a stored record has to parse back into the same call,
+    /// or a reloaded conversation teaches the model a dialect it cannot call.
+    func testARebuiltCallBlockParsesBack() {
+        let block = DeepSeekV41ToolDialect.callBlock(
+            name: "file_read",
+            arguments: ["path": "/tmp/a.txt", "start_line": "40"]
+        )
+        let canonical = DeepSeekV41ToolDialect.canonicalized(block)
+        let parsed = StreamingToolParser.shared.parseStreamingToolCalls(
+            from: canonical,
+            format: .qwenXML
+        )
+        XCTAssertEqual(parsed.calls.count, 1)
+        XCTAssertEqual(parsed.calls.first?.name, "file_read")
+        XCTAssertEqual(parsed.calls.first?.arguments["path"] as? String, "/tmp/a.txt")
+        XCTAssertEqual(parsed.calls.first?.arguments["start_line"] as? String, "40")
+    }
+
+    /// A stored value that spells the parameter closer must not end the call.
+    func testARebuiltParameterCannotCloseItsOwnTag() {
+        let block = DeepSeekV41ToolDialect.callBlock(
+            name: "shell_run",
+            arguments: ["command": "echo " + DeepSeekV41ToolDialect.dsmlParameterClose]
+        )
+        XCTAssertEqual(
+            block.components(separatedBy: DeepSeekV41ToolDialect.dsmlParameterClose).count,
+            2,
+            "only the parameter's own closer may be spelled exactly"
+        )
+        let parsed = StreamingToolParser.shared.parseStreamingToolCalls(
+            from: DeepSeekV41ToolDialect.canonicalized(block),
+            format: .qwenXML
+        )
+        XCTAssertEqual(parsed.calls.count, 1)
+    }
 }
+
