@@ -2413,22 +2413,20 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
 
     /// Whether two prefills of one token stream agree on what the indexer scored.
     ///
-    /// The same executor, reset, the same tokens, twice: 128 positions, and zero of
-    /// the 128 scores move. That is the invariant every other numeric claim on this
-    /// checkpoint rests on, and it holds here -- but NOT at 576 positions, where the
-    /// same test moves all 576 (worst |delta| 1.8e-3). The drift is a real defect and
-    /// not a float-order artefact: the first position whose pooled latent differs
-    /// differs by 0.49 on a 4.2 scale, and the whole suite becomes deterministic
-    /// again under Metal's debug layer with shader validation, which is the signature
-    /// of a read of memory nothing wrote. `Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #30",
-    /// carries the evidence and the validation recipe; the position count here is
-    /// deliberately the one that holds, so this stays a check rather than a red flag.
+    /// The same executor, reset, the same tokens, twice: 576 positions, and zero of the
+    /// 576 scores move -- bit for bit, not to a tolerance. That is the invariant every
+    /// other numeric claim on this checkpoint rests on, and the count is the full 576 on
+    /// purpose: this case moved ALL 576 scores (worst |delta| 0.4195) until "DSV4.1 #31"
+    /// fixed the Engram gate's threadgroup reduction race, and running only the length
+    /// that passed is how that defect stayed open. See `Benchmarks/PERF_FINDINGS.md`,
+    /// "DSV4.1 #31", for the mechanism and `testEveryStageOfTwoPrefillsOfOneStreamAgrees`
+    /// for the probe that localises a regression to a layer, a stage and a position.
     func testTwoPrefillsOfOneStreamAgreeOnTheIndexScores() async throws {
         let snapshot = try snapshotDirectory()
         let config = try DeepSeekV41Config.decode(
             contentsOf: snapshot.appendingPathComponent("config.json")
         )
-        let positionCount = 128
+        let positionCount = 576
         let tokens = Self.probeTokens(count: positionCount)
         let engine = try DynaMoeEngine(filePath: snapshot.path)
         let runtime = try makeRuntime(
@@ -2475,5 +2473,165 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
                 + "worst |delta| \(worst) at row \(worstAt) against a max |score| \(scale)"
         )
         XCTAssertEqual(differing, 0, "two identical prefills disagree on the index scores")
+    }
+
+    /// Whether every stage of two prefills of one stream agrees, and where not.
+    ///
+    /// `testTwoPrefillsOfOneStreamAgreeOnTheIndexScores` compares the scores a pass
+    /// produced; this one compares the workspace at every stage that made them, so a
+    /// regression names the layer, the stage and the position instead of only the
+    /// value. It is the probe that localised the 576-position nondeterminism
+    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #31"): two runs disagreed only at an
+    /// Engram stage, with the staged rows, the dequantized rows and the projection
+    /// all identical and the gate's own value moving, which is what named a
+    /// threadgroup reduction race rather than a bad read.
+    ///
+    /// It costs one wait per dense stage (the `recordsStageTiming` layout, which is
+    /// the only layout where a stage is complete before the next one is encoded), so
+    /// it runs on a prefix of the stream rather than the whole prompt. Opt-in with the
+    /// other published-checkpoint cases.
+    func testEveryStageOfTwoPrefillsOfOneStreamAgrees() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let positionCount = 192
+        let block = max(
+            1, DeepSeekV41DevicePlan.chunkSlots(config: config, contextLength: positionCount)
+        )
+        let tokens = Self.probeTokens(count: positionCount)
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: positionCount,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let engramTablesByLayer = Dictionary(
+            uniqueKeysWithValues: config.engramTables.enumerated().map { ($1.layer, $0) }
+        )
+        let indexLayers: Set<Int> = [2, 8, 14, 20, 24, 28, 32, 36]
+
+        let report = try await Task.detached {
+            [runtime, tokens, block, engramTablesByLayer, indexLayers] () -> [String] in
+            let executor = runtime.forward()
+            executor.recordsStageTiming = true
+            var lines: [String] = []
+            var baselines: [String: [String: [UInt64]]] = [:]
+            var pass = 0
+            // A buffer only some layers write still holds the PREVIOUS pass's bytes
+            // until its layer runs, so comparing it earlier reports the leftover rather
+            // than a divergence.
+            func liveDifferences(
+                _ before: [String: [UInt64]], _ current: [String: [UInt64]], layer: Int
+            ) -> [(name: String, slots: [Int], count: Int)] {
+                var out: [(name: String, slots: [Int], count: Int)] = []
+                for name in current.keys.sorted() {
+                    if (name == "engramKV" || name == "engramGates"),
+                       engramTablesByLayer[layer] == nil {
+                        continue
+                    }
+                    if (name == "indexQuery" || name == "indexWeights"),
+                       !indexLayers.contains(layer) {
+                        continue
+                    }
+                    // Each table's staging belongs to the ONE layer that owns it.
+                    if name.hasPrefix("engramRaw[") || name.hasPrefix("engramValues[") {
+                        guard let open = name.firstIndex(of: "["),
+                              let close = name.firstIndex(of: "]"),
+                              let table = Int(name[name.index(after: open)..<close]),
+                              engramTablesByLayer[layer] == table else { continue }
+                    }
+                    guard let now = current[name], let was = before[name] else { continue }
+                    let moved = now.indices.filter { now[$0] != was[$0] }
+                    guard !moved.isEmpty else { continue }
+                    out.append((name: name, slots: moved, count: now.count))
+                }
+                return out
+            }
+
+            func snapshot(
+                _ names: Set<String>?, withEngram: Bool
+            ) -> [String: [UInt64]] {
+                var digests = executor.slotDigests(names: names)
+                if withEngram {
+                    for (name, value) in executor.engramDigests() { digests[name] = value }
+                }
+                return digests
+            }
+
+            func compare(
+                key: String, current: [String: [UInt64]], layer: Int, header: String
+            ) {
+                guard let before = baselines[key] else { return }
+                let differences = liveDifferences(before, current, layer: layer)
+                guard !differences.isEmpty else { return }
+                lines.append(header)
+                for difference in differences {
+                    lines.append(
+                        "  \(difference.name): "
+                            + "\(difference.slots.map(String.init).joined(separator: ",")) "
+                            + "of \(difference.count) slot(s) differ"
+                    )
+                }
+            }
+
+            executor.onBlockEmbedded = { startPosition, _ in
+                let key = "block \(startPosition / block) embedding"
+                let current = snapshot(["hidden", "streams", "tokenIDs", "hcMix"], withEngram: false)
+                if pass == 0 {
+                    baselines[key] = current
+                } else {
+                    compare(
+                        key: key, current: current, layer: 0,
+                        header: "block \(startPosition / block) disagrees AFTER the embedding"
+                    )
+                }
+            }
+            executor.onBlockStageFinished = { layer, startPosition, stage in
+                let key = "block \(startPosition / block) layer \(layer) \(stage)"
+                var names: Set<String> = ["streams"]
+                if stage == "engram" { names.formUnion(["engramKV", "engramGates"]) }
+                let current = snapshot(names, withEngram: stage == "engram")
+                if pass == 0 {
+                    baselines[key] = current
+                } else {
+                    compare(
+                        key: key, current: current, layer: layer,
+                        header: "block \(startPosition / block) layer \(layer) "
+                            + "disagrees at stage \(stage)"
+                    )
+                }
+            }
+            executor.onBlockLayerFinished = { layer, startPosition, _ in
+                let key = "block \(startPosition / block) layer \(layer) end"
+                let current = snapshot(nil, withEngram: true)
+                if pass == 0 {
+                    baselines[key] = current
+                } else {
+                    compare(
+                        key: key, current: current, layer: layer,
+                        header: "block \(startPosition / block) layer \(layer) "
+                            + "disagrees at the layer's end"
+                    )
+                }
+            }
+
+            for passIndex in 0..<2 {
+                pass = passIndex
+                executor.reset()
+                for start in stride(from: 0, to: tokens.count, by: block) {
+                    let end = min(start + block, tokens.count)
+                    _ = try executor.prefillChunk(Array(tokens[start..<end]))
+                }
+            }
+            return lines
+        }.value
+
+        print("🔎 [dsv41 real] per-stage diff: \(report.count) line(s)")
+        for line in report { print("🔎 [dsv41 real] \(line)") }
+        XCTAssertTrue(report.isEmpty, "two identical prefills disagree")
     }
 }

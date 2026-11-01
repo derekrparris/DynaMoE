@@ -1137,6 +1137,31 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     public var recordsStageTiming = false
     public private(set) var stageTiming: [String: UInt64] = [:]
 
+    // MARK: Diagnostic hooks
+
+    /// Called once a block's embedding is complete, with the GPU idle, when set.
+    ///
+    /// A repeated prefill that disagrees has to be narrowed before it can be fixed:
+    /// a difference already present here cannot come from any layer, and one that is
+    /// not cannot come from the embedding. Nil in every production path
+    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #30" and "#31").
+    public var onBlockEmbedded: ((_ startPosition: Int, _ count: Int) -> Void)?
+
+    /// Called after each layer of a block, once the GPU is idle, when set.
+    ///
+    /// Diagnostic only, and it costs one wait per layer: the block path's mixture
+    /// half is otherwise still in flight at this point. Nil in every production path.
+    public var onBlockLayerFinished: ((_ layer: Int, _ startPosition: Int, _ count: Int) -> Void)?
+
+    /// Called after each stage of a block's dense half, with the GPU idle, when set.
+    ///
+    /// Only the `recordsStageTiming` layout can answer it, because every other layout
+    /// encodes a whole half into one command buffer and nothing is complete between
+    /// two stages. That layout gives each stage its own buffer, so this waits on it
+    /// and hands over: the cost is one wait per stage, which is why it is diagnostic
+    /// only. Nil in every production path.
+    public var onBlockStageFinished: ((_ layer: Int, _ startPosition: Int, _ stage: String) -> Void)?
+
     /// Clears the accumulated timing, so a measurement times one prompt rather than
     /// everything the executor has ever run.
     public func resetBlockTiming() {
@@ -1650,6 +1675,103 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// Positions the cache already holds.
     public var storedPositions: Int { cache.storedPositions }
 
+    // MARK: Diagnostic probes
+
+    /// One digest per position slot for each replicated buffer.
+    ///
+    /// Diagnostic only. A block-level difference has to name the POSITION it started
+    /// at before it can name a stage, and only the buffers that carry one copy per
+    /// position can answer that; the ones allocated a single copy (the pooled row, the
+    /// compressor block, the Engram staging) are shared by the whole block, which is
+    /// what `engramDigests` covers. A digest is FNV-1a over a slot's bytes, so two runs
+    /// compare equal only when every value in that slot is bit-identical.
+    public func slotDigests(names: Set<String>? = nil) -> [String: [UInt64]] {
+        let replicated: [(String, MTLBuffer)] = [
+            ("hidden", workspace.hidden),
+            ("normed", workspace.normed),
+            ("query", workspace.query),
+            ("latent", workspace.latent),
+            ("attentionOut", workspace.attentionOut),
+            ("output", workspace.output),
+            ("routerLogits", workspace.routerLogits),
+            ("expertWeights", workspace.expertWeights),
+            ("indexQuery", workspace.indexQuery),
+            ("indexWeights", workspace.indexWeights),
+            ("reduced", workspace.reduced),
+            ("moeOut", workspace.moeOut),
+            ("streams", workspace.streams),
+            ("hcLogits", workspace.hcLogits),
+            ("hcMix", workspace.hcMix),
+            ("hcAttentionPre", workspace.hcAttentionPre),
+            ("hcAttentionPost", workspace.hcAttentionPost),
+            ("hcAttentionComb", workspace.hcAttentionComb),
+            ("hcFFNPre", workspace.hcFFNPre),
+            ("hcFFNPost", workspace.hcFFNPost),
+            ("hcFFNComb", workspace.hcFFNComb),
+            ("hcResidual", workspace.hcResidual),
+            ("engramKV", workspace.engramKV),
+            ("engramGates", workspace.engramGates),
+            ("tokenIDs", workspace.tokenIDs)
+        ]
+        let slotCount = max(1, workspace.slots)
+        var out: [String: [UInt64]] = [:]
+        for (name, buffer) in replicated {
+            if let names, !names.contains(name) { continue }
+            let perSlot = buffer.length / slotCount
+            guard perSlot > 0 else { continue }
+            var digests: [UInt64] = []
+            digests.reserveCapacity(slotCount)
+            for slot in 0..<slotCount {
+                digests.append(
+                    digest(buffer, offset: slot * perSlot, length: perSlot)
+                )
+            }
+            out[name] = digests
+        }
+        return out
+    }
+
+    /// One digest per position slot for each Engram table's staging blocks.
+    ///
+    /// The raw block is what the HOST pread wrote and the value block is what the
+    /// dequant kernel made of it, so the pair separates "the rows were different" from
+    /// "the same rows were decoded differently". Neither is visible to `slotDigests`,
+    /// which only sees buffers replicated per position as a whole. Diagnostic only.
+    public func engramDigests() -> [String: [UInt64]] {
+        var out: [String: [UInt64]] = [:]
+        for staging in workspace.engramSlots where staging.positionSlots > 0 {
+            var raw: [UInt64] = []
+            var values: [UInt64] = []
+            raw.reserveCapacity(staging.positionSlots)
+            values.reserveCapacity(staging.positionSlots)
+            for slot in 0..<staging.positionSlots {
+                raw.append(digest(
+                    workspace.engramRaw,
+                    offset: staging.rawBytes(atPositionSlot: slot),
+                    length: staging.rawByteCount
+                ))
+                values.append(digest(
+                    workspace.engramValues,
+                    offset: staging.valueBytes(atPositionSlot: slot),
+                    length: staging.valueCount * MemoryLayout<Float>.stride
+                ))
+            }
+            out["engramRaw[\(staging.table)]"] = raw
+            out["engramValues[\(staging.table)]"] = values
+        }
+        return out
+    }
+
+    private func digest(_ buffer: MTLBuffer, offset: Int, length: Int) -> UInt64 {
+        guard length > 0, offset >= 0, offset + length <= buffer.length else { return 0 }
+        var hash: UInt64 = 0xcbf29ce484222325
+        let bytes = UnsafeRawBufferPointer(
+            start: buffer.contents().advanced(by: offset), count: length
+        )
+        for byte in bytes { hash = (hash ^ UInt64(byte)) &* 0x100000001b3 }
+        return hash
+    }
+
     /// How much of `promptTokenIds` this cache can skip.
     ///
     /// The count arithmetic is `reusablePrefix`'s; what the count cannot say is
@@ -1773,6 +1895,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         pendingDead = false
 
         try encodeEmbeddingBlock(tokens, startPosition: startPosition)
+        if let hook = onBlockEmbedded {
+            try settlePending()
+            hook(startPosition, tokens.count)
+        }
         for layer in plan {
             try runBlockLayer(layer, startPosition: startPosition, count: tokens.count)
         }
@@ -1841,6 +1967,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 ))
                 stageBuffers.append((stage: stage.rawValue, buffer: buffer))
                 frontBuffers.append(buffer)
+                if let hook = onBlockStageFinished {
+                    try settlePending()
+                    hook(layer.index, startPosition, stage.rawValue)
+                }
                 if stage == .indexer, layer.ownsCompressedIndex {
                     try settlePending()
                     try readIndexSelections(
@@ -1955,6 +2085,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 timingBuffers.append((buffer: expertCommand, bucket: 1))
             }
             recordLayerTiming(marks, positions: count)
+            if let hook = onBlockLayerFinished {
+                try settlePending()
+                hook(layer.index, startPosition, count)
+            }
             return
         }
 
@@ -1992,6 +2126,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         }
         if measuring { marks.append(DispatchTime.now().uptimeNanoseconds) }
         recordLayerTiming(marks, positions: count)
+        if let hook = onBlockLayerFinished {
+            try settlePending()
+            hook(layer.index, startPosition, count)
+        }
     }
 
     /// Folds one layer's four measurement marks into `blockTiming`.

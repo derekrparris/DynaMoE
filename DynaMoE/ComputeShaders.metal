@@ -1152,6 +1152,16 @@ inline float threadgroup_reduce_sum(float localSum, threadgroup float* sharedWar
     uint warpIdx = tid / 32;
     uint laneIdx = tid % 32;
 
+    // Every thread READS `sharedWarpSums[0]` at the end of this helper, so a caller
+    // that runs two reductions back to back needs the read protected from the next
+    // call's write. The trailing barrier alone does not do it: it orders this
+    // call's write before every thread passes, but nothing then stops a fast thread
+    // from writing the NEXT call's partials while a slow thread is still reading
+    // this call's result. The Engram gate calls this three times in a row
+    // (`streamSquares`, `keySquares`, `dot`) and was the only site that did, which
+    // is what made a 576-position prefill disagree with itself: `Benchmarks/
+    // PERF_FINDINGS.md`, "DSV4.1 #30" for the defect and "#31" for the fix.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (laneIdx == 0) {
         sharedWarpSums[warpIdx] = warpSum;
     }

@@ -6407,9 +6407,85 @@ difference between the port and the reference on a fixed set of activations. Tha
 why the parity work above is done on a dump: comparing two live runs would have
 measured this defect instead of the indexer.
 
-**Still open.** The nondeterminism itself. It is why the FP4 count above is a range:
-those rows sit on the cut, so which of them cross depends on where the boundary lands,
-and the boundary moves between runs. The rule arm does not have that problem -- its
-selection is identical in both dumps -- which is the shape the two results should
-have: an arithmetic comparison survives a moving input, a which-rows-cross-the-cut
-claim does not.
+**Solved in `#31`.** The nondeterminism was a threadgroup reduction race in the Engram
+gate, not a read of unwritten memory: see below. The FP4 count above is still a range
+for its own reason -- those rows sit on the cut, so which of them cross depends on
+where the boundary lands -- and the rule arm does not have that problem, which is the
+shape the two results should have: an arithmetic comparison survives a moving input, a
+which-rows-cross-the-cut claim does not.
+
+## DSV4.1 #31: THE 576-POSITION PREFILL IS REPRODUCIBLE, AND THE RACE THAT MADE IT NOT
+
+`#30` ended with an open defect: two prefills of the same 576 tokens through the same
+executor did not agree. All 576 layer-20 scores moved (worst |delta| 1.84e-3 on the run
+that found it, 0.4195 on one taken later), the selected rows with them; at 128 positions
+the same test was bit-identical, and under Metal's validation layer it was bit-identical
+at 576 but settled on a third distinct value. That last part is what made it read like a
+peek at memory nothing wrote. It was not.
+
+### Localising it
+
+The instrument is `DeepSeekV41MetalForward.slotDigests` plus three diagnostic hooks:
+`onBlockEmbedded`, `onBlockStageFinished` and `onBlockLayerFinished`. The digests hash the
+workspace one POSITION SLOT at a time, so two runs compare equal only if every value in a
+slot is bit-identical -- a whole-buffer hash cannot say which position moved, and a
+position is what names the stage. The stage hook needs the `recordsStageTiming` layout,
+the only one where a stage is complete before the next one is encoded.
+
+Three runs, each one narrowing the answer:
+
+| Observation | What it ruled out |
+|---|---|
+| At block ends everything was bit-identical except three per-slot scratch TAILS: `gathered` rows past a slot's row count, `indexScores` past the rows a position produced, `rowIndices` past theirs | A wrong value anywhere the graph reads: those tails are never read, at any row count |
+| The first live divergence was always at an `.engram` stage (layers 1 and 14) | Every path except the Engram write |
+| `engramRaw[T]` (the host pread), `engramValues[T]` (the dequant) and `engramKV` (the `wkv` projection) were identical at that stage, while `engramGates` and `streams` moved | The retrieved rows, their decode and their projection: the gate's own arithmetic was what moved |
+| The onset moved between runs (block 0 slots 6-7, then block 15, then block 28) and always left slot 0 alone | Anything geometric: slot 0 is the dispatch that has the queue to itself |
+
+The same probe also retracted an earlier reading of our own. `#30`'s first measurement
+put the first divergent pooled latent at position 86, slot 6 of block 10; that was a
+single run of a moving target, and with the position-level digests in place the onset
+was somewhere else every time. A session that had kept chasing position 86 would have
+chased a coincidence.
+
+### The race
+
+`threadgroup_reduce_sum` ended by having every thread read `sharedWarpSums[0]` after its
+trailing barrier. That barrier orders this call's WRITE before every thread passes;
+nothing then stops a fast thread from entering the next call and overwriting
+`sharedWarpSums[warpIdx]` -- for warp 0, element 0 again -- while a slow thread is still
+reading this call's result. A kernel that reduces once per dispatch cannot hit it, which
+is why rmsnorm and the GEMVs were never affected. The Engram gate is the port's only
+kernel that reduces three times in a row:
+
+    streamSquares = threadgroup_reduce_sum(localStream, ...)
+    keySquares    = threadgroup_reduce_sum(localKey,    ...)
+    dot           = threadgroup_reduce_sum(localDot,    ...)
+
+so `keySquares` could return a partial of `dot`, or `streamSquares` one of `keySquares`.
+The gate then differs, the residual it writes differs, and every layer downstream differs
+-- which is why the reported first divergence kept moving and why all 576 scores moved
+together rather than one region's worth of them.
+
+The fix is one barrier at the START of the helper, before the partials are written: it
+orders "read the previous result" against "write the next reduction's partials" for every
+caller, at the cost of a barrier a single-call kernel will not notice.
+
+### What it is worth
+
+| | before | after |
+|---|---|---|
+| `testTwoPrefillsOfOneStreamAgreeOnTheIndexScores`, 576 positions | 576/576 scores moved, worst \|delta\| 0.4195 | **0/576, worst 0.0** |
+| `testEveryStageOfTwoPrefillsOfOneStreamAgrees`, 192 positions, every stage of every layer | first divergence at an `.engram` stage | **0 differences** |
+
+The parity results in `#30` do not move: they were taken on a dump, where both sides
+score the same activations. What changes is what a LIVE run means. `#29`'s score census
+moving between runs (cut score -2.2880 -> -2.2704 -> -2.2442, layer-24 newest-row rank
+464 -> 476 -> 483) was this race and not the checkpoint, so a single real-weight run is
+now a sample of a stable distribution. The FP4 row count in `#30` (3 of 512 on one dump,
+5 on another) still needs two dumps to be honest, because those rows sit on the cut.
+
+The validation layer's apparent determinism was a timing artefact, not a shield: making
+the racing thread consistently early or late makes the SAME wrong partial get picked
+every time, so the run looks correct and reproducible. That is the general lesson and the
+reason this entry exists -- a wrong threadgroup partial looks exactly like garbage memory,
+and a debug layer that changes timing will hide it rather than report it.
