@@ -263,6 +263,35 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         return UInt32(clamping: best)
     }
 
+    /// Fits `seconds = fixed + perToken * tokens + squared * tokens^2` through three
+    /// measured points by Cramer's rule, so a tower cost decomposes into the term
+    /// that grows with the token count and the one that grows with its square.
+    ///
+    /// Returns nil when the three points are collinear in that basis, which means
+    /// the measurement cannot tell the two growth terms apart and printing a split
+    /// would be inventing one.
+    private nonisolated static func costModel(
+        tokens: [Double],
+        seconds: [Double]
+    ) -> (fixed: Double, perToken: Double, squared: Double)? {
+        guard tokens.count == 3, seconds.count == 3 else { return nil }
+        // Rows are the three sample points; columns are 1, t and t^2.
+        func determinant(_ a: [Double], _ b: [Double], _ c: [Double]) -> Double {
+            a[0] * (b[1] * c[2] - b[2] * c[1])
+                - b[0] * (a[1] * c[2] - a[2] * c[1])
+                + c[0] * (a[1] * b[2] - a[2] * b[1])
+        }
+        let ones: [Double] = [1, 1, 1]
+        let squares = tokens.map { $0 * $0 }
+        let base = determinant(ones, tokens, squares)
+        guard base.isFinite, abs(base) > 1e-9 else { return nil }
+        let fixed = determinant(seconds, tokens, squares) / base
+        let perToken = determinant(ones, seconds, squares) / base
+        let squared = determinant(ones, tokens, seconds) / base
+        guard fixed.isFinite, perToken.isFinite, squared.isFinite else { return nil }
+        return (fixed, perToken, squared)
+    }
+
     /// A reproducible token stream for the probes, cycled from ids the checkpoint's
     /// own tokenizer produces for ordinary text so routing is not degenerate.
     private static func probeTokens(count: Int) -> [Int] {
@@ -2979,6 +3008,100 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
                 + String(format: "%.2f s", floorSeconds)
                 + " (184 span positions)"
         )
+
+        // The LARGEST image the checkpoint accepts, which is the other end of the
+        // range and the one nothing has measured. The grid comes from `fit` rather
+        // than being chosen here, so this cannot drift from what a real oversized
+        // image would become: a 20,000 pixel square collapses onto the token
+        // budget, and the patch grid it returns is the biggest admissible one.
+        // Opt-in because the cost is quadratic in the token count, so at `-Onone`
+        // this would measure the interpreter for minutes rather than the tower.
+        if FileManager.default.fileExists(atPath: "/tmp/dynamoe_dsv41_vision_max") {
+            let capped = DeepSeekV41VisionLayout.fit(width: 20_000, height: 20_000, spec: spec)
+            XCTAssertGreaterThan(capped.tokens, 0)
+            XCTAssertLessThanOrEqual(
+                capped.tokens, spec.maxImageTokens,
+                "fit must return a span inside the checkpoint's own token budget"
+            )
+            let capSide = capped.width / max(1, spec.patchSize)
+            XCTAssertEqual(
+                capSide, capped.height / max(1, spec.patchSize),
+                "a square image must stay square through the resize plan"
+            )
+            // The fixed cost, measured instead of inferred. Every encode preads the
+            // tower's 970 MB of weights and widens them again, so a warm call is
+            // that cost plus its arithmetic; the first call of a process also fills
+            // the page cache. Without this the slope between the first and second
+            // small grid is negative whenever the fixed cost is small: the cold read
+            // lands entirely in the first sample.
+            let warmStart = CFAbsoluteTimeGetCurrent()
+            _ = try tower.imageSpan(patches: patches(2), rows: 2, columns: 2)
+            let warmSeconds = CFAbsoluteTimeGetCurrent() - warmStart
+            print(
+                "🔎 [dsv41 real] tower warm: a repeated 4-token call in "
+                    + String(format: "%.2f s", warmSeconds)
+                    + " (the first call pays the cold read, so this is the fixed cost)"
+            )
+
+            // Three token counts fit a cost model with a fixed, a linear and a
+            // quadratic term, which is the shape of the tower: everything but
+            // attention and softmax is linear in the token count, and those two are
+            // quadratic. Two points could only draw a line through the origin and
+            // would attribute every quadratic second to the linear term.
+            let midSide = 63
+            let midStart = CFAbsoluteTimeGetCurrent()
+            let midRows = try tower.imageSpan(
+                patches: patches(midSide), rows: midSide, columns: midSide
+            )
+            let midSeconds = CFAbsoluteTimeGetCurrent() - midStart
+            XCTAssertEqual(
+                midRows.count,
+                DeepSeekV41VisionLayout.imageTokenCount(
+                    columns: (midSide + spec.downsampleRatio - 1) / spec.downsampleRatio,
+                    rows: (midSide + spec.downsampleRatio - 1) / spec.downsampleRatio
+                )
+            )
+
+            let capPatches = capSide * capSide
+            let capStart = CFAbsoluteTimeGetCurrent()
+            let capRows = try tower.imageSpan(
+                patches: patches(capSide), rows: capSide, columns: capSide
+            )
+            let capSeconds = CFAbsoluteTimeGetCurrent() - capStart
+            XCTAssertEqual(
+                capRows.count, capped.tokens,
+                "the span must be the length the resize plan priced"
+            )
+            for row in capRows {
+                XCTAssertEqual(row.count, config.hiddenSize)
+                XCTAssertTrue(row.allSatisfy(\.isFinite), "the tower produced a non-finite row")
+            }
+            print(
+                "🔎 [dsv41 real] tower cap: \(capPatches) patch tokens (\(capSide)x\(capSide)) "
+                    + "-> \(capped.columns)x\(capped.rows) aligner grid, \(capRows.count) span "
+                    + "positions in " + String(format: "%.2f s", capSeconds)
+                    + String(format: " (%.1fx the smallest image, %.2f ms per patch token)",
+                             capSeconds / max(floorSeconds, 0.001),
+                             1_000 * capSeconds / Double(max(capPatches, 1)))
+            )
+            // cost(t) = fixed + perToken * t + perTokenSquared * t^2, solved exactly
+            // through the three measured points rather than least squares, so the
+            // numbers reproduce from the log.
+            let fitTokens = [4.0, Double(midSide * midSide), Double(capPatches)]
+            let fitSeconds = [warmSeconds, midSeconds, capSeconds]
+            if let model = Self.costModel(tokens: fitTokens, seconds: fitSeconds) {
+                let quadraticShare = model.squared * fitTokens[2] * fitTokens[2] / fitSeconds[2]
+                print(
+                    "🔎 [dsv41 real] tower cost model: "
+                        + String(format: "%.2f s fixed + %.3f ms per token + %.3e s per token^2",
+                                 model.fixed, 1_000 * model.perToken, model.squared)
+                        + String(format: "; at %d tokens the quadratic term is %.0f%% of the %.2f s",
+                                 capPatches, 100 * quadraticShare, capSeconds)
+                        + String(format: " (mid grid %dx%d = %d tokens in %.2f s)",
+                                 midSide, midSide, midSide * midSide, midSeconds)
+                )
+            }
+        }
 
         let settings = DeepSeekV41TurnRunner.Settings(
             temperature: 0,

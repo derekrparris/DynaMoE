@@ -6966,6 +6966,11 @@ attachments, and no chat or API request can carry an image. The 2.00 s is a stan
 mirror of the same shapes and the same calls, not a Release build of the app, whose own glue
 was not timed; the 68.06 s is the number the harness actually measured.
 
+**Updated in `#37`:** both gaps are closed. The app's own build, compiled `-O`, measures the
+smallest accepted image at **2.74 s** (24.8x the 68.06 s above), the largest image the
+checkpoint accepts at **41.71 s**, and 76% of that 41.71 s is the quadratic attention term. The
+2.00 s mirror was 21% optimistic against the 2.52 s of measured arithmetic; see `#37`.
+
 Pure-logic pins: `DeepSeekV41VisionForwardTests.testTheBatchedLinearMatchesItsDefinition` (an
 odd 3x7x5 shape so a transposed matrix or a wrong `lda` cannot cancel out),
 `testTheBatchedLinearHandlesASingleToken`, `testTheBatchedAttentionMatchesItsDefinition`,
@@ -6975,3 +6980,147 @@ rotation by zero), `testARaggedPatchRowIsRefused`, and the new
 half is not reinvented, FP32 passes through bit for bit, a short buffer yields zeros, the dtype
 widths). The suite is **556 tests, 0 failures, 41 skipped**, and 0 Metal validation errors
 under `MTL_DEBUG_LAYER`.
+
+## DSV4.1 #37: THE REAL TOWER AT `-O` TAKES 2.74 s, AND THE LARGEST IMAGE THE CHECKPOINT ACCEPTS IS 76% ATTENTION
+
+### The question
+
+`#36` left one claim in this journal that was a mirror rather than a measurement: it priced the
+tower's arithmetic at **2.00 s** by compiling a standalone `-O` harness of the same shapes and
+calls, while the 68.06 s everyone would actually see came from a `-Onone` test bundle. Two
+things were therefore unknown, and a third was named but unmeasured: what the app's OWN code
+costs per image at `-O` (its glue inside `encode` was never timed there), and what the LARGEST
+image the checkpoint accepts costs, which `#36` could only extrapolate from a quadratic
+attention term (0.49 s at 1,521 patch tokens becomes ~18 s at 9,216). Routing put
+`vision_release_measure` at **0.84** (confidence 0.80), "measure at `-O` before opening the
+composer" at **0.98**, and "the app's untimed glue is a real risk" at 0.81.
+
+### What changed
+
+Test-only. Production code is untouched, so every number below is the code that shipped in
+`#36` — just compiled the way a release build compiles it.
+
+- **The `-O` run is the app's own build**, not a mirror: `build-for-testing` with
+  `SWIFT_OPTIMIZATION_LEVEL=-O` into a SEPARATE derived data directory
+  (`-derivedDataPath /tmp/dd_dsv41_opt`), so the Debug products other runs depend on are left
+  alone. It produced a single 127 MB `DynaMoE` binary instead of the Debug configuration's
+  59 KB launcher plus 154 MB `DynaMoE.debug.dylib`, and a 19.0 MB `DynaMoETests` bundle against
+  Debug's 23.0 MB. That the flag took effect is not inferred from the size: the same test that
+  took 126.57 s takes 63.24 s.
+- **`testAnImageEntersAPublishedTurn` grew an opt-in tail** gated on
+  `/tmp/dynamoe_dsv41_vision_max`, because the quadratic term makes the big grids a
+  many-minute measurement at `-Onone`. It measures the largest image the checkpoint accepts
+  **through `fit`** (a 20,000 pixel square collapses onto the token budget) rather than
+  hard-coding a grid, so the measurement cannot drift from what an oversized real image would
+  become; it re-times the 4-token encode to get the fixed cost with the page cache warm; it
+  times a middle grid; and it solves `seconds = fixed + perToken * tokens + squared * tokens^2`
+  through the three points by Cramer's rule (`costModel(tokens:seconds:)`), returning nil rather
+  than inventing a split when the points cannot separate the growth terms.
+- The three small grids (`2x2`, `4x4`, `39x39`) still run on every invocation, so the `#36`
+  series stays comparable line for line.
+
+### Evidence at real weights
+
+Published checkpoint, `-O` build, `/tmp/slice37_o2.log`:
+
+```
+🔎 [dsv41 real] image prompt: 12 tokens, image id 129264
+🔎 [dsv41 real] vision weights: 266 tensors
+🔎 [dsv41 real] tower: 4 patch tokens in 0.24 s, 16 in 0.24 s, 1521 in 2.74 s; span 4 rows for the 2x2 grid, prompt 12 -> 15 tokens
+🔎 [dsv41 real] tower warm: a repeated 4-token call in 0.22 s (the first call pays the cold read, so this is the fixed cost)
+🔎 [dsv41 real] tower cap: 8649 patch tokens (93x93) -> 31x31 aligner grid, 994 span positions in 41.71 s (15.2x the smallest image, 4.82 ms per patch token)
+🔎 [dsv41 real] tower cost model: 0.22 s fixed + 1.126 ms per token + 4.245e-07 s per token^2; at 8649 tokens the quadratic term is 76% of the 41.71 s (mid grid 63x63 = 3969 tokens in 11.38 s)
+🔎 [dsv41 real] image turn: lengthCapped after 2 token(s), prompt 15, reused 0, prefill 2.15 s
+🔎 [dsv41 real] image turn text: This picture
+Test Case '...testAnImageEntersAPublishedTurn' passed (63.240 seconds)
+```
+
+| patch tokens | aligner grid | span positions | `#36` `-Onone` | `#37` `-O` |
+|---|---|---|---|---|
+| 4 (2×2) | 1×1 | 4 | 25.35 s | 0.24 s |
+| 16 (4×4) | 2×2 | 8 | 25.60 s | 0.24 s |
+| 1,521 (39×39) | 13×13 | 184 | 68.06 s | **2.74 s** |
+| 3,969 (63×63) | 21×21 | 464 | not measured | 11.38 s |
+| 8,649 (93×93) | 31×31 | 994 | not measured | **41.71 s** |
+
+The smallest image the checkpoint accepts is **24.8x** faster than the number `#36` published,
+and the whole test — three small towers, the warm repeat, the middle grid, the largest grid and
+a real image turn with 2 decoded tokens — goes 126.57 s → **63.24 s**.
+
+A second clean run reproduces every point: 2.75 s smallest, 0.22 s warm, 11.43 s middle,
+41.51 s largest, 2.14 s prefill, 62.71 s wall clock, and a model of
+`0.22 s + 1.170 ms/token + 4.167e-07 s/token^2` with the quadratic term at 75%. The spread is
+1% on the cache-warm points. A third run, taken while the same machine was busy with another
+process, read 3.82 s and 43.71 s — **+39% on the smallest image and +5% on the largest** — so
+the numbers quoted above are the quiet pair, and `-O` does not make the measurement immune to
+contention, only much faster than it. The image turn's own
+prefill (2.15 s against Debug's 2.53 s) is the backbone's Metal path and barely moves, which is
+the expected shape: `-O` cannot improve GPU dispatches.
+
+### The cost model, and three checks that it is not curve fitting
+
+`0.22 s fixed + 1.126 ms per token + 4.245e-07 s per token^2` is solved exactly through the
+4-token, 3,969-token and 8,649-token points, so it reproduces those three by construction. The
+checks are the parts it does NOT fit:
+
+1. **The fixed term is independently measured.** It comes out at 0.22 s, and the repeated
+   4-token encode — a separate call, timed for exactly this reason — is 0.22 s. It is the
+   tower's 970 MB of weights being `pread` once per encode (4.4 GB/s), not the widen, which
+   `#36` measured at 0.03 s when compiled.
+2. **An unused point agrees.** 1,521 tokens is not one of the three fit points; the model
+   predicts 0.22 + 1.71 + 0.98 = 2.91 s against 2.74 s measured, 6% high.
+3. **The quadratic term matches `#36`'s mirror.** The model attributes 0.98 s of the 1,521-token
+   encode to the `t^2` term, and the standalone mirror measured attention GEMMs at 0.49 s plus
+   softmax at 0.53 s, i.e. 1.02 s — 4% apart, from two completely different code paths.
+
+So the tower is three things at real weights: a 0.22 s weight read, 1.126 ms per patch token
+(35 µs/token/layer across 32 layers) of linear GEMM, norm and glue work, and attention plus
+softmax growing with the square of the token count.
+
+### What it means
+
+**The composer is now a measured decision, not an estimate.** The smallest accepted image is
+2.74 s of tower plus 2.15 s of prefill — about 5 s to the first token — and the largest
+admissible one is 41.71 s plus its prefill, about 45 s. That is a 15x range across legal
+images, so the composer should price an attachment from `DeepSeekV41Runtime.imageSpanPlan`
+before encoding it and say what it will cost, rather than discovering it afterwards.
+
+**`vision_device` now has a number instead of an adjective.** Its prize is the `t^2` term:
+31.75 s of a 41.71 s cap image, 0.98 s of a 2.74 s floor image. It does not touch the 0.22 s
+read and does not touch the 9.7 s linear term (unless the weights are also bound instead of
+`pread`). So the device tower is worth ~76% of a large image and ~36% of the smallest — a real
+prize for a big picture, a small one for a thumbnail. That is the honest ranking, and it keeps
+`vision_device` an optimisation rather than a prerequisite.
+
+**An image is encoded per ATTACHMENT, not per turn, and nothing caches that yet.** Every
+`imageSpan` call re-reads the 970 MB and re-runs the tower, and an image prompt never resumes a
+prefix, so a conversation that keeps a picture in context re-prefills every turn. The composer
+slice should cache the span by `ImageAttachmentRef`; nothing in the current code does.
+
+**Pinning the widened weights is still not justified**: 1.9 GB of `Float` buys 0.03 s, and the
+0.22 s fixed term is the read, which pinning would remove. That trade is 1.9 GB of resident
+memory for 0.22 s per image; worth revisiting only if the tower ever runs per turn.
+
+### What it does not mean
+
+- **`-O` here is the Debug configuration compiled with `SWIFT_OPTIMIZATION_LEVEL=-O`**, which is
+  the same sources and the same optimizer as a Release build of these paths. No Release build of
+  the app was archived or notarized, and the shipped Release configuration was not run.
+- **Nothing was opened.** `supportsVision` is still false, the composer still refuses
+  attachments, and no chat or API request can carry an image.
+- **8,649 patch tokens is the largest a SQUARE image becomes.** A non-square image gets a
+  smaller `columns * (rows + 1) + 2`, so it is the worst case, not the only case.
+- **What a developer runs from Xcode still costs 68 s**, because Debug is `-Onone`. Both numbers
+  are real; they belong to different builds.
+- The `-Onone` gate on the marker is load-bearing: at `-Onone` the largest grid would be tens of
+  minutes of interpreter overhead and would say nothing about the tower.
+
+### Verification
+
+The full DeepSeek suite is **556 tests, 0 failures, 41 skipped** on the Debug build, and 0 Metal
+validation errors under `MTL_DEBUG_LAYER` (`dsv41_validation43.xctestrun`). The vision suites
+(`DeepSeekV41VisionForwardTests`, `DeepSeekV41VisionWeightDecodeTests`,
+`DeepSeekV41VisionGoldenTests`, 25 tests) also pass in the `-O` build, which is the non-obvious
+one: `-O` must not move the GEMM parity bars, and it does not. Production code was not touched
+in this slice, so those bars are `#36`'s.
+
