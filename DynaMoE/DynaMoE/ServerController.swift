@@ -1058,19 +1058,17 @@ final class ServerController: ObservableObject {
             thinkingEnabled: thinkingEnabled,
             levelCapable: info.supportsThinkingLevels
         )
-        // The digest must cover the system text the model actually sees,
-        // including Spark's effort line: changing the level between turns has
-        // to invalidate a recorded raw turn, just as changing the system does.
-        let memorySystem: String
-        if engine.promptModelConfig?.isSparkModel == true {
-            memorySystem = ChatPromptFormatter.sparkSystemBody(
-                cleanSystem: cleanSystem,
-                thinkingEnabled: thinkingEnabled,
-                thinkingEffort: thinkingEffort
-            )
-        } else {
-            memorySystem = cleanSystem
-        }
+        // The digest must cover the system text the model actually sees: changing
+        // the level between turns has to invalidate a recorded raw turn, just as
+        // changing the system does. Both graded-effort families render the level
+        // into the System block, so `renderedSystemBody` is the authority here.
+        let memorySystem = ChatPromptFormatter.renderedSystemBody(
+            cleanSystem: cleanSystem,
+            thinkingEnabled: thinkingEnabled,
+            thinkingEffort: thinkingEffort,
+            modelConfig: engine.promptModelConfig,
+            promptDialect: engine.promptDialect
+        )
         // What a follow-up request has to reproduce before its own raw turn can
         // be trusted: the leading history as the client sent it, plus the system
         // prompt it was rendered against. Computed before substitution so both

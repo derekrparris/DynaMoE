@@ -403,10 +403,13 @@ final class DeepSeekV41ConfigTests: XCTestCase {
         XCTAssertEqual(qwen.resolveArchitectureType(summary: nil), .hybridSsmMoe)
     }
 
-    /// Until the turn loop exists, the family is detected (so the load refuses
-    /// clearly) but discovery must not advertise graded effort.
-    func testGradedEffortIsNotAdvertisedWhileTheRuntimeIsUnavailable() throws {
-        XCTAssertFalse(DeepSeekV41Availability.isRuntimeAvailable)
+    /// The family is advertised as available for text turns, and the graded
+    /// effort control that gates on that availability reaches the prompt. Vision
+    /// is deliberately outside the promise: local models report
+    /// `supportsVision == false`, so the composer refuses an attachment rather
+    /// than sending pixels a turn would drop.
+    func testTheRuntimeAdvertisesTextTurnsAndTheirEffortLevels() throws {
+        XCTAssertTrue(DeepSeekV41Availability.isRuntimeAvailable)
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("dsv41-effort-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -414,7 +417,16 @@ final class DeepSeekV41ConfigTests: XCTestCase {
         try Self.wrapperJSON.write(
             to: dir.appendingPathComponent("config.json"), atomically: true, encoding: .utf8
         )
-        XCTAssertFalse(ModelConfig.supportsThinkingLevels(modelPath: dir.path))
+        XCTAssertTrue(ModelConfig.supportsThinkingLevels(modelPath: dir.path))
+
+        // Level detection still has to be a gate: a directory that is neither
+        // DeepSeek V4.1 nor a Spark template keeps the plain on/off menu.
+        let other = dir.appendingPathComponent("other")
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        try #"{"model_type":"llama"}"#.write(
+            to: other.appendingPathComponent("config.json"), atomically: true, encoding: .utf8
+        )
+        XCTAssertFalse(ModelConfig.supportsThinkingLevels(modelPath: other.path))
     }
 }
 

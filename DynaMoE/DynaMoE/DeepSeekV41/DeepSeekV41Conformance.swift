@@ -25,11 +25,26 @@
 
 import Foundation
 
-/// Whether the family can serve a turn yet. Detection and the clear refusal stay
-/// on unconditionally; discovery and the graded-effort UI read this so a user is
-/// not invited to download a ~510 GB checkpoint that can only fail closed.
+/// Whether the family can serve a turn, which it can: a rendered prompt goes
+/// through `DeepSeekV41TurnRunner` on the published checkpoint, and every numeric
+/// rule in the graph it runs has a reference (see `DeepSeekV41Conformance`).
+/// Discovery reads this to omit an "unavailable" caveat from the model row, and
+/// `ModelConfig.supportsThinkingLevels` reads it because the dialect renders the
+/// checkpoint's own `Reasoning Effort:` line.
+///
+/// What it advertises is deliberately TEXT turns. The vision tower is a CPU
+/// reference with no device path and no image rows are fed into a turn; local
+/// models report `supportsVision == false`, so the composer refuses an attachment
+/// instead of dropping pixels. DSpark is not wired either: `#26` measured the
+/// speculative round losing to walking at every width, so it is an optimization
+/// this flag does not promise, and cache rewind for a rejected suffix is unbuilt.
+///
+/// The value is a constant rather than derived from `unverifiedSummary`: a gate
+/// records how far to trust a number, and one open rule for a stage the text path
+/// never runs must not disable a text turn that works. It is also not a download
+/// gate; discovery lists whatever is in the hub cache either way.
 nonisolated public enum DeepSeekV41Availability {
-    public static let isRuntimeAvailable = false
+    public static let isRuntimeAvailable = true
 }
 
 nonisolated public enum DeepSeekV41Conformance {

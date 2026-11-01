@@ -6674,5 +6674,73 @@ hold, and the two pieces a verify still needs are cache rewind for a rejected su
 accept/emit loop itself. The per-position logits are now the easy half; rewind (ring
 position, `tokenHistory`, `deadTokens` and the compressor group phase together) remains
 deliberately unbuilt because it buys a feature that loses to walking at every width measured.
-`DeepSeekV41Availability.isRuntimeAvailable` is also still false, and that is a separate
-question about what the flag promises, not about the graph.
+`DeepSeekV41Availability.isRuntimeAvailable` was also still false here, and that was a
+separate question about what the flag promises, not about the graph. **Updated in `#34`:**
+it is now true, with the promise scoped to text turns (see below).
+
+## DSV4.1 #34: THE FLAG NOW SAYS TEXT TURNS, AND THE EFFORT CONTROL IT SWITCHES ON REACHES THE PROMPT
+
+### The question
+
+`DeepSeekV41Availability.isRuntimeAvailable` had been `false` since the family was first
+detected. Its comment said the flag existed so "a user is not invited to download a ~510 GB
+checkpoint that can only fail closed" — a premise `#33` retired: every conformance gate is
+verified, `DeepSeekV41TurnRunner` runs the published checkpoint, and a real prompt answers.
+So the question was not "can it run" but "what does advertising it promise?".
+
+### What changed
+
+- `isRuntimeAvailable` is `true`, and its doc states the promise as TEXT turns and names what
+  is outside it: the vision tower has no device path, DSpark is unwired, cache rewind is
+  unbuilt, and the composer still refuses images because no local model advertises vision.
+  It stays a constant rather than being derived from `unverifiedSummary`: a gate records how
+  far to trust a number, and one open rule for a stage the text path never runs must not
+  disable a working text turn. It is also not a download gate; discovery lists the hub cache
+  either way.
+- The model row's `, runtime not available` caveat is now gated off by the flag (the string
+  stays for a future regression).
+- `ModelConfig.supportsThinkingLevels` detects DeepSeek V4.1 from the checkpoint identity
+  while the runtime is advertised, because its formatter renders the family's own
+  `Reasoning Effort:` line. That switches on the High/Low/Off menu Spark already had; every
+  prompt path (chat, agent continuation, both API adapters) was already threading the level
+  into the dialect.
+- The server's turn-memory digest now covers the rendered system block for V4.1 too.
+  `ChatPromptFormatter.renderedSystemBody` is the single authority for "the system text the
+  model saw" (Spark's body is unchanged by the extraction), so switching High to Low
+  invalidates a recorded raw turn instead of trusting one generated under a different system
+  prompt.
+- The DSV4.1 load log gains a `runtime: text turns (...)` line, so the promise is visible at
+  the same place the checkpoint's plan is printed.
+
+### Evidence at real weights
+
+`testAPublishedPromptCompletesATurn` now runs both shapes on one runtime: the thinking-off
+prompt it always ran, and the app's default (thinking on, effort high), whose 31-token prompt
+carries the effort instruction and opens the reasoning channel.
+
+```
+turn 1 (thinking off): lengthCapped after 8 token(s), prefill 1.85 s, decode 2.13 s
+  text: "Hey! How's it going? What"
+thinking turn (effort 100): lengthCapped after 7 token(s), prefill 9.27 s, decode 2.09 s
+  text: "The user just said \"hey\"."
+```
+
+The second turn is a fresh prefill because the effort line changes the prompt's first
+tokens; the generated text is the reasoning channel's own opening, which is what the
+checkpoint's encoder asks a thinking turn to produce. Its 9.27 s against the first prompt's
+1.85 s is not the flag's cost: the prompt is 31 tokens instead of 5 and starts over at
+position 0.
+
+Pure logic pins the wiring: `testTheRuntimeAdvertisesTextTurnsAndTheirEffortLevels` (flag
+true, the published config advertises levels, a plain `llama` config still does not),
+`ModelConfigThinkingLevelTests.testDeepSeekV41IsDetectedWithoutATemplateKnob`, and
+`ChatPromptFormatterConversationTests.testRenderedSystemBodyCarriesTheGradedEffortLevel`
+(High and Low differ, thinking off emits nothing, the block is a substring of the actually
+rendered prompt, and Spark's block is byte-identical to `sparkSystemBody`).
+
+### What it does not mean
+
+Vision is still CPU-reference only: no device tower, no image span reaches a turn, and the
+composer refuses attachments for every local model. DSpark is still unwired, still a
+measured loss at every width (`#26`), and cache rewind is still unbuilt. The flag advertises
+the text path that exists, not every head the checkpoint publishes.

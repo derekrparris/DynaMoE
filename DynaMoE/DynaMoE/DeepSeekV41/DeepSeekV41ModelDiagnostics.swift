@@ -131,6 +131,13 @@ public enum DeepSeekV41LoadDiagnostics {
             lines.append("vision: no tower (text-only checkpoint)")
         }
 
+        // What the app will run, as opposed to what the checkpoint publishes. The
+        // two differ: the vision tower has a CPU reference and no device path, and
+        // DSpark is planned but not wired into the turn loop.
+        lines.append(
+            "runtime: text turns (vision and DSpark are not wired; images are refused)"
+        )
+
         for warning in config.warnings(layerPlan: plan) {
             lines.append("note: \(warning)")
         }

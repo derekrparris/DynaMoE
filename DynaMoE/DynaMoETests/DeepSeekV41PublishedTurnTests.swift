@@ -3,8 +3,10 @@
 //  DynaMoETests
 //
 //  The one test that runs the published checkpoint end to end: load the 48 shards,
-//  prefill a rendered prompt, draw tokens from the logits the device produced, and
-//  continue from the sequence the first turn left resident.
+//  prefill rendered prompts, and draw tokens from the logits the device produced.
+//  It runs two shapes — the thinking-off prompt, and the app's default (thinking on
+//  with the high level, which puts the checkpoint's own `Reasoning Effort:` line in
+//  the System block and opens the reasoning channel).
 //
 //  Everything else in the DeepSeek suite either runs on a synthetic checkpoint or
 //  stops at the engine's doorstep. That is deliberate for the default suite, but it
@@ -15,10 +17,10 @@
 //  sized from a config field a fixture leaves at zero), and they surface here.
 //
 //  It is opt-in because it reads a few hundred gigabytes: a first turn pulls every
-//  routed expert it needs from NVMe, and the second one exercises `resume` rather
-//  than paying for a second full prefill. `xcodebuild` does not forward the
-//  invoking shell's environment into an app-hosted test, so the switch is a marker
-//  file as well as an environment variable. Run it with
+//  routed expert it needs from NVMe, and the second prompt differs at its first
+//  tokens so it pays another prefill rather than exercising `resume`. `xcodebuild`
+//  does not forward the invoking shell's environment into an app-hosted test, so the
+//  switch is a marker file as well as an environment variable. Run it with
 //
 //      touch /tmp/dynamoe_dsv41_real_turn
 //      xcodebuild test-without-building ... \
@@ -2110,7 +2112,26 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         )
         XCTAssertFalse(promptIds.isEmpty, "the rendered prompt tokenized to nothing")
 
-        let contextLength = promptIds.count + firstTurnTokens
+        // The app's DEFAULT shape is thinking on with the high level, and that is
+        // the shape the availability flag now advertises: the checkpoint's own
+        // `Reasoning Effort:` line opens the System block and the reasoning
+        // channel. It differs from the first prompt at the very first tokens, so
+        // the second turn is a fresh prefill rather than a reused one.
+        let thinkingPrompt = dialect.render(
+            turns: [.init(isUser: true, text: userText)],
+            cleanSystem: "",
+            thinkingEnabled: true,
+            effort: .high
+        )
+        XCTAssertTrue(
+            thinkingPrompt.contains(DeepSeekV41PromptDialect.effortInstruction(budget: 100)),
+            "the default thinking-on prompt must carry the effort line"
+        )
+        let thinkingIds = try tokenizer.encode(text: thinkingPrompt)
+        XCTAssertFalse(thinkingIds.isEmpty, "the thinking-on prompt tokenized to nothing")
+        print("🔎 [dsv41 real] thinking prompt: \(thinkingIds.count) tokens")
+
+        let contextLength = max(promptIds.count, thinkingIds.count) + firstTurnTokens
         // The zero-copy buffers point into this engine's mappings, so the engine has
         // to outlive every read they serve. The app keeps it for the load's lifetime;
         // a local here would unmap the weights as soon as the helper returned.
@@ -2176,6 +2197,33 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         XCTAssertGreaterThan(
             first.tokensGenerated, 0,
             "the published checkpoint produced no token at all (text \(first.text.debugDescription))"
+        )
+
+        // Turn 2: the app's default shape (thinking on, high effort). The effort
+        // line is the control the availability flag switches on, so the real
+        // weights have to see it and still answer.
+        let thinkingTurn = try await Task.detached { [runtime, thinkingIds] in
+            try DeepSeekV41TurnRunner.run(
+                forward: runtime.forward(),
+                promptTokenIds: thinkingIds,
+                settings: settings,
+                sample: { logits, _ in Self.argmax(logits) },
+                decode: { (try? tokenizer.decode(ids: $0)) ?? "" }
+            )
+        }.value
+        print(
+            "🔎 [dsv41 real] thinking turn: \(thinkingTurn.finishReason) after "
+                + "\(thinkingTurn.tokensGenerated) token(s), "
+                + String(
+                    format: "prefill %.2f s, decode %.2f s",
+                    thinkingTurn.prefillSeconds, thinkingTurn.decodeSeconds
+                )
+        )
+        print("🔎 [dsv41 real] thinking text: \(thinkingTurn.text.debugDescription)")
+        print("🔎 [dsv41 real] thinking ids: \(thinkingTurn.generatedTokenIds)")
+        XCTAssertGreaterThan(
+            thinkingTurn.tokensGenerated, 0,
+            "the effort-line prompt produced no token (text \(thinkingTurn.text.debugDescription))"
         )
 
         print(

@@ -1033,12 +1033,16 @@ public struct ModelConfig: Codable {
     }
 
     /// Whether a model exposes graded thinking levels on top of the on/off
-    /// switch. Only the Spark family's `reasoning_effort` dialect is
-    /// implemented, so detection requires a Spark `config.json` plus a chat
-    /// template that mentions `reasoning_effort`. `chat_template.jinja` is the
-    /// authoritative template when present; otherwise the copy embedded in
-    /// `tokenizer_config.json` is inspected. Results are memoized per path
-    /// because callers evaluate this while rendering.
+    /// switch. Two dialects are implemented: DeepSeek V4.1 renders the
+    /// checkpoint's own `Reasoning Effort:` line, and Spark exposes a
+    /// `reasoning_effort` template knob. Spark detection requires its
+    /// `config.json` plus a chat template that mentions `reasoning_effort`
+    /// (`chat_template.jinja` is the authoritative template when present;
+    /// otherwise the copy embedded in `tokenizer_config.json` is inspected),
+    /// while DeepSeek V4.1 detection requires the family identity AND the
+    /// advertised runtime, because the level menu is only honest while a text
+    /// turn can actually run. Results are memoized per path because callers
+    /// evaluate this while rendering.
     nonisolated public static func supportsThinkingLevels(modelPath: String?) -> Bool {
         guard let path = modelPath, !path.isEmpty else { return false }
         let key = path as NSString

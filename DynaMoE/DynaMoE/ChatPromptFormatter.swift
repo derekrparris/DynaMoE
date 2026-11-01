@@ -164,6 +164,37 @@ public enum ChatPromptFormatter {
         return base + "\n\n" + cleanSystem
     }
 
+    /// The System block a family renders, i.e. what a digest over "the system
+    /// prompt the model saw" has to cover. Both dialects with a graded effort
+    /// level put it inside that block (Spark appends `thinking_effort`, DeepSeek
+    /// V4.1 prefixes its `Reasoning Effort:` line), so a level change has to
+    /// change this string; otherwise a recorded raw turn stays trusted under a
+    /// system prompt it was never generated with. A family with no graded level
+    /// contributes the caller's text unchanged.
+    public static func renderedSystemBody(
+        cleanSystem: String,
+        thinkingEnabled: Bool,
+        thinkingEffort: ThinkingEffort?,
+        modelConfig: ModelConfig?,
+        promptDialect: DeepSeekV41PromptDialect = DeepSeekV41PromptDialect()
+    ) -> String {
+        if modelConfig?.isSparkModel == true {
+            return sparkSystemBody(
+                cleanSystem: cleanSystem,
+                thinkingEnabled: thinkingEnabled,
+                thinkingEffort: thinkingEffort
+            )
+        }
+        if modelConfig?.isDeepSeekV41Model == true {
+            return promptDialect.systemBody(
+                cleanSystem: cleanSystem,
+                thinkingEnabled: thinkingEnabled,
+                effort: thinkingEffort
+            )
+        }
+        return cleanSystem
+    }
+
     /// Gemma 4's native reasoning channel markers. The model opens the channel
     /// itself after `<|turn>model` when thinking is on, so a completed turn's
     /// echoed reasoning must be re-wrapped in them: the canonical
