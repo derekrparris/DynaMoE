@@ -765,6 +765,66 @@ nonisolated public struct DeepSeekV41IndexSelectionRecord: Sendable {
     }
 }
 
+// MARK: - Indexer input probe
+
+/// Asks the executor to keep what one index-source layer's indexer was given.
+///
+/// `Indexer.forward` derives its key cache from one pooled latent per compressed
+/// row, so a parity harness cannot reconstruct the layer from the query side alone:
+/// the latents are the input. `latents` is a caller-provided buffer of
+/// `contextLength * cacheRecordWidth` floats, one row per position, written as each
+/// group completes; the query-side vectors come back in `indexerInputDump`.
+nonisolated public struct DeepSeekV41IndexerInputRequest: Sendable {
+    /// The layer whose pooled latent is kept. It must be a compressed-KV owner,
+    /// because only that layer runs the compressor and the index-key write.
+    public var layer: Int
+    /// The position whose `x` and `qr` are kept, and whose scores are dumped.
+    public var position: Int
+    /// One `cacheRecordWidth`-wide latent per position, `0 ..< contextLength`.
+    public var latents: MTLBuffer
+
+    public init(layer: Int, position: Int, latents: MTLBuffer) {
+        self.layer = layer
+        self.position = position
+        self.latents = latents
+    }
+}
+
+/// What the indexer was given at one position, plus the scores it produced.
+///
+/// `input` and `queryInput` are the two vectors the reference projects itself:
+/// `weights_proj` reads the NORMED layer input and `wq_b` reads the rank-normed
+/// query, so dumping those rather than the projected heads is what lets the
+/// reference's own `wq_b` / `weights_proj` run on the checkpoint's tensors.
+nonisolated public struct DeepSeekV41IndexerInputDump: Sendable {
+    public var layer: Int
+    public var position: Int
+    /// The normed layer input at `position`, `hidden` wide.
+    public var input: [Float]
+    /// The rank-normed query at `position`, `q_lora_rank` wide.
+    public var queryInput: [Float]
+    /// One score per produced compressed row.
+    public var scores: [Float]
+    /// The rows the port selected, ascending.
+    public var selected: [Int]
+
+    public init(
+        layer: Int,
+        position: Int,
+        input: [Float],
+        queryInput: [Float],
+        scores: [Float],
+        selected: [Int]
+    ) {
+        self.layer = layer
+        self.position = position
+        self.input = input
+        self.queryInput = queryInput
+        self.scores = scores
+        self.selected = selected
+    }
+}
+
 /// Where a block's per-layer time goes, in nanoseconds.
 ///
 /// Three buckets rather than a profiler because the question is narrow: after the
@@ -1047,6 +1107,12 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// "#29", which is the published-checkpoint run this readback exists for).
     public var recordsIndexSelections = false
     public private(set) var indexSelectionRecords: [DeepSeekV41IndexSelectionRecord] = []
+
+    /// Opt-in dump of one layer's indexer inputs, so `Tools/dsv41_goldens.py` can
+    /// run the reference's own `Indexer.forward` on what the port actually fed it.
+    /// Nil in every production path.
+    public var indexerInputRequest: DeepSeekV41IndexerInputRequest?
+    public private(set) var indexerInputDump: DeepSeekV41IndexerInputDump?
 
     /// Where a block's per-layer time goes, accumulated while `recordsBlockTiming`
     /// is on. Off in every production path.
@@ -1568,6 +1634,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         indexSelectionsByPosition.removeAll(keepingCapacity: true)
         indexMasksByPosition.removeAll(keepingCapacity: true)
         indexSelectionRecords.removeAll(keepingCapacity: true)
+        // The REQUEST survives a reset: it is the caller's declaration of what to
+        // capture, and the harness sets it once before prefilling.
+        indexerInputDump = nil
         tokenHistory.removeAll(keepingCapacity: true)
         deadTokens.removeAll(keepingCapacity: true)
         pendingDead = false
@@ -3472,6 +3541,23 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         try encodeIndexKey(
             layer: layer, row: rows - 1, position: max(0, rows - 1) * ratio, encoder: encoder
         )
+        // The probe's row is the un-rotated, normed latent — exactly what
+        // `Indexer.forward` is handed — so it is copied here rather than after the
+        // rope, and at the FIRST position of the group because that is the position
+        // the reference attributes the latent to.
+        let latentRow = max(0, rows - 1) * ratio
+        if let request = indexerInputRequest, request.layer == layer.index {
+            let latentRows = request.latents.length / (width * MemoryLayout<Float>.stride)
+            if latentRow < latentRows {
+                try encodeCopy(
+                    encoder,
+                    from: workspace.pooled,
+                    to: request.latents,
+                    count: width,
+                    destinationByteOffset: latentRow * width * MemoryLayout<Float>.stride
+                )
+            }
+        }
         try encodeRope(
             encoder,
             vector: workspace.pooled,
@@ -3743,6 +3829,37 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                         selected: indexSelectionsByPosition[position] ?? [],
                         scores: scores
                     )
+                )
+            }
+            if let request = indexerInputRequest, request.layer == layer.index,
+               request.position == position {
+                // The two query-side inputs, read from the slot this position still
+                // occupies: `wq_b` reads the rank-normed query when the layer has a
+                // down projection and the normed hidden otherwise, which is the same
+                // choice `encodeIndexerStage` makes.
+                let hasDown = config.qLoraRank > 0
+                    && weights.tensor(.attnWqA, layer: layer.index) != nil
+                let inputFloats = hasDown ? max(1, config.qLoraRank) : shapes.hidden
+                let inputBuffer = hasDown ? workspace.reduced : workspace.normed
+                let inputBase = workspace.slotOffset(slot, width: inputFloats)
+                    / MemoryLayout<Float>.stride
+                let inputPointer = inputBuffer.contents()
+                    .assumingMemoryBound(to: Float.self)
+                let normedBase = workspace.slotOffset(slot, width: shapes.hidden)
+                    / MemoryLayout<Float>.stride
+                let normedPointer = workspace.normed.contents()
+                    .assumingMemoryBound(to: Float.self)
+                indexerInputDump = DeepSeekV41IndexerInputDump(
+                    layer: layer.index,
+                    position: position,
+                    input: Array(
+                        UnsafeBufferPointer(start: normedPointer + normedBase, count: shapes.hidden)
+                    ),
+                    queryInput: Array(
+                        UnsafeBufferPointer(start: inputPointer + inputBase, count: inputFloats)
+                    ),
+                    scores: scores,
+                    selected: indexSelectionsByPosition[position] ?? []
                 )
             }
         }

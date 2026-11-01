@@ -141,10 +141,24 @@ nonisolated public enum DeepSeekV41Conformance {
     /// checkpoint `index_topk` is 512 and the twenty ratio-1 layers read one
     /// compressed row per token, so the two disagreed from position 513 on.
     ///
-    /// What it does NOT cover: the FP4 activation quantization of the indexer's query
-    /// and keys, which the dense path skips everywhere else too, and the order among
-    /// exactly equal scores — a row every head votes against scores zero, and the
-    /// port breaks that tie to the lower row index.
+    /// VERIFIED AT THE PUBLISHED GEOMETRY, on the checkpoint's own tensors: a real
+    /// 576-position prefill of layer 20 is dumped through
+    /// `DeepSeekV41MetalForward.indexerInputRequest` and
+    /// `Tools/dsv41_goldens.py indexer_real` runs `Indexer.forward` on those exact
+    /// activations with the real `wq_b` / `weights_proj` / `wk` / `k_norm`. The
+    /// port's 576 scores differ from the reference's by at most 2.4e-6 in absolute
+    /// terms -- float summation order, since the scale is folded into the weights in
+    /// one and onto each term in the other -- and the 512 selected rows are
+    /// identical.
+    ///
+    /// What it does NOT cover, now measured rather than assumed: the FP4 activation
+    /// quantization of the indexer's query and keys, which the dense path skips
+    /// everywhere else too. Emulating the reference's own `fp4_act_quant` (E2M1, one
+    /// power-of-two E8M0 scale per 32-value block) moves 3 to 5 of the 512 selected
+    /// rows at that position and no others, so the deviation is real and bounded. The
+    /// order among exactly equal scores is also unspecified: a row every head votes
+    /// against scores zero, and the port breaks that tie to the lower row index
+    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #30").
     public static let candidateSelection: Gate = .verifiedAgainstReference
 
     /// How retrieved Engram rows are combined into the layer's residual.

@@ -748,6 +748,103 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
+    /// Dumps what one index-source layer's indexer was given, for the reference to re-run.
+    ///
+    /// `DeepSeekV41IndexerGoldenTests` pins `Indexer.forward` at a six-wide config,
+    /// which is enough to pin the RULE and nothing about the regime the checkpoint
+    /// runs in: 32 heads of 128, a 512-row budget, real activations. The reference
+    /// needs three vectors per position that no config can reconstruct -- the pooled
+    /// compressed latent `wk` reads, the normed layer input `weights_proj` reads, and
+    /// the rank-normed query `wq_b` reads -- so this writes them out and
+    /// `Tools/dsv41_goldens.py indexer_real` runs the checkpoint's own `Indexer` on
+    /// them. The comparison is offline on purpose: a live run's activations are its
+    /// own, and only the SAME activations can be scored both ways.
+    ///
+    /// Writes `/tmp/dsv41_indexer_inputs.json`; `DSV41_INDEXER_INPUT_DUMP` overrides
+    /// the path. The 576-position prefill is the cost, which is why this stays in the
+    /// opt-in file.
+    func testWhatTheIndexerWasGivenOnThePublishedCheckpoint() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let plan = try config.makeLayerPlan()
+        guard let source = plan.first(where: {
+            $0.ownsCompressedIndex && $0.ownsCompressedKV && $0.compressRatio == 1
+        }) else {
+            throw XCTSkip("no ratio-1 index source owns both its keys and its latent")
+        }
+        let positionCount = max(1, min(config.indexTopK + 64, 576))
+        let probePosition = positionCount - 1
+        let tokens = Self.probeTokens(count: positionCount)
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: positionCount,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+
+        let latentWidth = config.cacheRecordWidth
+        guard let latents = runtime.device.makeBuffer(
+            length: positionCount * latentWidth * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ) else {
+            return XCTFail("the latent dump buffer could not be allocated")
+        }
+        let dump = try await Task.detached { [runtime, tokens, latents] () -> (
+            DeepSeekV41IndexerInputDump?, [Float]
+        ) in
+            let executor = runtime.forward()
+            executor.reset()
+            executor.indexerInputRequest = DeepSeekV41IndexerInputRequest(
+                layer: source.index, position: tokens.count - 1, latents: latents
+            )
+            _ = try executor.prefillChunk(tokens)
+            let pointer = latents.contents().assumingMemoryBound(to: Float.self)
+            let rows = Array(
+                UnsafeBufferPointer(
+                    start: pointer, count: tokens.count * latentWidth
+                )
+            )
+            return (executor.indexerInputDump, rows)
+        }.value
+        let record = try XCTUnwrap(dump.0, "the indexer input dump was never taken")
+        let latentRows = dump.1
+        XCTAssertEqual(record.layer, source.index)
+        XCTAssertEqual(record.position, probePosition)
+        XCTAssertEqual(latentRows.count, positionCount * latentWidth)
+
+        func column(_ values: [Float]) -> String {
+            values.map { String(format: "%.9g", $0) }.joined(separator: ",")
+        }
+        let body = """
+        {
+          "layer": \(record.layer),
+          "position": \(record.position),
+          "positions": \(positionCount),
+          "latent_width": \(latentWidth),
+          "hidden": \(record.input.count),
+          "query_width": \(record.queryInput.count),
+          "latents": [\(column(latentRows))],
+          "input": [\(column(record.input))],
+          "query_input": [\(column(record.queryInput))],
+          "scores": [\(column(record.scores))],
+          "selected": [\(record.selected.map(String.init).joined(separator: ","))]
+        }
+        """
+        let path = ProcessInfo.processInfo.environment["DSV41_INDEXER_INPUT_DUMP"]
+            ?? "/tmp/dsv41_indexer_inputs.json"
+        try body.write(toFile: path, atomically: true, encoding: .utf8)
+        print(
+            "🔎 [dsv41 real] indexer inputs: layer \(record.layer) position \(record.position), "
+                + "\(positionCount) latent(s) of \(latentWidth), \(record.scores.count) score(s), "
+                + "\(record.selected.count) selected -> \(path)"
+        )
+    }
+
     /// Layer 0 alone, at the published widths, against the NumPy reference.
     ///
     /// `Tools/dsv41_layer_reference.py` computes the same layer from the same shard
@@ -2312,5 +2409,71 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         XCTAssertEqual(resultIds.last, 128813)
         XCTAssertGreaterThan(resultIds.count, 2)
         withExtendedLifetime(engine) {}
+    }
+
+    /// Whether two prefills of one token stream agree on what the indexer scored.
+    ///
+    /// The same executor, reset, the same tokens, twice: 128 positions, and zero of
+    /// the 128 scores move. That is the invariant every other numeric claim on this
+    /// checkpoint rests on, and it holds here -- but NOT at 576 positions, where the
+    /// same test moves all 576 (worst |delta| 1.8e-3). The drift is a real defect and
+    /// not a float-order artefact: the first position whose pooled latent differs
+    /// differs by 0.49 on a 4.2 scale, and the whole suite becomes deterministic
+    /// again under Metal's debug layer with shader validation, which is the signature
+    /// of a read of memory nothing wrote. `Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #30",
+    /// carries the evidence and the validation recipe; the position count here is
+    /// deliberately the one that holds, so this stays a check rather than a red flag.
+    func testTwoPrefillsOfOneStreamAgreeOnTheIndexScores() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let positionCount = 128
+        let tokens = Self.probeTokens(count: positionCount)
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: positionCount,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+
+        let passes = try await Task.detached { [runtime, tokens] () -> [[Float]] in
+            let executor = runtime.forward()
+            executor.recordsIndexSelections = true
+            var out: [[Float]] = []
+            for _ in 0..<2 {
+                executor.reset()
+                _ = try executor.prefillChunk(tokens)
+                let deepest = executor.indexSelectionRecords
+                    .filter { $0.layer == 20 }
+                    .max { $0.position < $1.position }
+                out.append(deepest?.scores ?? [])
+            }
+            return out
+        }.value
+
+        let first = passes[0]
+        let second = passes[1]
+        print("🔎 [dsv41 real] determinism: \(first.count) vs \(second.count) score(s)")
+        XCTAssertEqual(first.count, second.count)
+        XCTAssertFalse(first.isEmpty, "no layer-20 selection was recorded")
+        guard first.count == second.count, !first.isEmpty else { return }
+        var differing = 0
+        var worst: Float = 0
+        var worstAt = 0
+        for (index, pair) in zip(first, second).enumerated() {
+            let delta = abs(pair.0 - pair.1)
+            if delta > 0 { differing += 1 }
+            if delta > worst { worst = delta; worstAt = index }
+        }
+        let scale = max(Float(1e-6), first.map(abs).max() ?? 1)
+        print(
+            "🔎 [dsv41 real] determinism: \(differing)/\(first.count) score(s) moved, "
+                + "worst |delta| \(worst) at row \(worstAt) against a max |score| \(scale)"
+        )
+        XCTAssertEqual(differing, 0, "two identical prefills disagree on the index scores")
     }
 }

@@ -6288,3 +6288,128 @@ equal scores still break to the lower row index where `torch.topk` is unspecifie
 (the real run has no ties to break), and `candidateSelection`'s golden vectors remain
 synthetic: this contribution is the rule and the cache it reads, not a comparison of
 the port's scores against the checkpoint's own `Indexer.forward` at real weights.
+
+## DSV4.1 #30: THE INDEXER'S SCORES ARE THE REFERENCE'S, AND TWO LONG PREFILLS DO NOT AGREE
+
+**Question.** `#29` proved the port now reads the rows its own scores rank first on the
+real checkpoint. It did not prove those scores are `Indexer.forward`'s: every vector
+behind the rule was generated at a six-wide config, where `index_topk` 3 over 8 rows
+makes the cut invisible, and `Indexer.forward`'s own FP4 activation quantization was
+never measured either. So: on the checkpoint's tensors and a real prefill's
+activations, does the port score what the reference scores -- and does the
+quantization the port skips change which rows it reads?
+
+**Answer: yes to the first (worst |delta| 2.4e-6 over 576 rows, the selected 512 rows
+identical), 3 of 512 rows to the second, and along the way the forward pass turned out
+not to be reproducible at 576 positions.**
+
+### The comparison
+
+`Indexer.forward` cannot be run end to end here: 475 GB does not fit, so the reference
+cannot produce `x`, `qr` or the pooled latents itself. It CAN be handed them.
+`DeepSeekV41MetalForward.indexerInputRequest` is an opt-in probe that copies one
+layer's pooled latent per position into a caller's buffer as each group completes, and
+`indexerInputDump` carries the two query-side vectors. `DeepSeekV41PublishedTurnTests`
+`testWhatTheIndexerWasGivenOnThePublishedCheckpoint` prefills 576 positions of the real
+checkpoint, dumps layer 20, and `Tools/dsv41_goldens.py indexer_real` reads the
+checkpoint's own `layers.20.attn.indexer.{wq_b, weights_proj, wk, k_norm}` out of the
+shards, dequantizes `wq_b`'s FP8/E8M0 32x32 blocks, and runs the reference's `Indexer`
+at the published geometry on those activations. Both sides then see the SAME numbers,
+which is the only way the difference between them can be the indexer's arithmetic.
+
+Two independent dumps were scored, because the forward is not reproducible (below),
+and the agreement is the same both times:
+
+| | dump A | dump B |
+|---|---|---|
+| layer / position | 20 / 575, of 576 prefilled | same |
+| produced rows | 576 | 576 |
+| worst absolute score delta | **2.380e-6** (row 385; reference -2.881097, port -2.881099) | **2.149e-6** |
+| rows differing by more than 1e-5 | **0** of 576 | **0** of 576 |
+| worst relative delta | 1.195e-4 | 1.264e-4, both at near-zero scores: a cancellation, not a mismatch |
+| selected rows | **512 vs 512, identical** | **512 vs 512, identical** |
+| port score range | -3.3318 .. 3.8019 | -3.3509 .. 3.7777 |
+| cut score (512th) | -2.2896 | -2.2631 |
+
+The remaining 2.4e-6 is the summation order: the port's kernel multiplies each head's
+`relu(dot)` by `weight * (128**-0.5 * 32**-0.5)` inside the sum while the reference
+folds the scale into the weights first, its 128-wide dot product uses four
+accumulators where `einsum` uses another order, and `wq_b` runs as a dequantized GEMV
+here against an FP8 GEMM there. Nothing about the selection depends on any of it.
+
+### What the FP4 quantization is worth
+
+`Indexer.forward` rounds both the index keys and the index query to E2M1 with one
+power-of-two E8M0 scale per 32-value block (`fp4_act_quant`), in place, before
+scoring. The port skips every activation quantization in this model, so this is a
+real and documented deviation -- and now a measured one. `fp4_act_quant` is a tilelang
+kernel that cannot run on this machine, but its arithmetic is not ambiguous:
+`2 ** ceil(log2(amax / 6))` per block and then round-to-nearest-even into
+`{0, .5, 1, 1.5, 2, 3, 4, 6}`. `_fp4_quantizer` in `Tools/dsv41_goldens.py` is that,
+in torch, and the case runs a second arm through it.
+
+| arm | dump A | dump B |
+|---|---|---|
+| identity quant (what the port implements) | **0** of 512 rows differ | **0** of 512 |
+| the reference's FP4 quant | **3** of 512 (163, 436, 491 out for 289, 305, 464) | **5** of 512 (163, 379, 436, 470, 491 out for 236, 289, 339, 464, 487) |
+
+So skipping the quantization costs 3 to 5 of 512 rows at the deepest position of one
+source, and every row involved sits within 0.17 of the cut score: the quantization
+moves scores enough to reshuffle rows that are already tied with the boundary, and
+nothing else. Individual scores move much further (up to 1.9 relative) among rows that
+nearly cancel across heads, which is why a relative delta is the wrong statistic here
+and the row list is the right one. That range is the whole justification for the port
+skipping the quantization rather than a guess; a future slice that wants the last
+0.6-1% has a target and a test. The count moves between dumps because the activations
+move between runs -- the FP4 error lands on rows that are near the boundary, so which
+of them cross depends on the boundary's exact position.
+
+### The defect this found
+
+Two prefills of the same 576 tokens through the same executor, with `reset()` between
+them, do not agree. All 576 layer-20 scores move, worst |delta| 1.84e-3 against a
+3.80 maximum, and the selected rows with them. Two separate processes differ the same
+way, so it is not state carried across a `reset()`.
+
+The first position whose pooled latent differs is 86, and its latent differs by
+**0.4886** against a 4.24 maximum -- a discrete jump, not accumulating rounding. From
+87 on the differences are ~1e-2, which is what a single wrong residual write
+downstream of an attention would leave behind. Block width is 8, so position 86 is
+slot 6 of block 10, and slots 0-5 of that block are bit-identical.
+
+**The same test is bit-identical under Metal's debug layer with shader validation**
+(`MTL_DEBUG_LAYER=1`, `MTL_DEBUG_LAYER_ERROR_MODE=assert`,
+`MTL_DEBUG_LAYER_VALIDATE_ENABLE=1`, `MTL_DEBUG_LAYER_VALIDATE_LOAD_ACTIONS=1`,
+`MTL_SHADER_VALIDATION=1`): 0 of 576 moved. The value it settles on, 3.8018694, is a
+third distinct answer, which is what a read of memory nothing wrote looks like when
+the validation layer pins the contents. At 128 positions the same test is
+bit-identical WITHOUT validation, in one process and across two, so whatever is read
+unwritten is reached past the sliding window rather than in it.
+
+Not localised yet, and the reason this is written down rather than fixed: every
+ordering the code relies on was re-read and holds. `commit` waits with
+`waitUntilCompleted` on every pending buffer, so `ensureResident`'s preads cannot land
+under a live kernel in either the walk or the block path; every `encodeGemv` form and
+`encodeNorm` ends with `memoryBarrier(scope: .buffers)`; the gather's host row list
+is filled before its command buffer is committed; the arena's LRU is a counter, not a
+hash. What is left is a region some kernel reads and no kernel writes, and the
+validation layer is the tool that will point at it: run
+`DeepSeekV41PublishedTurnTests/testTheIndexerSelectsPastItsBudgetOnThePublishedCheckpoint`
+or the 576-position form of the determinism test under the flags above and watch for
+the first stage that reports differently.
+
+The reason this matters beyond bookkeeping: every real-weight numeric claim in `#28`
+and `#29` is a single run, and a single run of this forward is one sample. The
+structural results in `#29` (320/320 budget-exceeding selections differing from the
+newest window, 0 zero-score rows, 576 distinct scores) reproduce across runs; the
+exact score census does not, and the difference between runs is larger than the
+difference between the port and the reference on a fixed set of activations. That is
+why the parity work above is done on a dump: comparing two live runs would have
+measured this defect instead of the indexer.
+
+**Still open.** The nondeterminism itself. It is why the FP4 count above is a range:
+those rows sit on the cut, so which of them cross depends on where the boundary lands,
+and the boundary moves between runs. The rule arm does not have that problem -- its
+selection is identical in both dumps -- which is the shape the two results should
+have: an arithmetic comparison survives a moving input, a which-rows-cross-the-cut
+claim does not.
