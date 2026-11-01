@@ -983,14 +983,14 @@ final class DeepSeekV41ConformanceGateTests: XCTestCase {
         XCTAssertEqual(DeepSeekV41Conformance.hyperConnections, .verifiedAgainstReference)
         XCTAssertEqual(DeepSeekV41Conformance.routerScoring, .verifiedAgainstReference)
         XCTAssertEqual(DeepSeekV41Conformance.visionPatching, .verifiedAgainstReference)
-        // Still open: `candidateSelection` needs live cache state, and the batched
-        // device prefill's addressing rule is verified while the multi-position
-        // device graph that would consume it cannot be compared against a walk
-        // without real weights.
-        XCTAssertEqual(DeepSeekV41Conformance.candidateSelection, .unverified)
+        // The compressed-row selection is now the indexer's own top-k, matched
+        // against `Indexer.forward`; the one rule left is the batched device graph,
+        // whose addressing rule is verified while the pass that would consume it
+        // cannot be compared against a walk without real weights.
+        XCTAssertEqual(DeepSeekV41Conformance.candidateSelection, .verifiedAgainstReference)
         XCTAssertEqual(DeepSeekV41Conformance.dsparkDrafting, .verifiedAgainstReference)
         XCTAssertEqual(DeepSeekV41Conformance.batchedDevicePrefill, .unverified)
-        XCTAssertEqual(DeepSeekV41Conformance.unverifiedSummary.count, 2)
+        XCTAssertEqual(DeepSeekV41Conformance.unverifiedSummary.count, 1)
         XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("Engram hashing"))
         XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("Engram combination"))
         XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("compressor pooling"))

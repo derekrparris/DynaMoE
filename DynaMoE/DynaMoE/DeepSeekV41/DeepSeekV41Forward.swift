@@ -373,6 +373,11 @@ nonisolated public enum DeepSeekV41ForwardStages {
         case latentProject
         case latentNorm
         case ropeLatent
+        /// The compressor's pool and the indexer's compressed-row selection. This
+        /// sits between the dense projections and the cache write because the row a
+        /// group produces at position `p` is visible to `p`, and because the rows the
+        /// selection names are a HOST value that the gather binds.
+        case indexer
         case writeLatent
         case compressPool
         case attention
@@ -413,6 +418,7 @@ nonisolated public enum DeepSeekV41ForwardStages {
         .latentProject,
         .latentNorm,
         .ropeLatent,
+        .indexer,
         .writeLatent,
         .compressPool,
         .attention,
@@ -596,12 +602,21 @@ nonisolated public final class DeepSeekV41CPUForward {
     public private(set) var attentionInputs: [[[Float]]] = []
     /// Compressed rows per owner layer.
     public private(set) var compressed: [Int: [[Float]]] = [:]
-    /// Candidate block scores from the candidate-source layer, per position.
-    /// Recorded rather than consumed: row selection goes through
-    /// `DeepSeekV41CacheAddressing.attentionRowPlan` so the number of rows a
-    /// position reads is known before any dispatch (see that type for why). These
-    /// stay because they are what a probe run compares against.
+    /// Candidate block scores from the candidate-source layer, per position, kept
+    /// for a probe run to compare against the reference.
     public private(set) var candidateScores: [[Float]] = []
+    /// The block mask the candidate-source layer published, per position. Every
+    /// later layer scores with its own weights inside it, which is why the mask
+    /// travels separately from the scores.
+    public private(set) var candidateMasks: [[Bool]] = []
+    /// Index keys per compressed-KV owner, one per compressed row, already rotated.
+    /// `Indexer.owns_k` holds only for a `kv_source_layer`; every layer after it
+    /// reads that same cache.
+    public private(set) var indexKeys: [Int: [[Float]]] = [:]
+    /// The compressed rows each index-source layer selected, per position. A layer
+    /// between two sources reuses its source's list rather than scoring again
+    /// (`_compress_topk_idxs` hands back `shared_attn.topk_idxs`).
+    public private(set) var indexSelections: [Int: [[Int]]] = [:]
     /// Engram gates per layer, one entry per position that carried a lookup. The
     /// value is written into the residual at the top of the layer, before
     /// attention; keeping the gate is what a probe run compares against.
@@ -658,6 +673,9 @@ nonisolated public final class DeepSeekV41CPUForward {
         attentionInputs = []
         compressed = [:]
         candidateScores = []
+        candidateMasks = []
+        indexKeys = [:]
+        indexSelections = [:]
         engramGates = [:]
         tokenHistory = []
         deadTokens = []
@@ -948,8 +966,21 @@ nonisolated public final class DeepSeekV41CPUForward {
         }
 
         let sink = weights.vector(.attnSink, layer: index)
+        var reducedQueries: [[Float]] = []
+        reducedQueries.reserveCapacity(positions.count)
+        for (offset, _) in positions.enumerated() {
+            reducedQueries.append(
+                queryReduced(normedInputs[offset], layer: index, shape: shape)
+            )
+        }
         for (offset, position) in positions.enumerated() {
-            let keys = attentionKeys(layer: layer, position: position)
+            let selection = indexSelection(
+                layer: layer,
+                position: position,
+                input: normedInputs[offset],
+                reducedQuery: reducedQueries[offset]
+            )
+            let keys = attentionKeys(layer: layer, position: position, selection: selection)
             var attended = DeepSeekV41AttentionReference.attend(
                 query: queries[offset],
                 keys: keys,
@@ -1046,7 +1077,12 @@ nonisolated public final class DeepSeekV41CPUForward {
 
     // MARK: Attention pieces
 
-    func queryPath(
+    /// The low-rank half of the query projection: `q_norm(wq_a(x))`.
+    ///
+    /// The indexer's own query projection reads exactly this vector
+    /// (`Indexer.forward` takes `qr`, not the full query), so it is factored out
+    /// rather than recomputed.
+    func queryReduced(
         _ normed: [Float],
         scope: DeepSeekV41TensorScope = .backbone,
         layer: Int,
@@ -1065,6 +1101,16 @@ nonisolated public final class DeepSeekV41CPUForward {
                 epsilon: config.rmsNormEps
             )
         }
+        return reduced
+    }
+
+    func queryPath(
+        _ normed: [Float],
+        scope: DeepSeekV41TensorScope = .backbone,
+        layer: Int,
+        shape: DeepSeekV41AttentionShape
+    ) -> [Float] {
+        let reduced = queryReduced(normed, scope: scope, layer: layer, shape: shape)
         guard let up = weights.matrix(.attnWqB, scope: scope, layer: layer, expert: nil) else {
             return [Float](repeating: 0, count: shape.queryWidth)
         }
@@ -1107,16 +1153,182 @@ nonisolated public final class DeepSeekV41CPUForward {
         return up.apply(reduced)
     }
 
+    // MARK: Indexer
+
+    /// The index key one completed compressed row publishes.
+    ///
+    /// `Indexer.forward` builds it from the compressor's RoPE-FREE latent
+    /// (`k_norm(wk(latent))`) and rotates its tail only afterwards, at the position
+    /// of the group's FIRST token. So this runs before the pooled row is rotated for
+    /// the compressed cache, and it runs on the layer that OWNS the keys
+    /// (`Indexer.owns_k`, i.e. a `kv_source_layer`), not on every index source: the
+    /// index sources between two owners re-score the same keys with their own query.
+    private func appendIndexKey(layer: DeepSeekV41LayerPlan, latent: [Float], row: Int) {
+        guard layer.ownsCompressedIndex, layer.ownsCompressedKV,
+              config.indexHeadDim > 0,
+              let wk = weights.matrix(.indexerWk, layer: layer.index, expert: nil) else { return }
+        var key = wk.apply(latent)
+        key = rmsNorm(
+            key,
+            role: .indexerKNorm,
+            layer: layer.index,
+            epsilon: config.rmsNormEps
+        )
+        let ropeWidth = min(config.qkRopeHeadDim, config.indexHeadDim)
+        if ropeWidth > 0 {
+            DeepSeekV41RoPE.rotateSlice(
+                &key,
+                start: config.indexHeadDim - ropeWidth,
+                length: ropeWidth,
+                position: row * max(1, layer.compressRatio),
+                frequencies: latentFrequencyTable[layer.ropeTable] ?? []
+            )
+        }
+        var rows = indexKeys[layer.index] ?? []
+        while rows.count <= row { rows.append([]) }
+        rows[row] = key
+        indexKeys[layer.index] = rows
+    }
+
+    /// The score one query gives every compressed row its layer can see, and the
+    /// rows it selects.
+    ///
+    /// `Indexer.forward` in four steps: project `qr` into the indexer's own heads and
+    /// rotate the tail at this position; score every produced key with a rectified,
+    /// per-head-weighted dot; mask the rows this query has not reached yet; then cut
+    /// to `index_topk`. A candidate source among the layers after it also publishes a
+    /// block mask, which they score inside.
+    private func indexSelection(
+        layer: DeepSeekV41LayerPlan,
+        position: Int,
+        input: [Float],
+        reducedQuery: [Float]
+    ) -> [Int]? {
+        let headCount = config.indexNHeads
+        let headWidth = config.indexHeadDim
+        guard headCount > 0, headWidth > 0, layer.compressedIndexSource >= 0 else { return nil }
+        // A layer between two index sources does not run the indexer at all: it reads
+        // the list its source published (`_compress_topk_idxs` returns
+        // `shared_attn.topk_idxs`). Recomputing would be the same answer only while
+        // the two layers agreed on every input, and they do not share a query.
+        if !layer.ownsCompressedIndex {
+            guard let rows = indexSelections[layer.compressedIndexSource],
+                  rows.indices.contains(position) else { return nil }
+            return rows[position]
+        }
+        // Index keys are published by a `kv_source_layer` (`Indexer.owns_k`), and an
+        // index source that is not one of those -- the published checkpoint has four
+        // such layers -- re-scores the SAME cache with its own query, which is the
+        // owner's cache and not its own.
+        let keys = indexKeys[layer.compressedKVSource] ?? []
+        guard !keys.isEmpty else { return nil }
+
+        // `_compress_kv` slices the shared cache to `end_pos // ratio` of this layer,
+        // and the index keys line up with the owner's pooled rows one for one.
+        let ratio = max(1, layer.compressRatio)
+        let produced = min(
+            keys.count,
+            DeepSeekV41CacheAddressing.compressedRowCount(afterPosition: position, ratio: ratio)
+        )
+        // `arange(1, seqlen + 1) // ratio` at this position: a compressed row only
+        // becomes visible once the query has passed its last token.
+        let visible = min(produced, (position + 1) / ratio)
+        guard produced > 0 else { return nil }
+
+        guard let wqB = weights.matrix(.indexerWqB, layer: layer.index, expert: nil),
+              let weightsProj = weights.matrix(.indexerWeights, layer: layer.index, expert: nil)
+        else { return nil }
+        var query = wqB.apply(reducedQuery)
+        let ropeWidth = min(config.qkRopeHeadDim, headWidth)
+        if ropeWidth > 0, query.count >= headCount * headWidth {
+            DeepSeekV41RoPE.rotateHeads(
+                &query,
+                heads: headCount,
+                headDim: headWidth,
+                sliceStart: headWidth - ropeWidth,
+                sliceLength: ropeWidth,
+                position: position,
+                frequencies: queryFrequencyTable[layer.ropeTable] ?? []
+            )
+        }
+        var heads: [[Float]] = []
+        heads.reserveCapacity(headCount)
+        for head in 0..<headCount {
+            let start = head * headWidth
+            guard query.count >= start + headWidth else { return nil }
+            heads.append(Array(query[start..<(start + headWidth)]))
+        }
+
+        // `weights_proj(x) * (index_head_dim ** -0.5 * index_n_heads ** -0.5)`: the
+        // scale lands on the WEIGHTS, so a head contributes its own share of the
+        // sum rather than every head being scaled after the reduction.
+        let projectionScale = 1 / Float(headWidth).squareRoot() / Float(headCount).squareRoot()
+        let headWeights = weightsProj.apply(input).map { $0 * projectionScale }
+
+        var scores = DeepSeekV41Indexer.positionScores(
+            queryHeads: heads,
+            keys: Array(keys.prefix(produced)),
+            headWeights: headWeights
+        )
+        for row in visible..<scores.count { scores[row] = -.infinity }
+
+        let topK = min(config.indexTopK, produced)
+        if layer.isCandidateSource {
+            while candidateScores.count <= position { candidateScores.append([]) }
+            candidateScores[position] = scores
+            let mask = DeepSeekV41Indexer.candidateBlocks(
+                scores: scores,
+                visibleRows: visible,
+                blockSize: max(1, config.candidateBlockSize),
+                topKBlocks: max(0, config.candidateTopKBlocks)
+            )
+            while candidateMasks.count <= position { candidateMasks.append([]) }
+            candidateMasks[position] = mask
+            let selected = DeepSeekV41Indexer.selectedRows(
+                scores: scores, visibleRows: visible, topK: topK
+            )
+            recordIndexSelection(layer: layer.index, position: position, rows: selected)
+            return selected
+        }
+        // `uses_candidates` is "the candidate source is before me", and the mask it
+        // reads belonged to the SAME position, not to the last one computed.
+        let candidateSource = config.candidateSourceLayerID
+        let published: [Bool]? = (candidateSource >= 0 && candidateSource < layer.index
+            && candidateMasks.indices.contains(position))
+            ? candidateMasks[position]
+            : nil
+        let selected = DeepSeekV41Indexer.selectedRows(
+            scores: scores,
+            visibleRows: visible,
+            topK: topK,
+            candidates: published
+        )
+        recordIndexSelection(layer: layer.index, position: position, rows: selected)
+        return selected
+    }
+
+    private func recordIndexSelection(layer: Int, position: Int, rows: [Int]) {
+        var perPosition = indexSelections[layer] ?? []
+        while perPosition.count <= position { perPosition.append([]) }
+        perPosition[position] = rows
+        indexSelections[layer] = perPosition
+    }
+
     /// Every key the attention stage reads for one position: the live window, then
     /// the compressed rows the addressing rule selects.
-    func attentionKeys(layer: DeepSeekV41LayerPlan, position: Int) -> [[Float]] {
+    func attentionKeys(
+        layer: DeepSeekV41LayerPlan,
+        position: Int,
+        selection: [Int]? = nil
+    ) -> [[Float]] {
         var keys: [[Float]] = []
         let plan = DeepSeekV41CacheAddressing.attentionRowPlan(
             layer: layer,
             position: position,
             config: config,
             plan: self.plan,
-            geometry: geometry
+            geometry: geometry,
+            selection: selection
         )
         for row in plan.windowPositions {
             guard let written = latent(layer: layer.index, position: row) else { continue }
@@ -1190,11 +1402,7 @@ nonisolated public final class DeepSeekV41CPUForward {
         position: Int,
         shape: DeepSeekV41AttentionShape
     ) {
-        guard layer.flavor == .compressed, layer.ownsCompressedKV else {
-            // A non-owner still contributes candidate scores at the source layer.
-            if layer.isCandidateSource { recordCandidateScores(layer: layer, position: position) }
-            return
-        }
+        guard layer.flavor == .compressed, layer.ownsCompressedKV else { return }
         let ratio = max(1, layer.compressRatio)
         // A compressed row is produced only when a whole block has been seen, i.e.
         // exactly on the positions where `position + 1` is a multiple of the ratio.
@@ -1226,6 +1434,9 @@ nonisolated public final class DeepSeekV41CPUForward {
         pooled = rmsNorm(
             pooled, role: .compressorNorm, layer: layer.index, epsilon: config.rmsNormEps
         )
+        // The index key is built from the SAME un-rotated latent and rotated at the
+        // same position, so it has to be taken here rather than from the cache row.
+        appendIndexKey(layer: layer, latent: pooled, row: rows - 1)
         DeepSeekV41RoPE.rotateSlice(
             &pooled,
             start: shape.latentRopeStart,
@@ -1234,28 +1445,6 @@ nonisolated public final class DeepSeekV41CPUForward {
             frequencies: latentFrequencyTable[layer.ropeTable] ?? []
         )
         compressed[layer.index, default: []].append(pooled)
-        if layer.isCandidateSource { recordCandidateScores(layer: layer, position: position) }
-    }
-
-    private func recordCandidateScores(layer: DeepSeekV41LayerPlan, position: Int) {
-        // A chunk pools every group it completed before any position reads them, so the
-        // record is cut to the rows this position could have seen: the same set a
-        // per-position walk had when it reached the same position.
-        let ownerRatio = plan.first(where: { $0.index == layer.compressedKVSource })?.compressRatio
-            ?? layer.compressRatio
-        let visible = DeepSeekV41CacheAddressing.compressedRowCount(
-            afterPosition: position, ratio: max(1, ownerRatio)
-        )
-        let rows = Array((compressed[layer.compressedKVSource] ?? []).prefix(max(0, visible)))
-        guard !rows.isEmpty else { return }
-        let queries = [Array(rows[rows.count - 1].prefix(max(1, config.indexHeadDim)))]
-        let scores = DeepSeekV41Indexer.blockScores(
-            queries: queries,
-            keys: rows,
-            blockSize: max(1, config.candidateBlockSize),
-            keyWidth: max(1, config.indexHeadDim)
-        )
-        candidateScores.append(scores)
     }
 
     // MARK: FFN

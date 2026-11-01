@@ -620,80 +620,132 @@ nonisolated public enum DeepSeekV41Compressor {
 
 // MARK: - Indexer
 
-/// The candidate pass: score blocks of compressed rows so attention only reads the
-/// few most relevant ones.
+/// Which compressed rows a query attends to.
+///
+/// The reference answers this twice over `Indexer.forward` and
+/// `select_candidate_blocks`: a per-position score built from a small side attention,
+/// then a two-level cut -- blocks of rows, then the best `index_topk` rows inside the
+/// surviving blocks. The port used to answer it with "the newest `index_topk` rows",
+/// which is the same list only while a position has nothing to choose between.
+/// `index_topk` is 512 on the published checkpoint, so on the ratio-1 half of the
+/// model the two answers part company at position 513.
+///
+/// `Tools/dsv41_goldens.py indexer` runs the reference's own modules for all three
+/// pieces and `DeepSeekV41IndexerGoldenTests` carries the vectors.
 nonisolated public enum DeepSeekV41Indexer {
 
-    /// Block scores for one query position.
+    /// The score one query gives each of `keys`.
     ///
-    /// Mirrors the engine's Qwen-sparse-attention scorer: each block's score is the
-    /// MAX over its rows and over the indexer query heads of
-    /// `dot(q, key) / sqrt(keyWidth)`. Max rather than mean because a block is only
-    /// worth reading if some row in it is relevant; averaging lets one strong match
-    /// be diluted by its neighbours until it loses to a uniformly-mediocre block.
-    public static func blockScores(
-        queries: [[Float]],
+    /// `(relu(dot) * weight).sum(heads)`, with `index_head_dim ** -0.5 * index_n_heads
+    /// ** -0.5` already folded into the weights. Three details decide the ranking and
+    /// none of them is a rescaling of another: the rectifier is per head, before the
+    /// weighting, so a head that votes against a row removes only its own contribution;
+    /// the heads are SUMMED, not maxed, so a row several heads like beats a row one head
+    /// loves; and the weights come from the projection of the layer input, so the same
+    /// keys score differently at different layers.
+    public static func positionScores(
+        queryHeads: [[Float]],
         keys: [[Float]],
-        blockSize: Int,
-        keyWidth: Int
+        headWeights: [Float]
     ) -> [Float] {
-        guard blockSize > 0, keyWidth > 0, !keys.isEmpty else { return [] }
-        let invSqrt = 1 / sqrt(Float(keyWidth))
-        let blockCount = (keys.count + blockSize - 1) / blockSize
-        var scores = [Float](repeating: -Float.greatestFiniteMagnitude, count: blockCount)
-        for block in 0..<blockCount {
-            let start = block * blockSize
-            let end = min(start + blockSize, keys.count)
-            var blockMax = -Float.greatestFiniteMagnitude
-            for row in start..<end {
-                let key = keys[row]
-                let width = min(keyWidth, key.count)
-                for query in queries {
-                    let queryWidth = min(width, query.count)
-                    var dot: Float = 0
-                    for dim in 0..<queryWidth {
-                        dot += query[dim] * key[dim]
-                    }
-                    let score = dot * invSqrt
-                    if score > blockMax { blockMax = score }
-                }
+        guard !keys.isEmpty else { return [] }
+        var scores = [Float](repeating: 0, count: keys.count)
+        for (head, query) in queryHeads.enumerated() {
+            let weight = head < headWeights.count ? headWeights[head] : 0
+            let width = query.count
+            guard width > 0 else { continue }
+            for (row, key) in keys.enumerated() {
+                var dot: Float = 0
+                for dim in 0..<min(width, key.count) { dot += query[dim] * key[dim] }
+                // `relu` before the weight: a negative dot contributes nothing rather
+                // than a negative score, and an all-negative row scores zero.
+                if dot > 0 { scores[row] += dot * weight }
             }
-            scores[block] = blockMax == -Float.greatestFiniteMagnitude ? 0 : blockMax
         }
         return scores
     }
 
-    /// The `topK` best blocks, returned in ascending block order so a gathered row
-    /// list is deterministic and a reused prefix addresses the same rows.
-    public static func selectedBlocks(scores: [Float], topK: Int) -> [Int] {
-        guard topK > 0, !scores.isEmpty else { return [] }
-        if topK >= scores.count { return Array(scores.indices) }
-        let ranked = scores.enumerated()
-            .sorted { lhs, rhs in
-                lhs.element == rhs.element ? lhs.offset < rhs.offset : lhs.element > rhs.element
-            }
-            .prefix(topK)
-            .map(\.offset)
-        return ranked.sorted()
-    }
-
-    /// Expands selected blocks into the compressed row indices they cover.
-    public static func rows(
-        for blocks: [Int],
+    /// `select_candidate_blocks`: the first of the two cuts.
+    ///
+    /// A block scores as its best row, so one relevant row is enough to make a block
+    /// worth reading, and a block no query can reach yet scores `-inf` and drops out.
+    /// The block holding the query's newest reachable row is pinned at `+inf` first:
+    /// it is only partly filled, so on score alone it would lose to any older full
+    /// block, and it is the block with the most recent tokens in it.
+    ///
+    /// Returns one flag per row, shaped like the score vector, so a consumer just masks.
+    public static func candidateBlocks(
+        scores: [Float],
+        visibleRows: Int,
         blockSize: Int,
-        rowCount: Int
-    ) -> [Int] {
-        guard blockSize > 0, rowCount > 0 else { return [] }
-        var out: [Int] = []
-        out.reserveCapacity(blocks.count * blockSize)
-        for block in blocks.sorted() {
-            let start = block * blockSize
-            guard start < rowCount else { continue }
-            let end = min(start + blockSize, rowCount)
-            for row in start..<end {
-                out.append(row)
+        topKBlocks: Int
+    ) -> [Bool] {
+        guard blockSize > 0, !scores.isEmpty else { return [] }
+        let blockCount = (scores.count + blockSize - 1) / blockSize
+        var blockScores = [Float](repeating: -.infinity, count: blockCount)
+        for block in 0..<blockCount {
+            var best = -Float.infinity
+            for row in (block * blockSize)..<min(scores.count, (block + 1) * blockSize) {
+                best = max(best, scores[row])
             }
+            blockScores[block] = best
+        }
+        // The partly-filled block at the frontier: pinned, not scored.
+        let last = (visibleRows - 1) / blockSize
+        if visibleRows > 0, last >= 0, last < blockCount { blockScores[last] = .infinity }
+        let keep = min(max(topKBlocks, 0), blockCount)
+        guard keep > 0 else { return [Bool](repeating: false, count: scores.count) }
+        let ranked = blockScores.indices
+            .sorted { lhs, rhs in
+                blockScores[lhs] == blockScores[rhs]
+                    ? lhs < rhs
+                    : blockScores[lhs] > blockScores[rhs]
+            }
+            .prefix(keep)
+        var keptBlocks = [Bool](repeating: false, count: blockCount)
+        for block in ranked where blockScores[block] > -Float.infinity {
+            keptBlocks[block] = true
+        }
+        var out = [Bool](repeating: false, count: scores.count)
+        for row in scores.indices {
+            out[row] = keptBlocks[row / blockSize]
         }
         return out
+    }
+
+    /// The second cut: the `topK` best reachable rows, ascending.
+    ///
+    /// `topK` is the caller's `min(index_topk, rows produced so far)`, and a row past
+    /// the query's frontier is dropped afterwards rather than up front: the reference
+    /// ranks every produced row and maps the unreachable ones to `-1`, so a query at
+    /// the start of a prompt selects nothing rather than the rows it cannot see.
+    ///
+    /// `candidates` is the mask `candidateBlocks` published at the source layer, or nil
+    /// where the checkpoint configures no candidate source. A masked row is ranked as
+    /// `-inf` rather than removed, which is faithful: with `candidate_topk_blocks` at
+    /// 2,048 blocks of 8 the published mask covers 16,384 rows and never actually
+    /// removes one, so the difference only shows up in a configured-smaller model.
+    public static func selectedRows(
+        scores: [Float],
+        visibleRows: Int,
+        topK: Int,
+        candidates: [Bool]? = nil
+    ) -> [Int] {
+        let taken = min(max(topK, 0), scores.count)
+        guard taken > 0, visibleRows > 0 else { return [] }
+        func ranked(_ row: Int) -> Float {
+            if let candidates, row < candidates.count, !candidates[row] { return -.infinity }
+            return scores[row]
+        }
+        let order = scores.indices
+            .sorted { lhs, rhs in
+                let left = ranked(lhs)
+                let right = ranked(rhs)
+                return left == right ? lhs < rhs : left > right
+            }
+            .prefix(taken)
+        // Ascending so a gathered row list is deterministic and a reused prefix
+        // addresses the same rows in the same order.
+        return order.filter { $0 < visibleRows }.sorted()
     }
 }

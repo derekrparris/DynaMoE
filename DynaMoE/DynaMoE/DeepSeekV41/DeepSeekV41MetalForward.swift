@@ -547,6 +547,7 @@ nonisolated public enum DeepSeekV41DevicePlan {
         .latentProject,
         .latentNorm,
         .ropeLatent,
+        .indexer,
         .writeLatent,
         .compressPool,
         .attention,
@@ -959,6 +960,13 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// part in an n-gram and its gate is zero.
     private var deadTokens: [Bool] = []
     private var pendingDead = false
+    /// The compressed rows the indexer selected, per position. Value-dependent, so
+    /// it is read back from the device after the score kernel and reused by every
+    /// layer between two index sources.
+    private var indexSelectionsByPosition: [Int: [Int]] = [:]
+    /// The block mask the candidate-source layer published, per position, for the
+    /// layers after it to score inside.
+    private var indexMasksByPosition: [Int: [Bool]] = [:]
     /// Which block of the compressor scratch each owner fills. Divided from the
     /// plan at load, because the block a layer writes is a property of the layer
     /// rather than of the position being run.
@@ -1507,6 +1515,8 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// that the history it keeps really is the prompt's.
     public func reset() {
         cache.reset()
+        indexSelectionsByPosition.removeAll(keepingCapacity: true)
+        indexMasksByPosition.removeAll(keepingCapacity: true)
         tokenHistory.removeAll(keepingCapacity: true)
         deadTokens.removeAll(keepingCapacity: true)
         pendingDead = false
@@ -1711,6 +1721,12 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 ))
                 stageBuffers.append((stage: stage.rawValue, buffer: buffer))
                 frontBuffers.append(buffer)
+                if stage == .indexer, layer.ownsCompressedIndex {
+                    try settlePending()
+                    try readIndexSelections(
+                        layer: layer, startPosition: startPosition, count: count
+                    )
+                }
             }
             // Calibration: what `count` trivial dispatches cost with nothing to
             // compute, so the stage table can be read as dispatch overhead against
@@ -1747,8 +1763,8 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 }
             }
         } else {
-            let commandBuffer = try makeCommandBuffer()
-            let encoder = try makeEncoder(commandBuffer)
+            var commandBuffer = try makeCommandBuffer()
+            var encoder = try makeEncoder(commandBuffer)
             for stage in DeepSeekV41DevicePlan.frontHalf {
                 try encodeBlockStage(
                     stage,
@@ -1757,6 +1773,20 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                     count: count,
                     encoder: encoder
                 )
+                // The selection is a host value, so the dense half stops after the
+                // indexer and starts a second submission once the rows are known.
+                if stage == .indexer, layer.ownsCompressedIndex {
+                    encoder.endEncoding()
+                    try commit(
+                        commandBuffer,
+                        stage: "layer \(layer.index) indexer (block \(count))"
+                    )
+                    try readIndexSelections(
+                        layer: layer, startPosition: startPosition, count: count
+                    )
+                    commandBuffer = try makeCommandBuffer()
+                    encoder = try makeEncoder(commandBuffer)
+                }
             }
             encoder.endEncoding()
             if measuring { marks.append(DispatchTime.now().uptimeNanoseconds) }
@@ -2102,11 +2132,22 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 batch: count
             )
 
+        case .indexer:
+            try encodeIndexerStage(
+                layer: layer,
+                startPosition: startPosition,
+                count: count,
+                encoder: encoder,
+                shape: shape
+            )
+
         case .writeLatent:
-            // The ring is why the cache write, the pool and the gather stay in one
-            // loop: writing position `p + 1` evicts `p + 1 - window`, which a query
-            // at `p` still needs, so each position must gather before its successor
-            // writes. Only the attention itself is hoisted out of the loop: it reads
+            // The ring is why the cache write and the gather stay in one loop:
+            // writing position `p + 1` evicts `p + 1 - window`, which a query at `p`
+            // still needs, so each position must gather before its successor
+            // writes. The pool moved to `.indexer`, which runs first: the row a
+            // group produces at `p` is visible to `p`, so the selection has to see
+            // it. Only the attention itself is hoisted out of the loop: it reads
             // the gathered blocks and nothing else, so the whole block attends in ONE
             // dispatch of `count * heads` threadgroups instead of `count` dispatches
             // of `heads` — each of which is a fifth of the machine
@@ -2125,13 +2166,6 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                         layout: cache.layout
                     ) ?? -1,
                     physicalRow: 0
-                )
-                try encodePoolIfComplete(
-                    layer: layer,
-                    position: startPosition + slot,
-                    encoder: encoder,
-                    shape: shape,
-                    slotIndex: slot
                 )
                 attentionRows.append(
                     try encodeAttentionGather(
@@ -2636,21 +2670,33 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         let commandBuffer = try makeCommandBuffer()
         let encoder = try makeEncoder(commandBuffer)
 
+        var frontBuffer = commandBuffer
+        var frontEncoder = encoder
         for stage in DeepSeekV41DevicePlan.frontHalf {
             try encode(
                 stage,
                 layer: layer,
                 position: position,
-                encoder: encoder
+                encoder: frontEncoder
             )
+            // The indexer's selection is a HOST value: the scores have to come back
+            // before the gather can bind the rows they name, so the dense half stops
+            // here rather than carrying the gather in the same submission.
+            if stage == .indexer, layer.ownsCompressedIndex {
+                frontEncoder.endEncoding()
+                try commit(frontBuffer, stage: "layer \(layer.index) indexer")
+                try readIndexSelections(layer: layer, startPosition: position, count: 1)
+                frontBuffer = try makeCommandBuffer()
+                frontEncoder = try makeEncoder(frontBuffer)
+            }
         }
-        encoder.endEncoding()
+        frontEncoder.endEncoding()
         let frontEncoded = measuring ? DispatchTime.now().uptimeNanoseconds : 0
         // The routing readback below needs this half finished on the host. It also
         // drains the previous layer's expert half, which is what makes the arena
         // slots free to overwrite: a pread here can never land under a kernel that
         // is still reading the slot it replaces.
-        try commit(commandBuffer, stage: "layer \(layer.index) attention")
+        try commit(frontBuffer, stage: "layer \(layer.index) attention")
 
         // The mixture binds per-expert byte offsets, which are host values.
         let routing = readRouting()
@@ -2691,7 +2737,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             walkTiming.expertFillNanoseconds += filled - fillStarted
             walkTiming.mixtureEncodeNanoseconds += mixtureEncoded - filled
             walkTiming.layers += 1
-            walkBuffers.append((buffer: commandBuffer, isMixture: false))
+            walkBuffers.append((buffer: frontBuffer, isMixture: false))
             walkBuffers.append((buffer: expertCommand, isMixture: true))
         }
     }
@@ -2874,6 +2920,15 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 position: position
             )
 
+        case .indexer:
+            try encodeIndexerStage(
+                layer: layer,
+                startPosition: position,
+                count: 1,
+                encoder: encoder,
+                shape: shape
+            )
+
         case .writeLatent:
             try encodeStore(
                 encoder,
@@ -2888,9 +2943,8 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             )
 
         case .compressPool:
-            try encodePoolIfComplete(
-                layer: layer, position: position, encoder: encoder, shape: shape
-            )
+            // Both run inside `.indexer`: the pool has to precede the selection.
+            break
 
         case .attention:
             try encodeAttention(layer: layer, position: position, encoder: encoder, shape: shape)
@@ -3361,6 +3415,12 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             output: workspace.pooled,
             width: width
         )
+        // The index key is `k_norm(wk(latent))` off the SAME un-rotated latent, and
+        // then rotated at the group's first position — so it is taken here, between
+        // the norm and the rotation the compressed cache row gets.
+        try encodeIndexKey(
+            layer: layer, row: rows - 1, position: max(0, rows - 1) * ratio, encoder: encoder
+        )
         try encodeRope(
             encoder,
             vector: workspace.pooled,
@@ -3379,6 +3439,261 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             byteOffset: destinationRow,
             physicalRow: 0
         )
+    }
+
+    /// Publishes the index key for a compressed row.
+    ///
+    /// `Indexer.owns_k` holds only for a `kv_source_layer`, and the key is built from
+    /// the compressor's RoPE-free latent (`k_norm(wk(latent))`) then rotated at the
+    /// position of the group's FIRST token. Layers between two index sources re-score
+    /// this same cache with their own query, so it is written once, here.
+    private func encodeIndexKey(
+        layer: DeepSeekV41LayerPlan,
+        row: Int,
+        position: Int,
+        encoder: MTLComputeCommandEncoder
+    ) throws {
+        guard layer.ownsCompressedIndex, layer.ownsCompressedKV,
+              config.indexHeadDim > 0,
+              let indexBuffer = cache.indexerBuffer,
+              let destination = DeepSeekV41CacheAddressing.indexerByteOffset(
+                  layer: layer.index, row: row, layout: cache.layout
+              ),
+              let wk = weights.tensor(.indexerWk, layer: layer.index),
+              let gain = vectors.gain(.indexerKNorm, layer: layer.index, width: config.indexHeadDim)
+        else { return }
+        try encodeGemv(
+            encoder,
+            weight: wk,
+            scale: weights.scaleTensor(.indexerWk, layer: layer.index),
+            inDim: shapes.latentWidth,
+            outDim: config.indexHeadDim,
+            input: workspace.pooled,
+            output: workspace.indexKey
+        )
+        try encodeNorm(
+            encoder,
+            input: workspace.indexKey,
+            gain: gain,
+            output: workspace.indexKey,
+            width: config.indexHeadDim
+        )
+        let ropeWidth = min(config.qkRopeHeadDim, config.indexHeadDim)
+        try encodeRope(
+            encoder,
+            vector: workspace.indexKey,
+            rowWidth: config.indexHeadDim,
+            headDim: 0,
+            sliceStart: config.indexHeadDim - ropeWidth,
+            sliceLength: ropeWidth,
+            table: layer.ropeTable,
+            latent: true,
+            position: position
+        )
+        try encodeCopy(
+            encoder,
+            from: workspace.indexKey,
+            to: indexBuffer,
+            count: config.indexHeadDim,
+            destinationByteOffset: destination
+        )
+    }
+
+    /// The compressor's pool for the whole block, then the indexer's scores.
+    ///
+    /// The pool runs first and for EVERY slot because `_compress_kv` pools a chunk's
+    /// completed groups before any query in it scores, and because the row a group
+    /// completes at position `p` is visible to `p`. The scores then land in
+    /// `workspace.indexScores`, which the caller reads back to resolve the row list.
+    private func encodeIndexerStage(
+        layer: DeepSeekV41LayerPlan,
+        startPosition: Int,
+        count: Int,
+        encoder: MTLComputeCommandEncoder,
+        shape: DeepSeekV41AttentionShape
+    ) throws {
+        for slot in 0..<count {
+            try encodePoolIfComplete(
+                layer: layer,
+                position: startPosition + slot,
+                encoder: encoder,
+                shape: shape,
+                slotIndex: slot
+            )
+        }
+        guard layer.ownsCompressedIndex,
+              config.indexNHeads > 0,
+              config.indexHeadDim > 0,
+              layer.compressedKVSource >= 0,
+              let indexBuffer = cache.indexerBuffer,
+              let indexBase = cache.layout.indexerBase[layer.compressedKVSource],
+              let wqB = weights.tensor(.indexerWqB, layer: layer.index),
+              let weightsProj = weights.tensor(.indexerWeights, layer: layer.index) else { return }
+
+        let headCount = config.indexNHeads
+        let headWidth = config.indexHeadDim
+        let ownerRows = min(
+            workspace.indexerRows,
+            cache.layout.indexerRowsByOwner[layer.compressedKVSource] ?? workspace.indexerRows
+        )
+        let ratio = max(1, layer.compressRatio)
+        let hasDown = config.qLoraRank > 0 && weights.tensor(.attnWqA, layer: layer.index) != nil
+        let queryInputWidth = hasDown ? max(1, config.qLoraRank) : shapes.hidden
+
+        for slot in 0..<count {
+            // `weights_proj(x)`, one weight per index head. The scale lands on the
+            // weights in the reference, so the kernel multiplies by it.
+            try encodeGemv(
+                encoder,
+                weight: weightsProj,
+                scale: weights.scaleTensor(.indexerWeights, layer: layer.index),
+                inDim: shapes.hidden,
+                outDim: headCount,
+                input: workspace.normed,
+                output: workspace.indexWeights,
+                inputByteOffset: workspace.slotOffset(slot, width: shapes.hidden),
+                outputByteOffset: workspace.slotOffset(slot, width: headCount)
+            )
+            try encodeGemv(
+                encoder,
+                weight: wqB,
+                scale: weights.scaleTensor(.indexerWqB, layer: layer.index),
+                inDim: queryInputWidth,
+                outDim: headCount * headWidth,
+                input: hasDown ? workspace.reduced : workspace.normed,
+                output: workspace.indexQuery,
+                inputByteOffset: workspace.slotOffset(
+                    slot, width: hasDown ? max(1, config.qLoraRank) : shapes.hidden
+                ),
+                outputByteOffset: workspace.slotOffset(slot, width: headCount * headWidth)
+            )
+            // `Indexer.forward` rotates the tail of every index head at this
+            // position, using the layer's own table (the compressed one).
+            try encodeRope(
+                encoder,
+                vector: workspace.indexQuery,
+                rowWidth: headCount * headWidth,
+                headDim: headWidth,
+                sliceStart: headWidth - min(config.qkRopeHeadDim, headWidth),
+                sliceLength: min(config.qkRopeHeadDim, headWidth),
+                table: layer.ropeTable,
+                latent: false,
+                position: startPosition + slot,
+                byteOffset: workspace.slotOffset(slot, width: headCount * headWidth)
+            )
+
+            let position = startPosition + slot
+            let produced = min(
+                ownerRows,
+                DeepSeekV41CacheAddressing.compressedRowCount(afterPosition: position, ratio: ratio)
+            )
+            guard produced > 0 else { continue }
+            let visible = min(produced, (position + 1) / ratio)
+            encoder.setComputePipelineState(pipelines.indexerScores)
+            encoder.setBuffer(
+                workspace.indexQuery,
+                offset: workspace.slotOffset(slot, width: headCount * headWidth),
+                index: 0
+            )
+            encoder.setBuffer(indexBuffer, offset: indexBase, index: 1)
+            encoder.setBuffer(
+                workspace.indexWeights,
+                offset: workspace.slotOffset(slot, width: headCount),
+                index: 2
+            )
+            encoder.setBuffer(
+                workspace.indexScores,
+                offset: workspace.slotOffset(slot, width: workspace.indexerRows),
+                index: 3
+            )
+            var heads = UInt32(headCount)
+            var width = UInt32(headWidth)
+            var rows = UInt32(produced)
+            var reachable = UInt32(visible)
+            var scale = 1 / Float(headWidth).squareRoot() / Float(headCount).squareRoot()
+            encoder.setBytes(&heads, length: 4, index: 4)
+            encoder.setBytes(&width, length: 4, index: 5)
+            encoder.setBytes(&rows, length: 4, index: 6)
+            encoder.setBytes(&reachable, length: 4, index: 7)
+            encoder.setBytes(&scale, length: 4, index: 8)
+            encoder.dispatchThreads(
+                MTLSize(width: produced, height: 1, depth: 1),
+                threadsPerThreadgroup: threadgroup(produced)
+            )
+            encoder.memoryBarrier(scope: .buffers)
+        }
+    }
+
+    /// Resolves the rows the indexer selected, from the scores just read back.
+    ///
+    /// The scores are the only value-dependent state the port keeps per position:
+    /// which compressed rows a query reads is a top-k over them, which is not
+    /// expressible on the host without the numbers (`Benchmarks/PERF_FINDINGS.md`,
+    /// "DSV4.1 #28"). A layer that is not an index source reuses its source's
+    /// selection, which is what `_compress_topk_idxs` does.
+    private func readIndexSelections(
+        layer: DeepSeekV41LayerPlan,
+        startPosition: Int,
+        count: Int
+    ) throws {
+        guard config.indexTopK > 0 || config.candidateTopKBlocks > 0 else { return }
+        guard layer.ownsCompressedIndex, config.indexNHeads > 0, layer.compressedKVSource >= 0 else {
+            return
+        }
+        let ownerRows = min(
+            workspace.indexerRows,
+            cache.layout.indexerRowsByOwner[layer.compressedKVSource] ?? workspace.indexerRows
+        )
+        let ratio = max(1, layer.compressRatio)
+        let pointer = workspace.indexScores.contents().assumingMemoryBound(to: Float.self)
+        for slot in 0..<count {
+            let position = startPosition + slot
+            let produced = min(
+                ownerRows,
+                DeepSeekV41CacheAddressing.compressedRowCount(afterPosition: position, ratio: ratio)
+            )
+            let visible = min(produced, (position + 1) / ratio)
+            let base = workspace.slotOffset(slot, width: workspace.indexerRows)
+                / MemoryLayout<Float>.stride
+            let scores = produced > 0
+                ? Array(UnsafeBufferPointer(start: pointer + base, count: produced))
+                : []
+            let topK = min(config.indexTopK, produced)
+            if layer.isCandidateSource {
+                indexMasksByPosition[position] = DeepSeekV41Indexer.candidateBlocks(
+                    scores: scores,
+                    visibleRows: visible,
+                    blockSize: max(1, config.candidateBlockSize),
+                    topKBlocks: max(0, config.candidateTopKBlocks)
+                )
+                indexSelectionsByPosition[position] = DeepSeekV41Indexer.selectedRows(
+                    scores: scores, visibleRows: visible, topK: topK
+                )
+            } else {
+                let candidateSource = config.candidateSourceLayerID
+                let published: [Bool]? = candidateSource >= 0 && candidateSource < layer.index
+                    ? indexMasksByPosition[position]
+                    : nil
+                indexSelectionsByPosition[position] = DeepSeekV41Indexer.selectedRows(
+                    scores: scores,
+                    visibleRows: visible,
+                    topK: topK,
+                    candidates: published
+                )
+            }
+        }
+    }
+
+    /// The row list one position's gather binds.
+    private func indexSelection(for layer: DeepSeekV41LayerPlan, position: Int) throws -> [Int]? {
+        guard layer.flavor == .compressed, layer.compressedKVSource >= 0 else { return nil }
+        guard config.indexTopK > 0 else { return nil }
+        guard let rows = indexSelectionsByPosition[position] else {
+            throw DeepSeekV41EngineError.allocationFailed(
+                "position \(position) reached the gather before its compressed rows were selected"
+            )
+        }
+        return rows
     }
 
     /// Gathers the window plus the selected compressed rows into one dense block and
@@ -3431,7 +3746,8 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             plan: plan,
             geometry: geometry,
             ownerRowLimit: cache.layout.compressedRowsByOwner[layer.compressedKVSource]
-                ?? geometry.compressedRows
+                ?? geometry.compressedRows,
+            selection: try indexSelection(for: layer, position: position)
         )
         let windowCount = rowPlan.windowRows.count
         let compressedCount = rowPlan.compressedRows.count

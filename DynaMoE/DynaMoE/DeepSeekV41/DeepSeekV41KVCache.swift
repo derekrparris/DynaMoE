@@ -375,29 +375,21 @@ nonisolated public enum DeepSeekV41CacheAddressing {
         return (position + 1) % ratio == 0
     }
 
-    /// The compressed rows a position's compressed attentions may read: every
-    /// row produced so far, capped to the fewest the token budget allows.
+    /// The compressed rows that exist for a position, before any selection.
     ///
-    /// `topKRows` is the indexer's selection when the layer runs an indexer, and
-    /// 0 (meaning "all rows") when it does not. The caller resolves the selection
-    /// into an explicit row list; this only bounds it.
-    ///
-    /// These rows can overlap the sliding window. A block of `ratio` positions is
-    /// pooled once complete, so when `ratio <= windowSize` the newest block covers
+    /// These can overlap the sliding window. A block of `ratio` positions is pooled
+    /// once complete, so when `ratio <= windowSize` the newest block covers
     /// positions the window also reads, and the same latent is attended over twice
     /// (once as a window row, once as part of a pooled row). That is the reference
     /// behavior for this architecture, not an accounting bug: the scheduler keeps
     /// the two kinds as separate rows and the softmax sees both.
-    public static func compressedRowsForAttention(
+    public static func producedCompressedRows(
         position: Int,
         ratio: Int,
-        ownerRowCount: Int,
-        topKRows: Int
+        ownerRowCount: Int
     ) -> Range<Int> {
         let produced = min(compressedRowCount(afterPosition: position, ratio: ratio), ownerRowCount)
-        guard produced > 0 else { return 0..<0 }
-        if topKRows <= 0 || topKRows >= produced { return 0..<produced }
-        return (produced - topKRows)..<produced
+        return 0..<max(0, produced)
     }
 
     /// The live window positions for a query at `position`: the trailing
@@ -468,17 +460,17 @@ nonisolated public enum DeepSeekV41CacheAddressing {
 // MARK: - Row plan
 
 /// The cache rows one attention stage reads for one position: the live window,
-/// then the compressed rows, both resolved by the same rule on both backends.
+/// then the compressed rows the indexer selected.
 ///
-/// This exists so the host never has to read the cache back to know what to
-/// attend over. Selection is a function of the position and the ratio alone, so
-/// the row count is known before any dispatch and the CPU reference and the
-/// Metal executor cannot drift. The indexer's block scores are recorded (they
-/// are what `Tools/dsv41_probe.py` compares against), but they do not choose
-/// rows: `DeepSeekV41Conformance.candidateSelection` is still unverified, and a
-/// value-dependent selection would need a per-layer device-to-host readback of
-/// the count, which is exactly the kind of silent divergence this file is
-/// trying to avoid.
+/// Selection is value-dependent, so the caller computes it (`DeepSeekV41Indexer`)
+/// rather than this type guessing: which compressed rows a query reads is the
+/// top `index_topk` of the indexer's scores, and the port that answered "the
+/// newest `index_topk`" was only right while a position had nothing to choose
+/// between (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #28").
+///
+/// `selection` is expressed in owner-cache rows, ascending. Nil means every
+/// reachable row, which is what the reference reads on a layer that has no
+/// indexer at all.
 nonisolated public struct DeepSeekV41AttentionRowPlan: Sendable, Equatable {
     /// Logical positions in the sliding window, oldest first.
     public let windowPositions: [Int]
@@ -505,13 +497,18 @@ public extension DeepSeekV41CacheAddressing {
     ///     provisioned for. The reference passes `.max` (it keeps every row it
     ///     has ever pooled); the device path passes the allocation, because a
     ///     row beyond it has no buffer to read.
+    ///   - selection: the compressed rows the indexer chose, ascending. Rows past
+    ///     the cache or the allocation are dropped rather than clamped, because a
+    ///     selected row that does not exist is a bug in the selection rather than
+    ///     something to attend over.
     nonisolated static func attentionRowPlan(
         layer: DeepSeekV41LayerPlan,
         position: Int,
         config: DeepSeekV41Config,
         plan: [DeepSeekV41LayerPlan],
         geometry: DeepSeekV41CacheGeometry,
-        ownerRowLimit: Int = .max
+        ownerRowLimit: Int = .max,
+        selection: [Int]? = nil
     ) -> DeepSeekV41AttentionRowPlan {
         let windowPositions = Array(windowRange(position: position, windowSize: config.windowSize))
         let windowRows = windowPositions.map { windowRow(for: $0, geometry: geometry) }
@@ -530,16 +527,16 @@ public extension DeepSeekV41CacheAddressing {
             compressedRowCount(afterPosition: position, ratio: max(1, ownerRatio)),
             max(0, ownerRowLimit)
         )
-        let rows = compressedRowsForAttention(
-            position: position,
-            ratio: max(1, layer.compressRatio),
-            ownerRowCount: produced,
-            topKRows: config.indexTopK
-        )
+        let rows: [Int]
+        if let selection {
+            rows = selection.filter { $0 >= 0 && $0 < produced }.sorted()
+        } else {
+            rows = Array(0..<max(0, produced))
+        }
         return DeepSeekV41AttentionRowPlan(
             windowPositions: windowPositions,
             windowRows: windowRows,
-            compressedRows: Array(rows)
+            compressedRows: rows
         )
     }
 }

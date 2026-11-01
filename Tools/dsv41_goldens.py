@@ -1499,6 +1499,283 @@ def vision_case(torch, reference) -> dict:
     }
 
 
+def indexer_case(torch, reference) -> dict:
+    """`Indexer.forward` and `select_candidate_blocks`: which compressed rows a query reads.
+
+    The port answered this without looking at any value: read the newest `index_topk`
+    compressed rows, because those are the ones a position can see. That is the same
+    answer only while a position has nothing to choose between. `index_topk` is 512 on
+    the published checkpoint, so on the twenty ratio-1 layers the two rules part company
+    at position 513 -- ordinary context, not a long-context curiosity.
+
+    Three things are asked of the reference, and each can be wrong on its own:
+
+      * the SHAPE of a score. `index_score` is the relu of a per-head dot against the
+        shared index key, weighted per head, and SUMMED over heads, with
+        `index_head_dim ** -0.5 * index_n_heads ** -0.5` folded into the weights. A max
+        over heads, or a mean, ranks differently.
+      * which positions a query may score at all. A compressed row only becomes visible
+        once the query has passed its last token, so a prefill chunk scores the whole
+        cache and masks what each query has not reached. That mask is why the first
+        position of a prompt selects nothing rather than a row it cannot see.
+      * the two levels. `select_candidate_blocks` scores a block by its best position,
+        PINS the partly-filled block holding the query's newest position at +inf so it
+        cannot be outscored by an older full block, then hands the survivors to the
+        per-layer top-k. It runs on the candidate source only; the layers after it mask
+        with that source's blocks and score with their own weights.
+
+    `prefill` and `decode` run with `candidate_source_layer=-1`, so they exercise the
+    top-k alone. `blocks` runs a source and then a consumer, so both levels and the
+    reuse between them are in the vectors.
+    """
+    generator = torch.Generator().manual_seed(20251017)
+    # `fp4_act_quant` and `act_quant` are the checkpoint's fused kernels; these
+    # vectors are FP32 throughout, so their faithful form here is the identity.
+    original_quant = reference.act_quant
+    original_fp4 = reference.fp4_act_quant
+    original_shared = reference.shared_attn
+    reference.act_quant = _act_quant_identity()
+    reference.fp4_act_quant = _act_quant_identity()
+
+    # `_compress_kv` passes the window length as the compressed index offset.
+    offset = 2
+
+    def args_for(**overrides):
+        base = dict(
+            dim=6,
+            q_lora_rank=4,
+            head_dim=4,
+            index_n_heads=32,
+            index_head_dim=8,
+            rope_head_dim=4,
+            norm_eps=1e-6,
+            n_layers=3,
+            window_size=2,
+            compress_ratios=(0, 2, 2),
+            kv_source_layers=(1,),
+            index_source_layers=(1, 2),
+            max_batch_size=1,
+            max_seq_len=64,
+            original_seq_len=0,
+        )
+        base.update(overrides)
+        return reference.ModelArgs(**base)
+
+    class Shared:
+        """`SharedAttentionRuntime`, reduced to the three fields the indexer touches."""
+
+        index_k = None
+        candidates = None
+        topk_idxs = None
+
+    def build(args, layer_id):
+        module = fill(reference.Indexer(args, layer_id), torch)
+        # `wk` and `weights_proj` are declared bf16 by the reference, which then
+        # multiplies them by a bf16 activation. These vectors are FP32 throughout, so
+        # the stored (already bf16-rounded) values are upcast rather than the
+        # activations being narrowed: nothing about the rule moves, and the matmul
+        # runs at the precision the port reads.
+        for parameter in module.parameters():
+            if parameter.dtype != torch.float32:
+                parameter.data = parameter.data.float()
+        # `Attention.__init__` hands the indexer `self.freqs_cis`, which for a
+        # compressing layer is built at `compress_rope_theta`.
+        module.freqs_cis = reference.precompute_freqs_cis(
+            args.rope_head_dim,
+            args.max_seq_len,
+            args.original_seq_len,
+            args.compress_rope_theta,
+            args.rope_factor,
+            args.beta_fast,
+            args.beta_slow,
+        )
+        return module
+
+    def scored(module, tensors, start_pos, keys):
+        """`index_score` as `Indexer.forward` computes it, for the record.
+
+        The module returns only `topk_idxs`, so the score matrix is recomputed from the
+        module's own submodules and then checked against what it selected: if the two
+        disagree this raises rather than emitting a matrix nothing ranked.
+        """
+        seqlen = tensors["x"].size(1)
+        end_pos = start_pos + seqlen
+        q = module.wq_b(tensors["qr"]).unflatten(-1, (module.n_heads, module.index_head_dim))
+        reference.apply_rotary_emb(
+            q[..., -module.rope_head_dim :], module.freqs_cis[start_pos:end_pos]
+        )
+        weights = module.weights_proj(tensors["x"]) * (
+            module.softmax_scale * module.n_heads**-0.5
+        )
+        scores = torch.einsum("bshd,btd->bsht", q, keys)
+        scores = (scores.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+        if start_pos == 0:
+            compress_lens = (
+                torch.arange(1, seqlen + 1, device=scores.device) // module.compress_ratio
+            ).unsqueeze(-1)
+            scores.masked_fill_(
+                torch.arange(keys.size(1), device=scores.device) >= compress_lens, -torch.inf
+            )
+        else:
+            compress_lens = end_pos // module.compress_ratio
+        return scores, compress_lens
+
+    def record(module, tensors, start_pos, shared, idxs, name, args):
+        """One case: the module's own selection, plus the score matrix behind it."""
+        ratio = module.compress_ratio
+        keys = shared.index_k[:, : (start_pos + tensors["x"].size(1)) // ratio]
+        scores, compress_lens = scored(module, tensors, start_pos, keys)
+        # `select_candidate_blocks` runs on the source; every layer then masks with the
+        # blocks it published and takes its own top-k.
+        if module.is_candidate_source:
+            shared.candidates = reference.select_candidate_blocks(
+                scores, compress_lens, args.candidate_topk_blocks, args.candidate_block_size
+            )
+            masked = scores
+        elif module.uses_candidates:
+            masked = scores.masked_fill(~shared.candidates, -torch.inf)
+        else:
+            masked = scores
+        topk = min(module.index_topk, (start_pos + tensors["x"].size(1)) // ratio)
+        replay = masked.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+        replay = torch.where(replay < compress_lens, replay + offset, -1).int()
+        if not torch.equal(replay, idxs):
+            raise RuntimeError(
+                f"indexer goldens: the {name} score replay disagrees with the module"
+            )
+        return {
+            "name": name,
+            "start_pos": start_pos,
+            "compress_ratio": ratio,
+            "index_topk": module.index_topk,
+            "candidate_topk_blocks": args.candidate_topk_blocks,
+            "candidate_block_size": args.candidate_block_size,
+            "is_candidate_source": bool(module.is_candidate_source),
+            "uses_candidates": bool(module.uses_candidates),
+            "x": rows_of(tensors["x"][0]),
+            "qr": rows_of(tensors["qr"][0]),
+            "latent": rows_of(tensors["latent"][0]) if tensors["latent"] is not None else None,
+            # [positions][compressed rows]: -1 for a slot the query may not read.
+            "topk_idxs": rows_of(idxs)[0],
+            # [positions][compressed rows]: before the top-k, with the reach mask applied.
+            "scores": rows_of(scores)[0],
+            # [compressed rows]: the block mask the source published, if any.
+            "blocks": (
+                rows_of(shared.candidates[0].int()) if shared.candidates is not None else None
+            ),
+            # [compressed rows][index_head_dim]: the index keys the source published.
+            "index_k": rows_of(keys[0]),
+        }
+
+    def run(args, layer_id, tensors, start_pos, shared=None, k_cache=None):
+        module = build(args, layer_id)
+        # `Indexer.forward` publishes its OWN `k_cache` as `shared_attn.index_k`
+        # whenever the layer owns index keys, so a cache carried over from an earlier
+        # step has to be written into this module rather than handed to it.
+        if k_cache is not None and module.owns_k:
+            module.k_cache.zero_()
+            module.k_cache[:, : k_cache.size(1)] = k_cache
+        shared = shared if shared is not None else Shared()
+        reference.shared_attn = shared
+        with torch.no_grad():
+            idxs = module(tensors["x"], tensors["qr"], tensors["latent"], start_pos, offset)
+        return module, shared, idxs
+
+    cases = []
+    try:
+        # Top-k alone, over a chunk of eight positions at ratio 2: four compressed
+        # rows, reached at different times, so every query sees a different prefix.
+        prefill_args = args_for(candidate_source_layer=-1, index_topk=3)
+        prefill = {
+            "x": torch.randn(1, 8, prefill_args.dim, generator=generator),
+            "qr": torch.randn(1, 8, prefill_args.q_lora_rank, generator=generator),
+            "latent": torch.randn(1, 4, prefill_args.head_dim, generator=generator),
+        }
+        module, shared, idxs = run(prefill_args, 1, prefill, 0)
+        cases.append(record(module, prefill, 0, shared, idxs, "prefill", prefill_args))
+        weights = {
+            "wq_b": rows_of(module.wq_b.weight),
+            "weights_proj": rows_of(module.weights_proj.weight),
+            "wk": rows_of(module.wk.weight),
+            "k_norm": rows_of(module.k_norm.weight),
+        }
+        cache = shared.index_k.clone()
+
+        # The same source one decode step later: one position, no latent (its group is
+        # still incomplete), so the cache is read but not written.
+        decode_args = args_for(candidate_source_layer=-1, index_topk=3)
+        decode = {
+            "x": torch.randn(1, 1, decode_args.dim, generator=generator),
+            "qr": torch.randn(1, 1, decode_args.q_lora_rank, generator=generator),
+            "latent": None,
+        }
+        module, shared, idxs = run(decode_args, 1, decode, 8, k_cache=cache)
+        cases.append(record(module, decode, 8, shared, idxs, "decode", decode_args))
+
+        # Both levels. Sixteen positions at ratio 2 fill eight compressed rows, which
+        # is four blocks of two against `candidate_topk_blocks=2`; the source publishes
+        # the mask and the following layer scores with its own weights inside it.
+        block_args = args_for(
+            candidate_source_layer=1,
+            candidate_topk_blocks=2,
+            candidate_block_size=2,
+            index_topk=3,
+        )
+        chunk = {
+            "x": torch.randn(1, 16, block_args.dim, generator=generator),
+            "qr": torch.randn(1, 16, block_args.q_lora_rank, generator=generator),
+            "latent": torch.randn(1, 8, block_args.head_dim, generator=generator),
+        }
+        source, source_shared, source_idxs = run(block_args, 1, chunk, 0)
+        cases.append(
+            record(source, chunk, 0, source_shared, source_idxs, "blocks_source", block_args)
+        )
+        consumer_input = {
+            "x": torch.randn(1, 16, block_args.dim, generator=generator),
+            "qr": torch.randn(1, 16, block_args.q_lora_rank, generator=generator),
+            "latent": None,
+        }
+        # Layer 2 owns indexer weights but not index keys, so it reads the cache layer
+        # 1 published and re-scores inside the blocks layer 1 selected.
+        reuse = Shared()
+        reuse.index_k = source_shared.index_k
+        reuse.candidates = source_shared.candidates
+        consumer, consumer_shared, consumer_idxs = run(
+            block_args, 2, consumer_input, 0, reuse
+        )
+        cases.append(
+            record(
+                consumer, consumer_input, 0, consumer_shared, consumer_idxs,
+                "blocks_consumer", block_args,
+            )
+        )
+    finally:
+        reference.act_quant = original_quant
+        reference.fp4_act_quant = original_fp4
+        reference.shared_attn = original_shared
+
+    return {
+        "gate": "candidateSelection",
+        "reference": (
+            "inference/model.py Indexer.forward and select_candidate_blocks "
+            f"({snapshot_note()})"
+        ),
+        "config": {
+            "dim": prefill_args.dim,
+            "q_lora_rank": prefill_args.q_lora_rank,
+            "head_dim": prefill_args.head_dim,
+            "index_n_heads": prefill_args.index_n_heads,
+            "index_head_dim": prefill_args.index_head_dim,
+            "rope_head_dim": prefill_args.rope_head_dim,
+            "norm_eps": prefill_args.norm_eps,
+            "compress_rope_theta": prefill_args.compress_rope_theta,
+            "window_size": prefill_args.window_size,
+        },
+        "input": weights,
+        "cases": cases,
+    }
+
+
 CASES = {
     "engram": engram_case,
     "compressor": compressor_case,
@@ -1509,6 +1786,7 @@ CASES = {
     "dspark": dspark_case,
     "dspark_block": dspark_block_case,
     "vision": vision_case,
+    "indexer": indexer_case,
 }
 
 _SNAPSHOT = ""

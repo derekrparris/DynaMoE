@@ -690,6 +690,13 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
                   shapes: shapes,
                   config: config,
                   compressedOwners: plan.filter(\.ownsCompressedKV).count,
+                  // The widest owner's row count, not the geometry's base one: the
+                  // base is sized from the WIDEST ratio, and a ratio-1 owner pools
+                  // one row per token, so it needs the whole context.
+                  indexerRows: plan
+                      .filter(\.ownsCompressedIndex)
+                      .map { layout.geometry.compressedRows(forRatio: max(1, $0.compressRatio)) }
+                      .max() ?? 0,
                   // Prefill runs a block of positions per dispatch, so every
                   // per-position vector is replicated for the block. The ring
                   // caps the block: it holds `window` rows, and a wider block
@@ -1046,6 +1053,20 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
     public let compressorGroups: Int
     /// Slots one owner's compressor block holds, i.e. the widest compress ratio.
     public let compressorGroupWidth: Int
+    /// The indexer's own query for the position being scored, `indexHeadDim` wide
+    /// per index head, rotated. One copy per slot.
+    public let indexQuery: MTLBuffer
+    /// `weights_proj(x)` for the position, one weight per index head, unscaled: the
+    /// kernel multiplies by these, so the `index_head_dim ** -0.5 *
+    /// index_n_heads ** -0.5` factor is applied on the way in.
+    public let indexWeights: MTLBuffer
+    /// One index key while it is being built from a pooled latent.
+    public let indexKey: MTLBuffer
+    /// The indexer's score for every compressed row, one block per slot. Shared so
+    /// the host can read the selection it implies.
+    public let indexScores: MTLBuffer
+    /// Rows `indexScores` holds per slot.
+    public let indexerRows: Int
     /// The `wq_a` / `wo_a` rank-width scratch.
     public let reduced: MTLBuffer
     public let moeOut: MTLBuffer
@@ -1112,6 +1133,7 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
         shapes: DeepSeekV41TensorShapes,
         config: DeepSeekV41Config,
         compressedOwners: Int,
+        indexerRows: Int = 0,
         slots: Int = 1
     ) {
         let mult = max(1, config.hcMult)
@@ -1166,6 +1188,14 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
               let compressorScores = make(
                   float4(maxCompressed * compressorGroups * shapes.latentWidth)
               ),
+              let indexQuery = make(
+                  slotBytes(max(1, config.indexNHeads * config.indexHeadDim))
+              ),
+              let indexWeights = make(slotBytes(max(1, config.indexNHeads))),
+              let indexKey = make(float4(max(1, config.indexHeadDim))),
+              let indexScores = make(
+                  float4(max(1, indexerRows) * slots)
+              ),
               let reduced = make(slotBytes(max(1, max(shapes.qLoraRank, shapes.outputReducedWidth)))),
               let moeOut = make(slotBytes(shapes.hidden)),
               let streams = make(slotBytes(mult * shapes.hidden)),
@@ -1210,6 +1240,11 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
         self.compressorScores = compressorScores
         self.compressorGroups = compressorGroups
         self.compressorGroupWidth = maxCompressed
+        self.indexQuery = indexQuery
+        self.indexWeights = indexWeights
+        self.indexKey = indexKey
+        self.indexScores = indexScores
+        self.indexerRows = max(1, indexerRows)
         self.reduced = reduced
         self.moeOut = moeOut
         self.streams = streams

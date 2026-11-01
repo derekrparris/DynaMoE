@@ -117,17 +117,35 @@ nonisolated public enum DeepSeekV41Conformance {
     /// them is `DeepSeekV41AttentionReference`'s own and is pinned separately.
     public static let chunkAddressing: Gate = .verifiedAgainstReference
 
-    /// How the compressed-row candidate blocks are scored and truncated.
+    /// Which compressed rows a query reads: the indexer's two-level top-k.
     ///
-    /// Both backends currently read rows through
-    /// `DeepSeekV41CacheAddressing.attentionRowPlan`, which is value-free: the
-    /// count a position reads is known on the host before any dispatch. The
-    /// block-score path stays a recorded diagnostic (the reference keeps
-    /// `candidateScores`, the device path does not compute them) because a
-    /// value-dependent selection needs a per-layer readback of the selected count,
-    /// and paying that before the rule is verified would slow every token down to
-    /// reproduce a guess.
-    public static let candidateSelection: Gate = .unverified
+    /// MATCHED AGAINST `Indexer.forward` and `select_candidate_blocks`. Three rules
+    /// decide the answer and each is pinned separately by
+    /// `Tools/dsv41_goldens.py indexer` and `DeepSeekV41IndexerGoldenTests`:
+    ///
+    /// * the score. `(relu(dot) * weight).sum(heads)` against the shared index key,
+    ///   with `index_head_dim ** -0.5 * index_n_heads ** -0.5` on the WEIGHTS. The
+    ///   rectifier is per head, so a head that votes against a row removes only its
+    ///   own contribution, and the heads are summed rather than maxed.
+    /// * the reach mask. A compressed row becomes visible to a query only once the
+    ///   query has passed its last token (`arange(1, seqlen + 1) // ratio`), and the
+    ///   cut runs BEFORE that filter, so a row a query cannot see can take a slot and
+    ///   then leave the selection one short.
+    /// * the two cuts. A block scores as its best row, the partly-filled block at the
+    ///   frontier is pinned at `+inf` so it cannot lose to an older full block, and
+    ///   only the candidate source publishes that mask: the layers after it score
+    ///   with their OWN query and weights inside it.
+    ///
+    /// The port read the newest `index_topk` rows until this was verified, which is
+    /// the same list only while nothing competes for the slots. On the published
+    /// checkpoint `index_topk` is 512 and the twenty ratio-1 layers read one
+    /// compressed row per token, so the two disagreed from position 513 on.
+    ///
+    /// What it does NOT cover: the FP4 activation quantization of the indexer's query
+    /// and keys, which the dense path skips everywhere else too, and the order among
+    /// exactly equal scores — a row every head votes against scores zero, and the
+    /// port breaks that tie to the lower row index.
+    public static let candidateSelection: Gate = .verifiedAgainstReference
 
     /// How retrieved Engram rows are combined into the layer's residual.
     ///

@@ -6119,3 +6119,76 @@ costs nothing here because the container close IS the model's last token.
 | shipped instruction block → | 38 tokens, DSML |
 | inbound container | five shapes, all read, 16 tokens each |
 | agent turn after the fix | `toolFreeze`, 41 tokens, 1 call parsed |
+
+
+## DSV4.1 #28: THE COMPRESSED ROWS A QUERY READS ARE A SCORED TOP-K, AND THE PORT WAS READING THE NEWEST ONES
+
+**Question.** `attentionRowPlan` selected compressed rows with a rule that never
+looked at a value: read the newest `index_topk` rows, because those are the ones a
+position can see. `DeepSeekV41Conformance.candidateSelection` was `.unverified`
+and the note next to it said the reference "keeps `candidateScores`" — but nothing
+compared the two. Does the reference select the newest rows?
+
+**Answer: no, and the difference starts at ordinary context.**
+
+`inference/model.py` `Indexer.forward` is a small side attention: it projects the
+layer's own `qr` into `index_n_heads` of `index_head_dim`, scores every compressed
+key with `(relu(dot) * weight).sum(heads)`, masks the rows the query has not
+reached yet, and keeps the best `index_topk`. `select_candidate_blocks` is the
+level above it, and only the candidate source runs it.
+
+| rule | published value | when it starts to bind |
+| --- | --- | --- |
+| `index_topk` (level two) | 512 | position 513 on the twenty ratio-1 layers, 1025 on the ratio-2 half |
+| `candidate_topk_blocks` (level one) | 2048 blocks x 8 rows | 16,384 compressed positions, i.e. 16,384 tokens on the ratio-1 half |
+
+So the level the port got wrong is the one that binds first, and the level it
+never implemented (blocks) is inert on this checkpoint for any ordinary context.
+That is worth stating plainly: 20 of the 40 layers read one compressed row per
+token, so "newest 512" and "best 512" diverge from token 513.
+
+**What changed.**
+
+* `DeepSeekV41Indexer` is now an exact port of the reference: `positionScores`
+  (per-head rectified dot, weighted, summed), `candidateBlocks` (block score is
+  the block's best row, and the partly-filled frontier block is pinned at `+inf`
+  so it cannot lose to an older full block), and `selectedRows` (the cut, then the
+  reach filter — in that order, which can leave the selection one row short).
+* `Tools/dsv41_goldens.py indexer` runs `Indexer.forward` and
+  `select_candidate_blocks` at a tiny config for four cases: a prefill chunk whose
+  queries reach different prefixes, a decode step, a candidate source publishing a
+  mask, and the next layer rescoring inside it. `DeepSeekV41IndexerGoldenTests`
+  pins the scores AND the selections.
+* The host reference computes the index keys at the pooling point (`k_norm(wk(latent))`
+  on the RoPE-free latent, rotated at the group's first position), scores per
+  position, and reuses the source's list for the layers between two sources.
+* The device path does the same with `dsv41_indexer_scores_f32` (rewritten: it was
+  the Qwen max-over-heads block scorer and nothing called it), and reads the score
+  vector back. That readback is the cost the old note was avoiding, and it is one
+  wait per index-source layer: the dense half now ends after the indexer and a
+  second submission carries the gather, because the row list the gather binds is a
+  host value.
+
+**Numbers worth remembering.**
+
+| | value |
+| --- | --- |
+| index sources on the published checkpoint | 8 (`[2, 8, 14, 20, 24, 28, 32, 36]`), of which 4 own the keys |
+| first position where the old rule is wrong | 513 (ratio-1 layers), 1,025 (ratio-2) |
+| level one binds at | 16,384 compressed positions — never at ordinary context |
+| golden fixture tie rows | 0 (a tie would be a row every head voted against) |
+| DeepSeek suite | 479 passed, 0 failed, 35 skipped across 82 classes |
+| Metal validation | 0 errors on the same 479 |
+
+**Two things the golden caught that a fixture would not.** The cut runs before the
+reach filter, so a row a query cannot see can take a slot and then be dropped: with
+three visible rows and `topk` 2 the reference selects ONE row, not two. And the
+source layer does not mask itself — `is_candidate_source` publishes the blocks and
+`uses_candidates` (strictly later layers) applies them, which is why a consumer's
+selection differs from its source's on the same keys.
+
+**Still open.** The indexer's FP4 query/key quantization is skipped like every other
+activation quantization in the dense path, and exactly equal scores break to the
+lower row index where `torch.topk` is unspecified. Neither was measured against real
+weights: the whole slice is synthetic-checkpoint coverage, and the published
+geometry's first real run has not happened.

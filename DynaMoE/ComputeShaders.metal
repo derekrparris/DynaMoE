@@ -10352,39 +10352,53 @@ kernel void dsv41_pool_latents_f32(
     pooledBuffer[dim] = accumulator;
 }
 
-/// MSL Kernel: indexer block scores. Each block's score is the MAX over its rows
-/// and over the indexer query heads of `dot(q, key) / sqrt(keyWidth)`, which is
-/// the same rule the Qwen-sparse-attention scorer uses: a block is only worth
-/// reading if some row in it is relevant.
+/// MSL Kernel: the indexer's score for every compressed row, one thread per row.
+///
+/// The rule is `Indexer.forward`, and none of its three parts is a rescaling of
+/// another: each head's dot is RECTIFIED before it is weighted, the heads are
+/// SUMMED rather than maxed, and `index_head_dim ** -0.5 * index_n_heads ** -0.5`
+/// is folded into `headWeights` so a row several heads like beats a row one head
+/// loves. A row past the query's frontier scores -inf: a compressed row only
+/// becomes visible once the query has passed its last token.
+///
+/// The four accumulators are not decoration. A 512-long dependent FMA chain in one
+/// lane cost the attention kernel 2.7x until it was split (`DSV4.1 #17`).
 kernel void dsv41_indexer_scores_f32(
-    device const float* queryBuffer [[buffer(0)]],  // [heads * keyWidth]
-    device const float* keyBuffer [[buffer(1)]],    // [rowCount * keyWidth]
-    device float* blockScores [[buffer(2)]],
-    constant uint32_t& headCount [[buffer(3)]],
-    constant uint32_t& keyWidth [[buffer(4)]],
-    constant uint32_t& rowCount [[buffer(5)]],
-    constant uint32_t& blockSize [[buffer(6)]],
-    uint blockIdx [[thread_position_in_grid]]
+    device const float* queryBuffer [[buffer(0)]],   // [headCount * headWidth]
+    device const float* keyBuffer [[buffer(1)]],     // [rowCount * headWidth]
+    device const float* weightsBuffer [[buffer(2)]], // [headCount]
+    device float* scores [[buffer(3)]],              // [rowCount]
+    constant uint32_t& headCount [[buffer(4)]],
+    constant uint32_t& headWidth [[buffer(5)]],
+    constant uint32_t& rowCount [[buffer(6)]],
+    constant uint32_t& visibleRows [[buffer(7)]],
+    constant float& weightScale [[buffer(8)]],
+    uint row [[thread_position_in_grid]]
 ) {
-    if (blockSize == 0) return;
-    uint32_t start = blockIdx * blockSize;
-    if (start >= rowCount) return;
-    uint32_t end = min(start + blockSize, rowCount);
-
-    float invSqrt = rsqrt((float)keyWidth);
-    float blockMax = -1e30f;
-    for (uint32_t row = start; row < end; ++row) {
-        uint64_t keyBase = (uint64_t)row * keyWidth;
-        for (uint32_t head = 0; head < headCount; ++head) {
-            uint32_t queryBase = head * keyWidth;
-            float dot = 0.0f;
-            for (uint32_t dim = 0; dim < keyWidth; ++dim) {
-                dot += queryBuffer[queryBase + dim] * keyBuffer[keyBase + dim];
-            }
-            blockMax = max(blockMax, dot * invSqrt);
-        }
+    if (row >= rowCount) return;
+    if (row >= visibleRows) {
+        scores[row] = -INFINITY;
+        return;
     }
-    blockScores[blockIdx] = (blockMax == -1e30f) ? 0.0f : blockMax;
+    uint64_t keyBase = (uint64_t)row * headWidth;
+    float total = 0.0f;
+    for (uint32_t head = 0; head < headCount; ++head) {
+        uint32_t queryBase = head * headWidth;
+        float a = 0.0f, b = 0.0f, c = 0.0f, d = 0.0f;
+        uint32_t dim = 0;
+        for (; dim + 3 < headWidth; dim += 4) {
+            a += queryBuffer[queryBase + dim] * keyBuffer[keyBase + dim];
+            b += queryBuffer[queryBase + dim + 1] * keyBuffer[keyBase + dim + 1];
+            c += queryBuffer[queryBase + dim + 2] * keyBuffer[keyBase + dim + 2];
+            d += queryBuffer[queryBase + dim + 3] * keyBuffer[keyBase + dim + 3];
+        }
+        for (; dim < headWidth; ++dim) {
+            a += queryBuffer[queryBase + dim] * keyBuffer[keyBase + dim];
+        }
+        float dot = (a + b) + (c + d);
+        if (dot > 0.0f) total += dot * weightsBuffer[head] * weightScale;
+    }
+    scores[row] = total;
 }
 
 /// MSL Kernel: scored top-k routing with a per-expert selection bias.

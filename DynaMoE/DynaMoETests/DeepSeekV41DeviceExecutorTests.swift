@@ -149,7 +149,7 @@ final class DeepSeekV41AttentionRowPlanTests: XCTestCase {
         XCTAssertEqual(rows.totalRows, 3)
     }
 
-    func testCompressedLayerReadsTheMostRecentRowsAscending() throws {
+    func testANilSelectionReadsEveryReachableRow() throws {
         let config = try DeepSeekV41TestFixtures.config()
         let plan = try config.makeLayerPlan()
         let geometry = DeepSeekV41CacheGeometry.make(
@@ -167,7 +167,8 @@ final class DeepSeekV41AttentionRowPlanTests: XCTestCase {
             geometry: geometry
         )
         XCTAssertEqual(plan[1].flavor, .compressed)
-        XCTAssertEqual(rows.compressedRows, [1, 2, 3, 4])
+        // Nil is the reference's no-indexer case: every row, not the newest few.
+        XCTAssertEqual(rows.compressedRows, [0, 1, 2, 3, 4])
         XCTAssertEqual(rows.compressedRows, rows.compressedRows.sorted())
     }
 
@@ -194,6 +195,18 @@ final class DeepSeekV41AttentionRowPlanTests: XCTestCase {
         XCTAssertTrue(rows.compressedRows.allSatisfy { $0 < 2 })
     }
 
+    /// The rows the walk itself selected, so the plan and the keys are compared
+    /// against the same list rather than against a rule restated in the test.
+    private func consent(
+        forward: DeepSeekV41CPUForward,
+        layer: DeepSeekV41LayerPlan,
+        position: Int
+    ) -> [Int]? {
+        guard let rows = forward.indexSelections[layer.compressedIndexSource],
+              rows.indices.contains(position) else { return nil }
+        return rows[position]
+    }
+
     func testReferenceAndPlanReadTheSameRowCount() throws {
         let config = try DeepSeekV41TestFixtures.config()
         let plan = try config.makeLayerPlan()
@@ -203,16 +216,20 @@ final class DeepSeekV41AttentionRowPlanTests: XCTestCase {
 
         for position in 0..<7 {
             for layer in plan {
+                let selection = consent(forward: forward, layer: layer, position: position)
                 let planRows = DeepSeekV41CacheAddressing.attentionRowPlan(
                     layer: layer,
                     position: position,
                     config: config,
                     plan: plan,
-                    geometry: forward.geometry
+                    geometry: forward.geometry,
+                    selection: selection
                 )
                 // The reference drops a row it has not written yet; before position 0
                 // there are none, and past it every planned row exists.
-                let keys = forward.attentionKeys(layer: layer, position: position)
+                let keys = forward.attentionKeys(
+                    layer: layer, position: position, selection: selection
+                )
                 XCTAssertEqual(
                     keys.count,
                     planRows.totalRows,

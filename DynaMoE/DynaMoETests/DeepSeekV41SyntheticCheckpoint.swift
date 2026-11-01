@@ -222,9 +222,9 @@ extension DeepSeekV41SyntheticShape {
     /// of the sequence keeps the full `index_topk`: 1,024 positions at ratio 2
     /// pool 512 rows.
     ///
-    /// What is deliberately small: the indexer's `index_n_heads` /`index_head_dim`.
-    /// No backend reads those weights — row selection is a function of the
-    /// position and the ratio — so they size a cache region nothing attends over.
+    /// What is deliberately small: the indexer's `index_n_heads` / `index_head_dim`.
+    /// Both backends read them — the compressed-row selection is a scored top-k over
+    /// the indexer's own attention (`DSV4.1 #28`) — so they are real, just narrow.
     /// `index_topk` is NOT small, because it is the row count.
     static func compressedPublishedWidths(
         layers: Int = 2,
@@ -498,9 +498,9 @@ nonisolated final class DeepSeekV41SyntheticCheckpoint {
                     shape: [shape.latentWidth], magnitude: gain
                 )
             }
-            // The indexer's weights are published but never read: the row plan is
-            // a function of the position and the ratio, so selection needs no
-            // scores (`DeepSeekV41CacheAddressing`, `candidateSelection` gate).
+            // The indexer's weights, which both backends read: the compressed-row
+            // selection is a scored top-k over the indexer's own attention
+            // (`DeepSeekV41Indexer`, `candidateSelection` gate).
             for role in DeepSeekV41WeightCatalog.requiredIndexerRoles(layer: entry, config: config) {
                 switch role {
                 case .indexerWqB:

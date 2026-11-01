@@ -121,6 +121,33 @@ enum DeepSeekV41TestFixtures {
             source.set(generator.matrix(rows: shapes.queryWidth, columns: shapes.hidden), role: .attnWqB, layer: l)
             source.set(generator.matrix(rows: shapes.latentWidth, columns: shapes.hidden), role: .attnWkv, layer: l)
             source.set(generator.vector(shapes.latentWidth, scale: 0.1), role: .attnKvNorm, layer: l)
+            // The indexer's own projections, so the fixture runs the compressed-row
+            // selection instead of falling back to "every reachable row".
+            if layer.ownsCompressedIndex {
+                let reduced = shapes.qLoraRank > 0 ? shapes.qLoraRank : shapes.hidden
+                source.set(
+                    generator.matrix(rows: config.indexNHeads * config.indexHeadDim, columns: reduced),
+                    role: .indexerWqB,
+                    layer: l
+                )
+                source.set(
+                    generator.matrix(rows: config.indexNHeads, columns: shapes.hidden),
+                    role: .indexerWeights,
+                    layer: l
+                )
+                if layer.ownsCompressedKV {
+                    source.set(
+                        generator.matrix(rows: config.indexHeadDim, columns: shapes.latentWidth),
+                        role: .indexerWk,
+                        layer: l
+                    )
+                    source.set(
+                        generator.vector(config.indexHeadDim, scale: 0.1),
+                        role: .indexerKNorm,
+                        layer: l
+                    )
+                }
+            }
             source.set(generator.matrix(rows: shapes.oLoraRank, columns: shapes.attentionOutputWidth), role: .attnWoA, layer: l)
             source.set(generator.matrix(rows: shapes.hidden, columns: shapes.oLoraRank), role: .attnWoB, layer: l)
             source.set(generator.vector(config.numAttentionHeads, scale: 0.5), role: .attnSink, layer: l)
@@ -677,34 +704,87 @@ final class DeepSeekV41BlockDiagonalProjectionTests: XCTestCase {
 
 final class DeepSeekV41IndexerTests: XCTestCase {
 
-    func testBlockScoreIsTheMaxOverRowsAndHeads() {
-        let queries: [[Float]] = [
-            [1, 0],
-            [-1, 0]
-        ]
-        let keys: [[Float]] = [
-            [0.1, 0],   // block 0 row 0: 0.1 / sqrt(2)
-            [0.9, 0],   // block 0 row 1: 0.9 / sqrt(2)
-            [0, 0],     // block 1 row 0
-            [-0.4, 0]   // block 1 row 1: 0.4 / sqrt(2) via the negated query
-        ]
-        let scores = DeepSeekV41Indexer.blockScores(queries: queries, keys: keys, blockSize: 2, keyWidth: 2)
-        XCTAssertEqual(scores.count, 2)
-        XCTAssertEqual(scores[0], 0.9 / sqrt(2), accuracy: 1e-5)
-        XCTAssertEqual(scores[1], 0.4 / sqrt(2), accuracy: 1e-5)
+    func testAScoreIsTheHeadsSummedAfterTheirOwnRectifier() {
+        // Head 0 likes row 0; head 1 votes against it and likes row 1. Summed, the
+        // rows tie; maxed over heads they would not, and neither would a mean of the
+        // rectified dots (which would put row 0 at half its score).
+        let scores = DeepSeekV41Indexer.positionScores(
+            queryHeads: [[1, 0], [-1, 0]],
+            keys: [[1, 0], [-1, 0]],
+            headWeights: [1, 1]
+        )
+        XCTAssertEqual(scores, [1, 1])
+        // The rectifier is per head, so a head that votes against a row subtracts
+        // nothing: only the positive dot contributes, and it carries its own weight.
+        let weighted = DeepSeekV41Indexer.positionScores(
+            queryHeads: [[1, 0], [1, 0]],
+            keys: [[1, 0], [-1, 0]],
+            headWeights: [0.5, 2]
+        )
+        XCTAssertEqual(weighted, [2.5, 0])
     }
 
-    func testSelectionIsDescendingByScoreButReturnedAscending() {
+    func testTheFrontierBlockIsPinnedAheadOfAnyOlderFullBlock() {
+        // Eight rows in four blocks of two. Block 3 is the frontier for a query that
+        // reaches seven rows, and it holds a single row -- but it is pinned, so it
+        // survives a cut that keeps only two blocks even though its score is the worst.
+        let scores: [Float] = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, -99]
+        let kept = DeepSeekV41Indexer.candidateBlocks(
+            scores: scores, visibleRows: 7, blockSize: 2, topKBlocks: 2
+        )
+        XCTAssertEqual(kept, [true, true, false, false, false, false, true, true])
+        // A cut wider than the block count keeps every block. Rows the query cannot
+        // reach are dropped by the SECOND cut, not here: the mask is about blocks.
+        let all = DeepSeekV41Indexer.candidateBlocks(
+            scores: scores, visibleRows: 7, blockSize: 2, topKBlocks: 99
+        )
+        XCTAssertEqual(all, [Bool](repeating: true, count: 8))
+    }
+
+    func testTheSecondCutRanksByScoreAndDropsRowsPastTheFrontier() {
         let scores: [Float] = [0.1, 0.9, 0.5, 0.7]
-        XCTAssertEqual(DeepSeekV41Indexer.selectedBlocks(scores: scores, topK: 2), [1, 3])
-        XCTAssertEqual(DeepSeekV41Indexer.selectedBlocks(scores: scores, topK: 0), [])
-        XCTAssertEqual(DeepSeekV41Indexer.selectedBlocks(scores: scores, topK: 9), [0, 1, 2, 3])
+        // The cut runs over EVERY produced row and the reach filter runs after it,
+        // so a row the query cannot see can still take a slot and then leave the
+        // selection one short. That is the reference's order, not an optimization:
+        // row 3 outranks row 2 and is dropped, leaving one row rather than two.
+        XCTAssertEqual(
+            DeepSeekV41Indexer.selectedRows(scores: scores, visibleRows: 3, topK: 2),
+            [1]
+        )
+        // With the whole sequence visible the two best survive.
+        XCTAssertEqual(
+            DeepSeekV41Indexer.selectedRows(scores: scores, visibleRows: 4, topK: 2),
+            [1, 3]
+        )
+        // A query at the start of a prompt sees nothing, whatever the scores say.
+        XCTAssertEqual(
+            DeepSeekV41Indexer.selectedRows(scores: scores, visibleRows: 0, topK: 3), []
+        )
+        // A masked row is ranked last rather than removed, so it only survives when
+        // the cut is wider than the rows left in the surviving blocks.
+        let candidates: [Bool] = [true, true, false, false]
+        XCTAssertEqual(
+            DeepSeekV41Indexer.selectedRows(
+                scores: scores, visibleRows: 4, topK: 2, candidates: candidates
+            ),
+            [0, 1]
+        )
+        XCTAssertEqual(
+            DeepSeekV41Indexer.selectedRows(
+                scores: scores, visibleRows: 4, topK: 4, candidates: candidates
+            ),
+            [0, 1, 2, 3]
+        )
     }
 
-    func testRowExpansionCoversWholeBlocksAndTruncatesTheLast() {
-        XCTAssertEqual(DeepSeekV41Indexer.rows(for: [0, 1], blockSize: 2, rowCount: 5), [0, 1, 2, 3])
-        XCTAssertEqual(DeepSeekV41Indexer.rows(for: [2], blockSize: 2, rowCount: 5), [4])
-        XCTAssertEqual(DeepSeekV41Indexer.rows(for: [3], blockSize: 2, rowCount: 5), [])
+    func testTheNewestRowsAreNotWhatTheRuleSelects() {
+        // The rule the port used to implement: read the newest `topK` rows. Here the
+        // oldest row is the one every head likes, which the newest-three rule misses.
+        let scores: [Float] = [5, 0.1, 0.2, 0.3]
+        XCTAssertEqual(
+            DeepSeekV41Indexer.selectedRows(scores: scores, visibleRows: 4, topK: 3),
+            [0, 2, 3]
+        )
     }
 }
 
@@ -1435,18 +1515,20 @@ final class DeepSeekV41CacheLayoutTests: XCTestCase {
         XCTAssertEqual(DeepSeekV41CacheAddressing.poolRange(row: 2, ratio: 2), 4..<6)
     }
 
-    func testCompressedAttentionRangeHonoursTheTopKBudget() {
+    func testTheRowPlanReadsEveryReachableRowWithoutAnIndexer() {
+        // Nil selection is the reference's no-indexer case: every row the owner has
+        // pooled by this position, which at ratio 2 is `(position + 1) / 2`.
         XCTAssertEqual(
-            DeepSeekV41CacheAddressing.compressedRowsForAttention(position: 7, ratio: 2, ownerRowCount: 100, topKRows: 2),
-            2..<4
-        )
-        XCTAssertEqual(
-            DeepSeekV41CacheAddressing.compressedRowsForAttention(position: 7, ratio: 2, ownerRowCount: 100, topKRows: 0),
+            DeepSeekV41CacheAddressing.producedCompressedRows(
+                position: 7, ratio: 2, ownerRowCount: 100
+            ),
             0..<4
         )
         // The owner's own row count caps the range even when the position implies more.
         XCTAssertEqual(
-            DeepSeekV41CacheAddressing.compressedRowsForAttention(position: 99, ratio: 2, ownerRowCount: 3, topKRows: 0),
+            DeepSeekV41CacheAddressing.producedCompressedRows(
+                position: 99, ratio: 2, ownerRowCount: 3
+            ),
             0..<3
         )
     }
