@@ -897,6 +897,13 @@ nonisolated public struct DeepSeekV41WalkTiming: Sendable, Equatable {
     public var frontWaitNanoseconds: UInt64 = 0
     /// Host time blocked filling arena slots from the shards.
     public var expertFillNanoseconds: UInt64 = 0
+    /// Host time blocked on the INDEXER split, which is a second round trip inside the
+    /// dense half for the layers that own a compressed index.
+    ///
+    /// Kept out of `frontEncodeNanoseconds` because it is not encode time: it is another
+    /// `waitUntilCompleted`, so a bucket that folded it into the host's own work would
+    /// overstate what a batching change could remove.
+    public var indexerWaitNanoseconds: UInt64 = 0
     /// Host time encoding the mixture half.
     public var mixtureEncodeNanoseconds: UInt64 = 0
     /// Device time the dense halves occupied, from their own windows.
@@ -938,7 +945,12 @@ nonisolated public struct DeepSeekV41WalkTiming: Sendable, Equatable {
 
     public var hostNanoseconds: UInt64 {
         frontEncodeNanoseconds + frontWaitNanoseconds + expertFillNanoseconds
-            + mixtureEncodeNanoseconds
+            + mixtureEncodeNanoseconds + indexerWaitNanoseconds
+    }
+
+    /// Per-position time blocked on the indexer split, in milliseconds.
+    public func millisecondsPerPositionIndexerWait() -> Double {
+        Double(indexerWaitNanoseconds) / Double(max(1, positions)) / 1_000_000
     }
 
     /// Per-position cost of each bucket, in milliseconds.
@@ -970,15 +982,16 @@ nonisolated public struct DeepSeekV41WalkTiming: Sendable, Equatable {
         let missing = frontUnwindowedBuffers + mixtureUnwindowedBuffers
         return String(
             format: "walk %.1f ms/position over %d position(s), %d layer(s): "
-                + "front encode %.1f, front wait %.1f, expert fill %.1f, mixture encode %.1f, "
-                + "front device %.1f, mixture device %.1f; drained front %.1f, mixture %.1f, "
-                + "late start front %.1f, mixture %.1f"
+                + "front encode %.1f, front wait %.1f, indexer wait %.1f, expert fill %.1f, "
+                + "mixture encode %.1f, front device %.1f, mixture device %.1f; "
+                + "drained front %.1f, mixture %.1f, late start front %.1f, mixture %.1f"
                 + (missing > 0 ? " (%d/%d buffers with no window)" : ""),
             Double(hostNanoseconds) / Double(max(1, positions)) / 1_000_000,
             positions,
             layers,
             per.frontEncode,
             per.frontWait,
+            millisecondsPerPositionIndexerWait(),
             per.expertFill,
             per.mixtureEncode,
             per.frontDevice,
@@ -990,6 +1003,68 @@ nonisolated public struct DeepSeekV41WalkTiming: Sendable, Equatable {
             missing,
             frontUnwindowedBuffers
         )
+    }
+}
+
+/// One committed walk buffer's place in time, for the question a bucket total cannot
+/// answer: WHERE the idle is.
+///
+/// `DeepSeekV41WalkTiming` says a walked position at the largest image span spends
+/// 160.6 ms blocked in `waitUntilCompleted` and that the mixture half's own device window
+/// had not started for 129.7 of them, but "the buffer had not started" is a fact about a
+/// queue, not a cause:
+/// the GPU can be idle because the host had not committed the work yet (the fill), or
+/// because the driver had not picked a committed buffer up, or because the queue was
+/// still draining the half before it. Those want different fixes, and only the clocks
+/// separate them, so each buffer keeps the moment it was committed, the moment the host
+/// began waiting on it, and its own device window.
+///
+/// Off unless `DeepSeekV41MetalForward.recordsWalkTimeline` is on, and capped at
+/// `walkTimelineLimit` positions: a thousand walked positions is 80,000 entries.
+nonisolated public struct DeepSeekV41WalkTimelineEntry: Sendable, Equatable {
+    /// The `commit(stage:)` label, which names the layer and the half.
+    public let stage: String
+    /// When `commit()` returned, i.e. when the work was handed to the driver.
+    public let commitNanoseconds: UInt64
+    /// When the host began `waitUntilCompleted` on it. Zero when nothing waited on it.
+    public let waitBeginNanoseconds: UInt64
+    /// When that wait returned. Only then is the host free to encode the next buffer,
+    /// so this is what turns "the GPU was idle" into "the host was blocked".
+    public let waitEndNanoseconds: UInt64
+    /// The buffer's own device window, zero when Metal reported none.
+    public let windowStartNanoseconds: UInt64
+    public let windowEndNanoseconds: UInt64
+
+    public init(
+        stage: String,
+        commitNanoseconds: UInt64,
+        waitBeginNanoseconds: UInt64,
+        waitEndNanoseconds: UInt64,
+        windowStartNanoseconds: UInt64,
+        windowEndNanoseconds: UInt64
+    ) {
+        self.stage = stage
+        self.commitNanoseconds = commitNanoseconds
+        self.waitBeginNanoseconds = waitBeginNanoseconds
+        self.waitEndNanoseconds = waitEndNanoseconds
+        self.windowStartNanoseconds = windowStartNanoseconds
+        self.windowEndNanoseconds = windowEndNanoseconds
+    }
+
+    /// How long the host spent inside this buffer's `waitUntilCompleted`.
+    public var waitMilliseconds: Double {
+        guard waitEndNanoseconds > waitBeginNanoseconds else { return 0 }
+        return Double(waitEndNanoseconds - waitBeginNanoseconds) / 1_000_000
+    }
+
+    public var pickupMilliseconds: Double {
+        guard windowStartNanoseconds > commitNanoseconds else { return 0 }
+        return Double(windowStartNanoseconds - commitNanoseconds) / 1_000_000
+    }
+
+    public var windowMilliseconds: Double {
+        guard windowEndNanoseconds > windowStartNanoseconds else { return 0 }
+        return Double(windowEndNanoseconds - windowStartNanoseconds) / 1_000_000
     }
 }
 
@@ -1261,10 +1336,27 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// belongs to, so `recordWalkDeviceTiming` can divide the device time.
     private var walkBuffers: [(buffer: MTLCommandBuffer, isMixture: Bool)] = []
 
+    /// Where a walked position's idle time sits, buffer by buffer. Off by default and
+    /// off in every production path: it retains a timeline entry per committed buffer.
+    public var recordsWalkTimeline = false
+    /// Positions the timeline is kept for. Two is enough to see a steady-state position
+    /// and a wrapped cache; a thousand would be 80,000 entries.
+    public var walkTimelineLimit = 2
+    public private(set) var walkTimeline: [DeepSeekV41WalkTimelineEntry] = []
+    /// Positions recorded so far, so the limit is not re-derived from the array.
+    public private(set) var walkTimelinePositions = 0
+    /// Commit labels and times, keyed by the buffer they were recorded for.
+    private var walkTimelineCommits: [
+        ObjectIdentifier: (stage: String, commit: UInt64, waitBegin: UInt64, waitEnd: UInt64)
+    ] = [:]
+
     /// Clears the walk accumulation.
     public func resetWalkTiming() {
         walkTiming = DeepSeekV41WalkTiming()
         walkBuffers.removeAll(keepingCapacity: true)
+        walkTimeline.removeAll(keepingCapacity: true)
+        walkTimelinePositions = 0
+        walkTimelineCommits.removeAll(keepingCapacity: true)
     }
 
     /// Clears the per-stage accumulation.
@@ -3204,6 +3296,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
 
         var frontBuffer = commandBuffer
         var frontEncoder = encoder
+        var indexerWaits: UInt64 = 0
         for stage in DeepSeekV41DevicePlan.frontHalf {
             try encode(
                 stage,
@@ -3216,7 +3309,12 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             // here rather than carrying the gather in the same submission.
             if stage == .indexer, layer.ownsCompressedIndex {
                 frontEncoder.endEncoding()
+                let splitEncoded = measuring ? DispatchTime.now().uptimeNanoseconds : 0
                 try commit(frontBuffer, stage: "layer \(layer.index) indexer")
+                if measuring {
+                    indexerWaits += DispatchTime.now().uptimeNanoseconds - splitEncoded
+                    walkBuffers.append((buffer: frontBuffer, isMixture: false))
+                }
                 try readIndexSelections(layer: layer, startPosition: position, count: 1)
                 frontBuffer = try makeCommandBuffer()
                 frontEncoder = try makeEncoder(frontBuffer)
@@ -3264,7 +3362,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         try commit(expertCommand, stage: "layer \(layer.index) experts", waiting: false, mixture: true)
 
         if measuring {
-            walkTiming.frontEncodeNanoseconds += frontEncoded - started
+            // The indexer split's wait is measured inside the encode loop, so it is
+            // removed here rather than being counted as the host's own work.
+            walkTiming.frontEncodeNanoseconds += (frontEncoded - started) - indexerWaits
+            walkTiming.indexerWaitNanoseconds += indexerWaits
             walkTiming.frontWaitNanoseconds += fillStarted - frontEncoded
             walkTiming.expertFillNanoseconds += filled - fillStarted
             walkTiming.mixtureEncodeNanoseconds += mixtureEncoded - filled
@@ -3298,6 +3399,24 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             } else {
                 walkTiming.frontDeviceNanoseconds += nanoseconds
             }
+        }
+        if recordsWalkTimeline, walkTimelinePositions < walkTimelineLimit {
+            for entry in walkBuffers {
+                guard let recorded = walkTimelineCommits[ObjectIdentifier(entry.buffer)]
+                else { continue }
+                walkTimeline.append(DeepSeekV41WalkTimelineEntry(
+                    stage: recorded.stage,
+                    commitNanoseconds: recorded.commit,
+                    waitBeginNanoseconds: recorded.waitBegin,
+                    waitEndNanoseconds: recorded.waitEnd,
+                    windowStartNanoseconds: entry.buffer.gpuStartTime > 0
+                        ? UInt64(entry.buffer.gpuStartTime * 1_000_000_000) : 0,
+                    windowEndNanoseconds: entry.buffer.gpuEndTime > 0
+                        ? UInt64(entry.buffer.gpuEndTime * 1_000_000_000) : 0
+                ))
+            }
+            walkTimelinePositions += 1
+            walkTimelineCommits.removeAll(keepingCapacity: true)
         }
         walkBuffers.removeAll(keepingCapacity: true)
     }
@@ -4791,6 +4910,14 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         mixture: Bool = false
     ) throws {
         commandBuffer.commit()
+        if recordsWalkTimeline, walkTimelinePositions < walkTimelineLimit {
+            walkTimelineCommits[ObjectIdentifier(commandBuffer)] = (
+                stage: stage,
+                commit: DispatchTime.now().uptimeNanoseconds,
+                waitBegin: 0,
+                waitEnd: 0
+            )
+        }
         // Held until it completes: the queue keeps a committed buffer alive, but ARC
         // would drop our reference and with it the error still to be reported.
         pending.append((buffer: commandBuffer, stage: stage, isMixture: mixture))
@@ -4807,8 +4934,27 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         let outstanding = pending
         pending.removeAll(keepingCapacity: true)
         for entry in outstanding {
-            let begin = recordsWalkTiming ? DispatchTime.now().uptimeNanoseconds : 0
+            let begin = (recordsWalkTiming || recordsWalkTimeline)
+                ? DispatchTime.now().uptimeNanoseconds : 0
+            if recordsWalkTimeline,
+               let recorded = walkTimelineCommits[ObjectIdentifier(entry.buffer)] {
+                walkTimelineCommits[ObjectIdentifier(entry.buffer)] = (
+                    stage: recorded.stage,
+                    commit: recorded.commit,
+                    waitBegin: begin,
+                    waitEnd: 0
+                )
+            }
             entry.buffer.waitUntilCompleted()
+            if recordsWalkTimeline,
+               let recorded = walkTimelineCommits[ObjectIdentifier(entry.buffer)] {
+                walkTimelineCommits[ObjectIdentifier(entry.buffer)] = (
+                    stage: recorded.stage,
+                    commit: recorded.commit,
+                    waitBegin: recorded.waitBegin,
+                    waitEnd: DispatchTime.now().uptimeNanoseconds
+                )
+            }
             if recordsWalkTiming {
                 let end = DispatchTime.now().uptimeNanoseconds
                 // `gpuStartTime` shares mach's clock, which `DispatchTime` reads.

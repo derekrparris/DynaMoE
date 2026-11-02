@@ -4174,4 +4174,395 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         print("🔎 [dsv41 real] \(runtime.describe())")
         withExtendedLifetime(engine) {}
     }
+
+    /// Where a walked image prefill spends its time, per layer.
+    ///
+    /// `#46` measured the largest picture at 255.98-297.98 s of prefill and named the
+    /// arena's fill policy as the next lever, but that was an inference from a byte
+    /// count rather than an observation: 218,886 MB at the disk's 13-14 GB/s ceiling is
+    /// seventeen seconds, so the other ~250 s of a walked position is something else. A
+    /// walk commits two buffers per layer and blocks on the host twice, which is why a
+    /// position can cost far more than the sum of its kernels, and `recordsWalkTiming`
+    /// is the instrument that separates the five candidates: host encode, host wait,
+    /// the expert fill, the mixture encode, and each half's own device window.
+    ///
+    /// Three arms, one runtime, each from a reset arena and a cleared timing
+    /// accumulator, each reporting its own bytes and resize counters:
+    ///
+    /// - the shipped path, the composer's own prompt and the tower's own rows;
+    /// - the same arm again, so a first-arm effect cannot pass for a finding;
+    /// - a same-length walk of TEXT tokens, which is what an image span is paying for
+    ///   beyond its own length. An image row costs the tower's encode; once the row is
+    ///   in the residual, a position is a position.
+    ///
+    /// Opt-in (`/tmp/dynamoe_dsv41_walk_cost`): a thousand walked positions is four
+    /// minutes at `-O`, and this is a measurement rather than a regression test.
+    func testWhereAWalkedImagePrefillSpendsItsTime() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_walk_cost"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in walked-prefill measurement; touch \(markerPath) to run"
+        )
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let spec = try XCTUnwrap(config.vision)
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let markers = DeepSeekV41VisionMarkers.familyDefault
+        let dialect = DeepSeekV41PromptDialect.resolve(snapshotDir: snapshot)
+        let prompt = dialect.render(
+            turns: [.init(
+                isUser: true, text: "\(markers.imagePlaceholder)\nwhat is in this picture?"
+            )],
+            cleanSystem: "",
+            thinkingEnabled: false,
+            effort: nil
+        )
+        let promptIds = try tokenizer.encode(text: prompt)
+
+        // The same picture the end-to-end case uses, because the answer has to be about
+        // the prompt a person actually waits for.
+        let side = 4_096
+        var rgb = [UInt8](repeating: 0, count: side * side * 3)
+        for y in 0..<side {
+            let rowBase = y * side * 3
+            for x in 0..<side {
+                let offset = rowBase + x * 3
+                rgb[offset] = UInt8(x & 0xFF)
+                rgb[offset + 1] = UInt8(y & 0xFF)
+                rgb[offset + 2] = 96
+            }
+        }
+        let image = DeepSeekV41ImageInput(
+            rgb: rgb, width: side, height: side, sha256: "walk-cost"
+        )
+        let price = try DeepSeekV41TurnImages.price(
+            tokenIds: promptIds, images: [image], spec: spec
+        )
+        let contextLength = max(
+            1, min(config.maxPositionEmbeddings, price.promptTokens + 2)
+        )
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: contextLength,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let tower = try XCTUnwrap(runtime.visionForward())
+        let bound = try DeepSeekV41TurnImages.bind(
+            tokenIds: promptIds,
+            images: [image],
+            spec: spec,
+            rowWidth: config.hiddenSize
+        ) { input in
+            let fitted = DeepSeekV41VisionLayout.fit(
+                width: input.width, height: input.height, spec: spec
+            )
+            let rows = try tower.imageSpan(
+                rgb: input.rgb, width: input.width, height: input.height
+            )
+            return DeepSeekV41ImagePrompt.ImageSpan(
+                rows: rows, columns: fitted.columns, gridRows: fitted.rows
+            )
+        }
+        XCTAssertEqual(bound.tokenIds.count, price.promptTokens, "the price must equal the bind")
+        XCTAssertEqual(bound.rows.count, try XCTUnwrap(price.estimates.first).spanPositions)
+        let tokens = bound.tokenIds.map { Int($0) }
+        let rows = bound.rows
+
+        // The fixture `#46`'s length sweep used, at the same span length, because that
+        // sweep's walk measured 98% hit and 99,062 MB where the composer's walk measured
+        // 95% and 218,886 MB at the same position count. If this arm reproduces the
+        // sweep's number on the same runtime, the difference between the two tables is
+        // the fixture's routing rather than the length, which is the whole question.
+        let syntheticFit = DeepSeekV41VisionLayout.fit(
+            width: 20_000, height: 20_000, spec: spec
+        )
+        let patchVolume = 3 * spec.patchSize * spec.patchSize
+        let patchSide = syntheticFit.height / spec.patchSize
+        let syntheticCells = (0..<(patchSide * patchSide)).map { index in
+            (0..<patchVolume).map { dimension in
+                Float((index * 3 + dimension * 7) % 17) / 17 - 0.5
+            }
+        }
+        let syntheticSpanRows = try tower.imageSpan(
+            patches: syntheticCells, rows: patchSide, columns: patchSide
+        )
+        let syntheticPlan = try DeepSeekV41ImagePrompt.expand(
+            tokenIds: [1, 2, UInt32(spec.imageTokenID), 3],
+            spans: [.init(
+                rows: syntheticSpanRows,
+                columns: syntheticFit.columns,
+                gridRows: syntheticFit.rows
+            )],
+            imageTokenID: spec.imageTokenID,
+            rowWidth: config.hiddenSize
+        )
+
+        // A same-length prose walk. Long enough not to be periodic, so its routing is a
+        // fair comparison rather than one sentence's experts repeated.
+        var prose = ""
+        for index in 0..<60 {
+            prose += "Line \(index) says the quick brown fox jumps over \(index + 3) lazy dogs. "
+        }
+        let fillerIds = try tokenizer.encode(text: prose).map { Int($0) }
+        XCTAssertGreaterThan(fillerIds.count, 200, "the prose walk needs distinct tokens")
+
+        let executor = runtime.forward()
+        executor.recordsWalkTiming = true
+        let capacity = runtime.arena.capacity
+        print(
+            "🔎 [dsv41 real] walk cost: \(tokens.count) positions, \(rows.count) image rows, "
+                + "\(capacity) arena slots"
+        )
+
+        struct Arm {
+            let label: String
+            let seconds: Double
+            let milliseconds: Double
+            let megabytes: Double
+            let hit: Double
+            let misses: Int
+            let evictions: Int
+            let resident: Int
+            let acquisitions: Int
+            let readSeconds: Double
+            let allocateSeconds: Double
+            let placeSeconds: Double
+            let placements: Int
+            let timing: DeepSeekV41WalkTiming
+        }
+
+        func walk(_ label: String, _ tokenIds: [Int], _ embeddingRows: [Int: [Float]]) throws -> Arm {
+            executor.reset()
+            runtime.arena.reset()
+            executor.resetWalkTiming()
+            let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+            let loadedBefore = runtime.expertStreamer?.expertsLoaded ?? 0
+            let readBefore = runtime.expertStreamer?.timing.reading ?? 0
+            let allocateBefore = runtime.expertStreamer?.timing.allocating ?? 0
+            let placeBefore = runtime.expertStreamer?.placementTiming.seconds ?? 0
+            let placementsBefore = runtime.expertStreamer?.placementTiming.placements ?? 0
+            let started = DispatchTime.now().uptimeNanoseconds
+            for (position, token) in tokenIds.enumerated() {
+                if let row = embeddingRows[position] {
+                    _ = try executor.forwardEmbedding(row, token: token, position: position)
+                } else {
+                    _ = try executor.forwardToken(token, position: position)
+                }
+            }
+            let seconds = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000_000
+            let positions = Double(tokenIds.count)
+            return Arm(
+                label: label,
+                seconds: seconds,
+                milliseconds: 1_000 * seconds / positions,
+                megabytes: Double((runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore) / 1_048_576,
+                hit: runtime.arena.hitRate,
+                misses: (runtime.expertStreamer?.expertsLoaded ?? 0) - loadedBefore,
+                evictions: runtime.arena.evictions,
+                resident: runtime.arena.residentCount,
+                acquisitions: runtime.arena.acquisitions,
+                readSeconds: (runtime.expertStreamer?.timing.reading ?? 0) - readBefore,
+                allocateSeconds: (runtime.expertStreamer?.timing.allocating ?? 0) - allocateBefore,
+                placeSeconds: (runtime.expertStreamer?.placementTiming.seconds ?? 0) - placeBefore,
+                placements: (runtime.expertStreamer?.placementTiming.placements ?? 0) - placementsBefore,
+                timing: executor.walkTiming
+            )
+        }
+
+        func report(_ arm: Arm) {
+            let per = arm.timing.millisecondsPerPosition()
+            print(
+                "🔎 [dsv41 real] walk arm \(arm.label): "
+                    + String(format: "%.2f s (%.1f ms/position)", arm.seconds, arm.milliseconds)
+                    + String(format: ", %.0f MB read, %.1f%% hit, %d misses, %d evictions, ", arm.megabytes, 100 * arm.hit, arm.misses, arm.evictions)
+                    + "\(arm.resident)/\(capacity) resident, \(arm.acquisitions) acquisitions"
+            )
+            print(
+                "🔎 [dsv41 real]   pread " + String(format: "%.1f s at %.0f MB/s", arm.readSeconds, arm.megabytes / max(arm.readSeconds, 0.001))
+                    + String(format: ", allocate %.1f s, place %.1f s over %d pairs", arm.allocateSeconds, arm.placeSeconds, arm.placements)
+            )
+            print(
+                "🔎 [dsv41 real]   per position: front encode " + String(format: "%.1f", per.frontEncode)
+                    + String(format: " + front wait %.1f + indexer wait %.1f + expert fill %.1f"
+                             + " + mixture encode %.1f = host %.1f ms",
+                             per.frontWait,
+                             arm.timing.millisecondsPerPositionIndexerWait(),
+                             per.expertFill,
+                             per.mixtureEncode,
+                             per.frontEncode + per.frontWait + per.expertFill + per.mixtureEncode
+                                 + arm.timing.millisecondsPerPositionIndexerWait())
+                    + String(format: "; device front %.1f + mixture %.1f ms", per.frontDevice, per.mixtureDevice)
+            )
+            print("🔎 [dsv41 real]   \(arm.timing.describe())")
+        }
+
+        let first = try walk("shipped walk (image rows)", tokens, rows)
+        report(first)
+        let second = try walk("shipped walk, repeated", tokens, rows)
+        report(second)
+        let textOnly = (0..<tokens.count).map { Int(fillerIds[$0 % fillerIds.count]) }
+        let proseWalk = try walk("same length, text tokens", textOnly, [:])
+        report(proseWalk)
+        let syntheticWalk = try walk(
+            "sweep fixture (synthetic patch rows)",
+            syntheticPlan.tokenIds.map { Int($0) },
+            syntheticPlan.rows
+        )
+        report(syntheticWalk)
+
+        // The comparison that makes this a measurement rather than a table: a position
+        // that carries an image row and a position that carries a token run the same
+        // graph, so the two arms should cost the same per position once the tower is out
+        // of the picture. The routing breadth is content-dependent and printed above,
+        // which is why this ratio is reported with both arms' miss counts beside it.
+        print(
+            "🔎 [dsv41 real] walk verdict: an image span costs "
+                + String(format: "%.1f ms/position", first.milliseconds)
+                + " against a same-length text walk's "
+                + String(format: "%.1f ms/position", proseWalk.milliseconds)
+                + String(format: " (%.2fx); the repeat measured %.1f ms/position, so the arm is %.0f%% reproducible",
+                         first.milliseconds / max(proseWalk.milliseconds, 0.001),
+                         second.milliseconds,
+                         100 * second.milliseconds / max(first.milliseconds, 0.001))
+        )
+        print(
+            "🔎 [dsv41 real] sweep reconciliation: \(syntheticPlan.tokenIds.count) synthetic-row "
+                + "positions cost " + String(format: "%.1f ms/position", syntheticWalk.milliseconds)
+                + String(format: " and %.0f MB (%.1f%% hit, %d misses), against the composer's ",
+                         syntheticWalk.megabytes, 100 * syntheticWalk.hit, syntheticWalk.misses)
+                + String(format: "%.1f ms and %.0f MB", first.milliseconds, first.megabytes)
+                + String(format: " -> about %d distinct pairs against %d slots",
+                         syntheticWalk.misses + capacity, first.misses + capacity)
+        )
+        print("🔎 [dsv41 real] \(runtime.describe())")
+        withExtendedLifetime(engine) {}
+    }
+
+    /// Where a walked position's idle time actually sits.
+    ///
+    /// The bucket table above says a walked position blocks in `waitUntilCompleted` for
+    /// 146 ms and that the mixture half's device window had not opened for 112 of those
+    /// milliseconds. That is a fact about a queue rather than a cause: the GPU can be
+    /// idle because the host had not committed the work (the expert fill), because the
+    /// driver had not picked a committed buffer up, or because the half before it was
+    /// still running. `recordsWalkTimeline` keeps each buffer's commit time, the moment
+    /// the host began waiting, and its device window, which is what separates them.
+    ///
+    /// Text tokens on purpose: the walk's round-trip structure is the same whatever a
+    /// position carries (the length sweep above shows a text walk of the same length
+    /// paying 87 ms of the same idle), and this case is about the structure, so it must
+    /// not carry a tower's cost as well.
+    ///
+    /// Opt-in (`/tmp/dynamoe_dsv41_walk_cost`).
+    func testWhereAWalkedPositionsIdleTimeSits() throws {
+        let markerPath = "/tmp/dynamoe_dsv41_walk_cost"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in walk timeline; touch \(markerPath) to run"
+        )
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: 512,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let executor = runtime.forward()
+        // Two positions are recorded, and they are not the first two: a walk's first
+        // positions pay pipeline warm-up and an empty arena, so a timeline taken there
+        // describes a cold start rather than the steady state a thousand-position span
+        // spends its time in.
+        let positions = 402
+        let recordedFrom = positions - executor.walkTimelineLimit
+        let tokens = (0..<positions).map { 1_000 + ($0 * 37) }
+
+        executor.reset()
+        runtime.arena.reset()
+        executor.recordsWalkTiming = true
+        executor.resetWalkTiming()
+
+        var wall: [Int: Double] = [:]
+        for (position, token) in tokens.enumerated() {
+            if position == recordedFrom {
+                executor.recordsWalkTimeline = true
+                executor.resetWalkTiming()
+            }
+            let started = DispatchTime.now().uptimeNanoseconds
+            _ = try executor.forwardToken(token, position: position)
+            if position >= recordedFrom {
+                wall[position] = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000_000
+            }
+        }
+
+        let perPosition = executor.walkTimeline.count / max(1, executor.walkTimelinePositions)
+        print(
+            "🔎 [dsv41 real] walk timeline: \(executor.walkTimelinePositions) position(s) x "
+                + "\(perPosition) buffer(s) at positions \(recordedFrom)..."
+        )
+        for index in 0..<executor.walkTimelinePositions {
+            let slice = Array(executor.walkTimeline[
+                (index * perPosition)..<min((index + 1) * perPosition, executor.walkTimeline.count)
+            ])
+            guard let base = slice.first?.commitNanoseconds else { continue }
+            let milliseconds = { (value: UInt64) in Double(value) / 1_000_000 }
+            var device = 0.0
+            var blocked = 0.0
+            var pickup = 0.0
+            var idle = 0.0
+            var previousEnd: UInt64 = base
+            for entry in slice {
+                blocked += entry.waitMilliseconds
+                guard entry.windowEndNanoseconds > entry.windowStartNanoseconds else { continue }
+                device += entry.windowMilliseconds
+                pickup += entry.pickupMilliseconds
+                if entry.windowStartNanoseconds > previousEnd {
+                    idle += milliseconds(entry.windowStartNanoseconds - previousEnd)
+                }
+                previousEnd = max(previousEnd, entry.windowEndNanoseconds)
+            }
+            let position = recordedFrom + index
+            print(
+                "🔎 [dsv41 real]   position \(position): wall "
+                    + String(format: "%.1f ms", 1_000 * (wall[position] ?? 0))
+                    + String(format: " = device %.1f ms (%.0f%%) in %d buffer(s)", device, 100 * device / max(1, 1_000 * (wall[position] ?? 1)), slice.count)
+                    + String(format: ", host blocked %.1f ms (%.0f%%), GPU idle between buffers %.1f ms",
+                             blocked,
+                             100 * blocked / max(1, 1_000 * (wall[position] ?? 1)),
+                             idle)
+                    + String(format: ", commit-to-start %.1f ms (%.2f ms/buffer)", pickup, pickup / Double(max(1, slice.count)))
+            )
+            if index == 0 {
+                for entry in slice.prefix(10) {
+                    print(
+                        "🔎 [dsv41 real]     \(entry.stage): committed "
+                            + String(format: "%.2f ms", milliseconds(entry.commitNanoseconds - base))
+                            + ", started at " + String(format: "%.2f ms", milliseconds(entry.windowStartNanoseconds - base))
+                            + " for " + String(format: "%.2f ms", entry.windowMilliseconds)
+                            + ", host waited " + String(format: "%.3f ms", entry.waitMilliseconds)
+                    )
+                }
+            }
+        }
+        print("🔎 [dsv41 real] \(runtime.describe())")
+        withExtendedLifetime(engine) {}
+    }
 }

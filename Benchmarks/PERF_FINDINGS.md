@@ -8180,3 +8180,148 @@ classes), and the same run under `MTL_DEBUG_LAYER` is **562 / 0 / 60 with 0 vali
 failed assertions. That run matters more than usual here: a per-position Engram gate and a host write
 into a shared buffer before a command buffer exists are exactly the two changes a validation layer
 catches and nothing else does.
+
+## DSV4.1 #47: A WALKED POSITION IS 200 ms OF IDLE GPU, AND THE EXPERT STREAM IS ONLY A FIFTH OF IT
+
+### Question
+
+`#46` established the number a person actually waits for -- the largest picture the composer accepts
+costs 255.98-297.98 s of prefill, i.e. 254-297 ms per position -- and named the arena's fill policy as
+the lever. That name was an inference from a byte count, not an observation: 218,886 MB at the disk's
+13-14 GB/s ceiling is seventeen seconds, so 250 of those 255 milliseconds per position had to be
+somewhere else. Routing picked this slice at 0.900 (confidence 0.886) to find out where, and closed the
+shared path to behavioural change for the round (0.43): measure first.
+
+### What a walked position costs, in buckets
+
+Four arms, one runtime, one process, each from a reset arena and a cleared accumulator, each printing
+its own bytes, misses and evictions. The prompt is the composer's own (12 text tokens then a
+994-position span, 1,005 positions), rows from the device tower on a 4,096x4,096 picture, app's `-O`
+build, load average 3.2-3.4:
+
+| arm | positions | ms/position | MB read | hit | misses | evictions | pread | front encode | front wait | indexer wait | fill | mix encode | device |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| the shipped walk, real image rows | 1,005 | **269.4** | 218,886 | 94.9% | 12,208 | 8,448 | 57.4 s (3,812 MB/s) | 2.8 | 160.6 | 39.3 | 57.5 | 3.0 | 37.5+31.2 |
+| the same arm again | 1,005 | **275.7** | 218,886 | 94.9% | 12,208 | 8,448 | 60.6 s (3,615 MB/s) | 2.7 | 162.8 | 40.2 | 60.6 | 3.0 | 37.3+31.3 |
+| the same length, TEXT tokens | 1,005 | **228.2** | 111,415 | 97.4% | 6,214 | 2,454 | 30.2 s (3,690 MB/s) | 3.6 | 144.6 | 39.6 | 30.3 | 2.9 | 37.4+30.5 |
+| `#46`'s sweep fixture, synthetic rows | 997 | **149.0** | 99,062 | 97.7% | 5,525 | 1,765 | 25.7 s (3,860 MB/s) | 2.4 | 92.8 | 21.0 | 25.9 | 2.8 | 33.2+27.1 |
+
+An earlier run of the same four arms, before the indexer split was separated into its own bucket, read
+244.7 / 257.0 / 194.9 / 139.5 ms, so quote the ranges: **245-276 ms for the real span, 195-228 ms for
+a text walk of the same length, 140-149 ms for the synthetic fixture.** The byte columns are identical
+across runs to the megabyte, because routing is a deterministic function of the activations.
+
+Three facts fall out of the table before anything else:
+
+- **The host's own encoding is 2.4-3.6 ms per position for all forty layers** (about 70 microseconds a
+  layer). Every "fewer dispatches per layer" argument in this port's history is arguing over 1% of a
+  position.
+- **The expert fill is 21% of a walked position** (57.5 of 269.4), and the indexer readback another
+  15% (39.3, i.e. 4.9 ms on each of the eight compressed-index layers).
+- **A same-length text walk costs 195-228 ms with the identical shape**, so an image span is 1.18-1.26x
+  a text walk of its own length and nothing more. The difference is the real tower rows' routing
+  breadth: 12,208 misses against 6,214 at the same position count.
+
+### Where the idle actually sits
+
+Buckets say how long the host blocked, not what the GPU was doing, so `recordsWalkTimeline` now keeps
+each committed buffer's commit time, the moment the host began waiting on it, and its own device
+window. A steady-state position (400 of a walked text run, i.e. after warm-up) is 88 committed buffers:
+40 front halves, 40 mixtures and 8 indexer splits.
+
+| | position 400 | position 401 |
+|---|---|---|
+| wall | 297.5 ms | 224.3 ms |
+| device windows | 94.3 ms (32%) | **68.0 ms (30%)** |
+| host blocked in `waitUntilCompleted` | 205.5 ms (69%) | 148.7 ms (66%) |
+| GPU idle between buffers | 200.3 ms | 153.8 ms |
+| commit-to-start, summed | 257.2 ms | 184.4 ms |
+| commit-to-start, per buffer | 2.92 ms | **2.10 ms** |
+
+**A committed buffer's device window opens 2.1-2.9 ms after `commit()` returns, while the GPU has
+nothing else to do.** The first ten buffers of position 400, in order:
+
+```
+layer 0 attention: committed  0.00 ms, started at  0.02 for 1.14 ms, host waited 1.141 ms
+layer 0 experts:   committed 14.40 ms, started at 16.26 for 0.95 ms, host waited 2.270 ms
+layer 1 attention: committed 15.02 ms, started at 17.21 for 1.43 ms, host waited 1.408 ms
+layer 1 experts:   committed 18.78 ms, started at 22.96 for 0.96 ms, host waited 5.184 ms
+layer 2 indexer:   committed 18.81 ms, started at 23.93 for 0.61 ms, host waited 0.614 ms
+layer 2 attention: committed 24.70 ms, started at 24.79 for 0.71 ms, host waited 0.842 ms
+layer 2 experts:   committed 25.61 ms, started at 29.61 for 0.89 ms, host waited 4.928 ms
+layer 3 attention: committed 25.66 ms, started at 30.50 for 0.98 ms, host waited 0.953 ms
+layer 3 experts:   committed 37.64 ms, started at 38.38 for 1.12 ms, host waited 1.878 ms
+layer 4 attention: committed 37.70 ms, started at 39.51 for 1.58 ms, host waited 1.577 ms
+```
+
+Layer 1's mixture is handed to the driver at 18.78 ms, the GPU is idle (layer 1's front window ended
+at 18.64), and it starts at 22.96: **4.2 ms for a buffer holding one layer's mixture kernels.** That is
+not the fill -- the gap between that front's window ending and the mixture's commit is 0.14 ms, against
+the arm's 1.4 ms a layer average -- and it is not the host, whose entire front encode for the layer is
+30 microseconds.
+
+So a walked position decomposes as, per position at the real span:
+
+| | ms | share |
+|---|---|---|
+| device windows (front + mixture) | 68.7 | 26% |
+| GPU idle inside a wait, between buffers | ~131 | ~49% |
+| GPU idle during the expert fill | 57.5 | 21% |
+| host encoding (both halves) | 5.8 | 2% |
+
+**Seventy percent of a walked position the GPU does nothing at all**, and only a fifth of that idle is
+the disk.
+
+### Why `#46`'s sweep table was twice as fast as the composer's turn
+
+The sweep fixture reproduces `#46` exactly: 99,062 MB read (the same megabyte count), 97.7% hit
+against 98%, 140-149 ms/position against 154. It was a real measurement of a real graph on real
+weights. What it was not is a measurement of a real picture: its rows come from
+`imageSpan(patches:)` over a deterministic sawtooth, whose routing is 5,525 distinct pairs where the
+tower's own rows are 12,208. Both touch a 3,760-slot arena that cannot hold either working set, so the
+fixture's misses (and therefore its fill) are 45% of the real span's. That is why the sweep's
+`1.26x`-`1.92x` block-vs-walk ratios and the composer's `0.74x` are both true statements about
+different working sets, and why the composer's number is the one that describes a picture.
+
+### What it means (and what is not the lever)
+
+- **The lever is the number of command buffers per position, not the expert stream.** 88 buffers at
+  2.1-2.9 ms of startup each is 184-257 ms, against 63-94 ms of actual device work. Nothing in the
+  kernels touches this; it is a property of how many submissions a position is cut into.
+- **The fill is real but second-order**: 57.5 ms, and a fifth of the position. `#46`'s "the next lever
+  is the arena's fill policy" was directionally right and quantitatively wrong -- halving the misses
+  would buy at most ~29 ms and would not touch the 131 ms of restart idle.
+- **A surgical, unmeasured candidate**: `runLayer` commits the mixture of layer L and then the front of
+  layer L+1 as two buffers, with nothing between them but 30 microseconds of encoding. Merging them
+  into one submission halves the buffer count (the eight compressed-index layers keep an extra split),
+  and the two halves are adjacent in time anyway. That is a pure host-side change, it needs no new
+  kernel, and by this table it addresses half of the largest term.
+- **Batching already removes the restart term entirely and still loses.** The chunk form runs 5,040
+  mixture submissions for the same 1,005 positions -- about 5 buffers a position -- so the 184-257 ms
+  of restarts is nearly gone, and yet it measured 345.62-386.90 s against the walk's 255.98-297.98 s.
+  Whatever the block form's own cost is, it is therefore at least the restart saving plus its 84 ms
+  deficit: **~215 ms/position that `#47` has not explained.** That, not the fill, is where the next
+  measurement belongs.
+- **The vision cost model still prices 2% of a turn** (`#46`), and this slice does not change that: an
+  image attachment's user-visible cost is the walk of its span, and the walk is CPU/GPU hand-off.
+
+### Verification
+
+Two new opt-in published-checkpoint cases (`/tmp/dynamoe_dsv41_walk_cost`, on top of that class's
+`/tmp/dynamoe_dsv41_real_turn` gate): `testWhereAWalkedImagePrefillSpendsItsTime` (the four arms above,
+943 s at `-O`) and `testWhereAWalkedPositionsIdleTimeSits` (the timeline at positions 400-401, 101 s).
+The instruments themselves are pinned on the synthetic checkpoint by
+`testTheWalkInstrumentCoversEveryBufferOfAPosition`, which asserts that a position produces exactly two
+timeline entries per layer in commit order, that no window starts before its commit, that the device
+total cannot exceed the wall, and that the new indexer bucket is zero on a shape with no compressed
+index source and non-zero on one that has it -- because both instruments are off in every production
+path, and a bucket that silently stops covering part of a position would still print.
+
+The full DeepSeek suite on this code is **563 passed / 0 failed / 62 skipped** (94 classes; one new
+case plus the two new opt-in published ones, which skip without their markers), and the same run under
+`MTL_DEBUG_LAYER` is **563 / 0 / 62 with 0 validation errors and no failed assertions**. The `-O` arms
+are the app's own optimized build in `/tmp/dd_dsv41_opt`, load average 3.2-3.4; the same arms read
+245-276 ms under lighter load, which is why every number in this section is a range.
+
+One pre-existing warning is untouched: `DeepSeekV41IndexerInputRequest.latents` holds an `MTLBuffer` in
+a `Sendable` struct, which the Swift 6 language mode will make an error. It is not from this slice.

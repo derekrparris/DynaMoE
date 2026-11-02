@@ -2231,4 +2231,96 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
             XCTAssertEqual(pointer[row], expected[row], accuracy: 1e-4, "row \(row)")
         }
     }
+
+    /// The walk instrument's own contract, because every number in `#47` came out of it.
+    ///
+    /// `recordsWalkTiming` divides a walked position into five buckets and the timeline
+    /// records each committed buffer's commit, wait and device window. Both are off in
+    /// every production path, which means a rename, a reordering or a buffer that stops
+    /// being recorded would be silent: the buckets would still print, they would just
+    /// describe less of the position. This pins the shape on the synthetic checkpoint --
+    /// two buffers per layer, in commit order, every window inside the position, the
+    /// device total below the wall -- and pins the indexer bucket on a shape that
+    /// publishes a compressed index source, where the dense half really does stop twice.
+    func testTheWalkInstrumentCoversEveryBufferOfAPosition() throws {
+        let checkpoint = DeepSeekV41SyntheticCheckpoint()
+        let runtime = try makeRuntime(checkpoint)
+        let executor = runtime.forward()
+        executor.recordsWalkTiming = true
+        executor.recordsWalkTimeline = true
+        executor.walkTimelineLimit = 1
+        executor.reset()
+        runtime.arena.reset()
+        executor.resetWalkTiming()
+
+        var walls: [Double] = []
+        for position in 0..<3 {
+            let started = DispatchTime.now().uptimeNanoseconds
+            _ = try executor.forwardToken(1_000 + position, position: position)
+            walls.append(Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000)
+        }
+
+        XCTAssertEqual(executor.walkTiming.positions, 3, "every walked position is counted")
+        XCTAssertEqual(executor.walkTimelinePositions, 1, "the timeline stops at its limit")
+        XCTAssertEqual(
+            executor.walkTimeline.count, 2 * checkpoint.plan.count,
+            "one front half and one mixture half per layer"
+        )
+        var previousCommit: UInt64 = 0
+        for entry in executor.walkTimeline {
+            XCTAssertGreaterThanOrEqual(
+                entry.commitNanoseconds, previousCommit, "\(entry.stage) is out of order"
+            )
+            previousCommit = entry.commitNanoseconds
+            XCTAssertGreaterThanOrEqual(
+                entry.waitBeginNanoseconds, entry.commitNanoseconds,
+                "\(entry.stage) was waited on before it was committed"
+            )
+            XCTAssertGreaterThanOrEqual(
+                entry.waitEndNanoseconds, entry.waitBeginNanoseconds, entry.stage
+            )
+            if entry.windowEndNanoseconds > entry.windowStartNanoseconds {
+                XCTAssertGreaterThanOrEqual(
+                    entry.windowStartNanoseconds, entry.commitNanoseconds,
+                    "\(entry.stage) started before it was handed to the driver"
+                )
+                XCTAssertGreaterThanOrEqual(
+                    entry.windowEndNanoseconds, entry.windowStartNanoseconds, entry.stage
+                )
+            }
+        }
+        // The buckets have to fit inside the position: a device total above the wall, or
+        // a bucket that is negative, means the accumulators are attributing the same
+        // millisecond twice.
+        let perPosition = executor.walkTiming.millisecondsPerPosition()
+        let device = perPosition.frontDevice + perPosition.mixtureDevice
+        let host = Double(executor.walkTiming.hostNanoseconds)
+            / Double(max(1, executor.walkTiming.positions)) / 1_000_000
+        XCTAssertGreaterThan(device, 0, "a walk has device work")
+        XCTAssertLessThanOrEqual(
+            device, walls[0], "the device windows cannot exceed the position's wall time"
+        )
+        XCTAssertGreaterThan(host, 0)
+        XCTAssertEqual(
+            executor.walkTiming.millisecondsPerPositionIndexerWait(), 0,
+            "the default shape publishes no index source, so there is no second round trip"
+        )
+
+        // A shape that DOES publish one, where the dense half stops at `.indexer` and the
+        // host waits a second time inside the same layer.
+        let compressed = DeepSeekV41SyntheticCheckpoint(shape: .compressedSmall())
+        let compressedRuntime = try makeRuntime(compressed)
+        let compressedExecutor = compressedRuntime.forward()
+        compressedExecutor.recordsWalkTiming = true
+        compressedExecutor.reset()
+        compressedRuntime.arena.reset()
+        compressedExecutor.resetWalkTiming()
+        for position in 0..<3 {
+            _ = try compressedExecutor.forwardToken(1_000 + position, position: position)
+        }
+        XCTAssertGreaterThan(
+            compressedExecutor.walkTiming.millisecondsPerPositionIndexerWait(), 0,
+            "the compressed shape's index-source layer pays the split, so the bucket must see it"
+        )
+    }
 }
