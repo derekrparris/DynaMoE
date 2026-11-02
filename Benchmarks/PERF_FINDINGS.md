@@ -8325,3 +8325,123 @@ are the app's own optimized build in `/tmp/dd_dsv41_opt`, load average 3.2-3.4; 
 
 One pre-existing warning is untouched: `DeepSeekV41IndexerInputRequest.latents` holds an `MTLBuffer` in
 a `Sendable` struct, which the Swift 6 language mode will make an error. It is not from this slice.
+
+## DSV4.1 #48: A SUBMITTED BUFFER STARTS IN A TENTH OF A MILLISECOND, SO THE WALK'S IDLE IS NOT ITS SUBMISSION COUNT
+
+### Question
+
+`#47` measured a walked position at 245-276 ms with the GPU executing 63-94 ms of it, attributed the
+difference to `88 command buffers per position, each starting 2.1-2.9 ms after it was handed over`, and
+named the submission count as the lever -- with the surgical candidate being a merge of layer L's
+mixture buffer into layer L+1's front buffer. Before anything was changed, the question this slice had
+to answer was whether a committed buffer really costs 2-3 ms to start, and if so what it is
+proportional to: a fixed cost per BUFFER (merge them), a cost per DISPATCH (cut dispatches), or a cost
+of the QUEUE HAVING GONE EMPTY (keep more than one buffer in flight). Those have three different
+fixes and the walk's own numbers could not tell them apart.
+
+Two instruments answer it. `DeepSeekV41CommitPickupCostTests` drives command buffers of chosen shapes
+through one queue and splits each one's time four ways; the published timeline case sums the same
+split by boundary class over a real position.
+
+### What the walk's idle actually is
+
+`#47`'s per-buffer figure was `commit -> the buffer's own device window opening`, and that is not idle:
+a buffer committed while another is still queued "pays" the predecessor's remaining window. The
+published case now reports both, so the same two positions read:
+
+| | position 400 | position 401 |
+|---|---|---|
+| wall | 232.2 ms | 218.3 ms |
+| device windows (88 buffers) | 67.3 ms (29%) | 66.3 ms (30%) |
+| host blocked in `waitUntilCompleted` | 162.2 ms (70%) | 154.6 ms (71%) |
+| **idle with nothing queued** | **93.7 ms (40%)** | **87.4 ms (40%)** |
+| commit-to-start, summed over 88 buffers | 212.9 ms (2.42/buffer) | 197.8 ms (2.25/buffer) |
+| idle into the front half (40 boundaries) | 2.2 ms (0.05/buffer) | 2.9 ms (0.07/buffer) |
+| idle into the indexer split (8) | 0.0 ms | 0.0 ms |
+| **idle into the mixture half (40)** | **91.5 ms (2.29/buffer)** | **84.5 ms (2.11/buffer)** |
+| queue wait, front half | 94.2 ms (2.36/buffer) | 98.2 ms (2.46/buffer) |
+| host gap before the mixture commit | 0.15-0.21 ms/layer | 0.15-0.21 ms/layer |
+
+So the position has 87-94 ms of genuine idle, **97% of it in one gap per layer, immediately before the
+expert half starts**, and the host is already finished when that gap opens: it commits the mixture
+0.2 ms after the front half retires and then blocks on it. The 2.36 ms of "commit to start" the front
+half reports is queue wait behind that same mixture, i.e. real GPU work, not idle.
+
+That is the correction `#47` needs, and it changes what a fix has to do: there are not 88 late starts,
+there are 40, and they are all in the same place. (The timeline covers the layers' two buffers each;
+the embedding and output-head commits are not in `walkBuffers`, so the device column understates a
+position by those two submissions and would read a few milliseconds higher with them in.)
+
+### What a submission costs to start, across every shape a probe can hold
+
+Medians, `-O`-free Debug test build, load average 3.2-4.0, `gpuStartTime` against the mach clock the
+commit stamp is taken from:
+
+| arm | pickup | window |
+|---|---|---|
+| 1 launch, 1 small resource, queue idle | 0.080 ms | 0.002 ms |
+| the same, with no `scheduled` handler registered (instrument control) | 0.083 ms | 0.004 ms |
+| the same, after 2 ms of host idle | 0.071 ms | 0.005 ms |
+| the same, after 5 / 10 / 20 / 50 ms of host idle | 0.682 / 0.572 / 0.768 / 0.843 ms | 0.011 ms |
+| 8 / 32 / 128 launches in one buffer | 0.166 / 0.668 / 0.561 ms | 0.032 / 0.119 / 0.455 ms |
+| one launch over a 1,048,576-lane grid | 0.134 ms | 0.020 ms |
+| 64 launches over 64 resident 64 MiB resources | 0.470 ms | 0.236 ms |
+| 64 launches over 8 resident 512 MiB resources (same 4 GiB) | 0.495 ms | 0.238 ms |
+| 64 launches over 64 zero-copy mapped 64 MiB resources | 0.088 ms | 0.221 ms |
+| 20 launches naming 0 / 8 / 64 / 128 / 256 / 512 resources | 0.110 / 0.087 / 0.086 / 0.110 / 0.136 / 0.173 ms | 0.07 -> 0.04 ms |
+| 20 launches, 128 resources, a buffer barrier after each launch | 0.101 ms | 0.043 ms |
+| queue fed with 2 / 4 / 8 buffers before any wait: follower's gap from its predecessor's end | **0.001 ms** | |
+| a co-tenant saturating the GPU on another queue, 2 buffers at a time | **0.009 ms** (0.078 alone) | |
+| the walk's own alternation: 40 layers of front-commit-and-wait, host work, mixture committed and left in flight (80 buffers) | idle 6.6 ms of 12.3 (0.08/boundary) | |
+| ... with 128 MB of host writes into the mixture's own buffers every layer | pickup 0.088 ms (the added idle is the host's own `memset`) | |
+| ... with a different pipeline for the mixture than for the front | idle 8.5 ms of 15.3 (0.11/boundary) | |
+| ... (one merged pattern) all 80 buffers queued before any is waited on | idle 0.6 ms of 6.4 | |
+| a 64 MB read of memory the host had just written, every page touched | 0.096 ms (0.110 untouched) | 0.316 ms |
+
+Nothing reproduces 2.3 ms. The delay is not the submission's shape (launch count 1-128, grids to a
+million lanes, 2 GiB of bound memory, 512 named resources, buffer barriers), not its size, not the
+pipeline switch between halves, not the host's own writes into the memory the next submission reads,
+not the queue having gone empty (a fed queue starts a follower 1 microsecond after its predecessor
+retires), and not the machine state a 402-position walk leaves behind: **the same probe run in the
+walk's process, after the walk, still reads 0.053-0.073 ms.**
+
+### What it is not, and what it means
+
+- **The submission count is not the lever, and merging buffers would not buy the idle.** The 2.3 ms is
+  one gap per layer, before the expert half. Merging layer L's mixture into layer L+1's front would
+  remove one of the two submissions per layer and turn the front half's 2.36 ms of queue wait into
+  work inside a longer buffer -- but the merged buffer would still start where the mixture starts, so
+  the 91.5 ms of idle stays. `#47`'s surgical candidate is measured dead before it was built.
+- **The one lever the probe does confirm is keeping the queue fed**: a follower committed before its
+  predecessor retires starts 1 microsecond later, i.e. 2000x sooner than an isolated submission's
+  0.08 ms and 2000x sooner than the walk's 2.3 ms. Whether the walk can be arranged that way is a
+  different question from how many buffers it commits, but it is the shape with a measured payoff.
+- **What is left unexplained is specific and narrow**: one submission per layer, the expert half, is
+  the only submission in the port that (a) follows a `pread` into the memory it reads and (b) runs the
+  expert kernels. Both were held constant in a probe and neither moved the number, at 128 MB of write
+  and 64 MB of read. The next instrument therefore has to be inside the walk rather than beside it:
+  a GPU-side split of the buffer's own start (`MTLCounterSampleBuffer`, or the first launch's
+  timestamp) plus the layer's fill/eviction counts, so the 40 gaps can be correlated with what the
+  layer did -- 40 samples, one per layer, is a correlation the timeline can already carry.
+
+### Verification
+
+`DeepSeekV41CommitPickupCostTests` (seven cases, all default-suite, all on the GPU with no model): the
+pickup decomposition with the `scheduled`-handler control and the idle-gap curve, the queue-depth
+sweep with its in-order invariant, the dispatch/grid/residency sweep, the co-tenant arm, the walk's
+alternation with its host-write and pipeline variants, and the read-after-host-write arm. Each asserts
+its sample count, that every buffer opened a window, that `drain >= pickup + window` (the one
+structural relation the clocks guarantee), that a follower in a one-queue round never starts before its
+predecessor finished, and that the `scheduled` handler fired for every completed buffer -- because the
+first version of `#47`'s timeline stamped `waitEnd` before the wait and reported a clean 0.000 ms.
+
+The published case grew the boundary attribution (idle, queue wait and window per class, plus a
+twenty-boundary sequence) and the post-walk probe arm; it is still opt-in behind
+`/tmp/dynamoe_dsv41_walk_cost` on top of the class's `/tmp/dynamoe_dsv41_real_turn`.
+
+The full DeepSeek suite on this code is **570 passed / 0 failed / 62 skipped** (95 classes), and the
+same run under `MTL_DEBUG_LAYER` is **570 / 0 / 62 with 0 validation errors and no failed assertions**.
+The published numbers are the app's own `-O` build in `/tmp/dd_dsv41_opt` (positions 400-401, 102 s),
+load average 3.2-3.6; the probe arms are Debug and run in under 3 s together.
+
+Nothing in the production path changed: no kernel, no encoder, no submission pattern.

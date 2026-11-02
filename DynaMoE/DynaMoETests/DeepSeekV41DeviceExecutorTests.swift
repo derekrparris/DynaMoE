@@ -2532,3 +2532,1101 @@ final class DeepSeekV41CommandStartCostTests: XCTestCase {
         )
     }
 }
+
+// MARK: - Where a committed buffer's start delay comes from
+
+/// One committed buffer's time, split into the places it can go.
+///
+/// The walk commits 88 buffers a position and each one starts 2.1-2.9 ms after
+/// `commit()` while the GPU has nothing else to do (`Benchmarks/PERF_FINDINGS.md`,
+/// "DSV4.1 #47"). That single number admits three different causes, and they do not
+/// share a fix, so the probe below reports all four terms for every arm instead of
+/// the drain alone.
+struct DeepSeekV41CommitSample {
+    /// `commit()` returning to the buffer's own device window opening.
+    var pickupMilliseconds: Double = 0
+    /// The device window itself.
+    var windowMilliseconds: Double = 0
+    /// The GPU finishing to the host leaving `waitUntilCompleted`. This is the part of
+    /// a blocked wait that is notification rather than device work.
+    var tailMilliseconds: Double = 0
+    /// `commit()` returning to the host leaving `waitUntilCompleted`.
+    var drainMilliseconds: Double = 0
+    /// `commit()` returning to Metal's `scheduled` handler, nil when it never fired.
+    var scheduledMilliseconds: Double?
+    /// The device window's own bounds, so consecutive buffers can be lined up: what a
+    /// follower pays is the gap from its predecessor's end, not from its own commit.
+    var windowStartNanoseconds: UInt64 = 0
+    var windowEndNanoseconds: UInt64 = 0
+
+    var hasWindow: Bool { windowMilliseconds > 0 }
+}
+
+/// Drives command buffers of chosen shapes through one queue and reports where each
+/// one's time went. Nothing here is on a production path.
+///
+/// A fixed cost per BUFFER is fixed by merging buffers; a cost per DISPATCH is fixed
+/// by cutting dispatches; a cost of the QUEUE HAVING GONE EMPTY is fixed by keeping
+/// more than one buffer in flight. Only the last two are cheaper than the first, so
+/// the arms have to tell them apart before anything is changed.
+nonisolated final class DeepSeekV41CommitStartupProbe {
+    /// The widest grid any arm dispatches, so every arm writes inside its buffer.
+    static let widestGrid = 4_194_304
+
+    let device: MTLDevice
+    private let queue: MTLCommandQueue
+    private let pipeline: MTLComputePipelineState
+    /// A kernel that READS two buffers, because every other arm here writes: if a
+    /// submission starts late only for memory the host has just written, a write-only
+    /// probe cannot see it.
+    private let readPipeline: MTLComputePipelineState
+    private let target: MTLBuffer
+
+    static func make() throws -> DeepSeekV41CommitStartupProbe {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        guard let library = device.makeDefaultLibrary() else {
+            throw XCTSkip("no default library")
+        }
+        guard let function = library.makeFunction(name: "clear_vector_f32") else {
+            throw XCTSkip("clear_vector_f32 is missing")
+        }
+        guard let readFunction = library.makeFunction(name: "vector_add_f32") else {
+            throw XCTSkip("vector_add_f32 is missing")
+        }
+        return try DeepSeekV41CommitStartupProbe(
+            device: device, function: function, readFunction: readFunction
+        )
+    }
+
+    init(device: MTLDevice, function: MTLFunction, readFunction: MTLFunction) throws {
+        guard let queue = device.makeCommandQueue() else {
+            throw XCTSkip("no compute queue")
+        }
+        guard let target = device.makeBuffer(
+            length: Self.widestGrid * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ) else {
+            throw XCTSkip("no scratch buffer")
+        }
+        self.device = device
+        self.queue = queue
+        self.pipeline = try device.makeComputePipelineState(function: function)
+        self.readPipeline = try device.makeComputePipelineState(function: readFunction)
+        self.target = target
+    }
+
+    /// One submission whose kernels READ `source`, with the option to have the host
+    /// write every page of that memory first, the way a `pread` fills an arena slot.
+    func readSample(
+        source: [MTLBuffer],
+        lanes: Int,
+        destination: MTLBuffer,
+        hostWritesFirst: Bool
+    ) -> DeepSeekV41CommitSample? {
+        guard !source.isEmpty else { return nil }
+        if hostWritesFirst {
+            for buffer in source {
+                let pointer = buffer.contents().assumingMemoryBound(to: Float.self)
+                for page in 0..<max(1, buffer.length / 16_384) { pointer[page * 4_096] = 1 }
+            }
+        }
+        guard let buffer = queue.makeCommandBuffer(),
+              let encoder = buffer.makeComputeCommandEncoder() else { return nil }
+        encoder.setComputePipelineState(readPipeline)
+        encoder.setBuffer(source[0], offset: 0, index: 0)
+        encoder.setBuffer(source[1 % source.count], offset: 0, index: 1)
+        encoder.setBuffer(destination, offset: 0, index: 2)
+        var dim = UInt32(max(1, min(lanes, source[0].length / 4)))
+        encoder.setBytes(&dim, length: 4, index: 3)
+        let width = Int(dim)
+        encoder.dispatchThreads(
+            MTLSize(width: width, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: max(1, min(width, readPipeline.maxTotalThreadsPerThreadgroup)),
+                height: 1,
+                depth: 1
+            )
+        )
+        encoder.endEncoding()
+        buffer.commit()
+        let commit = DispatchTime.now().uptimeNanoseconds
+        buffer.waitUntilCompleted()
+        let returned = DispatchTime.now().uptimeNanoseconds
+        return enriched(buffer, commit: commit, returned: returned, stamp: CommitStamp())
+    }
+
+    /// A buffer holding `dispatches` copies of the clear kernel over `threads` lanes.
+    ///
+    /// `pool` mimics the walk, where every dispatch binds its own weight slice out of
+    /// one of ~57 shard buffers rather than re-binding a shared scratch vector: what
+    /// grows is the command buffer's resource list, not the number of launches.
+    ///
+    /// `residency` is declared with `useResource`, which puts it on the command
+    /// buffer's resource list without giving it a binding slot. That is the one axis a
+    /// binding slot cannot measure on this shader (the clear kernel reads buffer 0
+    /// only), and it is the axis a real half layer has: dozen of dispatches whose union
+    /// is every workspace buffer, gain vector and expert slot the layer touches.
+    func makeCommandBuffer(
+        dispatches: Int = 1,
+        threads: Int = 16,
+        pool: [MTLBuffer] = [],
+        residency: [MTLBuffer] = [],
+        barrier: Bool = false
+    ) -> MTLCommandBuffer? {
+        guard let buffer = queue.makeCommandBuffer(),
+              let encoder = buffer.makeComputeCommandEncoder() else { return nil }
+        encoder.setComputePipelineState(pipeline)
+        let grid = MTLSize(width: max(1, min(threads, Self.widestGrid)), height: 1, depth: 1)
+        let group = MTLSize(
+            width: max(1, min(grid.width, pipeline.maxTotalThreadsPerThreadgroup)),
+            height: 1,
+            depth: 1
+        )
+        for resource in residency { encoder.useResource(resource, usage: .read) }
+        for index in 0..<max(1, dispatches) {
+            encoder.setBuffer(pool.isEmpty ? target : pool[index % pool.count], offset: 0, index: 0)
+            encoder.dispatchThreads(grid, threadsPerThreadgroup: group)
+            if barrier { encoder.memoryBarrier(scope: .buffers) }
+        }
+        encoder.endEncoding()
+        return buffer
+    }
+
+    /// `count` buffers of `bytes` each in shared memory, held by the caller so they stay
+    /// alive for the life of an arm.
+    func residentPool(count: Int, bytes: Int) -> [MTLBuffer] {
+        var pool: [MTLBuffer] = []
+        for _ in 0..<max(1, count) {
+            guard let buffer = device.makeBuffer(length: bytes, options: .storageModeShared) else {
+                continue
+            }
+            // Touch one float a page so the allocation is backed before it is measured,
+            // otherwise the first arm pays the kernel's own page faults.
+            let pointer = buffer.contents().assumingMemoryBound(to: Float.self)
+            for page in 0..<max(1, bytes / 16_384) { pointer[page * 4_096] = 0 }
+            pool.append(buffer)
+        }
+        return pool
+    }
+
+    /// `count` buffers of `bytes` each wrapped over a sparse temp file with no copy,
+    /// which is how the checkpoint's shards reach the GPU. `maps` owns the mappings.
+    func mappedPool(count: Int, bytes: Int) -> (pool: [MTLBuffer], maps: [UnsafeMutableRawPointer]) {
+        let path = NSTemporaryDirectory() + "dsv41_commit_probe_mapping"
+        let fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0o600)
+        guard fd >= 0 else { return ([], []) }
+        defer { close(fd) }
+        guard ftruncate(fd, off_t(bytes)) == 0 else { return ([], []) }
+        var pool: [MTLBuffer] = []
+        var maps: [UnsafeMutableRawPointer] = []
+        for _ in 0..<max(1, count) {
+            guard let raw = mmap(nil, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0),
+                  raw != UnsafeMutableRawPointer(bitPattern: -1),
+                  let buffer = device.makeBuffer(
+                      bytesNoCopy: raw, length: bytes, options: .storageModeShared,
+                      deallocator: nil
+                  ) else { continue }
+            pool.append(buffer)
+            maps.append(raw)
+        }
+        return (pool, maps)
+    }
+
+    /// One buffer, committed on its own and waited immediately. This is the walk's
+    /// shape: the host has nothing else queued when the driver is handed the work.
+    ///
+    /// `recordsSchedule` registers a `scheduled` handler so the arm can separate "the
+    /// driver had not submitted it yet" from "the driver submitted it and the GPU was
+    /// slow to open the window"; turning it off is the control that says whether
+    /// registering a handler perturbs the commit path it is measuring.
+    func serialSample(
+        dispatches: Int = 1,
+        threads: Int = 16,
+        idleGapMilliseconds: Double = 0,
+        recordsSchedule: Bool = true,
+        pool: [MTLBuffer] = [],
+        residency: [MTLBuffer] = [],
+        barrier: Bool = false
+    ) -> DeepSeekV41CommitSample? {
+        let stamp = CommitStamp()
+        guard let buffer = makeCommandBuffer(
+            dispatches: dispatches, threads: threads, pool: pool,
+            residency: residency, barrier: barrier
+        ) else {
+            return nil
+        }
+        if recordsSchedule {
+            buffer.addScheduledHandler { _ in stamp.stamp(DispatchTime.now().uptimeNanoseconds) }
+        }
+        if idleGapMilliseconds > 0 {
+            Thread.sleep(forTimeInterval: idleGapMilliseconds / 1_000)
+        }
+        buffer.commit()
+        let commit = DispatchTime.now().uptimeNanoseconds
+        buffer.waitUntilCompleted()
+        let returned = DispatchTime.now().uptimeNanoseconds
+        return enriched(buffer, commit: commit, returned: returned, stamp: stamp)
+    }
+
+    /// `depth` buffers encoded up front and committed back to back with no wait
+    /// between them, then waited in order. A depth of one is the serial arm; anything
+    /// wider is the queue fed before it is emptied.
+    func pipelinedRound(
+        depth: Int,
+        dispatches: Int = 1,
+        threads: Int = 16,
+        pool: [MTLBuffer] = []
+    ) -> [DeepSeekV41CommitSample] {
+        var built: [(buffer: MTLCommandBuffer, stamp: CommitStamp)] = []
+        for _ in 0..<max(1, depth) {
+            let stamp = CommitStamp()
+            guard let buffer = makeCommandBuffer(
+                dispatches: dispatches, threads: threads, pool: pool
+            ) else {
+                continue
+            }
+            buffer.addScheduledHandler { _ in stamp.stamp(DispatchTime.now().uptimeNanoseconds) }
+            built.append((buffer, stamp))
+        }
+        var commits: [UInt64] = []
+        commits.reserveCapacity(built.count)
+        for entry in built {
+            entry.buffer.commit()
+            commits.append(DispatchTime.now().uptimeNanoseconds)
+        }
+        var samples: [DeepSeekV41CommitSample] = []
+        samples.reserveCapacity(built.count)
+        for (index, entry) in built.enumerated() {
+            entry.buffer.waitUntilCompleted()
+            let returned = DispatchTime.now().uptimeNanoseconds
+            samples.append(
+                enriched(entry.buffer, commit: commits[index], returned: returned, stamp: entry.stamp)
+            )
+        }
+        return samples
+    }
+
+    /// A mixture-shaped buffer running a DIFFERENT kernel from the front's: the walk
+    /// switches pipeline state between the two halves of every layer, and no arm above
+    /// ever submits more than one pipeline.
+    func makeReadCommandBuffer(source: [MTLBuffer], destination: MTLBuffer, lanes: Int)
+        -> MTLCommandBuffer? {
+        guard !source.isEmpty,
+              let buffer = queue.makeCommandBuffer(),
+              let encoder = buffer.makeComputeCommandEncoder() else { return nil }
+        encoder.setComputePipelineState(readPipeline)
+        encoder.setBuffer(source[0], offset: 0, index: 0)
+        encoder.setBuffer(source[1 % source.count], offset: 0, index: 1)
+        encoder.setBuffer(destination, offset: 0, index: 2)
+        var dim = UInt32(max(1, min(lanes, source[0].length / 4)))
+        encoder.setBytes(&dim, length: 4, index: 3)
+        let width = max(1, min(Int(dim), readPipeline.maxTotalThreadsPerThreadgroup))
+        encoder.dispatchThreads(
+            MTLSize(width: Int(dim), height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        return buffer
+    }
+
+    /// One position's submission pattern, exactly as `runLayer` writes it: a front half
+    /// committed and waited immediately (the routing readback needs it finished), then a
+    /// mixture half committed and left in flight, drained by the next front half's wait.
+    ///
+    /// `hostBytes` stands in for the host work between the two halves (the routing
+    /// readback and the expert fill), written into the scratch buffer so the submission
+    /// follows a real host write the way a mixture follows `pread`s.
+    func alternatingRound(
+        layers: Int,
+        dispatches: Int = 20,
+        frontPool: [MTLBuffer] = [],
+        mixturePool: [MTLBuffer] = [],
+        hostBytes: Int = 0,
+        mixtureIsRead: Bool = false
+    ) -> [DeepSeekV41CommitSample] {
+        var samples: [DeepSeekV41CommitSample] = []
+        var pending: [(buffer: MTLCommandBuffer, stamp: CommitStamp, commit: UInt64)] = []
+        func settle() {
+            for entry in pending {
+                entry.buffer.waitUntilCompleted()
+                let returned = DispatchTime.now().uptimeNanoseconds
+                samples.append(
+                    enriched(entry.buffer, commit: entry.commit, returned: returned, stamp: entry.stamp)
+                )
+            }
+            pending.removeAll(keepingCapacity: true)
+        }
+        for _ in 0..<max(1, layers) {
+            if let front = makeCommandBuffer(dispatches: dispatches, pool: frontPool) {
+                let stamp = CommitStamp()
+                front.addScheduledHandler { _ in stamp.stamp(DispatchTime.now().uptimeNanoseconds) }
+                front.commit()
+                pending.append((front, stamp, DispatchTime.now().uptimeNanoseconds))
+            }
+            settle()
+            if hostBytes > 0 {
+                // Written into the buffers the MIXTURE binds, not into a scratch vector:
+                // a mixture follows `pread`s that land in the expert arena, so the
+                // quantity under test is host writes into memory the next submission
+                // reads, not host work in general.
+                if mixturePool.isEmpty {
+                    memset(target.contents(), 0, min(hostBytes, target.length))
+                } else {
+                    let each = max(1, hostBytes / mixturePool.count)
+                    for buffer in mixturePool {
+                        memset(buffer.contents(), 0, min(each, buffer.length))
+                    }
+                }
+            }
+            let mixture = mixtureIsRead
+                ? makeReadCommandBuffer(
+                    source: mixturePool.isEmpty ? [target] : mixturePool,
+                    destination: target,
+                    lanes: 4_000_000
+                )
+                : makeCommandBuffer(dispatches: dispatches, pool: mixturePool)
+            if let mixture {
+                let stamp = CommitStamp()
+                mixture.addScheduledHandler { _ in stamp.stamp(DispatchTime.now().uptimeNanoseconds) }
+                mixture.commit()
+                pending.append((mixture, stamp, DispatchTime.now().uptimeNanoseconds))
+            }
+        }
+        settle()
+        return samples
+    }
+
+    /// The idle a run of submissions actually pays: the GPU with no window open. Time a
+    /// buffer spends waiting behind work that is already queued is NOT idle, and a
+    /// per-buffer "commit to start" figure counts it as though it were -- which is why
+    /// the walk's 206.7 ms of commit-to-start is not 206.7 ms of idle.
+    static func idle(_ samples: [DeepSeekV41CommitSample]) -> Double {
+        let windowed = samples
+            .filter { $0.hasWindow }
+            .sorted { $0.windowStartNanoseconds < $1.windowStartNanoseconds }
+        var total = 0.0
+        var previousEnd: UInt64 = 0
+        for entry in windowed {
+            if previousEnd > 0, entry.windowStartNanoseconds > previousEnd {
+                total += Double(entry.windowStartNanoseconds - previousEnd) / 1_000_000
+            }
+            previousEnd = max(previousEnd, entry.windowEndNanoseconds)
+        }
+        return total
+    }
+
+    /// Everything the GPU was busy for, likewise in window order.
+    static func busy(_ samples: [DeepSeekV41CommitSample]) -> Double {
+        samples.filter { $0.hasWindow }.reduce(0) { $0 + $1.windowMilliseconds }
+    }
+
+    /// `gpuStartTime` and `gpuEndTime` share mach's clock, which `DispatchTime` reads,
+    /// so all four terms are comparable without a conversion.
+    private func enriched(
+        _ buffer: MTLCommandBuffer,
+        commit: UInt64,
+        returned: UInt64,
+        stamp: CommitStamp
+    ) -> DeepSeekV41CommitSample {
+        var sample = DeepSeekV41CommitSample()
+        let start = UInt64(max(0, Double(buffer.gpuStartTime) * 1_000_000_000))
+        let end = UInt64(max(0, Double(buffer.gpuEndTime) * 1_000_000_000))
+        sample.windowStartNanoseconds = start
+        sample.windowEndNanoseconds = end
+        if start > commit { sample.pickupMilliseconds = Double(start - commit) / 1_000_000 }
+        if end > start { sample.windowMilliseconds = Double(end - start) / 1_000_000 }
+        if returned > end { sample.tailMilliseconds = Double(returned - end) / 1_000_000 }
+        if returned > commit { sample.drainMilliseconds = Double(returned - commit) / 1_000_000 }
+        if let scheduled = stamp.value {
+            sample.scheduledMilliseconds = scheduled > commit
+                ? Double(scheduled - commit) / 1_000_000 : 0
+        }
+        return sample
+    }
+}
+
+/// The first `scheduled` stamp Metal reports for one buffer, written from Metal's own
+/// thread and read by the test after the buffer completed.
+private nonisolated final class CommitStamp: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: UInt64?
+
+    func stamp(_ nanoseconds: UInt64) {
+        lock.lock()
+        if stored == nil { stored = nanoseconds }
+        lock.unlock()
+    }
+
+    var value: UInt64? {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+}
+
+private func commitMedian(_ values: [Double]) -> Double {
+    let sorted = values.sorted()
+    guard !sorted.isEmpty else { return 0 }
+    return sorted[sorted.count / 2]
+}
+
+/// What a committed buffer's start delay is proportional to.
+final class DeepSeekV41CommitPickupCostTests: XCTestCase {
+
+    private struct Anatomy {
+        var pickup: Double = 0
+        var window: Double = 0
+        var tail: Double = 0
+        var drain: Double = 0
+        var scheduled: Double = 0
+    }
+
+    private func anatomy(
+        _ probe: DeepSeekV41CommitStartupProbe,
+        label: String,
+        dispatches: Int = 1,
+        threads: Int = 16,
+        idleGapMilliseconds: Double = 0,
+        attempts: Int = 21,
+        recordsSchedule: Bool = true,
+        pool: [MTLBuffer] = [],
+        residency: [MTLBuffer] = [],
+        barrier: Bool = false
+    ) -> Anatomy {
+        var samples: [DeepSeekV41CommitSample] = []
+        for _ in 0..<attempts {
+            if let sample = probe.serialSample(
+                dispatches: dispatches,
+                threads: threads,
+                idleGapMilliseconds: idleGapMilliseconds,
+                recordsSchedule: recordsSchedule,
+                pool: pool,
+                residency: residency,
+                barrier: barrier
+            ) {
+                samples.append(sample)
+            }
+        }
+        XCTAssertEqual(samples.count, attempts, "\(label) dropped samples")
+        XCTAssertTrue(
+            samples.allSatisfy { $0.hasWindow },
+            "\(label) reported a buffer that never opened a window"
+        )
+        // Structural, not numeric: the host cannot leave the wait before the GPU has
+        // finished, so the drain has to cover the pickup and the window.
+        XCTAssertTrue(
+            samples.allSatisfy {
+                $0.drainMilliseconds + 0.3 >= $0.pickupMilliseconds + $0.windowMilliseconds
+            },
+            "\(label) drained faster than it was picked up and ran"
+        )
+        XCTAssertTrue(
+            samples.allSatisfy {
+                !recordsSchedule || $0.scheduledMilliseconds != nil
+            },
+            "\(label) never reported its buffer scheduled"
+        )
+        let result = Anatomy(
+            pickup: commitMedian(samples.map { $0.pickupMilliseconds }),
+            window: commitMedian(samples.map { $0.windowMilliseconds }),
+            tail: commitMedian(samples.map { $0.tailMilliseconds }),
+            drain: commitMedian(samples.map { $0.drainMilliseconds }),
+            scheduled: commitMedian(samples.compactMap { $0.scheduledMilliseconds })
+        )
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] %@: pickup %.3f ms, window %.3f ms, "
+                    + "tail %.3f ms, drain %.3f ms, scheduled %.3f ms",
+                label, result.pickup, result.window, result.tail, result.drain, result.scheduled
+            )
+        )
+        return result
+    }
+
+    /// A pickup that does not move with the work inside the buffer is a per-buffer
+    /// cost; one that grows with the dispatch count is per-dispatch.
+    func testWhatACommittedBuffersPickupIsProportionalTo() throws {
+        let probe = try DeepSeekV41CommitStartupProbe.make()
+
+        // Warm the pipeline, the queue and the driver's own shader setup.
+        for _ in 0..<5 { _ = probe.serialSample() }
+
+        let idle = anatomy(probe, label: "one dispatch, queue idle")
+        let noHandler = anatomy(
+            probe, label: "one dispatch, no scheduled handler", recordsSchedule: false
+        )
+        let gap2 = anatomy(probe, label: "one dispatch, 2 ms idle gap first", idleGapMilliseconds: 2)
+        let gap10 = anatomy(
+            probe, label: "one dispatch, 10 ms idle gap first", idleGapMilliseconds: 10
+        )
+        // The curve, not a point: the walk commits a mixture half ~1.5 ms after the GPU
+        // went idle for the expert fill, so what a gap of that length costs is the
+        // number that has to line up with the walk's own pickups.
+        let gap5 = anatomy(
+            probe, label: "one dispatch, 5 ms idle gap first",
+            idleGapMilliseconds: 5, attempts: 41
+        )
+        let gap20 = anatomy(
+            probe, label: "one dispatch, 20 ms idle gap first",
+            idleGapMilliseconds: 20, attempts: 21
+        )
+        let gap50 = anatomy(
+            probe, label: "one dispatch, 50 ms idle gap first",
+            idleGapMilliseconds: 50, attempts: 11
+        )
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] idle-gap curve: 0 ms %.3f, 2 ms %.3f, 5 ms "
+                    + "%.3f, 10 ms %.3f, 20 ms %.3f, 50 ms %.3f (pickup, ms)",
+                idle.pickup, gap2.pickup, gap5.pickup, gap10.pickup, gap20.pickup, gap50.pickup
+            )
+        )
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] instrument check: pickup is %.3f ms with a "
+                    + "scheduled handler and %.3f ms without it, so the handler costs %.3f ms",
+                idle.pickup, noHandler.pickup, idle.pickup - noHandler.pickup
+            )
+        )
+
+        var byDispatch: [(Int, Anatomy)] = []
+        for dispatches in [8, 32, 128] {
+            byDispatch.append((dispatches, anatomy(
+                probe, label: "\(dispatches) dispatches", dispatches: dispatches
+            )))
+        }
+        for (dispatches, result) in byDispatch {
+            print(
+                String(
+                    format: "🔎 [dsv41 commit startup] %d dispatches: pickup %.3f ms for a "
+                        + "%.3f ms window (%.3f ms of pickup per dispatch)",
+                    dispatches, result.pickup, result.window, result.pickup / Double(dispatches)
+                )
+            )
+        }
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] a buffer with no work at all costs %.3f ms to "
+                    + "start; one with 128 dispatches costs %.3f ms",
+                idle.pickup, byDispatch.last?.1.pickup ?? 0
+            )
+        )
+
+        var byGrid: [(Int, Anatomy)] = []
+        for threads in [65_536, 1_048_576] {
+            byGrid.append((threads, anatomy(
+                probe, label: "one dispatch over \(threads) lanes",
+                threads: threads, attempts: 11
+            )))
+        }
+        for (threads, result) in byGrid {
+            print(
+                String(
+                    format: "🔎 [dsv41 commit startup] one dispatch over %d lanes: pickup %.3f ms, "
+                        + "window %.3f ms",
+                    threads, result.pickup, result.window
+                )
+            )
+        }
+
+        // The idle-gap arms are the control for the surprising direction: if an idle
+        // host makes the pickup WORSE, the delay is the driver's deferral of work it
+        // does not have to start yet. If it does not move, the delay is per launch.
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] verdict: pickup %.3f ms fed, %.3f ms after 2 ms "
+                    + "idle, %.3f ms after 10 ms idle; %.3f ms with 128 dispatches inside one "
+                    + "buffer, so the delay tracks %@",
+                idle.pickup, gap2.pickup, gap10.pickup, byDispatch.last?.1.pickup ?? 0,
+                idle.pickup > 0.5 * (byDispatch.last?.1.pickup ?? 0) ? "the buffer" : "the work"
+            )
+        )
+    }
+
+    /// Committing several buffers before waiting on any of them: if a follower starts
+    /// as its predecessor retires, the pickup is the queue having gone empty and no
+    /// per-buffer merge is needed to remove it.
+    func testWhetherQueueDepthHidesACommittedBuffersPickup() throws {
+        let probe = try DeepSeekV41CommitStartupProbe.make()
+
+        for _ in 0..<5 { _ = probe.serialSample() }
+        _ = probe.pipelinedRound(depth: 4)
+
+        for depth in [1, 2, 4, 8] {
+            var rounds: [[DeepSeekV41CommitSample]] = []
+            for _ in 0..<11 {
+                let round = probe.pipelinedRound(depth: depth)
+                XCTAssertEqual(round.count, depth, "a round of \(depth) buffers built \(round.count)")
+                XCTAssertTrue(
+                    round.allSatisfy { $0.hasWindow },
+                    "a round of \(depth) reported a buffer that never opened a window"
+                )
+                // One in-order queue, so a follower cannot start before its
+                // predecessor retires. A violation means the windows are misread.
+                for index in 1..<max(1, round.count) {
+                    XCTAssertGreaterThanOrEqual(
+                        Double(round[index].windowStartNanoseconds) + 200_000,
+                        Double(round[index - 1].windowEndNanoseconds),
+                        "buffer \(index) of \(depth) started before its predecessor finished"
+                    )
+                }
+                rounds.append(round)
+            }
+            var pickups: [Double] = []
+            var gaps: [Double] = []
+            var windows: [Double] = []
+            for index in 0..<depth {
+                pickups.append(commitMedian(rounds.map { $0[index].pickupMilliseconds }))
+                windows.append(commitMedian(rounds.map { $0[index].windowMilliseconds }))
+                if index == 0 {
+                    gaps.append(pickups[0])
+                } else {
+                    gaps.append(commitMedian(rounds.map { round in
+                        let previousEnd = round[index - 1].windowEndNanoseconds
+                        let start = round[index].windowStartNanoseconds
+                        return start > previousEnd
+                            ? Double(start - previousEnd) / 1_000_000 : 0
+                    }))
+                }
+            }
+            let wall = commitMedian(rounds.map { $0.map { $0.drainMilliseconds }.reduce(0, +) })
+            print(
+                String(
+                    format: "🔎 [dsv41 commit startup] depth %d: total %.3f ms; first buffer "
+                        + "pickup %.3f ms; followers' pickups %@; followers' gap from the "
+                        + "predecessor's end %@; windows %@",
+                    depth, wall, pickups[0],
+                    pickups.dropFirst().map { String(format: "%.3f", $0) }.joined(separator: ", "),
+                    gaps.dropFirst().map { String(format: "%.3f", $0) }.joined(separator: ", "),
+                    windows.map { String(format: "%.3f", $0) }.joined(separator: ", ")
+                )
+            )
+        }
+
+        // The shape a pipelined walk would have: a predecessor still running when its
+        // followers are committed. Followers cannot pay a pickup for an empty queue
+        // because the queue was never empty.
+        let long = probe.pipelinedRound(depth: 8, dispatches: 96, threads: 1_048_576)
+        XCTAssertEqual(long.count, 8, "the long-predecessor arm built \(long.count) buffers")
+        var longGaps: [Double] = []
+        for index in 1..<long.count {
+            let previousEnd = long[index - 1].windowEndNanoseconds
+            let start = long[index].windowStartNanoseconds
+            longGaps.append(start > previousEnd ? Double(start - previousEnd) / 1_000_000 : 0)
+        }
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] fed queue, 96 dispatches a buffer: windows %@; "
+                    + "followers' pickups %@; followers' gap from the predecessor's end %@",
+                long.map { String(format: "%.3f", $0.windowMilliseconds) }.joined(separator: ", "),
+                long.dropFirst().map { String(format: "%.3f", $0.pickupMilliseconds) }
+                    .joined(separator: ", "),
+                longGaps.map { String(format: "%.3f", $0) }.joined(separator: ", ")
+            )
+        )
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] verdict: a buffer waited on at once costs "
+                    + "%.3f ms before it starts; the same buffer committed behind a running one "
+                    + "starts %.3f ms after its predecessor retires",
+                long.first?.pickupMilliseconds ?? 0,
+                commitMedian(longGaps)
+            )
+        )
+    }
+
+    /// What a command buffer has to carry before a submission stops starting at once.
+    ///
+    /// A trivial launch starts in a tenth of a millisecond, so the walk's 2-3 ms has to
+    /// come from something its buffers have: dozens of launches (a half layer), or a
+    /// resource list spread over every shard the layer reads, or memory the driver has
+    /// to make resident at submit time. The arms below separate those three, because
+    /// only the first is affected by how many buffers a position is cut into.
+    func testWhatACommandBufferHasToCarryToStartSlowly() throws {
+        let probe = try DeepSeekV41CommitStartupProbe.make()
+        for _ in 0..<5 { _ = probe.serialSample() }
+
+        // 1. The control: one launch, one 16 MB scratch buffer.
+        _ = anatomy(probe, label: "1 launch, 1 small resource", attempts: 11)
+
+        // 2. Launches alone, all binding the same vector — a half layer's launch count.
+        _ = anatomy(probe, label: "64 launches, 1 small resource", dispatches: 64, attempts: 11)
+        _ = anatomy(
+            probe, label: "64 launches at a published-width grid, 1 small resource",
+            dispatches: 64, threads: 73_728, attempts: 11
+        )
+
+        // 3. Resources alone, at a constant 4 GiB: 64 slices of 64 MiB against 8 slices
+        //    of 512 MiB tells resource COUNT apart from resource BYTES.
+        let many = probe.residentPool(count: 64, bytes: 64 << 20)
+        XCTAssertEqual(many.count, 64, "the 64-slice pool allocated \(many.count) buffers")
+        _ = anatomy(
+            probe, label: "64 launches, 64 resident resources of 64 MiB",
+            dispatches: 64, attempts: 11, pool: many
+        )
+        let few = probe.residentPool(count: 8, bytes: 512 << 20)
+        XCTAssertEqual(few.count, 8, "the 8-slice pool allocated \(few.count) buffers")
+        _ = anatomy(
+            probe, label: "64 launches, 8 resident resources of 512 MiB",
+            dispatches: 64, attempts: 11, pool: few
+        )
+
+        // 4. The same shape with no copy, over a sparse file: pageable memory, which is
+        //    what a shard mapping is and what the pinned chunks are not.
+        let mapped = probe.mappedPool(count: 64, bytes: 64 << 20)
+        XCTAssertEqual(mapped.pool.count, 64, "the mapped pool wrapped \(mapped.pool.count) buffers")
+        _ = anatomy(
+            probe, label: "64 launches, 64 mapped resources of 64 MiB",
+            dispatches: 64, attempts: 11, pool: mapped.pool
+        )
+
+        // 5. Does feeding the queue still hide it once the buffer is heavy?
+        var rounds: [[DeepSeekV41CommitSample]] = []
+        for _ in 0..<11 {
+            rounds.append(probe.pipelinedRound(depth: 4, dispatches: 64, pool: many))
+        }
+        var gaps: [Double] = []
+        for index in 1..<4 {
+            gaps.append(commitMedian(rounds.map { round in
+                let previousEnd = round[index - 1].windowEndNanoseconds
+                let start = round[index].windowStartNanoseconds
+                return start > previousEnd ? Double(start - previousEnd) / 1_000_000 : 0
+            }))
+        }
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] fed queue, 64 launches over 64 resident "
+                    + "resources: first pickup %.3f ms, followers' gap from the predecessor's "
+                    + "end %@",
+                commitMedian(rounds.map { $0[0].pickupMilliseconds }),
+                gaps.map { String(format: "%.3f", $0) }.joined(separator: ", ")
+            )
+        )
+
+        for map in mapped.maps { munmap(map, 64 << 20) }
+        try? FileManager.default.removeItem(
+            atPath: NSTemporaryDirectory() + "dsv41_commit_probe_mapping"
+        )
+    }
+
+    /// The one axis a binding slot cannot measure: how many DISTINCT resources a
+    /// submission names. A half layer's union is every workspace buffer, gain vector,
+    /// expert slot and shard slice it touches, and Metal builds that list per command
+    /// buffer however few of them any single launch binds.
+    func testWhatTheResourceListCostsACommittedBuffer() throws {
+        let probe = try DeepSeekV41CommitStartupProbe.make()
+        for _ in 0..<5 { _ = probe.serialSample() }
+
+        // 512 slices of 4 MiB: 2 GiB in total, so raising the count does not raise the
+        // bytes and the two cannot be confused.
+        let slices = probe.residentPool(count: 512, bytes: 4 << 20)
+        XCTAssertEqual(slices.count, 512, "the slice pool allocated \(slices.count) buffers")
+
+        var curve: [(Int, Anatomy)] = []
+        for count in [0, 32, 64, 128, 256, 512] {
+            curve.append((count, anatomy(
+                probe,
+                label: "20 launches naming \(count) resources",
+                dispatches: 20,
+                attempts: 11,
+                residency: Array(slices.prefix(count))
+            )))
+        }
+        for (count, result) in curve {
+            print(
+                String(
+                    format: "🔎 [dsv41 commit startup] 20 launches, %d resources of 4 MiB: "
+                        + "pickup %.3f ms, window %.3f ms, drain %.3f ms",
+                    count, result.pickup, result.window, result.drain
+                )
+            )
+        }
+        let first = curve.first?.1.pickup ?? 0
+        let last = curve.last?.1.pickup ?? 0
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] resource-list curve: %.3f ms with no "
+                    + "resources, %.3f ms with 512, i.e. %.3f ms of pickup per resource",
+                first, last, (last - first) / 512
+            )
+        )
+
+        // Same 2 GiB, eight resources instead of 512: bytes cannot be the cause.
+        let wide = probe.residentPool(count: 8, bytes: 256 << 20)
+        XCTAssertEqual(wide.count, 8, "the wide pool allocated \(wide.count) buffers")
+        let wideAnatomy = anatomy(
+            probe, label: "20 launches naming 8 resources of 256 MiB",
+            dispatches: 20, attempts: 11, residency: wide
+        )
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] 2 GiB as 8 resources: pickup %.3f ms "
+                    + "against %.3f ms as 512 resources and %.3f ms as none",
+                wideAnatomy.pickup, last, first
+            )
+        )
+
+        // A real half layer also fences between dispatches, and it does both at once.
+        let fenced = anatomy(
+            probe, label: "20 launches, 128 resources, a barrier after each dispatch",
+            dispatches: 20, attempts: 11,
+            residency: Array(slices.prefix(128)), barrier: true
+        )
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] 20 launches, 128 resources, 20 buffer "
+                    + "barriers: pickup %.3f ms, window %.3f ms",
+                fenced.pickup, fenced.window
+            )
+        )
+
+        // And fed: a deep queue used to hide everything measured so far.
+        var rounds: [[DeepSeekV41CommitSample]] = []
+        for _ in 0..<11 {
+            rounds.append(probe.pipelinedRound(
+                depth: 4, dispatches: 20,
+                pool: Array(slices.prefix(128))
+            ))
+        }
+        var gaps: [Double] = []
+        for index in 1..<4 {
+            gaps.append(commitMedian(rounds.map { round in
+                let previousEnd = round[index - 1].windowEndNanoseconds
+                let start = round[index].windowStartNanoseconds
+                return start > previousEnd ? Double(start - previousEnd) / 1_000_000 : 0
+            }))
+        }
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] fed queue of 4, 20 launches each naming "
+                    + "128 resources: followers' gap from the predecessor's end %@",
+                gaps.map { String(format: "%.3f", $0) }.joined(separator: ", ")
+            )
+        )
+    }
+
+    /// Whether a submission starts late because someone else is using the GPU.
+    ///
+    /// Every arm above starts in a tenth of a millisecond, so the walk's 2.3 ms has to
+    /// come from something that is not the submission. The last candidate that a single
+    /// process cannot rule out by shape is a co-tenant: the walk shares the GPU with
+    /// the compositor and with whatever else the machine is doing, and a queue that is
+    /// not the only one submitting can wait behind work no command buffer of ours
+    /// accounts for.
+    func testWhetherASecondQueueDelaysACommittedBuffersStart() throws {
+        let measured = try DeepSeekV41CommitStartupProbe.make()
+        let tenant = try DeepSeekV41CommitStartupProbe.make()
+
+        func pickup(attempts: Int = 21) -> (median: Double, worst: Double) {
+            var values: [Double] = []
+            for _ in 0..<attempts {
+                if let sample = measured.serialSample(dispatches: 20) {
+                    values.append(sample.pickupMilliseconds)
+                }
+            }
+            return (commitMedian(values), values.max() ?? 0)
+        }
+
+        // Warm both queues before either is measured.
+        for _ in 0..<5 {
+            _ = measured.serialSample()
+            _ = tenant.pipelinedRound(depth: 2, dispatches: 64, threads: 1_048_576)
+        }
+        let alone = pickup()
+
+        // A co-tenant whose own buffers take a few hundred microseconds, submitted
+        // back to back the way a compositor submits one frame after another. It holds
+        // the GPU for most of each millisecond without owning our queue.
+        let flag = CoTenantFlag()
+        Thread.detachNewThread {
+            while flag.isRunning {
+                _ = tenant.pipelinedRound(depth: 2, dispatches: 64, threads: 1_048_576)
+            }
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+        let shared = pickup()
+        flag.stop()
+        Thread.sleep(forTimeInterval: 0.05)
+
+        let after = pickup()
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] alone: pickup %.3f ms (worst %.3f); "
+                    + "with a co-tenant on another queue: %.3f ms (worst %.3f); after it "
+                    + "stopped: %.3f ms",
+                alone.median, alone.worst, shared.median, shared.worst, after.median
+            )
+        )
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] the co-tenant arm reads %.3f ms against "
+                    + "%.3f ms alone, i.e. a busy GPU starts a submission %@ than an idle one "
+                    + "(clock ramp, not contention)",
+                shared.median, alone.median,
+                shared.median < alone.median ? "sooner" : "later"
+            )
+        )
+    }
+
+    /// The walk's own submission pattern, with none of its work: 40 layers of a front
+    /// half committed and waited, then a mixture half committed and left in flight.
+    ///
+    /// Every arm above measures one submission in isolation or a queue fed before it is
+    /// emptied. This one measures the alternation itself, which is the only thing left
+    /// that a microbenchmark of the walk's own shapes has not covered.
+    func testWhetherTheWalksAlternationCostsWhatNoSingleBufferDoes() throws {
+        let probe = try DeepSeekV41CommitStartupProbe.make()
+
+        // Pools shaped like the two halves' working sets, not like the checkpoint's
+        // sizes: what is under test is the pattern, not the weights.
+        let frontPool = probe.residentPool(count: 8, bytes: 16 << 20)
+        let mixturePool = probe.residentPool(count: 6, bytes: 32 << 20)
+        for _ in 0..<3 { _ = probe.alternatingRound(layers: 4) }
+
+        func report(_ label: String, _ samples: [DeepSeekV41CommitSample]) {
+            let windowed = samples.filter { $0.hasWindow }
+            let first = windowed.map { $0.windowStartNanoseconds }.min() ?? 0
+            let last = windowed.map { $0.windowEndNanoseconds }.max() ?? 0
+            let wall = last > first ? Double(last - first) / 1_000_000 : 0
+            let idle = DeepSeekV41CommitStartupProbe.idle(samples)
+            print(
+                String(
+                    format: "🔎 [dsv41 commit startup] %@ (%d buffer(s)): GPU busy %.1f ms, "
+                        + "GPU idle %.1f ms of %.1f ms (%.0f%%), per-buffer drain %.3f ms, "
+                        + "per-buffer pickup %.3f ms",
+                    label, samples.count,
+                    DeepSeekV41CommitStartupProbe.busy(samples), idle, wall,
+                    100 * idle / max(0.001, wall),
+                    samples.reduce(0.0) { $0 + $1.drainMilliseconds }
+                        / Double(max(1, samples.count)),
+                    commitMedian(samples.map { $0.pickupMilliseconds })
+                )
+            )
+        }
+
+        report(
+            "the walk's pattern, no host work",
+            probe.alternatingRound(layers: 40, dispatches: 20)
+        )
+        report(
+            "the walk's pattern, 8 KB of host writes a layer",
+            probe.alternatingRound(
+                layers: 40, dispatches: 20,
+                frontPool: frontPool, mixturePool: mixturePool, hostBytes: 8 << 10
+            )
+        )
+        report(
+            "the walk's pattern, 1 MB of host writes a layer",
+            probe.alternatingRound(
+                layers: 40, dispatches: 20,
+                frontPool: frontPool, mixturePool: mixturePool, hostBytes: 1 << 20
+            )
+        )
+        // The mixture's own shape: the host fills the buffers it is about to read. The
+        // expert arena slot is ~17.9 MB, six of them are read per layer, and the fill
+        // writes all of it from `pread` before the mixture is encoded.
+        report(
+            "the walk's pattern, 128 MB of host writes into the mixture's own buffers",
+            probe.alternatingRound(
+                layers: 40, dispatches: 20,
+                frontPool: frontPool, mixturePool: mixturePool, hostBytes: 128 << 20
+            )
+        )
+
+        // The control: the same 80 buffers committed before any of them is waited on.
+        var fed: [DeepSeekV41CommitSample] = []
+        for _ in 0..<2 { fed += probe.pipelinedRound(depth: 40, dispatches: 20) }
+        // The one difference left between the two halves of a layer: they run different
+        // kernels. The front half and the expert half never share a pipeline, so every
+        // layer switches pipeline state between them.
+        report(
+            "the walk's pattern, a different pipeline for the mixture",
+            probe.alternatingRound(
+                layers: 40, dispatches: 20,
+                frontPool: frontPool, mixturePool: mixturePool, mixtureIsRead: true
+            )
+        )
+        report("the same buffers, all queued first", fed)
+    }
+
+    /// Whether a submission starts late for memory the host has just written.
+    ///
+    /// A layer's expert half is the only place the walk leaves the GPU idle, and it is
+    /// the one submission that follows a `pread` into the very bytes its first kernel
+    /// reads. Every arm above submits kernels that only WRITE, so this is the last
+    /// difference between a probe submission and a walk submission that a probe can
+    /// hold constant.
+    func testWhetherReadingWhatTheHostJustWroteDelaysAStart() throws {
+        let probe = try DeepSeekV41CommitStartupProbe.make()
+        let source = probe.residentPool(count: 2, bytes: 32 << 20)
+        guard let destination = probe.residentPool(count: 1, bytes: 32 << 20).first else {
+            XCTFail("no destination buffer")
+            return
+        }
+        XCTAssertEqual(source.count, 2, "the source pool allocated \(source.count) buffers")
+        let lanes = (32 << 20) / MemoryLayout<Float>.stride
+
+        func arm(_ label: String, hostWrites: Bool, attempts: Int = 21) -> Double {
+            for _ in 0..<5 {
+                _ = probe.readSample(
+                    source: source, lanes: lanes, destination: destination,
+                    hostWritesFirst: false
+                )
+            }
+            var pickups: [Double] = []
+            var windows: [Double] = []
+            for _ in 0..<attempts {
+                guard let sample = probe.readSample(
+                    source: source, lanes: lanes, destination: destination,
+                    hostWritesFirst: hostWrites
+                ) else { continue }
+                pickups.append(sample.pickupMilliseconds)
+                windows.append(sample.windowMilliseconds)
+            }
+            XCTAssertEqual(pickups.count, attempts, "\(label) dropped samples")
+            XCTAssertTrue(
+                windows.allSatisfy { $0 > 0 },
+                "\(label) reported a buffer that never opened a window"
+            )
+            let pickup = commitMedian(pickups)
+            print(
+                String(
+                    format: "🔎 [dsv41 commit startup] %@: pickup %.3f ms, window %.3f ms",
+                    label, pickup, commitMedian(windows)
+                )
+            )
+            return pickup
+        }
+
+        let cold = arm("64 MB read, nothing touched", hostWrites: false)
+        let warm = arm("64 MB read, every page written by the host first", hostWrites: true)
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] verdict: a submission over memory the host "
+                    + "just wrote starts in %.3f ms against %.3f ms for the same submission "
+                    + "over untouched memory",
+                warm, cold
+            )
+        )
+    }
+}
+
+/// A stop flag a detached thread can read without touching an actor.
+private nonisolated final class CoTenantFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var running = true
+
+    var isRunning: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return running
+    }
+
+    func stop() {
+        lock.lock()
+        running = false
+        lock.unlock()
+    }
+}

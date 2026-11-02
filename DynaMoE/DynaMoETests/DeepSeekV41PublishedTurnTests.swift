@@ -4550,6 +4550,53 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
                              idle)
                     + String(format: ", commit-to-start %.1f ms (%.2f ms/buffer)", pickup, pickup / Double(max(1, slice.count)))
             )
+
+            // Idle is the GPU with no window open, so a buffer's wait only counts when
+            // nothing else was queued: from the later of its own commit and the previous
+            // window's end. Waiting behind work already in the queue is a queue wait,
+            // not idle, and a per-buffer "commit to start" figure cannot tell them
+            // apart -- summing it as idle is what makes 88 submissions look like 2.9 ms
+            // of start latency each.
+            var boundaries: [String: (idle: Double, queue: Double, window: Double, count: Int)] = [:]
+            var previous: DeepSeekV41WalkTimelineEntry?
+            for entry in slice
+            where entry.windowEndNanoseconds > entry.windowStartNanoseconds {
+                defer { previous = entry }
+                let name = walkBoundaryClass(entry.stage)
+                var running = boundaries[name] ?? (0, 0, 0, 0)
+                let ready = max(
+                    entry.commitNanoseconds, previous?.windowEndNanoseconds ?? 0
+                )
+                if entry.windowStartNanoseconds > ready {
+                    running.idle += milliseconds(entry.windowStartNanoseconds - ready)
+                }
+                if entry.windowStartNanoseconds > entry.commitNanoseconds {
+                    running.queue += milliseconds(
+                        entry.windowStartNanoseconds - entry.commitNanoseconds
+                    )
+                }
+                running.window += entry.windowMilliseconds
+                running.count += 1
+                boundaries[name] = running
+            }
+            let idleTotal = boundaries.values.reduce(0) { $0 + $1.idle }
+            let queueTotal = boundaries.values.reduce(0) { $0 + $1.queue }
+            print(
+                "🔎 [dsv41 real]     idle with nothing queued "
+                    + String(format: "%.1f ms of %.1f ms wall (%.0f%%), queue wait %.1f ms",
+                             idleTotal, 1_000 * (wall[position] ?? 0),
+                             100 * idleTotal / max(1, 1_000 * (wall[position] ?? 1)), queueTotal)
+            )
+            for (name, running) in boundaries.sorted(by: { $0.key < $1.key }) {
+                print(
+                    "🔎 [dsv41 real]     boundary into \(name) (\(running.count)): idle "
+                        + String(format: "%.1f ms (%.2f/buffer), queue wait %.1f ms "
+                            + "(%.2f/buffer), window %.1f ms (%.2f/buffer)",
+                            running.idle, running.idle / Double(max(1, running.count)),
+                            running.queue, running.queue / Double(max(1, running.count)),
+                            running.window, running.window / Double(max(1, running.count)))
+                )
+            }
             if index == 0 {
                 for entry in slice.prefix(10) {
                     print(
@@ -4560,9 +4607,61 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
                             + ", host waited " + String(format: "%.3f ms", entry.waitMilliseconds)
                     )
                 }
+                // Twenty consecutive boundaries, so the shape is visible rather than
+                // summarised: only the first few of a position start from a cold queue.
+                previous = nil
+                for entry in slice.prefix(20)
+                where entry.windowEndNanoseconds > entry.windowStartNanoseconds {
+                    defer { previous = entry }
+                    let ready = max(
+                        entry.commitNanoseconds, previous?.windowEndNanoseconds ?? 0
+                    )
+                    let idle = entry.windowStartNanoseconds > ready
+                        ? milliseconds(entry.windowStartNanoseconds - ready) : 0
+                    let hostGap = previous.map {
+                        entry.commitNanoseconds > $0.windowEndNanoseconds
+                            ? milliseconds(entry.commitNanoseconds - $0.windowEndNanoseconds) : 0
+                    } ?? 0
+                    print(
+                        "🔎 [dsv41 real]       \(previous?.stage ?? "start") -> "
+                            + "\(entry.stage): host gap "
+                            + String(format: "%.3f ms, idle %.3f ms, window %.3f ms",
+                                     hostGap, idle, entry.windowMilliseconds)
+                    )
+                }
             }
+        }
+        // The same probe that reads a tenth of a millisecond in a fresh process, run
+        // here instead: if a submission starts late only after 402 walked positions, the
+        // cause is the machine state a long turn leaves behind, not the submission.
+        if let probe = try? DeepSeekV41CommitStartupProbe.make() {
+            for _ in 0..<5 { _ = probe.serialSample() }
+            var pickups: [Double] = []
+            for _ in 0..<21 {
+                if let sample = probe.serialSample(dispatches: 20) {
+                    pickups.append(sample.pickupMilliseconds)
+                }
+            }
+            pickups.sort()
+            print(
+                "🔎 [dsv41 real] after the walk, a 20-launch buffer still starts in "
+                    + String(format: "%.3f ms (median %.3f, worst %.3f) over %d attempt(s)",
+                             pickups.first ?? 0,
+                             pickups.isEmpty ? 0 : pickups[pickups.count / 2],
+                             pickups.last ?? 0, pickups.count)
+            )
         }
         print("🔎 [dsv41 real] \(runtime.describe())")
         withExtendedLifetime(engine) {}
+    }
+
+    /// Which half of a layer a committed buffer carries, read from the executor's own
+    /// stage label. A boundary is attributed to the buffer that follows it, because the
+    /// gap belongs to whatever was supposed to start next.
+    private func walkBoundaryClass(_ stage: String) -> String {
+        if stage.hasSuffix("attention") { return "front half" }
+        if stage.hasSuffix("experts") { return "mixture half" }
+        if stage.hasSuffix("indexer") { return "indexer split" }
+        return "other (\(stage))"
     }
 }
