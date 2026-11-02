@@ -7785,3 +7785,6 @@ drives the engine's own tower (`runtime.visionForward()`), asserts it carries a 
 therefore exercises the wiring and the one-time upload end to end; a Debug bundle reports that
 upload at `-Onone` (~26 s for 1.9 GB of FP32), which is why the app's `-O` figure is the only one
 quoted.
+
+The full DeepSeek suite on this code is **556 passed / 0 failed / 51 skipped** (607 executed),
+and the same run under `MTL_DEBUG_LAYER` is **556 / 0 / 51 with 0 validation errors**.
