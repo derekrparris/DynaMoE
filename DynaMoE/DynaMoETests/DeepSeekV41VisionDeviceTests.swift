@@ -245,9 +245,82 @@ final class DeepSeekV41VisionDeviceTests: XCTestCase {
         }
     }
 
-    /// A head with an odd dimension cannot be folded in adjacent pairs.
-    func testThePairedFoldRefusesAnOddHeadDimension() throws {
+    /// The matrix-tile form against the direct kernel and the host rule.
+    ///
+    /// This form is two passes over the keys and eight-wide fragments, so it exercises
+    /// paths nothing else does: a partial last key tile (`tokens` 37 and 33), a token
+    /// count that is exactly one tile (5), a head that is a single fragment wide (8) and
+    /// a head that is the published 64. It reorders both the score dot product and the
+    /// value fold, so it is held to the host rule rather than to bit equality.
+    func testTheMatrixTileAttentionMatchesTheDirectKernelAndTheHost() throws {
         let runner = try runner()
+        for (heads, headDim, tokens) in [(3, 8, 37), (2, 64, 5), (4, 32, 33), (2, 64, 16)] {
+            let rotary = DeepSeekV41VisionForward.rotaryTables(
+                rows: 1, columns: tokens, ropeDim: headDim / 2, theta: 10_000
+            )
+            let qkv = (0..<tokens).map { values(3 * heads * headDim, seed: $0 + 1) }
+            let planes = try runner.splitAndRotate(
+                qkv: qkv, heads: heads, headDim: headDim, ropeDim: headDim / 2,
+                cosine: rotary.cosine, sine: rotary.sine
+            )
+            let outputLength = tokens * heads * headDim * MemoryLayout<Float>.stride
+            guard let directBuffer = runner.device.makeBuffer(
+                length: outputLength, options: .storageModeShared
+            ), let tileBuffer = runner.device.makeBuffer(
+                length: outputLength, options: .storageModeShared
+            ) else {
+                XCTFail("could not allocate the tile parity outputs")
+                return
+            }
+            let direct = try runner.attention(planes, into: directBuffer, form: .direct)
+            let tiles = try runner.attention(planes, into: tileBuffer, form: .matrixTiles)
+            let directDifference = maximumDifference(tiles, direct)
+
+            let serial = DeepSeekV41VisionForward.attention(
+                qkv: qkv, heads: heads, headDim: headDim, ropeDim: headDim / 2,
+                cosine: rotary.cosine, sine: rotary.sine
+            )
+            let serialDifference = maximumDifference(tiles, serial)
+            print(
+                "🔎 [dsv41 vision] matrix-tile parity heads \(heads) dim \(headDim)"
+                    + " tokens \(tokens): direct worst "
+                    + String(format: "%.3g", directDifference)
+                    + String(format: ", host worst %.3g", serialDifference)
+            )
+            XCTAssertLessThan(directDifference, 2e-4)
+            XCTAssertLessThan(serialDifference, 2e-4)
+        }
+    }
+
+    /// A head that does not divide into 8-wide fragments cannot take the tile form.
+    func testTheMatrixTileAttentionRefusesAHeadThatIsNotAFragment() throws {
+        let runner = try runner()
+        let planes = try DeepSeekV41VisionAttentionDevice.allocatePlanes(
+            device: runner.device, tokens: 3, heads: 1, headDim: 12
+        )
+        guard let output = runner.device.makeBuffer(
+            length: 3 * 1 * 12 * MemoryLayout<Float>.stride, options: .storageModeShared
+        ) else {
+            XCTFail("could not allocate the output")
+            return
+        }
+        do {
+            _ = try runner.runAttention(planes, into: output, form: .matrixTiles)
+            XCTFail("a head that is not a multiple of 8 must be refused")
+        } catch {
+            switch error as? DeepSeekV41VisionDeviceError {
+            case .shapeMismatch(let detail):
+                XCTAssertTrue(detail.contains("multiple"), "unexpected detail: \(detail)")
+            default:
+                XCTFail("unexpected error: \(error)")
+            }
+        }
+        // Every SIMT form still runs the head it always ran.
+        XCTAssertNoThrow(try runner.runAttention(planes, into: output, form: .direct))
+    }
+
+    /// A head with an odd dimension cannot be folded in adjacent pairs.
+    func testThePairedFoldRefusesAnOddHeadDimension() throws {        let runner = try runner()
         let planes = try DeepSeekV41VisionAttentionDevice.allocatePlanes(
             device: runner.device, tokens: 3, heads: 1, headDim: 5
         )
@@ -717,6 +790,101 @@ final class DeepSeekV41VisionDeviceTests: XCTestCase {
         }
     }
 
+    /// What the matrix units buy the attention at the published geometry.
+    ///
+    /// The shipped form is the paired fold. The candidate walks the keys twice -- a
+    /// `simdgroup_float8x8` cannot be indexed, so a raised row maximum cannot rescale an
+    /// accumulator -- on units that measured the same rate as the FMA pipes, so what it
+    /// buys is instruction count and what it costs is half again the products. Two
+    /// things about the form are worth sweeping rather than guessing: how many SIMD
+    /// groups share a staged key tile, and whether to stage one at all -- a staged tile
+    /// is read from the plane, written to threadgroup memory and read again, where a
+    /// direct `simdgroup_load` is one read.
+    func testWhatTheMatrixTileAttentionCostsAtThePublishedGeometry() throws {
+        let enabled = ProcessInfo.processInfo.environment["DYNAMOE_DSV41_VISION_MEASURE"] == "1"
+            || FileManager.default.fileExists(atPath: Self.measurementMarkerPath)
+        try XCTSkipUnless(
+            enabled,
+            "opt-in timing; touch \(Self.measurementMarkerPath) to run"
+        )
+        let runner = try runner()
+        let heads = 16
+        let headDim = 64
+        let ropeDim = 32
+
+        for (label, side) in [("smallest", 39), ("largest", 93)] {
+            let tokens = side * side
+            let rotary = DeepSeekV41VisionForward.rotaryTables(
+                rows: side, columns: side, ropeDim: ropeDim, theta: 10_000
+            )
+            let planes = try runner.splitAndRotate(
+                qkv: (0..<tokens).map { values(3 * heads * headDim, seed: $0 + 1) },
+                heads: heads,
+                headDim: headDim,
+                ropeDim: ropeDim,
+                cosine: rotary.cosine,
+                sine: rotary.sine
+            )
+            let outputLength = tokens * heads * headDim * MemoryLayout<Float>.stride
+            guard let shippedBuffer = runner.device.makeBuffer(
+                length: outputLength, options: .storageModeShared
+            ), let tileBuffer = runner.device.makeBuffer(
+                length: outputLength, options: .storageModeShared
+            ) else {
+                XCTFail("could not allocate the tile-measurement outputs")
+                return
+            }
+            func best(_ body: () throws -> Double) rethrows -> Double {
+                try (0..<3).map { _ in try body() }.min() ?? 0
+            }
+            let shipped = try best {
+                try runner.runAttention(planes, into: shippedBuffer, form: .pairedFold)
+            }
+            print(
+                "🔎 [dsv41 vision] attention tiles \(label): "
+                    + String(format: "pairedFold %.2f ms", shipped * 1000)
+            )
+            var arms: [(String, Double)] = []
+            for width in [32, 128, 256] {
+                for staged in [true, false] {
+                    let name = (staged ? "staged" : "direct") + "/" + String(width)
+                    let measured = try best {
+                        try runner.runAttention(
+                            planes, into: tileBuffer, form: .matrixTiles,
+                            threadgroupWidth: width, stagesTiles: staged
+                        )
+                    }
+                    arms.append((name, measured))
+                    print(
+                        "🔎 [dsv41 vision] attention tiles \(label): " + name + " "
+                            + String(format: "%.2f ms (%.2fx)", measured * 1000,
+                                     shipped / measured)
+                    )
+                }
+            }
+            // Whatever arm wrote `tileBuffer` last is checked against the host rule, so a
+            // wrong staging or a wrong group offset cannot pass as a timing.
+            var worst: Float = 0
+            let produced = tileBuffer.contents().assumingMemoryBound(to: Float.self)
+            for token in [0, tokens / 2, tokens - 1] {
+                let expected = hostRow(planes: planes, head: 0, token: token)
+                let base = (token * heads) * headDim
+                for dimension in 0..<headDim {
+                    worst = max(worst, abs(produced[base + dimension] - expected[dimension]))
+                }
+            }
+            print(
+                "🔎 [dsv41 vision] attention tiles \(label): worst "
+                    + String(format: "%.3g", worst) + " against the host rule"
+            )
+            XCTAssertLessThan(worst, 5e-4, "the matrix-tile form disagrees with the host")
+            XCTAssertEqual(
+                arms.count, 6,
+                "the sweep lost an arm"
+            )
+        }
+    }
+
     /// The SIMT FP32 rate this machine can actually reach, for the dispatch to be
     /// compared against.
     ///
@@ -776,5 +944,89 @@ final class DeepSeekV41VisionDeviceTests: XCTestCase {
                 + String(format: ", %.2f TFLOP/s", flops / best / 1e12)
         )
         XCTAssertGreaterThan(flops / best / 1e12, 0.1, "the FMA loop was optimized away")
+    }
+
+    /// The FP32 matrix units' rate, which is what decides whether an MMA attention is
+    /// worth writing at all.
+    ///
+    /// One `simdgroup_float8x8` product is 512 multiply-adds per instruction, where the
+    /// shipped fold issues a shuffle, an address computation and a load per two. But a
+    /// matrix unit is only a lever if it runs faster than the FP32 pipes the 15.2-15.7
+    /// TFLOP/s SIMT peak already measured, and on Apple silicon FP32 MMA is not
+    /// obviously a different set of pipes. So it is measured before anything is built on
+    /// it: `mode` 0 is the product alone, `mode 1` the same loop with the right operand
+    /// loaded from threadgroup memory every step, which is the price of feeding it.
+    func testWhatThisGPUsFP32MatrixUnitsReach() throws {
+        let enabled = ProcessInfo.processInfo.environment["DYNAMOE_DSV41_VISION_MEASURE"] == "1"
+            || FileManager.default.fileExists(atPath: Self.measurementMarkerPath)
+        try XCTSkipUnless(
+            enabled,
+            "opt-in timing; touch \(Self.measurementMarkerPath) to run"
+        )
+        let runner = try runner()
+        guard let library = runner.device.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "dsv41_vision_mma_peak_f32") else {
+            XCTFail("the matrix-unit peak kernel is missing")
+            return
+        }
+        let pipeline = try runner.device.makeComputePipelineState(function: function)
+        let iterations: UInt32 = 256
+        let threads = 1 << 18
+        let groups = threads / 32
+        let threadgroupWidth = 256
+        guard let out = runner.device.makeBuffer(
+            length: groups * 512 * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ) else {
+            XCTFail("could not allocate the matrix-unit output")
+            return
+        }
+
+        func time(mode: UInt32) throws -> Double {
+            var best = Double.greatestFiniteMagnitude
+            for _ in 0..<3 {
+                guard let commandBuffer = runner.queue.makeCommandBuffer(),
+                      let encoder = commandBuffer.makeComputeCommandEncoder() else {
+                    XCTFail("no command buffer")
+                    return 0
+                }
+                var steps = iterations
+                var knob = mode
+                encoder.setComputePipelineState(pipeline)
+                encoder.setBuffer(out, offset: 0, index: 0)
+                encoder.setBytes(&steps, length: MemoryLayout<UInt32>.stride, index: 1)
+                encoder.setBytes(&knob, length: MemoryLayout<UInt32>.stride, index: 2)
+                encoder.setThreadgroupMemoryLength(
+                    64 * MemoryLayout<Float>.stride, index: 0
+                )
+                encoder.dispatchThreads(
+                    MTLSize(width: threads, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: threadgroupWidth, height: 1, depth: 1)
+                )
+                encoder.endEncoding()
+                commandBuffer.commit()
+                commandBuffer.waitUntilCompleted()
+                if let error = commandBuffer.error {
+                    XCTFail("the matrix-unit dispatch failed: \(error)")
+                    return 0
+                }
+                best = min(best, commandBuffer.gpuEndTime - commandBuffer.gpuStartTime)
+            }
+            return best
+        }
+
+        let productOnly = try time(mode: 0)
+        let fedFromThreadgroup = try time(mode: 1)
+        let flops = Double(groups) * Double(iterations) * 8 * 512 * 2
+        print(
+            "🔎 [dsv41 vision] FP32 matrix units: "
+                + String(format: "%.2f ms for %.1f GFLOP", productOnly * 1000, flops / 1e9)
+                + String(format: ", %.2f TFLOP/s", flops / productOnly / 1e12)
+                + String(format: "; fed from threadgroup %.2f ms (%.2fx)",
+                         fedFromThreadgroup * 1000, productOnly / fedFromThreadgroup)
+        )
+        XCTAssertGreaterThan(
+            flops / productOnly / 1e12, 0.1, "the matrix-multiply loop was optimized away"
+        )
     }
 }

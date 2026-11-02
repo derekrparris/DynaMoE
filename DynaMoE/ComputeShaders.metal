@@ -11358,6 +11358,310 @@ kernel void dsv41_vision_fma_peak_f32(
     out[id] = ((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7));
 }
 
+// MARK: - DeepSeek-V4.1 vision tower: what this GPU's FP32 matrix units reach
+
+/// MSL Kernel: `dsv41_vision_mma_peak_f32` -- eight independent
+/// `simdgroup_multiply_accumulate` chains per SIMD group and nothing else, i.e. the
+/// fastest a matrix-multiply kernel can go on this machine.
+///
+/// This is the probe `dsv41_vision_fma_peak_f32` cannot answer. "DSV4.1 #44" measured
+/// the SIMT FP32 rate at 15.2-15.7 TFLOP/s and the attention at 1.56, i.e. 10% of it,
+/// and the journal's next lever is the matrix units: one `simdgroup_float8x8` product
+/// is 512 multiply-adds in a single instruction, where the shipped fold issues a
+/// shuffle, an address computation and a load per two. What that is worth depends
+/// entirely on whether Apple's FP32 matrix units run FASTER than the FP32 FMA pipes,
+/// which is a property of the part and not something to assume.
+///
+/// `mode` 0 is the product alone. `mode` 1 loads the right operand from threadgroup
+/// memory every step, which is what a real attention tile costs, so the difference
+/// between the two modes is the price of feeding the units rather than running them.
+kernel void dsv41_vision_mma_peak_f32(
+    device float* out [[buffer(0)]],
+    constant uint32_t& iterations [[buffer(1)]],
+    constant uint32_t& mode [[buffer(2)]],
+    threadgroup float* staged [[threadgroup(0)]],
+    uint groupIdx [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
+) {
+    // One 8x8 tile shared by every group in the threadgroup, seeded from the lane so
+    // the compiler cannot fold the loop into a constant.
+    staged[lane] = 1.0f - (float)(lane & 31u) * 1.0e-6f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_float8x8 left(1.0f + (float)(lane & 255u) * 1.0e-7f);
+    simdgroup_float8x8 right(1.0f - (float)(lane & 31u) * 1.0e-6f);
+    simdgroup_float8x8 accumulators[8];
+    for (uint index = 0u; index < 8u; ++index) {
+        accumulators[index] = simdgroup_float8x8(0.0f);
+    }
+
+    for (uint32_t step = 0u; step < iterations; ++step) {
+        if (mode == 1u) {
+            simdgroup_load(right, staged, 8);
+        }
+        // Eight chains rather than one, because a single chain would measure the
+        // product's latency instead of its throughput, exactly as the FMA probe does.
+        for (uint index = 0u; index < 8u; ++index) {
+            simdgroup_multiply_accumulate(
+                accumulators[index], left, right, accumulators[index]
+            );
+        }
+    }
+
+    uint32_t simdCount = laneCount / 32u;
+    uint64_t base = ((uint64_t)groupIdx * simdCount + simdIdx) * 512u;
+    for (uint index = 0u; index < 8u; ++index) {
+        simdgroup_store(accumulators[index], out + base + index * 64u, 8);
+    }
+}
+
+// MARK: - DeepSeek-V4.1 vision tower: the attention on the matrix units
+
+/// MSL Kernel: `dsv41_vision_attention_mma_f32` -- the tower's attention as
+/// `simdgroup_float8x8` products instead of per-element work.
+///
+/// The probe above settles what the matrix units are worth: 7.4-7.8 TFLOP/s, i.e. the
+/// same rate as the FP32 FMA pipes. That is still a reason to try, because the shipped
+/// kernel runs at 1.56 TFLOP/s -- 10% of the FMA peak -- and what it spends the other
+/// 90% on is everything an MMA deletes. The fold issues a `simd_shuffle`, a 64-bit
+/// address computation and a load per TWO multiply-adds; one `simdgroup_float8x8`
+/// product is 512 of them in one instruction, read out of registers.
+///
+/// Two passes over the keys, which is the price of not being able to rescale a
+/// fragment: `simdgroup_float8x8` is opaque, so the flash-attention rescale (`acc *=
+/// exp(old - new)` when a tile raises the row maximum) cannot touch an accumulator in
+/// registers. Pass one computes the row maximum and the exponentials' sum -- the score
+/// products alone; pass two recomputes the scores, turns them into weights and folds
+/// them into the values. That is 24 products per tile where 16 suffice.
+///
+/// `mode` is the read knob, because there are two ways to feed a fragment and only one
+/// of them is obvious. Mode 0 stages a key or value tile in threadgroup memory first
+/// and shares it between the threadgroup's SIMD groups; mode 1 points `simdgroup_load`
+/// straight at the plane, which is fewer bytes moved (the staged path reads device,
+/// writes threadgroup and reads threadgroup again) but stages nothing for the next
+/// group to reuse. Mode 1 is only safe because the host pads every plane by a tile, so
+/// the last tile's fragment load stays inside its buffer.
+///
+/// `simdgroup_load`'s transpose flag is what makes the score product work: the key tile
+/// is `[key][dim]`, and the 8x8 the accumulator wants is `[dim][key]`.
+#define DSV41_VISION_MMA_GROUPS_MAX 8u
+#define DSV41_VISION_MMA_SCRATCH 136u
+
+kernel void dsv41_vision_attention_mma_f32(
+    device const float* queryPlane [[buffer(0)]],     // [heads, tokens + tile, headDim]
+    device const float* keyPlane [[buffer(1)]],
+    device const float* valuePlane [[buffer(2)]],
+    device float* outputBuffer [[buffer(3)]],         // [tokens, heads, headDim]
+    constant uint32_t& tokens [[buffer(4)]],
+    constant uint32_t& heads [[buffer(5)]],
+    constant uint32_t& headDim [[buffer(6)]],
+    constant uint32_t& tileStride [[buffer(7)]],      // stage stride: headDim or headDim + 1
+    constant uint32_t& mode [[buffer(8)]],            // 0 staged, 1 straight from the planes
+    threadgroup float* queryTile [[threadgroup(0)]],  // [groups][8][tileStride]
+    threadgroup float* keyTile [[threadgroup(1)]],    // [8][tileStride]
+    threadgroup float* valueTile [[threadgroup(2)]],  // [8][tileStride]
+    threadgroup float* scratch [[threadgroup(3)]],    // [groups]: scores 64, weights 64, scale 8
+    uint groupIdx [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
+) {
+    // The score tile is one fragment, so the head must divide into 8-wide chunks.
+    if (headDim == 0u || headDim > DSV41_VISION_HEAD_DIM_MAX || (headDim & 7u) != 0u) return;
+    uint32_t groupCount = laneCount / 32u;
+    if (groupCount == 0u || groupCount > DSV41_VISION_MMA_GROUPS_MAX) return;
+    bool staged = mode == 0u;
+    uint32_t queriesPerThreadgroup = 8u * groupCount;
+    uint32_t queryBlocks = (tokens + queriesPerThreadgroup - 1u) / queriesPerThreadgroup;
+    if (queryBlocks == 0u || groupIdx >= heads * queryBlocks) return;
+
+    uint32_t headIdx = groupIdx / queryBlocks;
+    uint32_t queryBase =
+        (groupIdx - headIdx * queryBlocks) * queriesPerThreadgroup + simdIdx * 8u;
+    uint32_t chunks = headDim / 8u;
+    uint32_t tileCount = 8u * headDim;
+
+    threadgroup float* groupQuery = queryTile + (uint64_t)simdIdx * 8u * tileStride;
+    threadgroup float* groupScores = scratch + (uint64_t)simdIdx * DSV41_VISION_MMA_SCRATCH;
+    threadgroup float* groupWeights = groupScores + 64u;
+    threadgroup float* groupScale = groupScores + 128u;
+
+    // Every plane is otherwise `[heads, tokens, headDim]`, and the host gives the whole
+    // buffer one extra tile of zeroed tail, so a fragment load over the last partial
+    // tile reads either the next head's rows (finite, and dropped by the softmax) or
+    // that tail rather than running past the allocation.
+    uint64_t headBase = (uint64_t)headIdx * tokens * headDim;
+    device const float* queryHead = queryPlane + headBase;
+    device const float* keyHead = keyPlane + headBase;
+    device const float* valueHead = valuePlane + headBase;
+
+    // The query rows are staged once per threadgroup no matter which read mode the key
+    // tiles take: a fragment load eight rows past the last token would read whatever
+    // follows the plane, and a zero here is also what makes the width check unnecessary.
+    for (uint32_t index = laneInSimd; index < tileCount; index += 32u) {
+        uint32_t row = index / headDim;
+        uint32_t dim = index - row * headDim;
+        uint32_t token = queryBase + row;
+        groupQuery[row * tileStride + dim] =
+            token < tokens ? queryHead[(uint64_t)token * headDim + dim] : 0.0f;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_float8x8 queryFragment[8];
+    for (uint32_t chunk = 0u; chunk < chunks; ++chunk) {
+        simdgroup_load(queryFragment[chunk], groupQuery + chunk * 8u, tileStride);
+    }
+
+    float invSqrt = rsqrt((float)headDim);
+    float rowMax = -1.0e30f;
+    float rowSum = 0.0f;
+
+    // Pass one: the row maximum and the exponentials' sum, so pass two can turn a score
+    // into a weight without ever rescaling an accumulator it cannot index.
+    for (uint32_t keyBase = 0u; keyBase < tokens; keyBase += 8u) {
+        if (staged) {
+            for (uint32_t index = lane; index < tileCount; index += laneCount) {
+                uint32_t row = index / headDim;
+                uint32_t dim = index - row * headDim;
+                uint32_t token = keyBase + row;
+                keyTile[row * tileStride + dim] =
+                    token < tokens ? keyHead[(uint64_t)token * headDim + dim] : 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        simdgroup_float8x8 scores(0.0f);
+        for (uint32_t chunk = 0u; chunk < chunks; ++chunk) {
+            simdgroup_float8x8 keyFragment;
+            if (staged) {
+                simdgroup_load(keyFragment, keyTile + chunk * 8u, tileStride, ulong2(0, 0), true);
+            } else {
+                simdgroup_load(
+                    keyFragment,
+                    keyHead + (uint64_t)keyBase * headDim + chunk * 8u,
+                    headDim, ulong2(0, 0), true
+                );
+            }
+            simdgroup_multiply_accumulate(scores, queryFragment[chunk], keyFragment, scores);
+        }
+        simdgroup_store(scores, groupScores, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Lanes 0-7 own one query row each and carry its running maximum and sum in
+        // their own registers across the whole pass.
+        if (laneInSimd < 8u) {
+            float tileMaximum = -1.0e30f;
+            for (uint32_t key = 0u; key < 8u; ++key) {
+                float scaled = groupScores[laneInSimd * 8u + key] * invSqrt;
+                tileMaximum = max(tileMaximum, keyBase + key < tokens ? scaled : -1.0e30f);
+            }
+            float newMaximum = max(rowMax, tileMaximum);
+            rowSum *= exp(rowMax - newMaximum);
+            for (uint32_t key = 0u; key < 8u; ++key) {
+                if (keyBase + key < tokens) {
+                    rowSum += exp(groupScores[laneInSimd * 8u + key] * invSqrt - newMaximum);
+                }
+            }
+            rowMax = newMaximum;
+        }
+        if (staged) {
+            // Before the next step overwrites the tile this one still reads.
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // Pass two: recompute the scores, normalise them against the finished row maximum,
+    // and fold them into the value tile.
+    simdgroup_float8x8 outputFragment[8];
+    for (uint32_t chunk = 0u; chunk < chunks; ++chunk) {
+        outputFragment[chunk] = simdgroup_float8x8(0.0f);
+    }
+    for (uint32_t keyBase = 0u; keyBase < tokens; keyBase += 8u) {
+        if (staged) {
+            for (uint32_t index = lane; index < tileCount; index += laneCount) {
+                uint32_t row = index / headDim;
+                uint32_t dim = index - row * headDim;
+                uint32_t token = keyBase + row;
+                bool inRange = token < tokens;
+                keyTile[row * tileStride + dim] =
+                    inRange ? keyHead[(uint64_t)token * headDim + dim] : 0.0f;
+                valueTile[row * tileStride + dim] =
+                    inRange ? valueHead[(uint64_t)token * headDim + dim] : 0.0f;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        simdgroup_float8x8 scores(0.0f);
+        for (uint32_t chunk = 0u; chunk < chunks; ++chunk) {
+            simdgroup_float8x8 keyFragment;
+            if (staged) {
+                simdgroup_load(keyFragment, keyTile + chunk * 8u, tileStride, ulong2(0, 0), true);
+            } else {
+                simdgroup_load(
+                    keyFragment,
+                    keyHead + (uint64_t)keyBase * headDim + chunk * 8u,
+                    headDim, ulong2(0, 0), true
+                );
+            }
+            simdgroup_multiply_accumulate(scores, queryFragment[chunk], keyFragment, scores);
+        }
+        simdgroup_store(scores, groupScores, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (laneInSimd < 8u) {
+            for (uint32_t key = 0u; key < 8u; ++key) {
+                bool inRange = keyBase + key < tokens;
+                float scaled = groupScores[laneInSimd * 8u + key] * invSqrt;
+                groupWeights[laneInSimd * 8u + key] = inRange ? exp(scaled - rowMax) : 0.0f;
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 probabilities;
+        simdgroup_load(probabilities, groupWeights, 8);
+        for (uint32_t chunk = 0u; chunk < chunks; ++chunk) {
+            simdgroup_float8x8 valueFragment;
+            if (staged) {
+                simdgroup_load(valueFragment, valueTile + chunk * 8u, tileStride);
+            } else {
+                simdgroup_load(
+                    valueFragment, valueHead + (uint64_t)keyBase * headDim + chunk * 8u, headDim
+                );
+            }
+            simdgroup_multiply_accumulate(
+                outputFragment[chunk], probabilities, valueFragment, outputFragment[chunk]
+            );
+        }
+        if (staged) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    // One over the denominator per row, then the fragments land in the staged query
+    // tile -- free by now, because the query is needed as fragments from here on.
+    if (laneInSimd < 8u) {
+        groupScale[laneInSimd] = rowSum > 0.0f ? 1.0f / rowSum : 0.0f;
+    }
+    for (uint32_t chunk = 0u; chunk < chunks; ++chunk) {
+        simdgroup_store(outputFragment[chunk], groupQuery + chunk * 8u, tileStride);
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint64_t outputStride = (uint64_t)heads * headDim;
+    for (uint32_t index = laneInSimd; index < tileCount; index += 32u) {
+        uint32_t row = index / headDim;
+        uint32_t dim = index - row * headDim;
+        uint32_t token = queryBase + row;
+        if (token < tokens) {
+            outputBuffer[(uint64_t)token * outputStride + headIdx * headDim + dim] =
+                groupQuery[row * tileStride + dim] * groupScale[row];
+        }
+    }
+}
+
 // MARK: - DeepSeek-V4.1 vision tower: the block GEMM
 
 /// MSL Kernel: `dsv41_vision_gemm_f32` -- the vision tower's projection,

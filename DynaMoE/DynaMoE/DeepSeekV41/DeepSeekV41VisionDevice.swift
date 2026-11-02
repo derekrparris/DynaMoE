@@ -53,6 +53,11 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
     public static let stagedTile = 32
     /// The widest dispatch the kernels accept, in SIMD groups (`DSV41_VISION_QUERIES_PER_GROUP`).
     public static let maximumQueriesPerGroup = 16
+    /// The query rows one `matrixTiles` threadgroup owns, i.e. one matrix unit's side.
+    public static let matrixTile = 8
+    /// The widest threadgroup the matrix-tile form takes, in SIMD groups: each group
+    /// owns one 8-query tile, and a staged key or value tile is shared between them.
+    public static let matrixTileGroups = 8
 
     /// Which of the two attention kernels a dispatch names.
     ///
@@ -68,10 +73,17 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
     /// 1.39x at the smallest admissible image and 1.03x at the largest ("DSV4.1 #44"),
     /// which is where `direct` stays as the ablation's baseline. `stagedKeyTile` lost
     /// 18% and is kept only as the measured negative.
+    ///
+    /// `matrixTiles` is the two-pass form: 8x8 score and value products on the matrix
+    /// units, which measured 7.4-7.8 TFLOP/s against the FMA pipes' 7.7-8.6, so the
+    /// lever is the instruction count rather than the arithmetic rate. A fragment cannot
+    /// be indexed, so a raised row maximum cannot rescale the accumulators as
+    /// flash-attention does; the form walks the keys twice instead.
     public enum AttentionForm: String, Sendable {
         case direct
         case stagedKeyTile
         case pairedFold
+        case matrixTiles
     }
 
     public let device: MTLDevice
@@ -80,6 +92,7 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
     private let attentionPipeline: MTLComputePipelineState
     private let stagedAttentionPipeline: MTLComputePipelineState
     private let pairedFoldPipeline: MTLComputePipelineState
+    private let matrixTilesPipeline: MTLComputePipelineState
 
     public init(device: MTLDevice? = nil, library: MTLLibrary? = nil) throws {
         guard let device = device ?? MTLCreateSystemDefaultDevice() else {
@@ -103,6 +116,7 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
         self.attentionPipeline = try make("dsv41_vision_attention_f32")
         self.stagedAttentionPipeline = try make("dsv41_vision_attention_staged_f32")
         self.pairedFoldPipeline = try make("dsv41_vision_attention_pairfold_f32")
+        self.matrixTilesPipeline = try make("dsv41_vision_attention_mma_f32")
     }
 
     /// q, k and v for every head, `[heads, tokens, headDim]`, ready for `attention`.
@@ -143,14 +157,24 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
         heads: Int,
         headDim: Int
     ) throws -> SplitPlanes {
-        let count = max(tokens * heads * headDim, 1) * MemoryLayout<Float>.stride
         guard tokens > 0, heads > 0, headDim > 0 else {
             throw DeepSeekV41VisionDeviceError.shapeMismatch("empty vision planes")
         }
+        // One extra tile of tail past the last head, zeroed. A matrix-tile dispatch
+        // reads its key and value fragments 8 rows at a time, so the last partial tile
+        // of the last head runs past the plane; the tail is what it lands in.
+        let tail = matrixTile * headDim
+        let count = max(tokens * heads * headDim + tail, 1) * MemoryLayout<Float>.stride
         guard let queries = device.makeBuffer(length: count, options: .storageModeShared),
               let keys = device.makeBuffer(length: count, options: .storageModeShared),
               let values = device.makeBuffer(length: count, options: .storageModeShared) else {
             throw DeepSeekV41VisionDeviceError.unavailable("could not allocate the vision planes")
+        }
+        let tailBytes = tail * MemoryLayout<Float>.stride
+        for buffer in [queries, keys, values] {
+            memset(
+                buffer.contents().advanced(by: count - tailBytes), 0, tailBytes
+            )
         }
         return SplitPlanes(
             queries: queries, keys: keys, values: values,
@@ -251,7 +275,7 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
                 "the qkv buffer is smaller than \(tokens) x \(3 * heads * headDim)"
             )
         }
-        let planeBytes = tokens * heads * headDim * stride
+        let planeBytes = (tokens * heads * headDim + Self.matrixTile * headDim) * stride
         guard planes.queries.length >= planeBytes, planes.keys.length >= planeBytes,
               planes.values.length >= planeBytes else {
             throw DeepSeekV41VisionDeviceError.shapeMismatch(
@@ -330,7 +354,9 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
         _ planes: SplitPlanes,
         into outputBuffer: MTLBuffer,
         form: AttentionForm = .pairedFold,
-        threadgroupWidth: Int = DeepSeekV41VisionAttentionDevice.threadgroupWidth
+        threadgroupWidth: Int = DeepSeekV41VisionAttentionDevice.threadgroupWidth,
+        paddedStage: Bool = false,
+        stagesTiles: Bool = true
     ) throws -> Double {
         guard let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
@@ -339,7 +365,8 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
         do {
             try dispatchAttention(
                 on: encoder, planes: planes, into: outputBuffer,
-                form: form, threadgroupWidth: threadgroupWidth
+                form: form, threadgroupWidth: threadgroupWidth,
+                paddedStage: paddedStage, stagesTiles: stagesTiles
             )
         } catch {
             // A refused dispatch must still close its encoder: Metal asserts when one is
@@ -366,7 +393,9 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
         planes: SplitPlanes,
         into outputBuffer: MTLBuffer,
         form: AttentionForm = .pairedFold,
-        threadgroupWidth: Int = DeepSeekV41VisionAttentionDevice.threadgroupWidth
+        threadgroupWidth: Int = DeepSeekV41VisionAttentionDevice.threadgroupWidth,
+        paddedStage: Bool = false,
+        stagesTiles: Bool = true
     ) throws {
         let tokens = planes.tokens
         let heads = planes.heads
@@ -388,6 +417,10 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
         var tokenCount = UInt32(tokens)
         var headCount = UInt32(heads)
         var dimension = UInt32(headDim)
+        // The grid and the threadgroup a form runs, which only the staged-tile form and
+        // the tile sweep leave to the caller.
+        var gridWidth = 0
+        var groupWidth = threadgroupWidth
         switch form {
         case .direct:
             encoder.setComputePipelineState(attentionPipeline)
@@ -408,6 +441,42 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
             encoder.setComputePipelineState(stagedAttentionPipeline)
             encoder.setThreadgroupMemoryLength(tileBytes, index: 0)
             encoder.setBytes(&tileStride, length: MemoryLayout<UInt32>.stride, index: 7)
+        case .matrixTiles:
+            // One 8x8 score tile is one fragment, so the head has to divide into
+            // 8-wide chunks.
+            guard headDim % Self.matrixTile == 0 else {
+                throw DeepSeekV41VisionDeviceError.shapeMismatch(
+                    "the matrix-tile form multiplies 8-wide fragments, so head dimension \(headDim) must be a multiple of \(Self.matrixTile)"
+                )
+            }
+            let groups = threadgroupWidth / 32
+            guard groups >= 1, groups <= Self.matrixTileGroups else {
+                throw DeepSeekV41VisionDeviceError.shapeMismatch(
+                    "the matrix-tile form takes 1...\(Self.matrixTileGroups) SIMD groups, not \(threadgroupWidth) threads"
+                )
+            }
+            let queries = Self.matrixTile * groups
+            let stageStride = paddedStage ? headDim + 1 : headDim
+            let queryBytes = queries * stageStride * MemoryLayout<Float>.stride
+            let tileBytes = Self.matrixTile * stageStride * MemoryLayout<Float>.stride
+            let scratchBytes = groups * 136 * MemoryLayout<Float>.stride
+            let totalBytes = queryBytes + 2 * tileBytes + scratchBytes
+            guard totalBytes <= device.maxThreadgroupMemoryLength else {
+                throw DeepSeekV41VisionDeviceError.shapeMismatch(
+                    "the matrix-tile form stages \(totalBytes) bytes, past this device's \(device.maxThreadgroupMemoryLength)"
+                )
+            }
+            var stage = UInt32(stageStride)
+            var readMode: UInt32 = stagesTiles ? 0 : 1
+            encoder.setComputePipelineState(matrixTilesPipeline)
+            encoder.setThreadgroupMemoryLength(queryBytes, index: 0)
+            encoder.setThreadgroupMemoryLength(tileBytes, index: 1)
+            encoder.setThreadgroupMemoryLength(tileBytes, index: 2)
+            encoder.setThreadgroupMemoryLength(scratchBytes, index: 3)
+            encoder.setBytes(&stage, length: MemoryLayout<UInt32>.stride, index: 7)
+            encoder.setBytes(&readMode, length: MemoryLayout<UInt32>.stride, index: 8)
+            groupWidth = threadgroupWidth
+            gridWidth = heads * ((tokens + queries - 1) / queries)
         }
         encoder.setBuffer(planes.queries, offset: 0, index: 0)
         encoder.setBuffer(planes.keys, offset: 0, index: 1)
@@ -416,11 +485,14 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
         encoder.setBytes(&tokenCount, length: MemoryLayout<UInt32>.stride, index: 4)
         encoder.setBytes(&headCount, length: MemoryLayout<UInt32>.stride, index: 5)
         encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 6)
-        let queriesPerGroup = threadgroupWidth / 32
-        let queryBlocks = (tokens + queriesPerGroup - 1) / queriesPerGroup
+        if gridWidth == 0 {
+            let queriesPerGroup = threadgroupWidth / 32
+            let queryBlocks = (tokens + queriesPerGroup - 1) / queriesPerGroup
+            gridWidth = heads * max(queryBlocks, 1)
+        }
         encoder.dispatchThreadgroups(
-            MTLSize(width: heads * max(queryBlocks, 1), height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: threadgroupWidth, height: 1, depth: 1)
+            MTLSize(width: max(gridWidth, 1), height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: groupWidth, height: 1, depth: 1)
         )
     }
 

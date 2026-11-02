@@ -7917,3 +7917,115 @@ The full DeepSeek suite on this code is **558 passed / 0 failed / 55 skipped** (
 classes), and the same run under `MTL_DEBUG_LAYER` is **558 / 0 / 55 with 0 validation errors** and
 no failed assertions -- which is what a new kernel and a changed default form have to survive before
 they are trusted.
+
+## DSV4.1 #45: THE MATRIX UNITS RUN AT THE FMA RATE, SO AN MMA ATTENTION LOSES BY ARITHMETIC
+
+### Question
+
+`#44` closed with a named next lever: the attention runs at 1.56 TFLOP/s, 10% of this GPU's SIMT
+FP32 peak, the loads / the broadcast / the dependency chain had all been measured away, so "the
+remaining cost is per-element instruction issue, and the matrix units do 512 multiply-adds per
+instruction". That is a theory about a number nobody had measured -- whether Apple's FP32 matrix
+units actually run FASTER than the FP32 FMA pipes -- plus a cost model that ignores what a fragment
+cannot do (it cannot be indexed, so it cannot be rescaled). This slice measured both before writing
+the kernel, then wrote it and swept its two shape knobs.
+
+### The units' own rate, measured first
+
+`dsv41_vision_mma_peak_f32`: eight independent `simdgroup_multiply_accumulate` chains per SIMD
+group and nothing else, 8,192 groups, 256 iterations, 17.2 GFLOP, best of three. `dsv41_vision_
+fma_peak_f32` was re-run beside it in the same process so the two are comparable:
+
+| probe | run 1 (load 2.2) | run 2 (load 2.0) |
+|---|---|---|
+| FP32 matrix units, product only | 2.19 ms, **7.84 TFLOP/s** | 2.33 ms, **7.38 TFLOP/s** |
+| the same loop fed from threadgroup memory | 2.19 ms (1.00x) | 2.19 ms (1.06x) |
+| SIMT FP32 FMA chains | **8.58 TFLOP/s** | **7.73 TFLOP/s** |
+
+**A matrix unit is not a faster pipe on this part: it is 0.91-0.95x the FMA pipes.** Feeding it from
+threadgroup memory is free, so the units themselves are not the constraint. (The absolute numbers
+moved by ~2x between this session and `#44`'s 15.2-15.7 TFLOP/s for the same FMA kernel -- 8.58
+against 15.74 in a run whose load average was 2.2 -- which is why only the ratio is quoted here.
+Both arms were measured in the same process, in the same run, back to back.)
+
+That fixes the ceiling before any kernel exists. An 8x8 score or value tile needs 64 dimensions of
+reduction per 8x8 output, and a fragment accumulator cannot be indexed -- so a raised row maximum
+cannot rescale it the way flash attention does, and the keys have to be walked **twice** (pass one
+for the row maximum and denominator, pass two for the weights and the fold). That is 24 products per
+tile where 16 suffice: **1.5x the multiply-adds at 0.95x the rate, i.e. a hard ceiling of 0.63x the
+shipped form**, whichever way the kernel is written.
+
+### What the kernel actually measured
+
+`dsv41_vision_attention_mma_f32` is that form: one SIMD group per (head, 8-query tile), 8x8 f32
+fragments for both products, lanes 0-7 carrying a query row's running maximum and sum in registers,
+`simdgroup_load`'s transpose flag turning the staged `[key][dim]` tile into the `[dim][key]` the
+score product needs. Two knobs were swept at the published geometry (16 heads of 64, 1,521 and 8,649
+patch tokens, best of three, app's own `-O` build, load average 2.94):
+
+| arm | 1,521 tokens | 8,649 tokens |
+|---|---|---|
+| `pairedFold` (shipped) | **4.65 ms/block** | **190.39 ms/block** |
+| staged tiles, 1 group (32 lanes) | 14.97 ms (0.31x) | 443.94 ms (0.43x) |
+| direct fragment reads, 1 group | 11.72 ms (0.40x) | 343.41 ms (0.55x) |
+| staged, 4 groups (128 lanes) | 13.04 ms (0.36x) | 364.90 ms (0.52x) |
+| direct, 4 groups | 11.82 ms (0.39x) | 339.38 ms (0.56x) |
+| staged, 8 groups (256 lanes) | 12.09 ms (0.38x) | 358.97 ms (0.53x) |
+| direct, 8 groups | 12.46 ms (0.37x) | 348.31 ms (0.55x) |
+
+Every arm agrees with the host rule (worst 1.73e-6 at the smallest image, 2.98e-6 at the largest), so
+the negatives are measurements of the right rule. An earlier run with only the staged arm landed at
+0.32x / 0.44x, which is the same story.
+
+- **The form loses everywhere, and the best arm is 84% of its own arithmetic ceiling** (0.56x against
+  the 0.63-0.67x the product count allows). So the kernel is not badly written; the arithmetic it
+  multiplies by is against it.
+- **Per multiply-add, the matrix unit is 0.84x the hand-written fold** (0.56 x 1.5): even after
+  deleting the fold's shuffle, its 64-bit addressing and its loads, a matrix product does LESS per
+  MAC than the shipped kernel does. That is the finding, and it kills the variant that would have
+  avoided the second pass: a one-pass MMA using a diagonal-fragment rescale does the same products at
+  the same rate, so its ceiling is parity and its measured per-MAC rate puts it at ~0.84x.
+- **Staging is a 10-20% tax, not the reason it loses.** Reading fragments straight out of the plane
+  beats staging the tile and sharing it: 0.55x against 0.43x at the largest image with one group.
+  Staging pays (device read -> threadgroup write -> threadgroup read) for the same bytes and buys the
+  next group's reuse; at 4-8 groups that reuse recovers only 0.09x (0.43 -> 0.52).
+- **Group width helps the staged arm and does nothing for the direct one** (0.55 -> 0.56 -> 0.55
+  across 1, 4 and 8 groups), which is what sharing a staged tile between groups should look like.
+- **The smallest image is where the form is worst** (0.40x against 0.55x). Fewer keys per query tile
+  means the once-per-threadgroup query staging and the two passes over a short key row are a larger
+  share of the work.
+
+### What it means
+
+- **Do not build a fifth SIMT shape, and do not build an MMA one either.** `#44`'s "the next lever is
+  the matrix units" is now falsified by measurement, and the falsification is arithmetic rather than
+  a bad kernel: same rate per pipe, 1.5x the products, and a per-MAC deficit even when the pass count
+  is free.
+- **The shipped `pairedFold` stays the default** and is untouched. `.matrixTiles` joins
+  `.stagedKeyTile` as a measured negative kept in `AttentionForm`, with its numbers in its own doc
+  comment: the two knobs are `threadgroupWidth` (SIMD groups sharing a staged tile) and
+  `stagesTiles` (stage a tile, or read fragments straight from the plane).
+- **The attention's 10% of peak is not an instruction-issue defect that a bigger instruction fixes.**
+  What is left for that stage is fewer bytes or fewer products -- and the byte hypotheses are already
+  dead (`#17`'s record halving, `#44`'s load halving, both ~1.0x), which leaves the algorithm: a
+  query tile that shares one head's key rows with another head's, or a cheaper score rule.
+- **Planes now carry one zeroed tile of tail.** A direct `simdgroup_load` reads 8 rows at a time, so
+  the last partial tile of the last head runs past `tokens * heads * headDim`. `allocatePlanes`
+  allocates one extra 8-row tile (zeroed, `matrixTile * headDim` floats) and the addressing formula is
+  unchanged, so every other form and the rope split are unaffected.
+
+### Verification
+
+The default suite gains `testTheMatrixTileAttentionMatchesTheDirectKernelAndTheHost` (heads 3/dim 8
+at 37 tokens, 2/64 at 5, 4/32 at 33, and 2/64 at 16 -- a partial last key tile, a single-tile prompt,
+a single-fragment head and the published head, worst **8.2e-7** against the direct kernel and
+**4.2e-7** against the serial host rule) and `testTheMatrixTileAttentionRefusesAHeadThatIsNotAFragment`
+(dim 12 is refused by the tile form and still runs on every SIMT form). Two opt-in cases join the
+published-geometry harness behind `/tmp/dynamoe_dsv41_vision_measure`:
+`testWhatThisGPUsFP32MatrixUnitsReach` and `testWhatTheMatrixTileAttentionCostsAtThePublishedGeometry`
+(seven arms, every timed arm's rows checked against the host before it prints).
+
+The full DeepSeek suite on this code is **560 passed / 0 failed / 57 skipped** (617 executed, 94
+classes), and the same run under `MTL_DEBUG_LAYER` is **560 / 0 / 57 with 0 validation errors** and no
+failed assertions -- which a new kernel and a changed plane allocation have to survive before they are
+trusted.
