@@ -7411,3 +7411,103 @@ checkpoint) and passes in 144.5 s. The full DeepSeek suite is **542 passed / 0 f
 with **0 validation errors**. The new case also ran under `MTL_DEBUG_LAYER` with the marker and
 reproduced the same 64 ids and text; its timings roughly double there (48.85 s + 39.22 s), which is
 the validation layer and not the model.
+
+## DSV4.1 #41: THE VISION TOWER'S QUADRATIC TERM RUNS ON THE GPU, 5.05x FASTER
+
+### The question
+
+`#37` priced the host vision tower on the app's own `-O` build: 2.74 s for the smallest
+admissible image and 41.71 s for the largest, split `0.22 s + 1.126 ms/token +
+4.245e-07 s/token^2`, with attention plus softmax **76% of the large one** (31.75 s). The host
+attention keeps a `tokens * tokens` score block per head while it computes a bidirectional
+softmax, so the largest image is 74.8 million (query, key) pairs per head per block and the
+score block alone is 299 MB. That term is the whole prize, and it is exactly what a GPU should
+not be doing with a score matrix. Routing was decisive: `vision_scope` chose `attention_first`
+at 0.959 with 0.945 confidence, and the alternatives (`whole_tower` 0.002,
+`linear_stages_first` 0.007, `not_vision` 0.032) were not close.
+
+### What landed
+
+- **`dsv41_vision_rope_split_f32`** turns the tower's interleaved `3 * hidden` row per patch
+  token into three `[heads, tokens, headDim]` planes, applying the checkpoint's split-half
+  rotation to q and k and copying v untouched. One thread per (token, head, pair), so a pair's
+  two halves are written by the same thread.
+- **`dsv41_vision_attention_f32`** is the stage itself, in 32-key tiles. The dot product needs
+  one lane per key; the value sum needs one lane per output dimension. A tile is what makes
+  both true at once: the tile's 32 scores are reduced with `simd_max` and `simd_sum`, and each
+  lane's weight is broadcast with `simd_shuffle` so every lane folds all 32 value rows into the
+  two dimensions it owns. The running maximum and denominator are uniform, a new tile maximum
+  rescales the two lane-local accumulators, no score row is stored, and no dot product is
+  computed twice.
+- **`DeepSeekV41VisionAttentionDevice`** is the stage runner: `splitAndRotate` builds the
+  planes, `attention` runs the stage, and `runAttention(_:into:)` returns the dispatch's GPU
+  time without the readback (the readback of a `tokens * hidden` matrix costs more than the
+  dispatch it describes, and `gpuEndTime - gpuStartTime` keeps that out of the number).
+
+### Evidence
+
+Parity, small shapes, against the host definition (`DeepSeekV41VisionForward.attention`) and the
+batched form the tower actually calls:
+
+```
+🔎 [dsv41 vision] attention parity: worst 2.98e-07 against the serial rule, 2.38e-07 against the batched one
+🔎 [dsv41 vision] narrow-head parity: worst 1.79e-07
+```
+
+The published geometry, one block's attention (`runsAttention` GPU time, three attempts, best):
+
+```
+🔎 [dsv41 vision] attention smallest: 1521 tokens per head, 6.72 ms per block, 0.21 s for 32 blocks
+🔎 [dsv41 vision] attention smallest row 0: worst 1.25e-06 against the host rule
+🔎 [dsv41 vision] attention smallest row 760: worst 1.61e-06 against the host rule
+🔎 [dsv41 vision] attention largest: 8649 tokens per head, 196.66 ms per block, 6.29 s for 32 blocks
+🔎 [dsv41 vision] attention largest row 0: worst 2.21e-06 against the host rule
+🔎 [dsv41 vision] attention largest row 4324: worst 2.38e-06 against the host rule
+```
+
+So the term `#37` measured at **31.75 s** now costs **6.29 s** for the 8,649-token image
+(**5.05x**) and the 0.98 s term for the 1,521-token image costs **0.21 s** (4.55x), with a
+host-row check at each size so the timing is of the right kernel and not of a fast wrong one.
+If the surrounding path were unchanged and the transfers free, the largest image's encode would
+go from 41.71 s to about 16.25 s; that is an estimate, not a measurement, and the wiring is not
+in yet.
+
+Two defects stood between the first draft and that number, and both were caught by the cases
+rather than by inspection:
+
+1. **The first design summed value accumulators ACROSS lanes**, which added dimension `l` to
+   dimension `m`; every output row came back constant across its dimensions. The tile plus
+   `simd_shuffle` is the fix, and it is why the kernel looks like flash attention.
+2. **A lane with no output dimension still wrote its accumulator.** `laneInSimd` is a dimension
+   index only while it is below `headDim`; at a 12-wide head lanes 12..31 wrote into the next
+   head's row. The published 64-wide head has a dimension for every lane, so this was invisible
+   at the shape that ships and fatal at the narrow one. The write, the first-dimension value
+   read and the accumulate are all guarded now.
+
+### What it means
+
+The vision tower has a device path for the stage that actually costs the money, and it is
+checked against the host rule at both the shape that ships and the shapes that break lane
+assumptions. The GPU number is a kernel number, not an integration number.
+
+### What it does not mean
+
+- The rest of the tower -- patch embed, the block projections, pixel-unshuffle, the aligner --
+  is still on the host. An encode would still pay those costs and would add the marshal of
+  `qkv` and the readback per block, which is why the 16.25 s figure is an estimate.
+- 196.66 ms is 1.56 TFLOP/s of arithmetic, well under what the GPU can do; the stage is likely
+  limited by re-reading each head's key and value planes for every query block. That is the next
+  measurement if the stage is ever integrated, not a claim that this is the fastest form.
+- The unit is one block at the published geometry on synthetic values; the tower's real sequence
+  of 32 blocks shares nothing across blocks, so 32x is the right extrapolation, but the number
+  was not taken with the tower in the loop.
+- The validation layer runs the same kernel about 6.7x slower (1,310.39 ms at the largest size).
+  Those are debug-layer numbers and must not be quoted as the stage's cost.
+
+### Verification
+
+`DeepSeekV41VisionDeviceTests` is new: three parity cases run with the default suite (2.98e-07
+and 1.79e-07 worst differences) and the published-geometry timing is opt-in behind
+`/tmp/dynamoe_dsv41_vision_measure`. The full DeepSeek suite is **545 passed / 0 failed / 46
+skipped** (591 executed) without the marker; with it, under `MTL_DEBUG_LAYER`, **546 passed / 0
+failed / 45 skipped and 0 validation errors**.

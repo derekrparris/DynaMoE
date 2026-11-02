@@ -10684,3 +10684,204 @@ kernel void dsv41_fp8_block32_down_accumulate(
     }
     outputVector[row] += routingWeight * total;
 }
+
+/// MSL Kernel: `dsv41_vision_rope_split_f32` -- the vision tower's per-token rotary
+/// and head split, done once per block instead of once per attention dispatch.
+///
+/// The tower keeps q, k and v interleaved in one `3 * hidden` row per patch token,
+/// and the rotation is per token and shared by every head. Attention wants one
+/// contiguous `headDim` record per (head, token), because a lane walks a key row
+/// end to end; this kernel writes that layout, applying the split-half rotation
+/// `apply_rotary` applies on the host:
+///
+///     out[i]        = x[i] * cos[i] - x[half + i] * sin[i]
+///     out[half + i] = x[half + i] * cos[i] + x[i] * sin[i]
+///
+/// One thread owns one (token, head, pair), so a pair's two halves are written by
+/// the same thread and no cross-thread ordering is needed.
+kernel void dsv41_vision_rope_split_f32(
+    device const float* qkvBuffer [[buffer(0)]],      // [tokens, 3 * hidden]
+    device const float* cosineBuffer [[buffer(1)]],   // [tokens, ropeDim]
+    device const float* sineBuffer [[buffer(2)]],     // [tokens, ropeDim]
+    device float* queryPlane [[buffer(3)]],           // [heads, tokens, headDim]
+    device float* keyPlane [[buffer(4)]],             // [heads, tokens, headDim]
+    device float* valuePlane [[buffer(5)]],           // [heads, tokens, headDim]
+    constant uint32_t& tokens [[buffer(6)]],
+    constant uint32_t& heads [[buffer(7)]],
+    constant uint32_t& headDim [[buffer(8)]],
+    constant uint32_t& ropeDim [[buffer(9)]],
+    uint2 position [[thread_position_in_grid]]
+) {
+    uint32_t halfDim = headDim / 2u;
+    uint32_t pair = position.x;
+    uint32_t tokenHead = position.y;
+    if (halfDim == 0u || pair >= halfDim || tokenHead >= tokens * heads) return;
+
+    uint32_t head = tokenHead % heads;
+    uint32_t token = tokenHead / heads;
+    uint32_t hidden = heads * headDim;
+    uint64_t sourceBase = (uint64_t)token * (uint64_t)(3u * hidden)
+        + (uint64_t)head * headDim;
+    uint64_t destinationBase = ((uint64_t)head * tokens + token) * headDim;
+
+    float q0 = qkvBuffer[sourceBase + pair];
+    float q1 = qkvBuffer[sourceBase + halfDim + pair];
+    float k0 = qkvBuffer[sourceBase + hidden + pair];
+    float k1 = qkvBuffer[sourceBase + hidden + halfDim + pair];
+    float v0 = qkvBuffer[sourceBase + 2u * hidden + pair];
+    float v1 = qkvBuffer[sourceBase + 2u * hidden + halfDim + pair];
+
+    // `ropeDim` is the width of an angle row; a pair past it has no angles and is
+    // copied through, which is the host rule's "this token does not rotate".
+    if (pair < ropeDim) {
+        float cosine = cosineBuffer[(uint64_t)token * ropeDim + pair];
+        float sine = sineBuffer[(uint64_t)token * ropeDim + pair];
+        float rotatedQ0 = q0 * cosine - q1 * sine;
+        float rotatedQ1 = q1 * cosine + q0 * sine;
+        float rotatedK0 = k0 * cosine - k1 * sine;
+        float rotatedK1 = k1 * cosine + k0 * sine;
+        q0 = rotatedQ0;
+        q1 = rotatedQ1;
+        k0 = rotatedK0;
+        k1 = rotatedK1;
+    }
+
+    queryPlane[destinationBase + pair] = q0;
+    queryPlane[destinationBase + halfDim + pair] = q1;
+    keyPlane[destinationBase + pair] = k0;
+    keyPlane[destinationBase + halfDim + pair] = k1;
+    valuePlane[destinationBase + pair] = v0;
+    valuePlane[destinationBase + halfDim + pair] = v1;
+}
+
+/// MSL Kernel: `dsv41_vision_attention_f32` -- the tower's bidirectional attention
+/// over every patch token, one SIMD group per (head, query token).
+///
+/// The tower's attention is the quadratic term: 8,649 patch tokens at the largest
+/// admissible image is 74.8 million (query, key) pairs per head per block, and
+/// softmax over the full row means a score matrix per head would be 299 MB. So this
+/// is the flash-attention shape, in 32-key tiles: one lane owns one key of the tile
+/// for the dot product, the tile's maximum and sum are reduced across the group, and
+/// each lane's weight is broadcast so every lane can fold all 32 value rows into the
+/// two output dimensions it owns. The running maximum and denominator are uniform
+/// (both reductions return to every lane), and a new tile maximum rescales the two
+/// lane-local accumulators; no score row is stored and no dot product is computed
+/// twice. The tower is bidirectional, so there is no causal mask and no window.
+///
+/// `headDim <= 64` because a lane owns two output dimensions (`lane` and
+/// `lane + 32`), which is the published 1024 / 16 shape and leaves the second
+/// accumulator unused at narrower heads. The host validates the bound.
+#define DSV41_VISION_HEAD_DIM_MAX 64u
+#define DSV41_VISION_QUERIES_PER_GROUP 4u
+
+kernel void dsv41_vision_attention_f32(
+    device const float* queryPlane [[buffer(0)]],     // [heads, tokens, headDim]
+    device const float* keyPlane [[buffer(1)]],       // [heads, tokens, headDim]
+    device const float* valuePlane [[buffer(2)]],     // [heads, tokens, headDim]
+    device float* outputBuffer [[buffer(3)]],         // [tokens, heads, headDim]
+    constant uint32_t& tokens [[buffer(4)]],
+    constant uint32_t& heads [[buffer(5)]],
+    constant uint32_t& headDim [[buffer(6)]],
+    uint groupIdx [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
+) {
+    uint32_t simdCount = laneCount / 32u;
+    if (simdCount == 0u || simdCount > DSV41_VISION_QUERIES_PER_GROUP) return;
+    if (headDim == 0u || headDim > DSV41_VISION_HEAD_DIM_MAX) return;
+    uint32_t queryBlocks = (tokens + simdCount - 1u) / simdCount;
+    if (groupIdx >= heads * queryBlocks) return;
+
+    uint32_t headIdx = groupIdx / queryBlocks;
+    uint32_t blockIdx = groupIdx - headIdx * queryBlocks;
+    uint32_t queryIdx = blockIdx * simdCount + simdIdx;
+    if (queryIdx >= tokens) return;
+
+    float invSqrt = rsqrt((float)headDim);
+    // Two output dimensions per lane: `laneInSimd` and `laneInSimd + 32`. A head
+    // narrower than 32 leaves lanes with no dimension at all, and writing through
+    // such a lane would land in the next head's row, so both slots are guarded.
+    bool hasFirstDimension = laneInSimd < headDim;
+    bool hasSecondDimension = (laneInSimd + 32u) < headDim;
+    // Every lane of the group reads the same query row at the same offset, so this
+    // is a uniform load that the L1 serves as a broadcast; the row is not staged in
+    // threadgroup memory, because 64 values per group are cheaper to re-read than to
+    // synchronize a copy.
+    uint64_t headBase = (uint64_t)headIdx * tokens * headDim;
+    device const float* queryHead = queryPlane + headBase + (uint64_t)queryIdx * headDim;
+
+    // A 32-key tile per step. The dot product needs one lane per key, while the
+    // value sum needs one lane per output dimension; a tile is what lets both be
+    // true at once. The tile's 32 scores are reduced to a maximum and a sum, and
+    // each lane's weight is broadcast so every lane can fold all 32 value rows into
+    // its two dimensions. Without the broadcast the output dimensions would have to
+    // be summed ACROSS lanes, which mixes dimension `l` with dimension `m`.
+    float runningMax = -1.0e30f;
+    float runningSum = 0.0f;
+    float accumulatorA = 0.0f;
+    float accumulatorB = 0.0f;
+    for (uint32_t tileBase = 0; tileBase < tokens; tileBase += 32u) {
+        uint32_t keyIdx = tileBase + laneInSimd;
+        bool inRange = keyIdx < tokens;
+        float score = -1.0e30f;
+        if (inRange) {
+            device const float* keyRow = keyPlane + headBase + (uint64_t)keyIdx * headDim;
+            // Four accumulators, because `dot += q * k` is a `headDim`-long chain of
+            // dependent FMAs and that chain, not bandwidth, was what the text tower's
+            // attention paid for ("DSV4.1 #17").
+            float d0 = 0.0f;
+            float d1 = 0.0f;
+            float d2 = 0.0f;
+            float d3 = 0.0f;
+            uint32_t dim = 0u;
+            for (; dim + 3u < headDim; dim += 4u) {
+                d0 += queryHead[dim] * keyRow[dim];
+                d1 += queryHead[dim + 1u] * keyRow[dim + 1u];
+                d2 += queryHead[dim + 2u] * keyRow[dim + 2u];
+                d3 += queryHead[dim + 3u] * keyRow[dim + 3u];
+            }
+            for (; dim < headDim; ++dim) {
+                d0 += queryHead[dim] * keyRow[dim];
+            }
+            score = ((d0 + d1) + (d2 + d3)) * invSqrt;
+        }
+
+        // Online softmax, one step per tile. `simd_max` and `simd_sum` return their
+        // result to every lane, so the running maximum, the rescale factor and the
+        // denominator are uniform across the group; only the two value accumulators
+        // stay lane-local.
+        float tileMax = simd_max(score);
+        float newMax = max(runningMax, tileMax);
+        float correction = exp(runningMax - newMax);
+        runningSum *= correction;
+        accumulatorA *= correction;
+        accumulatorB *= correction;
+        float weight = inRange ? exp(score - newMax) : 0.0f;
+        runningSum += simd_sum(weight);
+        for (uint32_t index = 0u; index < 32u; ++index) {
+            uint32_t key = tileBase + index;
+            if (key >= tokens) break;
+            float tileWeight = simd_shuffle(weight, (ushort)index);
+            device const float* valueRow = valuePlane + headBase + (uint64_t)key * headDim;
+            if (hasFirstDimension) {
+                accumulatorA += tileWeight * valueRow[laneInSimd];
+            }
+            if (hasSecondDimension) {
+                accumulatorB += tileWeight * valueRow[laneInSimd + 32u];
+            }
+        }
+        runningMax = newMax;
+    }
+
+    float inverse = runningSum > 0.0f ? 1.0f / runningSum : 0.0f;
+
+    uint64_t outputBase = ((uint64_t)queryIdx * heads + headIdx) * headDim;
+    if (hasFirstDimension) {
+        outputBuffer[outputBase + laneInSimd] = accumulatorA * inverse;
+    }
+    if (hasSecondDimension) {
+        outputBuffer[outputBase + laneInSimd + 32u] = accumulatorB * inverse;
+    }
+}
