@@ -7788,3 +7788,132 @@ quoted.
 
 The full DeepSeek suite on this code is **556 passed / 0 failed / 51 skipped** (607 executed),
 and the same run under `MTL_DEBUG_LAYER` is **556 / 0 / 51 with 0 validation errors**.
+
+## DSV4.1 #44: THE VISION ATTENTION IS AT 10% OF THIS GPU'S FP32 RATE, AND NOTHING THAT RESHAPES ITS LANES MOVES IT
+
+### Question
+
+`#43` left one kernel as the tower's floor: `dsv41_vision_attention_f32` is 6.29 s of a 6.90 s
+device encode at the largest admissible image, and everything else -- patch embed, all 128
+projections, all 64 norms, the elementwise work, the unshuffle and the aligner -- is ~0.6-0.7 s.
+The kernel was written for two reasons (one load instruction per key row is `headDim` floats wide,
+i.e. 32 cache lines for 128 bytes of use; and a threadgroup's several query SIMD groups can share a
+staged tile), and neither had been tested. So the question for this slice was: which shape should
+that kernel have, and is it even off the machine's pace?
+
+### What was measured
+
+Six shape arms at the published geometry (16 heads of 64, 1,521 and 8,649 patch tokens), best of
+three, on the app's own `-O` build, load average ~2.6:
+
+| arm | 1,521 tokens | 8,649 tokens |
+|---|---|---|
+| `direct/128` (shipped, 4 queries per threadgroup) | 6.15 ms/block, 1.54 TFLOP/s | 194.1 ms/block, 1.58 TFLOP/s |
+| `direct/256` (8 queries) | 6.11 ms, 1.55 | 194.2 ms, 1.58 |
+| `direct/512` (16 queries) | 6.11 ms, 1.55 | 195.6 ms, 1.57 |
+| `staged/128` (key tile in threadgroup memory) | 9.90 ms, 0.96 | 303.7 ms, 1.02 |
+| `staged/256` | 7.86 ms, 1.21 | 244.9 ms, 1.25 |
+| `staged/512` | 7.42 ms, 1.28 | 229.6 ms, 1.33 |
+
+- **Staging the key tile LOSES** 18% at its best (229.6 against 194.1) and 55% at its worst. It
+  fixes the coalescing it was built for and pays two threadgroup barriers per tile for it, and a
+  threadgroup of four queries does not reuse the tile enough to get that back.
+- **The threadgroup width is irrelevant** -- 4, 8 and 16 queries per threadgroup are the same
+  kernel to within 1%. So the dispatch is not limited by how many queries share a key/value read,
+  which is what kills every "more reuse" hypothesis before it is built (including a retry of `#6`).
+- Every staged arm agrees with the shipped one **bit for bit** (worst 0) on the whole
+  `tokens x heads x headDim` output, so the negative is a measurement of the right rule.
+
+### Where the dispatch actually goes
+
+The ablation kernel runs the two halves of a step separately. `mode` 2 runs both and reproduces the
+shipped kernel bit for bit (asserted), so the split is of this kernel and not another:
+
+| 8,649 tokens | ms/block | share |
+|---|---|---|
+| dot product + row softmax | 83-89 | 30-34% |
+| value fold (over a synthetic score) | 161-171 | 66-70% |
+| both | 196-207 | |
+
+Solving the three arms together (`both`, `dot+softmax`, `fold`) puts the per-tile softmax and loop
+overhead at **~53 ms**, the dot's arithmetic at **~36 ms** and the fold's at **~119 ms**. The fold
+is the stage.
+
+Then two more probes on the fold alone, which is what made this slice's answer unambiguous:
+
+- **removing the weight broadcast** (`simd_shuffle` for all 32 keys) is **1.00x** -- the broadcast is
+  free;
+- **removing half the row's loads** (one scalar instead of two) is **1.04-1.05x** -- the loads are
+  nearly free.
+
+### The machine's pace, measured
+
+`dsv41_vision_fma_peak_f32` is eight independent FMA chains per thread and no memory traffic at
+all, 34.4 GFLOP over 1,048,576 threads: **15.23-15.74 TFLOP/s**. The attention's 1.56 TFLOP/s is
+therefore **10% of this GPU's SIMT FP32 rate**, not 90% of it -- four reshapes landing within 5% of
+each other was not the ceiling, it was a shared defect those reshapes do not touch. What survives
+that list is a per-lane cost that every arm pays: the fold's per-key addressing (a 64-bit
+multiply-add and a 64-bit pointer add per key), its load instruction issue, and the loop itself.
+
+### What it means
+
+- **One reshape does ship.** `dsv41_vision_attention_pairfold_f32` gives a lane two ADJACENT
+  dimensions of the fold -- so its pair is one aligned `float2` -- and splits the tile across four
+  accumulator pairs instead of one 32-long dependent chain. At 1,521 tokens it is **1.28-1.39x**
+  (6.69 -> 5.24, 6.29 -> 4.52 across runs); at 8,649 it is **1.03-1.15x** (195.5 -> 189.2,
+  196.8 -> 191.3, 217.5 -> 189.2 under load). It is never slower. It is the default form now, and
+  the attention the tower runs measures **5.14 ms/block at 1,521 tokens (0.16 s for 32 blocks) and
+  184.6 ms at 8,649 (5.91 s)** against `#41`'s 6.29 s.
+- **The tower's own encode moves with it.** Re-measured on the shipped path at load average 1.5:
+  39x39 **0.31 s** device (host 3.03 s, 9.73x), 63x63 **1.60 s** (12.32 s, 7.68x), 93x93 **6.74 s**
+  (44.91 s, 6.66x), parity 1.4e-4 / 3.5e-5 / 8.2e-5, upload 0.37 s -- against `#43`'s
+  0.32 / 1.70 / 6.90 s.
+- **The 4-way split alone bought nothing.** The first version of that kernel made the split a
+  runtime `foldUnroll` branch and measured 1.02x, which measured a branch: the shipped form is
+  unconditionally four-way with no data-dependent exit from the body.
+- **The variable that does NOT matter is how a lane's dimensions are laid out away from
+  memory-width terms, or how many queries a threadgroup holds.** Both were the kernel's stated
+  reasons for its shape, and both are now measured dead.
+- **The next lever is not a SIMT shape.** At 10% of the FP32 rate with the loads, the broadcast and
+  the chain all cleared, the remaining cost is per-element instruction issue, and the matrix units
+  do 512 multiply-adds per instruction. That is a different kernel (8x8 score tiles in registers,
+  P x V as an MMA), not another reshape of this one, and it is its own slice.
+
+### What it does not mean
+
+- **Not a faster image turn.** The tower's encode is 6.9 s at the largest image and this takes
+  ~0.4 s of it; prefill and decode of the 994-position span are untouched.
+- **Not a claim that the fold is understood.** Removing the loads, the broadcast, the vectorization
+  and the dependency chain each failed to move it, which is a measurement of what it is NOT, not an
+  explanation of what it is. Do not build a fifth SIMT shape on a theory from this table.
+- **Not stable to the last digit.** The 8,649-token arm moved 195 -> 217 between a quiet and a
+  loaded run (`uptime` 2.6 against 4.4); every range above is quoted as a range for that reason.
+- **Not a `float2` win alone or an unroll win alone.** They landed in one kernel.
+
+### Two device faults this exposed
+
+- **`simd_shuffle` is a group collective and cannot be run by part of a group.** The paired fold
+  guards its accumulation on `ownsPair`, and a narrow head leaves most lanes owning nothing; with
+  the broadcast inside that guard, participating lanes were handed another lane's weight. Full
+  width (64 dimensions, every lane owns a pair) was exact, so the bug only appeared on the 8- and
+  32-wide heads: **0.62 and 0.705 absolute error where the shipped kernel was 2.4e-7**. The
+  broadcast is unconditional now and only the load and the accumulation are guarded.
+- **A refused dispatch must still close its encoder.** `runAttention` created an encoder and let a
+  `shapeMismatch` escape before `endEncoding`, and Metal asserts on release: a Debug-build abort
+  inside a test that was only asking for a refusal.
+
+### Verification
+
+The default suite gains `testTheShippedPairedFoldMatchesTheDirectKernelAndTheHost` -- three shapes
+(narrow head 8 at 37 tokens, full width 64 at 5 tokens, 32 at 33 tokens) against both the direct
+kernel and the serial host rule, worst **2.4e-7 / 1.2e-7 / 3.0e-7** -- and
+`testThePairedFoldRefusesAnOddHeadDimension`, which also asserts the direct form still runs the odd
+head it always ran. Four opt-in cases join the published-geometry harness behind
+`/tmp/dynamoe_dsv41_vision_measure`: the six-arm shape sweep, the ablation, the fold probes and the
+FMA peak, and every timed arm checks rows against the host before it prints. The parity case of the
+existing narrow-head test still passes through the new default.
+
+The full DeepSeek suite on this code is **558 passed / 0 failed / 55 skipped** (613 executed, 94
+classes), and the same run under `MTL_DEBUG_LAYER` is **558 / 0 / 55 with 0 validation errors** and
+no failed assertions -- which is what a new kernel and a changed default form have to survive before
+they are trusted.

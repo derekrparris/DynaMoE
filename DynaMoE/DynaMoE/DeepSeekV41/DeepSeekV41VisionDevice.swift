@@ -49,11 +49,37 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
     public static let threadgroupWidth = 128
     /// A lane owns two output dimensions, so this is the widest head the kernel takes.
     public static let maximumHeadDimension = 64
+    /// The number of keys one staged tile holds (`DSV41_VISION_STAGED_TILE`).
+    public static let stagedTile = 32
+    /// The widest dispatch the kernels accept, in SIMD groups (`DSV41_VISION_QUERIES_PER_GROUP`).
+    public static let maximumQueriesPerGroup = 16
+
+    /// Which of the two attention kernels a dispatch names.
+    ///
+    /// `direct` walks each key row in place: a lane owns one key of a 32-key tile and
+    /// reads that key's whole row, so a load instruction spreads over 32 cache lines.
+    /// `stagedKeyTile` copies the tile into threadgroup memory with a coalesced read
+    /// first, which the threadgroup's other SIMD groups then share. They compute the
+    /// same rule; only the read pattern differs, which is what the measurement A/Bs.
+    ///
+    /// `pairedFold` is the one that ships: a lane owns two adjacent dimensions of the
+    /// value fold, so its pair is one aligned `float2`, and the tile's additions split
+    /// across four accumulator pairs instead of one 32-long dependent chain. It measures
+    /// 1.39x at the smallest admissible image and 1.03x at the largest ("DSV4.1 #44"),
+    /// which is where `direct` stays as the ablation's baseline. `stagedKeyTile` lost
+    /// 18% and is kept only as the measured negative.
+    public enum AttentionForm: String, Sendable {
+        case direct
+        case stagedKeyTile
+        case pairedFold
+    }
 
     public let device: MTLDevice
     public let queue: MTLCommandQueue
     private let ropeSplitPipeline: MTLComputePipelineState
     private let attentionPipeline: MTLComputePipelineState
+    private let stagedAttentionPipeline: MTLComputePipelineState
+    private let pairedFoldPipeline: MTLComputePipelineState
 
     public init(device: MTLDevice? = nil, library: MTLLibrary? = nil) throws {
         guard let device = device ?? MTLCreateSystemDefaultDevice() else {
@@ -75,6 +101,8 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
         self.queue = queue
         self.ropeSplitPipeline = try make("dsv41_vision_rope_split_f32")
         self.attentionPipeline = try make("dsv41_vision_attention_f32")
+        self.stagedAttentionPipeline = try make("dsv41_vision_attention_staged_f32")
+        self.pairedFoldPipeline = try make("dsv41_vision_attention_pairfold_f32")
     }
 
     /// q, k and v for every head, `[heads, tokens, headDim]`, ready for `attention`.
@@ -270,7 +298,18 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
         ) else {
             throw DeepSeekV41VisionDeviceError.unavailable("could not allocate the attention output")
         }
-        _ = try runAttention(planes, into: outputBuffer)
+        return try attention(planes, into: outputBuffer)
+    }
+
+    /// The same readback over a caller-owned buffer and a named form, for a caller that
+    /// is comparing two forms on one set of planes.
+    public func attention(
+        _ planes: SplitPlanes,
+        into outputBuffer: MTLBuffer,
+        form: AttentionForm = .pairedFold
+    ) throws -> [[Float]] {
+        _ = try runAttention(planes, into: outputBuffer, form: form)
+        let hidden = planes.heads * planes.headDim
         let output = outputBuffer.contents().assumingMemoryBound(to: Float.self)
         return (0..<planes.tokens).map { token in
             Array(UnsafeBufferPointer(
@@ -287,12 +326,28 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
     /// more than the dispatch it describes. A measurement of this stage times this
     /// call; the rows are read separately when a test needs to compare them.
     @discardableResult
-    public func runAttention(_ planes: SplitPlanes, into outputBuffer: MTLBuffer) throws -> Double {
+    public func runAttention(
+        _ planes: SplitPlanes,
+        into outputBuffer: MTLBuffer,
+        form: AttentionForm = .pairedFold,
+        threadgroupWidth: Int = DeepSeekV41VisionAttentionDevice.threadgroupWidth
+    ) throws -> Double {
         guard let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw DeepSeekV41VisionDeviceError.unavailable("no command buffer")
         }
-        try dispatchAttention(on: encoder, planes: planes, into: outputBuffer)
+        do {
+            try dispatchAttention(
+                on: encoder, planes: planes, into: outputBuffer,
+                form: form, threadgroupWidth: threadgroupWidth
+            )
+        } catch {
+            // A refused dispatch must still close its encoder: Metal asserts when one is
+            // released without `endEncoding`, and that assertion is a Debug-build abort
+            // rather than an error a caller can handle.
+            encoder.endEncoding()
+            throw error
+        }
         encoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
@@ -303,10 +358,15 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
     }
 
     /// The attention dispatch alone, for a caller that owns the command buffer.
+    ///
+    /// `form` and `threadgroupWidth` are the two shape knobs the measurement sweeps;
+    /// the shipped tower takes both defaults.
     public func dispatchAttention(
         on encoder: MTLComputeCommandEncoder,
         planes: SplitPlanes,
-        into outputBuffer: MTLBuffer
+        into outputBuffer: MTLBuffer,
+        form: AttentionForm = .pairedFold,
+        threadgroupWidth: Int = DeepSeekV41VisionAttentionDevice.threadgroupWidth
     ) throws {
         let tokens = planes.tokens
         let heads = planes.heads
@@ -316,10 +376,39 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
                 "the output buffer is smaller than \(tokens) x \(heads) x \(headDim)"
             )
         }
+        guard threadgroupWidth % 32 == 0,
+              threadgroupWidth / 32 >= 1,
+              threadgroupWidth / 32 <= Self.maximumQueriesPerGroup else {
+            throw DeepSeekV41VisionDeviceError.shapeMismatch(
+                "a threadgroup of \(threadgroupWidth) is not 1...\(Self.maximumQueriesPerGroup) SIMD groups"
+            )
+        }
+        let keyStride = headDim + 1
+        var tileStride = UInt32(keyStride)
         var tokenCount = UInt32(tokens)
         var headCount = UInt32(heads)
         var dimension = UInt32(headDim)
-        encoder.setComputePipelineState(attentionPipeline)
+        switch form {
+        case .direct:
+            encoder.setComputePipelineState(attentionPipeline)
+        case .pairedFold:
+            guard headDim % 2 == 0 else {
+                throw DeepSeekV41VisionDeviceError.shapeMismatch(
+                    "the paired fold owns two adjacent dimensions, so head dimension \(headDim) must be even"
+                )
+            }
+            encoder.setComputePipelineState(pairedFoldPipeline)
+        case .stagedKeyTile:
+            let tileBytes = Self.stagedTile * keyStride * MemoryLayout<Float>.stride
+            guard tileBytes <= device.maxThreadgroupMemoryLength else {
+                throw DeepSeekV41VisionDeviceError.shapeMismatch(
+                    "a \(Self.stagedTile) x \(keyStride) key tile needs \(tileBytes) bytes of threadgroup memory"
+                )
+            }
+            encoder.setComputePipelineState(stagedAttentionPipeline)
+            encoder.setThreadgroupMemoryLength(tileBytes, index: 0)
+            encoder.setBytes(&tileStride, length: MemoryLayout<UInt32>.stride, index: 7)
+        }
         encoder.setBuffer(planes.queries, offset: 0, index: 0)
         encoder.setBuffer(planes.keys, offset: 0, index: 1)
         encoder.setBuffer(planes.values, offset: 0, index: 2)
@@ -327,11 +416,11 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
         encoder.setBytes(&tokenCount, length: MemoryLayout<UInt32>.stride, index: 4)
         encoder.setBytes(&headCount, length: MemoryLayout<UInt32>.stride, index: 5)
         encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 6)
-        let queriesPerGroup = Self.threadgroupWidth / 32
+        let queriesPerGroup = threadgroupWidth / 32
         let queryBlocks = (tokens + queriesPerGroup - 1) / queriesPerGroup
         encoder.dispatchThreadgroups(
             MTLSize(width: heads * max(queryBlocks, 1), height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: Self.threadgroupWidth, height: 1, depth: 1)
+            threadsPerThreadgroup: MTLSize(width: threadgroupWidth, height: 1, depth: 1)
         )
     }
 

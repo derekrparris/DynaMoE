@@ -10773,7 +10773,9 @@ kernel void dsv41_vision_rope_split_f32(
 /// `lane + 32`), which is the published 1024 / 16 shape and leaves the second
 /// accumulator unused at narrower heads. The host validates the bound.
 #define DSV41_VISION_HEAD_DIM_MAX 64u
-#define DSV41_VISION_QUERIES_PER_GROUP 4u
+// The threadgroup width is a dispatch-time choice up to this many SIMD groups, so one
+// kernel can be swept (4, 8 and 16 queries per group) without a second source.
+#define DSV41_VISION_QUERIES_PER_GROUP 16u
 
 kernel void dsv41_vision_attention_f32(
     device const float* queryPlane [[buffer(0)]],     // [heads, tokens, headDim]
@@ -10885,6 +10887,475 @@ kernel void dsv41_vision_attention_f32(
     if (hasSecondDimension) {
         outputBuffer[outputBase + laneInSimd + 32u] = accumulatorB * inverse;
     }
+}
+
+// MARK: - DeepSeek-V4.1 vision tower: the same attention with its key tile staged
+
+/// MSL Kernel: `dsv41_vision_attention_staged_f32` -- the tower's attention with the
+/// 32-key tile staged in threadgroup memory.
+///
+/// This exists because the kernel above reads its keys badly, not because it computes
+/// them badly. A lane owns one key of the tile and walks that key's whole row, so at
+/// any one load instruction the 32 lanes of a SIMD group are `headDim` floats apart:
+/// each load spreads over 32 cache lines to use 128 bytes of them. Those bytes are all
+/// consumed eventually, so the traffic is not wasted, but every load costs 32 memory
+/// transactions instead of two, and that is what holds the stage at ~1.56 TFLOP/s.
+///
+/// Staging turns it into one coalesced read of the tile (`idx = key * headDim + dim`,
+/// contiguous per warp) per THREADGROUP rather than per SIMD group, and then the dot
+/// product reads threadgroup memory. The tile row is padded by `keyStride = headDim +
+/// 1` because adjacent lanes read rows `headDim` apart, and a stride that is a multiple
+/// of the bank count puts all 32 lanes in one bank; an even `headDim` (the host
+/// validates it) makes the padded stride odd and the access conflict-free.
+///
+/// The value plane is NOT staged: its fold already reads `valueRow[laneInSimd]` and
+/// `valueRow[laneInSimd + 32]`, which is 32 consecutive floats per load, i.e. one
+/// coalesced transaction, and staging it would only buy L1 reuse.
+///
+/// Two barriers per tile, and both are required: the first publishes the staged tile
+/// to the other SIMD groups, the second stops a fast group from overwriting the tile
+/// for the next step while a slow group is still reading this one. A SIMD group that
+/// owns no query (`queryIdx >= tokens`) still walks the staging loop and both
+/// barriers, because a threadgroup-wide barrier cannot be crossed conditionally.
+#define DSV41_VISION_STAGED_TILE 32u
+
+kernel void dsv41_vision_attention_staged_f32(
+    device const float* queryPlane [[buffer(0)]],     // [heads, tokens, headDim]
+    device const float* keyPlane [[buffer(1)]],       // [heads, tokens, headDim]
+    device const float* valuePlane [[buffer(2)]],     // [heads, tokens, headDim]
+    device float* outputBuffer [[buffer(3)]],         // [tokens, heads, headDim]
+    constant uint32_t& tokens [[buffer(4)]],
+    constant uint32_t& heads [[buffer(5)]],
+    constant uint32_t& headDim [[buffer(6)]],
+    constant uint32_t& keyStride [[buffer(7)]],       // headDim + 1, the padded tile row
+    threadgroup float* keyTile [[threadgroup(0)]],    // [tile, keyStride]
+    uint groupIdx [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
+) {
+    uint32_t simdCount = laneCount / 32u;
+    if (simdCount == 0u || simdCount > DSV41_VISION_QUERIES_PER_GROUP) return;
+    if (headDim == 0u || headDim > DSV41_VISION_HEAD_DIM_MAX) return;
+    uint32_t queryBlocks = (tokens + simdCount - 1u) / simdCount;
+    if (groupIdx >= heads * queryBlocks) return;
+
+    uint32_t headIdx = groupIdx / queryBlocks;
+    uint32_t blockIdx = groupIdx - headIdx * queryBlocks;
+    uint32_t queryIdx = blockIdx * simdCount + simdIdx;
+    // Not an early return: the staging loop and its barriers are threadgroup-wide.
+    bool active = queryIdx < tokens;
+
+    float invSqrt = rsqrt((float)headDim);
+    bool hasFirstDimension = laneInSimd < headDim;
+    bool hasSecondDimension = (laneInSimd + 32u) < headDim;
+    uint64_t headBase = (uint64_t)headIdx * tokens * headDim;
+    device const float* queryHead = queryPlane + headBase + (uint64_t)queryIdx * headDim;
+
+    float runningMax = -1.0e30f;
+    float runningSum = 0.0f;
+    float accumulatorA = 0.0f;
+    float accumulatorB = 0.0f;
+    uint32_t tileCount = DSV41_VISION_STAGED_TILE * headDim;
+    for (uint32_t tileBase = 0; tileBase < tokens; tileBase += DSV41_VISION_STAGED_TILE) {
+        // Coalesced staging: consecutive `idx` walk one key's row, and only the write
+        // strides. A tile past the end of the sequence is zero-filled so a ragged
+        // token count needs no separate path.
+        for (uint32_t idx = lane; idx < tileCount; idx += laneCount) {
+            uint32_t key = idx / headDim;
+            uint32_t dim = idx - key * headDim;
+            uint32_t source = tileBase + key;
+            keyTile[key * keyStride + dim] =
+                source < tokens ? keyPlane[headBase + (uint64_t)source * headDim + dim] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint32_t keyIdx = tileBase + laneInSimd;
+        float score = -1.0e30f;
+        if (active && keyIdx < tokens) {
+            threadgroup const float* keyRow = keyTile + laneInSimd * keyStride;
+            float d0 = 0.0f;
+            float d1 = 0.0f;
+            float d2 = 0.0f;
+            float d3 = 0.0f;
+            uint32_t dim = 0u;
+            for (; dim + 3u < headDim; dim += 4u) {
+                d0 += queryHead[dim] * keyRow[dim];
+                d1 += queryHead[dim + 1u] * keyRow[dim + 1u];
+                d2 += queryHead[dim + 2u] * keyRow[dim + 2u];
+                d3 += queryHead[dim + 3u] * keyRow[dim + 3u];
+            }
+            for (; dim < headDim; ++dim) {
+                d0 += queryHead[dim] * keyRow[dim];
+            }
+            score = ((d0 + d1) + (d2 + d3)) * invSqrt;
+        }
+
+        float tileMax = simd_max(score);
+        float newMax = max(runningMax, tileMax);
+        float correction = exp(runningMax - newMax);
+        runningSum *= correction;
+        accumulatorA *= correction;
+        accumulatorB *= correction;
+        bool inRange = keyIdx < tokens;
+        float weight = (active && inRange) ? exp(score - newMax) : 0.0f;
+        runningSum += simd_sum(weight);
+        if (active) {
+            for (uint32_t index = 0u; index < DSV41_VISION_STAGED_TILE; ++index) {
+                uint32_t key = tileBase + index;
+                if (key >= tokens) break;
+                float tileWeight = simd_shuffle(weight, (ushort)index);
+                device const float* valueRow = valuePlane + headBase + (uint64_t)key * headDim;
+                if (hasFirstDimension) {
+                    accumulatorA += tileWeight * valueRow[laneInSimd];
+                }
+                if (hasSecondDimension) {
+                    accumulatorB += tileWeight * valueRow[laneInSimd + 32u];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        runningMax = newMax;
+    }
+
+    if (!active) return;
+    float inverse = runningSum > 0.0f ? 1.0f / runningSum : 0.0f;
+
+    uint64_t outputBase = ((uint64_t)queryIdx * heads + headIdx) * headDim;
+    if (hasFirstDimension) {
+        outputBuffer[outputBase + laneInSimd] = accumulatorA * inverse;
+    }
+    if (hasSecondDimension) {
+        outputBuffer[outputBase + laneInSimd + 32u] = accumulatorB * inverse;
+    }
+}
+
+/// MSL Kernel: `dsv41_vision_attention_probe_f32` -- the ablation the staged-tile
+/// measurement needed, and nothing else uses it.
+///
+/// "DSV4.1 #44" measured the two shapes above and found the staged key tile 18% SLOWER
+/// than the direct one and the threadgroup width irrelevant, which rules out the two
+/// explanations the kernel was written for (load coalescing and query-group sharing)
+/// without naming what does cost the time. So the stage's two halves are timed
+/// separately: `mode` 0 runs the dot product and the row softmax and skips the value
+/// fold, `mode` 1 runs the fold over a synthetic score and skips the dot, and `mode` 2
+/// runs both and reproduces `dsv41_vision_attention_f32` bit for bit (the measurement
+/// asserts it, so a probe cannot win by computing less than it says). `mode` 3 and 4
+/// exist because a reshaped fold (a `float2` pair per lane, four accumulators) measured
+/// only 1.02x: they are fold-only arms with the broadcast removed and with the second
+/// half of each row removed, so the fold's shuffles and its loads are priced apart.
+kernel void dsv41_vision_attention_probe_f32(
+    device const float* queryPlane [[buffer(0)]],
+    device const float* keyPlane [[buffer(1)]],
+    device const float* valuePlane [[buffer(2)]],
+    device float* outputBuffer [[buffer(3)]],
+    constant uint32_t& tokens [[buffer(4)]],
+    constant uint32_t& heads [[buffer(5)]],
+    constant uint32_t& headDim [[buffer(6)]],
+    constant uint32_t& mode [[buffer(7)]],            // 0 dot+softmax, 1 fold, 2 both
+    uint groupIdx [[threadgroup_position_in_grid]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
+) {
+    uint32_t simdCount = laneCount / 32u;
+    if (simdCount == 0u || simdCount > DSV41_VISION_QUERIES_PER_GROUP) return;
+    if (headDim == 0u || headDim > DSV41_VISION_HEAD_DIM_MAX) return;
+    uint32_t queryBlocks = (tokens + simdCount - 1u) / simdCount;
+    if (groupIdx >= heads * queryBlocks) return;
+
+    uint32_t headIdx = groupIdx / queryBlocks;
+    uint32_t blockIdx = groupIdx - headIdx * queryBlocks;
+    uint32_t queryIdx = blockIdx * simdCount + simdIdx;
+    if (queryIdx >= tokens) return;
+
+    bool runDot = mode == 0u || mode == 2u;
+    bool runFold = mode != 0u;
+    float invSqrt = rsqrt((float)headDim);
+    bool hasFirstDimension = laneInSimd < headDim;
+    bool hasSecondDimension = (laneInSimd + 32u) < headDim;
+    uint64_t headBase = (uint64_t)headIdx * tokens * headDim;
+    device const float* queryHead = queryPlane + headBase + (uint64_t)queryIdx * headDim;
+
+    float runningMax = -1.0e30f;
+    float runningSum = 0.0f;
+    float accumulatorA = 0.0f;
+    float accumulatorB = 0.0f;
+    for (uint32_t tileBase = 0; tileBase < tokens; tileBase += 32u) {
+        uint32_t keyIdx = tileBase + laneInSimd;
+        bool inRange = keyIdx < tokens;
+        float score = -1.0e30f;
+        if (runDot && inRange) {
+            device const float* keyRow = keyPlane + headBase + (uint64_t)keyIdx * headDim;
+            float d0 = 0.0f;
+            float d1 = 0.0f;
+            float d2 = 0.0f;
+            float d3 = 0.0f;
+            uint32_t dim = 0u;
+            for (; dim + 3u < headDim; dim += 4u) {
+                d0 += queryHead[dim] * keyRow[dim];
+                d1 += queryHead[dim + 1u] * keyRow[dim + 1u];
+                d2 += queryHead[dim + 2u] * keyRow[dim + 2u];
+                d3 += queryHead[dim + 3u] * keyRow[dim + 3u];
+            }
+            for (; dim < headDim; ++dim) {
+                d0 += queryHead[dim] * keyRow[dim];
+            }
+            score = ((d0 + d1) + (d2 + d3)) * invSqrt;
+        } else if (runFold && inRange) {
+            // A plausible score of the same scale as a real one, so the softmax and the
+            // fold see real weights and no denormal or infinite shortcut appears.
+            score = (float)(keyIdx % 17u) * 0.05f - 0.4f;
+        }
+
+        float tileMax = simd_max(score);
+        float newMax = max(runningMax, tileMax);
+        float correction = exp(runningMax - newMax);
+        runningSum *= correction;
+        accumulatorA *= correction;
+        accumulatorB *= correction;
+        float weight = inRange ? exp(score - newMax) : 0.0f;
+        runningSum += simd_sum(weight);
+        if (runFold) {
+            for (uint32_t index = 0u; index < 32u; ++index) {
+                uint32_t key = tileBase + index;
+                if (key >= tokens) break;
+                // mode 3 drops the broadcast and mode 4 drops the second half of the
+                // row, which is how the fold's shuffles and its loads are priced apart.
+                // Both compute the wrong answer on purpose.
+                float tileWeight = mode == 3u
+                    ? weight
+                    : simd_shuffle(weight, (ushort)index);
+                device const float* valueRow = valuePlane + headBase + (uint64_t)key * headDim;
+                if (hasFirstDimension) {
+                    accumulatorA += tileWeight * valueRow[laneInSimd];
+                }
+                if (hasSecondDimension && mode != 4u) {
+                    accumulatorB += tileWeight * valueRow[laneInSimd + 32u];
+                }
+            }
+        }
+        runningMax = newMax;
+    }
+
+    float inverse = runningSum > 0.0f ? 1.0f / runningSum : 0.0f;
+    uint64_t outputBase = ((uint64_t)queryIdx * heads + headIdx) * headDim;
+    // Without the fold the accumulators are still written, from the denominator, so the
+    // dot half cannot be optimized away for having no consumer.
+    if (!runFold) {
+        accumulatorA = runningSum;
+        accumulatorB = runningSum;
+    }
+    if (hasFirstDimension) {
+        outputBuffer[outputBase + laneInSimd] = accumulatorA * inverse;
+    }
+    if (hasSecondDimension) {
+        outputBuffer[outputBase + laneInSimd + 32u] = accumulatorB * inverse;
+    }
+}
+
+/// MSL Kernel: `dsv41_vision_attention_pairfold_f32` -- the value fold, reshaped.
+///
+/// The ablation above puts two thirds of an attention dispatch in the fold (161 ms of
+/// 196 at the largest image) and only a fifth in the dot product, so the fold is where
+/// a shape change has to land. Two things about it are wrong, and this kernel changes
+/// both so they can be measured apart:
+///
+///   * **The dimensions a lane owns are 128 bytes apart.** A lane owns `laneInSimd` and
+///     `laneInSimd + 32`, so it reads two scalars from two different halves of the row
+///     and issues two loads per key. Owning `2 * laneInSimd` and `2 * laneInSimd + 1`
+///     instead makes the pair one aligned `float2`, which halves the fold's load count
+///     for the same 64 dimensions. `headDim` is validated even, so the pair is always
+///     whole.
+///   * **Every key adds into the same two accumulators.** That is a 32-long dependent
+///     FMA chain per tile, the same defect `#17` took 2.74x off a text key dot product
+///     with by splitting the reduction. The tile's additions therefore split across four
+///     accumulator pairs that are summed once at the end. The first version of this
+///     kernel made that split a runtime `foldUnroll` branch and measured 1.02x, which
+///     measured nothing but a branch: the fold here is unconditionally four-way, with no
+///     data-dependent exit from the body, so the loads can be hoisted.
+///
+/// Summation order therefore differs from the shipped kernel, so this one is held to
+/// the host rule (5e-4 relative) rather than to bit equality with it.
+kernel void dsv41_vision_attention_pairfold_f32(
+    device const float* queryPlane [[buffer(0)]],
+    device const float* keyPlane [[buffer(1)]],
+    device const float* valuePlane [[buffer(2)]],
+    device float* outputBuffer [[buffer(3)]],
+    constant uint32_t& tokens [[buffer(4)]],
+    constant uint32_t& heads [[buffer(5)]],
+    constant uint32_t& headDim [[buffer(6)]],
+    uint groupIdx [[threadgroup_position_in_grid]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
+) {
+    uint32_t simdCount = laneCount / 32u;
+    if (simdCount == 0u || simdCount > DSV41_VISION_QUERIES_PER_GROUP) return;
+    if (headDim == 0u || headDim > DSV41_VISION_HEAD_DIM_MAX) return;
+    uint32_t queryBlocks = (tokens + simdCount - 1u) / simdCount;
+    if (groupIdx >= heads * queryBlocks) return;
+
+    uint32_t headIdx = groupIdx / queryBlocks;
+    uint32_t blockIdx = groupIdx - headIdx * queryBlocks;
+    uint32_t queryIdx = blockIdx * simdCount + simdIdx;
+    if (queryIdx >= tokens) return;
+
+    float invSqrt = rsqrt((float)headDim);
+    // One aligned pair of dimensions per lane: `2 * lane` and `2 * lane + 1`.
+    uint32_t firstDimension = 2u * laneInSimd;
+    bool ownsPair = firstDimension + 1u < headDim;
+    uint64_t headBase = (uint64_t)headIdx * tokens * headDim;
+    device const float* queryHead = queryPlane + headBase + (uint64_t)queryIdx * headDim;
+
+    float runningMax = -1.0e30f;
+    float runningSum = 0.0f;
+    float accumulatorA0 = 0.0f;
+    float accumulatorA1 = 0.0f;
+    float accumulatorA2 = 0.0f;
+    float accumulatorA3 = 0.0f;
+    float accumulatorB0 = 0.0f;
+    float accumulatorB1 = 0.0f;
+    float accumulatorB2 = 0.0f;
+    float accumulatorB3 = 0.0f;
+    for (uint32_t tileBase = 0; tileBase < tokens; tileBase += 32u) {
+        uint32_t keyIdx = tileBase + laneInSimd;
+        bool inRange = keyIdx < tokens;
+        float score = -1.0e30f;
+        if (inRange) {
+            device const float* keyRow = keyPlane + headBase + (uint64_t)keyIdx * headDim;
+            float d0 = 0.0f;
+            float d1 = 0.0f;
+            float d2 = 0.0f;
+            float d3 = 0.0f;
+            uint32_t dim = 0u;
+            for (; dim + 3u < headDim; dim += 4u) {
+                d0 += queryHead[dim] * keyRow[dim];
+                d1 += queryHead[dim + 1u] * keyRow[dim + 1u];
+                d2 += queryHead[dim + 2u] * keyRow[dim + 2u];
+                d3 += queryHead[dim + 3u] * keyRow[dim + 3u];
+            }
+            for (; dim < headDim; ++dim) {
+                d0 += queryHead[dim] * keyRow[dim];
+            }
+            score = ((d0 + d1) + (d2 + d3)) * invSqrt;
+        }
+
+        float tileMax = simd_max(score);
+        float newMax = max(runningMax, tileMax);
+        float correction = exp(runningMax - newMax);
+        runningSum *= correction;
+        accumulatorA0 *= correction;
+        accumulatorA1 *= correction;
+        accumulatorA2 *= correction;
+        accumulatorA3 *= correction;
+        accumulatorB0 *= correction;
+        accumulatorB1 *= correction;
+        accumulatorB2 *= correction;
+        accumulatorB3 *= correction;
+        float weight = inRange ? exp(score - newMax) : 0.0f;
+        runningSum += simd_sum(weight);
+
+        // The weight broadcast is executed by EVERY lane of the group and only the
+        // accumulation is guarded. `simd_shuffle` is a group collective: run by a subset
+        // of a group -- which a narrow head does, because most lanes own no pair -- it
+        // hands the participating lanes another lane's weight, and the only symptom is a
+        // row that is 0.6 off on a narrow head while full width is exact.
+        uint32_t tileKeys = tokens - tileBase;
+        if (tileKeys > 32u) tileKeys = 32u;
+        uint32_t index = 0u;
+        for (; index + 3u < tileKeys; index += 4u) {
+            float w0 = simd_shuffle(weight, (ushort)(index + 0u));
+            float w1 = simd_shuffle(weight, (ushort)(index + 1u));
+            float w2 = simd_shuffle(weight, (ushort)(index + 2u));
+            float w3 = simd_shuffle(weight, (ushort)(index + 3u));
+            if (ownsPair) {
+                uint32_t key = tileBase + index;
+                device const float2* row0 = (device const float2*)(valuePlane
+                    + headBase + (uint64_t)(key + 0u) * headDim + firstDimension);
+                device const float2* row1 = (device const float2*)(valuePlane
+                    + headBase + (uint64_t)(key + 1u) * headDim + firstDimension);
+                device const float2* row2 = (device const float2*)(valuePlane
+                    + headBase + (uint64_t)(key + 2u) * headDim + firstDimension);
+                device const float2* row3 = (device const float2*)(valuePlane
+                    + headBase + (uint64_t)(key + 3u) * headDim + firstDimension);
+                float2 v0 = *row0;
+                float2 v1 = *row1;
+                float2 v2 = *row2;
+                float2 v3 = *row3;
+                accumulatorA0 += w0 * v0.x;
+                accumulatorB0 += w0 * v0.y;
+                accumulatorA1 += w1 * v1.x;
+                accumulatorB1 += w1 * v1.y;
+                accumulatorA2 += w2 * v2.x;
+                accumulatorB2 += w2 * v2.y;
+                accumulatorA3 += w3 * v3.x;
+                accumulatorB3 += w3 * v3.y;
+            }
+        }
+        for (; index < tileKeys; ++index) {
+            float tileWeight = simd_shuffle(weight, (ushort)index);
+            if (ownsPair) {
+                uint32_t key = tileBase + index;
+                device const float2* row = (device const float2*)(valuePlane
+                    + headBase + (uint64_t)key * headDim + firstDimension);
+                float2 value = *row;
+                accumulatorA0 += tileWeight * value.x;
+                accumulatorB0 += tileWeight * value.y;
+            }
+        }
+        runningMax = newMax;
+    }
+
+    float inverse = runningSum > 0.0f ? 1.0f / runningSum : 0.0f;
+    if (ownsPair) {
+        uint64_t outputBase = ((uint64_t)queryIdx * heads + headIdx) * headDim;
+        outputBuffer[outputBase + firstDimension] =
+            ((accumulatorA0 + accumulatorA1) + (accumulatorA2 + accumulatorA3)) * inverse;
+        outputBuffer[outputBase + firstDimension + 1u] =
+            ((accumulatorB0 + accumulatorB1) + (accumulatorB2 + accumulatorB3)) * inverse;
+    }
+}
+
+// MARK: - DeepSeek-V4.1 vision tower: what this GPU's SIMT FP32 rate actually is
+
+/// MSL Kernel: `dsv41_vision_fma_peak_f32` -- eight independent FMA chains per thread
+/// and nothing else, i.e. the fastest a SIMT FP32 kernel can go on this machine.
+///
+/// "DSV4.1 #44" tried four shapes of the attention dispatch -- the shipped one at four,
+/// eight and sixteen queries per threadgroup, a staged key tile, and a fold that owns an
+/// aligned `float2` pair across four accumulators -- and they all landed between 0.98x
+/// and 1.05x of the shipped kernel at the largest image. That is what a kernel at the
+/// processor's FP32 rate looks like, but "we are at the ceiling" is only worth writing
+/// down if the ceiling has been measured, so this is the measurement: the dispatch's
+/// own TFLOP/s against a loop that does nothing but multiply and add. Eight chains
+/// rather than one, because a single chain would measure FMA latency.
+kernel void dsv41_vision_fma_peak_f32(
+    device float* out [[buffer(0)]],
+    constant uint32_t& iterations [[buffer(1)]],
+    uint id [[thread_position_in_grid]]
+) {
+    float scale = 1.0f + (float)(id & 255u) * 1.0e-7f;
+    float a0 = scale;
+    float a1 = scale * 1.1f;
+    float a2 = scale * 1.2f;
+    float a3 = scale * 1.3f;
+    float a4 = scale * 1.4f;
+    float a5 = scale * 1.5f;
+    float a6 = scale * 1.6f;
+    float a7 = scale * 1.7f;
+    for (uint32_t step = 0u; step < iterations; ++step) {
+        a0 = fma(a0, scale, 0.5f);
+        a1 = fma(a1, scale, 0.5f);
+        a2 = fma(a2, scale, 0.5f);
+        a3 = fma(a3, scale, 0.5f);
+        a4 = fma(a4, scale, 0.5f);
+        a5 = fma(a5, scale, 0.5f);
+        a6 = fma(a6, scale, 0.5f);
+        a7 = fma(a7, scale, 0.5f);
+    }
+    out[id] = ((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7));
 }
 
 // MARK: - DeepSeek-V4.1 vision tower: the block GEMM
