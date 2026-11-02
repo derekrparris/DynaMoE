@@ -4664,4 +4664,321 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         if stage.hasSuffix("indexer") { return "indexer split" }
         return "other (\(stage))"
     }
+
+    // MARK: - Layer hand-off
+
+    /// What one layer's dense-to-expert hand-off costs, and what the layer had to read
+    /// to get there.
+    ///
+    /// `#48` put the walk's only genuine idle at this boundary -- 2.1-2.3 ms per layer
+    /// with the queue empty -- and could not reproduce it with a probe beside the walk
+    /// in any shape: launch count, grid size, bound bytes, resource count, barriers,
+    /// zero-copy memory, a read of what the host just wrote, the walk's own
+    /// alternation, a saturated co-tenant, or the same probe inside this process after
+    /// 402 positions. A probe cannot reproduce the one thing that might matter: the
+    /// LAYER. This case is 40 boundaries with each layer's own fill, routing and encode
+    /// attached, over three arms that hold the submission pattern fixed and vary only
+    /// what the layer did:
+    ///
+    ///   1. distinct tokens, the steady state a long walk spends its time in;
+    ///   2. an eight-token cycle, which leaves the arena holding every pair the walk
+    ///      asks for, so the fill reads nothing and the gap can be attributed to it or
+    ///      cleared of it;
+    ///   3. the same distinct tokens with a one-dispatch buffer committed immediately
+    ///      before each expert half, which separates "this process will not start work"
+    ///      from "this buffer will not start".
+    ///
+    /// Opt-in because it walks the real checkpoint three times.
+    func testWhatEachLayersExpertHalfHandoffCosts() throws {
+        let markerPath = "/tmp/dynamoe_dsv41_layer_gaps"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in layer hand-off attribution; touch \(markerPath) to run"
+        )
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: 512,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let executor = runtime.forward()
+
+        let positions = 202
+        let distinct = (0..<positions).map { 1_000 + ($0 * 37) }
+        let cycled = (0..<positions).map { 1_000 + (($0 % 8) * 37) }
+
+        // Discarded: it is what leaves the page cache holding this arm's 555 MB, so the
+        // paired arms below are not the first-read arm paying for a cold disk.
+        _ = try layerGapArm(executor: executor, tokens: distinct, probe: false, touch: false)
+
+        // Alternating A/B on the same tokens and the same warm page cache. The read-back
+        // is the only difference between the pair, so an ordering or caching effect shows
+        // up as the two "off" arms disagreeing with each other.
+        var paired: [(label: String, touch: Bool, samples: [DeepSeekV41LayerGapSample])] = []
+        for round in ["A", "B"] {
+            for touch in [false, true] {
+                let label = (touch ? "read-back " : "plain      ") + round
+                let samples = try layerGapArm(
+                    executor: executor, tokens: distinct, probe: false, touch: touch
+                )
+                paired.append((label, touch, samples))
+                reportLayerGaps(
+                    label + (touch ? " (fill read back on the committing thread)" : " (no read-back)"),
+                    samples: samples
+                )
+            }
+        }
+        reportPairedArms(paired)
+
+        // The cache is reset by the arm so the walk starts from position 0 again; the
+        // ARENA deliberately is not, because this arm's point is a fill that reads
+        // nothing. It is the floor: the same 40 boundaries with no I/O at all.
+        let warm = try layerGapArm(executor: executor, tokens: cycled, probe: false, touch: false)
+        reportLayerGaps("warm (8-token cycle, zero-byte fill)", samples: warm)
+
+        // A third fill level, between the zero-byte arm and the full one, because two
+        // points can only say "the gap needs I/O"; three can say whether it scales with
+        // it, which is what makes the arena's hit rate worth what it is worth.
+        let partial = (0..<positions).map { 1_000 + (($0 % 96) * 37) }
+        let midway = try layerGapArm(
+            executor: executor, tokens: partial, probe: false, touch: false
+        )
+        reportLayerGaps("partial (96-token cycle)", samples: midway)
+
+        let probed = try layerGapArm(executor: executor, tokens: distinct, probe: true, touch: false)
+        reportLayerGaps("probed (trivial buffer before the expert half)", samples: probed)
+        reportProbeArm(samples: probed)
+
+        reportFillCurve([
+            ("zero-byte fill", warm),
+            ("partial fill", midway),
+            ("full fill (plain A)", paired[0].samples),
+            ("full fill (plain B)", paired[2].samples)
+        ])
+
+        print("🔎 [dsv41 real] \(runtime.describe())")
+        withExtendedLifetime(engine) {}
+    }
+
+    /// The A/B itself: two rounds, alternating, so a caching or ordering effect appears
+    /// as the two read-back-off arms disagreeing rather than as a difference between the
+    /// conditions.
+    private func reportPairedArms(
+        _ arms: [(label: String, touch: Bool, samples: [DeepSeekV41LayerGapSample])]
+    ) {
+        func stats(_ samples: [DeepSeekV41LayerGapSample]) -> (mean: Double, median: Double) {
+            let idle = samples.map(\.idleMilliseconds).sorted()
+            guard !idle.isEmpty else { return (0, 0) }
+            return (idle.reduce(0, +) / Double(idle.count), idle[idle.count / 2])
+        }
+        var off: [Double] = []
+        var on: [Double] = []
+        for arm in arms {
+            let reading = stats(arm.samples)
+            print(
+                "🔎 [dsv41 real] pair \(arm.label): idle mean "
+                    + String(format: "%.3f ms, median %.3f ms over %d layer(s)",
+                             reading.mean, reading.median, arm.samples.count)
+            )
+            if arm.touch { on.append(reading.mean) } else { off.append(reading.mean) }
+        }
+        guard !off.isEmpty, !on.isEmpty else { return }
+        let offMean = off.reduce(0, +) / Double(off.count)
+        let onMean = on.reduce(0, +) / Double(on.count)
+        print(
+            "🔎 [dsv41 real] pair summary: no read-back "
+                + String(format: "%.3f ms against %.3f ms with it (%.2fx)",
+                         offMean, onMean, offMean / max(onMean, 0.0001))
+                + String(format: "; the two off arms differ by %.3f ms",
+                         off.count > 1 ? (off.max()! - off.min()!) : 0)
+        )
+    }
+
+    /// Three fill levels against the same 40 boundaries: the gap is a property of the
+    /// walk's I/O, so the question is whether it tracks how much was read.
+    private func reportFillCurve(
+        _ arms: [(String, [DeepSeekV41LayerGapSample])]
+    ) {
+        for (label, samples) in arms {
+            guard !samples.isEmpty else { continue }
+            let fill = samples.map { Double($0.fillBytes) / 1_048_576 }.reduce(0, +)
+                / Double(samples.count)
+            let idle = samples.map(\.idleMilliseconds)
+            let mean = idle.reduce(0, +) / Double(idle.count)
+            let median = idle.sorted()[idle.count / 2]
+            print(
+                "🔎 [dsv41 real] curve " + label + ": fill "
+                    + String(format: "%.1f MB/layer -> idle mean %.3f ms, median %.3f ms",
+                             fill, mean, median)
+            )
+        }
+    }
+
+    /// Walks `tokens` with the hand-off recorder off, then records the LAST position
+    /// only, so the samples are one steady-state position's layers rather than every
+    /// position's behind-the-warm-up average.
+    private func layerGapArm(
+        executor: DeepSeekV41MetalForward,
+        tokens: [Int],
+        probe: Bool,
+        touch: Bool
+    ) throws -> [DeepSeekV41LayerGapSample] {
+        executor.reset()
+        executor.recordsLayerGaps = false
+        executor.recordsMixtureStartProbe = false
+        executor.touchesFilledRanges = touch
+        for (position, token) in tokens.enumerated() where position < tokens.count - 1 {
+            _ = try executor.forwardToken(token, position: position)
+        }
+        executor.resetWalkTiming()
+        executor.recordsLayerGaps = true
+        executor.recordsMixtureStartProbe = probe
+        _ = try executor.forwardToken(tokens[tokens.count - 1], position: tokens.count - 1)
+        executor.recordsLayerGaps = false
+        executor.recordsMixtureStartProbe = false
+        executor.touchesFilledRanges = false
+        return executor.layerGaps
+    }
+
+    /// Prints one arm's boundaries, then the correlations the slice is asking about:
+    /// does the gap track what the layer read, does it survive a layer that read
+    /// nothing, and is it different on a layer that also runs the compressed half.
+    private func reportLayerGaps(
+        _ label: String,
+        samples: [DeepSeekV41LayerGapSample]
+    ) {
+        guard !samples.isEmpty else {
+            print("🔎 [dsv41 real] layer gaps (\(label)): no samples")
+            return
+        }
+        print("🔎 [dsv41 real] layer gaps (\(label)): \(samples.count) layer(s)")
+        for sample in samples.sorted(by: { $0.layer < $1.layer }) {
+            print(
+                "🔎 [dsv41 real]   layer " + String(format: "%2d", sample.layer)
+                    + (sample.compressed ? " c" : "  ")
+                    + String(format: ": idle %.3f ms, host gap %.3f ms (routing %.3f + encode %.3f)",
+                             sample.idleMilliseconds,
+                             sample.hostGapMilliseconds,
+                             Double(sample.routingNanoseconds) / 1_000_000,
+                             Double(sample.mixtureEncodeNanoseconds) / 1_000_000)
+                    + String(format: ", fill %.1f MB / %d miss (%d new slot) in %.3f + %.3f ms",
+                             Double(sample.fillBytes) / 1_048_576,
+                             sample.fillMisses,
+                             sample.fillSlotsAllocated,
+                             1_000 * sample.fillReadSeconds,
+                             1_000 * sample.fillPlacementSeconds)
+                    + String(format: ", %d expert(s), window %.3f ms",
+                             sample.expertCount, sample.mixtureWindowMilliseconds)
+            )
+        }
+
+        let idle = samples.map(\.idleMilliseconds).sorted()
+        let total = idle.reduce(0, +)
+        let median = idle[idle.count / 2]
+        let windowed = samples.filter(\.hasWindow).count
+        print(
+            "🔎 [dsv41 real]   idle total " + String(format: "%.1f ms", total)
+                + String(format: " (mean %.3f, median %.3f, min %.3f, max %.3f per layer), %d/%d windowed",
+                         total / Double(samples.count), median, idle.first ?? 0,
+                         idle.last ?? 0, windowed, samples.count)
+        )
+        // The host's own gap is GPU idle too: the dense half is drained before the
+        // fill starts, so the routing readback, the pread and the encode all run with
+        // nothing queued. Counting only the post-commit part understates the GPU's
+        // idle budget by however long the fill took.
+        let hostGaps = samples.map(\.hostGapMilliseconds)
+        let device = samples.map(\.mixtureWindowMilliseconds).reduce(0, +)
+        print(
+            "🔎 [dsv41 real]   host gap total " + String(format: "%.1f ms", hostGaps.reduce(0, +))
+                + String(format: " (mean %.3f ms/layer), expert halves ran %.1f ms", 
+                         hostGaps.reduce(0, +) / Double(samples.count), device)
+                + String(format: " -> GPU idle including the host's gap %.1f ms of %.1f ms unaccounted",
+                         hostGaps.reduce(0, +) + total,
+                         hostGaps.reduce(0, +) + total + device)
+        )
+
+        // The attribution the arm exists for: a layer whose experts were all resident
+        // read nothing, so a gap that survives there cannot be the fill -- neither the
+        // pread nor the dirty lines its worker threads leave for the GPU to pick up.
+        let quiet = samples.filter { $0.fillBytes == 0 }
+        let busy = samples.filter { $0.fillBytes > 0 }
+        let meanQuiet = quiet.isEmpty
+            ? 0 : quiet.map(\.idleMilliseconds).reduce(0, +) / Double(quiet.count)
+        let meanBusy = busy.isEmpty
+            ? 0 : busy.map(\.idleMilliseconds).reduce(0, +) / Double(busy.count)
+        print(
+            "🔎 [dsv41 real]   idle with a zero-byte fill: "
+                + String(format: "%.3f ms over %d layer(s); with a non-zero fill %.3f ms over %d",
+                         meanQuiet, quiet.count, meanBusy, busy.count)
+        )
+        let compressed = samples.filter(\.compressed)
+        let windowOnly = samples.filter { !$0.compressed }
+        if !compressed.isEmpty, !windowOnly.isEmpty {
+            print(
+                "🔎 [dsv41 real]   idle on the compressed half: "
+                    + String(format: "%.3f ms over %d layer(s); window-only %.3f ms over %d",
+                             compressed.map(\.idleMilliseconds).reduce(0, +)
+                                / Double(compressed.count),
+                             compressed.count,
+                             windowOnly.map(\.idleMilliseconds).reduce(0, +)
+                                / Double(windowOnly.count),
+                             windowOnly.count)
+            )
+        }
+        print(
+            "🔎 [dsv41 real]   the recorded layer read "
+                + String(format: "%.1f MB in %d miss(es)",
+                         samples.map { Double($0.fillBytes) / 1_048_576 }.reduce(0, +),
+                         samples.map(\.fillMisses).reduce(0, +))
+        )
+    }
+
+    /// The probe arm's own reading: a one-dispatch buffer committed just before the
+    /// expert half. If it stalls too, the delay belongs to the process; if it starts at
+    /// once, the delay is the expert half's.
+    private func reportProbeArm(samples: [DeepSeekV41LayerGapSample]) {
+        let probed = samples.filter {
+            $0.probeWindowEndNanoseconds > $0.probeWindowStartNanoseconds
+        }
+        guard !probed.isEmpty else {
+            print("🔎 [dsv41 real]   probe: no probe window reported")
+            return
+        }
+        let windows = probed.map(\.probeWindowMilliseconds).sorted()
+        let mixture = probed.map(\.mixtureWindowMilliseconds).sorted()
+        print(
+            "🔎 [dsv41 real]   probe: \(probed.count) one-dispatch buffer(s), window "
+                + String(format: "median %.4f ms, max %.4f; expert half median %.3f ms",
+                         windows[windows.count / 2], windows.last ?? 0,
+                         mixture[mixture.count / 2])
+        )
+        // The discriminating pair: both buffers were committed into the same queue a
+        // few hundred microseconds apart, with nothing in flight. A probe that starts in
+        // a tenth of a millisecond while the expert half waits milliseconds means the
+        // delay is the expert buffer's own content, not the queue's willingness to run.
+        let pickups = probed.map(\.probePickupMilliseconds).sorted()
+        let mixes = probed.map(\.pickupMilliseconds).sorted()
+        print(
+            "🔎 [dsv41 real]   probe pickup median "
+                + String(format: "%.4f ms (max %.4f) against the expert half's %.3f ms",
+                         pickups[pickups.count / 2], pickups.last ?? 0, mixes[mixes.count / 2])
+        )
+        // Both windows follow the same dense half, so a probe that is still running when
+        // the expert half starts means the queue never went empty; a probe that finished
+        // first and left the queue idle again is the case where the gap is the buffer's.
+        let overlaps = probed.filter {
+            $0.probeWindowEndNanoseconds > $0.mixtureWindowStartNanoseconds
+        }.count
+        print(
+            "🔎 [dsv41 real]   probe ran into the expert half in \(overlaps) of \(probed.count) "
+                + "layer(s)"
+        )
+    }
 }

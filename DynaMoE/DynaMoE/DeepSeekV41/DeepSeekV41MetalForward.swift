@@ -1068,6 +1068,146 @@ nonisolated public struct DeepSeekV41WalkTimelineEntry: Sendable, Equatable {
     }
 }
 
+/// One layer's hand-off from its dense half to its expert half, with what the layer
+/// had to read to get there.
+///
+/// Off unless `DeepSeekV41MetalForward.recordsLayerGaps` is on. `#48` located the
+/// walk's only genuine idle at this boundary: 2.1-2.3 ms per layer with the queue
+/// empty, while a submission handed to an idle queue starts in a tenth of a
+/// millisecond in every shape a probe can hold. A probe beside the walk cannot
+/// explain that, because the one thing it cannot reproduce is the layer. This record
+/// is one boundary with the layer's own numbers attached, so 40 of them can be
+/// correlated with what each layer did rather than averaged into "2.2 ms per layer".
+///
+/// `idleMilliseconds` is the GPU doing nothing, counted from the later of the dense
+/// half's retirement and the expert half's commit: work queued behind the dense half
+/// is a queue wait, which is real GPU time and not idle.
+nonisolated public struct DeepSeekV41LayerGapSample: Sendable, Equatable {
+    public let layer: Int
+    public let position: Int
+    /// When the layer's dense half finished on the device.
+    public let frontWindowEndNanoseconds: UInt64
+    /// When the host handed the expert half to the driver.
+    public let mixtureCommitNanoseconds: UInt64
+    /// The expert half's own device window, zero when Metal reported none.
+    public let mixtureWindowStartNanoseconds: UInt64
+    public let mixtureWindowEndNanoseconds: UInt64
+    /// What the fill pulled off disk for this layer's routed experts.
+    public let fillBytes: Int
+    public let fillMisses: Int
+    public let fillSlotsAllocated: Int
+    /// Wall time inside the fill's `pread` batches, and inside the arena's placement.
+    public let fillReadSeconds: Double
+    public let fillPlacementSeconds: Double
+    /// Host time in the routing readback and in encoding the expert half.
+    public let routingNanoseconds: UInt64
+    public let mixtureEncodeNanoseconds: UInt64
+    /// How many experts the router selected.
+    public let expertCount: Int
+    /// Whether this layer runs the compressed half (compressor and indexer).
+    public let compressed: Bool
+    /// A one-dispatch command buffer committed immediately before the expert half,
+    /// when `recordsMixtureStartProbe` is on. Its window is what separates "this
+    /// process will not start work quickly" from "this buffer will not start quickly".
+    public let probeWindowStartNanoseconds: UInt64
+    public let probeWindowEndNanoseconds: UInt64
+    /// When the probe itself was committed, so its own commit-to-start can be priced.
+    public let probeCommitNanoseconds: UInt64
+
+    public init(
+        layer: Int,
+        position: Int,
+        frontWindowEndNanoseconds: UInt64,
+        mixtureCommitNanoseconds: UInt64,
+        mixtureWindowStartNanoseconds: UInt64,
+        mixtureWindowEndNanoseconds: UInt64,
+        fillBytes: Int,
+        fillMisses: Int,
+        fillSlotsAllocated: Int,
+        fillReadSeconds: Double,
+        fillPlacementSeconds: Double,
+        routingNanoseconds: UInt64,
+        mixtureEncodeNanoseconds: UInt64,
+        expertCount: Int,
+        compressed: Bool,
+        probeWindowStartNanoseconds: UInt64,
+        probeWindowEndNanoseconds: UInt64,
+        probeCommitNanoseconds: UInt64
+    ) {
+        self.layer = layer
+        self.position = position
+        self.frontWindowEndNanoseconds = frontWindowEndNanoseconds
+        self.mixtureCommitNanoseconds = mixtureCommitNanoseconds
+        self.mixtureWindowStartNanoseconds = mixtureWindowStartNanoseconds
+        self.mixtureWindowEndNanoseconds = mixtureWindowEndNanoseconds
+        self.fillBytes = fillBytes
+        self.fillMisses = fillMisses
+        self.fillSlotsAllocated = fillSlotsAllocated
+        self.fillReadSeconds = fillReadSeconds
+        self.fillPlacementSeconds = fillPlacementSeconds
+        self.routingNanoseconds = routingNanoseconds
+        self.mixtureEncodeNanoseconds = mixtureEncodeNanoseconds
+        self.expertCount = expertCount
+        self.compressed = compressed
+        self.probeWindowStartNanoseconds = probeWindowStartNanoseconds
+        self.probeWindowEndNanoseconds = probeWindowEndNanoseconds
+        self.probeCommitNanoseconds = probeCommitNanoseconds
+    }
+
+    /// Whether Metal reported a window for the expert half at all.
+    public var hasWindow: Bool {
+        mixtureWindowEndNanoseconds > mixtureWindowStartNanoseconds
+    }
+
+    /// How long the expert half itself ran on the device.
+    public var mixtureWindowMilliseconds: Double {
+        guard hasWindow else { return 0 }
+        return Double(mixtureWindowEndNanoseconds - mixtureWindowStartNanoseconds) / 1_000_000
+    }
+
+    /// The GPU doing nothing between the dense half retiring and the expert half
+    /// starting, counted from the later of the two.
+    public var idleMilliseconds: Double {
+        let ready = max(frontWindowEndNanoseconds, mixtureCommitNanoseconds)
+        guard mixtureWindowStartNanoseconds > ready else { return 0 }
+        return Double(mixtureWindowStartNanoseconds - ready) / 1_000_000
+    }
+
+    /// Commit to device start. This is `#48`'s per-buffer figure, which on this
+    /// boundary is the idle above, because the host waits for the dense half before
+    /// it can encode the expert half at all.
+    public var pickupMilliseconds: Double {
+        guard mixtureWindowStartNanoseconds > mixtureCommitNanoseconds else { return 0 }
+        return Double(mixtureWindowStartNanoseconds - mixtureCommitNanoseconds) / 1_000_000
+    }
+
+    /// How long the host spent between the dense half retiring and committing the
+    /// expert half: the routing readback, the fill and the encode.
+    public var hostGapMilliseconds: Double {
+        guard mixtureCommitNanoseconds > frontWindowEndNanoseconds else { return 0 }
+        return Double(mixtureCommitNanoseconds - frontWindowEndNanoseconds) / 1_000_000
+    }
+
+    /// The probe buffer's own commit-to-start is not knowable from here (it is
+    /// committed just before the expert half, so its commit stamp is not recorded),
+    /// which is why the probe reports its window rather than a pickup. What matters is
+    /// whether it ran at all, and how far ahead of the expert half it finished.
+    public var probeWindowMilliseconds: Double {
+        guard probeWindowEndNanoseconds > probeWindowStartNanoseconds else { return 0 }
+        return Double(probeWindowEndNanoseconds - probeWindowStartNanoseconds) / 1_000_000
+    }
+
+    /// The probe's own commit-to-start. This is the number that separates the two
+    /// remaining explanations of the expert half's delay: a trivial buffer committed
+    /// into the same empty queue at the same moment either starts at once, which makes
+    /// the delay the expert buffer's own content, or it waits too, which makes it the
+    /// queue or the process.
+    public var probePickupMilliseconds: Double {
+        guard probeWindowStartNanoseconds > probeCommitNanoseconds else { return 0 }
+        return Double(probeWindowStartNanoseconds - probeCommitNanoseconds) / 1_000_000
+    }
+}
+
 /// One loaded DeepSeek-V4.1 checkpoint, driven one position at a time.
 ///
 /// `forwardToken` appends exactly one position (the cache holds every position the
@@ -1350,6 +1490,69 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         ObjectIdentifier: (stage: String, commit: UInt64, waitBegin: UInt64, waitEnd: UInt64)
     ] = [:]
 
+    /// One record per layer hand-off, with the layer's own fill numbers attached. Off
+    /// by default and off in every production path: it retains a command buffer per
+    /// layer until that layer's expert half is drained.
+    public var recordsLayerGaps = false
+    public private(set) var layerGaps: [DeepSeekV41LayerGapSample] = []
+    /// Commits a one-dispatch buffer immediately before each layer's expert half, so a
+    /// gap that belongs to the PROCESS can be told from one that belongs to the BUFFER.
+    /// Measurement only; it adds two submissions per layer.
+    public var recordsMixtureStartProbe = false
+    /// Reads every page of a layer's fill back on the thread that commits its expert
+    /// half. Measurement only (`#49`): it is what separates a gap that is the pread
+    /// itself from a gap that is the writeback the pread left on other cores.
+    public var touchesFilledRanges: Bool {
+        get { streamer?.touchesFilledRanges ?? false }
+        set { streamer?.touchesFilledRanges = newValue }
+    }
+    /// Host-side fields for a layer whose expert half has been committed but not yet
+    /// drained. Keyed by the expert half's buffer, because that is the buffer whose
+    /// completion closes the record.
+    private var pendingLayerGaps: [
+        ObjectIdentifier: PendingLayerGap
+    ] = [:]
+
+    /// When the most recent `commit()` handed its buffer to the driver. Recorded only
+    /// while `recordsLayerGaps` is on, so a turn reads no extra clock.
+    private var lastCommitNanoseconds: UInt64 = 0
+
+    /// One snapshot of the expert streamer's own counters, so a layer's fill is
+    /// measured as a delta rather than as a running total.
+    private func streamerCounters()
+        -> (bytes: Int, misses: Int, slots: Int, reading: Double, placing: Double) {
+        guard let streamer else { return (0, 0, 0, 0, 0) }
+        let timing = streamer.timing
+        let placement = streamer.placementTiming
+        return (
+            streamer.bytesRead,
+            streamer.expertsLoaded,
+            timing.slotsAllocated,
+            timing.reading,
+            placement.seconds
+        )
+    }
+
+    /// The half of a layer record that is known before the GPU has run it.
+    private struct PendingLayerGap {
+        let layer: Int
+        let position: Int
+        let frontWindowEndNanoseconds: UInt64
+        let commitNanoseconds: UInt64
+        let fillBytes: Int
+        let fillMisses: Int
+        let fillSlotsAllocated: Int
+        let fillReadSeconds: Double
+        let fillPlacementSeconds: Double
+        let routingNanoseconds: UInt64
+        let mixtureEncodeNanoseconds: UInt64
+        let expertCount: Int
+        let compressed: Bool
+        /// Held only so its window can be read once the queue has run it.
+        let probe: MTLCommandBuffer?
+        let probeCommitNanoseconds: UInt64
+    }
+
     /// Clears the walk accumulation.
     public func resetWalkTiming() {
         walkTiming = DeepSeekV41WalkTiming()
@@ -1357,6 +1560,8 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         walkTimeline.removeAll(keepingCapacity: true)
         walkTimelinePositions = 0
         walkTimelineCommits.removeAll(keepingCapacity: true)
+        layerGaps.removeAll(keepingCapacity: true)
+        pendingLayerGaps.removeAll(keepingCapacity: true)
     }
 
     /// Clears the per-stage accumulation.
@@ -3282,6 +3487,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
 
     private func runLayer(_ layer: DeepSeekV41LayerPlan, at position: Int) throws {
         let measuring = recordsWalkTiming
+        let gapMeasuring = recordsLayerGaps
         let started = measuring ? DispatchTime.now().uptimeNanoseconds : 0
         // Engram rows are host reads, so they are issued before the layer's command
         // buffer exists rather than in the middle of an encode. Each table has its
@@ -3321,16 +3527,26 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             }
         }
         frontEncoder.endEncoding()
-        let frontEncoded = measuring ? DispatchTime.now().uptimeNanoseconds : 0
+        let frontEncoded = (measuring || gapMeasuring)
+            ? DispatchTime.now().uptimeNanoseconds : 0
         // The routing readback below needs this half finished on the host. It also
         // drains the previous layer's expert half, which is what makes the arena
         // slots free to overwrite: a pread here can never land under a kernel that
         // is still reading the slot it replaces.
         try commit(frontBuffer, stage: "layer \(layer.index) attention")
 
+        // The dense half is drained above, so its device window is final: this is the
+        // moment the GPU became free for the expert half.
+        let frontEnd = (measuring || gapMeasuring)
+            ? UInt64(frontBuffer.gpuEndTime * 1_000_000_000) : 0
+
         // The mixture binds per-expert byte offsets, which are host values.
+        let streamedBefore = gapMeasuring ? streamerCounters() : nil
+        let routingStarted = gapMeasuring ? DispatchTime.now().uptimeNanoseconds : 0
         let routing = readRouting()
-        let fillStarted = measuring ? DispatchTime.now().uptimeNanoseconds : 0
+        let routingEnded = gapMeasuring ? DispatchTime.now().uptimeNanoseconds : 0
+        let fillStarted = (measuring || gapMeasuring)
+            ? DispatchTime.now().uptimeNanoseconds : 0
 
         // Filled from disk before the expert half is encoded, so the kernels read
         // the slots rather than faulting the shard mapping a page at a time.
@@ -3341,7 +3557,31 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 experts: routing.expertIDs
             )
         }
-        let filled = measuring ? DispatchTime.now().uptimeNanoseconds : 0
+        let filled = (measuring || gapMeasuring)
+            ? DispatchTime.now().uptimeNanoseconds : 0
+        let streamedAfter = gapMeasuring ? streamerCounters() : nil
+
+        // Measurement only (`recordsMixtureStartProbe`): a one-dispatch buffer
+        // committed immediately before the expert half. If this waits as long as the
+        // expert half does, the delay belongs to the queue or the process; if it starts
+        // at once, the delay belongs to the expert half itself.
+        var startProbe: MTLCommandBuffer?
+        var probeCommit: UInt64 = 0
+        if gapMeasuring, recordsMixtureStartProbe {
+            if calibrationScratch == nil {
+                calibrationScratch = device.makeBuffer(length: 1024, options: .storageModeShared)
+            }
+            if let scratch = calibrationScratch {
+                let probe = try makeCommandBuffer()
+                let probeEncoder = try makeEncoder(probe)
+                try encodeClear(probeEncoder, buffer: scratch, count: 4)
+                probeEncoder.endEncoding()
+                probe.commit()
+                lastCommitNanoseconds = DispatchTime.now().uptimeNanoseconds
+                probeCommit = lastCommitNanoseconds
+                startProbe = probe
+            }
+        }
 
         let expertCommand = try makeCommandBuffer()
         let expertEncoder = try makeEncoder(expertCommand)
@@ -3356,10 +3596,32 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             )
         }
         expertEncoder.endEncoding()
-        let mixtureEncoded = measuring ? DispatchTime.now().uptimeNanoseconds : 0
+        let mixtureEncoded = (measuring || gapMeasuring)
+            ? DispatchTime.now().uptimeNanoseconds : 0
         // No readback of this half exists, so it is only ordered: the next layer's
         // front half commits behind it on the same queue.
         try commit(expertCommand, stage: "layer \(layer.index) experts", waiting: false, mixture: true)
+
+        if gapMeasuring {
+            pendingLayerGaps[ObjectIdentifier(expertCommand)] = PendingLayerGap(
+                layer: layer.index,
+                position: position,
+                frontWindowEndNanoseconds: frontEnd,
+                commitNanoseconds: lastCommitNanoseconds,
+                fillBytes: (streamedAfter?.bytes ?? 0) - (streamedBefore?.bytes ?? 0),
+                fillMisses: (streamedAfter?.misses ?? 0) - (streamedBefore?.misses ?? 0),
+                fillSlotsAllocated: (streamedAfter?.slots ?? 0) - (streamedBefore?.slots ?? 0),
+                fillReadSeconds: (streamedAfter?.reading ?? 0) - (streamedBefore?.reading ?? 0),
+                fillPlacementSeconds: (streamedAfter?.placing ?? 0)
+                    - (streamedBefore?.placing ?? 0),
+                routingNanoseconds: routingEnded - routingStarted,
+                mixtureEncodeNanoseconds: mixtureEncoded - filled,
+                expertCount: routing.expertIDs.count,
+                compressed: layer.compressRatio > 1,
+                probe: startProbe,
+                probeCommitNanoseconds: probeCommit
+            )
+        }
 
         if measuring {
             // The indexer split's wait is measured inside the encode loop, so it is
@@ -4910,6 +5172,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         mixture: Bool = false
     ) throws {
         commandBuffer.commit()
+        if recordsLayerGaps {
+            lastCommitNanoseconds = DispatchTime.now().uptimeNanoseconds
+        }
         if recordsWalkTimeline, walkTimelinePositions < walkTimelineLimit {
             walkTimelineCommits[ObjectIdentifier(commandBuffer)] = (
                 stage: stage,
@@ -4971,6 +5236,37 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             }
             if let error = entry.buffer.error {
                 throw DeepSeekV41EngineError.commandFailed("\(entry.stage): \(error)")
+            }
+            // The expert half has now run, so its window is final and the layer's
+            // hand-off can be closed. Reading it here rather than in the layer loop is
+            // the whole point: this buffer has no host reader, so it is only ever
+            // drained by the NEXT layer's dense half.
+            if let gap = pendingLayerGaps.removeValue(forKey: ObjectIdentifier(entry.buffer)) {
+                let start = entry.buffer.gpuStartTime
+                let finish = entry.buffer.gpuEndTime
+                func stamp(_ seconds: CFTimeInterval) -> UInt64 {
+                    seconds > 0 ? UInt64(seconds * 1_000_000_000) : 0
+                }
+                layerGaps.append(DeepSeekV41LayerGapSample(
+                    layer: gap.layer,
+                    position: gap.position,
+                    frontWindowEndNanoseconds: gap.frontWindowEndNanoseconds,
+                    mixtureCommitNanoseconds: gap.commitNanoseconds,
+                    mixtureWindowStartNanoseconds: stamp(start),
+                    mixtureWindowEndNanoseconds: stamp(finish),
+                    fillBytes: gap.fillBytes,
+                    fillMisses: gap.fillMisses,
+                    fillSlotsAllocated: gap.fillSlotsAllocated,
+                    fillReadSeconds: gap.fillReadSeconds,
+                    fillPlacementSeconds: gap.fillPlacementSeconds,
+                    routingNanoseconds: gap.routingNanoseconds,
+                    mixtureEncodeNanoseconds: gap.mixtureEncodeNanoseconds,
+                    expertCount: gap.expertCount,
+                    compressed: gap.compressed,
+                    probeWindowStartNanoseconds: gap.probe.map { stamp($0.gpuStartTime) } ?? 0,
+                    probeWindowEndNanoseconds: gap.probe.map { stamp($0.gpuEndTime) } ?? 0,
+                    probeCommitNanoseconds: gap.probeCommitNanoseconds
+                ))
             }
         }
     }

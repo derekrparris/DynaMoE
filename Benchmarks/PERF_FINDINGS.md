@@ -8445,3 +8445,142 @@ The published numbers are the app's own `-O` build in `/tmp/dd_dsv41_opt` (posit
 load average 3.2-3.6; the probe arms are Debug and run in under 3 s together.
 
 Nothing in the production path changed: no kernel, no encoder, no submission pattern.
+
+## DSV4.1 #49: THE GAP BEFORE A LAYER'S EXPERT HALF IS THE WALK'S I/O, AND IT COSTS A SECOND READING OF THE SAME BYTES
+
+### Question
+
+`#48` left the port with exactly one unexplained number. A walked position's genuine idle --
+the GPU with nothing queued -- was 87-94 ms of a 218-232 ms position, and 97% of it sat at a
+single boundary per layer: the hand-off from the layer's dense half to its expert half, 2.11-
+2.29 ms across 40 boundaries, with the host already finished. A probe beside the walk could not
+reproduce it in any shape it could hold (1-128 launches, a million-lane grid, 2 GiB of bound
+memory, 512 named resources, a barrier per launch, zero-copy mapped memory, a 64 MB read of what
+the host had just written, the walk's own alternation, a co-tenant saturating the GPU, and the
+same probe inside this process after 402 positions): every arm started in a tenth of a
+millisecond. The one thing a probe beside the walk cannot reproduce is the LAYER.
+
+So this slice instrumented the layer. Three instruments, none of them beside the walk:
+
+1. `DeepSeekV41MetalForward.recordsLayerGaps` -- one `DeepSeekV41LayerGapSample` per layer, closed
+   when that layer's expert half is drained by the next layer's dense half, carrying the dense
+   half's window end, the expert half's commit stamp and window, and the layer's own fill numbers
+   (bytes, misses, slots allocated, pread seconds, placement seconds) plus its routing read and
+   its encode.
+2. A zero-byte-fill arm: the same 40 boundaries and the same submissions over an eight-token
+   cycle, which leaves the arena holding every pair the walk asks for, so the fill reads nothing.
+3. A one-dispatch command buffer committed immediately before each expert half, carrying its own
+   commit stamp, which separates "the queue will not start work" from "this buffer will not
+   start".
+
+A fourth instrument -- reading every page of the fill back on the committing thread, to move the
+dirty lines to the core that commits -- was built, measured, and WITHDRAWN (below).
+
+### The gap tracks how much the walk read, and nothing else about the layer
+
+Four fill levels, one runtime, one process, one `-O` build (`/tmp/dd_dsv41_opt`), each arm
+recording one steady-state position's 40 boundaries. `idle` is the GPU with nothing queued, from
+the later of the dense half's retirement and the expert half's commit:
+
+| arm | fill / layer | idle mean | idle median | idle total over 40 layers | host gap mean |
+|---|---|---|---|---|---|
+| zero-byte fill (8-token cycle) | 0.0 MB | **0.145 ms** | **0.091 ms** | 5.8 ms | 0.167 ms |
+| partial fill (96-token cycle) | 7.2 MB | 1.343 ms | 0.932 ms | 53.7 ms | 1.381 ms |
+| full fill, plain A | 13.9 MB | 2.146 ms | 1.318 ms | 85.9 ms | 2.581 ms |
+| full fill, plain B | 13.9 MB | 2.314 ms | 1.410 ms | 92.6 ms | 2.357 ms |
+
+Two points can only say "the gap needs I/O". Three say it scales with it, and the fit is
+uncomfortably tight to the disk: the median slope is **0.088-0.117 ms of GPU idle per MB read**,
+and one MB off a 13.8 GB/s disk is 0.0725 ms. So the hand-off after a fill idles for **1.2-1.6x
+the time the bytes themselves took**, and the mean slope (0.144-0.166 ms/MB) says up to 2.3x
+because the distribution is spiky rather than smooth.
+
+What the layer itself did barely matters. Within a full-fill arm, 19 of the 40 layers read
+NOTHING -- their pairs were resident -- and they still idle 1.56-1.65 ms each, against 0.091 ms
+for the same boundary with no I/O anywhere in the walk. The correlation between a layer's own
+fill and its gap is +0.24. What predicts the gap is that the WALK is reading, not that this LAYER
+read.
+
+### It is not the submission, and it is not the writeback
+
+The probe settles the first half. A one-dispatch clear carrying 16 bytes, committed into the same
+empty queue a few hundred microseconds before the expert half, starts in **0.1019 ms** (max 0.645)
+while the expert half takes **1.573 ms** in the same position; in 0 of 40 layers did the probe
+still be running when the expert half started. `#48` was right that the queue is willing: a
+trivial buffer committed at that exact moment starts at once. What does not start at once is the
+expert half itself -- and no bound resource, grid, barrier or memory kind makes a buffer slow to
+start (`#48`), so what is left is the state the machine is in, not the shape of the work.
+
+The writeback hypothesis was the obvious second suspect: the fill writes from
+`DispatchQueue.concurrentPerform`'s worker threads, so the lines the expert half reads are dirty
+in other cores' caches, and `#21` had already learned that `F_NOCACHE` on these descriptors is a
+2.2x LOSS. `DeepSeekV41ExpertStreamer.touchesFilledRanges` reads every page of a fill back on the
+calling thread, and the arms were run as an ALTERNATING PAIR (off, on, off, on) on the same
+tokens and a warm page cache, because the first attempt at this comparison was confounded: a
+read-back arm that ran fourth looked 39% better than a cold arm that ran first, and most of that
+was the page cache, not the read-back.
+
+| paired arm | idle mean | idle median |
+|---|---|---|
+| plain A | 2.146 ms | 1.318 ms |
+| read-back A | 2.453 ms | 1.531 ms |
+| plain B | 2.314 ms | 1.410 ms |
+| read-back B | 2.421 ms | 1.813 ms |
+
+**The read-back is a measured negative.** The two read-back-off arms differ from each other by
+0.168 ms, and read-back moves the mean the WRONG way by 0.207 ms (2.230 -> 2.437, 0.91x). Medians
+agree: 1.318/1.410 without against 1.531/1.813 with. So the delay is not CPU cache ownership, and
+the same is true of an explicit flush or fence -- do not re-propose either without a new
+argument.
+
+### What it means
+
+The expert stream costs about **twice its own byte time**, and only half of that is the `pread`.
+At this arm's fill (13.9 MB/layer, 556 MB/position) the 40 hand-offs idle 85.9-92.6 ms on top of
+the host's own 94-103 ms gap, against 29.8-30.6 ms of expert-half device time and (from `#48`) a
+~66 ms device total for the position. The zero-fill arm's floor is 5.8 ms, so essentially all of
+that idle is the stream.
+
+Applying the median slope to `#21`'s measured steady state of 900-950 MB/token gives **79-111 ms
+of hand-off idle per position**, which is the number `#48` measured by a completely different
+route (87-94 ms). So the two agree, and the consequence is a correction to `#21`'s priority:
+halving the arena's misses does not buy the ~29 ms of `pread` that `#21` credited it with. It buys
+that, AND a comparable amount of the idle that follows it -- roughly **78 ms of a 205-260 ms
+position, or 1.5-1.6x decode**, which is the largest single lever measured on this port so far
+and it is the arena's hit rate, not a kernel.
+
+### What it is not (do not re-propose)
+
+- **Not the submission shape.** `#48`'s twenty arms, plus this slice's probe at 0.1019 ms in the
+  walk's own process.
+- **Not the CPU cache writeback, and not a flush/fence.** Measured negative in an alternating
+  pair with a noise estimate.
+- **Not the layer's own bytes.** 19 zero-read layers in a full-fill arm idle 1.56-1.65 ms.
+- **Not merging buffers.** `#48` measured that dead before it was built.
+- **Not `F_NOCACHE`.** 2.2x loss, `#21`.
+
+### Verification
+
+`DeepSeekV41PublishedTurnTests.testWhatEachLayersExpertHalfHandoffCosts` is opt-in behind
+`/tmp/dynamoe_dsv41_layer_gaps` on top of the class's `/tmp/dynamoe_dsv41_real_turn`, because it
+walks the real checkpoint eight times: a discarded warm-up (so the paired arms are not the
+first-read arm paying for a cold disk), the alternating read-back pair, the zero-fill arm, the
+partial-fill arm, and the probe arm. It asserts every layer produced a window (`40/40 windowed`
+in all eight arms), that the probe was dispatched and ran (`40 one-dispatch buffer(s)`), and it
+prints each arm's per-layer rows so the correlations above can be recomputed from the log rather
+than trusted.
+
+Nothing in the production path changed: no kernel, no encoder, no submission pattern, no arena
+policy. The three new flags (`recordsLayerGaps`, `recordsMixtureStartProbe`,
+`touchesFilledRanges`) are off everywhere, and the clock reads they gate are inside
+`commit()`/`settlePending()` behind them, so a turn pays nothing -- mechanism 7's rule from
+`#47`, kept.
+
+The full DeepSeek suite on this code is **570 passed / 0 failed / 63 skipped** (95 classes, 633
+cases: `#48`'s 632 plus this slice's new opt-in case), and the same run under `MTL_DEBUG_LAYER`
+is **570 / 0 / 63 with 0 validation errors and no failed assertions**. The published numbers are
+the app's own `-O` build in `/tmp/dd_dsv41_opt`, eight arms of 202 positions each in ~5.5 minutes,
+load average 2.6-3.8. One caveat worth carrying: the suite reads **573 / 0 / 60** whenever
+`/tmp/dsv41_indexer_inputs.json` is present, because the three `DeepSeekV41RealIndexerReScareTests`
+cases run instead of skipping -- an opt-in published case writes that dump as a side effect, so a
+suite count that moves by three is that file, not a regression.

@@ -431,6 +431,8 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
     /// read time so choosing slots is a number rather than an assumption.
     private var secondsPlacing: Double = 0
     public private(set) var placements: Int = 0
+    /// Keeps the optional read-back's loads alive so the compiler cannot drop them.
+    private var touchSink: Int = 0
 
     /// Read and allocation time so far, for the walk instrumentation.
     public var timing: (reading: Double, allocating: Double, slotsAllocated: Int) {
@@ -438,6 +440,16 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
         defer { lock.unlock() }
         return (secondsReading, secondsAllocating, slotsAllocated)
     }
+
+    /// Reads every page of a fill back on the CALLING thread, after the parallel reads
+    /// have returned.
+    ///
+    /// Measurement only (`#49`). The fill writes from `concurrentPerform`'s worker
+    /// threads, so the lines a command buffer is about to read are dirty in OTHER
+    /// cores' caches. Reading them here moves every line to the thread that is about to
+    /// commit, which is the difference between "the gap is this layer's pread" and "the
+    /// gap is the writeback that pread left behind". Off in every production path.
+    public var touchesFilledRanges = false
 
     /// Time spent choosing slots, and how many (layer, expert) pairs that covered.
     public var placementTiming: (seconds: Double, placements: Int) {
@@ -693,6 +705,22 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
             if let failure = failures.first {
                 vacate(misses.map(\.slot))
                 throw failure
+            }
+            if touchesFilledRanges {
+                // One load per page, from the thread that will commit the expert half.
+                // A short sum rather than a barrier, because the question is which core
+                // owns the line, not what the line holds.
+                var sink = 0
+                for ranges in batches.values {
+                    for range in ranges {
+                        var offset = 0
+                        while offset < range.length {
+                            sink &+= Int(range.destination.load(fromByteOffset: offset, as: UInt8.self))
+                            offset += 4096
+                        }
+                    }
+                }
+                touchSink &+= sink
             }
             lock.lock()
             expertsLoaded += misses.count
