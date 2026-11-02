@@ -122,6 +122,26 @@ private final class ScriptedForward: DeepSeekV41PositionForward, @unchecked Send
         }
         return DeepSeekV41ChunkLogits(last: last)
     }
+
+    /// The chunk form with supplied rows: the turn loop's batched image path. Recorded
+    /// separately from `chunkedPrompts` so a test can say WHICH chunk entry point ran,
+    /// since walking the chunk here would otherwise look identical.
+    private(set) var imageChunks: [(tokens: [Int], positions: [Int])] = []
+
+    func prefillChunk(_ tokens: [Int], embeddings: [Int: [Float]]) throws -> DeepSeekV41ChunkLogits {
+        imageChunks.append((tokens, embeddings.keys.sorted()))
+        chunkedPrompts.append(tokens)
+        guard !tokens.isEmpty else { return DeepSeekV41ChunkLogits(last: []) }
+        var last: [Float] = []
+        for (position, token) in tokens.enumerated() {
+            if let row = embeddings[position] {
+                last = try forwardEmbedding(row, token: token, position: position)
+            } else {
+                last = try forwardToken(token, position: position)
+            }
+        }
+        return DeepSeekV41ChunkLogits(last: last)
+    }
 }
 
 final class DeepSeekV41TurnLoopTests: XCTestCase {
@@ -504,12 +524,15 @@ final class DeepSeekV41TurnLoopTests: XCTestCase {
 
     // MARK: - Image positions
 
-    /// An image row replaces the token embedding at ITS position and nowhere else,
-    /// and a prompt with one is walked rather than chunked.
+    /// An image row replaces the token embedding at ITS position and nowhere else, and
+    /// the prompt is WALKED rather than chunked.
     ///
-    /// The chunk path wins positives as a rule (one command buffer per layer), and
-    /// that is exactly why it must not win here: it has no way to express a
-    /// position whose input did not come from the embedding table.
+    /// The chunk form can take a supplied row since `#46`, and it is faster while the
+    /// span's expert working set fits the arena. It is not used here because the largest
+    /// picture the composer accepts is the opposite case: ~12,200 distinct
+    /// `(layer, expert)` pairs against 3,760 slots, where the block form's union fill
+    /// loses its locality and measures 0.74x the walk (`Benchmarks/PERF_FINDINGS.md`,
+    /// "DSV4.1 #46"). This pins the decision, so a later change to it is deliberate.
     func testAnImageRowRunsOnlyAtItsOwnPosition() throws {
         let forward = ScriptedForward(positionLimit: 64, scripted: [5])
         let row = [Float](repeating: 0.25, count: 8)
@@ -520,7 +543,10 @@ final class DeepSeekV41TurnLoopTests: XCTestCase {
             settings: settings(maxTokens: 1)
         )
         XCTAssertEqual(output.promptTokens, 4)
-        XCTAssertTrue(forward.chunkedPrompts.isEmpty, "an image span must not go through the chunk path")
+        XCTAssertTrue(
+            forward.imageChunks.isEmpty,
+            "an image span is walked: batching it measured 0.74x for the largest picture"
+        )
         XCTAssertEqual(forward.forwardedPositions, [0, 1, 2, 3])
         XCTAssertEqual(forward.suppliedRows.map(\.position), [2])
         XCTAssertEqual(forward.suppliedRows.map(\.token), [12])
@@ -545,6 +571,7 @@ final class DeepSeekV41TurnLoopTests: XCTestCase {
         XCTAssertEqual(forward.resumedPrefixes, [])
         XCTAssertEqual(forward.resetCount, 1)
         XCTAssertEqual(forward.forwardedPositions, [0, 1, 2, 3])
+        XCTAssertTrue(forward.imageChunks.isEmpty, "a refused resume still walks the span")
     }
 
     /// A text-only prompt keeps both optimizations: this is the negative half of the

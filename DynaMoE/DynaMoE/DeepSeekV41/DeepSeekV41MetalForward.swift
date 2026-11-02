@@ -1137,6 +1137,16 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     public var recordsStageTiming = false
     public private(set) var stageTiming: [String: UInt64] = [:]
 
+    /// How each block layer's mixture ran: one submission over the block's expert
+    /// union, or one per position because the union did not fit the arena.
+    ///
+    /// The two layouts differ by 2-4x, so which one ran is not a detail of a
+    /// measurement, it is the measurement. Counted always (two integers), because a
+    /// batching change that silently fell back to the per-position layout would
+    /// otherwise look like a batching change that did not help.
+    public private(set) var blockMixtureSubmissions = 0
+    public private(set) var perPositionMixtureSubmissions = 0
+
     // MARK: Diagnostic hooks
 
     /// Called once a block's embedding is complete, with the GPU idle, when set.
@@ -1853,7 +1863,30 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// before this call) and whether the group completes here. A fresh cache starts
     /// the block at 0, which is the shape the reference's own prompt prefill takes.
     public func prefillChunk(_ tokens: [Int]) throws -> DeepSeekV41ChunkLogits {
-        try prefillChunk(tokens, capturingLogitsAt: [])
+        try prefillChunk(tokens, embeddings: [:], capturingLogitsAt: [])
+    }
+
+    /// The chunk form with an image span in it: a supplied residual row replaces the
+    /// token lookup at the position it names, and that position is DEAD for the n-gram
+    /// hashes.
+    ///
+    /// Before this existed an image prompt could only be WALKED, one position per layer
+    /// pass and one expert set per position, because the block path had no way to take
+    /// a row and because a dead flag was a single pending mark (`encodeEngram` gated a
+    /// whole block on its LAST position's flag, which a mixed block cannot express).
+    ///
+    /// It is a capability with a measured table rather than the shipped path: the block
+    /// form is 1.92x the walk at 128 positions, 1.62x at 512 and 1.26x at 997 when the
+    /// span's expert working set fits the arena, and **0.74x** for the largest picture
+    /// the composer accepts, whose ~12,200 distinct `(layer, expert)` pairs against
+    /// 3,760 slots make every union fill evict (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1
+    /// #46"). The rows are the tower's own output, so nothing here resamples or reshapes
+    /// them; a row of the wrong width is refused rather than projected.
+    public func prefillChunk(
+        _ tokens: [Int],
+        embeddings: [Int: [Float]]
+    ) throws -> DeepSeekV41ChunkLogits {
+        try prefillChunk(tokens, embeddings: embeddings, capturingLogitsAt: [])
     }
 
     /// The same pass, keeping the logits of named positions.
@@ -1873,7 +1906,29 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         _ tokens: [Int],
         capturingLogitsAt capture: Set<Int>
     ) throws -> DeepSeekV41ChunkLogits {
+        try prefillChunk(tokens, embeddings: [:], capturingLogitsAt: capture)
+    }
+
+    /// The one chunk pass: tokens, the positions that carry a supplied row, and the
+    /// positions whose logits are kept.
+    private func prefillChunk(
+        _ tokens: [Int],
+        embeddings: [Int: [Float]],
+        capturingLogitsAt capture: Set<Int>
+    ) throws -> DeepSeekV41ChunkLogits {
         guard !tokens.isEmpty else { return DeepSeekV41ChunkLogits(last: []) }
+        // A row outside the prompt or of the wrong width would be dropped or read as
+        // the residual, and both look like a model that ignores pictures.
+        if let stray = embeddings.keys.first(where: { $0 < 0 || $0 >= tokens.count }) {
+            throw DeepSeekV41TurnError.imagePositionOutOfRange(
+                position: stray, promptTokens: tokens.count
+            )
+        }
+        if let narrow = embeddings.first(where: { $0.value.count != shapes.hidden }) {
+            throw DeepSeekV41EngineError.embeddingWidthMismatch(
+                expected: shapes.hidden, actual: narrow.value.count
+            )
+        }
         let keep = capture.filter { $0 >= 0 && $0 < tokens.count }
         var last: [Float] = []
         var captured: [Int: [Float]] = [:]
@@ -1884,9 +1939,19 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             let end = min(offset + width, tokens.count)
             let block = Array(tokens[offset..<end])
             let blockKeep = Set(keep.filter { $0 >= offset && $0 < end }.map { $0 - offset })
+            // Rows are handed over per block: a block's positions are the only ones
+            // its embedding pass writes, so a row from a later block would be a slot
+            // offset no dispatch binds.
+            var blockRows: [Int: [Float]] = [:]
+            if !embeddings.isEmpty {
+                for (position, row) in embeddings where position >= offset && position < end {
+                    blockRows[position - offset] = row
+                }
+            }
             let result = try runBlock(
                 block,
                 startPosition: startPosition + offset,
+                embeddings: blockRows,
                 capturingLogitsAt: blockKeep
             )
             last = result.last
@@ -1908,6 +1973,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     private func runBlock(
         _ tokens: [Int],
         startPosition: Int,
+        embeddings: [Int: [Float]] = [:],
         capturingLogitsAt capture: Set<Int> = []
     ) throws -> DeepSeekV41ChunkLogits {
         guard problems.isEmpty else {
@@ -1922,14 +1988,15 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
 
         for (index, token) in tokens.enumerated() {
             tokenHistory.append(Int32(truncatingIfNeeded: token))
-            // A dead flag belongs to one position, so a block inherits it on its
-            // first position only; an image span marks every token it expands to and
-            // therefore still goes through the walk.
-            deadTokens.append(index == 0 ? pendingDead : false)
+            // A dead flag belongs to ONE position, so it cannot be a block-wide mark:
+            // a supplied residual row IS an image position and takes no part in an
+            // n-gram, while the text positions beside it do. Reading the flag off the
+            // row map is what keeps an image span from reaching the memory layers.
+            deadTokens.append(embeddings[index] != nil || (index == 0 && pendingDead))
         }
         pendingDead = false
 
-        try encodeEmbeddingBlock(tokens, startPosition: startPosition)
+        try encodeEmbeddingBlock(tokens, startPosition: startPosition, embeddings: embeddings)
         if let hook = onBlockEmbedded {
             try settlePending()
             hook(startPosition, tokens.count)
@@ -2138,6 +2205,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 marks.append(DispatchTime.now().uptimeNanoseconds)
                 timingBuffers.append((buffer: expertCommand, bucket: 1))
             }
+            blockMixtureSubmissions += 1
             recordLayerTiming(marks, positions: count)
             if let hook = onBlockLayerFinished {
                 try settlePending()
@@ -2145,6 +2213,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             }
             return
         }
+        perPositionMixtureSubmissions += 1
 
         // A union too large for the arena stays per position: fill the slots this
         // position routes, submit, and wait, because the next position's fill
@@ -2611,7 +2680,14 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
 
         case .engram:
             try eachSlot { slot in
-                try encodeEngram(encoder, layer: layer, slot: slot)
+                // The dead test is PER POSITION. It used to be the block's last flag,
+                // which was right while a block was always all-text or all-image; a
+                // batched image span mixes the two, and a block-level gate would take
+                // the live positions' memory contribution away with the dead ones'
+                // (`#46`).
+                try encodeEngram(
+                    encoder, layer: layer, slot: slot, position: startPosition + slot
+                )
             }
 
         case .router:
@@ -2856,7 +2932,11 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// `lookup_embeddings_bf16` already addresses a block: it reads
     /// `tokenIds[id / hiddenDim]`, so a grid `count` rows tall embeds a whole block
     /// with one dispatch.
-    private func encodeEmbeddingBlock(_ tokens: [Int], startPosition: Int) throws {
+    private func encodeEmbeddingBlock(
+        _ tokens: [Int],
+        startPosition: Int,
+        embeddings: [Int: [Float]] = [:]
+    ) throws {
         let count = tokens.count
         // Every position's id goes into one entry of `tokenIDs`, and each dispatch
         // binds its own entry, so a block wider than the workspace would both write
@@ -2868,6 +2948,19 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 "embedding a \(count)-position block into the \(tokenCapacity) token ids "
                     + "the workspace holds"
             )
+        }
+        // A supplied row goes in from the host, so it is copied BEFORE this block's
+        // command buffer exists: `forwardEmbedding` needs a barrier to order its
+        // upload against work it has not committed, and here the copy simply precedes
+        // every dispatch that reads the slot. The seeding below then starts the block's
+        // streams from the row exactly as it would from a token lookup.
+        for (index, row) in embeddings {
+            row.withUnsafeBytes { source in
+                guard let base = source.baseAddress else { return }
+                workspace.hidden.contents().advanced(
+                    by: workspace.slotOffset(index, width: shapes.hidden)
+                ).copyMemory(from: base, byteCount: shapes.hidden * MemoryLayout<Float>.stride)
+            }
         }
         let commandBuffer = try makeCommandBuffer()
         let encoder = try makeEncoder(commandBuffer)
@@ -2889,6 +2982,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         var hiddenDim = UInt32(shapes.hidden)
 
         for index in 0..<count {
+            // An image position already holds its residual: the tower computed it, so
+            // the embedding table has nothing to add.
+            if embeddings[index] != nil { continue }
             let hiddenOffset = workspace.slotOffset(index, width: shapes.hidden)
             if kernel == DeepSeekV41Kernels.bf16Embedding {
                 encoder.setComputePipelineState(pipelines.embeddingBF16)
@@ -3610,10 +3706,20 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     private func encodeEngram(
         _ encoder: MTLComputeCommandEncoder,
         layer: DeepSeekV41LayerPlan,
-        slot: Int = 0
+        slot: Int = 0,
+        position: Int? = nil
     ) throws {
         guard !skipEngram, let table = layer.engramTable else { return }
-        guard deadTokens.last != true else { return }
+        // A walk names no position and reads the one it is on; a block names each
+        // position it carries, because a batched image span holds both dead and live
+        // positions in the same command buffer.
+        if let position {
+            guard deadTokens.indices.contains(position), deadTokens[position] != true else {
+                return
+            }
+        } else {
+            guard deadTokens.last != true else { return }
+        }
         guard table >= 0, table < engramSlots.count else {
             throw DeepSeekV41EngineError.unsupportedStage("engram table \(table)")
         }

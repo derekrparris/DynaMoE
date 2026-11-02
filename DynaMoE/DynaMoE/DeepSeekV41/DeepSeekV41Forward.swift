@@ -800,27 +800,54 @@ nonisolated public final class DeepSeekV41CPUForward {
     /// prompt's own indices. The head only runs for those and for the last position,
     /// because it is `vocabSize` outputs per position and nothing reads the rest.
     ///
-    /// `markNextTokenDead` applies to the chunk's FIRST position only: a dead flag sits
-    /// on one position at a time, so an image span, which marks every token in it, still
-    /// goes through the walk.
+    /// `markNextTokenDead` applies to the chunk's FIRST position only: a dead flag
+    /// sits on one position at a time. An image span does not use it — each of its
+    /// positions carries its own flag, derived from whether a row was supplied (see the
+    /// `embeddings:` overload), because a span is dead at EVERY position and a single
+    /// pending mark would leave the rest live.
     public func prefillChunk(
         _ tokens: [Int],
         capturingLogitsAt capture: Set<Int> = []
+    ) -> DeepSeekV41ChunkLogits {
+        runChunk(tokens, embeddings: [:], capturingLogitsAt: capture)
+    }
+
+    /// The same chunk with an image span in it: a supplied residual row replaces the
+    /// token embedding at the position it names, exactly as `forwardEmbedding` does
+    /// for one walked position. Every position carrying a row is DEAD for the n-gram
+    /// hashes, which is the rule the reference applies to an image span rather than a
+    /// flag the caller has to remember.
+    ///
+    /// The oracle has no batching to do, so this is the same graph the walk runs; it
+    /// exists so the device's block form has something to be compared against.
+    public func prefillChunk(
+        _ tokens: [Int],
+        embeddings: [Int: [Float]]
+    ) -> DeepSeekV41ChunkLogits {
+        runChunk(tokens, embeddings: embeddings, capturingLogitsAt: [])
+    }
+
+    private func runChunk(
+        _ tokens: [Int],
+        embeddings: [Int: [Float]],
+        capturingLogitsAt capture: Set<Int>
     ) -> DeepSeekV41ChunkLogits {
         guard !tokens.isEmpty, storedPositions == 0 else {
             return DeepSeekV41ChunkLogits(last: [])
         }
         for (position, token) in tokens.enumerated() {
             tokenHistory.append(Int32(truncatingIfNeeded: token))
-            deadTokens.append(position == 0 ? pendingDead : false)
+            // A supplied row IS an image position (mechanism: a supplied residual row
+            // is dead by construction), so the block form does not need a second mark.
+            deadTokens.append(embeddings[position] != nil || (position == 0 && pendingDead))
         }
         pendingDead = false
 
         let mult = max(1, config.hcMult)
         var streams: [[[Float]]] = []
         streams.reserveCapacity(tokens.count)
-        for token in tokens {
-            streams.append(Array(repeating: embed(token), count: mult))
+        for (position, token) in tokens.enumerated() {
+            streams.append(Array(repeating: embeddings[position] ?? embed(token), count: mult))
         }
         var preMix: [[Float]] = tokens.map { _ in
             DeepSeekV41HyperConnections.identityMix(copies: mult)

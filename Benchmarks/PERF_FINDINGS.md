@@ -8029,3 +8029,154 @@ The full DeepSeek suite on this code is **560 passed / 0 failed / 57 skipped** (
 classes), and the same run under `MTL_DEBUG_LAYER` is **560 / 0 / 57 with 0 validation errors** and no
 failed assertions -- which a new kernel and a changed plane allocation have to survive before they are
 trusted.
+
+## DSV4.1 #46: THE LARGEST IMAGE COSTS FIVE MINUTES, NOT SEVEN SECONDS, AND THE PREFILL IS 98% OF IT
+
+### Question
+
+Routing picked this slice at 0.963 with 0.957 confidence, and it was the largest unmeasured number
+left in the port: what does the biggest picture the composer accepts actually cost the person who
+attached it? The tower's own cost is published (`#43`: 6.74 s for the largest admissible span) and
+every mechanical lever on its attention is measured dead (`#44`, `#45`), so the open question was not
+the tower at all -- it was the rest of the turn.
+
+### What the largest picture actually costs
+
+The composer's path is `price` (no weight read) -> provision the cache for the EXPANDED prompt ->
+`runtime.imageSpan` (the device tower) -> `TurnImages.bind` -> the turn loop. A 4,096x4,096 image is
+the largest `ImagePixels.decode` lets through (one side above that is refused before the tower sees
+it), and every side from there up collapses onto the checkpoint's own token budget, so it is the
+worst case an attachment can reach:
+
+| stage | measured |
+|---|---|
+| resize plan | 8,649 patch tokens, 31x31 aligner grid, **994 span positions**, prompt 12 -> 1,005 tokens |
+| price | **6.95 s** estimated, in 0.0001 s (no weight read) |
+| encode (device, cold process: weight upload included) | **7.23 s** |
+| encode (device, repeated) | **6.88 s** |
+| prefill of the 1,005-position prompt | **255.98 / 268.05 / 297.98 s** in three runs (254.7 / 266.7 / 296.5 ms/position, 218,886 MB of experts, 95% hit) |
+| first generated token | 0.00 s |
+| **to the first visible token** | **263.29 / 275.28 / 305.20 s** |
+
+**The encode is 2.4-2.6% of the wait; the prefill of the span is 97-98%.** A reader who trusts the
+published 6.74 s would predict a seven-second picture and be wrong by a factor of 39-45.
+
+### Why the prefill walked
+
+`DeepSeekV41TurnRunner` hands a whole prompt to `prefillChunk` only when every position is a token,
+so an image prompt was WALKED: one full layer pass and one expert set per position. Two separate
+reasons, and the second one was a latent bug:
+
+- the chunk form had **no way to take a supplied row** (`prefillChunk(_ tokens: [Int])`);
+- the dead flag was a **single pending mark** per call, and the block's Engram stage gated on
+  `deadTokens.last` -- the block's LAST position. A block that mixes image and text positions could
+  not say which position was dead, so the whole block inherited one position's answer.
+
+### The batched image prefill
+
+- `DeepSeekV41PositionForward.prefillChunk(_:embeddings:)`, with a protocol default that WALKS. A
+  partial executor owes correct numbers here rather than a refusal, because the walk and the block are
+  the same graph.
+- Device: each block gets only its own rows; the host copy happens BEFORE the block's command buffer
+  exists (a shared buffer written from the host is not ordered against work that has not executed, and
+  here the copy simply precedes every dispatch that reads the slot); a supplied row REPLACES the token
+  lookup instead of adding to it; a row that is out of range or the wrong width is refused.
+- Dead flags are read off the row map, one per position: **a supplied residual row IS an image
+  position and takes no part in an n-gram**.
+- `encodeEngram` gained the per-position dead test (`position: Int?`), which is the fix for the latent
+  bug above: a walk names none and reads `deadTokens.last`, a block names each position it carries.
+- The CPU oracle's `prefillChunk(_:embeddings:)` replaces `embed(token)` with the row and derives the
+  dead flag the same way, so the device has a reference that is not itself.
+
+### The latent Engram bug, caught by the parity test
+
+`testABatchedImagePrefillMatchesTheWalkOnThePublishedCheckpoint` compares a two-block image prefill
+with a walk of the same positions on the checkpoint's own weights and tower rows. With the block-level
+Engram gate it measured **2.81e-01 relative** at a logit scale of 22.0 -- the live text positions at
+the front of the span lost their memory contribution because the block's last position was an image
+position. With the gate moved per position the same case measures **1.08e-04**. The synthetic fixture
+could not have found it: it publishes no Engram layers at all.
+
+### Where batching pays, and where it does not
+
+Same runtime, same prompt, one arm each, arena reset before every arm, `block`/`per-position` counting
+which mixture layout actually ran (5,040 block, 0 per-position in every arm below). The prompt is the
+span alone at four lengths:
+
+| positions | batched | walk | ratio | expert bytes (batched / walk) | hit rate |
+|---|---|---|---|---|---|
+| 16 | 2,180.8 ms (136.3 ms/pos) | 1,656.3 ms (103.5 ms/pos) | 0.76x | 26,052 / 26,016 MB | 21% / 62% |
+| 128 | 9,220.9 ms (72.0 ms/pos) | 17,731.9 ms (138.5 ms/pos) | **1.92x** | 47,836 / 47,514 MB | 78% / 91% |
+| 512 | 47,184.0 ms (92.2 ms/pos) | 76,360.7 ms (149.1 ms/pos) | **1.62x** | 74,211 / 73,691 MB | 92% / 97% |
+| 997 | 121,980.2 ms (122.3 ms/pos) | 153,242.6 ms (153.7 ms/pos) | **1.26x** | 99,546 / 99,062 MB | 95% / 98% |
+
+The sixteen-position arm is the outlier in the other direction and it is not a result: the first arm of
+a process pays the arena's slot allocations and the page cache. The sweep warms up on a discarded
+eight-position chunk for exactly that reason, and 16 still reads 0.76x because it is next.
+
+Then the composer's own largest image, same protocol:
+
+| prompt | batched | walk (shipped) | ratio | expert bytes | hit rate |
+|---|---|---|---|---|---|
+| 1,005 positions, 4,096x4,096 pixels | 345.62 / 355.22 / 386.90 s | **255.98 / 268.05 / 278.38 s** | **0.75x / 0.74x / 0.72x** | 218,312 / 218,886 MB | 91% / 95% |
+
+So the same span is 1.26x faster batched at 997 positions and 0.74x faster walked at 1,005 -- and the
+difference is not the length, it is the **working set**. The bare-span prompt reads 99,546 MB over 997
+positions; the composer's prompt reads 218,886 MB over the same span, i.e. it touches 2.2x as many
+distinct `(layer, expert)` pairs (a different picture and eight extra text positions at the front move
+the routing). Against an arena of 3,760 slots the ratio tracks the working set monotonically:
+
+| distinct pairs touched | working set vs arena | ratio |
+|---|---|---|
+| 2,660 | 0.71x | 1.92x |
+| 4,118 | 1.10x | 1.62x |
+| 5,533 | 1.47x | 1.26x |
+| 12,228 | 3.25x | 0.74x |
+
+That is the mechanism: when the working set fits, the block form replaces eight per-position fills
+with one and wins; when it does not, EVERY fill evicts, and a union fill evicts 20-48 pairs at once
+where the walk's 6-pair fill keeps what it just used -- the hit rate falls from 95% to 91% and the
+bulk eviction costs more than the round trips save.
+
+### What it means
+
+- **The walk stays the shipped path for an image prompt**, and `DeepSeekV41TurnRunner` says so with
+  this table in its comment. `testAnImageRowRunsOnlyAtItsOwnPosition` pins the decision, and the
+  end-to-end case asserts the batched form is SLOWER at the largest span, so a later change to either
+  has to re-measure.
+- **The batched image prefill stays, as a capability with a number.** It is correct (1.08e-04 against
+  the walk on real weights), it is 1.26-1.92x faster while the span's expert working set fits the
+  arena, and the entry point is one call. What it needs next is not more batching but a fill policy
+  that does not discard the locality the walk had -- which is a targeted-invalidation question for
+  `DeepSeekV41ExpertArena`, not a prefill-layout one.
+- **The composer's estimate is right about the wrong thing.** `DeepSeekV41VisionCostModel.measured`
+  prices the TOWER (6.95 s predicted, 6.88-7.23 s measured), and the tower is 2% of the wait. Anything
+  user-facing that quotes a picture's cost from that model is quoting the encode.
+- **The 6.74 s encode is not the problem, and neither is anything `#44`/`#45` measured.** The two
+  levers that would move this number are the expert fill's behaviour above the arena's capacity and
+  the per-position work of a long prompt -- both outside the vision tower entirely.
+
+### Verification
+
+The default suite gains `testABatchedImageSpanMatchesTheWalk` (one block, rows at every other
+position, against the host's own `forwardEmbedding` walk AND against the host's chunk form, so a bug
+in the oracle's new entry point cannot cancel a bug in the device's) and
+`testABatchedImageSpanMapsItsRowsIntoTheRightBlocks` (two blocks, rows only from the second, which a
+per-block slice that dropped its offset would answer with the block's first slot). Both run on the
+synthetic checkpoint; `DeepSeekV41TurnLoopTests` is unchanged in shape and pins that an image prompt
+still walks.
+
+The published-checkpoint cases are opt-in with the rest of that file:
+`testABatchedImagePrefillMatchesTheWalkOnThePublishedCheckpoint` (16 positions, real tower rows, the
+Engram bug above), `testWhatBatchingAnImagePrefillSavesAtLength` (the four-length sweep, gated on
+`/tmp/dynamoe_dsv41_vision_max_turn`) and `testWhatTheLargestImageCostsEndToEnd` (gated on the same
+marker, ~10 minutes at `-O`).
+
+The end-to-end numbers above are the app's own `-O` build (`/tmp/dd_dsv41_opt`), load average
+3.2-4.8, and the two arms of every pair were measured in one process back to back.
+
+The full DeepSeek suite on this code is **562 passed / 0 failed / 60 skipped** (622 executed, 94
+classes), and the same run under `MTL_DEBUG_LAYER` is **562 / 0 / 60 with 0 validation errors** and no
+failed assertions. That run matters more than usual here: a per-position Engram gate and a host write
+into a shared buffer before a command buffer exists are exactly the two changes a validation layer
+catches and nothing else does.

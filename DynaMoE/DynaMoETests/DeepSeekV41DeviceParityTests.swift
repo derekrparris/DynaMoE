@@ -367,6 +367,109 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         }
     }
 
+    /// A block that carries supplied rows computes what the walk does, position by
+    /// position, including the text positions between them.
+    ///
+    /// This is the batched image prefill. Two ways to get it wrong still produce
+    /// plausible logits: a row uploaded to the block's slot 0 rather than to the
+    /// position's own slot, and the seeding of the hyper-connection copies from the
+    /// wrong slot. Rows at every OTHER position are what makes both visible: a block
+    /// whose rows all landed on slot 0 answers the first position only and leaves the
+    /// text positions beside it reading an image's residual.
+    func testABatchedImageSpanMatchesTheWalk() throws {
+        let runtime = try makeRuntime(checkpoint)
+        let host = makeHost(checkpoint)
+        let width = DeepSeekV41DevicePlan.chunkSlots(
+            config: checkpoint.config,
+            contextLength: checkpoint.shape.contextLength
+        )
+        XCTAssertGreaterThan(width, 1, "a block of one is the walk")
+        let tokens = (0..<width).map { 5 + $0 }
+        let rows = imageRows(at: stride(from: 0, to: width, by: 2).map { $0 }, checkpoint)
+        XCTAssertEqual(rows.count, (width + 1) / 2)
+
+        let chunk = try runtime.forward().prefillChunk(tokens, embeddings: rows)
+
+        let walked = makeHost(checkpoint)
+        var last: [Float] = []
+        for (position, token) in tokens.enumerated() {
+            if let row = rows[position] {
+                last = walked.forwardEmbedding(row, token: token, position: position)
+            } else {
+                last = walked.forwardToken(token, position: position)
+            }
+        }
+        XCTAssertEqual(chunk.last.count, last.count)
+        let scale = max(last.map(abs).max() ?? 1, 1e-6)
+        XCTAssertLessThan(
+            worstDelta(chunk.last, last) / scale,
+            decodeTolerance,
+            "a block with supplied rows disagrees with the host's walk"
+        )
+        // The host the device is compared against is a SECOND executor, so the first
+        // one's own walk is checked too: a bug in the block could otherwise match a
+        // bug in the oracle's chunk form and cancel out.
+        let oracleChunk = host.prefillChunk(tokens, embeddings: rows)
+        XCTAssertLessThan(worstDelta(oracleChunk.last, last), 1e-5)
+    }
+
+    /// A row in a LATER block lands in that block, not in the first one.
+    ///
+    /// `prefillChunk` splits the prompt at `workspace.slots` and hands each block only
+    /// its own rows. A mapping that forgot the block offset would put the second
+    /// block's image rows at its slot 0, which is a different position of a different
+    /// layer pass and still finite, so only a comparison with the walk can say.
+    func testABatchedImageSpanMapsItsRowsIntoTheRightBlocks() throws {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.contextLength = max(shape.contextLength, 16)
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        let width = DeepSeekV41DevicePlan.chunkSlots(
+            config: checkpoint.config,
+            contextLength: checkpoint.shape.contextLength
+        )
+        XCTAssertGreaterThan(width, 1, "the fixture has to allow a block")
+        let tokens = (0..<(width * 2 + 1)).map { 3 + $0 }
+        // Only the second block and the stretch that crosses into it carry rows, so a
+        // per-block slice that dropped its offset answers with the block's first slot.
+        let positions = Array((width - 1)..<tokens.count)
+        let rows = imageRows(at: positions, checkpoint)
+
+        let runtime = try makeRuntime(checkpoint)
+        let chunk = try runtime.forward().prefillChunk(tokens, embeddings: rows)
+
+        let walked = makeHost(checkpoint)
+        var last: [Float] = []
+        for (position, token) in tokens.enumerated() {
+            if let row = rows[position] {
+                last = walked.forwardEmbedding(row, token: token, position: position)
+            } else {
+                last = walked.forwardToken(token, position: position)
+            }
+        }
+        XCTAssertEqual(chunk.last.count, last.count)
+        let scale = max(last.map(abs).max() ?? 1, 1e-6)
+        XCTAssertLessThan(
+            worstDelta(chunk.last, last) / scale,
+            decodeTolerance,
+            "a row from the second block did not land at its own position"
+        )
+    }
+
+    /// Rows that vary by BOTH position and dimension, so a row uploaded to the wrong
+    /// slot cannot agree with the right one by symmetry.
+    private func imageRows(
+        at positions: [Int],
+        _ checkpoint: DeepSeekV41SyntheticCheckpoint
+    ) -> [Int: [Float]] {
+        var rows: [Int: [Float]] = [:]
+        for position in positions {
+            rows[position] = (0..<checkpoint.config.hiddenSize).map { index in
+                Float(((position + 1) * (index + 3)) % 17) / 17 - 0.5
+            }
+        }
+        return rows
+    }
+
     /// A block of one is a decode step: the same tokens, the same graph, and the
     /// same logits, wherever the block machinery differs from the walk's.
     func testABlockOfOneMatchesTheWalk() throws {
