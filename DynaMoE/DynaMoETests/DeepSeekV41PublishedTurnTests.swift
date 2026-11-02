@@ -2636,6 +2636,205 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
+    /// What the checkpoint does with the continuation the app actually builds after a
+    /// tool result.
+    ///
+    /// `#27` settled the container (the model read all five shapes the probe tried the
+    /// same way) and `#39` closed the SHAPE: the payload rides the call turn's own
+    /// end-of-sentence marker inside the `tool▁output` pair, and the next assistant
+    /// turn is opened after it. Both facts are pinned as strings and as a token
+    /// prefix, but neither has generated a token, so the loop's answer after a tool
+    /// result rests on a shape nobody has watched run.
+    ///
+    /// This walks the loop: the checkpoint is asked for a shell command, the model's
+    /// OWN frozen call becomes the turn, the response is built by
+    /// `AgentHarness.formatDeepSeekV41ToolResponseTurn` (the same call `ContentView`
+    /// makes) and the result is the evidence. A turn that reads the payload names the
+    /// files it was handed; a continuation that resumes the cache proves the spliced
+    /// prefix is the one the previous turn left resident.
+    func testATurnAnswersAfterAToolResultOnThePublishedCheckpoint() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        guard let tokenizer = try? DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        ) else {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let dialect = DeepSeekV41PromptDialect.resolve(snapshotDir: snapshot)
+        let markers = dialect.markers
+        let system = """
+        You are an expert AI software engineering assistant with direct access to local macOS tools.
+
+        # Tools
+
+        ### shell_run
+        Description: Runs a shell command and returns its output.
+        Parameters: {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}
+
+        \(DeepSeekV41ToolDialect.instructions())
+        """
+        let ask = "List the files in /tmp using the shell_run tool."
+        let prompt = dialect.render(
+            turns: [.init(isUser: true, text: ask)],
+            cleanSystem: system,
+            thinkingEnabled: false,
+            effort: nil
+        )
+        let promptIds = try tokenizer.encode(text: prompt)
+
+        let drawCount = 64
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: promptIds.count + 320,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let eos = config.eosTokenIDs.map { UInt32(clamping: $0) }
+        let settings = DeepSeekV41TurnRunner.Settings(
+            temperature: 0,
+            topP: 1,
+            minP: 0,
+            topK: 1,
+            repetitionPenalty: 1,
+            maxTokens: drawCount,
+            eosTokenIds: eos,
+            stopSequences: []
+        )
+
+        // The call must be the model's own: a hand-written one would measure a
+        // continuation whose call half the checkpoint never produced.
+        let call = try await Task.detached { [runtime, promptIds] in
+            let forward = runtime.forward()
+            forward.reset()
+            return try DeepSeekV41TurnRunner.run(
+                forward: forward,
+                promptTokenIds: promptIds,
+                settings: settings,
+                sample: { logits, _ in Self.argmax(logits) },
+                shouldFreeze: { DeepSeekV41ToolDialect.shouldFreeze($0, markers: markers) },
+                decode: { (try? tokenizer.decode(ids: $0)) ?? "" }
+            )
+        }.value
+        XCTAssertEqual(
+            call.finishReason, .toolFreeze,
+            "the turn did not stop on a call: \(call.text.debugDescription)"
+        )
+
+        // The response the loop would hand back for that call. `renderToolResultForModel`
+        // turns it into the plain text the model reads; the two file names are the
+        // sentinel the answer is judged against, because the question never mentioned
+        // them.
+        let responseJSON = #"{"tool":"shell_run","status":"success","result":{"command":"ls -la /tmp","exit_code":0,"output":"-rw-r--r-- 1 derek wheel 42 Oct 31 09:14 file_a.txt\n-rw-r--r-- 1 derek wheel 57 Oct 31 09:14 file_b.txt"}}"#
+        let suffix = await MainActor.run {
+            AgentHarness.shared.formatDeepSeekV41ToolResponseTurn(
+                responses: [responseJSON],
+                thinkingEnabled: false,
+                promptDialect: dialect
+            )
+        }
+        XCTAssertTrue(
+            suffix.hasPrefix(markers.toolOutputBegin),
+            "the result does not open the checkpoint's output pair: \(suffix.debugDescription)"
+        )
+        XCTAssertTrue(
+            suffix.hasSuffix(dialect.assistantPrefix(thinkingEnabled: false)),
+            "the continuation did not re-open the assistant turn: \(suffix.debugDescription)"
+        )
+        XCTAssertFalse(
+            suffix.contains("<|im_start|>"),
+            "a chatml role marker reached the continuation: \(suffix.debugDescription)"
+        )
+
+        let callTurnText = call.text.contains(markers.endOfSentence)
+            ? call.text
+            : call.text + markers.endOfSentence
+        let continuation = prompt + callTurnText + suffix
+        let continuationIds = try tokenizer.encode(text: continuation)
+        let endTagIds = try tokenizer.encode(text: markers.endOfSentence)
+        let suffixIds = try tokenizer.encode(text: suffix)
+        let splicedIds = promptIds + call.generatedTokenIds + endTagIds + suffixIds
+        let spliceMatches = splicedIds == continuationIds
+        print(
+            "🔎 [dsv41 real] tool continuation: \(promptIds.count) prompt + "
+                + "\(call.generatedTokenIds.count) generated + \(endTagIds.count) end + "
+                + "\(suffixIds.count) suffix = \(splicedIds.count) spliced, "
+                + "\(continuationIds.count) re-encoded, splice==reencode \(spliceMatches)"
+        )
+        if !spliceMatches {
+            let divergence = zip(splicedIds, continuationIds)
+                .enumerated()
+                .first { $0.element.0 != $0.element.1 }?
+                .offset ?? min(splicedIds.count, continuationIds.count)
+            print(
+                "🔎 [dsv41 real] tool continuation diverges at \(divergence): "
+                    + "spliced \(splicedIds.count), re-encoded \(continuationIds.count)"
+            )
+        }
+        // The app pins the continuation as prompt ids + the real generation ids +
+        // the closure, rather than re-encoding the whole transcript. If the two
+        // disagree, the model reads a different prompt than the one that was
+        // measured here and the resident prefix is no longer the turn's own.
+        XCTAssertTrue(
+            spliceMatches,
+            "the spliced continuation is not the re-encoded one: \(splicedIds.count) "
+                + "spliced vs \(continuationIds.count) re-encoded"
+        )
+
+        // What the app would propose: every token that went through the cache, which
+        // is the prompt plus the generation (the turn's end tag is appended after the
+        // freeze and never forwarded). The executor still compares them.
+        let forwardedTokens = promptIds.count + call.generatedTokenIds.count - 1
+        let prefix = runtime.forward().reusablePrefix(
+            proposedPrefix: forwardedTokens,
+            promptTokenIds: continuationIds.map { Int($0) }
+        )
+        print("🔎 [dsv41 real] tool continuation resumes \(prefix) of \(continuationIds.count)")
+        // The freeze token is drawn but never forwarded, so the cache holds the
+        // prompt plus everything but the last generated id. A larger or smaller
+        // count means the pin and the turn it extends no longer describe the same
+        // sequence, which is the one thing a post-tool turn cannot afford.
+        XCTAssertEqual(
+            prefix, forwardedTokens,
+            "the continuation resumed \(prefix) of \(continuationIds.count), not the "
+                + "call turn's \(forwardedTokens) forwarded tokens"
+        )
+
+        let answer = try await Task.detached { [runtime, continuationIds, prefix] in
+            try DeepSeekV41TurnRunner.run(
+                forward: runtime.forward(),
+                promptTokenIds: continuationIds,
+                prefixTokens: prefix,
+                settings: settings,
+                sample: { logits, _ in Self.argmax(logits) },
+                decode: { (try? tokenizer.decode(ids: $0)) ?? "" }
+            )
+        }.value
+        print(
+            "🔎 [dsv41 real] tool answer: \(answer.finishReason.rawValue) after "
+                + "\(answer.tokensGenerated) token(s), reused \(answer.prefixTokensReused), "
+                + String(format: "prefill %.2f s, decode %.2f s",
+                         answer.prefillSeconds, answer.decodeSeconds)
+        )
+        print("🔎 [dsv41 real] tool answer text: \(answer.text.debugDescription)")
+        print("🔎 [dsv41 real] tool answer ids: \(answer.generatedTokenIds)")
+        XCTAssertGreaterThan(
+            answer.tokensGenerated, 0,
+            "the continuation produced no token (text \(answer.text.debugDescription))"
+        )
+        // The question never named a file, so an answer that names one came from the
+        // result and not from the context above it.
+        XCTAssertTrue(
+            answer.text.contains("file_a"),
+            "the answer did not read the tool result: \(answer.text.debugDescription)"
+        )
+        withExtendedLifetime(engine) {}
+    }
+
     /// Whether two prefills of one token stream agree on what the indexer scored.
     ///
     /// The same executor, reset, the same tokens, twice: 576 positions, and zero of the

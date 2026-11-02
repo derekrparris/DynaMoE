@@ -7334,3 +7334,80 @@ generation, so the resident prefix is reusable.
 `DeepSeekV41ChatPromptFormatterTests` (11), `ChatPromptFormatterConversationTests` (20),
 `DeepSeekV41ToolDialectTests` (28) pass; the full suite is 542/0/44 and the Metal-validation run
 is clean.
+
+## DSV4.1 #40: A TURN AFTER A TOOL RESULT READS IT, AND THE CONTINUATION IS THE TURN'S OWN TOKEN STREAM
+
+### The question
+
+`#39` closed the continuation-after-a-tool-result SHAPE and named what it had not done in its own
+section: the shape was pinned as a string (`testTheLiveContinuationSuffixMatchesTheHistoryRender`)
+and as a token prefix (`testAChatTurnsTokensExtendThePreviousPromptPlusGeneration`), and `#27` had
+measured which result container the checkpoint can READ, but no token had been generated from the
+continuation the app actually builds. A model that answers five containers in a probe is not a loop
+that answers one. Routing was decisive (`tool_result_end_to_end` 0.876, confidence 0.855; "measure
+before build" 0.969), so this slice measured rather than built.
+
+### What was measured
+
+One walk of the loop the app walks, on the published checkpoint:
+
+- the checkpoint is asked for a shell command with `DeepSeekV41ToolDialect.instructions()` in the
+  system prompt, and it freezes on its OWN call rather than a hand-written one;
+- the response is `shell_run`'s JSON, rendered by `renderToolResultForModel` and wrapped by
+  `AgentHarness.formatDeepSeekV41ToolResponseTurn` — the same call `ContentView` makes;
+- the continuation is `formattedPrompt + closed call turn + the result turn`, and the answer is
+  generated from it.
+
+### Evidence
+
+`DeepSeekV41PublishedTurnTests.testATurnAnswersAfterAToolResultOnThePublishedCheckpoint`:
+
+```
+🔎 [dsv41 real] tool continuation: 299 prompt + 41 generated + 1 end + 75 suffix = 416 spliced, 416 re-encoded, splice==reencode true
+🔎 [dsv41 real] tool continuation resumes 339 of 416
+🔎 [dsv41 real] tool answer: lengthCapped after 64 token(s), reused 339, prefill 24.72 s, decode 20.78 s
+🔎 [dsv41 real] tool answer text: "Here are the files in `/tmp`:\n\n| Permissions | Owner | Group | Size | Date | Name |\n|---|---|---|---|---|---|\n| `-rw-r--r--` | derek | wheel | 42 B | Oct 31 09:14 | `file_a.txt` |\n| `-rw"
+```
+
+Three things are asserted, not printed:
+
+- the continuation the app splices (prompt ids + the real generation ids + the closure + the
+  suffix) IS the re-encoded string, 416 ids both ways, so the pin and the prompt agree token for
+  token;
+- the cache resumes 339 of 416, which is the prompt plus 40 of the 41 generated ids (the freeze
+  token is drawn and never forwarded), so a post-tool turn pays a 77-position walk rather than a
+  full prefill;
+- the answer names `file_a.txt`, which the question never mentioned: it read the result.
+
+Two runs produced the same 64 ids and the same text, at temperature 0.
+
+### What it means
+
+The live loop answers after a tool result with the shape `#39` shipped: the checkpoint reads the
+result the app renders, the assistant turn the continuation opens is the one the model answers in,
+and the pin extends by exactly the ids that went through the cache. On this machine a continued
+turn costs ~0.32 s for each of its 77 prefilled positions and ~0.32 s per generated token
+(24.72 s + 20.78 s for the 64-token answer above).
+
+### What it does not mean
+
+- Only the thinking-off continuation was generated. The thinking-on suffix differs by its last
+  marker only, but a branch whose prompt is SHORTER than the resident cache cannot reuse a partial
+  prefix (`reusablePrefix` refuses when the stored sequence is longer than the prompt), so measuring
+  it after the thinking-off turn would pay a full 416-position prefill for one special token. The
+  marker itself is pinned in `#39`.
+- The API path still renders a client's tool result as a plain user turn (`Function result
+  (name): …`). That is a protocol-adapter choice, and it is unchanged.
+- A `tools_load`/`tools_unload` result still cannot reproduce its `[TOOL_REGISTRATION]` line on a
+  history rebuild; the gap is every family's, not this checkpoint's.
+- The turn was length-capped at the test's own 64-token budget while writing its table. That is the
+  budget, not the model failing to stop.
+
+### Verification
+
+`testATurnAnswersAfterAToolResultOnThePublishedCheckpoint` is new and opt-in (it reads the 475 GB
+checkpoint) and passes in 144.5 s. The full DeepSeek suite is **542 passed / 0 failed / 45 skipped**
+(587 executed; the new case skips without the marker), and the Metal-validation run is the same
+with **0 validation errors**. The new case also ran under `MTL_DEBUG_LAYER` with the marker and
+reproduced the same 64 ids and text; its timings roughly double there (48.85 s + 39.22 s), which is
+the validation layer and not the model.
