@@ -7624,8 +7624,9 @@ three measurements of different things and must not be quoted as an encode.
   projection), and pixel-unshuffle into the aligner's channel-major cells. `dsv41_rmsnorm_f32_gain`
   already exists for the two norms per block.
 - The weight upload is outside the timed arm, which is the steady state an integrated tower would
-  create (97 MB of tower weights uploaded once, not per block). A per-call uploader would add
-  ~30 ms per 32 blocks and the table would not describe it.
+  create (970 MB of BF16 tower weights, 1.9 GB once decoded to FP32, uploaded once and not per
+  block). A per-call uploader would add a read plus a copy to every encode and the table would not
+  describe it.
 - `wo`'s host rate at the smallest size is the weakest of the four (1.84x on `w2`, 2.60x on `qkv`
   against 12.63x at the large size): the same kernel, so it is the shape -- 16 column tiles against
   88, i.e. 2,176 threadgroups against 11,968 on a machine with ~40 cores. Named as the next tuning
@@ -7643,3 +7644,144 @@ full DeepSeek suite is **551 passed / 0 failed / 47 skipped** (598 executed) wit
 and **551 passed / 0 failed / 47 skipped with 0 validation errors** under `MTL_DEBUG_LAYER`. The
 run BEFORE the tiles were bound is the one that exposed the 49,152-byte allocation: it lost the
 four parity cases and killed the process each time.
+
+
+## DSV4.1 #43: THE WHOLE VISION TOWER RUNS IN ONE DEVICE PASS, 8.81x TO 6.02x FASTER
+
+### The question
+
+`#41` and `#42` measured the tower's two expensive halves on the GPU and left both as STAGE
+runners: `encode` still called `linearBatched`, so neither stage ran in a turn. `#42`'s own
+journal said why wiring alone would be a LOSS -- at the largest image `w1`'s product is 195 MB, so
+a host<->device round trip per projection costs more than the host GEMM it replaces -- and the
+prize only exists if the token matrix stays on the GPU across all 32 blocks. That is a device
+encode: patch embed, the two norms, the four projections, the split-and-rotate, the attention, the
+gated MLP, the final norm, the pixel-unshuffle and the aligner, all in one command buffer.
+
+Routing agreed decisively. The first request (`/tmp/route43.json`) put `vision_device_encode` at
+**0.954 @ 0.947**, `device_encode_now` at **0.989** and `measure_before_build` at **0.935**; every
+other candidate was below 0.04. The last of those three is why this section opens with a host
+stage split: the middle 3.02 s of the per-token term had never been seen.
+
+### What landed
+
+Three elementwise kernels in `ComputeShaders.metal`, all FP32 and all `dsv41_vision_*`:
+
+- `dsv41_vision_gelu_f32` -- the aligner's activation. MSL has no `erf`, so the kernel carries
+  Abramowitz & Stegun 7.1.26 (`|error| <= 1.5e-7`), which is far below the parity bar and is the
+  only approximation the device pass introduces.
+- `dsv41_vision_silu_mul_f32` -- one thread per output unit, reading the gate and up halves of one
+  `w1` row.
+- `dsv41_vision_unshuffle_f32` -- channel-major cells with the padded rows and columns written as
+  zero.
+
+`DeepSeekV41VisionEncodeDevice` composes those with the two existing stage runners
+(`dsv41_vision_gemm_f32`, `dsv41_vision_rope_split_f32` + `dsv41_vision_attention_f32`) and the
+existing `dsv41_rmsnorm_f32_gain` / `vector_add_f32`. One command buffer per encode, one
+`waitUntilCompleted`, no host round trip between stages. The weights are read through the same
+`DeepSeekV41VisionWeights` resolver the host path uses and uploaded once per tower (0.35 s), and
+the token-sized workspace is reused while the patch grid does not change. `encodeOnHost` gained an
+`onStage` closure (nil in every production path) so the host split could be measured without
+perturbing the oracle; the host path itself is unchanged.
+
+The device pass is now what `DeepSeekV41VisionForward.encode` calls when it carries one, and the
+engine builds one in `visionForward()`. `dynamoe_dsv41_vision_device_off` forces the host path.
+
+### The host split, measured (`-O`, load average ~2.7)
+
+The two smaller sizes exist to separate the quadratic term; the largest is the one that matters.
+Each number is the sum over 32 blocks of `encodeOnHost`'s stage clock, from the first of the two
+runs (the second moved the host total by 0.9%).
+
+| stage | 39x39 / 1,521 tokens | 63x63 / 3,969 tokens | 93x93 / 8,649 tokens |
+|---|---|---|---|
+| attention | 1.241 s (44.0%) | 7.822 s (67.9%) | 34.034 s (81.4%) |
+| w1 | 0.418 s | 0.946 s | 1.954 s |
+| qkv | 0.355 s | 0.833 s | 1.745 s |
+| silu(gate) * up | 0.215 s | 0.564 s | 1.237 s |
+| w2 | 0.212 s | 0.488 s | 1.019 s |
+| wo | 0.132 s | 0.290 s | 0.611 s |
+| residual add 2 | 0.075 s | 0.200 s | 0.439 s |
+| residual add 1 | 0.076 s | 0.196 s | 0.439 s |
+| norm1 | 0.016 s | 0.044 s | 0.102 s |
+| norm2 | 0.014 s | 0.037 s | 0.082 s |
+| aligner w1 | 0.036 s | 0.051 s | 0.081 s |
+| aligner w2 | 0.020 s | 0.029 s | 0.049 s |
+| unshuffle | 0.003 s | 0.007 s | 0.017 s |
+| patch embed | 0.003 s | 0.007 s | 0.016 s |
+| aligner gelu | 0.001 s | 0.003 s | 0.007 s |
+| final norm | 0.001 s | 0.001 s | 0.003 s |
+| **host total** | **2.82 s** | **11.52 s** | **41.83 s** |
+
+The answer to the measurement question: at 8,649 tokens the host's non-attention work is **7.80 s**,
+of which the four projections are **5.33 s** and the elementwise stages (silu * up, the two
+residual adds, unshuffle and gelu) are **2.13 s**, with the norms at 0.18 s. The elementwise stages
+were not negligible -- 5.1% of a largest-image encode -- and the three new kernels were worth
+writing.
+
+### The measured encode
+
+Same run, same tower, same checkpoint (`-O`, app's own code):
+
+| image | patch tokens | host | device (GPU) | speedup | parity (relative) |
+|---|---|---|---|---|---|
+| 546x546 (the pixel floor) | 1,521 | 2.82-2.84 s | **0.32 s** | **8.81-8.93x** | 1.7e-4 |
+| 882x882 | 3,969 | 11.52-11.76 s | **1.70 s** | **6.78-6.90x** | 4.0e-5 |
+| the largest admissible | 8,649 | 41.83-42.20 s | **6.90-6.95 s** | **6.02-6.12x** | 4.8e-5 |
+
+The ranges are two runs of the same test: the first before and the second after a barrier was
+added at each stage boundary (a no-op on the values, and the device arm moved under 1%). The
+weight upload is 0.35-0.36 s once per tower and is outside the device arm. Across the two runs the
+device three-point solve reads `-0.06 to -0.08 s + 0.13-0.15 ms/token + 7.6-7.9e-08 s/token^2`, and
+the host `-0.11 to -0.28 s + 1.30-1.44 ms/token + 4.0-4.1e-07 s/token^2`. The negative constant is
+the fit's noise (the GPU time excludes the upload), so `DeepSeekV41VisionCostModel.measured` is
+fitted with a zero constant from the two extreme points -- `8.4e-5 * t + 8.32e-8 * t^2` -- which
+reproduces 0.32 s, 1.70 s and 6.90-6.95 s to within 4%. The `#37` host constants are kept as
+`hostReference`.
+
+### What it means
+
+- **The tower's shipped range is now 0.32-6.90 s, not 2.82-41.83 s.** The composer's estimate
+  moved with it; the smallest image is under a third of a second and the largest under seven.
+- **The device total is almost entirely #41's attention.** 6.90-6.95 s at the largest size against
+  `#41`'s measured 6.29 s of attention, i.e. everything else -- patch embed, all 128 projections,
+  all 64 norms, the elementwise work, the unshuffle and the aligner -- is **~0.6-0.7 s**. The
+  ceiling for this pass is now the attention kernel, not the graph around it.
+- **The speedup FALLS as the image grows** (8.93x -> 6.12x) precisely because the host's attention
+  share rises (44.0% -> 81.4%): the already-device half cannot be accelerated twice. Quoting one
+  number for the tower without the size is not meaningful.
+- **The elementwise stages cost the device tens of milliseconds, not seconds.** The host paid
+  2.13 s for silu * up, two residual adds, unshuffle and gelu at the largest size; the device's
+  whole non-attention remainder is smaller than that.
+
+### What it does not mean
+
+- **Not a 6x faster image TURN.** The encode is one part of an image turn; prefill and decode of
+  the expanded prompt are untouched.
+- **Not a faster attention kernel.** #41's 6.29 s is the floor this pass inherits, and the attention
+  is 81.4% of the largest host encode.
+- **Not the isolated #42 projection numbers.** #42 timed `linearBatched` alone on warm synthetic
+  weights and read 6.72 s for 32 blocks; the in-situ host tower reads 5.33 s for the same
+  projections at the same size, because the isolated harness also timed the `[[Float]]`
+  materialization around each GEMM. The encode table is the number to quote for the tower.
+- **The parity bars are relative to the row scale, not absolute.** 1.7e-4 at the smallest size and
+  4.8e-5 at the largest are the host's own summation-order difference from a device pass, through
+  32 blocks, including the erf approximation.
+- **The 0.35 s upload is a real first-image cost.** It is not in the GPU time and not in the cost
+  model, which prices a warm tower; a session's first picture pays it.
+- These numbers are from one `-O` build on an M5 Max at load average ~2.7. The device arm was
+  reproducible to under 1% across two runs; the host arm moved with load.
+
+### Verification
+
+`DeepSeekV41VisionEncodeDeviceTests` is new: seven parity/refusal cases run with the default
+suite (the whole small tower against the host, a padded grid, two blocks, workspace reuse across
+grids, a ragged patch row, a missing weight, and a text-width mismatch), and the published-
+geometry measurement is opt-in behind `/tmp/dynamoe_dsv41_vision_encode_measure` or
+`DYNAMOE_DSV41_VISION_ENCODE_MEASURE=1`. The tiny tower agrees with the host to **2.2e-7
+relative**, and every timed published arm checks one grid of rows against the host before
+printing. `DeepSeekV41PublishedTurnTests.testAnRGBImagePricesAndBindsOnThePublishedWeights` now
+drives the engine's own tower (`runtime.visionForward()`), asserts it carries a device pass, and
+therefore exercises the wiring and the one-time upload end to end; a Debug bundle reports that
+upload at `-Onone` (~26 s for 1.9 GB of FP32), which is why the app's `-O` figure is the only one
+quoted.

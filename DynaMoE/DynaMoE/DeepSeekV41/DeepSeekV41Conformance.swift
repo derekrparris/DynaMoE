@@ -32,12 +32,13 @@ import Foundation
 /// `ModelConfig.supportsThinkingLevels` reads it because the dialect renders the
 /// checkpoint's own `Reasoning Effort:` line.
 ///
-/// What it advertises is deliberately TEXT turns. The vision tower is a CPU
-/// reference with no device path and no image rows are fed into a turn; local
-/// models report `supportsVision == false`, so the composer refuses an attachment
-/// instead of dropping pixels. DSpark is not wired either: `#26` measured the
-/// speculative round losing to walking at every width, so it is an optimization
-/// this flag does not promise, and cache rewind for a rejected suffix is unbuilt.
+/// What it advertises is deliberately TEXT turns: this is the gate discovery and
+/// the thinking-level UI read. The vision tower is a separate promise
+/// (`ModelConfig.supportsVision`), and as of `#43` it runs as one device pass; an
+/// image reaches an in-app turn, but the API path still has no span cache and is
+/// not promised. DSpark is not wired either: `#26` measured the speculative round
+/// losing to walking at every width, so it is an optimization this flag does not
+/// promise, and cache rewind for a rejected suffix is unbuilt.
 ///
 /// The value is a constant rather than derived from `unverifiedSummary`: a gate
 /// records how far to trust a number, and one open rule for a stage the text path

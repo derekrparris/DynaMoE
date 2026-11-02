@@ -206,13 +206,13 @@ final class DeepSeekV41VisionCostTests: XCTestCase {
         ropeTheta: 10_000
     )
 
-    /// The three measured points from the published checkpoint on an optimized
-    /// build (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #37").
-    func testTheModelReproducesTheMeasuredPoints() {
+    /// The three measured points on the SHIPPED device encode, from the published
+    /// checkpoint on an optimized build (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #43").
+    func testTheModelReproducesTheDevicePoints() {
         let model = DeepSeekV41VisionCostModel.measured
-        XCTAssertEqual(model.seconds(patchTokens: 0), 0.22, accuracy: 1e-9)
-        XCTAssertEqual(model.seconds(patchTokens: 1_521), 2.74, accuracy: 0.25)
-        XCTAssertEqual(model.seconds(patchTokens: 8_649), 41.71, accuracy: 1.0)
+        XCTAssertEqual(model.seconds(patchTokens: 1_521), 0.32, accuracy: 0.05)
+        XCTAssertEqual(model.seconds(patchTokens: 3_969), 1.70, accuracy: 0.15)
+        XCTAssertEqual(model.seconds(patchTokens: 8_649), 6.95, accuracy: 0.4)
         // And it is monotonic, which the composer's label relies on being true.
         XCTAssertLessThan(
             model.seconds(patchTokens: 1_521), model.seconds(patchTokens: 3_969)
@@ -220,6 +220,14 @@ final class DeepSeekV41VisionCostTests: XCTestCase {
         XCTAssertLessThan(
             model.seconds(patchTokens: 3_969), model.seconds(patchTokens: 8_649)
         )
+    }
+
+    /// The host tower's model, kept as the oracle's cost (`#37`).
+    func testTheHostReferenceReproducesTheHostPoints() {
+        let model = DeepSeekV41VisionCostModel.hostReference
+        XCTAssertEqual(model.seconds(patchTokens: 0), 0.22, accuracy: 1e-9)
+        XCTAssertEqual(model.seconds(patchTokens: 1_521), 2.74, accuracy: 0.25)
+        XCTAssertEqual(model.seconds(patchTokens: 8_649), 41.71, accuracy: 1.0)
     }
 
     func testPricingUsesTheCheckpointsOwnResizePlan() throws {

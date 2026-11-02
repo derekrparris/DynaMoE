@@ -3083,11 +3083,15 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             contextLength: 256,
             allowEngramSkip: false
         )
-        let source = try XCTUnwrap(
-            DeepSeekV41VisionWeights(snapshotDir: snapshot, catalog: runtime.catalog)
+        // The engine's own tower, so this drives the path an attachment takes: the
+        // device pass, its one-time weight upload, and the priced length.
+        let tower = try XCTUnwrap(
+            runtime.visionForward(),
+            "the engine could not build the tower from the published shards"
         )
-        let tower = DeepSeekV41VisionForward(
-            spec: spec, weights: source, textHiddenSize: config.hiddenSize
+        XCTAssertNotNil(
+            tower.device,
+            "the published tower should run as one device pass"
         )
 
         // A 56x56 image, which `fit` scales up to the checkpoint's pixel floor, so
@@ -3150,7 +3154,8 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             "🔎 [dsv41 real] rgb bind: \(side)x\(side) pixels -> \(estimate.patchTokens) patch "
                 + "tokens, \(estimate.spanPositions) span positions, priced "
                 + String(format: "%.2f s", estimate.seconds) + " against "
-                + String(format: "%.2f s", seconds) + " measured"
+                + String(format: "%.2f s", seconds) + " measured (a Debug bundle pays the "
+                + "one-time BF16->FP32 upload at -Onone; the app's -O build pays ~0.35 s)"
         )
         withExtendedLifetime(engine) {}
     }

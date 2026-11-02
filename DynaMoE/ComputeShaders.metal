@@ -11057,3 +11057,99 @@ kernel void dsv41_vision_gemm_f32(
         }
     }
 }
+
+/// MSL Kernel: `dsv41_vision_gelu_f32` -- the aligner's activation.
+///
+/// The checkpoint's `F.gelu` is the exact erf form, not the tanh approximation, so
+/// the rule is `0.5 * x * (1 + erf(x / sqrt(2)))`. MSL has no `erf`, so the kernel
+/// carries Abramowitz & Stegun 7.1.26 (`|error| <= 1.5e-7`), which is far below the
+/// parity bar the tower's aligner is held to. In-place is safe (a thread reads and
+/// writes one index) and is what lets the aligner's first projection's output be
+/// its own input.
+inline float dsv41_erf_approximation(float value) {
+    float sign = value < 0.0f ? -1.0f : 1.0f;
+    float magnitude = fabs(value);
+    float t = 1.0f / (1.0f + 0.3275911f * magnitude);
+    float polynomial = t * (
+        0.254829592f + t * (
+            -0.284496736f + t * (
+                1.421413741f + t * (
+                    -1.453152027f + t * 1.061405429f
+                )
+            )
+        )
+    );
+    return sign * (1.0f - polynomial * exp(-magnitude * magnitude));
+}
+
+kernel void dsv41_vision_gelu_f32(
+    device const float* inVector [[buffer(0)]],
+    device float* outVector [[buffer(1)]],
+    constant uint32_t& count [[buffer(2)]],
+    uint index [[thread_position_in_grid]]
+) {
+    if (index >= count) return;
+    float value = inVector[index];
+    outVector[index] = 0.5f * value
+        * (1.0f + dsv41_erf_approximation(value * 0.70710678118654752440f));
+}
+
+/// MSL Kernel: `dsv41_vision_silu_mul_f32` -- the tower's gated MLP activation.
+///
+/// `w1` emits the gate half followed by the up half of one row, and the block's
+/// rule is `silu(gate) * up`. One thread owns one output unit of one token, so a
+/// token's gate and up halves are read from the same row and no staging is needed.
+kernel void dsv41_vision_silu_mul_f32(
+    device const float* gateAndUp [[buffer(0)]],   // [tokens, 2 * intermediate]
+    device float* outVector [[buffer(1)]],         // [tokens, intermediate]
+    constant uint32_t& intermediate [[buffer(2)]],
+    uint2 position [[thread_position_in_grid]]
+) {
+    uint unit = position.x;
+    uint token = position.y;
+    if (intermediate == 0u || unit >= intermediate) return;
+    uint64_t base = (uint64_t)token * (uint64_t)(2u * intermediate);
+    float gate = gateAndUp[base + unit];
+    float up = gateAndUp[base + (uint64_t)intermediate + unit];
+    float silu = gate / (1.0f + exp(-gate));
+    outVector[(uint64_t)token * intermediate + unit] = silu * up;
+}
+
+/// MSL Kernel: `dsv41_vision_unshuffle_f32` -- the aligner's pixel-unshuffle.
+///
+/// `F.unfold` after `F.pad(x, (0, -n_w % r, 0, -n_h % r))`: a cell is channel-major,
+/// and inside a channel the `ratio x ratio` block is row-major. The padded cells
+/// read outside the patch grid, so those slots are written as zero rather than
+/// left uninitialized. One thread owns one value of one cell.
+kernel void dsv41_vision_unshuffle_f32(
+    device const float* patches [[buffer(0)]],   // [patchRows * patchColumns, width]
+    device float* cells [[buffer(1)]],           // [cells, width * ratio * ratio]
+    constant uint32_t& patchRows [[buffer(2)]],
+    constant uint32_t& patchColumns [[buffer(3)]],
+    constant uint32_t& width [[buffer(4)]],
+    constant uint32_t& ratio [[buffer(5)]],
+    uint2 position [[thread_position_in_grid]]
+) {
+    if (ratio == 0u || width == 0u) return;
+    uint cellVolume = width * ratio * ratio;
+    uint element = position.x;
+    uint cellIndex = position.y;
+    if (element >= cellVolume) return;
+    uint gridColumns = (patchColumns + ratio - 1u) / ratio;
+    uint gridRows = (patchRows + ratio - 1u) / ratio;
+    if (cellIndex >= gridRows * gridColumns) return;
+
+    uint cellRow = cellIndex / gridColumns;
+    uint cellColumn = cellIndex - cellRow * gridColumns;
+    uint innerRow = (element / ratio) % ratio;
+    uint innerColumn = element % ratio;
+    uint channel = element / (ratio * ratio);
+    uint sourceRow = cellRow * ratio + innerRow;
+    uint sourceColumn = cellColumn * ratio + innerColumn;
+
+    float value = 0.0f;
+    if (sourceRow < patchRows && sourceColumn < patchColumns) {
+        value = patches[((uint64_t)sourceRow * patchColumns + sourceColumn) * width + channel];
+    }
+    cells[(uint64_t)cellIndex * cellVolume + element] = value;
+}

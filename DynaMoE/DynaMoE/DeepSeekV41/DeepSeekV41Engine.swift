@@ -588,10 +588,14 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
     /// RoPE table is load work a turn needs and a pure diagnostic does not.
     private var cachedForward: DeepSeekV41MetalForward?
 
-    /// The host vision tower, built on first use. Kept only for its weight resolver:
-    /// the decode itself is per call and cache-free, because one encode reads each
-    /// tensor exactly once.
+    /// The vision tower, built on first use. Kept for its weight resolver and its
+    /// device pass: the host encode is per call and cache-free, because one encode
+    /// reads each tensor exactly once, while the device pass uploads the tower's
+    /// weights once and keeps the token matrix on the GPU across all blocks.
     private var cachedVision: DeepSeekV41VisionForward?
+    /// Why the device tower was not built, when one was asked for. Nil means either
+    /// the device pass is in use or no image has needed the tower yet.
+    public private(set) var visionDeviceProblem: String?
     /// The directory the shards were indexed from, which the tower's `pread` reads
     /// need. Nil for a runtime built without one (a test fixture).
     public let snapshotDir: URL?
@@ -877,17 +881,31 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
     ///
     /// Nil when `config.json` publishes no `vision_config`, the snapshot directory is
     /// unknown, or the tower's tensors could not be resolved from the shards. The
-    /// tower is a HOST reference by design (`DeepSeekV41VisionForward`): its weights
-    /// are read per encode and never mapped, so this costs one `pread` per tensor per
-    /// image and no GPU memory at all.
+    /// tower carries a device pass when Metal can build one: its weights are read
+    /// once and the whole encode stays on the GPU, which is what makes #41's and
+    /// #42's measured stages pay. `dynamoe_dsv41_vision_device_off` forces the host
+    /// path, and a device tower that cannot be built leaves `visionDeviceProblem`
+    /// set rather than failing the image.
     public func visionForward() -> DeepSeekV41VisionForward? {
         if let cachedVision { return cachedVision }
         guard let spec = config.vision, let snapshotDir else { return nil }
         guard let source = DeepSeekV41VisionWeights(
             snapshotDir: snapshotDir, catalog: catalog
         ), let textHidden = source.textHiddenSize else { return nil }
+        var deviceTower: DeepSeekV41VisionEncodeDevice?
+        if UserDefaults.standard.bool(forKey: "dynamoe_dsv41_vision_device_off") {
+            visionDeviceProblem = "disabled by dynamoe_dsv41_vision_device_off"
+        } else {
+            do {
+                deviceTower = try DeepSeekV41VisionEncodeDevice(
+                    spec: spec, weights: source, textHiddenSize: textHidden
+                )
+            } catch {
+                visionDeviceProblem = "\(error)"
+            }
+        }
         let built = DeepSeekV41VisionForward(
-            spec: spec, weights: source, textHiddenSize: textHidden
+            spec: spec, weights: source, textHiddenSize: textHidden, device: deviceTower
         )
         cachedVision = built
         return built
@@ -938,6 +956,7 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         // The tower's resolver holds one descriptor per shard it reads from; dropping
         // it here is what closes them with everything else this runtime owns.
         cachedVision = nil
+        visionDeviceProblem = nil
         weights.close()
         expertStreamer?.close()
         arena.reset()

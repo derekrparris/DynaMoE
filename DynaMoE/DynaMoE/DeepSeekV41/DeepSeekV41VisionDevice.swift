@@ -12,10 +12,10 @@
 //
 //  This file is the device half of that stage and only that stage: the rotation and
 //  head split that feed it (`dsv41_vision_rope_split_f32`), and the online-softmax
-//  attention itself (`dsv41_vision_attention_f32`). The rest of the tower -- patch
-//  embed, the block projections, pixel-unshuffle, the aligner -- still runs on the
-//  host, which is why this is a stage runner rather than a second `encode`. Keeping
-//  it separate is what lets the numerical rule be checked against the host oracle
+//  attention itself (`dsv41_vision_attention_f32`). It stays a stage runner even
+//  though the shipped tower now runs on the device: `DeepSeekV41VisionEncodeDevice`
+//  composes this with the projections and the elementwise stages into one pass, and
+//  the runner is the unit that can be checked against the host oracle on its own
 //  before any of the surrounding pipeline moves.
 //
 
@@ -103,6 +103,33 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
         }
     }
 
+    /// Empty planes for a caller that reuses one allocation across every block.
+    ///
+    /// A device encode runs 32 blocks over the same token grid, and allocating the
+    /// three `heads * tokens * headDim` planes per block would churn a hundred
+    /// megabytes at the larger image sizes. The planes are pure scratch: the split
+    /// overwrites all of them before attention reads them.
+    public static func allocatePlanes(
+        device: MTLDevice,
+        tokens: Int,
+        heads: Int,
+        headDim: Int
+    ) throws -> SplitPlanes {
+        let count = max(tokens * heads * headDim, 1) * MemoryLayout<Float>.stride
+        guard tokens > 0, heads > 0, headDim > 0 else {
+            throw DeepSeekV41VisionDeviceError.shapeMismatch("empty vision planes")
+        }
+        guard let queries = device.makeBuffer(length: count, options: .storageModeShared),
+              let keys = device.makeBuffer(length: count, options: .storageModeShared),
+              let values = device.makeBuffer(length: count, options: .storageModeShared) else {
+            throw DeepSeekV41VisionDeviceError.unavailable("could not allocate the vision planes")
+        }
+        return SplitPlanes(
+            queries: queries, keys: keys, values: values,
+            tokens: tokens, heads: heads, headDim: headDim
+        )
+    }
+
     /// Rotates q and k and splits the interleaved row into head-major planes.
     ///
     /// `cosine` and `sine` carry one row of `ropeDim` angles per token, exactly as
@@ -128,7 +155,13 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
                 "every qkv row must be \(rowWidth) wide"
             )
         }
+        let planes = try Self.allocatePlanes(
+            device: device, tokens: tokens, heads: heads, headDim: headDim
+        )
         let flat = qkv.flatMap { $0 }
+        guard let qkvBuffer = makeFloatBuffer(flat) else {
+            throw DeepSeekV41VisionDeviceError.unavailable("could not allocate the qkv buffer")
+        }
         let rotated = !cosine.isEmpty && !sine.isEmpty && ropeDim > 0
         let angles = rotated ? tokens * ropeDim : 1
         let flatCos: [Float] = rotated ? cosine.flatMap { $0.prefix(ropeDim) } : [0]
@@ -138,48 +171,18 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
                 "angle rows must be \(ropeDim) wide for \(tokens) tokens"
             )
         }
-        let planeCount = heads * tokens * headDim
-
-        guard let qkvBuffer = makeFloatBuffer(flat),
-              let cosineBuffer = makeFloatBuffer(flatCos),
-              let sineBuffer = makeFloatBuffer(flatSin),
-              let queryBuffer = device.makeBuffer(
-                  length: max(planeCount, 1) * MemoryLayout<Float>.stride,
-                  options: .storageModeShared
-              ),
-              let keyBuffer = device.makeBuffer(
-                  length: max(planeCount, 1) * MemoryLayout<Float>.stride,
-                  options: .storageModeShared
-              ),
-              let valueBuffer = device.makeBuffer(
-                  length: max(planeCount, 1) * MemoryLayout<Float>.stride,
-                  options: .storageModeShared
-              ) else {
-            throw DeepSeekV41VisionDeviceError.unavailable("could not allocate the vision planes")
+        guard let cosineBuffer = makeFloatBuffer(flatCos),
+              let sineBuffer = makeFloatBuffer(flatSin) else {
+            throw DeepSeekV41VisionDeviceError.unavailable("could not allocate the angle buffers")
         }
-
-        var tokenCount = UInt32(tokens)
-        var headCount = UInt32(heads)
-        var dimension = UInt32(headDim)
-        var rotationWidth = UInt32(rotated ? ropeDim : 0)
         guard let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw DeepSeekV41VisionDeviceError.unavailable("no command buffer")
         }
-        encoder.setComputePipelineState(ropeSplitPipeline)
-        encoder.setBuffer(qkvBuffer, offset: 0, index: 0)
-        encoder.setBuffer(cosineBuffer, offset: 0, index: 1)
-        encoder.setBuffer(sineBuffer, offset: 0, index: 2)
-        encoder.setBuffer(queryBuffer, offset: 0, index: 3)
-        encoder.setBuffer(keyBuffer, offset: 0, index: 4)
-        encoder.setBuffer(valueBuffer, offset: 0, index: 5)
-        encoder.setBytes(&tokenCount, length: MemoryLayout<UInt32>.stride, index: 6)
-        encoder.setBytes(&headCount, length: MemoryLayout<UInt32>.stride, index: 7)
-        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 8)
-        encoder.setBytes(&rotationWidth, length: MemoryLayout<UInt32>.stride, index: 9)
-        encoder.dispatchThreads(
-            MTLSize(width: max(headDim / 2, 1), height: tokens * heads, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        try dispatchSplitAndRotate(
+            on: encoder,
+            qkv: qkvBuffer, cosine: cosineBuffer, sine: sineBuffer,
+            planes: planes, ropeDim: rotated ? ropeDim : 0
         )
         encoder.endEncoding()
         commandBuffer.commit()
@@ -187,14 +190,72 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
         if let error = commandBuffer.error {
             throw DeepSeekV41VisionDeviceError.unavailable("rope split failed: \(error)")
         }
+        return planes
+    }
 
-        return SplitPlanes(
-            queries: queryBuffer,
-            keys: keyBuffer,
-            values: valueBuffer,
-            tokens: tokens,
-            heads: heads,
-            headDim: headDim
+    /// The rotation-and-split dispatch alone, for a caller that owns the command
+    /// buffer and the planes.
+    public func dispatchSplitAndRotate(
+        on encoder: MTLComputeCommandEncoder,
+        qkv: MTLBuffer,
+        cosine: MTLBuffer,
+        sine: MTLBuffer,
+        planes: SplitPlanes,
+        ropeDim: Int
+    ) throws {
+        let tokens = planes.tokens
+        let heads = planes.heads
+        let headDim = planes.headDim
+        guard tokens > 0, heads > 0, headDim > 0, headDim % 2 == 0,
+              headDim <= Self.maximumHeadDimension else {
+            throw DeepSeekV41VisionDeviceError.shapeMismatch(
+                "the split needs positive, even, at most \(Self.maximumHeadDimension)-wide heads"
+            )
+        }
+        guard ropeDim >= 0, ropeDim <= headDim / 2 else {
+            throw DeepSeekV41VisionDeviceError.shapeMismatch(
+                "rope dimension \(ropeDim) exceeds half a head of \(headDim)"
+            )
+        }
+        let stride = MemoryLayout<Float>.stride
+        guard qkv.length >= tokens * 3 * heads * headDim * stride else {
+            throw DeepSeekV41VisionDeviceError.shapeMismatch(
+                "the qkv buffer is smaller than \(tokens) x \(3 * heads * headDim)"
+            )
+        }
+        let planeBytes = tokens * heads * headDim * stride
+        guard planes.queries.length >= planeBytes, planes.keys.length >= planeBytes,
+              planes.values.length >= planeBytes else {
+            throw DeepSeekV41VisionDeviceError.shapeMismatch(
+                "a vision plane is smaller than \(tokens) x \(heads) x \(headDim)"
+            )
+        }
+        if ropeDim > 0 {
+            let angleBytes = tokens * ropeDim * stride
+            guard cosine.length >= angleBytes, sine.length >= angleBytes else {
+                throw DeepSeekV41VisionDeviceError.shapeMismatch(
+                    "the rotation needs one \(ropeDim)-wide angle row per token"
+                )
+            }
+        }
+        var tokenCount = UInt32(tokens)
+        var headCount = UInt32(heads)
+        var dimension = UInt32(headDim)
+        var rotationWidth = UInt32(ropeDim)
+        encoder.setComputePipelineState(ropeSplitPipeline)
+        encoder.setBuffer(qkv, offset: 0, index: 0)
+        encoder.setBuffer(cosine, offset: 0, index: 1)
+        encoder.setBuffer(sine, offset: 0, index: 2)
+        encoder.setBuffer(planes.queries, offset: 0, index: 3)
+        encoder.setBuffer(planes.keys, offset: 0, index: 4)
+        encoder.setBuffer(planes.values, offset: 0, index: 5)
+        encoder.setBytes(&tokenCount, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&headCount, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.setBytes(&rotationWidth, length: MemoryLayout<UInt32>.stride, index: 9)
+        encoder.dispatchThreads(
+            MTLSize(width: max(headDim / 2, 1), height: tokens * heads, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
         )
     }
 
@@ -227,6 +288,26 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
     /// call; the rows are read separately when a test needs to compare them.
     @discardableResult
     public func runAttention(_ planes: SplitPlanes, into outputBuffer: MTLBuffer) throws -> Double {
+        guard let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw DeepSeekV41VisionDeviceError.unavailable("no command buffer")
+        }
+        try dispatchAttention(on: encoder, planes: planes, into: outputBuffer)
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error {
+            throw DeepSeekV41VisionDeviceError.unavailable("attention failed: \(error)")
+        }
+        return commandBuffer.gpuEndTime - commandBuffer.gpuStartTime
+    }
+
+    /// The attention dispatch alone, for a caller that owns the command buffer.
+    public func dispatchAttention(
+        on encoder: MTLComputeCommandEncoder,
+        planes: SplitPlanes,
+        into outputBuffer: MTLBuffer
+    ) throws {
         let tokens = planes.tokens
         let heads = planes.heads
         let headDim = planes.headDim
@@ -234,10 +315,6 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
             throw DeepSeekV41VisionDeviceError.shapeMismatch(
                 "the output buffer is smaller than \(tokens) x \(heads) x \(headDim)"
             )
-        }
-        guard let commandBuffer = queue.makeCommandBuffer(),
-              let encoder = commandBuffer.makeComputeCommandEncoder() else {
-            throw DeepSeekV41VisionDeviceError.unavailable("no command buffer")
         }
         var tokenCount = UInt32(tokens)
         var headCount = UInt32(heads)
@@ -256,13 +333,6 @@ nonisolated public final class DeepSeekV41VisionAttentionDevice {
             MTLSize(width: heads * max(queryBlocks, 1), height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: Self.threadgroupWidth, height: 1, depth: 1)
         )
-        encoder.endEncoding()
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        if let error = commandBuffer.error {
-            throw DeepSeekV41VisionDeviceError.unavailable("attention failed: \(error)")
-        }
-        return commandBuffer.gpuEndTime - commandBuffer.gpuStartTime
     }
 
     /// Rotation, split and attention in one call, the shape the host oracle's

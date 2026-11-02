@@ -23,10 +23,12 @@
 //  The matrix multiplies and the attention run through Accelerate, with the scalar
 //  forms kept beside them as the oracle: one dot product per output row is the
 //  DEFINITION of a linear, one GEMM for the whole block of tokens is what the tower
-//  runs, and a test pins the two together. Attention is still quadratic, but
-//  quadratic over a GEMM rather than over scalar Swift: a 1521-patch image is 2.3
-//  million dots per head per layer, and one lane per dot is what made the smallest
-//  image the checkpoint accepts cost ten hours.
+//  runs, and a test pins the two together. This file is the DEFINITION and the
+//  oracle; the shipped path is `DeepSeekV41VisionEncodeDevice`, which runs the same
+//  rule as one device pass and is checked against this one. Attention is still
+//  quadratic, but quadratic over a GEMM rather than over scalar Swift: a 1521-patch
+//  image is 2.3 million dots per head per layer, and one lane per dot is what made
+//  the smallest image the checkpoint accepts cost ten hours.
 //
 
 import Accelerate
@@ -56,6 +58,12 @@ nonisolated public struct DeepSeekV41VisionForward {
     public let weights: DeepSeekV41WeightSource
     /// The language model's hidden size, which is the aligner's output width.
     public let textHiddenSize: Int
+    /// The device-resident form of this tower, when one was built.
+    ///
+    /// Nil keeps the host path, which is the definition every device stage is
+    /// checked against; the engine builds one for the published checkpoint, and a
+    /// test builds one when it needs to compare the two.
+    public let device: DeepSeekV41VisionEncodeDevice?
 
     /// `RMSNorm.__init__`'s default, which the tower's norms keep: the text tower's
     /// `norm_eps` is 1e-20 and using it here would change every normalized value.
@@ -64,14 +72,20 @@ nonisolated public struct DeepSeekV41VisionForward {
     public init(
         spec: DeepSeekV41VisionSpec,
         weights: DeepSeekV41WeightSource,
-        textHiddenSize: Int
+        textHiddenSize: Int,
+        device: DeepSeekV41VisionEncodeDevice? = nil
     ) {
         self.spec = spec
         self.weights = weights
         self.textHiddenSize = textHiddenSize
+        self.device = device
     }
 
     /// One row per aligner grid cell, `textHiddenSize` wide, in reading order.
+    ///
+    /// When a device tower is attached the whole encode runs in one device pass;
+    /// otherwise this is `encodeOnHost`. The two are pinned against each other by
+    /// `DeepSeekV41VisionEncodeDeviceTests`.
     ///
     /// - Parameters:
     ///   - patches: `rows * columns` vectors of `3 * patchSize^2` values, in the
@@ -83,6 +97,37 @@ nonisolated public struct DeepSeekV41VisionForward {
         rows: Int,
         columns: Int
     ) throws -> [[Float]] {
+        if let device {
+            guard device.textHiddenSize == textHiddenSize else {
+                throw DeepSeekV41VisionForwardError.shapeMismatch(
+                    "the device tower projects to \(device.textHiddenSize), not \(textHiddenSize)"
+                )
+            }
+            return try device.encode(patches: patches, rows: rows, columns: columns)
+        }
+        return try encodeOnHost(patches: patches, rows: rows, columns: columns)
+    }
+
+    /// The CPU tower: the definition, and the oracle every device stage is checked
+    /// against.
+    ///
+    /// `onStage` receives each stage's name and elapsed time as the encode walks
+    /// them. It is nil in every production and parity path, so the only cost is the
+    /// clock read; the measurement test passes a closure and gets the split #37's
+    /// three-point fit could only price as one per-token term.
+    public func encodeOnHost(
+        patches: [[Float]],
+        rows: Int,
+        columns: Int,
+        onStage: ((String, Double) -> Void)? = nil
+    ) throws -> [[Float]] {
+        var stageStart = CFAbsoluteTimeGetCurrent()
+        func mark(_ stage: String) {
+            guard let onStage else { return }
+            let now = CFAbsoluteTimeGetCurrent()
+            onStage(stage, now - stageStart)
+            stageStart = now
+        }
         guard rows > 0, columns > 0, patches.count >= rows * columns else {
             throw DeepSeekV41VisionForwardError.emptyImage
         }
@@ -105,6 +150,7 @@ nonisolated public struct DeepSeekV41VisionForward {
             expectedInput: 3 * spec.patchSize * spec.patchSize,
             expectedOutput: hidden
         )
+        mark("patchEmbed")
 
         // One frequency vector per patch token, shared by every head.
         let rotary = Self.rotaryTables(
@@ -117,6 +163,7 @@ nonisolated public struct DeepSeekV41VisionForward {
                 x, weight: try normWeight(.visionBlockNorm1, layer: block, dimension: hidden),
                 dimension: hidden
             )
+            mark("block.norm1")
             let qkv = try linear(
                 normed,
                 weight: matrix(.visionBlockWqkv, layer: block),
@@ -124,6 +171,7 @@ nonisolated public struct DeepSeekV41VisionForward {
                 expectedInput: hidden,
                 expectedOutput: 3 * hidden
             )
+            mark("block.qkv")
             let attended = Self.attentionBatched(
                 qkv: qkv,
                 heads: heads,
@@ -132,6 +180,7 @@ nonisolated public struct DeepSeekV41VisionForward {
                 cosine: rotary.cosine,
                 sine: rotary.sine
             )
+            mark("block.attention")
             let projected = try linear(
                 attended,
                 weight: matrix(.visionBlockWo, layer: block),
@@ -139,11 +188,13 @@ nonisolated public struct DeepSeekV41VisionForward {
                 expectedInput: hidden,
                 expectedOutput: hidden
             )
+            mark("block.wo")
             for index in 0..<tokenCount {
                 for dimension in 0..<hidden {
                     x[index][dimension] += projected[index][dimension]
                 }
             }
+            mark("block.residual1")
 
             // x = x + mlp(norm2(x)): `w1` emits gate and up halves, and only the
             // gate goes through the activation.
@@ -151,6 +202,7 @@ nonisolated public struct DeepSeekV41VisionForward {
                 x, weight: try normWeight(.visionBlockNorm2, layer: block, dimension: hidden),
                 dimension: hidden
             )
+            mark("block.norm2")
             let gateAndUp = try linear(
                 normed2,
                 weight: matrix(.visionBlockW1, layer: block),
@@ -158,6 +210,7 @@ nonisolated public struct DeepSeekV41VisionForward {
                 expectedInput: hidden,
                 expectedOutput: 2 * spec.intermediateSize
             )
+            mark("block.w1")
             var activated = [[Float]](repeating: [], count: tokenCount)
             for index in 0..<tokenCount {
                 var value = [Float](repeating: 0, count: spec.intermediateSize)
@@ -168,6 +221,7 @@ nonisolated public struct DeepSeekV41VisionForward {
                 }
                 activated[index] = value
             }
+            mark("block.siluMul")
             let mlp = try linear(
                 activated,
                 weight: matrix(.visionBlockW2, layer: block),
@@ -175,11 +229,13 @@ nonisolated public struct DeepSeekV41VisionForward {
                 expectedInput: spec.intermediateSize,
                 expectedOutput: hidden
             )
+            mark("block.w2")
             for index in 0..<tokenCount {
                 for dimension in 0..<hidden {
                     x[index][dimension] += mlp[index][dimension]
                 }
             }
+            mark("block.residual2")
         }
 
         // `ViT.forward` closes with a norm.
@@ -187,6 +243,7 @@ nonisolated public struct DeepSeekV41VisionForward {
             x, weight: try normWeight(.visionFinalNorm, layer: nil, dimension: hidden),
             dimension: hidden
         )
+        mark("finalNorm")
 
         // Aligner: pixel-unshuffle onto the downsample grid, then two linears.
         let cells = Self.pixelUnshuffle(
@@ -196,6 +253,7 @@ nonisolated public struct DeepSeekV41VisionForward {
             ratio: max(1, spec.downsampleRatio),
             width: hidden
         )
+        mark("unshuffle")
         let unshuffledWidth = hidden * max(1, spec.downsampleRatio) * max(1, spec.downsampleRatio)
         let hiddenCells = try linear(
             cells,
@@ -204,14 +262,18 @@ nonisolated public struct DeepSeekV41VisionForward {
             expectedInput: unshuffledWidth,
             expectedOutput: textHiddenSize
         )
+        mark("aligner1")
         let activatedCells = hiddenCells.map { row in row.map(Self.gelu) }
-        return try linear(
+        mark("alignerGelu")
+        let result = try linear(
             activatedCells,
             weight: matrix(.visionAlignerW2, layer: nil),
             bias: weights.vector(.visionAlignerW2Bias, layer: nil),
             expectedInput: textHiddenSize,
             expectedOutput: textHiddenSize
         )
+        mark("aligner2")
+        return result
     }
 
     /// The whole span an image occupies in the residual stream: the start marker,

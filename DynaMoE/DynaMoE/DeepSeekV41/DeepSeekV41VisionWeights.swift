@@ -4,12 +4,11 @@
 //
 //  The vision tower's weights, straight out of the checkpoint's shards.
 //
-//  The tower is the one part of this checkpoint whose forward runs on the host: it
-//  is 970 MB of BF16, and one image costs the tower's 32 blocks once, where the
-//  510 GB backbone costs a full pass per position. Its weights are still read
-//  through `pread` and decoded on demand rather than pinned, because one encode
-//  touches each tensor exactly once: a pinned copy would be 1.9 GB of `Float` to
-//  save reads that happen a single time.
+//  The tower is 970 MB of BF16, and one image costs the tower's 32 blocks once,
+//  where the 510 GB backbone costs a full pass per position. Its weights are read
+//  through `pread` and decoded on demand rather than pinned: the host oracle reads
+//  each tensor once per encode, and the device path reads each tensor once per
+//  tower and keeps its own FP32 copy, so neither needs a resident mapping here.
 //
 //  Resolution is by tensor NAME through the checkpoint's own `index.json` and
 //  safetensors headers, not through the segmented `ModelSummary`. The summary is

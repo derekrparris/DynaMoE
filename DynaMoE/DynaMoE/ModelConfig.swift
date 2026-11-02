@@ -1114,9 +1114,10 @@ public struct ModelConfig: Codable {
     /// What an attachment of this pixel size is expected to cost the vision tower,
     /// from the resize plan alone.
     ///
-    /// The range across images the checkpoint accepts is wide (2.74 s for the
-    /// smallest, 41.71 s for the largest, measured), so the composer shows this
-    /// before the encode rather than letting a large photo look like a hang.
+    /// The range across images the checkpoint accepts is wide (0.32 s for the
+    /// smallest, 6.95 s for the largest on the device encode, measured), so the
+    /// composer shows this before the encode rather than letting a large photo look
+    /// like a hang.
     nonisolated public static func visionCostEstimate(
         modelPath: String?,
         width: Int,

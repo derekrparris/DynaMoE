@@ -132,10 +132,11 @@ public enum DeepSeekV41LoadDiagnostics {
         }
 
         // What the app will run, as opposed to what the checkpoint publishes. The
-        // two differ: the vision tower has a CPU reference and no device path, and
-        // DSpark is planned but not wired into the turn loop.
+        // two differ: the vision tower has a device encode but no image reaches the
+        // API path, and DSpark is planned but not wired into the turn loop.
         lines.append(
-            "runtime: text turns (vision and DSpark are not wired; images are refused)"
+            "runtime: text turns and in-app images (device vision encode when Metal "
+                + "can build it); DSpark is not wired; the API path refuses images"
         )
 
         for warning in config.warnings(layerPlan: plan) {

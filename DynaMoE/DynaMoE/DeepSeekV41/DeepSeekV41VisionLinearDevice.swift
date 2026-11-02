@@ -15,9 +15,10 @@
 //  token matrix that leaves for the host between blocks costs a transfer per stage.
 //
 //  This file is the stage and only the stage -- `dsv41_vision_gemm_f32`, its shape
-//  validation, and a runner whose return value is the dispatch's GPU time. The tower
-//  still calls `linearBatched`; wiring `encode` to this is a separate change, and it
-//  should be made only against a measured win at the published shapes.
+//  validation, and a runner whose return value is the dispatch's GPU time. The host
+//  tower still calls `linearBatched` as the oracle; the shipped path composes this
+//  stage inside `DeepSeekV41VisionEncodeDevice`, whose measured encode runs the whole
+//  tower in 6.02-6.12x the host's time at the largest image (`#43`).
 //
 
 import Foundation
@@ -103,8 +104,10 @@ nonisolated public final class DeepSeekV41VisionLinearDevice {
             inputs: inputs, weights: weights, output: output,
             rows: rows, outputs: outputs, depth: depth
         )
-        let zeroBias: MTLBuffer?
-        if bias == nil {
+        let zeroBias: MTLBuffer
+        if let bias {
+            zeroBias = bias
+        } else {
             guard let zeros = device.makeBuffer(
                 length: max(outputs, 1) * MemoryLayout<Float>.stride,
                 options: .storageModeShared
@@ -113,21 +116,53 @@ nonisolated public final class DeepSeekV41VisionLinearDevice {
             }
             memset(zeros.contents(), 0, zeros.length)
             zeroBias = zeros
-        } else {
-            zeroBias = bias
         }
-        guard let biasBuffer = zeroBias,
-              let commandBuffer = queue.makeCommandBuffer(),
+        guard let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw DeepSeekV41VisionDeviceError.unavailable("no command buffer")
         }
+        try dispatchLinear(
+            on: encoder,
+            inputs: inputs, weights: weights, bias: zeroBias, output: output,
+            rows: rows, outputs: outputs, depth: depth
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error {
+            throw DeepSeekV41VisionDeviceError.unavailable("vision GEMM failed: \(error)")
+        }
+        return commandBuffer.gpuEndTime - commandBuffer.gpuStartTime
+    }
+
+    /// The GEMM's dispatch alone, for a caller that owns the command buffer.
+    ///
+    /// A device-resident encode runs every stage of every block in ONE command
+    /// buffer, so it cannot use a runner that commits and waits per projection: the
+    /// wait is the round trip the residency exists to remove. The bias is
+    /// non-optional here because managing the zero substitute belongs to whoever
+    /// owns the pipeline's lifetime, not to a per-dispatch allocation.
+    public func dispatchLinear(
+        on encoder: MTLComputeCommandEncoder,
+        inputs: MTLBuffer,
+        weights: MTLBuffer,
+        bias: MTLBuffer,
+        output: MTLBuffer,
+        rows: Int,
+        outputs: Int,
+        depth: Int
+    ) throws {
+        try validate(
+            inputs: inputs, weights: weights, output: output,
+            rows: rows, outputs: outputs, depth: depth
+        )
         var rowCount = UInt32(rows)
         var outputCount = UInt32(outputs)
         var depthCount = UInt32(depth)
         encoder.setComputePipelineState(gemmPipeline)
         encoder.setBuffer(inputs, offset: 0, index: 0)
         encoder.setBuffer(weights, offset: 0, index: 1)
-        encoder.setBuffer(biasBuffer, offset: 0, index: 2)
+        encoder.setBuffer(bias, offset: 0, index: 2)
         encoder.setBuffer(output, offset: 0, index: 3)
         encoder.setBytes(&rowCount, length: MemoryLayout<UInt32>.stride, index: 4)
         encoder.setBytes(&outputCount, length: MemoryLayout<UInt32>.stride, index: 5)
@@ -147,13 +182,6 @@ nonisolated public final class DeepSeekV41VisionLinearDevice {
             MTLSize(width: max(columnGroups, 1), height: max(rowGroups, 1), depth: 1),
             threadsPerThreadgroup: MTLSize(width: Self.threadgroupWidth, height: 1, depth: 1)
         )
-        encoder.endEncoding()
-        commandBuffer.commit()
-        commandBuffer.waitUntilCompleted()
-        if let error = commandBuffer.error {
-            throw DeepSeekV41VisionDeviceError.unavailable("vision GEMM failed: \(error)")
-        }
-        return commandBuffer.gpuEndTime - commandBuffer.gpuStartTime
     }
 
     /// One projection as rows, the shape `DeepSeekV41VisionForward.linear` returns.

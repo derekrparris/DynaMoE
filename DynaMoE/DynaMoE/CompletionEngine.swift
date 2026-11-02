@@ -247,11 +247,12 @@ public final class CompletionEngine: @unchecked Sendable {
     /// Encoded image spans, keyed by `snapshot path | image sha256`.
     ///
     /// A chat turn re-renders the whole conversation, so a picture that stays in
-    /// context would otherwise re-run the vision tower on every turn: 2.74 s for the
-    /// smallest image the checkpoint accepts and 41.71 s for the largest, measured
-    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #37"). The rows are the expensive
-    /// part (a smallest image's span is 3.8 MB of `Float`), so the cache is small
-    /// and drops everything once it outgrows it rather than growing without bound.
+    /// context would otherwise re-run the vision tower on every turn: 0.32 s for the
+    /// smallest image the checkpoint accepts and 6.95 s for the largest on the
+    /// shipped device encode, measured (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #43").
+    /// The rows are the expensive part (a smallest image's span is 3.8 MB of
+    /// `Float`), so the cache is small and drops everything once it outgrows it
+    /// rather than growing without bound.
     private var cachedImageSpans: [String: DeepSeekV41ImagePrompt.ImageSpan] = [:]
     private static let imageSpanCacheLimit = 4
 
@@ -462,11 +463,12 @@ public final class CompletionEngine: @unchecked Sendable {
 
                 // Encode the attachments now that the tower can be reached, and bind
                 // its rows to the placeholders. This is the slow part of an image turn
-                // (2.74 s for the smallest image the checkpoint accepts, 41.71 s for
-                // the largest, measured), and it happens before the turn starts so the
-                // first streamed frame is still the first generated token. An
-                // attachment this engine already encoded is reused: a conversation
-                // that keeps a picture in context re-renders it every turn.
+                // (0.32 s for the smallest image the checkpoint accepts, 6.95 s for
+                // the largest on the device encode, measured), and it happens before
+                // the turn starts so the first streamed frame is still the first
+                // generated token. An attachment this engine already encoded is
+                // reused: a conversation that keeps a picture in context re-renders it
+                // every turn.
                 stateLock.lock()
                 let cachedSpans = cachedImageSpans
                 stateLock.unlock()
