@@ -6,6 +6,7 @@
 //
 
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 /// Unpacks an FP8 (E4M3) byte into an unscaled FP32 float
@@ -10883,5 +10884,176 @@ kernel void dsv41_vision_attention_f32(
     }
     if (hasSecondDimension) {
         outputBuffer[outputBase + laneInSimd + 32u] = accumulatorB * inverse;
+    }
+}
+
+// MARK: - DeepSeek-V4.1 vision tower: the block GEMM
+
+/// MSL Kernel: `dsv41_vision_gemm_f32` -- the vision tower's projection,
+/// `C = A * Bᵀ + bias`, over a whole block of patch tokens.
+///
+/// `A` is `[rows][depth]` row-major (the token matrix), `B` is `[outputs][depth]`
+/// row-major, which is exactly how a `Linear`'s weight is stored, so neither operand
+/// is transposed on the host; `C` is `[rows][outputs]`, the layout the host tower's
+/// `linearBatched` returns. The host path already runs one Accelerate `sgemm` per
+/// projection rather than a dot product per output row, so this kernel has to beat a
+/// near-peak CPU GEMM to be worth anything: it exists because the largest image the
+/// checkpoint accepts spends ~9.74 s of its 41.71 s in exactly these projections
+/// ("DSV4.1 #37", per-token term), and because a device tower cannot hand its token
+/// matrix back to the host between blocks.
+///
+/// One threadgroup owns a 64x64 tile of the output. Its 256 threads are eight SIMD
+/// groups laid out 2x4, and each group owns 32 rows by 16 columns of that tile, i.e.
+/// eight `simdgroup_float8x8` accumulators. A 64x16 chunk of each operand is staged
+/// in threadgroup memory once per depth step and read by all eight groups, so the
+/// weight tile is fetched once per output tile instead of once per group.
+///
+/// Bounds are handled by zero-filling the staged tiles and guarding only the write,
+/// which is what lets a ragged `rows`, `outputs` or `depth` take the same path: a
+/// zero outside the matrix contributes nothing to a dot product.
+///
+/// The three tiles are BOUND threadgroup buffers rather than declared arrays, and
+/// that is not stylistic. Declared here, the offline `metal` compiler allocates
+/// 49,152 bytes for a kernel that names 24,576 -- it duplicates the whole set, which
+/// the driver tolerates and `MTL_DEBUG_LAYER` rejects against the device's 32,768
+/// limit. Bound memory is sized by the host, so the number in the shader is the
+/// number the device sees.
+#define DSV41_VISION_GEMM_ROWS 64u
+#define DSV41_VISION_GEMM_COLUMNS 64u
+#define DSV41_VISION_GEMM_DEPTH 16u
+#define DSV41_VISION_GEMM_THREADS 256u
+#define DSV41_VISION_GEMM_GROUP_ROWS 32u
+#define DSV41_VISION_GEMM_GROUP_COLUMNS 16u
+
+kernel void dsv41_vision_gemm_f32(
+    device const float* inputs [[buffer(0)]],
+    device const float* weights [[buffer(1)]],
+    device const float* bias [[buffer(2)]],
+    device float* output [[buffer(3)]],
+    constant uint& rows [[buffer(4)]],
+    constant uint& outputs [[buffer(5)]],
+    constant uint& depth [[buffer(6)]],
+    threadgroup float* inputTile [[threadgroup(0)]],
+    threadgroup float* weightTile [[threadgroup(1)]],
+    threadgroup float* outputTile [[threadgroup(2)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simdGroup [[simdgroup_index_in_threadgroup]]
+) {
+
+    uint rowBase = group.y * DSV41_VISION_GEMM_ROWS;
+    uint columnBase = group.x * DSV41_VISION_GEMM_COLUMNS;
+
+    uint groupRow = simdGroup / 4u;
+    uint groupColumn = simdGroup % 4u;
+    uint fragmentRow = groupRow * DSV41_VISION_GEMM_GROUP_ROWS;
+    uint fragmentColumn = groupColumn * DSV41_VISION_GEMM_GROUP_COLUMNS;
+
+    simdgroup_float8x8 accumulator[4][2];
+    for (uint r = 0u; r < 4u; ++r) {
+        for (uint c = 0u; c < 2u; ++c) {
+            accumulator[r][c] = simdgroup_float8x8(0.0f);
+        }
+    }
+
+    // Four floats per thread fill either 64x16 tile: 1024 values, 256 threads, and
+    // a thread's four are always inside one row because the tile is 16 wide.
+    uint tileOffset = lane * 4u;
+    uint tileRow = tileOffset / DSV41_VISION_GEMM_DEPTH;
+    uint tileColumn = tileOffset % DSV41_VISION_GEMM_DEPTH;
+
+    for (uint start = 0u; start < depth; start += DSV41_VISION_GEMM_DEPTH) {
+        uint inputRow = rowBase + tileRow;
+        uint weightRow = columnBase + tileRow;
+        uint inputBase = inputRow * depth + start + tileColumn;
+        uint weightBase = weightRow * depth + start + tileColumn;
+        float4 stagedInput = float4(0.0f);
+        float4 stagedWeight = float4(0.0f);
+        // The row stride is a runtime value, so even `start + tileColumn` is only a
+        // 4-byte-aligned offset; scalar loads are what make that safe.
+        if (inputRow < rows) {
+            for (uint element = 0u; element < 4u; ++element) {
+                if (start + tileColumn + element < depth) {
+                    stagedInput[element] = inputs[inputBase + element];
+                }
+            }
+        }
+        if (weightRow < outputs) {
+            for (uint element = 0u; element < 4u; ++element) {
+                if (start + tileColumn + element < depth) {
+                    stagedWeight[element] = weights[weightBase + element];
+                }
+            }
+        }
+        inputTile[tileOffset + 0u] = stagedInput.x;
+        inputTile[tileOffset + 1u] = stagedInput.y;
+        inputTile[tileOffset + 2u] = stagedInput.z;
+        inputTile[tileOffset + 3u] = stagedInput.w;
+        weightTile[tileOffset + 0u] = stagedWeight.x;
+        weightTile[tileOffset + 1u] = stagedWeight.y;
+        weightTile[tileOffset + 2u] = stagedWeight.z;
+        weightTile[tileOffset + 3u] = stagedWeight.w;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint inner = 0u; inner < DSV41_VISION_GEMM_DEPTH; inner += 8u) {
+            // One input fragment serves both column fragments, so each staged row
+            // is loaded once per group per depth step.
+            simdgroup_float8x8 inputFragment[4];
+            for (uint r = 0u; r < 4u; ++r) {
+                simdgroup_load(
+                    inputFragment[r],
+                    inputTile + (fragmentRow + r * 8u) * DSV41_VISION_GEMM_DEPTH + inner,
+                    DSV41_VISION_GEMM_DEPTH
+                );
+            }
+            for (uint c = 0u; c < 2u; ++c) {
+                // The weight tile is `[output][depth]`, so the 8x8 the accumulator
+                // needs is its transpose: `simdgroup_load`'s transpose flag reads
+                // the staged rows as columns.
+                simdgroup_float8x8 weightFragment;
+                simdgroup_load(
+                    weightFragment,
+                    weightTile + (fragmentColumn + c * 8u) * DSV41_VISION_GEMM_DEPTH + inner,
+                    DSV41_VISION_GEMM_DEPTH,
+                    ulong2(0, 0),
+                    true
+                );
+                for (uint r = 0u; r < 4u; ++r) {
+                    simdgroup_multiply_accumulate(
+                        accumulator[r][c], inputFragment[r], weightFragment, accumulator[r][c]
+                    );
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint r = 0u; r < 4u; ++r) {
+        for (uint c = 0u; c < 2u; ++c) {
+            simdgroup_store(
+                accumulator[r][c],
+                outputTile + (fragmentRow + r * 8u) * DSV41_VISION_GEMM_COLUMNS
+                    + fragmentColumn + c * 8u,
+                DSV41_VISION_GEMM_COLUMNS
+            );
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Four float4-sized writes per thread cover the 4096-value output tile.
+    for (uint pass = 0u; pass < 4u; ++pass) {
+        uint offset = pass * DSV41_VISION_GEMM_THREADS * 4u + lane * 4u;
+        uint localRow = offset / DSV41_VISION_GEMM_COLUMNS;
+        uint outputRow = rowBase + localRow;
+        if (outputRow >= rows) continue;
+        uint localColumn = offset % DSV41_VISION_GEMM_COLUMNS;
+        for (uint element = 0u; element < 4u; ++element) {
+            uint column = columnBase + localColumn + element;
+            if (column >= outputs) break;
+            output[outputRow * outputs + column] = outputTile[offset + element] + bias[column];
+        }
     }
 }

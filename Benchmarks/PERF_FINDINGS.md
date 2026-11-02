@@ -7511,3 +7511,135 @@ and 1.79e-07 worst differences) and the published-geometry timing is opt-in behi
 `/tmp/dynamoe_dsv41_vision_measure`. The full DeepSeek suite is **545 passed / 0 failed / 46
 skipped** (591 executed) without the marker; with it, under `MTL_DEBUG_LAYER`, **546 passed / 0
 failed / 45 skipped and 0 validation errors**.
+
+## DSV4.1 #42: THE VISION TOWER'S PROJECTIONS RUN ON THE GPU, 11.16x FASTER
+
+### The question
+
+`#41` left the largest image at an estimated 16.25 s, with the per-token term -- `1.126 ms/token`
+over 8,649 tokens, i.e. **9.74 s** -- the majority of what was left. That term was never split by
+stage: it came out of `#37`'s three-point solve, and `#37` only checked it against the fixed and
+quadratic terms, not against its own parts. What the tower calls there is not scalar Swift:
+`DeepSeekV41VisionForward.linearBatched` flattens the token block and runs **one
+`cblas_sgemm`** per projection, so at 838 MFLOP per patch token in 1.126 ms the host is running
+near **744 GFLOP/s**. Moving that to the GPU is therefore a bet on device headroom, not a repair,
+and it is also what any device-resident tower needs -- a token matrix that leaves for the host
+between blocks costs a transfer per stage.
+
+Router: `vision_priority` (is the tower the highest-value target ahead of the protocol surfaces?)
+came back **0.933**; the first `next_slice` request was mid-band (`vision_device_linear_stages`
+0.395 at 0.308 confidence) and was re-filed with the measured costs in `state`, which raised it to
+**0.578** and put `new_kernel_worth_it` at **0.819** -- a decisive "a GEMM kernel is justified".
+The smaller alternatives were `attention_queries_per_group` 0.098, `wire_the_shipped_kernel_only`
+0.115 and `host_stage_split_first` 0.209.
+
+### What landed
+
+- **`dsv41_vision_gemm_f32`** computes `C = A * Bᵀ + bias` over a whole block of patch tokens.
+  `A` is `[rows][depth]`, `B` is `[outputs][depth]` (exactly how a `Linear`'s weight is stored), `C`
+  is `[rows][outputs]` -- the host GEMM's own layout, so neither operand is transposed.
+  - One threadgroup owns a **64x64** output tile. Its 256 threads are eight SIMD groups laid out
+    2x4, and each group owns 32 rows by 16 columns, i.e. **eight `simdgroup_float8x8`
+    accumulators**; a 64x16 chunk of each operand is staged once per depth step and read by all
+    eight groups.
+  - The weight tile is `[output][depth]`, so the 8x8 the accumulator needs is its TRANSPOSE and the
+    fragment is loaded with `simdgroup_load`'s transpose flag rather than by staging a second copy.
+  - Bounds are handled by **zero-filling the staged tiles** and guarding only the write-out, which
+    is what lets a ragged `rows`, `outputs` or `depth` take the same path: a zero outside the matrix
+    contributes nothing to a dot product. The bias is added on the write, where the guards are.
+- **`DeepSeekV41VisionLinearDevice`** is the stage runner: `runLinear` takes device buffers and
+  returns `gpuEndTime - gpuStartTime` (no readback), `linear` takes the tower's `[[Float]]` and a
+  `DeepSeekV41Matrix` and returns rows, and `readRows`/`makeBuffer` are the plumbing a measurement
+  needs. A ragged input row is REFUSED, because the kernel would read the next row's values for
+  the missing tail.
+
+### The tile had to be BOUND, not declared, and the validation layer is how that was found
+
+The first form declared its three tiles in the kernel body. On the app's own build the offline
+`metal` compiler allocated **49,152 bytes** for a kernel that names **24,576** -- it duplicates the
+whole set: `xcrun metal` + `metallib` on the same source reports 49,152 while
+`makeLibrary(source:)` at runtime reports 24,576, and a minimal kernel with the same three
+declarations reports 24,576 through the offline compiler too, so it is this kernel's shape rather
+than the declarations. The driver ran it anyway and produced correct numbers -- the three `-O`
+measurement runs below passed before the fix -- but `MTL_DEBUG_LAYER` refused the dispatch against
+the device's `maxThreadgroupMemoryLength` of **32,768** and killed the test process, which is
+exactly the class of defect the validation run exists for. The tiles are now
+`[[threadgroup(0..2)]]` parameters sized by the host (`setThreadgroupMemoryLength`, 4 KB + 4 KB +
+16 KB = 24,576), so `staticThreadgroupMemoryLength` is **0** and the number in the shader is the
+number the device sees. It is also faster, because the compiler is no longer carrying a duplicate
+set: `wo` at the largest size went 6.88 ms -> 1.71 ms.
+
+### Evidence
+
+Parity, `-O`, against both host forms (relative, and the definition is the only check that would
+catch a shared transposed operand):
+
+```
+🔎 [dsv41 vision] linear parity (ragged): worst relative 0.0
+🔎 [dsv41 vision] linear parity (definition): worst relative 1.1920929e-07
+🔎 [dsv41 vision] linear parity (published width): worst relative 0.0
+🔎 [dsv41 vision] linear threadgroup memory: declared 0, bound 24576, device limit 32768
+```
+
+The four block projections at the two published token counts, app's own `-O` build
+(`/tmp/dd_dsv41_opt`), device arm = `runLinear` GPU time on pre-uploaded buffers, host arm =
+`linearBatched` as the tower calls it (flatten and slice included), best of three:
+
+| shape | smallest (1,521 tokens) | largest (8,649 tokens) |
+|---|---|---|
+| qkv `1024 -> 3072` | 3.52 ms vs 9.16 ms (2.60x) | 4.38 ms vs 55.31 ms (12.63x) |
+| wo `1024 -> 1024` | 0.57 ms vs 3.66 ms (6.43x) | 1.71 ms vs 18.78 ms (10.97x) |
+| w1 `1024 -> 5632` | 3.10 ms vs 16.06 ms (5.19x) | 7.92 ms vs 99.21 ms (12.53x) |
+| w2 `2816 -> 1024` | 3.57 ms vs 6.58 ms (1.84x) | 4.81 ms vs 36.66 ms (7.63x) |
+| **32 blocks** | **0.34 s vs 1.13 s (3.30x)** | **0.60 s vs 6.72 s (11.16x)** |
+
+Runs before the tile was bound, same harness, read 0.36 s vs 1.11 s (3.12x) and 0.91 s vs 6.38 s
+(7.04x), and a second after it read 3.30x and 11.16x; the device arm moves 12-27% between runs
+because the machine was carrying a load average of 2-7, so the honest statement is **3.1-3.9x at
+the smallest image and 7.0-11.2x at the largest**.
+
+The same test on a DEBUG build reports the host arm at 34.76 s and 197.14 s, because the flatten
+and the per-token slice are `-Onone` while `cblas` is not. That is a build artifact and the reason
+every host number here and in `#37` is quoted from `-O`.
+
+### What it means
+
+The per-token term is now SPLIT, which it had never been: the four block projections are **6.72 s
+of the 9.74 s** at the largest image -- 69%, independently confirming the three-point solve -- and
+the device runs them in **0.60 s**. Arithmetic on measured parts, not a measured encode: with
+`#41`'s attention also in place the largest image would be `0.22 + (9.74 - 6.72 + 0.60) + 6.29` =
+**10.13 s** against the 41.71 s that ships, i.e. 4.1x. Nothing is wired, so that number is a sum of
+three measurements of different things and must not be quoted as an encode.
+
+### What it does not mean
+
+- **`encode` still calls `linearBatched`.** This is a stage with an oracle. Swapping the stage in
+  without moving the rest of the tower would be a LOSS: at the largest size `w1`'s product is
+  8,649 x 5,632 floats (195 MB) and its input 35 MB, so a host<->device round trip per projection
+  costs more than the 99 ms host GEMM it replaces. The win requires keeping the token matrix
+  device-resident across all 32 blocks, which is a device encode, not a substitution.
+- A device encode still needs four things this file does not have: an FP32 gelu and silu, the fused
+  `silu(gate) * up` split of the 2x-intermediate projection (the MLP emits gate and up halves in
+  one matrix), the residual add (an FP32 `vector_add_f32` exists, but nothing fuses it with a
+  projection), and pixel-unshuffle into the aligner's channel-major cells. `dsv41_rmsnorm_f32_gain`
+  already exists for the two norms per block.
+- The weight upload is outside the timed arm, which is the steady state an integrated tower would
+  create (97 MB of tower weights uploaded once, not per block). A per-call uploader would add
+  ~30 ms per 32 blocks and the table would not describe it.
+- `wo`'s host rate at the smallest size is the weakest of the four (1.84x on `w2`, 2.60x on `qkv`
+  against 12.63x at the large size): the same kernel, so it is the shape -- 16 column tiles against
+  88, i.e. 2,176 threadgroups against 11,968 on a machine with ~40 cores. Named as the next tuning
+  target if the tower is ever integrated, not fixed here.
+- These are kernel numbers on one block's projection at synthetic values; the tower's 32 blocks
+  share nothing but the weight, so 32x is the right extrapolation for the DISPATCH, and no run took
+  it with the tower in the loop.
+
+### Verification
+
+`DeepSeekV41VisionLinearDeviceTests` is new: five parity/refusal cases and the threadgroup-memory
+guard run with the default suite, and the published-geometry timing is opt-in behind
+`/tmp/dynamoe_dsv41_linear_measure`. The class is now in `/tmp/args41m37.txt` (93 entries), so the
+full DeepSeek suite is **551 passed / 0 failed / 47 skipped** (598 executed) without the marker,
+and **551 passed / 0 failed / 47 skipped with 0 validation errors** under `MTL_DEBUG_LAYER`. The
+run BEFORE the tiles were bound is the one that exposed the 49,152-byte allocation: it lost the
+four parity cases and killed the process each time.
