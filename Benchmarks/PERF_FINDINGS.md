@@ -8584,3 +8584,139 @@ load average 2.6-3.8. One caveat worth carrying: the suite reads **573 / 0 / 60*
 `/tmp/dsv41_indexer_inputs.json` is present, because the three `DeepSeekV41RealIndexerReScareTests`
 cases run instead of skipping -- an opt-in published case writes that dump as a side effect, so a
 suite count that moves by three is that file, not a regression.
+
+## DSV4.1 #50: THE HAND-OFF IS 71-75% OF A WALKED POSITION, IT ACCOUNTS FOR ITSELF, AND NO COMMAND BUFFER A PROBE CAN BUILD REPRODUCES THE STALL AFTER THE COMMIT
+
+### Question
+
+`#49` attributed the walk's last unexplained stall to the walk's I/O and priced the expert stream at
+about twice its own byte time. Three things were still unmeasured when it closed, and one of them was
+an assumption rather than a number:
+
+1. **Nothing had checked that forty layer records add up to the position they came from.** `#49`
+   reported 85.9-92.6 ms of post-commit idle and 94-103 ms of pre-commit host gap for one arm, plus
+   29.8-30.6 ms of expert-half device time; with `#48`'s ~66 ms of dense device time that is a 285 ms
+   position, and `#48` measured 218-232 ms for one. Two of those numbers had to be the same interval,
+   and only a per-position clock can say which.
+2. **`#49`'s single probe localised the stall to "the expert buffer" by elimination**, and a probe
+   that binds nothing is not the expert half. `#48` had already failed to make a buffer slow to start
+   in twenty arms, so "the expert buffer's own content" was the surviving candidate by default.
+3. **The fill's throughput inside a walk had never been compared against `#21`'s isolated 13.8 GB/s.**
+
+### What was added (measurement only, every flag off in production)
+
+`recordsLayerGaps` grew four things; no kernel, encoder, submission pattern or arena policy changed:
+
+- `layerGapPositions` -- one `DeepSeekV41GapPositionSample` per recorded position: its WALL time and
+  how many layer records were taken during it. This is the control.
+- `frontWindowStartNanoseconds` on the layer record, so the dense half's own device time is separable
+  from the hand-off (only its end was recorded before).
+- `mixtureStartProbeDepth` and `mixtureStartProbeDispatches` -- how many trivial buffers to commit
+  back to back, and how many trivial dispatches each holds.
+- `mixtureStartProbeBinding` / `mixtureStartProbeDirtyBytes` -- what a probe BINDS: nothing, one
+  resident expert's arena slot, the workspace's gathered rows, thirty distinct shard allocations, or
+  a 16 MB shared buffer the host has just `memset`.
+
+### The parts tile the position, and the hand-off is most of it
+
+Fourteen arms, one runtime, one process, one `-O` build (`/tmp/dd_dsv41_opt`), each recording one
+steady-state position's 40 boundaries. `hand-off` is the host's gap (dense retire -> expert commit)
+plus the pickup (commit -> expert window start). They TILE rather than overlap: the host is blocked on
+the dense half until it retires, so `mixtureCommitNanoseconds` is always the later of the two and
+`idleMilliseconds` IS `pickupMilliseconds` -- the `max` in it never binds.
+
+| arm | position | dense halves | hand-off | expert halves | accounted |
+|---|---|---|---|---|---|
+| zero-byte fill (8-token cycle) | 71.0 ms | 26.5 | **12.7** | 24.3 | 89.3% |
+| partial fill (96-token cycle) | 211.9 ms | 30.6 | **142.5** | 30.5 | 96.1% |
+| full fill, plain A | 275.0 ms | 30.1 | **205.0** | 30.7 | 96.7% |
+| full fill, plain B | 241.4 ms | 28.1 | **176.5** | 27.9 | 96.3% |
+| eight probe arms (below) | 236.7-281.9 ms | 28.6-34.3 | **171.1-208.7** | 28.9-33.0 | 96.3-96.8% |
+
+So `#49`'s accounting is sound: the four pieces tile a position to 96-97%, and the remainder is the
+host's own work between one layer's expert half and the next layer's dense half -- ~8-9 ms of a
+position, and 7.5 ms of it is visible even in the zero-fill arm. What the control adds is that the
+hand-off is **167-209 ms of a 236-305 ms position (71-75%)** on this arm's fill, against 61-66 ms of
+device time in total. `#48`'s 40% was a lighter arm; this one reads 556 MB/position.
+
+### The walk's fill does not reach the disk
+
+555.8 MB per position in 74.2-97.8 ms of `pread` is **5.5-7.3 GB/s**, where `#21` measured an isolated
+fill at 13-14 GB/s against a 13.8 GB/s ceiling. One miss (17.9 MB, one shard, six ranges) takes 3.8-
+4.7 ms and three misses across three shards take 10.2-10.7 ms. `DeepSeekV41ExpertStreamer` accumulates
+`secondsReading` as the WALL time of the concurrent batch, so this is not a per-thread sum showing up
+as wall time. The host's half of the hand-off is 74-98 ms of the position and it is running at about
+half the disk.
+
+### Every probe starts in a tenth of a millisecond, whatever it binds
+
+The probe's own pickup against the expert half's, per arm, median over the 40 layers of one position:
+
+| probe | window | probe pickup | the expert half behind it |
+|---|---|---|---|
+| one clear, nothing bound | 0.0027 ms | **0.1040 ms** | 1.7743 ms |
+| three of them, back to back | 0.0025 ms each | **0.1040 / 0.1018 / 0.0968** | 1.6418 ms |
+| one, eight dispatches | 0.0093 ms | **0.1072 ms** | 1.4803 ms |
+| one, reading a resident expert's arena slot | 0.0027 ms | **0.1094 ms** | 1.6229 ms |
+| one, reading the gathered key rows | 0.0025 ms | **0.1033 ms** | 1.3044 ms |
+| one, binding thirty shard allocations | 0.0027 ms | **0.1000 ms** | 1.2872 ms |
+| one, reading 4 KB the host just wrote | 0.0025 ms | **0.0993 ms** | 1.6303 ms |
+| one, reading 16 MB the host just wrote | 0.0027 ms | **0.1026 ms** | 1.4455 ms |
+
+Read that as a set of eliminations. The stall after the commit is not the queue (a probe is handed the
+same empty one), not the cadence of committing into it (three commits in a row, each 0.1 ms), not how
+much work the buffer carries (eight dispatches, a 3.4x wider window), not one arena binding, not the
+workspace, not the length of the resource list (thirty allocations against a probe's two), and not
+CPU-dirtied shared memory (16 MB `memset` on the host immediately before the commit). In 0 of 40
+layers was any probe still running when the expert half started -- so the queue was idle again, in
+both senses, before the expert half was.
+
+### And it is still the walk's I/O
+
+The same arm separates the two sides. A layer whose experts were all resident reads NOTHING and still
+shows a host gap of 0.15-0.20 ms and a pickup of 1.14-2.76 ms, while in the zero-fill ARM -- where no
+layer of the position reads anything at all -- all forty pickups are 0.069-0.547 ms (median 0.095).
+Within a reading arm a layer's own fill predicts nothing: correlation +0.05 with its own bytes, -0.19
+with the previous layer's, +0.07 with its own read seconds, +0.00 with slots allocated (plain A).
+
+So the stall is a property of the MACHINE while the walk has been reading, not of the buffer that
+waits in front of it. That is `#49`'s own closing sentence -- "what is left is the state the machine
+is in, not the shape of the work" -- now with the "shape of the work" half measured instead of
+assumed.
+
+### What it means
+
+- **The stream's price is confirmed, and it is larger than `#49`'s headline.** On this arm the hand-off
+  is 205 ms of a 275 ms position: 98 ms of host gap (90 ms of it `pread`) and 107 ms of post-commit
+  stall. Any miss the arena stops making is worth its bytes AND the stall that follows them.
+- **The fill has a second lever nobody has priced: it runs at 5.5-7.3 GB/s in a walk.** Its reads are
+  issued per shard batch, `concurrentPerform` over the batches, and a one-miss layer is one batch of
+  six ranges -- so a layer that misses one expert reads 17.9 MB at 3.8-4.7 GB/s where the disk serves
+  13.8. That is 40-50 ms of a position, and unlike the arena's hit rate it needs no policy.
+- **The post-commit stall has no in-buffer lever left.** Every shape a probe can hold starts in a
+  tenth of a millisecond; the only remaining attacks on it are structural -- fewer hand-offs per
+  position (the batched block path), or giving the GPU work from somewhere else while a hand-off
+  happens (two streams).
+
+### What it is not (do not re-propose)
+
+- **Not the submission, the cadence, the dispatch count or the resource list.** Measured above, one
+  arm each.
+- **Not one arena binding, not the gathered rows, not CPU-dirtied shared memory.**
+- **Not the CPU cache writeback or a flush/fence.** `#49`'s alternating pair.
+- **Not `F_NOCACHE`.** 2.2x loss, `#21`. **Not merging buffers.** `#48`.
+
+### Verification
+
+`DeepSeekV41PublishedTurnTests.testWhatEachLayersExpertHalfHandoffCosts` is opt-in behind
+`/tmp/dynamoe_dsv41_layer_gaps` on top of the class's `/tmp/dynamoe_dsv41_real_turn`. It now walks the
+real checkpoint fifteen times -- a discarded warm-up, the alternating read-back pair, the zero-fill
+arm, the partial-fill arm, and eight probe arms -- asserting 40/40 windows in every arm and printing
+each arm's per-layer rows and its parts-versus-wall line, so every number here can be recomputed from
+the log rather than trusted.
+
+The full DeepSeek suite is **570 passed / 0 failed / 63 skipped** (95 classes, 633 cases), and the same
+run under `MTL_DEBUG_LAYER` is **570 / 0 / 63 with 0 validation errors and no failed assertions**. The
+published numbers are the app's own `-O` build in `/tmp/dd_dsv41_opt`, fourteen arms of 202 positions
+in ~11 minutes, load average 2.4-3.7. The usual caveat stands: the suite reads **573 / 0 / 60**
+whenever `/tmp/dsv41_indexer_inputs.json` is present, so a count that moves by three is that file.

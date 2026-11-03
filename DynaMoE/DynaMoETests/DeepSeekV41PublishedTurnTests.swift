@@ -4716,7 +4716,7 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
 
         // Discarded: it is what leaves the page cache holding this arm's 555 MB, so the
         // paired arms below are not the first-read arm paying for a cold disk.
-        _ = try layerGapArm(executor: executor, tokens: distinct, probe: false, touch: false)
+        _ = try layerGapArm(executor: executor, tokens: distinct, probe: 0, touch: false)
 
         // Alternating A/B on the same tokens and the same warm page cache. The read-back
         // is the only difference between the pair, so an ordering or caching effect shows
@@ -4725,14 +4725,15 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         for round in ["A", "B"] {
             for touch in [false, true] {
                 let label = (touch ? "read-back " : "plain      ") + round
-                let samples = try layerGapArm(
-                    executor: executor, tokens: distinct, probe: false, touch: touch
+                let arm = try layerGapArm(
+                    executor: executor, tokens: distinct, probe: 0, touch: touch
                 )
-                paired.append((label, touch, samples))
+                paired.append((label, touch, arm.samples))
                 reportLayerGaps(
                     label + (touch ? " (fill read back on the committing thread)" : " (no read-back)"),
-                    samples: samples
+                    samples: arm.samples
                 )
+                reportParts(label, arm: arm)
             }
         }
         reportPairedArms(paired)
@@ -4740,25 +4741,117 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         // The cache is reset by the arm so the walk starts from position 0 again; the
         // ARENA deliberately is not, because this arm's point is a fill that reads
         // nothing. It is the floor: the same 40 boundaries with no I/O at all.
-        let warm = try layerGapArm(executor: executor, tokens: cycled, probe: false, touch: false)
-        reportLayerGaps("warm (8-token cycle, zero-byte fill)", samples: warm)
+        let warm = try layerGapArm(executor: executor, tokens: cycled, probe: 0, touch: false)
+        reportLayerGaps("warm (8-token cycle, zero-byte fill)", samples: warm.samples)
+        reportParts("warm (8-token cycle, zero-byte fill)", arm: warm)
 
         // A third fill level, between the zero-byte arm and the full one, because two
         // points can only say "the gap needs I/O"; three can say whether it scales with
         // it, which is what makes the arena's hit rate worth what it is worth.
         let partial = (0..<positions).map { 1_000 + (($0 % 96) * 37) }
         let midway = try layerGapArm(
-            executor: executor, tokens: partial, probe: false, touch: false
+            executor: executor, tokens: partial, probe: 0, touch: false
         )
-        reportLayerGaps("partial (96-token cycle)", samples: midway)
+        reportLayerGaps("partial (96-token cycle)", samples: midway.samples)
+        reportParts("partial (96-token cycle)", arm: midway)
 
-        let probed = try layerGapArm(executor: executor, tokens: distinct, probe: true, touch: false)
-        reportLayerGaps("probed (trivial buffer before the expert half)", samples: probed)
-        reportProbeArm(samples: probed)
+        let probed = try layerGapArm(executor: executor, tokens: distinct, probe: 1, touch: false)
+        reportLayerGaps(
+            "probed (one trivial buffer before the expert half)", samples: probed.samples
+        )
+        reportProbeArm(samples: probed.samples)
+        reportParts("probed (one trivial buffer)", arm: probed)
+
+        // `#50`: several trivial buffers committed back to back just before the expert
+        // half. `#49`'s single probe said the expert half waits while a trivial buffer
+        // does not; it could not say whether the delay is the expert BUFFER or the act
+        // of committing anything else into an idle queue. The second and third probes
+        // are that question: if they pick up in a tenth of a millisecond too, the
+        // stacked commits are cheap and the expert half's delay is its own.
+        let stacked = try layerGapArm(executor: executor, tokens: distinct, probe: 3, touch: false)
+        reportLayerGaps(
+            "stacked (three trivial buffers before the expert half)", samples: stacked.samples
+        )
+        reportProbeArm(samples: stacked.samples)
+        reportParts("stacked (three trivial buffers)", arm: stacked)
+
+        // One buffer holding eight trivial dispatches, more than a mixture has stages. If
+        // this one waits like the expert half, the stall follows the work a buffer
+        // carries; if it starts at once, the stall is the expert buffer's own resources.
+        let loaded = try layerGapArm(
+            executor: executor, tokens: distinct, probe: 1, touch: false, dispatches: 8
+        )
+        reportLayerGaps(
+            "loaded (one eight-dispatch trivial buffer before the expert half)",
+            samples: loaded.samples
+        )
+        reportProbeArm(samples: loaded.samples)
+        reportParts("loaded (one eight-dispatch trivial buffer)", arm: loaded)
+
+        // The probe that binds what the expert half binds and does nothing with it. If
+        // its pickup jumps to the expert half's, the delay follows the RESOURCES a buffer
+        // references rather than the work it carries.
+        let arenaBound = try layerGapArm(
+            executor: executor, tokens: distinct, probe: 1, touch: false, binding: 1
+        )
+        reportLayerGaps(
+            "arena-bound (probe reads one resident expert's slot)", samples: arenaBound.samples
+        )
+        reportProbeArm(samples: arenaBound.samples)
+        reportParts("arena-bound (probe reads one arena slot)", arm: arenaBound)
+
+        // The control for the same probe against a large allocation the CPU never wrote:
+        // the gathered key rows, which only the GPU has touched.
+        let workspaceBound = try layerGapArm(
+            executor: executor, tokens: distinct, probe: 1, touch: false, binding: 2
+        )
+        reportLayerGaps(
+            "workspace-bound (probe reads the gathered rows)", samples: workspaceBound.samples
+        )
+        reportProbeArm(samples: workspaceBound.samples)
+        reportParts("workspace-bound (probe reads the gathered rows)", arm: workspaceBound)
+
+        // `#50`'s last standing difference: the expert half references far more distinct
+        // allocations than any probe above. If that were the cost, thirty of them at the
+        // ~3 us each a two-buffer probe's 0.1 ms implies would be a millisecond.
+        let wide = try layerGapArm(
+            executor: executor, tokens: distinct, probe: 1, touch: false, binding: 3
+        )
+        reportLayerGaps(
+            "wide (probe binds thirty shard allocations)", samples: wide.samples
+        )
+        reportProbeArm(samples: wide.samples)
+        reportParts("wide (probe binds thirty shard allocations)", arm: wide)
+
+        // The surviving difference, and the one the arena slots really do have: the CPU
+        // wrote them, a few hundred microseconds before the expert half reads them. A
+        // probe that reads a buffer the host has just written tests that directly. The
+        // small arm bounds how much of any effect is the write itself.
+        let dirtySmall = try layerGapArm(
+            executor: executor, tokens: distinct, probe: 1, touch: false,
+            binding: 4, dirtyBytes: 4096
+        )
+        reportLayerGaps(
+            "dirty 4 KB (probe reads a buffer the host just wrote)",
+            samples: dirtySmall.samples
+        )
+        reportProbeArm(samples: dirtySmall.samples)
+        reportParts("dirty 4 KB (probe reads a host-written buffer)", arm: dirtySmall)
+
+        let dirtyLarge = try layerGapArm(
+            executor: executor, tokens: distinct, probe: 1, touch: false,
+            binding: 4, dirtyBytes: 16 << 20
+        )
+        reportLayerGaps(
+            "dirty 16 MB (probe reads a buffer the host just wrote)",
+            samples: dirtyLarge.samples
+        )
+        reportProbeArm(samples: dirtyLarge.samples)
+        reportParts("dirty 16 MB (probe reads a host-written buffer)", arm: dirtyLarge)
 
         reportFillCurve([
-            ("zero-byte fill", warm),
-            ("partial fill", midway),
+            ("zero-byte fill", warm.samples),
+            ("partial fill", midway.samples),
             ("full fill (plain A)", paired[0].samples),
             ("full fill (plain B)", paired[2].samples)
         ])
@@ -4824,12 +4917,19 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
     /// Walks `tokens` with the hand-off recorder off, then records the LAST position
     /// only, so the samples are one steady-state position's layers rather than every
     /// position's behind-the-warm-up average.
+    ///
+    /// `probe` is how many trivial buffers are committed before each expert half, `0`
+    /// for none. The position record comes from the same walk, which is what lets the
+    /// layer records be checked against the position they were taken from.
     private func layerGapArm(
         executor: DeepSeekV41MetalForward,
         tokens: [Int],
-        probe: Bool,
-        touch: Bool
-    ) throws -> [DeepSeekV41LayerGapSample] {
+        probe: Int,
+        touch: Bool,
+        dispatches: Int = 1,
+        binding: Int = 0,
+        dirtyBytes: Int = 0
+    ) throws -> LayerGapArm {
         executor.reset()
         executor.recordsLayerGaps = false
         executor.recordsMixtureStartProbe = false
@@ -4839,12 +4939,84 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         }
         executor.resetWalkTiming()
         executor.recordsLayerGaps = true
-        executor.recordsMixtureStartProbe = probe
+        executor.recordsMixtureStartProbe = probe > 0
+        executor.mixtureStartProbeDepth = max(1, probe)
+        executor.mixtureStartProbeDispatches = max(1, dispatches)
+        executor.mixtureStartProbeBinding = binding
+        executor.mixtureStartProbeDirtyBytes = dirtyBytes
         _ = try executor.forwardToken(tokens[tokens.count - 1], position: tokens.count - 1)
         executor.recordsLayerGaps = false
         executor.recordsMixtureStartProbe = false
+        executor.mixtureStartProbeDepth = 1
+        executor.mixtureStartProbeDispatches = 1
+        executor.mixtureStartProbeBinding = 0
+        executor.mixtureStartProbeDirtyBytes = 0
         executor.touchesFilledRanges = false
-        return executor.layerGaps
+        let samples = executor.layerGaps
+        let position = executor.layerGapPositions.last
+        // The instrument's own contract, so a broken recorder cannot be read as a result:
+        // one record per layer, every expert half reporting a device window, and four
+        // pieces that tile the position rather than overlapping it. A sum that EXCEEDS the
+        // position would mean two of the pieces are the same interval.
+        XCTAssertEqual(samples.count, executor.plan.count, "one record per layer")
+        XCTAssertTrue(samples.allSatisfy(\.hasWindow), "every expert half must report a window")
+        if let position, !samples.isEmpty {
+            let summed = samples.map {
+                $0.frontWindowMilliseconds + $0.hostGapMilliseconds
+                    + $0.idleMilliseconds + $0.mixtureWindowMilliseconds
+            }.reduce(0, +)
+            XCTAssertLessThanOrEqual(
+                summed, position.wallMilliseconds * 1.02,
+                "the layer records must tile the position, not overlap it"
+            )
+            XCTAssertGreaterThanOrEqual(
+                summed, position.wallMilliseconds * 0.8,
+                "the layer records must account for most of the position"
+            )
+        } else {
+            XCTFail("the recorded position must have a wall record")
+        }
+        return LayerGapArm(samples: samples, position: position)
+    }
+
+    /// One arm's reading: the layer records, and the position record beside them.
+    private struct LayerGapArm {
+        let samples: [DeepSeekV41LayerGapSample]
+        let position: DeepSeekV41GapPositionSample?
+
+        func partsMilliseconds() -> (front: Double, handoff: Double, mixture: Double) {
+            (
+                samples.map(\.frontWindowMilliseconds).reduce(0, +),
+                samples.map { $0.hostGapMilliseconds + $0.idleMilliseconds }.reduce(0, +),
+                samples.map(\.mixtureWindowMilliseconds).reduce(0, +)
+            )
+        }
+    }
+
+    /// The control `#49` did not have: do the layer records add up to the position?
+    ///
+    /// A layer's four pieces tile the position with no overlap, so their sum has to land
+    /// just under the position's wall time, with the remainder being the host's work
+    /// between one layer's expert half retiring and the next layer's dense half being
+    /// encoded. A sum that EXCEEDS the wall time means two pieces are the same interval,
+    /// and every conclusion drawn from the split is wrong.
+    private func reportParts(_ label: String, arm: LayerGapArm) {
+        guard let position = arm.position, !arm.samples.isEmpty else {
+            print("🔎 [dsv41 real] parts (\(label)): no position record")
+            return
+        }
+        let parts = arm.partsMilliseconds()
+        let summed = parts.front + parts.handoff + parts.mixture
+        print(
+            "🔎 [dsv41 real] parts (\(label)): position "
+                + String(format: "%.1f ms = dense halves %.1f + hand-off %.1f + expert halves %.1f",
+                         position.wallMilliseconds, parts.front, parts.handoff, parts.mixture)
+                + String(format: " -> %.1f ms accounted (%.1f%%) over %d layer(s), %.1f ms unaccounted",
+                         summed,
+                         100 * summed / max(position.wallMilliseconds, 0.0001),
+                         arm.samples.count,
+                         position.wallMilliseconds - summed)
+        )
     }
 
     /// Prints one arm's boundaries, then the correlations the slice is asking about:
@@ -4874,8 +5046,10 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
                              sample.fillSlotsAllocated,
                              1_000 * sample.fillReadSeconds,
                              1_000 * sample.fillPlacementSeconds)
-                    + String(format: ", %d expert(s), window %.3f ms",
-                             sample.expertCount, sample.mixtureWindowMilliseconds)
+                    + String(format: ", %d expert(s), dense %.3f ms, window %.3f ms",
+                             sample.expertCount,
+                             sample.frontWindowMilliseconds,
+                             sample.mixtureWindowMilliseconds)
             )
         }
 
@@ -4897,7 +5071,7 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         let device = samples.map(\.mixtureWindowMilliseconds).reduce(0, +)
         print(
             "🔎 [dsv41 real]   host gap total " + String(format: "%.1f ms", hostGaps.reduce(0, +))
-                + String(format: " (mean %.3f ms/layer), expert halves ran %.1f ms", 
+                + String(format: " (mean %.3f ms/layer), expert halves ran %.1f ms",
                          hostGaps.reduce(0, +) / Double(samples.count), device)
                 + String(format: " -> GPU idle including the host's gap %.1f ms of %.1f ms unaccounted",
                          hostGaps.reduce(0, +) + total,
@@ -4917,6 +5091,18 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             "🔎 [dsv41 real]   idle with a zero-byte fill: "
                 + String(format: "%.3f ms over %d layer(s); with a non-zero fill %.3f ms over %d",
                          meanQuiet, quiet.count, meanBusy, busy.count)
+        )
+        // `#50`'s split of the same two groups: on a layer that read nothing the host's
+        // own gap is what the pread would have been, and what is left is the device
+        // failing to start the buffer it was given.
+        let quietGap = quiet.isEmpty
+            ? 0 : quiet.map(\.hostGapMilliseconds).reduce(0, +) / Double(quiet.count)
+        let busyGap = busy.isEmpty
+            ? 0 : busy.map(\.hostGapMilliseconds).reduce(0, +) / Double(busy.count)
+        print(
+            "🔎 [dsv41 real]   host gap with a zero-byte fill: "
+                + String(format: "%.3f ms over %d layer(s); with a non-zero fill %.3f ms over %d",
+                         quietGap, quiet.count, busyGap, busy.count)
         )
         let compressed = samples.filter(\.compressed)
         let windowOnly = samples.filter { !$0.compressed }
@@ -4940,45 +5126,60 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         )
     }
 
-    /// The probe arm's own reading: a one-dispatch buffer committed just before the
-    /// expert half. If it stalls too, the delay belongs to the process; if it starts at
-    /// once, the delay is the expert half's.
+    /// The probe arm's own reading, slot by slot: trivial buffers committed back to back
+    /// just before the expert half. If the first one waits too, the delay belongs to the
+    /// process; if every one starts at once and the expert half behind them does not,
+    /// the delay is the expert buffer's, and not the act of committing into an idle
+    /// queue (`#50`).
     private func reportProbeArm(samples: [DeepSeekV41LayerGapSample]) {
-        let probed = samples.filter {
-            $0.probeWindowEndNanoseconds > $0.probeWindowStartNanoseconds
-        }
-        guard !probed.isEmpty else {
+        let depth = samples.map(\.probes.count).max() ?? 0
+        guard depth > 0 else {
             print("🔎 [dsv41 real]   probe: no probe window reported")
             return
         }
-        let windows = probed.map(\.probeWindowMilliseconds).sorted()
-        let mixture = probed.map(\.mixtureWindowMilliseconds).sorted()
+        for slot in 0..<depth {
+            let probed = samples.compactMap { sample -> DeepSeekV41GapProbe? in
+                guard sample.probes.count > slot else { return nil }
+                let probe = sample.probes[slot]
+                return probe.hasWindow ? probe : nil
+            }
+            guard !probed.isEmpty else {
+                print("🔎 [dsv41 real]   probe \(slot): no window reported")
+                continue
+            }
+            let windows = probed.map(\.windowMilliseconds).sorted()
+            let pickups = probed.map(\.pickupMilliseconds).sorted()
+            print(
+                "🔎 [dsv41 real]   probe \(slot): \(probed.count)/\(samples.count) windowed, window "
+                    + String(format: "median %.4f ms, max %.4f; pickup median %.4f ms, max %.4f",
+                             windows[windows.count / 2], windows.last ?? 0,
+                             pickups[pickups.count / 2], pickups.last ?? 0)
+            )
+        }
+        // The discriminating pair: the probes and the expert half were committed into
+        // the same queue within a few hundred microseconds of each other, with nothing
+        // in flight. A probe that starts in a tenth of a millisecond while the expert
+        // half waits milliseconds means the delay is the expert buffer's own content.
+        let mixes = samples.map(\.pickupMilliseconds).sorted()
         print(
-            "🔎 [dsv41 real]   probe: \(probed.count) one-dispatch buffer(s), window "
-                + String(format: "median %.4f ms, max %.4f; expert half median %.3f ms",
-                         windows[windows.count / 2], windows.last ?? 0,
-                         mixture[mixture.count / 2])
+            "🔎 [dsv41 real]   probe against the expert half's pickup median "
+                + String(format: "%.4f ms (max %.4f)", mixes[mixes.count / 2], mixes.last ?? 0)
         )
-        // The discriminating pair: both buffers were committed into the same queue a
-        // few hundred microseconds apart, with nothing in flight. A probe that starts in
-        // a tenth of a millisecond while the expert half waits milliseconds means the
-        // delay is the expert buffer's own content, not the queue's willingness to run.
-        let pickups = probed.map(\.probePickupMilliseconds).sorted()
-        let mixes = probed.map(\.pickupMilliseconds).sorted()
+        // The first probe is the one committed immediately after the dense half drained,
+        // so a probe that is still running when the expert half starts means the queue
+        // never went empty; a probe that finished first and left the queue idle again is
+        // the case where the gap is the buffer's.
+        let first = samples.compactMap { $0.probes.first }
+        let overlaps = first.filter { $0.windowEndNanoseconds > $0.windowStartNanoseconds }
+            .filter { probe in
+                samples.contains { sample in
+                    probe.windowEndNanoseconds > sample.mixtureWindowStartNanoseconds
+                        && probe.windowStartNanoseconds <= sample.mixtureWindowStartNanoseconds
+                }
+            }.count
         print(
-            "🔎 [dsv41 real]   probe pickup median "
-                + String(format: "%.4f ms (max %.4f) against the expert half's %.3f ms",
-                         pickups[pickups.count / 2], pickups.last ?? 0, mixes[mixes.count / 2])
-        )
-        // Both windows follow the same dense half, so a probe that is still running when
-        // the expert half starts means the queue never went empty; a probe that finished
-        // first and left the queue idle again is the case where the gap is the buffer's.
-        let overlaps = probed.filter {
-            $0.probeWindowEndNanoseconds > $0.mixtureWindowStartNanoseconds
-        }.count
-        print(
-            "🔎 [dsv41 real]   probe ran into the expert half in \(overlaps) of \(probed.count) "
-                + "layer(s)"
+            "🔎 [dsv41 real]   the first probe ran into the expert half in \(overlaps) of "
+                + "\(samples.count) layer(s)"
         )
     }
 }
