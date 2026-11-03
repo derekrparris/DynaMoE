@@ -253,9 +253,21 @@ nonisolated public final class DeepSeekV41ExpertShardReader: @unchecked Sendable
 
     /// Reads every range, in parallel once there are enough of them for queue depth
     /// to matter. Returns the bytes read. Throws the first failure, naming the range.
+    ///
+    /// `chunkBytes` splits each range into pieces of at most that size and fans the
+    /// PIECES out instead of the ranges. A fill that misses one expert asks for six
+    /// ranges and no more, so the queue is six deep however large those ranges are; a
+    /// page-cache miss is a round trip, so six requests of 3 MB answer in about the
+    /// time one of them takes and the depth, not the size, is what turns a round trip
+    /// into throughput. Zero keeps the shipped one-read-per-range form.
     @discardableResult
-    public func read(_ ranges: [Range]) throws -> Int {
+    public func read(
+        _ ranges: [Range],
+        chunkBytes: Int = 0,
+        sequential: Bool = false
+    ) throws -> Int {
         guard !ranges.isEmpty else { return 0 }
+        let pieces = chunkBytes > 0 ? Self.pieces(of: ranges, chunkBytes: chunkBytes) : ranges
         lock.lock()
         defer { lock.unlock() }
         guard !isClosed else {
@@ -263,7 +275,7 @@ nonisolated public final class DeepSeekV41ExpertShardReader: @unchecked Sendable
         }
         // Checked before any read: `pread` past the end returns a short count, and a
         // short count in the middle of a matrix is a silently wrong weight row.
-        for range in ranges {
+        for range in pieces {
             guard range.fileOffset >= 0, range.length >= 0,
                   range.fileOffset + range.length <= fileSize else {
                 throw DeepSeekV41ExpertStreamError.shortRead(
@@ -280,18 +292,41 @@ nonisolated public final class DeepSeekV41ExpertShardReader: @unchecked Sendable
         let context = DeepSeekV41RangeReadContext(
             fd: fd,
             path: path,
-            ranges: ranges,
+            ranges: pieces,
             failures: failures
         )
 
         let readOne: @Sendable (Int) -> Void = { index in context.read(index) }
-        if ranges.count >= 2 {
-            DispatchQueue.concurrentPerform(iterations: ranges.count, execute: readOne)
+        if pieces.count >= 2, !sequential {
+            DispatchQueue.concurrentPerform(iterations: pieces.count, execute: readOne)
         } else {
-            for index in ranges.indices { readOne(index) }
+            for index in pieces.indices { readOne(index) }
         }
         if let first = failures.first { throw first }
-        return ranges.reduce(0) { $0 + $1.length }
+        return pieces.reduce(0) { $0 + $1.length }
+    }
+
+    /// Splits every range into pieces of at most `chunkBytes`, in file order, so each
+    /// byte is still read exactly once and lands in its own place in the destination.
+    /// Two pieces of one range never overlap, which is what makes the fan-out safe
+    /// without any coordination: the parallel reads write disjoint bytes.
+    static func pieces(of ranges: [Range], chunkBytes: Int) -> [Range] {
+        guard chunkBytes > 0 else { return ranges }
+        var out: [Range] = []
+        out.reserveCapacity(ranges.count * 4)
+        for range in ranges {
+            var offset = 0
+            while offset < range.length {
+                let length = min(chunkBytes, range.length - offset)
+                out.append(Range(
+                    fileOffset: range.fileOffset + offset,
+                    destination: range.destination.advanced(by: offset),
+                    length: length
+                ))
+                offset += length
+            }
+        }
+        return out
     }
 }
 
@@ -361,6 +396,23 @@ nonisolated private struct DeepSeekV41ShardBatchContext: @unchecked Sendable {
     let batches: [(shard: UInt32, ranges: [DeepSeekV41ExpertShardReader.Range])]
     let readers: [UInt32: DeepSeekV41ExpertShardReader]
     let failures: DeepSeekV41ReadFailureBox
+    /// Zero for one read per range; otherwise each range is split into pieces this
+    /// large so the fan-out is deeper than the range count.
+    let chunkBytes: Int
+    /// True to issue this shard's ranges one at a time, i.e. no fan-out at all.
+    let sequential: Bool
+
+    /// Ranges as the fill listed them, before any splitting.
+    var rangeCount: Int {
+        batches.reduce(0) { $0 + $1.ranges.count }
+    }
+
+    /// The bytes the fill actually asks the file for.
+    var byteCount: Int {
+        batches.reduce(0) { total, batch in
+            total + batch.ranges.reduce(0) { $0 + $1.length }
+        }
+    }
 
     func run(_ index: Int) {
         let batch = batches[index]
@@ -369,12 +421,76 @@ nonisolated private struct DeepSeekV41ShardBatchContext: @unchecked Sendable {
             return
         }
         do {
-            try reader.read(batch.ranges)
+            try reader.read(
+                batch.ranges, chunkBytes: chunkBytes, sequential: sequential
+            )
         } catch let error as DeepSeekV41ExpertStreamError {
             failures.record(error)
         } catch {
             failures.record(.cannotOpen("\(error)"))
         }
+    }
+}
+
+// MARK: - Fill form
+
+/// How a fill's reads are issued.
+///
+/// The shipped form groups the misses by shard and lets each file fan its own ranges
+/// out. `#50` measured a walk's fill at 5.5-7.3 GB/s where the same disk serves 13.8,
+/// and a one-miss layer offers exactly one shard's six ranges, so the queue is six
+/// deep at best. The alternatives exist so the fan-out can be measured rather than
+/// argued about: `chunked` splits each range into pieces (a deeper queue for the same
+/// bytes), and `serial` issues one read at a time (the file's own rate with no
+/// concurrency at all, which is the number that says whether the walk is paying for
+/// bandwidth or for latency).
+nonisolated public enum DeepSeekV41FillForm: Sendable, Equatable {
+    case shardBatched
+    case chunked(bytes: Int)
+    case serial
+
+    /// Zero means "do not split a range".
+    public var chunkBytes: Int {
+        switch self {
+        case .shardBatched, .serial: return 0
+        case .chunked(let bytes): return max(bytes, 4096)
+        }
+    }
+
+    /// True when the form issues no read concurrently with another.
+    public var isSequential: Bool {
+        self == .serial
+    }
+}
+
+/// One fill, as the streamer issued it.
+///
+/// Measurement only (`#51`). `bytes` is what the file was asked for, not what a slot
+/// is sized to: a slot is padded to the arena's alignment, so pricing bytes off the
+/// slot count overstates the traffic and makes a throughput comparison against the
+/// disk's own rate meaningless.
+nonisolated public struct DeepSeekV41FillSample: Sendable, Equatable {
+    public let misses: Int
+    public let shards: Int
+    public let ranges: Int
+    /// True bytes requested from the file.
+    public let bytes: Int
+    public let seconds: Double
+
+    public init(misses: Int, shards: Int, ranges: Int, bytes: Int, seconds: Double) {
+        self.misses = misses
+        self.shards = shards
+        self.ranges = ranges
+        self.bytes = bytes
+        self.seconds = seconds
+    }
+
+    public var milliseconds: Double {
+        seconds * 1000
+    }
+
+    public var gigabytesPerSecond: Double {
+        seconds > 0 ? Double(bytes) / seconds / 1_000_000_000 : 0
     }
 }
 
@@ -433,6 +549,20 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
     public private(set) var placements: Int = 0
     /// Keeps the optional read-back's loads alive so the compiler cannot drop them.
     private var touchSink: Int = 0
+
+    /// How a fill's reads are issued. `.shardBatched` is what ships; the others exist
+    /// so the fan-out is a measurement instead of an opinion (`#51`).
+    public var fillForm: DeepSeekV41FillForm = .shardBatched
+
+    /// One record per fill, when on. Off in every production path.
+    public var recordsFillSamples = false
+    public private(set) var fillSamples: [DeepSeekV41FillSample] = []
+
+    public func clearFillSamples() {
+        lock.lock()
+        fillSamples.removeAll(keepingCapacity: true)
+        lock.unlock()
+    }
 
     /// Read and allocation time so far, for the walk instrumentation.
     public var timing: (reading: Double, allocating: Double, slotsAllocated: Int) {
@@ -695,13 +825,24 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
         if !misses.isEmpty {
             let readStarted = DispatchTime.now().uptimeNanoseconds
             let failures = DeepSeekV41ReadFailureBox()
+            let form = fillForm
             let context = DeepSeekV41ShardBatchContext(
                 batches: batches.map { (shard: $0.key, ranges: $0.value) },
                 readers: readers,
-                failures: failures
+                failures: failures,
+                chunkBytes: form.chunkBytes,
+                sequential: form.isSequential
             )
             let runOne: @Sendable (Int) -> Void = { index in context.run(index) }
-            DispatchQueue.concurrentPerform(iterations: context.batches.count, execute: runOne)
+            switch form {
+            case .serial:
+                // One read at a time, in batch order. The file's own rate.
+                for index in context.batches.indices { runOne(index) }
+            case .shardBatched, .chunked:
+                DispatchQueue.concurrentPerform(
+                    iterations: context.batches.count, execute: runOne
+                )
+            }
             if let failure = failures.first {
                 vacate(misses.map(\.slot))
                 throw failure
@@ -725,9 +866,19 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
             lock.lock()
             expertsLoaded += misses.count
             bytesRead += misses.count * geometry.slotBytes
-            secondsReading += Double(
+            let readSeconds = Double(
                 DispatchTime.now().uptimeNanoseconds - readStarted
             ) / 1_000_000_000
+            secondsReading += readSeconds
+            if recordsFillSamples {
+                fillSamples.append(DeepSeekV41FillSample(
+                    misses: misses.count,
+                    shards: context.batches.count,
+                    ranges: context.rangeCount,
+                    bytes: context.byteCount,
+                    seconds: readSeconds
+                ))
+            }
             lock.unlock()
         }
 

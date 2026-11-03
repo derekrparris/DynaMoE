@@ -8720,3 +8720,131 @@ run under `MTL_DEBUG_LAYER` is **570 / 0 / 63 with 0 validation errors and no fa
 published numbers are the app's own `-O` build in `/tmp/dd_dsv41_opt`, fourteen arms of 202 positions
 in ~11 minutes, load average 2.4-3.7. The usual caveat stands: the suite reads **573 / 0 / 60**
 whenever `/tmp/dsv41_indexer_inputs.json` is present, so a count that moves by three is that file.
+
+## DSV4.1 #51: THE FILL'S FAN-OUT IS NOT WHY A WALK'S FILL IS SLOW -- THE SHIPPED FORM IS THE FASTEST ONE, AND EVERY DEEPER QUEUE LOSES 1.3-2.7x IN SITU
+
+`#50` closed with one lever nobody had priced: a walk's expert fill runs at **5.5-7.3 GB/s** in
+555.8 MB per position, where the isolated fill the arena was tuned against measures 13-14 GB/s
+(`#21`), and a one-miss layer's 17.9 MB takes 3.8-4.7 ms where the disk would take 1.3. The
+hypothesis that followed from the code was the fan-out's depth: `ensureResident` groups misses by
+shard and one shard's ranges fan out inside the reader, so a layer that misses ONE expert issues
+**six** requests of 5.5 MB and no more, however large they are.
+
+### Question
+
+Is the walk's fill slow because it is too shallow, or because of the machine it runs on?
+
+### What was added
+
+- **`DeepSeekV41FillForm`** (`.shardBatched` shipped, `.chunked(bytes:)`, `.serial`) on
+  `DeepSeekV41ExpertStreamer.fillForm`, and `chunkBytes`/`sequential` on
+  `DeepSeekV41ExpertShardReader.read`. `.chunked` splits each range into pieces and fans the PIECES
+  out (deeper queue for the same bytes); `.serial` issues one read at a time. `chunkBytes = 0` is the
+  shipped path, unchanged.
+- **`DeepSeekV41FillSample`** (`misses`, `shards`, `ranges`, **true bytes requested from the file**,
+  `seconds`) behind `recordsFillSamples`. The byte count is the ranges' own lengths, not the slot's:
+  pricing traffic off the slot count (17.93 MB) instead of the bytes asked for (17.5 MB) makes a
+  comparison against the disk's rate wrong by 2%.
+- `DeepSeekV41FillThroughputTests`, opt-in behind `/tmp/dynamoe_dsv41_fill_measure`, two cases: the
+  isolated decomposition and the in-walk A/B.
+
+### The harness's own control caught the harness first
+
+The first sweep ran the arms in a **fixed order** and reported the shipped form at 4.26 ms for
+17.9 MB while `.chunk 8 MB` reported 1.30 ms. Those are the **same code path**: every published range
+is smaller than 8 MB, so splitting is the identity. The difference was position in the round — the
+first arm of each round reads against a colder page cache. With the order **rotated by the round** and
+six rounds (one per arm, so every arm is measured at every position) the two agree exactly:
+
+| form (identity pair) | misses 1 best | misses 1 median | misses 6 best |
+|---|---|---|---|
+| `.shardBatched` (shipped) | 0.86 ms (21.8 GB/s) | 1.67 ms (10.8) | 2.63 ms (42.8) |
+| `.chunk 8 MB` (the identity) | 0.80 ms (23.6 GB/s) | 1.70 ms (10.5) | 2.58 ms (43.7) |
+
+That pair is kept in the table on purpose. **Any A/B of a fill form that does not reproduce it is
+measuring the order.**
+
+### The isolated decomposition
+
+Same distinct `(layer, expert)` pairs, same rounds, same reader, into a Metal arena slot
+(`.shardBatched`) and into a malloc'd host buffer (the control), best of six rounds:
+
+| arm | misses 1 | misses 3 | misses 6 |
+|---|---|---|---|
+| `.shardBatched` (shipped) | 0.86 ms (21.8 GB/s) | 1.57 (35.9) | 2.63 (42.8) |
+| `.serial` | 1.24 (15.2) | 3.84 (14.7) | 7.32 (15.4) |
+| `.chunk 2 MB` | 1.33 (14.1) | 2.64 (21.4) | 4.23 (26.7) |
+| `.chunk 512 KB` | 1.46 (12.9) | 3.72 (15.2) | 7.28 (15.5) |
+| `.chunk 128 KB` | 1.42 (13.2) | 4.16 (13.5) | 8.35 (13.5) |
+| host fan-out (6) | | | 6.74 ms (16.7) |
+| host serial (6) | | | 11.35 (9.9) |
+| host chunk 512 KB (6) | | | 5.97 (18.9) |
+
+Three things fall out. **Concurrency helps** (serial is 2-3x slower), **deeper is not better** (128 KB
+is the worst arm at every count), and the **destination is not the problem**: the same ranges into a
+malloc'd buffer through the same reader are not faster than into an arena slot at the same shape.
+
+### In situ, the shipped form wins every round
+
+Three walks of 42 positions per arm, one arm order per round, a real tokenized text stream per walk
+(distinct streams, because the arena serves a second walk over the same tokens for free -- `#26`):
+
+| round | `.shardBatched` | `.chunk 2 MB` | `.chunk 512 KB` |
+|---|---|---|---|
+| 0 | **12.8 GB/s, 205.0 ms/position** | 7.3, 331.2 | 4.8, 448.3 |
+| 1 | **5.9, 387.8** | 6.0, 357.8 | 4.6, 476.9 |
+| 2 | **6.7, 339.0** | 6.0, 353.6 | 4.8, 405.3 |
+
+`.chunk 512 KB` is 1.4-2.7x slower per byte and costs the walk **240 ms per position** in round 0.
+The mechanism is the one the isolated table hints at and the walk makes obvious: a 5.5 MB `pread` gets
+the file's sequential coalescing and readahead, and 512 KB of it does not. **Deepening the queue
+trades coalescing for parallelism on a device where the parallelism was already there.**
+
+### What the numbers say the fill's rate actually is
+
+Rate is a function of **misses per fill**, not of the form. In the walk, `.shardBatched` at 1.7-2.2
+misses per fill reads at 5.9-15.2 GB/s; in the same walk at 1 miss it reads at 3.8-4.7 GB/s (`#50`).
+The isolated arms say the same thing from the other side: 1 miss 11-22 GB/s, 3 misses 15-36, 6 misses
+16-43. A fill is **latency-bound while it carries one expert and bandwidth-bound once it carries
+three**, and that is a property of how many experts the router picked, not of the code that reads them.
+
+### What it means
+
+- **The fill's fan-out is closed.** The shipped form is the fastest form measured, in isolation and in
+  a walk, and the deeper forms lose 1.3-2.7x. The seam stays (`.chunked`/`.serial` are the baselines
+  those numbers were taken against) and `.shardBatched` stays the default.
+- **`#50`'s "5.5-7.3 GB/s" is not a code defect.** It is what a one-miss fill costs on a machine whose
+  page cache is being consumed by the arena's own reads. There is no form of that read that makes it
+  faster; there is only **fewer of them**, which is the batched block path's 2.16x and 7.6x less I/O
+  (`#22`) and is unchanged as the next lever.
+- **A probe that reports a rate must report misses per fill beside it.** Every fill number in this
+  project before this slice was an average over fills carrying between one and six experts, which is
+  the one variable that moves the rate by 3x.
+
+### What it is not (do not re-propose)
+
+- **Not the fan-out's depth.** Measured, isolated and in situ, both directions.
+- **Not the destination.** Arena slots and malloc'd host memory read at the same rate at the same
+  shape (16.7 against 16.6 GB/s for six experts); `#20`'s "the cost is this destination" is refined,
+  not contradicted: the cost is the machine's state, and `F_NOCACHE` (2.2x loss, `#21`) is still dead.
+- **Not the arena's slot allocation.** `#21` measured ~1 ms/position; it is inside the "total" column
+  here and never inside the fill's own seconds.
+- **Not thread-pool wake-up.** `.serial` exists so that claim could be checked: no concurrency is
+  *slower*, so the shipped path is not paying for a thread to be scheduled.
+
+### Verification
+
+`DeepSeekV41FillThroughputTests` (opt-in, `/tmp/dynamoe_dsv41_fill_measure`) runs
+`testWhatAFillsShapeCostsOnThePublishedCheckpoint` -- six forms x three miss counts x six rotated
+rounds, plus three host-buffer arms each with its own pairs -- and
+`testWhatAFillFormIsWorthInAWalk` -- three arms x three rounds of 42 real positions, reporting each
+walk's own bytes, fills, misses per fill, fill seconds and wall. The isolated case costs 4 s; the
+walk case 145 s at `-O`.
+
+The full DeepSeek suite is **570 passed / 0 failed / 65 skipped** (96 classes, 635 cases; the new
+class's two cases skip without the marker), and the same run under `MTL_DEBUG_LAYER` is
+**570 / 0 / 65 with 0 validation errors and no failed assertions**. Two harness bugs were found and
+fixed on the way, both worth carrying: an engine returned out of scope unmaps the `bytesNoCopy` shard
+buffers under the runtime, which surfaces as a SIGSEGV at an address in the middle of nowhere (484 GB
+here) inside a gain-vector widen; and a stale test bundle in `-derivedDataPath /tmp/dd_dsv41_opt`
+reported a line number from the pre-edit source, which is what made a build look like a crash.
