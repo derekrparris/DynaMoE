@@ -1667,8 +1667,27 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     public var recordsWalkTiming = false
     public private(set) var walkTiming = DeepSeekV41WalkTiming()
     /// Every walk buffer committed while `recordsWalkTiming` is on, with the half it
-    /// belongs to, so `recordWalkDeviceTiming` can divide the device time.
-    private var walkBuffers: [(buffer: MTLCommandBuffer, isMixture: Bool)] = []
+    /// belongs to and — in the `recordsWalkStageTiming` layout — the stage it holds, so
+    /// `recordWalkDeviceTiming` can divide the device time by half and by stage.
+    private var walkBuffers: [(buffer: MTLCommandBuffer, isMixture: Bool, stage: String?)] = []
+
+    /// Device time per stage of a WALKED position, in nanoseconds, by stage name.
+    ///
+    /// Off unless `recordsWalkStageTiming` is on, which changes the LAYOUT rather than
+    /// the work: every stage of a layer's dense half and of its expert half is
+    /// committed in its own command buffer, in the same submission order on the same
+    /// queue, so each reports its own `gpuStartTime`/`gpuEndTime`. The block path's
+    /// `recordsStageTiming` does the same for a batched prefill; a walked position has
+    /// never been attributed at the published widths, and the block's own table is not
+    /// a substitute: its three biggest dense stages are GEMV projections whose cost is
+    /// the per-position activation traffic a block re-requests once per output row,
+    /// while a walk asks for one position's worth (`Benchmarks/PERF_FINDINGS.md`,
+    /// "DSV4.1 #60").
+    public var recordsWalkStageTiming = false
+    public private(set) var walkStageTiming: [String: UInt64] = [:]
+    /// Positions the walk stage table was accumulated over, so a caller divides by
+    /// positions rather than by layers.
+    public private(set) var walkStagePositions = 0
 
     /// Where a walked position's idle time sits, buffer by buffer. Off by default and
     /// off in every production path: it retains a timeline entry per committed buffer.
@@ -1773,12 +1792,34 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     public func resetWalkTiming() {
         walkTiming = DeepSeekV41WalkTiming()
         walkBuffers.removeAll(keepingCapacity: true)
+        walkStageTiming.removeAll(keepingCapacity: true)
+        walkStagePositions = 0
         walkTimeline.removeAll(keepingCapacity: true)
         walkTimelinePositions = 0
         walkTimelineCommits.removeAll(keepingCapacity: true)
         layerGaps.removeAll(keepingCapacity: true)
         layerGapPositions.removeAll(keepingCapacity: true)
         pendingLayerGaps.removeAll(keepingCapacity: true)
+    }
+
+    /// The walk's per-stage device time, biggest first, as milliseconds per position
+    /// and share of the whole measured half.
+    ///
+    /// A table rather than a `describe()` line because the interesting shape is the
+    /// ranking: a stage that holds 20% of a decoded position is the next kernel to
+    /// attack and one that holds 1% is not, and neither is visible in a sum.
+    public func walkStageTable()
+        -> [(stage: String, millisecondsPerPosition: Double, share: Double)] {
+        let divisor = Double(max(1, walkStagePositions))
+        let total = walkStageTiming.values.reduce(0, +)
+        return walkStageTiming.map { entry in
+            (
+                stage: entry.key,
+                millisecondsPerPosition: Double(entry.value) / divisor / 1_000_000,
+                share: total > 0 ? Double(entry.value) / Double(total) : 0
+            )
+        }
+        .sorted { $0.millisecondsPerPosition > $1.millisecondsPerPosition }
     }
 
     /// Clears the per-stage accumulation.
@@ -3398,9 +3439,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 layerCount: layerGaps.count
             ))
         }
-        if recordsWalkTiming {
+        if recordsWalkTiming || recordsWalkStageTiming {
             recordWalkDeviceTiming()
-            walkTiming.positions += 1
+            if recordsWalkTiming { walkTiming.positions += 1 }
         }
 
         var logits = [Float](repeating: 0, count: config.vocabSize)
@@ -3484,9 +3525,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 layerCount: layerGaps.count
             ))
         }
-        if recordsWalkTiming {
+        if recordsWalkTiming || recordsWalkStageTiming {
             recordWalkDeviceTiming()
-            walkTiming.positions += 1
+            if recordsWalkTiming { walkTiming.positions += 1 }
         }
 
         var logits = [Float](repeating: 0, count: config.vocabSize)
@@ -3812,13 +3853,17 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             try readEngramRows(layer: layer)
         }
 
-        let commandBuffer = try makeCommandBuffer()
-        let encoder = try makeEncoder(commandBuffer)
-
-        var frontBuffer = commandBuffer
-        var frontEncoder = encoder
+        // `recordsWalkStageTiming` gives every stage its own command buffer, the way
+        // the block path's `recordsStageTiming` does: the submission order on the queue
+        // is unchanged, so every hazard is protected exactly as before, while each
+        // stage reports its own device window. It is a layout flag, not a work flag.
+        let splittingStages = recordsWalkStageTiming
+        var frontBuffers: [MTLCommandBuffer] = []
+        var frontBuffer = try makeCommandBuffer()
+        var frontEncoder = try makeEncoder(frontBuffer)
+        var frontEncoderOpen = true
         var indexerWaits: UInt64 = 0
-        for stage in DeepSeekV41DevicePlan.frontHalf {
+        for (index, stage) in DeepSeekV41DevicePlan.frontHalf.enumerated() {
             try encode(
                 stage,
                 layer: layer,
@@ -3828,34 +3873,78 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             // The indexer's selection is a HOST value: the scores have to come back
             // before the gather can bind the rows they name, so the dense half stops
             // here rather than carrying the gather in the same submission.
-            if stage == .indexer, layer.ownsCompressedIndex {
-                frontEncoder.endEncoding()
-                let splitEncoded = measuring ? DispatchTime.now().uptimeNanoseconds : 0
+            let splitsForIndexer = stage == .indexer && layer.ownsCompressedIndex
+            guard splittingStages || splitsForIndexer else { continue }
+            frontEncoder.endEncoding()
+            frontEncoderOpen = false
+            let splitEncoded = measuring ? DispatchTime.now().uptimeNanoseconds : 0
+            if splittingStages {
+                try commit(
+                    frontBuffer,
+                    stage: "layer \(layer.index) \(stage.rawValue)",
+                    waiting: false
+                )
+            } else {
                 try commit(frontBuffer, stage: "layer \(layer.index) indexer")
-                if measuring {
+            }
+            if measuring || splittingStages {
+                if splittingStages {
+                    walkBuffers.append((
+                        buffer: frontBuffer, isMixture: false, stage: stage.rawValue
+                    ))
+                } else {
+                    // The split's wait is a second round trip inside the dense half, so
+                    // it is kept out of the encode bucket rather than counted as the
+                    // host's own work.
                     indexerWaits += DispatchTime.now().uptimeNanoseconds - splitEncoded
-                    walkBuffers.append((buffer: frontBuffer, isMixture: false))
+                    walkBuffers.append((buffer: frontBuffer, isMixture: false, stage: nil))
+                }
+            }
+            frontBuffers.append(frontBuffer)
+            if splitsForIndexer {
+                // The score readback needs everything committed so far retired. The
+                // single-buffer layout waited on its own commit above; the split
+                // layout has one buffer per stage, so it waits here and books the time
+                // the same way.
+                if splittingStages {
+                    let before = measuring ? DispatchTime.now().uptimeNanoseconds : 0
+                    try settlePending()
+                    if measuring {
+                        indexerWaits += DispatchTime.now().uptimeNanoseconds - before
+                    }
                 }
                 try readIndexSelections(layer: layer, startPosition: position, count: 1)
+            }
+            if index + 1 < DeepSeekV41DevicePlan.frontHalf.count {
                 frontBuffer = try makeCommandBuffer()
                 frontEncoder = try makeEncoder(frontBuffer)
+                frontEncoderOpen = true
             }
         }
-        frontEncoder.endEncoding()
+        if frontEncoderOpen { frontEncoder.endEncoding() }
         let frontEncoded = (measuring || gapMeasuring)
             ? DispatchTime.now().uptimeNanoseconds : 0
         // The routing readback below needs this half finished on the host. It also
         // drains the previous layer's expert half, which is what makes the arena
         // slots free to overwrite: a pread here can never land under a kernel that
         // is still reading the slot it replaces.
-        try commit(frontBuffer, stage: "layer \(layer.index) attention")
+        if splittingStages {
+            // Every stage was submitted without waiting, so this is that one wait.
+            try settlePending()
+        } else {
+            try commit(frontBuffer, stage: "layer \(layer.index) attention")
+            frontBuffers.append(frontBuffer)
+        }
 
         // The dense half is drained above, so its device window is final: this is the
-        // moment the GPU became free for the expert half.
+        // moment the GPU became free for the expert half. The split layout's dense half
+        // is many buffers, so it is the first one's start to the last one's end; the
+        // single-buffer layout keeps the window of the one that carried the readback.
+        let windowStart = splittingStages ? frontBuffers.first : frontBuffers.last
         let frontStart = (measuring || gapMeasuring)
-            ? UInt64(frontBuffer.gpuStartTime * 1_000_000_000) : 0
+            ? UInt64((windowStart?.gpuStartTime ?? 0) * 1_000_000_000) : 0
         let frontEnd = (measuring || gapMeasuring)
-            ? UInt64(frontBuffer.gpuEndTime * 1_000_000_000) : 0
+            ? UInt64((frontBuffers.last?.gpuEndTime ?? 0) * 1_000_000_000) : 0
 
         // The mixture binds per-expert byte offsets, which are host values.
         let streamedBefore = gapMeasuring ? streamerCounters() : nil
@@ -3949,27 +4038,63 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             }
         }
 
-        let expertCommand = try makeCommandBuffer()
-        let expertEncoder = try makeEncoder(expertCommand)
-        for stage in DeepSeekV41DevicePlan.backHalf {
+        // The layout flag splits this half too, which is the only way to say whether a
+        // position's mixture is its routed experts or its shared one: they are separate
+        // stages in one submission otherwise.
+        var mixtureBuffers: [MTLCommandBuffer] = []
+        var mixtureBuffer = try makeCommandBuffer()
+        var mixtureEncoder = try makeEncoder(mixtureBuffer)
+        var mixtureEncoderOpen = true
+        for (index, stage) in DeepSeekV41DevicePlan.backHalf.enumerated() {
             try encode(
                 stage,
                 layer: layer,
                 position: position,
-                encoder: expertEncoder,
+                encoder: mixtureEncoder,
                 routing: routing,
                 residents: residents
             )
+            guard splittingStages else { continue }
+            mixtureEncoder.endEncoding()
+            mixtureEncoderOpen = false
+            try commit(
+                mixtureBuffer,
+                stage: "layer \(layer.index) \(stage.rawValue)",
+                waiting: false,
+                mixture: true
+            )
+            if measuring || splittingStages {
+                walkBuffers.append((
+                    buffer: mixtureBuffer, isMixture: true, stage: stage.rawValue
+                ))
+            }
+            mixtureBuffers.append(mixtureBuffer)
+            if index + 1 < DeepSeekV41DevicePlan.backHalf.count {
+                mixtureBuffer = try makeCommandBuffer()
+                mixtureEncoder = try makeEncoder(mixtureBuffer)
+                mixtureEncoderOpen = true
+            }
         }
-        expertEncoder.endEncoding()
+        if mixtureEncoderOpen { mixtureEncoder.endEncoding() }
         let mixtureEncoded = (measuring || gapMeasuring)
             ? DispatchTime.now().uptimeNanoseconds : 0
         // No readback of this half exists, so it is only ordered: the next layer's
         // front half commits behind it on the same queue.
-        try commit(expertCommand, stage: "layer \(layer.index) experts", waiting: false, mixture: true)
+        if !splittingStages {
+            try commit(
+                mixtureBuffer,
+                stage: "layer \(layer.index) experts",
+                waiting: false,
+                mixture: true
+            )
+            mixtureBuffers.append(mixtureBuffer)
+        }
+        // The buffer whose completion closes the layer's hand-off record: the one that
+        // carries the last stage of the expert half, whichever layout built it.
+        let mixtureTail = mixtureBuffers.last ?? mixtureBuffer
 
         if gapMeasuring {
-            pendingLayerGaps[ObjectIdentifier(expertCommand)] = PendingLayerGap(
+            pendingLayerGaps[ObjectIdentifier(mixtureTail)] = PendingLayerGap(
                 layer: layer.index,
                 position: position,
                 frontWindowStartNanoseconds: frontStart,
@@ -3998,8 +4123,12 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             walkTiming.expertFillNanoseconds += filled - fillStarted
             walkTiming.mixtureEncodeNanoseconds += mixtureEncoded - filled
             walkTiming.layers += 1
-            walkBuffers.append((buffer: frontBuffer, isMixture: false))
-            walkBuffers.append((buffer: expertCommand, isMixture: true))
+        }
+        if !splittingStages, measuring {
+            // Both halves already appended one buffer per stage as they committed it,
+            // so the single-buffer layout is the only one that collects its two here.
+            walkBuffers.append((buffer: frontBuffer, isMixture: false, stage: nil))
+            walkBuffers.append((buffer: mixtureTail, isMixture: true, stage: nil))
         }
     }
 
@@ -4010,24 +4139,40 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// queue was still draining the previous layer reports its own window, which is
     /// exactly the attribution a host-side wait cannot give.
     private func recordWalkDeviceTiming() {
+        let stageMeasuring = recordsWalkStageTiming
         for entry in walkBuffers {
             let start = entry.buffer.gpuStartTime
             let end = entry.buffer.gpuEndTime
             guard end > start else {
-                if entry.isMixture {
-                    walkTiming.mixtureUnwindowedBuffers += 1
-                } else {
-                    walkTiming.frontUnwindowedBuffers += 1
+                // In the split layout a stage with nothing to dispatch (an `.engram` on
+                // a layer with no table, an `.indexer` on a layer with no compressed
+                // index) commits an empty buffer, whose window is absent. That is not a
+                // missing measurement, so only a buffer that carries a whole half counts
+                // as one.
+                if recordsWalkTiming, entry.stage == nil {
+                    if entry.isMixture {
+                        walkTiming.mixtureUnwindowedBuffers += 1
+                    } else {
+                        walkTiming.frontUnwindowedBuffers += 1
+                    }
                 }
                 continue
             }
             let nanoseconds = UInt64((end - start) * 1_000_000_000)
-            if entry.isMixture {
-                walkTiming.mixtureDeviceNanoseconds += nanoseconds
-            } else {
-                walkTiming.frontDeviceNanoseconds += nanoseconds
+            if recordsWalkTiming {
+                if entry.isMixture {
+                    walkTiming.mixtureDeviceNanoseconds += nanoseconds
+                } else {
+                    walkTiming.frontDeviceNanoseconds += nanoseconds
+                }
+            }
+            // The same window, divided by stage instead of by half. Both totals cover
+            // exactly the buffers of one position, so their sums must agree.
+            if stageMeasuring, let stage = entry.stage {
+                walkStageTiming[stage, default: 0] += nanoseconds
             }
         }
+        if stageMeasuring { walkStagePositions += 1 }
         if recordsWalkTimeline, walkTimelinePositions < walkTimelineLimit {
             for entry in walkBuffers {
                 guard let recorded = walkTimelineCommits[ObjectIdentifier(entry.buffer)]

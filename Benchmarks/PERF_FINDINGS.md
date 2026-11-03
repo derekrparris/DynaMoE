@@ -9778,3 +9778,178 @@ pre-existing environmental ones (`DynaMoETests`: help-topic count, Qwen3.8 Flash
 tool-discover lifecycle, truncated tool-call recovery; `ModelDogfoodAndPrefixCacheTests`: the 9
 prompt/web-fetch/headless-Chrome cases); both `ServerQueueLogicTests` timing flakes that appeared in
 `#58`'s run passed here. Run: `/tmp/test59_suite2.log`.
+
+## DSV4.1 #60: THE EXPERT STAGES ARE 43% OF A WALKED POSITION'S DEVICE TIME, AND THE BLOCK'S STAGE RANKING DOES NOT TRANSFER
+
+`#59` closed the arena's replacement question and left a warm decode at 101-122 ms/position with
+53.8 ms of device windows -- the largest single bucket, and one no published table had ever attributed.
+Every stage table in this journal comes from a synthetic fixture, and the one table taken on the real
+checkpoint (`#52`) is a BLOCK of eight positions. This asks the walk's side of it, because the block's
+answer cannot be the walk's: its three biggest stages are GEMV projections whose cost there is the
+per-position activation traffic a block re-requests once per output row (`#18` priced it at 1.9 GB of
+requests for one block), and that traffic grows with the block width while a walk asks for one
+position's worth.
+
+### The run
+
+One runtime through the app's own loading path, one 128-position token stream (the `#52`-`#59` text,
+one rotation), the shipping frequency rule, `-O`, the shipped 65.84 GB arena (3,760 slots of 17.9 MB).
+A warm-up pass is discarded (a young process pays slot creation, wiring and a cold page cache), then
+two arms walk the SAME stream without an arena reset between them, so both are in the steady state a
+live turn decodes in -- `#59`'s C2/C3 regime:
+
+1. **baseline**: one command buffer per half, the decomposition `#59` quoted;
+2. **stages**: one command buffer per stage (`recordsWalkStageTiming`), so every stage reports its own
+   `gpuStartTime`/`gpuEndTime`.
+
+| arm | wall | device | dense device | mixture device | misses | read |
+|---|---|---|---|---|---|---|
+| baseline, one buffer per half | 105.6 ms/pos | 54.3 | 28.7 | 25.6 | 2,002 | 35.1 GB |
+| stages, one buffer per stage | 82.1 ms/pos | 58.5 | 32.9 | 25.5 | 1,640 | 28.7 GB |
+
+The two walls are NOT comparable and the difference is not the layout: the second arm's fill came out
+of the page cache (11.1 ms/position against the first's 24.0, 28.7 GB at ~20 GB/s), exactly the order
+effect `#59` saw on its third arm. The miss and byte columns are the structural ones and they are
+`#59`'s own (2,002 / 35.1 then 1,640 / 28.7). Only the device columns are read below.
+
+### The layout is the same graph
+
+- **The answer is unchanged to the bit**: worst logit delta 0.00e+00 absolute on a 24.96 scale, after
+  128 positions. Splitting a half into per-stage buffers changes no kernel, no binding and no
+  submission order.
+- **The mixture's four stages add up to the mixture half**: 25.51 against 25.6, and 24.99 against
+  25.3 in the second run -- 0.4-1.2%. Each carries ~3 ms of device time per layer, so a per-buffer
+  cost is invisible there.
+- **The dense half's twenty stages add up to MORE than its one-buffer total**: 32.9 against 28.7, and
+  32.85 against 28.6 in the second run -- +4.2 ms/position, +14.6%, every time. The one-buffer layout
+  overlaps adjacent dense stages (or the split pays ~5 us per boundary); either way the dense shares
+  below are shares of a SERIALIZED 32.9 ms whose overlapped cost is 28.7, and the table is read as a
+  ranking with that upward bias, not as absolute milliseconds.
+- The per-stage windows sum to exactly the half totals the same arm reported
+  (`stageTotal == frontDevice + mixtureDevice`), which is what makes the division a division of one
+  population rather than of two.
+
+### The table
+
+Milliseconds per walked position and share of the 58.45 ms of serialized device time, 27 stages that
+report a window (`.compressPool` dispatches nothing -- the pool runs inside `.indexer`).
+
+| stage | ms/pos | share | half |
+|---|---|---|---|
+| sharedExpert | 12.963 | 22.2% | mixture |
+| routedExperts | 12.198 | 20.9% | mixture |
+| queryUp | 4.357 | 7.5% | dense |
+| outputDown | 4.165 | 7.1% | dense |
+| hcAttentionCoefficients | 4.105 | 7.0% | dense |
+| router | 3.621 | 6.2% | dense |
+| outputUp | 3.505 | 6.0% | dense |
+| hcFFNCoefficients | 3.373 | 5.8% | dense |
+| latentProject | 1.585 | 2.7% | dense |
+| attention | 1.409 | 2.4% | dense |
+| indexer | 1.170 | 2.0% | dense |
+| queryDown | 0.955 | 1.6% | dense |
+| ropeOutput | 0.900 | 1.5% | dense |
+| ropeQuery | 0.884 | 1.5% | dense |
+| engram | 0.635 | 1.1% | dense |
+| ffnNorm | 0.538 | 0.9% | dense |
+| attnNorm | 0.507 | 0.9% | dense |
+| queryNorm | 0.237 | 0.4% | dense |
+| writeFFNStreams | 0.205 | 0.4% | mixture |
+| ropeLatent | 0.191 | 0.3% | dense |
+| latentNorm | 0.190 | 0.3% | dense |
+| writeLatent | 0.179 | 0.3% | dense |
+| mixFFNStreams | 0.153 | 0.3% | dense |
+| writeAttentionStreams | 0.150 | 0.3% | dense |
+| collapseStreams | 0.143 | 0.2% | mixture |
+| mixAttentionStreams | 0.132 | 0.2% | dense |
+| compressPool | 0.001 | 0.0% | dense |
+
+The second run reproduced every figure within 2% (total 57.84, dense 32.85, mixture 24.99; the top
+eight in the same order), so this is not a one-run table.
+
+### What it says
+
+- **The two expert stages are 43.1% of a walked position's device time and 99% of the mixture half.**
+  The SHARED expert (12.96) is the single largest stage of a decode -- larger than all six routed
+  experts together (12.20). Nothing in the dense half comes close.
+- **The routed experts run at the machine's measured GEMV ceiling; the shared expert does not.** One
+  position reads 240 experts (6 x 40 layers) x 17.9 MB = 4.30 GB in 12.20 ms, i.e. **352 GB/s**,
+  which is `#20`'s 300-370 GB/s in isolation. The shared expert reads 40 x 3 x 5120 x 2304 values =
+  1.42 GB (1.46 GB with its 32x32 block scales) in 12.96 ms, i.e. **109-113 GB/s** -- about a third
+  of the routed kernels on the same shapes and at twice their per-byte rate. `#20` measured the
+  coalesced FP8 form in isolation at 262 GB/s on the shared `w1` alone, so this is an in-situ gap,
+  not a form that was never measured.
+- **The block's ranking does not transfer, and the direction is the one `#18` predicted.** `queryUp`
+  is 20.4% of a block's dense half and 7.5% of a walk's device time; `outputUp` 19.1% -> 6.0%;
+  `outputDown` 17.7% -> 7.1%. Between them 57% -> 20.6%. A block re-reads every position's activation
+  vector once per output row; a walk reads one 20 KB vector and the weight once.
+- **Those three GEMVs are themselves bandwidth-bound.** `queryUp` reads 32,768 x 1,280 values =
+  1.73 GB/position in 4.36 ms (**397 GB/s**), `outputDown` 1.38 GB in 4.17 ms (**332 GB/s**); both are
+  at the ceiling, so their cost is the bytes they must read and no kernel shape will take it away.
+- **The mHC coefficient pair is 7.48 ms/position, 12.8% of device time** -- 4.1 for the attention
+  sub-layer's projection and 3.4 for the FFN's. The block table put the same pair at 1.9 ms/position,
+  and the difference is the batching: a block projects ONCE for eight positions, a walk once per
+  position, 120 dispatches per position of 24 threadgroups each (four slots x six logits).
+- **`router` is 3.62 ms/position, 6.2%**, for the same reason: one dispatch per position scoring 384
+  experts, amortized over a block and paid per token by a walk.
+- **The attention itself is not a target.** `attention` is 1.41 ms (2.4%) and `writeLatent` 0.18 ms
+  (0.3%). `#17` closed the attention at these widths and the walk agrees.
+- **The compressor is free on a walk** (0.001 ms): it runs inside `.indexer`, which is 1.17 ms
+  (2.0%) including the selection.
+- **What is left is a tail of small per-position kernels.** mHC pair 7.48 + router 3.62 + ropes 1.98
+  + norms 1.47 + stream mixes 0.58 = **15.1 ms/position, 26% of device time and 14% of the wall**,
+  all of it latency-bound rather than bandwidth-bound. A block pays each once per eight positions;
+  a walk pays each forty times.
+- **The wall around it** (baseline arm): 101.7 ms/position of host buckets -- front encode 2.5, front
+  wait 60.0, indexer wait 12.5, expert fill 24.0, mixture encode 2.7 -- against a 105.6 ms wall, so
+  ~3.9 ms is outside every bucket. The wait's own split is drained front 32.0 / mixture 44.0 with
+  late starts 0.7 / 14.7 ms; those drains cross window boundaries (the indexer's readback and the
+  token's final settle are settles that are not front waits), so they do not partition the 60.0 and
+  are not a fourth bucket.
+
+### What it is not (do not re-propose)
+
+- **Not a case for the attention, the cache write or the compressor.** 1.41, 0.18 and 0.001
+  ms/position, measured at the published widths.
+- **Not evidence that the three GEMVs are the walk's problem.** They are 20.6% together, and at
+  332-397 GB/s they are already at the ceiling. The block table's 57% is a block property.
+- **Not a rows-per-threadgroup or "wider block" argument for the walk.** `#18` and `#21` both closed
+  those on the shapes they were measured on, and nothing here reopens them.
+- **Not a page-cache or fill result.** The two arms' walls differ by 12-17 ms/position purely because
+  the second arm's fill was served from cache; only the device columns are compared.
+- **Not a capacity or replacement result.** The arena is the shipped one and the policy is the
+  shipping rule; this slice varies neither.
+- **Not a claim that the block table was wrong.** It was a correct table of a block. It is simply
+  not a decode's ranking, and this is the decode's.
+
+### Verification
+
+`testWhereAWalkedPositionsDeviceTimeGoes` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_walk_stages` plus the class's own `/tmp/dynamoe_dsv41_real_turn`), 49-61 s at
+`-O`. It asserts that the two layouts return identical logits, that the stage windows cover every
+position and add up to the half totals, that no half buffer is unwindowed, and that every stage the
+checkpoint dispatches appears in the table. Runs: `/tmp/test60_walk2.log` (the one tabulated above)
+and `/tmp/test60_walk3.log` (the reproduction); `/tmp/test60_walk1.log` is a first cut whose arms were
+arena-reset (cold), and it produced the same ranking. The same case also passes under the Metal debug
+layer (`/tmp/test60_walk_mtl.log`, 50.1 s, no validation errors), where it reports 57.65 ms/position
+of device time (32.77 dense, 24.88 mixture) -- a third run of the same table.
+
+The instrument itself is pinned without the checkpoint by
+`DeepSeekV41DeviceGraphParityTests.testThePerStageWalkLayoutIsTheSameWalk` (synthetic fixture): the
+split layout must return bit-identical logits, its stage windows must equal the half totals, and the
+table must name every stage the fixture dispatches. That case also passes under the debug layer.
+
+The full `DynaMoETests` target ran 1,481 tests with 92 skipped and 30 failures in 119.7 s on the `-O`
+build: every `DeepSeekV41*` suite passed with 0 failures (the two new cases included), and the 13
+failed cases are exactly the pre-existing environmental set (4 in `DynaMoETests`: help-topic count,
+Qwen3.8 Flash Next forward, tool-discover lifecycle, truncated tool-call recovery; 9
+`ModelDogfoodAndPrefixCacheTests` prompt/web-fetch/headless-Chrome cases). Run:
+`/tmp/test60_suite.log`.
+
+No kernel, encoder, dispatch shape or production path changed: `recordsWalkStageTiming` is a flag
+that is off in every production path, and the single-buffer layout a turn uses is byte-for-byte the
+one `#59` measured.
+
+No kernel, encoder, dispatch shape or production path changed: `recordsWalkStageTiming` is a flag
+that is off in every production path, and the single-buffer layout a turn uses is byte-for-byte the
+one `#59` measured.

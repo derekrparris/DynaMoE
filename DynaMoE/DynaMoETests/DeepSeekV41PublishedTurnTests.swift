@@ -7214,6 +7214,312 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
+    /// Which stage holds a walked position's device time, on the checkpoint itself.
+    ///
+    /// `#59` closed the arena's replacement question and left a warm decode at 101-122
+    /// ms/position with 53.8 ms of device windows -- the largest bucket, and the one no
+    /// published table has ever attributed. Every stage table in
+    /// `Benchmarks/PERF_FINDINGS.md` comes from a synthetic fixture, and the one table
+    /// taken on the real checkpoint is a BLOCK of eight positions: its three biggest
+    /// stages (`queryUp`, `outputUp`, `outputDown`, 57% between them) are GEMV
+    /// projections whose cost there is the per-position activation traffic a block
+    /// re-requests once per output row (`#18` priced it at 1.9 GB of requests for one
+    /// block), and that term grows with the block width. A walk asks for ONE position's
+    /// worth, so the block's ranking is not evidence about a decode and this asks it
+    /// directly.
+    ///
+    /// Two arms, one runtime, one 128-position stream, the shipping frequency policy:
+    ///
+    /// 1. baseline -- the single-buffer layout with `recordsWalkTiming`, which is the
+    ///    decomposition `#59` quoted;
+    /// 2. stages -- `recordsWalkStageTiming`, which commits every stage of every half
+    ///    in its own command buffer, in the same order on the same queue, so each
+    ///    reports its own device window.
+    ///
+    /// The stages arm has to return the same logits as the baseline and its windows
+    /// have to add up to the baseline's device total, so the table is read against a
+    /// number a different layout produced rather than against itself.
+    ///
+    /// Opt-in (`/tmp/dynamoe_dsv41_walk_stages`, plus the class's own marker): a cold
+    /// walk of the stream reads the whole routed working set off disk.
+    func testWhereAWalkedPositionsDeviceTimeGoes() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_walk_stages"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in walk stage probe; touch \(markerPath) to run"
+        )
+
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        // The same 128-position stream `#52`-`#59` measured, so this slice's buckets are
+        // comparable with theirs position for position.
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+        func prompt(_ length: Int, rotation: Int) -> [Int] {
+            (0..<length).map { index in
+                let repetition = index / stream.count
+                return stream[(index + repetition * rotation) % stream.count]
+            }
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let positions = 128
+        let tokens = prompt(positions, rotation: 7)
+
+        /// One walked pass: its wall, its bucket instrument, and the logits the last
+        /// position produced (so the two layouts can be compared for answer).
+        struct Outcome {
+            let wallMilliseconds: Double
+            let timing: DeepSeekV41WalkTiming
+            let lastLogits: [Float]
+        }
+
+        func pass(
+            _ label: String,
+            executor: DeepSeekV41MetalForward,
+            arena: DeepSeekV41ExpertArena,
+            streamer: DeepSeekV41ExpertStreamer?,
+            splittingStages: Bool
+        ) -> Outcome? {
+            executor.reset()
+            executor.resetWalkTiming()
+            executor.recordsWalkTiming = true
+            executor.recordsWalkStageTiming = splittingStages
+            let acquisitionsBefore = arena.acquisitions
+            let hitsBefore = arena.hits
+            let bytesBefore = streamer?.bytesRead ?? 0
+            let start = DispatchTime.now().uptimeNanoseconds
+            var logits: [Float] = []
+            do {
+                for (position, token) in tokens.enumerated() {
+                    logits = try executor.forwardToken(token, position: position)
+                }
+            } catch {
+                XCTFail("\(label) refused at a position: \(error)")
+                return nil
+            }
+            let wall = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+            executor.recordsWalkTiming = false
+            executor.recordsWalkStageTiming = false
+            let device = executor.walkTiming.frontDeviceNanoseconds
+                + executor.walkTiming.mixtureDeviceNanoseconds
+            let acquisitions = arena.acquisitions - acquisitionsBefore
+            let misses = acquisitions - (arena.hits - hitsBefore)
+            let bytes = (streamer?.bytesRead ?? 0) - bytesBefore
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   %@: %.1f ms/position, device %.1f ms/position, "
+                        + "%d miss(es), %.1f GB read",
+                    label,
+                    wall / Double(positions),
+                    Double(device) / Double(positions) / 1_000_000,
+                    misses,
+                    Double(bytes) / 1_073_741_824
+                )
+            )
+            print("🔎 [dsv41 real]   \(label) buckets: " + executor.walkTiming.describe())
+            return Outcome(
+                wallMilliseconds: wall, timing: executor.walkTiming, lastLogits: logits
+            )
+        }
+
+        do {
+            let runtime = try makeRuntime(
+                snapshot: snapshot,
+                engine: engine,
+                config: config,
+                contextLength: positions + 1,
+                allowEngramSkip: false,
+                wireArena: nil
+            )
+            // `makeRuntime` pins LRU so every `#20`-`#58` table stays comparable; a
+            // decode in the shipping build uses the frequency rule (`#59`), so both arms
+            // here do too.
+            runtime.arena.victimPolicy = .leastFrequentlyUsed
+            let executor = runtime.forward()
+
+            // A discarded warm-up: the first pass of a young process pays the arena's
+            // slot creation and wiring (`#54`, `#57`) and the page cache is cold, and
+            // neither belongs to a stage. Both measured arms then walk the warm arena a
+            // live turn decodes in. They are not reset between the arms on purpose:
+            // `#59` showed the rule converges over warm passes, and a reset would turn
+            // both into cold passes whose fill is the biggest bucket and whose wall
+            // says nothing about a decode. The device windows do not depend on the hit
+            // rate, so the layout A/B stays valid across the two.
+            executor.reset()
+            runtime.arena.reset()
+            for (position, token) in tokens.enumerated() {
+                _ = try executor.forwardToken(token, position: position)
+            }
+            let slots = runtime.arena.capacity
+            let slotMB = runtime.expertStreamer.map {
+                Double($0.geometry.slotBytes) / 1_048_576
+            } ?? 0
+            print(
+                String(
+                    format: "🔎 [dsv41 real] walk stage probe: %d positions, arena %d slots "
+                        + "of %.1f MB, policy %@, warm-up done",
+                    positions,
+                    slots,
+                    slotMB,
+                    runtime.arena.victimPolicy == .leastFrequentlyUsed ? "frequency" : "LRU"
+                )
+            )
+
+            let baseline = try XCTUnwrap(
+                pass(
+                    "baseline, one buffer per half",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    splittingStages: false
+                )
+            )
+            let stages = try XCTUnwrap(
+                pass(
+                    "stages, one buffer per stage",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    splittingStages: true
+                )
+            )
+
+            // The layout must not change the answer: every stage is submitted in the
+            // same order on the same queue and binds the same buffers.
+            let scale = baseline.lastLogits.map(abs).max() ?? 1
+            let worst = zip(baseline.lastLogits, stages.lastLogits)
+                .map { abs($0 - $1) }
+                .max() ?? 0
+            XCTAssertLessThan(
+                worst / max(scale, 1e-6), 2e-3,
+                "the per-stage layout changed the logits"
+            )
+            print(
+                String(
+                    format: "🔎 [dsv41 real] layout control: worst logit delta %.2e absolute "
+                        + "of a %.2f scale (%.2e relative)",
+                    worst,
+                    scale,
+                    worst / max(scale, 1e-6)
+                )
+            )
+
+            // The table has to cover every position and add up to the device total the
+            // baseline measured in the other layout.
+            XCTAssertEqual(stages.timing.positions, positions)
+            XCTAssertEqual(executor.walkStagePositions, positions)
+            XCTAssertEqual(
+                stages.timing.frontUnwindowedBuffers + stages.timing.mixtureUnwindowedBuffers,
+                0,
+                "a half's buffer reported no device window"
+            )
+            let stageTotal = executor.walkStageTiming.values.reduce(0, +)
+            XCTAssertEqual(
+                stageTotal,
+                stages.timing.frontDeviceNanoseconds + stages.timing.mixtureDeviceNanoseconds,
+                "the per-stage windows do not add up to the half totals"
+            )
+
+            let frontNames = Set(DeepSeekV41DevicePlan.frontHalf.map(\.rawValue))
+            let table = executor.walkStageTable()
+            // Every stage this checkpoint actually dispatches has to appear: a stage
+            // that silently vanished from the split layout would still add up, because
+            // both sides count the same buffers. `.compressPool` is the one stage that
+            // never dispatches on its own (the pool runs inside `.indexer`).
+            var expected = frontNames
+                .union(DeepSeekV41DevicePlan.backHalf.map(\.rawValue))
+            expected.remove(DeepSeekV41ForwardStages.Stage.compressPool.rawValue)
+            let reported = Set(table.map(\.stage))
+            XCTAssertTrue(
+                expected.subtracting(reported).isEmpty,
+                "the walk's stage table is missing "
+                    + "\(expected.subtracting(reported).sorted())"
+            )
+
+            let denseTotal = table
+                .filter { frontNames.contains($0.stage) }
+                .reduce(0) { $0 + $1.millisecondsPerPosition }
+            let mixtureTotal = table
+                .filter { !frontNames.contains($0.stage) }
+                .reduce(0) { $0 + $1.millisecondsPerPosition }
+            let totalPerPosition = Double(stageTotal)
+                / Double(max(1, executor.walkStagePositions)) / 1_000_000
+            print(
+                String(
+                    format: "🔎 [dsv41 real] walked position by stage: %.2f ms/position "
+                        + "total, %.2f dense, %.2f mixture, over %d position(s) and %d stage(s)",
+                    totalPerPosition,
+                    denseTotal,
+                    mixtureTotal,
+                    executor.walkStagePositions,
+                    table.count
+                )
+            )
+            // The same split `#59`'s closing sentence was written from, now with the
+            // drains and late starts beside it: a wait that is mostly its own drain is
+            // the GPU working, and one that is mostly late start is not.
+            func perPosition(_ nanoseconds: UInt64) -> String {
+                String(format: "%.1f", Double(nanoseconds) / Double(positions) / 1_000_000)
+            }
+            print(
+                "🔎 [dsv41 real] baseline per-position buckets: front device "
+                    + perPosition(baseline.timing.frontDeviceNanoseconds)
+                    + ", mixture device "
+                    + perPosition(baseline.timing.mixtureDeviceNanoseconds)
+                    + ", front wait "
+                    + perPosition(baseline.timing.frontWaitNanoseconds)
+                    + " (of which drained front "
+                    + perPosition(baseline.timing.frontDrainNanoseconds)
+                    + ", drained mixture "
+                    + perPosition(baseline.timing.mixtureDrainNanoseconds)
+                    + ", late start front "
+                    + perPosition(baseline.timing.frontLateStartNanoseconds)
+                    + ", mixture "
+                    + perPosition(baseline.timing.mixtureLateStartNanoseconds)
+                    + "), indexer wait "
+                    + String(format: "%.1f", baseline.timing.millisecondsPerPositionIndexerWait())
+                    + " ms"
+            )
+            print(
+                "🔎 [dsv41 real] walked position by stage "
+                    + "(ms/position, share of the position's measured device time):"
+            )
+            for entry in table {
+                print(
+                    "🔎 [dsv41 real]   "
+                        + String(
+                            format: "%-40@ %7.3f ms %5.1f%%  %@",
+                            entry.stage as NSString,
+                            entry.millisecondsPerPosition,
+                            entry.share * 100,
+                            frontNames.contains(entry.stage) ? "dense" : "mixture"
+                        )
+                )
+            }
+            XCTAssertGreaterThan(
+                baseline.timing.positions, 0, "the baseline instrument reported nothing"
+            )
+            runtime.shutdown()
+        }
+        withExtendedLifetime(engine) {}
+    }
+
     /// A page-aligned anonymous mapping this test can wire.
     ///
     /// `mlock` is the only in-process way to tell the kernel a page may be neither

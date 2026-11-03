@@ -312,6 +312,93 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         }
     }
 
+    /// The per-stage walk layout is only a measurement if it is the same graph.
+    ///
+    /// `recordsWalkStageTiming` commits every stage of a layer in its own command
+    /// buffer so each reports a device window. That changes no kernel, no binding and
+    /// no submission order, so the answer must be unchanged; the table's windows must
+    /// also cover exactly the buffers the half totals cover, which is what keeps a
+    /// stage's share from being read against a different population. The stage NAMES
+    /// are checked too: a layout that silently dropped a stage would still add up, and
+    /// the missing cost would land on whichever stage the probe printed last.
+    func testThePerStageWalkLayoutIsTheSameWalk() throws {
+        let runtime = try makeRuntime(checkpoint)
+        let device = runtime.forward()
+        let tokens = (0..<6).map { 11 + $0 }
+
+        device.reset()
+        device.resetWalkTiming()
+        device.recordsWalkTiming = true
+        var baseline: [Float] = []
+        for (position, token) in tokens.enumerated() {
+            baseline = try device.forwardToken(token, position: position)
+        }
+        device.recordsWalkTiming = false
+        let baselineTiming = device.walkTiming
+        XCTAssertEqual(baselineTiming.positions, tokens.count)
+        XCTAssertGreaterThan(baselineTiming.frontDeviceNanoseconds, 0)
+        XCTAssertGreaterThan(baselineTiming.mixtureDeviceNanoseconds, 0)
+
+        device.reset()
+        device.resetWalkTiming()
+        device.recordsWalkTiming = true
+        device.recordsWalkStageTiming = true
+        var split: [Float] = []
+        for (position, token) in tokens.enumerated() {
+            split = try device.forwardToken(token, position: position)
+        }
+        device.recordsWalkTiming = false
+        device.recordsWalkStageTiming = false
+        let splitTiming = device.walkTiming
+
+        XCTAssertEqual(split, baseline, "the per-stage layout changed the walk's logits")
+        XCTAssertEqual(device.walkStagePositions, tokens.count)
+        XCTAssertEqual(
+            splitTiming.frontUnwindowedBuffers + splitTiming.mixtureUnwindowedBuffers,
+            0,
+            "a split buffer reported no device window"
+        )
+        let stageTotal = device.walkStageTiming.values.reduce(0, +)
+        XCTAssertEqual(
+            stageTotal,
+            splitTiming.frontDeviceNanoseconds + splitTiming.mixtureDeviceNanoseconds,
+            "the stage windows do not cover the same buffers as the half totals"
+        )
+
+        let frontNames = Set(DeepSeekV41DevicePlan.frontHalf.map(\.rawValue))
+        let backNames = Set(DeepSeekV41DevicePlan.backHalf.map(\.rawValue))
+        let reported = Set(device.walkStageTiming.keys)
+        // Every stage this fixture actually dispatches has to appear. A stage that
+        // dispatches nothing (`.compressPool` runs inside `.indexer`; `.engram` and
+        // `.indexer` are skipped on a layer that has neither) commits an empty buffer
+        // and legitimately reports no window, so the expectation is the pipeline minus
+        // the ones the plan says cannot run here.
+        var expected = frontNames.union(backNames)
+        expected.remove(DeepSeekV41ForwardStages.Stage.compressPool.rawValue)
+        if !checkpoint.plan.contains(where: { $0.engramTable != nil }) {
+            expected.remove(DeepSeekV41ForwardStages.Stage.engram.rawValue)
+        }
+        if !checkpoint.plan.contains(where: { $0.ownsCompressedIndex }) {
+            expected.remove(DeepSeekV41ForwardStages.Stage.indexer.rawValue)
+        }
+        XCTAssertTrue(
+            expected.subtracting(reported).isEmpty,
+            "the table is missing \(expected.subtracting(reported).sorted())"
+        )
+        XCTAssertTrue(
+            reported.subtracting(frontNames).subtracting(backNames).isEmpty,
+            "a buffer was reported under a name that is not a stage: "
+                + "\(reported.subtracting(frontNames).subtracting(backNames).sorted())"
+        )
+        XCTAssertGreaterThan(
+            device.walkStageTable().first?.millisecondsPerPosition ?? 0, 0
+        )
+
+        device.resetWalkTiming()
+        XCTAssertTrue(device.walkStageTiming.isEmpty)
+        XCTAssertEqual(device.walkStagePositions, 0)
+    }
+
     /// A supplied residual row (how an image span arrives) computes exactly what the
     /// same row computes on the host.
     ///
