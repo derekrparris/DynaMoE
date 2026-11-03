@@ -10365,3 +10365,36 @@ Production code changed: one kernel (`dsv41_router_topk_lanes`), one pipeline,
 `DeepSeekV41DevicePlan.routerTopKWantsLanes`, the selection in `encodeRouter`, and three
 measurement-only seams on the executor (`routerProjectionRepeats`, `routerTopKRepeats`,
 `disablesRouterTopKLanes`), all off in every production path.
+## DSV4.1 #64: THE INDEXER'S DRAIN IS THE GPU, SO A DEVICE SELECTION WOULD BUY NOTHING
+
+After `#61`-`#63` the walked position's device time is **40.35 ms/position** (24.14 dense, 16.21
+mixture) against `#60`'s 58.45, and the stage ordering has changed underneath it: routedExperts
+11.82 (29.3%, 352 GB/s), queryUp 4.33, outputDown 4.13, sharedExpert 4.03, outputUp 3.45 -- all at
+their DRAM ceilings -- then a tail in which nothing is above 1.8 ms: indexer 1.77, attention 1.39,
+queryDown 1.15, latentProject 1.13, router 1.04, ropes 1.80 between them, norms 1.48, the mHC pair
+1.07, the stream mixes 0.88, engram 0.63.
+
+The one item left that is WALL rather than device is the indexer: 20 of the 40 layers own a
+compressed index, and each one stops the dense half for a score readback because the row list the
+attention gathers is a HOST value (`readIndexSelections`). `#60` measured that drain at 12.5
+ms/position and this run at 9.4, of a ~80 ms wall.
+
+So the obvious slice is to compute the selection on the device and remove the round trip. This
+prices the decision before it is taken, by splitting the bucket rather than guessing:
+`DeepSeekV41WalkTiming.indexerSelectNanoseconds` times the host's own work inside the round trip
+(readback + `candidateBlocks` + `selectedRows`), and `describe()` prints it as `indexer host X of
+that wait`.
+
+**The answer is 0.0 ms/position.** The entire 9.4 is `settlePending` waiting for the GPU, i.e. the
+layer's own dense work up to and including the score kernel -- 470 us per index-source layer against
+a 515 us-per-layer dense half, so the drain is not overhead at all, it is the work that the front
+wait would otherwise have covered. A device-side selection would remove the ~0.0-0.1 ms of host CPU
+and nothing else, while reimplementing a selection rule that `#28`-`#32` pinned. **Do not port it
+for this reason.** What it would still buy is *ordering*: the drain serializes the host against the
+GPU, and the pickup after the queue empties is `#22`'s ~0.5-1.2 ms/layer -- but that cost is inside
+the 9.4 and cannot be separated from it by this instrument, and it is bounded by the same GPU work.
+
+The instrument is the whole change. Runs: `/tmp/test64_walk2.log` (indexer wait 9.4, indexer host
+0.0) with `/tmp/test64_walk1.log` as the fresh whole-walk attribution taken the run before (device
+40.35, stage table above; the two runs' walls differ by 1.3 ms for page-cache reasons and the
+indexer wait is 9.4 in both).

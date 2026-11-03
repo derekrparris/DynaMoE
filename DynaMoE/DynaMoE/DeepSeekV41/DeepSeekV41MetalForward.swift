@@ -1113,6 +1113,12 @@ nonisolated public struct DeepSeekV41WalkTiming: Sendable, Equatable {
     /// `waitUntilCompleted`, so a bucket that folded it into the host's own work would
     /// overstate what a batching change could remove.
     public var indexerWaitNanoseconds: UInt64 = 0
+
+    /// The HOST part of the indexer's round trip: the score readback plus the two
+    /// selections. It is subtracted from `indexerWaitNanoseconds` at the print so the
+    /// GPU drain and the host's own work can be told apart — a device-side selection
+    /// could only remove this part.
+    public var indexerSelectNanoseconds: UInt64 = 0
     /// Host time encoding the mixture half.
     public var mixtureEncodeNanoseconds: UInt64 = 0
     /// Device time the dense halves occupied, from their own windows.
@@ -1162,6 +1168,10 @@ nonisolated public struct DeepSeekV41WalkTiming: Sendable, Equatable {
         Double(indexerWaitNanoseconds) / Double(max(1, positions)) / 1_000_000
     }
 
+    public func millisecondsPerPositionIndexerSelect() -> Double {
+        Double(indexerSelectNanoseconds) / Double(max(1, positions)) / 1_000_000
+    }
+
     /// Per-position cost of each bucket, in milliseconds.
     public func millisecondsPerPosition() -> (
         frontEncode: Double,
@@ -1193,6 +1203,7 @@ nonisolated public struct DeepSeekV41WalkTiming: Sendable, Equatable {
             format: "walk %.1f ms/position over %d position(s), %d layer(s): "
                 + "front encode %.1f, front wait %.1f, indexer wait %.1f, expert fill %.1f, "
                 + "mixture encode %.1f, front device %.1f, mixture device %.1f; "
+                + "indexer host %.1f of that wait, "
                 + "drained front %.1f, mixture %.1f, late start front %.1f, mixture %.1f"
                 + (missing > 0 ? " (%d/%d buffers with no window)" : ""),
             Double(hostNanoseconds) / Double(max(1, positions)) / 1_000_000,
@@ -1205,6 +1216,7 @@ nonisolated public struct DeepSeekV41WalkTiming: Sendable, Equatable {
             per.mixtureEncode,
             per.frontDevice,
             per.mixtureDevice,
+            millisecondsPerPositionIndexerSelect(),
             Double(frontDrainNanoseconds) / divisor,
             Double(mixtureDrainNanoseconds) / divisor,
             Double(frontLateStartNanoseconds) / divisor,
@@ -4061,7 +4073,12 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                         indexerWaits += DispatchTime.now().uptimeNanoseconds - before
                     }
                 }
+                let selectionStart = measuring ? DispatchTime.now().uptimeNanoseconds : 0
                 try readIndexSelections(layer: layer, startPosition: position, count: 1)
+                if measuring {
+                    walkTiming.indexerSelectNanoseconds += DispatchTime.now().uptimeNanoseconds
+                        - selectionStart
+                }
             }
             if index + 1 < DeepSeekV41DevicePlan.frontHalf.count {
                 frontBuffer = try makeCommandBuffer()
