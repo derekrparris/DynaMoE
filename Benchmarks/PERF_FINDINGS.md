@@ -9666,3 +9666,115 @@ count, Qwen3.8 Flash Next forward, tool-discover lifecycle, truncated tool-call 
 `ServerQueueLogicTests.testTimedOutTurnKeepsFIFOBarrierForSuccessors` and — new to this run's list —
 `ServerQueueLogicTests.testPerformTimeoutFiresWhileLeaderGateClosed`, both of which pass in isolation
 (13/13 in the suite in 2.8 s) and are timing cases under full-suite load.
+
+## DSV4.1 #59: THE REPLACEMENT RULE TRANSFERS TO THE WALK -- A WARM DECODE READS 31.9 GB INSTEAD OF 56.2 AND SAVES 15-19% OF A POSITION
+
+`#58` shipped the frequency rule on a 128-position PREFILL and named its own caveat: a live turn's
+decode loop is the walk, one position at a time through the same arena, and no walk had ever run
+under the rule. `#21` had measured a 53-position walk whose 3,739 distinct pairs *just* fit 3,760
+slots, which is how it concluded there were no evictions to tune; `#58` then showed a 128-position
+working set does not fit. This asks the walk side of that question at the length where the overflow
+exists, with no production change: the rule already ships, and this is what it is worth to a decode.
+
+### The run
+
+One runtime through the app's own loading path, one 128-position token stream (the `#52`-`#58` text,
+one rotation), six walks. Every arm replays the SAME stream from position 0, so every arm issues the
+identical 30,720 acquisitions and only the pair a miss replaces changes. Cold arms `reset()` the
+arena; warm arms do not, which is the steady state a live turn decodes in. `-O`, shipped 65.84 GB
+arena (3,760 slots of 17.9 MB), 128 positions.
+
+| arm | policy | ms/pos | read GB | fill GB/s | misses | first touch | re-fetch | evictions |
+|---|---|---|---|---|---|---|---|---|
+| A1 cold | LRU | 158.3 | 87.6 | 13.8 | 5,005 | 4,790 | 215 (4.3%) | 1,245 |
+| A2 warm | LRU | 121.9 | 56.2 | 12.4 | 3,210 | 0 | 3,210 (100%) | 3,210 |
+| A3 warm | LRU | 122.0 | 56.2 | 12.4 | 3,210 | 0 | 3,210 (100%) | 3,210 |
+| C1 cold | frequency | 140.8 | 87.6 | 13.3 | 5,004 | 4,790 | 214 (4.3%) | 1,244 |
+| C2 warm | frequency | 106.4 | 35.1 | 12.3 | 2,002 | 0 | 2,002 (100%) | 2,002 |
+| C3 warm | frequency | 100.8 | 28.7 | 12.2 | 1,640 | 0 | 1,640 (100%) | 1,640 |
+
+Warm mean: **LRU 122.0 ms/position and 56.2 GB read; frequency 103.6 and 31.9, i.e. -15.0% wall and
+-43.3% read.** The worst frequency warm arm (C2, 106.4 ms and 35.1 GB) still beats the best LRU one
+(121.9 and 56.2), so the ordering does not depend on picking an arm. The probe ran three times; the
+other two gave -14.9% and -19.4% wall with the SAME -43.3% read, so the byte win is the reproducible
+one and the wall win is 15-19%, depending on page-cache state (see the C3 note below).
+
+### What it says
+
+- **A warm walk's misses are re-fetches, all of them.** `firstTouch` is 0 in every warm arm, exactly
+  as `#58`'s prefill A3 found: an arena that has already seen the stream re-reads what it evicted
+  and nothing it has never seen. The compulsory column is the cold pass, and it is untouched.
+- **The rule transfers, and by a wider read margin than on a prefill.** Frequency takes a warm walk
+  from 56.2 to 31.9 GB (-43.3%) against the prefill's 54.6-56.7 to 38.6-39.3 (-28%), and the wall
+  by 14.9-19.4% against the prefill's -13.7%. A decode position draws 240 acquisitions (6 experts x
+  40 layers), so it repeats its working set more often per byte read, which is the direction the rule
+  wins in.
+- **The win is the fill bucket, and the graph is untouched.** Comparing the first warm pass of each
+  policy (A2 against C2): front encode 2.5 + front wait 61.4 + expert fill 38.6 + mixture encode 2.6
+  ms/position under LRU, against 2.5 + 60.5 + 24.5 + 2.7 under frequency (device 53.8 both). The fill
+  drops 38.6 to 24.5, i.e. 14.1 ms/position, and the host round trip and both device halves are flat.
+  Replacement changes how much I/O is repeated, not what is computed.
+- **The fill stays disk-bound in this run: all six arms read at 12.2-13.8 GB/s**, the disk's own
+  rate. One earlier run of the same probe had C3 at 26.0 GB/s, ABOVE the measured 13.8 ceiling, so
+  part of that arm's 28.7 GB came from the page cache rather than the disk; that is an order effect
+  the engine does not control (all six arms replay one stream, so a later arm's bytes may still be
+  cached), and it is why the wall win is quoted as a range. The miss/byte columns are the structural
+  result: they were identical in all three runs (3,210 under LRU against 2,002 and 1,640 under
+  frequency).
+- **The walk's working set is the prefill's regime, not `#21`'s.** 4,790 distinct pairs (85.7 GB)
+  against 3,760 slots (65.84 GB), 27.4% over, and 1,030 pairs cannot fit whoever picks the victim.
+  Frequency leaves 1,640-2,002 misses at that capacity, which is the floor a future rule is measured
+  against.
+- **Frequency converges over warm passes; LRU is flat.** C2 (2,002 misses, 35.1 GB) is the first warm
+  walk after a cold one, C3 (1,640, 28.7 GB) the second, because the use counts a cold pass seeds are
+  all ones. LRU misses the same 3,210 and reads the same 56.2 GB both times. The mean above uses both
+  arms; a reader quoting a single warm arm should say which one. A live turn's arena is warmed by its
+  prefill and then by every position of its answer, so the converged number is the one it reaches,
+  not the one it starts at.
+- **The cold pass is still a control, not a result.** Both cold walks touched the same 4,790 pairs,
+  missed within one of each other (5,005 against 5,004) and read the same 87.6 GB, so the rule does
+  not move compulsory traffic. The 17.5 ms/position wall gap between A1 and C1 is not the policy: A1
+  is the pass that creates and wires the arena's 3,760 slot buffers (fill 72.8 against 56.4
+  ms/position, about 2.1 s over 128 positions; the other two runs gave 22.9-23.9 ms), which is
+  `#57`'s first-pass note that the lock is paid inside the pass that allocates rather than up front.
+  C1 reuses the buffers `arena.reset()` does not free.
+- **What a decode now costs.** 101-122 ms/position on a warm arena, of which 59-63 ms is the host
+  round trip and about 25 ms the mixture's device window. `#22`'s 205-324 ms/position was a colder
+  regime; this is the steady state, and it says the next decode lever is still the round trip
+  (`#22`'s late start) rather than replacement.
+
+### What it is not (do not re-propose)
+
+- Not a production change. No source outside the test harness and this journal moved; the rule
+  shipped in `#58` and this is its decode-side measurement.
+- Not a case for a bigger arena: capacity was priced in `#58`'s B1 (81.19 GB wired, 0 GB free, cold
+  pass at 6.4 GB/s), and this slice varies no capacity.
+- Not a licence to change the host round trip from a replacement result: `front wait` is 59.3-62.9
+  ms/position across the six arms of the quoted run (58.9-65.7 across all three) and does not move
+  with the policy.
+- Not evidence that a cold pass got faster: the arms differ by one miss and identical bytes, and the
+  wall gap is slot creation and wiring in the first arm.
+- Not a page-cache argument: one run's C3 hit the cache at 26.0 GB/s, but the engine does not control
+  that, and the rule's contribution is the 24.3 GB per pass it stops asking the cache for.
+- Not a re-run of `#21`'s capacity A/B and not a partial wiring or memory-pressure valve argument;
+  `#56`-`#58` still say why.
+
+### Verification
+
+`testWhatTheReplacementRuleIsWorthToAWalk` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_walk_policy`, plus the class's own `/tmp/dynamoe_dsv41_real_turn`), 102 s at
+`-O`. It asserts that the composition covers every miss, that the fills the streamer sampled equal
+the arena's misses, that both cold walks touched an identical working set, and that every warm arm
+fills above 8 GB/s. No new unit case: the rule's replacement, aging, composition and default are
+already pinned by `DeepSeekV41ExpertArenaTests` (`#58`), and this slice adds no production code.
+Runs: `/tmp/test59_walk3.log` (the one quoted above), plus `/tmp/test59_walk1.log` and
+`/tmp/test59_walk2.log` for the wall range. Markers were touched and removed in the same command;
+none survived.
+
+The full `DynaMoETests` target ran 1,479 tests with 91 skipped and 30 failures in 119.1 s on the
+final `-O` test build. Every `DeepSeekV41*` suite passed with 0 failures, including the new probe when
+it was skipped and the existing `DeepSeekV41ExpertArenaTests`. The 13 failed cases are exactly the
+pre-existing environmental ones (`DynaMoETests`: help-topic count, Qwen3.8 Flash Next forward,
+tool-discover lifecycle, truncated tool-call recovery; `ModelDogfoodAndPrefixCacheTests`: the 9
+prompt/web-fetch/headless-Chrome cases); both `ServerQueueLogicTests` timing flakes that appeared in
+`#58`'s run passed here. Run: `/tmp/test59_suite2.log`.

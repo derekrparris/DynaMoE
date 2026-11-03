@@ -6883,6 +6883,337 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
+    /// Whether the replacement rule is worth anything to a DECODE, not only to a prefill.
+    ///
+    /// `#58` measured the rule on a 128-position prefill and left one caveat standing: a
+    /// live turn's decode loop is the WALK -- one position at a time through the same
+    /// arena -- and no walk had ever run under frequency. `#21` measured a 53-position
+    /// walk whose 3,739 distinct pairs just fit 3,760 slots, which is why it saw no
+    /// evictions to tune; `#58` then showed a 128-position working set does not fit. This
+    /// asks the walk side of that: at the length where the working set overflows, does
+    /// the pair a miss replaces by move the decode?
+    ///
+    /// One runtime, one token stream, six passes. Every arm replays the SAME stream from
+    /// position 0, so every arm issues the identical acquisition sequence -- routing
+    /// does not consult the arena -- and only the pair a miss replaces changes. The cold
+    /// passes are the control: their first-touch column must match exactly, or the two
+    /// policies are not being compared on the same sequence. Warm passes do not reset,
+    /// so they measure the steady state a live turn is in, which is the number the rule
+    /// has to move.
+    ///
+    /// Opt-in (`/tmp/dynamoe_dsv41_walk_policy`, plus the class's own marker), because a
+    /// cold walk of 128 positions reads the whole routed working set off disk.
+    func testWhatTheReplacementRuleIsWorthToAWalk() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_walk_policy"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in walk policy probe; touch \(markerPath) to run"
+        )
+
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        // The same 128-position stream `#52`-`#58` measured, so this slice's working set
+        // is comparable with theirs position for position.
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+        func prompt(_ length: Int, rotation: Int) -> [Int] {
+            (0..<length).map { index in
+                let repetition = index / stream.count
+                return stream[(index + repetition * rotation) % stream.count]
+            }
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let positions = 128
+        let tokens = prompt(positions, rotation: 7)
+
+        /// What one walked pass cost and what its misses were made of.
+        struct Outcome {
+            let millisecondsPerPosition: Double
+            let readBytes: Int
+            let readRate: Double
+            let misses: Int
+            let firstTouch: Int
+            let refetch: Int
+            let distinctPairs: Int
+        }
+
+        /// One walk of the stream. `resetting` is the only difference between a cold and
+        /// a warm arm, so every counter is comparable.
+        func pass(
+            _ label: String,
+            runtime: DeepSeekV41Runtime,
+            resetting: Bool
+        ) -> Outcome {
+            let executor = runtime.forward()
+            let arena = runtime.arena
+            guard let streamer = runtime.expertStreamer else {
+                XCTFail("\(label): the runtime has no expert streamer")
+                return Outcome(
+                    millisecondsPerPosition: 0, readBytes: 0, readRate: 0, misses: 0,
+                    firstTouch: 0, refetch: 0, distinctPairs: 0
+                )
+            }
+            executor.reset()
+            if resetting { arena.reset() }
+            executor.resetWalkTiming()
+            executor.recordsWalkTiming = true
+            // Set after the reset on purpose: the flag describes the instrument, the
+            // counters describe the window (`#58`).
+            arena.recordsMissComposition = true
+            streamer.recordsFillSamples = true
+            streamer.clearFillSamples()
+            let acquisitionsBefore = arena.acquisitions
+            let hitsBefore = arena.hits
+            let evictionsBefore = arena.evictions
+            let compositionBefore = arena.missComposition
+            let residentBefore = arena.residentCount
+            let bytesBefore = streamer.bytesRead
+            let readingBefore = streamer.timing.reading
+            let before = hostMemoryCounters()
+            let start = DispatchTime.now().uptimeNanoseconds
+            do {
+                for (position, token) in tokens.enumerated() {
+                    _ = try executor.forwardToken(token, position: position)
+                }
+            } catch {
+                XCTFail("\(label) refused at a position: \(error)")
+            }
+            let wall = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+            executor.recordsWalkTiming = false
+            let timing = executor.walkTiming
+            let per = timing.millisecondsPerPosition()
+            let fills = streamer.fillSamples.count
+            let sampledMisses = streamer.fillSamples.reduce(0) { $0 + $1.misses }
+            streamer.recordsFillSamples = false
+            let acquisitions = arena.acquisitions - acquisitionsBefore
+            let hits = arena.hits - hitsBefore
+            let misses = acquisitions - hits
+            let evictions = arena.evictions - evictionsBefore
+            let composition = arena.missComposition
+            let firstTouch = composition.firstTouch - compositionBefore.firstTouch
+            let refetch = composition.refetch - compositionBefore.refetch
+            let readBytes = streamer.bytesRead - bytesBefore
+            let readSeconds = streamer.timing.reading - readingBefore
+            let rate = readSeconds > 0 ? Double(readBytes) / 1_000_000_000 / readSeconds : 0
+            let after = hostMemoryCounters()
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   %@ walk: %.1f ms/pos, read %.1f GB at %.1f GB/s, "
+                        + "%d miss(es) (%.1f per fill over %d fills), device %.1f ms/pos, "
+                        + "resident %d -> %d, compressor %.1f -> %.1f GB",
+                    label,
+                    wall / Double(positions),
+                    Double(readBytes) / 1_073_741_824,
+                    rate,
+                    misses,
+                    fills > 0 ? Double(misses) / Double(fills) : 0,
+                    fills,
+                    per.frontDevice + per.mixtureDevice,
+                    residentBefore,
+                    arena.residentCount,
+                    before.systemCompressorGB,
+                    after.systemCompressorGB
+                )
+            )
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   %@ composition: %d acquisitions, %d hits "
+                        + "(%.1f%%), %d misses = %d first touch + %d re-fetch (%.1f%%), "
+                        + "%d eviction(s), %d distinct pair(s) of %d slot(s); %.1f GB read "
+                        + "per position",
+                    label,
+                    acquisitions,
+                    hits,
+                    acquisitions > 0 ? 100 * Double(hits) / Double(acquisitions) : 0,
+                    misses,
+                    firstTouch,
+                    refetch,
+                    misses > 0 ? 100 * Double(refetch) / Double(misses) : 0,
+                    evictions,
+                    arena.distinctPairs,
+                    arena.capacity,
+                    Double(readBytes) / Double(positions) / 1_048_576
+                )
+            )
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   %@ walk buckets: front encode %.1f, front wait "
+                        + "%.1f, expert fill %.1f, mixture encode %.1f, mixture device %.1f "
+                        + "ms/position",
+                    label,
+                    per.frontEncode,
+                    per.frontWait,
+                    per.expertFill,
+                    per.mixtureEncode,
+                    per.mixtureDevice
+                )
+            )
+            // The instrument's own arithmetic: every miss is classified exactly once,
+            // and the fills the streamer sampled are the arena's misses.
+            XCTAssertEqual(
+                firstTouch + refetch, misses,
+                "\(label): the composition does not cover the misses"
+            )
+            XCTAssertEqual(
+                sampledMisses, misses,
+                "\(label): the fills loaded \(sampledMisses) experts, the arena missed \(misses)"
+            )
+            return Outcome(
+                millisecondsPerPosition: wall / Double(positions),
+                readBytes: readBytes,
+                readRate: rate,
+                misses: misses,
+                firstTouch: firstTouch,
+                refetch: refetch,
+                distinctPairs: arena.distinctPairs
+            )
+        }
+
+        var cold: [(label: String, outcome: Outcome)] = []
+        var warm: [(label: String, outcome: Outcome)] = []
+        do {
+            let runtime = try makeRuntime(
+                snapshot: snapshot,
+                engine: engine,
+                config: config,
+                contextLength: positions + 1,
+                allowEngramSkip: false,
+                wireArena: nil
+            )
+            let streamer = try XCTUnwrap(
+                runtime.expertStreamer,
+                "no expert streamer: \(runtime.expertStreamerProblem ?? "no reason")"
+            )
+            // `makeRuntime` pins LRU so every `#20`-`#57` table stays comparable; this
+            // case is measuring the rule, so it says which one each arm is under.
+            print("🔎 [dsv41 real] \(streamer.describe())")
+            print(
+                String(
+                    format: "🔎 [dsv41 real] walk policy probe: %d positions, arena %d slots "
+                        + "of %.1f MB (%.2f GB), policy %@",
+                    positions,
+                    runtime.arena.capacity,
+                    Double(streamer.geometry.slotBytes) / 1_048_576,
+                    Double(runtime.arena.capacity * streamer.geometry.slotBytes) / 1_073_741_824,
+                    runtime.arena.victimPolicy == .leastFrequentlyUsed ? "frequency" : "LRU"
+                )
+            )
+            for arm in [
+                ("A1 cold, LRU", true), ("A2 warm, LRU", false), ("A3 warm, LRU", false)
+            ] {
+                let outcome = pass(arm.0, runtime: runtime, resetting: arm.1)
+                if arm.1 { cold.append((arm.0, outcome)) } else { warm.append((arm.0, outcome)) }
+            }
+            let lruCold = cold.last?.outcome
+
+            // The policy A/B: same arena, same slots, same token stream. Only the rule a
+            // miss replaces by changes, so the compulsory column has to come out
+            // identical -- routing does not consult the arena -- and only the re-fetch
+            // column can move.
+            runtime.arena.victimPolicy = .leastFrequentlyUsed
+            for arm in [
+                ("C1 cold, frequency", true),
+                ("C2 warm, frequency", false),
+                ("C3 warm, frequency", false)
+            ] {
+                let outcome = pass(arm.0, runtime: runtime, resetting: arm.1)
+                if arm.1 { cold.append((arm.0, outcome)) } else { warm.append((arm.0, outcome)) }
+            }
+            let frequencyCold = cold.last?.outcome
+            if let lruCold, let frequencyCold {
+                // Routing does not consult the arena, so the working set is a control:
+                // the two cold walks must have touched exactly the same pairs, and only
+                // the column a policy can move may differ.
+                XCTAssertEqual(
+                    frequencyCold.firstTouch, lruCold.firstTouch,
+                    "the same stream touched a different working set, so the two policies "
+                        + "are not being compared on the same passes"
+                )
+                print(
+                    String(
+                        format: "🔎 [dsv41 real] policy control: both cold walks touched %d "
+                            + "pairs (%d of %d slots); LRU missed %d (%d re-fetch), "
+                            + "frequency missed %d (%d re-fetch)",
+                        lruCold.firstTouch,
+                        lruCold.distinctPairs,
+                        runtime.arena.capacity,
+                        lruCold.misses,
+                        lruCold.refetch,
+                        frequencyCold.misses,
+                        frequencyCold.refetch
+                    )
+                )
+            }
+            // The comparison: the warm arms are the steady state a live turn decodes in.
+            let lruWarm = warm.prefix(2).map(\.outcome)
+            let frequencyWarm = warm.suffix(2).map(\.outcome)
+            func mean(_ values: [Double]) -> Double {
+                values.isEmpty ? 0 : values.reduce(0, +) / Double(values.count)
+            }
+            if lruWarm.count == 2, frequencyWarm.count == 2 {
+                let lruWall = mean(lruWarm.map(\.millisecondsPerPosition))
+                let frequencyWall = mean(frequencyWarm.map(\.millisecondsPerPosition))
+                let lruRead = mean(lruWarm.map { Double($0.readBytes) / 1_073_741_824 })
+                let frequencyRead = mean(frequencyWarm.map { Double($0.readBytes) / 1_073_741_824 })
+                let lruMisses = mean(lruWarm.map { Double($0.misses) })
+                let frequencyMisses = mean(frequencyWarm.map { Double($0.misses) })
+                print(
+                    String(
+                        format: "🔎 [dsv41 real] warm walk A/B: LRU %.1f ms/pos, %.1f GB read, "
+                            + "%.0f misses; frequency %.1f ms/pos, %.1f GB read, %.0f misses "
+                            + "i.e. %+.1f%% wall, %+.1f%% read, %+.1f%% misses",
+                        lruWall,
+                        lruRead,
+                        lruMisses,
+                        frequencyWall,
+                        frequencyRead,
+                        frequencyMisses,
+                        100 * (frequencyWall - lruWall) / max(0.001, lruWall),
+                        100 * (frequencyRead - lruRead) / max(0.001, lruRead),
+                        100 * (frequencyMisses - lruMisses) / max(1, lruMisses)
+                    )
+                )
+                // A warm walk must not spend its time on the disk: whoever picks the
+                // victim, the fill is the smaller bucket and the walk stays far above the
+                // unwired regime's 6-7 GB/s. This is a regime check, not a win.
+                for arm in warm {
+                    XCTAssertGreaterThan(
+                        arm.outcome.readRate, 8,
+                        "\(arm.label) filled at \(arm.outcome.readRate) GB/s, the "
+                            + "unwired regime"
+                    )
+                }
+            }
+            print(
+                String(
+                    format: "🔎 [dsv41 real] after the six walks: %d eviction(s) in the last "
+                        + "window, compressor %.1f GB, free %.1f GB",
+                    runtime.arena.evictions,
+                    hostMemoryCounters().systemCompressorGB,
+                    hostMemoryCounters().systemFreeGB
+                )
+            )
+            runtime.shutdown()
+        }
+        withExtendedLifetime(engine) {}
+    }
+
     /// A page-aligned anonymous mapping this test can wire.
     ///
     /// `mlock` is the only in-process way to tell the kernel a page may be neither
