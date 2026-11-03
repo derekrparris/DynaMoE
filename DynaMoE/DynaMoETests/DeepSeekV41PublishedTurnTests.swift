@@ -5617,6 +5617,543 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
+    // MARK: - Slot residency
+
+    /// Whether an arena's slots can stay out of the compressor, and what that buys.
+    ///
+    /// `#55` ended the search for the baked-in prefill penalty with a destination
+    /// difference: the same warm bytes into freshly made `storageModeShared` slots run at
+    /// 0.8-3.4 GB/s on a machine with no free memory, against 90-97 into slots the
+    /// process already owns and 21-28 into fresh host memory, while the disk, the page
+    /// cache and the process's own read path stay flat. Its counters name the compressor
+    /// (free memory 64.8 -> 0.1 GB, machine compressor 0.1 -> 28-44 GB, decompressions
+    /// 3.5M -> 27.3M), but a counter that moves with the fill is a correlation: the fill
+    /// writes 90 GB a pass and the machine compresses tens of gigabytes a pass, and
+    /// nothing has yet shown the second is caused by the first.
+    ///
+    /// A wired page is the one destination the compressor cannot take, so the probe
+    /// below writes a fixed 1.1 GB of expert ranges that are already in the file cache
+    /// (the source is held constant on purpose) into destinations that differ in exactly
+    /// one property:
+    ///
+    ///   * `resident metal` — slots written at the previous probe, cold to this one.
+    ///   * `fresh metal` — the `#55` arm, reproduced.
+    ///   * `touched metal` — the same new slots, zeroed before the clock starts. Slow
+    ///     `fresh` beside fast `touched` is page materialization, i.e. the allocator and
+    ///     not the compressor.
+    ///   * `wired host` / `wired metal` — `mmap` + `mlock`, once as plain memory and once
+    ///     through `makeBuffer(bytesNoCopy:)`, which is the shape an arena fix would
+    ///     actually take. `mlock` refusing is an answer too.
+    ///   * `fresh host` / `touched host` — the same two properties without Metal, which
+    ///     separates "Metal's allocation path" from "a destination page on this machine".
+    ///   * `resident footprint` — warm bytes rotated through a destination four times
+    ///     the probe's size, reporting every window. The fill's footprint is 67 GB; if
+    ///     the rate is a function of how much destination a process has already written,
+    ///     it shows here and nowhere else.
+    ///
+    /// Every arm reports the decompressions it caused, because that is the mechanism and
+    /// the rate is only its symptom.
+    ///
+    /// The passes are the second half. After `#55`'s squeeze the arena's own slots are
+    /// wired in rungs and a pass is timed at each, with misses per fill printed beside
+    /// the rate: `#54` and `#55` both warn that a rate alone says nothing here, because
+    /// a fill's rate is a function of its misses and a smaller arena changes it by
+    /// itself. A wired arena cannot be compressed, so the machine has to find the room
+    /// somewhere else, and where it found it is printed on the same line.
+    ///
+    /// Opt-in: it reads hundreds of gigabytes and wires tens of them.
+    ///
+    ///     touch /tmp/dynamoe_dsv41_slot_residency
+    @MainActor
+    func testWhetherAnArenasSlotsCanStayOutOfTheCompressor() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_slot_residency"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in slot residency probe; touch \(markerPath) to run"
+        )
+
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        // The same stream and the same 128 positions `#53`-`#55` measured, rotated per
+        // pass so a pass does not cycle the routing and leave the arena warm (`#52`).
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+        func prompt(_ length: Int, rotation: Int) -> [Int] {
+            (0..<length).map { index in
+                let repetition = index / stream.count
+                return stream[(index + repetition * rotation) % stream.count]
+            }
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let positions = 128
+
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: positions + 1,
+            allowEngramSkip: false
+        )
+        let streamer = try XCTUnwrap(
+            runtime.expertStreamer,
+            "no expert streamer: \(runtime.expertStreamerProblem ?? "no reason")"
+        )
+        let geometry = streamer.geometry
+        let slot = geometry.slotBytes
+        // A `bytesNoCopy` Metal buffer over wired memory must start on a page, so the
+        // probe's slots are laid out at a padded stride. The ranges requested are
+        // unchanged, which is what keeps this comparable to a fill.
+        let page = max(4096, Int(vm_kernel_page_size))
+        let stride = (slot + page - 1) / page * page
+        let layerPlan = runtime.plan.map(\.index)
+
+        // Sixty-four fixed pairs, advancing one layer at a time so the probe spans the
+        // whole checkpoint the way a pass does rather than sitting in one shard.
+        let probePairs: [(layer: Int, expert: Int)] = (0..<64).map { index in
+            (
+                layer: layerPlan[index % layerPlan.count],
+                expert: (index * 5 + 1) % config.numRoutedExperts
+            )
+        }
+        let probeBytes = probePairs.count * stride
+
+        /// The probe's ranges, laid out exactly as a fill lays out a slot's: six
+        /// contiguous ranges per pair, grouped per shard, the destination by index.
+        func batches(_ destination: (Int) -> UnsafeMutableRawPointer) -> [Dsv41ProbeBatches.Batch] {
+            var byShard: [UInt32: [DeepSeekV41ExpertShardReader.Range]] = [:]
+            for (index, pair) in probePairs.enumerated() {
+                guard let gate = runtime.weights.tensor(
+                    .expertW1, layer: pair.layer, expert: pair.expert
+                ),
+                    let upT = runtime.weights.tensor(
+                        .expertW3, layer: pair.layer, expert: pair.expert
+                    ),
+                    let downT = runtime.weights.tensor(
+                        .expertW2, layer: pair.layer, expert: pair.expert
+                    ) else { continue }
+                let gateScale = runtime.weights.scaleTensor(
+                    .expertW1, layer: pair.layer, expert: pair.expert
+                )
+                let upScale = runtime.weights.scaleTensor(
+                    .expertW3, layer: pair.layer, expert: pair.expert
+                )
+                let downScale = runtime.weights.scaleTensor(
+                    .expertW2, layer: pair.layer, expert: pair.expert
+                )
+                let base = destination(index)
+                func range(
+                    _ tensor: DeepSeekV41DeviceTensor?,
+                    offset: Int,
+                    length: Int
+                ) -> DeepSeekV41ExpertShardReader.Range? {
+                    guard length > 0, let tensor else { return nil }
+                    return DeepSeekV41ExpertShardReader.Range(
+                        fileOffset: tensor.byteOffset,
+                        destination: base.advanced(by: offset),
+                        length: length
+                    )
+                }
+                let pieces = [
+                    range(gate, offset: geometry.gateWeightOffset, length: geometry.gateWeightBytes),
+                    range(gateScale, offset: geometry.gateScaleOffset, length: geometry.gateScaleBytes),
+                    range(upT, offset: geometry.upWeightOffset, length: geometry.upWeightBytes),
+                    range(upScale, offset: geometry.upScaleOffset, length: geometry.upScaleBytes),
+                    range(downT, offset: geometry.downWeightOffset, length: geometry.downWeightBytes),
+                    range(
+                        downScale, offset: geometry.downScaleOffset,
+                        length: geometry.downScaleBytes
+                    )
+                ].compactMap { $0 }
+                byShard[gate.shardIndex, default: []].append(contentsOf: pieces)
+            }
+            return byShard.map { Dsv41ProbeBatches.Batch(shard: $0.key, ranges: $0.value) }
+        }
+
+        // One descriptor per shard file, opened once for the whole run so no arm pays
+        // for `open` in the rate it reports.
+        var probeShards: [UInt32] = []
+        for pair in probePairs {
+            if let gate = runtime.weights.tensor(
+                .expertW1, layer: pair.layer, expert: pair.expert
+            ) {
+                probeShards.append(gate.shardIndex)
+            }
+        }
+        let probeReaders = try Dsv41ProbeBatches.OpenShards(
+            snapshot: snapshot, indices: probeShards
+        )
+        defer { probeReaders.close() }
+
+        /// Times one arm and reports the decompressions it caused. That pairing is the
+        /// point: a rate says the write was slow, the decompression count says whether
+        /// the kernel had to reconstruct the destination first.
+        func measure(
+            _ label: String,
+            _ list: [Dsv41ProbeBatches.Batch]
+        ) -> (rate: Double, decompressions: Int) {
+            guard !list.isEmpty else { return (0, 0) }
+            let before = hostMemoryCounters().decompressions
+            let run = Dsv41ProbeBatches(
+                readers: probeReaders.readers, batches: list, chunkBytes: 0, sequential: false
+            )
+            let result = run.run()
+            let after = hostMemoryCounters().decompressions
+            if let failure = run.failure {
+                print("🔎 [dsv41 real]   arm \(label) refused: \(failure)")
+                return (0, 0)
+            }
+            return (
+                Double(result.bytes) / 1_000_000_000 / max(result.seconds, 1e-9),
+                after - before
+            )
+        }
+
+        // Destinations written at every probe and held for the whole run: the fill's
+        // later-pass situation, where every slot is already allocated and was written
+        // before the pass that is now being measured.
+        let residentHost = UnsafeMutableRawPointer.allocate(
+            byteCount: probeBytes, alignment: page
+        )
+        defer { residentHost.deallocate() }
+        var residentMetal: [MTLBuffer] = []
+        for _ in probePairs.indices {
+            guard let buffer = device.makeBuffer(
+                length: stride, options: .storageModeShared
+            ) else { break }
+            residentMetal.append(buffer)
+        }
+        XCTAssertEqual(
+            residentMetal.count, probePairs.count,
+            "the resident probe slots could not be allocated"
+        )
+
+        // Four times the probe's own size, allocated before the first pass while the
+        // machine still has memory, so a rate that falls with how much destination this
+        // process has written is visible inside one arm. Four rather than eight because
+        // a 67 GB arena already leaves this machine at 0.1 GB free, and a probe that has
+        // to evict its own destination to allocate the arm after it would be measuring
+        // itself.
+        var footprint: [MTLBuffer] = []
+        for _ in 0..<(probePairs.count * 4) {
+            guard let buffer = device.makeBuffer(
+                length: stride, options: .storageModeShared
+            ) else { break }
+            footprint.append(buffer)
+        }
+        print(
+            String(
+                format: "🔎 [dsv41 real] probe slot %.1f MB at a %.1f MB stride, %d pairs "
+                    + "= %.2f GB an arm; resident footprint %.2f GB (%d slots)",
+                Double(slot) / 1_048_576,
+                Double(stride) / 1_048_576,
+                probePairs.count,
+                Double(probeBytes) / 1_073_741_824,
+                Double(footprint.count * stride) / 1_073_741_824,
+                footprint.count
+            )
+        )
+
+        func residentMetalArm() -> (rate: Double, decompressions: Int) {
+            guard residentMetal.count == probePairs.count else { return (0, 0) }
+            return measure(
+                "metal resident", batches { residentMetal[$0].contents() }
+            )
+        }
+
+        func freshMetalArm(touched: Bool) -> (rate: Double, decompressions: Int) {
+            var buffers: [MTLBuffer] = []
+            for _ in probePairs.indices {
+                guard let buffer = device.makeBuffer(
+                    length: stride, options: .storageModeShared
+                ) else { break }
+                buffers.append(buffer)
+            }
+            guard buffers.count == probePairs.count else { return (0, 0) }
+            if touched {
+                // Untimed on purpose: this arm asks what the READ costs once the
+                // destination's pages exist, not what making them costs.
+                for buffer in buffers { memset(buffer.contents(), 0, stride) }
+            }
+            return measure(
+                touched ? "metal touched" : "metal fresh",
+                batches { buffers[$0].contents() }
+            )
+        }
+
+        func freshHostArm(touched: Bool) -> (rate: Double, decompressions: Int) {
+            let base = UnsafeMutableRawPointer.allocate(
+                byteCount: probeBytes, alignment: page
+            )
+            defer { base.deallocate() }
+            if touched { memset(base, 0, probeBytes) }
+            return measure(
+                touched ? "host touched" : "host fresh",
+                batches { base.advanced(by: $0 * stride) }
+            )
+        }
+
+        /// Warm bytes through the whole multi-gigabyte destination, one window at a
+        /// time. A rate that holds is a destination that is simply memory; a rate that
+        /// falls window by window is the footprint itself, and the fill's is 67 GB.
+        func footprintArm() -> [Double] {
+            guard footprint.count >= probePairs.count * 2 else { return [] }
+            var rates: [Double] = []
+            var start = 0
+            while start + probePairs.count <= footprint.count {
+                let window = Array(footprint[start..<(start + probePairs.count)])
+                rates.append(
+                    measure("metal footprint", batches { window[$0].contents() }).rate
+                )
+                start += probePairs.count
+            }
+            return rates
+        }
+
+        func probe(_ label: String) {
+            // The source: read cold once so the arms that follow it read the same bytes
+            // WARM from the file cache. Without this every destination arm would be
+            // measuring the disk.
+            let cold = measure(
+                "host cold", batches { residentHost.advanced(by: $0 * stride) }
+            )
+            let warm = measure(
+                "host warm", batches { residentHost.advanced(by: $0 * stride) }
+            )
+            let resident = residentMetalArm()
+            let fresh = freshMetalArm(touched: false)
+            let touched = freshMetalArm(touched: true)
+
+            // The arm the slice is about. `mlock` is attempted before anything is timed
+            // and its result is printed, because a refusal (a machine with no room to
+            // keep the pages) is itself the finding.
+            var wiredHost = (rate: 0.0, decompressions: 0)
+            var wiredMetal = (rate: 0.0, decompressions: 0)
+            var wireNote = "not attempted"
+            if let region = Dsv41WiredRegion(bytes: probeBytes, wire: true) {
+                if region.wireResult == 0 {
+                    wireNote = "wired"
+                    wiredHost = measure(
+                        "host wired",
+                        batches { region.base.advanced(by: $0 * stride) }
+                    )
+                    var buffers: [MTLBuffer] = []
+                    for index in probePairs.indices {
+                        let start = region.base.advanced(by: index * stride)
+                        guard let buffer = device.makeBuffer(
+                            bytesNoCopy: start,
+                            length: stride,
+                            options: .storageModeShared,
+                            deallocator: nil
+                        ) else { break }
+                        buffers.append(buffer)
+                    }
+                    if buffers.count == probePairs.count {
+                        wiredMetal = measure(
+                            "metal wired", batches { buffers[$0].contents() }
+                        )
+                    }
+                } else {
+                    wireNote = "mlock refused \(region.wireResult)"
+                }
+            }
+
+            let freshHost = freshHostArm(touched: false)
+            let touchedHost = freshHostArm(touched: true)
+            let windows = footprintArm()
+            let memory = hostMemoryCounters()
+            let wiring = streamer.wiring
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   probe %@: cold %.1f | warm %.1f | resident "
+                        + "metal %.1f (dec %d) | fresh metal %.1f (dec %d) | touched metal "
+                        + "%.1f (dec %d) | %@ host %.1f (dec %d) metal %.1f (dec %d) | "
+                        + "fresh host %.1f | touched host %.1f",
+                    label,
+                    cold.rate,
+                    warm.rate,
+                    resident.rate,
+                    resident.decompressions,
+                    fresh.rate,
+                    fresh.decompressions,
+                    touched.rate,
+                    touched.decompressions,
+                    wireNote,
+                    wiredHost.rate,
+                    wiredHost.decompressions,
+                    wiredMetal.rate,
+                    wiredMetal.decompressions,
+                    freshHost.rate,
+                    touchedHost.rate
+                )
+            )
+            if !windows.isEmpty {
+                let text = windows.map { String(format: "%.1f", $0) }.joined(separator: " ")
+                print(
+                    "🔎 [dsv41 real]     footprint windows, each 1.1 GB warm: \(text) GB/s"
+                )
+            }
+            print(
+                String(
+                    format: "🔎 [dsv41 real]     footprint %.1f GB, graphics %.1f GB "
+                        + "(compressed %.2f), compressed %.1f GB, decompressions %d, "
+                        + "swapins %d, pressure %d, metal %.1f GB, arena wired %.2f GB "
+                        + "(%d refusals), machine compressor %.1f GB / free %.1f GB / "
+                        + "swap %.1f GB",
+                    memory.footprintMB / 1_024,
+                    memory.graphicsMB / 1_024,
+                    memory.graphicsCompressedMB / 1_024,
+                    memory.compressedMB / 1_024,
+                    memory.decompressions,
+                    memory.swapins,
+                    memory.pressureLevel,
+                    Double(device.currentAllocatedSize) / 1_073_741_824,
+                    Double(wiring.bytes) / 1_073_741_824,
+                    wiring.failures,
+                    memory.systemCompressorGB,
+                    memory.systemFreeGB,
+                    memory.swapUsedGB
+                )
+            )
+        }
+
+        /// One prefill of the shipped block path, with the streamer's per-fill samples on
+        /// and, when a budget is given, the arena's slots wired first.
+        func pass(_ label: String, rotation: Int, wiring budget: Int? = nil) {
+            if let budget {
+                let started = DispatchTime.now().uptimeNanoseconds
+                let state = streamer.wireResidentSlots(budgetBytes: budget)
+                let seconds = Double(
+                    DispatchTime.now().uptimeNanoseconds - started
+                ) / 1_000_000_000
+                let request = budget >= Int.max / 4
+                    ? "the whole arena"
+                    : String(format: "%.1f GB", Double(budget) / 1_073_741_824)
+                print(
+                    String(
+                        format: "🔎 [dsv41 real]   wiring to %@: %.2f GB wired in "
+                            + "%.1f s, %d refusal(s)",
+                        request,
+                        Double(state.bytes) / 1_073_741_824,
+                        seconds,
+                        state.failures
+                    )
+                )
+            }
+            let executor = runtime.forward()
+            executor.reset()
+            runtime.arena.reset()
+            executor.resetBlockTiming()
+            executor.recordsBlockTiming = true
+            streamer.recordsFillSamples = true
+            streamer.clearFillSamples()
+            let before = hostMemoryCounters()
+            let start = DispatchTime.now().uptimeNanoseconds
+            do {
+                _ = try executor.prefillChunk(prompt(positions, rotation: rotation))
+            } catch {
+                print("🔎 [dsv41 real]   \(label) refused: \(error)")
+                executor.recordsBlockTiming = false
+                streamer.recordsFillSamples = false
+                return
+            }
+            let wall = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+            executor.recordsBlockTiming = false
+            streamer.recordsFillSamples = false
+            let timing = executor.blockTiming
+            let per = timing.millisecondsPerPosition()
+            let samples = streamer.fillSamples
+            let fillSeconds = Double(timing.expertFillNanoseconds) / 1_000_000_000
+            let rate = fillSeconds > 0
+                ? Double(timing.fillBytes) / 1_000_000_000 / fillSeconds : 0
+            let after = hostMemoryCounters()
+            let missesPerFill = samples.isEmpty
+                ? 0 : Double(timing.fillMisses) / Double(samples.count)
+            XCTAssertGreaterThan(timing.layers, 0, "the block switch recorded nothing")
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   %@ pass: %.1f ms/pos, fill %.1f GB/s (%.0f "
+                        + "MB, %d misses, %.1f per fill), device %.1f, wall %.0f s, "
+                        + "decompressions +%d, compressor %.1f -> %.1f GB, arena wired "
+                        + "%.2f GB",
+                    label,
+                    wall / Double(positions),
+                    rate,
+                    Double(timing.fillBytes) / 1_048_576,
+                    timing.fillMisses,
+                    missesPerFill,
+                    per.denseDevice + per.mixtureDevice,
+                    wall / 1_000,
+                    after.decompressions - before.decompressions,
+                    before.systemCompressorGB,
+                    after.systemCompressorGB,
+                    Double(streamer.wiring.bytes) / 1_073_741_824
+                )
+            )
+        }
+
+        probe("quiet machine")
+        pass("P1", rotation: 13)
+        probe("after P1")
+        pass("P2 wired 8 GB", rotation: 7, wiring: 8 << 30)
+        probe("after P2")
+        pass("P3 wired 24 GB", rotation: 13, wiring: 24 << 30)
+        probe("after P3")
+        // The rung that matters for a fix: a slot that cannot be compressed cannot be
+        // compressor input at all, so the whole arena is wired and the same pass is
+        // timed again. The rungs before it price the transition, because a wired arena
+        // has to leave the machine somewhere to find the room the compressor was using.
+        pass("P4 fully wired", rotation: 7, wiring: Int.max / 2)
+        probe("after P4")
+        withExtendedLifetime(engine) {}
+    }
+
+    /// A page-aligned anonymous mapping this test can wire.
+    ///
+    /// `mlock` is the only in-process way to tell the kernel a page may be neither
+    /// evicted nor compressed, which is what an arena slot would have to become for the
+    /// fill's destination to stop being compressor input (`#56`). It is used both as a
+    /// host destination and, through `makeBuffer(bytesNoCopy:)`, as the backing of
+    /// arena-shaped Metal slots, so the two arms differ in Metal and nothing else.
+    private final class Dsv41WiredRegion {
+        let base: UnsafeMutableRawPointer
+        let bytes: Int
+        let wireResult: Int32
+
+        init?(bytes requested: Int, wire: Bool) {
+            let page = max(4096, Int(vm_kernel_page_size))
+            let length = (requested + page - 1) / page * page
+            let mapped = mmap(
+                nil, length, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0
+            )
+            guard let mapped, mapped != MAP_FAILED else { return nil }
+            base = mapped
+            bytes = length
+            wireResult = wire ? mlock(mapped, length) : 0
+        }
+
+        deinit {
+            if wireResult == 0 { munlock(base, bytes) }
+            munmap(base, bytes)
+        }
+    }
+
     /// Issues one probe's reads the way a fill issues its own: one batch per shard, the
     /// batches concurrently, each shard's ranges fanned out by the reader.
     ///

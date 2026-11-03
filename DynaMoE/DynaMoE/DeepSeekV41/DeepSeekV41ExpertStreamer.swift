@@ -549,6 +549,9 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
     public private(set) var placements: Int = 0
     /// Keeps the optional read-back's loads alive so the compiler cannot drop them.
     private var touchSink: Int = 0
+    /// Bytes of slot memory `wireResidentSlots` succeeded in wiring, and refusals.
+    private var wiredBytes: Int = 0
+    private var wireFailures: Int = 0
 
     /// How a fill's reads are issued. `.shardBatched` is what ships; the others exist
     /// so the fan-out is a measurement instead of an opinion (`#51`).
@@ -586,6 +589,45 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return (secondsPlacing, placements)
+    }
+
+    /// How much of the arena has been wired with `mlock`, and how many slots refused.
+    ///
+    /// Measurement only (`#56`). A wired page can be neither evicted nor compressed,
+    /// so this is the one in-process way to ask whether the fill's write rate is the
+    /// compressor working on its own destination.
+    public var wiring: (bytes: Int, failures: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (wiredBytes, wireFailures)
+    }
+
+    /// Wires the pages of the slots this arena already holds, up to `budgetBytes`.
+    ///
+    /// Measurement only (`#56`), and the reason it exists is `#55`: a fill writes the
+    /// same bytes at 0.8-6.4 GB/s into a machine with no free memory, against 90-97
+    /// into slots the process already owns, and the only counters that move with it are
+    /// the process's and the machine's compressor. A wired slot cannot become
+    /// compressor input, so wiring a measured fraction of the arena is how the question
+    /// "is the destination the cost" stops being a correlation. It returns the wiring
+    /// state so a caller reports what it actually wired rather than what it asked for;
+    /// `mlock` can refuse, and its refusal (a machine with no room to keep the pages)
+    /// is itself the answer. Production never calls this.
+    @discardableResult
+    public func wireResidentSlots(budgetBytes: Int) -> (bytes: Int, failures: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        for buffer in slotBuffers {
+            guard let buffer else { continue }
+            let length = buffer.length
+            guard length > 0, wiredBytes + length <= budgetBytes else { continue }
+            if mlock(buffer.contents(), length) == 0 {
+                wiredBytes += length
+            } else {
+                wireFailures += 1
+            }
+        }
+        return (wiredBytes, wireFailures)
     }
 
     public init(

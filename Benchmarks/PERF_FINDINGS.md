@@ -9305,3 +9305,131 @@ streamer's counters, the per-fill minimum/median/maximum and the fill rate bucke
 read; and per probe, six destination arms plus the task and machine memory accounting. Runs:
 `/tmp/test55_decay1.log` (four arms, with the second runtime) and `/tmp/test55_decay2.log` (six arms, no
 second runtime). Both used `touch` and `rm -f` in the same command, and no marker survived either.
+
+## DSV4.1 #56: THE FILL'S DESTINATION IS COMPRESSOR INPUT -- WIRING THE ARENA TAKES A PREFILL FROM 371 TO 172 ms/POSITION AND PUTS THE FILL BACK ON THE DISK'S CEILING
+
+`#55` left one sentence standing: the same warm bytes run at 0.8-3.4 GB/s into freshly made
+`storageModeShared` slots on a squeezed machine and 90-97 into slots the process owns, while the disk, the
+page cache and the process's read path stay flat. Its counters named the compressor, but a counter that
+moves with the fill is a correlation. A wired page is the one destination the compressor cannot take, so
+this slice makes that the variable.
+
+### The probe
+
+One runtime, the `#52`-`#55` 128-position stream, and a fixed 1.12 GB of expert ranges (64 pairs, 17.9 MB
+each) that are read cold once and then WARM for every arm, so the source is constant and only the
+destination differs. The arms: `resident metal` (written at every previous probe, cold to this one),
+`fresh metal` (`#55`'s arm), `touched metal` (the same new slots zeroed before the clock starts), `wired
+host` and `wired metal` (`mmap` + `mlock`, once as plain memory and once as the backing of arena-shaped
+`bytesNoCopy` Metal buffers), `fresh host` and `touched host`, and `resident footprint` (warm bytes
+rotated through a 4.48 GB destination four times the probe's size). Every arm reports the decompressions
+it caused. After each pass the arena's own slots are wired in rungs and the same pass is timed again,
+with misses per fill printed beside the rate.
+
+Two runs, and they agree to the millisecond where it matters. Run A (three rungs) and run B (four):
+
+| pass | run A ms/pos | run A fill GB/s | run B ms/pos | run B fill GB/s | misses/fill | decompressions (run B) |
+|---|---|---|---|---|---|---|
+| P1, unwired | 444.7 | 4.6 | 370.6 | 6.0 | 8.1 | +8.1M |
+| P2, 8 GB wired | 364.6 | 6.0 | 426.9 | 5.2 | 8.2 | +13.2M |
+| P3, 24 GB wired | 361.5 | 6.5 | 330.7 | 6.7 | 8.1 | +8.3M |
+| P4, **whole arena wired** (89.82 GB) | - | - | **173.8** | **13.0** | 8.2 | **+1.4M** |
+
+Run C repeated run B end to end: P1 324.3 / 6.3, P2 412.7 / 5.3, P3 374.6 / 6.2, P4 **171.8 / 13.0** with
+`device` 47.2 ms and `decompressions` +1.3M. So the fully wired pass is reproducible to 1% and the
+intermediate rungs are not: 8 GB of wiring is worse than none in both runs, 24 GB is a wash, and the
+whole arena is a different machine.
+
+The destination arms, after P1 in run B (pressure level 2, 0.1 GB free, compressor 62 GB):
+
+| arm | GB/s | decompressions | what it says |
+|---|---|---|---|
+| cold host (disk) | 12.6 | 0 | the disk is fine |
+| warm host | 84.3 | 0 | the page cache is fine |
+| resident metal | 47.5 | 14,787 | an unwired destination under pressure |
+| fresh metal | **1.9** | 0 | `#55` reproduced; the cost is materializing pages |
+| touched metal | 41.2 | 1 | pre-faulting recovers part of it |
+| wired host | **92.6** | 0 | the same bytes, wired |
+| wired metal | **99.8** | 0 | the same bytes, wired, as Metal slots |
+
+and after P3 in run A, which is the cleaner reading because the arm had been idle through a pass:
+
+| arm | GB/s | decompressions |
+|---|---|---|
+| resident metal | 13.1 | **73,050** |
+| touched metal | 41.8 | 0 |
+| wired host / wired metal | 88.0 / 96.0 | 0 |
+| fresh metal | 1.0 | 0 |
+
+### What it says
+
+- **An unwired destination is compressed between uses, and a rewrite pays to reconstruct it.** 73,050
+  decompressions against 1.12 GB of destination is 1.05 decompressions per 16 KB page: essentially every
+  page of the arm had been compressed since the previous probe and every write reconstructed one. The
+  same arm on a machine with room reads 96.2 GB/s with **0** decompressions (run C, quiet machine). The
+  count tracks pressure, not the code.
+- **A wired destination is untouched by it.** 79.2-99.8 GB/s at every phase in all three runs, including
+  pressure level 2 with 0.1 GB free, and 0 decompressions every time. Host memory and Metal slots agree,
+  so it is not Metal's allocation path; `fresh host` is the noisy arm (5.5-97.9, depending on which freed
+  region a 1.12 GB allocation lands on) but it never beats wired.
+- **Pre-faulting alone is not enough.** A zeroed-but-unwired slot recovers to 24.7-44.4 GB/s (0
+  decompressions), i.e. 1/3 to 1/2 of the gap. The rest is the pages being compressible again.
+- **The footprint decays on its own.** The 4.48 GB resident destination reads 65.7 GB/s in a quiet
+  machine and 59.3 / 31.8 / 19.0 / 19.9 window by window after one pass, so a rate falls with how much
+  destination the process holds, on a destination that is wired to nothing.
+- **The whole arena, wired, is a different regime.** `mlock` took **6.0-6.7 s for 89.82 GB with zero
+  refusals** at 0.1 GB free, and then: fill 13.0 GB/s (against the disk's own 13.6-15.2 from `#55`, i.e.
+  the fill is finally disk-bound), `decompressions` 8.3M -> 1.4M, the machine's compressor 44-71 GB ->
+  11-16 GB, the process's compressed total 58.7 -> 16.5 GB (the graphics ledger's compressed share
+  46.3 -> 8.1 GB), and the pass 330.7-374.6 -> 171.8-173.8
+  ms/position. The **device** halves moved too, 63.9-73.6 -> 47.2-47.7 ms, which is what a GPU reading
+  slot pages that no longer need reconstructing should look like.
+- **Wiring a fraction is not a fraction of the win.** 8 GB is *worse* than none in both full runs (412-427
+  against 324-371 ms/pos), and 24 GB is inside the 5.5-7.5 GB/s band `#55` measured unwired. A pass
+  writes all 90 GB of destinations, so every slot it touches that is still compressible costs a
+  decompression; the rungs do not remove those, they only take room away from the compressor that the
+  rest of the arena then needs (compressor stays 41-52 GB at 24 GB wired). The decompression column says
+  the same thing non-linearly: 6.5-13.2M at 0-24 GB wired, 1.3-1.4M at 90.
+
+### What it means
+
+The turn's expert traffic was never waiting on NVMe. It was waiting on pages the kernel had compressed
+and that the fill then had to reconstruct one by one, and a wired arena removes the mechanism entirely at
+a cost of 6 s and no refusals. That makes the arena's RESIDENCY POLICY the first production-shaped lever
+this port has measured above 2x on the prefill path: 1.9-2.2x against the passes in these runs and
+against `#55`'s unwired 315-369 ms/position.
+
+It is a measurement, not a fix, and three things have to be answered before it ships. A wired arena is
+memory the machine cannot reclaim, so a policy needs a budget derived from the memory plan and a refusal
+path -- `mlock` here claimed 89.82 GB because the evicted thing was the page cache, which is
+re-readable; a machine whose other occupants need it has no such slack. The rungs say the transition is
+not linear, so a partial wiring policy is not obviously worth having. And the wired pass is now disk
+bound, so the next lever behind it is the miss rate, which is where `#21` already stopped.
+
+### What it is not (do not re-propose)
+
+- Not the disk: 12.6-15.3 GB/s cold in every phase of every run, and the wired fill reads at 13.0, at
+  that ceiling.
+- Not the page cache: warm reads 51.4-90.8 throughout, and the same arm reads 96.2 with 0 decompressions
+  when the machine has room.
+- Not Metal's allocation path: a wired HOST destination is just as fast (88.0-94.0), and Metal over the
+  same wired memory reads 91.6-99.8.
+- Not the arena's capacity, eviction order or placement, and not the prompt: misses per fill are printed
+  on every row and are 8.1-8.2 in all four rungs of all three runs (`#54`'s first trap), and no rung
+  changes the arena's size (`#54`'s second).
+- Not the read form, the fan-out, `F_NOCACHE`, the block width, the command queue or the attention
+  (`#20`, `#21`, `#48`, `#50`-`#52`).
+- Not a shipped knob. `wireResidentSlots(budgetBytes:)` and its counters are measurement seams in the
+  streamer, in the style of `recordsFillSamples`/`touchesFilledRanges`; production never calls them and
+  no `UserDefaults` key was added (verified with `defaults read`, which finds none).
+
+### Verification
+
+`testWhetherAnArenasSlotsCanStayOutOfTheCompressor` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_slot_residency`, plus the class's own `/tmp/dynamoe_dsv41_real_turn`), 187 s at `-O`
+for four passes and five probes. It prints, per probe, ten destination arms with each arm's decompression
+count, the footprint windows, and the task and machine memory accounting; and per pass, ms/position, the
+fill rate, bytes, misses and misses per fill, device time, decompressions, compressor before and after,
+and the arena's wired bytes. Runs: `/tmp/test56_residency2.log` (three rungs), `/tmp/test56_residency3.log`
+(four rungs) and `/tmp/test56_residency4.log` (the confirmation). All used `touch` and `rm -f` in the same
+command, and no marker survived any of them.
