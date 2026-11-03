@@ -9100,3 +9100,109 @@ and 2,365 s across two runs) and `testWhetherBatchingATextPrefillPaysInsideOnePr
 command. Three processes over ~70 minutes: `/tmp/test53_sign3.log` (text 128 + picture),
 `/tmp/test53_sign4.log` (text 128 + 1,005) and `/tmp/test53_sign5.log` (all three, with the slot
 counters).
+
+## DSV4.1 #54: THE FIRST-PASS ADVANTAGE IS NOT THE PROMPT, NOT THE ALLOCATION, AND NOT THERMAL, SWAP OR THE PAGE CACHE
+
+### Question
+
+`#53` found every throughput bucket of a batched prefill 1.3-1.6x slower once a process had warmed,
+gave the effect a precise magnitude and left its cause open. The app lives in the slow state for every
+prefill after its first, so a cause here is worth 30-60% on every batched prefill. Routing picked
+`first_pass_state_cause` at 0.992 / 0.990 and said do not touch a shipped path (0.008), so this slice
+reads the kernel's own memory accounting (`task_vm_info` plus `host_statistics64`) beside the
+existing buckets and tests each candidate with a controlled pass sequence.
+
+### The passes, on one runtime, on identical work
+
+Every pass below reads the same prompt, and every one of them reads 90,025 MB in 5,021 misses, i.e.
+7.8 misses per fill (`#51`'s law held fixed by design). Two prompts (P and Q, the same paragraph
+rotated differently) alternate so a pass never carries the previous pass's expert set. Run A
+(`/tmp/test54_state4.log`):
+
+| pass | ms/position | dense encode | front wait | expert fill | fill rate | device | slot buffers created |
+|---|---|---|---|---|---|---|---|
+| P, 1st | **234.1** | 33.3 | 117.9 | 75.2 | **9.1 GB/s** | 60.0 | 3,760 |
+| Q, 1st | 310.7 | 41.5 | 139.5 | 119.4 | 5.7 GB/s | 63.6 | 0 |
+| P, 2nd | 308.5 | 46.9 | 142.8 | 110.4 | 6.2 GB/s | 65.0 | 0 |
+| Q, 2nd | 314.8 | 46.4 | 144.6 | 114.9 | 6.0 GB/s | 63.9 | 0 |
+
+Two more runs of the same case reproduce the shape with different absolute levels: 9.6 -> 7.4 -> 6.9
+-> 6.7 GB/s (`/tmp/test54_state3.log`) and 8.6 -> 6.4 -> 6.2 -> 5.4 under the layer hook
+(`/tmp/test54_state5.log`). The first pass of a fresh runtime has measured 197.1, 232.4, 234.1, 301.6
+and 316.5 ms/position on this identical work, i.e. a 1.6x spread BETWEEN processes, while the decay
+inside a process is always 1.3-1.5x.
+
+### What the candidates do
+
+| candidate | test | verdict |
+|---|---|---|
+| the prompt / its expert set | a second pass on a DIFFERENT prompt (Q) is as slow as a second pass on P; misses 4,998 against 5,021 | **out** |
+| the arena's slot allocation | the allocating pass is not reliably fast: first passes created 2,554-3,760 slot buffers and ranged 197-317 ms/position, and the aged picture pass in `#53` created 2,913 and was the slowest of its set | **out** |
+| thermal throttling | `ProcessInfo.thermalState` read `nominal` in every round of every run | **out** |
+| swapping | 0 swapins in run A and 131,072 in another; swap used 2.0-2.1 GB unchanged across passes | **out** |
+| the page cache | every pass reads the same 90,025 MB from the shards; the byte count does not move | **out** |
+| misses per fill (`#51`) | 7.8 per fill in every 128-position pass, 5,021 misses each | **ruled constant** |
+| the arena's size | the quarter-arena control (1,202 slots) doubles misses per fill to 16.2 and read 6.0-6.5 GB/s at HIGHER compression and pressure 2, so its rate says nothing about compression | **withdrawn, uninterpretable** |
+| unified-memory compression | every memory counter is FLAT or FALLING while throughput falls: task `compressed` 37.5 -> 36.4 GB and the GRAPHICS ledger's compressed share 13.1 -> 11.9 GB in one run, 53.4 -> 51.6 and 29.7 -> 25.3 GB in the other, the machine's compressor 13.8 -> 12.5 and 30.1 -> 25.8 GB | **out** |
+
+The process's memory is genuinely squeezed, and that is worth knowing on its own: after one pass the
+footprint is 74.5 GB, 36-53 GB of it compressed, the machine's compressor holds 12-30 GB, and every
+128-position pass costs 4.7-8.4 MILLION decompressions. But the squeeze eases as the run proceeds
+while throughput falls, in both runs that carry the counters, so the decompressions are a consequence
+of the arena existing rather than what the fill pays for.
+
+**What the decay is made of is the FILL, and almost only the fill.** The last run's buckets, per
+position: expert fill 91.3 -> 120.2 -> 124.3 -> 123.3 ms (+35%), front wait 31.3 -> 36.6 -> 36.2 ->
+35.9 (+17%), device 60.6 -> 67.0 -> 63.8 -> 64.6 (+7%). So the same 90,025 MB is re-read at 7.5 GB/s
+on a runtime's first pass and at 5.5 GB/s on its fourth, in one process, with the same 5,021 misses and
+the same 7.8 misses per fill. That is a disk-path term, not a memory term and not a kernel term.
+
+### Two things worth carrying
+
+- **A per-block split cannot be taken with the existing hook, and the hook is not free.** It ends with
+  its own `settlePending()`, so installing it serialises the path a layer at a time. Two runs minutes
+  apart, one without the hook and one with it, put the same arm at 234.1 and 232.4 ms/position, so the
+  WALL does not move, but the recorded front wait collapses from 117.9 to 27.1 ms/position, because
+  there is then never queued work to wait on, and the buckets stop tiling the wall (49% against 96%).
+  Its absolute numbers are therefore not comparable with an unhooked run, and its per-block split was
+  noisy enough to disagree with itself between runs, so no block-level claim is made here.
+- **The block path's per-layer `settlePending` is free, and its overlap buys nothing.** The diagnostic
+  hooks settle after every layer, which serialises the path; the same arm's wall time did not move
+  (232.4 against 234.1 ms/position measured both ways) while the recorded front wait collapsed from
+  117.9 to 27.1 ms/position, because there is then never queued work to wait on. That is `#52`'s
+  "57-77% waiting" seen from the other side: the queue is empty anyway, so nothing was being overlapped.
+
+### What it means
+
+- **Do not quote a prefill number without the process's position in it.** A runtime's first pass is a
+  different machine, and the effect is larger than every layout margin `#53` measured.
+- **The next experiment has a shape, and it is about the disk path.** The decay is a pread rate, so
+  the lever is whatever makes the same bytes read 1.35x slower on a runtime's fourth pass than on its
+  first: sample per-fill rates through `recordsFillSamples` across passes (the streamer already records
+  chicken bytes, pread seconds and placement separately), then separate "the volume of I/O this process
+  has issued" from "the file cache's state" by repeating the passes after a rest, and by reading a
+  DIFFERENT set of shard ranges (a prompt whose experts live in other files) so a per-file effect
+  cannot hide behind a per-process one. If the rate recovers after a rest, it is I/O throttling or
+  thermal on the controller rather than anything in this code.
+
+### What it is not (do not re-propose)
+
+- Not the fill's form, fan-out, chunk size, `F_NOCACHE` or destination (`#51`), not the arena's
+  capacity or eviction (`#21`), not a wider block or a denser dense half (`#52`), not the attention's
+  shape (`#17`), not a second command queue without a probe (`#48`).
+- Not a reason to add a shipped knob. The routed instruction was measurement-only and nothing here
+  changes a production path; the probe installs its hook only inside the test.
+- Not unified-memory compression, which was the leading candidate going in and is now ruled out by its
+  own counters falling as throughput falls.
+
+### Verification
+
+`testWhatTurnsABatchedPrefillsStateInsideOneProcess` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_state_probe`), 154-507 s at `-O`. It prints, per pass, the block buckets, the
+streamer's counters and slot allocations, the task's footprint/graphics/compressed/purgeable ledgers,
+decompressions, swapins, the pressure level, `MTLDevice.currentAllocatedSize`, the machine's compressor
+and free pages and swap used, and the first block's cost apart from the rest. Runs:
+`/tmp/test54_state1.log` (8 passes, no machine counters), `_state2.log` (the withdrawn quarter-arena
+phase), `_state3.log` (machine counters), `_state4.log` (the P/Q alternation), `_state5.log` (with the
+layer hook). Every run used `touch` and `rm -f` in the same command, and the quarter-arena phase's
+`UserDefaults` seam was removed with the phase (verified with `defaults read`, which finds no key).

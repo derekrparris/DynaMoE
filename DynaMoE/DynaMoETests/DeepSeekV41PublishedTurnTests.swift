@@ -89,6 +89,85 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
 
     // MARK: - Harness
 
+    /// The host's own memory accounting, read from the kernel rather than guessed at.
+    ///
+    /// `#53` found every throughput bucket of the batched prefill 1.3-1.6x slower once a
+    /// process had warmed, while the walked arm stayed flat, and left the cause open. The
+    /// leading candidate is unified-memory pressure: the arena holds 67 GB of
+    /// `storageModeShared` slot buffers that are not wired, so the kernel is free to
+    /// compress or evict them, which would slow the pread that writes them and the GPU
+    /// that reads them at the same time. That is the only mechanism found so far that
+    /// moves the disk, the host encoder and the device windows together, and the kernel
+    /// publishes the evidence directly: `phys_footprint`, the GRAPHICS ledger and how
+    /// much of it is compressed, the process's remaining limit, decompressions and
+    /// swapins. A compressor that fills, a graphics footprint that shrinks, a shrinking
+    /// limit or swap activity would show the mechanism; a flat reading rules it out.
+    ///
+    /// Page counts are not used here: every field below is already in bytes.
+    private func hostMemoryCounters() -> (
+        footprintMB: Double,
+        graphicsMB: Double,
+        graphicsCompressedMB: Double,
+        compressedMB: Double,
+        limitRemainingMB: Double,
+        purgeableMB: Double,
+        decompressions: Int,
+        swapins: Int,
+        pressureLevel: Int,
+        systemCompressorGB: Double,
+        systemFreeGB: Double,
+        swapUsedGB: Double
+    ) {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
+        )
+        let status = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), rebound, &count)
+            }
+        }
+        var pressure: Int32 = 0
+        var pressureSize = MemoryLayout<Int32>.size
+        let pressureStatus = sysctlbyname(
+            "kern.memorystatus_vm_pressure_level", &pressure, &pressureSize, nil, 0
+        )
+        // The MACHINE's own view, not this process's: the decay `#53` found tracks how
+        // squeezed unified memory is at the time, and a task-level reading cannot tell a
+        // process that is big from a machine that has no room left.
+        var statistics = vm_statistics64_data_t()
+        var statisticsCount = mach_msg_type_number_t(
+            MemoryLayout<vm_statistics64_data_t>.size / MemoryLayout<integer_t>.size
+        )
+        let statisticsStatus = withUnsafeMutablePointer(to: &statistics) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(statisticsCount)) {
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &statisticsCount)
+            }
+        }
+        let systemPageSize = Double(vm_kernel_page_size) / 1_073_741_824
+        var swap = xsw_usage()
+        var swapSize = MemoryLayout<xsw_usage>.size
+        let swapStatus = sysctlbyname("vm.swapusage", &swap, &swapSize, nil, 0)
+        let ok = status == KERN_SUCCESS
+        let megabytes = { (bytes: Int64) -> Double in Double(bytes) / 1_048_576 }
+        return (
+            ok ? Double(info.phys_footprint) / 1_048_576 : -1,
+            ok ? megabytes(info.ledger_tag_graphics_footprint) : -1,
+            ok ? megabytes(info.ledger_tag_graphics_footprint_compressed) : -1,
+            ok ? megabytes(Int64(bitPattern: info.compressed)) : -1,
+            ok ? megabytes(Int64(bitPattern: info.limit_bytes_remaining)) : -1,
+            ok ? megabytes(info.ledger_purgeable_nonvolatile) : -1,
+            ok ? Int(info.decompressions) : -1,
+            ok ? Int(info.ledger_swapins) : -1,
+            pressureStatus == 0 ? Int(pressure) : -1,
+            statisticsStatus == KERN_SUCCESS
+                ? Double(statistics.compressor_page_count) * systemPageSize : -1,
+            statisticsStatus == KERN_SUCCESS
+                ? Double(statistics.free_count) * systemPageSize : -1,
+            swapStatus == 0 ? Double(swap.xsu_used) / 1_073_741_824 : -1
+        )
+    }
+
     private func snapshotDirectory() throws -> URL {
         let hub = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(
@@ -4801,6 +4880,233 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
                 rounds: rounds
             )
         }
+        withExtendedLifetime(engine) {}
+    }
+
+    /// What turns a batched prefill's state, from the kernel's own numbers.
+    ///
+    /// `#53` established the effect and left the cause open: every throughput bucket of
+    /// the batched arm is 1.3-1.6x slower once a process has warmed (text at 128
+    /// positions went dense encode 31.5 -> 42.0 ms/position, expert fill 66.2 -> 102.9 at
+    /// 10.4 -> 6.7 GB/s, device 54.0 -> 69.0), on byte and miss counts identical to the
+    /// digit, while the walked arm holds device 62.3-63.9 flat. The app lives in the slow
+    /// state for every prefill after its first, so a cause here is worth 30-60% on every
+    /// batched prefill.
+    ///
+    /// Two candidate mechanisms are decidable from `task_vm_info` alone. Unified-memory
+    /// pressure would show in the GRAPHICS ledger being compressed, in a shrinking limit,
+    /// in decompressions or in swapins; a Metal heap that degrades under repeated 67 GB
+    /// allocation would show as a steady `currentAllocatedSize` against a falling fill
+    /// rate with every host counter flat. The passes also settle the SHAPE of the
+    /// transition: eight in a row say whether it is a step at the arena's first
+    /// commitment or a slide, and a short prompt at the end says whether it is about the
+    /// arena's residency or something process-wide.
+    ///
+    /// Note what the per-block split costs: `onBlockLayerFinished` ends with a
+    /// `settlePending()` of its own, so installing it serialises the block path a layer at
+    /// a time. The wall time does not move (232.4 against 234.1 ms/position on the same
+    /// arm, measured both ways), but the recorded front wait collapses from 117.9 to 27.1
+    /// ms/position because there is never queued work to wait on, and the buckets stop
+    /// tiling the wall. Its ABSOLUTE numbers are therefore not comparable with a run
+    /// without the hook; its ratios across passes are, because every pass carries it.
+    ///
+    /// Opt-in (`/tmp/dynamoe_dsv41_state_probe`), about seven minutes at `-O`.
+    @MainActor
+    func testWhatTurnsABatchedPrefillsStateInsideOneProcess() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_state_probe"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in prefill state probe; touch \(markerPath) to run"
+        )
+
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+        // Rotated once per repetition so the sequence is not periodic: a plain repeat
+        // cycles the same routing and leaves the arena warm (`#52`). Two rotations give
+        // two prompts of the same shape that route differently, which is what separates
+        // "this pass allocated the arena" from "this pass is not the first one".
+        func prompt(_ length: Int, rotation: Int = 13) -> [Int] {
+            (0..<length).map { index in
+                let repetition = index / stream.count
+                return stream[(index + repetition * rotation) % stream.count]
+            }
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+
+        /// One phase: build nothing, just measure the passes this runtime is given, with
+        /// the layout's buckets, the streamer's counters and the kernel's memory
+        /// accounting on one line per pass.
+        func probe(
+            label: String,
+            runtime: DeepSeekV41Runtime,
+            rounds: Int,
+            shortPrompt: Bool
+        ) throws {
+            let executor = runtime.forward()
+            let before = hostMemoryCounters()
+            print(
+                String(
+                    format: "🔎 [dsv41 real] state probe, %@: arena %d slot(s) of "
+                        + "17.93 MB (%.0f GB), metal %.1f GB allocated against a %.1f GB "
+                        + "working set; before any pass footprint %.1f GB, graphics %.1f "
+                        + "GB (compressed %.2f), compressed %.1f GB, pressure %d",
+                    label,
+                    runtime.arena.capacity,
+                    Double(runtime.arena.capacity) * 17.93 / 1_024,
+                    Double(device.currentAllocatedSize) / 1_073_741_824,
+                    Double(device.recommendedMaxWorkingSetSize) / 1_073_741_824,
+                    before.footprintMB / 1_024,
+                    before.graphicsMB / 1_024,
+                    before.graphicsCompressedMB / 1_024,
+                    before.compressedMB / 1_024,
+                    before.pressureLevel
+                )
+            )
+
+            func pass(_ tokens: [Int], label: String, index: Int) throws {
+                executor.reset()
+                runtime.arena.reset()
+                executor.resetBlockTiming()
+                executor.recordsBlockTiming = true
+                let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+                let missesBefore = runtime.expertStreamer?.expertsLoaded ?? 0
+                let slotsBefore = runtime.expertStreamer?.timing.slotsAllocated ?? 0
+                // The hook fires once per (block, layer), so the first forty deltas are
+                // the FIRST block's layers: the only ones that can allocate slots. A first
+                // pass whose advantage sits there is about allocation; one whose advantage
+                // is spread over all 126 blocks is about the process's state.
+                var firstBlockMilliseconds = 0.0
+                var laterBlocksMilliseconds = 0.0
+                var layerCallbacks = 0
+                var lastCallback: UInt64 = 0
+                executor.onBlockLayerFinished = { _, _, _ in
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    defer {
+                        lastCallback = now
+                        layerCallbacks += 1
+                    }
+                    guard lastCallback != 0 else { return }
+                    let milliseconds = Double(now - lastCallback) / 1_000_000
+                    if layerCallbacks < 40 {
+                        firstBlockMilliseconds += milliseconds
+                    } else {
+                        laterBlocksMilliseconds += milliseconds
+                    }
+                }
+                let start = DispatchTime.now().uptimeNanoseconds
+                _ = try executor.prefillChunk(tokens)
+                executor.onBlockLayerFinished = nil
+                let wall = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+                executor.recordsBlockTiming = false
+                let timing = executor.blockTiming
+                let per = timing.millisecondsPerPosition()
+                let positions = Double(max(1, tokens.count))
+                let fillSeconds = Double(timing.expertFillNanoseconds) / 1_000_000_000
+                let rate = fillSeconds > 0
+                    ? Double(timing.fillBytes) / 1_073_741_824 / fillSeconds : 0
+                let memory = hostMemoryCounters()
+                XCTAssertGreaterThan(timing.layers, 0, "the block switch recorded nothing")
+                print(
+                    String(
+                        format: "🔎 [dsv41 real]   %@ pass %d: %.1f ms/pos, encode "
+                            + "%.1f, front wait %.1f, fill %.1f at %.1f GB/s (%.0f MB, %d "
+                            + "misses), device %.1f, slots +%d | footprint %.1f GB, "
+                            + "graphics %.1f GB (compressed %.2f), compressed %.1f GB, "
+                            + "decompressions %d, swapins %d, pressure %d, metal %.1f GB, "
+                            + "machine compressor %.1f GB / free %.1f GB / swap %.1f GB | "
+                            + "block 0 %.0f ms, later blocks %.0f ms",
+                        label,
+                        index,
+                        wall / positions,
+                        per.denseEncode,
+                        per.frontWait,
+                        per.expertFill,
+                        rate,
+                        Double((runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore) / 1_048_576,
+                        (runtime.expertStreamer?.expertsLoaded ?? 0) - missesBefore,
+                        per.denseDevice + per.mixtureDevice,
+                        (runtime.expertStreamer?.timing.slotsAllocated ?? 0) - slotsBefore,
+                        memory.footprintMB / 1_024,
+                        memory.graphicsMB / 1_024,
+                        memory.graphicsCompressedMB / 1_024,
+                        memory.compressedMB / 1_024,
+                        memory.decompressions,
+                        memory.swapins,
+                        memory.pressureLevel,
+                        Double(device.currentAllocatedSize) / 1_073_741_824,
+                        memory.systemCompressorGB,
+                        memory.systemFreeGB,
+                        memory.swapUsedGB,
+                        firstBlockMilliseconds,
+                        laterBlocksMilliseconds
+                    )
+                )
+            }
+
+            // The arm `#53` measured at 205.0 ms/position on its first pass and 296-305
+            // afterwards, and the cheapest one that shows the effect. The prompts
+            // alternate between two rotations so every pass carries a fresh expert set:
+            // the first pass is the only one that ALLOCATES the arena's 3,760 slot
+            // buffers, so if the second pass on a different prompt is as fast as the
+            // first, the allocation is what the effect is about; if it is slow, the state
+            // is the process's and not the buffers'.
+            for index in 1...rounds {
+                let rotation = index % 2 == 1 ? 13 : 7
+                try pass(
+                    prompt(128, rotation: rotation),
+                    label: label + (rotation == 13 ? " P" : " Q"),
+                    index: (index + 1) / 2
+                )
+            }
+            if shortPrompt {
+                // A prompt that touches ~2,660 `(layer, expert)` pairs instead of ~5,020.
+                // If the state turns on the arena's own residency this is the control that
+                // says so; if it is process-wide it stays slow.
+                for index in 1...2 {
+                    try pass(prompt(32), label: label + ", 32 positions", index: index)
+                }
+            }
+        }
+
+        // Phase A: the shipped arena, a quarter of RAM at the shipped default.
+        do {
+            let runtime = try makeRuntime(
+                snapshot: snapshot,
+                engine: engine,
+                config: config,
+                contextLength: 129,
+                allowEngramSkip: false
+            )
+            try probe(label: "default arena", runtime: runtime, rounds: 4, shortPrompt: false)
+        }
+
+        // A quarter-size arena was tried here as the control and WITHDRAWN, because it
+        // cannot separate the hypothesis: with 1,202 slots the same 128-position prompt
+        // misses 10,342 times instead of 5,021, i.e. 16.2 misses per fill against 7.8, and
+        // `#51` measured that a fill's rate is a function of exactly that (one miss reads
+        // at 3.8-4.7 GB/s, six at 13-43). The arm duly read 6.0-6.5 GB/s at a higher
+        // compressed footprint and a pressure level of 2, so its rate says nothing about
+        // compression. Separating the two needs the same misses per fill at two different
+        // compression states, which no in-process knob reaches.
         withExtendedLifetime(engine) {}
     }
 
