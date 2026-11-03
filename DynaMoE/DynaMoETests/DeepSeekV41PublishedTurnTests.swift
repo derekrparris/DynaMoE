@@ -5110,6 +5110,614 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
+    // MARK: - The fill's own decay
+
+    /// What makes a process's Nth read slower than its first.
+    ///
+    /// `#54` ruled out every mechanism it could name for the warmed-prefill penalty and
+    /// left one fact standing: the expert fill re-reads the same 90,025 MB at 7.5 GB/s on
+    /// a runtime's first pass and 5.5 on its fourth, with misses per fill unchanged. No
+    /// counter the runtime owns moves with that (they are flat or falling), so the
+    /// question has to be asked from OUTSIDE the fill: did the process's read slow down,
+    /// or the fill's?
+    ///
+    /// The probe below is the control the fill never had. It reads a fixed 1.1 GB of
+    /// expert ranges six ways, before the first pass and after every one:
+    ///
+    ///   * `host`: the checkpoint's own ranges into one host buffer. Between phases a
+    ///     pass churns 90 GB of other experts, more than this machine can cache, so each
+    ///     phase's reading is cold again rather than free. The probe after the rest is
+    ///     the exception on purpose: it is the one that reads warm, at 67-88 GB/s, and it
+    ///     is what says the file cache itself still works.
+    ///   * `host repeat`: the same ranges immediately again, i.e. the WARM rate. If the
+    ///     warm rate holds while the cold rate falls, the cache still works and it is the
+    ///     disk's cold read that changed.
+    ///   * `metal`: the same (already warm) ranges into arena-shaped
+    ///     `storageModeShared` buffers, the destination the fill actually writes. A warm
+    ///     arm that slows here is the destination, not the disk.
+    ///   * `scratch`: a file this test writes itself, the same byte count, that nothing
+    ///     else reads. A decay here is the machine's, not this checkpoint's page cache.
+    ///   * `fresh host` / `fresh metal`: the same WARM bytes into destinations this
+    ///     process has not written, once as plain anonymous memory and once as
+    ///     arena-shaped slots. These are the arms that separate "the machine serves
+    ///     fewer bytes per second" from "making a destination page available costs
+    ///     more", because the source is already in the file cache and only the
+    ///     destination differs. They are measured last in a phase, being the only arms
+    ///     that allocate.
+    ///
+    /// Two more phases answer the rest of it. A twenty-second rest separates "time since
+    /// the process started" from "bytes this process has read", and a SECOND runtime
+    /// built in the same aged process separates the runtime's own 67 GB of slot buffers
+    /// from the process itself. The second runtime is behind its own marker because two
+    /// arenas at once is 134 GB on a 128 GB machine.
+    ///
+    /// What it found (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #55"): nothing outside the
+    /// fill decays (the disk serves 13.6-15.2 GB/s at every phase, warm reads 83-96), the
+    /// fill decays WITHIN its first pass from 15.3 GB/s in its first byte quartile to 4.5
+    /// in its third, and the only arm that lands on the fill's own rate is a FRESH METAL
+    /// destination: 0.8-3.4 GB/s for the same warm bytes into newly made slots, against
+    /// 90-97 into resident ones and 21-28 into fresh host memory, and 48.2 once a rest
+    /// gave the machine 3.4 GB of free memory back.
+    ///
+    /// Opt-in: it reads tens of gigabytes and, with the second marker, builds two
+    /// runtimes.
+    ///
+    ///     touch /tmp/dynamoe_dsv41_fill_decay         # four passes and six probes
+    ///     touch /tmp/dynamoe_dsv41_fill_decay_fresh   # plus a second runtime
+    @MainActor
+    func testWhatMakesAProcessesReadsSlowerThanItsFirst() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_fill_decay"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in fill decay probe; touch \(markerPath) to run"
+        )
+        let freshMarker = "/tmp/dynamoe_dsv41_fill_decay_fresh"
+
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        // The same stream and the same 128 positions `#53` and `#54` measured, rotated
+        // once per repetition so a pass does not cycle the routing and leave the arena
+        // warm (`#52`).
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+        func prompt(_ length: Int, rotation: Int) -> [Int] {
+            (0..<length).map { index in
+                let repetition = index / stream.count
+                return stream[(index + repetition * rotation) % stream.count]
+            }
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let device = try XCTUnwrap(MTLCreateSystemDefaultDevice())
+        let positions = 128
+
+        /// One prefill of the shipped block path, with the streamer's per-fill samples
+        /// on, printed the way `#54` printed its passes so the two tables read together.
+        func pass(_ runtime: DeepSeekV41Runtime, _ tokens: [Int], label: String) {
+            guard let streamer = runtime.expertStreamer else {
+                print("🔎 [dsv41 real]   \(label): no expert streamer, nothing to measure")
+                return
+            }
+            let executor = runtime.forward()
+            executor.reset()
+            runtime.arena.reset()
+            executor.resetBlockTiming()
+            executor.recordsBlockTiming = true
+            streamer.recordsFillSamples = true
+            streamer.clearFillSamples()
+            let slotsBefore = streamer.timing.slotsAllocated
+            let start = DispatchTime.now().uptimeNanoseconds
+            do {
+                _ = try executor.prefillChunk(tokens)
+            } catch {
+                print("🔎 [dsv41 real]   \(label) refused: \(error)")
+                executor.recordsBlockTiming = false
+                streamer.recordsFillSamples = false
+                return
+            }
+            let wall = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+            executor.recordsBlockTiming = false
+            streamer.recordsFillSamples = false
+            let timing = executor.blockTiming
+            let samples = streamer.fillSamples
+            let per = timing.millisecondsPerPosition()
+            let positionsInPass = Double(max(1, tokens.count))
+            let fillSeconds = Double(timing.expertFillNanoseconds) / 1_000_000_000
+            let rate = fillSeconds > 0 ? Double(timing.fillBytes) / 1_000_000_000 / fillSeconds : 0
+            XCTAssertGreaterThan(timing.layers, 0, "the block switch recorded nothing")
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   %@ pass: %.1f ms/pos, encode %.1f, front "
+                        + "wait %.1f, fill %.1f at %.1f GB/s (%.0f MB, %d misses), device "
+                        + "%.1f, slots +%d",
+                    label,
+                    wall / positionsInPass,
+                    per.denseEncode,
+                    per.frontWait,
+                    per.expertFill,
+                    rate,
+                    Double(timing.fillBytes) / 1_048_576,
+                    timing.fillMisses,
+                    per.denseDevice + per.mixtureDevice,
+                    streamer.timing.slotsAllocated - slotsBefore
+                )
+            )
+            guard !samples.isEmpty else { return }
+            // Where in the pass the slow fills are. A rate that falls as the pass
+            // accumulates bytes is a within-pass effect (something about having read);
+            // a pass whose quartiles are flat and whose average still fell against the
+            // previous pass is a step between passes (something about being older).
+            var quartileBytes = [0, 0, 0, 0]
+            var quartileSeconds = [0.0, 0.0, 0.0, 0.0]
+            let totalBytes = samples.reduce(0) { $0 + $1.bytes }
+            var running = 0
+            for sample in samples {
+                let bucket = totalBytes > 0
+                    ? min(3, running * 4 / totalBytes) : 0
+                quartileBytes[bucket] += sample.bytes
+                quartileSeconds[bucket] += sample.seconds
+                running += sample.bytes
+            }
+            let quartiles = (0..<4).map { index in
+                quartileSeconds[index] > 0
+                    ? Double(quartileBytes[index]) / 1_000_000_000 / quartileSeconds[index]
+                    : 0
+            }
+            let rates = samples.filter { $0.bytes > 0 }.map(\.gigabytesPerSecond).sorted()
+            let minimum = rates.first ?? 0
+            let median = rates.isEmpty ? 0 : rates[rates.count / 2]
+            let maximum = rates.last ?? 0
+            let memory = hostMemoryCounters()
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   %@ fills: %d fills, per-fill %.1f/%.1f/%.1f "
+                        + "GB/s (min/median/max), by cumulative bytes Q1..Q4 %.1f %.1f "
+                        + "%.1f %.1f; footprint %.1f GB, graphics %.1f GB (compressed "
+                        + "%.2f), compressed %.1f GB, decompressions %d, pressure %d, "
+                        + "metal %.1f GB",
+                    label,
+                    samples.count,
+                    minimum,
+                    median,
+                    maximum,
+                    quartiles[0],
+                    quartiles[1],
+                    quartiles[2],
+                    quartiles[3],
+                    memory.footprintMB / 1_024,
+                    memory.graphicsMB / 1_024,
+                    memory.graphicsCompressedMB / 1_024,
+                    memory.compressedMB / 1_024,
+                    memory.decompressions,
+                    memory.pressureLevel,
+                    Double(device.currentAllocatedSize) / 1_073_741_824
+                )
+            )
+        }
+
+        // ── Phase A: one runtime, four passes, a rest, and a probe at every step ──
+        do {
+            let runtime = try makeRuntime(
+                snapshot: snapshot,
+                engine: engine,
+                config: config,
+                contextLength: positions + 1,
+                allowEngramSkip: false
+            )
+            let streamer = try XCTUnwrap(
+                runtime.expertStreamer,
+                "no expert streamer: \(runtime.expertStreamerProblem ?? "no reason")"
+            )
+            let geometry = streamer.geometry
+            let slot = geometry.slotBytes
+            let layerPlan = runtime.plan.map(\.index)
+
+            // Sixty-four fixed pairs, advancing one layer at a time so the probe spans
+            // the whole checkpoint the way a pass does rather than sitting in one shard.
+            let probePairs: [(layer: Int, expert: Int)] = (0..<64).map { index in
+                (
+                    layer: layerPlan[index % layerPlan.count],
+                    expert: (index * 5 + 1) % config.numRoutedExperts
+                )
+            }
+            let probeBytes = probePairs.count * slot
+
+            /// The probe's ranges, laid out exactly as a fill lays out a slot's: six
+            /// contiguous ranges per pair, grouped per shard, destination by index.
+            func batches(
+                destination: (Int) -> UnsafeMutableRawPointer
+            ) -> [Dsv41ProbeBatches.Batch] {
+                var byShard: [UInt32: [DeepSeekV41ExpertShardReader.Range]] = [:]
+                for (index, pair) in probePairs.enumerated() {
+                    guard let gate = runtime.weights.tensor(
+                        .expertW1, layer: pair.layer, expert: pair.expert
+                    ),
+                        let upT = runtime.weights.tensor(
+                            .expertW3, layer: pair.layer, expert: pair.expert
+                        ),
+                        let downT = runtime.weights.tensor(
+                            .expertW2, layer: pair.layer, expert: pair.expert
+                        ) else { continue }
+                    let gateScale = runtime.weights.scaleTensor(
+                        .expertW1, layer: pair.layer, expert: pair.expert
+                    )
+                    let upScale = runtime.weights.scaleTensor(
+                        .expertW3, layer: pair.layer, expert: pair.expert
+                    )
+                    let downScale = runtime.weights.scaleTensor(
+                        .expertW2, layer: pair.layer, expert: pair.expert
+                    )
+                    let base = destination(index)
+                    func range(
+                        _ tensor: DeepSeekV41DeviceTensor?,
+                        offset: Int,
+                        length: Int
+                    ) -> DeepSeekV41ExpertShardReader.Range? {
+                        guard length > 0, let tensor else { return nil }
+                        return DeepSeekV41ExpertShardReader.Range(
+                            fileOffset: tensor.byteOffset,
+                            destination: base.advanced(by: offset),
+                            length: length
+                        )
+                    }
+                    let pieces = [
+                        range(
+                            gate, offset: geometry.gateWeightOffset,
+                            length: geometry.gateWeightBytes
+                        ),
+                        range(
+                            gateScale, offset: geometry.gateScaleOffset,
+                            length: geometry.gateScaleBytes
+                        ),
+                        range(
+                            upT, offset: geometry.upWeightOffset,
+                            length: geometry.upWeightBytes
+                        ),
+                        range(
+                            upScale, offset: geometry.upScaleOffset,
+                            length: geometry.upScaleBytes
+                        ),
+                        range(
+                            downT, offset: geometry.downWeightOffset,
+                            length: geometry.downWeightBytes
+                        ),
+                        range(
+                            downScale, offset: geometry.downScaleOffset,
+                            length: geometry.downScaleBytes
+                        )
+                    ].compactMap { $0 }
+                    byShard[gate.shardIndex, default: []].append(contentsOf: pieces)
+                }
+                return byShard.map { Dsv41ProbeBatches.Batch(shard: $0.key, ranges: $0.value) }
+            }
+
+            // One host destination and one set of arena-shaped Metal buffers, allocated
+            // once and held for the whole phase: a phase then measures the read and not
+            // the destination's first touch. Reusing the Metal buffers is also the fill's
+            // own later-pass situation, where every slot is already allocated.
+            let hostBase = UnsafeMutableRawPointer.allocate(
+                byteCount: probeBytes, alignment: 4096
+            )
+            defer { hostBase.deallocate() }
+            var metalBuffers: [MTLBuffer] = []
+            for _ in probePairs.indices {
+                guard let buffer = device.makeBuffer(
+                    length: slot, options: .storageModeShared
+                ) else { break }
+                metalBuffers.append(buffer)
+            }
+            let metalIsComplete = metalBuffers.count == probePairs.count
+            if !metalIsComplete {
+                print("🔎 [dsv41 real] only \(metalBuffers.count) probe slots were allocated")
+            }
+
+            // The independent control: a file this test writes, read through the same
+            // reader class the fill uses, so the only thing it shares with the checkpoint
+            // is the machine.
+            let scratchPath = "/tmp/dsv41_fill_decay_scratch.bin"
+            let chunk = 8 << 20
+            let block = Data(repeating: 0xA5, count: chunk)
+            var scratchWritten = FileManager.default.createFile(atPath: scratchPath, contents: nil)
+            if scratchWritten, let handle = FileHandle(forWritingAtPath: scratchPath) {
+                var written = 0
+                while written < probeBytes {
+                    let piece = min(chunk, probeBytes - written)
+                    handle.write(block.prefix(piece))
+                    written += piece
+                }
+                scratchWritten = (try? handle.synchronize()) != nil
+                try? handle.close()
+            }
+            defer { try? FileManager.default.removeItem(atPath: scratchPath) }
+            var scratchReader: DeepSeekV41ExpertShardReader?
+            if scratchWritten {
+                scratchReader = try? DeepSeekV41ExpertShardReader(
+                    url: URL(fileURLWithPath: scratchPath)
+                )
+            }
+            XCTAssertNotNil(scratchReader, "the scratch file could not be written or opened")
+
+            let scratchBatches: [Dsv41ProbeBatches.Batch] = (0..<probePairs.count).map { index in
+                Dsv41ProbeBatches.Batch(
+                    shard: 0,
+                    ranges: [DeepSeekV41ExpertShardReader.Range(
+                        fileOffset: index * slot,
+                        destination: hostBase.advanced(by: index * slot),
+                        length: slot
+                    )]
+                )
+            }
+
+            let probeReaders = try Dsv41ProbeBatches.OpenShards(
+                snapshot: snapshot, indices: batches(destination: { _ in hostBase }).map(\.shard)
+            )
+
+            func measure(
+                _ label: String,
+                _ list: [Dsv41ProbeBatches.Batch],
+                _ readers: [UInt32: DeepSeekV41ExpertShardReader]
+            ) -> Double {
+                guard !list.isEmpty else { return 0 }
+                let run = Dsv41ProbeBatches(
+                    readers: readers, batches: list, chunkBytes: 0, sequential: false
+                )
+                let result = run.run()
+                if let failure = run.failure {
+                    print("🔎 [dsv41 real]   probe \(label) refused: \(failure)")
+                    return 0
+                }
+                return Double(result.bytes) / 1_000_000_000 / max(result.seconds, 1e-9)
+            }
+
+            /// The same warm bytes into a destination this process has never written:
+            /// 1.1 GB of fresh pages, timed from the first byte of the read. It is the
+            /// one arm that separates "the machine serves fewer bytes per second" from
+            /// "writing the bytes costs more", because the data is already in the file
+            /// cache and only the destination differs.
+            func measureFreshHost(_ label: String) -> Double {
+                let fresh = UnsafeMutableRawPointer.allocate(
+                    byteCount: probeBytes, alignment: 4096
+                )
+                defer { fresh.deallocate() }
+                return measure(label, batches { fresh.advanced(by: $0 * slot) },
+                               probeReaders.readers)
+            }
+
+            /// The same again into freshly made arena-shaped slots, which is the
+            /// destination the fill writes. The two fresh arms are the pair that says
+            /// whether the destination TYPE matters as well as its residency: they read
+            /// identical bytes, at the same instant, differing only in what they write.
+            func measureFreshMetal(_ label: String) -> Double {
+                var fresh: [MTLBuffer] = []
+                for _ in probePairs.indices {
+                    guard let buffer = device.makeBuffer(
+                        length: slot, options: .storageModeShared
+                    ) else { break }
+                    fresh.append(buffer)
+                }
+                guard fresh.count == probePairs.count else { return 0 }
+                return measure(label, batches { fresh[$0].contents() }, probeReaders.readers)
+            }
+
+            func probe(_ label: String) {
+                let host = batches { hostBase.advanced(by: $0 * slot) }
+                var metal: [Dsv41ProbeBatches.Batch] = []
+                if metalIsComplete {
+                    metal = batches { metalBuffers[$0].contents() }
+                }
+                let scratchRate = scratchReader.map { opened in
+                    measure("scratch", scratchBatches, [0: opened])
+                } ?? 0
+                let cold = measure("host", host, probeReaders.readers)
+                let warm = measure("host repeat", host, probeReaders.readers)
+                let metalRate = measure("metal", metal, probeReaders.readers)
+                // Last, because these allocate: the arms above are meant to be read as
+                // a quiet machine, and a 1.1 GB allocation at zero free memory is not.
+                let freshHost = measureFreshHost("fresh host")
+                let freshMetal = measureFreshMetal("fresh metal")
+                let memory = hostMemoryCounters()
+                print(
+                    String(
+                        format: "🔎 [dsv41 real]   probe %@: host cold %.1f GB/s, host "
+                            + "repeat %.1f (warm), metal %.1f (warm), scratch %.1f (cold), "
+                            + "fresh host %.1f (warm data), fresh metal %.1f, "
+                            + "%.0f MB an arm | footprint %.1f GB, graphics %.1f GB "
+                            + "(compressed %.2f), compressed %.1f GB, decompressions %d, "
+                            + "swapins %d, pressure %d, metal %.1f GB, machine "
+                            + "compressor %.1f GB / free %.1f GB / swap %.1f GB",
+                        label,
+                        cold,
+                        warm,
+                        metalRate,
+                        scratchRate,
+                        freshHost,
+                        freshMetal,
+                        Double(probeBytes) / 1_048_576,
+                        memory.footprintMB / 1_024,
+                        memory.graphicsMB / 1_024,
+                        memory.graphicsCompressedMB / 1_024,
+                        memory.compressedMB / 1_024,
+                        memory.decompressions,
+                        memory.swapins,
+                        memory.pressureLevel,
+                        Double(device.currentAllocatedSize) / 1_073_741_824,
+                        memory.systemCompressorGB,
+                        memory.systemFreeGB,
+                        memory.swapUsedGB
+                    )
+                )
+            }
+
+            probe("before any pass")
+            for index in 1...3 {
+                let rotation = index % 2 == 1 ? 13 : 7
+                pass(runtime, prompt(positions, rotation: rotation), label: "P\(index)")
+                probe("after P\(index)")
+            }
+            // A rest issues no I/O and lets the compressor settle, so it separates "this
+            // process has been alive for a while" from "this process has read a lot".
+            print("🔎 [dsv41 real]   resting 20 s with no reads")
+            try await Task.sleep(for: .seconds(20))
+            probe("after the rest")
+            pass(runtime, prompt(positions, rotation: 7), label: "P4 after the rest")
+            probe("after P4")
+            print(
+                String(
+                    format: "🔎 [dsv41 real] metal %d -> %.1f GB allocated once the phase ends",
+                    metalBuffers.count,
+                    Double(device.currentAllocatedSize) / 1_073_741_824
+                )
+            )
+            probeReaders.close()
+        }
+
+        // ── Phase B: a SECOND runtime in the same aged process ──────────────────
+        guard FileManager.default.fileExists(atPath: freshMarker) else {
+            print(
+                "🔎 [dsv41 real] fresh-runtime phase skipped (touch \(freshMarker) to run it)"
+            )
+            withExtendedLifetime(engine) {}
+            return
+        }
+        let beforeSecond = hostMemoryCounters()
+        print(
+            String(
+                format: "🔎 [dsv41 real] second runtime: metal %.1f GB allocated, pressure "
+                    + "%d, swap %.1f GB before it is built",
+                Double(device.currentAllocatedSize) / 1_073_741_824,
+                beforeSecond.pressureLevel,
+                beforeSecond.swapUsedGB
+            )
+        )
+        do {
+            let runtime = try makeRuntime(
+                snapshot: snapshot,
+                engine: engine,
+                config: config,
+                contextLength: positions + 1,
+                allowEngramSkip: false
+            )
+            pass(runtime, prompt(positions, rotation: 13), label: "fresh runtime, aged process")
+        }
+        withExtendedLifetime(engine) {}
+    }
+
+    /// Issues one probe's reads the way a fill issues its own: one batch per shard, the
+    /// batches concurrently, each shard's ranges fanned out by the reader.
+    ///
+    /// The same shape as `DeepSeekV41ShardBatchContext`, and for the same reason: a
+    /// probe that read its shards one after another would be latency bound at 3.8-4.7
+    /// GB/s (`#51`) and would not be the rate the fill is paying.
+    private final class Dsv41ProbeBatches: @unchecked Sendable {
+        struct Batch: @unchecked Sendable {
+            let shard: UInt32
+            let ranges: [DeepSeekV41ExpertShardReader.Range]
+        }
+
+        /// One descriptor per shard file, opened once and held for the whole phase so a
+        /// probe does not pay for `open` in the arm it is measuring.
+        final class OpenShards: @unchecked Sendable {
+            let readers: [UInt32: DeepSeekV41ExpertShardReader]
+
+            init(snapshot: URL, indices: [UInt32]) throws {
+                let files = ((try? FileManager.default.contentsOfDirectory(
+                    atPath: snapshot.path
+                )) ?? []).filter { $0.hasSuffix(".safetensors") }.sorted()
+                var opened: [UInt32: DeepSeekV41ExpertShardReader] = [:]
+                for shard in Set(indices) {
+                    guard Int(shard) < files.count else { continue }
+                    opened[shard] = try DeepSeekV41ExpertShardReader(
+                        url: snapshot.appendingPathComponent(files[Int(shard)])
+                    )
+                }
+                readers = opened
+            }
+
+            func close() {
+                for reader in readers.values { reader.closeNow() }
+            }
+        }
+
+        private let readers: [UInt32: DeepSeekV41ExpertShardReader]
+        private let batches: [Batch]
+        private let chunkBytes: Int
+        private let sequential: Bool
+        private let lock = NSLock()
+        private var recordedFailure: String?
+
+        init(
+            readers: [UInt32: DeepSeekV41ExpertShardReader],
+            batches: [Batch],
+            chunkBytes: Int,
+            sequential: Bool
+        ) {
+            self.readers = readers
+            self.batches = batches
+            self.chunkBytes = chunkBytes
+            self.sequential = sequential
+        }
+
+        var bytes: Int {
+            batches.reduce(0) { total, batch in
+                total + batch.ranges.reduce(0) { $0 + $1.length }
+            }
+        }
+
+        var failure: String? {
+            lock.lock()
+            defer { lock.unlock() }
+            return recordedFailure
+        }
+
+        func run() -> (seconds: Double, bytes: Int) {
+            let started = DispatchTime.now().uptimeNanoseconds
+            let one: @Sendable (Int) -> Void = { self.read($0) }
+            if batches.count >= 2, !sequential {
+                DispatchQueue.concurrentPerform(iterations: batches.count, execute: one)
+            } else {
+                for index in batches.indices { one(index) }
+            }
+            return (
+                Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000_000,
+                bytes
+            )
+        }
+
+        private func read(_ index: Int) {
+            let batch = batches[index]
+            guard let reader = readers[batch.shard] else {
+                note("no descriptor for shard \(batch.shard)")
+                return
+            }
+            do {
+                try reader.read(batch.ranges, chunkBytes: chunkBytes, sequential: sequential)
+            } catch {
+                note("\(error)")
+            }
+        }
+
+        private func note(_ text: String) {
+            lock.lock()
+            if recordedFailure == nil { recordedFailure = text }
+            lock.unlock()
+        }
+    }
+
     /// What the largest picture the composer accepts costs a person, end to end.
     ///
     /// The tower's own cost is measured and published (`#43`: 6.74 s for the largest

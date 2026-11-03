@@ -9206,3 +9206,102 @@ and free pages and swap used, and the first block's cost apart from the rest. Ru
 phase), `_state3.log` (machine counters), `_state4.log` (the P/Q alternation), `_state5.log` (with the
 layer hook). Every run used `touch` and `rm -f` in the same command, and the quarter-arena phase's
 `UserDefaults` seam was removed with the phase (verified with `defaults read`, which finds no key).
+
+## DSV4.1 #55: THE WARMED PREFILL PENALTY IS THE ARENA'S DESTINATION PAGES, NOT THE DISK -- AND THE FILL DECAYS WITHIN ITS OWN FIRST PASS
+
+`#54` left one sentence standing: the expert fill re-reads the same 90,025 MB at 7.5 GB/s on a
+runtime's first pass and 5.5 on its fourth, with misses per fill unchanged, and no counter the runtime
+owns explains it. Every explanation it could name had been tested from inside the fill. This slice asks
+from outside the fill instead: it probes a fixed 1.1 GB of expert ranges through its own descriptors,
+before the first pass and after every one, into four kinds of destination, and it samples every fill of
+every pass.
+
+### The probe
+
+One runtime, the `#52`/`#53`/`#54` 128-position stream, four passes with the arena reset before each,
+and a 1.1 GB probe (64 fixed `(layer, expert)` pairs, six contiguous ranges each, grouped per shard and
+read concurrently exactly as a fill reads) at six points: before any pass, after each of the first
+three, after a 20 s rest, and after the fourth.
+
+| phase | pass ms/pos | fill GB/s | host cold | host repeat | metal resident | scratch | fresh host | fresh metal | free GB | machine compressor GB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| before any pass | - | - | 14.7 | 96.0 | 75.6 | 16.5 | 55.3 | 59.2 | 64.8 | 0.1 |
+| P1 | 238.2 | **8.4** | | | | | | | | |
+| after P1 | | | 0.7 | 61.7 | 97.7 | 10.5 | 21.2 | **3.4** | 0.1 | 38.9 |
+| P2 | 315.4 | **6.4** | | | | | | | | |
+| after P2 | | | 14.1 | 89.1 | 95.3 | 9.9 | 25.7 | **2.5** | 0.1 | 30.1 |
+| P3 | 368.8 | **5.5** | | | | | | | | |
+| after P3 | | | 15.2 | 86.6 | 90.0 | 10.0 | 27.9 | **0.8** | 0.1 | 44.4 |
+| after a 20 s rest | - | - | 67.1 | 67.2 | 80.8 | 10.2 | 49.9 | **48.2** | 3.4 | 41.1 |
+| P4 | 325.0 | **6.3** | | | | | | | | |
+| after P4 | | | 13.6 | 83.6 | 92.9 | 10.0 | 23.7 | 10.6 | 0.1 | 28.2 |
+
+An earlier run of the same case without the two `fresh` arms reproduced the pass column (274.9, 340.5,
+332.1, 341.6 ms/position at 7.7, 5.9, 6.4, 6.0 GB/s) and the same flat probe columns (host cold 15.6 /
+15.1 / 12.7 / 14.7 / 16.1, host repeat 83-96, metal resident 72-98, scratch 5.6-10.9).
+
+### What it says
+
+- **The decay is inside the first pass, not between passes.** P1's fill runs 15.3 GB/s over its first
+  byte quartile, 13.4 over its second, 4.5 over its third and 8.9 over its fourth (the earlier run:
+  16.7 / 11.1 / 4.6 / 6.5). Every later pass starts where P1 ended (first quartile 10.4, 6.4, 10.0) and
+  stays there (6.4 / 6.0 / 6.3 / 4.2). So "a first pass is 1.3-1.6x faster" is really "the first ~20 GB
+  this process reads are fast, and it never comes back": a fourth pass after a 20 s rest is still 6.3
+  GB/s.
+- **Nothing outside the fill decays.** The checkpoint's own bytes read cold at 13.6-15.2 GB/s at every
+  phase, including after four passes (0.7 once, in a phase whose other arms read 61.7 and 97.7, i.e. a
+  stall rather than a decay). A file this test writes itself reads at 10.0-16.5 GB/s. Warm reads of the
+  same ranges run at 83.6-96.0 and resident Metal slots at 72.4-97.7. The disk, the page cache, the
+  process's read path and the destination TYPE are all flat across the run.
+- **The destination's RESIDENCY is what changed.** The same warm bytes written into fresh arena-shaped
+  slots run at **3.4, 2.5 and 0.8 GB/s** after the first three passes, against 90.0-97.7 into slots this
+  process already owns. Into a fresh HOST buffer the same bytes run at 21.2-27.9. That is the fill's own
+  rate (5.5-6.4) and no other arm is anywhere near it: the fill is reading from a fine source into a
+  destination the kernel has to make available first.
+- **One rest is enough to prove it is memory pressure and not Metal's allocation cost.** After 20 s idle
+  the machine had 3.4 GB free, and the same fresh-slot arm ran at 48.2 GB/s instead of 0.8. The
+  allocation path had not changed; the free memory had.
+- **What the arena costs is the machine's free memory.** Free memory goes 64.8 GB before P1 to 0.1 GB
+  after it, the machine's compressor 0.1 to 28-44 GB, the process's compressed total 0.0 to 53-64 GB,
+  the graphics ledger's compressed share 0.00 to 15-44 GB, and decompressions 3.5M to 27.3M over the
+  four passes. Those are the only counters that move with the fill, and they move with it in the right
+  direction; `#54` compared their TOTALS across passes, which drift either way, and so found them
+  "flat or falling" while the fill slowed.
+- **This is why the walked arm was insensitive in `#53`.** A walk's fill is already at 5.5-7.3 GB/s on
+  its first position (`#50`), because the arena has been filled and the machine squeezed before a single
+  token is decoded; the batched arm was measured while its arena was still growing, so the same decay
+  showed up as a 1.3-1.6x difference between its first round and its later ones.
+
+### What it means
+
+The turn's expert traffic is not waiting on the disk. It is waiting on the kernel to materialize pages in
+`storageModeShared` slot buffers while the machine has no free memory and is compressing those same
+buffers. The lever is therefore the arena's residency, not its capacity, its eviction order, its
+placement, or the read that fills it. The candidate to measure next (NOT to build on this evidence) is
+whether the slots can stay uncompressed or wired: any fix has to survive the two traps `#54` recorded
+(misses per fill must be held constant, and a smaller arena changes the rate by itself) plus the one this
+slice adds (`fresh` and `resident` destinations must both be measured, because they differ by 30x).
+
+### What it is not (do not re-propose)
+
+- Not the disk: 13.6-15.2 GB/s cold at every point in the process's life, and an unrelated file at
+  10.0-16.5.
+- Not the page cache: the same bytes read warm at 83-96 GB/s throughout, and a probe that nothing evicts
+  reads at 88.5 and 67.1 after rests.
+- Not the runtime's identity or its slot allocation: P2 allocates 0 slots and is as slow as P3, and a
+  second runtime built in the aged process ran at 3.3 GB/s (`#54`'s confound applies in reverse here:
+  that phase was at pressure level 2 with 138.7 GB compressed, so it is recorded, not relied on).
+- Not thermal (`nominal` in every round `#54` sampled), not swap (1.9 GB used, unchanged, and 0-131k
+  swapins across runs), not the prompt or its expert set (`#54`).
+- Not `F_NOCACHE`, a deeper fan-out, a different fill form, a wider block, a second queue or the
+  attention's shape (measured negatives, `#20`, `#21`, `#48`, `#50`, `#51`, `#52`).
+
+### Verification
+
+`testWhatMakesAProcessesReadsSlowerThanItsFirst` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_fill_decay`, plus `/tmp/dynamoe_dsv41_fill_decay_fresh` for the second-runtime
+phase), 192 s at `-O` for four passes and six probes. It prints, per pass, the block buckets, the
+streamer's counters, the per-fill minimum/median/maximum and the fill rate bucketed by cumulative bytes
+read; and per probe, six destination arms plus the task and machine memory accounting. Runs:
+`/tmp/test55_decay1.log` (four arms, with the second runtime) and `/tmp/test55_decay2.log` (six arms, no
+second runtime). Both used `touch` and `rm -f` in the same command, and no marker survived either.
