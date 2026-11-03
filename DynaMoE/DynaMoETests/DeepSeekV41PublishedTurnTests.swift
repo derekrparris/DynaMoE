@@ -7921,6 +7921,583 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
+    /// What the mHC coefficient pair's two dispatches are worth on a real decode.
+    ///
+    /// `#60` attributed a walked position and left two stages far below the machine's
+    /// measured GEMV ceiling: `hcAttentionCoefficients` 4.09 ms/position and
+    /// `hcFFNCoefficients` 3.37, i.e. 102 us per layer for a 1.97 MB FP32 weight read,
+    /// **19 GB/s** where the dense GEMVs run at 332-397. `#61` then closed the stage
+    /// ranked above them, so the pair was the largest item left that was not at the
+    /// ceiling — and it is two dispatches, not one: the projection `#9` had already
+    /// given a threadgroup per (slot, logit), and the split, which is ONE thread per
+    /// position running the schedule's twenty Sinkhorn iterations.
+    ///
+    /// The probe prices each half on its own, because "the stage is slow" is not a
+    /// diagnosis:
+    ///
+    /// 1. **the projection** — `#9` swept the threadgroup width at a BLOCK's
+    ///    occupancy (192 threadgroups, where 256 lanes wins). A walk's grid is 24, and
+    ///    `testWhatOneHyperConnectionProjectionCostsAtThePublishedWidths` measures that
+    ///    grid at 0.022 ms with one dependent accumulator pair and 0.006 with four; so
+    ///    the arms here are the one-chain kernel and the four-chain one at 256, 512 and
+    ///    the plan's width;
+    /// 2. **the split** — the Sinkhorn's 4x4 matrix lives in DEVICE memory, so every
+    ///    one of ~160 normalization passes is a chain of dependent loads and stores on
+    ///    one thread. The register-resident form is A/B'd against it, and the
+    ///    `Sinkhorn 1` / `10 iteration` arms price one iteration of the chain;
+    /// 3. **the fixed part** — `projection x2` / `x4` and `split x2` repeat a dispatch
+    ///    (idempotent, so the graph's answer cannot move) and the slope IS that
+    ///    dispatch's in-situ cost. An isolated kernel table cannot give this: in a walk
+    ///    the read competes with everything else a position streams.
+    ///
+    /// The last arms run the PRODUCTION layout — one command buffer per half, no
+    /// per-stage windows — because a per-stage buffer holds one dispatch and the GPU
+    /// may be clocked for that dispatch alone; `frontDevice` is then the dense half as
+    /// a turn pays it.
+    ///
+    /// Opt-in (`/tmp/dynamoe_dsv41_hcwalk_stage`, plus the class's own marker).
+    func testWhatTheHyperConnectionProjectionAndSplitAreWorthToAWalk() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_hcwalk_stage"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in mHC probe; touch \(markerPath) to run"
+        )
+
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        // The 128-position stream `#52`-`#61` measured, so the tables line up.
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+        func prompt(_ length: Int, rotation: Int) -> [Int] {
+            (0..<length).map { index in
+                let repetition = index / stream.count
+                return stream[(index + repetition * rotation) % stream.count]
+            }
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let positions = 128
+        let tokens = prompt(positions, rotation: 7)
+        let sampledPositions: Set<Int> = [0, 1, 2, 3, 7, 15, 31, 63, 127]
+
+        struct Outcome {
+            let wallMilliseconds: Double
+            let timing: DeepSeekV41WalkTiming
+            let lastLogits: [Float]
+            let table: [(stage: String, millisecondsPerPosition: Double, share: Double)]
+            let attentionCoefficients: Double
+            let feedForwardCoefficients: Double
+            let sampledLogits: [Int: [Float]]
+        }
+
+        func pass(
+            _ label: String,
+            executor: DeepSeekV41MetalForward,
+            arena: DeepSeekV41ExpertArena,
+            streamer: DeepSeekV41ExpertStreamer?,
+            lanes: Int,
+            oneChain: Bool = false,
+            splitRegisters: Bool = true,
+            projectionRepeats: Int = 1,
+            splitRepeats: Int = 1,
+            splitLanes: Int = 0,
+            sinkhornIterations: Int? = nil,
+            staged: Bool = true
+        ) -> Outcome? {
+            executor.reset()
+            executor.resetWalkTiming()
+            executor.recordsWalkTiming = true
+            executor.recordsWalkStageTiming = staged
+            executor.hyperConnectionLaneWidthOverride = lanes
+            executor.disablesHyperConnectionX4 = oneChain
+            executor.disablesHyperConnectionSplitRegisters = !splitRegisters
+            executor.hyperConnectionProjectionRepeats = projectionRepeats
+            executor.hyperConnectionSplitRepeats = splitRepeats
+            executor.hyperConnectionSplitLanesOverride = splitLanes
+            executor.hyperConnectionSinkhornIterationsOverride = sinkhornIterations
+            let bytesBefore = streamer?.bytesRead ?? 0
+            let start = DispatchTime.now().uptimeNanoseconds
+            var logits: [Float] = []
+            var sampled: [Int: [Float]] = [:]
+            do {
+                for (position, token) in tokens.enumerated() {
+                    logits = try executor.forwardToken(token, position: position)
+                    if sampledPositions.contains(position) { sampled[position] = logits }
+                }
+            } catch {
+                XCTFail("\(label) refused at a position: \(error)")
+                return nil
+            }
+            let wall = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+            executor.recordsWalkTiming = false
+            executor.recordsWalkStageTiming = false
+            executor.hyperConnectionLaneWidthOverride = 0
+            executor.disablesHyperConnectionX4 = false
+            executor.disablesHyperConnectionSplitRegisters = false
+            executor.hyperConnectionProjectionRepeats = 1
+            executor.hyperConnectionSplitRepeats = 1
+            executor.hyperConnectionSplitLanesOverride = 0
+            executor.hyperConnectionSinkhornIterationsOverride = nil
+            let table = executor.walkStageTable()
+            func window(_ stage: DeepSeekV41ForwardStages.Stage) -> Double {
+                table.first { $0.stage == stage.rawValue }?.millisecondsPerPosition ?? -1
+            }
+            let device = executor.walkTiming.frontDeviceNanoseconds
+                + executor.walkTiming.mixtureDeviceNanoseconds
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   %@: %.1f ms/position, device %.1f ms/position, "
+                        + "hcAttn %.3f + hcFFN %.3f = %.3f ms/position, %.1f GB read",
+                    label,
+                    wall / Double(positions),
+                    Double(device) / Double(positions) / 1_000_000,
+                    window(.hcAttentionCoefficients),
+                    window(.hcFFNCoefficients),
+                    window(.hcAttentionCoefficients) + window(.hcFFNCoefficients),
+                    Double((streamer?.bytesRead ?? 0) - bytesBefore) / 1_073_741_824
+                )
+            )
+            return Outcome(
+                wallMilliseconds: wall,
+                timing: executor.walkTiming,
+                lastLogits: logits,
+                table: table,
+                attentionCoefficients: window(.hcAttentionCoefficients),
+                feedForwardCoefficients: window(.hcFFNCoefficients),
+                sampledLogits: sampled
+            )
+        }
+
+        do {
+            let runtime = try makeRuntime(
+                snapshot: snapshot,
+                engine: engine,
+                config: config,
+                contextLength: positions + 1,
+                allowEngramSkip: false,
+                wireArena: nil
+            )
+            runtime.arena.victimPolicy = .leastFrequentlyUsed
+            let executor = runtime.forward()
+
+            // A discarded warm-up, as `#59`-`#61`: the first pass pays slot creation and
+            // wiring, and the measured arms are then warm and are not reset between.
+            executor.reset()
+            runtime.arena.reset()
+            for (position, token) in tokens.enumerated() {
+                _ = try executor.forwardToken(token, position: position)
+            }
+            let mixCount = (2 + config.hcMult) * config.hcMult
+            print(
+                String(
+                    format: "🔎 [dsv41 real] mHC probe: %d positions, %d lanes at a walk, "
+                        + "%d mix logits, warm-up done",
+                    positions,
+                    DeepSeekV41DevicePlan.hyperConnectionLaneWidth(slots: 1),
+                    mixCount
+                )
+            )
+
+            let baseline = try XCTUnwrap(
+                pass(
+                    "one-chain kernel, 256 lanes (what shipped)",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    lanes: 256,
+                    oneChain: true,
+                    splitRegisters: false
+                )
+            )
+            let projectionOnly = try XCTUnwrap(
+                pass(
+                    "four-chain projection, device-memory split",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    lanes: 256,
+                    splitRegisters: false
+                )
+            )
+            let splitOnly = try XCTUnwrap(
+                pass(
+                    "one-chain projection, register split",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    lanes: 256,
+                    oneChain: true
+                )
+            )
+            let control = try XCTUnwrap(
+                pass(
+                    "four-chain kernel, 512 lanes (control width)",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    lanes: 512
+                )
+            )
+            let shipped = try XCTUnwrap(
+                pass(
+                    "four-chain kernel, \(DeepSeekV41DevicePlan.hyperConnectionLaneWidth(slots: 1)) lanes (shipped)",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    lanes: 0
+                )
+            )
+            // The in-situ slope of each half of the stage. An isolated kernel table
+            // cannot say this: in a walk the same dispatch reads weights that nothing
+            // else just touched, while the surrounding position streams 35 GB.
+            let projectionTwice = try XCTUnwrap(
+                pass(
+                    "shipped, projection dispatched twice",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    lanes: 0,
+                    projectionRepeats: 2
+                )
+            )
+            let projectionFourTimes = try XCTUnwrap(
+                pass(
+                    "shipped, projection dispatched four times",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    lanes: 0,
+                    projectionRepeats: 4
+                )
+            )
+            let splitTwice = try XCTUnwrap(
+                pass(
+                    "shipped, split dispatched twice",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    lanes: 0,
+                    splitRepeats: 2
+                )
+            )
+            // Why a one-thread dispatch costs what it does: a wider threadgroup (the
+            // kernel returns at once on the lanes past `slotCount`), and a shorter
+            // Sinkhorn chain. Neither arm's answer is compared; they price the body.
+            let splitWide = try XCTUnwrap(
+                pass(
+                    "shipped, split at 32 lanes",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    lanes: 0,
+                    splitLanes: 32
+                )
+            )
+            let sinkhornOne = try XCTUnwrap(
+                pass(
+                    "shipped, Sinkhorn 1 iteration",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    lanes: 0,
+                    sinkhornIterations: 1
+                )
+            )
+            let sinkhornTen = try XCTUnwrap(
+                pass(
+                    "shipped, Sinkhorn 10 iterations",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    lanes: 0,
+                    sinkhornIterations: 10
+                )
+            )
+
+            func worstRelative(
+                _ lhs: [Float], _ rhs: [Float]
+            ) -> (absolute: Float, relative: Double) {
+                let scale = max(lhs.map(abs).max() ?? 1, 1)
+                let worst = zip(lhs, rhs).map { abs($0 - $1) }.max() ?? 0
+                return (worst, Double(worst / scale))
+            }
+            for position in sampledPositions.sorted() {
+                guard let a = baseline.sampledLogits[position],
+                      let b = shipped.sampledLogits[position] else { continue }
+                let argmaxA = a.enumerated().max { $0.element < $1.element }?.offset
+                let argmaxB = b.enumerated().max { $0.element < $1.element }?.offset
+                XCTAssertEqual(
+                    argmaxA, argmaxB,
+                    "the greedy token at position \(position) changed with the kernel form"
+                )
+            }
+            let drift = worstRelative(baseline.lastLogits, shipped.lastLogits)
+            let controlDrift = worstRelative(control.lastLogits, shipped.lastLogits)
+            print(
+                String(
+                    format: "🔎 [dsv41 real] answer control: one-chain vs shipped %.2e absolute "
+                        + "(%.2e relative), 512 vs shipped %.2e absolute (%.2e relative), "
+                        + "ratio %.1fx",
+                    drift.absolute,
+                    drift.relative,
+                    controlDrift.absolute,
+                    controlDrift.relative,
+                    controlDrift.relative > 0 ? drift.relative / controlDrift.relative : 0
+                )
+            )
+
+            // The projection's OWN arithmetic at layer 0, where a lane-width change can
+            // be read before forty layers amplify it.
+            guard let device = MTLCreateSystemDefaultDevice() else {
+                XCTFail("no Metal device for the coefficient probes")
+                return
+            }
+            guard let attentionProbe = device.makeBuffer(
+                      length: mixCount * MemoryLayout<Float>.stride,
+                      options: .storageModeShared
+                  ),
+                  let feedForwardProbe = device.makeBuffer(
+                      length: mixCount * MemoryLayout<Float>.stride,
+                      options: .storageModeShared
+                  ) else {
+                XCTFail("the coefficient probes did not allocate")
+                return
+            }
+            func floats(_ buffer: MTLBuffer, count: Int) -> [Float] {
+                let pointer = buffer.contents().assumingMemoryBound(to: Float.self)
+                return Array(UnsafeBufferPointer(start: pointer, count: count))
+            }
+            func capturedCoefficients(
+                lanes: Int, oneChain: Bool
+            ) -> ([Float], [Float])? {
+                executor.reset()
+                executor.hyperConnectionLaneWidthOverride = lanes
+                executor.disablesHyperConnectionX4 = oneChain
+                executor.parityProbes = DeepSeekV41ParityProbes(
+                    attentionLogits: attentionProbe,
+                    feedForwardLogits: feedForwardProbe,
+                    hyperConnectionCaptureLayer: 0
+                )
+                do {
+                    _ = try executor.forwardToken(tokens[0], position: 0)
+                } catch {
+                    XCTFail("the coefficient capture refused: \(error)")
+                    return nil
+                }
+                executor.hyperConnectionLaneWidthOverride = 0
+                executor.disablesHyperConnectionX4 = false
+                executor.parityProbes = DeepSeekV41ParityProbes()
+                return (
+                    floats(attentionProbe, count: mixCount),
+                    floats(feedForwardProbe, count: mixCount)
+                )
+            }
+            let baselineCapture = try XCTUnwrap(
+                capturedCoefficients(lanes: 256, oneChain: true),
+                "the one-chain capture did not run"
+            )
+            let shippedCapture = try XCTUnwrap(
+                capturedCoefficients(lanes: 0, oneChain: false), "the shipped capture did not run"
+            )
+            do {
+                let attention = worstRelative(baselineCapture.0, shippedCapture.0)
+                let feedForward = worstRelative(baselineCapture.1, shippedCapture.1)
+                print(
+                    String(
+                        format: "🔎 [dsv41 real] layer-0 coefficient logits: attention "
+                            + "%.2e absolute (%.2e relative of %.2f), FFN %.2e (%.2e of %.2f)",
+                        attention.absolute,
+                        attention.relative,
+                        baselineCapture.0.map(abs).max() ?? 0,
+                        feedForward.absolute,
+                        feedForward.relative,
+                        baselineCapture.1.map(abs).max() ?? 0
+                    )
+                )
+                XCTAssertLessThan(
+                    attention.relative, 1e-5,
+                    "the four-chain form computes a different attention coefficient"
+                )
+                XCTAssertLessThan(
+                    feedForward.relative, 1e-5,
+                    "the four-chain form computes a different FFN coefficient"
+                )
+            }
+
+            XCTAssertEqual(baseline.timing.positions, positions)
+            XCTAssertEqual(shipped.timing.positions, positions)
+            XCTAssertGreaterThan(baseline.attentionCoefficients, 0)
+            XCTAssertGreaterThan(shipped.attentionCoefficients, 0)
+            let before = baseline.attentionCoefficients + baseline.feedForwardCoefficients
+            let after = shipped.attentionCoefficients + shipped.feedForwardCoefficients
+            print(
+                String(
+                    format: "🔎 [dsv41 real] mHC pair %.3f -> %.3f ms/position "
+                        + "(%.2fx, %.3f ms saved; %.1f%% of the baseline's device time); "
+                        + "projection alone (four chains, device-memory split) %.3f, "
+                        + "register split alone (one chain) %.3f",
+                    before,
+                    after,
+                    before / after,
+                    before - after,
+                    (before - after)
+                        / (Double(baseline.timing.frontDeviceNanoseconds
+                            + baseline.timing.mixtureDeviceNanoseconds)
+                            / Double(positions) / 1_000_000) * 100,
+                    projectionOnly.attentionCoefficients + projectionOnly.feedForwardCoefficients,
+                    splitOnly.attentionCoefficients + splitOnly.feedForwardCoefficients
+                )
+            )
+            func coefficients(_ outcome: Outcome) -> Double {
+                outcome.attentionCoefficients + outcome.feedForwardCoefficients
+            }
+            // 80 dispatches per position: the projection and the split, once per
+            // sub-layer, twice per layer, forty layers.
+            let extraProjection = (coefficients(projectionTwice) - coefficients(shipped))
+                / 80 * 1_000
+            let extraProjectionFour = (coefficients(projectionFourTimes) - coefficients(shipped))
+                / (3 * 80) * 1_000
+            let extraSplit = (coefficients(splitTwice) - coefficients(shipped))
+                / 80 * 1_000
+            let oneIteration = (coefficients(sinkhornOne) - coefficients(shipped))
+                / 80 * 1_000
+            let tenIterations = (coefficients(sinkhornTen) - coefficients(shipped))
+                / 80 * 1_000
+            print(
+                String(
+                    format: "🔎 [dsv41 real] in-situ slope per extra dispatch (us): projection "
+                        + "%.2f / %.2f, split %.2f, split at 32 lanes %.2f, Sinkhorn 1 iter "
+                        + "%.2f, 10 iters %.2f; one stage window is %.2f us",
+                    extraProjection,
+                    extraProjectionFour,
+                    extraSplit,
+                    (coefficients(splitWide) - coefficients(shipped)) / 80 * 1_000,
+                    oneIteration,
+                    tenIterations,
+                    coefficients(shipped) / 80 * 1_000
+                )
+            )
+            // The same two knobs in the PRODUCTION layout: one command buffer per half,
+            // no per-stage windows. A per-stage buffer holds one dispatch, so the GPU
+            // may be clocked for that dispatch alone; a turn's buffer holds twenty and
+            // the dense half's own time is what a decode pays. If the split's cost is
+            // still here, it is the chain; if it is not, it is the instrument.
+            let halfShipped = try XCTUnwrap(
+                pass(
+                    "half layout, shipped",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    lanes: 0,
+                    staged: false
+                )
+            )
+            let halfBaseline = try XCTUnwrap(
+                pass(
+                    "half layout, one-chain and device-memory split",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    lanes: 256,
+                    oneChain: true,
+                    splitRegisters: false,
+                    staged: false
+                )
+            )
+            let halfSinkhornOne = try XCTUnwrap(
+                pass(
+                    "half layout, Sinkhorn 1 iteration",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    lanes: 0,
+                    sinkhornIterations: 1,
+                    staged: false
+                )
+            )
+            let halfSplitTwice = try XCTUnwrap(
+                pass(
+                    "half layout, split dispatched twice",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    lanes: 0,
+                    splitRepeats: 2,
+                    staged: false
+                )
+            )
+            func dense(_ outcome: Outcome) -> Double {
+                Double(outcome.timing.frontDeviceNanoseconds)
+                    / Double(positions) / 1_000_000
+            }
+            print(
+                String(
+                    format: "🔎 [dsv41 real] half layout dense half: %.3f ms/position as "
+                        + "shipped, %.3f before #62 (%.3f ms won); Sinkhorn 1 %.3f "
+                        + "(%.3f ms of the dense half is 19 iterations), split x2 %.3f "
+                        + "(one split costs %.2f us in situ)",
+                    dense(halfShipped),
+                    dense(halfBaseline),
+                    dense(halfBaseline) - dense(halfShipped),
+                    dense(halfSinkhornOne),
+                    dense(halfShipped) - dense(halfSinkhornOne),
+                    dense(halfSplitTwice),
+                    (dense(halfSplitTwice) - dense(halfShipped)) / 80 * 1_000
+                )
+            )
+            for (label, outcome) in [
+                ("one-chain, 256", baseline),
+                ("four-chain projection only", projectionOnly),
+                ("register split only", splitOnly),
+                ("four-chain, 512", control),
+                ("shipped", shipped),
+                ("shipped, projection x2", projectionTwice),
+                ("shipped, projection x4", projectionFourTimes),
+                ("shipped, split x2", splitTwice),
+                ("shipped, split 32 lanes", splitWide),
+                ("shipped, Sinkhorn 1", sinkhornOne),
+                ("shipped, Sinkhorn 10", sinkhornTen),
+            ] {
+                let frontNames = Set(DeepSeekV41DevicePlan.frontHalf.map(\.rawValue))
+                let denseTotal = outcome.table
+                    .filter { frontNames.contains($0.stage) }
+                    .reduce(0) { $0 + $1.millisecondsPerPosition }
+                let mixtureTotal = outcome.table
+                    .filter { !frontNames.contains($0.stage) }
+                    .reduce(0) { $0 + $1.millisecondsPerPosition }
+                print(
+                    String(
+                        format: "🔎 [dsv41 real] %@ stage table: %.2f dense, %.2f mixture; "
+                            + "top five %@",
+                        label,
+                        denseTotal,
+                        mixtureTotal,
+                        outcome.table.prefix(5)
+                            .map { String(format: "%@ %.2f", $0.stage, $0.millisecondsPerPosition) }
+                            .joined(separator: ", ") as NSString
+                    )
+                )
+            }
+            runtime.shutdown()
+        }
+        withExtendedLifetime(engine) {}
+    }
+
     /// A page-aligned anonymous mapping this test can wire.
     ///
     /// `mlock` is the only in-process way to tell the kernel a page may be neither

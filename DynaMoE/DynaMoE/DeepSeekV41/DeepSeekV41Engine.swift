@@ -366,7 +366,14 @@ nonisolated public struct DeepSeekV41Pipelines {
     /// The mHC rule: project the flattened stack, split the logits, collapse with a
     /// mix, expand back through `comb`.
     public let hcProject: MTLComputePipelineState
+    /// The four-accumulator form of the projection, which a decode step ships: the
+    /// walk's 24-threadgroup grid has one load in flight per lane without it
+    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #62").
+    public let hcProjectX4: MTLComputePipelineState
     public let hcSplit: MTLComputePipelineState
+    /// The same split with the `mult == 4` Sinkhorn held in registers, which is the
+    /// form a decode step ships (`#62`).
+    public let hcSplitRegs: MTLComputePipelineState
     public let hcPre: MTLComputePipelineState
     public let hcPost: MTLComputePipelineState
     public let hcIdentityMix: MTLComputePipelineState
@@ -428,7 +435,9 @@ nonisolated public struct DeepSeekV41Pipelines {
         self.engramGate = try make("dsv41_engram_gate_f32")
         self.hcSinkhorn = try make("dsv41_hc_sinkhorn")
         self.hcProject = try make("dsv41_hc_project_f32")
+        self.hcProjectX4 = try make("dsv41_hc_project_f32_x4")
         self.hcSplit = try make("dsv41_hc_split_f32")
+        self.hcSplitRegs = try make("dsv41_hc_split_f32_regs")
         self.hcPre = try make("dsv41_hc_pre_f32")
         self.hcPost = try make("dsv41_hc_post_f32")
         self.hcIdentityMix = try make("dsv41_hc_identity_mix_f32")

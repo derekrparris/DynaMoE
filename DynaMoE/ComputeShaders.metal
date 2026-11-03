@@ -9806,6 +9806,95 @@ kernel void dsv41_hc_project_f32(
     }
 }
 
+/// MSL Kernel: the mHC coefficient projection with four independent accumulator
+/// pairs, and the form a decode step ships.
+///
+/// Same bindings and grid as `dsv41_hc_project_f32`, so a caller swaps the
+/// pipeline and nothing else. The difference is the reduction's shape: the
+/// original walks the row with ONE dependent pair of chains (`sumSquares +=`,
+/// `total +=`), so at a WALK's occupancy — the grid is `(2 + mult) * mult` = 24
+/// threadgroups, one per logit — there are ~192 warps and each has one load in
+/// flight. That is 24 KB in flight, which against a ~1 us cold DRAM latency is
+/// 24 GB/s, and `#60` measured the stage at 19.
+///
+/// Four chains give four loads per lane, and a block of positions (192
+/// threadgroups) is already covered by the lanes alone. `#17` measured the same
+/// lesson on the attention kernel (0.820 -> 0.299 ms, 2.74x) and the coalesced
+/// FP8 fused pair carries two chains for it (`#20`). No vector loads: the
+/// checkpoint's `hc_ffn_fn` starts at a shard offset of 12 mod 16, so a `float4`
+/// read is not safe here and the four chains are what buys the memory-level
+/// parallelism instead.
+kernel void dsv41_hc_project_f32_x4(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const float* streamBuffer [[buffer(1)]],
+    device float* logitsBuffer [[buffer(2)]],
+    constant uint64_t& weightOffset [[buffer(3)]],
+    constant float& normEpsilon [[buffer(4)]],
+    constant uint32_t& width [[buffer(5)]],
+    constant uint32_t& outDim [[buffer(6)]],
+    constant uint32_t& slotCount [[buffer(7)]],
+    threadgroup float* partials [[threadgroup(0)]],  // [32] squares, then [32] dots
+    uint groupIdx [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
+) {
+    if (outDim == 0 || width == 0) return;
+    uint row = groupIdx % outDim;
+    uint slot = groupIdx / outDim;
+    if (slot >= slotCount) return;
+    device const float* wPtr = (device const float*)(rawWeightBuffer + weightOffset)
+        + (uint64_t)row * width;
+    device const float* stream = streamBuffer + (uint64_t)slot * width;
+    device float* logits = logitsBuffer + (uint64_t)slot * outDim;
+
+    float squares0 = 0.0f, squares1 = 0.0f, squares2 = 0.0f, squares3 = 0.0f;
+    float total0 = 0.0f, total1 = 0.0f, total2 = 0.0f, total3 = 0.0f;
+    uint32_t stride = laneCount * 4u;
+    uint32_t i = lane;
+    for (; i + 3u * laneCount < width; i += stride) {
+        float value0 = stream[i];
+        float value1 = stream[i + laneCount];
+        float value2 = stream[i + 2u * laneCount];
+        float value3 = stream[i + 3u * laneCount];
+        squares0 += value0 * value0;
+        squares1 += value1 * value1;
+        squares2 += value2 * value2;
+        squares3 += value3 * value3;
+        total0 += wPtr[i] * value0;
+        total1 += wPtr[i + laneCount] * value1;
+        total2 += wPtr[i + 2u * laneCount] * value2;
+        total3 += wPtr[i + 3u * laneCount] * value3;
+    }
+    // The residual row: fewer than four lane-strides left, still one chain because
+    // there is one value per lane at most.
+    for (; i < width; i += laneCount) {
+        float value = stream[i];
+        squares0 += value * value;
+        total0 += wPtr[i] * value;
+    }
+    float sumSquares = (squares0 + squares1) + (squares2 + squares3);
+    float total = (total0 + total1) + (total2 + total3);
+    float warpSquares = simd_sum(sumSquares);
+    float warpTotal = simd_sum(total);
+    if (laneInSimd == 0) {
+        partials[simdIdx] = warpSquares;
+        partials[32 + simdIdx] = warpTotal;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0) {
+        uint32_t simdCount = (laneCount + 31u) / 32u;
+        float squares = 0.0f;
+        float sum = 0.0f;
+        for (uint32_t group = 0; group < simdCount; ++group) {
+            squares += partials[group];
+            sum += partials[32 + group];
+        }
+        logits[row] = sum * rsqrt(squares / (float)width + normEpsilon);
+    }
+}
+
 /// MSL Kernel: the mHC split — `(2 + mult) * mult` logits to `pre`, `post` and
 /// `comb`.
 ///
@@ -9847,6 +9936,127 @@ kernel void dsv41_hc_split_f32(
         post[copy] = 2.0f * (1.0f / (1.0f + exp(-postValue)));
     }
     uint base = 2 * n;
+    for (uint i = 0; i < n * n; ++i) {
+        comb[i] = slotLogits[base + i] * scaleBuffer[2] + baseBuffer[base + i];
+    }
+    dsv41_hc_sinkhorn_into(comb, n, iterations, epsilon);
+}
+
+/// The 4x4 Sinkhorn schedule of `dsv41_hc_sinkhorn_into`, on a REGISTER-resident
+/// matrix.
+///
+/// Every sum is folded in the general helper's order, so this computes the same
+/// coefficients; measured against the device-memory kernel at the checkpoint's 20
+/// iterations the two agree to within ONE ulp of a float (the seed's product+add
+/// rounds once in a register where a store rounds it twice), and the schedule is
+/// contractive. What changes is where the matrix lives: `hc_mult` is 4 on the
+/// published checkpoint, so the schedule is 1 seed pass + 1 column pass + 19
+/// row/column rounds = ~160 passes over 16 values. On a `device float*` those are
+/// dependent 4-byte loads and stores on ONE thread: 3.0 us per iteration, 59 us for
+/// the schedule, 9.7% of a decode's device time (`Benchmarks/PERF_FINDINGS.md`,
+/// "DSV4.1 #62").
+inline void dsv41_hc_sinkhorn4(thread float m[16], uint iterations, float epsilon) {
+    for (uint r = 0; r < 4; ++r) {
+        uint b = r * 4;
+        float rowMax = -1e30f;
+        rowMax = max(rowMax, m[b]);
+        rowMax = max(rowMax, m[b + 1]);
+        rowMax = max(rowMax, m[b + 2]);
+        rowMax = max(rowMax, m[b + 3]);
+        float v0 = exp(m[b] - rowMax);
+        float v1 = exp(m[b + 1] - rowMax);
+        float v2 = exp(m[b + 2] - rowMax);
+        float v3 = exp(m[b + 3] - rowMax);
+        float sum = ((v0 + v1) + v2) + v3;
+        float inverse = sum > 0.0f ? 1.0f / sum : 0.0f;
+        m[b] = v0 * inverse;
+        m[b + 1] = v1 * inverse;
+        m[b + 2] = v2 * inverse;
+        m[b + 3] = v3 * inverse;
+    }
+    for (uint i = 0; i < 16; ++i) m[i] += epsilon;
+    if (iterations == 0) return;
+
+    for (uint c = 0; c < 4; ++c) {
+        float sum = ((m[c] + m[4 + c]) + m[8 + c]) + m[12 + c];
+        float inverse = 1.0f / (sum + epsilon);
+        m[c] *= inverse;
+        m[4 + c] *= inverse;
+        m[8 + c] *= inverse;
+        m[12 + c] *= inverse;
+    }
+    for (uint iteration = 1; iteration < iterations; ++iteration) {
+        for (uint r = 0; r < 4; ++r) {
+            uint b = r * 4;
+            float sum = ((m[b] + m[b + 1]) + m[b + 2]) + m[b + 3];
+            float inverse = 1.0f / (sum + epsilon);
+            m[b] *= inverse;
+            m[b + 1] *= inverse;
+            m[b + 2] *= inverse;
+            m[b + 3] *= inverse;
+        }
+        for (uint c = 0; c < 4; ++c) {
+            float sum = ((m[c] + m[4 + c]) + m[8 + c]) + m[12 + c];
+            float inverse = 1.0f / (sum + epsilon);
+            m[c] *= inverse;
+            m[4 + c] *= inverse;
+            m[8 + c] *= inverse;
+            m[12 + c] *= inverse;
+        }
+    }
+}
+
+/// MSL Kernel: the mHC split with the Sinkhorn held in registers, which is the
+/// form a decode step ships.
+///
+/// Same bindings, grid and arithmetic as `dsv41_hc_split_f32`; the only difference
+/// is the `mult == 4` path, which is a single ulp from the device-memory schedule
+/// (`dsv41_hc_sinkhorn4` says why) and 10-30x cheaper because the matrix stops
+/// making a round trip to device memory per normalization pass. A checkpoint with
+/// another `hc_mult` takes the general helper unchanged.
+kernel void dsv41_hc_split_f32_regs(
+    device const float* logits [[buffer(0)]],
+    device const float* scaleBuffer [[buffer(1)]],   // [3]
+    device const float* baseBuffer [[buffer(2)]],    // [(2 + mult) * mult]
+    device float* preBuffer [[buffer(3)]],           // [slots][mult]
+    device float* postBuffer [[buffer(4)]],          // [slots][mult]
+    device float* combBuffer [[buffer(5)]],          // [slots][mult * mult]
+    constant uint32_t& mult [[buffer(6)]],
+    constant uint32_t& iterations [[buffer(7)]],
+    constant float& epsilon [[buffer(8)]],
+    constant uint32_t& slotCount [[buffer(9)]],
+    uint slot [[thread_position_in_grid]]
+) {
+    if (slot >= slotCount) return;
+    uint n = mult;
+    if (n == 0 || n > 16) return;
+    uint mixCount = (2 + n) * n;
+    device const float* slotLogits = logits + (uint64_t)slot * mixCount;
+    device float* pre = preBuffer + (uint64_t)slot * n;
+    device float* post = postBuffer + (uint64_t)slot * n;
+    device float* comb = combBuffer + (uint64_t)slot * n * n;
+
+    for (uint copy = 0; copy < n; ++copy) {
+        float preValue = slotLogits[copy] * scaleBuffer[0] + baseBuffer[copy];
+        pre[copy] = 1.0f / (1.0f + exp(-preValue)) + epsilon;
+        float postValue = slotLogits[n + copy] * scaleBuffer[1] + baseBuffer[n + copy];
+        post[copy] = 2.0f * (1.0f / (1.0f + exp(-postValue)));
+    }
+    uint base = 2 * n;
+    if (n == 4) {
+        float m[16];
+        // The seed is written in TWO statements on purpose. `a * b + c` in one
+        // expression may be contracted to an FMA, and a fused product is one rounding
+        // where the general helper's store to `comb` is two — which moves the
+        // coefficients by an ulp before the schedule even starts.
+        for (uint i = 0; i < 16; ++i) {
+            float scaled = slotLogits[base + i] * scaleBuffer[2];
+            m[i] = scaled + baseBuffer[base + i];
+        }
+        dsv41_hc_sinkhorn4(m, iterations, epsilon);
+        for (uint i = 0; i < 16; ++i) comb[i] = m[i];
+        return;
+    }
     for (uint i = 0; i < n * n; ++i) {
         comb[i] = slotLogits[base + i] * scaleBuffer[2] + baseBuffer[base + i];
     }

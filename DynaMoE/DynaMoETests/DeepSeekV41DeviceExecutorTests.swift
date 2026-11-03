@@ -2008,6 +2008,136 @@ final class DeepSeekV41HyperConnectionKernelTests: XCTestCase {
             XCTAssertEqual(residual[index], sentinel[index], "residual \(index)")
         }
     }
+
+    /// The register-resident Sinkhorn computes the same split as the device-memory
+    /// one.
+    ///
+    /// `#62` found the split's schedule costing 3.0 us per Sinkhorn iteration and 59 us
+    /// for the checkpoint's twenty, because the 4x4 matrix makes a round trip to device
+    /// memory on every one of ~160 normalization passes, on ONE thread. The replacement
+    /// keeps it in registers and folds every sum in the same order, so the bar is a
+    /// rounding one rather than a tolerance: the seed's product+add rounds once in a
+    /// register where a store rounds it twice, which moves the coefficients by a single
+    /// ulp, and the schedule is contractive afterwards. Both `mult == 4` (the fast path)
+    /// and `mult == 2` (the general helper the kernel falls back to) are checked, and 20
+    /// iterations is the checkpoint's own `hc_sinkhorn_iters`.
+    func testTheRegisterResidentSinkhornComputesTheSameSplit() throws {
+        let (device, library, queue) = try environment()
+        let devicePipeline = try pipeline("dsv41_hc_split_f32", library, device)
+        let registerPipeline = try pipeline("dsv41_hc_split_f32_regs", library, device)
+
+        func run(
+            copies: Int,
+            logits: [Float],
+            scale: [Float],
+            base: [Float],
+            iterations: Int,
+            pipeline: MTLComputePipelineState
+        ) throws -> (pre: [Float], post: [Float], comb: [Float]) {
+            let logitsBuffer = try buffer(device, logits)
+            let scaleBuffer = try buffer(device, scale)
+            let baseBuffer = try buffer(device, base)
+            let preBuffer = try XCTUnwrap(
+                device.makeBuffer(
+                    length: copies * MemoryLayout<Float>.stride, options: .storageModeShared
+                )
+            )
+            let postBuffer = try XCTUnwrap(
+                device.makeBuffer(
+                    length: copies * MemoryLayout<Float>.stride, options: .storageModeShared
+                )
+            )
+            let combBuffer = try XCTUnwrap(
+                device.makeBuffer(
+                    length: copies * copies * MemoryLayout<Float>.stride,
+                    options: .storageModeShared
+                )
+            )
+            let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+            let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(logitsBuffer, offset: 0, index: 0)
+            encoder.setBuffer(scaleBuffer, offset: 0, index: 1)
+            encoder.setBuffer(baseBuffer, offset: 0, index: 2)
+            encoder.setBuffer(preBuffer, offset: 0, index: 3)
+            encoder.setBuffer(postBuffer, offset: 0, index: 4)
+            encoder.setBuffer(combBuffer, offset: 0, index: 5)
+            var mult = UInt32(copies)
+            var schedule = UInt32(iterations)
+            var epsilon: Float = 1e-6
+            var slots: UInt32 = 1
+            encoder.setBytes(&mult, length: 4, index: 6)
+            encoder.setBytes(&schedule, length: 4, index: 7)
+            encoder.setBytes(&epsilon, length: 4, index: 8)
+            encoder.setBytes(&slots, length: 4, index: 9)
+            encoder.dispatchThreads(
+                MTLSize(width: 1, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
+            )
+            encoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            XCTAssertNil(commandBuffer.error)
+            func read(_ buffer: MTLBuffer, _ count: Int) -> [Float] {
+                Array(
+                    UnsafeBufferPointer(
+                        start: buffer.contents().assumingMemoryBound(to: Float.self), count: count
+                    )
+                )
+            }
+            return (
+                read(preBuffer, copies),
+                read(postBuffer, copies),
+                read(combBuffer, copies * copies)
+            )
+        }
+
+        // Deterministic logits with mixed signs, so no row or column is uniform and a
+        // transposed index or a wrong fold order cannot cancel out.
+        func logits(_ count: Int) -> [Float] {
+            (0..<count).map { index in
+                let wave = Float((index * 37) % 23) / 23 - 0.5
+                return wave * 4 + (index % 2 == 0 ? 0.3 : -0.2)
+            }
+        }
+        let scale: [Float] = [0.7, -0.3, 0.5]
+        for copies in [4, 2] {
+            let count = (2 + copies) * copies
+            let base = logits(count).map { $0 * 0.25 }
+            let values = logits(count)
+            for iterations in [0, 1, 3, 20] {
+                let byDevice = try run(
+                    copies: copies, logits: values, scale: scale, base: base,
+                    iterations: iterations, pipeline: devicePipeline
+                )
+                let byRegister = try run(
+                    copies: copies, logits: values, scale: scale, base: base,
+                    iterations: iterations, pipeline: registerPipeline
+                )
+                for index in 0..<copies {
+                    XCTAssertEqual(
+                        byRegister.pre[index], byDevice.pre[index],
+                        accuracy: 1e-6,
+                        "pre \(index) moved at mult \(copies), \(iterations) iteration(s)"
+                    )
+                    XCTAssertEqual(
+                        byRegister.post[index], byDevice.post[index],
+                        accuracy: 1e-6,
+                        "post \(index) moved at mult \(copies), \(iterations) iteration(s)"
+                    )
+                }
+                for index in 0..<(copies * copies) {
+                    // `comb` is a normalized matrix: every value is in (0, 1], so an
+                    // absolute bar is also a relative one.
+                    XCTAssertEqual(
+                        byRegister.comb[index], byDevice.comb[index],
+                        accuracy: 1e-7,
+                        "comb \(index) moved at mult \(copies), \(iterations) iteration(s)"
+                    )
+                }
+            }
+        }
+    }
 }
 
 // MARK: - FP8 block-scaled GEMV forms

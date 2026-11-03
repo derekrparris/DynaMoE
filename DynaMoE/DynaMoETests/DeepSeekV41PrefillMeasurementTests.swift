@@ -1375,35 +1375,46 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
     /// `testWhereABlocksRemainingTimeGoesAtThePublishedWidths` leaves the two
     /// hyper-connection projections as the largest term of a block's dense half, at
     /// 0.74 ms/position between them. The cause is visible in the dispatch rather than
-    /// the traffic: `(2 + mult) * mult` is 24 at `hc_mult` 4, so the kernel runs 24
-    /// threads per position and each one walks a `mult * hidden` = 28,672-wide
-    /// reduction twice, once for the RMS statistic and once for the dot product. That
-    /// is one warp-ish per position against 2.75 MB of weight rows.
+    /// the traffic: `(2 + mult) * mult` is 24 at `hc_mult` 4, so the kernel runs one
+    /// threadgroup per (slot, logit) and each one walks a `mult * hidden`-wide
+    /// reduction twice, once for the RMS statistic and once for the dot product.
     ///
-    /// This times it alone, at that geometry, and checks a few logits against the host
-    /// rule before printing, so the number is never reported for a different
-    /// computation.
+    /// `#9` swept that threadgroup's width at a BLOCK's occupancy and picked 256; `#60`
+    /// then measured the stage at 19 GB/s on a WALK, whose grid is 24 threadgroups and
+    /// not 192. This prices both occupancies, both lane widths and both reduction
+    /// forms — one dependent accumulator pair against four — and checks a few logits
+    /// against the host rule before printing, so the number is never reported for a
+    /// different computation. Each dispatch inside a timed buffer reads the NEXT of 40
+    /// weight regions, so the rate is a real read rather than one region's cache hit.
     func testWhatOneHyperConnectionProjectionCostsAtThePublishedWidths() throws {
         guard let metal = MTLCreateSystemDefaultDevice() else {
             throw XCTSkip("No Metal device")
         }
         guard let library = metal.makeDefaultLibrary(),
-              let function = library.makeFunction(name: "dsv41_hc_project_f32"),
-              let pipeline = try? metal.makeComputePipelineState(function: function),
+              let oneChainFunction = library.makeFunction(name: "dsv41_hc_project_f32"),
+              let fourChainFunction = library.makeFunction(name: "dsv41_hc_project_f32_x4"),
+              let oneChain = try? metal.makeComputePipelineState(function: oneChainFunction),
+              let fourChain = try? metal.makeComputePipelineState(function: fourChainFunction),
               let queue = metal.makeCommandQueue() else {
-            XCTFail("the mHC projection kernel is not in the default library")
+            XCTFail("the mHC projection kernels are not in the default library")
             return
         }
 
-        // The published geometry: hidden 7,168 with four hyper-connection copies, so
-        // the flattened stack is 28,672 wide and the projection has 24 output rows.
+        // The checkpoint's geometry: hidden 5,120 with four hyper-connection copies, so
+        // the flattened stack is 20,480 wide and the projection has 24 output rows.
+        // `#9` measured the synthetic block's 7,168; a walk runs this one.
         let mult = 4
-        let hidden = 7_168
+        let hidden = 5_120
         let width = mult * hidden
         let outDim = (2 + mult) * mult
         // The ceiling `chunkSlots` applies: eight positions per block.
         let slots = 8
         let epsilon: Float = 1e-6
+        // Distinct weight regions, cycled per dispatch. One region re-read twenty times
+        // is served from the cache after the first, which is why `#9`'s table is a
+        // RANKING of forms rather than a rate; 40 regions is 110 MB, close to the 157 MB
+        // of FP32 `hc_*_fn` a position has to read, so the bytes below are a real read.
+        let regions = 40
 
         func sample(_ count: Int, seed: UInt64) -> [Float] {
             var state = seed
@@ -1421,8 +1432,17 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
         }
 
         let weights = sample(outDim * width, seed: 11)
+        // Eight slots is the ceiling `chunkSlots` applies, and one is a decode step.
+        // `#9` swept the LANE width at the block's occupancy and stopped there; `#60`
+        // then found the same kernel a walked position's fifth-largest stage at a
+        // third of the routed experts' rate, which says the walk's grid -- 24
+        // threadgroups, not 192 -- was never in the sweep. Both are now.
+        let slotCounts = [1, slots]
         let stream = sample(slots * width, seed: 12)
-        guard let weightBuffer = buffer(weights),
+        let regionBytes = outDim * width * MemoryLayout<Float>.stride
+        guard let weightBuffer = metal.makeBuffer(
+                  length: regions * regionBytes, options: .storageModeShared
+              ),
               let streamBuffer = buffer(stream),
               let logitsBuffer = metal.makeBuffer(
                   length: slots * outDim * MemoryLayout<Float>.stride,
@@ -1431,17 +1451,28 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
             XCTFail("the mHC projection buffers did not allocate")
             return
         }
+        weights.withUnsafeBytes { source in
+            guard let base = source.baseAddress else { return }
+            for region in 0..<regions {
+                memcpy(weightBuffer.contents() + region * regionBytes, base, regionBytes)
+            }
+        }
         print(
-            "[dsv41 hc] width=\(width) outDim=\(outDim) slots=\(slots) "
-                + "weights=\(weights.count * 4 / 1_048_576) MB"
+            "[dsv41 hc] width=\(width) outDim=\(outDim) "
+                + "weights=\(regionBytes / 1_048_576) MB x \(regions) regions"
         )
 
-        func encode(_ encoder: MTLComputeCommandEncoder) {
+        func encode(
+            _ encoder: MTLComputeCommandEncoder,
+            pipeline: MTLComputePipelineState,
+            slots: Int,
+            region: Int
+        ) {
             encoder.setComputePipelineState(pipeline)
             encoder.setBuffer(weightBuffer, offset: 0, index: 0)
             encoder.setBuffer(streamBuffer, offset: 0, index: 1)
             encoder.setBuffer(logitsBuffer, offset: 0, index: 2)
-            var weightOffset = UInt64(0)
+            var weightOffset = UInt64(region * regionBytes)
             var normEpsilon = epsilon
             var w = UInt32(width)
             var out = UInt32(outDim)
@@ -1452,7 +1483,7 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
             encoder.setBytes(&out, length: 4, index: 6)
             encoder.setBytes(&slotCount, length: 4, index: 7)
         }
-        func dispatch(_ encoder: MTLComputeCommandEncoder, threads: Int) {
+        func dispatch(_ encoder: MTLComputeCommandEncoder, threads: Int, slots: Int) {
             encoder.setThreadgroupMemoryLength(64 * MemoryLayout<Float>.stride, index: 0)
             encoder.dispatchThreadgroups(
                 MTLSize(width: outDim * slots, height: 1, depth: 1),
@@ -1460,66 +1491,104 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
             )
         }
 
-        let repetitions = 20
-        var timings: [(threads: Int, perDispatch: Double)] = []
-        for threads in [32, 64, 128, 256, 512] {
-            var perDispatch = Double.infinity
-            for attempt in 0..<(warmups + repetitions) {
-                guard attempt >= warmups else {
-                    guard let command = queue.makeCommandBuffer(),
-                          let encoder = command.makeComputeCommandEncoder() else { return }
-                    encode(encoder)
-                    dispatch(encoder, threads: threads)
-                    encoder.endEncoding()
-                    command.commit()
-                    command.waitUntilCompleted()
-                    continue
-                }
-                guard let command = queue.makeCommandBuffer(),
-                      let encoder = command.makeComputeCommandEncoder() else { return }
-                encode(encoder)
-                for _ in 0..<repetitions {
-                    dispatch(encoder, threads: threads)
-                }
-                encoder.endEncoding()
-                command.commit()
-                command.waitUntilCompleted()
-                let window = command.gpuEndTime - command.gpuStartTime
-                perDispatch = min(perDispatch, window / Double(repetitions) * 1000)
+        /// One command buffer holding `dispatches` copies of the same dispatch, in
+        /// milliseconds. One dispatch is the whole cost a stage pays; the marginal
+        /// (20 dispatches / 20) is what the KERNEL costs once the buffer is fed, and
+        /// the difference between the two is the launch. Each copy reads the NEXT
+        /// weight region, so the marginal is a real read rather than a cache hit.
+        func window(
+            pipeline: MTLComputePipelineState, slots: Int, threads: Int, dispatches: Int
+        ) -> Double {
+            guard let command = queue.makeCommandBuffer(),
+                  let encoder = command.makeComputeCommandEncoder() else { return .infinity }
+            for index in 0..<dispatches {
+                encode(
+                    encoder, pipeline: pipeline, slots: slots, region: index % regions
+                )
+                dispatch(encoder, threads: threads, slots: slots)
             }
-            timings.append((threads, perDispatch))
+            encoder.endEncoding()
+            command.commit()
+            command.waitUntilCompleted()
+            return (command.gpuEndTime - command.gpuStartTime) * 1000
         }
 
-        // The host rule, for one slot: `rstd` of the flattened stack times the dot of
-        // one weight row with it. Two rows are enough to catch a broken reduction.
-        let logits = floats(logitsBuffer, count: slots * outDim)
-        let slot = 0
-        let stack = Array(stream[(slot * width)..<((slot + 1) * width)])
-        let sumSquares = stack.reduce(0) { $0 + $1 * $1 }
-        let rstd = 1 / (sumSquares / Float(width) + epsilon).squareRoot()
-        for row in [0, 7, 23] {
-            let weightRow = Array(weights[(row * width)..<((row + 1) * width)])
-            var dot: Float = 0
-            for index in 0..<width { dot += weightRow[index] * stack[index] }
-            let expected = dot * rstd
-            let actual = logits[slot * outDim + row]
-            let scale = max(abs(expected), 1e-3)
-            XCTAssertLessThan(
-                abs(actual - expected) / scale,
-                2e-3,
-                "row \(row) disagrees with the host rule"
-            )
+        /// The host rule for one slot: `rstd` of the flattened stack times the dot of
+        /// one weight row with it. Two rows are enough to catch a broken reduction.
+        func check(slots: Int, slot: Int) {
+            let logits = floats(logitsBuffer, count: slots * outDim)
+            let stack = Array(stream[(slot * width)..<((slot + 1) * width)])
+            let sumSquares = stack.reduce(0) { $0 + $1 * $1 }
+            let rstd = 1 / (sumSquares / Float(width) + epsilon).squareRoot()
+            for row in [0, 23] {
+                let weightRow = Array(weights[(row * width)..<((row + 1) * width)])
+                var dot: Float = 0
+                for index in 0..<width { dot += weightRow[index] * stack[index] }
+                let expected = dot * rstd
+                let actual = logits[slot * outDim + row]
+                let scale = max(abs(expected), 1e-3)
+                XCTAssertLessThan(
+                    abs(actual - expected) / scale,
+                    2e-3,
+                    "\(slots) slot(s), slot \(slot), row \(row) disagrees with the host rule"
+                )
+            }
         }
 
-        for (threads, perDispatch) in timings {
+        let repetitions = 20
+        let bytes = Double(regionBytes)
+        var timings: [
+            (form: String, slots: Int, threads: Int, alone: Double, marginal: Double)
+        ] = []
+        for (form, pipeline) in [("one-chain", oneChain), ("four-chain", fourChain)] {
+            for slots in slotCounts {
+                for threads in [64, 128, 256, 512, 1_024] {
+                    // A warm-up pass, then the validation pass, so a sweep can never
+                    // report a fast dispatch that wrote nothing. Both start at region 0,
+                    // which is what the host rule is computed against.
+                    _ = window(
+                        pipeline: pipeline, slots: slots, threads: threads, dispatches: 1
+                    )
+                    _ = window(
+                        pipeline: pipeline, slots: slots, threads: threads, dispatches: 1
+                    )
+                    check(slots: slots, slot: 0)
+                    if slots > 1 { check(slots: slots, slot: slots - 1) }
+                    var alone = Double.infinity
+                    var marginal = Double.infinity
+                    for _ in 0..<5 {
+                        alone = min(
+                            alone,
+                            window(
+                                pipeline: pipeline, slots: slots, threads: threads,
+                                dispatches: 1
+                            )
+                        )
+                        marginal = min(
+                            marginal,
+                            window(
+                                pipeline: pipeline, slots: slots, threads: threads,
+                                dispatches: repetitions
+                            ) / Double(repetitions)
+                        )
+                    }
+                    timings.append((form, slots, threads, alone, marginal))
+                }
+            }
+        }
+
+        for timing in timings {
             print(
                 String(
-                    format: "[dsv41 hc] %4d threads  %8.3f ms/dispatch  %8.3f ms/position "
-                        + "over %d slots",
-                    threads,
-                    perDispatch,
-                    perDispatch / Double(slots),
-                    slots
+                    format: "[dsv41 hc] %@ %d slot(s) %4d lanes  %8.3f ms/alone  "
+                        + "%8.3f ms/marginal  %7.1f GB/s  %8.3f ms/position",
+                    timing.form as NSString,
+                    timing.slots,
+                    timing.threads,
+                    timing.alone,
+                    timing.marginal,
+                    timing.marginal > 0 ? bytes / timing.marginal / 1_048_576 : 0,
+                    timing.marginal / Double(timing.slots)
                 )
             )
         }

@@ -326,6 +326,34 @@ nonisolated public enum DeepSeekV41DevicePlan {
     /// way round (`#20`), and it reduces ONE matrix rather than a fused pair.
     public static let fp8FusedLaneWidth = 32
 
+    /// The lanes the mHC coefficient projection dispatches at, which depends on how
+    /// many threadgroups the grid has.
+    ///
+    /// The projection is `(2 + mult) * mult` = 24 logits over a `mult * hidden` =
+    /// 20,480-wide stack, so a WALK's grid is 24 threadgroups: the machine is covered
+    /// by 24 x `lanes` threads and nothing else is in the buffer. `#9` swept the lane
+    /// width at a BLOCK's occupancy (8 slots = 192 threadgroups) and picked 256, which
+    /// is still the right answer there — with the four-chain form the re-run at the
+    /// checkpoint's 5,120 width is 0.015 ms at 256, 0.014 at 512 and 0.015 at 1,024,
+    /// i.e. flat inside a block's eight-way amortization. One slot is the opposite:
+    /// 0.008 ms at 256 against **0.006 at 1,024**, 240 against 337 GB/s, because 24
+    /// threadgroups of 256 is 6,144 threads and not enough of them to cover a 2 MB
+    /// read's latency, while 24,576 is.
+    ///
+    /// `testWhatOneHyperConnectionProjectionCostsAtThePublishedWidths` is the sweep.
+    /// Its arms cycle 40 distinct weight regions (79 MB, near the 157 MB a position
+    /// reads), so the rate is a read rather than one region's cache hit; the in-situ
+    /// result is `#62`'s `hcAttentionCoefficients` window, which `#60` measured at 4.09
+    /// ms per walked position, i.e. 102 us per layer against 19 GB/s.
+    public static func hyperConnectionLaneWidth(slots: Int) -> Int {
+        slots <= 1 ? 1_024 : 256
+    }
+
+    /// The shared expert's block width and every other constant above were measured on
+    /// one machine; this one errs the same way — a wider threadgroup at a walk costs
+    /// one barrier past 32 SIMD groups and buys 4x the memory-level parallelism.
+    public static let hyperConnectionMaxLaneWidth = 1_024
+
     /// The fused gate+up kernel, or nil when the format's kernel cannot apply the
     /// checkpoint's `swiglu_limit`. The clip is part of the trained function, so a
     /// kernel without it is a wrong answer rather than a rougher approximation.
@@ -727,6 +755,11 @@ nonisolated public struct DeepSeekV41ParityProbes {
     /// `(2 + mult) * mult` logits for each sub-layer's projection.
     public var attentionLogits: MTLBuffer?
     public var feedForwardLogits: MTLBuffer?
+    /// The layer the two coefficient captures are taken at. Nil copies them at every
+    /// layer, which leaves the LAST layer's values — forty layers of amplification
+    /// away from the projection that is being compared. A lane-width or reduction-order
+    /// change has to be read at the layer it happens in.
+    public var hyperConnectionCaptureLayer: Int?
     /// The stack after the attention sub-layer's `hc_post` (`mult * hidden`).
     public var afterAttention: MTLBuffer?
     /// The FFN's normed input (`hidden`), captured at `sharedExpertCaptureLayer`.
@@ -743,6 +776,7 @@ nonisolated public struct DeepSeekV41ParityProbes {
         beforeAttention: MTLBuffer? = nil,
         attentionLogits: MTLBuffer? = nil,
         feedForwardLogits: MTLBuffer? = nil,
+        hyperConnectionCaptureLayer: Int? = nil,
         afterAttention: MTLBuffer? = nil,
         ffnNormed: MTLBuffer? = nil,
         sharedIntermediate: MTLBuffer? = nil,
@@ -751,6 +785,7 @@ nonisolated public struct DeepSeekV41ParityProbes {
         self.beforeAttention = beforeAttention
         self.attentionLogits = attentionLogits
         self.feedForwardLogits = feedForwardLogits
+        self.hyperConnectionCaptureLayer = hyperConnectionCaptureLayer
         self.afterAttention = afterAttention
         self.ffnNormed = ffnNormed
         self.sharedIntermediate = sharedIntermediate
@@ -1731,6 +1766,44 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// so a probe can separate a form's arithmetic from the graph's own sensitivity to
     /// a rounding-level difference, which no single A/B can.
     public var fp8FusedLaneWidthOverride = 0
+
+    /// Measurement only: the lane width the mHC coefficient projection dispatches at,
+    /// or 0 for the shipped `DeepSeekV41DevicePlan.hyperConnectionLaneWidth`. A walk's
+    /// 24-threadgroup grid and a block's 192 want different widths, so a probe has to
+    /// be able to hold one while varying the other.
+    public var hyperConnectionLaneWidthOverride = 0
+
+    /// Measurement only: refuses the mHC projection's four-accumulator form, so a
+    /// probe can time the one-chain reduction on the same runtime over the same token
+    /// stream. Off in every production path.
+    public var disablesHyperConnectionX4 = false
+
+    /// Measurement only: how many times a stage repeats the mHC projection's dispatch
+    /// (1 in every production path). Two identical dispatches write the same logits, so
+    /// the graph's answer is unchanged and the slope of the stage window IS the
+    /// in-situ cost of one dispatch — the number an isolated kernel table cannot give,
+    /// because in situ the read competes with everything else a walk streams.
+    public var hyperConnectionProjectionRepeats = 1
+
+    /// Measurement only: the same repeats for the mHC split, which is ONE thread per
+    /// position running a 20-iteration Sinkhorn. Its slope is what a stage window
+    /// spends on that chain rather than on the 2 MB projection beside it.
+    public var hyperConnectionSplitRepeats = 1
+
+    /// Measurement only: the lane count the mHC split dispatches at, or 0 for the
+    /// shipped `max(1, min(32, slots))`. A walk hands it one thread, so the grid is a
+    /// single lane on a single core; this separates "the chain is long" from "one
+    /// threadgroup of one lane is a cheap dispatch".
+    public var hyperConnectionSplitLanesOverride = 0
+
+    /// Measurement only: the Sinkhorn iterations the split runs, or nil for the
+    /// checkpoint's. The schedule is serial, so the cost should scale with this; the
+    /// probe uses it to price one iteration of the chain.
+    public var hyperConnectionSinkhornIterationsOverride: Int?
+
+    /// Measurement only: refuses the split's register-resident Sinkhorn, so a probe
+    /// can time the device-memory schedule it replaces. Off in every production path.
+    public var disablesHyperConnectionSplitRegisters = false
 
     /// Where a walked position's idle time sits, buffer by buffer. Off by default and
     /// off in every production path: it retains a timeline entry per committed buffer.
@@ -5477,16 +5550,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// become.
     private static let attentionReductionSlots = 32
 
-    /// Threads the mHC coefficient projection's reduction runs on.
-    ///
-    /// The kernel gives a threadgroup one (slot, logit) pair and strides the
-    /// `mult * hidden` reduction across its lanes, so this is the parallelism one
-    /// logit gets. The published reduction is 28,672 wide, which leaves every lane
-    /// eight values at 256 threads, and the accumulators are two floats.
-    private static let hyperConnectionThreadgroupWidth = 256
-
     /// Partials the mHC projection's reduction writes: one slot per SIMD group, for
-    /// the squares and for the dot product.
+    /// the squares and for the dot product. Sized for the widest threadgroup
+    /// `DeepSeekV41DevicePlan.hyperConnectionMaxLaneWidth` allows, which is why that
+    /// constant is 1,024 and not more.
     private static let hyperConnectionReductionSlots = 32
 
     /// Lanes one output row of a BF16 projection's reduction runs on, when the row
@@ -6409,7 +6476,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             throw DeepSeekV41EngineError.missingTensor(base.rawValue)
         }
 
-        encoder.setComputePipelineState(pipelines.hcProject)
+        encoder.setComputePipelineState(
+            disablesHyperConnectionX4 ? pipelines.hcProject : pipelines.hcProjectX4
+        )
         encoder.setBuffer(buffer, offset: 0, index: 0)
         encoder.setBuffer(workspace.streams, offset: 0, index: 1)
         encoder.setBuffer(workspace.hcLogits, offset: 0, index: 2)
@@ -6426,19 +6495,34 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         // One threadgroup per (slot, logit), because the reduction is the work: the
         // output is only `(2 + mult) * mult` rows, so a thread per row left each
         // position on a single warp while it walked `mult * hidden` values twice
-        // (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #9").
+        // (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #9"). How many lanes that threadgroup
+        // gets depends on how many of them the grid has: a walk's 24 against a block's
+        // 192 (`hyperConnectionLaneWidth`).
+        let laneWidth = hyperConnectionLaneWidthOverride > 0
+            ? hyperConnectionLaneWidthOverride
+            : DeepSeekV41DevicePlan.hyperConnectionLaneWidth(slots: slots)
+        let lanes = max(
+            32,
+            min(
+                laneWidth,
+                DeepSeekV41DevicePlan.hyperConnectionMaxLaneWidth,
+                pipelines.hcProject.maxTotalThreadsPerThreadgroup
+            )
+        )
         encoder.setThreadgroupMemoryLength(
             Self.hyperConnectionReductionSlots * 2 * MemoryLayout<Float>.stride, index: 0
         )
-        encoder.dispatchThreadgroups(
-            MTLSize(width: mixCount * slots, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(
-                width: Self.hyperConnectionThreadgroupWidth, height: 1, depth: 1
+        for _ in 0..<max(1, hyperConnectionProjectionRepeats) {
+            encoder.dispatchThreadgroups(
+                MTLSize(width: mixCount * slots, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
             )
-        )
+        }
         encoder.memoryBarrier(scope: .buffers)
 
-        encoder.setComputePipelineState(pipelines.hcSplit)
+        encoder.setComputePipelineState(
+            disablesHyperConnectionSplitRegisters ? pipelines.hcSplit : pipelines.hcSplitRegs
+        )
         encoder.setBuffer(workspace.hcLogits, offset: 0, index: 0)
         encoder.setBuffer(scaleBuffer, offset: 0, index: 1)
         encoder.setBuffer(baseBuffer, offset: 0, index: 2)
@@ -6446,7 +6530,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         encoder.setBuffer(post, offset: 0, index: 4)
         encoder.setBuffer(comb, offset: 0, index: 5)
         var copies = UInt32(mult)
-        var iterations = UInt32(max(0, config.hcSinkhornIterations))
+        var iterations = UInt32(
+            max(0, hyperConnectionSinkhornIterationsOverride ?? config.hcSinkhornIterations)
+        )
         var epsilon = config.hcEps
         encoder.setBytes(&copies, length: 4, index: 6)
         encoder.setBytes(&iterations, length: 4, index: 7)
@@ -6454,14 +6540,23 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         encoder.setBytes(&slotCount, length: 4, index: 9)
         // One thread per position: `hc_mult` is 4 and the schedule is serial, so a
         // slot's chain cannot be split, but a block's slots run concurrently.
-        encoder.dispatchThreads(
-            MTLSize(width: slots, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: max(1, min(32, slots)), height: 1, depth: 1)
-        )
+        let splitLanes = hyperConnectionSplitLanesOverride > 0
+            ? hyperConnectionSplitLanesOverride
+            : max(1, min(32, slots))
+        for _ in 0..<max(1, hyperConnectionSplitRepeats) {
+            encoder.dispatchThreads(
+                MTLSize(width: slots, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: splitLanes, height: 1, depth: 1)
+            )
+        }
         encoder.memoryBarrier(scope: .buffers)
 
-        // The probe is a single-position diagnostic, so it reads the first slot.
-        if let probe = function == .hcAttnFn
+        // The probe is a single-position diagnostic, so it reads the first slot. An
+        // unset capture layer means every layer.
+        let capturesHere = parityProbes.hyperConnectionCaptureLayer.map { $0 == layer }
+            ?? (parityProbes.attentionLogits != nil || parityProbes.feedForwardLogits != nil)
+        if capturesHere,
+           let probe = function == .hcAttnFn
             ? parityProbes.attentionLogits
             : parityProbes.feedForwardLogits {
             try encodeCopy(encoder, from: workspace.hcLogits, to: probe, count: mixCount)

@@ -10079,3 +10079,197 @@ Production code changed: two kernels, two pipelines, `DeepSeekV41Kernels`, the s
 `fp8FusedLaneWidth` plan constant, and two measurement-only seams on the executor
 (`disablesFP8FusedRows`, `fp8FusedLaneWidthOverride`) plus three `DeepSeekV41ParityProbes` fields,
 all off in every production path.
+## DSV4.1 #62: THE mHC PAIR WAS A ONE-THREAD SINKHORN, NOT A PROJECTION (7.0x)
+
+`#60` attributed a walked position and left the two hyper-connection coefficient stages as the
+largest items not at the machine's ceiling: `hcAttentionCoefficients` 4.09 ms/position and
+`hcFFNCoefficients` 3.37, i.e. 102 us per layer for a 1.97 MB FP32 weight read, **19 GB/s** where
+the dense GEMVs run at 332-397 and the routed experts at 352. `#61` then closed the shared expert,
+which ranked above them, so this pair was what was left.
+
+It is TWO dispatches, and `#60` never separated them: `dsv41_hc_project_f32` (one threadgroup per
+(slot, logit), 24 of them at a walk) and `dsv41_hc_split_f32` (ONE thread per position, running the
+checkpoint's twenty Sinkhorn iterations over a 4x4 matrix). This slice prices each half.
+
+### The run
+
+One runtime through the app's own loading path, one 128-position token stream (the `#52`-`#61`
+text, one rotation), the shipping frequency rule, `-O`, the shipped 65.84 GB arena. A warm-up pass
+is discarded and the measured arms share the arena, as in `#59`-`#61`. Every arm repeats the SAME
+walk; the only difference is which kernel a stage dispatches.
+
+### The projection, isolated
+
+`testWhatOneHyperConnectionProjectionCostsAtThePublishedWidths`, re-run at the checkpoint's own
+geometry (hidden 5,120, `hc_mult` 4, so a 20,480-wide reduction and 24 logits) and with **40
+distinct weight regions cycled per dispatch** (79 MB, close to the 157 MB a position reads), so the
+rate is a read rather than one region's cache hit. Best of five, both forms self-checked against
+the host rule before printing; `ms/marginal` is 20 dispatches in one buffer over 20, i.e. the
+kernel, and `ms/alone` is one dispatch, i.e. kernel plus launch:
+
+| lanes | one chain, 1 slot | four chains, 1 slot | one chain, 8 slots | four chains, 8 slots |
+|---:|---:|---:|---:|---:|
+| 64 | 0.091 ms (21 GB/s) | 0.023 (81) | 0.075 | 0.023 |
+| 128 | 0.040 (47) | 0.013 (145) | 0.039 | 0.016 |
+| 256 | 0.022 (87) | 0.008 (240) | 0.021 | **0.015** |
+| 512 | 0.012 (154) | **0.006 (335)** | 0.018 | 0.014 |
+| 1,024 | 0.008 (234) | **0.006 (337)** | 0.019 | 0.015 |
+
+Two things fall out. At a WALK's occupancy (one slot = 24 threadgroups) the projection is
+0.022 ms one-chain at 256 lanes and 0.006 with four independent accumulator pairs at 512-1,024 —
+**3.7x**, and both halves of that are real (four chains alone is 2.75x at 256 lanes; 1,024 lanes
+alone is 2.75x with one chain) because each buys memory-level parallelism and the second buys less
+once the first is in. At a BLOCK's occupancy (eight slots = 192 threadgroups) four chains are worth
+1.4x and the width is flat — 0.015 ms at 256, 0.014 at 512, 0.015 at 1,024, inside a block's
+eight-way amortization — so 256 stays. **The lane width is a property of the grid, not of the
+kernel**: `hyperConnectionLaneWidth(slots:)` is 1,024 for a walk and 256 for a block.
+
+### The split, in situ
+
+An isolated table cannot price this one honestly, so the split is measured where it runs: a
+*repeat* of its dispatch (idempotent — it writes the same `pre`/`post`/`comb` twice, so the
+graph's answer cannot move) makes the slope of the stage window the dispatch's in-situ cost. The
+same trick on the projection, and on the Sinkhorn's iteration count, separates the chain from the
+launch:
+
+| what | slope per extra dispatch |
+|---|---:|
+| the projection, four chains | 5.0-7.4 us |
+| the split, device-memory Sinkhorn | **75.7 us** |
+| the split, register Sinkhorn (shipped) | 3.3 us |
+| the split at 32 lanes instead of 1 | -0.03 us (nothing) |
+| one Sinkhorn iteration instead of 20 (device-memory form) | 16.8 us for the window (a stage is 73.8) |
+
+So the 20-iteration schedule was 3.0 us per iteration and 59 us of a 74 us stage: the 4x4 matrix
+lives in a `device float*`, so each of the schedule's ~160 normalization passes is a chain of
+dependent 4-byte loads and stores on ONE thread. A threadgroup width of 32 rather than 1 changes
+nothing, which is what says it is the chain and not the dispatch.
+
+**The fix.** `dsv41_hc_split_f32_regs` holds the matrix in REGISTERS for the `mult == 4` path
+(`dsv41_hc_sinkhorn4`, every sum folded in the general helper's order), and falls back to the
+general helper for any other `hc_mult`. `dsv41_hc_project_f32_x4` adds the four accumulator pairs,
+and the lane width comes from the plan above.
+
+### In situ, the pair
+
+Milliseconds per walked position; the pair is 80 dispatches (a projection and a split, once per
+sub-layer, twice per layer, forty layers); all arms under `recordsWalkStageTiming`:
+
+| arm | hcAttn | hcFFN | pair | device |
+|---|---:|---:|---:|---:|
+| one chain, 256 lanes, device-memory split (what shipped) | 4.164 | 3.426 | **7.590** | 49.8 |
+| four chains, 256, device-memory split | 3.413 | 2.732 | 6.145 | 48.7 |
+| one chain, 256, register split | 1.636 | 1.284 | 2.920 | 45.7 |
+| four chains, 512, register split | 0.535 | 0.527 | 1.063 | 43.1 |
+| four chains, 1,024, register split (shipped) | 0.539 | 0.544 | **1.084** | 43.2 |
+
+**7.590 -> 1.084 ms/position: 7.00x, 6.506 ms saved, 13.1% of the one-chain arm's device time.**
+The baseline reproduces `#60`'s 7.48 within half a percent. The two changes are strongly
+interacting — each is worth less than half alone (6.145 and 2.920) because the projection is only
+visible once the Sinkhorn stops dominating, and the register split only shows its full value once
+the projection stops dominating. A stage window is now 13.55 us: ~6 projection, ~4 split, ~4 fixed.
+
+**The production layout agrees**, which is the number that matters: in the arm that commits one
+command buffer per half (no per-stage windows, the layout a turn runs), the dense half goes from
+**28.626 to 23.044 ms/position, 5.582 ms won**, i.e. 86% of the stage-window figure. Of that,
+`Sinkhorn 1 iteration` is only 0.166 ms cheaper than 20 — the chain is gone — and a repeated split
+costs 4.12 us, which is what the register form is worth per dispatch in situ.
+
+### The answer was checked three ways
+
+1. *The projection's own arithmetic on real activations.* `DeepSeekV41ParityProbes` grew
+   `hyperConnectionCaptureLayer` (the coefficient probes previously copied at EVERY layer, so they
+   reported the last layer's values, forty layers of amplification away from the projection being
+   compared). At layer 0 the two arms' logits differ by 3.05e-05 absolute of 374.35 (**8.15e-08
+   relative**) for the attention sub-layer and 2.67e-05 of 155.79 (**1.71e-07**) for the FFN,
+   against a 1e-5 bar.
+2. *A reduction-tree control.* The shipped form against the same kernels at 512 lanes drifts
+   2.17e-04 relative at the last position; the old form drifts 7.83e-04, 3.6x more, and that is
+   the OLD form's error — one dependent chain over 80 blocks where a threadgroup sums a shallow
+   tree.
+3. *The decision itself.* The greedy token is identical at every sampled position of the stream
+   (0, 1, 2, 3, 7, 15, 31, 63, 127).
+
+The split itself is pinned without the checkpoint:
+`DeepSeekV41HyperConnectionKernelTests.testTheRegisterResidentSinkhornComputesTheSameSplit` runs
+both kernels over the same logits at `mult` 4 (the fast path) and 2 (the fallback) and at 0, 1, 3
+and 20 iterations, and requires agreement to 1e-7 on a normalized matrix — the register form is one
+ulp from the device form because the seed's product+add rounds once in a register where a store
+rounds it twice, and the schedule is contractive after that. The projection's general path keeps
+its agreement with `DeepSeekV41HyperConnections` through
+`testProjectionAndSplitMatchTheHostRule`, and both forms are checked against the host rule inside
+the measurement case before it prints.
+
+### What it says
+
+- **The pair's cost was never the projection.** 76 of the 102 us per layer was a Sinkhorn over
+  SIXTEEN numbers, executed by one thread, keeping its matrix in device memory. `#60` called the
+  pair "latency-bound rather than bandwidth-bound" and was right for a reason nobody had priced:
+  not the dispatch count, not the grid, but ~160 dependent device round trips per position.
+- **The projection still needed its own fix, and its cross-over is occupancy.** 24 threadgroups is
+  not enough lanes to cover a 2 MB read's latency, so a walk wants the widest threadgroup it can
+  get and four independent chains, while a block (192 threadgroups) is already covered and prefers
+  256 lanes. `#9`'s lane table was a correct table of a block.
+- **The stage table is a table of the graph, and the production layout agrees with it to 86%.** The
+  remaining 14% is the per-stage buffer boundary `#60` priced at ~5 us.
+- **What is left of a walked position is now the routed mixture and the router.** After this:
+  routedExperts 11.95 (at 352 GB/s), queryUp 4.29 and outputDown 4.16 (at 332-397), sharedExpert
+  4.06 (at the ceiling since `#61`), **router 3.64** — and the mHC pair, which used to be second,
+  is now 1.08 and out of the top five. `router` is the last large item that is not at the ceiling:
+  90 us per layer for a 3.93 MB BF16 GEMV plus a serial top-k scan, i.e. 44 GB/s where the same
+  bytes in `queryUp` run at 397.
+
+### What it is not (do not re-propose)
+
+- **Not a case for the projection's shape.** Four chains and 1,024 lanes are shipped; the sweep
+  above is the record and a block keeps 256 lanes.
+- **Not a case for a wider threadgroup on the split.** 32 lanes instead of 1 measured -0.03 us.
+  The kernel is one thread because the schedule is serial, and that is now correct rather than
+  slow.
+- **Not a case for changing `hc_sinkhorn_iters`.** Twenty is the checkpoint's schedule and the
+  register form makes the other nineteen cost 0.166 ms/position.
+- **Not a dispatch-launch result.** A one-thread dispatch with ONE iteration still costs 16.8 us of
+  window, so the launch/fixed part is ~14 us and the chain was 59.
+- **Not the per-stage instrument.** The one-buffer-per-half arm wins 5.582 of the 6.506.
+- **Not an arena, fill, page-cache or prompt result.** The arena is the shipped one and the policy
+  is the shipping rule; the arms' reads differ by up to 8 GB per position because a rounding-level
+  change occasionally flips a routing decision (`35.1` on the baseline arm against `27.3` on the
+  shipped one), so the walls are NOT compared across arms. Only the stage windows and the device
+  halves are results.
+- **Not a wide-block or batched-verify argument.** A block already amortized this stage (one
+  dispatch per eight positions); this is a decode-shaped fix measured on a decode.
+
+### Verification
+
+`testWhatTheHyperConnectionProjectionAndSplitAreWorthToAWalk` in `DeepSeekV41PublishedTurnTests`,
+opt-in (`/tmp/dynamoe_dsv41_hcwalk_stage` plus the class's own `/tmp/dynamoe_dsv41_real_turn`),
+~3 min at `-O` because it runs fifteen arms. It asserts the layer-0 coefficient equivalence, the
+greedy token at every sampled position, that both instruments covered all 128 positions, and that
+the stage table names both coefficient stages. Runs: `/tmp/test62_walk4.log` (the one tabulated
+above, 7.590 -> 1.084, dense half 28.626 -> 23.044) and `/tmp/test62_walk5.log`, an independent
+reproduction after the doc edits (7.607 -> 1.073, 7.09x, dense half 28.697 -> 23.059, the same
+8.15e-08 / 1.71e-07 layer-0 equivalence and the same 7.83e-04 / 2.17e-04 answer control), with
+`/tmp/test62_walk2.log` and `/tmp/test62_walk3.log` as the instrument's own development (the repeat
+slopes and the Sinkhorn-iteration sweep against the device-memory split).
+The isolated form sweep is
+`DeepSeekV41PrefillMeasurementTests.testWhatOneHyperConnectionProjectionCostsAtThePublishedWidths`
+(opt-in, `/tmp/dynamoe_dsv41_prefill_measure`, 0.16 s): `/tmp/test62_hc2.log`. The kernels are
+pinned without the checkpoint by
+`DeepSeekV41HyperConnectionKernelTests.testTheRegisterResidentSinkhornComputesTheSameSplit`
+(`/tmp/test62_kernels3.log`).
+
+The full `DynaMoETests` target ran 1,491 tests with 95 skipped and 30 failures in 117.5 s on the
+`-O` build: every `DeepSeekV41*` suite passed (594 cases, 0 failures), and the 13 failed cases are
+exactly the pre-existing environmental set (4 in `DynaMoETests`: help-topic count, Qwen3.8 Flash
+Next forward, tool-discover lifecycle, truncated tool-call recovery; 9
+`ModelDogfoodAndPrefixCacheTests` prompt/web-fetch/headless-Chrome cases). Run:
+`/tmp/test62_suite1.log`.
+
+Production code changed: two kernels (`dsv41_hc_project_f32_x4`, `dsv41_hc_split_f32_regs` plus the
+inline `dsv41_hc_sinkhorn4`), two pipelines, `DeepSeekV41DevicePlan.hyperConnectionLaneWidth`, the
+selection in `encodeHyperConnectionCoefficients`, and seven measurement-only seams on the executor
+(`disablesHyperConnectionX4`, `hyperConnectionLaneWidthOverride`,
+`hyperConnectionProjectionRepeats`, `hyperConnectionSplitRepeats`,
+`hyperConnectionSplitLanesOverride`, `hyperConnectionSinkhornIterationsOverride`,
+`disablesHyperConnectionSplitRegisters`) plus one `DeepSeekV41ParityProbes` field, all off in every
+production path.
