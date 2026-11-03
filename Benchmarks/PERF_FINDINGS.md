@@ -9539,3 +9539,130 @@ Qwen3.8 Flash Next forward, tool-discover lifecycle, truncated tool-call recover
 the 9 prompt/web-fetch/headless-Chrome cases) plus `ServerQueueLogicTests.testTimedOutTurnKeepsFIFOBarrierForSuccessors`,
 which passes in isolation in 0.24 s and fails only under full-suite load, so it is a timing flake and not
 this change.
+
+## DSV4.1 #58: THE RESIDUAL MISSES ARE THE ARENA'S OWN EVICTIONS -- A WARM PASS RE-READS 54.6-56.7 GB IT ALREADY HAD, AND A FREQUENCY RULE TAKES THAT TO 38.6-39.3
+
+`#57` shipped the residency policy and left one number standing: the wired fill reads at 14.4-14.5
+GB/s, the disk's own 13.6-15.2, with **8.1-8.2 misses per fill** that nothing in the policy moved.
+That made the miss rate the next lever, and `#21` had already closed it -- "the fill is cold-start
+bound, not capacity bound" -- from a 53-position walk whose 3,739 distinct pairs *just* fit the
+3,760 slots. Those two readings are compatible only if a pass's misses are its COMPULSORY working
+set, pairs read once and never needed again, because no replacement rule can remove a read that has
+never happened before. This slice makes that answerable instead of arguable, and the answer is no:
+the cold pass is compulsory, and every warm pass after it is the arena throwing away what it had.
+
+### The instrument
+
+`DeepSeekV41ExpertArena.recordsMissComposition` classifies each miss since the last `reset()` as a
+pair this window had never loaded (`firstTouchMisses`) or one it had loaded and then evicted
+(`refetchMisses`), with `distinctPairs` as the window's working set. It costs one `Set` insert per
+miss and is off in every production path. The two columns are the whole question: the first is the
+floor a perfect oracle would still pay on the same slots, and only the second is what a policy can
+win back. Every arm asserts `firstTouch + refetch == acquisitions - hits` and that the streamer's
+own `fillMisses` equals the arena's, so the decomposition cannot silently miss a miss.
+
+There is a second, policy-free decomposition in the same table: a pass from `arena.reset()` is a
+COLD arena, and a pass without one is the steady state a live turn is in.
+
+### The run
+
+One runtime through the app's own loading path, the `#52`-`#57` 128-position rotated stream, the
+shipped 65.84 GB arena (3,760 slots of 17.9 MB) wired by the shipping policy, and six passes: three
+under LRU and three under frequency, with identical rotations on both sides. Then a seventh and
+eighth pass on a second runtime at a 0.72 arena fraction. `-O`, one process per runtime.
+
+| arm | policy | arena | ms/pos | fill GB/s | read GB | misses | first touch | re-fetch | evictions |
+|---|---|---|---|---|---|---|---|---|---|
+| A1 cold | LRU | 65.84 GB | 126.6 | 10.9 | 87.9 | 5,021 | 4,784 | 237 (4.7%) | 1,261 |
+| A2 warm | LRU | 65.84 GB | **84.2** | 13.8 | 54.6 | 3,117 | 527 | 2,590 (83.1%) | 3,117 |
+| A3 warm | LRU | 65.84 GB | **84.8** | 13.8 | 56.7 | 3,239 | 0 | 3,239 (100%) | 3,239 |
+| C1 cold | frequency | 65.84 GB | 104.3 | 14.5 | 87.9 | 5,022 | 4,784 | 238 (4.7%) | 1,262 |
+| C2 warm | frequency | 65.84 GB | **72.7** | 14.4 | 39.3 | 2,247 | 527 | 1,720 (76.5%) | 2,247 |
+| C3 warm | frequency | 65.84 GB | **73.2** | 14.4 | 38.6 | 2,203 | 0 | 2,203 (100%) | 2,203 |
+| B1 cold | LRU | 81.19 GB | **239.0** | 6.4 | 83.8 | 4,786 | 4,784 | 2 | 149 |
+| B2 warm | LRU | 81.19 GB | 79.5 | 13.1 | 32.4 | 1,852 | 527 | 1,325 (71.5%) | 1,852 |
+
+A1 pays the first pass's slot allocation and `mlock` (2.2 s), which is why its rate is 10.9 against
+the 13.8-14.5 band the passes after it read; that is `#57`'s shape, not a new observation.
+
+### What it says
+
+- **The working set EXCEEDS the arena, and by enough to matter.** A 128-position pass touches 4,784
+  distinct pairs -- 83.8 GB -- against a 3,760-slot arena, 21.4% short. `#21`'s 53-position walk
+  touched 3,739, i.e. it stopped one position short of the regime where capacity starts to bite, and
+  its 0.6-vs-0.72 A/B compared bytes at a position that fit both sizes, so it could not have seen a
+  difference by construction. Quote the working-set column before quoting any capacity conclusion.
+- **A cold pass is compulsory and a policy cannot help it.** 95.3% of A1's misses are first touches
+  (4,784 of 5,021) and the arena's own share of the read is 4.1 GB of 87.9. The frequency rule
+  changes the cold pass by one miss (5,021 against 5,022, 4,784 first touches both), which is also
+  the control that says routing does not consult the arena: the two policies were measured on the
+  same 16,658 acquisitions and the same 4,784 pairs.
+- **A warm pass is almost entirely re-fetches.** 83.1-100% of a warm pass's misses are pairs the
+  arena already held, and A3 is the pure case: a warm arena that has already seen this exact stream
+  re-reads 56.7 GB with **zero** first touches. The arena is not cold, it is thrashing. That is what
+  the 8.1-8.2 misses per fill `#57` left standing actually is.
+- **Capacity fixes the re-fetches, and costs more than they are worth.** At 4,637 slots the cold
+  pass's re-fetch column collapses from 237 to 2 and its evictions from 1,261 to 149, and a warm
+  pass reads 32.4 GB against 54.6. But `mlock` took the whole 81.19 GB with **zero refusals** and
+  left the machine with **0 GB free**, so the cold pass fell to 6.4 GB/s with 1.91M decompressions
+  and 239.0 ms/position against the shipped arena's 126.6 -- everything the process did not wire
+  (the 10.95 GB dense pin, the shard mappings, the workspace) became compressor input. The 40% read
+  win is real and the wall-clock win is 4.7 ms/position, against a 112 ms/position loss on the pass
+  that fills it. The static `wireBudgetBytes` gate granted it, correctly: the bytes do fit. What
+  does not is everything else the machine was holding.
+- **The replacement rule is the cheap lever, and it wins.** At the SAME 3,760 slots and the same
+  stream, frequency takes a warm pass from 84.2-84.8 to 72.7-73.2 ms/position (-13.7%) and its read
+  from 54.6-56.7 GB to 38.6-39.3 (-28%). It is cheaper than capacity on both count and time: 72.7
+  ms/position at 65.84 GB beats 79.5 at 81.19 GB, with no extra memory and no slower first pass.
+- **The rule is what LRU cannot know.** A pass touches its 4,784 pairs 3.5 times each on average, so
+  the recurring set is exactly the one with a count above one. LRU sees only recency, so a singleton
+  evicts a pair this layer-block will want again; frequency evicts the lowest count and breaks ties
+  by LRU, and a capacity-worth of misses halves every count so a stale hot pair is retired instead
+  of pinned forever. 2,203-2,247 misses remain at 3,760 slots, i.e. 1,024 pairs cannot fit whoever
+  chooses the victim -- the floor a policy is measured against.
+
+### What it is not (do not re-propose)
+
+- Not the disk, the page cache, the read form, the fan-out, `F_NOCACHE`, the block width, the
+  command queue or the attention: every arm filled at 13.1-14.5 GB/s in its steady state, at the
+  disk's own rate, and `#51` closed the forms.
+- Not the prompt: both cold passes touched the same 4,784 pairs on the same stream, and the warm
+  passes are the same two rotations.
+- Not a bigger arena by default. The capacity win exists and is measured here, and so is its price;
+  the arena fraction stays at 0.6 and `dynamoe_dsv41_arena_fraction` remains the debug seam.
+- Not a memory-pressure valve, a partial wiring policy, or arena eviction measured without a
+  working-set column: `#56`/`#57` still say why, and this slice says why the column is mandatory.
+- Not `mlock` refusing: the wider arena locked all 81.19 GB with zero refusals. The policy did its
+  job; the machine had nothing left for anything else.
+
+### Verification
+
+`testWhatTheResidualMissesAreMadeOf` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_miss_composition`, plus the class's own `/tmp/dynamoe_dsv41_real_turn`), 126 s
+at `-O` for six passes and two runtime builds. It asserts the decomposition covers every miss and
+matches the streamer, that both cold passes touched an identical working set, that the shipped
+regime's warm passes read above 8 GB/s, and that the wider arena stayed wired with no refusal.
+`DeepSeekV41ExpertArenaTests` pins the policy without a checkpoint: frequency keeps the pair it has
+seen more often, the tie-break among equals is still LRU, aging retires a pair nothing has touched
+since, frequency is the default, and the composition counters classify once each and reset with the
+arena. Runs: `/tmp/test58_probe1.log` (the decomposition), `/tmp/test58_probe2.log` and
+`/tmp/test58_probe3.log` (with residency and the policy arms) and `/tmp/test58_probe4.log` (the
+paired rotations, the green log). Every run used `touch` and `rm -f` in the same command and no
+marker survived any of them.
+
+The frequency rule ships as the arena's default; `dynamoe_dsv41_arena_lru` is the debug opt-out, and
+every measurement harness pins LRU explicitly so `#20`-`#57`'s tables stay comparable. Shipping it
+was a judgment call the numbers only half settled -- SubQ put "should frequency be the default?" at
+0.58 (mid-band, low confidence) and "should the arena fraction be raised?" at 0.005 -- so the record
+is that the decision was made on the mechanism: the cold pass is provably unaffected, the warm pass
+is 13.7% faster on two rotations in two processes, and the rule cannot change what a slot holds,
+only which pair loses one.
+
+The full `DynaMoETests` target ran 1,478 tests with 90 skipped and 34 failures in 132.6 s; all 98
+`DeepSeekV41*` suites passed with 0 failures, including the six new arena cases and the opt-in probe
+skipped. The 14 failed cases are the pre-existing environmental ones (`DynaMoETests`: help-topic
+count, Qwen3.8 Flash Next forward, tool-discover lifecycle, truncated tool-call recovery;
+`ModelDogfoodAndPrefixCacheTests`: the 9 prompt/web-fetch/headless-Chrome cases) plus
+`ServerQueueLogicTests.testTimedOutTurnKeepsFIFOBarrierForSuccessors` and — new to this run's list —
+`ServerQueueLogicTests.testPerformTimeoutFiresWhileLeaderGateClosed`, both of which pass in isolation
+(13/13 in the suite in 2.8 s) and are timing cases under full-suite load.

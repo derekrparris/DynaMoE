@@ -659,6 +659,20 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         UserDefaults.standard.bool(forKey: wireArenaOffDefaultKey)
     }
 
+    /// `defaults write DRP.DynaMoE dynamoe_dsv41_arena_lru -bool YES`
+    ///
+    /// Debug-only opt-out from the arena's frequency replacement rule. `#58` measured
+    /// the rule on a warm 128-position prefill: 2,190-2,394 misses and 38.3-41.9 GB read
+    /// against LRU's 3,117-3,239 and 54.6-56.7 GB at the same 3,760 slots, i.e. 13-14%
+    /// of the pass. It is on because the cold pass is unaffected -- routing does not
+    /// consult the arena, so a first touch is a miss under any rule -- so this exists to
+    /// get the old order back for an A/B, not to be a setting.
+    public static let arenaLRUDefaultKey = "dynamoe_dsv41_arena_lru"
+
+    public static var arenaLRUForced: Bool {
+        UserDefaults.standard.bool(forKey: arenaLRUDefaultKey)
+    }
+
     private static let initializationError = InitErrorBox()
 
     static func record(_ reason: String) {
@@ -674,7 +688,11 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         cachePrecision: DeepSeekV41CachePrecision = .fp16,
         allowEngramSkip: Bool = false,
         pinDenseWeights: Bool? = nil,
-        wireArena: Bool? = nil
+        wireArena: Bool? = nil,
+        // How much of RAM the expert arena may hold, resolved ahead of the
+        // `dynamoe_dsv41_arena_fraction` seam. `#58` needs two capacities in one
+        // process, one runtime at a time, without writing the developer's defaults.
+        arenaFraction: Double? = nil
     ) {
         guard let plan = try? config.makeLayerPlan() else {
             DeepSeekV41Runtime.record("the per-layer plan could not be built from config.json")
@@ -761,11 +779,15 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
             DeepSeekV41MemoryPlan.affordableExpertSlots(
                 plan: memoryPlan,
                 physicalGB: physicalGB,
-                fraction: DeepSeekV41Runtime.arenaFractionOverride ?? 0.6
+                fraction: arenaFraction ?? DeepSeekV41Runtime.arenaFractionOverride ?? 0.6
             ),
             max(1, config.numRoutedExperts * max(1, config.numHiddenLayers))
         )
         let arena = DeepSeekV41ExpertArena(slotCount: slotCount)
+        // `#58`: a warm pass misses mostly on pairs the arena already loaded and evicted,
+        // so the replacement rule is a lever at a fixed capacity. The frequency rule
+        // ships; this is the one debug seam back to LRU.
+        if DeepSeekV41Runtime.arenaLRUForced { arena.victimPolicy = .leastRecentlyUsed }
 
         // The dense backbone is read in full on every token. Through the shard
         // mappings that is a GPU page fault per 16 KB, and the expert stream

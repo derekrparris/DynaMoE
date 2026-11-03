@@ -1028,6 +1028,129 @@ final class DeepSeekV41ExpertArenaTests: XCTestCase {
         XCTAssertTrue(resident[0].isHit)
         XCTAssertEqual(resident[0].slot, 0)
     }
+
+    /// The counter `#58` decides on: only a pair the arena loaded once and then
+    /// evicted can be win back by a replacement rule. A first touch cannot.
+    func testAMissIsAFirstTouchUntilThePairIsEvictedAndNeededAgain() {
+        let arena = DeepSeekV41ExpertArena(slotCount: 2)
+        XCTAssertEqual(arena.describeMisses().hasPrefix("miss composition off"), true)
+
+        arena.recordsMissComposition = true
+        _ = arena.acquire([(layer: 0, expert: 0), (layer: 0, expert: 1)])
+        XCTAssertEqual(arena.missComposition.firstTouch, 2)
+        XCTAssertEqual(arena.missComposition.refetch, 0)
+        XCTAssertEqual(arena.distinctPairs, 2)
+
+        // A hit is neither: the pair was already here and nothing was read.
+        _ = arena.acquire([(layer: 0, expert: 0)])
+        XCTAssertEqual(arena.missComposition.firstTouch, 2)
+        XCTAssertEqual(arena.missComposition.refetch, 0)
+
+        // Capacity two and expert 0 was just touched, so expert 1 is the victim.
+        _ = arena.acquire([(layer: 0, expert: 2)])
+        XCTAssertEqual(arena.missComposition.firstTouch, 3)
+        XCTAssertEqual(arena.missComposition.refetch, 0)
+        XCTAssertEqual(arena.evictions, 1)
+
+        // Expert 1 comes back: a miss again, but not a first touch. This is the only
+        // kind of miss an eviction policy can ever remove.
+        let again = arena.acquireDetailed([(layer: 0, expert: 1)])
+        XCTAssertFalse(again[0].isHit)
+        XCTAssertEqual(arena.missComposition.firstTouch, 3)
+        XCTAssertEqual(arena.missComposition.refetch, 1)
+        XCTAssertEqual(arena.distinctPairs, 3)
+
+        // The instrument's own arithmetic: every miss is exactly one of the two.
+        XCTAssertEqual(
+            arena.missComposition.firstTouch + arena.missComposition.refetch,
+            arena.acquisitions - arena.hits
+        )
+    }
+
+    func testTheCompositionIsNotRecordedUnlessAsked() {
+        let arena = DeepSeekV41ExpertArena(slotCount: 2)
+        _ = arena.acquire([(layer: 0, expert: 0), (layer: 0, expert: 1), (layer: 0, expert: 2)])
+        XCTAssertEqual(arena.missComposition.firstTouch, 0)
+        XCTAssertEqual(arena.missComposition.refetch, 0)
+        XCTAssertEqual(arena.distinctPairs, 0)
+    }
+
+    /// `#58`: a warm pass misses mostly on pairs the arena already had, so the
+    /// replacement rule is a lever at a FIXED capacity. LRU cannot tell a pair a pass
+    /// touches four times from one it touches once, so the singles evict the recurring
+    /// set; frequency can.
+    func testTheFrequencyPolicyKeepsThePairItHasSeenMoreOften() {
+        // Four slots so one aging round (every `slotCount` misses) fits inside the
+        // setup: A ends the setup on two uses after being halved from four, the three
+        // singles on one.
+        let arena = DeepSeekV41ExpertArena(slotCount: 4)
+        // Frequency is what ships as of `#58`; this case pins the rule it implements.
+        XCTAssertEqual(arena.victimPolicy, .leastFrequentlyUsed)
+
+
+        _ = arena.acquire([(layer: 0, expert: 0)])
+        for _ in 0..<3 { _ = arena.acquire([(layer: 0, expert: 0)]) }
+        _ = arena.acquire([(layer: 0, expert: 1)])
+        _ = arena.acquire([(layer: 0, expert: 2)])
+        _ = arena.acquire([(layer: 0, expert: 3)])
+
+        _ = arena.acquire([(layer: 0, expert: 4)])
+        XCTAssertEqual(arena.evictions, 1)
+        // A is the LEAST recently used of the five and LRU would take it; frequency
+        // takes the oldest of the pairs it has seen once.
+        XCTAssertNotNil(arena.slot(forLayer: 0, expert: 0), "the frequent pair was evicted")
+        XCTAssertNil(arena.slot(forLayer: 0, expert: 1), "the singleton survived")
+        XCTAssertNotNil(arena.slot(forLayer: 0, expert: 4))
+    }
+
+    func testTheFrequencyPolicyStillEvictsTheOldestAmongEqualCounts() {
+        let arena = DeepSeekV41ExpertArena(slotCount: 2)
+        arena.victimPolicy = .leastFrequentlyUsed
+        _ = arena.acquire([(layer: 0, expert: 0)])
+        _ = arena.acquire([(layer: 0, expert: 1)])
+        // Both are on one use; the tie-break has to be the LRU order, not the slot.
+        _ = arena.acquire([(layer: 0, expert: 2)])
+        XCTAssertNil(arena.slot(forLayer: 0, expert: 0))
+        XCTAssertNotNil(arena.slot(forLayer: 0, expert: 1))
+    }
+
+    /// Aging is what keeps the first text a process sees from owning the arena forever:
+    /// counts only ever rise, so without halving a stale hot pair outranks every pair a
+    /// later turn touches once.
+    func testFrequencyAgingRetiresAPairThatStopsBeingUsed() {
+        let arena = DeepSeekV41ExpertArena(slotCount: 2)
+        arena.victimPolicy = .leastFrequentlyUsed
+        _ = arena.acquire([(layer: 0, expert: 0)])
+        for _ in 0..<3 { _ = arena.acquire([(layer: 0, expert: 0)]) }
+        _ = arena.acquire([(layer: 0, expert: 1)])
+
+        // A capacity-worth of misses halves every count, so the stale pair decays from
+        // four to one and then loses the tie-break to everything placed after it.
+        for expert in 2...6 {
+            _ = arena.acquire([(layer: 0, expert: expert)])
+        }
+        XCTAssertNil(
+            arena.slot(forLayer: 0, expert: 0),
+            "a pair nothing has touched since is still pinned by its old count"
+        )
+        XCTAssertNotNil(arena.slot(forLayer: 0, expert: 6))
+    }
+
+    func testResetClearsTheCompositionWithTheResidency() {
+        let arena = DeepSeekV41ExpertArena(slotCount: 2)
+        arena.recordsMissComposition = true
+        _ = arena.acquire([(layer: 0, expert: 0), (layer: 0, expert: 1)])
+        _ = arena.acquire([(layer: 0, expert: 2)])
+        _ = arena.acquire([(layer: 0, expert: 0)])
+        XCTAssertGreaterThan(arena.missComposition.refetch, 0)
+
+        arena.reset()
+        XCTAssertEqual(arena.missComposition.firstTouch, 0)
+        XCTAssertEqual(arena.missComposition.refetch, 0)
+        XCTAssertEqual(arena.distinctPairs, 0)
+        // The flag survives a reset: it describes the instrument, not the window.
+        XCTAssertTrue(arena.recordsMissComposition)
+    }
 }
 
 // MARK: - Hyper-connections

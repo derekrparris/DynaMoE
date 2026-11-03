@@ -225,11 +225,39 @@ nonisolated public enum DeepSeekV41Activation {
 /// where 72 us per pair is what one full scan costs).
 nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
 
+    /// Which resident pair a miss replaces.
+    ///
+    /// `leastRecentlyUsed` is what shipped through `#57`. `#58` measured the regime it
+    /// was never measured in -- a pass whose working set EXCEEDS the arena, 4,784 pairs
+    /// against 3,760 slots -- and in a warm arena 84-100% of misses were pairs the
+    /// arena had already loaded and evicted. LRU cannot tell a pair a pass touches four
+    /// times from one it touches once, so the singletons evict the recurring set and
+    /// the pass re-reads 54.6-56.7 GB it already had. `leastFrequentlyUsed` keeps the
+    /// count on the slot, evicts the lowest count, breaks ties by LRU, and halves every
+    /// count once a capacity-worth of misses has gone by so a stale hot pair is retired
+    /// rather than pinned forever.
+    public enum VictimPolicy: Sendable, Equatable {
+        case leastRecentlyUsed
+        case leastFrequentlyUsed
+    }
+
+    /// The replacement rule. `leastFrequentlyUsed` is what ships as of `#58`, where it
+    /// took a warm pass from 85.1-86.3 to 72.9-74.6 ms/position and its expert read
+    /// from 54.6-56.7 to 38.3-41.9 GB at the same capacity; the runtime pins
+    /// `leastRecentlyUsed` when `dynamoe_dsv41_arena_lru` is set, and the older
+    /// measurement harnesses pin it so their tables stay comparable. A probe can switch
+    /// it mid-run on one arena, which is what makes the A/B a policy change rather than
+    /// a machine change.
+    public var victimPolicy: VictimPolicy = .leastFrequentlyUsed
+
     public struct Slot: Sendable, Equatable {
         public let layer: Int
         public let expert: Int
         /// Monotonic access counter, used only for LRU ordering.
         public let lastUsed: UInt64
+        /// Fills in which this pair was acquired since it was placed, halved as it
+        /// ages. Only `leastFrequentlyUsed` reads it.
+        public let uses: Int
     }
 
     /// The key a slot is owned by. `Hashable` so placement is a lookup instead of a
@@ -254,6 +282,47 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
     public private(set) var acquisitions: Int = 0
     public private(set) var hits: Int = 0
     public private(set) var evictions: Int = 0
+
+    /// Classifies every miss since the last `reset()` into a pair this arena had
+    /// never loaded and a pair it had loaded, evicted, and is loading again.
+    ///
+    /// `#57` left the wired fill disk-bound (14.4 GB/s against the disk's own
+    /// 13.6-15.2) with 8.1-8.2 misses per fill, and `#21` had already said eviction
+    /// was not where a short run's bytes went. The two are consistent only if a
+    /// pass's misses are its COMPULSORY working set -- pairs read once and never
+    /// needed again -- because then no replacement rule can remove them. This
+    /// counter is how that stops being an assumption: `firstTouchMisses` is the
+    /// floor a perfect oracle would still pay, and only the difference
+    /// (`refetchMisses`) is what a policy could win back.
+    ///
+    /// Off in every production path, and the `Set` only grows while it is on:
+    /// classifying a miss costs one hash insert, which is not something a decode
+    /// loop should pay for a number nobody reads.
+    public var recordsMissComposition = false
+    public private(set) var firstTouchMisses = 0
+    public private(set) var refetchMisses = 0
+
+    /// Distinct pairs touched since the last `reset()`, i.e. the pass's working set.
+    ///
+    /// Equal to `firstTouchMisses` by construction -- a pair reaches `placement` only
+    /// on a miss -- and exposed separately because it is the number a capacity
+    /// argument is decided by, not a miss count.
+    public var distinctPairs: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return touchedPairs.count
+    }
+
+    /// `(firstTouch, refetch)` in one locked read.
+    public var missComposition: (firstTouch: Int, refetch: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (firstTouchMisses, refetchMisses)
+    }
+
+    private var touchedPairs: Set<PairKey> = []
+    /// Misses since the frequencies were last halved (`leastFrequentlyUsed`).
+    private var missesSinceAging = 0
 
     public init(slotCount: Int) {
         self.slotCount = max(1, slotCount)
@@ -303,48 +372,101 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
             if let existing = placement[key] {
                 hits += 1
                 counter += 1
-                slots[existing] = Slot(layer: pair.layer, expert: pair.expert, lastUsed: counter)
+                let uses = slots[existing]?.uses ?? 0
+                slots[existing] = Slot(
+                    layer: pair.layer,
+                    expert: pair.expert,
+                    lastUsed: counter,
+                    uses: min(uses + 1, Self.maximumUses)
+                )
                 out.append((slot: existing, isHit: true))
                 continue
+            }
+            if recordsMissComposition {
+                if touchedPairs.insert(key).inserted {
+                    firstTouchMisses += 1
+                } else {
+                    refetchMisses += 1
+                }
             }
             guard let slot = freeSlotOrVictim() else {
                 out.append((slot: 0, isHit: false))
                 continue
             }
             if let victim = slots[slot] {
-                // Evict the least recently used pair, and forget it in the index so a
+                // Evict the pair the policy chose, and forget it in the index so a
                 // later acquire for it is a miss rather than a stale hit.
                 evictions += 1
                 placement.removeValue(forKey: PairKey(layer: victim.layer, expert: victim.expert))
             }
+            if victimPolicy == .leastFrequentlyUsed {
+                missesSinceAging += 1
+                if missesSinceAging >= slotCount { ageFrequencies() }
+            }
             counter += 1
-            slots[slot] = Slot(layer: pair.layer, expert: pair.expert, lastUsed: counter)
+            slots[slot] = Slot(layer: pair.layer, expert: pair.expert, lastUsed: counter, uses: 1)
             placement[key] = slot
             out.append((slot: slot, isHit: false))
         }
         return out
     }
 
-    /// A free slot if there is one, otherwise the least recently used.
+    /// A free slot if there is one, otherwise the victim the policy chooses.
     ///
     /// One pass over the array: a miss used to scan once for a free slot and, when
     /// the arena was full, again for the LRU.
     private func freeSlotOrVictim() -> Int? {
         var free: Int?
-        var oldest: Int?
-        var oldestUsed = UInt64.max
+        var victim: Int?
+        var victimUses = Int.max
+        var victimUsed = UInt64.max
         for candidate in slots.indices {
             guard let slot = slots[candidate] else {
                 if free == nil { free = candidate }
                 continue
             }
-            if slot.lastUsed < oldestUsed {
-                oldestUsed = slot.lastUsed
-                oldest = candidate
+            switch victimPolicy {
+            case .leastRecentlyUsed:
+                if slot.lastUsed < victimUsed {
+                    victimUsed = slot.lastUsed
+                    victim = candidate
+                }
+            case .leastFrequentlyUsed:
+                if slot.uses < victimUses
+                    || (slot.uses == victimUses && slot.lastUsed < victimUsed) {
+                    victimUses = slot.uses
+                    victimUsed = slot.lastUsed
+                    victim = candidate
+                }
             }
         }
-        return free ?? oldest
+        return free ?? victim
     }
+
+    /// Halves every resident pair's count, once a capacity-worth of misses has gone by.
+    ///
+    /// Without it the first text a process sees would own the arena forever: a pair
+    /// touched eight times would outrank every pair a later turn touches once, and the
+    /// count would only ever rise. Halving preserves the ORDER of the counts and lets
+    /// a stale pair decay to the floor in a few capacities' worth of misses, where the
+    /// LRU tie-break retires it. The floor is 1 rather than 0 so a pair that is still
+    /// being touched stays distinguishable from a fresh insert for one more round.
+    private func ageFrequencies() {
+        missesSinceAging = 0
+        for index in slots.indices {
+            guard let slot = slots[index] else { continue }
+            slots[index] = Slot(
+                layer: slot.layer,
+                expert: slot.expert,
+                lastUsed: slot.lastUsed,
+                uses: max(1, slot.uses / 2)
+            )
+        }
+    }
+
+    /// The count `uses` saturates at; a byte would do, and this is the value the
+    /// halving arithmetic is written against.
+    private static let maximumUses = 255
 
     /// Forgets what a slot holds, so the next `acquire` for that pair is a miss.
     ///
@@ -373,9 +495,13 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
         lock.lock()
         slots = Array(repeating: nil, count: slotCount)
         placement.removeAll(keepingCapacity: true)
+        touchedPairs.removeAll(keepingCapacity: true)
         acquisitions = 0
         hits = 0
         evictions = 0
+        firstTouchMisses = 0
+        refetchMisses = 0
+        missesSinceAging = 0
         counter = 0
         lock.unlock()
     }
@@ -386,6 +512,29 @@ nonisolated public final class DeepSeekV41ExpertArena: @unchecked Sendable {
         defer { lock.unlock() }
         guard acquisitions > 0 else { return 0 }
         return Double(hits) / Double(acquisitions)
+    }
+
+    /// One-line miss composition, or the reason there is none (`#58`).
+    public func describeMisses() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        guard recordsMissComposition else {
+            return "miss composition off (set recordsMissComposition)"
+        }
+        let misses = firstTouchMisses + refetchMisses
+        let share = misses > 0 ? 100 * Double(refetchMisses) / Double(misses) : 0
+        return String(
+            format: "%d miss(es): %d first touch (%d distinct pairs of %d slots, %.1f%% of the "
+                + "arena), %d re-fetch (%.1f%% of misses) with %d eviction(s)",
+            misses,
+            firstTouchMisses,
+            touchedPairs.count,
+            slotCount,
+            100 * Double(touchedPairs.count) / Double(max(1, slotCount)),
+            refetchMisses,
+            share,
+            evictions
+        )
     }
 }
 

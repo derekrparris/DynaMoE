@@ -205,7 +205,8 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         config: DeepSeekV41Config,
         contextLength: Int,
         allowEngramSkip: Bool,
-        wireArena: Bool? = false
+        wireArena: Bool? = false,
+        arenaFraction: Double? = nil
     ) throws -> DeepSeekV41Runtime {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw XCTSkip("no Metal device")
@@ -249,13 +250,19 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             shardBuffers: buffers,
             contextLength: contextLength,
             allowEngramSkip: allowEngramSkip,
-            wireArena: wireArena
+            wireArena: wireArena,
+            arenaFraction: arenaFraction
         ) else {
             throw XCTSkip(
                 "the runtime did not build: "
                     + (DeepSeekV41Runtime.lastInitializationError ?? "no reason recorded")
             )
         }
+        // `#58` made the arena's frequency rule the shipping default. Every table in
+        // `#20`-`#57` was taken under LRU, so the harness pins that order unless the
+        // case is measuring the rule itself; a run that silently changed replacement
+        // would move all of them.
+        runtime.arena.victimPolicy = .leastRecentlyUsed
         return runtime
     }
 
@@ -6388,6 +6395,491 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
                 hostMemoryCounters().systemCompressorGB
             )
         )
+        withExtendedLifetime(engine) {}
+    }
+
+    // MARK: - What the misses are made of
+
+    /// Whether the residual expert traffic can be attacked at all.
+    ///
+    /// `#57` shipped the arena's residency policy and left the wired fill at 14.4-14.5
+    /// GB/s, i.e. on the disk's own ceiling, with **8.1-8.2 misses per fill** unchanged
+    /// by anything the policy did. That made the miss rate the next lever, and `#21`
+    /// had already said eviction was not where a short run's bytes went -- the two are
+    /// compatible only if a pass's misses are its COMPULSORY working set, pairs read
+    /// once and never needed again, because no replacement rule can remove a read that
+    /// has not happened before.
+    ///
+    /// That is a question with an exact answer, and it needs no policy: classify each
+    /// miss as a pair this window has not loaded yet or a pair it loaded and then
+    /// evicted (`DeepSeekV41ExpertArena.recordsMissComposition`). The first kind is the
+    /// floor a perfect oracle would still pay; only the second can any policy win back.
+    /// `#54`'s quarter-arena control already hints at the answer -- 1,202 slots missed
+    /// 10,342 times against 5,021 at 3,760 -- so capacity does something, and the
+    /// question is whether it is replacing first touches or re-fetches.
+    ///
+    /// Six passes over `#52`-`#57`'s 128-position stream, all with the shipping arena
+    /// and the shipping residency policy, plus a seventh on a second runtime:
+    ///
+    ///   * `A1` from `arena.reset()`: a COLD arena, i.e. what `#54`-`#57` measured.
+    ///   * `A2` and `A3`, WITHOUT a reset: the steady state a live turn sees, where the
+    ///     arena already holds the previous pass's surviving pairs. If the cold pass's
+    ///     misses were compulsory, a warm pass pays only what the new text touches; if
+    ///     they were re-fetches, the warm pass pays them again.
+    ///   * `C1` from `arena.reset()` and `C2`/`C3` warm, with the arena's replacement
+    ///     rule switched to `leastFrequentlyUsed`: the same arena, the same slots, the
+    ///     same stream. The cold passes are the control -- routing does not consult the
+    ///     arena, so they must touch an identical working set -- and the warm ones are
+    ///     the A/B, because a warm pass is what a live turn pays.
+    ///   * `B1` and `B2` on a runtime built with a 0.72 arena fraction (4,637 slots,
+    ///     81.19 GB): the same two passes at a bigger capacity, which `#21` could not
+    ///     measure because its working set fit both sizes.
+    ///
+    /// Every pass prints the decomposition in absolute terms and the bytes each side is
+    /// worth (`slotBytes` per miss), because "the miss rate" is only actionable if the
+    /// re-fetch column is a meaningful share of 89 GB.
+    ///
+    /// Then a SECOND runtime at a 0.72 arena fraction, one cold pass of the same stream.
+    /// Routing is a deterministic function of the activations, so the compulsory column
+    /// must come out identical and only the re-fetch column can move -- which makes the
+    /// capacity question arithmetic instead of an inference. `#21` compared 0.6 against
+    /// 0.72 and found the bytes identical, but it compared them at a position where the
+    /// working set fit BOTH capacities, so that arm could not see a difference by
+    /// construction.
+    ///
+    /// Opt-in: it reads hundreds of gigabytes and builds two runtimes.
+    ///
+    ///     touch /tmp/dynamoe_dsv41_miss_composition
+    @MainActor
+    func testWhatTheResidualMissesAreMadeOf() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_miss_composition"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in miss composition probe; touch \(markerPath) to run"
+        )
+
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+        func prompt(_ length: Int, rotation: Int) -> [Int] {
+            (0..<length).map { index in
+                let repetition = index / stream.count
+                return stream[(index + repetition * rotation) % stream.count]
+            }
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let positions = 128
+
+        /// What one pass cost and what its misses were made of.
+        struct Outcome {
+            let rate: Double
+            let millisecondsPerPosition: Double
+            let misses: Int
+            let firstTouch: Int
+            let refetch: Int
+            let evictions: Int
+            let bytes: Int
+        }
+
+        /// One prefill of the shipped block path. `resetting` is the only difference
+        /// between the cold and warm arms, so every other counter is comparable.
+        func pass(
+            _ label: String,
+            runtime: DeepSeekV41Runtime,
+            rotation: Int,
+            resetting: Bool
+        ) -> Outcome {
+            let executor = runtime.forward()
+            let arena = runtime.arena
+            guard let streamer = runtime.expertStreamer else {
+                XCTFail("\(label): the runtime has no expert streamer")
+                return Outcome(
+                    rate: 0, millisecondsPerPosition: 0, misses: 0,
+                    firstTouch: 0, refetch: 0, evictions: 0, bytes: 0
+                )
+            }
+            executor.reset()
+            if resetting { arena.reset() }
+            executor.resetBlockTiming()
+            executor.recordsBlockTiming = true
+            // Set after the reset on purpose: the flag describes the instrument, the
+            // counters describe the window (`#58`).
+            arena.recordsMissComposition = true
+            streamer.recordsFillSamples = true
+            streamer.clearFillSamples()
+            let acquisitionsBefore = arena.acquisitions
+            let hitsBefore = arena.hits
+            let evictionsBefore = arena.evictions
+            let compositionBefore = arena.missComposition
+            let residentBefore = arena.residentCount
+            let wiringBefore = streamer.wiringState
+            let before = hostMemoryCounters()
+            let start = DispatchTime.now().uptimeNanoseconds
+            do {
+                _ = try executor.prefillChunk(prompt(positions, rotation: rotation))
+            } catch {
+                XCTFail("\(label) refused: \(error)")
+                executor.recordsBlockTiming = false
+                streamer.recordsFillSamples = false
+                return Outcome(
+                    rate: 0, millisecondsPerPosition: 0, misses: 0,
+                    firstTouch: 0, refetch: 0, evictions: 0, bytes: 0
+                )
+            }
+            let wall = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+            executor.recordsBlockTiming = false
+            let timing = executor.blockTiming
+            let fills = streamer.fillSamples.count
+            streamer.recordsFillSamples = false
+            let per = timing.millisecondsPerPosition()
+            let fillSeconds = Double(timing.expertFillNanoseconds) / 1_000_000_000
+            let rate = fillSeconds > 0
+                ? Double(timing.fillBytes) / 1_000_000_000 / fillSeconds : 0
+            let missesPerFill = fills > 0 ? Double(timing.fillMisses) / Double(fills) : 0
+            let acquisitions = arena.acquisitions - acquisitionsBefore
+            let hits = arena.hits - hitsBefore
+            let misses = acquisitions - hits
+            let evictions = arena.evictions - evictionsBefore
+            let composition = arena.missComposition
+            let firstTouch = composition.firstTouch - compositionBefore.firstTouch
+            let refetch = composition.refetch - compositionBefore.refetch
+            let after = hostMemoryCounters()
+            let wiringAfter = streamer.wiringState
+            let slotBytes = streamer.geometry.slotBytes
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   %@ pass: %.1f ms/pos, fill %.1f GB/s (%.0f MB, "
+                        + "%d misses, %.1f per fill over %d fills), device %.1f, wall %.0f s, "
+                        + "decompressions +%d, resident %d -> %d",
+                    label,
+                    wall / Double(positions),
+                    rate,
+                    Double(timing.fillBytes) / 1_048_576,
+                    misses,
+                    missesPerFill,
+                    fills,
+                    per.denseDevice + per.mixtureDevice,
+                    wall / 1_000,
+                    after.decompressions - before.decompressions,
+                    residentBefore,
+                    arena.residentCount
+                )
+            )
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   %@ composition: %d acquisitions, %d hits "
+                        + "(%.1f%%), %d misses = %d first touch + %d re-fetch (%.1f%%), "
+                        + "%d eviction(s); %.1f distinct/position, %.1f GB compulsory "
+                        + "against %.2f GB of arena, %.1f GB re-read, %.1f GB/position read",
+                    label,
+                    acquisitions,
+                    hits,
+                    acquisitions > 0 ? 100 * Double(hits) / Double(acquisitions) : 0,
+                    misses,
+                    firstTouch,
+                    refetch,
+                    misses > 0 ? 100 * Double(refetch) / Double(misses) : 0,
+                    evictions,
+                    Double(firstTouch) / Double(positions),
+                    Double(firstTouch * slotBytes) / 1_073_741_824,
+                    Double(arena.capacity * slotBytes) / 1_073_741_824,
+                    Double(refetch * slotBytes) / 1_073_741_824,
+                    Double(misses * slotBytes) / Double(positions) / 1_048_576
+                )
+            )
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   %@ residency: wired %.2f -> %.2f GB (+%d slots, "
+                        + "%d refusal(s), refused %@), %.0f GB free, compressor %.1f GB "
+                        + "-> %.1f GB",
+                    label,
+                    Double(wiringBefore.bytes) / 1_073_741_824,
+                    Double(wiringAfter.bytes) / 1_073_741_824,
+                    wiringAfter.slots - wiringBefore.slots,
+                    wiringAfter.failures,
+                    wiringAfter.isRefused ? "yes" : "no",
+                    after.systemFreeGB,
+                    before.systemCompressorGB,
+                    after.systemCompressorGB
+                )
+            )
+            // No rate assertion here on purpose: `#56`/`#57`'s "wired means the disk's
+            // own 13.6-15.2 GB/s" holds for the shipped arena, and the wide arm below is
+            // wired and reads at 6.3 because the machine has no free memory left for
+            // anything the process did NOT wire. The caller asserts where the regime is
+            // the shipped one.
+            // The instrument's own arithmetic: every miss is classified exactly once,
+            // and the streamer's fill count is the arena's miss count.
+            XCTAssertEqual(
+                firstTouch + refetch, misses,
+                "\(label): the composition does not cover the misses"
+            )
+            XCTAssertEqual(
+                timing.fillMisses, misses,
+                "\(label): the fill loaded \(timing.fillMisses) experts, the arena missed \(misses)"
+            )
+            return Outcome(
+                rate: rate,
+                millisecondsPerPosition: wall / Double(positions),
+                misses: misses,
+                firstTouch: firstTouch,
+                refetch: refetch,
+                evictions: evictions,
+                bytes: misses * slotBytes
+            )
+        }
+
+        var cold: [(label: String, outcome: Outcome)] = []
+        var warm: [(label: String, outcome: Outcome)] = []
+        var narrowArenaGB = 0.0
+        do {
+            let runtime = try makeRuntime(
+                snapshot: snapshot,
+                engine: engine,
+                config: config,
+                contextLength: positions + 1,
+                allowEngramSkip: false,
+                wireArena: nil
+            )
+            let streamer = try XCTUnwrap(
+                runtime.expertStreamer,
+                "no expert streamer: \(runtime.expertStreamerProblem ?? "no reason")"
+            )
+            let wiring = streamer.wiringState
+            print("🔎 [dsv41 real] \(streamer.describe())")
+            print(
+                String(
+                    format: "🔎 [dsv41 real] arena %d slots of %.1f MB (%.2f GB), wired %@ "
+                        + "(%.2f GB), refused %@",
+                    runtime.arena.capacity,
+                    Double(streamer.geometry.slotBytes) / 1_048_576,
+                    Double(runtime.arena.capacity * streamer.geometry.slotBytes) / 1_073_741_824,
+                    wiring.isEnabled ? "yes" : "no",
+                    Double(wiring.bytes) / 1_073_741_824,
+                    wiring.isRefused ? "yes" : "no"
+                )
+            )
+            narrowArenaGB = Double(runtime.arena.capacity * streamer.geometry.slotBytes)
+                / 1_073_741_824
+            let quiet = hostMemoryCounters()
+            print(
+                String(
+                    format: "🔎 [dsv41 real] before: compressor %.1f GB, free %.1f GB, "
+                        + "pressure %d, decompressions %d",
+                    quiet.systemCompressorGB,
+                    quiet.systemFreeGB,
+                    quiet.pressureLevel,
+                    quiet.decompressions
+                )
+            )
+            for arm in [("A1 cold, LRU", 13, true), ("A2 warm, LRU", 7, false), ("A3 warm, LRU", 13, false)] {
+                let outcome = pass(arm.0, runtime: runtime, rotation: arm.1, resetting: arm.2)
+                // The shipped regime (a wired 65.84 GB arena on this machine) reads at
+                // or above the disk's own 13.6-15.2 GB/s in its warm passes (`#56`).
+                if !arm.2 {
+                    XCTAssertGreaterThan(
+                        outcome.rate, 8, "\(arm.0) filled at \(outcome.rate) GB/s, the unwired regime"
+                    )
+                }
+                if arm.2 { cold.append((arm.0, outcome)) } else { warm.append((arm.0, outcome)) }
+            }
+            let lruCold = cold.last?.outcome
+
+            // The policy A/B: same arena, same slots, same stream. Only the rule a miss
+            // replaces by changes, so the compulsory column has to come out identical --
+            // routing does not consult the arena -- and only the re-fetch column can move.
+            runtime.arena.victimPolicy = .leastFrequentlyUsed
+            for arm in [
+                ("C1 cold, frequency", 13, true),
+                ("C2 warm, frequency", 7, false),
+                ("C3 warm, frequency", 13, false)
+            ] {
+                let outcome = pass(arm.0, runtime: runtime, rotation: arm.1, resetting: arm.2)
+                if !arm.2 {
+                    XCTAssertGreaterThan(
+                        outcome.rate, 8, "\(arm.0) filled at \(outcome.rate) GB/s, the unwired regime"
+                    )
+                }
+                if arm.2 { cold.append((arm.0, outcome)) } else { warm.append((arm.0, outcome)) }
+            }
+            let frequencyCold = cold.last?.outcome
+            if let lruCold, let frequencyCold {
+                // Routing does not consult the arena, so the working set is a control: the
+                // two cold passes must have touched exactly the same pairs, and only the
+                // column a policy can move may differ.
+                XCTAssertEqual(
+                    frequencyCold.firstTouch, lruCold.firstTouch,
+                    "the same stream touched a different working set, so the two policies are "
+                        + "not being compared on the same passes"
+                )
+                print(
+                    String(
+                        format: "🔎 [dsv41 real] policy control: both cold passes touched %d "
+                            + "pairs; LRU missed %d (%d re-fetch), frequency missed %d (%d)",
+                        lruCold.firstTouch,
+                        lruCold.misses,
+                        lruCold.refetch,
+                        frequencyCold.misses,
+                        frequencyCold.refetch
+                    )
+                )
+            }
+            // A warm pass is the regime a live turn is in, and the two policies' warm
+            // passes are the comparison. Printed as a table rather than one delta because
+            // the arms follow different predecessors, so a reader can match rotations.
+            for arm in warm {
+                print(
+                    String(
+                        format: "🔎 [dsv41 real]   %@ pass summary: %d misses (%d re-fetch, "
+                            + "%.1f GB), re-read %.1f GB, %.1f ms/pos",
+                        arm.label,
+                        arm.outcome.misses,
+                        arm.outcome.refetch,
+                        Double(arm.outcome.bytes) / 1_073_741_824,
+                        Double(arm.outcome.refetch * streamer.geometry.slotBytes) / 1_073_741_824,
+                        arm.outcome.millisecondsPerPosition
+                    )
+                )
+            }
+            print(
+                String(
+                    format: "🔎 [dsv41 real] after the six passes: %d eviction(s) in the last "
+                        + "window, %d distinct pairs touched there of %d slots, compressor %.1f GB",
+                    runtime.arena.evictions,
+                    runtime.arena.distinctPairs,
+                    runtime.arena.capacity,
+                    hostMemoryCounters().systemCompressorGB
+                )
+            )
+            runtime.shutdown()
+        }
+
+        // The capacity arm. Two runtimes at once is 147 GB on a 128 GB machine, so the
+        // first is shut down before the second is built; routing does not depend on the
+        // arena, so the compulsory column is the control that says the two passes saw
+        // the same stream.
+        let wide = 0.72
+        do {
+            let runtime = try makeRuntime(
+                snapshot: snapshot,
+                engine: engine,
+                config: config,
+                contextLength: positions + 1,
+                allowEngramSkip: false,
+                wireArena: nil,
+                arenaFraction: wide
+            )
+            let streamer = try XCTUnwrap(
+                runtime.expertStreamer,
+                "no expert streamer at \(wide): \(runtime.expertStreamerProblem ?? "no reason")"
+            )
+            let wiring = streamer.wiringState
+            print(
+                String(
+                    format: "🔎 [dsv41 real] wide arena: fraction %.2f, %d slots of %.1f MB "
+                        + "(%.2f GB), wired %@ (%.2f GB), refused %@; memory plan says %@",
+                    wide,
+                    runtime.arena.capacity,
+                    Double(streamer.geometry.slotBytes) / 1_048_576,
+                    Double(runtime.arena.capacity * streamer.geometry.slotBytes) / 1_073_741_824,
+                    wiring.isEnabled ? "yes" : "no",
+                    Double(wiring.bytes) / 1_073_741_824,
+                    wiring.isRefused ? "yes" : "no",
+                    runtime.memoryPlan.describe(expertSlots: runtime.arena.capacity)
+                )
+            )
+            let outcome = pass("B1 cold, wider arena", runtime: runtime, rotation: 13, resetting: true)
+            // The capacity question is asked by the WARM pass: a cold one pays its
+            // working set's first touches whatever the arena holds, and only a warm one
+            // shows how much of the previous pass survived.
+            let wideWarm = pass(
+                "B2 warm, wider arena", runtime: runtime, rotation: 7, resetting: false
+            )
+            let wideWiring = streamer.wiringState
+            // The policy is all-or-nothing, so the arm is only a capacity measurement if
+            // the whole 81.19 GB actually stayed wired. `mlock` refusals would have
+            // withdrawn it and the arm would be the unwired regime instead.
+            XCTAssertFalse(
+                wideWiring.isRefused,
+                "the wider arena was refused after \(wideWiring.failures) lock failure(s), so "
+                    + "this is not a capacity arm"
+            )
+            XCTAssertGreaterThan(wideWiring.bytes, 0, "the wider arena wired nothing")
+            let slotBytes = streamer.geometry.slotBytes
+            let narrowWarm = warm.first?.outcome
+            if let narrowWarm {
+                print(
+                    String(
+                        format: "🔎 [dsv41 real] warm capacity A/B (rotation 7, no reset): "
+                            + "%.2f GB of arena -> %d misses (%d re-fetch, %.1f GB read, "
+                            + "%.1f ms/pos); %.2f GB -> %d misses (%d re-fetch, %.1f GB read, "
+                            + "%.1f ms/pos), i.e. %+.1f%% read and %+.1f ms/position",
+                        narrowArenaGB,
+                        narrowWarm.misses,
+                        narrowWarm.refetch,
+                        Double(narrowWarm.bytes) / 1_073_741_824,
+                        narrowWarm.millisecondsPerPosition,
+                        Double(runtime.arena.capacity * slotBytes) / 1_073_741_824,
+                        wideWarm.misses,
+                        wideWarm.refetch,
+                        Double(wideWarm.bytes) / 1_073_741_824,
+                        wideWarm.millisecondsPerPosition,
+                        100 * Double(wideWarm.bytes - narrowWarm.bytes)
+                            / Double(max(1, narrowWarm.bytes)),
+                        wideWarm.millisecondsPerPosition - narrowWarm.millisecondsPerPosition
+                    )
+                )
+            }
+            let narrow = cold.first?.outcome
+            if let narrow {
+                // The whole point of the arm: routing is deterministic, so the number of
+                // pairs this pass touched cannot depend on how many slots could hold
+                // them. Only the column a policy could win may move.
+                XCTAssertEqual(
+                    outcome.firstTouch, narrow.firstTouch,
+                    "the two capacities touched different working sets, so the passes are "
+                        + "not comparable: routing must not depend on the arena"
+                )
+                print(
+                    String(
+                        format: "🔎 [dsv41 real] capacity A/B: %.2f GB of arena -> %d misses "
+                            + "(%.1f GB read, %.1f ms/pos); %.2f GB -> %d misses (%.1f GB "
+                            + "read, %.1f ms/pos). Re-fetch %d against %d, i.e. %+.1f%% read "
+                            + "and %+.1f ms/position",
+                        narrowArenaGB,
+                        narrow.misses,
+                        Double(narrow.bytes) / 1_073_741_824,
+                        narrow.millisecondsPerPosition,
+                        Double(runtime.arena.capacity * slotBytes) / 1_073_741_824,
+                        outcome.misses,
+                        Double(outcome.bytes) / 1_073_741_824,
+                        outcome.millisecondsPerPosition,
+                        narrow.refetch,
+                        outcome.refetch,
+                        100 * Double(outcome.bytes - narrow.bytes) / Double(max(1, narrow.bytes)),
+                        outcome.millisecondsPerPosition - narrow.millisecondsPerPosition
+                    )
+                )
+            }
+            runtime.shutdown()
+        }
         withExtendedLifetime(engine) {}
     }
 

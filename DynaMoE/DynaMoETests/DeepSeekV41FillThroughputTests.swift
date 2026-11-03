@@ -125,6 +125,10 @@ final class DeepSeekV41FillThroughputTests: XCTestCase {
                     + (DeepSeekV41Runtime.lastInitializationError ?? "no reason recorded")
             )
         }
+        // `#58` made the arena's frequency rule the shipping default; `#48`-`#52`'s
+        // tables were taken under LRU, so the regime is pinned here for the same reason
+        // as `wireArena`.
+        runtime.arena.victimPolicy = .leastRecentlyUsed
         return (runtime, engine)
     }
 
