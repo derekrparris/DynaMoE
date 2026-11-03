@@ -2453,6 +2453,418 @@ final class DeepSeekV41FP8GemvKernelTests: XCTestCase {
     }
 }
 
+/// The shared expert's two FP8 kernels, in the one-thread form the graph used to run
+/// and the coalesced form `#61` wired.
+///
+/// `#60` attributed a decoded position's device time and found the shared expert the
+/// largest single stage at 109-113 GB/s, about a third of what the routed experts
+/// read on the same bytes. The cause was the dispatch shape: `dsv41_fp8_block32_gemv`
+/// had a coalesced sibling but the FUSED swiglu and the down accumulate did not, so
+/// the one projection the model runs on every layer of every token still gave a
+/// thread a whole row. This pins the two new kernels against the host rule, at both
+/// lane widths, on the published shapes and on shapes that exercise the 32x32 scale
+/// grid's partial group.
+final class DeepSeekV41FP8SharedExpertKernelTests: XCTestCase {
+
+    private func environment() throws -> (MTLDevice, MTLLibrary, MTLCommandQueue) {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        guard let library = device.makeDefaultLibrary() else {
+            XCTFail("the default library is missing")
+            throw XCTSkip("no default library")
+        }
+        guard let queue = device.makeCommandQueue() else {
+            XCTFail("no compute queue")
+            throw XCTSkip("no compute queue")
+        }
+        return (device, library, queue)
+    }
+
+    /// E4M3 bytes whose exponents stay in the finite range, so a decoded value is a
+    /// plain number: exponent 0 is subnormal and 15 is NaN/Inf territory.
+    private func weightBytes(_ count: Int) -> [UInt8] {
+        (0..<count).map { index in
+            let sign: UInt8 = (index % 7 == 3) ? 0x80 : 0
+            let exponent = UInt8((index / 5) % 9)
+            let mantissa = UInt8(index % 8)
+            return sign | (exponent << 3) | mantissa
+        }
+    }
+
+    /// Block scales near 2^0, so a block sum stays in a range where a relative bar
+    /// means something.
+    private func scaleBytes(_ count: Int) -> [UInt8] {
+        (0..<count).map { index in UInt8(124 + (index % 7)) }
+    }
+
+    private func values(_ count: Int) -> [Float] {
+        (0..<count).map { index in Float((index &* 29 &+ 7) % 17 - 8) / 16 }
+    }
+
+    /// The host rule for the fused pair: per 32-value block, the gate and up dots
+    /// scaled by that block's E8M0 byte, summed over the row, then the checkpoint's
+    /// clip and `silu(gate) * up`. The scale row is `row / 32` because the grid is
+    /// 32x32, and rows past `outDim` are skipped.
+    private func swigluReference(
+        gate: [UInt8],
+        up: [UInt8],
+        gateScales: [UInt8],
+        upScales: [UInt8],
+        inDim: Int,
+        outDim: Int,
+        tokens: Int,
+        input: [Float],
+        limit: Float
+    ) -> [Float] {
+        let blocks = max(1, inDim / 32)
+        var out = [Float](repeating: 0, count: tokens * outDim)
+        for token in 0..<tokens {
+            for row in 0..<outDim {
+                var gateTotal: Float = 0
+                var upTotal: Float = 0
+                for block in 0..<blocks {
+                    let scaleIndex = (row / 32) * blocks + block
+                    let gateScale = DeepSeekV41EngramRowDequantizer.e8m0(gateScales[scaleIndex])
+                    let upScale = DeepSeekV41EngramRowDequantizer.e8m0(upScales[scaleIndex])
+                    var gateDot: Float = 0
+                    var upDot: Float = 0
+                    for index in 0..<32 {
+                        let at = row * inDim + block * 32 + index
+                        let x = input[token * inDim + block * 32 + index]
+                        gateDot += DeepSeekV41EngramRowDequantizer.e4m3(gate[at]) * x
+                        upDot += DeepSeekV41EngramRowDequantizer.e4m3(up[at]) * x
+                    }
+                    gateTotal += gateDot * gateScale
+                    upTotal += upDot * upScale
+                }
+                var gateValue = gateTotal
+                var upValue = upTotal
+                if limit > 0 {
+                    gateValue = min(gateValue, limit)
+                    upValue = min(max(upValue, -limit), limit)
+                }
+                out[token * outDim + row] = gateValue / (1 + exp(-gateValue)) * upValue
+            }
+        }
+        return out
+    }
+
+    /// The host rule for the down accumulate: the same block dot, then
+    /// `output[row] += routingWeight * total`.
+    private func downReference(
+        weight: [UInt8],
+        scales: [UInt8],
+        inDim: Int,
+        outDim: Int,
+        activation: [Float],
+        routing: Float
+    ) -> [Float] {
+        let blocks = max(1, inDim / 32)
+        var out = [Float](repeating: 0, count: outDim)
+        for row in 0..<outDim {
+            var total: Float = 0
+            for block in 0..<blocks {
+                let scale = DeepSeekV41EngramRowDequantizer.e8m0(
+                    scales[(row / 32) * blocks + block]
+                )
+                var blockDot: Float = 0
+                for index in 0..<32 {
+                    let at = row * inDim + block * 32 + index
+                    blockDot += DeepSeekV41EngramRowDequantizer.e4m3(weight[at])
+                        * activation[block * 32 + index]
+                }
+                total += blockDot * scale
+            }
+            out[row] = routing * total
+        }
+        return out
+    }
+
+    private func buffer(_ device: MTLDevice, bytes: [UInt8]) -> MTLBuffer? {
+        device.makeBuffer(bytes: bytes, length: bytes.count, options: .storageModeShared)
+    }
+
+    private func floats(_ buffer: MTLBuffer, count: Int) -> [Float] {
+        let pointer = buffer.contents().assumingMemoryBound(to: Float.self)
+        return Array(UnsafeBufferPointer(start: pointer, count: count))
+    }
+
+    /// One shape's fused pair through the host rule, the one-thread form and the
+    /// coalesced form at both lane widths. `outDim` is allowed to be off the 32-row
+    /// scale boundary, which is the case a lane's scale-index arithmetic gets wrong.
+    /// Returns the coalesced output so a caller can compare two limits.
+    @discardableResult
+    private func checkSwiGLU(
+        outDim: Int,
+        inDim: Int,
+        tokens: Int = 1,
+        limit: Float = 0
+    ) throws -> [Float] {
+        let (device, library, queue) = try environment()
+        guard let perRowFunction = library.makeFunction(name: DeepSeekV41Kernels.fp8SwiGLU),
+              let rowsFunction = library.makeFunction(name: DeepSeekV41Kernels.fp8SwiGLURows),
+              let perRow = try? device.makeComputePipelineState(function: perRowFunction),
+              let rows = try? device.makeComputePipelineState(function: rowsFunction) else {
+            XCTFail("the FP8 shared-expert kernels are not in the default library")
+            return []
+        }
+        let blocks = inDim / 32
+        // A row count off the 32-row grid needs its partial scale group published, or
+        // the host rule and both kernels read past the companion.
+        let scaleGroups = (outDim + 31) / 32
+        let gate = weightBytes(outDim * inDim)
+        let up = weightBytes(outDim * inDim).reversed()
+        let upBytes = Array(up)
+        let gateScales = scaleBytes(scaleGroups * blocks)
+        let upScales = scaleBytes(scaleGroups * blocks)
+        let input = values(tokens * inDim)
+
+        guard let gateBuffer = buffer(device, bytes: gate),
+              let upBuffer = buffer(device, bytes: upBytes),
+              let gateScaleBuffer = buffer(device, bytes: gateScales),
+              let upScaleBuffer = buffer(device, bytes: upScales),
+              let inputBuffer = device.makeBuffer(
+                  bytes: input,
+                  length: input.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared) else {
+            XCTFail("the shared-expert buffers did not allocate")
+            return []
+        }
+
+        let expected = swigluReference(
+            gate: gate, up: upBytes, gateScales: gateScales, upScales: upScales,
+            inDim: inDim, outDim: outDim, tokens: tokens, input: input, limit: limit
+        )
+        let magnitude = max(1, expected.map { abs($0) }.max() ?? 1)
+
+        func dispatch(
+            pipeline: MTLComputePipelineState,
+            coalesced: Bool,
+            lanes: Int
+        ) -> [Float] {
+            guard let output = device.makeBuffer(
+                length: tokens * outDim * MemoryLayout<Float>.stride,
+                options: .storageModeShared
+            ) else { return [] }
+            memset(output.contents(), 0, output.length)
+            guard let commandBuffer = queue.makeCommandBuffer(),
+                  let encoder = commandBuffer.makeComputeCommandEncoder() else {
+                XCTFail("no command buffer")
+                return []
+            }
+            var gateWeightOffset = UInt64(0)
+            var gateScaleOffset = UInt64(0)
+            var upWeightOffset = UInt64(0)
+            var upScaleOffset = UInt64(0)
+            var inDimension = UInt32(inDim)
+            var outDimension = UInt32(outDim)
+            var swiglu = limit
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(gateBuffer, offset: 0, index: 0)
+            encoder.setBuffer(gateScaleBuffer, offset: 0, index: 1)
+            encoder.setBuffer(upBuffer, offset: 0, index: 2)
+            encoder.setBuffer(upScaleBuffer, offset: 0, index: 3)
+            encoder.setBuffer(inputBuffer, offset: 0, index: 4)
+            encoder.setBuffer(output, offset: 0, index: 5)
+            encoder.setBytes(&gateWeightOffset, length: 8, index: 6)
+            encoder.setBytes(&gateScaleOffset, length: 8, index: 7)
+            encoder.setBytes(&upWeightOffset, length: 8, index: 8)
+            encoder.setBytes(&upScaleOffset, length: 8, index: 9)
+            encoder.setBytes(&inDimension, length: 4, index: 10)
+            encoder.setBytes(&outDimension, length: 4, index: 11)
+            encoder.setBytes(&swiglu, length: 4, index: 12)
+            if coalesced {
+                encoder.setThreadgroupMemoryLength(
+                    2 * 32 * MemoryLayout<Float>.stride, index: 0
+                )
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: outDim * tokens, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+                )
+            } else {
+                encoder.dispatchThreads(
+                    MTLSize(width: outDim, height: tokens, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: min(outDim, 64), height: 1, depth: 1)
+                )
+            }
+            encoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            XCTAssertNil(commandBuffer.error)
+            return floats(output, count: tokens * outDim)
+        }
+
+        let oneThread = dispatch(pipeline: perRow, coalesced: false, lanes: 64)
+        var lastProduced: [Float] = []
+        for lanes in [32, 64] {
+            let produced = dispatch(pipeline: rows, coalesced: true, lanes: lanes)
+            lastProduced = produced
+            for index in 0..<(tokens * outDim) {
+                XCTAssertLessThan(
+                    abs(produced[index] - expected[index]), magnitude * 1e-4,
+                    "coalesced swiglu (lanes \(lanes)) drifted at \(index) of "
+                        + "\(outDim)x\(inDim)"
+                )
+                XCTAssertLessThan(
+                    abs(oneThread[index] - produced[index]), magnitude * 1e-4,
+                    "the two forms disagree at \(index) of \(outDim)x\(inDim)"
+                )
+            }
+        }
+        return lastProduced
+    }
+
+    /// The same for the down accumulate, from a zeroed output so the `+=` is the
+    /// whole result.
+    private func checkDown(outDim: Int, inDim: Int, routing: Float = 0.75) throws {
+        let (device, library, queue) = try environment()
+        guard let perRowFunction = library.makeFunction(name: DeepSeekV41Kernels.fp8DownAccumulate),
+              let rowsFunction = library.makeFunction(name: DeepSeekV41Kernels.fp8DownAccumulateRows),
+              let perRow = try? device.makeComputePipelineState(function: perRowFunction),
+              let rows = try? device.makeComputePipelineState(function: rowsFunction) else {
+            XCTFail("the FP8 shared-expert kernels are not in the default library")
+            return
+        }
+        let blocks = inDim / 32
+        let scaleGroups = (outDim + 31) / 32
+        let weight = weightBytes(outDim * inDim)
+        let scales = scaleBytes(scaleGroups * blocks)
+        let activation = values(inDim)
+
+        guard let weightBuffer = buffer(device, bytes: weight),
+              let scaleBuffer = buffer(device, bytes: scales),
+              let activationBuffer = device.makeBuffer(
+                  bytes: activation,
+                  length: activation.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared) else {
+            XCTFail("the shared-expert buffers did not allocate")
+            return
+        }
+
+        let expected = downReference(
+            weight: weight, scales: scales, inDim: inDim, outDim: outDim,
+            activation: activation, routing: routing
+        )
+        let magnitude = max(1, expected.map { abs($0) }.max() ?? 1)
+
+        func dispatch(
+            pipeline: MTLComputePipelineState,
+            coalesced: Bool,
+            lanes: Int
+        ) -> [Float] {
+            guard let output = device.makeBuffer(
+                length: outDim * MemoryLayout<Float>.stride,
+                options: .storageModeShared
+            ) else { return [] }
+            memset(output.contents(), 0, output.length)
+            guard let commandBuffer = queue.makeCommandBuffer(),
+                  let encoder = commandBuffer.makeComputeCommandEncoder() else {
+                XCTFail("no command buffer")
+                return []
+            }
+            var weightOffset = UInt64(0)
+            var scaleOffset = UInt64(0)
+            var inDimension = UInt32(inDim)
+            var outDimension = UInt32(outDim)
+            var routingWeight = routing
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(weightBuffer, offset: 0, index: 0)
+            encoder.setBuffer(scaleBuffer, offset: 0, index: 1)
+            encoder.setBuffer(activationBuffer, offset: 0, index: 2)
+            encoder.setBuffer(output, offset: 0, index: 3)
+            encoder.setBytes(&weightOffset, length: 8, index: 4)
+            encoder.setBytes(&scaleOffset, length: 8, index: 5)
+            encoder.setBytes(&inDimension, length: 4, index: 6)
+            encoder.setBytes(&outDimension, length: 4, index: 7)
+            encoder.setBytes(&routingWeight, length: 4, index: 8)
+            if coalesced {
+                encoder.setThreadgroupMemoryLength(
+                    32 * MemoryLayout<Float>.stride, index: 0
+                )
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: outDim, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+                )
+            } else {
+                encoder.dispatchThreads(
+                    MTLSize(width: outDim, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: min(outDim, 64), height: 1, depth: 1)
+                )
+            }
+            encoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            XCTAssertNil(commandBuffer.error)
+            return floats(output, count: outDim)
+        }
+
+        let oneThread = dispatch(pipeline: perRow, coalesced: false, lanes: 64)
+        for lanes in [32, 64] {
+            let produced = dispatch(pipeline: rows, coalesced: true, lanes: lanes)
+            for index in 0..<outDim {
+                XCTAssertLessThan(
+                    abs(produced[index] - expected[index]), magnitude * 1e-4,
+                    "coalesced down (lanes \(lanes)) drifted at row \(index) of "
+                        + "\(outDim)x\(inDim)"
+                )
+                XCTAssertLessThan(
+                    abs(oneThread[index] - produced[index]), magnitude * 1e-4,
+                    "the two down forms disagree at row \(index)"
+                )
+            }
+        }
+    }
+
+    func testTheCoalescedFusedPairMatchesTheHostRuleAtThePublishedShape() throws {
+        try checkSwiGLU(outDim: 2_304, inDim: 5_120)
+    }
+
+    func testTheCoalescedDownMatchesTheHostRuleAtThePublishedShape() throws {
+        try checkDown(outDim: 5_120, inDim: 2_304)
+    }
+
+    /// A row count off the 32-row scale boundary, and a row shorter than a lane's
+    /// block count (1,024 values is 32 blocks against 64 lanes), so the partial
+    /// group and the idle lanes are both exercised.
+    func testTheCoalescedPairHandlesAPartialScaleGroupAndAShortRow() throws {
+        try checkSwiGLU(outDim: 65, inDim: 1_024)
+        try checkDown(outDim: 65, inDim: 1_024)
+    }
+
+    /// The fused kernel carries the token axis: the flat grid's token is
+    /// `groupIdx / outDim`, so a row-major mix-up would give token 1 the rows of
+    /// token 0.
+    func testTheCoalescedFusedPairCarriesTheTokenAxis() throws {
+        try checkSwiGLU(outDim: 96, inDim: 1_280, tokens: 3)
+    }
+
+    /// `swiglu_limit` is part of the trained function, so it has to survive the move:
+    /// the clipped pair must match the host rule AND differ from the unlimited run, or
+    /// a kernel that dropped the clip would pass.
+    func testTheCoalescedFusedPairAppliesTheSwiGLULimit() throws {
+        let unlimited = try checkSwiGLU(outDim: 96, inDim: 1_280)
+        let clipped = try checkSwiGLU(outDim: 96, inDim: 1_280, limit: 0.25)
+        let changed = zip(unlimited, clipped).filter { abs($0 - $1) > 1e-6 }.count
+        XCTAssertGreaterThan(
+            changed, unlimited.count / 4,
+            "a 0.25 limit should clip most of a 40-block row, not \(changed) values"
+        )
+    }
+
+    /// The plan rule sends both published shared-expert shapes to the coalesced form.
+    func testTheRuleSendsThePublishedSharedExpertToTheCoalescedForm() {
+        XCTAssertTrue(
+            DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(outDim: 2_304, inDim: 5_120, rows: 1),
+            "the shared gate+up is 160 blocks over 64 lanes"
+        )
+        XCTAssertTrue(
+            DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(outDim: 5_120, inDim: 2_304, rows: 1),
+            "the shared down is 72 blocks over 64 lanes"
+        )
+    }
+}
+
 /// What a committed command buffer costs to START once the queue has gone idle.
 ///
 /// The walk's mixture drain is ~2.5 ms/layer against a ~0.7 ms device window, and

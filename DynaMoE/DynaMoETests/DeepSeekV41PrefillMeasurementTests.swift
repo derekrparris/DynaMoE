@@ -2541,6 +2541,247 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
         }
     }
 
+    // MARK: The shared expert's fused forms
+
+    /// What the coalesced FP8 fused pair is worth on the shared expert.
+    ///
+    /// `#60` attributed a walked position and found the shared expert the largest
+    /// single stage of a decode: 12.96 ms of 54.3 ms of device time, reading its
+    /// 1.42 GB at 109-113 GB/s while the routed experts read at 352. The A/B above
+    /// measured the plain GEMV's coalesced sibling at 3.88x on the same shape, so the
+    /// cause is the dispatch shape — a thread per whole row, which the FUSED swiglu
+    /// and the down accumulate never stopped using. This prices the two kernels the
+    /// graph actually dispatches, at the widths the checkpoint publishes.
+    ///
+    /// Each arm runs `dispatches` distinct weight regions inside one command buffer so
+    /// the commit-and-wait round trip is amortized and no arm reads bytes another arm
+    /// just cached; the arms are interleaved inside every repetition so a first-timed
+    /// arm cannot pay for being first.
+    func testWhatTheCoalescedSharedExpertIsWorth() throws {
+        guard let metal = MTLCreateSystemDefaultDevice(),
+              let library = metal.makeDefaultLibrary(),
+              let queue = metal.makeCommandQueue() else {
+            throw XCTSkip("No Metal device or compute queue")
+        }
+        func pipeline(_ name: String) throws -> MTLComputePipelineState {
+            guard let function = library.makeFunction(name: name) else {
+                throw XCTSkip("\(name) is missing from the default library")
+            }
+            return try metal.makeComputePipelineState(function: function)
+        }
+        let swigluPerRow = try pipeline(DeepSeekV41Kernels.fp8SwiGLU)
+        let swigluRows = try pipeline(DeepSeekV41Kernels.fp8SwiGLURows)
+        let downPerRow = try pipeline(DeepSeekV41Kernels.fp8DownAccumulate)
+        let downRows = try pipeline(DeepSeekV41Kernels.fp8DownAccumulateRows)
+
+        let repetitions = 8
+        let dispatches = 6
+        let limit: Float = 10
+
+        // Safe E4M3 patterns: exponents 0-8 keep every decoded value finite, and the
+        // scales sit near 2^0, so the two forms can be compared numerically.
+        let weightTile: [UInt8] = (0..<4_096).map { index in
+            let sign: UInt8 = (index % 7 == 3) ? 0x80 : 0
+            return sign | (UInt8((index / 5) % 9) << 3) | UInt8(index % 8)
+        }
+        let scaleTile: [UInt8] = (0..<256).map { UInt8(124 + ($0 % 7)) }
+        let inputTile: [Float] = (0..<8_192).map { Float(($0 &* 29 &+ 7) % 17 - 8) / 16 }
+
+        func fill<T>(_ buffer: MTLBuffer, bytes: Int, tile: [T]) {
+            let valueStride = MemoryLayout<T>.stride
+            let destination = buffer.contents()
+            tile.withUnsafeBytes { source in
+                guard let base = source.baseAddress else { return }
+                var written = 0
+                while written < bytes {
+                    let chunk = min(tile.count * valueStride, bytes - written)
+                    memcpy(destination + written, base, chunk)
+                    written += chunk
+                }
+            }
+        }
+
+        /// One projection's two forms, validated against each other and then timed.
+        func measure(
+            name: String,
+            fused: Bool,
+            outDim: Int,
+            inDim: Int
+        ) {
+            let perRow = fused ? swigluPerRow : downPerRow
+            let rowsPipeline = fused ? swigluRows : downRows
+            let weightBytes = outDim * inDim
+            let blocks = inDim / 32
+            let scaleBytes = (outDim / 32) * blocks
+            let outputBytes = outDim * MemoryLayout<Float>.stride
+            // The fused pair reads gate and up as separate matrices, so each gets its
+            // own set of regions: sharing them would serve half the traffic from the
+            // cache lines the other half just pulled.
+            let regions = weightBytes * dispatches * (fused ? 2 : 1)
+            guard let weight = metal.makeBuffer(
+                      length: regions, options: .storageModeShared
+                  ),
+                  let scale = metal.makeBuffer(length: scaleBytes, options: .storageModeShared),
+                  let input = metal.makeBuffer(
+                      length: max(inDim, outDim) * MemoryLayout<Float>.stride,
+                      options: .storageModeShared
+                  ),
+                  let perRowOutput = metal.makeBuffer(
+                      length: outputBytes, options: .storageModeShared
+                  ),
+                  let rowsOutput = metal.makeBuffer(
+                      length: outputBytes, options: .storageModeShared
+                  ) else {
+                XCTFail("\(name): buffers did not allocate")
+                return
+            }
+            fill(weight, bytes: weightBytes * dispatches, tile: weightTile)
+            fill(scale, bytes: scaleBytes, tile: scaleTile)
+            fill(input, bytes: max(inDim, outDim) * MemoryLayout<Float>.stride, tile: inputTile)
+            memset(perRowOutput.contents(), 0, perRowOutput.length)
+            memset(rowsOutput.contents(), 0, rowsOutput.length)
+
+            func run(
+                _ pipeline: MTLComputePipelineState,
+                coalesced: Bool,
+                lanes: Int,
+                output: MTLBuffer,
+                repeats: Int
+            ) {
+                guard let commandBuffer = queue.makeCommandBuffer(),
+                      let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+                var gateWeightOffset = UInt64(0)
+                var gateScaleOffset = UInt64(0)
+                var upWeightOffset = UInt64(0)
+                var upScaleOffset = UInt64(0)
+                var inDimension = UInt32(inDim)
+                var outDimension = UInt32(outDim)
+                var swigluLimit = limit
+                var routing: Float = 0.75
+                encoder.setComputePipelineState(pipeline)
+                encoder.setBuffer(weight, offset: 0, index: 0)
+                encoder.setBuffer(scale, offset: 0, index: 1)
+                if fused {
+                    encoder.setBuffer(weight, offset: 0, index: 2)
+                    encoder.setBuffer(scale, offset: 0, index: 3)
+                    encoder.setBuffer(input, offset: 0, index: 4)
+                    encoder.setBuffer(output, offset: 0, index: 5)
+                    encoder.setBytes(&gateWeightOffset, length: 8, index: 6)
+                    encoder.setBytes(&gateScaleOffset, length: 8, index: 7)
+                    encoder.setBytes(&upWeightOffset, length: 8, index: 8)
+                    encoder.setBytes(&upScaleOffset, length: 8, index: 9)
+                    encoder.setBytes(&inDimension, length: 4, index: 10)
+                    encoder.setBytes(&outDimension, length: 4, index: 11)
+                    encoder.setBytes(&swigluLimit, length: 4, index: 12)
+                } else {
+                    encoder.setBuffer(input, offset: 0, index: 2)
+                    encoder.setBuffer(output, offset: 0, index: 3)
+                    encoder.setBytes(&gateWeightOffset, length: 8, index: 4)
+                    encoder.setBytes(&gateScaleOffset, length: 8, index: 5)
+                    encoder.setBytes(&inDimension, length: 4, index: 6)
+                    encoder.setBytes(&outDimension, length: 4, index: 7)
+                    encoder.setBytes(&routing, length: 4, index: 8)
+                }
+                // A different region per dispatch, so the queue is reading a weight the
+                // previous dispatch did not just pull into the cache.
+                let stride = UInt64(weightBytes)
+                let upBase = fused ? UInt64(weightBytes * dispatches) : 0
+                for repeatIndex in 0..<max(1, repeats) {
+                    let region = UInt64(repeatIndex) * stride
+                    if fused {
+                        gateWeightOffset = region
+                        upWeightOffset = upBase + region
+                        encoder.setBytes(&gateWeightOffset, length: 8, index: 6)
+                        encoder.setBytes(&upWeightOffset, length: 8, index: 8)
+                    } else {
+                        gateWeightOffset = region
+                        encoder.setBytes(&gateWeightOffset, length: 8, index: 4)
+                    }
+                    if coalesced {
+                        encoder.setThreadgroupMemoryLength(
+                            (fused ? 2 : 1) * 32 * MemoryLayout<Float>.stride, index: 0
+                        )
+                        encoder.dispatchThreadgroups(
+                            MTLSize(width: outDim, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+                        )
+                    } else {
+                        encoder.dispatchThreads(
+                            MTLSize(width: outDim, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(
+                                width: min(outDim, 64), height: 1, depth: 1
+                            )
+                        )
+                    }
+                }
+                encoder.endEncoding()
+                commandBuffer.commit()
+                commandBuffer.waitUntilCompleted()
+            }
+
+            run(perRow, coalesced: false, lanes: 64, output: perRowOutput, repeats: 1)
+            memset(rowsOutput.contents(), 0, rowsOutput.length)
+            run(rowsPipeline, coalesced: true, lanes: 64, output: rowsOutput, repeats: 1)
+            let first = floats(perRowOutput, count: outDim)
+            let second = floats(rowsOutput, count: outDim)
+            let magnitude = max(1, first.map { abs($0) }.max() ?? 1)
+            let drift = worstDelta(first, second)
+            print(
+                String(
+                    format: "[dsv41 shared form] %-14@ %5dx%-5d drift %.3g / %.3g",
+                    name as NSString, outDim, inDim, drift, magnitude
+                )
+            )
+            guard drift < magnitude * 1e-3 else {
+                print("[dsv41 shared form] \(name): the two forms disagree, not timing it")
+                return
+            }
+
+            var perRowBest = Double.infinity
+            var rowsBest: [Int: Double] = [32: .infinity, 64: .infinity]
+            for _ in 0..<repetitions {
+                perRowBest = min(perRowBest, milliseconds {
+                    run(perRow, coalesced: false, lanes: 64, output: perRowOutput,
+                        repeats: dispatches)
+                })
+                // Interleaved, so a first-timed arm does not pay for being first.
+                for lanes in [32, 64] {
+                    rowsBest[lanes] = min(rowsBest[lanes] ?? .infinity, milliseconds {
+                        run(rowsPipeline, coalesced: true, lanes: lanes, output: rowsOutput,
+                            repeats: dispatches)
+                    })
+                }
+            }
+            func gigabytesPerSecond(_ elapsedMilliseconds: Double) -> Double {
+                // The fused pair reads gate AND up, so its traffic is twice the tile.
+                let matrices = fused ? 2.0 : 1.0
+                return Double(weightBytes * dispatches) * matrices / (elapsedMilliseconds * 1e6)
+            }
+            var columns = String(
+                format: "[dsv41 shared form] %-14@ %6.1f MB  one-thread %7.3f ms "
+                    + "(%5.0f GB/s)",
+                name as NSString,
+                Double(weightBytes) / 1_048_576,
+                perRowBest / Double(dispatches),
+                gigabytesPerSecond(perRowBest)
+            )
+            for lanes in [32, 64] {
+                guard let best = rowsBest[lanes] else { continue }
+                columns += String(
+                    format: "  %d-lane %7.3f ms (%5.0f GB/s) %4.2fx",
+                    lanes,
+                    best / Double(dispatches),
+                    gigabytesPerSecond(best),
+                    perRowBest / best
+                )
+            }
+            print(columns)
+        }
+
+        measure(name: "w1+w3 (fused)", fused: true, outDim: 2_304, inDim: 5_120)
+        measure(name: "w2 (down)", fused: false, outDim: 5_120, inDim: 2_304)
+    }
+
     // MARK: Routed mixture forms
 
     /// What the coalesced forms are worth on the routed mixture.

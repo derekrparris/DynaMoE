@@ -396,6 +396,9 @@ nonisolated public struct DeepSeekV41Pipelines {
     /// half needs its own two.
     public let fp8SwiGLU: MTLComputePipelineState
     public let fp8DownAccumulate: MTLComputePipelineState
+    /// The same pair with one output row per threadgroup (coalesced weight loads).
+    public let fp8SwiGLURows: MTLComputePipelineState
+    public let fp8DownAccumulateRows: MTLComputePipelineState
     /// BF16 fallback for a checkpoint whose FFN was not quantized.
     public let bf16Gemv: MTLComputePipelineState
     public let bf16GemvRows: MTLComputePipelineState
@@ -443,6 +446,8 @@ nonisolated public struct DeepSeekV41Pipelines {
         self.rmsNormGain = try make("dsv41_rmsnorm_f32_gain")
         self.fp8SwiGLU = try make("dsv41_fp8_block32_swiglu_gate_up")
         self.fp8DownAccumulate = try make("dsv41_fp8_block32_down_accumulate")
+        self.fp8SwiGLURows = try make("dsv41_fp8_block32_swiglu_gate_up_rows")
+        self.fp8DownAccumulateRows = try make("dsv41_fp8_block32_down_accumulate_rows")
         self.bf16Gemv = try make("bf16_gemv")
         self.bf16GemvRows = try make("bf16_gemv_rows")
         self.bf16GemvBlock = try make("bf16_gemv_rows8")

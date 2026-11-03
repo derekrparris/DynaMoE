@@ -7520,6 +7520,407 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
+    /// What the shared expert's coalesced forms are worth on a real decode.
+    ///
+    /// `#60` attributed a walked position and found the shared expert the single
+    /// largest stage: 12.96 ms of 54.3 ms of device time, at 109-113 GB/s while the
+    /// routed experts read 352 GB/s on the same kind of bytes. The cause was the
+    /// dispatch shape — `dsv41_fp8_block32_gemv` had a coalesced sibling but the FUSED
+    /// swiglu and the down accumulate did not, so the projection the model runs on
+    /// every layer of every token still gave a thread a whole row.
+    ///
+    /// Two arms, one runtime, one 128-position stream, the shipping frequency policy,
+    /// both under `recordsWalkStageTiming` so the `sharedExpert` window is measured the
+    /// same way in both:
+    ///
+    /// 1. one-thread — `disablesFP8FusedRows`, the forms the checkpoint ran before;
+    /// 2. coalesced — the shipped choice (`fp8GemvWantsWideGrid`).
+    ///
+    /// The two forms sum in a different order, so the answer is compared within a bar
+    /// rather than bit for bit; everything else in the graph is unchanged.
+    ///
+    /// Opt-in (`/tmp/dynamoe_dsv41_shared_stage`, plus the class's own marker).
+    func testWhatTheCoalescedSharedExpertIsWorthToAWalk() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_shared_stage"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in shared-expert probe; touch \(markerPath) to run"
+        )
+
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        // The same 128-position stream `#52`-`#60` measured, so the buckets line up
+        // with theirs position for position.
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+        func prompt(_ length: Int, rotation: Int) -> [Int] {
+            (0..<length).map { index in
+                let repetition = index / stream.count
+                return stream[(index + repetition * rotation) % stream.count]
+            }
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let positions = 128
+        let tokens = prompt(positions, rotation: 7)
+
+        struct Outcome {
+            let wallMilliseconds: Double
+            let timing: DeepSeekV41WalkTiming
+            let lastLogits: [Float]
+            let table: [(stage: String, millisecondsPerPosition: Double, share: Double)]
+            let sharedExpertPerPosition: Double
+            /// Logits sampled along the walk, so the two forms' drift can be read as a
+            /// trend rather than only at the last position: a reduction-order
+            /// difference starts at FP32 rounding and is amplified by forty layers, so
+            /// where it starts is what says whether it is rounding or a defect.
+            let sampledLogits: [Int: [Float]]
+        }
+
+        let sampledPositions: Set<Int> = [0, 1, 2, 3, 7, 15, 31, 63, 127]
+
+        func pass(
+            _ label: String,
+            executor: DeepSeekV41MetalForward,
+            arena: DeepSeekV41ExpertArena,
+            streamer: DeepSeekV41ExpertStreamer?,
+            oneThread: Bool,
+            lanes: Int = 0
+        ) -> Outcome? {
+            executor.reset()
+            executor.resetWalkTiming()
+            executor.recordsWalkTiming = true
+            executor.recordsWalkStageTiming = true
+            executor.disablesFP8FusedRows = oneThread
+            executor.fp8FusedLaneWidthOverride = lanes
+            let acquisitionsBefore = arena.acquisitions
+            let hitsBefore = arena.hits
+            let bytesBefore = streamer?.bytesRead ?? 0
+            let start = DispatchTime.now().uptimeNanoseconds
+            var logits: [Float] = []
+            var sampled: [Int: [Float]] = [:]
+            do {
+                for (position, token) in tokens.enumerated() {
+                    logits = try executor.forwardToken(token, position: position)
+                    if sampledPositions.contains(position) { sampled[position] = logits }
+                }
+            } catch {
+                XCTFail("\(label) refused at a position: \(error)")
+                return nil
+            }
+            let wall = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+            executor.recordsWalkTiming = false
+            executor.recordsWalkStageTiming = false
+            executor.disablesFP8FusedRows = false
+            executor.fp8FusedLaneWidthOverride = 0
+            let device = executor.walkTiming.frontDeviceNanoseconds
+                + executor.walkTiming.mixtureDeviceNanoseconds
+            let acquisitions = arena.acquisitions - acquisitionsBefore
+            let misses = acquisitions - (arena.hits - hitsBefore)
+            let bytes = (streamer?.bytesRead ?? 0) - bytesBefore
+            let table = executor.walkStageTable()
+            let shared = table.first { $0.stage == DeepSeekV41ForwardStages.Stage.sharedExpert.rawValue }
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   %@: %.1f ms/position, device %.1f ms/position, "
+                        + "sharedExpert %.3f ms/position, %d miss(es), %.1f GB read",
+                    label,
+                    wall / Double(positions),
+                    Double(device) / Double(positions) / 1_000_000,
+                    shared?.millisecondsPerPosition ?? -1,
+                    misses,
+                    Double(bytes) / 1_073_741_824
+                )
+            )
+            print("🔎 [dsv41 real]   \(label) buckets: " + executor.walkTiming.describe())
+            return Outcome(
+                wallMilliseconds: wall,
+                timing: executor.walkTiming,
+                lastLogits: logits,
+                table: table,
+                sharedExpertPerPosition: shared?.millisecondsPerPosition ?? -1,
+                sampledLogits: sampled
+            )
+        }
+
+        do {
+            let runtime = try makeRuntime(
+                snapshot: snapshot,
+                engine: engine,
+                config: config,
+                contextLength: positions + 1,
+                allowEngramSkip: false,
+                wireArena: nil
+            )
+            runtime.arena.victimPolicy = .leastFrequentlyUsed
+            let executor = runtime.forward()
+
+            // A discarded warm-up, exactly as `#59`/`#60`: the first pass pays the
+            // arena's slot creation and wiring, and the two measured arms are then warm
+            // and are not reset between arms.
+            executor.reset()
+            runtime.arena.reset()
+            for (position, token) in tokens.enumerated() {
+                _ = try executor.forwardToken(token, position: position)
+            }
+            print(
+                String(
+                    format: "🔎 [dsv41 real] shared-expert probe: %d positions, arena %d slots, "
+                        + "policy frequency, warm-up done",
+                    positions,
+                    runtime.arena.capacity
+                )
+            )
+
+            let oneThread = try XCTUnwrap(
+                pass(
+                    "one-thread FP8 fused forms",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    oneThread: true
+                )
+            )
+            let coalesced = try XCTUnwrap(
+                pass(
+                    "coalesced FP8 fused forms, shipped lanes",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    oneThread: false
+                )
+            )
+            // The shipped form at the OTHER lane width: a different reduction tree over
+            // the same math. It is the control the answer comparison needs — whatever
+            // two widths of one kernel drift is the graph's sensitivity to a
+            // rounding-level change, and the one-thread form can be read against it.
+            let controlLanes = try XCTUnwrap(
+                pass(
+                    "coalesced FP8 fused forms, 64 lanes (control)",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    oneThread: false,
+                    lanes: 64
+                )
+            )
+
+            // The forms reduce in a different order, so the answer is compared the way
+            // the other form sweeps compare it — but with a control, because forty
+            // layers amplify a rounding-level change. The 32- and 64-lane arms are the
+            // SAME kernel with a different reduction tree over the same arithmetic, so
+            // whatever they drift is the graph's own sensitivity. If the one-thread arm
+            // drifts no further than that, the coalesced form is arithmetic-equivalent;
+            // if it drifts much further, it is reading something different.
+            func worstRelative(_ lhs: [Float], _ rhs: [Float]) -> (absolute: Float, relative: Double) {
+                let scale = max(lhs.map(abs).max() ?? 1, 1)
+                let worst = zip(lhs, rhs).map { abs($0 - $1) }.max() ?? 0
+                return (worst, Double(worst / scale))
+            }
+            let formDrift = worstRelative(oneThread.lastLogits, coalesced.lastLogits)
+            let controlDrift = worstRelative(controlLanes.lastLogits, coalesced.lastLogits)
+            print(
+                String(
+                    format: "🔎 [dsv41 real] answer control: one-thread vs 64 lanes %.2e "
+                        + "absolute (%.2e relative), shipped vs 64 lanes %.2e absolute "
+                        + "(%.2e relative), ratio %.1fx",
+                    formDrift.absolute,
+                    formDrift.relative,
+                    controlDrift.absolute,
+                    controlDrift.relative,
+                    controlDrift.relative > 0
+                        ? formDrift.relative / controlDrift.relative
+                        : 0
+                )
+            )
+            let worst = formDrift.absolute
+            let scale = oneThread.lastLogits.map(abs).max() ?? 1
+            // The answer-level requirement, checked at every sampled position: a
+            // rounding-level difference must not change a decision. The drift itself is
+            // expected to be larger than the 32-vs-64 control's, because the one-thread
+            // form sums 160 blocks in ONE dependent chain where a threadgroup sums a
+            // shallow tree — that is the old form's error, not the new one's.
+            for position in sampledPositions.sorted() {
+                guard let a = oneThread.sampledLogits[position],
+                      let b = coalesced.sampledLogits[position] else { continue }
+                let argmaxA = a.enumerated().max { $0.element < $1.element }?.offset
+                let argmaxB = b.enumerated().max { $0.element < $1.element }?.offset
+                XCTAssertEqual(
+                    argmaxA, argmaxB,
+                    "the greedy token at position \(position) changed with the kernel form"
+                )
+            }
+            // Where the drift sits along the stream: it is not monotone, which is what
+            // amplification of a 1e-7 stage difference looks like rather than a bias.
+            for position in sampledPositions.sorted() {
+                guard let a = oneThread.sampledLogits[position],
+                      let b = coalesced.sampledLogits[position] else { continue }
+                let localScale = max(1, a.map(abs).max() ?? 1)
+                let delta = zip(a, b).map { abs($0 - $1) }.max() ?? 0
+                print(
+                    String(
+                        format: "🔎 [dsv41 real]   drift at position %d: %.2e absolute "
+                            + "(%.2e relative of %.2f)",
+                        position,
+                        delta,
+                        delta / localScale,
+                        localScale
+                    )
+                )
+            }
+
+            // The kernel's own arithmetic on real activations. The two arms' logits
+            // have been through forty layers each, and a rounding-level difference is
+            // amplified by that; the shared expert's fused output at layer 0 depends on
+            // nothing but the normed input and its own weights, so the two forms are
+            // compared THERE, once, on the same position.
+            let hidden = config.hiddenSize
+            let sharedWidth = executor.shapes.sharedIntermediate
+            guard let device = MTLCreateSystemDefaultDevice() else {
+                XCTFail("no Metal device for the feed-forward probes")
+                return
+            }
+            guard let normedProbe = device.makeBuffer(
+                      length: hidden * MemoryLayout<Float>.stride,
+                      options: .storageModeShared
+                  ),
+                  let sharedProbe = device.makeBuffer(
+                      length: sharedWidth * MemoryLayout<Float>.stride,
+                      options: .storageModeShared
+                  ) else {
+                XCTFail("the feed-forward probes did not allocate")
+                return
+            }
+            func capturedSharedOutput(oneThread: Bool) -> (normed: [Float], shared: [Float])? {
+                executor.reset()
+                executor.disablesFP8FusedRows = oneThread
+                executor.parityProbes = DeepSeekV41ParityProbes(
+                    ffnNormed: normedProbe,
+                    sharedIntermediate: sharedProbe,
+                    sharedExpertCaptureLayer: 0
+                )
+                do {
+                    _ = try executor.forwardToken(tokens[0], position: 0)
+                } catch {
+                    XCTFail("the capture walk refused: \(error)")
+                    return nil
+                }
+                executor.disablesFP8FusedRows = false
+                executor.parityProbes = DeepSeekV41ParityProbes()
+                return (
+                    floats(normedProbe, count: hidden),
+                    floats(sharedProbe, count: sharedWidth)
+                )
+            }
+            func floats(_ buffer: MTLBuffer, count: Int) -> [Float] {
+                let pointer = buffer.contents().assumingMemoryBound(to: Float.self)
+                return Array(UnsafeBufferPointer(start: pointer, count: count))
+            }
+            let perThreadCapture = try XCTUnwrap(
+                capturedSharedOutput(oneThread: true), "the one-thread capture did not run"
+            )
+            let coalescedCapture = try XCTUnwrap(
+                capturedSharedOutput(oneThread: false), "the coalesced capture did not run"
+            )
+            do {
+                let perThread = perThreadCapture
+                let coalescedOutput = coalescedCapture
+                func worst(_ a: [Float], _ b: [Float]) -> (absolute: Float, relative: Double) {
+                    let scale = max(a.map(abs).max() ?? 1, 1e-9)
+                    let delta = zip(a, b).map { abs($0 - $1) }.max() ?? 0
+                    return (delta, Double(delta / scale))
+                }
+                let inputDrift = worst(perThread.normed, coalescedOutput.normed)
+                let outputDrift = worst(perThread.shared, coalescedOutput.shared)
+                print(
+                    String(
+                        format: "🔎 [dsv41 real] layer-0 shared expert on real activations: "
+                            + "input drift %.2e (%.2e relative, %.2f scale), gate/up drift "
+                            + "%.2e (%.2e relative, %.2f scale)",
+                        inputDrift.absolute,
+                        inputDrift.relative,
+                        perThread.normed.map(abs).max() ?? 0,
+                        outputDrift.absolute,
+                        outputDrift.relative,
+                        perThread.shared.map(abs).max() ?? 0
+                    )
+                )
+                XCTAssertEqual(
+                    inputDrift.absolute, 0,
+                    "the two arms must feed the shared expert the same normed input"
+                )
+                XCTAssertLessThan(
+                    outputDrift.relative, 1e-5,
+                    "the coalesced fused kernel computes a different gate/up output"
+                )
+            }
+
+            XCTAssertEqual(oneThread.timing.positions, positions)
+            XCTAssertEqual(coalesced.timing.positions, positions)
+            XCTAssertGreaterThan(oneThread.sharedExpertPerPosition, 0)
+            XCTAssertGreaterThan(coalesced.sharedExpertPerPosition, 0)
+
+            let speedup = oneThread.sharedExpertPerPosition / coalesced.sharedExpertPerPosition
+            let savedPerPosition = oneThread.sharedExpertPerPosition
+                - coalesced.sharedExpertPerPosition
+            print(
+                String(
+                    format: "🔎 [dsv41 real] sharedExpert %.3f -> %.3f ms/position "
+                        + "(%.2fx, %.3f ms saved per position; %.1f%% of the baseline's "
+                        + "device time)",
+                    oneThread.sharedExpertPerPosition,
+                    coalesced.sharedExpertPerPosition,
+                    speedup,
+                    savedPerPosition,
+                    savedPerPosition
+                        / (Double(oneThread.timing.frontDeviceNanoseconds
+                            + oneThread.timing.mixtureDeviceNanoseconds)
+                            / Double(positions) / 1_000_000) * 100
+                )
+            )
+
+            for (label, outcome) in [("one-thread", oneThread), ("coalesced", coalesced)] {
+                let frontNames = Set(DeepSeekV41DevicePlan.frontHalf.map(\.rawValue))
+                let denseTotal = outcome.table
+                    .filter { frontNames.contains($0.stage) }
+                    .reduce(0) { $0 + $1.millisecondsPerPosition }
+                let mixtureTotal = outcome.table
+                    .filter { !frontNames.contains($0.stage) }
+                    .reduce(0) { $0 + $1.millisecondsPerPosition }
+                print(
+                    String(
+                        format: "🔎 [dsv41 real] %@ stage table: %.2f dense, %.2f mixture, "
+                            + "%d stage(s); top five %@",
+                        label,
+                        denseTotal,
+                        mixtureTotal,
+                        outcome.table.count,
+                        outcome.table.prefix(5)
+                            .map { String(format: "%@ %.2f", $0.stage, $0.millisecondsPerPosition) }
+                            .joined(separator: ", ") as NSString
+                    )
+                )
+            }
+            runtime.shutdown()
+        }
+        withExtendedLifetime(engine) {}
+    }
+
     /// A page-aligned anonymous mapping this test can wire.
     ///
     /// `mlock` is the only in-process way to tell the kernel a page may be neither

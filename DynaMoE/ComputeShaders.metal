@@ -10686,6 +10686,320 @@ kernel void dsv41_fp8_block32_down_accumulate(
     outputVector[row] += routingWeight * total;
 }
 
+/// MSL Kernel: fused E4M3 32x32 block-scaled gate+up, one threadgroup per row.
+///
+/// `dsv41_fp8_block32_swiglu_gate_up` gives a thread a whole output row, so a warp's
+/// 32 lanes walk 32 rows that are a full row width apart and every lane's eight
+/// UInt8 loads pull their own sector. That is the shape `#20` replaced for the plain
+/// GEMV and for the MXFP4 mixture, and the FP8 shared expert -- the largest single
+/// stage of a decode -- kept it, which is why it read at 109-113 GB/s where the
+/// routed experts read at 352 (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #60").
+///
+/// Here a threadgroup owns one output row: lane `l` covers blocks `l, l + lanes, ...`,
+/// so a warp's 32 lanes read one contiguous 1 KB window per step. The checkpoint's
+/// scale grid is 32x32, so 32 consecutive rows share a scale row and each lane reads
+/// its byte per block exactly as the one-thread form does.
+///
+/// Grid: (outDim * batchSize, 1, 1) flat, `row = groupIdx % outDim` and the token is
+/// `groupIdx / outDim`, the shape `dsv41_fp8_block32_gemv_rows` uses.
+/// `[[threadgroup(0)]]` needs two floats per 32 lanes (one for gate, one for up).
+kernel void dsv41_fp8_block32_swiglu_gate_up_rows(
+    device const uchar* gateWeightBuffer [[buffer(0)]],
+    device const uchar* gateScaleBuffer [[buffer(1)]],
+    device const uchar* upWeightBuffer [[buffer(2)]],
+    device const uchar* upScaleBuffer [[buffer(3)]],
+    device const float* inputVector [[buffer(4)]],
+    device float* outputVector [[buffer(5)]],
+    constant uint64_t& gateWeightOffset [[buffer(6)]],
+    constant uint64_t& gateScaleOffset [[buffer(7)]],
+    constant uint64_t& upWeightOffset [[buffer(8)]],
+    constant uint64_t& upScaleOffset [[buffer(9)]],
+    constant uint32_t& inDim [[buffer(10)]],
+    constant uint32_t& outDim [[buffer(11)]],
+    constant float& swigluLimit [[buffer(12)]],
+    threadgroup float* partials [[threadgroup(0)]],
+    uint groupIdx [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
+) {
+    if (inDim == 0u || outDim == 0u || (inDim % 32u) != 0u) return;
+
+    uint32_t row = groupIdx % outDim;
+    uint32_t tokenIdx = groupIdx / outDim;
+    uint32_t blockCount = inDim / 32u;
+    uint32_t scaleRowBase = (row / 32u) * blockCount;
+    uint64_t rowByte = (uint64_t)row * (uint64_t)inDim;
+
+    device const uchar* gRow = gateWeightBuffer + gateWeightOffset + rowByte;
+    device const uchar* gsRow = gateScaleBuffer + gateScaleOffset + scaleRowBase;
+    device const uchar* uRow = upWeightBuffer + upWeightOffset + rowByte;
+    device const uchar* usRow = upScaleBuffer + upScaleOffset + scaleRowBase;
+    device const float* xRow = inputVector + ((uint64_t)tokenIdx * (uint64_t)inDim);
+
+    float gate0 = 0.0f;
+    float gate1 = 0.0f;
+    float up0 = 0.0f;
+    float up1 = 0.0f;
+    for (uint32_t block = lane; block < blockCount; block += laneCount) {
+        float gScale = decode_e8m0_scale(gsRow[block]);
+        float uScale = decode_e8m0_scale(usRow[block]);
+        uint32_t base = block * 32u;
+        device const float* x = xRow + base;
+        uchar4 g0 = *(device const uchar4*)(gRow + base);
+        uchar4 g1 = *(device const uchar4*)(gRow + base + 4u);
+        uchar4 g2 = *(device const uchar4*)(gRow + base + 8u);
+        uchar4 g3 = *(device const uchar4*)(gRow + base + 12u);
+        uchar4 g4 = *(device const uchar4*)(gRow + base + 16u);
+        uchar4 g5 = *(device const uchar4*)(gRow + base + 20u);
+        uchar4 g6 = *(device const uchar4*)(gRow + base + 24u);
+        uchar4 g7 = *(device const uchar4*)(gRow + base + 28u);
+        uchar4 u0 = *(device const uchar4*)(uRow + base);
+        uchar4 u1 = *(device const uchar4*)(uRow + base + 4u);
+        uchar4 u2 = *(device const uchar4*)(uRow + base + 8u);
+        uchar4 u3 = *(device const uchar4*)(uRow + base + 12u);
+        uchar4 u4 = *(device const uchar4*)(uRow + base + 16u);
+        uchar4 u5 = *(device const uchar4*)(uRow + base + 20u);
+        uchar4 u6 = *(device const uchar4*)(uRow + base + 24u);
+        uchar4 u7 = *(device const uchar4*)(uRow + base + 28u);
+        float4 x0 = *(device const float4*)(x);
+        float4 x1 = *(device const float4*)(x + 4u);
+        float4 x2 = *(device const float4*)(x + 8u);
+        float4 x3 = *(device const float4*)(x + 12u);
+        float4 x4 = *(device const float4*)(x + 16u);
+        float4 x5 = *(device const float4*)(x + 20u);
+        float4 x6 = *(device const float4*)(x + 24u);
+        float4 x7 = *(device const float4*)(x + 28u);
+        // Two accumulator pairs per matrix: the 32 products of a block are a
+        // dependent chain in one register otherwise ("DSV4.1 #17").
+        float gateA = 0.0f;
+        float gateB = 0.0f;
+        float upA = 0.0f;
+        float upB = 0.0f;
+        gateA += unpack_e4m3(g0.x) * x0.x;
+        gateB += unpack_e4m3(g0.y) * x0.y;
+        upA += unpack_e4m3(u0.x) * x0.x;
+        upB += unpack_e4m3(u0.y) * x0.y;
+        gateA += unpack_e4m3(g0.z) * x0.z;
+        gateB += unpack_e4m3(g0.w) * x0.w;
+        upA += unpack_e4m3(u0.z) * x0.z;
+        upB += unpack_e4m3(u0.w) * x0.w;
+        gateA += unpack_e4m3(g1.x) * x1.x;
+        gateB += unpack_e4m3(g1.y) * x1.y;
+        upA += unpack_e4m3(u1.x) * x1.x;
+        upB += unpack_e4m3(u1.y) * x1.y;
+        gateA += unpack_e4m3(g1.z) * x1.z;
+        gateB += unpack_e4m3(g1.w) * x1.w;
+        upA += unpack_e4m3(u1.z) * x1.z;
+        upB += unpack_e4m3(u1.w) * x1.w;
+        gateA += unpack_e4m3(g2.x) * x2.x;
+        gateB += unpack_e4m3(g2.y) * x2.y;
+        upA += unpack_e4m3(u2.x) * x2.x;
+        upB += unpack_e4m3(u2.y) * x2.y;
+        gateA += unpack_e4m3(g2.z) * x2.z;
+        gateB += unpack_e4m3(g2.w) * x2.w;
+        upA += unpack_e4m3(u2.z) * x2.z;
+        upB += unpack_e4m3(u2.w) * x2.w;
+        gateA += unpack_e4m3(g3.x) * x3.x;
+        gateB += unpack_e4m3(g3.y) * x3.y;
+        upA += unpack_e4m3(u3.x) * x3.x;
+        upB += unpack_e4m3(u3.y) * x3.y;
+        gateA += unpack_e4m3(g3.z) * x3.z;
+        gateB += unpack_e4m3(g3.w) * x3.w;
+        upA += unpack_e4m3(u3.z) * x3.z;
+        upB += unpack_e4m3(u3.w) * x3.w;
+        gateA += unpack_e4m3(g4.x) * x4.x;
+        gateB += unpack_e4m3(g4.y) * x4.y;
+        upA += unpack_e4m3(u4.x) * x4.x;
+        upB += unpack_e4m3(u4.y) * x4.y;
+        gateA += unpack_e4m3(g4.z) * x4.z;
+        gateB += unpack_e4m3(g4.w) * x4.w;
+        upA += unpack_e4m3(u4.z) * x4.z;
+        upB += unpack_e4m3(u4.w) * x4.w;
+        gateA += unpack_e4m3(g5.x) * x5.x;
+        gateB += unpack_e4m3(g5.y) * x5.y;
+        upA += unpack_e4m3(u5.x) * x5.x;
+        upB += unpack_e4m3(u5.y) * x5.y;
+        gateA += unpack_e4m3(g5.z) * x5.z;
+        gateB += unpack_e4m3(g5.w) * x5.w;
+        upA += unpack_e4m3(u5.z) * x5.z;
+        upB += unpack_e4m3(u5.w) * x5.w;
+        gateA += unpack_e4m3(g6.x) * x6.x;
+        gateB += unpack_e4m3(g6.y) * x6.y;
+        upA += unpack_e4m3(u6.x) * x6.x;
+        upB += unpack_e4m3(u6.y) * x6.y;
+        gateA += unpack_e4m3(g6.z) * x6.z;
+        gateB += unpack_e4m3(g6.w) * x6.w;
+        upA += unpack_e4m3(u6.z) * x6.z;
+        upB += unpack_e4m3(u6.w) * x6.w;
+        gateA += unpack_e4m3(g7.x) * x7.x;
+        gateB += unpack_e4m3(g7.y) * x7.y;
+        upA += unpack_e4m3(u7.x) * x7.x;
+        upB += unpack_e4m3(u7.y) * x7.y;
+        gateA += unpack_e4m3(g7.z) * x7.z;
+        gateB += unpack_e4m3(g7.w) * x7.w;
+        upA += unpack_e4m3(u7.z) * x7.z;
+        upB += unpack_e4m3(u7.w) * x7.w;
+        gate0 += gateA * gScale;
+        gate1 += gateB * gScale;
+        up0 += upA * uScale;
+        up1 += upB * uScale;
+    }
+
+    float gateTotal = simd_sum(gate0 + gate1);
+    float upTotal = simd_sum(up0 + up1);
+    if (laneCount <= 32u) {
+        if (lane == 0u) {
+            float gate = gateTotal;
+            float up = upTotal;
+            if (swigluLimit > 0.0f) {
+                gate = min(gate, swigluLimit);
+                up = clamp(up, -swigluLimit, swigluLimit);
+            }
+            outputVector[((uint64_t)tokenIdx * (uint64_t)outDim) + row]
+                = (gate / (1.0f + exp(-gate))) * up;
+        }
+        return;
+    }
+    if (laneInSimd == 0u) {
+        partials[simdIdx * 2u] = gateTotal;
+        partials[simdIdx * 2u + 1u] = upTotal;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) {
+        uint32_t simdCount = (laneCount + 31u) / 32u;
+        float gate = 0.0f;
+        float up = 0.0f;
+        for (uint32_t group = 0; group < simdCount; ++group) {
+            gate += partials[group * 2u];
+            up += partials[group * 2u + 1u];
+        }
+        if (swigluLimit > 0.0f) {
+            gate = min(gate, swigluLimit);
+            up = clamp(up, -swigluLimit, swigluLimit);
+        }
+        outputVector[((uint64_t)tokenIdx * (uint64_t)outDim) + row]
+            = (gate / (1.0f + exp(-gate))) * up;
+    }
+}
+
+/// MSL Kernel: weighted E4M3 32x32 block-scaled down-projection, one threadgroup per
+/// row.
+///
+/// The same move as `dsv41_fp8_block32_swiglu_gate_up_rows`, and the same reason: the
+/// one-thread form walks a whole row per lane, and the shared expert's down
+/// projection is the widest of its three matrices. Lane `l` covers blocks
+/// `l, l + lanes, ...`; lane 0 adds the reduced total into the output row exactly as
+/// the one-thread form does (`output[row] += routingWeight * total`), so the caller's
+/// buffer ordering still folds the mixture.
+///
+/// Buffer indices match `dsv41_fp8_block32_down_accumulate`. `[[threadgroup(0)]]`
+/// needs one float per 32 lanes.
+kernel void dsv41_fp8_block32_down_accumulate_rows(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const uchar* rawScaleBuffer [[buffer(1)]],
+    device const float* activationVector [[buffer(2)]],
+    device float* outputVector [[buffer(3)]],
+    constant uint64_t& weightOffset [[buffer(4)]],
+    constant uint64_t& scaleOffset [[buffer(5)]],
+    constant uint32_t& inDim [[buffer(6)]],
+    constant uint32_t& outDim [[buffer(7)]],
+    constant float& routingWeight [[buffer(8)]],
+    threadgroup float* partials [[threadgroup(0)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
+) {
+    if (inDim == 0u || outDim == 0u || row >= outDim || (inDim % 32u) != 0u) return;
+
+    uint32_t blockCount = inDim / 32u;
+    uint32_t scaleRowBase = (row / 32u) * blockCount;
+    device const uchar* wRow = rawWeightBuffer + weightOffset
+        + ((uint64_t)row * (uint64_t)inDim);
+    device const uchar* sRow = rawScaleBuffer + scaleOffset + scaleRowBase;
+
+    float dot0 = 0.0f;
+    float dot1 = 0.0f;
+    for (uint32_t block = lane; block < blockCount; block += laneCount) {
+        float blockScale = decode_e8m0_scale(sRow[block]);
+        uint32_t base = block * 32u;
+        device const float* x = activationVector + base;
+        uchar4 w0 = *(device const uchar4*)(wRow + base);
+        uchar4 w1 = *(device const uchar4*)(wRow + base + 4u);
+        uchar4 w2 = *(device const uchar4*)(wRow + base + 8u);
+        uchar4 w3 = *(device const uchar4*)(wRow + base + 12u);
+        uchar4 w4 = *(device const uchar4*)(wRow + base + 16u);
+        uchar4 w5 = *(device const uchar4*)(wRow + base + 20u);
+        uchar4 w6 = *(device const uchar4*)(wRow + base + 24u);
+        uchar4 w7 = *(device const uchar4*)(wRow + base + 28u);
+        float4 x0 = *(device const float4*)(x);
+        float4 x1 = *(device const float4*)(x + 4u);
+        float4 x2 = *(device const float4*)(x + 8u);
+        float4 x3 = *(device const float4*)(x + 12u);
+        float4 x4 = *(device const float4*)(x + 16u);
+        float4 x5 = *(device const float4*)(x + 20u);
+        float4 x6 = *(device const float4*)(x + 24u);
+        float4 x7 = *(device const float4*)(x + 28u);
+        float low0 = 0.0f;
+        float low1 = 0.0f;
+        float high0 = 0.0f;
+        float high1 = 0.0f;
+        low0 += unpack_e4m3(w0.x) * x0.x;
+        low1 += unpack_e4m3(w0.y) * x0.y;
+        high0 += unpack_e4m3(w0.z) * x0.z;
+        high1 += unpack_e4m3(w0.w) * x0.w;
+        low0 += unpack_e4m3(w1.x) * x1.x;
+        low1 += unpack_e4m3(w1.y) * x1.y;
+        high0 += unpack_e4m3(w1.z) * x1.z;
+        high1 += unpack_e4m3(w1.w) * x1.w;
+        low0 += unpack_e4m3(w2.x) * x2.x;
+        low1 += unpack_e4m3(w2.y) * x2.y;
+        high0 += unpack_e4m3(w2.z) * x2.z;
+        high1 += unpack_e4m3(w2.w) * x2.w;
+        low0 += unpack_e4m3(w3.x) * x3.x;
+        low1 += unpack_e4m3(w3.y) * x3.y;
+        high0 += unpack_e4m3(w3.z) * x3.z;
+        high1 += unpack_e4m3(w3.w) * x3.w;
+        low0 += unpack_e4m3(w4.x) * x4.x;
+        low1 += unpack_e4m3(w4.y) * x4.y;
+        high0 += unpack_e4m3(w4.z) * x4.z;
+        high1 += unpack_e4m3(w4.w) * x4.w;
+        low0 += unpack_e4m3(w5.x) * x5.x;
+        low1 += unpack_e4m3(w5.y) * x5.y;
+        high0 += unpack_e4m3(w5.z) * x5.z;
+        high1 += unpack_e4m3(w5.w) * x5.w;
+        low0 += unpack_e4m3(w6.x) * x6.x;
+        low1 += unpack_e4m3(w6.y) * x6.y;
+        high0 += unpack_e4m3(w6.z) * x6.z;
+        high1 += unpack_e4m3(w6.w) * x6.w;
+        low0 += unpack_e4m3(w7.x) * x7.x;
+        low1 += unpack_e4m3(w7.y) * x7.y;
+        high0 += unpack_e4m3(w7.z) * x7.z;
+        high1 += unpack_e4m3(w7.w) * x7.w;
+        dot0 += (low0 + low1) * blockScale;
+        dot1 += (high0 + high1) * blockScale;
+    }
+
+    float warpTotal = simd_sum(dot0 + dot1);
+    if (laneCount <= 32u) {
+        if (lane == 0u) outputVector[row] += routingWeight * warpTotal;
+        return;
+    }
+    if (laneInSimd == 0u) partials[simdIdx] = warpTotal;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) {
+        uint32_t simdCount = (laneCount + 31u) / 32u;
+        float total = 0.0f;
+        for (uint32_t group = 0; group < simdCount; ++group) {
+            total += partials[group];
+        }
+        outputVector[row] += routingWeight * total;
+    }
+}
+
 /// MSL Kernel: `dsv41_vision_rope_split_f32` -- the vision tower's per-token rotary
 /// and head split, done once per block instead of once per attention dispatch.
 ///

@@ -102,6 +102,10 @@ nonisolated public enum DeepSeekV41Kernels {
     public static let fp8GemvRows2 = "dsv41_fp8_block32_gemv_rows2"
     public static let fp8SwiGLU = "dsv41_fp8_block32_swiglu_gate_up"
     public static let fp8DownAccumulate = "dsv41_fp8_block32_down_accumulate"
+    /// The shared expert's two kernels with one output row per threadgroup, so a
+    /// warp's 32 E4M3 bytes per block are adjacent instead of a row apart.
+    public static let fp8SwiGLURows = "dsv41_fp8_block32_swiglu_gate_up_rows"
+    public static let fp8DownAccumulateRows = "dsv41_fp8_block32_down_accumulate_rows"
     public static let mxfp4Gemv = "dsv41_mxfp4_gemv"
     public static let mxfp4SwiGLU = "dsv41_mxfp4_swiglu_gate_up"
     public static let mxfp4DownAccumulate = "dsv41_mxfp4_down_accumulate"
@@ -309,6 +313,18 @@ nonisolated public enum DeepSeekV41DevicePlan {
     public static func mixtureWantsWideGrid(inDim: Int, outDim: Int) -> Bool {
         outDim >= 32 && inDim >= 1_024
     }
+
+    /// The lanes the shared expert's coalesced fused pair dispatches at.
+    ///
+    /// 32 is one SIMD group, so `simd_sum` finishes the reduction and the kernel
+    /// returns without touching threadgroup memory or paying a barrier. Measured on
+    /// the checkpoint's own shapes: the fused gate+up is a tie (0.123 ms at 32 lanes,
+    /// 0.122 at 64, 4.1x the one-thread form either way) and the down projection is
+    /// 9% better at 32 (0.084 against 0.092, 1.81x), which in situ over a 128-position
+    /// walk is 4.05 against 4.25 ms/position for the pair. The plain
+    /// `gemvLaneWidth` 64 stays what the FP8 GEMV uses: that kernel measured the other
+    /// way round (`#20`), and it reduces ONE matrix rather than a fused pair.
+    public static let fp8FusedLaneWidth = 32
 
     /// The fused gate+up kernel, or nil when the format's kernel cannot apply the
     /// checkpoint's `swiglu_limit`. The clip is part of the trained function, so a
@@ -713,17 +729,32 @@ nonisolated public struct DeepSeekV41ParityProbes {
     public var feedForwardLogits: MTLBuffer?
     /// The stack after the attention sub-layer's `hc_post` (`mult * hidden`).
     public var afterAttention: MTLBuffer?
+    /// The FFN's normed input (`hidden`), captured at `sharedExpertCaptureLayer`.
+    public var ffnNormed: MTLBuffer?
+    /// The shared expert's fused gate/up output (`sharedIntermediate`), captured at
+    /// `sharedExpertCaptureLayer` — the one buffer that depends on nothing but the
+    /// normed input and the expert's own weights, so two kernel forms can be compared
+    /// on real activations rather than through forty layers of amplification.
+    public var sharedIntermediate: MTLBuffer?
+    /// The layer the two feed-forward captures are taken at. Nil disables them.
+    public var sharedExpertCaptureLayer: Int?
 
     public init(
         beforeAttention: MTLBuffer? = nil,
         attentionLogits: MTLBuffer? = nil,
         feedForwardLogits: MTLBuffer? = nil,
-        afterAttention: MTLBuffer? = nil
+        afterAttention: MTLBuffer? = nil,
+        ffnNormed: MTLBuffer? = nil,
+        sharedIntermediate: MTLBuffer? = nil,
+        sharedExpertCaptureLayer: Int? = nil
     ) {
         self.beforeAttention = beforeAttention
         self.attentionLogits = attentionLogits
         self.feedForwardLogits = feedForwardLogits
         self.afterAttention = afterAttention
+        self.ffnNormed = ffnNormed
+        self.sharedIntermediate = sharedIntermediate
+        self.sharedExpertCaptureLayer = sharedExpertCaptureLayer
     }
 }
 
@@ -1688,6 +1719,18 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// Positions the walk stage table was accumulated over, so a caller divides by
     /// positions rather than by layers.
     public private(set) var walkStagePositions = 0
+
+    /// Measurement only: refuses the shared expert's coalesced FP8 forms so a probe can
+    /// time the one-thread forms on the same runtime, over the same token stream, with
+    /// the same arena. Off in every production path — the shipped choice is
+    /// `DeepSeekV41DevicePlan.fp8GemvWantsWideGrid`'s.
+    public var disablesFP8FusedRows = false
+
+    /// Measurement only: the lane width the coalesced FP8 fused forms dispatch at, or 0
+    /// for the shipped `gemvLaneWidth`. Two widths reduce in two different tree shapes,
+    /// so a probe can separate a form's arithmetic from the graph's own sensitivity to
+    /// a rounding-level difference, which no single A/B can.
+    public var fp8FusedLaneWidthOverride = 0
 
     /// Where a walked position's idle time sits, buffer by buffer. Off by default and
     /// off in every production path: it retains a timeline entry per committed buffer.
@@ -4494,6 +4537,28 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
 
         case .sharedExpert:
             try encodeSharedExpert(layer: index, encoder: encoder)
+            // The one place a shared expert's own arithmetic can be read back without
+            // moving a probe into `encodeSharedExpert`: the fused pair ends with a
+            // buffer barrier, so a copy here sees what it wrote and nothing else.
+            if parityProbes.sharedExpertCaptureLayer == index,
+               parityProbes.ffnNormed != nil || parityProbes.sharedIntermediate != nil {
+                if let probe = parityProbes.ffnNormed {
+                    try encodeCopy(
+                        encoder,
+                        from: workspace.normed,
+                        to: probe,
+                        count: shapes.hidden
+                    )
+                }
+                if let probe = parityProbes.sharedIntermediate {
+                    try encodeCopy(
+                        encoder,
+                        from: workspace.sharedIntermediate,
+                        to: probe,
+                        count: shapes.sharedIntermediate
+                    )
+                }
+            }
 
         case .routedExperts:
             try encodeRoutedExperts(
@@ -6116,6 +6181,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         var outDimension = UInt32(outDim)
 
         var wideGrid = false
+        // The coalesced family's lanes. FP8 and MXFP4 disagree, so the dispatch reads
+        // this rather than a constant: 32 for the mixture, 64 for FP8
+        // (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #20").
+        var wideLaneWidth = Self.mixtureLaneWidth
         switch format {
         case .fp8Block32, .mxfp4:
             guard let gateScale, let upScale else {
@@ -6126,11 +6195,22 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             guard let gateScaleBuffer, let upScaleBuffer else {
                 throw DeepSeekV41EngineError.missingTensor("a feed-forward scale companion")
             }
-            wideGrid = format == .mxfp4
-                && DeepSeekV41DevicePlan.mixtureWantsWideGrid(inDim: inDim, outDim: outDim)
+            if format == .fp8Block32 {
+                wideGrid = !disablesFP8FusedRows
+                    && DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(
+                        outDim: outDim, inDim: inDim, rows: 1
+                    )
+                wideLaneWidth = fp8FusedLaneWidthOverride > 0
+                    ? fp8FusedLaneWidthOverride
+                    : DeepSeekV41DevicePlan.fp8FusedLaneWidth
+            } else {
+                wideGrid = DeepSeekV41DevicePlan.mixtureWantsWideGrid(
+                    inDim: inDim, outDim: outDim
+                )
+            }
             encoder.setComputePipelineState(
                 format == .fp8Block32
-                    ? pipelines.fp8SwiGLU
+                    ? (wideGrid ? pipelines.fp8SwiGLURows : pipelines.fp8SwiGLU)
                     : (wideGrid ? pipelines.mxfp4SwiGLURows : pipelines.mxfp4SwiGLU)
             )
             encoder.setBuffer(gateBuffer, offset: 0, index: 0)
@@ -6167,18 +6247,18 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             throw DeepSeekV41EngineError.unsupportedDtype("a feed-forward gate", gate.dtype)
         }
         if wideGrid {
-            // One threadgroup per output row and one SIMD group per row, so the row's
-            // 16-byte weight blocks are adjacent across the lanes and the reduction
-            // needs no barrier at all. Measured 6.3x the one-thread form at the
-            // published expert (`DeepSeekV41PrefillMeasurementTests
-            // .testWhatTheCoalescedMixtureIsWorth`).
+            // One threadgroup per output row, so the row's weight blocks are adjacent
+            // across the lanes and the reduction is a `simd_sum` plus one lane-0 pass.
+            // Measured 6.3x the one-thread form on the routed mixture
+            // (`DeepSeekV41PrefillMeasurementTests.testWhatTheCoalescedMixtureIsWorth`)
+            // and, for the FP8 shared expert, what `#61` wires.
             encoder.setThreadgroupMemoryLength(
                 Self.mixtureReductionSlots * 2 * MemoryLayout<Float>.stride, index: 0
             )
             encoder.dispatchThreadgroups(
                 MTLSize(width: outDim, height: 1, depth: 1),
                 threadsPerThreadgroup: MTLSize(
-                    width: Self.mixtureLaneWidth, height: 1, depth: 1
+                    width: wideLaneWidth, height: 1, depth: 1
                 )
             )
             encoder.memoryBarrier(scope: .buffers)
@@ -6218,6 +6298,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         var routing = weightToAdd
 
         var wideGrid = false
+        var wideLaneWidth = Self.mixtureLaneWidth
         switch format {
         case .fp8Block32, .mxfp4:
             guard let scale else {
@@ -6227,11 +6308,22 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             guard let scaleBuffer else {
                 throw DeepSeekV41EngineError.missingTensor("a down projection's scale companion")
             }
-            wideGrid = format == .mxfp4
-                && DeepSeekV41DevicePlan.mixtureWantsWideGrid(inDim: inDim, outDim: outDim)
+            if format == .fp8Block32 {
+                wideGrid = !disablesFP8FusedRows
+                    && DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(
+                        outDim: outDim, inDim: inDim, rows: 1
+                    )
+                wideLaneWidth = fp8FusedLaneWidthOverride > 0
+                    ? fp8FusedLaneWidthOverride
+                    : DeepSeekV41DevicePlan.fp8FusedLaneWidth
+            } else {
+                wideGrid = DeepSeekV41DevicePlan.mixtureWantsWideGrid(
+                    inDim: inDim, outDim: outDim
+                )
+            }
             encoder.setComputePipelineState(
                 format == .fp8Block32
-                    ? pipelines.fp8DownAccumulate
+                    ? (wideGrid ? pipelines.fp8DownAccumulateRows : pipelines.fp8DownAccumulate)
                     : (wideGrid ? pipelines.mxfp4DownAccumulateRows : pipelines.mxfp4DownAccumulate)
             )
             encoder.setBuffer(weightBuffer, offset: 0, index: 0)
@@ -6265,7 +6357,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.dispatchThreadgroups(
                 MTLSize(width: outDim, height: 1, depth: 1),
                 threadsPerThreadgroup: MTLSize(
-                    width: Self.mixtureLaneWidth, height: 1, depth: 1
+                    width: wideLaneWidth, height: 1, depth: 1
                 )
             )
             encoder.memoryBarrier(scope: .buffers)

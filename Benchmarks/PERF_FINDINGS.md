@@ -9953,3 +9953,129 @@ one `#59` measured.
 No kernel, encoder, dispatch shape or production path changed: `recordsWalkStageTiming` is a flag
 that is off in every production path, and the single-buffer layout a turn uses is byte-for-byte the
 one `#59` measured.
+
+## DSV4.1 #61: THE SHARED EXPERT WAS ONE THREAD PER ROW, AND IT IS 15% OF A DECODE
+
+`#60` attributed a walked position's device time and found the shared expert the largest single
+stage of a decode: 12.96 ms of 54.3 ms, reading its 1.42 GB/position at 109-113 GB/s while the
+routed experts read 352 GB/s on the same kind of bytes. `#20` had already fixed the shape that
+causes it -- a thread per whole output row, so a warp's 32 lanes sit a full row width apart and
+every lane's load pulls its own sector -- for the plain FP8 GEMV and for the MXFP4 mixture. It had
+never been fixed for the two kernels the shared expert actually calls: `dsv41_fp8_block32_swiglu_gate_up`
+(fused gate+up) and `dsv41_fp8_block32_down_accumulate`. The checkpoint's shared expert is
+`F8_E4M3` `[2304, 5120]` gate and up with `F8_E8M0` `[72, 160]` 32x32 scales, and a `[5120, 2304]`
+down, on forty layers, so this one omission was ~1.4 GB of a decoded token's reads.
+
+**The fix.** Two coalesced siblings, `dsv41_fp8_block32_swiglu_gate_up_rows` and
+`dsv41_fp8_block32_down_accumulate_rows`: one threadgroup per output row, lane `l` covering blocks
+`l, l + lanes, ...`, so a warp's 32 lanes read one contiguous 1 KB window per step, and the
+reduction is a `simd_sum` plus (past 32 lanes) one lane-0 pass over threadgroup memory. Both bind
+the SAME buffer indices as their one-thread siblings, so the call site swaps the pipeline and the
+dispatch shape and nothing else. `fp8GemvWantsWideGrid` already sends both published shapes that
+way (`inDim` 5,120 and 2,304 against its 2,048 crossover); the lanes are the new decision, below.
+
+**Isolated A/B, the checkpoint's own shapes** (six distinct weight regions in one command buffer,
+best of 8, both forms checked against each other first):
+
+| projection | one thread/row | coalesced 32 lanes | coalesced 64 lanes |
+|---|---:|---:|---:|
+| fused gate+up 2,304x5,120 | 0.506 ms (47 GB/s) | **0.123 (4.12x, 192 GB/s)** | 0.122 (4.13x, 193 GB/s) |
+| down 5,120x2,304 | 0.153 (77 GB/s) | **0.084 (1.81x, 140 GB/s)** | 0.092 (1.66x, 128 GB/s) |
+
+The fused row counts BOTH matrices (gate and up are separate 11.2 MB tiles); the traffic numbers
+above include both, which is why they are not the 262-370 GB/s `#20` quoted for a single-matrix
+GEMV. 32 lanes wins the down projection by 9% and ties the fused pair, and 32 is one SIMD group, so
+the kernel returns without touching threadgroup memory at all -- the same argument that made
+`mixtureLaneWidth` 32. `gemvLaneWidth` stays 64 for the plain FP8 GEMV: that kernel measured the
+other way round (`#20`) and it reduces one matrix rather than a fused pair.
+`DeepSeekV41DevicePlan.fp8FusedLaneWidth` is 32 and the GEMV keeps its own.
+
+**In situ, one runtime, one 128-position stream, the shipping frequency rule**, all three arms under
+`recordsWalkStageTiming` so the `sharedExpert` window is measured the same way in each:
+
+| arm | device | mixture device | sharedExpert | misses | read |
+|---|---:|---:|---:|---:|---:|
+| one-thread (what shipped until now) | 58.0 ms/pos | 25.1 | **12.785 ms** | 2,007 | 35.1 GB |
+| coalesced, 32 lanes (shipped) | 49.2 | 16.4 | **4.061 ms** | 1,681 | 29.4 GB |
+| coalesced, 64 lanes (control) | 49.4 | 16.6 | 4.235 | 1,562 | 27.3 GB |
+
+**The shared expert goes from the largest stage of a decode to the fifth**, 12.785 -> 4.061
+ms/position (3.15x, 8.72 ms saved, 15.0% of the one-thread arm's device time), and the mixture half
+of a position goes 25.1 -> 16.4 ms. `routedExperts` (11.97) is the mixture's remaining cost and the
+largest stage again; the new order is routedExperts 11.97, queryUp 4.42, outputDown 4.12,
+hcAttentionCoefficients 4.09, sharedExpert 4.06.
+
+**The answer was checked three ways, because a kernel swap that is 23x noisier than a lane-width
+change has to be explained rather than excused.**
+
+1. *The kernel's own arithmetic on the checkpoint's activations.* `DeepSeekV41ParityProbes` grew
+   `ffnNormed` / `sharedIntermediate` / `sharedExpertCaptureLayer`, which copy the FFN's normed
+   input and the fused pair's output at one layer (off in production). At layer 0, position 0, over
+   a 128-position walk, the two arms feed the shared expert a **bit-identical** normed vector and
+   its fused output differs by **2.98e-07 absolute on a 1.85 scale, 1.61e-07 relative** -- FP32
+   rounding, nothing else.
+2. *A reduction-tree control.* The shipped 32-lane form and the 64-lane form are the same arithmetic
+   with two tree shapes; they drift **6.88e-04 relative** at the last position. The one-thread form
+   drifts **1.58e-02**, 23.0x more, and that is the OLD form's error: it sums 160 blocks in one
+   dependent chain where a threadgroup sums a shallow tree, so its rounding is ~log2(160) times
+   worse, and forty layers of mHC Sinkhorn and routed selection amplify it.
+3. *The decision itself.* The greedy token is identical at every sampled position of the stream
+   (0, 1, 2, 3, 7, 15, 31, 63, 127), so the form changes no answer. The drift is not monotone along
+   the stream (7.8e-04 at position 0, 1.9e-04 at 15, 7.1e-03 at 63), which is what amplification of
+   a 1e-7 stage difference looks like rather than a bias.
+
+`DeepSeekV41FP8SharedExpertKernelTests` pins both kernels against a HOST rule at the published
+shapes, at both lane widths, with a row count off the 32-row scale boundary (65 rows, which needs
+the partial scale group), an input shorter than a lane's block count, the token axis, and
+`swiglu_limit` (a 0.25 limit must change the answer, so a kernel that dropped the clip fails).
+
+### What it says
+
+- **The shared expert was never a bandwidth problem, it was a dispatch shape**, and it was the same
+  defect `#20` named, one kernel family later. The evidence `#20` left behind -- a coalesced A/B of
+  `shared_experts.w1` at 3.88x -- was measured on the plain GEMV, which the shared expert does not
+  call. This closes that gap: the two kernels it DOES call now have their sibling.
+- **What is left of a walked position is the routed mixture and the small per-position kernels.**
+  After this: routedExperts 11.97, queryUp 4.42, outputDown 4.12, hcAttentionCoefficients 4.09,
+  sharedExpert 4.06, router ~3.6, the rest under 2. The dense GEMVs are at 332-397 GB/s (`#60`) and
+  the routed mixture at 352, so the remaining large items are **latency**, not bytes: the mHC
+  coefficient pair and the router are per-position dispatches a block amortizes, and 60 ms of a
+  ~64 ms wall is still `front wait` (41.3) plus the expert fill (6.3) plus two encodes.
+- **32 lanes beat 64 on this pair and lose to it on the plain GEMV**, so the lane width is a property
+  of the kernel family, not of the format.
+
+### What it is not (do not re-propose)
+
+- **Not a claim that the one-thread forms were reading the wrong bytes.** They are arithmetically
+  equivalent (1.6e-7); they are slow, not wrong. Nothing here changes what an answer is.
+- **Not a licence to switch the plain FP8 GEMV to 32 lanes.** It measured 15% the other way (`#20`).
+- **Not a reason to add rows per threadgroup.** `#21` measured that a wash on FP8 (0.85-1.10x) with
+  a different explanation, and this slice does not touch the question: the fused pair's input is
+  one cached 5 KB vector, so sharing it across rows buys nothing.
+- **Not an arena, replacement, fill, page-cache or prompt result.** The arena is the shipped one and
+  the policy is the shipping rule; the arms' miss counts differ (2,007 vs 1,681 vs 1,562) because a
+  rounding-level difference occasionally flips a routing decision, and their walls are not compared
+  across arms for that reason plus the fill's page-cache share (23.2 vs 6.3 vs 4.3 ms/position).
+  Only the `sharedExpert` and device columns are results.
+- **Not a wide-block or batched-verify argument.** A block already amortizes this stage differently
+  (`#18`); this is a decode-shaped fix measured on a decode.
+
+### Verification
+
+`testWhatTheCoalescedSharedExpertIsWorthToAWalk` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_shared_stage` plus the class's own `/tmp/dynamoe_dsv41_real_turn`), ~53 s at
+`-O`. It asserts the layer-0 kernel equivalence (input bit-identical, fused output < 1e-5), the
+greedy token at every sampled position, that both arms' instruments covered all 128 positions, and
+that the stage table reports the shared expert. Runs: `/tmp/test61_walk7.log` (the one tabulated
+above), with `/tmp/test61_walk4.log` and `/tmp/test61_walk5.log` as reproductions of the shape
+(12.73-12.78 -> 4.05-4.26 ms/position, 3.0-3.15x). The isolated form sweep is
+`DeepSeekV41PrefillMeasurementTests.testWhatTheCoalescedSharedExpertIsWorth` (opt-in,
+`/tmp/dynamoe_dsv41_prefill_measure`, 0.09 s): `/tmp/test61_shared2.log`. The kernels are pinned
+without the checkpoint by `DeepSeekV41FP8SharedExpertKernelTests` (6 cases,
+`/tmp/test61_kernels.log`).
+
+Production code changed: two kernels, two pipelines, `DeepSeekV41Kernels`, the selection in
+`encodeSwiGLU`/`encodeDown` (FP8 only; MXFP4 keeps its existing rule and lane width), the
+`fp8FusedLaneWidth` plan constant, and two measurement-only seams on the executor
+(`disablesFP8FusedRows`, `fp8FusedLaneWidthOverride`) plus three `DeepSeekV41ParityProbes` fields,
+all off in every production path.
