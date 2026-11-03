@@ -1105,6 +1105,11 @@ nonisolated public struct DeepSeekV41WalkTiming: Sendable, Equatable {
     /// Host time blocked committing the dense half, which is the routing readback.
     public var frontWaitNanoseconds: UInt64 = 0
     /// Host time blocked filling arena slots from the shards.
+    ///
+    /// It is placement plus the read, because the arena decides every slot before a byte
+    /// moves. A gated arm (`gatesMixtureOnExpertFill`) moves the read behind the commit,
+    /// so the two host buckets are still the same two intervals, just ordered the other
+    /// way round.
     public var expertFillNanoseconds: UInt64 = 0
     /// Host time blocked on the INDEXER split, which is a second round trip inside the
     /// dense half for the layers that own a compressed index.
@@ -1828,6 +1833,34 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// checkpoint's. The schedule is serial, so the cost should scale with this; the
     /// probe uses it to price one iteration of the chain.
     public var hyperConnectionSinkhornIterationsOverride: Int?
+
+    /// Whether a walk commits its expert half BEFORE the arena slots hold the bytes.
+    ///
+    /// The expert kernels bind arena slots, and the arena decides every one of them at
+    /// PLACEMENT (`DeepSeekV41ExpertStreamer.placeResident`), so the half can be encoded
+    /// and committed against them while the disk is still filling, gated on a shared
+    /// event the read signals. The hope was that the commit's pickup would then be paid
+    /// under the fill instead of after it.
+    ///
+    /// **It is not, and that is measured** (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #65").
+    /// At matched read volume the gated arm's wall is the same (63.8 against 63.5
+    /// ms/position over the same 1,559 misses and 27.3 GB) and so is
+    /// `mixtureLateStartNanoseconds` (11.7 against 11.6), because the GPU's cost from
+    /// "the host hands the work over" to "the kernels start" is the same whether the
+    /// handover is a commit or an event signal: a gated buffer does not park on its
+    /// event, it resumes through the same driver path. Off in every production path, and
+    /// left here with its probe because it is the baseline the next deferred-bind idea
+    /// has to beat.
+    ///
+    /// Only the single-buffer layout can gate: `recordsWalkStageTiming` splits the half
+    /// into one buffer per stage to TIME them, and a layout that exists to be measured
+    /// must not also change what it is measuring.
+    public var gatesMixtureOnExpertFill = false
+
+    /// The gate's event and its value. One event with a rising value is enough for a
+    /// queue that is in-order, and only the walk's own thread ever touches these.
+    private var expertGateEvent: MTLSharedEvent?
+    private var expertGateValue: UInt64 = 0
 
     /// Measurement only: refuses the split's register-resident Sinkhorn, so a probe
     /// can time the device-memory schedule it replaces. Off in every production path.
@@ -4121,16 +4154,35 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
 
         // Filled from disk before the expert half is encoded, so the kernels read
         // the slots rather than faulting the shard mapping a page at a time.
+        //
+        // `gatesMixtureOnExpertFill` splits that in two. PLACEMENT resolves every
+        // binding the expert half needs, so the half is encoded and committed against
+        // the slots below; only then does the read run, and the commit is gated on the
+        // event the read signals. The GPU is therefore parked on the work when the last
+        // byte lands instead of being handed it afterwards (`#65`).
         var residents: [DeepSeekV41ResidentExpert]?
+        var pendingFill: DeepSeekV41ExpertStreamer.DeepSeekV41PendingFill?
+        let gating = gatesMixtureOnExpertFill && !splittingStages
+            && makeExpertGate() != nil
         if let streamer, !routing.expertIDs.isEmpty {
-            residents = try streamer.ensureResident(
-                layer: layer.index,
-                experts: routing.expertIDs
-            )
+            if gating {
+                let placed = try streamer.placeResident(
+                    layer: layer.index, experts: routing.expertIDs
+                )
+                residents = placed.residents
+                pendingFill = placed
+            } else {
+                residents = try streamer.ensureResident(
+                    layer: layer.index,
+                    experts: routing.expertIDs
+                )
+            }
         }
-        let filled = (measuring || gapMeasuring)
+        let placedAt = (measuring || gapMeasuring)
             ? DispatchTime.now().uptimeNanoseconds : 0
-        let streamedAfter = gapMeasuring ? streamerCounters() : nil
+        var filled = (measuring || gapMeasuring) && pendingFill == nil
+            ? DispatchTime.now().uptimeNanoseconds : 0
+        var streamedAfter = gapMeasuring ? streamerCounters() : nil
 
         // Measurement only (`recordsMixtureStartProbe`): one or more one-dispatch
         // buffers committed immediately before the expert half. If they wait as long as
@@ -4208,6 +4260,14 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         // stages in one submission otherwise.
         var mixtureBuffers: [MTLCommandBuffer] = []
         var mixtureBuffer = try makeCommandBuffer()
+        // The gate goes in BEFORE the first encoder, because that is the only place it
+        // holds: `encodeWaitForEvent` orders everything encoded AFTER it in the buffer,
+        // so a wait encoded at the end of an encoder sequence would leave every dispatch
+        // in front of it free to read slots the fill has not written yet (`#65`).
+        if pendingFill != nil, let gate = expertGateEvent {
+            expertGateValue += 1
+            mixtureBuffer.encodeWaitForEvent(gate, value: expertGateValue)
+        }
         var mixtureEncoder = try makeEncoder(mixtureBuffer)
         var mixtureEncoderOpen = true
         for (index, stage) in DeepSeekV41DevicePlan.backHalf.enumerated() {
@@ -4244,7 +4304,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         let mixtureEncoded = (measuring || gapMeasuring)
             ? DispatchTime.now().uptimeNanoseconds : 0
         // No readback of this half exists, so it is only ordered: the next layer's
-        // front half commits behind it on the same queue.
+        // front half commits behind it on the same queue. When the fill is deferred the
+        // gate encoded at the head of this buffer is the ONLY thing ordering these
+        // kernels against the bytes they read.
         if !splittingStages {
             try commit(
                 mixtureBuffer,
@@ -4253,6 +4315,16 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 mixture: true
             )
             mixtureBuffers.append(mixtureBuffer)
+        }
+        // Now the bytes. The gate fires on every path, including a failed read: a
+        // committed buffer waiting on an event that never signals would stop the queue.
+        if let fill = pendingFill {
+            defer { expertGateEvent?.signaledValue = expertGateValue }
+            try fill.read()
+            if measuring || gapMeasuring {
+                filled = DispatchTime.now().uptimeNanoseconds
+            }
+            if gapMeasuring { streamedAfter = streamerCounters() }
         }
         // The buffer whose completion closes the layer's hand-off record: the one that
         // carries the last stage of the expert half, whichever layout built it.
@@ -4272,7 +4344,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 fillPlacementSeconds: (streamedAfter?.placing ?? 0)
                     - (streamedBefore?.placing ?? 0),
                 routingNanoseconds: routingEnded - routingStarted,
-                mixtureEncodeNanoseconds: mixtureEncoded - filled,
+                mixtureEncodeNanoseconds: pendingFill == nil
+                    ? mixtureEncoded - filled
+                    : mixtureEncoded - placedAt,
                 expertCount: routing.expertIDs.count,
                 compressed: layer.compressRatio > 1,
                 probes: probes
@@ -4285,8 +4359,18 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             walkTiming.frontEncodeNanoseconds += (frontEncoded - started) - indexerWaits
             walkTiming.indexerWaitNanoseconds += indexerWaits
             walkTiming.frontWaitNanoseconds += fillStarted - frontEncoded
-            walkTiming.expertFillNanoseconds += filled - fillStarted
-            walkTiming.mixtureEncodeNanoseconds += mixtureEncoded - filled
+            if pendingFill == nil {
+                walkTiming.expertFillNanoseconds += filled - fillStarted
+                walkTiming.mixtureEncodeNanoseconds += mixtureEncoded - filled
+            } else {
+                // The gate puts the encode IN FRONT of the read, so the fill bucket is
+                // placement + read and the encode bucket runs from placement's end to the
+                // commit. The two still tile the same interval, so a gated arm and a
+                // control arm stay comparable bucket by bucket.
+                walkTiming.expertFillNanoseconds += (placedAt - fillStarted)
+                    + (filled - mixtureEncoded)
+                walkTiming.mixtureEncodeNanoseconds += mixtureEncoded - placedAt
+            }
             walkTiming.layers += 1
         }
         if !splittingStages, measuring {
@@ -5904,6 +5988,16 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         pending.append((buffer: commandBuffer, stage: stage, isMixture: mixture))
         guard waiting else { return }
         try settlePending()
+    }
+
+    /// The event an expert half waits on, made on first use so a runtime that never
+    /// walks allocates nothing. `nil` only if the device refuses to make one, in which
+    /// case the caller reads the fill BEFORE it commits instead of gating.
+    private func makeExpertGate() -> MTLSharedEvent? {
+        if let expertGateEvent { return expertGateEvent }
+        let event = device.makeSharedEvent()
+        expertGateEvent = event
+        return event
     }
 
     /// Waits for every buffer committed so far and reports the first failure.

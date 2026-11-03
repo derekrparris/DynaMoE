@@ -10398,3 +10398,88 @@ The instrument is the whole change. Runs: `/tmp/test64_walk2.log` (indexer wait 
 0.0) with `/tmp/test64_walk1.log` as the fresh whole-walk attribution taken the run before (device
 40.35, stage table above; the two runs' walls differ by 1.3 ms for page-cache reasons and the
 indexer wait is 9.4 in both).
+## DSV4.1 #65: A DEFERRED-BIND EXPERT HALF DOES NOT START UNDER THE FILL, SO THE HANDOFF IS THE MACHINE, NOT THE COMMIT
+
+`#64` closed the indexer with a negative and left the walk's structure as the last lever. Every layer
+stops the queue for the routing readback, then streams its experts, and only then hands the GPU the
+half that reads them. The GPU is idle for the whole fill, and by the time the half is committed the
+queue has been empty long enough that its own window opens late: `mixtureLateStartNanoseconds` is
+11.6-12.5 ms/position in the warm regime below, and `#22`/`#50` had already shown that number is not
+the buffer's shape, its bindings, its resource list, or CPU-dirtied memory.
+
+The one change that can move that pickup under the fill is a **deferred bind**. The expert half binds
+only what the arena PLACED, so it can be encoded and committed before its bytes exist, gated on a
+`MTLSharedEvent` the read signals. `DeepSeekV41ExpertStreamer.placeResident` splits placement from the
+read to make that possible (`ensureResident` is literally the two composed), and
+`DeepSeekV41MetalForward.gatesMixtureOnExpertFill` makes the walk use it.
+
+### The answer: the gate buys nothing, and it is priced twice
+
+**On the driver** (`DeepSeekV41CommandStartCostTests.testWhatAnEventGateSavesOnACommitIntoAnEmptyQueue`,
+`/tmp/test65_gate4.log`). Two arms at each gap: `idle` is today's shape (queue empty, host sleeps inside
+a `pread`-shaped gap, then commits), `gated` commits first and signals when the same sleep ends. Both
+are timed from the moment the DATA was ready — the commit for `idle`, the signal for `gated`.
+
+| gap | dispatches | idle ready->window | gated ready->window | window |
+|---|---|---|---|---|
+| 0 ms | 1 | 0.083 ms | 0.099 | 0.007 |
+| 0 ms | 20 | 0.106 | 0.108 | 0.071 |
+| 0 ms | 64 | 0.103 | 0.102 | 0.229 |
+| 0.6 ms | 1 | **0.122** | **0.112** | 0.009 |
+| 0.6 ms | 20 | **0.161** | **0.163** | 0.074 |
+| 0.6 ms | 64 | **0.155** | **0.144** | 0.238 |
+
+**On the graph** (`DeepSeekV41PublishedTurnTests.testWhatAGatedMixtureCommitSavesOnAWalk`,
+`/tmp/test65_gatewalk3.log`). One runtime, one arena, the 128-position stream `#52`-`#64` used, four
+arms in a rotation so the page cache cannot be read as a win:
+
+| arm | wall | device | misses | read | fill | mixture late start |
+|---|---|---|---|---|---|---|
+| control, arm 1 (cold) | 82.4 | 36.9 | 2001 | 35.0 GB | 21.7 | 12.5 |
+| gated, arm 1 | 64.4 | 36.7 | 1646 | 28.8 GB | 5.0 | 11.6 |
+| gated, arm 2 | 63.8 | 36.6 | 1559 | 27.3 GB | 4.3 | 11.7 |
+| control, arm 2 | **63.5** | 36.5 | **1559** | **27.3 GB** | 4.2 | **11.6** |
+
+The two SECOND arms are the comparison: they run back to back, so they read the same 1,559 misses and
+the same 27.3 GB, and the wall differs by 0.2 ms — in the CONTROL's favour. The gated arms' apparent
+win is entirely the cold arm's 35.0 GB. And the answer is bit-identical at every sampled position of
+all four arms, so the gate is correctly ordered (see the two traps below); it simply has nothing to
+recover.
+
+### What it says
+
+- **The pickup is not a handover delay.** A gate changes WHICH call hands the work over and not how
+  long the machine takes to begin it. An ungated commit into an empty queue and a gated buffer whose
+  event has just fired cost the same 0.11-0.16 ms for a trivial buffer, and the same 0.3 ms/layer on
+  the real graph. `#50`'s reading — a property of the machine after it has been reading, not of the
+  buffer — survives the one structural change that could have explained it away.
+- **Do not re-propose the deferred bind, an event gate, or a second command queue for the expert
+  half.** All three change when the host hands the work over; the number that matters is the machine's
+  cost to start it, and this slice measured it from both sides.
+- **What is left is the dispatch floor, and it is device time.** The sweep shows the START is flat in
+  dispatch count (0.083-0.163 ms for 1, 20 or 64 dispatches) while the WINDOW grows by ~3.5 us per
+  dispatch (0.007 -> 0.071 -> 0.229). A walked position issues ~20 dispatches per expert half and
+  ~1,080 overall, so ~3.8 ms/position of the 36.6 ms of device time is per-dispatch overhead. That is
+  a FUSION question (fewer, larger kernels), not a scheduling one.
+- The warm position's remaining wall is 63.5 ms: device 36.5, mixture late start 11.6, indexer wait
+  9.4 (GPU drain, `#64`), fill 4.2, encodes 4.6, front late start 0.7.
+
+### Two traps, both of which make a gate look good
+
+1. **A wait encoded after the dispatches does not hold them.** `encodeWaitForEvent` orders everything
+   encoded AFTER it in the buffer, so the first cut of the production change appended the wait at the
+   commit and every dispatch in front of it ran free. The walk caught it as a RACE (three positions of
+   128 off, 10-88% relative on the logits, `/tmp/test65_gatewalk1.log`), which is why the probe asserts
+   BIT-identical logits rather than a tolerance: a scheduling change that moves a logit is a bug.
+2. **A shared event's value never goes back down.** An arm that restarts its values at 1 finds its gate
+   already satisfied and measures the UNGATED path under the gated arm's name — which is how the first
+   version of the driver's sweep "measured" a gate that started work 0.001 ms after the signal. The
+   event needs one monotonic counter for the whole test (`/tmp/test65_gate2.log` and
+   `/tmp/test65_gate3.log` are the two wrong versions, kept by name so the mistake is recognisable).
+
+### Verification
+
+`/tmp/test65_gate4.log` (driver sweep, monotonic event), `/tmp/test65_gatewalk3.log` (the walk, four
+arms, bit-identical logits), `/tmp/test65_gatewalk1.log` (the racy first cut). Production default is
+`gatesMixtureOnExpertFill = false`: the seam and its probe stay as the baseline any future deferred-bind
+idea has to beat, and `DeepSeekV41ExpertStreamer.placeResident` is the split that idea would need.

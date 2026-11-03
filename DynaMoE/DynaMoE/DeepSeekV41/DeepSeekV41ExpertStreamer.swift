@@ -854,7 +854,54 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
         layer: Int,
         experts: [Int]
     ) throws -> [DeepSeekV41ResidentExpert] {
-        guard !experts.isEmpty else { return [] }
+        let fill = try placeResident(layer: layer, experts: experts)
+        try fill.read()
+        return fill.residents
+    }
+
+    /// A fill whose slots have been CHOSEN and whose bindings are final, but whose
+    /// bytes are still on disk.
+    ///
+    /// The split from `ensureResident` is what a deferred bind needs: a caller can encode
+    /// and commit the expert half against the arena slots while the reads are still
+    /// outstanding, and release it with an event the read signals. It is safe because the
+    /// bindings are final at PLACEMENT — every slot is decided by the arena before a
+    /// single byte moves — and it was built to price exactly that
+    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #65"), which found the gate buys nothing:
+    /// a gated buffer resumes through the same driver path a commit uses. It stays
+    /// because it is that idea's baseline, and because `ensureResident` is the two halves
+    /// composed.
+    public struct DeepSeekV41PendingFill {
+        /// One entry per requested expert, in the order requested.
+        public let residents: [DeepSeekV41ResidentExpert]
+        private let readBytes: () throws -> Void
+
+        init(residents: [DeepSeekV41ResidentExpert], readBytes: @escaping () throws -> Void) {
+            self.residents = residents
+            self.readBytes = readBytes
+        }
+
+        /// Blocks the calling thread until every missing slot holds its bytes.
+        ///
+        /// Throws after vacating the slots it touched, so a caller that fails here must
+        /// still release anything it committed against those slots.
+        public func read() throws {
+            try readBytes()
+        }
+    }
+
+    /// Places every requested expert in the arena and resolves its bindings, WITHOUT
+    /// reading the misses.
+    ///
+    /// Placement is the half the expert kernels bind; `read()` is the half that needs
+    /// the disk, so a caller with work to hand the GPU in between separates them.
+    public func placeResident(
+        layer: Int,
+        experts: [Int]
+    ) throws -> DeepSeekV41PendingFill {
+        guard !experts.isEmpty else {
+            return DeepSeekV41PendingFill(residents: [], readBytes: {})
+        }
         guard experts.count <= capacity else {
             throw DeepSeekV41ExpertStreamError.tooManyExperts(
                 requested: experts.count, capacity: capacity
@@ -928,67 +975,7 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
             misses.append((slot: reservation.slot, expert: expert))
         }
 
-        if !misses.isEmpty {
-            let readStarted = DispatchTime.now().uptimeNanoseconds
-            let failures = DeepSeekV41ReadFailureBox()
-            let form = fillForm
-            let context = DeepSeekV41ShardBatchContext(
-                batches: batches.map { (shard: $0.key, ranges: $0.value) },
-                readers: readers,
-                failures: failures,
-                chunkBytes: form.chunkBytes,
-                sequential: form.isSequential
-            )
-            let runOne: @Sendable (Int) -> Void = { index in context.run(index) }
-            switch form {
-            case .serial:
-                // One read at a time, in batch order. The file's own rate.
-                for index in context.batches.indices { runOne(index) }
-            case .shardBatched, .chunked:
-                DispatchQueue.concurrentPerform(
-                    iterations: context.batches.count, execute: runOne
-                )
-            }
-            if let failure = failures.first {
-                vacate(misses.map(\.slot))
-                throw failure
-            }
-            if touchesFilledRanges {
-                // One load per page, from the thread that will commit the expert half.
-                // A short sum rather than a barrier, because the question is which core
-                // owns the line, not what the line holds.
-                var sink = 0
-                for ranges in batches.values {
-                    for range in ranges {
-                        var offset = 0
-                        while offset < range.length {
-                            sink &+= Int(range.destination.load(fromByteOffset: offset, as: UInt8.self))
-                            offset += 4096
-                        }
-                    }
-                }
-                touchSink &+= sink
-            }
-            lock.lock()
-            expertsLoaded += misses.count
-            bytesRead += misses.count * geometry.slotBytes
-            let readSeconds = Double(
-                DispatchTime.now().uptimeNanoseconds - readStarted
-            ) / 1_000_000_000
-            secondsReading += readSeconds
-            if recordsFillSamples {
-                fillSamples.append(DeepSeekV41FillSample(
-                    misses: misses.count,
-                    shards: context.batches.count,
-                    ranges: context.rangeCount,
-                    bytes: context.byteCount,
-                    seconds: readSeconds
-                ))
-            }
-            lock.unlock()
-        }
-
-        return reservations.map { reservation in
+        let residents = reservations.map { reservation in
             let buffer = slotBuffers[reservation.slot]
             guard let buffer else {
                 // Unreachable: every miss allocated its buffer above and every hit
@@ -1005,6 +992,74 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
             }
             return DeepSeekV41ResidentExpert(buffer: buffer, geometry: geometry)
         }
+        return DeepSeekV41PendingFill(residents: residents) { [self] in
+            try readMisses(batches: batches, misses: misses)
+        }
+    }
+
+    /// Reads every missing slot, on the calling thread.
+    private func readMisses(
+        batches: [UInt32: [DeepSeekV41ExpertShardReader.Range]],
+        misses: [(slot: Int, expert: Int)]
+    ) throws {
+        guard !misses.isEmpty else { return }
+        let readStarted = DispatchTime.now().uptimeNanoseconds
+        let failures = DeepSeekV41ReadFailureBox()
+        let form = fillForm
+        let context = DeepSeekV41ShardBatchContext(
+            batches: batches.map { (shard: $0.key, ranges: $0.value) },
+            readers: readers,
+            failures: failures,
+            chunkBytes: form.chunkBytes,
+            sequential: form.isSequential
+        )
+        let runOne: @Sendable (Int) -> Void = { index in context.run(index) }
+        switch form {
+        case .serial:
+            // One read at a time, in batch order. The file's own rate.
+            for index in context.batches.indices { runOne(index) }
+        case .shardBatched, .chunked:
+            DispatchQueue.concurrentPerform(
+                iterations: context.batches.count, execute: runOne
+            )
+        }
+        if let failure = failures.first {
+            vacate(misses.map(\.slot))
+            throw failure
+        }
+        if touchesFilledRanges {
+            // One load per page, from the thread that will commit the expert half.
+            // A short sum rather than a barrier, because the question is which core
+            // owns the line, not what the line holds.
+            var sink = 0
+            for ranges in batches.values {
+                for range in ranges {
+                    var offset = 0
+                    while offset < range.length {
+                        sink &+= Int(range.destination.load(fromByteOffset: offset, as: UInt8.self))
+                        offset += 4096
+                    }
+                }
+            }
+            touchSink &+= sink
+        }
+        lock.lock()
+        expertsLoaded += misses.count
+        bytesRead += misses.count * geometry.slotBytes
+        let readSeconds = Double(
+            DispatchTime.now().uptimeNanoseconds - readStarted
+        ) / 1_000_000_000
+        secondsReading += readSeconds
+        if recordsFillSamples {
+            fillSamples.append(DeepSeekV41FillSample(
+                misses: misses.count,
+                shards: context.batches.count,
+                ranges: context.rangeCount,
+                bytes: context.byteCount,
+                seconds: readSeconds
+            ))
+        }
+        lock.unlock()
     }
 
     private func vacate(_ slots: [Int]) {

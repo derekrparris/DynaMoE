@@ -8781,6 +8781,286 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
+    /// What an event-gated expert half is worth to a walked position: NOTHING.
+    ///
+    /// `#64` split the indexer's readback into its GPU drain and the host's own work and
+    /// found the host's part is nothing, which left the walk's structure as the last
+    /// lever: every layer stops the queue for the routing readback, then streams the
+    /// experts, and only then hands the GPU the half that reads them. The GPU is idle for
+    /// the whole fill, and when the half is committed the queue has been empty long
+    /// enough that the buffer's window opens ~0.3 ms later
+    /// (`mixtureLateStartNanoseconds`, `#22` and `#50`) — 12 ms of a warm position.
+    ///
+    /// The one change that could move that under the fill is a DEFERRED BIND: the expert
+    /// half binds only what the arena PLACED, so it can be encoded and committed before
+    /// the bytes exist, gated on a shared event the read signals. `#65` built it, and
+    /// this probe is why it is not shipped. At MATCHED read volume — the second control
+    /// and the second gated arm read the same 1,559 misses and the same 27.3 GB, because
+    /// they run back to back on one arena — the wall is the same within noise and
+    /// `mixtureLateStartNanoseconds` is the same, so the gate neither removes the pickup
+    /// nor moves it. A gated buffer does not park on its event; it resumes through the
+    /// same driver path a commit uses, which is what
+    /// `DeepSeekV41CommandStartCostTests` measures from the other side.
+    ///
+    /// The arms are a rotation (control, gated, gated, control) because the page cache
+    /// and the arena's frequency counts are both still converging over the first pass, so
+    /// a gated arm placed second would read faster for reasons the gate did not cause.
+    /// Comparing the two SECOND arms is the whole control: arm 1 of either kind pays the
+    /// cold fill (35.0 GB against 27.3) and is not comparable with anything.
+    ///
+    /// The gate changes no arithmetic, so the answer is asserted BIT-identical across
+    /// every arm and every sampled position: a scheduling change that moves a logit is a
+    /// bug, not a win. That assertion is what caught the first cut of the gate encoding
+    /// its wait AFTER the kernels it was supposed to hold.
+    func testWhatAGatedMixtureCommitSavesOnAWalk() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_gatewalk"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in gate probe; touch \(markerPath) to run"
+        )
+
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        // The 128-position stream every assembly from `#52` on measured.
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+        func prompt(_ length: Int, rotation: Int) -> [Int] {
+            (0..<length).map { index in
+                let repetition = index / stream.count
+                return stream[(index + repetition * rotation) % stream.count]
+            }
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let positions = 128
+        let tokens = prompt(positions, rotation: 7)
+        let sampledPositions: Set<Int> = [0, 1, 2, 3, 7, 15, 31, 63, 127]
+
+        struct Outcome {
+            let wallMilliseconds: Double
+            let timing: DeepSeekV41WalkTiming
+            let lastLogits: [Float]
+            let sampledLogits: [Int: [Float]]
+            let misses: Int
+            let bytes: Int
+        }
+
+        do {
+            let runtime = try makeRuntime(
+                snapshot: snapshot,
+                engine: engine,
+                config: config,
+                contextLength: positions + 1,
+                allowEngramSkip: false,
+                wireArena: nil
+            )
+            // The shipping rule, as every probe from `#59` on has used.
+            runtime.arena.victimPolicy = .leastFrequentlyUsed
+            let executor = runtime.forward()
+
+            func pass(_ label: String, gated: Bool) -> Outcome? {
+                executor.reset()
+                executor.resetWalkTiming()
+                executor.gatesMixtureOnExpertFill = gated
+                executor.recordsWalkTiming = true
+                executor.recordsWalkStageTiming = false
+                let acquisitionsBefore = runtime.arena.acquisitions
+                let hitsBefore = runtime.arena.hits
+                let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+                let start = DispatchTime.now().uptimeNanoseconds
+                var logits: [Float] = []
+                var sampled: [Int: [Float]] = [:]
+                do {
+                    for (position, token) in tokens.enumerated() {
+                        logits = try executor.forwardToken(token, position: position)
+                        if sampledPositions.contains(position) { sampled[position] = logits }
+                    }
+                } catch {
+                    XCTFail("\(label) refused at a position: \(error)")
+                    return nil
+                }
+                let wall = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+                executor.recordsWalkTiming = false
+                let acquisitions = runtime.arena.acquisitions - acquisitionsBefore
+                let misses = acquisitions - (runtime.arena.hits - hitsBefore)
+                let bytes = (runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore
+                let timing = executor.walkTiming
+                let per = timing.millisecondsPerPosition()
+                let divisor = Double(max(1, positions)) * 1_000_000
+                print(
+                    String(
+                        format: "🔎 [dsv41 real]   %@: %.1f ms/position, device %.1f, "
+                            + "%d miss(es), %.1f GB read; front wait %.1f, fill %.1f, "
+                            + "mixture encode %.1f; drained mixture %.1f, late start "
+                            + "mixture %.1f, late start front %.1f",
+                        label,
+                        wall / Double(positions),
+                        per.frontDevice + per.mixtureDevice,
+                        misses,
+                        Double(bytes) / 1_073_741_824,
+                        per.frontWait,
+                        per.expertFill,
+                        per.mixtureEncode,
+                        Double(timing.mixtureDrainNanoseconds) / divisor,
+                        Double(timing.mixtureLateStartNanoseconds) / divisor,
+                        Double(timing.frontLateStartNanoseconds) / divisor
+                    )
+                )
+                return Outcome(
+                    wallMilliseconds: wall,
+                    timing: timing,
+                    lastLogits: logits,
+                    sampledLogits: sampled,
+                    misses: misses,
+                    bytes: bytes
+                )
+            }
+
+            // A discarded warm-up: slot creation, slot wiring and a cold page cache all
+            // belong to the process, not to either arm.
+            executor.reset()
+            runtime.arena.reset()
+            for (position, token) in tokens.enumerated() {
+                _ = try executor.forwardToken(token, position: position)
+            }
+            print(
+                String(
+                    format: "🔎 [dsv41 real] gate probe: %d positions, arena %d slots, "
+                        + "warm-up done",
+                    positions,
+                    runtime.arena.capacity
+                )
+            )
+
+            // The rotation: the two controls bracket the two gated arms, so a warming
+            // cache shows up as a control-versus-control difference instead of as a win.
+            let controlFirst = try XCTUnwrap(
+                pass("control (commit after the fill), arm 1", gated: false)
+            )
+            let gatedFirst = try XCTUnwrap(
+                pass("gated (commit before the fill), arm 1", gated: true)
+            )
+            let gatedSecond = try XCTUnwrap(
+                pass("gated (commit before the fill), arm 2", gated: true)
+            )
+            let controlSecond = try XCTUnwrap(
+                pass("control (commit after the fill), arm 2", gated: false)
+            )
+
+            // The gate moves WHEN the half is submitted, not what it computes, so the
+            // answer has to be identical to the bit at every sampled position.
+            for (label, outcome) in [
+                ("gated arm 1", gatedFirst), ("gated arm 2", gatedSecond),
+                ("control arm 2", controlSecond),
+            ] {
+                XCTAssertEqual(
+                    outcome.lastLogits, controlFirst.lastLogits,
+                    "\(label) moved the last position's logits"
+                )
+                XCTAssertEqual(
+                    Set(outcome.sampledLogits.keys), Set(controlFirst.sampledLogits.keys),
+                    "\(label) sampled a different set of positions"
+                )
+                for (position, logits) in controlFirst.sampledLogits {
+                    XCTAssertEqual(
+                        outcome.sampledLogits[position], logits,
+                        "\(label) moved position \(position)'s logits"
+                    )
+                }
+            }
+            print(
+                "🔎 [dsv41 real] gate control: every sampled position's logits are "
+                    + "bit-identical across all four arms"
+            )
+
+            // The instrument has to have covered the whole stream, or the wall it
+            // reports is not this stream's.
+            for (label, outcome) in [
+                ("control arm 1", controlFirst), ("gated arm 1", gatedFirst),
+                ("gated arm 2", gatedSecond), ("control arm 2", controlSecond),
+            ] {
+                XCTAssertEqual(outcome.timing.positions, positions, "\(label) lost positions")
+                XCTAssertEqual(
+                    outcome.timing.frontUnwindowedBuffers
+                        + outcome.timing.mixtureUnwindowedBuffers,
+                    0,
+                    "\(label) reported a half with no device window"
+                )
+            }
+
+            func perPosition(_ nanoseconds: UInt64) -> Double {
+                Double(nanoseconds) / Double(positions) / 1_000_000
+            }
+            // The pairing is the SECOND arms: they run back to back, so they share a page
+            // cache and an arena state and read the same bytes. The FIRST arms are the
+            // cold pair and differ by the whole fill (35.0 GB against 27.3), which is why
+            // an average over all four would report a win the gate did not earn.
+            let wallCold = controlFirst.wallMilliseconds / Double(positions)
+            let wallWarmControl = controlSecond.wallMilliseconds / Double(positions)
+            let wallWarmGated = gatedSecond.wallMilliseconds / Double(positions)
+            let wallColdGated = gatedFirst.wallMilliseconds / Double(positions)
+            let lateWarmControl = perPosition(controlSecond.timing.mixtureLateStartNanoseconds)
+            let lateWarmGated = perPosition(gatedSecond.timing.mixtureLateStartNanoseconds)
+            let deviceWarmControl = perPosition(
+                controlSecond.timing.frontDeviceNanoseconds
+                    + controlSecond.timing.mixtureDeviceNanoseconds
+            )
+            let deviceWarmGated = perPosition(
+                gatedSecond.timing.frontDeviceNanoseconds
+                    + gatedSecond.timing.mixtureDeviceNanoseconds
+            )
+            print(
+                String(
+                    format: "🔎 [dsv41 real] gate result: at MATCHED read (%d against %d "
+                        + "miss(es), %.1f against %.1f GB) wall %.1f against %.1f "
+                        + "ms/position (%.1f of difference), mixture late start %.1f "
+                        + "against %.1f, device %.1f against %.1f; the cold arms read "
+                        + "%.1f and %.1f GB and their walls are %.1f and %.1f",
+                    controlSecond.misses,
+                    gatedSecond.misses,
+                    Double(controlSecond.bytes) / 1_073_741_824,
+                    Double(gatedSecond.bytes) / 1_073_741_824,
+                    wallWarmControl,
+                    wallWarmGated,
+                    wallWarmGated - wallWarmControl,
+                    lateWarmControl,
+                    lateWarmGated,
+                    deviceWarmControl,
+                    deviceWarmGated,
+                    Double(controlFirst.bytes) / 1_073_741_824,
+                    Double(gatedFirst.bytes) / 1_073_741_824,
+                    wallCold,
+                    wallColdGated
+                )
+            )
+            // The finding, stated as a bound rather than as a coincidence: if the gate
+            // moved the pickup under the fill at all, the warm pair would differ by more
+            // than the ~1 ms that separates two arms reading the same bytes.
+            XCTAssertLessThan(
+                abs(wallWarmGated - wallWarmControl), 2.0,
+                "the gate changed the wall at matched read volume"
+            )
+            XCTAssertEqual(controlSecond.misses, gatedSecond.misses, "the arms did not read alike")
+            runtime.shutdown()
+        }
+        withExtendedLifetime(engine) {}
+    }
+
     /// A page-aligned anonymous mapping this test can wire.
     ///
     /// `mlock` is the only in-process way to tell the kernel a page may be neither

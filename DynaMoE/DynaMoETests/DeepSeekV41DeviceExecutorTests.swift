@@ -3234,6 +3234,154 @@ final class DeepSeekV41CommandStartCostTests: XCTestCase {
             )
         )
     }
+
+    /// Whether an event-gated commit lets the GPU pick the buffer up WHILE the host is
+    /// still working, instead of after it stops. It does not: the answer is no.
+    ///
+    /// The walk commits its expert half once a fill has landed in the arena: the queue
+    /// has been empty for the length of the fill, and the buffer's window opens ~0.29 ms
+    /// after the commit (`DeepSeekV41WalkTiming.mixtureLateStartNanoseconds`, `#64`).
+    /// If the buffer could be committed BEFORE the fill and gated on an event the fill
+    /// signals, that pickup would be paid under the fill instead of after it, worth
+    /// `mixture late start` per position — but only if the driver submits a gated buffer
+    /// early. A gate that defers submission defeats itself (`Benchmarks/PERF_FINDINGS.md`,
+    /// "DSV4.1 #65").
+    ///
+    /// Two arms at each gap: `idle` is the walk's shape today (queue empty, host sleeps,
+    /// then commits), `gated` commits first and signals when the same sleep ends. Both
+    /// report the delay from the moment the DATA was ready — the commit for `idle`, the
+    /// signal for `gated` — so the two are comparable at the only instant that matters.
+    ///
+    /// **The gated arm does not start earlier**: at a 0.6 ms gap, 1 dispatch costs 0.122
+    /// (idle) against 0.112 (gated), 20 dispatches 0.161 against 0.163, and 64
+    /// dispatches 0.155 against 0.144. The gate changes WHICH call hands the work over,
+    /// not how long the machine takes to begin it, which is why the walk's in-situ arm
+    /// (the same experiment, on the real graph) is also a wash.
+    ///
+    /// Two traps this arm hit, both of which made a gate look better than it is: a wait
+    /// encoded after the dispatches does not hold them, and a shared event's value never
+    /// goes back down, so an arm that restarts its values at 1 finds its gate already
+    /// satisfied and measures the UNGATED path under the gated arm's name. `dispatches`
+    /// is swept because the walk's half is ~20, and a one-dispatch arm cannot speak for it.
+    func testWhatAnEventGateSavesOnACommitIntoAnEmptyQueue() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        guard let library = device.makeDefaultLibrary() else {
+            throw XCTSkip("no default library")
+        }
+        guard let function = library.makeFunction(name: "clear_vector_f32") else {
+            throw XCTSkip("clear_vector_f32 is missing")
+        }
+        guard let queue = device.makeCommandQueue() else {
+            throw XCTSkip("no compute queue")
+        }
+        guard let event = device.makeSharedEvent() else {
+            throw XCTSkip("no shared event")
+        }
+        let pipeline = try device.makeComputePipelineState(function: function)
+        guard let target = device.makeBuffer(length: 4096, options: .storageModeShared) else {
+            throw XCTSkip("no scratch buffer")
+        }
+
+        /// `dispatches` copies of one tiny kernel, separated by a barrier the way a
+        /// real half's stages are. The walk's expert half is ~20 dispatches over ~200
+        /// bindings, so a one-dispatch arm cannot answer whether a gate helps a buffer
+        /// that takes the driver real work to hand over.
+        func encode(into buffer: MTLCommandBuffer, dispatches: Int = 1) {
+            guard let encoder = buffer.makeComputeCommandEncoder() else { return }
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(target, offset: 0, index: 0)
+            for _ in 0..<max(1, dispatches) {
+                encoder.dispatchThreads(
+                    MTLSize(width: 16, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 16, height: 1, depth: 1)
+                )
+                encoder.memoryBarrier(scope: .buffers)
+            }
+            encoder.endEncoding()
+        }
+
+        /// One counter for the WHOLE test, because a shared event's value never goes
+        /// back down: an arm that restarted at 1 would find its gate already satisfied
+        /// and measure the ungated path under the gated arm's name.
+        var nextGateValue: UInt64 = 0
+
+        /// Median of `attempts` runs of one arm. `readyToWindow` is measured from the
+        /// commit (idle arm) or the signal (gated arm) to the buffer's own window
+        /// opening; `readyToDone` from the same instant to the host leaving the wait, so
+        /// the host's own sleep is inside neither.
+        func measure(
+            gapMilliseconds: Double,
+            gated: Bool,
+            dispatches: Int = 1,
+            attempts: Int = 41
+        ) -> (readyToWindow: Double, readyToDone: Double, window: Double) {
+            var starts: [Double] = []
+            var drains: [Double] = []
+            var windows: [Double] = []
+            for _ in 0..<attempts {
+                guard let buffer = queue.makeCommandBuffer() else { continue }
+                nextGateValue += 1
+                let value = nextGateValue
+                if gated { buffer.encodeWaitForEvent(event, value: value) }
+                encode(into: buffer, dispatches: dispatches)
+                if !gated, gapMilliseconds > 0 {
+                    // The walk's shape: the host has been reading (`pread`) and the
+                    // queue has been idle for the whole fill, so the commit is what
+                    // hands the driver work after a gap.
+                    Thread.sleep(forTimeInterval: gapMilliseconds / 1000)
+                }
+                buffer.commit()
+                if gated, gapMilliseconds > 0 {
+                    Thread.sleep(forTimeInterval: gapMilliseconds / 1000)
+                }
+                let ready = DispatchTime.now().uptimeNanoseconds
+                if gated { event.signaledValue = value }
+                buffer.waitUntilCompleted()
+                let returned = DispatchTime.now().uptimeNanoseconds
+                let windowStart = Double(buffer.gpuStartTime) * 1_000_000_000
+                let windowEnd = Double(buffer.gpuEndTime) * 1_000_000_000
+                starts.append(max(0, (windowStart - Double(ready)) / 1_000_000))
+                drains.append(Double(returned - ready) / 1_000_000)
+                if windowEnd > windowStart {
+                    windows.append((windowEnd - windowStart) / 1_000_000)
+                }
+            }
+            func median(_ values: [Double]) -> Double {
+                let sorted = values.sorted()
+                return sorted.isEmpty ? 0 : sorted[sorted.count / 2]
+            }
+            return (median(starts), median(drains), median(windows))
+        }
+
+        // Warm up so the first arm is not paying for shader setup.
+        _ = measure(gapMilliseconds: 0, gated: false, attempts: 5)
+        _ = measure(gapMilliseconds: 0, gated: true, attempts: 5)
+
+        for dispatches in [1, 20, 64] {
+            for gap in [0.0, 0.6] {
+                let idle = measure(
+                    gapMilliseconds: gap, gated: false, dispatches: dispatches
+                )
+                let gated = measure(
+                    gapMilliseconds: gap, gated: true, dispatches: dispatches
+                )
+                print(
+                    String(
+                        format: "🔎 [dsv41 gate] %d dispatch(es), gap %.1f ms: idle "
+                            + "ready->window %.3f ms, ready->done %.3f ms, window %.3f ms; "
+                            + "gated ready->window %.3f ms, ready->done %.3f ms, "
+                            + "window %.3f ms",
+                        dispatches,
+                        gap,
+                        idle.readyToWindow, idle.readyToDone, idle.window,
+                        gated.readyToWindow, gated.readyToDone, gated.window
+                    )
+                )
+            }
+        }
+    }
 }
 
 // MARK: - Where a committed buffer's start delay comes from
