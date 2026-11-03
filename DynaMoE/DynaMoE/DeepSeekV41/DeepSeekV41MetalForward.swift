@@ -2389,13 +2389,16 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// a row and because a dead flag was a single pending mark (`encodeEngram` gated a
     /// whole block on its LAST position's flag, which a mixed block cannot express).
     ///
-    /// It is a capability with a measured table rather than the shipped path: the block
-    /// form is 1.92x the walk at 128 positions, 1.62x at 512 and 1.26x at 997 when the
-    /// span's expert working set fits the arena, and **0.74x** for the largest picture
-    /// the composer accepts, whose ~12,200 distinct `(layer, expert)` pairs against
-    /// 3,760 slots make every union fill evict (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1
-    /// #46"). The rows are the tower's own output, so nothing here resamples or reshapes
-    /// them; a row of the wrong width is refused rather than projected.
+    /// It is a capability with a measured table rather than the shipped path, and every
+    /// figure in that table moved once the passes were repeated inside one process: the
+    /// block form is **1.05x** the walk at 128 text positions, **1.24x** at 1,005, and
+    /// **0.96x** on the largest picture the composer accepts, whose ~12,200 distinct
+    /// `(layer, expert)` pairs against 3,760 slots make every union fill evict. A pass
+    /// that runs FIRST in a young process is 1.3-1.6x faster in every bucket of this
+    /// arm, which is what "1.92x at 128" and `#46`'s "0.74x" each measured; the
+    /// single-digit table above is the steady state (`Benchmarks/PERF_FINDINGS.md`,
+    /// "DSV4.1 #53"). The rows are the tower's own output, so nothing here resamples or
+    /// reshapes them; a row of the wrong width is refused rather than projected.
     public func prefillChunk(
         _ tokens: [Int],
         embeddings: [Int: [Float]]

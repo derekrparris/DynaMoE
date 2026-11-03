@@ -8997,3 +8997,106 @@ LAYER per position, so every bucket read as "ms per position-layer" (5.3 against
 40x low); and the fix, deriving the position count from `positions / layers`, truncated on a
 1,004-position prefill's short last block and inflated the 1,005-position arm by 14%. `positionCount`
 is stored now, and `describe()` prints both the wall it must tile and the share it tiles.
+
+## DSV4.1 #53: THE PREFILL DECISION REPRODUCES, THE MARGINS DO NOT, AND A FIRST PASS IN A YOUNG PROCESS IS WORTH MORE THAN EITHER LAYOUT
+
+### Question
+
+`#52` left the turn's walk-vs-block decision resting on a number that flipped sign between two runs of
+the same prompt: `#46` measured the composer's largest picture at 0.74x batched (walk first in the
+process), `#52` re-ran it at 1.57x (block first), on the same 1,005 positions, the same misses and the
+same 213 GB. Routing picked `prefill_decision_revalidation` at 0.961 / 0.952 and said do not touch a
+shipped path (0.010), so this slice alternates the two layouts inside ONE process over four rounds on
+that exact prompt, prints every round instead of a best-of, and adds the identity pairs the harness
+needs to know its own noise floor.
+
+### What was added
+
+`testWhetherTheBatchedPrefillDecisionHoldsInsideOneProcess` (the composer's own largest picture) and
+`testWhetherBatchingATextPrefillPaysInsideOneProcess` (the `#52` text stream at 128 positions, plus
+1,005 behind a second marker), both opt-in, sharing one private `measurePrefillSign` helper: arm order
+alternates every round, every round is printed, each arm prints its own whole-vs-parts line, and the
+harness prints its identity pairs, its per-arm spread, its byte check and, from `#53` on, the slot
+`MTLBuffer`s each pass created. No shipped path changed.
+
+### The result, three processes
+
+`walk / block`, so a figure above 1 means the batched form won. Round 1 of each case is marked: it is
+the pass that ran first on a freshly created runtime, and it is the one both earlier measurements
+quoted.
+
+| prompt | round 1 | rounds 2-4 | steady state | spread (block / walk) |
+|---|---|---|---|---|
+| text, 128 positions (3 runs) | 1.39-1.42 | 1.03-1.07 | **1.04-1.05** | 1.48x / 1.11-1.13x |
+| text, 1,005 positions (young process) | 1.25 | 1.24, 1.24, 1.23 | **1.24** | 1.04x / 1.02x |
+| text, 1,005 positions (aged process) | 1.26 | 1.05, 0.95, 0.95 | 0.98 | 1.66x / 1.26x |
+| largest picture, 1,005 positions (run A) | 1.55 | 1.00, 0.96, 0.92 | **0.96** | 1.73x / 1.04x |
+| largest picture, 1,005 positions (run C) | 0.87 | 0.84, 0.77, 0.79 | **0.80** | 1.07x / 1.12x |
+
+- **The text prefill decision holds, at 4-24% rather than 46%.** At 128 positions three independent
+  processes agree on 1.04, 1.05 and 1.05, in every round after the first. At 1,005 positions one
+  process measured 1.23-1.25 in all four rounds with identity pairs of 0.98 and 0.99; `#52`'s 1.24x
+  reproduces exactly, and so does its 1.46x -- as the 128-position arm's ROUND ONE.
+- **The image prefill decision holds, at 4-20% rather than 26%.** The walk is ahead in every round of
+  both picture runs once past the first pass (0.92-1.00 and 0.77-0.87), so `#46`'s direction was right
+  and `#52` was wrong to overturn it. The block's only win on that prompt (1.55x) is a round one.
+- **`#46`'s 0.74x understated it and `#52`'s 1.57x overstated the other way; both are first-pass
+  numbers.** 0.74x is close to run C's steady 0.80; 1.57x is close to run A's round-one 1.55.
+
+### A first pass in a young process is 1.3-1.6x faster, in every bucket of the batched arm
+
+The batched arm's own clock, per position, first pass against the same arm later in the same runtime:
+
+| case | dense encode | expert fill | device | fill rate |
+|---|---|---|---|---|
+| text 128, round 1 -> 2 | 31.5 -> 42.0 ms | 66.2 -> 102.9 ms | 54.0 -> 69.0 ms | 10.4 -> 6.7 GB/s |
+| largest picture, run A round 1 -> 2 | 17.8 -> 29.0 | 28.5 -> 41.4 | 42.3 -> 55.4 | 7.4 -> 5.1 GB/s |
+
+Every bucket moves together -- host command encoding, pread throughput and the GPU's own windows -- on
+byte counts and miss counts that are identical to the digit (218,312 MB and 12,176 misses in all four
+picture rounds; 90,025 MB and 5,021 at 128 text positions). The walk is nearly insensitive to it
+(device 62.3-63.9 flat, fill 38.7-41.3 flat on the picture), because its wall is the per-layer
+hand-off rather than a throughput term, so the artefact always hands the win to whichever arm runs
+first. That is exactly what `#46` (walk first) and `#52` (block first) each measured.
+
+The slot counters close one hypothesis and leave another open. A runtime allocates its 3,760 slot
+`MTLBuffer`s lazily on first write and never frees them, so a fresh runtime's first prefill creates
+them: 2,554 at 128 text positions, 2,913 on the picture, and **0 in every later pass**. But run C's
+picture case created 2,913 of them in round one and was NOT fast (316.5 ms/position, 3.5 GB/s), while
+run A's identical round one was (119.3 ms/position, 7.4 GB/s). The difference between the two runs is
+the process's age (5 minutes against 45), so the state that matters is the process's, not the
+runtime's, and what turns it is not established here. What is established is that quoting a runtime's
+first prefill as a layout's ratio is invalid.
+
+### What it means
+
+- **Both shipped decisions survive.** Text prefills batch (1.04-1.05x at 128 positions, 1.23-1.25x at
+  1,005); image prefills walk (the walk is ahead by 4-20%). Neither margin is what the code comments
+  claimed, and the comments now quote this table.
+- **A prefill A/B needs three things this one now has**: every runtime's first pass discarded,
+  arm order alternated per round, and the identity pairs printed beside the ratio. The identity pairs
+  here range 0.60-0.68x for a batched arm and 0.79-1.12x for a walked one, i.e. wider than every
+  effect measured -- so a single-pass comparison cannot resolve the layout at ANY of these spans.
+- **The margins are single-digit on the picture and on 128-position text, and 24% at length.** That
+  reframes what a batching change is worth: not the 1.5-2x `#46` reported at short spans, but a few
+  percent there and ~20% on a long prompt whose working set still fits the arena.
+
+### What it is not (do not re-propose)
+
+- Not a reason to flip either shipped path. The routed instruction was measurement-only, and the
+  steady state agrees with what ships.
+- Not thermal: `ProcessInfo.thermalState` read `nominal` in all twelve rounds.
+- Not the page cache: the two layouts read within 0.26-0.63% of the same bytes in every case, and the
+  runs whose bytes exceed RAM show the same first-pass effect as the ones that fit.
+- Not the arena's capacity or its eviction policy (`#21`), and not the fill's form or fan-out (`#51`).
+
+### Verification
+
+Both cases are opt-in and both skip without their markers:
+`testWhetherTheBatchedPrefillDecisionHoldsInsideOneProcess` (`/tmp/dynamoe_dsv41_prefill_sign`, 1,495 s
+and 2,365 s across two runs) and `testWhetherBatchingATextPrefillPaysInsideOneProcess`
+(`/tmp/dynamoe_dsv41_prefill_sign_text`, 302-1,754 s; `_text_long` adds the 1,005-position arm;
+`_quick` halves the rounds for a harness check). Every run used `touch` and `rm -f` in the same
+command. Three processes over ~70 minutes: `/tmp/test53_sign3.log` (text 128 + picture),
+`/tmp/test53_sign4.log` (text 128 + 1,005) and `/tmp/test53_sign5.log` (all three, with the slot
+counters).

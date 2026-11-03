@@ -314,13 +314,16 @@ nonisolated public enum DeepSeekV41TurnRunner {
             // starts mid-sequence.
             //
             // An image prompt keeps it too, and that is a measurement rather than a
-            // limitation: `prefillChunk(_:embeddings:)` exists, is verified against the
-            // walk on this checkpoint (1.08e-4 relative), and is 1.26-1.92x FASTER while
-            // the span's expert working set fits the arena -- but the largest picture
-            // the composer accepts touches ~12,200 `(layer, expert)` pairs against
-            // 3,760 slots, and there the block form's union fill evicts 20-48 pairs at
-            // once and loses its locality: 345.62 s against the walk's 255.98 s, i.e.
-            // 0.74x (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #46").
+            // limitation: `prefillChunk(_:embeddings:)` exists and is verified against
+            // the walk on this checkpoint (1.08e-4 relative). The largest picture the
+            // composer accepts touches ~12,200 `(layer, expert)` pairs against 3,760
+            // slots, and there the block form's union fill evicts 20-48 pairs at once and
+            // loses its locality: over four alternated rounds inside one process the walk
+            // is ahead by 4-20% on the same 218 GB, and the much wider margins `#46`
+            // (0.74x) and `#52` (1.57x) reported are each a runtime's FIRST pass, which
+            // is 1.3-1.6x faster in every bucket of the batched arm and therefore hands
+            // the win to whichever arm runs first (`Benchmarks/PERF_FINDINGS.md`,
+            // "DSV4.1 #53").
             if isCancelled() {
                 return cancelledOutput(
                     generated: [], text: "", promptTokens: promptTokenIds.count,

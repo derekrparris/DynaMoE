@@ -4348,6 +4348,462 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
+    /// Whether batching actually loses on the largest picture, decided inside ONE
+    /// process.
+    ///
+    /// `#46` measured this prompt at 0.74x batched and `#52` re-ran it at 1.57x, on the
+    /// same positions, the same misses and the same bytes. Both times the arm that ran
+    /// FIRST won, and the page cache cannot explain that: each arm reads ~213 GB
+    /// against 128 GB of RAM, so there is no cache for a rotation to protect, and the
+    /// two layouts read the same bytes on that prompt. A sign that flips between
+    /// processes is not a property of the layout, and the shipped turn's decision to
+    /// WALK an image prompt rests on it.
+    ///
+    /// So this alternates the two layouts inside one process and prints EVERY round
+    /// rather than a best-of, which makes three things readable: the per-round ratio
+    /// (is the sign constant?), each arm's drift across rounds (does the machine slow
+    /// as it streams?), and the identity pairs (block of round 0 against block of round
+    /// 2, walk of round 1 against walk of round 3), which are the harness's own noise
+    /// floor under the rotation `#51` requires. Thermal state is printed beside every
+    /// round, because a throttle is the obvious way for whichever arm runs first to
+    /// keep winning.
+    ///
+    /// Opt-in (`/tmp/dynamoe_dsv41_prefill_sign`; `/tmp/dynamoe_dsv41_prefill_sign_quick`
+    /// halves it to two rounds, which is the cheap harness check rather than the
+    /// measurement).
+    func testWhetherTheBatchedPrefillDecisionHoldsInsideOneProcess() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_prefill_sign"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in prefill sign revalidation; touch \(markerPath) to run"
+        )
+        let rounds = FileManager.default.fileExists(
+            atPath: "/tmp/dynamoe_dsv41_prefill_sign_quick"
+        ) ? 2 : 4
+
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let spec = try XCTUnwrap(config.vision)
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+
+        // The composer's own path, on the composer's own largest picture: `#52` showed
+        // that a synthetic patch grid at this same resolution is a different routing
+        // regime (5,552 distinct pairs against this prompt's 12,176), so the pixels
+        // have to be the ones an attachment would carry.
+        let markers = DeepSeekV41VisionMarkers.familyDefault
+        let dialect = DeepSeekV41PromptDialect.resolve(snapshotDir: snapshot)
+        let rendered = dialect.render(
+            turns: [.init(
+                isUser: true, text: "\(markers.imagePlaceholder)\nwhat is in this picture?"
+            )],
+            cleanSystem: "",
+            thinkingEnabled: false,
+            effort: nil
+        )
+        let promptIds = try tokenizer.encode(text: rendered)
+        let side = 4_096
+        var rgb = [UInt8](repeating: 0, count: side * side * 3)
+        for y in 0..<side {
+            let rowBase = y * side * 3
+            for x in 0..<side {
+                let offset = rowBase + x * 3
+                rgb[offset] = UInt8(x & 0xFF)
+                rgb[offset + 1] = UInt8(y & 0xFF)
+                rgb[offset + 2] = 96
+            }
+        }
+        let image = DeepSeekV41ImageInput(
+            rgb: rgb, width: side, height: side, sha256: "largest-image"
+        )
+        let price = try DeepSeekV41TurnImages.price(
+            tokenIds: promptIds, images: [image], spec: spec
+        )
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: price.promptTokens + 1,
+            allowEngramSkip: false
+        )
+        let tower = try XCTUnwrap(runtime.visionForward())
+        let bound = try DeepSeekV41TurnImages.bind(
+            tokenIds: promptIds,
+            images: [image],
+            spec: spec,
+            rowWidth: config.hiddenSize
+        ) { input in
+            let fitted = DeepSeekV41VisionLayout.fit(
+                width: input.width, height: input.height, spec: spec
+            )
+            let rows = try tower.imageSpan(
+                rgb: input.rgb, width: input.width, height: input.height
+            )
+            return DeepSeekV41ImagePrompt.ImageSpan(
+                rows: rows, columns: fitted.columns, gridRows: fitted.rows
+            )
+        }
+        let tokens = bound.tokenIds.map { Int($0) }
+        XCTAssertEqual(tokens.count, price.promptTokens, "the price must equal the bind")
+        try measurePrefillSign(
+            label: "largest picture, \(bound.rows.count) image rows",
+            runtime: runtime,
+            tokens: tokens,
+            rows: bound.rows,
+            rounds: rounds
+        )
+        withExtendedLifetime(engine) {}
+    }
+
+    /// The two layouts over one prompt, inside ONE process, printing every round.
+    ///
+    /// Shared by the picture case and the text case because the finding is about the
+    /// PROCESS rather than about the prompt: a process's first pass is not comparable
+    /// with the passes after it, and both `#46` and `#52` measured their winning arm as
+    /// the first pass of a fresh process. What a layout comparison needs is the steady
+    /// state, so this alternates the order every round, prints every round rather than
+    /// a best-of, and prints the identity pairs (block of round 1 against round 3, walk
+    /// of round 2 against round 4) as the harness's own noise floor.
+    ///
+    /// Returns the per-round `walk / block` ratios, so a caller can see whether the
+    /// sign held.
+    @discardableResult
+    private func measurePrefillSign(
+        label: String,
+        runtime: DeepSeekV41Runtime,
+        tokens: [Int],
+        rows: [Int: [Float]],
+        rounds: Int
+    ) throws -> [Double] {
+        let positions = Double(max(1, tokens.count))
+        print(
+            "🔎 [dsv41 real] prefill sign, \(label): prompt \(tokens.count) positions, "
+                + "\(rows.count) supplied row(s), arena \(runtime.arena.capacity) slot(s), "
+                + "\(rounds) round(s)"
+        )
+
+        let executor = runtime.forward()
+        executor.reset()
+        runtime.arena.reset()
+        _ = try executor.prefillChunk(Array(tokens.prefix(8)))
+
+        /// One arm's whole-prompt pass, with the layout's own clock and counters. The
+        /// two layouts are priced from the instrument that belongs to each, because a
+        /// walk has no block buckets and a block has no per-position timeline.
+        struct Arm {
+            var wall: Double
+            var bytes: Double
+            var misses: Int
+            var device: Double
+            var fill: Double
+            var layers: Int
+            /// Slot `MTLBuffer`s this pass created, and the wall time that cost. One
+            /// buffer per slot is allocated on first use and never freed, so a fresh
+            /// runtime allocates 3,760 of them (67 GB) during its FIRST prefill and none
+            /// afterwards. That is the state change the buckets turn on.
+            var slots: Int
+            var allocating: Double
+            /// The layout's own whole-vs-parts line, so a round that comes out slow
+            /// says WHICH bucket it went to rather than only that it was slow.
+            var detail: String
+        }
+
+        func blockArm() throws -> Arm {
+            executor.reset()
+            runtime.arena.reset()
+            executor.resetBlockTiming()
+            executor.recordsBlockTiming = true
+            let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+            let missesBefore = runtime.expertStreamer?.expertsLoaded ?? 0
+            let slotsBefore = runtime.expertStreamer?.timing.slotsAllocated ?? 0
+            let allocatingBefore = runtime.expertStreamer?.timing.allocating ?? 0
+            let started = DispatchTime.now().uptimeNanoseconds
+            _ = try executor.prefillChunk(tokens, embeddings: rows)
+            let wall = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+            executor.recordsBlockTiming = false
+            let timing = executor.blockTiming
+            let per = timing.millisecondsPerPosition()
+            return Arm(
+                wall: wall,
+                bytes: Double((runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore) / 1_048_576,
+                misses: (runtime.expertStreamer?.expertsLoaded ?? 0) - missesBefore,
+                device: per.denseDevice + per.mixtureDevice,
+                fill: per.expertFill,
+                layers: timing.layers,
+                slots: (runtime.expertStreamer?.timing.slotsAllocated ?? 0) - slotsBefore,
+                allocating: (runtime.expertStreamer?.timing.allocating ?? 0) - allocatingBefore,
+                detail: timing.describe()
+            )
+        }
+
+        func walkArm() throws -> Arm {
+            executor.reset()
+            runtime.arena.reset()
+            executor.resetWalkTiming()
+            executor.recordsWalkTiming = true
+            let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+            let missesBefore = runtime.expertStreamer?.expertsLoaded ?? 0
+            let slotsBefore = runtime.expertStreamer?.timing.slotsAllocated ?? 0
+            let allocatingBefore = runtime.expertStreamer?.timing.allocating ?? 0
+            let started = DispatchTime.now().uptimeNanoseconds
+            for (position, token) in tokens.enumerated() {
+                if let row = rows[position] {
+                    _ = try executor.forwardEmbedding(row, token: token, position: position)
+                } else {
+                    _ = try executor.forwardToken(token, position: position)
+                }
+            }
+            let wall = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+            executor.recordsWalkTiming = false
+            let timing = executor.walkTiming
+            let per = timing.millisecondsPerPosition()
+            return Arm(
+                wall: wall,
+                bytes: Double((runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore) / 1_048_576,
+                misses: (runtime.expertStreamer?.expertsLoaded ?? 0) - missesBefore,
+                device: per.frontDevice + per.mixtureDevice,
+                fill: per.expertFill,
+                layers: timing.layers,
+                slots: (runtime.expertStreamer?.timing.slotsAllocated ?? 0) - slotsBefore,
+                allocating: (runtime.expertStreamer?.timing.allocating ?? 0) - allocatingBefore,
+                detail: timing.describe()
+            )
+        }
+
+        var blockRuns: [Arm] = []
+        var walkRuns: [Arm] = []
+        var ratios: [Double] = []
+        let processStart = Date()
+        for round in 0..<rounds {
+            // Rotated by round, so whichever arm runs first alternates: that ordering
+            // is the variable the two processes disagreed on.
+            let blockFirst = round % 2 == 0
+            let block: Arm
+            let walk: Arm
+            if blockFirst {
+                block = try blockArm()
+                walk = try walkArm()
+            } else {
+                walk = try walkArm()
+                block = try blockArm()
+            }
+            blockRuns.append(block)
+            walkRuns.append(walk)
+            let ratio = walk.wall / max(block.wall, 1)
+            ratios.append(ratio)
+            print(
+                String(
+                    format: "🔎 [dsv41 real] round %d/%d (+%.0f s, %@ first, thermal %@): "
+                        + "block %.1f ms/pos (%.1f s), %.0f MB, %d misses, device %.1f, "
+                        + "fill %.1f; walk %.1f ms/pos (%.1f s), %.0f MB, %d misses, "
+                        + "device %.1f, fill %.1f -> %.2fx",
+                    round + 1,
+                    rounds,
+                    Date().timeIntervalSince(processStart),
+                    blockFirst ? "block" : "walk",
+                    String(describing: ProcessInfo.processInfo.thermalState),
+                    block.wall / positions,
+                    block.wall / 1_000,
+                    block.bytes,
+                    block.misses,
+                    block.device,
+                    block.fill,
+                    walk.wall / positions,
+                    walk.wall / 1_000,
+                    walk.bytes,
+                    walk.misses,
+                    walk.device,
+                    walk.fill,
+                    ratio
+                )
+            )
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   slot buffers created: block %d "
+                        + "(%.1f s), walk %d (%.1f s)",
+                    block.slots,
+                    block.allocating,
+                    walk.slots,
+                    walk.allocating
+                )
+            )
+            print("🔎 [dsv41 real]   block: " + block.detail)
+            print("🔎 [dsv41 real]   walk: " + walk.detail)
+        }
+
+        XCTAssertTrue(
+            blockRuns.allSatisfy { $0.layers > 0 }, "the block switch recorded nothing"
+        )
+        XCTAssertTrue(
+            walkRuns.allSatisfy { $0.layers > 0 }, "the walk switch recorded nothing"
+        )
+
+        /// Each layout's own spread across rounds, in ms per position, so the per-round
+        /// ratios can be read against the noise they were taken in.
+        func spread(_ runs: [Arm]) -> String {
+            let perPosition = runs.map { $0.wall / positions }
+            let low = perPosition.min() ?? 0
+            let high = perPosition.max() ?? 0
+            return String(
+                format: "%.1f..%.1f ms/pos (%.2fx spread)",
+                low, high, high / max(low, 1)
+            )
+        }
+
+        let blockAlways = ratios.allSatisfy { $0 > 1 }
+        let walkAlways = ratios.allSatisfy { $0 < 1 }
+        let verdict = blockAlways
+            ? "block faster in EVERY round"
+            : (walkAlways ? "walk faster in EVERY round" : "the sign is NOT stable")
+        print(
+            "🔎 [dsv41 real] sign across \(rounds) round(s), ratios "
+                + ratios.map { String(format: "%.2f", $0) }.joined(separator: ", ")
+                + ": \(verdict)"
+        )
+        print(
+            "🔎 [dsv41 real] spread: block " + spread(blockRuns)
+                + ", walk " + spread(walkRuns)
+        )
+        if rounds >= 4 {
+            // Identity pairs: same layout, same position in the round order, different
+            // round. Their ratio is what this harness can call noise.
+            let blockPair = blockRuns[0].wall / max(blockRuns[2].wall, 1)
+            let walkPair = walkRuns[1].wall / max(walkRuns[3].wall, 1)
+            print(
+                String(
+                    format: "🔎 [dsv41 real] identity pairs: block round 1 / round 3 "
+                        + "%.2fx, walk round 2 / round 4 %.2fx",
+                    blockPair,
+                    walkPair
+                )
+            )
+        }
+        // Both layouts must have read the same prompt, or a ratio between them says
+        // nothing about the layout. `#52` measured the two byte counts 0.3% apart.
+        let blockBytes = blockRuns.map(\.bytes)
+        let walkBytes = walkRuns.map(\.bytes)
+        let byteGap = abs((blockBytes.min() ?? 0) - (walkBytes.min() ?? 0))
+        let byteShare = byteGap / max(walkBytes.min() ?? 1, 1)
+        print(
+            String(
+                format: "🔎 [dsv41 real] bytes per arm: block %.0f-%.0f MB, walk "
+                    + "%.0f-%.0f MB, layouts %.2f%% apart",
+                blockBytes.min() ?? 0,
+                blockBytes.max() ?? 0,
+                walkBytes.min() ?? 0,
+                walkBytes.max() ?? 0,
+                byteShare * 100
+            )
+        )
+        // The decision statistic: every round AFTER the process's first pass. That
+        // first pass is the one `#46` and `#52` each measured their winner on, and it
+        // is fast in every bucket (host encode, disk and device alike), so it cannot be
+        // part of a layout comparison.
+        if ratios.count > 1 {
+            let steady = Array(ratios.dropFirst())
+            let mean = steady.reduce(0, +) / Double(steady.count)
+            let verdict = steady.allSatisfy { $0 > 1 }
+                ? "block faster in every one"
+                : (steady.allSatisfy { $0 < 1 } ? "walk faster in every one" : "mixed")
+            print(
+                String(
+                    format: "🔎 [dsv41 real] steady state (rounds 2-%d): %.2fx on "
+                        + "average, %@",
+                    rounds,
+                    mean,
+                    verdict
+                )
+            )
+        }
+        return ratios
+    }
+
+    /// The same A/B on a TEXT prompt, because the batched form is the SHIPPED text
+    /// prefill and `#52` measured 1.46x at 128 positions on a round whose block arm was
+    /// the first pass of a fresh process.
+    ///
+    /// The stream is the paragraph `#52` used, rotated 13 tokens per repetition so the
+    /// sequence is not periodic: a plain repeat cycles the same routing and leaves the
+    /// arena warm, which is a different regime from any real prompt.
+    ///
+    /// Opt-in (`/tmp/dynamoe_dsv41_prefill_sign_text`; `_quick` halves the rounds).
+    func testWhetherBatchingATextPrefillPaysInsideOneProcess() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_prefill_sign_text"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in text prefill sign revalidation; touch \(markerPath) to run"
+        )
+        let rounds = FileManager.default.fileExists(
+            atPath: "/tmp/dynamoe_dsv41_prefill_sign_text_quick"
+        ) ? 2 : 4
+
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+        func prompt(_ length: Int) -> [Int] {
+            (0..<length).map { index in
+                let repetition = index / stream.count
+                return stream[(index + repetition * 13) % stream.count]
+            }
+        }
+
+        // 128 positions: the length `#52` reported 1.46x at, and the length where a
+        // round trip costs the walk the most per position.
+        // 128 positions is the length `#52` reported 1.46x at, and it is where a round
+        // trip costs the walk the most per position. `_long` adds 1,005, where `#52`
+        // reported 1.24x: the length where a batching win would matter most, and the one
+        // number a shipped text prefill would notice if it came out below 1.
+        let lengths = FileManager.default.fileExists(
+            atPath: "/tmp/dynamoe_dsv41_prefill_sign_text_long"
+        ) ? [128, 1_005] : [128]
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: (lengths.max() ?? 128) + 1,
+            allowEngramSkip: false
+        )
+        // One runtime for BOTH lengths on purpose: the second call's round 1 is then not
+        // the runtime's first pass, which is the state every pass after it lives in.
+        for length in lengths {
+            try measurePrefillSign(
+                label: "text, \(length) positions",
+                runtime: runtime,
+                tokens: prompt(length),
+                rows: [:],
+                rounds: rounds
+            )
+        }
+        withExtendedLifetime(engine) {}
+    }
+
     /// What the largest picture the composer accepts costs a person, end to end.
     ///
     /// The tower's own cost is measured and published (`#43`: 6.74 s for the largest
