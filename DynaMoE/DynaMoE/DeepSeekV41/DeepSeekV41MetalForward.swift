@@ -354,6 +354,22 @@ nonisolated public enum DeepSeekV41DevicePlan {
     /// one barrier past 32 SIMD groups and buys 4x the memory-level parallelism.
     public static let hyperConnectionMaxLaneWidth = 1_024
 
+    /// Whether the router's top-k runs as one SIMD group per position or as one
+    /// thread.
+    ///
+    /// The scan's per-expert score is `sqrtsoftplus` — three transcendentals — and
+    /// `#63` measured the one-thread form at **72 us per position** for 384 experts,
+    /// 6.6% of a decode's device time, while the projection beside it is 6. The lane
+    /// form keeps `count` candidates per lane in fixed-size registers and merges
+    /// them with the same total order, so it is exact rather than approximate.
+    ///
+    /// The cap is the merge's fixed register list: the published top-k is 6 and eight
+    /// is where the per-lane list still unrolls. A checkpoint with a wider top-k keeps
+    /// the one-thread scan rather than spilling.
+    public static func routerTopKWantsLanes(topK: Int) -> Bool {
+        topK >= 1 && topK <= 8
+    }
+
     /// The fused gate+up kernel, or nil when the format's kernel cannot apply the
     /// checkpoint's `swiglu_limit`. The clip is part of the trained function, so a
     /// kernel without it is a wrong answer rather than a rougher approximation.
@@ -1804,6 +1820,20 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// Measurement only: refuses the split's register-resident Sinkhorn, so a probe
     /// can time the device-memory schedule it replaces. Off in every production path.
     public var disablesHyperConnectionSplitRegisters = false
+
+    /// Measurement only: how many times a router stage repeats its BF16 projection
+    /// (1 in every production path). The dispatch writes the same logits twice, so the
+    /// slope of the stage window IS the projection's in-situ cost — the router is
+    /// 384 rows over a 5,120-wide input, the smallest GEMV grid in the graph, and the
+    /// top-k scan beside it is one thread.
+    public var routerProjectionRepeats = 1
+
+    /// Measurement only: the same repeats for the router's top-k scan.
+    public var routerTopKRepeats = 1
+
+    /// Measurement only: refuses the router's lane-parallel top-k, so a probe can
+    /// time the one-thread scan it replaces. Off in every production path.
+    public var disablesRouterTopKLanes = false
 
     /// Where a walked position's idle time sits, buffer by buffer. Off by default and
     /// off in every production path: it retains a timeline entry per committed buffer.
@@ -3436,16 +3466,18 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             guard let gate = weights.tensor(.routerWeight, layer: index) else {
                 throw DeepSeekV41EngineError.missingTensor("ffn.gate")
             }
-            try encodeGemv(
-                encoder,
-                weight: gate,
-                scale: weights.scaleTensor(.routerWeight, layer: index),
-                inDim: shapes.hidden,
-                outDim: config.numRoutedExperts,
-                input: workspace.normed,
-                output: workspace.routerLogits,
-                rows: count
-            )
+            for _ in 0..<max(1, routerProjectionRepeats) {
+                try encodeGemv(
+                    encoder,
+                    weight: gate,
+                    scale: weights.scaleTensor(.routerWeight, layer: index),
+                    inDim: shapes.hidden,
+                    outDim: config.numRoutedExperts,
+                    input: workspace.normed,
+                    output: workspace.routerLogits,
+                    rows: count
+                )
+            }
             encoder.memoryBarrier(scope: .buffers)
             try encodeRouter(encoder, layer: index, count: count)
 
@@ -4596,15 +4628,17 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             guard let gate = weights.tensor(.routerWeight, layer: index) else {
                 throw DeepSeekV41EngineError.missingTensor("ffn.gate")
             }
-            try encodeGemv(
-                encoder,
-                weight: gate,
-                scale: weights.scaleTensor(.routerWeight, layer: index),
-                inDim: shapes.hidden,
-                outDim: config.numRoutedExperts,
-                input: workspace.normed,
-                output: workspace.routerLogits
-            )
+            for _ in 0..<max(1, routerProjectionRepeats) {
+                try encodeGemv(
+                    encoder,
+                    weight: gate,
+                    scale: weights.scaleTensor(.routerWeight, layer: index),
+                    inDim: shapes.hidden,
+                    outDim: config.numRoutedExperts,
+                    input: workspace.normed,
+                    output: workspace.routerLogits
+                )
+            }
             encoder.memoryBarrier(scope: .buffers)
             try encodeRouter(encoder, layer: index)
 
@@ -5726,7 +5760,6 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         // The readback buffer pads each slot to at least four entries, so the kernel
         // is told that stride rather than assuming `topK`.
         let indexStride = max(4 * topKCount, 16)  // bytes per slot
-        encoder.setComputePipelineState(pipelines.router)
         encoder.setBuffer(workspace.routerLogits, offset: 0, index: 0)
         // An absent bias is a bound zero vector, not an unbound slot: the kernel
         // checks the pointer against `nullptr` and then dereferences it.
@@ -5756,10 +5789,33 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         var slotCount = UInt32(slots)
         encoder.setBytes(&strideInIndices, length: 4, index: 10)
         encoder.setBytes(&slotCount, length: 4, index: 11)
-        encoder.dispatchThreads(
-            MTLSize(width: slots, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: max(1, min(32, slots)), height: 1, depth: 1)
-        )
+        // The lane form is one threadgroup of 32 per position, and the merge's
+        // candidate tables are `lanes x 8` entries each in threadgroup memory. Every
+        // binding above is shared with the one-thread form, which is why the choice
+        // is the pipeline and the dispatch shape and nothing else.
+        let lanes = 32
+        if !disablesRouterTopKLanes,
+           DeepSeekV41DevicePlan.routerTopKWantsLanes(topK: topKCount) {
+            encoder.setComputePipelineState(pipelines.routerTopKLanes)
+            let tableBytes = lanes * 8 * MemoryLayout<Float>.stride
+            encoder.setThreadgroupMemoryLength(tableBytes, index: 0)
+            encoder.setThreadgroupMemoryLength(tableBytes, index: 1)
+            encoder.setThreadgroupMemoryLength(tableBytes, index: 2)
+            for _ in 0..<max(1, routerTopKRepeats) {
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: slots, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+                )
+            }
+            return
+        }
+        encoder.setComputePipelineState(pipelines.router)
+        for _ in 0..<max(1, routerTopKRepeats) {
+            encoder.dispatchThreads(
+                MTLSize(width: slots, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: max(1, min(32, slots)), height: 1, depth: 1)
+            )
+        }
     }
 
     /// The routing the router kernel wrote. `bias` is per layer, so it is bound from

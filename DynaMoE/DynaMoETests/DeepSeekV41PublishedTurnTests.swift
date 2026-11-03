@@ -8498,6 +8498,289 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
+    /// What a router stage is made of on a walk, dispatch by dispatch.
+    ///
+    /// `#62` left `router` the last large stage of a walked position that is not at a
+    /// bandwidth ceiling: 3.6 ms/position, i.e. 90 us per layer for a 3.93 MB BF16
+    /// projection plus a top-k scan that is ONE thread over 384 experts. The stage is
+    /// two dispatches and nothing had separated them, so this repeats each in place
+    /// (both are idempotent — the projection rewrites the same logits and the scan
+    /// rewrites the same indices — so the graph's answer cannot move) and takes the
+    /// slope of the stage window. The half-layout arms repeat the exercise with one
+    /// command buffer per half, so the result is not a per-stage-table artifact.
+    ///
+    /// Opt-in (`/tmp/dynamoe_dsv41_router_stage`, plus the class's own marker).
+    func testWhatARouterStageIsMadeOfOnAWalk() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_router_stage"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in router probe; touch \(markerPath) to run"
+        )
+
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        // The 128-position stream `#52`-`#62` measured.
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+        func prompt(_ length: Int, rotation: Int) -> [Int] {
+            (0..<length).map { index in
+                let repetition = index / stream.count
+                return stream[(index + repetition * rotation) % stream.count]
+            }
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let positions = 128
+        let tokens = prompt(positions, rotation: 7)
+        let sampledPositions: Set<Int> = [0, 1, 2, 3, 7, 15, 31, 63, 127]
+
+        struct Outcome {
+            let wallMilliseconds: Double
+            let timing: DeepSeekV41WalkTiming
+            let lastLogits: [Float]
+            let table: [(stage: String, millisecondsPerPosition: Double, share: Double)]
+            let routerPerPosition: Double
+            let sampledLogits: [Int: [Float]]
+        }
+
+        func pass(
+            _ label: String,
+            executor: DeepSeekV41MetalForward,
+            streamer: DeepSeekV41ExpertStreamer?,
+            projectionRepeats: Int = 1,
+            topKRepeats: Int = 1,
+            laneTopK: Bool = true,
+            staged: Bool = true
+        ) -> Outcome? {
+            executor.reset()
+            executor.resetWalkTiming()
+            executor.recordsWalkTiming = true
+            executor.recordsWalkStageTiming = staged
+            executor.routerProjectionRepeats = projectionRepeats
+            executor.routerTopKRepeats = topKRepeats
+            executor.disablesRouterTopKLanes = !laneTopK
+            let bytesBefore = streamer?.bytesRead ?? 0
+            let start = DispatchTime.now().uptimeNanoseconds
+            var logits: [Float] = []
+            var sampled: [Int: [Float]] = [:]
+            do {
+                for (position, token) in tokens.enumerated() {
+                    logits = try executor.forwardToken(token, position: position)
+                    if sampledPositions.contains(position) { sampled[position] = logits }
+                }
+            } catch {
+                XCTFail("\(label) refused at a position: \(error)")
+                return nil
+            }
+            let wall = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+            executor.recordsWalkTiming = false
+            executor.recordsWalkStageTiming = false
+            executor.routerProjectionRepeats = 1
+            executor.routerTopKRepeats = 1
+            executor.disablesRouterTopKLanes = false
+            let table = executor.walkStageTable()
+            let router = table.first {
+                $0.stage == DeepSeekV41ForwardStages.Stage.router.rawValue
+            }?.millisecondsPerPosition ?? -1
+            let device = executor.walkTiming.frontDeviceNanoseconds
+                + executor.walkTiming.mixtureDeviceNanoseconds
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   %@: %.1f ms/position, device %.1f ms/position, "
+                        + "router %.3f ms/position (%.2f us/layer), %.1f GB read",
+                    label,
+                    wall / Double(positions),
+                    Double(device) / Double(positions) / 1_000_000,
+                    router,
+                    router / 40 * 1_000,
+                    Double((streamer?.bytesRead ?? 0) - bytesBefore) / 1_073_741_824
+                )
+            )
+            return Outcome(
+                wallMilliseconds: wall,
+                timing: executor.walkTiming,
+                lastLogits: logits,
+                table: table,
+                routerPerPosition: router,
+                sampledLogits: sampled
+            )
+        }
+
+        do {
+            let runtime = try makeRuntime(
+                snapshot: snapshot,
+                engine: engine,
+                config: config,
+                contextLength: positions + 1,
+                allowEngramSkip: false,
+                wireArena: nil
+            )
+            runtime.arena.victimPolicy = .leastFrequentlyUsed
+            let executor = runtime.forward()
+
+            executor.reset()
+            runtime.arena.reset()
+            for (position, token) in tokens.enumerated() {
+                _ = try executor.forwardToken(token, position: position)
+            }
+            print(
+                "🔎 [dsv41 real] router probe: \(positions) positions, "
+                    + "\(config.numRoutedExperts) experts over \(config.hiddenSize) wide, warm-up done"
+            )
+
+            let baseline = try XCTUnwrap(
+                pass(
+                    "one-thread top-k (what shipped)", executor: executor,
+                    streamer: runtime.expertStreamer, laneTopK: false
+                )
+            )
+            let shipped = try XCTUnwrap(
+                pass("lane top-k (shipped)", executor: executor, streamer: runtime.expertStreamer)
+            )
+            let projectionTwice = try XCTUnwrap(
+                pass(
+                    "projection x2", executor: executor, streamer: runtime.expertStreamer,
+                    projectionRepeats: 2
+                )
+            )
+            let projectionFour = try XCTUnwrap(
+                pass(
+                    "projection x4", executor: executor, streamer: runtime.expertStreamer,
+                    projectionRepeats: 4
+                )
+            )
+            let topKTwice = try XCTUnwrap(
+                pass(
+                    "top-k x2", executor: executor, streamer: runtime.expertStreamer,
+                    topKRepeats: 2
+                )
+            )
+            let halfShipped = try XCTUnwrap(
+                pass(
+                    "half layout, shipped", executor: executor, streamer: runtime.expertStreamer,
+                    staged: false
+                )
+            )
+            let halfBaseline = try XCTUnwrap(
+                pass(
+                    "half layout, one-thread top-k", executor: executor,
+                    streamer: runtime.expertStreamer, laneTopK: false, staged: false
+                )
+            )
+            let halfProjection = try XCTUnwrap(
+                pass(
+                    "half layout, projection x2", executor: executor,
+                    streamer: runtime.expertStreamer, projectionRepeats: 2, staged: false
+                )
+            )
+            let halfTopK = try XCTUnwrap(
+                pass(
+                    "half layout, top-k x2", executor: executor, streamer: runtime.expertStreamer,
+                    topKRepeats: 2, staged: false
+                )
+            )
+
+            // The repeats are idempotent and the lane form is exact, so the answer may
+            // not move AT ALL: any drift means either a repeat is not repeating what
+            // the stage does, or the merge's total order differs from the scan's.
+            for (label, outcome) in [
+                ("projection x2", projectionTwice), ("top-k x2", topKTwice),
+                ("half layout", halfShipped), ("one-thread top-k", baseline),
+            ] {
+                XCTAssertEqual(
+                    outcome.lastLogits, shipped.lastLogits,
+                    "\(label) changed the answer"
+                )
+            }
+            for position in sampledPositions.sorted() {
+                guard let a = shipped.sampledLogits[position],
+                      let b = projectionFour.sampledLogits[position] else { continue }
+                XCTAssertEqual(
+                    a, b, "the projection repeats changed the answer at position \(position)"
+                )
+            }
+
+            let projectionSlope = (projectionTwice.routerPerPosition
+                - shipped.routerPerPosition) / 40 * 1_000
+            let projectionSlopeFour = (projectionFour.routerPerPosition
+                - shipped.routerPerPosition) / (3 * 40) * 1_000
+            let topKSlope = (topKTwice.routerPerPosition - shipped.routerPerPosition)
+                / 40 * 1_000
+            print(
+                String(
+                    format: "🔎 [dsv41 real] router stage %.3f -> %.3f ms/position "
+                        + "(%.2fx, %.3f ms saved); per layer %.2f -> %.2f us; "
+                        + "in-situ slope per extra dispatch: projection %.2f / %.2f us, "
+                        + "top-k (lane form) %.2f us",
+                    baseline.routerPerPosition,
+                    shipped.routerPerPosition,
+                    baseline.routerPerPosition / shipped.routerPerPosition,
+                    baseline.routerPerPosition - shipped.routerPerPosition,
+                    baseline.routerPerPosition / 40 * 1_000,
+                    shipped.routerPerPosition / 40 * 1_000,
+                    projectionSlope,
+                    projectionSlopeFour,
+                    topKSlope
+                )
+            )
+            func dense(_ outcome: Outcome) -> Double {
+                Double(outcome.timing.frontDeviceNanoseconds)
+                    / Double(positions) / 1_000_000
+            }
+            print(
+                String(
+                    format: "🔎 [dsv41 real] half layout dense half: %.3f ms/position as "
+                        + "shipped, %.3f before #63 (%.3f ms won); projection x2 %.3f "
+                        + "(one costs %.2f us), top-k x2 %.3f (one costs %.2f us)",
+                    dense(halfShipped),
+                    dense(halfBaseline),
+                    dense(halfBaseline) - dense(halfShipped),
+                    dense(halfProjection),
+                    (dense(halfProjection) - dense(halfShipped)) / 40 * 1_000,
+                    dense(halfTopK),
+                    (dense(halfTopK) - dense(halfShipped)) / 40 * 1_000
+                )
+            )
+            for (label, outcome) in [
+                ("one-thread top-k", baseline), ("shipped", shipped),
+                ("projection x2", projectionTwice), ("projection x4", projectionFour),
+                ("top-k x2", topKTwice),
+            ] {
+                let frontNames = Set(DeepSeekV41DevicePlan.frontHalf.map(\.rawValue))
+                let denseTotal = outcome.table
+                    .filter { frontNames.contains($0.stage) }
+                    .reduce(0) { $0 + $1.millisecondsPerPosition }
+                print(
+                    String(
+                        format: "🔎 [dsv41 real] %@ stage table: %.2f dense; top five %@",
+                        label,
+                        denseTotal,
+                        outcome.table.prefix(5)
+                            .map { String(format: "%@ %.2f", $0.stage, $0.millisecondsPerPosition) }
+                            .joined(separator: ", ") as NSString
+                    )
+                )
+            }
+            runtime.shutdown()
+        }
+        withExtendedLifetime(engine) {}
+    }
+
     /// A page-aligned anonymous mapping this test can wire.
     ///
     /// `mlock` is the only in-process way to tell the kernel a page may be neither

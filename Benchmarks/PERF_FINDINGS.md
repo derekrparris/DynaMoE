@@ -10273,3 +10273,95 @@ selection in `encodeHyperConnectionCoefficients`, and seven measurement-only sea
 `hyperConnectionSplitLanesOverride`, `hyperConnectionSinkhornIterationsOverride`,
 `disablesHyperConnectionSplitRegisters`) plus one `DeepSeekV41ParityProbes` field, all off in every
 production path.
+## DSV4.1 #63: THE ROUTER'S TOP-K WAS ONE THREAD OF TRANSCENDENTALS (3.5x)
+
+`#62` closed the mHC pair and left `router` as the last large stage of a walked position that is not
+at a bandwidth ceiling: 3.63 ms/position, 91 us per layer for a 3.93 MB BF16 projection plus a top-k
+scan over 384 experts. The stage is two dispatches and nothing had separated them.
+
+### The run
+
+Same harness as `#62`: one runtime, one 128-position stream, the shipping rule, `-O`, and each
+dispatch repeated in place — both are idempotent, so the graph's answer cannot move and the slope of
+the stage window IS the dispatch's in-situ cost. The repeats also make a free correctness check: the
+answer must be **bit-identical** across every arm, and it is.
+
+| arm | router stage |
+|---|---:|
+| one thread, what shipped | 3.632 ms/position (90.81 us/layer) |
+| **lane-parallel top-k (shipped)** | **1.035 (25.88 us/layer)** |
+| projection dispatched twice | 1.322 |
+| projection dispatched four times | 1.736 |
+| top-k dispatched twice | 1.453 |
+
+**The split was 6 us of projection against 72 us of top-k.** The scan is one thread, and each of 384
+experts costs three transcendentals (`sqrtsoftplus` = `exp`, `log`, `sqrt`); on top of that, the
+top-`k` arrays were declared at their bound (64) and indexed dynamically, so they lived in local
+memory. 72 us per layer is 6.6% of a decode's device time for the *selection* of six experts.
+
+**The fix.** `dsv41_router_topk_lanes` gives each position one SIMD group: lane `l` scans experts
+`l, l + lanes, ...` (a coalesced read), keeps its own `count` candidates in registers, and publishes
+them to threadgroup memory. The merge is the k-way one, run by every lane: each round takes the best
+remaining head with `simd_max`, then the winning expert's id with `simd_min` — which resolves a tie
+to the LOWER expert id, exactly the rule the one-thread insertion uses, without needing the lower
+lane to win. The winner's weight comes back through `simd_sum`, and the selection is staged in the
+output buffer's weight slot because lane 0's candidate table is still being read by later rounds.
+`DeepSeekV41DevicePlan.routerTopKWantsLanes(topK:)` caps the lane form at a top-k of eight (the
+published value is six) and sends anything wider to the one-thread scan rather than spilling the
+merge.
+
+The first version of this kernel merged SERIALLY on lane 0 and was only 1.37x (91 -> 67 us/layer):
+the merge's lists are dynamically indexed thread arrays, i.e. local memory, and 192 candidates
+through them cost 48 us. The k-way merge with shuffles is what makes the whole dispatch 10.6 us.
+
+### What it says
+
+- **The router goes 3.632 -> 1.035 ms/position, 3.51x and 2.597 ms saved**, and it leaves the top
+  five: routedExperts 11.85, queryUp 4.32, outputDown 4.13, sharedExpert 4.04, outputUp 3.47.
+- **The production layout agrees**: one command buffer per half puts the dense half at 20.424
+  ms/position against 23.022 before, i.e. **2.598 ms won**, 99.9% of the stage-window figure.
+- **The answer is unchanged to the bit**, which the repeats and the lane form both require and the
+  probe asserts at every sampled position. Nothing is re-associated: each expert's score is computed
+  by whichever lane owns it, with the same expression, and the selection order is a total order.
+- **A dispatch of one SIMD group still costs ~10 us**, of which the projection's 6 is a real weight
+  read and the merge is a few hundred cycles. What is left in the stage is a per-dispatch floor that
+  a block amortizes over eight positions and a walk cannot.
+
+### What it is not (do not re-propose)
+
+- **Not a case for a wider or narrower SIMD group.** 32 lanes is one warp and the merge's shuffles
+  need exactly that; nothing here swept the width.
+- **Not a case for changing the routing rule.** The bias ranks and the weight is unbiased, the
+  normalization is the checkpoint's `1e-20` and not `norm_eps`, and the tie-break is the lower expert
+  id; all of that is `#13`'s rule, untouched, and `DeepSeekV41RouterKernelTests` still pins it.
+- **Not a projection result.** The projection is 6 us in situ, already at ~600 GB/s; the stage was
+  never the GEMV.
+- **Not a reason to parallelize the mHC split the same way.** That kernel is one thread because its
+  schedule is serial, and `#62` fixed it by moving the matrix to registers. Here the work IS
+  parallel (384 independent scores), which is why the shape is different.
+- **Not an arena, fill, page-cache or prompt result.** As in `#62`, the arms' reads differ (35.0
+  against 28.8 GB) because a rounding-level change occasionally flips a routing decision, so the
+  walls are not compared; only the stage windows and the device halves are results.
+
+### Verification
+
+`testWhatARouterStageIsMadeOfOnAWalk` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_router_stage` plus the class's own `/tmp/dynamoe_dsv41_real_turn`), ~2 min at
+`-O`. It asserts that the repeats and the lane form leave the logits bit-identical at the last
+position and at every sampled position, and that the stage table reports the router. Runs:
+`/tmp/test63_router3.log` (the one tabulated above) and `/tmp/test63_router4.log`, an independent
+reproduction after the merge's dead-code cleanup (3.637 -> 1.038, 3.50x, dense half 23.015 ->
+20.410), with `/tmp/test63_router2.log` (the serial-merge form, 1.37x) and `/tmp/test63_router1.log`
+(the instrument's first cut, both dispatches on the one-thread kernels) as its development.
+
+The kernel is pinned without the checkpoint by
+`DeepSeekV41RouterKernelTests.testTheLaneFormOfTheTopKIsTheOneThreadFormsResult`, which runs both
+kernels over the same logits at the published shape (384 experts, top-k 6), at eight slots, and at a
+5-expert shape shorter than a SIMD group, with a deliberate equal-score pair so the tie-break has to
+agree — and requires **exact** equality of both the indices and the weights, because nothing in the
+lane form re-associates a sum. `/tmp/test63_kernels4.log`.
+
+Production code changed: one kernel (`dsv41_router_topk_lanes`), one pipeline,
+`DeepSeekV41DevicePlan.routerTopKWantsLanes`, the selection in `encodeRouter`, and three
+measurement-only seams on the executor (`routerProjectionRepeats`, `routerTopKRepeats`,
+`disablesRouterTopKLanes`), all off in every production path.

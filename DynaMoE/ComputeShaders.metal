@@ -10733,6 +10733,152 @@ kernel void dsv41_router_topk(
     }
 }
 
+/// MSL Kernel: the router's scored top-k with one SIMD group per position, which
+/// is the form a decode step ships.
+///
+/// Same buffers, same rule and the same arithmetic as `dsv41_router_topk`; what
+/// changes is who does the work. That kernel scans all `expertCount` experts on
+/// ONE thread, and `#63` measured it at 72 us per position for 384 experts —
+/// 6.6% of a decode's device time — because each expert costs three
+/// transcendentals (`sqrtsoftplus`) and the top-`k` arrays are declared at their
+/// bound (64) and indexed dynamically, so they live in local memory.
+///
+/// Here lane `l` scans experts `l, l + lanes, ...` (a coalesced read), keeps its
+/// own `count` best in fixed-size registers, and publishes them to threadgroup
+/// memory; lane 0 then merges `lanes x count` sorted candidates with the SAME
+/// total order the one-thread scan uses (score descending, expert id ascending),
+/// so the result is the one-thread kernel's, exactly — the score of an expert does
+/// not depend on who computed it and no sum is re-associated.
+///
+/// `count` is bounded by 8 here (the published top-k is 6): the plan sends a
+/// wider top-k back to the one-thread form rather than spilling the merge.
+/// Grid: (slots, 1, 1) threadgroups of `lanes` threads.
+kernel void dsv41_router_topk_lanes(
+    device const float* logits [[buffer(0)]],
+    device const float* biasBuffer [[buffer(1)]],     // may be null
+    device uint32_t* expertIndices [[buffer(2)]],
+    device float* expertWeights [[buffer(3)]],
+    constant uint32_t& expertCount [[buffer(4)]],
+    constant uint32_t& topK [[buffer(5)]],
+    constant float& scalingFactor [[buffer(6)]],
+    constant uint32_t& normalise [[buffer(7)]],
+    constant uint32_t& scoringFunction [[buffer(8)]],
+    constant float& gateTemp [[buffer(9)]],
+    constant uint32_t& indexStride [[buffer(10)]],
+    constant uint32_t& slotCount [[buffer(11)]],
+    threadgroup float* candidateScores [[threadgroup(0)]],    // [lanes][8]
+    threadgroup float* candidateWeights [[threadgroup(1)]],   // [lanes][8]
+    threadgroup uint32_t* candidateIndices [[threadgroup(2)]],// [lanes][8]
+    uint slot [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint lanes [[threads_per_threadgroup]]
+) {
+    if (slot >= slotCount || expertCount == 0 || topK == 0 || lanes == 0) return;
+    uint32_t count = min(min(topK, expertCount), 8u);
+    device const float* slotLogits = logits + (uint64_t)slot * expertCount;
+    device uint32_t* slotIndices = expertIndices + (uint64_t)slot * indexStride;
+    device float* slotWeights = expertWeights + (uint64_t)slot * topK;
+
+    float topScore[8];
+    float topWeight[8];
+    uint32_t topIndex[8];
+    uint32_t filled = 0;
+
+    float temperature = gateTemp > 0.0f ? gateTemp : 1.0f;
+    for (uint32_t expert = lane; expert < expertCount; expert += lanes) {
+        float logit = slotLogits[expert] / temperature;
+        // The weight is the UNBIASED score; the bias only moves the ranking.
+        float weight = (scoringFunction == 0u)
+            ? (logit >= 0.0f ? (1.0f / (1.0f + exp(-logit)))
+                             : (exp(logit) / (1.0f + exp(logit))))
+            : sqrt(max(logit, 0.0f) + log(1.0f + exp(-fabs(logit))));
+        float score = weight + ((biasBuffer != nullptr) ? biasBuffer[expert] : 0.0f);
+
+        uint32_t position = filled;
+        while (position > 0) {
+            bool goesBefore = score > topScore[position - 1]
+                || (score == topScore[position - 1] && expert < topIndex[position - 1]);
+            if (!goesBefore) break;
+            position--;
+        }
+        if (filled < count) {
+            for (uint32_t move = filled; move > position; --move) {
+                topScore[move] = topScore[move - 1];
+                topWeight[move] = topWeight[move - 1];
+                topIndex[move] = topIndex[move - 1];
+            }
+            topScore[position] = score;
+            topWeight[position] = weight;
+            topIndex[position] = expert;
+            filled++;
+        } else if (position < count) {
+            for (uint32_t move = count - 1; move > position; --move) {
+                topScore[move] = topScore[move - 1];
+                topWeight[move] = topWeight[move - 1];
+                topIndex[move] = topIndex[move - 1];
+            }
+            topScore[position] = score;
+            topWeight[position] = weight;
+            topIndex[position] = expert;
+        }
+    }
+
+    // An unfilled rank is -infinity, which no real score can be, so a sentinel can
+    // never win the merge's `simd_max` while any real candidate remains — no second
+    // count array is needed.
+    uint32_t base = lane * 8u;
+    for (uint32_t rank = 0; rank < 8u; ++rank) {
+        bool held = rank < filled;
+        candidateScores[base + rank] = held ? topScore[rank] : -INFINITY;
+        candidateWeights[base + rank] = held ? topWeight[rank] : 0.0f;
+        candidateIndices[base + rank] = held ? topIndex[rank] : 0xFFFFFFFFu;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // The merge is the k-way one, and it runs on every lane: each round takes the
+    // best remaining head across the lanes with `simd_max`, then the winning
+    // expert's id with `simd_min` — so ties resolve to the LOWER expert id exactly
+    // as the one-thread scan's insertion does, without needing the lower lane to
+    // win. A serial merge over `lanes x count` candidates was implemented first and
+    // cost 48 us: its lists are dynamically indexed thread arrays, i.e. local
+    // memory, and that is the same defect this kernel exists to remove.
+    uint32_t head = 0;
+    float total = 0.0f;
+    // Every lane runs every round: the shuffles need uniform control flow, so the
+    // writes are conditioned on `lane == 0` rather than branched out of.
+    for (uint32_t rank = 0; rank < count; ++rank) {
+        // `head` advances at most once per round, so it is below `count` on entry.
+        float score = candidateScores[base + head];
+        uint32_t expert = candidateIndices[base + head];
+        float weight = candidateWeights[base + head];
+
+        float bestScore = simd_max(score);
+        uint32_t bestExpert = simd_min(score == bestScore ? expert : 0xFFFFFFFFu);
+        bool won = score == bestScore && expert == bestExpert;
+        float wonWeight = simd_sum(won ? weight : 0.0f);
+        if (won) head++;
+        if (lane == 0) {
+            total += wonWeight;
+            slotIndices[rank] = bestExpert;
+            // The selection is staged in the OUTPUT buffer: lane 0's own candidate
+            // table is still being read by later rounds (`base + head`), so writing
+            // the chosen weight back into it would clobber a candidate.
+            slotWeights[rank] = wonWeight;
+        }
+    }
+    if (lane != 0) return;
+
+    // `norm_topk_prob and topk > 1`, with the training-time 1e-20 rather than
+    // `norm_eps` (`Gate.forward`).
+    if (normalise != 0u && count > 1u) total += 1e-20f;
+    for (uint32_t rank = 0; rank < count; ++rank) {
+        float mixWeight = slotWeights[rank];
+        if (normalise != 0u && total > 0.0f) mixWeight /= total;
+        if (scalingFactor > 0.0f) mixWeight *= scalingFactor;
+        slotWeights[rank] = mixWeight;
+    }
+}
+
 // ============================================================================
 // MARK: - DeepSeek V4.1 executor kernels
 //

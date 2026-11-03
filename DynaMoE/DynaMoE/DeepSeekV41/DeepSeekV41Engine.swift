@@ -377,6 +377,9 @@ nonisolated public struct DeepSeekV41Pipelines {
     public let hcPre: MTLComputePipelineState
     public let hcPost: MTLComputePipelineState
     public let hcIdentityMix: MTLComputePipelineState
+    /// The router's top-k with one SIMD group per position, which a decode step
+    /// ships: the one-thread scan is a `sqrtsoftplus` per expert (`#63`).
+    public let routerTopKLanes: MTLComputePipelineState
     public let rope: MTLComputePipelineState
     public let storeLatent: MTLComputePipelineState
     public let gatherLatents: MTLComputePipelineState
@@ -441,6 +444,7 @@ nonisolated public struct DeepSeekV41Pipelines {
         self.hcPre = try make("dsv41_hc_pre_f32")
         self.hcPost = try make("dsv41_hc_post_f32")
         self.hcIdentityMix = try make("dsv41_hc_identity_mix_f32")
+        self.routerTopKLanes = try make("dsv41_router_topk_lanes")
         self.rope = try make("dsv41_rope_latent")
         self.storeLatent = try make("dsv41_store_latent_f16")
         self.gatherLatents = try make("dsv41_gather_latents_f16")

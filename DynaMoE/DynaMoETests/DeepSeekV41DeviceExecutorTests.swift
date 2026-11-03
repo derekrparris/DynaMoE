@@ -1261,6 +1261,167 @@ final class DeepSeekV41RouterKernelTests: XCTestCase {
         let selectionValue = DeepSeekV41Router.sigmoid(-3) + 5
         XCTAssertNotEqual(weights[0], selectionValue / total * scaling, accuracy: 0.1)
     }
+
+    /// The lane-parallel top-k returns exactly what the one-thread scan does.
+    ///
+    /// `#63` measured the one-thread scan at 72 us per position, because each of 384
+    /// experts costs three transcendentals on a single lane and the top-`k` arrays are
+    /// declared at their bound. The lane form splits the scan across a SIMD group and
+    /// merges each lane's candidates with the SAME total order (score descending,
+    /// expert id ascending), so nothing is re-associated and the requirement is
+    /// equality rather than a tolerance — which also means a wrong merge cannot hide
+    /// inside a rounding bar. The last case is shorter than one SIMD group, so the
+    /// lanes that own no expert must publish nothing that can be selected.
+    func testTheLaneFormOfTheTopKIsTheOneThreadFormsResult() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        let library = try XCTUnwrap(device.makeDefaultLibrary())
+        let slowFunction = try XCTUnwrap(library.makeFunction(name: "dsv41_router_topk"))
+        let laneFunction = try XCTUnwrap(library.makeFunction(name: "dsv41_router_topk_lanes"))
+        let slow = try device.makeComputePipelineState(function: slowFunction)
+        let lanes = try device.makeComputePipelineState(function: laneFunction)
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+
+        func run(
+            _ pipeline: MTLComputePipelineState,
+            lanesPerSlot: Int,
+            slots: Int,
+            expertCount: Int,
+            topK: Int,
+            logits: [Float],
+            bias: [Float]
+        ) throws -> (indices: [UInt32], weights: [Float]) {
+            let indexStride = max(4 * topK, 16)
+            let logitsBuffer = try XCTUnwrap(
+                device.makeBuffer(
+                    bytes: logits, length: logits.count * MemoryLayout<Float>.stride,
+                    options: .storageModeShared
+                )
+            )
+            let biasBuffer = try XCTUnwrap(
+                device.makeBuffer(
+                    bytes: bias, length: bias.count * MemoryLayout<Float>.stride,
+                    options: .storageModeShared
+                )
+            )
+            let indexBuffer = try XCTUnwrap(
+                device.makeBuffer(
+                    length: slots * indexStride * MemoryLayout<UInt32>.stride,
+                    options: .storageModeShared
+                )
+            )
+            let weightBuffer = try XCTUnwrap(
+                device.makeBuffer(
+                    length: slots * topK * MemoryLayout<Float>.stride, options: .storageModeShared
+                )
+            )
+            let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+            let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(logitsBuffer, offset: 0, index: 0)
+            encoder.setBuffer(biasBuffer, offset: 0, index: 1)
+            encoder.setBuffer(indexBuffer, offset: 0, index: 2)
+            encoder.setBuffer(weightBuffer, offset: 0, index: 3)
+            var experts = UInt32(expertCount)
+            var count = UInt32(topK)
+            var scaling: Float = 2.5
+            var normalise: UInt32 = 1
+            var scoring: UInt32 = 1  // sqrtsoftplus, the checkpoint's
+            var temperature: Float = 1
+            var stride = UInt32(indexStride)
+            var slotCount = UInt32(slots)
+            encoder.setBytes(&experts, length: 4, index: 4)
+            encoder.setBytes(&count, length: 4, index: 5)
+            encoder.setBytes(&scaling, length: 4, index: 6)
+            encoder.setBytes(&normalise, length: 4, index: 7)
+            encoder.setBytes(&scoring, length: 4, index: 8)
+            encoder.setBytes(&temperature, length: 4, index: 9)
+            encoder.setBytes(&stride, length: 4, index: 10)
+            encoder.setBytes(&slotCount, length: 4, index: 11)
+            if lanesPerSlot > 1 {
+                for index in 0..<3 {
+                    encoder.setThreadgroupMemoryLength(
+                        lanesPerSlot * 8 * MemoryLayout<Float>.stride, index: index
+                    )
+                }
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: slots, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: lanesPerSlot, height: 1, depth: 1)
+                )
+            } else {
+                encoder.dispatchThreads(
+                    MTLSize(width: slots, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
+                )
+            }
+            encoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            XCTAssertNil(commandBuffer.error)
+            let indexPointer = indexBuffer.contents().assumingMemoryBound(to: UInt32.self)
+            let weightPointer = weightBuffer.contents().assumingMemoryBound(to: Float.self)
+            var indices: [UInt32] = []
+            var weights: [Float] = []
+            for slot in 0..<slots {
+                indices.append(contentsOf: (0..<topK).map { indexPointer[slot * indexStride + $0] })
+                weights.append(contentsOf: (0..<topK).map { weightPointer[slot * topK + $0] })
+            }
+            return (indices, weights)
+        }
+
+        // Deterministic logits with mixed signs plus a DUPLICATE pair, so the
+        // tie-break (a lower expert id wins) has to be the same in both merges.
+        func logits(_ count: Int, shift: Int) -> [Float] {
+            (0..<count).map { index in
+                let at = (index + shift) % count
+                if at == 17 || at == 200 { return 1.25 }
+                let wave = Float((at * 41) % 29) / 29 - 0.5
+                return wave * 6 + (at % 3 == 0 ? 0.4 : 0)
+            }
+        }
+        func bias(_ count: Int) -> [Float] {
+            (0..<count).map { Float(($0 * 13) % 11) / 22 - 0.25 }
+        }
+
+        let shapes: [(experts: Int, topK: Int, slots: Int)] = [
+            (384, 6, 1),
+            (384, 6, 8),
+            (5, 3, 1),
+        ]
+        for shape in shapes {
+            var allLogits: [Float] = []
+            for slot in 0..<shape.slots {
+                allLogits.append(contentsOf: logits(shape.experts, shift: slot * 7))
+            }
+            let byThread = try run(
+                slow, lanesPerSlot: 1, slots: shape.slots, expertCount: shape.experts,
+                topK: shape.topK, logits: allLogits, bias: bias(shape.experts)
+            )
+            let byLane = try run(
+                lanes, lanesPerSlot: 32, slots: shape.slots, expertCount: shape.experts,
+                topK: shape.topK, logits: allLogits, bias: bias(shape.experts)
+            )
+            for rank in 0..<(shape.slots * shape.topK) {
+                XCTAssertEqual(
+                    byLane.indices[rank], byThread.indices[rank],
+                    "\(shape.experts) experts, \(shape.topK) of them, rank \(rank) selected "
+                        + "a different expert"
+                )
+                XCTAssertEqual(
+                    byLane.weights[rank], byThread.weights[rank],
+                    "\(shape.experts) experts, \(shape.topK) of them, rank \(rank) got a "
+                        + "different weight"
+                )
+            }
+        }
+        XCTAssertTrue(DeepSeekV41DevicePlan.routerTopKWantsLanes(topK: 6))
+        XCTAssertTrue(DeepSeekV41DevicePlan.routerTopKWantsLanes(topK: 1))
+        XCTAssertFalse(
+            DeepSeekV41DevicePlan.routerTopKWantsLanes(topK: 9),
+            "a wider top-k must fall back to the one-thread scan rather than spill the merge"
+        )
+    }
 }
 
 // MARK: - Rope kernel
