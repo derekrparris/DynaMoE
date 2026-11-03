@@ -3926,6 +3926,428 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
+    /// Where a batched prefill's time goes at a published span.
+    ///
+    /// `#46` answered WHO wins (the block form up to a 1.5x working set, the walk
+    /// beyond it) and named the mechanism (a union fill evicts 20-48 pairs at once
+    /// where a walk's 6-pair fill keeps what it just used). What it could not say is
+    /// where the block form's OWN time goes when it loses: `DeepSeekV41BlockTiming`
+    /// had three host buckets that folded the routing readback, the union fill and the
+    /// mixture encode into one, no block wall time, and none of the drain/late-start
+    /// attribution the walk got in `#50`, so ~215 ms/position of a 353 ms/position
+    /// block arm was unattributed by construction.
+    ///
+    /// This runs both layouts over the same stream in one runtime, each from a reset
+    /// executor and a reset arena, printing each arm's own bucket table, its wall time
+    /// and its expert bytes. Two rounds with the arm order ROTATED, because a warm page
+    /// cache is worth 2x on the first arm (`#51`).
+    ///
+    /// A text stream rather than a picture: the lengths are what matter here and the
+    /// tower's 6.9 s encode would be paid twice for nothing. The working-set ratio the
+    /// arm reaches is printed beside the numbers so the regime can be read off rather
+    /// than assumed.
+    ///
+    /// Opt-in (`/tmp/dynamoe_dsv41_block_span` for 128 positions,
+    /// `/tmp/dynamoe_dsv41_block_span_long` for the 1,005-position arm, which is ~20
+    /// minutes at `-O`).
+    func testWhereABatchedPrefillsTimeGoesOnThePublishedCheckpoint() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_block_span"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in block attribution; touch \(markerPath) to run"
+        )
+        let longMarkerPath = "/tmp/dynamoe_dsv41_block_span_long"
+        let lengths = FileManager.default.fileExists(atPath: longMarkerPath)
+            ? [128, 1_005] : [128]
+
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+
+        /// The prompt of `length` tokens: the paragraph repeated, rotated once per
+        /// repetition so the sequence is not periodic. A plain repeat cycles the same
+        /// routing and leaves the arena warm, which is a different regime from any real
+        /// prompt; the arm's own misses per position are printed so the regime it did
+        /// reach is read off rather than assumed.
+        func prompt(_ length: Int) -> [Int] {
+            (0..<length).map { index in
+                let repetition = index / stream.count
+                return stream[(index + repetition * 13) % stream.count]
+            }
+        }
+
+        let longest = lengths.max() ?? 128
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: longest + 1,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let executor = runtime.forward()
+        let width = DeepSeekV41DevicePlan.chunkSlots(
+            config: config, contextLength: runtime.contextLength
+        )
+        let slots = runtime.arena.capacity
+        print(
+            "🔎 [dsv41 real] block attribution: block width \(width), arena \(slots) slot(s), "
+                + "stream repeats every \(stream.count) token(s)"
+        )
+
+        // One discarded warm-up so the first arm does not pay the slot allocations.
+        executor.reset()
+        runtime.arena.reset()
+        _ = try executor.prefillChunk(Array(stream.prefix(8)))
+
+        for length in lengths {
+            let tokens = prompt(length)
+            let positions = Double(max(1, length))
+
+            func blockArm() throws -> (wall: Double, bytes: Double, misses: Int, timing: DeepSeekV41BlockTiming) {
+                executor.reset()
+                runtime.arena.reset()
+                executor.resetBlockTiming()
+                executor.recordsBlockTiming = true
+                let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+                let missesBefore = runtime.expertStreamer?.expertsLoaded ?? 0
+                let started = DispatchTime.now().uptimeNanoseconds
+                _ = try executor.prefillChunk(tokens)
+                let wall = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+                executor.recordsBlockTiming = false
+                return (
+                    wall,
+                    Double((runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore) / 1_048_576,
+                    (runtime.expertStreamer?.expertsLoaded ?? 0) - missesBefore,
+                    executor.blockTiming
+                )
+            }
+
+            func walkArm() throws -> (wall: Double, bytes: Double, misses: Int, timing: DeepSeekV41WalkTiming) {
+                executor.reset()
+                runtime.arena.reset()
+                executor.resetWalkTiming()
+                executor.recordsWalkTiming = true
+                let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+                let missesBefore = runtime.expertStreamer?.expertsLoaded ?? 0
+                let started = DispatchTime.now().uptimeNanoseconds
+                for (position, token) in tokens.enumerated() {
+                    _ = try executor.forwardToken(token, position: position)
+                }
+                let wall = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+                executor.recordsWalkTiming = false
+                return (
+                    wall,
+                    Double((runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore) / 1_048_576,
+                    (runtime.expertStreamer?.expertsLoaded ?? 0) - missesBefore,
+                    executor.walkTiming
+                )
+            }
+
+            var bestBlock: (wall: Double, bytes: Double, misses: Int, timing: DeepSeekV41BlockTiming)?
+            var bestWalk: (wall: Double, bytes: Double, misses: Int, timing: DeepSeekV41WalkTiming)?
+            for round in 0..<2 {
+                // Rotated: whoever runs first reads a colder cache, which is worth ~2x
+                // on the fill and would otherwise decide the comparison.
+                if round % 2 == 0 {
+                    let arm = try blockArm()
+                    let other = try walkArm()
+                    if bestBlock == nil || arm.wall < bestBlock!.wall { bestBlock = arm }
+                    if bestWalk == nil || other.wall < bestWalk!.wall { bestWalk = other }
+                } else {
+                    let other = try walkArm()
+                    let arm = try blockArm()
+                    if bestBlock == nil || arm.wall < bestBlock!.wall { bestBlock = arm }
+                    if bestWalk == nil || other.wall < bestWalk!.wall { bestWalk = other }
+                }
+            }
+            let block = try XCTUnwrap(bestBlock)
+            let walk = try XCTUnwrap(bestWalk)
+            XCTAssertGreaterThan(block.timing.layers, 0, "the block switch recorded nothing")
+            XCTAssertGreaterThan(walk.timing.layers, 0, "the walk switch recorded nothing")
+
+            let per = block.timing.millisecondsPerPosition()
+            print(
+                String(
+                    format: "🔎 [dsv41 real] %d positions (arena %d slot(s)): block %.1f "
+                        + "ms/pos (%.1f s), %.0f MB and %d misses (%.1f per position); "
+                        + "walk %.1f ms/pos (%.1f s), %.0f MB and %d misses (%.1f per "
+                        + "position) -> %.2fx",
+                    length,
+                    slots,
+                    block.wall / positions,
+                    block.wall / 1_000,
+                    block.bytes,
+                    block.misses,
+                    Double(block.misses) / positions,
+                    walk.wall / positions,
+                    walk.wall / 1_000,
+                    walk.bytes,
+                    walk.misses,
+                    Double(walk.misses) / positions,
+                    walk.wall / max(block.wall, 1)
+                )
+            )
+            print("🔎 [dsv41 real] " + block.timing.describe())
+            print(
+                "🔎 [dsv41 real] block buckets per position: wall "
+                    + String(format: "%.1f", per.wall)
+                    + ", embedding " + String(format: "%.1f", per.embedding)
+                    + ", dense encode " + String(format: "%.1f", per.denseEncode)
+                    + ", front wait " + String(format: "%.1f", per.frontWait)
+                    + ", routing " + String(format: "%.1f", per.routing)
+                    + ", expert fill " + String(format: "%.1f", per.expertFill)
+                    + ", mixture encode " + String(format: "%.1f", per.mixtureEncode)
+                    + ", device " + String(format: "%.1f", per.denseDevice + per.mixtureDevice)
+                    + " ms (drained front "
+                    + String(format: "%.1f",
+                        Double(block.timing.frontDrainNanoseconds)
+                            / Double(max(1, block.timing.positionCount)) / 1_000_000)
+                    + ", mixture "
+                    + String(format: "%.1f",
+                        Double(block.timing.mixtureDrainNanoseconds)
+                            / Double(max(1, block.timing.positionCount)) / 1_000_000)
+                    + ", late start front "
+                    + String(format: "%.1f",
+                        Double(block.timing.frontLateStartNanoseconds)
+                            / Double(max(1, block.timing.positionCount)) / 1_000_000)
+                    + ", mixture "
+                    + String(format: "%.1f",
+                        Double(block.timing.mixtureLateStartNanoseconds)
+                            / Double(max(1, block.timing.positionCount)) / 1_000_000)
+                    + ")"
+            )
+            print("🔎 [dsv41 real] " + walk.timing.describe())
+        }
+
+        // The dense-half ranking at the widths the checkpoint ships, which `#46`'s
+        // tables never had: every stage table in the journal was taken on a synthetic
+        // fixture, so a real weight's per-stage cost has never been attributed.
+        executor.reset()
+        runtime.arena.reset()
+        executor.resetStageTiming()
+        executor.recordsStageTiming = true
+        executor.recordsBlockTiming = true
+        _ = try executor.prefillChunk(Array(stream.prefix(8)))
+        executor.recordsStageTiming = false
+        executor.recordsBlockTiming = false
+        let stages = executor.stageTiming
+        XCTAssertFalse(stages.isEmpty, "no stage reported a device window")
+        let total = Double(stages.values.reduce(0, +))
+        print(
+            "🔎 [dsv41 real] one real block of 8 positions, dense stages "
+                + "(ms for the block, share of the dense half):"
+        )
+        for (stage, nanoseconds) in stages.sorted(by: { $0.value > $1.value }) {
+            print(
+                "🔎 [dsv41 real]   "
+                    + String(
+                        format: "%-42@ %8.3f ms  %5.1f%%",
+                        stage as NSString,
+                        Double(nanoseconds) / 1_000_000,
+                        Double(nanoseconds) / max(total, 1) * 100
+                    )
+            )
+        }
+        withExtendedLifetime(engine) {}
+    }
+
+    /// The same attribution on the prompt that actually loses: the largest picture.
+    ///
+    /// `#46` measured the batched form at 0.74x the walk on the composer's own 1,005
+    /// position picture prompt, against 1.26x on a bare text span of the same length,
+    /// and attributed the loss to bulk eviction. The bytes do not support that on their
+    /// own — the two layouts read the same 218 GB on that prompt — so this runs the two
+    /// arms with the instrument above attached to each and prints the split, plus the
+    /// per-position cost of both layouts on a prompt whose positions are mostly IMAGE
+    /// rows. Both arms are 2x slower per position on this prompt than on text of the
+    /// same length (`#46`: 353 and 266 ms against 122 and 150), which is a fact about
+    /// the graph rather than the layout and is what this case exists to attribute.
+    ///
+    /// Opt-in (`/tmp/dynamoe_dsv41_block_span_picture`): the tower encode plus two
+    /// rotated rounds of a thousand-position prefill is ~25 minutes at `-O`.
+    func testWhereAPicturesPrefillGoesOnThePublishedCheckpoint() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_block_span_picture"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in picture attribution; touch \(markerPath) to run"
+        )
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let spec = try XCTUnwrap(config.vision)
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+
+        // The composer's own path, because the regime is the picture's CONTENT and not
+        // its length. `#46`'s bare-span arm (a synthetic patch grid, 5,533 distinct
+        // pairs) measured 1.26x, and a synthetic grid reproduces that arm rather than
+        // this one: the same grid through this instrument reads 5,552 pairs and 1.67x.
+        // The composer's prompt touches 12,228, i.e. 3.25x the arena, which is the case
+        // that loses. So the pixels are a real gradient and the rows are the tower's.
+        let markers = DeepSeekV41VisionMarkers.familyDefault
+        let dialect = DeepSeekV41PromptDialect.resolve(snapshotDir: snapshot)
+        let rendered = dialect.render(
+            turns: [.init(
+                isUser: true, text: "\(markers.imagePlaceholder)\nwhat is in this picture?"
+            )],
+            cleanSystem: "",
+            thinkingEnabled: false,
+            effort: nil
+        )
+        let promptIds = try tokenizer.encode(text: rendered)
+        let side = 4_096
+        var rgb = [UInt8](repeating: 0, count: side * side * 3)
+        for y in 0..<side {
+            let rowBase = y * side * 3
+            for x in 0..<side {
+                let offset = rowBase + x * 3
+                rgb[offset] = UInt8(x & 0xFF)
+                rgb[offset + 1] = UInt8(y & 0xFF)
+                rgb[offset + 2] = 96
+            }
+        }
+        let image = DeepSeekV41ImageInput(
+            rgb: rgb, width: side, height: side, sha256: "largest-image"
+        )
+        let price = try DeepSeekV41TurnImages.price(
+            tokenIds: promptIds, images: [image], spec: spec
+        )
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: price.promptTokens + 1,
+            allowEngramSkip: false
+        )
+        let tower = try XCTUnwrap(runtime.visionForward())
+        let bound = try DeepSeekV41TurnImages.bind(
+            tokenIds: promptIds,
+            images: [image],
+            spec: spec,
+            rowWidth: config.hiddenSize
+        ) { input in
+            let fitted = DeepSeekV41VisionLayout.fit(
+                width: input.width, height: input.height, spec: spec
+            )
+            let rows = try tower.imageSpan(
+                rgb: input.rgb, width: input.width, height: input.height
+            )
+            return DeepSeekV41ImagePrompt.ImageSpan(
+                rows: rows, columns: fitted.columns, gridRows: fitted.rows
+            )
+        }
+        let tokens = bound.tokenIds.map { Int($0) }
+        let positions = Double(max(1, tokens.count))
+        let slots = runtime.arena.capacity
+        XCTAssertEqual(tokens.count, price.promptTokens, "the price must equal the bind")
+        print(
+            "🔎 [dsv41 real] picture attribution: \(bound.rows.count) image rows, prompt "
+                + "\(tokens.count) positions, arena \(slots) slot(s)"
+        )
+
+        let executor = runtime.forward()
+        executor.reset()
+        runtime.arena.reset()
+        _ = try executor.prefillChunk(Array(tokens.prefix(8)))
+
+        func blockArm() throws -> (wall: Double, bytes: Double, misses: Int, timing: DeepSeekV41BlockTiming) {
+            executor.reset()
+            runtime.arena.reset()
+            executor.resetBlockTiming()
+            executor.recordsBlockTiming = true
+            let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+            let missesBefore = runtime.expertStreamer?.expertsLoaded ?? 0
+            let started = DispatchTime.now().uptimeNanoseconds
+            _ = try executor.prefillChunk(tokens, embeddings: bound.rows)
+            let wall = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+            executor.recordsBlockTiming = false
+            return (
+                wall,
+                Double((runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore) / 1_048_576,
+                (runtime.expertStreamer?.expertsLoaded ?? 0) - missesBefore,
+                executor.blockTiming
+            )
+        }
+
+        func walkArm() throws -> (wall: Double, bytes: Double, misses: Int, timing: DeepSeekV41WalkTiming) {
+            executor.reset()
+            runtime.arena.reset()
+            executor.resetWalkTiming()
+            executor.recordsWalkTiming = true
+            let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+            let missesBefore = runtime.expertStreamer?.expertsLoaded ?? 0
+            let started = DispatchTime.now().uptimeNanoseconds
+            for (position, token) in tokens.enumerated() {
+                if let row = bound.rows[position] {
+                    _ = try executor.forwardEmbedding(row, token: token, position: position)
+                } else {
+                    _ = try executor.forwardToken(token, position: position)
+                }
+            }
+            let wall = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+            executor.recordsWalkTiming = false
+            return (
+                wall,
+                Double((runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore) / 1_048_576,
+                (runtime.expertStreamer?.expertsLoaded ?? 0) - missesBefore,
+                executor.walkTiming
+            )
+        }
+
+        // ONE round, unlike the text case: each arm here reads ~218 GB, which is larger
+        // than this machine's RAM, so the rotation exists to protect an arm from a page
+        // cache the other arm warmed and there is no such cache to protect against.
+        let block = try blockArm()
+        let walk = try walkArm()
+        XCTAssertGreaterThan(block.timing.layers, 0, "the block switch recorded nothing")
+        XCTAssertGreaterThan(walk.timing.layers, 0, "the walk switch recorded nothing")
+        print(
+            String(
+                format: "🔎 [dsv41 real] picture prefill: block %.1f ms/pos (%.1f s), "
+                    + "%.0f MB, %d misses; walk %.1f ms/pos (%.1f s), %.0f MB, %d misses "
+                    + "-> %.2fx",
+                block.wall / positions,
+                block.wall / 1_000,
+                block.bytes,
+                block.misses,
+                walk.wall / positions,
+                walk.wall / 1_000,
+                walk.bytes,
+                walk.misses,
+                walk.wall / max(block.wall, 1)
+            )
+        )
+        print("🔎 [dsv41 real] " + block.timing.describe())
+        print("🔎 [dsv41 real] " + walk.timing.describe())
+        withExtendedLifetime(engine) {}
+    }
+
     /// What the largest picture the composer accepts costs a person, end to end.
     ///
     /// The tower's own cost is measured and published (`#43`: 6.74 s for the largest

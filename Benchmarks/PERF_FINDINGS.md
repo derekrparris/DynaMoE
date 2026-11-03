@@ -8848,3 +8848,152 @@ fixed on the way, both worth carrying: an engine returned out of scope unmaps th
 buffers under the runtime, which surfaces as a SIGSEGV at an address in the middle of nowhere (484 GB
 here) inside a gain-vector widen; and a stale test bundle in `-derivedDataPath /tmp/dd_dsv41_opt`
 reported a line number from the pre-edit source, which is what made a build look like a crash.
+
+## DSV4.1 #52: A BATCHED PREFILL'S TIME IS NOW FULLY ACCOUNTED, AND IT IS STILL 57-77% WAITING
+
+### Question
+
+Routing picked `block_prefill_cost` at 0.997 / 0.996, on `#51`'s conclusion that the only remaining
+lever on the expert stream is FEWER fills, and on the fact that `DeepSeekV41BlockTiming` had never
+run on a published span. That type had three host buckets, folded the routing readback, the union
+fill and the mixture encode into one, carried no block wall time, and had none of the
+drain/late-start attribution `#50` gave the walk -- so "~215 ms per position of the batched form's
+own cost is unexplained" was a statement about the INSTRUMENT as much as about the code.
+
+### What was added
+
+Additive, off in every production path, and nothing in the shipped walk changed:
+
+- `DeepSeekV41BlockTiming` gained `wallNanoseconds` (the block's own wall, embedding pass included),
+  `embeddingNanoseconds`, `routingReadbackNanoseconds`, `expertFillNanoseconds` (split out of
+  `mixtureEncodeNanoseconds`), `fillMisses`/`fillBytes` (from the streamer's own counters),
+  `blocks`, `positionCount`, and the four drain/late-start fields -- the same attribution the walk
+  got in `#48`/`#50`, computed in `settlePending` under `recordsBlockTiming`. The block path commits
+  its mixture WITHOUT a wait, so a mixture's drain lands in the next layer's settle: that is the
+  block's hand-off, and a bucket total cannot say so.
+- Two published-checkpoint cases: `testWhereABatchedPrefillsTimeGoesOnThePublishedCheckpoint` (a
+  tokenized text stream at 128 and 1,005 positions, both layouts, two rounds with the arm order
+  rotated) and `testWhereAPicturesPrefillGoesOnThePublishedCheckpoint` (the composer's own largest
+  picture, real pixels through the tower, one round -- each arm reads 218 GB, larger than this
+  machine's RAM, so there is no page cache for the rotation to protect against).
+
+### The block's whole cost, on the checkpoint's own weights
+
+Three regimes, `-O`, load 2.6-3.7. Every figure is ms per position; "host" is the sum of the host
+buckets, which is also the harness's own whole-vs-parts control:
+
+| regime | block | walk | ratio | host/wall | dense encode | front wait | expert fill | mixture encode | device |
+|---|---|---|---|---|---|---|---|---|---|
+| 128 text positions, 39 misses/pos | **197.0** | 288.4 | 1.46x | 98% | 28.6 | 96.3 | 65.9 | 1.6 | 52.3 |
+| 1,005 text positions, 8.5 misses/pos | **128.7** | 159.2 | 1.24x | 98% | 23.0 | 77.5 | 23.7 | 1.6 | 46.0 |
+| 1,005 positions, largest picture, 12 misses/pos | **117.1** | 183.8 | 1.57x | 98% | 17.6 | 67.3 | 28.5 | 1.6 | 41.5 |
+
+**Nothing is unexplained.** The buckets sum to 98% of the block's wall in all three regimes -- the
+same tile the walk got in `#50` (96-97%) -- and the answer to the open question is that the batched
+form spends 57-77% of a position in `frontWait`, not in its kernels. The mixture's own device work is
+25-38 ms of that position; the rest is the hand-off.
+
+**The mixture's LATE START survives batching.** Per position: 65.4 ms at 128 text positions, 50.2 at
+1,005 text, 40.5 on the picture -- i.e. 33%, 39% and 35% of the block's whole position is time the
+queue had not yet begun the mixture after the host started waiting. `#48` found the same stall on a
+walked position (69-101 ms) and `#49`/`#50` traced it to the expert half and ruled out every command
+buffer a probe can build. Batching removes dispatches, round trips and (below) bytes; it does not
+touch this, because the readback that empties the queue is still between the two halves.
+
+**Batching's real, attributable win is the fill's shape.** The union fill carries 1.1-2.4 misses per
+fill where a walk's carries ~0.3, and `#51`'s law says a fill reads faster the more it carries: the
+picture's 213.2 GB costs **28.5 ms/position batched at 7.4 GB/s against 39.2 ms/position walked at
+5.4 GB/s**, on byte counts that differ by 0.3% (218,312 against 218,886 MB). That is 10.7 ms/position
+of the 66.7 ms gap, measured rather than argued.
+
+### `#46`'s 0.74x does not reproduce, and that is the finding
+
+`#46` measured the composer's largest picture at 345.62 / 355.22 / 386.90 s batched against
+255.98 / 268.05 / 278.38 s walked -- 0.74x -- and that number is why the turn still WALKS an image
+prompt. This run reproduces the prompt exactly (1,005 positions, 994 image rows, 12,176 against
+12,208 misses, 218,312 against 218,886 MB) and gets **117.7 s batched against 184.8 s walked, 1.57x**.
+Both arms here are ~2x faster in absolute terms than in `#46`, on the same bytes.
+
+The order argument cannot rescue either number, and it is why this matters:
+
+| run | first arm | second arm | result |
+|---|---|---|---|
+| `#46` | walk | block (cache-warm) | block 0.74x |
+| `#52` | block (cache-cold) | walk (cache-warm) | block 1.57x |
+
+The arm that ran second had the page-cache advantage in both, and the outcome reversed. So the ratio
+at this span is not stable across runs, and **the shipped-path decision rests on a measurement that
+flipped sign between two runs of the same prompt** -- not on a mechanism. Until a single process
+alternates the arms over several rounds and reports both, neither layout can claim this span, and the
+`DeepSeekV41TurnRunner` comment that cites 0.74x should be read as "measured once, under one machine
+state".
+
+What the regime table DOES show is that `#46`'s mechanism was wrong in a way that matters: it
+attributed the loss to bulk eviction costing more than the round trips save, but the two layouts read
+the same bytes on that prompt (0.3% apart), so no eviction count can explain an 84 ms/position gap.
+The gap batched wins is the fill's rate plus the round trips, and the gap it pays is a wider union.
+
+### The first real-weight per-stage table
+
+On one block of eight positions, the dense half's own device windows, largest first (ms for the whole
+block, share of the dense half):
+
+| stage | ms | share |
+|---|---|---|
+| `queryUp` | 45.1 | 20.0% |
+| `outputUp` | 43.3 | 19.2% |
+| `outputDown` | 37.8 | 16.8% |
+| `indexer` | 24.3 | 10.8% |
+| `queryDown` | 10.6 | 4.7% |
+| `latentProject` | 8.7 | 3.9% |
+| `engram` | 8.7 | 3.8% |
+| `router` | 8.0 | 3.5% |
+| `writeLatent` | 4.3 | 1.9% |
+
+Every stage table in this journal before now was taken on the synthetic fixture, where `writeLatent`
+was 29.4% of the dense half. On the checkpoint's own weights it is 1.9%, and 67% sits in three BF16
+GEMVs plus the indexer. Two caveats, both measured: the table is not additive into the block table
+(its total is ~2x the in-situ dense device, because each stage now owns a command buffer and pays its
+own pickup -- `#16`'s warning), and its `calibration(8 dispatch)` row (1.15 ms) is a floor the table
+cannot be corrected by, only read beside.
+
+### What it means
+
+- **The batched prefill's cost is accounted, and it is not the batched prefill's kernels.** 57-77% of
+  a batched position is the same hand-off the walk pays. A change that removes dispatches from the
+  dense or mixture halves cannot move these numbers; only fewer hand-offs or another stream's work
+  can (mechanism 109, unchanged).
+- **`#46`'s shipped-path decision is unstable, not wrong-when-measured.** Do not flip the turn to the
+  batched path on this run either: alternate the arms inside one process, several rounds, and require
+  the same sign twice.
+- **Any future block number must quote misses per fill and misses per position beside its rate**, for
+  the same reason `#51` requires it on a fill: the block's fill reads at 6.3-10.4 GB/s across these
+  three regimes purely because the router put 1.1-2.4 experts in each of them.
+
+### What it is not (do not re-propose)
+
+- Not a denser dense half: `denseEncode` is 12-22% of a batched position and part of that is the
+  indexer's second submission, which is a host value by contract (mechanism 11).
+- Not a wider block: width is capped at 8 by `chunkSlots`, and `#18` measured sixteen positions
+  losing per position on the synthetic fixture.
+- Not the arena: `#21` moved capacity 3,760 -> 4,637 with identical bytes on a walk, and this run's
+  union fills (1.1-2.4 misses each) are already the shape `#51` says reads fastest.
+- Not the vision tower: it is 6.9 s of a 118-185 s prefill on the largest picture, and its mechanical
+  levers are closed in `#44`/`#45`.
+
+### Verification
+
+Two new cases in `DeepSeekV41PublishedTurnTests`, both opt-in:
+`testWhereABatchedPrefillsTimeGoesOnThePublishedCheckpoint` (`/tmp/dynamoe_dsv41_block_span`, 128
+positions, 152 s; `/tmp/dynamoe_dsv41_block_span_long` adds the 1,005-position arm, 728 s) and
+`testWhereAPicturesPrefillGoesOnThePublishedCheckpoint`
+(`/tmp/dynamoe_dsv41_block_span_picture`, 315 s). The shipped walk and the block path are byte-identical
+in behaviour: the additions are clock reads behind `recordsBlockTiming`, which is off in production,
+plus an `if let residents {` that binds the same value the old `if let residents = try ...` did.
+
+Two unit bugs were caught by the harness's own control rather than by the numbers looking wrong, and
+both are worth carrying: `millisecondsPerPosition()` divided by `positions`, which counts one entry per
+LAYER per position, so every bucket read as "ms per position-layer" (5.3 against a wall of 197.0, i.e.
+40x low); and the fix, deriving the position count from `positions / layers`, truncated on a
+1,004-position prefill's short last block and inflated the 1,005-position arm by 14%. `positionCount`
+is stored now, and `describe()` prints both the wall it must tile and the share it tiles.

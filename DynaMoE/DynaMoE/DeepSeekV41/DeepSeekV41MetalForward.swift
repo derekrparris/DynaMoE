@@ -851,12 +851,139 @@ nonisolated public struct DeepSeekV41BlockTiming: Sendable, Equatable {
     public var mixtureDeviceNanoseconds: UInt64 = 0
     /// Layers measured, so a caller divides by layers rather than by blocks.
     public var layers: Int = 0
-    /// Positions measured, i.e. the sum of every measured block's width.
+    /// Positions measured, i.e. the sum of every measured block's width OVER EVERY
+    /// LAYER, so the per-layer buckets divide by it and a per-position figure divides by
+    /// `positionCount`.
     public var positions: Int = 0
+
+    /// Wall time the measured blocks took end to end, embedding pass included.
+    ///
+    /// The four buckets above are HOST intervals and `mixtureEncodeNanoseconds` carries
+    /// more than an encode, so on their own they cannot say whether a block's wall time
+    /// is accounted for. The walk got that from `#50`'s whole-vs-parts control, which
+    /// tiled 96-97% of a position; a block had no equivalent until this field, and at a
+    /// published span it is the one that separates "the buckets explain it" from "the
+    /// block is mostly idle".
+    public var wallNanoseconds: UInt64 = 0
+    /// Host time in the embedding pass, which runs once per block rather than per layer
+    /// and therefore belongs in `wallNanoseconds` and not in any per-layer bucket.
+    public var embeddingNanoseconds: UInt64 = 0
+    /// Host time reading a block's routing scores back, one `readRouting` per slot.
+    public var routingReadbackNanoseconds: UInt64 = 0
+    /// Host time filling the block's deduplicated expert union from the shards.
+    ///
+    /// Split out of `mixtureEncodeNanoseconds` because it is the disk, not an encode:
+    /// a union fill reads up to `count * topK` experts where a walk's fill reads the
+    /// misses among six, and at a span whose working set is several times the arena
+    /// that is the whole difference between the two layouts (`Benchmarks/PERF_FINDINGS.md`,
+    /// "DSV4.1 #46").
+    public var expertFillNanoseconds: UInt64 = 0
+    /// Arena misses and bytes the union fills actually read, so a block's I/O can be
+    /// compared with a walk's without a second instrument.
+    public var fillMisses: Int = 0
+    public var fillBytes: Int = 0
+    /// Wall time blocked inside `waitUntilCompleted` on a dense buffer, and on a mixture
+    /// buffer. The mixture half is committed without a wait, so its drain lands in the
+    /// NEXT layer's settle: that is the block's hand-off, and a bucket total that folds
+    /// it into `frontWaitNanoseconds` cannot say so.
+    public var frontDrainNanoseconds: UInt64 = 0
+    public var mixtureDrainNanoseconds: UInt64 = 0
+    /// How long after the host began waiting a buffer's own device window started.
+    /// A drain is late start + device window + tail; a large late start means the queue
+    /// had not begun the buffer when the host asked for it.
+    public var frontLateStartNanoseconds: UInt64 = 0
+    public var mixtureLateStartNanoseconds: UInt64 = 0
 
     public init() {}
 
     public var encodedNanoseconds: UInt64 { denseEncodeNanoseconds + mixtureEncodeNanoseconds }
+
+    /// Per-position cost of every bucket, in milliseconds, plus the block's own wall
+    /// time so the parts can be checked against the whole.
+    public func millisecondsPerPosition() -> (
+        wall: Double,
+        embedding: Double,
+        denseEncode: Double,
+        frontWait: Double,
+        routing: Double,
+        expertFill: Double,
+        mixtureEncode: Double,
+        denseDevice: Double,
+        mixtureDevice: Double
+    ) {
+        let divisor = Double(max(1, positionCount))
+        func milliseconds(_ nanoseconds: UInt64) -> Double {
+            Double(nanoseconds) / divisor / 1_000_000
+        }
+        return (
+            milliseconds(wallNanoseconds),
+            milliseconds(embeddingNanoseconds),
+            milliseconds(denseEncodeNanoseconds),
+            milliseconds(frontWaitNanoseconds),
+            milliseconds(routingReadbackNanoseconds),
+            milliseconds(expertFillNanoseconds),
+            milliseconds(mixtureEncodeNanoseconds),
+            milliseconds(denseDeviceNanoseconds),
+            milliseconds(mixtureDeviceNanoseconds)
+        )
+    }
+
+    /// Positions the measured blocks actually carried.
+    ///
+    /// Kept as its own field rather than derived from `positions / layers`: the last
+    /// block of a prefill is short, so that division truncates and reported every bucket
+    /// of a 1,004-position arm 14% high.
+    public var positionCount: Int = 0
+    /// Blocks measured, so the average width is readable off the table.
+    public var blocks: Int = 0
+
+    /// The block's own whole-vs-parts line: how much of a position the buckets explain,
+    /// what the union fill read and missed on, and how much of the wait was the queue
+    /// rather than the host.
+    public func describe() -> String {
+        let per = millisecondsPerPosition()
+        let blockDivisor = Double(max(1, positionCount)) * 1_000_000
+        let host = Double(
+            embeddingNanoseconds + denseEncodeNanoseconds + frontWaitNanoseconds
+                + routingReadbackNanoseconds + expertFillNanoseconds + mixtureEncodeNanoseconds
+        ) / blockDivisor
+        let device = per.denseDevice + per.mixtureDevice
+        let share = per.wall > 0 ? host / per.wall * 100 : 0
+        let missesPerFill = layers > 0 ? Double(fillMisses) / Double(layers) : 0
+        let seconds = Double(expertFillNanoseconds) / 1_000_000_000
+        let rate = seconds > 0 ? Double(fillBytes) / 1_073_741_824 / seconds : 0
+        return String(
+            format: "block %.1f ms/position over %d position(s) in %d block(s) of %.1f, "
+                + "%d layer pass(es): embedding %.2f, dense encode %.2f, front wait %.2f, "
+                + "routing %.2f, expert fill %.2f, mixture encode %.2f, device %.2f "
+                + "(dense %.2f, mixture %.2f); host sums to %.0f%% of wall; "
+                + "drained front %.1f, mixture %.1f, late start front %.1f, mixture %.1f "
+                + "(per position); fill %.1f misses/layer at %.1f GB/s (%.1f GB, %d misses)",
+            per.wall,
+            positionCount,
+            blocks,
+            blocks > 0 ? Double(positionCount) / Double(blocks) : 0,
+            layers,
+            per.embedding,
+            per.denseEncode,
+            per.frontWait,
+            per.routing,
+            per.expertFill,
+            per.mixtureEncode,
+            device,
+            per.denseDevice,
+            per.mixtureDevice,
+            share,
+            Double(frontDrainNanoseconds) / blockDivisor,
+            Double(mixtureDrainNanoseconds) / blockDivisor,
+            Double(frontLateStartNanoseconds) / blockDivisor,
+            Double(mixtureLateStartNanoseconds) / blockDivisor,
+            missesPerFill,
+            rate,
+            Double(fillBytes) / 1_073_741_824,
+            fillMisses
+        )
+    }
 
     /// Per-position, per-layer cost of each bucket, in milliseconds. `positions`
     /// already counts every measured block's width, so this is `layers * block
@@ -2383,7 +2510,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         }
         pendingDead = false
 
+        let measuring = recordsBlockTiming
+        let wallStart = measuring ? DispatchTime.now().uptimeNanoseconds : 0
         try encodeEmbeddingBlock(tokens, startPosition: startPosition, embeddings: embeddings)
+        let embedded = measuring ? DispatchTime.now().uptimeNanoseconds : 0
         if let hook = onBlockEmbedded {
             try settlePending()
             hook(startPosition, tokens.count)
@@ -2419,6 +2549,12 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         for slot in keep {
             captured[slot] = logits(slot: slot)
         }
+        if measuring {
+            blockTiming.embeddingNanoseconds += embedded - wallStart
+            blockTiming.wallNanoseconds += DispatchTime.now().uptimeNanoseconds - wallStart
+            blockTiming.blocks += 1
+            blockTiming.positionCount += tokens.count
+        }
         return DeepSeekV41ChunkLogits(
             last: logits(slot: tokens.count - 1),
             captured: captured
@@ -2432,12 +2568,19 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         startPosition: Int,
         count: Int
     ) throws {
-        // Measurement only (`recordsBlockTiming`): four marks — layer start, dense
-        // half encoded, front half waited on, mixture encoded. The split is the one
-        // that matters, because host encode time and device time want opposite
-        // fixes: fewer dispatches over more positions, or fewer kernels.
+        // Measurement only (`recordsBlockTiming`): named marks rather than an array,
+        // because a block has six host intervals that want different fixes — the dense
+        // encode, the wait that drains the previous mixture, the routing readback, the
+        // union fill, the mixture encode, and the block's own wall time. Folding the
+        // last three into one bucket, which the first version did, is what left ~215
+        // ms/position of a published span unexplained (`Benchmarks/PERF_FINDINGS.md`,
+        // "DSV4.1 #52").
         let measuring = recordsBlockTiming
-        var marks: [UInt64] = measuring ? [DispatchTime.now().uptimeNanoseconds] : []
+        let layerStart = measuring ? DispatchTime.now().uptimeNanoseconds : 0
+        let missesBefore = measuring ? streamer?.expertsLoaded ?? 0 : 0
+        let bytesBefore = measuring ? streamer?.bytesRead ?? 0 : 0
+        var denseEncoded = layerStart
+        var frontWaited = layerStart
 
         // Engram rows are host reads, one position at a time, and each goes into the
         // table's staging block before the layer's command buffer exists.
@@ -2511,11 +2654,11 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                     buffer: calibration
                 ))
             }
-            if measuring { marks.append(DispatchTime.now().uptimeNanoseconds) }
+            if measuring { denseEncoded = DispatchTime.now().uptimeNanoseconds }
             try settlePending()
             recordStageTiming()
             if measuring {
-                marks.append(DispatchTime.now().uptimeNanoseconds)
+                frontWaited = DispatchTime.now().uptimeNanoseconds
                 for buffer in frontBuffers {
                     timingBuffers.append((buffer: buffer, bucket: 0))
                 }
@@ -2547,22 +2690,29 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 }
             }
             encoder.endEncoding()
-            if measuring { marks.append(DispatchTime.now().uptimeNanoseconds) }
+            if measuring { denseEncoded = DispatchTime.now().uptimeNanoseconds }
             try commit(commandBuffer, stage: "layer \(layer.index) attention (block \(count))")
             if measuring {
-                marks.append(DispatchTime.now().uptimeNanoseconds)
+                frontWaited = DispatchTime.now().uptimeNanoseconds
                 timingBuffers.append((buffer: commandBuffer, bucket: 0))
             }
         }
 
         let routings = (0..<count).map { readRouting(slot: $0) }
+        let routingDone = measuring ? DispatchTime.now().uptimeNanoseconds : 0
+
+        // The union fill, on its own clock: it is a disk read of up to `count * topK`
+        // experts, and at a span whose working set is a multiple of the arena it is the
+        // one term that can make a block SLOWER than a walk despite doing less work.
+        let residents = try blockResidents(layer: layer, routings: routings)
+        let fillDone = measuring ? DispatchTime.now().uptimeNanoseconds : 0
 
         // The mixture as one submission, which is what makes a block cheaper than a
         // walk: one arena fill for the block's expert union instead of one per
         // position, one command buffer, and no round trip between positions. The
         // fill is safe here because the front half above was just waited on, so the
         // GPU is idle and no kernel is reading the slots about to be overwritten.
-        if let residents = try blockResidents(layer: layer, routings: routings) {
+        if let residents {
             let expertCommand = try makeCommandBuffer()
             let expertEncoder = try makeEncoder(expertCommand)
             for index in 0..<count {
@@ -2588,12 +2738,20 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 waiting: false,
                 mixture: true
             )
-            if measuring {
-                marks.append(DispatchTime.now().uptimeNanoseconds)
-                timingBuffers.append((buffer: expertCommand, bucket: 1))
-            }
+            let mixtureEncoded = measuring ? DispatchTime.now().uptimeNanoseconds : 0
+            if measuring { timingBuffers.append((buffer: expertCommand, bucket: 1)) }
             blockMixtureSubmissions += 1
-            recordLayerTiming(marks, positions: count)
+            recordLayerTiming(
+                from: layerStart,
+                denseEncoded: denseEncoded,
+                frontWaited: frontWaited,
+                routingDone: routingDone,
+                fillDone: fillDone,
+                mixtureEncoded: mixtureEncoded,
+                count: count,
+                missesBefore: missesBefore,
+                bytesBefore: bytesBefore
+            )
             if let hook = onBlockLayerFinished {
                 try settlePending()
                 hook(layer.index, startPosition, count)
@@ -2605,13 +2763,18 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         // A union too large for the arena stays per position: fill the slots this
         // position routes, submit, and wait, because the next position's fill
         // would otherwise land under a kernel still reading them.
+        var perPositionFillNanoseconds: UInt64 = 0
         for index in 0..<count {
             let routing = routings[index]
             var residents: [DeepSeekV41ResidentExpert]?
+            let fillBegan = measuring ? DispatchTime.now().uptimeNanoseconds : 0
             if let streamer, !routing.expertIDs.isEmpty {
                 residents = try streamer.ensureResident(
                     layer: layer.index, experts: routing.expertIDs
                 )
+            }
+            if measuring {
+                perPositionFillNanoseconds += DispatchTime.now().uptimeNanoseconds - fillBegan
             }
             let expertCommand = try makeCommandBuffer()
             let expertEncoder = try makeEncoder(expertCommand)
@@ -2634,22 +2797,54 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             )
             if measuring { timingBuffers.append((buffer: expertCommand, bucket: 1)) }
         }
-        if measuring { marks.append(DispatchTime.now().uptimeNanoseconds) }
-        recordLayerTiming(marks, positions: count)
+        let mixtureEncoded = measuring ? DispatchTime.now().uptimeNanoseconds : 0
+        recordLayerTiming(
+            from: layerStart,
+            denseEncoded: denseEncoded,
+            frontWaited: frontWaited,
+            routingDone: routingDone,
+            fillDone: fillDone,
+            mixtureEncoded: mixtureEncoded,
+            count: count,
+            missesBefore: missesBefore,
+            bytesBefore: bytesBefore,
+            extraFillNanoseconds: perPositionFillNanoseconds
+        )
         if let hook = onBlockLayerFinished {
             try settlePending()
             hook(layer.index, startPosition, count)
         }
     }
 
-    /// Folds one layer's four measurement marks into `blockTiming`.
-    private func recordLayerTiming(_ marks: [UInt64], positions: Int) {
-        guard marks.count == 4 else { return }
-        blockTiming.denseEncodeNanoseconds += marks[1] - marks[0]
-        blockTiming.frontWaitNanoseconds += marks[2] - marks[1]
-        blockTiming.mixtureEncodeNanoseconds += marks[3] - marks[2]
+    /// Folds one layer's measurement marks into `blockTiming`.
+    ///
+    /// `frontWaited` is read after the commit that waits on the dense half, so
+    /// `frontWait` includes draining the PREVIOUS layer's mixture — which is the
+    /// block's hand-off and the reason `frontDrain`/`mixtureDrain` exist beside it.
+    private func recordLayerTiming(
+        from layerStart: UInt64,
+        denseEncoded: UInt64,
+        frontWaited: UInt64,
+        routingDone: UInt64,
+        fillDone: UInt64,
+        mixtureEncoded: UInt64,
+        count: Int,
+        missesBefore: Int,
+        bytesBefore: Int,
+        extraFillNanoseconds: UInt64 = 0
+    ) {
+        guard layerStart > 0 else { return }
+        blockTiming.denseEncodeNanoseconds += denseEncoded - layerStart
+        blockTiming.frontWaitNanoseconds += frontWaited - denseEncoded
+        blockTiming.routingReadbackNanoseconds += routingDone - frontWaited
+        blockTiming.expertFillNanoseconds += fillDone - routingDone + extraFillNanoseconds
+        blockTiming.mixtureEncodeNanoseconds += mixtureEncoded - fillDone
         blockTiming.layers += 1
-        blockTiming.positions += positions
+        blockTiming.positions += count
+        if let streamer {
+            blockTiming.fillMisses += streamer.expertsLoaded - missesBefore
+            blockTiming.fillBytes += streamer.bytesRead - bytesBefore
+        }
     }
 
     /// Reads the device time of every command buffer the measured layers committed.
@@ -5367,7 +5562,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         let outstanding = pending
         pending.removeAll(keepingCapacity: true)
         for entry in outstanding {
-            let begin = (recordsWalkTiming || recordsWalkTimeline)
+            let begin = (recordsWalkTiming || recordsWalkTimeline || recordsBlockTiming)
                 ? DispatchTime.now().uptimeNanoseconds : 0
             if recordsWalkTimeline,
                let recorded = walkTimelineCommits[ObjectIdentifier(entry.buffer)] {
@@ -5400,6 +5595,24 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 } else {
                     walkTiming.frontDrainNanoseconds += end - begin
                     walkTiming.frontLateStartNanoseconds += lateStart
+                }
+            }
+            if recordsBlockTiming {
+                // The block path commits its mixture without a wait, so a mixture's
+                // drain here is the block's hand-off and the front's is its dense wait
+                // behind it. Same attribution the walk gets, so the two layouts are
+                // comparable bucket by bucket (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1
+                // #52").
+                let end = DispatchTime.now().uptimeNanoseconds
+                let windowStart = Double(entry.buffer.gpuStartTime) * 1_000_000_000
+                let lateStart = windowStart > Double(begin)
+                    ? UInt64(windowStart - Double(begin)) : 0
+                if entry.isMixture {
+                    blockTiming.mixtureDrainNanoseconds += end - begin
+                    blockTiming.mixtureLateStartNanoseconds += lateStart
+                } else {
+                    blockTiming.frontDrainNanoseconds += end - begin
+                    blockTiming.frontLateStartNanoseconds += lateStart
                 }
             }
             if let error = entry.buffer.error {
