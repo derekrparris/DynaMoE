@@ -542,6 +542,9 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
     /// it is the one part of a fill that a bigger arena would not repeat.
     private var secondsAllocating: Double = 0
     private var slotsAllocated: Int = 0
+    /// Wall time spent inside `mlock`, which a shipping policy pays inside the fill
+    /// that creates a slot rather than up front (`#57`).
+    private var secondsWiring: Double = 0
     /// Wall time spent inside the arena's placement call: a lookup per resident pair
     /// plus one pass over the slot array for each miss. Exposed separately from the
     /// read time so choosing slots is a number rather than an assumption.
@@ -549,9 +552,15 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
     public private(set) var placements: Int = 0
     /// Keeps the optional read-back's loads alive so the compiler cannot drop them.
     private var touchSink: Int = 0
-    /// Bytes of slot memory `wireResidentSlots` succeeded in wiring, and refusals.
-    private var wiredBytes: Int = 0
-    private var wireFailures: Int = 0
+    /// The arena's residency policy: whether its slots may be wired, and what that
+    /// actually did. Guarded by `lock` like the rest of the mutable state.
+    private var slotWiring = DeepSeekV41SlotWiring.system
+    /// True when `slotBuffer` applies the policy to every slot it allocates.
+    ///
+    /// Off until `enableSlotWiring` says otherwise, so the `#56` retroactive seam
+    /// keeps measuring what it measured: a rung that wires existing slots must not
+    /// silently wire the ones the next pass allocates.
+    private var wiresAllocatedSlots = false
 
     /// How a fill's reads are issued. `.shardBatched` is what ships; the others exist
     /// so the fan-out is a measurement instead of an opinion (`#51`).
@@ -567,11 +576,11 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Read and allocation time so far, for the walk instrumentation.
-    public var timing: (reading: Double, allocating: Double, slotsAllocated: Int) {
+    /// Read, allocation and page-lock time so far, for the walk instrumentation.
+    public var timing: (reading: Double, allocating: Double, slotsAllocated: Int, wiring: Double) {
         lock.lock()
         defer { lock.unlock() }
-        return (secondsReading, secondsAllocating, slotsAllocated)
+        return (secondsReading, secondsAllocating, slotsAllocated, secondsWiring)
     }
 
     /// Reads every page of a fill back on the CALLING thread, after the parallel reads
@@ -593,13 +602,47 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
 
     /// How much of the arena has been wired with `mlock`, and how many slots refused.
     ///
-    /// Measurement only (`#56`). A wired page can be neither evicted nor compressed,
-    /// so this is the one in-process way to ask whether the fill's write rate is the
-    /// compressor working on its own destination.
+    /// The two counters that answer the compressor question directly: a wired page can
+    /// be neither evicted nor compressed, so this is the one in-process way to ask
+    /// whether the fill's write rate is the compressor working on its own destination
+    /// (`#56`). `#57` turned the thing that fills them from a measurement into the
+    /// shipping policy; `wiringState` carries the rest of what it did.
     public var wiring: (bytes: Int, failures: Int) {
         lock.lock()
         defer { lock.unlock() }
-        return (wiredBytes, wireFailures)
+        return (slotWiring.status.bytes, slotWiring.status.failures)
+    }
+
+    /// What the arena's residency policy has done, as one value (`#57`).
+    public var wiringState: DeepSeekV41SlotWiring.Status {
+        lock.lock()
+        defer { lock.unlock() }
+        return slotWiring.status
+    }
+
+    /// Applies the arena's residency policy to every slot this arena allocates, up
+    /// to `budgetBytes`.
+    ///
+    /// This is the shipping half of `#56`: rather than wiring the slots a pass has
+    /// already allocated, each slot is wired when it is created, so a pass pays the
+    /// lock once per slot and every later pass reads pages the compressor has never
+    /// been able to take. `budgetBytes` is the arena's own size, granted by the
+    /// memory plan; the policy is all-or-nothing, so a `mlock` refusal hands the
+    /// already-wired slots back and leaves the arena in the unwired regime instead
+    /// of a partly wired one (`#56` measured that as the worst of the three).
+    public func enableSlotWiring(budgetBytes: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        wiresAllocatedSlots = true
+        slotWiring.enable(budgetBytes: budgetBytes)
+    }
+
+    /// Hands every wired slot back and turns the policy off.
+    public func disableSlotWiring() {
+        lock.lock()
+        defer { lock.unlock() }
+        wiresAllocatedSlots = false
+        slotWiring.disable()
     }
 
     /// Wires the pages of the slots this arena already holds, up to `budgetBytes`.
@@ -612,22 +655,21 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
     /// "is the destination the cost" stops being a correlation. It returns the wiring
     /// state so a caller reports what it actually wired rather than what it asked for;
     /// `mlock` can refuse, and its refusal (a machine with no room to keep the pages)
-    /// is itself the answer. Production never calls this.
+    /// is itself the answer. Production never calls this: the shipping path is
+    /// `enableSlotWiring`, which wires each slot as it is allocated.
+    ///
+    /// A later call with a larger budget raises it and wires the slots allocated
+    /// since; one that was already wired is not locked or counted twice.
     @discardableResult
     public func wireResidentSlots(budgetBytes: Int) -> (bytes: Int, failures: Int) {
         lock.lock()
         defer { lock.unlock() }
+        slotWiring.enable(budgetBytes: budgetBytes)
         for buffer in slotBuffers {
             guard let buffer else { continue }
-            let length = buffer.length
-            guard length > 0, wiredBytes + length <= budgetBytes else { continue }
-            if mlock(buffer.contents(), length) == 0 {
-                wiredBytes += length
-            } else {
-                wireFailures += 1
-            }
+            slotWiring.wire(buffer.contents(), length: buffer.length)
         }
-        return (wiredBytes, wireFailures)
+        return (slotWiring.status.bytes, slotWiring.status.failures)
     }
 
     public init(
@@ -759,6 +801,9 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
     }
 
     public func close() {
+        // The slots are about to go with this streamer, and until they do the machine
+        // should not have to treat them as pinned (`#57`).
+        disableSlotWiring()
         for reader in readers.values { reader.closeNow() }
     }
 
@@ -773,11 +818,30 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
             Double(bytesRead) / 1_073_741_824,
             arena.hitRate * 100
         )
-        return secondsReading > 0
-            ? line + String(
+        let rate = secondsReading > 0
+            ? String(
                 format: " at %.0f MB/s", Double(bytesRead) / 1_048_576 / secondsReading
             )
-            : line
+            : ""
+        let wiring = wiringState
+        let residency: String
+        if wiring.isRefused {
+            residency = String(
+                format: ", arena wiring refused after %d MB (%d refusal(s))",
+                wiring.bytes / 1_048_576,
+                wiring.failures
+            )
+        } else if wiring.isEnabled {
+            residency = String(
+                format: ", arena wired %.2f of %.2f GB (%d slots)",
+                Double(wiring.bytes) / 1_073_741_824,
+                Double(wiring.budgetBytes) / 1_073_741_824,
+                wiring.slots
+            )
+        } else {
+            residency = ""
+        }
+        return line + rate + residency
     }
 
     /// Makes every requested expert resident and returns its bindings, in the order
@@ -969,6 +1033,16 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
             DispatchTime.now().uptimeNanoseconds - allocationStarted
         ) / 1_000_000_000
         slotsAllocated += 1
+        // The shipping policy wires each slot as it is created, not retroactively:
+        // the pages exist now, and the next pass is the one that should never see
+        // them compressible (`#56`, `#57`).
+        if wiresAllocatedSlots {
+            let wiringStarted = DispatchTime.now().uptimeNanoseconds
+            slotWiring.wire(buffer.contents(), length: buffer.length)
+            secondsWiring += Double(
+                DispatchTime.now().uptimeNanoseconds - wiringStarted
+            ) / 1_000_000_000
+        }
         return buffer
     }
 }

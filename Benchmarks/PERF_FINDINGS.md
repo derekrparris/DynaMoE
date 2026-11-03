@@ -9433,3 +9433,109 @@ fill rate, bytes, misses and misses per fill, device time, decompressions, compr
 and the arena's wired bytes. Runs: `/tmp/test56_residency2.log` (three rungs), `/tmp/test56_residency3.log`
 (four rungs) and `/tmp/test56_residency4.log` (the confirmation). All used `touch` and `rm -f` in the same
 command, and no marker survived any of them.
+
+## DSV4.1 #57: THE RESIDENCY POLICY SHIPS -- WIRING AT ALLOCATION REPRODUCES 108 ms/POSITION, AND WITHDRAWING IT COSTS 2.05x
+
+`#56` ended with one sentence it could not answer: the win was measured by wiring the arena
+RETROACTIVELY, every slot locked before the timed pass, and a shipping policy cannot do that. Slots are
+allocated on first use, so a policy wires each slot inside the fill that creates it, and the first pass
+pays for it. `#56` also said the rungs were not linear and that a budget had to come from the memory plan
+rather than `Int.max / 2`. This slice turns the measurement into that policy and runs it.
+
+### The policy
+
+- **The grant is the whole arena or nothing.** `DeepSeekV41MemoryPlan.wireBudgetBytes(arenaBytes:physicalGB:floorGB:)`
+  answers with the arena's own bytes when the plan's other claims (`cacheBytes + residentWeightBytes +
+  engramStagingBytes`) plus a 16 GB floor for the OS, other applications and the page cache still fit in
+  physical memory, and with 0 otherwise. A partial grant is not offered, because `#56` measured 8 GB
+  wired as worse than none: a pass writes every slot, so a still-compressible slot costs a decompression
+  whichever rung the policy stopped at.
+- **Wiring happens when the slot is allocated.** `DeepSeekV41ExpertStreamer.enableSlotWiring(budgetBytes:)`
+  makes `slotBuffer(_:)` apply `DeepSeekV41SlotWiring` to each buffer it creates. The `#56` retroactive
+  seam (`wireResidentSlots`) stays as the measurement it was, and does not silently wire the slots a
+  later pass allocates.
+- **A refusal is all-or-nothing.** The first `mlock` that refuses hands back every slot already wired and
+  latches the policy off, so the arena is either entirely wired or entirely not. The memory is valid
+  either way; the fill runs in the unwired regime. `DeepSeekV41SlotWiring` takes its page primitives as
+  a parameter, which is the only way a test can make the kernel refuse on purpose, and one case drives
+  the real `mlock`/`munlock` pair as well.
+- **The machine decides, with a debug opt-out.** `DeepSeekV41Runtime` grants the budget when
+  `dynamoe_dsv41_wire_arena_off` is unset; `close()` hands the pages back with the streamer, and the load
+  log names what happened (`arena wired 0.00 of 65.84 GB (0 slots)` at construction, then the running
+  figure in `describe()`).
+
+### The run
+
+One runtime through the app's own loading path, the `#52`-`#56` 128-position rotated stream, a 65.84 GB
+grant (3,760 slots of 17.9 MB), and five passes: three with the policy on, one after `disableSlotWiring()`,
+and one after restoring it retroactively the way `#56` did. Two independent runs:
+
+| pass | run 1 ms/pos | run 1 fill GB/s | run 2 ms/pos | run 2 fill GB/s | decompressions (run 2) | compressor (run 2) |
+|---|---|---|---|---|---|---|
+| P1, policy on (allocates and wires 65.84 GB) | 136.5 | 10.4 | 128.4 | 11.0 | 0 | 1.7 -> 1.8 GB |
+| P2, after wiring | 110.8 | 14.4 | 108.5 | 14.4 | 0 | 1.8 |
+| P3, after wiring | 111.8 | 14.5 | 108.3 | 14.4 | 0 | 1.8 -> 1.7 |
+| P4, policy withdrawn | - | - | **222.4** | **8.8** | **+4,592,426** | 1.7 -> 13.2 GB |
+| P5, retroactively restored (65.84 GB in 2.9 s) | - | - | 123.6 | **14.4** | +59,251 | 4.4 -> 4.1 GB |
+
+`mlock` took **2.16-2.27 s for 65.84 GB with zero refusals**, in both runs, inside P1: 17-18 ms/position
+of the 20-25 ms/position P1 pays over the wired band. So the policy costs one pass and repays it on the
+next; the rest of P1's excess is slot allocation and a cold page cache, which an unwired first pass pays
+too.
+
+### What it says
+
+- **The shipping shape reproduces the wired regime.** P2 and P3 read 14.4-14.5 GB/s in both runs (108.3-111.8
+  ms/position), i.e. at or above the disk's own 13.6-15.2 and the same regime `#56` reached by wiring
+  before the pass (13.0). Across two processes the wired pass is reproducible to 0.3-3%.
+- **Withdrawing the policy is the A/B, and it is 2.05x.** The same runtime, stream, arena and slot
+  contents, with only `disableSlotWiring()` between P3 and P4: fill 8.8 GB/s against 14.4, the pass 222.4
+  against 108.4 ms/position, the device halves 55.3 against 39.6-39.8, and **4.59M decompressions** where
+  the wired passes made none. The machine's compressor grows 1.7 -> 13.2 GB in that one pass. Re-wiring
+  the same 65.84 GB takes 2.9 s and puts the fill rate back at exactly 14.4.
+- **8.8 GB/s is a FLOOR on the unwired arm, not the ceiling.** This machine started P4 with 57 GB free and
+  a 1.7 GB compressor, so the compressor only reached 13.2 GB. `#56`'s squeezed machine (0.1 GB free,
+  compressor 44-71 GB) measured 4.6-6.7 GB/s unwired, i.e. the policy's win grows with the pressure it
+  prevents, and the 2.05x here is what a quiet machine shows.
+- **Wiring at allocation is cheaper than restoring afterwards.** Fresh slots cost 2.16-2.27 s for 65.84 GB;
+  the retroactive restore after P4 compressed them costs 2.9 s. The pages exist and are unshared when the
+  slot is created, which is the moment the policy is designed to take them.
+- **P5's pass is still 14% above the wired band while its fill rate is fully recovered.** The compressor
+  is unwinding the 13 GB P4 made it hold, so the recovery is the fill's and not the whole pass's. No
+  second lever is claimed from that number.
+
+### What it is not
+
+- Not the disk: the wired fill is at or above the disk's 13.6-15.2, and the unwired one is far below it.
+- Not a partial policy: a grant smaller than the arena is not offered, and the refusal path takes the
+  whole policy back. `#56`'s rungs still say why.
+- Not a memory-pressure valve. One was considered and rejected: `#56`'s win exists exactly when pressure
+  is high, so a policy that unwired on `.warning` would undo the fix at the moment it is needed and hand
+  65 GB back to the compressor. The release paths are the static floor gate, the `mlock` refusal, and
+  `close()`.
+- Not a shipped setting: `dynamoe_dsv41_wire_arena_off` exists to A/B the policy, in the style of
+  `dynamoe_dsv41_pin_dense_off`.
+- Not applied to the older measurement harnesses: `DeepSeekV41PublishedTurnTests.makeRuntime` defaults to
+  `wireArena: false` and `DeepSeekV41FillThroughputTests` pins the same regime, because every number
+  `#20`-`#56` logged was taken unwired and a run that silently wired 65 GB would move them.
+
+### Verification
+
+`testWhatTheArenaResidencyPolicyIsWorthIncludingItsLock` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_wired_policy`, plus the class's own `/tmp/dynamoe_dsv41_real_turn`), 98 s at `-O`
+for five passes. It asserts the grant is enabled, every allocated slot is wired, the wired passes read
+above 8 GB/s, and nothing was refused. Policy logic is pinned without a checkpoint by
+`DeepSeekV41SlotWiringTests` (a slot is wired once, a budget is never exceeded, a refusal unlocks exactly
+what it wired and latches, a zero budget is off rather than a refusal, and the system `mlock` pair wires
+a real page) and `DeepSeekV41ArenaWiringBudgetTests` (a whole arena granted, one that would eat the floor
+refused entirely, and the floor proven to be the reason). Runs: `/tmp/test57_policy1.log` (three passes)
+and `/tmp/test57_policy2.log` (the five-pass A/B). Both used `touch` and `rm -f` in the same command, and
+no marker survived.
+
+The full `DynaMoETests` target ran 1,471 tests with 89 skipped and 33 failures in 131.0 s; all 98
+`DeepSeekV41*` suites passed with 0 failures, including the 9 new policy cases and the opt-in case
+skipped. The 14 failed cases are the pre-existing environmental ones (`DynaMoETests`: help-topic count,
+Qwen3.8 Flash Next forward, tool-discover lifecycle, truncated tool-call recovery; `ModelDogfoodAndPrefixCacheTests`:
+the 9 prompt/web-fetch/headless-Chrome cases) plus `ServerQueueLogicTests.testTimedOutTurnKeepsFIFOBarrierForSuccessors`,
+which passes in isolation in 0.24 s and fails only under full-suite load, so it is a timing flake and not
+this change.

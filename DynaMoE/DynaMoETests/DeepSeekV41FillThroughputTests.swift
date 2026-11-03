@@ -113,7 +113,12 @@ final class DeepSeekV41FillThroughputTests: XCTestCase {
             config: config,
             shardBuffers: buffers,
             contextLength: contextLength,
-            allowEngramSkip: false
+            allowEngramSkip: false,
+            // These cases measure the fill's FORM, and every number `#48`-`#52`
+            // logged was taken with the arena unwired. The shipping residency policy
+            // (`#57`) would put every destination on the disk's ceiling and hide the
+            // differences the arms exist to show, so the regime is pinned.
+            wireArena: false
         ) else {
             throw XCTSkip(
                 "the runtime did not build: "

@@ -112,6 +112,24 @@ public enum DeepSeekV41LoadDiagnostics {
         )
         lines.append("memory: \(memory.describe(expertSlots: expertSlots))")
 
+        // `#56`/`#57`: a wired arena stops being compressor input, which is worth up
+        // to 2x on a prefill of this checkpoint, but the pages then cannot be
+        // reclaimed. Say what this machine will do rather than leaving the load log
+        // silent about a policy that changes the memory contract.
+        let arenaBytes = expertSlots * memory.bytesPerExpert
+        let wiring = DeepSeekV41Runtime.wireArenaDisabled
+            ? 0
+            : memory.wireBudgetBytes(arenaBytes: arenaBytes, physicalGB: physicalGB)
+        if wiring > 0 {
+            lines.append(
+                "arena residency: wire the whole \(String(format: "%.2f GB", Double(wiring) / 1_073_741_824)) arena (mlock)"
+            )
+        } else {
+            lines.append(
+                "arena residency: unwired (a \(String(format: "%.2f GB", Double(arenaBytes) / 1_073_741_824)) arena cannot be pinned beside this machine's other claims)"
+            )
+        }
+
         // The prompt dialect: which marker set the checkpoint's own template asked
         // for. A repacked checkpoint silently falls back, and a wrong marker set
         // tokenizes every turn into plain text, so the source is printed.

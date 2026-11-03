@@ -194,12 +194,18 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
     /// shard past `maxBufferLength`, map every segment zero-copy, then hand the
     /// summary to the runtime. A test that built its own summary or its own buffers
     /// would not be running the graph the app runs.
+    ///
+    /// `wireArena` pins the arena's residency regime. Every measurement below was
+    /// taken with the arena unwired (`#20`-`#56`), so the harness defaults to that
+    /// and only the `#57` policy case asks for the shipping default; a run that
+    /// silently wired 90 GB would move every earlier slice's numbers.
     private func makeRuntime(
         snapshot: URL,
         engine: DynaMoeEngine,
         config: DeepSeekV41Config,
         contextLength: Int,
-        allowEngramSkip: Bool
+        allowEngramSkip: Bool,
+        wireArena: Bool? = false
     ) throws -> DeepSeekV41Runtime {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw XCTSkip("no Metal device")
@@ -242,7 +248,8 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             config: config,
             shardBuffers: buffers,
             contextLength: contextLength,
-            allowEngramSkip: allowEngramSkip
+            allowEngramSkip: allowEngramSkip,
+            wireArena: wireArena
         ) else {
             throw XCTSkip(
                 "the runtime did not build: "
@@ -2141,13 +2148,13 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
                 executor.resetWalkTiming()
                 let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
                 let timingBefore = runtime.expertStreamer?.timing
-                    ?? (reading: 0, allocating: 0, slotsAllocated: 0)
+                    ?? (reading: 0, allocating: 0, slotsAllocated: 0, wiring: 0)
                 let started = DispatchTime.now().uptimeNanoseconds
                 _ = try executor.forwardToken(token, position: position)
                 let nanoseconds = DispatchTime.now().uptimeNanoseconds - started
                 let read = (runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore
                 let timingAfter = runtime.expertStreamer?.timing
-                    ?? (reading: 0, allocating: 0, slotsAllocated: 0)
+                    ?? (reading: 0, allocating: 0, slotsAllocated: 0, wiring: 0)
                 if position % 4 == 0 || position == tokens.count - 1 {
                     print(
                         "🔎 [dsv41 real] position \(position): "
@@ -6121,6 +6128,266 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         // has to leave the machine somewhere to find the room the compressor was using.
         pass("P4 fully wired", rotation: 7, wiring: Int.max / 2)
         probe("after P4")
+        withExtendedLifetime(engine) {}
+    }
+
+    // MARK: - Arena residency policy
+
+    /// What the shipping wiring policy is worth, paying the lock where it is paid.
+    ///
+    /// `#56` established the mechanism and the magnitude by wiring the arena
+    /// RETROACTIVELY: every slot was locked before the pass being timed, so the pass
+    /// itself was pure win. A shipping policy cannot do that. Slots are allocated on
+    /// first use, so the policy wires each slot inside the fill that creates it and
+    /// the first pass pays the `mlock` cost; only the passes after it see the
+    /// regime `#56` measured.
+    ///
+    /// This case builds the runtime through the app's own path: the memory plan
+    /// prices the arena, `wireBudgetBytes` grants it or refuses it, and the streamer
+    /// wires each slot as it allocates it. It then prints the grant and times three
+    /// rotated passes of the same 128-position stream, with misses per fill beside
+    /// every rate (`#54`'s trap) and the wiring counters, the lock time and the
+    /// decompressions of each pass beside it.
+    ///
+    /// Pass 1 is expected to be the slow one and pass 2+ to land in `#56`'s
+    /// 171-174 ms/position band. If pass 1 is not slower, the lock is cheap enough
+    /// that the policy costs a user nothing they would notice; if pass 2 is not in
+    /// the band, the shipping shape does not reproduce the measurement and the
+    /// retroactive seam was measuring a machine a user never has.
+    ///
+    /// Opt-in: it reads hundreds of gigabytes and wires tens of them.
+    ///
+    ///     touch /tmp/dynamoe_dsv41_wired_policy
+    @MainActor
+    func testWhatTheArenaResidencyPolicyIsWorthIncludingItsLock() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_wired_policy"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in arena residency policy probe; touch \(markerPath) to run"
+        )
+
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        // The same stream and the same 128 positions `#53`-`#56` measured, rotated
+        // per pass so a pass does not cycle the routing and leave the arena warm.
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+        func prompt(_ length: Int, rotation: Int) -> [Int] {
+            (0..<length).map { index in
+                let repetition = index / stream.count
+                return stream[(index + repetition * rotation) % stream.count]
+            }
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let positions = 128
+        // `wireArena: nil` is the shipping default: the memory plan decides. Every
+        // other measurement in this file pins the unwired regime instead.
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: positions + 1,
+            allowEngramSkip: false,
+            wireArena: nil
+        )
+        let streamer = try XCTUnwrap(
+            runtime.expertStreamer,
+            "no expert streamer: \(runtime.expertStreamerProblem ?? "no reason")"
+        )
+        let granted = streamer.wiringState
+        print("🔎 [dsv41 real] \(streamer.describe())")
+        print(
+            String(
+                format: "🔎 [dsv41 real] wiring grant: enabled %@, budget %.2f GB, "
+                    + "refused %@, %d refusal(s), arena %d slots of %.1f MB",
+                granted.isEnabled ? "yes" : "no",
+                Double(granted.budgetBytes) / 1_073_741_824,
+                granted.isRefused ? "yes" : "no",
+                granted.failures,
+                streamer.capacity,
+                Double(streamer.geometry.slotBytes) / 1_048_576
+            )
+        )
+        try XCTSkipUnless(
+            granted.isEnabled,
+            "the memory plan did not afford wiring this arena on a machine with "
+                + "\(String(format: "%.1f", Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824)) GB"
+        )
+
+        /// One prefill of the shipped block path, with the policy already engaged.
+        /// Returns the fill rate so the caller can assert on the passes that should
+        /// be wired; pass 1 also pays the lock, so it is not held to that band.
+        @discardableResult
+        func pass(_ label: String, rotation: Int) -> Double {
+            let executor = runtime.forward()
+            executor.reset()
+            runtime.arena.reset()
+            executor.resetBlockTiming()
+            executor.recordsBlockTiming = true
+            streamer.recordsFillSamples = true
+            streamer.clearFillSamples()
+            let wiringBefore = streamer.wiringState
+            let timingBefore = streamer.timing
+            let before = hostMemoryCounters()
+            let start = DispatchTime.now().uptimeNanoseconds
+            do {
+                _ = try executor.prefillChunk(prompt(positions, rotation: rotation))
+            } catch {
+                print("🔎 [dsv41 real]   \(label) refused: \(error)")
+                executor.recordsBlockTiming = false
+                streamer.recordsFillSamples = false
+                return 0
+            }
+            let wall = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+            executor.recordsBlockTiming = false
+            streamer.recordsFillSamples = false
+            let timing = executor.blockTiming
+            let per = timing.millisecondsPerPosition()
+            let samples = streamer.fillSamples
+            let fillSeconds = Double(timing.expertFillNanoseconds) / 1_000_000_000
+            let rate = fillSeconds > 0
+                ? Double(timing.fillBytes) / 1_000_000_000 / fillSeconds : 0
+            let missesPerFill = samples.isEmpty
+                ? 0 : Double(timing.fillMisses) / Double(samples.count)
+            let after = hostMemoryCounters()
+            let wiringAfter = streamer.wiringState
+            let timingAfter = streamer.timing
+            XCTAssertGreaterThan(timing.layers, 0, "the block switch recorded nothing")
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   %@ pass: %.1f ms/pos, fill %.1f GB/s (%.0f "
+                        + "MB, %d misses, %.1f per fill), device %.1f, wall %.0f s, "
+                        + "decompressions +%d, compressor %.1f -> %.1f GB, wired "
+                        + "%.2f -> %.2f GB (+%d slots, %.2f s locking), refusals %d",
+                    label,
+                    wall / Double(positions),
+                    rate,
+                    Double(timing.fillBytes) / 1_048_576,
+                    timing.fillMisses,
+                    missesPerFill,
+                    per.denseDevice + per.mixtureDevice,
+                    wall / 1_000,
+                    after.decompressions - before.decompressions,
+                    before.systemCompressorGB,
+                    after.systemCompressorGB,
+                    Double(wiringBefore.bytes) / 1_073_741_824,
+                    Double(wiringAfter.bytes) / 1_073_741_824,
+                    wiringAfter.slots - wiringBefore.slots,
+                    timingAfter.wiring - timingBefore.wiring,
+                    wiringAfter.failures
+                )
+            )
+            // The mechanism, not a mood: a wired fill reads at the disk's own rate
+            // (`#56`: 13.0 against the disk's 13.6-15.2) and an unwired one at
+            // 4.6-6.7 on this machine. The caller asserts this on the passes after
+            // the one that paid the lock.
+            return rate
+        }
+
+        let quiet = hostMemoryCounters()
+        print(
+            String(
+                format: "🔎 [dsv41 real] before: compressor %.1f GB, free %.1f GB, "
+                    + "pressure %d, decompressions %d",
+                quiet.systemCompressorGB,
+                quiet.systemFreeGB,
+                quiet.pressureLevel,
+                quiet.decompressions
+            )
+        )
+        pass("P1 policy on", rotation: 13)
+        let second = pass("P2 after wiring", rotation: 7)
+        let third = pass("P3 after wiring", rotation: 13)
+        XCTAssertGreaterThan(second, 8, "P2 filled at \(second) GB/s, the unwired regime")
+        XCTAssertGreaterThan(third, 8, "P3 filled at \(third) GB/s, the unwired regime")
+
+        // The A/B the policy is actually asking, on the same runtime and the same
+        // stream: withdraw it and let a pass grow the compressor into the pages again.
+        // That is the regime `#55`/`#56` measured, and it is what the policy is
+        // preventing rather than repairing.
+        streamer.disableSlotWiring()
+        let unlocked = hostMemoryCounters()
+        print(
+            String(
+                format: "🔎 [dsv41 real] policy withdrawn: wired 0.00 GB, compressor "
+                    + "%.1f GB, free %.1f GB",
+                unlocked.systemCompressorGB,
+                unlocked.systemFreeGB
+            )
+        )
+        let unprotected = pass("P4 policy off", rotation: 7)
+        let afterUnprotected = hostMemoryCounters()
+        print(
+            String(
+                format: "🔎 [dsv41 real] after P4: compressor %.1f GB (was %.1f), "
+                    + "decompressions +%d, fill %.1f GB/s",
+                afterUnprotected.systemCompressorGB,
+                unlocked.systemCompressorGB,
+                afterUnprotected.decompressions - unlocked.decompressions,
+                unprotected
+            )
+        )
+
+        // Restore it the way `#56` did, retroactively, which is also the expensive way
+        // once a pass has compressed the pages: the policy paid 2 s for fresh slots
+        // as it allocated them, and this pays for pages the compressor already took.
+        let restoredStarted = DispatchTime.now().uptimeNanoseconds
+        let restored = streamer.wireResidentSlots(budgetBytes: Int.max / 2)
+        let restoredSeconds = Double(
+            DispatchTime.now().uptimeNanoseconds - restoredStarted
+        ) / 1_000_000_000
+        print(
+            String(
+                format: "🔎 [dsv41 real] retroactive restore: %.2f GB wired in %.1f s, "
+                    + "%d refusal(s)",
+                Double(restored.bytes) / 1_073_741_824,
+                restoredSeconds,
+                restored.failures
+            )
+        )
+        let restoredRate = pass("P5 policy restored", rotation: 13)
+        XCTAssertGreaterThan(
+            restoredRate, 8, "P5 filled at \(restoredRate) GB/s, the unwired regime"
+        )
+
+        let wiring = streamer.wiringState
+        let allocated = streamer.timing.slotsAllocated
+        XCTAssertFalse(wiring.isRefused, "the policy withdrew: \(wiring.failures) refusal(s)")
+        XCTAssertGreaterThan(wiring.bytes, 0, "the shipping policy wired nothing")
+        XCTAssertLessThanOrEqual(wiring.bytes, wiring.budgetBytes)
+        XCTAssertEqual(
+            wiring.slots, allocated,
+            "every allocated slot must be wired under the shipping policy"
+        )
+        print(
+            String(
+                format: "🔎 [dsv41 real] after: %d of %d slots wired, %.2f of %.2f GB, "
+                    + "%d refusal(s), %.2f s locking, compressor %.1f GB",
+                wiring.slots,
+                allocated,
+                Double(wiring.bytes) / 1_073_741_824,
+                Double(wiring.budgetBytes) / 1_073_741_824,
+                wiring.failures,
+                streamer.timing.wiring,
+                hostMemoryCounters().systemCompressorGB
+            )
+        )
         withExtendedLifetime(engine) {}
     }
 

@@ -646,6 +646,19 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         return value > 0 ? value : nil
     }
 
+    /// `defaults write DRP.DynaMoE dynamoe_dsv41_wire_arena_off -bool YES`
+    ///
+    /// Debug-only opt-out from the arena's residency policy. Wiring the slots is the
+    /// `#56` lever: a wired page cannot become compressor input, which took a
+    /// 128-position prefill of this checkpoint from 330-375 to 171-174 ms/position.
+    /// It is on where the memory plan can afford it, so this exists to A/B the
+    /// policy and to get an unwired machine back, not to be a setting.
+    public static let wireArenaOffDefaultKey = "dynamoe_dsv41_wire_arena_off"
+
+    public static var wireArenaDisabled: Bool {
+        UserDefaults.standard.bool(forKey: wireArenaOffDefaultKey)
+    }
+
     private static let initializationError = InitErrorBox()
 
     static func record(_ reason: String) {
@@ -660,7 +673,8 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         contextLength: Int,
         cachePrecision: DeepSeekV41CachePrecision = .fp16,
         allowEngramSkip: Bool = false,
-        pinDenseWeights: Bool? = nil
+        pinDenseWeights: Bool? = nil,
+        wireArena: Bool? = nil
     ) {
         guard let plan = try? config.makeLayerPlan() else {
             DeepSeekV41Runtime.record("the per-layer plan could not be built from config.json")
@@ -817,6 +831,20 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
             }
         } else {
             streamerProblem = "the snapshot directory is unknown, so the expert shards cannot be read"
+        }
+
+        // The arena's slots are the destination a fill writes, and `#56` measured the
+        // same bytes into them at 4.6-6.7 GB/s unwired against 13.0 wired, i.e. the
+        // page compressor reconstructing every page a pass rewrote. The policy is
+        // all-or-nothing and the budget is the arena's own size, granted only when the
+        // memory plan says the rest of the machine still fits beside it.
+        if let streamer, wireArena ?? !DeepSeekV41Runtime.wireArenaDisabled {
+            let arenaBytes = streamer.capacity * streamer.geometry.slotBytes
+            if memoryPlan.wireBudgetBytes(
+                arenaBytes: arenaBytes, physicalGB: physicalGB
+            ) > 0 {
+                streamer.enableSlotWiring(budgetBytes: arenaBytes)
+            }
         }
 
         self.config = config

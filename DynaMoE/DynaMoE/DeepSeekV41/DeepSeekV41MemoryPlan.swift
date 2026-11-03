@@ -110,6 +110,36 @@ nonisolated public struct DeepSeekV41MemoryPlan: Sendable, Equatable {
         return Int(min(slots, 65_536))
     }
 
+    /// Bytes of the expert arena a residency policy may wire, or 0 when wiring it
+    /// would leave the machine without the room the compressor needs.
+    ///
+    /// `#56` measured what wiring buys: a 128-position prefill of the published
+    /// checkpoint falls from 330-375 to 171-174 ms/position and the expert fill
+    /// returns to the disk's own ceiling, because a wired page cannot become
+    /// compressor input. It also measured the shape of the budget: wiring a
+    /// FRACTION of the arena is worse than wiring none, so this answers with the
+    /// whole arena or with nothing.
+    ///
+    /// The plan already prices the arena as resident, so the bytes fit by
+    /// construction. What a wired arena takes away is the kernel's freedom to
+    /// compress them, and the machine still has to hold everything the plan did
+    /// NOT price: the rest of the process, `floorGB` for the OS, other
+    /// applications and the page cache the fill streams through. This is the same
+    /// claim expressed as an upper bound, so a machine that cannot afford it is
+    /// refused here rather than discovered by a compression storm.
+    public func wireBudgetBytes(
+        arenaBytes: Int,
+        physicalGB: Double,
+        floorGB: Double = 16
+    ) -> Int {
+        guard arenaBytes > 0, physicalGB > 0, floorGB >= 0 else { return 0 }
+        let physical = physicalGB * 1_073_741_824
+        let fixed = Double(cacheBytes + residentWeightBytes + engramStagingBytes)
+        let floor = floorGB * 1_073_741_824
+        guard Double(arenaBytes) + fixed + floor <= physical else { return 0 }
+        return arenaBytes
+    }
+
     /// One-line load-log summary.
     public func describe(expertSlots: Int) -> String {
         func gb(_ bytes: Int) -> String {
