@@ -10483,3 +10483,85 @@ recover.
 arms, bit-identical logits), `/tmp/test65_gatewalk1.log` (the racy first cut). Production default is
 `gatesMixtureOnExpertFill = false`: the seam and its probe stay as the baseline any future deferred-bind
 idea has to beat, and `DeepSeekV41ExpertStreamer.placeResident` is the split that idea would need.
+
+## DSV4.1 #66: THE DISPATCH FLOOR IS 2,072 DISPATCHES AT ~1.07 us EACH, SO FUSION CAN RETURN AT MOST 1.06 ms
+
+`#65` closed the deferred-bind expert half and handed the next slice a lever with two inferences
+behind it: "fuse kernels rather than reschedule them", priced at ~1,080 dispatches/position (27
+pipeline stages x 40 layers) and ~3.5 us per dispatch of WINDOW growth from a driver sweep. The
+first is a stage count, not a dispatch count — `.routedExperts` issues one clear plus two per active
+expert — and the second was measured with trivial dispatches going into an EMPTY queue, where nothing
+can hide their cost. So both were measured in the graph, on the 128-position stream `#52`-`#65` used.
+
+**The count is 2,071.8 dispatches per walked position**, identical in every arm and in both runs
+(265,195 per 128 positions), i.e. 1.9x the estimate. `countsDispatches` counts at the encoder call
+itself — every dispatch in the file now goes through a `dispatch(encoder, threads:/threadgroups:)`
+wrapper — so this is what the GPU is handed, not what the stage switch happens to name.
+
+| stage | dispatches/position | share | device ms | of which dispatch |
+|---|---|---|---|---|
+| routedExperts | 520.0 | 25.1% | 11.831 | 0.56 |
+| outputDown | 320.0 | 15.4% | 4.130 | 0.34 |
+| attention | 117.9 | 5.7% | 1.394 | 0.13 |
+| hcFFNCoefficients | 80.0 | 3.9% | 0.540 | 0.09 |
+| sharedExpert | 80.0 | 3.9% | 4.030 | 0.09 |
+| writeFFNStreams | 80.0 | 3.9% | 0.186 | 0.09 |
+| router | 80.0 | 3.9% | 1.038 | 0.09 |
+| hcAttentionCoefficients | 80.0 | 3.9% | 0.533 | 0.09 |
+| indexer | 59.0 | 2.8% | 1.780 | 0.06 |
+| 16 stages at 40.0 each | 640.0 | 30.9% | 17.117 | 0.68 |
+| embedding / engram / head | 15.0 | 0.7% | 0.631 | 0.02 |
+
+(`routedExperts` is 1 clear + 2 x 6 experts; `outputDown` is one dispatch per block-diagonal group,
+8 per layer; `attention` is ~3 per layer because the compressed layers also gather and store. The
+16 stages at exactly 40.0 are the ones that issue one dispatch per layer.)
+
+**The marginal dispatch costs ~1.07 us**, not 3.5. `injectedDispatchRepeats` adds K clears of a
+4-float scratch buffer to every stage's own command buffer, so an injected arm's census is the
+control's plus exactly 27 x 40 x K — asserted, not assumed — and the slope across three arms is the
+per-dispatch cost:
+
+| arm | wall ms/position | device ms/position | misses | read |
+|---|---|---|---|---|
+| control | 63.9 | 36.7 | 1,559 | 27.3 GB |
+| +1 clear/stage (3,151.8 dispatches) | 65.0 | 38.0 | 1,559 | 27.3 GB |
+| +4 clears/stage (6,391.8 dispatches) | 68.9 | 41.0 | 1,559 | 27.3 GB |
+| control again | 63.9 | 36.7 | 1,559 | 27.3 GB |
+
+That is **1.03 and 1.17 us of wall, 1.18 and 0.98 us of device** per dispatch (a second run:
+0.83/1.18 wall, 1.16/0.98 device; control 63.7 both times). The two arms agree, the repeated control
+lands on the first to 0.1 ms, and every arm returns bit-identical logits because the extra dispatches
+write a buffer nobody reads.
+
+**So the whole dispatch floor is 2,072 x 1.07 us = 2.2 ms** of a 36.7 ms device position and 2.1 ms
+of a 63.7 ms wall, 3.3%. Fusing every stage of every layer into a SINGLE dispatch — the bound no
+kernel can beat — returns **1.06 ms**, 1.7% of a walked position. The driver sweep's 3.5 us would
+have predicted 7.25 ms and a redesign; in the graph a marginal dispatch costs a third of that
+because it hides under the work already in its buffer, which is the same lesson `#65` learned about
+a commit: the queue's own state is what the isolated instrument cannot see.
+
+What that reframes: a warm walked position's 36.7 ms of device time is 34.5 ms of WORK and 2.2 of
+dispatch. There is nothing structural left in the kernel count. The remaining wall (63.7 against
+36.7) is the buckets `#65` named and none of them is a dispatch: mixture late start 11.6, indexer
+drain 9.4 (which `#64` showed is the GPU's own work), fill ~4, encodes ~4.6.
+
+**What it is not.** It is not a reason to fuse the eight `outputDown` band dispatches: `#11` tried
+exactly that, measured 29% slower in isolation and no change in place, and the census now explains
+why — the whole stage's dispatch overhead is 0.34 ms and the bands are 4.1 ms of weight traffic.
+It is not a reason to fuse the mHC pair or the router either: 0.09 ms each. And it does not say a
+fusion can never pay — it says a fusion has to remove WORK (bytes read, a redundant residual read,
+a barrier-separated pass over the same vector), because the dispatches themselves are worth 1.7%.
+
+**Two traps, both of which produced a plausible win.** (1) The first run compared a control that ran
+FIRST, so it paid the arena's cold fill (2,001 misses, 35.0 GB) against arms at 1,559 misses and
+27.3 GB, and the injected arms "won" 20 ms by reading 7 GB less; `#65` recorded the same shape. The
+probe now runs three discarded warm-ups, asserts equal miss counts and equal bytes, and repeats the
+control last. (2) The per-dispatch figure was first divided by `count * 1_000` instead of
+`count`, which printed 0.001 us and made the floor look like 0.02 ms — a units error that agreed
+with the "dispatches are free" hypothesis, so nothing looked wrong.
+
+Verification: `/tmp/test66_census2.log` and `/tmp/test66_census3.log` (two full runs, arms and stage
+table above), `/tmp/test66_census1.log` (the cold-arm first cut). The instrument lives behind
+`countsDispatches` / `resetDispatchCensus()` and `injectedDispatchRepeats`, both off in every
+production path; the dispatch wrapper is a load and a compare, and the control's 63.7-63.9 ms/position
+matches `#65`'s 63.5, so the census costs nothing measurable.

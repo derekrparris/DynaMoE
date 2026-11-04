@@ -9061,6 +9061,423 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         withExtendedLifetime(engine) {}
     }
 
+    /// How many dispatches a walked position issues, and what one costs in situ.
+    ///
+    /// `#65` closed the deferred-bind expert half and left the next lever as "fuse
+    /// kernels rather than reschedule them", with a ~1,080 dispatches/position estimate
+    /// (27 pipeline stages x 40 layers) and a driver-level ~3.5 us per dispatch of
+    /// WINDOW growth. Both are inferences, and the second was taken in the least
+    /// favourable conditions for it: a buffer of trivial dispatches committed into an
+    /// EMPTY queue, where nothing else can hide the cost. In the graph a dispatch shares
+    /// its buffer with real work the GPU is already saturated by, so the marginal
+    /// dispatch may be nearly free — and if it is, no fusion is worth writing.
+    ///
+    /// So both are measured here, on the same 128-position stream `#52`-`#65` used:
+    ///
+    /// 1. **The count** — `countsDispatches` counts what the encoder actually issues, by
+    ///    stage. A stage is not a dispatch: `.routedExperts` issues a clear plus two per
+    ///    active expert (13 at six), `.sharedExpert` two, `.router` two, the mHC
+    ///    coefficient stage two, and `.outputDown` one per block-diagonal group.
+    /// 2. **The marginal cost** — `injectedDispatchRepeats` adds K clears of a 4-float
+    ///    scratch buffer to every stage's own command buffer, so an injected arm's count
+    ///    is the control's plus exactly 27 x layers x K, and the slope of the wall (and
+    ///    of the device window) IS what removing a dispatch would save.
+    ///
+    /// The injected arms have to return bit-identical logits: the extra dispatches write
+    /// a buffer nothing reads. A second control runs last to say whether the wall drifted
+    /// between the arms, and a stage-split arm carries the same census so each stage's
+    /// dispatches can be read beside the window `#60` ranked.
+    ///
+    /// Opt-in (`/tmp/dynamoe_dsv41_dispatch_census`, plus the class's own marker).
+    func testWhatAWalkedPositionsDispatchesCost() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_dispatch_census"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in dispatch census probe; touch \(markerPath) to run"
+        )
+
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        // The stream `#52`-`#65` measured, position for position.
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+        func prompt(_ length: Int, rotation: Int) -> [Int] {
+            (0..<length).map { index in
+                let repetition = index / stream.count
+                return stream[(index + repetition * rotation) % stream.count]
+            }
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let positions = 128
+        let tokens = prompt(positions, rotation: 7)
+        let stageCount = DeepSeekV41DevicePlan.frontHalf.count
+            + DeepSeekV41DevicePlan.backHalf.count
+        let injectedPerPositionPerRepeat = stageCount * config.numHiddenLayers
+
+        /// One walked pass: what it cost, what it issued, and what it produced.
+        struct Outcome {
+            let wallMilliseconds: Double
+            let timing: DeepSeekV41WalkTiming
+            let census: [String: Int]
+            let censusPositions: Int
+            let stageSeconds: [String: UInt64]
+            let misses: Int
+            let bytes: Int
+            let lastLogits: [Float]
+        }
+
+        func pass(
+            _ label: String,
+            executor: DeepSeekV41MetalForward,
+            arena: DeepSeekV41ExpertArena,
+            streamer: DeepSeekV41ExpertStreamer?,
+            repeats: Int,
+            counting: Bool,
+            splittingStages: Bool = false
+        ) -> Outcome? {
+            executor.reset()
+            executor.resetWalkTiming()
+            executor.resetDispatchCensus()
+            executor.recordsWalkTiming = true
+            executor.recordsWalkStageTiming = splittingStages
+            executor.countsDispatches = counting
+            executor.injectedDispatchRepeats = repeats
+            let acquisitionsBefore = arena.acquisitions
+            let hitsBefore = arena.hits
+            let bytesBefore = streamer?.bytesRead ?? 0
+            let start = DispatchTime.now().uptimeNanoseconds
+            var logits: [Float] = []
+            do {
+                for (position, token) in tokens.enumerated() {
+                    logits = try executor.forwardToken(token, position: position)
+                }
+            } catch {
+                XCTFail("\(label) refused at a position: \(error)")
+                return nil
+            }
+            let wall = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
+            executor.recordsWalkTiming = false
+            executor.recordsWalkStageTiming = false
+            executor.countsDispatches = false
+            executor.injectedDispatchRepeats = 0
+            let acquisitions = arena.acquisitions - acquisitionsBefore
+            let misses = acquisitions - (arena.hits - hitsBefore)
+            let bytes = (streamer?.bytesRead ?? 0) - bytesBefore
+            let issued = executor.dispatchCensus.values.reduce(0, +)
+            let device = executor.walkTiming.frontDeviceNanoseconds
+                + executor.walkTiming.mixtureDeviceNanoseconds
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   %@: %.1f ms/position, device %.1f, "
+                        + "%d miss(es), %.1f GB read, %d dispatches (%@ per position)",
+                    label,
+                    wall / Double(positions),
+                    Double(device) / Double(positions) / 1_000_000,
+                    misses,
+                    Double(bytes) / 1_073_741_824,
+                    issued,
+                    counting ? String(format: "%.1f", Double(issued) / Double(positions)) : "n/a"
+                )
+            )
+            return Outcome(
+                wallMilliseconds: wall,
+                timing: executor.walkTiming,
+                census: executor.dispatchCensus,
+                censusPositions: executor.dispatchCensusPositions,
+                stageSeconds: executor.walkStageTiming,
+                misses: misses,
+                bytes: bytes,
+                lastLogits: logits
+            )
+        }
+
+        do {
+            let runtime = try makeRuntime(
+                snapshot: snapshot,
+                engine: engine,
+                config: config,
+                contextLength: positions + 1,
+                allowEngramSkip: false,
+                wireArena: nil
+            )
+            runtime.arena.victimPolicy = .leastFrequentlyUsed
+            let executor = runtime.forward()
+
+            // Discarded warm-ups, three of them because that is what the arena's read
+            // takes to converge: `#65` saw 35.0, 28.8, 27.3 and 27.3 GB over four arms,
+            // so an arm that runs before the third is measuring the fill rather than a
+            // dispatch. Everything below reads the same bytes, and the assertions at the
+            // end are what hold that.
+            for warmUp in 1...3 {
+                _ = pass(
+                    "warm-up \(warmUp)",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    repeats: 0,
+                    counting: false
+                )
+            }
+            print(
+                String(
+                    format: "🔎 [dsv41 real] dispatch census: %d positions, %d stage(s) per "
+                        + "layer, %d layer(s), arena %d slots, warm-up done",
+                    positions,
+                    stageCount,
+                    config.numHiddenLayers,
+                    runtime.arena.capacity
+                )
+            )
+
+            // The count first, with its stage windows: the census is the target list, and
+            // the injected arms below are read against it.
+            let stages = try XCTUnwrap(
+                pass(
+                    "stages, one buffer per stage",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    repeats: 0,
+                    counting: true,
+                    splittingStages: true
+                )
+            )
+            let control = try XCTUnwrap(
+                pass(
+                    "control",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    repeats: 0,
+                    counting: true
+                )
+            )
+            let injectedOne = try XCTUnwrap(
+                pass(
+                    "injected 1/stage",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    repeats: 1,
+                    counting: true
+                )
+            )
+            let injectedFour = try XCTUnwrap(
+                pass(
+                    "injected 4/stage",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    repeats: 4,
+                    counting: true
+                )
+            )
+            let controlAgain = try XCTUnwrap(
+                pass(
+                    "control (repeat, census off)",
+                    executor: executor,
+                    arena: runtime.arena,
+                    streamer: runtime.expertStreamer,
+                    repeats: 0,
+                    counting: false
+                )
+            )
+
+            // An injected dispatch writes a scratch buffer nobody reads, so every arm
+            // has to answer with the same logits, to the bit.
+            for (label, outcome) in [
+                ("injected 1/stage", injectedOne), ("injected 4/stage", injectedFour),
+                ("control arm 2", controlAgain),
+            ] {
+                XCTAssertEqual(
+                    outcome.lastLogits, control.lastLogits,
+                    "\(label) moved the last position's logits"
+                )
+            }
+            print(
+                "🔎 [dsv41 real] dispatch control: every arm's last position is "
+                    + "bit-identical"
+            )
+
+            // The instrument has to have covered the whole stream, and the injection
+            // has to be exactly the count it claims: one clear per stage per layer.
+            XCTAssertEqual(control.timing.positions, positions)
+            XCTAssertEqual(control.censusPositions, positions)
+            XCTAssertEqual(stages.censusPositions, positions)
+            let controlTotal = control.census.values.reduce(0, +)
+            let oneTotal = injectedOne.census.values.reduce(0, +)
+            let fourTotal = injectedFour.census.values.reduce(0, +)
+            XCTAssertGreaterThan(controlTotal, 0, "the census counted nothing")
+            XCTAssertEqual(
+                oneTotal - controlTotal,
+                injectedPerPositionPerRepeat * positions,
+                "the injected arm did not issue exactly one clear per stage per layer"
+            )
+            XCTAssertEqual(
+                fourTotal - controlTotal,
+                4 * injectedPerPositionPerRepeat * positions,
+                "the injected arm did not issue exactly four clears per stage per layer"
+            )
+            // The split layout submits the same dispatches in more buffers.
+            XCTAssertEqual(
+                stages.census.values.reduce(0, +), controlTotal,
+                "the per-stage layout changed the dispatch count"
+            )
+
+            let dispatchesPerPosition = Double(controlTotal) / Double(positions)
+            print(
+                String(
+                    format: "🔎 [dsv41 real] dispatch count: %.1f dispatches per walked "
+                        + "position over %d layer(s); the handover's 27 stages x 40 layers "
+                        + "estimate was %d",
+                    dispatchesPerPosition,
+                    config.numHiddenLayers,
+                    stageCount * config.numHiddenLayers
+                )
+            )
+            // The marginal cost. Two injected arms and a control, so the slope does not
+            // rest on one difference, and a second control that says whether the wall
+            // drifted while the arms ran. The arms are matched-read (the warm-ups are
+            // what make them so), which is the assertion below rather than an assumption.
+            let wallControl = control.wallMilliseconds / Double(positions)
+            let wallOne = injectedOne.wallMilliseconds / Double(positions)
+            let wallFour = injectedFour.wallMilliseconds / Double(positions)
+            let wallControlAgain = controlAgain.wallMilliseconds / Double(positions)
+            let deviceControl = Double(
+                control.timing.frontDeviceNanoseconds + control.timing.mixtureDeviceNanoseconds
+            ) / Double(positions) / 1_000_000
+            let deviceOne = Double(
+                injectedOne.timing.frontDeviceNanoseconds
+                    + injectedOne.timing.mixtureDeviceNanoseconds
+            ) / Double(positions) / 1_000_000
+            let deviceFour = Double(
+                injectedFour.timing.frontDeviceNanoseconds
+                    + injectedFour.timing.mixtureDeviceNanoseconds
+            ) / Double(positions) / 1_000_000
+            let injectedOneCount = Double(injectedPerPositionPerRepeat)
+            let injectedFourCount = Double(injectedPerPositionPerRepeat) * 4
+            // ms per dispatch; multiplied by 1,000 where it is printed as microseconds.
+            let perDispatchWallOne = (wallOne - wallControl) / injectedOneCount
+            let perDispatchWallFour = (wallFour - wallControl) / injectedFourCount
+            let perDispatchDeviceOne = (deviceOne - deviceControl) / injectedOneCount
+            let perDispatchDeviceFour = (deviceFour - deviceControl) / injectedFourCount
+            print(
+                String(
+                    format: "🔎 [dsv41 real] injected dispatch: wall %.1f (control) / %.1f "
+                        + "(+1) / %.1f (+4) / %.1f (control again) ms/position, device "
+                        + "%.1f / %.1f / %.1f; that is %.3f and %.3f us of wall, %.3f and "
+                        + "%.3f us of device, per injected dispatch",
+                    wallControl,
+                    wallOne,
+                    wallFour,
+                    wallControlAgain,
+                    deviceControl,
+                    deviceOne,
+                    deviceFour,
+                    perDispatchWallOne * 1_000,
+                    perDispatchWallFour * 1_000,
+                    perDispatchDeviceOne * 1_000,
+                    perDispatchDeviceFour * 1_000
+                )
+            )
+            XCTAssertEqual(control.misses, injectedOne.misses, "the arms did not read alike")
+            XCTAssertEqual(control.misses, injectedFour.misses, "the arms did not read alike")
+            XCTAssertEqual(
+                control.bytes, injectedFour.bytes,
+                "the injected arms read a different number of bytes"
+            )
+            XCTAssertEqual(
+                control.misses, controlAgain.misses,
+                "the repeated control read a different number of bytes"
+            )
+            let perDispatchWall = (perDispatchWallOne + perDispatchWallFour) / 2
+            let perDispatchDevice = (perDispatchDeviceOne + perDispatchDeviceFour) / 2
+
+            print(
+                "🔎 [dsv41 real] dispatches per position by stage, most first, beside the "
+                    + "stage's device window (`#60`'s ranking, same stream) and what its "
+                    + "dispatches cost at the measured rate:"
+            )
+            let frontNames = Set(DeepSeekV41DevicePlan.frontHalf.map(\.rawValue))
+            let stageDivisor = Double(max(1, stages.censusPositions))
+            func stageMilliseconds(_ stage: String) -> Double {
+                Double(stages.stageSeconds[stage] ?? 0) / stageDivisor / 1_000_000
+            }
+            // Read from the arm's own copy, not from the executor: `pass` clears the live
+            // census at the start of every arm, so the last one to run is empty.
+            let ordered = stages.census
+                .map { (stage: $0.key, count: Double($0.value) / stageDivisor) }
+                .sorted { $0.count > $1.count }
+            for entry in ordered {
+                let milliseconds = stageMilliseconds(entry.stage)
+                print(
+                    "🔎 [dsv41 real]   "
+                        + String(
+                            format: "%-40@ %7.1f dispatches %5.1f%%  %6.3f ms  %5.2f ms "
+                                + "of dispatch  %@",
+                            entry.stage as NSString,
+                            entry.count,
+                            entry.count / max(dispatchesPerPosition, 1) * 100,
+                            milliseconds,
+                            entry.count * perDispatchDevice,
+                            frontNames.contains(entry.stage) ? "dense" : "mixture"
+                        )
+                )
+            }
+            // Every stage that issues anything has to appear, and the ones that never
+            // issue a dispatch on their own must not.
+            var expected = frontNames.union(DeepSeekV41DevicePlan.backHalf.map(\.rawValue))
+            expected.remove(DeepSeekV41ForwardStages.Stage.compressPool.rawValue)
+            let counted = Set(stages.census.keys)
+            XCTAssertTrue(
+                expected.subtracting(counted).isEmpty,
+                "the census is missing \(expected.subtracting(counted).sorted())"
+            )
+
+            // The two numbers the next slice has to be planned against: what the whole
+            // dispatch floor is, and the most a fusion of every stage into one dispatch
+            // could return (which is the relinquished bound, not a proposal).
+            let dispatchFloor = dispatchesPerPosition * perDispatchDevice
+            let fusionCeiling = (dispatchesPerPosition - Double(stageCount * config.numHiddenLayers))
+                * perDispatchDevice
+            print(
+                String(
+                    format: "🔎 [dsv41 real] the dispatch floor: %.1f dispatches x %.3f us "
+                        + "= %.2f ms of a %.1f ms device position and %.2f ms of a %.1f ms "
+                        + "wall position, where the driver sweep's 3.5 us would have said "
+                        + "%.2f ms; fusing every stage into one dispatch, the most that "
+                        + "removing dispatches ALONE could return, is %.2f ms",
+                    dispatchesPerPosition,
+                    perDispatchDevice * 1_000,
+                    dispatchFloor,
+                    deviceControl,
+                    dispatchesPerPosition * perDispatchWall,
+                    wallControl,
+                    dispatchesPerPosition * 0.0035,
+                    fusionCeiling
+                )
+            )
+            runtime.shutdown()
+        }
+        withExtendedLifetime(engine) {}
+    }
+
     /// A page-aligned anonymous mapping this test can wire.
     ///
     /// `mlock` is the only in-process way to tell the kernel a page may be neither

@@ -1925,6 +1925,37 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// committed, for `mixtureStartProbeBinding == 4`. That is the one thing the expert
     /// half's arena slots have that no probe above reproduces: the CPU wrote them.
     public var mixtureStartProbeDirtyBytes = 0
+
+    /// Counts, per stage, how many dispatches a walked position's encoder issues.
+    ///
+    /// `#65`'s driver sweep priced a trivial dispatch's own WINDOW at ~3.5 us and turned
+    /// the "dispatch floor" into the next named lever, but its ~1,080 dispatches/position
+    /// is 27 pipeline stages x 40 layers — a stage is not a dispatch. `.routedExperts`
+    /// issues one clear plus two per active expert (13 at six), `.sharedExpert` two,
+    /// `.router` two (a GEMV and the top-k scan), a norm one per row, and the mHC
+    /// coefficient stage two. This counts what `encode` actually issues, so a fusion
+    /// candidate can be ranked by the dispatches it would remove rather than by the
+    /// stages it names. It only increments an integer; no dispatch does different work.
+    public var countsDispatches = false
+    /// Dispatches issued for each stage name, accumulated until `resetDispatchCensus`.
+    public private(set) var dispatchCensus: [String: Int] = [:]
+    /// Positions the census covers, so the table reads as dispatches per POSITION.
+    public private(set) var dispatchCensusPositions = 0
+    /// Where the next dispatch's count goes.
+    private var dispatchCensusStage = ""
+
+    /// Measurement only: extra no-op dispatches per stage (0 in every production path).
+    ///
+    /// It is how the driver-level ~3.5 us per dispatch behind `#65` is checked IN SITU
+    /// rather than assumed: that sweep timed a buffer of trivial dispatches into an
+    /// EMPTY queue, while a walk's dispatches share a buffer with real work the GPU is
+    /// already saturated by, so an added dispatch may cost nothing at all. Clearing a
+    /// 4-float scratch buffer is the cheapest real dispatch the runtime can issue;
+    /// repeating it K times per stage and reading the slope of the wall and of the
+    /// device window is what says whether removing dispatches is worth a fusion.
+    public var injectedDispatchRepeats = 0
+    private var dispatchProbeScratch: MTLBuffer?
+
     /// Reads every page of a layer's fill back on the thread that commits its expert
     /// half. Measurement only (`#49`): it is what separates a gap that is the pread
     /// itself from a gap that is the writeback the pread left on other cores.
@@ -1991,6 +2022,13 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         layerGaps.removeAll(keepingCapacity: true)
         layerGapPositions.removeAll(keepingCapacity: true)
         pendingLayerGaps.removeAll(keepingCapacity: true)
+    }
+
+    /// Clears the dispatch census (`countsDispatches`).
+    public func resetDispatchCensus() {
+        dispatchCensus.removeAll(keepingCapacity: true)
+        dispatchCensusPositions = 0
+        dispatchCensusStage = ""
     }
 
     /// The walk's per-stage device time, biggest first, as milliseconds per position
@@ -3636,6 +3674,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             recordWalkDeviceTiming()
             if recordsWalkTiming { walkTiming.positions += 1 }
         }
+        if countsDispatches { dispatchCensusPositions += 1 }
 
         var logits = [Float](repeating: 0, count: config.vocabSize)
         let count = min(config.vocabSize, workspace.logits.length / MemoryLayout<Float>.stride)
@@ -3722,6 +3761,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             recordWalkDeviceTiming()
             if recordsWalkTiming { walkTiming.positions += 1 }
         }
+        if countsDispatches { dispatchCensusPositions += 1 }
 
         var logits = [Float](repeating: 0, count: config.vocabSize)
         let count = min(config.vocabSize, workspace.logits.length / MemoryLayout<Float>.stride)
@@ -3761,7 +3801,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 offset: workspace.slotOffset(index, width: mult),
                 index: 0
             )
-            encoder.dispatchThreads(
+            dispatch(encoder, threads:
                 MTLSize(width: mult, height: 1, depth: 1),
                 threadsPerThreadgroup: threadgroup(mult)
             )
@@ -3784,6 +3824,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         embeddings: [Int: [Float]] = [:]
     ) throws {
         let count = tokens.count
+        if countsDispatches { dispatchCensusStage = "embedding (block)" }
         // Every position's id goes into one entry of `tokenIDs`, and each dispatch
         // binds its own entry, so a block wider than the workspace would both write
         // past the buffer and bind an offset outside it (Metal refuses the second,
@@ -3858,7 +3899,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 encoder.setBytes(&scaleOffset, length: 8, index: 5)
                 encoder.setBytes(&hiddenDim, length: 4, index: 6)
             }
-            encoder.dispatchThreads(
+            dispatch(encoder, threads:
                 MTLSize(width: shapes.hidden, height: 1, depth: 1),
                 threadsPerThreadgroup: threadgroup(shapes.hidden)
             )
@@ -3894,7 +3935,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 index: 0
             )
             encoder.setBytes(&copies, length: 4, index: 1)
-            encoder.dispatchThreads(
+            dispatch(encoder, threads:
                 MTLSize(width: mult, height: 1, depth: 1),
                 threadsPerThreadgroup: threadgroup(mult)
             )
@@ -3905,6 +3946,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     }
 
     private func encodeEmbedding(_ token: Int) throws {
+        if countsDispatches { dispatchCensusStage = "embedding" }
         let commandBuffer = try makeCommandBuffer()
         let encoder = try makeEncoder(commandBuffer)
 
@@ -3944,7 +3986,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.setBytes(&scaleOffset, length: 8, index: 5)
             encoder.setBytes(&hiddenDim, length: 4, index: 6)
         }
-        encoder.dispatchThreads(
+        dispatch(encoder, threads:
             MTLSize(width: shapes.hidden, height: 1, depth: 1),
             threadsPerThreadgroup: threadgroup(shapes.hidden)
         )
@@ -3968,7 +4010,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         encoder.setBuffer(workspace.hcMix, offset: 0, index: 0)
         var copies = UInt32(mult)
         encoder.setBytes(&copies, length: 4, index: 1)
-        encoder.dispatchThreads(
+        dispatch(encoder, threads:
             MTLSize(width: mult, height: 1, depth: 1),
             threadsPerThreadgroup: threadgroup(mult)
         )
@@ -3992,6 +4034,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         let slot = max(0, firstSlot)
         let hiddenOffset = workspace.slotOffset(slot, width: shapes.hidden)
         let logitsOffset = workspace.slotOffset(slot, width: config.vocabSize)
+        if countsDispatches { dispatchCensusStage = "output head" }
         let commandBuffer = try makeCommandBuffer()
         let encoder = try makeEncoder(commandBuffer)
 
@@ -4456,6 +4499,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     ) throws {
         let index = layer.index
         let shape = DeepSeekV41AttentionShape.make(config: config, layer: layer)
+        if countsDispatches { dispatchCensusStage = stage.rawValue }
 
         switch stage {
         case .hcAttentionCoefficients:
@@ -4801,6 +4845,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 snapshotting: false
             )
         }
+        // Measurement only: the census and the injected no-ops are both keyed on the
+        // stage name set above, so they see exactly the dispatches this stage issued.
+        try injectProbeDispatches(encoder)
     }
 
     // MARK: Engram stage
@@ -4907,7 +4954,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         )
         encoder.setBytes(&rowCount, length: 4, index: 2)
         encoder.setBytes(&headDimension, length: 4, index: 3)
-        encoder.dispatchThreads(
+        dispatch(encoder, threads:
             MTLSize(width: staging.headDimension, height: staging.columns, depth: 1),
             threadsPerThreadgroup: MTLSize(
                 width: threadgroup(staging.headDimension).width, height: 1, depth: 1
@@ -4988,7 +5035,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         // 64-thread threadgroup asks for 8 bytes and is refused outright.
         let gatePartials = (lanes / 32) * MemoryLayout<Float>.stride
         encoder.setThreadgroupMemoryLength((gatePartials + 15) & ~15, index: 0)
-        encoder.dispatchThreadgroups(
+        dispatch(encoder, threadgroups:
             MTLSize(width: mult, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
         )
@@ -5106,7 +5153,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         var blockSize = UInt32(ratio)
         encoder.setBytes(&poolWidth, length: 4, index: 3)
         encoder.setBytes(&blockSize, length: 4, index: 4)
-        encoder.dispatchThreads(
+        dispatch(encoder, threads:
             MTLSize(width: width, height: 1, depth: 1),
             threadsPerThreadgroup: threadgroup(width)
         )
@@ -5340,7 +5387,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.setBytes(&rows, length: 4, index: 6)
             encoder.setBytes(&reachable, length: 4, index: 7)
             encoder.setBytes(&scale, length: 4, index: 8)
-            encoder.dispatchThreads(
+            dispatch(encoder, threads:
                 MTLSize(width: produced, height: 1, depth: 1),
                 threadsPerThreadgroup: threadgroup(produced)
             )
@@ -5661,7 +5708,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         counts.withUnsafeBytes { bytes in
             encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: 10)
         }
-        encoder.dispatchThreadgroups(
+        dispatch(encoder, threadgroups:
             MTLSize(width: shape.numHeads * slots.count, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(
                 width: Self.attentionThreadgroupWidth, height: 1, depth: 1
@@ -5903,7 +5950,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.setThreadgroupMemoryLength(tableBytes, index: 1)
             encoder.setThreadgroupMemoryLength(tableBytes, index: 2)
             for _ in 0..<max(1, routerTopKRepeats) {
-                encoder.dispatchThreadgroups(
+                dispatch(encoder, threadgroups:
                     MTLSize(width: slots, height: 1, depth: 1),
                     threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
                 )
@@ -5912,7 +5959,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         }
         encoder.setComputePipelineState(pipelines.router)
         for _ in 0..<max(1, routerTopKRepeats) {
-            encoder.dispatchThreads(
+            dispatch(encoder, threads:
                 MTLSize(width: slots, height: 1, depth: 1),
                 threadsPerThreadgroup: MTLSize(width: max(1, min(32, slots)), height: 1, depth: 1)
             )
@@ -5963,6 +6010,59 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             throw DeepSeekV41EngineError.allocationFailed("a compute encoder")
         }
         return encoder
+    }
+
+    /// The two dispatch forms the graph uses, wrapped so `countsDispatches` can count
+    /// them and `injectedDispatchRepeats` can add to them.
+    ///
+    /// Every dispatch in this file goes through one of these, which is what makes the
+    /// census a count of what the encoder issues rather than of what the stage switch
+    /// happens to call: `encodeRoutedExperts` issues a clear plus two per active expert,
+    /// a norm issues one per row, and the mHC coefficient stage issues two. Off in every
+    /// production path, where each of these is a load, a compare, and the call it wraps.
+    private func dispatch(
+        _ encoder: MTLComputeCommandEncoder,
+        threads: MTLSize,
+        threadsPerThreadgroup: MTLSize
+    ) {
+        if countsDispatches { dispatchCensus[dispatchCensusStage, default: 0] += 1 }
+        encoder.dispatchThreads(threads, threadsPerThreadgroup: threadsPerThreadgroup)
+    }
+
+    /// The threadgroup form; see the `threads:` overload.
+    private func dispatch(
+        _ encoder: MTLComputeCommandEncoder,
+        threadgroups: MTLSize,
+        threadsPerThreadgroup: MTLSize
+    ) {
+        if countsDispatches { dispatchCensus[dispatchCensusStage, default: 0] += 1 }
+        encoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
+    }
+
+    /// Adds `injectedDispatchRepeats` clears of a 4-float scratch buffer to `encoder`.
+    ///
+    /// A probe-only instrument (`#66`): it must be a real dispatch, so it is a clear of a
+    /// buffer nobody reads rather than a call the driver can elide, and it lands in the
+    /// same command buffer as the stage's own work, which is where a fused kernel would
+    /// have removed one. It deliberately carries NO barrier between repeats, so the
+    /// slope it measures is a dispatch's own cost rather than a dispatch plus a fence;
+    /// the #65 sweep's trivial arm was the same shape.
+    private func injectProbeDispatches(_ encoder: MTLComputeCommandEncoder) throws {
+        let repeats = injectedDispatchRepeats
+        guard repeats > 0 else { return }
+        if dispatchProbeScratch == nil {
+            dispatchProbeScratch = device.makeBuffer(length: 16, options: .storageModeShared)
+        }
+        guard let scratch = dispatchProbeScratch else { return }
+        encoder.setComputePipelineState(pipelines.clear)
+        encoder.setBuffer(scratch, offset: 0, index: 0)
+        for _ in 0..<repeats {
+            dispatch(
+                encoder,
+                threads: MTLSize(width: 4, height: 1, depth: 1),
+                threadsPerThreadgroup: threadgroup(4)
+            )
+        }
     }
 
     private func commit(
@@ -6117,7 +6217,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         guard count > 0 else { return }
         encoder.setComputePipelineState(pipelines.clear)
         encoder.setBuffer(buffer, offset: byteOffset, index: 0)
-        encoder.dispatchThreads(
+        dispatch(encoder, threads:
             MTLSize(width: count, height: 1, depth: 1),
             threadsPerThreadgroup: threadgroup(count)
         )
@@ -6157,7 +6257,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.setBuffer(output, offset: outputByteOffset + row * stride, index: 2)
             encoder.setBytes(&dim, length: 4, index: 3)
             encoder.setBytes(&epsilon, length: 4, index: 4)
-            encoder.dispatchThreadgroups(
+            dispatch(encoder, threadgroups:
                 grid.threadgroups,
                 threadsPerThreadgroup: grid.threadsPerThreadgroup
             )
@@ -6228,7 +6328,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 encoder.setThreadgroupMemoryLength(
                     Self.gemvReductionSlots * MemoryLayout<Float>.stride, index: 0
                 )
-                encoder.dispatchThreadgroups(
+                dispatch(encoder, threadgroups:
                     MTLSize(width: outDim * max(1, rows), height: 1, depth: 1),
                     threadsPerThreadgroup: MTLSize(
                         width: Self.gemvLaneWidth, height: 1, depth: 1
@@ -6270,7 +6370,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 encoder.setThreadgroupMemoryLength(
                     32 * 8 * rowsPerGroup * MemoryLayout<Float>.stride, index: 0
                 )
-                encoder.dispatchThreadgroups(
+                dispatch(encoder, threadgroups:
                     MTLSize(
                         width: (outDim + rowsPerGroup - 1) / rowsPerGroup, height: 1, depth: 1
                     ),
@@ -6285,7 +6385,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 encoder.setThreadgroupMemoryLength(
                     Self.gemvReductionSlots * MemoryLayout<Float>.stride, index: 0
                 )
-                encoder.dispatchThreadgroups(
+                dispatch(encoder, threadgroups:
                     MTLSize(width: outDim * max(1, rows), height: 1, depth: 1),
                     threadsPerThreadgroup: MTLSize(
                         width: Self.gemvLaneWidth, height: 1, depth: 1
@@ -6297,7 +6397,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         case .unsupported:
             throw DeepSeekV41EngineError.unsupportedDtype("a projection", weight.dtype)
         }
-        encoder.dispatchThreads(
+        dispatch(encoder, threads:
             MTLSize(width: outDim, height: max(1, rows), depth: 1),
             threadsPerThreadgroup: threadgroup(outDim)
         )
@@ -6489,7 +6589,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.setThreadgroupMemoryLength(
                 Self.mixtureReductionSlots * 2 * MemoryLayout<Float>.stride, index: 0
             )
-            encoder.dispatchThreadgroups(
+            dispatch(encoder, threadgroups:
                 MTLSize(width: outDim, height: 1, depth: 1),
                 threadsPerThreadgroup: MTLSize(
                     width: wideLaneWidth, height: 1, depth: 1
@@ -6498,7 +6598,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.memoryBarrier(scope: .buffers)
             return
         }
-        encoder.dispatchThreads(
+        dispatch(encoder, threads:
             MTLSize(width: outDim, height: 1, depth: 1),
             threadsPerThreadgroup: threadgroup(outDim)
         )
@@ -6588,7 +6688,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.setThreadgroupMemoryLength(
                 Self.mixtureReductionSlots * MemoryLayout<Float>.stride, index: 0
             )
-            encoder.dispatchThreadgroups(
+            dispatch(encoder, threadgroups:
                 MTLSize(width: outDim, height: 1, depth: 1),
                 threadsPerThreadgroup: MTLSize(
                     width: wideLaneWidth, height: 1, depth: 1
@@ -6597,7 +6697,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.memoryBarrier(scope: .buffers)
             return
         }
-        encoder.dispatchThreads(
+        dispatch(encoder, threads:
             MTLSize(width: outDim, height: 1, depth: 1),
             threadsPerThreadgroup: threadgroup(outDim)
         )
@@ -6680,7 +6780,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             Self.hyperConnectionReductionSlots * 2 * MemoryLayout<Float>.stride, index: 0
         )
         for _ in 0..<max(1, hyperConnectionProjectionRepeats) {
-            encoder.dispatchThreadgroups(
+            dispatch(encoder, threadgroups:
                 MTLSize(width: mixCount * slots, height: 1, depth: 1),
                 threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
             )
@@ -6711,7 +6811,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             ? hyperConnectionSplitLanesOverride
             : max(1, min(32, slots))
         for _ in 0..<max(1, hyperConnectionSplitRepeats) {
-            encoder.dispatchThreads(
+            dispatch(encoder, threads:
                 MTLSize(width: slots, height: 1, depth: 1),
                 threadsPerThreadgroup: MTLSize(width: splitLanes, height: 1, depth: 1)
             )
@@ -7309,7 +7409,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         counts.withUnsafeBytes { bytes in
             encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: 10)
         }
-        encoder.dispatchThreadgroups(
+        dispatch(encoder, threadgroups:
             MTLSize(width: shape.numHeads * slots, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(
                 width: Self.attentionThreadgroupWidth, height: 1, depth: 1
@@ -7655,7 +7755,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.setBytes(&scaleOffset, length: 8, index: 5)
             encoder.setBytes(&width, length: 4, index: 6)
         }
-        encoder.dispatchThreads(
+        dispatch(encoder, threads:
             MTLSize(width: table.columns, height: 1, depth: 1),
             threadsPerThreadgroup: threadgroup(table.columns)
         )
@@ -7791,7 +7891,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         encoder.setBytes(&width, length: 4, index: 4)
         encoder.setBytes(&copies, length: 4, index: 5)
         encoder.setBytes(&snapshot, length: 4, index: 6)
-        encoder.dispatchThreads(
+        dispatch(encoder, threads:
             MTLSize(width: shapes.hidden, height: 1, depth: 1),
             threadsPerThreadgroup: threadgroup(shapes.hidden)
         )
@@ -7822,7 +7922,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         var copies = UInt32(mult)
         encoder.setBytes(&width, length: 4, index: 5)
         encoder.setBytes(&copies, length: 4, index: 6)
-        encoder.dispatchThreads(
+        dispatch(encoder, threads:
             MTLSize(width: shapes.hidden, height: mult, depth: 1),
             threadsPerThreadgroup: MTLSize(
                 width: threadgroup(shapes.hidden).width, height: 1, depth: 1
@@ -7845,7 +7945,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         encoder.setBuffer(destination, offset: destinationByteOffset, index: 1)
         var length = UInt32(count)
         encoder.setBytes(&length, length: 4, index: 2)
-        encoder.dispatchThreads(
+        dispatch(encoder, threads:
             MTLSize(width: count, height: 1, depth: 1),
             threadsPerThreadgroup: threadgroup(count)
         )
@@ -7897,7 +7997,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         encoder.setBytes(&batchCount, length: 4, index: 6)
         encoder.setBytes(&offset, length: 4, index: 7)
         encoder.setBytes(&conjugate, length: 4, index: 8)
-        encoder.dispatchThreads(
+        dispatch(encoder, threads:
             MTLSize(width: Int(pairs), height: max(1, batch), depth: 1),
             threadsPerThreadgroup: threadgroup(Int(pairs))
         )
@@ -7927,7 +8027,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         encoder.setBytes(&offset, length: 8, index: 2)
         encoder.setBytes(&width, length: 4, index: 3)
         encoder.setBytes(&row, length: 4, index: 4)
-        encoder.dispatchThreads(
+        dispatch(encoder, threads:
             MTLSize(width: shapes.latentWidth, height: 1, depth: 1),
             threadsPerThreadgroup: threadgroup(shapes.latentWidth)
         )
@@ -7962,7 +8062,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         encoder.setBytes(&width, length: 4, index: 4)
         encoder.setBytes(&rows, length: 4, index: 5)
         encoder.setBytes(&destination, length: 8, index: 6)
-        encoder.dispatchThreads(
+        dispatch(encoder, threads:
             MTLSize(width: shapes.latentWidth, height: rowCount, depth: 1),
             threadsPerThreadgroup: MTLSize(width: threadgroup(shapes.latentWidth).width, height: 1, depth: 1)
         )
