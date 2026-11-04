@@ -3919,6 +3919,436 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         )
     }
 
+    /// What one streamed turn emitted, accumulated from its SSE transcript.
+    private struct StreamedTurn {
+        var content: String
+        var reasoning: String
+        var promptTokens: Int
+        var completionTokens: Int
+        /// True when the protocol's own terminal marker arrived (`[DONE]` for
+        /// OpenAI, `message_stop` for Anthropic). A stream that ends without one
+        /// was truncated, however much text it produced first.
+        var reachedTerminalMarker: Bool
+        var eventCount: Int
+        /// The writers' keep-alives: `:` comment blocks on the OpenAI route,
+        /// `event: ping` frames on the Anthropic one.
+        var heartbeatCount: Int
+        /// A refusal travels as an SSE frame under a 200, so this is the only
+        /// place a rejected attachment shows up on a streaming route.
+        var errorMessage: String?
+    }
+
+    /// Splits an SSE body into its frames.
+    ///
+    /// A frame is a block of lines ended by a blank line: `event:` names it and
+    /// `data:` carries its payload (multi-line payloads join with newlines, as the
+    /// SSE spec says). A block with no field at all but a leading `:` is a heartbeat
+    /// and carries nothing.
+    private func parseSSEFrames(
+        _ text: String
+    ) -> (frames: [(event: String?, data: String)], heartbeats: Int) {
+        var frames: [(event: String?, data: String)] = []
+        var heartbeats = 0
+        for block in text.components(separatedBy: "\n\n") {
+            var name: String?
+            var payload: [String] = []
+            var sawField = false
+            for line in block.split(separator: "\n", omittingEmptySubsequences: false) {
+                if line.hasPrefix("event:") {
+                    name = line.dropFirst("event:".count).trimmingCharacters(in: .whitespaces)
+                    sawField = true
+                } else if line.hasPrefix("data:") {
+                    payload.append(line.dropFirst("data:".count).trimmingCharacters(in: .whitespaces))
+                    sawField = true
+                }
+            }
+            if sawField {
+                frames.append((name, payload.joined(separator: "\n")))
+            } else if block.contains(":") {
+                heartbeats += 1
+            }
+        }
+        return (frames, heartbeats)
+    }
+
+    /// POSTs a body and returns the whole response as text.
+    ///
+    /// `data(for:)` reads a chunked SSE body to EOF, which is exactly the
+    /// transcript the assertions want: every frame, in the order the writer
+    /// emitted it.
+    private func postStreaming(port: Int, path: String, body: String) async throws -> String {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)\(path)")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.httpBody = Data(body.utf8)
+        request.timeoutInterval = 900
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        // A streaming route answers 200 even when the turn fails: the error is a
+        // frame, not a status. Asserting the header is what separates the two.
+        XCTAssertEqual(
+            http.statusCode, 200,
+            "streaming routes must answer 200: \(String(decoding: data, as: UTF8.self))"
+        )
+        XCTAssertTrue(
+            (http.value(forHTTPHeaderField: "Content-Type") ?? "").contains("text/event-stream"),
+            "the streaming route must answer as SSE, got \(http.value(forHTTPHeaderField: "Content-Type") ?? "nil")"
+        )
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// Streams one OpenAI chat completion, text or text+image.
+    private func streamChat(
+        port: Int, text: String, imageBase64: String?
+    ) async throws -> StreamedTurn {
+        var parts = ["{\"type\":\"text\",\"text\":\"\(text)\"}"]
+        if let imageBase64, !imageBase64.isEmpty {
+            parts.append(
+                "{\"type\":\"image_url\",\"image_url\":"
+                    + "{\"url\":\"data:image/png;base64,\(imageBase64)\"}}"
+            )
+        }
+        // Twice the non-streaming budget: reasoning is streamed into its own
+        // `reasoning_content` field on this route, so the visible answer needs
+        // tokens that `#78` spent on the pre-amble it printed instead.
+        let body = """
+        {"model":"any","max_tokens":48,"stream":true,"messages":[
+            {"role":"user","content":[\(parts.joined(separator: ","))]}
+        ]}
+        """
+        let raw = try await postStreaming(port: port, path: "/v1/chat/completions", body: body)
+        let parsed = parseSSEFrames(raw)
+        var content = ""
+        var reasoning = ""
+        var promptTokens = -1
+        var completionTokens = -1
+        var reachedDone = false
+        var errorMessage: String?
+        for frame in parsed.frames {
+            if frame.data == "[DONE]" {
+                reachedDone = true
+                continue
+            }
+            guard let data = frame.data.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+            if let error = json["error"] as? [String: Any],
+               let message = error["message"] as? String {
+                errorMessage = message
+            }
+            // The usage tail is the one chunk with no choices, and it is where
+            // the EXPANDED prompt length reaches a streaming client.
+            if let usage = json["usage"] as? [String: Any] {
+                promptTokens = usage["prompt_tokens"] as? Int ?? promptTokens
+                completionTokens = usage["completion_tokens"] as? Int ?? completionTokens
+            }
+            if let choice = (json["choices"] as? [[String: Any]])?.first,
+               let delta = choice["delta"] as? [String: Any] {
+                content += delta["content"] as? String ?? ""
+                reasoning += delta["reasoning_content"] as? String ?? ""
+            }
+        }
+        return StreamedTurn(
+            content: content,
+            reasoning: reasoning,
+            promptTokens: promptTokens,
+            completionTokens: completionTokens,
+            reachedTerminalMarker: reachedDone,
+            eventCount: parsed.frames.count,
+            heartbeatCount: parsed.heartbeats,
+            errorMessage: errorMessage
+        )
+    }
+
+    /// Streams one Anthropic message, text or text+image.
+    private func streamMessages(
+        port: Int, text: String, imageBase64: String?
+    ) async throws -> StreamedTurn {
+        var content = ["{\"type\":\"text\",\"text\":\"\(text)\"}"]
+        if let imageBase64, !imageBase64.isEmpty {
+            content.append(
+                "{\"type\":\"image\",\"source\":{\"type\":\"base64\","
+                    + "\"media_type\":\"image/png\",\"data\":\"\(imageBase64)\"}}"
+            )
+        }
+        let body = """
+        {"model":"any","max_tokens":48,"stream":true,"messages":[
+            {"role":"user","content":[\(content.joined(separator: ","))]}
+        ]}
+        """
+        let raw = try await postStreaming(port: port, path: "/v1/messages", body: body)
+        let parsed = parseSSEFrames(raw)
+        var visible = ""
+        var reasoning = ""
+        var promptTokens = -1
+        var completionTokens = -1
+        var reachedStop = false
+        var pings = 0
+        var errorMessage: String?
+        for frame in parsed.frames {
+            guard let data = frame.data.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { continue }
+            switch frame.event {
+            case "message_start":
+                // The only frame that carries the prompt length, and the reason
+                // `promptTokensBox` exists: it is written before the first token.
+                if let message = json["message"] as? [String: Any],
+                   let usage = message["usage"] as? [String: Any] {
+                    promptTokens = usage["input_tokens"] as? Int ?? promptTokens
+                }
+            case "content_block_delta":
+                guard let delta = json["delta"] as? [String: Any] else { break }
+                switch delta["type"] as? String {
+                case "text_delta": visible += delta["text"] as? String ?? ""
+                case "thinking_delta": reasoning += delta["thinking"] as? String ?? ""
+                default: break
+                }
+            case "message_delta":
+                if let usage = json["usage"] as? [String: Any] {
+                    completionTokens = usage["output_tokens"] as? Int ?? completionTokens
+                }
+            case "ping":
+                // This route keeps the connection warm with a named event rather
+                // than an SSE comment, so a heartbeat is a frame here.
+                pings += 1
+            case "message_stop":
+                reachedStop = true
+            case "error":
+                if let error = json["error"] as? [String: Any] {
+                    errorMessage = error["message"] as? String
+                }
+            default:
+                break
+            }
+        }
+        return StreamedTurn(
+            content: visible,
+            reasoning: reasoning,
+            promptTokens: promptTokens,
+            completionTokens: completionTokens,
+            reachedTerminalMarker: reachedStop,
+            eventCount: parsed.frames.count,
+            heartbeatCount: parsed.heartbeats + pings,
+            errorMessage: errorMessage
+        )
+    }
+
+    /// Polls the request log until `count` rows for `path` have landed.
+    ///
+    /// A streaming row is recorded by the body closure's `defer`, which runs as the
+    /// response finishes, so the row can trail the client's EOF by a few
+    /// milliseconds. Polling is what makes that a boundary rather than a race.
+    private func waitForLogRows(
+        _ store: ServerRequestLogStore, path: String, count: Int
+    ) async throws -> [ServerRequestLog] {
+        let deadline = Date().addingTimeInterval(15)
+        while Date() < deadline {
+            let rows = await store.fetch(limit: 50).filter { $0.path == path }
+            if rows.count >= count { return rows }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let rows = await store.fetch(limit: 50)
+        XCTFail(
+            "expected \(count) \(path) row(s); store holds "
+                + "\(rows.map { "\($0.method) \($0.path) \($0.httpStatus)" })"
+        )
+        return []
+    }
+
+    /// A streamed image turn over `/v1/chat/completions`.
+    ///
+    /// `#78` proved the image path end to end on the non-streaming route. The
+    /// streaming route builds its plan somewhere else entirely — inside
+    /// `TurnExecutionQueue.streamTurn`'s closure, after the FIFO hands the turn its
+    /// single-flight slot — and reports what it learned over frames rather than a
+    /// response object. So the expanded prompt length reaches a streaming client
+    /// through a different value (`promptTokensBox` into the usage tail) than it
+    /// does on the other route, and nothing had ever carried an attachment through
+    /// this one.
+    func testAStreamedAPIRequestWithAnImageAnswersOverTheLocalServer() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let spec = try XCTUnwrap(config.vision, "the checkpoint must publish a vision config")
+        XCTAssertTrue(
+            ModelConfig.supportsVision(modelPath: snapshot.path),
+            "the loaded checkpoint must advertise the tower the request will use"
+        )
+        let engine = try loadPublishedCheckpointIntoTheSharedEngine(snapshot)
+        defer {
+            unloadSharedEngine()
+            withExtendedLifetime(engine) {}
+        }
+
+        let png = try smallestRedSquarePNG()
+        let pixels = try DeepSeekV41ImagePixels.decode(png)
+        let estimate = try XCTUnwrap(
+            DeepSeekV41VisionPricing.estimate(
+                width: pixels.width, height: pixels.height, spec: spec
+            ),
+            "the resize plan must price an image the decoder accepted"
+        )
+        XCTAssertGreaterThan(estimate.spanPositions, 1)
+
+        let port = 8793
+        let question = "what is in this picture?"
+        try await withLocalServer(on: port) { store in
+            let plain = try await streamChat(port: port, text: question, imageBase64: nil)
+            let pictured = try await streamChat(
+                port: port, text: question, imageBase64: png.base64EncodedString()
+            )
+            print(
+                "🔎 [dsv41 real] streamed image turn: plain \(plain.promptTokens) prompt tokens / "
+                    + "\(plain.completionTokens) generated over \(plain.eventCount) frame(s), "
+                    + "pictured \(pictured.promptTokens) / \(pictured.completionTokens) over "
+                    + "\(pictured.eventCount), span \(estimate.spanPositions) position(s)"
+            )
+            print(
+                "🔎 [dsv41 real] streamed image answer: \(pictured.content.debugDescription) "
+                    + "(\(pictured.reasoning.count) chars of reasoning, "
+                    + "\(pictured.heartbeatCount) heartbeat(s), done "
+                    + "\(pictured.reachedTerminalMarker))"
+            )
+            XCTAssertNil(
+                pictured.errorMessage,
+                "the streamed image turn failed: \(pictured.errorMessage ?? "nil")"
+            )
+            XCTAssertTrue(
+                pictured.reachedTerminalMarker, "the stream never reached [DONE]"
+            )
+            XCTAssertEqual(
+                pictured.promptTokens,
+                plain.promptTokens + 2 + estimate.spanPositions - 1,
+                "the streamed usage must report the expanded prompt: plain "
+                    + "\(plain.promptTokens), pictured \(pictured.promptTokens), span "
+                    + "\(estimate.spanPositions)"
+            )
+            XCTAssertGreaterThan(
+                pictured.completionTokens, 0, "the streamed image turn generated no token"
+            )
+            XCTAssertFalse(
+                pictured.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                "the stream produced no visible text (reasoning chars "
+                    + "\(pictured.reasoning.count))"
+            )
+
+            let logged = try await waitForLogRows(store, path: "/v1/chat/completions", count: 2)
+            XCTAssertTrue(
+                logged.allSatisfy { $0.wasStreaming },
+                "a streamed turn's row must be marked as streaming"
+            )
+            XCTAssertTrue(
+                logged.allSatisfy { $0.streamTermination == .completed },
+                "both streams finished cleanly: \(logged.map { String(describing: $0.streamTermination) })"
+            )
+            XCTAssertTrue(
+                logged.contains {
+                    $0.inputTokens == pictured.promptTokens
+                        && ($0.requestBody ?? "").contains("\"image_parts\":1")
+                },
+                "the image row must carry the expanded streaming count and name its picture: "
+                    + "\(logged.map { "\($0.inputTokens ?? -1) \($0.requestBody ?? "")" })"
+            )
+        }
+    }
+
+    /// A streamed image turn over `/v1/messages`.
+    ///
+    /// The same claim as `#79` made for the non-streaming Anthropic route, on the
+    /// writer instead of the response object: `message_start.usage.input_tokens` is
+    /// the expanded length, the text arrives as `text_delta` blocks, and the row is
+    /// marked streaming and completed.
+    func testAStreamedAnthropicRequestWithAnImageAnswersOverTheLocalServer() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let spec = try XCTUnwrap(config.vision, "the checkpoint must publish a vision config")
+        XCTAssertTrue(
+            ModelConfig.supportsVision(modelPath: snapshot.path),
+            "the loaded checkpoint must advertise the tower the request will use"
+        )
+        let engine = try loadPublishedCheckpointIntoTheSharedEngine(snapshot)
+        defer {
+            unloadSharedEngine()
+            withExtendedLifetime(engine) {}
+        }
+
+        let png = try smallestRedSquarePNG()
+        let pixels = try DeepSeekV41ImagePixels.decode(png)
+        let estimate = try XCTUnwrap(
+            DeepSeekV41VisionPricing.estimate(
+                width: pixels.width, height: pixels.height, spec: spec
+            ),
+            "the resize plan must price an image the decoder accepted"
+        )
+        XCTAssertGreaterThan(estimate.spanPositions, 1)
+
+        let port = 8794
+        let question = "what is in this picture?"
+        try await withLocalServer(on: port) { store in
+            let plain = try await streamMessages(port: port, text: question, imageBase64: nil)
+            let pictured = try await streamMessages(
+                port: port, text: question, imageBase64: png.base64EncodedString()
+            )
+            print(
+                "🔎 [dsv41 real] streamed anthropic image turn: plain \(plain.promptTokens) input "
+                    + "tokens / \(plain.completionTokens) generated over \(plain.eventCount) "
+                    + "frame(s), pictured \(pictured.promptTokens) / "
+                    + "\(pictured.completionTokens) over \(pictured.eventCount), span "
+                    + "\(estimate.spanPositions) position(s)"
+            )
+            print(
+                "🔎 [dsv41 real] streamed anthropic image answer: "
+                    + "\(pictured.content.debugDescription) (\(pictured.reasoning.count) chars of "
+                    + "reasoning, \(pictured.heartbeatCount) heartbeat(s), stopped "
+                    + "\(pictured.reachedTerminalMarker))"
+            )
+            XCTAssertNil(
+                pictured.errorMessage,
+                "the streamed image turn failed: \(pictured.errorMessage ?? "nil")"
+            )
+            XCTAssertTrue(
+                pictured.reachedTerminalMarker, "the stream never reached message_stop"
+            )
+            XCTAssertEqual(
+                pictured.promptTokens,
+                plain.promptTokens + 2 + estimate.spanPositions - 1,
+                "the streamed message_start usage must report the expanded prompt: plain "
+                    + "\(plain.promptTokens), pictured \(pictured.promptTokens), span "
+                    + "\(estimate.spanPositions)"
+            )
+            XCTAssertGreaterThan(
+                pictured.completionTokens, 0, "the streamed image turn generated no token"
+            )
+            XCTAssertFalse(
+                pictured.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                "the stream produced no text block (reasoning chars \(pictured.reasoning.count))"
+            )
+
+            let logged = try await waitForLogRows(store, path: "/v1/messages", count: 2)
+            XCTAssertTrue(
+                logged.allSatisfy { $0.wasStreaming },
+                "a streamed turn's row must be marked as streaming"
+            )
+            XCTAssertTrue(
+                logged.allSatisfy { $0.streamTermination == .completed },
+                "both streams finished cleanly: \(logged.map { String(describing: $0.streamTermination) })"
+            )
+            XCTAssertTrue(
+                logged.contains {
+                    $0.inputTokens == pictured.promptTokens
+                        && ($0.requestBody ?? "").contains("\"image_blocks\":1")
+                },
+                "the image row must carry the expanded streaming count and name its picture: "
+                    + "\(logged.map { "\($0.inputTokens ?? -1) \($0.requestBody ?? "")" })"
+            )
+        }
+    }
+
     /// The smallest thing ImageIO will decode.
     ///
     /// The checkpoint's own `min_pixels` floor (544x544) turns this 2x2 into its

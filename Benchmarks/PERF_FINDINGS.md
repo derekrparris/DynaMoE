@@ -12489,3 +12489,114 @@ in the same command (`/tmp/test79_build1.log`, `/tmp/test79_run1.log`). Bundle f
 running, because `#78`'s silent-zero trap is a green run that executes nothing. `Executed 2 tests, with 0
 failures`, and each case's `passed` line is present, which is the only thing that distinguishes a real
 run from that trap.
+## DSV4.1 #80: THE STREAMING ROUTES CARRY A PICTURE TOO, AND A STREAMED REFUSAL WEARS A 200
+
+### The question
+
+`#78` and `#79` proved the image path end to end over real HTTP on both protocols, and both drove the
+**non-streaming** route. The streaming route is a different program above the same engine seam:
+
+- The plan is built *inside* `TurnExecutionQueue.streamTurn`'s closure, after the FIFO hands the turn the
+  engine's single-flight slot — not on the request path. A picture is resolved by
+  `buildTurnPlan` either way, but on a different call site, at a different time, in a `do`/`catch` whose
+  failure path is a frame rather than an HTTP error.
+- The expanded prompt length reaches the client through `promptTokensBox`: the OpenAI writer puts it in a
+  final usage chunk with `choices: []`, the Anthropic writer in `message_start.message.usage.input_tokens`.
+  Neither is the non-streaming `usage` object, and neither had ever been asked for an image's number.
+- **A streamed failure wears a 200.** Both routes answer `200 text/event-stream` before the turn is
+  planned, so a refused attachment arrives as an error frame and then a terminal marker. A test that only
+  asserts "status 200 and some text" cannot tell a picture the model saw from a picture the server refused.
+
+Routing: `next_slice` = `streaming_image_turn` **0.844 @ 0.819** against advertising vision in
+`/v1/models` 0.140, single-flight queueing 0.007, a docs pass 0.004 and the three remaining prefill terms
+at 0.0021, 0.0012 and 0.0011; `perf_still_worth_a_slice` **0.0014**.
+
+### What landed
+
+Two opt-in cases, `testAStreamedAPIRequestWithAnImageAnswersOverTheLocalServer` (port 8793) and
+`testAStreamedAnthropicRequestWithAnImageAnswersOverTheLocalServer` (8794), plus five helpers:
+`parseSSEFrames`, `postStreaming`, `streamChat`, `streamMessages` and `waitForLogRows`.
+
+- `parseSSEFrames` splits the transcript the way the spec does: a frame is a block of lines ended by a
+  blank line, `event:` names it, `data:` carries the payload (multi-line payloads joined), and a block with
+  no field but a leading `:` is a comment heartbeat.
+- `postStreaming` reads the chunked SSE body to EOF with `data(for:)` and asserts the two things a
+  streaming route promises regardless of the turn's fate: `200` and `Content-Type: text/event-stream`.
+- `waitForLogRows` polls the in-memory store, because a streaming row is recorded by the body closure's
+  `defer` as the response finishes and can trail the client's EOF by a few milliseconds. `#78`'s
+  single `fetch` was safe only because a non-streaming row is recorded before the route returns.
+- Both cases reuse `#78`'s `withLocalServer` and `#79`'s `loadPublishedCheckpointIntoTheSharedEngine`
+  unchanged, and keep the delta contract: plain turn and pictured turn, same question, same body.
+
+Two deliberate differences from the non-streaming cases, both recorded in the code:
+
+- **`max_tokens: 48` rather than 24.** On the OpenAI route reasoning is streamed into its own
+  `reasoning_content` field (`resolvedInlineReasoning` is off by default), so the visible answer needs
+  tokens the non-streaming case spent on the pre-amble it printed as content. 48 leaves room for both.
+- **The error frame is collected and asserted nil.** That is the only signal a streamed refusal leaves.
+
+### Evidence
+
+```
+🔎 [dsv41 real] live server: 96085 tensors in 48 shard(s), mapped 48/48 segment(s), 475.2508442029357 GB
+🔎 [dsv41 real] streamed image turn: plain 190 prompt tokens / 47 generated over 51 frame(s),
+   pictured 375 / 47 over 52, span 184 position(s)
+🔎 [dsv41 real] streamed image answer: "The user has shared an image that appears to be entirely
+   red/crimson colored with no visible content — it looks like a solid color block, possibly a
+   placeholder or an image that failed to load properly. I should describe what I see"
+   (0 chars of reasoning, 264 heartbeat(s), done true)
+Test Case '…testAStreamedAPIRequestWithAnImageAnswersOverTheLocalServer' passed (122.841 seconds).
+🔎 [dsv41 real] live server: 96085 tensors in 48 shard(s), mapped 48/48 segment(s), 475.2508442029357 GB
+🔎 [dsv41 real] streamed anthropic image turn: plain 165 input tokens / 46 generated over
+   79 frame(s), pictured 350 / 32 over 288, span 184 position(s)
+🔎 [dsv41 real] streamed anthropic image answer: "The image you shared appears to be completely
+   solid red with no visible content, shapes, text, or objects—just a uniform red color filling
+   the entire frame." (0 chars of reasoning, 251 heartbeat(s), stopped true)
+Test Case '…testAStreamedAnthropicRequestWithAnImageAnswersOverTheLocalServer' passed (115.401 seconds).
+	 Executed 2 tests, with 0 failures (0 unexpected) in 238.241 seconds
+```
+
+The delta is the same 185 on both routes and on both transports: `375 - 190` and `350 - 165`, each
+`= 2 + 184 - 1`. The rows are the other half of the claim and are asserted as such: both turns logged
+`wasStreaming`, both `streamTermination == .completed`, and the image row's `inputTokens` is the
+**expanded** count the usage frame reported (`"image_parts":1` / `"image_blocks":1` in the captured body).
+
+### The two writers keep the connection warm in two different ways, and the first run's instrument said they did not
+
+The first run printed `0 heartbeat(s)` for the Anthropic pictured turn and `266` for the OpenAI one, on
+turns that took the same ~95 s of image prefill. That read like a real asymmetry, and it was the
+instrument: OpenAI's keep-alive is `writer.write(":\(comment)\n\n")` — an SSE **comment block**, which is
+what `parseSSEFrames` counts as a heartbeat — while the Anthropic writer calls `sse("ping",
+AnthropicPingEvent())`, which emits a named `event: ping` frame with a JSON payload. The parser counted
+those as payload frames, so the Anthropic turn's 251 keep-alives were sitting inside its 288 "frames".
+
+Fixed before anything was written down, by counting `event: ping` as a heartbeat on that route: **264
+keep-alives on the OpenAI route and 251 on the Anthropic one**, against 52 and 288 total frames. So both
+writers do hold a long image prefill open, at roughly a 0.35 s cadence, and the earlier number was a
+parser classifying the two mechanisms differently.
+
+### What it does not mean
+
+- **Not a latency claim.** These cases prove the transcript, not the cadence: the frames are asserted for
+  order and content, and no timing is asserted anywhere.
+- **Not `/v1/models`.** It still advertises no vision capability, so a client cannot discover that the
+  served model accepts pictures. That remains the next completeness gap.
+- **Not a queue or lifecycle change.** Single-flight is untouched: a concurrent request during an in-app
+  turn still gets a 503 rather than queueing behind it, and the streaming routes inherit that as
+  `#77` left it.
+- **Not a second image path.** Both protocols still reach the same `attachImageMarkers`, the same
+  `DeepSeekV41TurnImages.bind` and the same expanded-prompt cache provisioning. Four cases now walk the
+  two protocols on both transports to one implementation.
+- **Not deterministic text.** Two runs of the Anthropic case generated 47 and 32 tokens from the same
+  prompt (`top_p` sampling), so the assertions are the delta, the terminal marker, non-emptiness and the
+  row. The wording is printed as evidence and never asserted.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_80` twice (status 0 both times; only the two
+pre-existing `ContentView.swift` Swift-6 actor warnings), then `test-without-building` **with the same
+`-derivedDataPath`** for both cases in one run each time — `/tmp/test80_run1.log` before the heartbeat fix
+and `/tmp/test80_run2.log` after it, `Executed 2 tests, with 0 failures` in both, with each case's
+`passed` line present. Bundle freshness checked with
+`strings … | grep -c "testAStreamedAPI…\|testAStreamedAnthropic…"` (2) before running, because `#78`'s
+silent-zero trap is a green run that executes nothing.
