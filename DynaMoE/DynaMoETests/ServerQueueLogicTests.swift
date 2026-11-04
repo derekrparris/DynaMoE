@@ -461,4 +461,238 @@ final class ServerQueueLogicTests: XCTestCase {
         XCTAssertEqual(firstValue, 1)
         try await waitUntil { await queue.pendingCount == 0 }
     }
+
+    /// Tracks how many turns were inside their work at the same time.
+    private final class OverlapBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var live = 0
+        private var peak = 0
+        private var finished = 0
+
+        func enter() {
+            lock.lock()
+            live += 1
+            peak = max(peak, live)
+            lock.unlock()
+        }
+
+        func leave() {
+            lock.lock()
+            live -= 1
+            finished += 1
+            lock.unlock()
+        }
+
+        func stats() -> (peak: Int, finished: Int) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (peak, finished)
+        }
+    }
+
+    /// The queue's chain is READ AND ADVANCED WITHOUT A SUSPENSION in between, and
+    /// that atomicity IS the queue: a turn that read a half-advanced tail would chain
+    /// off the turn before it and run alongside it. The engine then refuses the second
+    /// as "a generation is already active", so the symptom is a 503 under load rather
+    /// than anything visible in this queue.
+    ///
+    /// A burst of independent enqueues is the case that exposes it, and the property
+    /// it pins is peak concurrency rather than timing: the pre-fix queue reached a
+    /// peak above 1 here, and the shipped one stays at 1 over five consecutive runs.
+    func testConcurrentEnqueuesNeverRunTwoTurnsAtOnce() async throws {
+        // Both paths through the wait, because they get their exclusivity from
+        // different places: no deadline relies on the chain alone, and a deadline
+        // adds the engine-slot probe on top.
+        for queueWaitTimeout in [nil, 5.0] as [TimeInterval?] {
+            let queue = TurnExecutionQueue(slotProbe: { true })
+            let box = OverlapBox()
+            let turns = 24
+
+            await withTaskGroup(of: Void.self) { group in
+                for _ in 0..<turns {
+                    group.addTask {
+                        _ = try? await queue.perform({ () async throws -> Int in
+                            box.enter()
+                            // Long enough for a second turn to overlap if the chain
+                            // lets it, short enough to keep the case fast.
+                            try? await Task.sleep(nanoseconds: 1_000_000)
+                            box.leave()
+                            return 0
+                        }, queueWaitTimeout: queueWaitTimeout)
+                    }
+                }
+                await group.waitForAll()
+            }
+
+            let stats = box.stats()
+            let label = queueWaitTimeout == nil ? "unbounded" : "deadline"
+            XCTAssertEqual(stats.finished, turns, "\(label): every enqueued turn must run")
+            XCTAssertEqual(
+                stats.peak, 1,
+                "\(label): two turns must never hold the engine at once"
+            )
+            try await waitUntil { await queue.pendingCount == 0 }
+        }
+    }
+
+    // MARK: An in-app generation holding the engine slot
+
+    /// Stands in for `CompletionEngine.isActive` in the queue's slot probe.
+    private final class SlotBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var free = false
+
+        func setFree(_ newValue: Bool) {
+            lock.lock()
+            free = newValue
+            lock.unlock()
+        }
+
+        func isFree() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return free
+        }
+    }
+
+    /// Lock-guarded list so the order turns actually ran in can be asserted from
+    /// the test task while the queue's tasks append.
+    private final class OrderBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var items: [Int] = []
+
+        func append(_ value: Int) {
+            lock.lock()
+            items.append(value)
+            lock.unlock()
+        }
+
+        func snapshot() -> [Int] {
+            lock.lock()
+            defer { lock.unlock() }
+            return items
+        }
+    }
+
+    /// The chat UI launches turns straight through `CompletionEngine.launchTurn`
+    /// and never routes them through this queue, so an in-app generation holds the
+    /// engine's ONE generation slot where the FIFO cannot see it. A request that
+    /// arrives mid-answer must therefore queue behind it: the client asked first,
+    /// the resource is busy for a bounded time, and the queue already has a
+    /// deadline and a heartbeat. Before this, such a request was refused with 503
+    /// before it had waited at all.
+    func testPerformWaitsForAnInAppGenerationInsteadOfRefusing() async throws {
+        let slot = SlotBox()
+        let queue = TurnExecutionQueue(slotProbe: { slot.isFree() })
+        let ran = FlagBox()
+
+        let turn = Task { try await queue.perform { ran.set(true); return 7 } }
+        try await waitUntil { await queue.pendingCount == 1 }
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        XCTAssertFalse(ran.get(), "the work must not run while the app holds the engine slot")
+        XCTAssertFalse(turn.isCancelled)
+
+        slot.setFree(true)
+        let value = try await turn.value
+        XCTAssertEqual(value, 7, "the queued request runs once the app's generation ends")
+        XCTAssertTrue(ran.get())
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
+
+    /// The wait is bounded by the same deadline as every other queue wait, and it
+    /// says which of the two things it waited on: a client debugging a 408 needs
+    /// to know whether the queue was long or the app was busy.
+    func testPerformTimesOutWaitingForAnInAppGeneration() async throws {
+        let slot = SlotBox()
+        let queue = TurnExecutionQueue(slotProbe: { slot.isFree() })
+        let ran = FlagBox()
+        let slotOpened = FlagBox()
+
+        do {
+            _ = try await queue.perform(
+                { ran.set(true); return 1 },
+                queueWaitTimeout: 0.2,
+                onSlotOpened: { slotOpened.set(true) }
+            )
+            XCTFail("the request must be told it could not get the slot")
+        } catch let error as ServerAPIError {
+            XCTAssertEqual(error.status, .requestTimeout)
+            XCTAssertTrue(error.message.contains("timed out"), "the timeout error must explain itself")
+            XCTAssertTrue(
+                error.message.contains("DynaMoE app"),
+                "the message must name the in-app generation, not a queue of other requests"
+            )
+        }
+        XCTAssertFalse(ran.get(), "a timed-out request never reaches the engine")
+        XCTAssertFalse(slotOpened.get(), "no queue wait is billed, because no turn ran")
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
+
+    /// The same rule on the streaming path, where the refusal travels as an error
+    /// frame rather than an HTTP status.
+    func testStreamTurnEmitsLaunchFailedWhileAnInAppGenerationHoldsTheSlot() async throws {
+        let slot = SlotBox()
+        let queue = TurnExecutionQueue(slotProbe: { slot.isFree() })
+        let ran = FlagBox()
+
+        let (stream, _) = await queue.streamTurn({ _ in ran.set(true) }, queueWaitTimeout: 0.2)
+        var failure: ServerAPIError?
+        for await event in stream {
+            if case .launchFailed(let apiError) = event { failure = apiError }
+        }
+        XCTAssertEqual(failure?.status, .requestTimeout)
+        XCTAssertTrue(failure?.message.contains("DynaMoE app") == true)
+        XCTAssertFalse(ran.get())
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
+
+    /// Queue wait is measured from request arrival, and the wait for an in-app
+    /// generation is queue wait: the slot-open hook is what the log rows stamp
+    /// `queueWaitMs` from, so firing it early would count the app's generation as
+    /// this request's own.
+    func testSlotOpenedHookWaitsForTheInAppGenerationToo() async throws {
+        let slot = SlotBox()
+        let queue = TurnExecutionQueue(slotProbe: { slot.isFree() })
+        let slotOpened = FlagBox()
+
+        let turn = Task {
+            try await queue.perform(
+                { () async throws -> Int in 3 },
+                onSlotOpened: { slotOpened.set(true) }
+            )
+        }
+        try await waitUntil { await queue.pendingCount == 1 }
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(slotOpened.get(), "the hook must not fire while the app holds the slot")
+
+        slot.setFree(true)
+        let value = try await turn.value
+        XCTAssertEqual(value, 3)
+        XCTAssertTrue(slotOpened.get(), "the hook fires when the slot genuinely opens")
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
+
+    /// One slot, two ways to hold it: a turn queued behind an in-app generation
+    /// still queues behind the earlier SERVER turn first, and the FIFO order among
+    /// requests survives the new wait.
+    func testFIFOOrderSurvivesWaitingForAnInAppGeneration() async throws {
+        let slot = SlotBox()
+        let queue = TurnExecutionQueue(slotProbe: { slot.isFree() })
+        let order = OrderBox()
+
+        let first = Task { try await queue.perform { order.append(1); return 1 } }
+        try await waitUntil { await queue.pendingCount == 1 }
+        let second = Task { try await queue.perform { order.append(2); return 2 } }
+        try await waitUntil { await queue.pendingCount == 2 }
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(order.snapshot(), [], "nothing runs while the app holds the slot")
+
+        slot.setFree(true)
+        _ = try await first.value
+        _ = try await second.value
+        XCTAssertEqual(order.snapshot(), [1, 2], "requests keep the order they arrived in")
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
 }

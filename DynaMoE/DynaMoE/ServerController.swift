@@ -40,12 +40,25 @@ enum QueuedTurnEvent: @unchecked Sendable {
 
 /// FIFO queue over the engine's single-flight generation slot. Each request
 /// enqueues its whole turn; the work only begins once every earlier turn has
-/// fully drained. Cancellation propagates to the owner task, which cancels
-/// the engine turn handle. Queue-wait timeouts are delivered at their
-/// deadline even when a predecessor is stalled; the timed-out turn leaves
-/// the queue without running work, while turns queued behind it still wait
-/// for their predecessors' drain.
+/// fully drained AND the engine's one generation slot is free — the chat UI
+/// and the agent harness launch turns straight through the engine, so they
+/// hold that slot without appearing in this FIFO and a request waits for them
+/// the same way it waits for its predecessor. Cancellation propagates to the
+/// owner task, which cancels the engine turn handle. Queue-wait timeouts are
+/// delivered at their deadline even when a predecessor is stalled; the
+/// timed-out turn leaves the queue without running work, while turns queued
+/// behind it still wait for their predecessors' drain.
 actor TurnExecutionQueue {
+    /// How the queue asks whether the engine's single-flight generation slot is
+    /// free. A probe rather than a direct read so the wait for an in-app
+    /// generation can be tested without loading a model; production passes the
+    /// default.
+    private let slotProbe: @Sendable () async -> Bool
+
+    init(slotProbe: @escaping @Sendable () async -> Bool = TurnExecutionQueue.engineSlotIsFree) {
+        self.slotProbe = slotProbe
+    }
+
     /// Chain element for successor turns: resolves only once every earlier
     /// operation's work has drained. A timed-out operation contributes no
     /// work, so its chain element resolves when its own predecessor drains.
@@ -81,64 +94,123 @@ actor TurnExecutionQueue {
         liveCancelBoxes[id] = nil
     }
 
-    /// Waits for the predecessor to drain, but gives up at `deadline` so a
-    /// stalled or long-running leader cannot hold a timed-out request past
-    /// its deadline. `Task.value` awaits ignore cancellation, so the
-    /// predecessor's completion is observed by a detached watcher and raced
-    /// against the deadline on a short poll cadence; the watcher is
-    /// abandoned on timeout and completes on its own. Returning `true` means
-    /// the slot is genuinely open — the FIFO barrier for real work is
-    /// untouched, since callers run work only after this returns true.
-    nonisolated private static func waitForSlot(_ previous: Task<Void, Never>, deadline: Date) async throws -> Bool {
+    /// Why a turn stopped waiting for the engine's generation slot.
+    private enum SlotWaitOutcome {
+        /// Nothing holds the slot: run the work.
+        case opened
+        /// An earlier SERVER turn was still draining at the deadline.
+        case timedOutBehindTurns
+        /// The deadline passed with a generation the app started holding the slot.
+        case timedOutBehindInAppTurn
+    }
+
+    /// The engine's single-flight slot as it stands right now.
+    ///
+    /// Read through the engine rather than tracked here, because the chat UI and
+    /// the agent harness call `CompletionEngine.launchTurn` directly and never
+    /// route through this queue — so a slot this queue believes free is not
+    /// necessarily free.
+    nonisolated private static func engineSlotIsFree() async -> Bool {
+        let active = await CompletionEngine.shared.isActive
+        return !active
+    }
+
+    /// Waits for the engine's single-flight generation slot to be free: first for
+    /// every earlier queued turn to drain, then for whoever else holds it.
+    ///
+    /// There is ONE slot, and an in-app generation occupies it without passing
+    /// through this FIFO. Waiting for it rather than failing is what makes a
+    /// request that arrives mid-answer queue instead of returning 503: the client
+    /// asked first, the resource is busy for a bounded time, and the queue already
+    /// has a deadline and a heartbeat. `deadline` bounds both waits, so a stalled
+    /// predecessor or a very long in-app generation cannot hold a request past its
+    /// budget — it is told, with a message that names which of the two it waited
+    /// on. Returning `.opened` means the slot is genuinely free; callers run work
+    /// only then, so the FIFO barrier for real work is untouched.
+    nonisolated private static func waitForSlot(
+        _ previous: Task<Void, Never>,
+        deadline: Date?,
+        slotProbe: @Sendable () async -> Bool
+    ) async throws -> SlotWaitOutcome {
         let drained = DrainFlag()
         let watcher = Task.detached(priority: .utility) { [previous, drained] in
             _ = await previous.value
             drained.mark()
         }
         defer { watcher.cancel() }
-        while !drained.isDrained {
+        // `Task.value` awaits ignore cancellation, so an unbounded wait polls the
+        // drained flag rather than awaiting the predecessor directly. With no
+        // deadline (the user asked to wait indefinitely) there is nothing to race,
+        // so await it properly and spend nothing.
+        if let deadline {
+            while !drained.isDrained {
+                try Task.checkCancellation()
+                if Date() >= deadline {
+                    return .timedOutBehindTurns
+                }
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+        } else {
+            await previous.value
+        }
+        // Same deadline, same cadence: only reached while a generation is actually
+        // running, so the idle case costs one MainActor hop.
+        while true {
             try Task.checkCancellation()
-            if Date() >= deadline {
-                return false
+            if await slotProbe() { return .opened }
+            if let deadline, Date() >= deadline {
+                return .timedOutBehindInAppTurn
             }
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
-        return true
     }
 
     /// Enqueues streaming work. Returns the event relay stream plus the task
     /// that owns the work (cancel it to abort a queued/running turn).
     /// `queueWaitTimeout` bounds how long the turn may sit behind earlier
-    /// turns; when it expires the relay emits a launchFailed event instead of
-    /// running the work — promptly, even if an earlier turn is stalled. Nil
-    /// (the default) waits indefinitely. `onSlotOpened` fires exactly once,
-    /// the instant the FIFO slot opens and immediately before the work runs
-    /// (never on the timeout or cancellation paths), mirroring `perform`: the
-    /// streaming writers stamp their box's `queueWaitMs` through the hook —
-    /// at the producer — because the relay can deliver an event late, so an
-    /// SSE writer blocked on an earlier heartbeat would otherwise stamp
-    /// generation time as queue wait.
+    /// turns OR behind a generation the app started (the queue is a FIFO over
+    /// one engine slot, and the chat UI occupies that slot without passing
+    /// through it); when it expires the relay emits a launchFailed event
+    /// instead of running the work — promptly, even if an earlier turn is
+    /// stalled. Nil (the default) waits indefinitely. `onSlotOpened` fires
+    /// exactly once, the instant the FIFO slot opens and immediately before
+    /// the work runs (never on the timeout or cancellation paths), mirroring
+    /// `perform`: the streaming writers stamp their box's `queueWaitMs`
+    /// through the hook — at the producer — because the relay can deliver an
+    /// event late, so an SSE writer blocked on an earlier heartbeat would
+    /// otherwise stamp generation time as queue wait.
     func streamTurn(
         _ work: @escaping @Sendable (_ emit: @escaping @Sendable (QueuedTurnEvent) -> Void) async -> Void,
         queueWaitTimeout: TimeInterval? = nil,
         onSlotOpened: (@Sendable () -> Void)? = nil
     ) -> (AsyncStream<QueuedTurnEvent>, Task<Void, Never>) {
         let (stream, continuation) = AsyncStream.makeStream(of: QueuedTurnEvent.self, bufferingPolicy: .unbounded)
+        // Read and advance the chain with no suspension in between, exactly as
+        // `perform` does: the gate is built first and waits on `drained`, which the
+        // turn's own task resolves in its `defer`.
         let previous = tail
         enqueuedOperations += 1
         let deadline = queueWaitTimeout.map { Date().addingTimeInterval($0) }
+        let drained = SlotDrain()
+        let gate = Task<Void, Never> { [previous, drained] in
+            await previous.value
+            await drained.wait()
+        }
+        tail = gate
+
         let cancelBox = ServerTurnCancelBox()
         let hookID = registerCancelBox(cancelBox)
         let heartbeat = Task {
             // Queue-wait heartbeat so clients don't idle-timeout while a long
-            // turn ahead of us holds the single-flight slot.
+            // turn ahead of us — or a generation the app is running — holds the
+            // single-flight slot.
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
                 guard !Task.isCancelled else { return }
                 continuation.yield(.ping(comment: nil))
             }
         }
-        let task = Task<Void, Never> { [previous, heartbeat, deadline, onSlotOpened] in
+        let task = Task<Void, Never> { [previous, heartbeat, deadline, onSlotOpened, slotProbe, drained] in
             defer {
                 // The heartbeat also serves the RUNNING turn: cancel it here, not
                 // right after the previous turn drains, so the SSE stream keeps
@@ -147,17 +219,22 @@ actor TurnExecutionQueue {
                 self.completedOperations += 1
                 self.deregisterCancelBox(hookID)
                 heartbeat.cancel()
+                drained.resolve()
             }
             do {
-                let slotOpened: Bool
-                if let deadline {
-                    slotOpened = try await Self.waitForSlot(previous, deadline: deadline)
-                } else {
-                    await previous.value
-                    slotOpened = true
-                }
-                guard slotOpened else {
-                    continuation.yield(.launchFailed(ServerAPIError.requestTimeout("Request timed out waiting in the generation queue")))
+                switch try await Self.waitForSlot(
+                    previous, deadline: deadline, slotProbe: slotProbe
+                ) {
+                case .opened:
+                    break
+                case .timedOutBehindTurns:
+                    continuation.yield(.launchFailed(ServerAPIError.requestTimeout(
+                        "Request timed out waiting in the generation queue")))
+                    continuation.finish()
+                    return
+                case .timedOutBehindInAppTurn:
+                    continuation.yield(.launchFailed(ServerAPIError.requestTimeout(
+                        "Request timed out waiting for a generation running in the DynaMoE app")))
                     continuation.finish()
                     return
                 }
@@ -175,23 +252,15 @@ actor TurnExecutionQueue {
             continuation.finish()
         }
         cancelBox.set { task.cancel() }
-        // Successors wait for this turn's full drain, not merely its task
-        // completion: a turn that timed out without running still holds its
-        // predecessors' drain for the turns queued behind it.
-        let gate = Task<Void, Never> { [previous, task] in
-            await previous.value
-            _ = await task.value
-        }
-        // Keep the chain element alive regardless of this task's outcome.
-        tail = gate
         return (stream, task)
     }
 
     /// Enqueues value-returning work (non-streaming requests and other
     /// engine-facing endpoints). `queueWaitTimeout` bounds how long the work
-    /// may sit behind earlier turns; when it expires the perform throws a
-    /// request-timeout error instead of running the work — promptly, even if
-    /// an earlier turn is stalled. Nil (the default) waits indefinitely.
+    /// may sit behind earlier turns OR behind a generation the app started;
+    /// when it expires the perform throws a request-timeout error instead of
+    /// running the work — promptly, even if an earlier turn is stalled. Nil
+    /// (the default) waits indefinitely.
     /// `onSlotOpened` fires exactly once, the instant the FIFO slot opens and
     /// immediately before the work runs (never on the timeout or
     /// cancellation paths), so callers can split queue wait from generation
@@ -204,36 +273,49 @@ actor TurnExecutionQueue {
         queueWaitTimeout: TimeInterval? = nil,
         onSlotOpened: (@Sendable () -> Void)? = nil
     ) async throws -> T {
+        // The chain is READ AND ADVANCED WITHOUT A SUSPENSION between the two, and
+        // only value construction and a nonisolated lock box sit between them. That
+        // atomicity is the queue: a successor that read a half-advanced `tail` would
+        // chain off the turn BEFORE this one and run alongside it, which the engine
+        // then refuses as a second active turn. Building the gate before the work
+        // task is what makes it possible — the gate waits on `drained`, which the
+        // task resolves in its own `defer`.
         let previous = tail
         enqueuedOperations += 1
         let deadline = queueWaitTimeout.map { Date().addingTimeInterval($0) }
+        let drained = SlotDrain()
+        let gate = Task<Void, Never> { [previous, drained] in
+            await previous.value
+            await drained.wait()
+        }
+        tail = gate
+
         let cancelBox = ServerTurnCancelBox()
         let hookID = registerCancelBox(cancelBox)
-        let task = Task<T, Error> { [previous, deadline] in
+        let task = Task<T, Error> { [previous, deadline, slotProbe, drained] in
             defer {
                 self.completedOperations += 1
                 self.deregisterCancelBox(hookID)
+                drained.resolve()
             }
-            let slotOpened: Bool
-            if let deadline {
-                slotOpened = try await Self.waitForSlot(previous, deadline: deadline)
-            } else {
-                await previous.value
-                slotOpened = true
-            }
-            guard slotOpened else {
+            let outcome = try await Self.waitForSlot(
+                previous, deadline: deadline, slotProbe: slotProbe
+            )
+            switch outcome {
+            case .opened:
+                break
+            case .timedOutBehindTurns:
                 throw ServerAPIError.requestTimeout("Request timed out waiting in the generation queue")
+            case .timedOutBehindInAppTurn:
+                throw ServerAPIError.requestTimeout(
+                    "Request timed out waiting for a generation running in the DynaMoE app"
+                )
             }
             try Task.checkCancellation()
             onSlotOpened?()
             return try await work()
         }
         cancelBox.set { task.cancel() }
-        let gate = Task<Void, Never> { [previous, task] in
-            await previous.value
-            _ = try? await task.value
-        }
-        tail = gate
         return try await withTaskCancellationHandler {
             try await task.value
         } onCancel: {
@@ -244,7 +326,13 @@ actor TurnExecutionQueue {
 
 /// Lock-guarded one-shot flag so a queue slot wait can poll its
 /// predecessor's drain without a data race.
-private final class DrainFlag: @unchecked Sendable {
+///
+/// `nonisolated` because every one of these boxes is touched from the queue
+/// actor and from a nonisolated static wait: the target builds with
+/// `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, so leaving them unannotated
+/// makes them main-actor types called across an isolation boundary from the
+/// queue's critical path.
+private nonisolated final class DrainFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var drained = false
 
@@ -261,10 +349,52 @@ private final class DrainFlag: @unchecked Sendable {
     }
 }
 
+/// One-shot completion signal for a queued turn.
+///
+/// The FIFO gate has to exist BEFORE the turn's task does — that is what lets the
+/// queue read and advance its chain without a suspension in between — so the gate
+/// waits on this instead of on `Task.value`. Resolving twice is free, and a
+/// resolve that lands before the wait still releases it.
+private nonisolated final class SlotDrain: @unchecked Sendable {
+    private let lock = NSLock()
+    private var resolved = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func resolve() {
+        lock.lock()
+        guard !resolved else {
+            lock.unlock()
+            return
+        }
+        resolved = true
+        let pending = waiters
+        waiters = []
+        lock.unlock()
+        for waiter in pending { waiter.resume() }
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if resolved {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            waiters.append(continuation)
+            lock.unlock()
+        }
+    }
+}
+
 /// Cancel invoker for a queued turn's shutdown registry entry. The work task
 /// does not exist yet at enqueue time, so the real cancel closure is
 /// installed right after task creation; `invoke` before that is a no-op.
-private final class ServerTurnCancelBox: @unchecked Sendable {
+///
+/// `nonisolated` for the same reason as `DrainFlag`: the queue actor installs
+/// and invokes it, and `cancelLiveWork()` must be able to run it from server
+/// shutdown without crossing an actor.
+private nonisolated final class ServerTurnCancelBox: @unchecked Sendable {
     private let lock = NSLock()
     private var cancel: (() -> Void)?
 

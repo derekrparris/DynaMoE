@@ -12799,8 +12799,11 @@ composer quotes, so the wire range cannot disagree with the per-image chip: 0.32
   resize plan) without shipping the tower's weights, which is exactly the half-downloaded case
   `supportsVision` refuses for the composer. `entry(for:)` gates the cost block on `supportsVision`,
   so the two cannot disagree about whether an attachment will be read.
-- **Not a change to the single-flight contract.** A request that arrives during an in-app turn still
-  gets a `503` rather than queueing (0.059 against changing it).
+- **Not a change to the single-flight contract, in this slice.** A request that arrives during an
+  in-app turn still got a `503` rather than queueing here (0.059 against changing it), which `#83`
+  then took on anyway — on the user's instruction, and it turned up the defect underneath the
+  policy question: the queue was not serializing concurrent enqueues at all. Nothing about the
+  cost metadata above depends on that.
 
 ### The two prose repairs that rode along
 
@@ -12855,3 +12858,107 @@ the suite):
 and `ServerControllerSmokeTests.testModelsEndpointServesOpenAIListShape` still passes unchanged
 (0.948 s, `/tmp/test82_run3.log`): it asserts the list shape and the id, which is the part this slice
 left alone.
+
+## DSV4.1 #83: THE FIFO WAS NOT A FIFO UNDER A BURST, AND AN IN-APP GENERATION NOW QUEUES INSTEAD OF REFUSING
+
+### The question
+
+Two things were wrong with the server's turn queueing, and they were the same thing:
+`TurnExecutionQueue` is documented as "a FIFO over the engine's single-flight generation
+slot", and it was neither.
+
+1. **A request that arrived while the app was generating got `503` before it had waited at
+   all.** `CompletionEngine.launchTurn` refuses a second turn (`engineNotReady`), and the
+   server mapped that straight to `503 overloaded`. The queue serialized *server* turns only;
+   the chat UI and the agent harness call `launchTurn` directly, so the one engine slot had a
+   second holder the FIFO could not see. A client that asked while a chat answer was streaming
+   was told the server was overloaded.
+2. **Under a burst, the queue let every request through at once.** `perform`/`streamTurn` read
+   `tail`, then did several things — including constructing and configuring
+   `ServerTurnCancelBox`, a `MainActor`-isolated type in this target — before writing the new
+   chain element. Those calls are hops off the queue actor, so a burst of enqueues could all
+   read the SAME `tail` and chain off a turn that was not the previous one. The engine then
+   refused all but the first as a second active turn: **23 of 24 concurrent requests returned
+   `503`**, and the queue's own bookkeeping never noticed.
+
+Routing: the user asked for this slice after `#82`; the previous run had already put
+`serve_queueing_should_change` at **0.059**, so this is work taken on the user's instruction
+rather than on the routing evidence — which is the right call in hindsight, because what it
+found was not the policy question that ran (should an API turn queue behind an in-app turn)
+but a defect underneath it.
+
+### What was wrong, measured
+
+`ServerQueueLogicTests.testConcurrentEnqueuesNeverRunTwoTurnsAtOnce` is the instrument: 24
+independent enqueues, each turn incrementing a lock-guarded live counter on entry and
+decrementing it on exit, 1 ms of work inside, and the peak recorded.
+
+| arm | peak concurrent turns | finished |
+|---|---|---|
+| pre-fix queue, no deadline | **24** | 24 |
+| pre-fix queue, 5 s deadline | **24** | 24 |
+| shipped queue, either arm | **1** | 24 |
+
+That case failed **5 of 5** runs against the pre-fix queue (`XCTAssertEqual failed: ("24") is
+not equal to ("1")`) and passes 11 of 11 after. It also explains a pre-existing red test that
+had been failing on `main`: `testPerformInvokesSlotOpenedOnlyWhenSlotOpens` asserts the
+slot-open hook does not fire while the leader holds the slot, and failed on a clean baseline
+build of the parent commit — the same stale-chain read, in the single-deadline form.
+
+### What landed
+
+- **The chain is read and advanced with no suspension in between.** A `SlotDrain` (one-shot,
+  nonisolated lock box) is allocated, the gate `Task` is built to await it, `tail = gate`
+  happens immediately, and only THEN are the cancel box, the hook registry and the work task
+  created. The gate waits on `drained` instead of on `Task.value`, which is what lets it exist
+  before the task does. Nothing that can hop actors sits between the read and the write.
+- **`DrainFlag`, `ServerTurnCancelBox` and the new `SlotDrain` are `nonisolated`.** This target
+  compiles with `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, so leaving them bare made them
+  main-actor types called from the queue actor's critical path — the warnings that had been
+  sitting in this region were pointing at exactly the calls that broke the FIFO. Six of them
+  are gone.
+- **The queue waits for the engine slot, not just for its predecessor.** `waitForSlot` now
+  finishes with a poll of `CompletionEngine.isActive`, so an in-app generation is waited out
+  the same way an earlier request is. The wait is bounded by the SAME deadline and fed by the
+  SAME heartbeat, so nothing about the latency promise changes; what changes is that a request
+  inside its budget is served rather than refused. Past the deadline it gets `408` with a
+  message that names which of the two things it waited on — "the generation queue" or "a
+  generation running in the DynaMoE app" — because a client debugging a 408 needs to know.
+- **`slotProbe` is injectable** (`TurnExecutionQueue(slotProbe:)`), so the wait for an in-app
+  turn can be tested without loading a 475 GB model. Production passes the default.
+
+The wait sits BEFORE the `onSlotOpened` hook, deliberately: that hook is where the request log
+rows stamp `queueWaitMs`, and a request that spent 40 s behind a chat answer has been waiting,
+not generating.
+
+### What it does not mean
+
+- **Not a new knob and not unbounded latency.** The bound is the existing
+  `dynamoe_server_queue_timeout` (default 120 s, `0` = wait forever). Nothing new to configure;
+  the semantics of an existing setting simply now cover the case they described.
+- **Not a change to what `stop()` may cancel.** `cancelLiveWork()` still cancels exactly the
+  server-owned boxes, and the app's turn is still untouchable — the queue observes the engine
+  slot, it does not own it.
+- **Not proof that the queue is now race-free.** The invariant is stated and pinned ("no two
+  turns inside the work at once, over 24 concurrent enqueues, on both wait paths"), not proven.
+  What the five consecutive green suite runs do establish is that the burst case that failed
+  5 of 5 now passes 11 of 11.
+- **Not the end of the single-flight `503`.** A request can still hit it if an in-app turn
+  starts in the microseconds between the slot opening and `launchTurn` — a hop, not a wait.
+  That window is a design seam (the queue cannot reserve the engine slot), and it is rare;
+  closing it would mean giving `launchTurn` a reservation API.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_83` (status 0; the queue region's
+actor-isolation warnings have dropped from ten to four, and the remaining ones are in route
+handlers this slice did not touch). `test-without-building` with the same `-derivedDataPath`:
+
+| suite | result |
+|---|---|
+| `ServerQueueLogicTests` (19 cases, now including 5 for the in-app wait and 1 for the burst) | **5 consecutive green runs** after the fix, 3 more after the burst test widened to both wait paths |
+| `ServerStreamSafetyTests`, `ServerHardeningLogicTests`, `ServerToolArgumentTests`, `AnthropicAdapterLogicTests`, `OpenAIAdapterLogicTests`, `TurnToolMaskTests`, `ReasoningRoundTripTests` | 90 cases, 0 failures |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787) | 17 cases, 0 failures |
+
+The pre-fix arm is a real A/B, not an estimate: the parent commit's `ServerController.swift`
+was restored, built into `/tmp/dd_dsv41_pre`, and the burst case run against it five times.
