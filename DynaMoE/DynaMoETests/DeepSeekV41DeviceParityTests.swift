@@ -606,14 +606,16 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         XCTAssertEqual(reported.last, tokens.count)
     }
 
-    /// The width a prompt is prefilled at follows its working set, not the workspace.
+    /// The width a prompt is prefilled at is the workspace's width, whatever its length.
     ///
-    /// `chunkSlots` sizes the buffers; a prompt longer than the expert arena can hold
-    /// runs narrower blocks, because past that point every block is a fill and a wider
-    /// block's own device work per layer grows faster than its position count (`#70`).
-    /// This pins the rule and the cadence it actually produces, which is the only way a
-    /// change to either would be noticed: the report count is the block count.
-    func testThePrefillWidthFollowsTheWorkingSet() throws {
+    /// `#70` shipped a threshold here (the workspace width below 64 positions, four above)
+    /// on the theory that a short prompt's routed experts fit the arena. That sweep ran
+    /// with the arena UNWIRED, a regime the app never runs in; with the slots `mlock`ed the
+    /// fill runs at the disk's ceiling, the two widths land within 0.2-4.5% of each other,
+    /// and the widest one measured ahead in five of six comparisons (`#71`). This pins
+    /// that AND the cadence it produces, because the report count is the block count and
+    /// that is what a composer's progress line reads.
+    func testThePrefillWidthIsTheWorkspaceWidth() throws {
         var shape = DeepSeekV41SyntheticShape()
         shape.window = 10
         shape.contextLength = 128
@@ -621,27 +623,33 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         let slots = DeepSeekV41DevicePlan.chunkSlots(
             config: checkpoint.config, contextLength: shape.contextLength
         )
-        let bound = DeepSeekV41DevicePlan.prefillFillBound
-        XCTAssertGreaterThan(slots, 4, "the workspace has to be wider than the long-prompt rule")
+        XCTAssertGreaterThan(slots, 1, "this case needs a workspace wider than one position")
+        for tokens in [1, 3, 4, 5, 63, 64, 128] {
+            XCTAssertEqual(
+                DeepSeekV41DevicePlan.prefillBlockWidth(
+                    config: checkpoint.config, contextLength: shape.contextLength,
+                    promptTokens: tokens
+                ),
+                slots,
+                "a prompt of \(tokens) did not run at the workspace's width"
+            )
+        }
+        // A context shorter than four positions, or a window narrower than one, is
+        // capped by the workspace: the rule may not ask for a block the buffers cannot
+        // hold, which is the one thing that would crash rather than slow down.
+        var narrow = shape
+        narrow.contextLength = 2
+        let narrowCheckpoint = DeepSeekV41SyntheticCheckpoint(shape: narrow)
         XCTAssertEqual(
             DeepSeekV41DevicePlan.prefillBlockWidth(
-                config: checkpoint.config, contextLength: shape.contextLength,
-                promptTokens: bound - 1
+                config: narrowCheckpoint.config, contextLength: 2, promptTokens: 2
             ),
-            slots,
-            "a prompt whose working set fits runs the workspace's width"
-        )
-        XCTAssertEqual(
-            DeepSeekV41DevicePlan.prefillBlockWidth(
-                config: checkpoint.config, contextLength: shape.contextLength,
-                promptTokens: bound
-            ),
-            4,
-            "a prompt past the working set runs the narrow block"
+            2,
+            "the rule ran past a workspace that holds two positions"
         )
 
-        // The cadence is the contract a composer's progress line reads, so both ends are
-        // driven through a real prefill rather than asserted off the rule alone.
+        // The cadence is the contract a composer's progress line reads, so it is driven
+        // through a real prefill rather than asserted off the rule alone.
         func reports(_ tokens: Int) throws -> [Int] {
             let runtime = try makeRuntime(checkpoint)
             var reported: [Int] = []
@@ -651,18 +659,18 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
             XCTAssertEqual(reported.last, tokens, "the last report is what the turn ran")
             return reported
         }
-        func expected(_ tokens: Int, width: Int) -> [Int] {
+        func expected(_ tokens: Int) -> [Int] {
             var out: [Int] = []
             var offset = 0
             while offset < tokens {
-                offset = min(offset + width, tokens)
+                offset = min(offset + slots, tokens)
                 out.append(offset)
             }
             return out
         }
-        XCTAssertEqual(try reports(bound - 1), expected(bound - 1, width: slots))
-        XCTAssertEqual(try reports(bound), expected(bound, width: 4))
-        XCTAssertNotEqual(slots, 4, "the two halves of the rule have to differ to be tested")
+        for tokens in [3, 9, 64, 128] {
+            XCTAssertEqual(try reports(tokens), expected(tokens), "\(tokens) positions")
+        }
     }
 
     /// A capture keeps each position's own logits, not the block's last one.

@@ -508,47 +508,38 @@ nonisolated public enum DeepSeekV41DevicePlan {
         return max(1, min(ceiling, min(window, max(1, contextLength))))
     }
 
-    /// Positions past which a prompt cannot keep its routed experts in the arena at
-    /// once, measured rather than tuned: the published checkpoint touches 2,641
-    /// distinct `(layer, expert)` pairs over 31 positions, 3,767 over 64, and 5,045
-    /// over 128, against an arena of 3,760 slots on this machine. Sixty-four is where
-    /// the working set stops fitting.
-    public static let prefillFillBound = 64
-
-    /// How many positions one prefill block carries.
+    /// How many positions one prefill block carries: the workspace's width, at every
+    /// prompt length.
     ///
-    /// Not `chunkSlots`: that sizes the WORKSPACE (every per-position vector is
-    /// replicated per slot), i.e. the widest block the buffers can hold. The width a
-    /// prompt should RUN at is decided by whether its routed working set can live in
-    /// the arena at once.
+    /// `#70` shipped a threshold here (the workspace width below 64 positions, four
+    /// above) on the theory that a short prompt's routed experts fit the arena, so
+    /// per-layer overhead dominates and the widest block wins. That sweep, and every
+    /// prefill table before it, ran with the arena UNWIRED (the harness's `wireArena:
+    /// false`, so `#20`-`#56` compare like with like), a regime the app never runs in:
+    /// production `mlock`s every slot when the memory plan grants it, and `#56` measured
+    /// the same bytes into the same slots at 4.6-6.7 GB/s unwired against 13.0 wired.
+    /// With the arena wired the fill runs at the disk's own ceiling, and the width is
+    /// worth 0.2-4.5% instead of the 6-24% the unwired sweep saw (`Benchmarks/PERF_FINDINGS.md`,
+    /// "DSV4.1 #71"). The same text stream, cold arena, rotated rounds, shipping arena,
+    /// three processes, ms per position:
     ///
-    /// A short prompt is pure per-layer overhead (one dense-half wait, one routing
-    /// readback, one indexer split and one union fill per layer, forty times over), so
-    /// the widest block wins, because that is the only thing that amortises. A long
-    /// prompt cannot fit, so every block pays the fill, and there the narrower block
-    /// wins: a wider block's own device work per layer grows faster than its position
-    /// count (the mixture half alone moves from 24.4 ms per position walked to 26.2 at
-    /// width four and 29.1 at width eight). Measured on the `#52`-`#59` text stream,
-    /// cold arena, rotating rounds (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #70"), ms
-    /// per position:
+    ///     positions   walk     width 4           width 8          runs
+    ///     128         121.5    102.6 (101.6-114.0)  99.7 (97.8-112.2)  3, eight ahead in 3
+    ///     64          154.5    133.7            133.4            1, tied
+    ///     31          190.4    173.6 (179.9-182.3)  165.7 (179.2-187.4)  3, eight ahead in 2
     ///
-    ///     positions   walk     width 4   width 8
-    ///     31          372.1    422.6     399.9
-    ///     64          306.5    278.4     345.8
-    ///     128         266.7    222.9     264.2
-    ///
-    /// Both sides are 6-24%, so this is not a rounding question. It also does not
-    /// follow the fill's warmness, which is what an earlier attempt assumed: with the
-    /// arena fully warm at 31 positions (0 MB read) width eight is still 1.05-1.19x
-    /// ahead, and at 128 positions even a warm pass still reads 56 GB and width four is
-    /// 1.09-1.12x ahead.
+    /// Eight is ahead in five of the six comparisons and behind once, by 2.7% on the
+    /// app's own 31-token prompt in the run whose machine state was slowest. So the
+    /// answer is the widest block the workspace holds, which is what the engine ran
+    /// before `#70` and what this returns: the seam stays so a future sweep can move it
+    /// without touching `prefillChunk`, and `promptTokens` stays in the signature because
+    /// a width rule is about a prompt's length even when the answer does not depend on it.
     public static func prefillBlockWidth(
         config: DeepSeekV41Config,
         contextLength: Int,
         promptTokens: Int
     ) -> Int {
-        let slots = chunkSlots(config: config, contextLength: contextLength)
-        return promptTokens < prefillFillBound ? slots : min(4, slots)
+        return chunkSlots(config: config, contextLength: contextLength)
     }
 
     /// Wiring problems the executor can see without touching a weight: a dimension

@@ -11187,3 +11187,203 @@ Its wall moved from 5.79-5.85 s to 8.57 s and back to 6.69 s on a build that ran
 work at width four, because that turn is 74 GB of cold expert read and the disk's rate is
 what varies (11,368 against 9,995 MB/s reported by the streamer on the same bytes). Quote
 that turn's wall as a range or not at all.
+
+## DSV4.1 #71: THE PREFILL FILL IS AT THE DISK'S CEILING — #70's 31 ms GAP WAS THE HARNESS'S UNWIRED ARENA, AND THE WIDTH THRESHOLD IT SHIPPED DOES NOT SURVIVE
+
+`#70` closed by naming one open number: at the best prefill width a 128-position prompt
+spends 81.1 ms/position filling the expert arena, 703 MB/position at **7.7-8.5 GB/s**
+against this machine's measured 13-14 GB/s ceiling, i.e. ~31 ms/position of apparent
+headroom, and the largest single open figure the journal had. The same journal had already
+measured a cold WALKED position — same bytes, same misses — at **15.1 GB/s** (`#67`), and
+`#70` itself recorded the app's own turn moving 5.79 s to 8.57 s to 6.69 s on
+byte-identical reads. Two processes, one workload, 2x apart, and nobody had asked which
+process was normal.
+
+### Question
+
+Is a prefill's fill slower than a walk's, or is the bucket not the read, or is the number
+a property of the process that measured it?
+
+### What was added
+
+Nothing on a shipped path except the rule at the end. One probe, and the seam it needs:
+
+- `testWhatRegimeAPrefillsFillIsMeasuredInOnThePublishedCheckpoint` (opt-in,
+  `/tmp/dynamoe_dsv41_fill_regime`): one runtime through the app's own loading path, the
+  `#52`-`#70` 128-token stream, `recordsFillSamples` on, the walk and widths 4 and 8 at 128
+  and at 31 positions, three rounds with the arm order rotated and round 1 discarded, the
+  arena dropped before every arm so every arm reads the same bytes.
+- It bills each arm TWICE. The outer bucket is `DeepSeekV41BlockTiming.expertFillNanoseconds`
+  (or the walk's), the wall around `ensureResident` — which is what `#70` divided its bytes
+  by. The inner one is the streamer's own clocks: `readMisses`'s wall (`timing.reading`),
+  placement (`placementTiming`), the rest of `placeResident` (`prepareTiming`, which
+  CONTAINS allocation and wiring), the true bytes of the ranges, and one
+  `DeepSeekV41FillSample` per fill (`misses`, `shards`, `ranges`, true `bytes`, `seconds`),
+  which also gives the rate per fill SHAPE.
+- And it CALIBRATES: the same `ensureResident` the prefill calls, cold, eight fills of six
+  experts and eight of twenty-four, from distinct pairs so nothing is read twice. The only
+  honest ceiling for an in-situ rate is one the same process measured.
+
+### The answer is the arena's wiring, and it is not close
+
+The first cut ran the harness's default runtime — `makeRuntime(wireArena: false)` — and got
+`#70`'s numbers. The same probe with the app's own runtime, which wires every slot
+(`wireArena: nil`), gets:
+
+| 128 positions | wall | fill bucket | read | GB/s | bytes | misses |
+|---|---|---|---|---|---|---|
+| walk | 132.9 | 58.4 | 57.8 | **12.2** | 90,455 MB | 5,045 |
+| width 4 | **114.0** | 54.1 | 53.5 | **13.2** | 90,025 MB | 5,021 |
+| width 8 | 113.6 | 55.0 | 54.5 | **12.9** | 89,971 MB | 5,018 |
+
+| 31 positions | wall | fill bucket | read | GB/s | bytes | misses |
+|---|---|---|---|---|---|---|
+| walk | 207.5 | 122.8 | 121.7 | **12.6** | 47,352 MB | 2,641 |
+| width 4 | 182.5 | 114.7 | 113.7 | **13.4** | 47,352 MB | 2,641 |
+| width 8 | 187.0 | 112.2 | 111.4 | **13.7** | 47,406 MB | 2,644 |
+
+(Those are process 1's walls. Three processes measured the same arms and the fill read rate
+is stable across them — 12.2-13.9 GB/s at every width and length — while the walls move
+5-30% with the machine, which is why the width comparison below is per process.)
+
+Both sides are the same bytes and the same misses, so the only difference between these
+rows and `#70`'s is the regime:
+
+| regime | prefill fill rate (128 positions) | same-process calibration |
+|---|---|---|
+| harness, `wireArena: false` (`#70`, and a fresh process of this probe) | 5.9-8.5 GB/s | — |
+| app, `wireArena: nil` (this probe, three processes) | **12.2-13.9 GB/s** | **13.2-17.0 GB/s** at 6 experts, **14.8-17.0** at 24 |
+
+`#56` had already measured it and said so: the same bytes into the same slots run at
+**4.6-6.7 GB/s unwired against 13.0 wired**, because an unwired slot is a page the
+compressor reconstructs after every pass that rewrote it. Every prefill table in this
+journal since `#20` was taken unwired — the harness default exists so `#20`-`#56` compare
+like with like — and the app wires. `#67`'s 15.1 was the shipping regime; `#70`'s 7.7-8.5
+was not.
+
+**So the 31 ms/position is withdrawn, and with the wiring on the bucket is 99% read:**
+at width four on the 128-position stream, placement is 0.29 ms/position, preparation 0.28
+(and allocation and wiring inside it are 0.00, because the slots exist by then), and 0.13
+is unaccounted — 0.70 ms of 54.1. The fill's bookkeeping is not a lever because there is
+none to find. At 77-87% of what the same process can do in an isolated fill, with 100% of
+its misses compulsory (5,021 misses against 5,045 distinct pairs), a prefill's expert read
+is the disk doing its job.
+
+### Where a wired prefill position actually goes
+
+128 positions, round 2, per position, ms — the same table `#70` printed, in the regime the
+app runs:
+
+| bucket | walk | width 4 | width 8 |
+|---|---|---|---|
+| **wall** | 132.9 | **114.0** | **113.6** |
+| dense encode (host) | 2.8 | 1.38 | 1.10 |
+| indexer wait | 11.9 | 11.24 | 11.44 |
+| front wait | 52.5 | 43.87 | 43.73 |
+| expert fill | 59.0 | 53.48 | 54.93 |
+| mixture encode (host) | 2.4 | 1.75 | 1.51 |
+| **device, both halves** | 39.7 | 31.78 | 33.66 |
+| - dense half | 21.7 | **13.24** | 13.67 |
+| - mixture half | 18.0 | 18.54 | 19.99 |
+| mixture late start | 22.9 | 19.3 | 17.9 |
+
+Read it against `#70`'s unwired table and every bucket moves, because the fill is what the
+whole layer was waiting on: the indexer split falls 30.2 → 11.2 (it drains the previous
+mixture, which is now cheap), the mixture's late start 82.8 → 19.3 (the queue is idle for a
+1.3 ms fill instead of a 2 ms one), and the dense half's device window 17.3 → 13.2. What
+does NOT move is the shape: the fill is still the largest single bucket, the mixture's
+device half is still the second, and the dense half is still the only thing batching
+amortises.
+
+### The width curve in the app's regime, and the rule
+
+Three processes, cold arena, arm order rotated, round 1 discarded, mean of the measured
+rounds, ms per position. The winner column is the two widths against each other:
+
+| positions | process | walk | width 4 | width 8 | winner |
+|---|---|---|---|---|---|
+| 128 | 1 | 133.0 | 114.0 | **113.6** | eight, 0.4% |
+| 128 | 2 | 120.2 | 102.1 | **97.0** | eight, 5.3% |
+| 128 | 3 | 121.5 | 102.6 | **99.7** | eight, 2.9% |
+| 64 | 3 | 154.5 | 133.7 | 133.4 | tied, 0.3% |
+| 31 | 1 | 207.5 | **182.5** | 187.0 | four, 2.5% |
+| 31 | 2 | 252.2 | 183.8 | **180.5** | eight, 1.8% |
+| 31 | 3 | 190.4 | 173.6 | **165.7** | eight, 4.8% |
+
+Both widths beat the walk everywhere, by 1.10-1.22x, which is the same prize `#70` found
+for width four. Between the widths the whole effect is 0.3-5.3%, eight is ahead in five of
+the six comparisons, and the one loss is the app's own 31-token prompt in process 1, the
+process whose machine state was slowest (its walk is 207.5 against 190.4 in process 3).
+
+`#70` shipped a threshold on the strength of the opposite reading: the workspace width below
+64 positions and four above, on the theory that a short prompt's routed experts fit the
+arena so per-layer overhead dominates and the widest block amortises it best. In the
+shipping regime that theory has nothing left to explain, and the threshold's crossover is
+where the two widths are closest (64 positions: 133.7 against 133.4). **So the threshold is
+gone and `prefillBlockWidth` returns the workspace's width at every prompt length** — what
+the engine ran before `#70`, which is the conservative direction to revert in, and what the
+measurements support (eight or tied in five of six). `prefillFillBound` is deleted; the
+function stays as the seam a future sweep can move without touching `prefillChunk`.
+
+The first cut of this slice shipped a CONSTANT FOUR on process 1's numbers alone, where
+four was 2.5% ahead at 31 positions and 0.4% behind at 128. Processes 2 and 3 reversed both
+readings. That is the honest lesson about a 2-5% effect measured on one machine: n=1 is not
+a measurement, and the only defensible rule at this margin is the one with the best central
+tendency across processes.
+
+### What it means for the app
+
+`#69`'s live-turn numbers are this regime's counterpart and are ~2x pessimistic. Re-run
+with the app's arena, the same 31-token default prompt prefills in **6.67 s** (215.3
+ms/position over 31, four reports at the shipped width) and the whole turn is **7.74 s of
+wall for 74,283 MB read** with 133.4 ms per decoded token, against `#69`'s 8.57 s unwired
+on the same bytes; a second shipping process at width four prefilled in 5.80 s and turned in
+6.85 s, which is the same 5-30% machine variance the width table shows. The 5-token `"hey"`
+prompt prefills in 1.80 s and turns in 3.29 s. The streamer's own report over those four
+turns is **14,084 MB/s** with the arena wired 65.84 of 65.84 GB, which is the same rate the
+probe measured and the same policy `#57` shipped.
+
+The lesson that generalises past this slice: `makeRuntime` defaults to the unwired regime,
+so **a test that prices the app must pass `wireArena: nil`**, and `#69`'s turn case now
+does. Anything else is a number about the harness.
+
+### What it is not (do not re-propose)
+
+- **Not the fill's bookkeeping.** 0.70 ms of a 54.1 ms bucket at width four: placement,
+  preparation, allocation, wiring and resolve are all accounted for and all under 1.5%.
+- **Not the bytes, the arena or the layout.** 5,021 misses against 5,045 distinct pairs on
+  a 128-position prompt is 100% compulsory; there is no refetch left for capacity, policy
+  or a different block shape to remove.
+- **Not the wiring policy.** It is the shipping default, it is worth 2x on every fill, and
+  `#57` already showed the alternative (P4, unwired, 222.4 ms/position).
+- **Not a narrower block.** The two widths are within 0.3-5.3% in the shipping regime and
+  eight leads in five of six comparisons, so a rule that narrows a prompt is buying noise.
+  The workspace's eight is both the ceiling on the buffers and the running width.
+- **Not a second arena in one process.** The unwired arm, run after a wired one in the same
+  process, collapsed to 0.9 GB/s (3,108 ms/position): that is 2 x 65.84 GB against 128 GB,
+  not a regime. The probe runs one regime per process for that reason.
+- **Not the disk.** 12.2-13.7 GB/s in situ against 15.2-15.9 isolated is the machine, and
+  the streamer's own four-turn report agrees at 13,479 MB/s.
+
+### Verification
+
+`testWhatRegimeAPrefillsFillIsMeasuredInOnThePublishedCheckpoint` is opt-in and draws no
+slot `MTLBuffer` beyond what a normal prefill allocates. Runs: `/tmp/test71_fill1.log` (the
+first cut, unwired, which is where 5.9-6.9 GB/s came from), `/tmp/test71_regime1.log` (the
+shipping regime every table above is taken from, and the contaminated unwired arm it
+replaced) and `/tmp/test71_turn2.log` (the live turn). It asserts, per arm: that the fill
+samples cover every miss the bucket was charged for, that the read is shorter than the
+bucket that contains it, that the ranges and the slot count agree on the bytes within 5%,
+that every arm read the same bytes across rounds, and that widths 4 and 8 land on the
+walk's token (relative 5e-2, exact argmax). The calibration asserts it read every pair it
+asked for.
+
+Shipped: `DeepSeekV41DevicePlan.prefillBlockWidth` returns the workspace's width at every
+prompt length, and `prefillFillBound` is deleted. Pinned by
+`DeepSeekV41DeviceGraphParityTests.testThePrefillWidthIsTheWorkspaceWidth`, which checks
+the rule at seven prompt lengths and at a workspace narrower than the ceiling, and drives a
+real prefill at 3, 9, 64 and 128 positions to assert the report cadence.
+`DeepSeekV41DeviceGraphParityTests` 37 tests pass and `DeepSeekV41TurnLoopTests` 26 pass.
+`testWhatAWholeTurnActuallyCosts` passes with its cadence expectation derived from the
+shipped rule instead of from `chunkSlots` directly; the indirection is what caught the
+first cut, which asserted a block count the engine no longer produced.

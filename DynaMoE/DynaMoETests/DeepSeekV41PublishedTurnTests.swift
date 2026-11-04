@@ -11859,6 +11859,10 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
     /// for the entire prefill and then jumped to a finished count. The assertions here
     /// are that contract -- reports climb, one per block when chunked and one per
     /// position when walked, and the last one is what the turn actually ran.
+    ///
+    /// The arena is WIRED (`#71`), which is the app's regime: `#69` first ran this arm
+    /// with the harness's unwired default, where a fill costs twice as much, so its
+    /// absolute walls are the slow regime's and not a turn a user waits on.
     func testWhatAWholeTurnActuallyCosts() async throws {
         let snapshot = try snapshotDirectory()
         let config = try DeepSeekV41Config.decode(
@@ -11890,6 +11894,12 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
 
         let contextLength = max(promptIds.count, thinkingIds.count) + firstTurnTokens * 2 + 16
         let engine = try DynaMoeEngine(filePath: snapshot.path)
+        // The SHIPPING arena, because this case exists to price the turn the app runs.
+        // `makeRuntime` defaults to the unwired regime so the earlier slices compare with
+        // each other, and that regime is not the app's: a fill into an unwired slot is a
+        // page the compressor reconstructs, which `#56` measured at 4.6-6.7 GB/s against
+        // 13.0 wired and `#71` confirmed on this very stream. The default is overridden
+        // here and only here.
         let runtime = try makeRuntime(
             snapshot: snapshot,
             engine: engine,
@@ -11897,7 +11907,8 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             contextLength: contextLength,
             allowEngramSkip: FileManager.default.fileExists(
                 atPath: Self.engramOffMarkerPath
-            )
+            ),
+            wireArena: nil
         )
         XCTAssertTrue(runtime.isRunnable, runtime.describe())
         let forward = runtime.forward()
@@ -12064,8 +12075,12 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             XCTAssertGreaterThan(out.decodeSeconds, 0, "\(label): decode took no time")
         }
 
-        let blockWidth = DeepSeekV41DevicePlan.chunkSlots(
-            config: config, contextLength: contextLength
+        // The SHIPPED width, not the workspace's: since `#71` the rule is a constant four
+        // at every prompt length, so it is resolved here for the widest prompt this case
+        // runs and the cadence below is that many reports. Taking `chunkSlots` here read
+        // the buffer size instead and asserted a report count the engine never produces.
+        let blockWidth = DeepSeekV41DevicePlan.prefillBlockWidth(
+            config: config, contextLength: contextLength, promptTokens: 0
         )
         let first = try runTurn(promptIds)
         report(
@@ -12195,6 +12210,14 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
     /// read different bytes would not be comparable at all. Byte counts are printed and
     /// asserted stable across rounds for the same arm.
     ///
+    /// This runs the harness's UNWIRED arena (`makeRuntime`'s default), which is how
+    /// `#20`-`#69` compare like with like and NOT the regime the app runs. Every absolute
+    /// figure here is therefore about twice the shipping one: `#71` re-ran these arms
+    /// wired and got 132.9 / 114.0 / 113.6 ms per position at 128 positions and 207.5 /
+    /// 182.5 / 187.0 at 31, where the fill reads at 12.2-13.7 GB/s instead of 7.7-8.5.
+    /// What survives from this table is the ORDER and the fact that the fill was the
+    /// largest bucket; what does not is the 31 ms/position "gap" it has left open.
+    ///
     /// Opt-in (`/tmp/dynamoe_dsv41_prefix_time`): two lengths, twenty-four passes of up
     /// to 128 positions, ~15 minutes at `-O`.
     /// `/tmp/dynamoe_dsv41_prefix_time_quick` runs one round of 32 positions instead.
@@ -12255,8 +12278,8 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         )
         XCTAssertTrue(runtime.isRunnable, runtime.describe())
         let executor = runtime.forward()
-        let shippedWidth = DeepSeekV41DevicePlan.chunkSlots(
-            config: config, contextLength: runtime.contextLength
+        let shippedWidth = DeepSeekV41DevicePlan.prefillBlockWidth(
+            config: config, contextLength: runtime.contextLength, promptTokens: longest
         )
         print(
             "🔎 [dsv41 real] prefix attribution: lengths \(lengths), \(rounds) round(s), "
@@ -12342,9 +12365,10 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             let tokens = prompt(length)
             // The app's own length does not need the whole sweep, only the two widths a
             // decision would choose between; the long arm pays for the four.
-            let widths: [Int?] = length == longest
-                ? [nil, 1, 2, 4, shippedWidth]
-                : [nil, 4, shippedWidth]
+            var widths: [Int?] = length == longest ? [nil, 1, 2, 4] : [nil, 4]
+            // `shippedWidth` is four since `#71`, so it is usually already in the list;
+            // appending it blindly measured the same width twice a round.
+            if !widths.contains(shippedWidth) { widths.append(shippedWidth) }
             var steady: [String: [PrefixArm]] = [:]
             var bytesByLabel: [String: [Double]] = [:]
 
@@ -12543,5 +12567,532 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         }
 
         withExtendedLifetime(engine) {}
+    }
+    // MARK: - #71: which arena regime a prefill is measured in
+
+    /// The streamer's counters at one instant, so a fill can be billed from the inside.
+    struct StreamerMarks: Sendable {
+        var bytesRead: Int
+        var misses: Int
+        var reading: Double
+        var allocating: Double
+        var slots: Int
+        var wiring: Double
+        var placing: Double
+        var placements: Int
+        var preparing: Double
+        var preparations: Int
+    }
+
+    /// One arm's fill, read two ways: the bucket the timing struct reports, and what the
+    /// streamer measured while it was filling.
+    ///
+    /// `#70` priced a prefill's expert fill off the OUTER bucket — the wall around
+    /// `ensureResident` — and got 7.7-8.5 GB/s against a 13-14 GB/s ceiling, and left the
+    /// ~31 ms/position difference as the largest open number in the journal. That bucket
+    /// is not only the read: it is arena placement, the slot's first allocation, `mlock`
+    /// wiring, the resolve of six byte ranges per expert, and the `pread`. Only the last
+    /// of those is the disk, and `readMisses` times it separately.
+    struct FillSplit {
+        /// Every fill of one size, kept together so a rate can be read per shape.
+        struct Group {
+            var fills: Int
+            var ranges: Int
+            var megabytes: Double
+            var seconds: Double
+        }
+
+        var label: String
+        var positions: Int
+        var wallMilliseconds: Double
+        /// The timing struct's own fill bucket, per position.
+        var outerMilliseconds: Double
+        /// `readMisses`'s wall, which is the `pread` fan-out and nothing else.
+        var readMilliseconds: Double
+        var placeMilliseconds: Double
+        /// Everything else inside `placeResident`. It CONTAINS allocation and wiring, so
+        /// the two are printed nested rather than added.
+        var prepareMilliseconds: Double
+        var allocateMilliseconds: Double
+        var wiringMilliseconds: Double
+        var misses: Int
+        var fills: Int
+        var ranges: Int
+        /// What `bytesRead` counted, i.e. misses x slot size.
+        var slotMegabytes: Double
+        /// What the ranges actually asked the file for.
+        var rangeMegabytes: Double
+        var byMisses: [Int: Group]
+        var lastLogits: [Float]
+
+        var missesPerPosition: Double { Double(misses) / Double(max(1, positions)) }
+        var missesPerFill: Double { Double(misses) / Double(max(1, fills)) }
+        var millisecondsPerPosition: Double {
+            wallMilliseconds / Double(max(1, positions))
+        }
+
+        /// GB/s over the slot bytes `bytesRead` counts, which is the convention `#70`
+        /// used and therefore the one its 7.7-8.5 is comparable with. A megabyte per
+        /// millisecond IS a gigabyte per second, so this is a plain division.
+        var outerGigabytesPerSecond: Double {
+            outerMilliseconds > 0
+                ? slotMegabytes / Double(max(1, positions)) / outerMilliseconds : 0
+        }
+
+        /// The same over the ranges' true bytes, which is the number `#51`'s isolated
+        /// fill quotes.
+        var readGigabytesPerSecond: Double {
+            readMilliseconds > 0
+                ? rangeMegabytes / Double(max(1, positions)) / readMilliseconds : 0
+        }
+
+        /// What the outer bucket holds beyond the read, per position.
+        var bookkeepingMilliseconds: Double {
+            max(0, outerMilliseconds - readMilliseconds)
+        }
+    }
+
+    /// What regime a prefill's expert fill is measured in, and whether the width rule
+    /// `#70` shipped survives the one production actually runs.
+    ///
+    /// `#70` left one number open: at the best prefill width a 128-position prompt spends
+    /// 81.1 ms/position filling the arena, 703 MB/position at 7.7-8.5 GB/s against this
+    /// machine's 13-14 GB/s ceiling. The same journal had already measured a cold WALKED
+    /// position, same bytes and same misses, at 15.1 GB/s (`#67`), and `#70` itself
+    /// recorded the app's own turn moving 5.79 s to 8.57 s to 6.69 s on byte-identical
+    /// reads. Two processes, one workload, 2x apart.
+    ///
+    /// The difference is not the layout and not the disk. It is the ARENA: `#56` measured
+    /// the same bytes into the same slots at **4.6-6.7 GB/s unwired against 13.0 wired**,
+    /// because a slot that is not `mlock`ed is a page the compressor reconstructs after
+    /// every pass that rewrote it. Production wires the arena whenever the memory plan
+    /// grants the budget (`DeepSeekV41Engine.swift`, `wireArena ?? !wireArenaDisabled`),
+    /// and the harness's `makeRuntime` defaults to **`wireArena: false`** precisely so
+    /// that `#20`-`#56` compare like with like. `#70`'s width sweep, its bucket table and
+    /// the 31 ms gap all inherited that default, so the gap is the harness's regime and
+    /// not the app's.
+    ///
+    /// That matters beyond the number: if a fill is twice as expensive in the regime the
+    /// sweep ran in, the balance the width rule was derived from is the wrong balance. So
+    /// this measures the fill AND the width curve in both regimes, shipping first:
+    ///
+    /// - the streamer's own clocks, with `recordsFillSamples` on, tile each fill into
+    ///   placement, preparation, allocation, wiring and the `pread` itself;
+    /// - a CALIBRATION runs the same `ensureResident` cold at 6 and 24 experts in the same
+    ///   process, because the only honest ceiling for an in-situ rate is a rate this
+    ///   process measured;
+    /// - the walk and widths 4 and 8 at 128 positions (where `#70` chose four) and at 31
+    ///   (where it chose eight), in the shipping regime only. An unwired arm was tried
+    ///   and withdrawn: run second in one process it collapses to 0.9 GB/s, which is a
+    ///   second 65.84 GB arena in a process that just released a wired one and not a
+    ///   regime. The contrast is `#70`'s own table and `/tmp/test71_fill1.log`.
+    ///
+    /// Opt-in (`/tmp/dynamoe_dsv41_fill_regime`), two measured rounds and a discarded
+    /// warm-up: ~13 minutes at `-O`.
+    /// `/tmp/dynamoe_dsv41_fill_regime_quick` runs one round of 24 positions instead.
+    func testWhatRegimeAPrefillsFillIsMeasuredInOnThePublishedCheckpoint() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_fill_regime"
+        let quickMarkerPath = "/tmp/dynamoe_dsv41_fill_regime_quick"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in prefill fill regime; touch \(markerPath) to run"
+        )
+        let quick = FileManager.default.fileExists(atPath: quickMarkerPath)
+        // 64 is the crossover candidate: `#70` put its threshold there on the strength of a
+        // working-set measurement, and a shipping-regime rule may not inherit a threshold
+        // whose crossover was located in a different regime.
+        let lengths = quick ? [24] : [128, 64, 31]
+        let longest = lengths[0]
+        // ONE regime, the app's. An unwired arm was tried here and withdrawn: run after
+        // a wired one in the same process it collapses to 0.9 GB/s (a second 65.84 GB
+        // arena in a process that just released one), so it measures memory pressure
+        // rather than a regime. The unwired contrast comes from `#70`'s own table and
+        // from a fresh process that ran nothing else (`/tmp/test71_fill1.log`: 5.9-6.9
+        // GB/s), which is what `#56` said it would be.
+        let shippingWiring: Bool? = nil
+        let regime = (label: "shipping", wireArena: shippingWiring, rounds: quick ? 1 : 2)
+
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        // The same paragraph and rotation `#52`-`#70` used, so this arm's bytes and misses
+        // are comparable with every prefill table in the journal.
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8)
+        func prompt(_ length: Int) -> [Int] {
+            (0..<length).map { index -> Int in
+                let repetition = index / stream.count
+                return stream[(index + repetition * 13) % stream.count]
+            }
+        }
+
+        /// Every arm of one regime, in one runtime. The runtime is local to this function
+        /// so the arena it holds — 65.84 GB of wired shared memory — is released before
+        /// the next regime builds its own; two of them do not fit on this machine.
+        func measure(regime label: String, wireArena: Bool?, rounds: Int) throws -> [FillSplit] {
+            let engine = try DynaMoeEngine(filePath: snapshot.path)
+            let runtime = try makeRuntime(
+                snapshot: snapshot,
+                engine: engine,
+                config: config,
+                contextLength: longest + 1,
+                allowEngramSkip: false,
+                wireArena: wireArena
+            )
+            XCTAssertTrue(runtime.isRunnable, runtime.describe())
+            let executor = runtime.forward()
+            let streamer = try XCTUnwrap(runtime.expertStreamer)
+            streamer.recordsFillSamples = true
+            let wiring = streamer.wiringState
+            let slotMegabytes = Double(streamer.geometry.slotBytes) / 1_048_576
+            print(
+                "🔎 [dsv41 real] regime \(label): arena \(runtime.arena.capacity) slot(s) of "
+                    + String(format: "%.2f", slotMegabytes) + " MB, wiring "
+                    + (wiring.isEnabled ? "ENABLED" : (wiring.isRefused ? "REFUSED" : "off"))
+                    + String(
+                        format: " (%.2f of %.2f GB, %d slot(s))",
+                        Double(wiring.bytes) / 1_073_741_824,
+                        Double(wiring.budgetBytes) / 1_073_741_824,
+                        wiring.slots
+                    )
+            )
+
+            func mark() -> StreamerMarks {
+                let timing = streamer.timing
+                let placing = streamer.placementTiming
+                let preparing = streamer.prepareTiming
+                return StreamerMarks(
+                    bytesRead: streamer.bytesRead,
+                    misses: streamer.expertsLoaded,
+                    reading: timing.reading,
+                    allocating: timing.allocating,
+                    slots: timing.slotsAllocated,
+                    wiring: timing.wiring,
+                    placing: placing.seconds,
+                    placements: placing.placements,
+                    preparing: preparing.seconds,
+                    preparations: preparing.preparations
+                )
+            }
+
+            func groups(_ samples: [DeepSeekV41FillSample]) -> [Int: FillSplit.Group] {
+                var byMisses: [Int: FillSplit.Group] = [:]
+                for sample in samples {
+                    var entry = byMisses[sample.misses]
+                        ?? FillSplit.Group(fills: 0, ranges: 0, megabytes: 0, seconds: 0)
+                    entry.fills += 1
+                    entry.ranges += sample.ranges
+                    entry.megabytes += Double(sample.bytes) / 1_048_576
+                    entry.seconds += sample.seconds
+                    byMisses[sample.misses] = entry
+                }
+                return byMisses
+            }
+
+            /// One pass, with the arena dropped first so it re-reads every expert. A
+            /// width of nil is the walk, which is the per-position baseline.
+            func arm(tokens: [Int], width: Int?) throws -> FillSplit {
+                executor.reset()
+                runtime.arena.reset()
+                streamer.clearFillSamples()
+                executor.resetBlockTiming()
+                executor.resetWalkTiming()
+                executor.recordsBlockTiming = width != nil
+                executor.recordsWalkTiming = width == nil
+                let before = mark()
+                let started = DispatchTime.now().uptimeNanoseconds
+                var last: [Float] = []
+                if let blockWidth = width {
+                    var offset = 0
+                    while offset < tokens.count {
+                        let end = min(offset + blockWidth, tokens.count)
+                        last = try executor.prefillChunk(
+                            Array(tokens[offset..<end]), blockWidth: blockWidth
+                        ).last ?? []
+                        offset = end
+                    }
+                } else {
+                    for (position, token) in tokens.enumerated() {
+                        last = try executor.forwardToken(token, position: position)
+                    }
+                }
+                let seconds = Double(
+                    DispatchTime.now().uptimeNanoseconds - started
+                ) / 1_000_000_000
+                let after = mark()
+                executor.recordsBlockTiming = false
+                executor.recordsWalkTiming = false
+                let samples = streamer.fillSamples
+                let positions = Double(max(1, tokens.count))
+                let scale = 1_000.0 / positions
+                let outerNanoseconds = width != nil
+                    ? executor.blockTiming.expertFillNanoseconds
+                    : executor.walkTiming.expertFillNanoseconds
+                return FillSplit(
+                    label: width.map { "block \($0)" } ?? "walk",
+                    positions: tokens.count,
+                    wallMilliseconds: seconds * 1_000,
+                    outerMilliseconds: Double(outerNanoseconds) / 1_000_000 / positions,
+                    readMilliseconds: (after.reading - before.reading) * scale,
+                    placeMilliseconds: (after.placing - before.placing) * scale,
+                    prepareMilliseconds: (after.preparing - before.preparing) * scale,
+                    allocateMilliseconds: (after.allocating - before.allocating) * scale,
+                    wiringMilliseconds: (after.wiring - before.wiring) * scale,
+                    misses: after.misses - before.misses,
+                    fills: samples.count,
+                    ranges: samples.reduce(0) { $0 + $1.ranges },
+                    slotMegabytes: Double(after.bytesRead - before.bytesRead) / 1_048_576,
+                    rangeMegabytes: samples.reduce(0) { $0 + Double($1.bytes) } / 1_048_576,
+                    byMisses: groups(samples),
+                    lastLogits: last
+                )
+            }
+
+            /// The same fill a prefill runs, with nothing else on the machine, from a
+            /// `firstPair` the caller rotates so no calibration re-reads another's pairs
+            /// out of the page cache (which is what made the first cut of this probe
+            /// report 86 GB/s).
+            func calibrate(
+                label: String, perFill: Int, fills: Int, firstPair: Int
+            ) throws -> FillSplit {
+                runtime.arena.reset()
+                streamer.clearFillSamples()
+                let before = mark()
+                let started = DispatchTime.now().uptimeNanoseconds
+                for index in 0..<fills {
+                    let layer = [0, 7, 13, 21, 29, 33, 36, 39][index % 8]
+                    let base = (firstPair + index * perFill) % max(config.numRoutedExperts - perFill, 1)
+                    let experts = (0..<perFill).map { base + $0 }
+                    _ = try streamer.ensureResident(layer: layer, experts: experts)
+                }
+                let seconds = Double(
+                    DispatchTime.now().uptimeNanoseconds - started
+                ) / 1_000_000_000
+                let after = mark()
+                let samples = streamer.fillSamples
+                let positions = Double(max(1, fills))
+                let scale = 1_000.0 / positions
+                return FillSplit(
+                    label: label,
+                    positions: fills,
+                    wallMilliseconds: seconds * 1_000,
+                    outerMilliseconds: seconds * 1_000 / positions,
+                    readMilliseconds: (after.reading - before.reading) * scale,
+                    placeMilliseconds: (after.placing - before.placing) * scale,
+                    prepareMilliseconds: (after.preparing - before.preparing) * scale,
+                    allocateMilliseconds: (after.allocating - before.allocating) * scale,
+                    wiringMilliseconds: (after.wiring - before.wiring) * scale,
+                    misses: after.misses - before.misses,
+                    fills: samples.count,
+                    ranges: samples.reduce(0) { $0 + $1.ranges },
+                    slotMegabytes: Double(after.bytesRead - before.bytesRead) / 1_048_576,
+                    rangeMegabytes: samples.reduce(0) { $0 + Double($1.bytes) } / 1_048_576,
+                    byMisses: groups(samples),
+                    lastLogits: []
+                )
+            }
+
+            func report(_ split: FillSplit, unit: String) {
+                print(
+                    "🔎 [dsv41 real]   " + split.label + " " + unit + "s: fill bucket "
+                        + String(format: "%.2f", split.outerMilliseconds) + " ms = read "
+                        + String(format: "%.2f", split.readMilliseconds) + " + place "
+                        + String(format: "%.2f", split.placeMilliseconds) + " + prepare "
+                        + String(format: "%.2f", split.prepareMilliseconds) + " (of it create "
+                        + String(format: "%.2f", split.allocateMilliseconds) + ", wire "
+                        + String(format: "%.2f", split.wiringMilliseconds) + ") + "
+                        + String(
+                            format: "%.2f unaccounted; %.1f misses/%@ in %.0f fill(s) of "
+                                + "%.1f (%.0f range(s)); %.0f MB at %.1f GB/s slot, "
+                                + "%.1f GB/s asked",
+                            split.bookkeepingMilliseconds - split.placeMilliseconds
+                                - split.prepareMilliseconds,
+                            split.missesPerPosition,
+                            unit,
+                            Double(split.fills),
+                            split.missesPerFill,
+                            split.fills > 0 ? Double(split.ranges) / Double(split.fills) : 0,
+                            split.slotMegabytes,
+                            split.outerGigabytesPerSecond,
+                            split.readGigabytesPerSecond
+                        )
+                )
+                for (misses, entry) in split.byMisses.sorted(by: { $0.key < $1.key }) {
+                    print(
+                        "🔎 [dsv41 real]     fills of " + String(misses) + ": "
+                            + String(format: "%3d fill(s), %5.1f range(s), %7.1f MB, "
+                                + "%6.2f ms each, %5.1f GB/s",
+                                entry.fills,
+                                entry.fills > 0
+                                    ? Double(entry.ranges) / Double(entry.fills) : 0,
+                                entry.megabytes,
+                                entry.seconds / Double(max(1, entry.fills)) * 1_000,
+                                entry.seconds > 0
+                                    ? entry.megabytes / entry.seconds / 1_000 : 0)
+                    )
+                }
+            }
+
+            // Two shapes, measured last of all so the arms' own churn cannot flatter
+            // them: six experts is a walked layer's set, twenty-four is a width-four
+            // block's union. Distinct pairs from the arms and from each other.
+            var results: [FillSplit] = []
+            var bytesByLabel: [String: [Double]] = [:]
+            for length in lengths {
+                let tokens = prompt(length)
+                var steady: [FillSplit] = []
+                for round in 0..<(rounds + 1) {
+                    let order = [nil, 4, 8]
+                    for offset in 0..<order.count {
+                        let width = order[(offset + round) % order.count]
+                        let split = try arm(tokens: tokens, width: width)
+                        print(
+                            "🔎 [dsv41 real]   " + label + " " + String(length)
+                                + " pos round " + String(round + 1) + " "
+                                + split.label + String(
+                                    format: " %7.1f ms/position, %.0f MB, %d misses",
+                                    split.millisecondsPerPosition,
+                                    split.slotMegabytes,
+                                    split.misses
+                                )
+                        )
+                        report(split, unit: "position")
+                        if width != nil {
+                            print("🔎 [dsv41 real]     " + executor.blockTiming.describe())
+                        } else {
+                            print("🔎 [dsv41 real]     " + executor.walkTiming.describe())
+                        }
+                        // The first round runs in a young process, where every bucket is
+                        // 1.3-1.6x faster (`#53`), so it is printed and never averaged.
+                        guard round > 0 else { continue }
+                        steady.append(split)
+                        bytesByLabel[split.label + " @ " + String(length), default: []]
+                            .append(split.slotMegabytes)
+                    }
+                }
+
+                print(
+                    "🔎 [dsv41 real]   " + label + " at " + String(length)
+                        + " positions, " + String(rounds) + " measured round(s):"
+                )
+                var walkMilliseconds: Double?
+                for armLabel in ["walk", "block 4", "block 8"] {
+                    let splits = steady.filter { $0.label == armLabel }
+                    guard !splits.isEmpty else { continue }
+                    let count = Double(splits.count)
+                    let wall = splits.map(\.millisecondsPerPosition).reduce(0, +) / count
+                    let outer = splits.map(\.outerMilliseconds).reduce(0, +) / count
+                    let read = splits.map(\.readMilliseconds).reduce(0, +) / count
+                    let bytes = splits.map(\.slotMegabytes).reduce(0, +) / count
+                    let misses = Double(splits.map(\.misses).reduce(0, +)) / count
+                    if armLabel == "walk" { walkMilliseconds = wall }
+                    print(
+                        String(
+                            format: "🔎 [dsv41 real]     %-7@ %7.1f ms/position, fill "
+                                + "%6.1f (read %6.1f, %.1f GB/s), %.0f MB, %.0f misses, "
+                                + "%.2fx the walk",
+                            armLabel as NSString,
+                            wall,
+                            outer,
+                            read,
+                            read > 0 ? bytes / Double(splits[0].positions) / read : 0,
+                            bytes,
+                            misses,
+                            (walkMilliseconds ?? wall) / max(wall, 0.001)
+                        )
+                    )
+                }
+                // The fill's own samples must cover every miss the bucket was charged
+                // for, or the decomposition is describing a different set of fills than
+                // the timer.
+                for split in steady {
+                    XCTAssertEqual(
+                        split.byMisses.reduce(0) { $0 + $1.key * $1.value.fills },
+                        split.misses,
+                        "\(label) \(split.label) fill samples do not cover its misses"
+                    )
+                    XCTAssertLessThanOrEqual(
+                        split.readMilliseconds, split.outerMilliseconds + 1,
+                        "\(label) \(split.label) read longer than the bucket holding it"
+                    )
+                    XCTAssertLessThan(
+                        abs(split.rangeMegabytes - split.slotMegabytes),
+                        max(split.slotMegabytes * 0.05, 1),
+                        "\(label) \(split.label) ranges and slots disagree on the bytes"
+                    )
+                }
+                // The two layouts are different graphs, so this is not a parity check: it
+                // is the probe's guard that an arm did not reuse another arm's cache.
+                if let reference = steady.first(where: { $0.label == "walk" })?.lastLogits,
+                   !reference.isEmpty {
+                    let scale = max(reference.map { abs(Double($0)) }.max() ?? 0, 1e-6)
+                    for split in steady where split.label != "walk" {
+                        guard split.lastLogits.count == reference.count else {
+                            XCTFail("\(split.label) returned no logits")
+                            continue
+                        }
+                        let worst = zip(reference, split.lastLogits)
+                            .map { abs(Double($0) - Double($1)) }
+                            .max() ?? 0
+                        XCTAssertLessThan(
+                            worst / scale, 5e-2,
+                            "\(label) \(split.label) disagreed with the walk"
+                        )
+                        XCTAssertEqual(
+                            Self.argmax(split.lastLogits), Self.argmax(reference),
+                            "\(label) \(split.label) chose a different token"
+                        )
+                    }
+                }
+            }
+
+            do {
+                let ceilings = [
+                    try calibrate(label: "calib6", perFill: 6, fills: 8, firstPair: 96),
+                    try calibrate(label: "calib24", perFill: 24, fills: 8, firstPair: 192)
+                ]
+                print("🔎 [dsv41 real]   " + label + " calibration, cold fills, same call:")
+                for split in ceilings {
+                    report(split, unit: "fill")
+                    XCTAssertEqual(
+                        split.misses,
+                        split.fills * (split.label == "calib24" ? 24 : 6),
+                        "\(label) \(split.label) did not read every pair it asked for"
+                    )
+                }
+                results += ceilings
+            }
+
+            // The harness's own determinism check: an arm that read different bytes in
+            // two rounds is not the same regime.
+            for (armLabel, counts) in bytesByLabel.sorted(by: { $0.key < $1.key }) {
+                let low = counts.min() ?? 0
+                let high = counts.max() ?? 0
+                XCTAssertLessThan(
+                    high - low, max(high * 0.005, 1),
+                    "\(label) \(armLabel) read \(low)-\(high) MB across rounds"
+                )
+            }
+            streamer.recordsFillSamples = false
+            return results
+        }
+
+        _ = try measure(
+            regime: regime.label, wireArena: regime.wireArena, rounds: regime.rounds
+        )
     }
 }
