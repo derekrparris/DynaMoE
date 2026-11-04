@@ -2595,6 +2595,17 @@ final class DeepSeekV41FP8GemvKernelTests: XCTestCase {
             DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(outDim: 16, inDim: 512, rows: 1),
             "16 rows over 512 columns is too little work to pay for a barrier"
         )
+        // The same short row as `attn.wq_b`, with an eighth of the rows: 4,096 threads
+        // cannot fill the machine, so the coalesced form measured 0.61x the one-thread
+        // form's time there (`#74`) and the occupancy clause sends it that way.
+        XCTAssertTrue(
+            DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(outDim: 4_096, inDim: 1_280, rows: 1),
+            "attn.indexer.wq_b is starved in the one-thread form and takes the wide grid"
+        )
+        XCTAssertEqual(
+            DeepSeekV41DevicePlan.fp8WideGridThreadThreshold, 16_384,
+            "the occupancy clause's threshold is the measurement, not a guess"
+        )
     }
 
     // MARK: Two rows per threadgroup

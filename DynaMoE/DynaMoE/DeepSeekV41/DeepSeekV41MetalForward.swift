@@ -305,8 +305,31 @@ nonisolated public enum DeepSeekV41DevicePlan {
     /// over 1,280 columns is 40 blocks, so the one-thread form is 1.07-1.6x faster
     /// there (a block of positions included) and this rule sends it that way. The
     /// numbers are in `Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #20" and "#21".
+    ///
+    /// A row shorter than 2,048 columns is not automatically the one-thread form's:
+    /// that argument assumes the weft is wide enough to run the block, and
+    /// `attn.indexer.wq_b` (4,096 rows over 1,280) is not (`#74`). See
+    /// `fp8WideGridThreadThreshold`.
+    /// Threads, in the one-thread-per-row form, below which the grid cannot fill the
+    /// machine and the coalesced form's reduction barrier is worth paying instead.
+    ///
+    /// `#74` measured both forms on the indexer's `attn.indexer.wq_b` (4,096 rows over
+    /// 1,280 columns, one position per dispatch): the coalesced form is 1.65x faster,
+    /// 0.741 -> 0.450 ms/position for the stage that encodes it. The same comparison on
+    /// `attn.wq_b` (32,768 rows over the same 1,280 columns) has the one-thread form
+    /// ahead (`#21`). Both shapes give a thread one FP8 row, so the difference is how
+    /// many threads there are to run them: 4,096 starves the machine, 32,768 does not.
+    /// This sits between the two on a log scale and errs conservative, the direction
+    /// `#18` chose for `rowSharingWidth`.
+    public static let fp8WideGridThreadThreshold = 16_384
+
     public static func fp8GemvWantsWideGrid(outDim: Int, inDim: Int, rows: Int) -> Bool {
-        outDim >= 32 && inDim >= 2_048
+        guard outDim >= 32 else { return false }
+        if inDim >= 2_048 { return true }
+        // A short row is the lane-per-block side of the argument and is unchanged; the
+        // clause below is the OCCUPANCY side, which only matters for a row too short to
+        // reach 2,048 columns and an `outDim` too small to fill the machine.
+        return outDim * max(1, rows) < fp8WideGridThreadThreshold
     }
 
     /// Whether an FP8 projection over a BLOCK of positions takes the slot form.
@@ -907,6 +930,29 @@ nonisolated public struct DeepSeekV41IndexSelectionRecord: Sendable {
         self.selected = selected
         self.scores = scores
     }
+}
+
+// MARK: - Indexer sections
+
+/// The three unrelated things one `.indexer` stage encodes, so a stage table can
+/// bill each of them (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #74").
+///
+/// The stage is one command buffer in every production path, and splitting it is a
+/// measurement instrument: `recordsStageTiming` gives each section its own buffer,
+/// which adds a submission per section that the shipped layout does not pay. The
+/// RATIO between the sections is the result; the sum is not the shipped wall.
+enum DeepSeekV41IndexerSection: String, CaseIterable {
+    /// The compressor's two block-scaled projections plus its pool, on the four
+    /// layers that own a compressed KV cache. Runs for every slot, because the pool
+    /// kernel itself is gated on the group completing, not the projections.
+    case pool
+    /// The indexer's own two projections and its query rope, on the eight layers that
+    /// own a compressed index. Per position, and between them they re-read
+    /// `attn.indexer.wq_b` (1280 x 4096 of E4M3) once for every position of a block.
+    case project
+    /// The row scores: `index_topk`-capped rows, one thread each, every one of them a
+    /// `headCount * headWidth` dot product against the compressed key cache.
+    case select
 }
 
 // MARK: - Indexer input probe
@@ -1896,6 +1942,18 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// the same arena. Off in every production path — the shipped choice is
     /// `DeepSeekV41DevicePlan.fp8GemvWantsWideGrid`'s.
     public var disablesFP8FusedRows = false
+
+    /// Measurement only: gives EVERY FP8 block-scaled projection the coalesced form, so
+    /// a probe can price that form on a shape the plan rule refuses without changing what
+    /// the rule decides. Off in every production path (`Benchmarks/PERF_FINDINGS.md`,
+    /// "DSV4.1 #74").
+    ///
+    /// The rule's `inDim >= 2,048` clause is a lane-per-block argument, and it was
+    /// measured on shapes whose `outDim` alone already fills the machine. The indexer's
+    /// `attn.indexer.wq_b` is 4,096 rows over 1,280 columns: 4,096 threads is a tenth of
+    /// what a prefill reads the dense projections with, so the clause is asked a question
+    /// it was never measured on.
+    public var forcesFP8WideGrid = false
 
     /// Measurement only: lets a probe time the FP8 projection's slot form on the same
     /// runtime, over the same token stream, with the same arena.
@@ -3029,24 +3087,76 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         if recordsStageTiming {
             var frontBuffers: [MTLCommandBuffer] = []
             for stage in DeepSeekV41DevicePlan.frontHalf {
-                let buffer = try makeCommandBuffer()
-                let encoder = try makeEncoder(buffer)
-                try encodeBlockStage(
-                    stage,
-                    layer: layer,
-                    startPosition: startPosition,
-                    count: count,
-                    encoder: encoder
-                )
-                encoder.endEncoding()
-                buffer.commit()
-                pending.append((
-                    buffer: buffer,
-                    stage: "layer \(layer.index) \(stage.rawValue) (block \(count))",
-                    isMixture: false
-                ))
-                stageBuffers.append((stage: stage.rawValue, buffer: buffer))
-                frontBuffers.append(buffer)
+                if stage == .indexer {
+                    // `.indexer` is three unrelated rails in one buffer (`#74`): the
+                    // compressor's pool, the indexer's projections, and the row scores.
+                    // Each gets its own buffer here so the table can bill them apart,
+                    // and each is ALSO recorded under the stage's own name because a
+                    // table read across slices must still find an `indexer` row.
+                    //
+                    // A rail gets a buffer only on the layers that run it. Thirty-two of
+                    // forty layers run none of them, and giving those an empty conditional
+                    // buffer would bill a window with no dispatch to the stage -- which is
+                    // what `#73`'s single `indexer` window did, and it is most of why that
+                    // row read 1.7 ms/position. Those layers are labelled `indexer.idle`
+                    // instead, so the amortised cost of an empty window stays visible
+                    // rather than being hidden by omitting it.
+                    let shape = DeepSeekV41AttentionShape.make(config: config, layer: layer)
+                    let sections = DeepSeekV41IndexerSection.allCases.filter { section in
+                        switch section {
+                        case .pool:
+                            return layer.ownsCompressedKV
+                        case .project, .select:
+                            return layer.ownsCompressedIndex
+                        }
+                    }
+                    let labels = sections.isEmpty
+                        ? ["indexer.idle"]
+                        : sections.map { "indexer.\($0.rawValue)" }
+                    for (offset, label) in labels.enumerated() {
+                        let buffer = try makeCommandBuffer()
+                        let encoder = try makeEncoder(buffer)
+                        if !sections.isEmpty {
+                            try encodeIndexerSection(
+                                sections[offset],
+                                layer: layer,
+                                startPosition: startPosition,
+                                count: count,
+                                encoder: encoder,
+                                shape: shape
+                            )
+                        }
+                        encoder.endEncoding()
+                        buffer.commit()
+                        pending.append((
+                            buffer: buffer,
+                            stage: "layer \(layer.index) \(label) (block \(count))",
+                            isMixture: false
+                        ))
+                        stageBuffers.append((stage: stage.rawValue, buffer: buffer))
+                        stageBuffers.append((stage: label, buffer: buffer))
+                        frontBuffers.append(buffer)
+                    }
+                } else {
+                    let buffer = try makeCommandBuffer()
+                    let encoder = try makeEncoder(buffer)
+                    try encodeBlockStage(
+                        stage,
+                        layer: layer,
+                        startPosition: startPosition,
+                        count: count,
+                        encoder: encoder
+                    )
+                    encoder.endEncoding()
+                    buffer.commit()
+                    pending.append((
+                        buffer: buffer,
+                        stage: "layer \(layer.index) \(stage.rawValue) (block \(count))",
+                        isMixture: false
+                    ))
+                    stageBuffers.append((stage: stage.rawValue, buffer: buffer))
+                    frontBuffers.append(buffer)
+                }
                 if let hook = onBlockStageFinished {
                     try settlePending()
                     hook(layer.index, startPosition, stage.rawValue)
@@ -5545,14 +5655,46 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         encoder: MTLComputeCommandEncoder,
         shape: DeepSeekV41AttentionShape
     ) throws {
-        for slot in 0..<count {
-            try encodePoolIfComplete(
+        for section in DeepSeekV41IndexerSection.allCases {
+            try encodeIndexerSection(
+                section,
                 layer: layer,
-                position: startPosition + slot,
+                startPosition: startPosition,
+                count: count,
                 encoder: encoder,
-                shape: shape,
-                slotIndex: slot
+                shape: shape
             )
+        }
+    }
+
+    /// One rail of the stage. `#73` billed the whole `.indexer` window at 1.7
+    /// ms/position with only eight of forty layers owning a compressed index, and the
+    /// three rails have nothing in common: the pool is four layers' worth of
+    /// block-scaled projections, the projections re-read one matrix per position, and
+    /// the scores are the only dispatch whose cost depends on how many rows a position
+    /// can see.
+    private func encodeIndexerSection(
+        _ section: DeepSeekV41IndexerSection,
+        layer: DeepSeekV41LayerPlan,
+        startPosition: Int,
+        count: Int,
+        encoder: MTLComputeCommandEncoder,
+        shape: DeepSeekV41AttentionShape
+    ) throws {
+        switch section {
+        case .pool:
+            for slot in 0..<count {
+                try encodePoolIfComplete(
+                    layer: layer,
+                    position: startPosition + slot,
+                    encoder: encoder,
+                    shape: shape,
+                    slotIndex: slot
+                )
+            }
+            return
+        case .project, .select:
+            break
         }
         guard layer.ownsCompressedIndex,
               config.indexNHeads > 0,
@@ -5574,46 +5716,49 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         let queryInputWidth = hasDown ? max(1, config.qLoraRank) : shapes.hidden
 
         for slot in 0..<count {
-            // `weights_proj(x)`, one weight per index head. The scale lands on the
-            // weights in the reference, so the kernel multiplies by it.
-            try encodeGemv(
-                encoder,
-                weight: weightsProj,
-                scale: weights.scaleTensor(.indexerWeights, layer: layer.index),
-                inDim: shapes.hidden,
-                outDim: headCount,
-                input: workspace.normed,
-                output: workspace.indexWeights,
-                inputByteOffset: workspace.slotOffset(slot, width: shapes.hidden),
-                outputByteOffset: workspace.slotOffset(slot, width: headCount)
-            )
-            try encodeGemv(
-                encoder,
-                weight: wqB,
-                scale: weights.scaleTensor(.indexerWqB, layer: layer.index),
-                inDim: queryInputWidth,
-                outDim: headCount * headWidth,
-                input: hasDown ? workspace.reduced : workspace.normed,
-                output: workspace.indexQuery,
-                inputByteOffset: workspace.slotOffset(
-                    slot, width: hasDown ? max(1, config.qLoraRank) : shapes.hidden
-                ),
-                outputByteOffset: workspace.slotOffset(slot, width: headCount * headWidth)
-            )
-            // `Indexer.forward` rotates the tail of every index head at this
-            // position, using the layer's own table (the compressed one).
-            try encodeRope(
-                encoder,
-                vector: workspace.indexQuery,
-                rowWidth: headCount * headWidth,
-                headDim: headWidth,
-                sliceStart: headWidth - min(config.qkRopeHeadDim, headWidth),
-                sliceLength: min(config.qkRopeHeadDim, headWidth),
-                table: layer.ropeTable,
-                latent: false,
-                position: startPosition + slot,
-                byteOffset: workspace.slotOffset(slot, width: headCount * headWidth)
-            )
+            if section == .project {
+                // `weights_proj(x)`, one weight per index head. The scale lands on the
+                // weights in the reference, so the kernel multiplies by it.
+                try encodeGemv(
+                    encoder,
+                    weight: weightsProj,
+                    scale: weights.scaleTensor(.indexerWeights, layer: layer.index),
+                    inDim: shapes.hidden,
+                    outDim: headCount,
+                    input: workspace.normed,
+                    output: workspace.indexWeights,
+                    inputByteOffset: workspace.slotOffset(slot, width: shapes.hidden),
+                    outputByteOffset: workspace.slotOffset(slot, width: headCount)
+                )
+                try encodeGemv(
+                    encoder,
+                    weight: wqB,
+                    scale: weights.scaleTensor(.indexerWqB, layer: layer.index),
+                    inDim: queryInputWidth,
+                    outDim: headCount * headWidth,
+                    input: hasDown ? workspace.reduced : workspace.normed,
+                    output: workspace.indexQuery,
+                    inputByteOffset: workspace.slotOffset(
+                        slot, width: hasDown ? max(1, config.qLoraRank) : shapes.hidden
+                    ),
+                    outputByteOffset: workspace.slotOffset(slot, width: headCount * headWidth)
+                )
+                // `Indexer.forward` rotates the tail of every index head at this
+                // position, using the layer's own table (the compressed one).
+                try encodeRope(
+                    encoder,
+                    vector: workspace.indexQuery,
+                    rowWidth: headCount * headWidth,
+                    headDim: headWidth,
+                    sliceStart: headWidth - min(config.qkRopeHeadDim, headWidth),
+                    sliceLength: min(config.qkRopeHeadDim, headWidth),
+                    table: layer.ropeTable,
+                    latent: false,
+                    position: startPosition + slot,
+                    byteOffset: workspace.slotOffset(slot, width: headCount * headWidth)
+                )
+                continue
+            }
 
             let position = startPosition + slot
             let produced = min(
@@ -6621,9 +6766,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 throw DeepSeekV41EngineError.missingTensor("a projection's scale companion")
             }
             let wideGrid = format == .fp8Block32
-                && DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(
-                    outDim: outDim, inDim: inDim, rows: rows
-                )
+                && (forcesFP8WideGrid
+                    || DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(
+                        outDim: outDim, inDim: inDim, rows: rows
+                    ))
             let slotForm = format == .fp8Block32
                 && enablesFP8SlotGemv
                 && DeepSeekV41DevicePlan.fp8GemvWantsSlotForm(

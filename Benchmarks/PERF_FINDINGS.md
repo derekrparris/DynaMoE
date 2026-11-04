@@ -11539,7 +11539,7 @@ with one shared-expert dispatch), and `workspace.sharedIntermediate` at one row 
 instead of 9 KB). The split layout and `sharedExpertCapture`/`ffnNormed` probes are measurement-only
 and still off in every production path.
 
-## DSV4.1 #73: THE DENSE HALF IS THREE FP8 PROJECTIONS, AND READING THEIR WEIGHT ONCE PER BLOCK INSTEAD OF ONCE PER POSITION COSTS 2.45x
+## DSV4.1 #73: THE DENSE HALF IS THREE FP8 PROJECTIONS, AND READING THEIR WEIGHT ONCE PER BLOCK INSTEAD OF ONCE PER POSITION COSTS 2.42x
 
 ### Question
 
@@ -11645,19 +11645,19 @@ shapes with full-range bytes, so the form is correct and simply slower.
 **So the repetition was free.** Eight visits to the same 1.25-8 KB row are served by the caches in
 front of DRAM, and the eight threadgroups that make those visits are what the stage was using. This
 is `#72`'s lesson one level up: there the removal of the repetition was free and worth 1.19x; here
-the removal costs 2.45x because a plain GEMV has nothing else to overlap with, and it is the one
+the removal costs 2.42x because a plain GEMV has nothing else to overlap with, and it is the one
 place a batching change is a LOSS.
 
 ### What it is not (do not re-propose)
 
 - **Rows-per-threadgroup, slot forms or a "read the weight once" variant on the plain FP8 GEMV at a
-  prefill block.** Measured: 2.45x worse, both layouts, both widths, five projections. `#21`
+  prefill block.** Measured: 2.42x worse, both layouts, both widths, five projections. `#21`
   forbade it on FP8 until a shape whose INPUT traffic is the measured cost turned up; `#72` found
   one and it paid 1.19x. This is the other case: the input is 164 KB per layer-block against 39 MB
   of weight, so the form removes the cheap half and spends its parallelism.
 - **"The dense half is weight-bandwidth bound."** Its 425-523 GB/s is arithmetic that fits a
   per-position model, not a measurement of traffic; the experiment that would have confirmed it is
-  the one that lost by 2.45x.
+  the one that lost by 2.42x.
 - **`#17`'s 29-45% for `writeLatent` as a short-prefix statement.** At 128 positions it is 4.0%.
   Prefix length is the variable, and the two tables are not comparable.
 - **Not the width, the fill, the arena or the prompt.** Every arm read the same bytes (56,281 MB /
@@ -11681,3 +11681,134 @@ because its scale bytes reached 2^127.
 Production changed: nothing. The kernel, pipeline and rule are in the tree as a measured baseline
 behind `enablesFP8SlotGemv`, which is false in every production path; the graph still dispatches
 `dsv41_fp8_block32_gemv` / `dsv41_fp8_block32_gemv_rows` exactly as `#20` and `#21` left them.
+
+## DSV4.1 #74: THE INDEXER STAGE IS THREE RAILS, AND ITS PROJECTION RAIL WAS STARVED OF THREADS
+
+### Question
+
+`#73` billed `.indexer` at 1.715 ms/position, 11.3% of a prefill position's dense half and the
+fourth largest row of it, and stopped there: the stage is ONE command buffer holding three
+unrelated rails. Four of forty layers own a compressed KV cache and run the compressor, eight own
+a compressed index and run the query-side projections, and only the row scores depend on how many
+rows a position can see. 40 MB of weight is all the stage touches, so "1.7 ms" had no mechanism
+behind it and no way to tell a wall from a shape.
+
+### What was added
+
+- `DeepSeekV41IndexerSection` (`.pool` / `.project` / `.select`) and `encodeIndexerSection`.
+  Production is unchanged in shape and in order: `encodeIndexerStage` loops the three sections into
+  the one encoder it always used.
+- Under `recordsStageTiming` each rail gets its own command buffer, and only on the layers that RUN
+  it. The other thirty-two of forty encode none of the three, and an empty buffer reports no device
+  window at all, so giving them one would have billed nothing while pretending to. They are labelled
+  `indexer.idle` and measure 0.000, which is the finding that retires a hypothesis rather than
+  confirming one: `#73`'s single `indexer` window was NOT thirty-two empty windows (see below).
+- `forcesFP8WideGrid`, a measurement-only flag, so the coalesced form could be priced on a shape the
+  plan rule refuses without changing what the rule decides for everything else.
+- `testWhatTheIndexerStageIsMadeOfOnThePublishedCheckpoint` in `DeepSeekV41PublishedTurnTests`
+  (`touch /tmp/dynamoe_dsv41_indexer_stages`): 128 positions at the shipped width, the app's regime
+  (`wireArena: nil`), three arms rotated and round 1 discarded — shipped split, forced-coalesced
+  split, and the one-buffer production layout for the answer and the byte count.
+- One shape, `attn.indexer.wq_b` at 4,096 rows over 1,280 columns, in the existing FP8 form A/B
+  (`testWhatTwoRowsPerThreadgroupSavesOnTheFP8Gemv`), which is the isolated comparison the plan
+  rule's `inDim` clause had never been measured against.
+
+### The table (128 positions, width 8, split layout, ms/position)
+
+| rail | ms/position | of the stage | of the dense half | per layer that runs it | read per position | rate |
+|---|---|---|---|---|---|---|
+| `indexer.pool` | 0.401 | 21.7% | 2.6% | 0.100 | 35.00 MB | 85 GB/s |
+| `indexer.project` | **0.741 → 0.631** | 34.1% | 4.1% | 0.093 → 0.079 | 42.54 MB | 56 → 66 GB/s |
+| `indexer.select` | **0.818** | 44.2% | 5.3% | 0.102 | 0.20 MB | — |
+| `indexer.idle` | 0.000 | 0.0% | 0.0% | — | — | — |
+| **sum** | 1.982 → **1.850** | | 12.9 → 12.1% | | | |
+
+Dense device 15.24 → 15.30 in the split layout and 10.93 → 11.07 in the one-buffer layout, which is
+the first sign that the whole change is smaller than the process-to-process spread. `indexer wait`
+(the host round trip the split still pays) is 2.5 ms/position in the split layout against 7.7-8.8 in
+the one-buffer layout: in production the host waits at `.indexer` for EVERYTHING encoded before it,
+so most of that 8 is the dense half's drain and only the 2.5 is the indexer's own. `#71`'s `indexer
+wait` figure is the same quantity in a different layout and is not the stage.
+
+### What it says
+
+1. **Three rails, roughly a third each.** Nothing owns the stage, so there was no single fix to
+   find; `#73`'s row was the sum of a compressor, two projections and a score kernel.
+2. **`select` is neither bandwidth nor FLOP bound.** 0.20 MB and ~1.6M multiply-adds per position,
+   eight dispatches of 64-128 threads — a fortieth of the machine per dispatch. That is a latency and
+   occupancy row, and its ceiling is its own 0.82 ms.
+3. **`project` was one thread per row over 4,096 rows.** 42.54 MB of weight per position read at
+   56 GB/s where the coalesced form measures 132-133 GB/s on the same bytes: the plan rule sent it to
+   `dsv41_fp8_block32_gemv` because 1,280 columns is under its 2,048, and that clause is a
+   lane-per-block argument derived on `attn.wq_b`, whose 32,768 rows fill the machine on their own.
+4. **`pool` is four layers' worth of two BF16 `[512, 5120]` projections per position** at 85 GB/s.
+   Already coalesced, so its rate is a shape question rather than a rule question, and the whole rail
+   is 0.4 ms.
+5. **The split overstates the stage.** Its three windows sum to 1.982 against `#73`'s single window
+   of 1.715, i.e. the two extra submissions per owning layer cost ~0.27. The SHARES are the result;
+   the sum is not the shipped wall, the same bias as `#60` and `#73`.
+6. **The whole stage is ~1.85 ms of a ~78 ms position, 2.4%.** That is the ceiling on any indexer
+   work, and it is why the rule change below is priced as a rounding error in situ and shipped on an
+   isolated number instead.
+
+### What shipped: an occupancy clause in the FP8 wide-grid rule
+
+`fp8GemvWantsWideGrid` gained a second clause, `outDim * rows < 16_384`, and
+`fp8WideGridThreadThreshold` names it. The isolated A/B on the published shapes (six distinct weight
+regions per dispatch, best of 8, arms interleaved) is what supports it:
+
+| shape | tokens | one-thread | one row per threadgroup | winner |
+|---|---|---|---|---|
+| `attn.indexer.wq_b` 4,096x1,280 | 1 | 0.058 ms (90 GB/s) | **0.040 ms (132 GB/s)** | coalesced 1.46x |
+| `attn.wq_b` 32,768x1,280 | 1 | **0.135 ms (310 GB/s)** | 0.142 ms | one-thread 1.05x |
+| `attn.indexer.wq_b` 4,096x1,280 | 8 | **0.107 ms (49 GB/s)** | 0.141 ms | one-thread 1.32x |
+| row width 1,024-4,096, 5,120 rows | 1 | 0.055-0.139 | **0.037-0.064 (1.49-2.17x)** | coalesced at every width |
+| row width 1,024 / 1,536 | 8 | **0.102 / 0.147** | 0.108 / 0.175 | one-thread below 2,048 |
+| row width 2,048-4,096 | 8 | 0.182-0.334 | **0.178-0.317 (1.01-1.05x)** | coalesced at and above 2,048 |
+
+Every cell of that table falls out of the one clause: at one position the grid is `outDim` threads
+and 5,120 or 4,096 of them cannot fill the machine, so the coalesced form wins at ANY width; at a
+block of eight the grid is `outDim * 8` and the old `inDim >= 2,048` crossover is the right one
+again. The indexer's projections are encoded per slot (`rows: 1`), which is the row that wins 1.46x,
+and the clause catches the batched case for any future caller.
+
+In situ the change moves `indexer.project` 0.741 → 0.631 and the stage 1.982 → 1.850 ms/position,
+i.e. 0.13-0.29 ms of a ~78 ms position (0.2-0.4%), which is under what two processes resolve on this
+machine: quote the isolated 1.46x as the result and the in-situ figure as direction. Forcing the
+coalesced form on EVERY FP8 projection costs the dense half 1.8 ms/position (15.30 → 17.08), which is
+what makes the rule a rule rather than a code change.
+
+Narrower rows also want the coalesced form at a decode step (`row width 1,024` and `1,536` at one
+token, 1.49x), so the clause corrects a miscellany of shapes, not only the indexer's: no other
+published FP8 projection sits in the region, because every one of them either reaches 2,048 columns
+or has an `outDim` that fills the machine on its own.
+
+### What it is not (do not re-propose)
+
+- **The host selection.** `readIndexSelections` is inside the round trip, not the stage; the stage
+  table is device windows only. A device-side top-k is a different slice (`#28`/`#30` closed the
+  arithmetic).
+- **The compressed-row gather.** It runs in `writeLatent`, which `#73` priced at 4.0% of the half.
+- **A bandwidth wall on either projection rail.** Both are below what the same bytes reach under a
+  better shape, and `pool`'s 85 GB/s is a 512-row projection rather than DRAM.
+- **Empty `.indexer` windows as an explanation of `#73`'s 1.715.** `indexer.idle` measures 0.000: a
+  command buffer with no dispatch reports no device window, so thirty-two of forty layers contribute
+  nothing to the row. The inflation is the two extra submissions on the eight that do.
+- **A slot dimension in the scores kernel, for now.** It is the select rail's only lever and its
+  ceiling is that rail's own 0.82 ms/position (1.1% of a position); `#73`'s rejection of slot forms
+  does not transfer (this kernel reads no weight), but neither is there a measured win to point at.
+  Build it only with an isolated A/B in hand, the way this slice built the wide-grid question.
+- Everything from `#51`-`#73` still stands.
+
+### Verification
+
+`DeepSeekV41DeviceGraphParityTests`, `DeepSeekV41DeviceParityTests`, `DeepSeekV41TurnLoopTests`,
+`DeepSeekV41SlotWiringTests`, `DeepSeekV41ExpertStreamTests`, `DeepSeekV41FP8GemvKernelTests`,
+`DeepSeekV41FP8SharedExpertKernelTests`, `DeepSeekV41IndexerKernelTests`: 89 tests, 0 failures
+(`/tmp/test74_parity1.log`). The compressed block parity cases (`testACompressedBlockPrefillsLikeTheWalk`,
+`testTheDeviceAndTheHostAgreeOnCompressedRows`, `testEveryPositionOfABlockAttendsOverItsOwnRows`)
+drive the refactored sections against the host. The probe asserts the split layout returns
+bit-identical logits to the one-buffer layout (measured 0.0 at a 1e-6 bar), the same bytes within
+2%, that all four rail rows are reported, and that they sum to the stage row. The rule test pins
+4,096x1,280 to the coalesced form, 32,768x1,280 to the one-thread form at both row counts, a 16x512
+projection to neither, and the threshold constant itself.

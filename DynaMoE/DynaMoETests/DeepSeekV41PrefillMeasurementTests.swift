@@ -3335,6 +3335,12 @@ final class DeepSeekV41PrefillMeasurementTests: XCTestCase {
 
         for tokens in [1, 8] {
             measure(name: "attn.wq_b", outDim: 32_768, inDim: 1_280, tokens: tokens)
+            // The same 1,280-wide row with an eighth of the rows: `attn.indexer.wq_b` at
+            // the published widths. `#74` found the plan rule's `inDim` clause sending
+            // this one to the one-thread form, which the occupancy argument it was
+            // derived from does not cover — so this is the isolated comparison that
+            // clause was never measured against.
+            measure(name: "attn.indexer.wq_b", outDim: 4_096, inDim: 1_280, tokens: tokens)
             measure(name: "shared_experts.w1", outDim: 2_304, inDim: 5_120, tokens: tokens)
             measure(name: "shared_experts.w2", outDim: 5_120, inDim: 2_304, tokens: tokens)
             measure(name: "attn.wo_b", outDim: 5_120, inDim: 8_192, tokens: tokens)

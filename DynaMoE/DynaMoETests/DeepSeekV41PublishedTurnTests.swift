@@ -13798,4 +13798,342 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         }
         withExtendedLifetime(engine) {}
     }
+
+    // MARK: - #74: what the indexer stage is made of
+
+    /// `#73` billed `.indexer` at 1.7 ms/position, 11.3% of a prefill position's dense
+    /// half, and left it there: the stage is ONE command buffer holding three unrelated
+    /// rails, so the number named no mechanism. Four of forty layers own a compressed KV
+    /// cache and run the compressor, eight own a compressed index and run the query-side
+    /// projections, and only the scores depend on how many rows a position can see.
+    ///
+    /// `DeepSeekV41IndexerSection` splits the stage so `recordsStageTiming` gives each
+    /// rail its own buffer, and this prices each against the bytes it re-reads per
+    /// position: the compressor's pair (once per slot, on four layers), the indexer's
+    /// pair (once per slot, on eight, and `attn.indexer.wq_b` is 1280 x 4096 of E4M3),
+    /// and the score kernel's row census. The split is an instrument, so the sum of its
+    /// three windows is a little larger than the single-buffer stage `#73` printed.
+    func testWhatTheIndexerStageIsMadeOfOnThePublishedCheckpoint() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_indexer_stages"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in indexer attribution; touch \(markerPath) to run"
+        )
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+        let length = 128
+        let tokens = (0..<length).map { index in
+            let repetition = index / stream.count
+            return stream[(index + repetition * 13) % stream.count]
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: length + 1,
+            allowEngramSkip: false,
+            wireArena: nil
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let executor = runtime.forward()
+        let width = DeepSeekV41DevicePlan.prefillBlockWidth(
+            config: config, contextLength: runtime.contextLength, promptTokens: length
+        )
+        let layers = runtime.plan
+        let kvOwners = layers.filter(\.ownsCompressedKV)
+        let indexOwners = layers.filter(\.ownsCompressedIndex)
+
+        /// One pass over the owners' tensors, scales included: an FP8 projection reads
+        /// its E8M0 companion alongside the values, which is what the kernel binds.
+        func weightBytes(
+            _ roles: [DeepSeekV41TensorRole],
+            over owners: [DeepSeekV41LayerPlan]
+        ) -> Int {
+            var total = 0
+            for layer in owners {
+                for role in roles {
+                    total += runtime.weights.tensor(role, layer: layer.index)?.byteLength ?? 0
+                    total += runtime.weights.scaleTensor(role, layer: layer.index)?.byteLength ?? 0
+                }
+            }
+            return total
+        }
+        // Both projection pairs run once for EVERY slot, so their bytes are already a
+        // per-position figure.
+        let poolBytes = weightBytes([.compressorWkv, .compressorWgate], over: kvOwners)
+        let projectBytes = weightBytes([.indexerWqB, .indexerWeights], over: indexOwners)
+        // The scores read one key row per reachable row instead of a matrix, so their
+        // traffic is the row census the cache itself reports rather than an average.
+        var selectBytesTotal = 0
+        for layer in indexOwners {
+            let ratio = max(1, layer.compressRatio)
+            for position in 0..<length {
+                let produced = DeepSeekV41CacheAddressing.compressedRowCount(
+                    afterPosition: position, ratio: ratio
+                )
+                selectBytesTotal += min(produced, config.indexTopK) * config.indexHeadDim * 4
+            }
+        }
+        let selectBytes = selectBytesTotal / length
+
+        struct IndexerSample {
+            var label: String
+            var stages: [String: Double]
+            var denseDevice: Double
+            var indexerWait: Double
+            var megabytes: Double
+            var last: [Float]
+        }
+
+        func attempt(split: Bool, forced: Bool) throws -> IndexerSample {
+            executor.reset()
+            executor.resetBlockTiming()
+            executor.resetStageTiming()
+            executor.recordsBlockTiming = true
+            executor.recordsStageTiming = split
+            executor.forcesFP8WideGrid = forced
+            let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+            let result = try executor.prefillChunk(tokens, blockWidth: width)
+            executor.recordsStageTiming = false
+            executor.recordsBlockTiming = false
+            executor.forcesFP8WideGrid = false
+            let timing = executor.blockTiming
+            let per = timing.millisecondsPerPosition()
+            let divisor = Double(length) * 1_000_000
+            var stages: [String: Double] = [:]
+            for (stage, nanoseconds) in executor.stageTiming {
+                stages[stage] = Double(nanoseconds) / divisor
+            }
+            return IndexerSample(
+                label: !split ? "one buffer" : (forced ? "split wide" : "split"),
+                stages: stages,
+                denseDevice: per.denseDevice,
+                indexerWait: per.indexerWait,
+                megabytes: Double((runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore)
+                    / 1_048_576,
+                last: result.last
+            )
+        }
+
+        // One discarded pass so no arm pays the slot allocations or a cold page cache.
+        executor.reset()
+        runtime.arena.reset()
+        _ = try executor.prefillChunk(Array(stream.prefix(8)))
+
+        var averaged: [String: [IndexerSample]] = [:]
+        for round in 0..<3 {
+            // Rotated for the reason `#72` and `#73` rotate: whoever runs first reads the
+            // colder cache, and the two layouts have to be compared like for like.
+            let arms = [(split: true, forced: false), (split: true, forced: true),
+                        (split: false, forced: false)]
+            let offset = round % arms.count
+            let order = Array(arms[offset...]) + Array(arms[..<offset])
+            for (split, forced) in order {
+                let sample = try attempt(split: split, forced: forced)
+                // The one-buffer arm reports no stage rows at all: it has one buffer per
+                // layer, which is the layout whose answer and byte count this arm is here
+                // to pin against the split.
+                let detail = split
+                    ? String(
+                        format: "indexer %.3f ms/position (idle %.3f, pool %.3f, project "
+                            + "%.3f, select %.3f), ",
+                        sample.stages["indexer"] ?? 0,
+                        sample.stages["indexer.idle"] ?? 0,
+                        sample.stages["indexer.pool"] ?? 0,
+                        sample.stages["indexer.project"] ?? 0,
+                        sample.stages["indexer.select"] ?? 0
+                    )
+                    : ""
+                print(
+                    String(
+                        format: "🔎 [dsv41 real]   %-10@ round %d: %@dense device %.2f, "
+                            + "indexer wait %.2f, %.0f MB",
+                        sample.label as NSString,
+                        round + 1,
+                        detail as NSString,
+                        sample.denseDevice,
+                        sample.indexerWait,
+                        sample.megabytes
+                    )
+                )
+                // A young process is 1.3-1.6x faster in every bucket (`#53`).
+                guard round > 0 else { continue }
+                averaged[sample.label, default: []].append(sample)
+            }
+        }
+
+        func mean(_ samples: [IndexerSample]) -> IndexerSample {
+            let count = Double(max(1, samples.count))
+            var stages: [String: Double] = [:]
+            for sample in samples {
+                for (stage, milliseconds) in sample.stages {
+                    stages[stage, default: 0] += milliseconds / count
+                }
+            }
+            func average(_ keyPath: KeyPath<IndexerSample, Double>) -> Double {
+                samples.map { $0[keyPath: keyPath] }.reduce(0, +) / count
+            }
+            return IndexerSample(
+                label: samples[0].label,
+                stages: stages,
+                denseDevice: average(\.denseDevice),
+                indexerWait: average(\.indexerWait),
+                megabytes: average(\.megabytes),
+                last: samples[0].last
+            )
+        }
+
+        let split = mean(try XCTUnwrap(averaged["split"], "the split arm was never measured"))
+        let oneBuffer = mean(
+            try XCTUnwrap(averaged["one buffer"], "the one-buffer arm was never measured")
+        )
+        print(
+            String(
+                format: "🔎 [dsv41 real] indexer attribution: %d positions at width %d, "
+                    + "%d layer(s): %d own a compressed KV cache, %d a compressed index; "
+                    + "dense device %.2f ms/position",
+                length,
+                width,
+                layers.count,
+                kvOwners.count,
+                indexOwners.count,
+                split.denseDevice
+            )
+        )
+        let indexer = split.stages["indexer"] ?? 0
+        let running = Set(kvOwners.map(\.index)).union(indexOwners.map(\.index)).count
+        let rails: [(name: String, bytes: Int, owners: Int)] = [
+            ("indexer.idle", 0, layers.count - running),
+            ("indexer.pool", poolBytes, kvOwners.count),
+            ("indexer.project", projectBytes, indexOwners.count),
+            ("indexer.select", selectBytes, indexOwners.count)
+        ]
+        var railTotal = 0.0
+        for rail in rails {
+            let milliseconds = split.stages[rail.name] ?? 0
+            railTotal += milliseconds
+            let megabytes = Double(rail.bytes) / 1_048_576
+            let rate = milliseconds > 0 ? megabytes / 1_024 / (milliseconds / 1_000) : 0
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   %-16@ %7.3f ms/position = %5.1f%% of the stage, "
+                        + "%5.1f%% of the dense half, %.3f per layer that runs it, %6.2f MB "
+                        + "read per position (%3.0f GB/s)",
+                    rail.name as NSString,
+                    milliseconds,
+                    indexer > 0 ? milliseconds / indexer * 100 : 0,
+                    split.denseDevice > 0 ? milliseconds / split.denseDevice * 100 : 0,
+                    milliseconds / Double(max(1, rail.owners)),
+                    megabytes,
+                    rate
+                )
+            )
+        }
+        print(
+            String(
+                format: "🔎 [dsv41 real]   %-16@ %7.3f ms/position = %5.1f%% of the dense half; "
+                    + "host wait on the split %.2f ms/position (the round trip, not the stage)",
+                "indexer (sum)" as NSString,
+                railTotal,
+                split.denseDevice > 0 ? railTotal / split.denseDevice * 100 : 0,
+                split.indexerWait
+            )
+        )
+
+        // The one candidate the split names: the indexer's `wq_b` is 4,096 rows over
+        // 1,280 columns and the plan rule keeps it on the one-thread form because
+        // 1,280 < 2,048. That clause is a lane-per-block argument measured on shapes
+        // whose `outDim` alone fills the machine; here it is 4,096 threads. Forcing the
+        // coalesced form prices the question instead of arguing it, and only the
+        // `indexer.project` row is a clean comparison: it is the only FP8 projection the
+        // stage encodes, and the other stages' rows move as a side effect.
+        let wide = mean(
+            try XCTUnwrap(averaged["split wide"], "the forced-wide-grid arm was never measured")
+        )
+        let shippedProject = split.stages["indexer.project"] ?? 0
+        let wideProject = wide.stages["indexer.project"] ?? 0
+        print(
+            String(
+                format: "🔎 [dsv41 real] the coalesced form on the indexer's 4096x1280: "
+                    + "project %.3f -> %.3f ms/position (%.2fx), dense device %.2f -> %.2f, "
+                    + "%.0f MB either way",
+                shippedProject,
+                wideProject,
+                wideProject / max(shippedProject, 1e-9),
+                split.denseDevice,
+                wide.denseDevice,
+                wide.megabytes
+            )
+        )
+        let wideScale = max(oneBuffer.last.map { abs(Double($0)) }.max() ?? 0, 1e-6)
+        let wideWorst = zip(wide.last, oneBuffer.last)
+            .map { abs(Double($0) - Double($1)) }
+            .max() ?? 0
+        print(
+            String(
+                format: "🔎 [dsv41 real] the forced form's logits move %.1e relative",
+                wideWorst / wideScale
+            )
+        )
+        XCTAssertLessThan(
+            wideWorst / wideScale, 5e-2,
+            "forcing the coalesced form on every FP8 projection changed the answer"
+        )
+        XCTAssertLessThan(
+            abs(wide.megabytes - oneBuffer.megabytes),
+            max(oneBuffer.megabytes * 0.02, 1),
+            "the forced-wide-grid arm read different bytes"
+        )
+
+        // The instrument's own guard: the three section entries are the same three
+        // windows the stage row sums, so anything but agreement means one of them is
+        // billed twice or dropped.
+        XCTAssertEqual(railTotal, indexer, accuracy: max(indexer * 1e-6, 1e-9))
+        for rail in rails {
+            XCTAssertNotNil(
+                split.stages[rail.name],
+                "the split layout never reported \(rail.name)"
+            )
+        }
+        // The split adds submissions and changes nothing else: same graph, same order on
+        // one in-order queue, one encoder per stage either way.
+        let scale = max(oneBuffer.last.map { abs(Double($0)) }.max() ?? 0, 1e-6)
+        let worst = zip(split.last, oneBuffer.last)
+            .map { abs(Double($0) - Double($1)) }
+            .max() ?? 0
+        print(
+            String(
+                format: "🔎 [dsv41 real] the section split's logits move %.1e relative; "
+                    + "%.0f MB either way",
+                worst / scale,
+                split.megabytes
+            )
+        )
+        XCTAssertLessThan(worst / scale, 1e-6, "the indexer split changed the answer")
+        XCTAssertLessThan(
+            abs(split.megabytes - oneBuffer.megabytes),
+            max(oneBuffer.megabytes * 0.02, 1),
+            "the two layouts read different bytes"
+        )
+        withExtendedLifetime(engine) {}
+    }
 }
