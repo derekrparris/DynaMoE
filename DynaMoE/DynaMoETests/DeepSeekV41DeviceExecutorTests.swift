@@ -3154,6 +3154,294 @@ final class DeepSeekV41FP8SharedExpertKernelTests: XCTestCase {
             "the shared down is 72 blocks over 64 lanes"
         )
     }
+
+    /// The slot forms project a BLOCK of positions from one read of the row, which is
+    /// what a prefill block needs from the shared expert: its weight is the same for
+    /// every position, and `#72` measured the per-position form reading it `width`
+    /// times at the machine's ceiling, i.e. all of it redundant
+    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #72").
+    ///
+    /// What they must reproduce is the per-slot `_rows` form: the same bytes, the same
+    /// arithmetic, one pass over the weight instead of `slotCount`. Five slots, so no
+    /// form can assume a width of four or eight, and the published shapes, so the
+    /// comparison is at the width that ships.
+    func testTheSlotFormsProjectEveryPositionFromOneWeightRead() throws {
+        let (device, library, queue) = try environment()
+        guard
+            let rowsFunction = library.makeFunction(name: DeepSeekV41Kernels.fp8SwiGLURows),
+            let slotsFunction = library.makeFunction(
+                name: DeepSeekV41Kernels.fp8SwiGLURowsSlots
+            ),
+            let downRowsFunction = library.makeFunction(
+                name: DeepSeekV41Kernels.fp8DownAccumulateRows
+            ),
+            let downSlotsFunction = library.makeFunction(
+                name: DeepSeekV41Kernels.fp8DownAccumulateRowsSlots
+            ),
+            let rowsPipeline = try? device.makeComputePipelineState(function: rowsFunction),
+            let slotsPipeline = try? device.makeComputePipelineState(function: slotsFunction),
+            let downRowsPipeline = try? device.makeComputePipelineState(
+                function: downRowsFunction
+            ),
+            let downSlotsPipeline = try? device.makeComputePipelineState(
+                function: downSlotsFunction
+            )
+        else {
+            XCTFail("the shared-expert slot kernels are not in the default library")
+            return
+        }
+        let slots = 5
+        let floatStride = MemoryLayout<Float>.stride
+
+        /// Runs `body` in one command buffer on `queue` and waits for it.
+        func run(_ body: (MTLComputeCommandEncoder) -> Void) {
+            guard let commandBuffer = queue.makeCommandBuffer(),
+                  let encoder = commandBuffer.makeComputeCommandEncoder() else {
+                XCTFail("no command buffer")
+                return
+            }
+            body(encoder)
+            encoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            XCTAssertNil(commandBuffer.error)
+        }
+
+        func check(outDim: Int, inDim: Int, againstHost: Bool) throws {
+            let blocks = inDim / 32
+            let scaleGroups = (outDim + 31) / 32
+            let gate = weightBytes(outDim * inDim)
+            let upBytes = Array(weightBytes(outDim * inDim).reversed())
+            let gateScales = scaleBytes(scaleGroups * blocks)
+            let upScales = scaleBytes(scaleGroups * blocks)
+            let inputs = values(slots * inDim)
+            guard let gateBuffer = buffer(device, bytes: gate),
+                  let upBuffer = buffer(device, bytes: upBytes),
+                  let gateScaleBuffer = buffer(device, bytes: gateScales),
+                  let upScaleBuffer = buffer(device, bytes: upScales),
+                  let inputBuffer = device.makeBuffer(
+                      bytes: inputs,
+                      length: inputs.count * floatStride,
+                      options: .storageModeShared
+                  ),
+                  let perSlot = device.makeBuffer(
+                      length: slots * outDim * floatStride,
+                      options: .storageModeShared
+                  ),
+                  let batched = device.makeBuffer(
+                      length: slots * outDim * floatStride,
+                      options: .storageModeShared
+                  ) else {
+                XCTFail("the shared-expert buffers did not allocate")
+                return
+            }
+            memset(perSlot.contents(), 0, perSlot.length)
+            memset(batched.contents(), 0, batched.length)
+
+            let bound: (MTLComputeCommandEncoder) -> Void = { encoder in
+                var gateWeightOffset = UInt64(0)
+                var gateScaleOffset = UInt64(0)
+                var upWeightOffset = UInt64(0)
+                var upScaleOffset = UInt64(0)
+                var inDimension = UInt32(inDim)
+                var outDimension = UInt32(outDim)
+                var limit: Float = 0.5
+                encoder.setBuffer(gateBuffer, offset: 0, index: 0)
+                encoder.setBuffer(gateScaleBuffer, offset: 0, index: 1)
+                encoder.setBuffer(upBuffer, offset: 0, index: 2)
+                encoder.setBuffer(upScaleBuffer, offset: 0, index: 3)
+                encoder.setBytes(&gateWeightOffset, length: 8, index: 6)
+                encoder.setBytes(&gateScaleOffset, length: 8, index: 7)
+                encoder.setBytes(&upWeightOffset, length: 8, index: 8)
+                encoder.setBytes(&upScaleOffset, length: 8, index: 9)
+                encoder.setBytes(&inDimension, length: 4, index: 10)
+                encoder.setBytes(&outDimension, length: 4, index: 11)
+                encoder.setBytes(&limit, length: 4, index: 12)
+            }
+
+            // The reference: one threadgroup per row, one dispatch per position.
+            run { encoder in
+                for slot in 0..<slots {
+                    encoder.setComputePipelineState(rowsPipeline)
+                    bound(encoder)
+                    encoder.setBuffer(
+                        inputBuffer, offset: slot * inDim * floatStride, index: 4
+                    )
+                    encoder.setBuffer(
+                        perSlot, offset: slot * outDim * floatStride, index: 5
+                    )
+                    encoder.setThreadgroupMemoryLength(2 * 32 * floatStride, index: 0)
+                    encoder.dispatchThreadgroups(
+                        MTLSize(width: outDim, height: 1, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+                    )
+                }
+            }
+            // The block form: one dispatch, the position loop inside the threadgroup.
+            run { encoder in
+                encoder.setComputePipelineState(slotsPipeline)
+                bound(encoder)
+                encoder.setBuffer(inputBuffer, offset: 0, index: 4)
+                encoder.setBuffer(batched, offset: 0, index: 5)
+                var slotCount = UInt32(slots)
+                encoder.setBytes(&slotCount, length: 4, index: 13)
+                encoder.setThreadgroupMemoryLength(2 * 32 * floatStride, index: 0)
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: outDim, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+                )
+            }
+            let reference = floats(perSlot, count: slots * outDim)
+            let produced = floats(batched, count: slots * outDim)
+            let magnitude = max(1, reference.map { abs($0) }.max() ?? 1)
+            for index in 0..<(slots * outDim) {
+                XCTAssertLessThan(
+                    abs(produced[index] - reference[index]), magnitude * 1e-4,
+                    "the slot fused pair drifted at \(index) of \(outDim)x\(inDim)"
+                )
+            }
+            // Every position must land in its OWN row: a kernel that wrote slot 0 five
+            // times would pass a comparison against a reference that did the same. The
+            // clip saturates about half of a row at these fixture magnitudes, so this is
+            // "some rows move" rather than "most", and the equality above is what
+            // carries the correctness.
+            for slot in 1..<slots {
+                let moved = (0..<outDim).filter {
+                    abs(produced[slot * outDim + $0] - produced[$0]) > 1e-5
+                }.count
+                XCTAssertGreaterThan(
+                    moved, outDim / 4,
+                    "slot \(slot) of \(outDim)x\(inDim) matched slot 0"
+                )
+            }
+            if againstHost {
+                let expected = swigluReference(
+                    gate: gate, up: upBytes, gateScales: gateScales, upScales: upScales,
+                    inDim: inDim, outDim: outDim, tokens: slots, input: inputs, limit: 0.5
+                )
+                for index in 0..<(slots * outDim) {
+                    XCTAssertLessThan(
+                        abs(produced[index] - expected[index]), magnitude * 1e-4,
+                        "the slot fused pair drifted from the host rule at \(index)"
+                    )
+                }
+            }
+
+            // The same for the down projection, which accumulates into the slot's row.
+            let weight = weightBytes(outDim * inDim)
+            let scales = scaleBytes(scaleGroups * blocks)
+            let activations = values(slots * inDim)
+            guard let weightBuffer = buffer(device, bytes: weight),
+                  let scaleBuffer = buffer(device, bytes: scales),
+                  let activationBuffer = device.makeBuffer(
+                      bytes: activations,
+                      length: activations.count * floatStride,
+                      options: .storageModeShared
+                  ),
+                  let downPerSlot = device.makeBuffer(
+                      length: slots * outDim * floatStride,
+                      options: .storageModeShared
+                  ),
+                  let downBatched = device.makeBuffer(
+                      length: slots * outDim * floatStride,
+                      options: .storageModeShared
+                  ) else {
+                XCTFail("the down buffers did not allocate")
+                return
+            }
+            memset(downPerSlot.contents(), 0, downPerSlot.length)
+            memset(downBatched.contents(), 0, downBatched.length)
+
+            let downBound: (MTLComputeCommandEncoder) -> Void = { encoder in
+                var weightOffset = UInt64(0)
+                var scaleOffset = UInt64(0)
+                var inDimension = UInt32(inDim)
+                var outDimension = UInt32(outDim)
+                var routing: Float = 0.75
+                encoder.setBuffer(weightBuffer, offset: 0, index: 0)
+                encoder.setBuffer(scaleBuffer, offset: 0, index: 1)
+                encoder.setBytes(&weightOffset, length: 8, index: 4)
+                encoder.setBytes(&scaleOffset, length: 8, index: 5)
+                encoder.setBytes(&inDimension, length: 4, index: 6)
+                encoder.setBytes(&outDimension, length: 4, index: 7)
+                encoder.setBytes(&routing, length: 4, index: 8)
+            }
+            run { encoder in
+                for slot in 0..<slots {
+                    encoder.setComputePipelineState(downRowsPipeline)
+                    downBound(encoder)
+                    encoder.setBuffer(
+                        activationBuffer, offset: slot * inDim * floatStride, index: 2
+                    )
+                    encoder.setBuffer(
+                        downPerSlot, offset: slot * outDim * floatStride, index: 3
+                    )
+                    encoder.setThreadgroupMemoryLength(32 * floatStride, index: 0)
+                    encoder.dispatchThreadgroups(
+                        MTLSize(width: outDim, height: 1, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+                    )
+                }
+            }
+            run { encoder in
+                encoder.setComputePipelineState(downSlotsPipeline)
+                downBound(encoder)
+                encoder.setBuffer(activationBuffer, offset: 0, index: 2)
+                encoder.setBuffer(downBatched, offset: 0, index: 3)
+                var slotCount = UInt32(slots)
+                encoder.setBytes(&slotCount, length: 4, index: 9)
+                encoder.setThreadgroupMemoryLength(32 * floatStride, index: 0)
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: outDim, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+                )
+            }
+            let downExpected = floats(downPerSlot, count: slots * outDim)
+            let downProduced = floats(downBatched, count: slots * outDim)
+            let downMagnitude = max(1, downExpected.map { abs($0) }.max() ?? 1)
+            for index in 0..<(slots * outDim) {
+                XCTAssertLessThan(
+                    abs(downProduced[index] - downExpected[index]),
+                    downMagnitude * 1e-4,
+                    "the slot down projection drifted at \(index) of \(outDim)x\(inDim)"
+                )
+            }
+            for slot in 1..<slots {
+                let moved = (0..<outDim).filter {
+                    abs(downProduced[slot * outDim + $0] - downProduced[$0]) > 1e-5
+                }.count
+                XCTAssertGreaterThan(
+                    moved, outDim / 4,
+                    "down slot \(slot) of \(outDim)x\(inDim) matched slot 0"
+                )
+            }
+            if againstHost {
+                for slot in 0..<slots {
+                    let row = Array(activations[(slot * inDim)..<((slot + 1) * inDim)])
+                    let expected = downReference(
+                        weight: weight,
+                        scales: scales,
+                        inDim: inDim,
+                        outDim: outDim,
+                        activation: row,
+                        routing: 0.75
+                    )
+                    for index in 0..<outDim {
+                        XCTAssertLessThan(
+                            abs(downProduced[slot * outDim + index] - expected[index]),
+                            downMagnitude * 1e-4,
+                            "the slot down projection drifted from the host rule at "
+                                + "slot \(slot) row \(index)"
+                        )
+                    }
+                }
+            }
+        }
+
+        try check(outDim: 96, inDim: 1_280, againstHost: true)
+        try check(outDim: 2_304, inDim: 5_120, againstHost: false)
+        try check(outDim: 5_120, inDim: 2_304, againstHost: false)
+    }
 }
 
 /// What a committed command buffer costs to START once the queue has gone idle.

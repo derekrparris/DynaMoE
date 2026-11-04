@@ -13095,4 +13095,293 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             regime: regime.label, wireArena: regime.wireArena, rounds: regime.rounds
         )
     }
+
+    // MARK: - #72: what a block's mixture half is made of
+
+    /// The mixture half is the largest bucket of a prefill position that is not the
+    /// disk (19.3-20.0 ms/position at the shipped width against 18.0 walked), and it is
+    /// the one bucket that does NOT fall with the block width. That is either a stage
+    /// whose bytes per position are fixed by the graph or a stage that never batches,
+    /// and nothing in this journal could say which: every block stage table (`#52`)
+    /// covers the DENSE half, because `recordsStageTiming` only ever gave that half a
+    /// buffer per stage.
+    ///
+    /// So this measures the four mixture stages at widths four and eight in the app's
+    /// own regime (`wireArena: nil`, `#71`), with the shipped one-buffer layout as the
+    /// control. The split is a different submission order (stage-major rather than
+    /// position-major), so the two layouts must return the same answer, and the table is
+    /// read as a ranking of stages rather than as the shipped layout's wall.
+    func testWhereABlocksMixtureTimeGoesOnThePublishedCheckpoint() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_mixture_stages"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in mixture attribution; touch \(markerPath) to run"
+        )
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+
+        let length = 128
+        let tokens = (0..<length).map { index in
+            let repetition = index / stream.count
+            return stream[(index + repetition * 13) % stream.count]
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: length + 1,
+            allowEngramSkip: false,
+            wireArena: nil
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let executor = runtime.forward()
+        let shippedWidth = DeepSeekV41DevicePlan.prefillBlockWidth(
+            config: config, contextLength: runtime.contextLength, promptTokens: length
+        )
+        var widths = [shippedWidth]
+        if !widths.contains(4) { widths.append(4) }
+        // The dense half's stage names, so the mixture's can be told apart in a table
+        // that is one dictionary.
+        let denseStages = Set(DeepSeekV41DevicePlan.frontHalf.map(\.rawValue))
+        let mixtureStages = DeepSeekV41DevicePlan.backHalf.map(\.rawValue)
+        XCTAssertFalse(mixtureStages.isEmpty, "the plan has no mixture stages")
+        let expertBytes = runtime.expertStreamer?.geometry.slotBytes ?? 0
+        let sharedBytesPerLayer = 3 * executor.shapes.sharedIntermediate * config.hiddenSize
+        let wiredGigabytes = Double(runtime.arena.capacity) * Double(expertBytes) / 1_073_741_824
+        let expertMegabytes = Double(expertBytes) / 1_048_576
+        let sharedMegabytes = Double(sharedBytesPerLayer) / 1_048_576
+        let expertRatio = "\(config.numActivatedExperts)/\(config.numRoutedExperts)"
+        print(
+            String(
+                format: "🔎 [dsv41 real] mixture attribution: %d positions, arena %d slot(s) "
+                    + "wired (%.1f GB), widths %@, %@ experts of %.2f MB, shared expert "
+                    + "%.1f MB/layer",
+                length,
+                runtime.arena.capacity,
+                wiredGigabytes,
+                String(describing: widths),
+                expertRatio,
+                expertMegabytes,
+                sharedMegabytes
+            )
+        )
+        print("🔎 [dsv41 real] mixture stages: " + mixtureStages.joined(separator: ", "))
+
+        struct MixtureSample {
+            var label: String
+            var width: Int
+            var millisecondsPerPosition: Double
+            var stageMilliseconds: [String: Double]
+            var denseDevice: Double
+            var mixtureDevice: Double
+            var megabytes: Double
+            var misses: Int
+            var last: [Float]
+        }
+
+        func arm(width: Int, split: Bool) throws -> MixtureSample {
+            executor.reset()
+            executor.resetBlockTiming()
+            executor.resetStageTiming()
+            executor.recordsBlockTiming = true
+            executor.recordsStageTiming = split
+            let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+            let missesBefore = runtime.expertStreamer?.expertsLoaded ?? 0
+            let started = DispatchTime.now().uptimeNanoseconds
+            let result = try executor.prefillChunk(tokens, blockWidth: width)
+            let wall = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+            executor.recordsStageTiming = false
+            executor.recordsBlockTiming = false
+            let per = executor.blockTiming.millisecondsPerPosition()
+            let divisor = Double(length) * 1_000_000
+            var stages: [String: Double] = [:]
+            for (stage, nanoseconds) in executor.stageTiming {
+                stages[stage] = Double(nanoseconds) / divisor
+            }
+            return MixtureSample(
+                label: split ? "split" : "one buffer",
+                width: width,
+                millisecondsPerPosition: wall / Double(length),
+                stageMilliseconds: stages,
+                denseDevice: per.denseDevice,
+                mixtureDevice: per.mixtureDevice,
+                megabytes: Double((runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore) / 1_048_576,
+                misses: (runtime.expertStreamer?.expertsLoaded ?? 0) - missesBefore,
+                last: result.last
+            )
+        }
+
+        // One discarded pass so no arm pays the slot allocations or a cold page cache.
+        executor.reset()
+        runtime.arena.reset()
+        _ = try executor.prefillChunk(Array(stream.prefix(8)))
+
+        var averaged: [String: [MixtureSample]] = [:]
+        for width in widths {
+            for round in 0..<3 {
+                // Rotated: whoever runs first reads the colder cache, and the shipped
+                // layout is the one that must be compared like for like.
+                let order = round % 2 == 0 ? [false, true] : [true, false]
+                for split in order {
+                    let sample = try arm(width: width, split: split)
+                    let label = "\(sample.label) @ \(width)"
+                    print(
+                        String(
+                            format: "🔎 [dsv41 real]   %-18@ round %d wall %7.1f ms/position, "
+                                + "device %.1f (dense %.1f, mixture %.1f), %.0f MB, %d misses",
+                            label as NSString,
+                            round + 1,
+                            sample.millisecondsPerPosition,
+                            sample.denseDevice + sample.mixtureDevice,
+                            sample.denseDevice,
+                            sample.mixtureDevice,
+                            sample.megabytes,
+                            sample.misses
+                        )
+                    )
+                    // A young process is 1.3-1.6x faster in every bucket (`#53`), so the
+                    // first round is printed and never averaged.
+                    guard round > 0 else { continue }
+                    averaged[label, default: []].append(sample)
+                }
+            }
+        }
+
+        func mean(_ samples: [MixtureSample]) -> MixtureSample {
+            let count = Double(max(1, samples.count))
+            var stages: [String: Double] = [:]
+            for sample in samples {
+                for (stage, milliseconds) in sample.stageMilliseconds {
+                    stages[stage, default: 0] += milliseconds / count
+                }
+            }
+            return MixtureSample(
+                label: samples[0].label,
+                width: samples[0].width,
+                millisecondsPerPosition: samples.map(\.millisecondsPerPosition).reduce(0, +) / count,
+                stageMilliseconds: stages,
+                denseDevice: samples.map(\.denseDevice).reduce(0, +) / count,
+                mixtureDevice: samples.map(\.mixtureDevice).reduce(0, +) / count,
+                megabytes: samples.map(\.megabytes).reduce(0, +) / count,
+                misses: Int(Double(samples.map(\.misses).reduce(0, +)) / count),
+                last: samples[0].last
+            )
+        }
+
+        for width in widths {
+            let oneBuffer = try XCTUnwrap(
+                averaged["one buffer @ \(width)"].map(mean),
+                "the one-buffer arm at width \(width) was never measured"
+            )
+            let split = try XCTUnwrap(
+                averaged["split @ \(width)"].map(mean),
+                "the split arm at width \(width) was never measured"
+            )
+
+            // The split is the same graph: same kernels, same bindings per slot, and one
+            // in-order queue instead of one buffer. Anything but an identical answer is
+            // a hazard the single-buffer layout was hiding.
+            let scale = max(split.last.map { abs(Double($0)) }.max() ?? 0, 1e-6)
+            let worst = zip(oneBuffer.last, split.last)
+                .map { abs(Double($0) - Double($1)) }
+                .max() ?? 0
+            XCTAssertEqual(
+                split.last.count, oneBuffer.last.count, "the two layouts returned no logits"
+            )
+            XCTAssertLessThan(
+                worst / scale, 1e-6,
+                "the stage-major mixture order changed the answer at width \(width)"
+            )
+            XCTAssertEqual(
+                Self.argmax(split.last), Self.argmax(oneBuffer.last),
+                "the stage-major mixture order chose a different token at width \(width)"
+            )
+            // Not a result, a guard: an arm that read different bytes is a different
+            // regime and its device windows are not comparable.
+            XCTAssertLessThan(
+                abs(split.megabytes - oneBuffer.megabytes),
+                max(oneBuffer.megabytes * 0.02, 1),
+                "the two layouts at width \(width) read different bytes"
+            )
+            for stage in mixtureStages {
+                XCTAssertNotNil(
+                    split.stageMilliseconds[stage],
+                    "the split layout never reported \(stage) at width \(width)"
+                )
+            }
+
+            let mixtureTotal = mixtureStages.reduce(0.0) { $0 + (split.stageMilliseconds[$1] ?? 0) }
+            print(
+                String(
+                    format: "🔎 [dsv41 real] width %d, mixture device %.2f ms/position (one "
+                        + "buffer %.2f), stages sum to %.2f of it; dense device %.2f; "
+                        + "%.0f MB, %d misses",
+                    width,
+                    split.mixtureDevice,
+                    oneBuffer.mixtureDevice,
+                    mixtureTotal,
+                    split.denseDevice,
+                    split.megabytes,
+                    split.misses
+                )
+            )
+            for stage in mixtureStages {
+                let milliseconds = split.stageMilliseconds[stage] ?? 0
+                // The shared expert's bytes are the same for every position of the
+                // block, which is what makes its rate the question: a block that reads
+                // them once per position pays `width` times.
+                let bytes = Double(config.numHiddenLayers) * Double(sharedBytesPerLayer)
+                    / 1_073_741_824
+                let rate = stage == "sharedExpert" && milliseconds > 0
+                    ? bytes / (milliseconds / 1_000) : 0
+                let suffix = rate > 0
+                    ? String(
+                        format: "  (%.2f GB/position of weight, %.0f GB/s)", bytes, rate
+                    )
+                    : ""
+                print(
+                    String(
+                        format: "🔎 [dsv41 real]   %-20@ %7.3f ms/position  %5.1f%% of the "
+                            + "mixture half%@",
+                        stage as NSString,
+                        milliseconds,
+                        milliseconds / max(split.mixtureDevice, 1e-9) * 100,
+                        suffix as NSString
+                    )
+                )
+            }
+            let denseTotal = split.stageMilliseconds
+                .filter { denseStages.contains($0.key) }
+                .values.reduce(0, +)
+            print(
+                String(
+                    format: "🔎 [dsv41 real] width %d, dense stages sum to %.2f of %.2f "
+                        + "ms/position of dense device (%.0f%% over, the split pays its own "
+                        + "pickup, `#60`)",
+                    width, denseTotal, split.denseDevice,
+                    split.denseDevice > 0 ? (denseTotal / split.denseDevice - 1) * 100 : 0
+                )
+            )
+        }
+        withExtendedLifetime(engine) {}
+    }
 }

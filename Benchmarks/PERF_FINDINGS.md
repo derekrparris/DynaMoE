@@ -11387,3 +11387,154 @@ real prefill at 3, 9, 64 and 128 positions to assert the report cadence.
 `testWhatAWholeTurnActuallyCosts` passes with its cadence expectation derived from the
 shipped rule instead of from `chunkSlots` directly; the indirection is what caught the
 first cut, which asserted a block count the engine no longer produced.
+
+## DSV4.1 #72: THE MIXTURE HALF DOES NOT AMORTISE WITH WIDTH BECAUSE BOTH ITS BIG STAGES ARE PER POSITION -- AND THE SHARED EXPERT'S REPETITION WAS REQUESTS, NOT BYTES
+
+### Question
+
+`#71` closed the fill and listed what is left of a 128-position prefill at the shipped width:
+99.7 ms/position of which fill 52.2 (read 51.8 at 13.6 GB/s), **mixture device 19.3-20.0**, dense
+device 13.4, indexer wait 11.3, front wait 43.7. The mixture half is the largest bucket that is not
+the disk, and it is the one bucket that did NOT fall with the block width -- `#71`'s table had it
+rising 18.0 (walk) -> 18.5 (width 4) -> 20.0 (width 8). Every stage table in this journal before now
+covers the DENSE half (`#52` measured one on a real block; `#60` did the walk's), because
+`recordsStageTiming` only ever gave those stages a command buffer each. So "the mixture half costs
+19-20 ms and does not batch" was a statement about a bucket, not about a stage.
+
+### What was added
+
+Measurement only, off in every production path:
+
+- `recordsStageTiming` now splits a BLOCK's mixture half the same way it already split its dense
+  half: one command buffer per back-half stage, every position of the block inside it. The order
+  becomes stage-major rather than position-major, and that is safe rather than
+  equivalent-by-luck: the slots are disjoint, and the only cross-stage hazard (`routedExperts`
+  clears and accumulates `moeOut`, `writeFFNStreams` reads it) stays ordered because every buffer
+  is on one in-order queue. The probe asserts the two layouts return the same answer.
+- `testWhereABlocksMixtureTimeGoesOnThePublishedCheckpoint` (opt-in,
+  `/tmp/dynamoe_dsv41_mixture_stages`, 135 s): 128 positions in the app's own regime
+  (`wireArena: nil`), widths 8 and 4, three rounds with the arm order rotated and round 1 discarded
+  (`#53`), the shipped one-buffer layout beside the stage split. It prints the four mixture stages
+  per width and asserts: identical logits between layouts (relative 1e-6), the same argmax, all four
+  stages reported, and that the two layouts read the same bytes (a guard, not a result).
+
+### The table, before any change
+
+Milliseconds per position, 128 positions, arena 3,760 slots wired (65.8 GB), two layouts measured in
+the same process:
+
+| width | mixture device (split / one buffer) | routedExperts | sharedExpert | writeFFNStreams | collapseStreams |
+|---|---|---|---|---|---|
+| 8 | 16.17 / 17.06 | **12.272 (75.9%)** | **3.655 (22.6%)** | 0.152 | 0.095 |
+| 4 | 16.37 / 17.32 | **12.409 (75.8%)** | **3.703 (22.6%)** | 0.157 | 0.100 |
+
+Two stages are 98.5% of the half. Their bytes say what they are:
+
+- **`routedExperts` is the machine's GEMV ceiling and is per position by construction.** One
+  position routes 6 of 384 experts on each of 40 layers, 6 x 17.93 MB x 40 = 4.30 GB, read in
+  12.22 ms -- **352 GB/s**, which is `#20`'s 300-370 GB/s and `#60`/`#61`'s 352 reproduced at a
+  block. Eight positions of a block touch about 45 DISTINCT experts of the 48 they route (a 6%
+  union saving), so batching can remove almost nothing: the bytes are the routing.
+- **`sharedExpert` reads the same 33.8 MB per layer for every position** -- 1.32 GB/position -- and
+  it was doing so at 390 GB/s, i.e. at the ceiling, once per position. That is the one repetition
+  in the mixture half that batching can remove.
+
+**`#71`'s "it rises with width" does not reproduce.** The same instrument in two processes puts the
+mixture half at 15.5 (width 8) and 15.8 (width 4); the 18.0 -> 18.5 -> 20.0 row was instrument
+spread in the bucket table, not a width effect.
+
+### The batched shared expert, and what it is actually worth
+
+Two additive kernels, `dsv41_fp8_block32_swiglu_gate_up_rows_slots` and
+`dsv41_fp8_block32_down_accumulate_rows_slots`: one threadgroup per output row with the POSITION
+loop inside it, so the row's bytes are requested once and the later positions' passes come from the
+caches in front of DRAM. Buffer indices are their `_rows` siblings' plus `slotCount`; the output is
+`[slot][outDim]`, and lane 0 accumulates each slot's row exactly as the `_rows` form accumulates
+one. The block path now encodes the mixture stage-major and hands `.sharedExpert` ONE dispatch with
+`rows: count`; every other format (and a narrow fixture, where `fp8GemvWantsWideGrid` is false)
+keeps the per-position loop. `workspace.sharedIntermediate` is one row per slot.
+
+Predicted from the byte model: `(1 - 1/8) x 3.66 = 3.2 ms/position`. Measured:
+
+| width | sharedExpert before | sharedExpert after | mixture device after (split / one buffer) |
+|---|---|---|---|
+| 8 | 3.655 | **3.060 (1.19x)** | 15.53 / 15.50 |
+| 4 | 3.703 | **3.177 (1.17x)** | 15.78 / 15.90 |
+
+**So 84% of the predicted saving was not there, and the reason matters more than the number.** If
+those 1.32 GB/position had been DRAM traffic, removing 7/8 of them would have taken 3.2 ms.
+Removing them took 0.56 ms, which means the per-position re-reads were being served by the caches
+in front of DRAM: a layer's shared expert is 33.8 MB, and eight consecutive passes over it fit.
+The stage was never bandwidth-bound on its WEIGHT.
+
+What it IS bound on is its INPUT. A threadgroup owns one output row and reads EVERY position's
+normed vector for the length of that row:
+
+    outDim x slots x inDim x 4 bytes = 2,304 x 8 x 5,120 x 4 = 377 MB per layer-block
+
+which is 1.88 GB per position, 14x the weight, and 377 MB in the 0.61 ms a layer-block takes is
+**616 GB/s**. That is the stage, and batching the weight does not touch it. `#18` found exactly this
+for the block's BF16 GEMVs (a block of sixteen was WORSE than eight because the input, not the
+weight, is what a threadgroup re-requests per output row); this is the same defect in the shared
+expert, which is the one stage of the mixture that all eight positions share.
+
+In situ, the shipped layout's wall moved with it, in two processes and at both widths: width 8
+82.6 / 80.7 -> 78.5 / 77.7, width 4 88.6 / 87.4 -> 83.6 / 84.7 ms/position, i.e. **~3.5
+ms/position, 4%**. Part of that is the stage (0.56) and part is the layout (the mixture half is now
+15.50 one-buffer against 17.06, and the two layouts agree after the change where they differed by
+0.9 before), so quote the stage number as the result and the wall as the direction. The live turn
+agrees in size: the app's 31-position default prompt went 6.67 s (215.3 ms/position, `#71`) to
+**6.29 s (203.0 ms/position)**, turn 7.74 -> 7.35 s, on a machine whose absolute walls move 5-30%
+between processes.
+
+### What it says
+
+- **The mixture half's floor is `routedExperts` + whatever the shared expert's input traffic
+  costs**, and at a block that is 12.2 + ~3.1 of a 15.5 ms half. Neither is a kernel-form
+  question: the routed bytes are the routing, and the shared expert's stage is its activations.
+- **A block does not amortise the routed mixture, and that is a property of the model.** Six of 384
+  experts per position means two positions share an expert about 1.5% of the time.
+- **The one lever left inside the mixture half is rows per threadgroup on the shared expert**, and
+  `#21`'s prohibition has an exception written into it: "do not re-propose rows-per-threadgroup for
+  FP8 without a shape whose INPUT traffic is the measured cost". This is such a shape (616 GB/s of
+  activation re-reads). `#18` measured the two-row form at 1.20-1.34x on `attn.wo_a`/`attn.wo_b`,
+  which here would put the stage at ~2.4 ms/position -- under 1% of a prefill. It is a named,
+  unbuilt lever with a size, not a recommendation.
+
+### What it is not (do not re-propose)
+
+- **Not evidence that the mixture half should fall with width.** It is flat (15.5 at 8, 15.8 at 4)
+  because both its stages are per-position; `#71`'s rising row was spread.
+- **Not a batching argument for the routed experts.** The union dedup saves 6% of the slots and
+  nothing of the bytes, and the bytes are at the ceiling.
+- **Not a caller-side fix.** The block already submits its mixture as one command buffer with no
+  round trip between positions (`#52`).
+- **Not the dispatch count or fusion.** `writeFFNStreams` and `collapseStreams` are 0.25 ms/position
+  together; `#66` already put the whole graph's dispatch floor at ~1.06 ms.
+- **Not the arena, the fill, the page cache or the width.** Every arm here read the same bytes
+  (56,281 MB / 3,139 misses at width 8, 56,963 / 3,177 at width 4 across all layouts and rounds)
+  and the fill was closed in `#71`.
+- **Not a reason to touch the walk.** The batched form is a block form; a decode step has one
+  position and `rows: 1` keeps the `_rows` kernel it already shipped.
+
+### Verification
+
+`testWhereABlocksMixtureTimeGoesOnThePublishedCheckpoint` in `DeepSeekV41PublishedTurnTests`
+(opt-in, `/tmp/dynamoe_dsv41_mixture_stages` plus the class's `/tmp/dynamoe_dsv41_real_turn`, 135 s
+at `-O`): runs `/tmp/test72_mix1.log` (before), `/tmp/test72_mix2.log` and `/tmp/test72_mix3.log`
+(after, reproducing every stage within 2%). The kernel change is pinned without the checkpoint by
+`DeepSeekV41FP8SharedExpertKernelTests.testTheSlotFormsProjectEveryPositionFromOneWeightRead`:
+five slots (so no form can assume four or eight), the published shapes, the batched output against
+the per-slot `_rows` form AND -- at a small shape -- the host rule, plus a check that each slot lands
+in its own row. The class's 7 cases pass. `DeepSeekV41DeviceGraphParityTests`,
+`DeepSeekV41DeviceParityTests`, `DeepSeekV41TurnLoopTests`, `DeepSeekV41SlotWiringTests` and
+`DeepSeekV41ExpertStreamTests` pass, 68 cases with 0 failures; those compare the device block and
+walk against `DeepSeekV41CPUForward`, which is what makes the stage-major reorder and the batched
+shared expert checked against the host graph rather than against themselves. The live turn is
+`/tmp/test72_turn1.log`.
+
+Production changed: two kernels, two pipelines, `DeepSeekV41Kernels` names, `encodeSwiGLU` /
+`encodeDown`'s `rows:`, `encodeSharedExpert`'s batch decision, `encodeBlockMixtureStage` (stage-major
+with one shared-expert dispatch), and `workspace.sharedIntermediate` at one row per slot (8 x 9 KB
+instead of 9 KB). The split layout and `sharedExpertCapture`/`ffnNormed` probes are measurement-only
+and still off in every production path.

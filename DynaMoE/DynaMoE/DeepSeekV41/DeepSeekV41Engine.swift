@@ -409,6 +409,10 @@ nonisolated public struct DeepSeekV41Pipelines {
     /// The same pair with one output row per threadgroup (coalesced weight loads).
     public let fp8SwiGLURows: MTLComputePipelineState
     public let fp8DownAccumulateRows: MTLComputePipelineState
+    /// The same pair over a BLOCK of positions, with the row's weight requested once:
+    /// the shared expert is the one weight every position of a block reads.
+    public let fp8SwiGLURowsSlots: MTLComputePipelineState
+    public let fp8DownAccumulateRowsSlots: MTLComputePipelineState
     /// BF16 fallback for a checkpoint whose FFN was not quantized.
     public let bf16Gemv: MTLComputePipelineState
     public let bf16GemvRows: MTLComputePipelineState
@@ -461,6 +465,8 @@ nonisolated public struct DeepSeekV41Pipelines {
         self.fp8DownAccumulate = try make("dsv41_fp8_block32_down_accumulate")
         self.fp8SwiGLURows = try make("dsv41_fp8_block32_swiglu_gate_up_rows")
         self.fp8DownAccumulateRows = try make("dsv41_fp8_block32_down_accumulate_rows")
+        self.fp8SwiGLURowsSlots = try make("dsv41_fp8_block32_swiglu_gate_up_rows_slots")
+        self.fp8DownAccumulateRowsSlots = try make("dsv41_fp8_block32_down_accumulate_rows_slots")
         self.bf16Gemv = try make("bf16_gemv")
         self.bf16GemvRows = try make("bf16_gemv_rows")
         self.bf16GemvBlock = try make("bf16_gemv_rows8")
@@ -1343,7 +1349,10 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
               let expertIndices = make(max(4 * config.numActivatedExperts, 16) * slots),
               let expertWeights = make(slotBytes(config.numActivatedExperts)),
               let intermediate = make(float4(shapes.expertIntermediate)),
-              let sharedIntermediate = make(float4(shapes.sharedIntermediate)),
+              // One staging row per position: a block's shared expert projects every
+              // slot's normed input in one dispatch, so this block is slot-sized rather
+              // than one position wide.
+              let sharedIntermediate = make(slotBytes(shapes.sharedIntermediate)),
               let pooled = make(float4(shapes.latentWidth)),
               let compressorLatents = make(
                   float4(maxCompressed * compressorGroups * shapes.latentWidth)

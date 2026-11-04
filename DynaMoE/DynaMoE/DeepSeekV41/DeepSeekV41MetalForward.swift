@@ -106,6 +106,12 @@ nonisolated public enum DeepSeekV41Kernels {
     /// warp's 32 E4M3 bytes per block are adjacent instead of a row apart.
     public static let fp8SwiGLURows = "dsv41_fp8_block32_swiglu_gate_up_rows"
     public static let fp8DownAccumulateRows = "dsv41_fp8_block32_down_accumulate_rows"
+    /// The same pair over a BLOCK of positions, with the row's weight requested once:
+    /// the shared expert is the one weight every position of a block reads, so a
+    /// per-position dispatch re-reads it `slotCount` times (`#72`).
+    public static let fp8SwiGLURowsSlots = "dsv41_fp8_block32_swiglu_gate_up_rows_slots"
+    public static let fp8DownAccumulateRowsSlots =
+        "dsv41_fp8_block32_down_accumulate_rows_slots"
     public static let mxfp4Gemv = "dsv41_mxfp4_gemv"
     public static let mxfp4SwiGLU = "dsv41_mxfp4_swiglu_gate_up"
     public static let mxfp4DownAccumulate = "dsv41_mxfp4_down_accumulate"
@@ -3112,33 +3118,77 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         // fill is safe here because the front half above was just waited on, so the
         // GPU is idle and no kernel is reading the slots about to be overwritten.
         if let residents {
-            let expertCommand = try makeCommandBuffer()
-            let expertEncoder = try makeEncoder(expertCommand)
-            for index in 0..<count {
+            var mixtureBuffers: [MTLCommandBuffer] = []
+            if recordsStageTiming {
+                // One buffer per mixture stage, the layout the dense half already has
+                // under this switch, so a stage table can say which of the four owns
+                // the half's device time. The order is stage-major rather than
+                // position-major and that is safe rather than equivalent-by-luck: the
+                // slots are disjoint, and the only cross-stage hazard (`routedExperts`
+                // clears and accumulates `moeOut`, `writeFFNStreams` reads it) stays
+                // ordered because every buffer here is on one in-order queue.
                 for stage in DeepSeekV41DevicePlan.backHalf {
-                    try encodeBlockExpertStage(
+                    let buffer = try makeCommandBuffer()
+                    let encoder = try makeEncoder(buffer)
+                    try encodeBlockMixtureStage(
                         stage,
                         layer: layer,
-                        slot: index,
+                        count: count,
+                        encoder: encoder,
+                        routings: routings,
+                        residents: residents
+                    )
+                    encoder.endEncoding()
+                    buffer.commit()
+                    pending.append((
+                        buffer: buffer,
+                        stage: "layer \(layer.index) \(stage.rawValue) (block \(count))",
+                        isMixture: true
+                    ))
+                    stageBuffers.append((stage: stage.rawValue, buffer: buffer))
+                    mixtureBuffers.append(buffer)
+                }
+            } else {
+                let expertCommand = try makeCommandBuffer()
+                let expertEncoder = try makeEncoder(expertCommand)
+                for stage in DeepSeekV41DevicePlan.backHalf {
+                    try encodeBlockMixtureStage(
+                        stage,
+                        layer: layer,
+                        count: count,
                         encoder: expertEncoder,
-                        routing: routings[index],
-                        residents: residents[index]
+                        routings: routings,
+                        residents: residents
                     )
                 }
+                expertEncoder.endEncoding()
+                // Nothing of this half is read back on the host, so it is ordered rather
+                // than waited for: the next layer's front half commits behind it, and
+                // that wait drains this one (`runLayer` orders its experts half the same
+                // way). The last layer lands in `settlePending` before the logits.
+                try commit(
+                    expertCommand,
+                    stage: "layer \(layer.index) experts (block \(count))",
+                    waiting: false,
+                    mixture: true
+                )
+                mixtureBuffers.append(expertCommand)
             }
-            expertEncoder.endEncoding()
-            // Nothing of this half is read back on the host, so it is ordered rather
-            // than waited for: the next layer's front half commits behind it, and
-            // that wait drains this one (`runLayer` orders its experts half the same
-            // way). The last layer lands in `settlePending` before the logits.
-            try commit(
-                expertCommand,
-                stage: "layer \(layer.index) experts (block \(count))",
-                waiting: false,
-                mixture: true
-            )
             let mixtureEncoded = measuring ? DispatchTime.now().uptimeNanoseconds : 0
-            if measuring { timingBuffers.append((buffer: expertCommand, bucket: 1)) }
+            if measuring {
+                for buffer in mixtureBuffers {
+                    timingBuffers.append((buffer: buffer, bucket: 1))
+                }
+            }
+            if recordsStageTiming {
+                // A stage window is only meaningful once its buffer finished, so this
+                // layout spends the layer's hand-off rather than passing it on. That
+                // inflates nothing the table reports (the windows are the stages' own)
+                // but it does mean the split arm's WALL is not the shipped layout's
+                // (`#60` measured the same +14.6% bias on the dense half).
+                try settlePending()
+                recordStageTiming()
+            }
             blockMixtureSubmissions += 1
             recordLayerTiming(
                 from: layerStart,
@@ -3276,8 +3326,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         timingBuffers.removeAll(keepingCapacity: true)
     }
 
-    /// Reads each front-half stage's own device window, after the wait that covered
-    /// them all. Called only from the `recordsStageTiming` layout.
+    /// Reads each stage's own device window, after the wait that covered them all.
+    /// Called only from the `recordsStageTiming` layout, which is the only one that
+    /// gives a stage a buffer of its own: the dense half does it per layer, and so does
+    /// a block's mixture.
     private func recordStageTiming() {
         for entry in stageBuffers {
             let start = entry.buffer.gpuStartTime
@@ -3762,6 +3814,39 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             )
         default:
             throw DeepSeekV41EngineError.unsupportedStage("stage \(stage.rawValue) in a mixture")
+        }
+    }
+
+    /// One mixture stage for a whole block, in the order the four must run.
+    ///
+    /// Stage-major rather than position-major, because the shared expert is ONE weight
+    /// that every position of a block multiplies by its own normed input: a per-position
+    /// dispatch re-reads it `count` times, which `#72` measured as 3.66 ms/position and
+    /// 22.6% of the mixture half at the machine's ceiling, i.e. all of it redundant
+    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #72"). Running it once for the block also
+    /// fixes where it has to sit: after EVERY position's routed half, because
+    /// `encodeRoutedExperts` clears `moeOut` for its slot before accumulating.
+    private func encodeBlockMixtureStage(
+        _ stage: DeepSeekV41ForwardStages.Stage,
+        layer: DeepSeekV41LayerPlan,
+        count: Int,
+        encoder: MTLComputeCommandEncoder,
+        routings: [DeepSeekV41Routing],
+        residents: [[DeepSeekV41ResidentExpert]?]
+    ) throws {
+        if stage == .sharedExpert, count > 1 {
+            try encodeSharedExpert(layer: layer.index, encoder: encoder, rows: count)
+            return
+        }
+        for index in 0..<count {
+            try encodeBlockExpertStage(
+                stage,
+                layer: layer,
+                slot: index,
+                encoder: encoder,
+                routing: routings[index],
+                residents: residents[index]
+            )
         }
     }
 
@@ -5912,7 +5997,8 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         layer index: Int,
         encoder: MTLComputeCommandEncoder,
         scope: DeepSeekV41TensorScope = .backbone,
-        slot: Int = 0
+        slot: Int = 0,
+        rows: Int = 1
     ) throws {
         // The shared expert runs for every token, unscaled, and accumulates into the
         // same vector the routed experts do. A checkpoint that declares no shared
@@ -5931,29 +6017,75 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         guard buffer.length >= width * MemoryLayout<Float>.stride else {
             throw DeepSeekV41EngineError.allocationFailed("the shared expert intermediate")
         }
-        try encodeSwiGLU(
-            encoder,
-            gate: w1,
-            gateScale: weights.scaleTensor(.sharedExpertW1, scope: scope, layer: index),
-            up: w3,
-            upScale: weights.scaleTensor(.sharedExpertW3, scope: scope, layer: index),
-            inDim: shapes.hidden,
-            outDim: width,
-            input: workspace.normed,
-            output: buffer,
-            inputByteOffset: workspace.slotOffset(slot, width: shapes.hidden)
-        )
-        try encodeDown(
-            encoder,
-            weight: w2,
-            scale: weights.scaleTensor(.sharedExpertW2, scope: scope, layer: index),
-            inDim: width,
-            outDim: shapes.hidden,
-            activation: buffer,
-            output: workspace.moeOut,
-            weightToAdd: 1,
-            byteOffset: workspace.slotOffset(slot, width: shapes.hidden)
-        )
+        // The shared expert is the ONE weight in a block's mixture that every position
+        // reads, so a prefill block can project all of its slots in one dispatch and
+        // request each row once instead of `rows` times. `#72` measured the per-position
+        // form at 3.66 ms/position, 22.6% of the mixture half, at the machine's ceiling,
+        // i.e. all of it redundant repetition
+        // (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #72"). Only the coalesced FP8 form has
+        // a slot kernel; every other format keeps the per-position loop.
+        let batchable = rows > 1
+            && DeepSeekV41DevicePlan.linearFormat(
+                tensor: w1,
+                scale: weights.scaleTensor(.sharedExpertW1, scope: scope, layer: index)
+            ) == .fp8Block32
+            && !disablesFP8FusedRows
+            && DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(
+                outDim: width, inDim: shapes.hidden, rows: 1
+            )
+        if batchable {
+            try encodeSwiGLU(
+                encoder,
+                gate: w1,
+                gateScale: weights.scaleTensor(.sharedExpertW1, scope: scope, layer: index),
+                up: w3,
+                upScale: weights.scaleTensor(.sharedExpertW3, scope: scope, layer: index),
+                inDim: shapes.hidden,
+                outDim: width,
+                input: workspace.normed,
+                output: buffer,
+                inputByteOffset: 0,
+                rows: rows
+            )
+            try encodeDown(
+                encoder,
+                weight: w2,
+                scale: weights.scaleTensor(.sharedExpertW2, scope: scope, layer: index),
+                inDim: width,
+                outDim: shapes.hidden,
+                activation: buffer,
+                output: workspace.moeOut,
+                weightToAdd: 1,
+                byteOffset: 0,
+                rows: rows
+            )
+            return
+        }
+        for positionSlot in slot..<(slot + max(1, rows)) {
+            try encodeSwiGLU(
+                encoder,
+                gate: w1,
+                gateScale: weights.scaleTensor(.sharedExpertW1, scope: scope, layer: index),
+                up: w3,
+                upScale: weights.scaleTensor(.sharedExpertW3, scope: scope, layer: index),
+                inDim: shapes.hidden,
+                outDim: width,
+                input: workspace.normed,
+                output: buffer,
+                inputByteOffset: workspace.slotOffset(positionSlot, width: shapes.hidden)
+            )
+            try encodeDown(
+                encoder,
+                weight: w2,
+                scale: weights.scaleTensor(.sharedExpertW2, scope: scope, layer: index),
+                inDim: width,
+                outDim: shapes.hidden,
+                activation: buffer,
+                output: workspace.moeOut,
+                weightToAdd: 1,
+                byteOffset: workspace.slotOffset(positionSlot, width: shapes.hidden)
+            )
+        }
     }
 
     /// The routed mixture.
@@ -6648,7 +6780,8 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         input: MTLBuffer,
         output: MTLBuffer,
         resident: DeepSeekV41ResidentExpert? = nil,
-        inputByteOffset: Int = 0
+        inputByteOffset: Int = 0,
+        rows: Int = 1
     ) throws {
         let format = DeepSeekV41DevicePlan.linearFormat(tensor: gate, scale: gateScale)
         guard DeepSeekV41DevicePlan.swigluKernel(format, swigluLimit: swigluLimit) != nil else {
@@ -6692,7 +6825,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             }
             encoder.setComputePipelineState(
                 format == .fp8Block32
-                    ? (wideGrid ? pipelines.fp8SwiGLURows : pipelines.fp8SwiGLU)
+                    ? (rows > 1 && wideGrid
+                        ? pipelines.fp8SwiGLURowsSlots
+                        : (wideGrid ? pipelines.fp8SwiGLURows : pipelines.fp8SwiGLU))
                     : (wideGrid ? pipelines.mxfp4SwiGLURows : pipelines.mxfp4SwiGLU)
             )
             encoder.setBuffer(gateBuffer, offset: 0, index: 0)
@@ -6713,6 +6848,12 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.setBytes(&inDimension, length: 4, index: 10)
             encoder.setBytes(&outDimension, length: 4, index: 11)
             encoder.setBytes(&limit, length: 4, index: 12)
+            if rows > 1 && format == .fp8Block32 && wideGrid {
+                // The slot kernel projects every position of a block from ONE read of
+                // the row; the token axis is its own loop rather than a grid height.
+                var slotCount = UInt32(rows)
+                encoder.setBytes(&slotCount, length: 4, index: 13)
+            }
         case .bf16:
             encoder.setComputePipelineState(pipelines.bf16SwiGLU)
             encoder.setBuffer(gateBuffer, offset: 0, index: 0)
@@ -6727,6 +6868,14 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.setBytes(&outDimension, length: 4, index: 7)
         case .unsupported:
             throw DeepSeekV41EngineError.unsupportedDtype("a feed-forward gate", gate.dtype)
+        }
+        // The slot form exists for the coalesced FP8 pair only. Anything else would
+        // dispatch the one-position kernel `rows` times into slot 0, which is a wrong
+        // answer rather than a slow one.
+        if rows > 1 && !(format == .fp8Block32 && wideGrid) {
+            throw DeepSeekV41EngineError.unsupportedStage(
+                "a \(rows)-position shared expert gate over \(format)"
+            )
         }
         if wideGrid {
             // One threadgroup per output row, so the row's weight blocks are adjacent
@@ -6765,7 +6914,8 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         output: MTLBuffer,
         weightToAdd: Float,
         resident: DeepSeekV41ResidentExpert? = nil,
-        byteOffset: Int = 0
+        byteOffset: Int = 0,
+        rows: Int = 1
     ) throws {
         let format = DeepSeekV41DevicePlan.linearFormat(tensor: weight, scale: scale)
         guard DeepSeekV41DevicePlan.downKernel(format) != nil else {
@@ -6805,8 +6955,12 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             }
             encoder.setComputePipelineState(
                 format == .fp8Block32
-                    ? (wideGrid ? pipelines.fp8DownAccumulateRows : pipelines.fp8DownAccumulate)
-                    : (wideGrid ? pipelines.mxfp4DownAccumulateRows : pipelines.mxfp4DownAccumulate)
+                    ? (rows > 1 && wideGrid
+                        ? pipelines.fp8DownAccumulateRowsSlots
+                        : (wideGrid ? pipelines.fp8DownAccumulateRows
+                            : pipelines.fp8DownAccumulate))
+                    : (wideGrid ? pipelines.mxfp4DownAccumulateRows
+                        : pipelines.mxfp4DownAccumulate)
             )
             encoder.setBuffer(weightBuffer, offset: 0, index: 0)
             encoder.setBuffer(scaleBuffer, offset: 0, index: 1)
@@ -6819,6 +6973,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.setBytes(&inDimension, length: 4, index: 6)
             encoder.setBytes(&outDimension, length: 4, index: 7)
             encoder.setBytes(&routing, length: 4, index: 8)
+            if rows > 1 && format == .fp8Block32 && wideGrid {
+                var slotCount = UInt32(rows)
+                encoder.setBytes(&slotCount, length: 4, index: 9)
+            }
         case .bf16:
             encoder.setComputePipelineState(pipelines.bf16DownAccumulate)
             encoder.setBuffer(weightBuffer, offset: 0, index: 0)
@@ -6831,6 +6989,12 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.setBytes(&routing, length: 4, index: 6)
         case .unsupported:
             throw DeepSeekV41EngineError.unsupportedDtype("a down projection", weight.dtype)
+        }
+        // As in `encodeSwiGLU`: the slot form is the coalesced FP8 pair's alone.
+        if rows > 1 && !(format == .fp8Block32 && wideGrid) {
+            throw DeepSeekV41EngineError.unsupportedStage(
+                "a \(rows)-position shared expert down projection over \(format)"
+            )
         }
         if wideGrid {
             encoder.setThreadgroupMemoryLength(
