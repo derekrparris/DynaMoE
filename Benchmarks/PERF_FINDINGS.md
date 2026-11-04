@@ -12251,3 +12251,133 @@ One suite-order note, which is the documented pattern and not this slice: `Serve
 loses 4-6 of 13 when it shares a process with the adapter suites (`/tmp/test77_logic2.log`,
 `/tmp/test77_queue2.log`) and is **13/13 alone** (`/tmp/test77_queue1.log`). It also loses them
 without the new test class in the same batch, so the new file is not the cause.
+
+## DSV4.1 #78: AN IMAGE REQUEST NOW ANSWERS OVER THE REAL SERVER, AND THE MODEL DESCRIBES THE PICTURE IT WAS SENT
+
+### The question
+
+`#77` let the local server accept image content parts and pinned everything it could reach without a
+loaded model: the two wire spellings, the marker placement, the image-token count, the expanded prompt
+budget, the session-key digest. It said so in its own section —
+
+> **Not a claim about a full generated turn over the API.** The assembly, the ids, the price and the
+> placement are pinned; the generation is not, because an app-hosted test has no model loaded and the
+> published-turn harness drives `TurnRunner` directly rather than through the server.
+
+That left the largest untested stretch in the whole image path, and not a small one. Everything below
+`TurnPlan.request.images` is the code that runs in production and nothing else: `launchTurn` prices the
+spans from the resize plan, provisions the KV cache for the **expanded** prompt (not the
+placeholders), builds or reuses the DeepSeek runtime, calls `DeepSeekV41TurnImages.bind` which runs the
+tower and places its rows, asserts the bound length equals the priced one, hands the expanded ids to the
+prefix pin and the sampler, and streams the turn. A mistake anywhere along it is a refusal or a 500 —
+never a wrong token — so no arithmetic test can see it and no unit test had ever executed it.
+
+It is also worth stating plainly: `CompletionEngine.shared.configure` appears **nowhere** in the test
+target before this slice. Every DeepSeek case in `DeepSeekV41PublishedTurnTests` builds its own
+`DeepSeekV41Runtime` and calls `DeepSeekV41TurnRunner.run`. The app's own turn path had never run on
+the published checkpoint at all, with text or with pictures.
+
+Routing put it first without reservation: `next_slice` = `live_image_turn` **0.991 @ 0.989** against
+shared-expert rows 0.0016, `select`'s slots 0.0003, `pool`'s BF16 pair 0.0001 and a docs pass 0.0069;
+`gap_is_real` **0.9996**; `perf_exhausted` **0.9997** (the named remainders are ~4.5% of a position and
+every dominant term is at a measured ceiling).
+
+### What landed
+
+One opt-in case, `testAnAPIRequestWithAnImageAnswersOverTheLocalServer`, and three helpers:
+
+- **The load is the app's own sequence**, not a shortcut: `DynaMoeEngine(filePath:)` →
+  `getSummary()` → `InferenceEngine.segmentShardsForMetal` at the device's buffer limit → one
+  `makeBuffer(bytesNoCopy: .storageModeShared)` per segment → `CompletionEngine.shared.configure`.
+  The `DynaMoeEngine` is held for the life of the case, because the buffers point into its mappings.
+  A test that built its own summary would not be exercising the load path the server's turns run on.
+- **The server is the real one** — `ServerController.shared.start()` on a private port (8791, so a
+  developer's own DynaMoE on 8787 cannot turn a bind failure into a connection error), hit with
+  `URLSession` exactly as a client would. Every default the server consults (`enabled`, `port`,
+  `api_key`, body capture) is saved, set and restored, and the request log is pointed at an
+  `inMemory()` store so an app-hosted run never appends to the developer's log.
+- **The request is a real one**: `content: [{"type":"text"}, {"type":"image_url"}]` with a real PNG
+  base64'd into a `data:` URL, `max_tokens: 24`, no auth.
+
+### The check is a delta, because the server renders its own prompt
+
+The prompt the server tokenizes includes the app's whole system block — identity, date, the
+checkpoint's own instruction shape — which is 190 tokens for a one-line question. A test that
+re-derived that string would be pinning a second copy of the template, and the first time the two
+drifted it would fail for the wrong reason. So the same question is sent twice, plain and with one
+attachment, and the counted prompt tokens must differ by exactly
+
+```
+marker + newline   (2 tokens at this checkpoint's tokenizer, measured by #35's 10 -> 12)
++ spanPositions - 1   (the span replaces the marker's single token)
+```
+
+Both numbers come from outside the server: the span is `DeepSeekV41VisionPricing.estimate` — the same
+function the engine prices with — applied to the pixels `DeepSeekV41ImagePixels.decode` produces, and
+the marker cost is `#35`'s. A prompt that never saw the marker counts the same as the plain one, and a
+span that bound nothing costs one token; both fail this assertion by 183.
+
+### Evidence
+
+```
+🔎 [dsv41 real] live server: 96085 tensors in 48 shard(s), mapped 48/48 segment(s), 475.2508442029357 GB
+🔎 [dsv41 real] live image turn: plain 190 prompt tokens / 23 generated, pictured 375 / 23,
+   span 184 position(s) over 1521 patch token(s), 0.32 s of tower
+🔎 [dsv41 real] live image answer: "The user has shared an image that appears to be entirely
+   red/maroon colored with no visible content. Let me"
+Test Case '…testAnAPIRequestWithAnImageAnswersOverTheLocalServer' passed (117.739 seconds).
+```
+
+`375 - 190 = 185 = 2 + 184 - 1`. The 2x2 fixture is the smallest thing ImageIO decodes, and the
+checkpoint's `min_pixels` floor turns it into 1,521 patch tokens on a 13x13 aligner grid, i.e. 184
+prompt positions — the same span `#38` priced and `#43` encodes.
+
+The answer is the point of the slice. The picture is a **solid red square**, and the model says so:
+*"an image that appears to be entirely red/maroon colored with no visible content."* Nothing upstream
+of the tower could have produced that sentence — the pixels went through `ImagePixels.decode`, the
+device tower, the span bind, the expanded prompt and the cache in the order `launchTurn` prescribes,
+and came out as a description of the right colour.
+
+The first arm ran the same request at `max_tokens: 8` and stopped mid-sentence (*"The user has shared
+an image that"*, 7 tokens), which is why the budget is 24: a truncated reasoning channel hides the one
+observation worth printing. Two runs of the finished case agree on every number and vary only in
+wording — *"entirely red/maroon colored with no visible content"* and *"entirely solid red/crimson
+colored with no discernible content"* — which is the server's default sampler doing what a `min_p`
+filter at temperature 0 allows. So the case asserts only that the answer is non-empty and that the
+token accounting is exact; the colour is the model's evidence and not the port's contract.
+
+Cost: **117.7 s** for the load plus both turns — a 375-position image prefill, a 190-position text
+prefill and 46 decoded tokens — behind a 0.32 s encode. That is the API image turn `#77` priced at
+~78 ms/position and it lands where the price said.
+
+The row contract is asserted too: both turns log a `/v1/chat/completions` row, the image row's
+`input_tokens` is the **expanded** 375 (not the 191 the placeholders would count), and its captured
+body names the picture (`"image_parts":1`) rather than carrying it.
+
+### What it does not mean
+
+- **Not a faster image turn.** Nothing here dispatches a new kernel; the tower is `#43`'s and the
+  prefill is `#75`/`#76`'s. A largest image is still ~1,005 positions of prefill.
+- **Not asserted on content.** The answer describing red is evidence the pixels arrived, not a test
+  the model must keep passing: a wording change is not a regression, so the case prints it and asserts
+  only non-emptiness plus the token accounting.
+- **Only the OpenAI protocol is driven end to end.** The Anthropic adapter's image blocks share
+  `attachImageMarkers` and `ServerImageParts`, and `#77` pins their decoding and their turn placement;
+  what this case adds is the engine seam beneath both, which is protocol-independent.
+- **Not a queue or lifecycle change.** `TurnExecutionQueue`'s single-flight behaviour, the 503 for a
+  concurrent in-app turn, and `/v1/models`' silence about vision are all as `#77` left them.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_78`, then `test-without-building` **with the same
+`-derivedDataPath`** for the single case, gated on `touch /tmp/dynamoe_dsv41_real_turn` and removed in
+the same command (`/tmp/test78_run2.log`, `/tmp/test78_run3.log`, 1/0 each). Bundle freshness checked
+with `strings … | grep -c testAnAPIRequestWithAnImageAnswersOverTheLocalServer` (1).
+
+One trap worth recording, because it produced a green run that proved nothing: **`-derivedDataPath`
+has to be passed to `test-without-building` as well as to `build-for-testing`.** Omitted, the run
+silently used the default DerivedData bundle, which predates `#77` — the suite reported
+`Test Suite 'DeepSeekV41PublishedTurnTests' passed` with **0 tests executed**, and a class-wide run
+listed 39 names with neither of the two newest API cases among them. The `status=0` and the "passed"
+line are exactly the shape of a real pass, which is the same silent-zero trap the repo already
+documents for `-destination` and for the two-part `-only-testing` form.

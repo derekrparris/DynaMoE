@@ -3492,6 +3492,327 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         )
     }
 
+    /// The same request, over the real server, on the real weights: does an image
+    /// turn actually answer?
+    ///
+    /// Slice #77 let the local server accept image content parts and pinned the
+    /// assembly: the marker heads its turn, one attachment renders one image token,
+    /// and the prompt budget is the EXPANDED length. What it could not pin is the
+    /// wiring. An app-hosted test has no model loaded, so #77's request stopped at
+    /// the planner, and every case in this file drives `DeepSeekV41TurnRunner`
+    /// directly rather than through the server. Everything downstream of the plan
+    /// is therefore the one part of the image path no test has run: `images`
+    /// reaching `CompletionEngine.launchTurn`, which prices the spans, provisions
+    /// the cache for the expanded prompt, runs the tower, binds the rows and
+    /// asserts the bound length equals the priced one. A mistake anywhere along it
+    /// is a refusal or a 500, never a wrong token, so the whole path is either
+    /// exercised here or not at all.
+    ///
+    /// That the picture really entered the prompt is checked as a DELTA. The server
+    /// renders its own prompt (system date included), so a test that re-derived it
+    /// would be pinning a second copy of the template; instead the same text is
+    /// sent twice, plain and with one attachment, and the counted prompt tokens
+    /// must differ by exactly the marker's own cost plus the span the resize plan
+    /// predicts. Both numbers come from outside the server: the marker and the
+    /// newline after it are two tokens at the checkpoint's tokenizer (`#35`
+    /// measured 10 -> 12 on the composer's prompt), and the span is
+    /// `DeepSeekV41VisionPricing.estimate` (the same function the engine prices
+    /// with) on the pixels `DeepSeekV41ImagePixels.decode` produces.
+    func testAnAPIRequestWithAnImageAnswersOverTheLocalServer() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let spec = try XCTUnwrap(config.vision, "the checkpoint must publish a vision config")
+        guard let tokenizer = try? DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        ) else {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("no Metal device")
+        }
+        let modelConfig = try XCTUnwrap(
+            ModelConfig.load(from: snapshot),
+            "the checkpoint's config.json did not decode as a ModelConfig"
+        )
+        // The server's own gate, asserted first: when it is false the request below
+        // is refused before a pixel is read, which is a different failure from a
+        // broken image path and must not be read as one.
+        XCTAssertTrue(
+            ModelConfig.supportsVision(modelPath: snapshot.path),
+            "the loaded checkpoint must advertise the tower the request will use"
+        )
+
+        // The load the app performs, in the app's order: index the checkpoint, split
+        // any shard past the device's buffer limit, map every segment zero-copy, then
+        // publish it to the shared engine the server's turns run on. The engine owns
+        // the mappings every buffer points into, so it has to outlive the whole case.
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let indexed = try engine.getSummary()
+        let summary = try InferenceEngine.segmentShardsForMetal(
+            indexed, maxBufferLength: UInt64(device.maxBufferLength)
+        )
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let length = Int(shard.length)
+            guard length > 0, length <= Int(device.maxBufferLength),
+                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)),
+                  let buffer = device.makeBuffer(
+                      bytesNoCopy: pointer,
+                      length: length,
+                      options: .storageModeShared,
+                      deallocator: nil
+                  )
+            else { continue }
+            buffers[shard.index] = buffer
+        }
+        print(
+            "🔎 [dsv41 real] live server: \(indexed.tensors.count) tensors in "
+                + "\(indexed.shards.count) shard(s), mapped \(buffers.count)/"
+                + "\(summary.shards.count) segment(s), \(indexed.sizeGb) GB"
+        )
+        CompletionEngine.shared.configure(
+            summary: summary,
+            modelConfig: modelConfig,
+            tokenizer: tokenizer,
+            shardBuffers: buffers,
+            activeLoadedModelPath: snapshot.path
+        )
+        defer {
+            CompletionEngine.shared.configure(
+                summary: nil,
+                modelConfig: nil,
+                tokenizer: nil,
+                shardBuffers: [:],
+                activeLoadedModelPath: nil
+            )
+        }
+
+        // The smallest thing ImageIO will decode, which the checkpoint's own
+        // `min_pixels` floor turns into its smallest admissible encode. That floor,
+        // not this 2x2, is what the turn pays for: 1,521 patch tokens on a 13x13
+        // aligner grid, i.e. 184 prompt positions.
+        let space = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
+        let context = try XCTUnwrap(CGContext(
+            data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 8,
+            space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ))
+        context.setFillColor(red: 0.9, green: 0.15, blue: 0.1, alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
+        let cgImage = try XCTUnwrap(context.makeImage())
+        let png = try XCTUnwrap(
+            NSBitmapImageRep(cgImage: cgImage).representation(using: .png, properties: [:])
+        )
+        let pixels = try DeepSeekV41ImagePixels.decode(png)
+        let estimate = try XCTUnwrap(
+            DeepSeekV41VisionPricing.estimate(
+                width: pixels.width, height: pixels.height, spec: spec
+            ),
+            "the resize plan must price an image the decoder accepted"
+        )
+        XCTAssertGreaterThan(
+            estimate.spanPositions, 1,
+            "the span has to exceed the placeholder it replaces or there is nothing to check"
+        )
+
+        let port = 8791
+        let question = "what is in this picture?"
+        try await withLocalServer(on: port) { store in
+            let plain = try await postChat(port: port, text: question, imageBase64: nil)
+            let pictured = try await postChat(
+                port: port, text: question, imageBase64: png.base64EncodedString()
+            )
+            print(
+                "🔎 [dsv41 real] live image turn: plain \(plain.promptTokens) prompt tokens / "
+                    + "\(plain.completionTokens) generated, pictured \(pictured.promptTokens) / "
+                    + "\(pictured.completionTokens), span \(estimate.spanPositions) position(s) "
+                    + "over \(estimate.patchTokens) patch token(s), "
+                    + String(format: "%.2f s", estimate.seconds) + " of tower"
+            )
+            print(
+                "🔎 [dsv41 real] live image answer: \(pictured.content.debugDescription) "
+                    + "(finish \(pictured.finishReason ?? "nil"))"
+            )
+            // The picture must cost the prompt the marker plus its span, and nothing
+            // else: a prompt that never saw the marker would count the same as the
+            // plain one, and a span that bound nothing would cost one token.
+            XCTAssertEqual(
+                pictured.promptTokens - plain.promptTokens,
+                2 + estimate.spanPositions - 1,
+                "the attachment must add its marker plus its span; plain "
+                    + "\(plain.promptTokens), pictured \(pictured.promptTokens), span "
+                    + "\(estimate.spanPositions)"
+            )
+            XCTAssertGreaterThan(
+                pictured.completionTokens, 0, "the image turn generated no token at all"
+            )
+            XCTAssertFalse(
+                pictured.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                "the image turn returned no text (finish \(pictured.finishReason ?? "nil"))"
+            )
+
+            // The request-log row is the other half of the contract: the length the
+            // client was billed is the length the server recorded, and a picture is
+            // NAMED in the captured body rather than carried in it.
+            let rows = await store.fetch(limit: 20)
+            let logged = rows.filter { $0.path == "/v1/chat/completions" }
+            XCTAssertEqual(logged.count, 2, "both turns must be logged")
+            XCTAssertTrue(
+                logged.contains {
+                    $0.inputTokens == pictured.promptTokens
+                        && ($0.requestBody ?? "").contains("\"image_parts\":1")
+                },
+                "the image turn's row must carry the expanded prompt length and name its "
+                    + "picture: \(logged.map { "\($0.inputTokens ?? -1) \($0.requestBody ?? "")" })"
+            )
+        }
+        withExtendedLifetime(engine) {}
+    }
+
+    /// Runs `body` with the local server listening on `port`, then puts everything
+    /// back.
+    ///
+    /// A private port rather than the app's 8787: a developer's own DynaMoE may be
+    /// running, and a bind failure would otherwise read as a connection error. Every
+    /// default the server consults is saved and restored, and the request log is
+    /// pointed at an in-memory store so an app-hosted run never appends to the
+    /// developer's real log.
+    private func withLocalServer(
+        on port: Int,
+        _ body: (ServerRequestLogStore) async throws -> Void
+    ) async throws {
+        let defaults = UserDefaults.standard
+        let savedEnabled = defaults.object(forKey: ServerController.enabledKey)
+        let savedPort = defaults.object(forKey: ServerController.portKey)
+        let savedKey = defaults.object(forKey: ServerController.apiKeyKey)
+        let savedCapture = defaults.object(forKey: ServerRequestLogRecorder.captureBodiesKey)
+        let store = ServerRequestLogStore.inMemory()
+
+        func restore() {
+            if let savedEnabled {
+                defaults.set(savedEnabled, forKey: ServerController.enabledKey)
+            } else {
+                defaults.removeObject(forKey: ServerController.enabledKey)
+            }
+            if let savedPort {
+                defaults.set(savedPort, forKey: ServerController.portKey)
+            } else {
+                defaults.removeObject(forKey: ServerController.portKey)
+            }
+            if let savedKey {
+                defaults.set(savedKey, forKey: ServerController.apiKeyKey)
+            } else {
+                defaults.removeObject(forKey: ServerController.apiKeyKey)
+            }
+            if let savedCapture {
+                defaults.set(savedCapture, forKey: ServerRequestLogRecorder.captureBodiesKey)
+            } else {
+                defaults.removeObject(forKey: ServerRequestLogRecorder.captureBodiesKey)
+            }
+            ServerRequestLogRecorder.shared.useOverrideStore(nil)
+        }
+
+        defaults.set(true, forKey: ServerController.enabledKey)
+        defaults.set(port, forKey: ServerController.portKey)
+        // The case sends unauthenticated requests, so a key saved in the app's
+        // settings would turn both of them into a 401.
+        defaults.removeObject(forKey: ServerController.apiKeyKey)
+        // Metadata names the parts; only a captured body shows the `image_parts`
+        // count the case asserts on.
+        defaults.set(true, forKey: ServerRequestLogRecorder.captureBodiesKey)
+        ServerRequestLogRecorder.shared.useOverrideStore(store)
+
+        // A server another case left running is on ITS port, and `start()` is a
+        // no-op while one is up.
+        if ServerController.shared.isRunning {
+            await ServerController.shared.stop()
+        }
+        ServerController.shared.start()
+        do {
+            let deadline = Date().addingTimeInterval(20)
+            var listening = false
+            while Date() < deadline {
+                if let (_, response) = try? await URLSession.shared.data(
+                    from: URL(string: "http://127.0.0.1:\(port)/health")!
+                ), (response as? HTTPURLResponse)?.statusCode == 200 {
+                    listening = true
+                    break
+                }
+                try await Task.sleep(nanoseconds: 100_000_000)
+            }
+            try XCTSkipUnless(
+                listening, "the local server never answered /health on port \(port)"
+            )
+            try await body(store)
+        } catch {
+            await ServerController.shared.stop()
+            restore()
+            throw error
+        }
+        await ServerController.shared.stop()
+        restore()
+    }
+
+    /// What one non-streaming chat completion reported back.
+    private struct ChatTurn {
+        var content: String
+        var promptTokens: Int
+        var completionTokens: Int
+        var finishReason: String?
+    }
+
+    /// Posts one OpenAI chat completion to the local server, text or text+image.
+    private func postChat(
+        port: Int, text: String, imageBase64: String?
+    ) async throws -> ChatTurn {
+        var parts = ["{\"type\":\"text\",\"text\":\"\(text)\"}"]
+        if let imageBase64, !imageBase64.isEmpty {
+            parts.append(
+                "{\"type\":\"image_url\",\"image_url\":"
+                    + "{\"url\":\"data:image/png;base64,\(imageBase64)\"}}"
+            )
+        }
+        // Long enough to leave the app's default thinking-on prompt's reasoning
+        // channel and write a sentence about the picture. Sampling is the server's
+        // default (temperature 0, top-k 50), so the text is near-greedy and a run
+        // that changes it says more about the graph than about the sampler.
+        let body = """
+        {"model":"any","max_tokens":24,"messages":[
+            {"role":"user","content":[\(parts.joined(separator: ","))]}
+        ]}
+        """
+        var request = URLRequest(
+            url: URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!
+        )
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data(body.utf8)
+        // A turn is a full prefill plus its decode, and the expanded prompt is the
+        // smallest span the checkpoint accepts, still ~200 positions.
+        request.timeoutInterval = 900
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any],
+            "the server's reply was not a JSON object: "
+                + String(decoding: data, as: UTF8.self)
+        )
+        guard http.statusCode == 200 else {
+            XCTFail("\(http.statusCode) from the local server: \(json)")
+            return ChatTurn(content: "", promptTokens: -1, completionTokens: -1, finishReason: nil)
+        }
+        let choice = try XCTUnwrap((json["choices"] as? [[String: Any]])?.first)
+        let message = try XCTUnwrap(choice["message"] as? [String: Any])
+        let usage = try XCTUnwrap(json["usage"] as? [String: Any])
+        return ChatTurn(
+            content: message["content"] as? String ?? "",
+            promptTokens: usage["prompt_tokens"] as? Int ?? -1,
+            completionTokens: usage["completion_tokens"] as? Int ?? -1,
+            finishReason: choice["finish_reason"] as? String
+        )
+    }
+
     /// The chat UI's history, at the checkpoint's own tokenizer.
     ///
     /// `DeepSeekV41ChatPromptFormatterTests` pins the rendered SHAPE. This pins the
