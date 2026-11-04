@@ -508,6 +508,49 @@ nonisolated public enum DeepSeekV41DevicePlan {
         return max(1, min(ceiling, min(window, max(1, contextLength))))
     }
 
+    /// Positions past which a prompt cannot keep its routed experts in the arena at
+    /// once, measured rather than tuned: the published checkpoint touches 2,641
+    /// distinct `(layer, expert)` pairs over 31 positions, 3,767 over 64, and 5,045
+    /// over 128, against an arena of 3,760 slots on this machine. Sixty-four is where
+    /// the working set stops fitting.
+    public static let prefillFillBound = 64
+
+    /// How many positions one prefill block carries.
+    ///
+    /// Not `chunkSlots`: that sizes the WORKSPACE (every per-position vector is
+    /// replicated per slot), i.e. the widest block the buffers can hold. The width a
+    /// prompt should RUN at is decided by whether its routed working set can live in
+    /// the arena at once.
+    ///
+    /// A short prompt is pure per-layer overhead (one dense-half wait, one routing
+    /// readback, one indexer split and one union fill per layer, forty times over), so
+    /// the widest block wins, because that is the only thing that amortises. A long
+    /// prompt cannot fit, so every block pays the fill, and there the narrower block
+    /// wins: a wider block's own device work per layer grows faster than its position
+    /// count (the mixture half alone moves from 24.4 ms per position walked to 26.2 at
+    /// width four and 29.1 at width eight). Measured on the `#52`-`#59` text stream,
+    /// cold arena, rotating rounds (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #70"), ms
+    /// per position:
+    ///
+    ///     positions   walk     width 4   width 8
+    ///     31          372.1    422.6     399.9
+    ///     64          306.5    278.4     345.8
+    ///     128         266.7    222.9     264.2
+    ///
+    /// Both sides are 6-24%, so this is not a rounding question. It also does not
+    /// follow the fill's warmness, which is what an earlier attempt assumed: with the
+    /// arena fully warm at 31 positions (0 MB read) width eight is still 1.05-1.19x
+    /// ahead, and at 128 positions even a warm pass still reads 56 GB and width four is
+    /// 1.09-1.12x ahead.
+    public static func prefillBlockWidth(
+        config: DeepSeekV41Config,
+        contextLength: Int,
+        promptTokens: Int
+    ) -> Int {
+        let slots = chunkSlots(config: config, contextLength: contextLength)
+        return promptTokens < prefillFillBound ? slots : min(4, slots)
+    }
+
     /// Wiring problems the executor can see without touching a weight: a dimension
     /// a kernel cannot chew, a compress ratio wider than the window ring, the
     /// stages only the reference implements.
@@ -916,7 +959,21 @@ nonisolated public struct DeepSeekV41IndexerInputDump: Sendable {
 /// `DeepSeekV41MetalForward.recordsBlockTiming` is on.
 nonisolated public struct DeepSeekV41BlockTiming: Sendable, Equatable {
     /// Host time encoding every stage of the dense half, batched and per slot.
+    ///
+    /// Net of `indexerWaitNanoseconds`, so it means the same thing the walk's
+    /// `frontEncodeNanoseconds` does. The indexer split is a second submission plus a
+    /// host readback inside the dense half, and folding it in here is what made a
+    /// block read 28.6 ms of "encode" per position against a walked position's ~3.5.
     public var denseEncodeNanoseconds: UInt64 = 0
+    /// Host time in the indexer split: the drain of the dense half up to the indexer,
+    /// which `encodeBlockStage` submits on its own because the selection is a HOST
+    /// value, and the score readback plus the two selections inside it.
+    ///
+    /// The walk keeps this apart in `DeepSeekV41WalkTiming.indexerWaitNanoseconds`
+    /// for the same reason: it is not host work, it is another round trip, and a
+    /// bucket that folded it into an encode would overstate what a batching change
+    /// could remove.
+    public var indexerWaitNanoseconds: UInt64 = 0
     /// Host time blocked on the dense half, which is the routing readback's wait:
     /// device time plus the commit — INCLUDING whatever the queue had not finished,
     /// which is the previous layer's mixture. That is why the two device fields
@@ -986,6 +1043,7 @@ nonisolated public struct DeepSeekV41BlockTiming: Sendable, Equatable {
         wall: Double,
         embedding: Double,
         denseEncode: Double,
+        indexerWait: Double,
         frontWait: Double,
         routing: Double,
         expertFill: Double,
@@ -1001,6 +1059,7 @@ nonisolated public struct DeepSeekV41BlockTiming: Sendable, Equatable {
             milliseconds(wallNanoseconds),
             milliseconds(embeddingNanoseconds),
             milliseconds(denseEncodeNanoseconds),
+            milliseconds(indexerWaitNanoseconds),
             milliseconds(frontWaitNanoseconds),
             milliseconds(routingReadbackNanoseconds),
             milliseconds(expertFillNanoseconds),
@@ -1026,8 +1085,9 @@ nonisolated public struct DeepSeekV41BlockTiming: Sendable, Equatable {
         let per = millisecondsPerPosition()
         let blockDivisor = Double(max(1, positionCount)) * 1_000_000
         let host = Double(
-            embeddingNanoseconds + denseEncodeNanoseconds + frontWaitNanoseconds
-                + routingReadbackNanoseconds + expertFillNanoseconds + mixtureEncodeNanoseconds
+            embeddingNanoseconds + denseEncodeNanoseconds + indexerWaitNanoseconds
+                + frontWaitNanoseconds + routingReadbackNanoseconds + expertFillNanoseconds
+                + mixtureEncodeNanoseconds
         ) / blockDivisor
         let device = per.denseDevice + per.mixtureDevice
         let share = per.wall > 0 ? host / per.wall * 100 : 0
@@ -1036,9 +1096,9 @@ nonisolated public struct DeepSeekV41BlockTiming: Sendable, Equatable {
         let rate = seconds > 0 ? Double(fillBytes) / 1_073_741_824 / seconds : 0
         return String(
             format: "block %.1f ms/position over %d position(s) in %d block(s) of %.1f, "
-                + "%d layer pass(es): embedding %.2f, dense encode %.2f, front wait %.2f, "
-                + "routing %.2f, expert fill %.2f, mixture encode %.2f, device %.2f "
-                + "(dense %.2f, mixture %.2f); host sums to %.0f%% of wall; "
+                + "%d layer pass(es): embedding %.2f, dense encode %.2f, indexer wait %.2f, "
+                + "front wait %.2f, routing %.2f, expert fill %.2f, mixture encode %.2f, "
+                + "device %.2f (dense %.2f, mixture %.2f); host sums to %.0f%% of wall; "
                 + "drained front %.1f, mixture %.1f, late start front %.1f, mixture %.1f "
                 + "(per position); fill %.1f misses/layer at %.1f GB/s (%.1f GB, %d misses)",
             per.wall,
@@ -1048,6 +1108,7 @@ nonisolated public struct DeepSeekV41BlockTiming: Sendable, Equatable {
             layers,
             per.embedding,
             per.denseEncode,
+            per.indexerWait,
             per.frontWait,
             per.routing,
             per.expertFill,
@@ -2742,12 +2803,22 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         try prefillChunk(tokens, embeddings: [:], capturingLogitsAt: capture)
     }
 
+    /// The same pass at an explicit block width, for a measurement that has to compare
+    /// widths against `prefillBlockWidth`'s choice. Production never calls it.
+    public func prefillChunk(_ tokens: [Int], blockWidth: Int) throws -> DeepSeekV41ChunkLogits {
+        try prefillChunk(
+            tokens, embeddings: [:], capturingLogitsAt: [], blockWidth: blockWidth
+        )
+    }
+
     /// The one chunk pass: tokens, the positions that carry a supplied row, the
-    /// positions whose logits are kept, and an optional per-block progress hook.
+    /// positions whose logits are kept, an optional block width, and an optional
+    /// per-block progress hook.
     private func prefillChunk(
         _ tokens: [Int],
         embeddings: [Int: [Float]],
         capturingLogitsAt capture: Set<Int>,
+        blockWidth: Int? = nil,
         onProgress: (Int) -> Void = { _ in }
     ) throws -> DeepSeekV41ChunkLogits {
         guard !tokens.isEmpty else { return DeepSeekV41ChunkLogits(last: []) }
@@ -2766,7 +2837,13 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         let keep = capture.filter { $0 >= 0 && $0 < tokens.count }
         var last: [Float] = []
         var captured: [Int: [Float]] = [:]
-        let width = max(1, workspace.slots)
+        // The plan's width, capped by what the workspace holds: a block larger than the
+        // replicated slots would bind a slot no buffer was allocated for. A caller may
+        // name its own, which is how `#70` swept widths.
+        let planned = blockWidth ?? DeepSeekV41DevicePlan.prefillBlockWidth(
+            config: config, contextLength: contextLength, promptTokens: tokens.count
+        )
+        let width = max(1, min(planned, max(1, workspace.slots)))
         let startPosition = cache.storedPositions
         var offset = 0
         while offset < tokens.count {
@@ -2832,6 +2909,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         pendingDead = false
 
         let measuring = recordsBlockTiming
+        if countsDispatches { dispatchCensusPositions += tokens.count }
         let wallStart = measuring ? DispatchTime.now().uptimeNanoseconds : 0
         try encodeEmbeddingBlock(tokens, startPosition: startPosition, embeddings: embeddings)
         let embedded = measuring ? DispatchTime.now().uptimeNanoseconds : 0
@@ -2902,6 +2980,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         let bytesBefore = measuring ? streamer?.bytesRead ?? 0 : 0
         var denseEncoded = layerStart
         var frontWaited = layerStart
+        var indexerWaited: UInt64 = 0
 
         // Engram rows are host reads, one position at a time, and each goes into the
         // table's staging block before the layer's command buffer exists.
@@ -2944,10 +3023,14 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                     hook(layer.index, startPosition, stage.rawValue)
                 }
                 if stage == .indexer, layer.ownsCompressedIndex {
+                    let splitBegan = measuring ? DispatchTime.now().uptimeNanoseconds : 0
                     try settlePending()
                     try readIndexSelections(
                         layer: layer, startPosition: startPosition, count: count
                     )
+                    if measuring {
+                        indexerWaited += DispatchTime.now().uptimeNanoseconds - splitBegan
+                    }
                 }
             }
             // Calibration: what `count` trivial dispatches cost with nothing to
@@ -2998,6 +3081,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 // The selection is a host value, so the dense half stops after the
                 // indexer and starts a second submission once the rows are known.
                 if stage == .indexer, layer.ownsCompressedIndex {
+                    let splitBegan = measuring ? DispatchTime.now().uptimeNanoseconds : 0
                     encoder.endEncoding()
                     try commit(
                         commandBuffer,
@@ -3006,6 +3090,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                     try readIndexSelections(
                         layer: layer, startPosition: startPosition, count: count
                     )
+                    if measuring {
+                        indexerWaited += DispatchTime.now().uptimeNanoseconds - splitBegan
+                    }
                     commandBuffer = try makeCommandBuffer()
                     encoder = try makeEncoder(commandBuffer)
                 }
@@ -3071,7 +3158,8 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 mixtureEncoded: mixtureEncoded,
                 count: count,
                 missesBefore: missesBefore,
-                bytesBefore: bytesBefore
+                bytesBefore: bytesBefore,
+                indexerWaited: indexerWaited
             )
             if let hook = onBlockLayerFinished {
                 try settlePending()
@@ -3129,6 +3217,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             count: count,
             missesBefore: missesBefore,
             bytesBefore: bytesBefore,
+            indexerWaited: indexerWaited,
             extraFillNanoseconds: perPositionFillNanoseconds
         )
         if let hook = onBlockLayerFinished {
@@ -3152,10 +3241,16 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         count: Int,
         missesBefore: Int,
         bytesBefore: Int,
+        indexerWaited: UInt64,
         extraFillNanoseconds: UInt64 = 0
     ) {
         guard layerStart > 0 else { return }
-        blockTiming.denseEncodeNanoseconds += denseEncoded - layerStart
+        // The indexer split is a drain plus a host readback, not host encoding, so it
+        // is taken out of this bucket and kept beside it: the walk reports it as its
+        // own column, and a block that folded it into an encode would read 5x a
+        // walked position's encode per position.
+        blockTiming.denseEncodeNanoseconds += (denseEncoded - layerStart) - indexerWaited
+        blockTiming.indexerWaitNanoseconds += indexerWaited
         blockTiming.frontWaitNanoseconds += frontWaited - denseEncoded
         blockTiming.routingReadbackNanoseconds += routingDone - frontWaited
         blockTiming.expertFillNanoseconds += fillDone - routingDone + extraFillNanoseconds
@@ -3274,6 +3369,11 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     ) throws {
         let index = layer.index
         let shape = DeepSeekV41AttentionShape.make(config: config, layer: layer)
+        // Labelled `block …` so a census over a batched prefill cannot be read as a
+        // walked position's. The block path dispatches the stages that cannot batch
+        // once per SLOT, so its dispatch count per position is exactly what a width
+        // sweep of this table exists to answer.
+        if countsDispatches { dispatchCensusStage = "block \(stage.rawValue)" }
 
         func eachSlot(_ body: (Int) throws -> Void) rethrows {
             for slot in 0..<count { try body(slot) }

@@ -10975,3 +10975,215 @@ The progress plumbing is pinned without any model as well:
 forward that reports per block, asserting the counts climb and end on the chunk) and
 `DeepSeekV41DeviceGraphParityTests.testAPrefillReportsEveryBlockItRuns` (the real device
 executor over 9 positions at a 4-wide block, asserting `[4, 8, 9]`).
+## DSV4.1 #70: A PREFILL POSITION IS ONLY CHEAPER THAN A DECODE ONE WHEN ITS WORKING SET FITS — AND THE WIDTH THAT WINS FOLLOWS THAT, NOT THE LAYOUT
+
+### Question
+
+`#69` measured the app's own turn and found a prefill position costs what a decode position
+costs (187-281 against 138-183 ms), on a layout that pays ONE dense-half wait, ONE routing
+readback, ONE indexer split and ONE union fill per layer for a whole block of eight. Eight
+positions for the price of one should be a large win; the numbers say the layout is worth
+2-5%, and nothing since `#53` has measured the SHAPE of that. Every prefill table in this
+journal is also older than the dozen optimisations from `#56` to `#67`, all of which tuned
+the WALK a turn resumes into rather than the block a prompt is prefilled with.
+
+Routing asked which prefill slice was worth the next machine hour and ranked a width-scale
+attribution at 0.84 (confidence 0.80) over instrumenting the block's encode (0.07), a
+16-slot block form (0.02) and batching the per-slot dispatches (0.06). It also put "is the
+width already saturated at eight" at 0.80, which turned out to be the one thing this slice
+overturned.
+
+### What was added
+
+Nothing on a shipped path until the last section; three instrument repairs and one probe:
+
+- `DeepSeekV41BlockTiming` gained `indexerWaitNanoseconds`. `encodeBlockStage` submits the
+  dense half in two parts around the indexer, because the row selection is a HOST value,
+  and that drain plus readback was being counted as `denseEncode`. It made a block read
+  28.6 ms of "encode" per position against a walked position's 3.5. The walk has kept the
+  same column separate since `#48`; the two layouts' tables can now be read side by side.
+  `describe()` prints it and includes it in its own whole-vs-parts control.
+- The dispatch census learned the block path. `encodeBlockStage` never labelled its stages
+  (so every block dispatch was attributed to whatever the walk set last) and
+  `dispatchCensusPositions` never counted a block's positions.
+- `prefillChunk(_:blockWidth:)` — a public overload naming the block width, so a sweep can
+  compare widths without changing what production runs at. `prefillChunk`'s private form
+  takes it and falls back to `DeepSeekV41DevicePlan.prefillBlockWidth`.
+- `testWhereATextPrefixsPerPositionCostGoesOnThePublishedCheckpoint` (opt-in,
+  `/tmp/dynamoe_dsv41_prefix_time`): the `#52`-`#59` 128-token stream, the walk and widths
+  1, 2, 4 and 8, three rounds with the arm order rotated, arena reset before every arm, and
+  the same instruments on each. Then the same comparison at 31 positions (the app's own
+  DEFAULT prompt, which `#69` measured at 2.9 s of prefill) and at 64 (to bracket the
+  crossover), then the two widths again with the arena left WARM, which a follow-up turn
+  meets and a cold arm cannot see.
+
+### The width curve: four wins on a long prompt, eight wins on a short one
+
+Cold arena, steady state (rounds 2-3, round 1 discarded), ms per position. The first table
+is one process that had the machine to itself and swept all three lengths; the second is
+how three earlier processes reproduced it, because a prefill arm is cheap enough to repeat
+and every earlier prefill table in this journal was a single pass:
+
+| positions | walk | width 1 | width 2 | width 4 | width 8 |
+|---|---|---|---|---|---|
+| 128 | 266.7 | 258.9 | 235.1 | **222.9** | 264.2 |
+| 64 | 306.5 | - | - | **278.4** | 345.8 |
+| 31 | 372.1 | - | - | 422.6 | **399.9** |
+
+| process | 128 walk / w1 / w2 / w4 / w8 | 64 walk / w4 / w8 | 31 walk / w4 / w8 |
+|---|---|---|---|
+| run 1 | 273.7 / 266.1 / 250.1 / 232.3 / 269.1 | - | - |
+| run 2 | 276.7 / 282.8 / 249.7 / 242.4 / 270.9 | - | 390.8 / 411.6 / 406.5 |
+| run 3 | 280.7 / 273.5 / 253.9 / 238.2 / 263.7 | - | 402.3 / 463.7 / 418.6 |
+
+Every arm at a given length reads the same bytes (89,971-90,545 MB over 5,018-5,050 misses
+at 128; 67,541 MB over 3,767 at 64; 47,352 MB over 2,641 at 31), which is what makes the
+columns comparable at all. Run 4's 64-position arms are left out on purpose: they overlapped
+builds and a parity suite and read every arm 10-15% slow while keeping the order, which is
+the failure mode the rotation rule exists to catch and cannot always catch on its own.
+
+- **Eight is not the optimum, and it is barely better than walking.** At 128 positions width
+  eight is 1.01-1.05x the walk across four processes — `#53`'s 1.04-1.05 reproduced exactly —
+  while width four is 1.18-1.20x. A width-1 block, which batches nothing, is 2-4% ahead of
+  the walk, so the block path's own overhead is small and the curve is about width.
+- **The curve is not monotonic, and it turns over between 31 and 64 positions.** At 31
+  positions width eight beats width four by 6-12% and both are slightly BEHIND the walk
+  (0.88-0.93x); at 64 four is 1.10x ahead of the walk and 1.24x ahead of eight; at 128 four
+  is 1.19-1.20x ahead of the walk and 1.18x ahead of eight.
+- **The crossover is the working set, not the length and not the warmness.** A prompt's
+  routed `(layer, expert)` pairs saturate as it lengthens — 2,641 at 31 positions, 3,767 at
+  64, 5,045 at 128 — against an arena of 3,760 slots, so 64 positions is exactly where a
+  prompt stops fitting. Before that, a prefill is pure per-layer overhead and the widest
+  block amortises it best. After it, every block pays a fill and a wider block costs more
+  per layer than its extra positions buy back.
+- **A warm arena does not change which width wins, only how much is left to win.** With the
+  arena left as the previous pass filled it, at 31 positions (0 MB read, pure compute) width
+  eight is still ahead, 1.05-1.19x across two processes (83.1 against 86.9, and 69.4 against
+  84.4 ms/position), and at 128 positions even a warm pass still reads 56 GB and width four
+  is 1.09-1.12x ahead (189.7 against 212.8, and 184.1 against 201.1). That matters because
+  it is the arm that killed the obvious guess: a short prompt is warm, so eight is right
+  there, and a long prompt cannot be warm, so four is right there.
+
+### Where a block's position actually goes
+
+Same 128-position stream, round 2 of run 3, per position in ms (this is the whole answer
+to "why does batching not amortise"):
+
+| bucket | walk | w1 | w2 | w4 | w8 |
+|---|---|---|---|---|---|
+| **wall** | 259.5 | 248.3 | 230.8 | **218.5** | 265.6 |
+| dense encode (host) | 3.0 | 3.00 | 1.91 | 1.38 | 0.98 |
+| indexer wait | 33.8 | 29.4 | 30.0 | 30.2 | 35.4 |
+| front wait | 125.7 | 117.0 | 107.6 | 99.8 | 129.6 |
+| expert fill | 94.2 | 89.6 | 84.5 | 81.1 | 87.0 |
+| mixture encode (host) | 2.8 | 2.95 | 2.37 | 1.91 | 1.64 |
+| **device, both halves** | 51.9 | 46.5 | 43.7 | 42.1 | 50.7 |
+| - dense half | 28.1 | 23.1 | 19.4 | **17.3** | 20.9 |
+| - mixture half | 23.8 | 23.3 | 24.3 | 24.9 | **29.8** |
+| mixture late start | 105.2 | 93.5 | 88.3 | 82.8 | 103.0 |
+| dispatches / position | 2,072 | 2,072 | 1,630 | 1,410 | 1,299 |
+
+- **The dense weight read is the only thing that amortises.** Its device half goes 28.1 →
+  17.3 ms per position from walk to width four, −39%, because the dense backbone is resident
+  and read once per block instead of once per position. That is the entire prize: ~11 ms of
+  260, and half of it goes back at width eight (20.9).
+- **The mixture half gets WORSE with width, monotonically.** 23.8 walked, 23.3 at width one,
+  24.3 at two, 24.9 at four, 29.8 at eight. Batching the mixture was supposed to be its win
+  (`#52` measured the union fill carrying 1.1-2.4 experts where a walk's carries 0.3); on
+  this checkpoint the per-position expert computation is what a mixture costs, and a wider
+  block spreads it over more slots per submission without making it cheaper.
+- **The fill is the largest single bucket at every width and it barely moves.** 94.2 ms
+  walked, 81.1 at width four, 87.0 at eight, on identical bytes: 88-90 GB per 128-position
+  prefill at 7.7-8.5 GB/s. `#67` measured this machine's ceiling at 13-14 GB/s, so a cold
+  text prefill sits at ~60% of it, and the layout moves it by 14%.
+- **The hand-off stops improving past width four.** The mixture's late start falls 105 →
+  82.8 from walk to four and then rises to 103.0 at eight: past four the block's own mixture
+  takes long enough that the next layer's dense half is waiting for it again.
+- **Every bucket tiles.** The block's host buckets sum to 96-98% of its own wall in all six
+  regimes, the same control `#50` and `#52` used.
+
+### The block path's own dispatch census, for the first time
+
+At width eight over 128 positions: 166,299 dispatches, 1,299 per position, and 56.2% of them
+are the router (93,440). Then `writeLatent` 9.5%, `indexer` 4.5%, and eight stages at 3.1%
+each (`attnNorm`, `queryNorm`, `latentNorm`, `ffnNorm`, `mixAttentionStreams`,
+`mixFFNStreams`, `writeAttentionStreams`, `outputDown`).
+
+- **The per-slot stages are emitted once per position, so the count per position falls only
+  37% across an eight-fold width** (2,072 → 1,299). A width-1 block and a walk emit exactly
+  the same 2,072, which is the block path's overhead and nothing else.
+- **It buys nothing to care.** The encode bucket at width eight is 0.98 ms per position and
+  at width one 3.00, i.e. those dispatches cost ~0.5 µs each, already under `#66`'s 1.07 µs
+  floor. Batching the per-slot dispatches is not where a prefill's time is; the journal's
+  `#15` note that "the gathers are the remaining candidates and unmeasured" is answered:
+  measured, they are 9.5% of a dispatch count that is itself 1% of a position.
+
+### What it means
+
+- **Batching a text prefill is worth 0-20% per position, not 2x**, and where the optimum
+  sits is decided by whether the prompt's expert working set fits the arena.
+- **The shipped width was eight, which is right for the app's own prompt and ~19% off for a
+  long one.** `prefillBlockWidth` now returns the workspace's width below
+  `prefillFillBound` (64) positions and four above it. The threshold is where the measured
+  working set stops fitting (3,767 distinct pairs at 64 against 3,760 slots), so it is a
+  derivation rather than a tuned constant, and it is `min`-capped by the workspace so a
+  narrow-context fixture cannot ask for a block its buffers do not hold.
+- **A prefill position is a decode position because the mixture is a decode position.** The
+  dense half does amortise; the experts do not, and they are 33-37% of the wall plus most of
+  the device half.
+- **The fill is at ~60% of the disk's ceiling on a cold text prefill** (7.7-8.5 against
+  `#67`'s 13-14 GB/s). `#67` named every millisecond of a walked position's fill and found
+  it at the ceiling; a block's union fill, at 3.9-7.8 misses per fill, does not reach it.
+  That is a ~31 ms/position gap at width four and it is the largest single open number this
+  slice leaves.
+
+### What it is not (do not re-propose)
+
+- Not the bytes: every width reads within 0.6% of the same expert bytes on the same stream.
+- Not the dispatch count or fusion (`#66`): the block path's encode is 1.0-1.4 ms/position
+  at every width past one.
+- Not a block wider than the workspace's eight: measured, it is 10% worse at 128 positions
+  and only wins when the working set fits.
+- Not the arena's capacity or eviction policy (`#21`, `#58`, `#59`), not a second command
+  queue or a deferred bind (`#65`), not the indexer (`#64`), and not the mixture's kernels
+  (`#60`-`#63`).
+- Not warm-versus-cold as the discriminator for width: measured both ways at both ends of
+  the threshold, and the sign is the same in both regimes at each length.
+
+### Verification
+
+`testWhereATextPrefixsPerPositionCostGoesOnThePublishedCheckpoint` is opt-in and skips
+without `/tmp/dynamoe_dsv41_prefix_time`; it draws no slot `MTLBuffer` beyond what a normal
+prefill allocates and changes no shipped path. Five processes over ~100 minutes:
+`/tmp/test70_prefix_run1.log` (128 positions, three rounds), `run2.log` (128 + 31),
+`run3.log` (128 + 31 + the warm arms), `run4.log` (adds 64, overlapped other work) and
+`final2.log` (the three-length sweep every table above is taken from).
+
+The word "clean" matters here, and one run had to be killed for it. A second process left
+running from an earlier invocation put two runtimes over one machine, which is 2 x 74 GB
+against 128 and 52 GB of swap: the affected sweep read 1,040 ms/position against a normal
+176-266, i.e. 4-6x, and every arm kept its ORDER. A rotated sweep only protects against an
+effect that moves with arm position; it cannot see a constant load, so quote one only from a
+process that had the machine and say so.
+
+Two unit bugs were caught by the harness's own controls rather than by the numbers looking
+wrong, and both are worth carrying: the arms identified themselves by `width`, which is 1
+for a walk, so the walk's census assertion read the block-1 arm's; and the parity bar was
+5e-4, taken from `#33`'s block-versus-walk comparison at 16 positions, where legitimate
+widths on this stream disagree by 5.3e-3 at 128 positions and 1.1e-2 at 31. The bar is 5e-2
+with an exact argmax check beside it, and a skipped stage or a slot reading another
+position's rows is orders of magnitude larger than either.
+
+Shipped path: one rule (`prefillBlockWidth`) plus the seam it is decided through. Pinned by
+`DeepSeekV41DeviceGraphParityTests.testThePrefillWidthFollowsTheWorkingSet` (the rule at
+both ends of the threshold, and the report cadence it produces driven through a real
+prefill) and `testEveryPositionOfABlockAttendsOverItsOwnRows` now names its width
+explicitly, because its subject is a block as wide as the workspace and not what a prompt
+ships at. `DeepSeekV41DeviceGraphParityTests` 37 tests pass; `DeepSeekV41TurnLoopTests` 26
+pass; `testWhatAWholeTurnActuallyCosts` is unchanged where it counts: the app's 31-token prompt
+still prefills in FOUR reports at width eight, with the same 74,282.7 MB read, the same
+12,224 arena acquisitions at the same 62.0% hit rate and the same generated text as `#69`.
+Its wall moved from 5.79-5.85 s to 8.57 s and back to 6.69 s on a build that ran the same
+work at width four, because that turn is 74 GB of cold expert read and the disk's rate is
+what varies (11,368 against 9,995 MB/s reported by the streamer on the same bytes). Quote
+that turn's wall as a range or not at all.

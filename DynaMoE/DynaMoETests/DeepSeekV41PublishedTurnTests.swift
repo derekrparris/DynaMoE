@@ -4204,6 +4204,7 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
                     + String(format: "%.1f", per.wall)
                     + ", embedding " + String(format: "%.1f", per.embedding)
                     + ", dense encode " + String(format: "%.1f", per.denseEncode)
+                    + ", indexer wait " + String(format: "%.1f", per.indexerWait)
                     + ", front wait " + String(format: "%.1f", per.frontWait)
                     + ", routing " + String(format: "%.1f", per.routing)
                     + ", expert fill " + String(format: "%.1f", per.expertFill)
@@ -12108,6 +12109,439 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
                 )
         )
         print("🔎 [dsv41 real] \(runtime.expertStreamer?.describe() ?? "no streamer")")
+        withExtendedLifetime(engine) {}
+    }
+    // MARK: - #70: where a text prefix's per-position cost goes
+
+    /// One prefill arm's whole trace: the wall the user waits on, what it read, and
+    /// every counter that can attribute it.
+    struct PrefixArm: Sendable {
+        var label: String
+        var length: Int
+        var width: Int
+        var isWalk: Bool
+        var seconds: Double
+        var positions: Int
+        var bytes: Double
+        var misses: Int
+        var dispatches: Int
+        var dispatchTable: [String: Int]
+        var blocks: Int
+        var layerPasses: Int
+        var blockMixtures: Int
+        var perPositionMixtures: Int
+        var blockTiming: DeepSeekV41BlockTiming?
+        var walkTiming: DeepSeekV41WalkTiming?
+        var lastLogits: [Float]
+
+        var millisecondsPerPosition: Double {
+            seconds * 1000 / Double(max(1, positions))
+        }
+
+        /// Milliseconds per LAYER PASS. A walked arm pays one per position; a block
+        /// arm pays one per block however many positions it carries, so dividing it by
+        /// the block width gives the per-position figure batching is supposed to lower.
+        var millisecondsPerLayerPass: Double {
+            seconds * 1000 / Double(max(1, layerPasses))
+        }
+
+        var millisecondsPerBlock: Double {
+            seconds * 1000 / Double(max(1, blocks))
+        }
+
+        var dispatchesPerPosition: Double {
+            Double(dispatches) / Double(max(1, positions))
+        }
+    }
+
+    /// Where a text prefill's per-position cost goes, and whether a block amortises any
+    /// of it.
+    ///
+    /// `#69` measured the app's own turn and found a prefill position costs what a
+    /// decode position costs (187-281 against 138-183 ms). That is a statement about
+    /// the shipped layout, which chunks a prompt into blocks of eight and, per layer,
+    /// pays ONE dense-half wait, ONE union fill and ONE mixture submission for the whole
+    /// block. Eight positions for the price of one ought to be cheap; the numbers say
+    /// they are not, and no slice since `#53` has measured the SHAPE of that.
+    ///
+    /// So this runs the walk (the per-position baseline) and the block path at widths
+    /// 1, 2, 4 and the shipped 8 over the same 128-token stream, in one process, with
+    /// the arm order rotated every round so no width owns the young-process advantage.
+    /// A width-1 block is the block path with nothing to batch, so the difference
+    /// between it and the walk is the block path's own overhead, and the difference
+    /// between it and width 8 is what batching is worth on this checkpoint. It then
+    /// repeats the comparison at the app's own prompt length, where a prompt is four
+    /// blocks at the shipped width and the hand-off count is what a change to that
+    /// width would move.
+    ///
+    /// Three columns decide the question:
+    ///
+    /// - **milliseconds per layer pass**, divided by the block width. The walked arm
+    ///   pays 40 per position; a block pays 40 per block. A flat column means the work
+    ///   inside a layer scales with positions and no layout can amortise it.
+    /// - **dispatches per position**, from the census. The block path dispatches the
+    ///   stages that cannot batch once per SLOT, so if its count per position is not
+    ///   below the walk's, host encode cannot amortise either. This is the census's
+    ///   first run on the block path: `encodeBlockStage` never labelled its stages, and
+    ///   `dispatchCensusPositions` never counted a block's positions.
+    /// - **the buckets**, now comparable across the two layouts. The block's
+    ///   `denseEncode` used to fold the indexer split (a GPU drain plus a host
+    ///   readback) into an encode, which made a block read 28.6 ms of encode per
+    ///   position against a walked position's ~3.5; it is `indexerWait` now, its own
+    ///   column, exactly as the walk reports it.
+    ///
+    /// The arena is reset before every arm, so every arm is cold against the page cache
+    /// and reads the same bytes: that is the regime a prompt meets, and two arms that
+    /// read different bytes would not be comparable at all. Byte counts are printed and
+    /// asserted stable across rounds for the same arm.
+    ///
+    /// Opt-in (`/tmp/dynamoe_dsv41_prefix_time`): two lengths, twenty-four passes of up
+    /// to 128 positions, ~15 minutes at `-O`.
+    /// `/tmp/dynamoe_dsv41_prefix_time_quick` runs one round of 32 positions instead.
+    func testWhereATextPrefixsPerPositionCostGoesOnThePublishedCheckpoint() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_prefix_time"
+        let quickMarkerPath = "/tmp/dynamoe_dsv41_prefix_time_quick"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in prefill width attribution; touch \(markerPath) to run"
+        )
+        let quick = FileManager.default.fileExists(atPath: quickMarkerPath)
+        let rounds = quick ? 1 : 3
+        let longest = quick ? 32 : 128
+        // The app's own prompt is 31 positions (its DEFAULT thinking-on shape, which
+        // `#69` measured at four blocks). The long arm is the same stream `#52`-`#59`
+        // all used, so its numbers are comparable with every prefill table in the
+        // journal; the short arm is the one a user actually waits on.
+        // The 64-position arm exists to bracket the crossover between the two widths:
+        // a prompt's routed working set fits the arena at 31 positions and does not at
+        // 128, and the width that wins follows that, not the length.
+        let lengths = quick ? [32] : [128, 64, 31]
+
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+        // The paragraph repeated with a rotation per repetition, so the sequence is not
+        // periodic: a plain repeat cycles the same routing and leaves the arena warm.
+        func prompt(_ length: Int) -> [Int] {
+            (0..<length).map { index -> Int in
+                let repetition = index / stream.count
+                return stream[(index + repetition * 13) % stream.count]
+            }
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: longest + 1,
+            allowEngramSkip: false
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let executor = runtime.forward()
+        let shippedWidth = DeepSeekV41DevicePlan.chunkSlots(
+            config: config, contextLength: runtime.contextLength
+        )
+        print(
+            "🔎 [dsv41 real] prefix attribution: lengths \(lengths), \(rounds) round(s), "
+                + "shipped block width \(shippedWidth), arena \(runtime.arena.capacity) slot(s)"
+        )
+
+        /// One arm. `width` nil is the walk, which is the per-position baseline and the
+        /// path a resumed turn takes; anything else is the block path truncating the
+        /// stream into chunks of that many tokens, which is how a prompt is laid out.
+        func run(width armWidth: Int?, tokens: [Int], warm: Bool = false) throws -> PrefixArm {
+            executor.reset()
+            // A cold arm drops the arena so it re-reads every expert; a warm arm leaves
+            // what the previous pass put there, which is what a follow-up turn meets.
+            if !warm { runtime.arena.reset() }
+            executor.resetBlockTiming()
+            executor.resetWalkTiming()
+            executor.resetDispatchCensus()
+            executor.recordsBlockTiming = armWidth != nil
+            executor.recordsWalkTiming = armWidth == nil
+            executor.countsDispatches = true
+            let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+            let missesBefore = runtime.expertStreamer?.expertsLoaded ?? 0
+            let blockMixturesBefore = executor.blockMixtureSubmissions
+            let perPositionMixturesBefore = executor.perPositionMixtureSubmissions
+            let started = DispatchTime.now().uptimeNanoseconds
+            var last: [Float] = []
+            if let blockWidth = armWidth {
+                var offset = 0
+                while offset < tokens.count {
+                    let end = min(offset + blockWidth, tokens.count)
+                    last = try executor.prefillChunk(
+                        Array(tokens[offset..<end]), blockWidth: blockWidth
+                    ).last
+                    offset = end
+                }
+            } else {
+                for (position, token) in tokens.enumerated() {
+                    last = try executor.forwardToken(token, position: position)
+                }
+            }
+            let seconds = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000_000
+            executor.recordsBlockTiming = false
+            executor.recordsWalkTiming = false
+            executor.countsDispatches = false
+            let blockTiming = executor.blockTiming
+            let walkTiming = executor.walkTiming
+            let label = armWidth.map { "block \($0)" } ?? "walk"
+            return PrefixArm(
+                label: label,
+                length: tokens.count,
+                width: armWidth ?? 1,
+                isWalk: armWidth == nil,
+                seconds: seconds,
+                positions: tokens.count,
+                bytes: Double((runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore) / 1_048_576,
+                misses: (runtime.expertStreamer?.expertsLoaded ?? 0) - missesBefore,
+                dispatches: executor.dispatchCensus.values.reduce(0, +),
+                dispatchTable: executor.dispatchCensus,
+                blocks: armWidth != nil ? blockTiming.blocks : walkTiming.positions,
+                layerPasses: armWidth != nil ? blockTiming.layers : walkTiming.layers,
+                blockMixtures: executor.blockMixtureSubmissions - blockMixturesBefore,
+                perPositionMixtures: executor.perPositionMixtureSubmissions
+                    - perPositionMixturesBefore,
+                blockTiming: armWidth != nil ? blockTiming : nil,
+                walkTiming: armWidth == nil ? walkTiming : nil,
+                lastLogits: last
+            )
+        }
+
+        /// Relative difference against the reference arm's own logit scale.
+        func relativeDifference(_ reference: [Float], _ other: [Float]) -> Double {
+            guard !reference.isEmpty, reference.count == other.count else {
+                return .infinity
+            }
+            let scale = max(reference.map { abs(Double($0)) }.max() ?? 0, 1e-6)
+            let worst = zip(reference, other)
+                .map { abs(Double($0) - Double($1)) }
+                .max() ?? 0
+            return worst / scale
+        }
+
+        for length in lengths {
+            let tokens = prompt(length)
+            // The app's own length does not need the whole sweep, only the two widths a
+            // decision would choose between; the long arm pays for the four.
+            let widths: [Int?] = length == longest
+                ? [nil, 1, 2, 4, shippedWidth]
+                : [nil, 4, shippedWidth]
+            var steady: [String: [PrefixArm]] = [:]
+            var bytesByLabel: [String: [Double]] = [:]
+
+            for round in 0..<rounds {
+                // Rotated, because a pass that runs first in a young process is 1.3-1.6x
+                // faster in every bucket (`#53`, and `#55`/`#56` traced it to the
+                // arena's destination pages rather than to any code path) and that
+                // artefact would otherwise decide the sweep.
+                let order = (0..<widths.count).map { widths[($0 + round) % widths.count] }
+                var results: [PrefixArm] = []
+                for armWidth in order {
+                    let arm = try run(width: armWidth, tokens: tokens)
+                    results.append(arm)
+                    bytesByLabel[arm.label, default: []].append(arm.bytes)
+                    if round > 0 { steady[arm.label, default: []].append(arm) }
+                    print(
+                        String(
+                            format: "🔎 [dsv41 real]   %d pos, round %d %-7@ %6.2f s, "
+                                + "%6.1f ms/position, %6.2f ms/layer/position, %.0f MB, "
+                                + "%d misses, %.0f dispatch(es)/position, "
+                                + "mixtures %d block + %d per position",
+                            length,
+                            round + 1,
+                            arm.label as NSString,
+                            arm.seconds,
+                            arm.millisecondsPerPosition,
+                            arm.millisecondsPerLayerPass / Double(arm.width),
+                            arm.bytes,
+                            arm.misses,
+                            arm.dispatchesPerPosition,
+                            arm.blockMixtures,
+                            arm.perPositionMixtures
+                        )
+                    )
+                    if let timing = arm.blockTiming {
+                        print("🔎 [dsv41 real]     " + timing.describe())
+                        XCTAssertGreaterThan(
+                            timing.positionCount, 0, "\(arm.label) at \(length) measured nothing"
+                        )
+                    }
+                    if let timing = arm.walkTiming {
+                        print("🔎 [dsv41 real]     " + timing.describe())
+                        XCTAssertGreaterThan(
+                            timing.positions, 0, "\(arm.label) at \(length) measured nothing"
+                        )
+                    }
+                }
+                // Every width runs the same graph, so every width must land on the same
+                // logits at the last position. The bar is loose on purpose: a width
+                // change re-associates every reduction and can flip a routing tie, and
+                // the legitimate widths measured 5.3e-3 to 1.1e-2 apart at a logit scale
+                // of ~20 on this stream (128 and 31 positions), while a stage that was
+                // skipped or a slot that read another position's rows is orders of
+                // magnitude larger. The argmax must agree exactly, which is the check a
+                // real defect fails.
+                let reference = try XCTUnwrap(
+                    results.first(where: { !$0.isWalk && $0.width == shippedWidth })?.lastLogits
+                )
+                let referenceChoice = Self.argmax(reference)
+                for arm in results where arm.isWalk || arm.width != shippedWidth {
+                    let difference = relativeDifference(reference, arm.lastLogits)
+                    XCTAssertLessThan(
+                        difference, 5e-2,
+                        "\(arm.label) at \(length) disagreed with block \(shippedWidth) "
+                            + "by \(difference) relative"
+                    )
+                    XCTAssertEqual(
+                        Self.argmax(arm.lastLogits), referenceChoice,
+                        "\(arm.label) at \(length) chose a different token"
+                    )
+                }
+                XCTAssertGreaterThan(
+                    results.first(where: \.isWalk)?.dispatches ?? 0, 0,
+                    "the walk's census is empty"
+                )
+                for arm in results where !arm.isWalk {
+                    XCTAssertGreaterThan(
+                        arm.dispatches, 0,
+                        "\(arm.label) at \(length) reported no dispatch, so its stages "
+                            + "are unlabelled"
+                    )
+                }
+            }
+
+            // The byte counts are the harness's own determinism check: an arm that read
+            // a different number of bytes between two rounds is not a stable regime.
+            for (label, counts) in bytesByLabel.sorted(by: { $0.key < $1.key }) {
+                let low = counts.min() ?? 0
+                let high = counts.max() ?? 0
+                XCTAssertLessThan(
+                    high - low, max(high * 0.005, 1),
+                    "\(length) \(label) read \(low)-\(high) MB across rounds, "
+                        + "so the rounds are not comparable"
+                )
+            }
+
+            // The steady state, one row per width: this is the table that says whether a
+            // block amortises the per-pass work or pays it once per position.
+            let walkRow: PrefixArm
+            if let recorded = steady["walk"]?.first {
+                walkRow = recorded
+            } else {
+                walkRow = try run(width: nil, tokens: tokens)
+            }
+            print("🔎 [dsv41 real] steady state at \(length) positions (rounds 2+):")
+            for label in [walkRow.label] + widths.compactMap({ $0.map { "block \($0)" } }) {
+                let arms = label == walkRow.label ? [walkRow] : (steady[label] ?? [])
+                guard !arms.isEmpty else { continue }
+                let positions = arms.map(\.millisecondsPerPosition).reduce(0, +)
+                    / Double(arms.count)
+                let passes = arms.map(\.millisecondsPerLayerPass).reduce(0, +)
+                    / Double(arms.count)
+                let blocks = arms.map(\.millisecondsPerBlock).reduce(0, +) / Double(arms.count)
+                let bytes = arms.map(\.bytes).reduce(0, +) / Double(arms.count)
+                let dispatches = arms.map(\.dispatchesPerPosition).reduce(0, +)
+                    / Double(arms.count)
+                print(
+                    String(
+                        format: "🔎 [dsv41 real]   %-7@ %7.1f ms/position, %6.2f ms/layer pass, "
+                            + "%7.1f ms/block, %.0f MB, %.0f dispatch(es)/position, %.2fx the walk",
+                        label as NSString,
+                        positions,
+                        passes,
+                        blocks,
+                        bytes,
+                        dispatches,
+                        walkRow.millisecondsPerPosition / max(positions, 0.001)
+                    )
+                )
+            }
+
+        // The same two widths against an arena the previous passes filled.
+        //
+        // This is the arm the decision turns on. Every arm above resets the arena, so
+        // every one of them pays the full expert read, and in that regime the width
+        // barely matters: at 31 positions four and eight are a percent apart because
+        // both are dominated by 47 GB of routed experts. A live turn meets the other
+        // regime - turn 3 of `#69` follows two turns that left two thousand experts
+        // resident - and there the block's own per-layer overhead is what a width
+        // changes. It is measured here rather than argued, because getting it wrong is
+        // a 15% regression on the prompt a user actually waits on.
+        for length in lengths {
+            let tokens = prompt(length)
+            for round in 0..<max(1, rounds - 1) {
+                for armWidth in [4, shippedWidth] {
+                    let arm = try run(width: armWidth, tokens: tokens, warm: true)
+                    print(
+                        String(
+                            format: "🔎 [dsv41 real]   %d pos, WARM round %d %-7@ %6.2f s, "
+                                + "%6.1f ms/position, %.0f MB, %d misses",
+                            length,
+                            round + 1,
+                            arm.label as NSString,
+                            arm.seconds,
+                            arm.millisecondsPerPosition,
+                            arm.bytes,
+                            arm.misses
+                        )
+                    )
+                    if let timing = arm.blockTiming {
+                        print("🔎 [dsv41 real]     " + timing.describe())
+                    }
+                }
+            }
+        }
+            // Which stage holds the block path's dispatch count, at the widest width: the
+            // per-slot loop is the candidate that would have to become one dispatch for
+            // host encode to amortise with width.
+            if length == longest {
+                let censusArm: PrefixArm
+                if let recorded = steady["block \(shippedWidth)"]?.first {
+                    censusArm = recorded
+                } else {
+                    censusArm = try run(width: shippedWidth, tokens: tokens)
+                }
+                let censusTotal = max(censusArm.dispatchTable.values.reduce(0, +), 1)
+                print(
+                    "🔎 [dsv41 real] block \(shippedWidth) dispatch census, "
+                        + "\(censusArm.dispatchTable.count) stage(s), "
+                        + "\(censusTotal) dispatch(es) total:"
+                )
+                for (stage, count) in censusArm.dispatchTable
+                    .sorted(by: { $0.value > $1.value })
+                    .prefix(12)
+                {
+                    print(
+                        String(
+                            format: "🔎 [dsv41 real]   %-38@ %6d  %5.1f%%",
+                            stage as NSString,
+                            count,
+                            Double(count) / Double(censusTotal) * 100
+                        )
+                    )
+                }
+            }
+        }
+
         withExtendedLifetime(engine) {}
     }
 }
