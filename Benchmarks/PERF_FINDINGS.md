@@ -10848,3 +10848,130 @@ almost all cold, while these arms are 48 positions long so each block is filled 
 turn so far left -- the ~80% hit rate `#67` measured on a live turn. That is why width three reads
 0.78x here and 1.08x there: neither is wrong, and the one that answers "does a verify pay in a live
 turn" is this one.
+
+## DSV4.1 #69: WHAT A WHOLE TURN COSTS, END TO END — AND WHY THE PREFILL BAR NEVER MOVED
+
+### Question
+
+Every slice from `#60` on measured a PIECE of a decoded position: one stage of the dense
+half (`#60`-`#63`), the indexer's wait (`#64`), the deferred bind (`#65`), a dispatch
+(`#66`), the expert fill (`#67`), a verify that turned out not to pay (`#68`). The only
+end-to-end figure anywhere in this journal is `#22`'s 205-324 ms/position, and it was
+taken before the dense pin, the coalesced FP8/MXFP4 GEMV family, the arena's replacement
+rule and `#67`'s re-measurement of its own regime -- so nothing since is comparable with
+it, or with each other. There was no common reference.
+
+There was also a user-visible symptom of the same gap. In the chat UI the prefill status
+did not appear on the first prompt at all, and on a follow-up turn it appeared as a single
+late count. Both came from the same place: a whole prompt is ONE call into the executor.
+
+### The run
+
+`DeepSeekV41PublishedTurnTests.testWhatAWholeTurnActuallyCosts` runs
+`DeepSeekV41TurnRunner` exactly as `CompletionEngine.launchTurn` does -- one chunked
+prefill from position 0, then a walk per drawn token -- over the published checkpoint,
+and reuses the runtime across turns so the arena's behaviour is the app's. Two prompt
+shapes, each followed by its own continuation (the prompt the model saw plus what it
+wrote, which is what the app's pin proposes):
+
+| turn | prompt | reused | run | prefill | steps | decode | ms/position | first token |
+|---|---|---|---|---|---|---|---|---|
+| 1 thinking off ("hey") | 5 | 0 | 5 | 1.41 s (281 ms/pos) | 1 | 1.29-1.32 s | 161.6-164.4 | 1.41 s |
+| 2 its continuation | 13 | 12 | 1 | 0.14 s (136-138) | 1 | 0.97-0.98 s | 138.5-139.7 | 0.14 s |
+| 3 app default (thinking on, high) | 31 | 0 | 31 | 5.79-5.85 s (187-189) | 4 (8,8,8,7) | 1.40-1.46 s | 175.2-182.6 | 5.79-5.85 s |
+| 4 its continuation | 39 | 38 | 1 | 0.18 s (177-182) | 1 | 1.32-1.36 s | 164.9-169.7 | 0.18 s |
+
+The decode, decomposed by the executor's own buckets, per walked position (host buckets
+are mutually exclusive; the device windows are a SUBSET of the host waits, so they are
+reported as "of that host time" rather than added):
+
+| turn | wall | host | encode | front wait | expert fill | indexer wait | mixture encode | device windows | outside the walk |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 184.7-187.9 | 180.8-184.2 | 3.1 | 52.4-52.9 | 112.0-112.6 | 10.4-13.8 | 2.4 | 42.0-43.8 | 3.7-3.8 |
+| 3 | 200.2-208.7 | 195.4-204.4 | 3.5-3.6 | 79.5-88.9 | 90.5-92.3 | 17.2-18.8 | 2.8 | 44.0-47.3 | 4.2-4.8 |
+
+Four turns read 81.35 GB into 4,646 slots, ended 3,760/3,760 resident at 62.0% hit over
+12,224 acquisitions, and the streamer served it at 11.7-11.8 GB/s.
+
+### What it says
+
+**1. The composer's blank prefill was plumbing, and it is fixed.** A whole prompt goes
+through one `prefillChunk` call, and the turn loop reported progress only AFTER that call
+returned (`onPrefill(newPositions, newPositions)`), while the app's own `done % 8 == 0`
+guard dropped every report a short turn produced. So the first prompt emitted nothing
+until the prefill was over and then jumped to a finished count, and a resumed turn -- one
+or two positions -- emitted exactly one line. Both are the same defect: a report with no
+granularity behind it. `DeepSeekV41PositionForward` now carries
+`prefillChunk(_:onProgress:)`; the device executor fires it once per `runBlock` (a block
+is one command buffer, so that is the honest granularity), the walk-based executors
+report once at the end, and the app emits a 0/N line before the call and then a
+time-throttled, rate-bearing status (`Prefilling 24/31 (+38 resident) • 5.3 pos/s`). The
+cost of the fix is one closure call per block.
+
+**2. A 31-token default prompt is 5.8 seconds of nothing.** That is the number the user
+stares at, and it is now on the screen as it happens. `user waits 5.79-5.85 s for the
+first token` is the column to watch for any future prefill work.
+
+**3. The batched prefill buys essentially nothing on a prompt of this size, measured
+through the app rather than in an arm.** Its per-position cost is 187-189 ms against a
+cold decode position's 175-183 ms, i.e. **1.02-1.07x**, which is `#53`'s 1.05x at 128
+positions arriving from the app's own path. The block form's win was never per-position
+expert traffic (`#68` withdrew that premise); it is the per-layer host round trip, and a
+31-position prompt has four of them to amortise. There is nothing here to speed up by
+batching harder.
+
+**4. A live decode position is the expert fill plus the routing round trip, and nothing
+else.** Of turn 3's ~205 ms: 90-92 ms is the fill (44%), 80-89 ms is the front wait
+(39-43%, of which ~44-47 ms is device windows), 17-19 ms is the indexer's second wait,
+and 6 ms is host encoding. **3.4-5.2 ms is outside the walk altogether** -- the head, the
+sampling, the text decode and the stream hop together -- so no amount of work on the
+non-walk path is worth measuring. This is `#67`'s conclusion (the fill is the floor) and
+`#22`'s conclusion (the readback empties the queue and the next commit is picked up late)
+arriving through a third instrument, and it is the first time either has been shown on
+the path the chat UI actually runs.
+
+**5. The resumed turn is nearly free, which is the prefix cache working.** 12 of 13 and
+38 of 39 prompt positions were skipped, so a follow-up's first token arrives in 0.14-0.18 s
+against a first prompt's 5.8 s, and that single walked position costs the same as any
+other (136-182 ms).
+
+### What it is not (do not re-propose)
+
+- **Not a contradiction of `#67`.** Its arms were 48-position walks against a 14-position
+  prefix; these turns start at an empty arena and fill it as they go (62% hit by the end
+  of the fourth). The 162-183 ms/position here is what a turn pays from cold, which is
+  why it sits above `#67`'s 121.8. Both are right and neither is the other's regime.
+- **Not a case for a different prefill shape.** 1.02-1.07x is `#53`'s number; a wider
+  block, a narrower one or a device-side pool all have to beat that, and `#53` already
+  measured the first two.
+- **Not a target in the 3-5 ms outside the walk.** The head, sampling and text decode
+  together are 2% of a position.
+- Everything `#60`-`#68` closed: the dense GEMVs and the wider block, the shared expert,
+  mHC and router kernels, the indexer's host work, the deferred bind, the dispatch count
+  and fusion, the expert read and arena, the hand-off idle, and speculative decoding at
+  every width.
+
+### Verification
+
+`/tmp/test69_turn_run1.log` and `/tmp/test69_turn_run2.log` (two runs of the same case in
+the same process order): every wall agrees to 1-3%, every byte column is IDENTICAL
+(24,563.7 / 32,112.1 / 74,282.7 / 83,301.3 MB), and the generated text is token-identical
+in both. The case asserts, per turn, that prefill reports are monotonic, that the last one
+equals the positions the turn actually ran, and that the count is one per block when
+chunked (3's four reports for 31 positions at a block width of 8) and one per position
+when walked (a resumed turn's single position) -- which is the composer's contract, and
+was the thing that was broken. Run with the class marker and the opt-in file:
+
+```bash
+touch /tmp/dynamoe_dsv41_real_turn && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcodebuild test-without-building -project DynaMoE.xcodeproj -scheme DynaMoE \
+  -destination 'platform=macOS,arch=arm64' -derivedDataPath /tmp/dd_dsv41_61_opt \
+  -parallel-testing-enabled NO \
+  -only-testing:DynaMoETests/DeepSeekV41PublishedTurnTests/testWhatAWholeTurnActuallyCosts
+```
+
+The progress plumbing is pinned without any model as well:
+`DeepSeekV41TurnLoopTests.testAWholePromptReportsProgressBlockByBlock` (a scripted
+forward that reports per block, asserting the counts climb and end on the chunk) and
+`DeepSeekV41DeviceGraphParityTests.testAPrefillReportsEveryBlockItRuns` (the real device
+executor over 9 positions at a 4-wide block, asserting `[4, 8, 9]`).

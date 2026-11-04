@@ -142,6 +142,36 @@ private final class ScriptedForward: DeepSeekV41PositionForward, @unchecked Send
         }
         return DeepSeekV41ChunkLogits(last: last)
     }
+
+    /// How wide a block this fake pretends to run, for the progress path. Nil is an
+    /// executor that cannot batch, which reports once, at the end.
+    var chunkBlockSize: Int?
+
+    /// The batching path's progress, at the granularity the device executor has: one
+    /// report per `runBlock`, carrying the positions the chunk has covered.
+    func prefillChunk(
+        _ tokens: [Int],
+        onProgress: (Int) -> Void
+    ) throws -> DeepSeekV41ChunkLogits {
+        guard let width = chunkBlockSize, width > 0 else {
+            let result = try prefillChunk(tokens)
+            onProgress(tokens.count)
+            return result
+        }
+        chunkedPrompts.append(tokens)
+        guard !tokens.isEmpty else { return DeepSeekV41ChunkLogits(last: []) }
+        var last: [Float] = []
+        var offset = 0
+        while offset < tokens.count {
+            let end = min(offset + width, tokens.count)
+            for (index, token) in tokens[offset..<end].enumerated() {
+                last = try forwardToken(token, position: offset + index)
+            }
+            offset = end
+            onProgress(offset)
+        }
+        return DeepSeekV41ChunkLogits(last: last)
+    }
 }
 
 final class DeepSeekV41TurnLoopTests: XCTestCase {
@@ -266,6 +296,28 @@ final class DeepSeekV41TurnLoopTests: XCTestCase {
         // Position 2 is the one prompt position the cache did not hold; the token
         // drawn from it hits the cap before it is fed back.
         XCTAssertEqual(forward.forwardedPositions, [2])
+    }
+
+    /// A whole prompt reports as each block lands, not only when it finishes.
+    ///
+    /// This is what the composer reads: one chunk call is one status line, and a
+    /// prompt spanning several blocks used to leave it blank until the last block
+    /// drained. The counts are positions of THIS turn, so they run to the chunk's
+    /// length and no further.
+    func testAWholePromptReportsProgressBlockByBlock() throws {
+        let forward = ScriptedForward(positionLimit: 64, scripted: [7])
+        forward.chunkBlockSize = 2
+        var progress: [(Int, Int)] = []
+        let output = try run(
+            forward: forward,
+            prompt: [10, 11, 12, 13, 14],
+            settings: settings(maxTokens: 1),
+            prefill: { progress.append(($0, $1)) }
+        )
+        XCTAssertEqual(output.promptTokens, 5)
+        XCTAssertEqual(forward.chunkedPrompts, [[10, 11, 12, 13, 14]])
+        XCTAssertEqual(progress.map(\.0), [2, 4, 5], "one report per block, the last partial")
+        XCTAssertEqual(progress.map(\.1), [5, 5, 5])
     }
 
     func testAStopSequenceEndsTheTurnAndIsReported() throws {

@@ -11812,4 +11812,302 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         }
         return []
     }
+
+    // MARK: - #69: the whole turn, end to end
+
+    /// One prefill report as it arrived: how many positions the chunk held, and the
+    /// wall clock when the executor reported it.
+    struct TurnPrefillBlock: Sendable {
+        var done: Int
+        var seconds: Double
+    }
+
+    /// What one turn reported while it ran, beside what it returned.
+    struct TurnTrace: Sendable {
+        var output: DeepSeekV41TurnRunner.Output
+        var prefillBlocks: [TurnPrefillBlock]
+        var tokenSeconds: [Double]
+    }
+
+    /// What a live turn actually costs, start to finish.
+    ///
+    /// Every slice from `#60` on measured a piece of a decoded position: a stage of the
+    /// dense half, the expert fill's floor, one kernel cell by cell. The only
+    /// end-to-end figure in this journal is `#22`'s 205-324 ms/position, taken before
+    /// the dense pin, the coalesced GEMV family, the arena's replacement rule and
+    /// `#67`'s re-measurement of the same regime, so the numbers since are not
+    /// comparable with it or with each other.
+    ///
+    /// This runs `DeepSeekV41TurnRunner` over the published checkpoint exactly as
+    /// `CompletionEngine.launchTurn` does -- one chunked prefill from position 0, then
+    /// a walk per drawn token -- and reports the wall the app's user waits on: prefill
+    /// seconds divided into its blocks, the wait for the first token, decode seconds
+    /// per position, and the host/device split of that decode from the executor's own
+    /// counters. Each prompt gets a second turn that continues it, so the resume the
+    /// app performs is measured rather than assumed: how much of the prompt the cache
+    /// still holds, how many positions the turn really ran, and what those cost.
+    ///
+    /// Two prompt shapes, both the app's. The short thinking-off one keeps this
+    /// comparable with every earlier slice. The app's DEFAULT (thinking on, effort
+    /// high) is longer than one block, so its prefill shows the cadence rather than a
+    /// single report.
+    ///
+    /// It also pins the composer's progress contract at the published sizes. A whole
+    /// prompt is ONE call into the executor, and before the progress hook existed that
+    /// call reported nothing until the last block drained: the status line stayed blank
+    /// for the entire prefill and then jumped to a finished count. The assertions here
+    /// are that contract -- reports climb, one per block when chunked and one per
+    /// position when walked, and the last one is what the turn actually ran.
+    func testWhatAWholeTurnActuallyCosts() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        guard let tokenizer = try? DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        ) else {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let dialect = DeepSeekV41PromptDialect.resolve(snapshotDir: snapshot)
+        func renderPrompt(thinking: Bool) -> [UInt32] {
+            let text = dialect.render(
+                turns: [.init(isUser: true, text: userText)],
+                cleanSystem: "",
+                thinkingEnabled: thinking,
+                effort: thinking ? .high : nil
+            )
+            return (try? tokenizer.encode(text: text)) ?? []
+        }
+        let promptIds = renderPrompt(thinking: false)
+        let thinkingIds = renderPrompt(thinking: true)
+        XCTAssertFalse(promptIds.isEmpty, "the rendered prompt tokenized to nothing")
+        XCTAssertFalse(thinkingIds.isEmpty, "the thinking-on prompt tokenized to nothing")
+        print(
+            "🔎 [dsv41 real] prompts: \(promptIds.count) token(s) thinking off, "
+                + "\(thinkingIds.count) thinking on high"
+        )
+
+        let contextLength = max(promptIds.count, thinkingIds.count) + firstTurnTokens * 2 + 16
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: contextLength,
+            allowEngramSkip: FileManager.default.fileExists(
+                atPath: Self.engramOffMarkerPath
+            )
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let forward = runtime.forward()
+        XCTAssertTrue(forward.isRunnable, forward.describe())
+        // The walk's own buckets are what decompose the decode half. The block path
+        // does not fill them, so a chunked prefill cannot pollute the columns; a WALKED
+        // prefill adds its positions, which is why every print names the position count
+        // it divided by.
+        forward.recordsWalkTiming = true
+
+        let settings = DeepSeekV41TurnRunner.Settings(
+            temperature: 0,
+            topP: 1,
+            minP: 0,
+            topK: 1,
+            repetitionPenalty: 1,
+            maxTokens: firstTurnTokens,
+            eosTokenIds: config.eosTokenIDs.map { UInt32(clamping: $0) }
+        )
+
+        /// One turn, asked for exactly what the app asks for: the pin proposes every
+        /// position but the last, and the executor decides how much it really holds.
+        func runTurn(_ prompt: [UInt32]) throws -> TurnTrace {
+            let reused = forward.reusablePrefix(
+                proposedPrefix: max(0, prompt.count - 1),
+                promptTokenIds: prompt.map { Int($0) }
+            )
+            forward.resetWalkTiming()
+            let started = CFAbsoluteTimeGetCurrent()
+            var blocks: [TurnPrefillBlock] = []
+            var tokenSeconds: [Double] = []
+            let output = try DeepSeekV41TurnRunner.run(
+                forward: forward,
+                promptTokenIds: prompt,
+                prefixTokens: reused,
+                settings: settings,
+                sample: { logits, _ in Self.argmax(logits) },
+                decode: { (try? tokenizer.decode(ids: $0)) ?? "" },
+                onPrefill: { done, _ in
+                    blocks.append(
+                        TurnPrefillBlock(
+                            done: done, seconds: CFAbsoluteTimeGetCurrent() - started
+                        )
+                    )
+                },
+                onText: { _, _, elapsed in tokenSeconds.append(elapsed) }
+            )
+            return TurnTrace(
+                output: output, prefillBlocks: blocks, tokenSeconds: tokenSeconds
+            )
+        }
+
+        /// Every column the app's user waits on, plus the split of the decode.
+        func report(_ label: String, _ trace: TurnTrace, blockWidth: Int) {
+            let out = trace.output
+            let run = out.promptTokens - out.prefixTokensReused
+            print(
+                "🔎 [dsv41 real] \(label): \(out.promptTokens) prompt position(s), "
+                    + "\(out.prefixTokensReused) reused, \(run) run"
+            )
+            print(
+                "🔎 [dsv41 real]   prefill "
+                    + String(
+                        format: "%.2f s (%.1f ms/position over %d)", out.prefillSeconds,
+                        out.prefillSeconds / Double(max(1, run)) * 1000, run
+                    )
+                    + ", \(trace.prefillBlocks.count) report(s)"
+            )
+            var previousSeconds = 0.0
+            var previousDone = 0
+            for block in trace.prefillBlocks {
+                let positions = block.done - previousDone
+                let seconds = block.seconds - previousSeconds
+                print(
+                    "🔎 [dsv41 real]     step \(block.done)/\(run): "
+                        + String(
+                            format: "%.2f s for %d position(s), %.1f ms each",
+                            seconds, positions, seconds / Double(max(1, positions)) * 1000
+                        )
+                )
+                previousSeconds = block.seconds
+                previousDone = block.done
+            }
+            let timing = forward.walkTiming
+            let hostNanoseconds = timing.frontEncodeNanoseconds + timing.frontWaitNanoseconds
+                + timing.expertFillNanoseconds + timing.indexerWaitNanoseconds
+                + timing.mixtureEncodeNanoseconds
+            let deviceNanoseconds = timing.frontDeviceNanoseconds + timing.mixtureDeviceNanoseconds
+            let walked = max(1, timing.positions)
+            // A resumed turn walks its prefill, so the walk's own counters cover the
+            // prefill positions too. Dividing the decode window by every walked
+            // position would understate both, and once made the remainder negative.
+            // The window these buckets belong to is prefill + decode when the prefill
+            // walked, and the decode alone when it was one chunk.
+            let walkedPrefill = out.prefixTokensReused == 0 ? 0 : run
+            let wallMilliseconds = out.decodeSeconds * 1000
+                + (walkedPrefill > 0 ? out.prefillSeconds * 1000 : 0)
+            print(
+                "🔎 [dsv41 real]   decode \(out.tokensGenerated) token(s) in "
+                    + String(
+                        format: "%.2f s, %.1f ms/position, %.1f tok/s",
+                        out.decodeSeconds,
+                        out.decodeSeconds * 1000 / Double(max(1, out.tokensGenerated)),
+                        out.tokensPerSecond
+                    )
+                    + String(
+                        format: "; user waits %.2f s for the first token",
+                        out.prefillSeconds + (out.timeToFirstTokenSeconds ?? 0)
+                    )
+            )
+            print(
+                "🔎 [dsv41 real]   split over \(timing.positions) walked position(s) "
+                    + "(\(walkedPrefill) prefill + \(timing.positions - walkedPrefill) decode): "
+                    + String(
+                        format: "%.1f ms wall, %.1f ms host (encode %.1f + front wait %.1f "
+                            + "+ fill %.1f + indexer %.1f + mixture encode %.1f), "
+                            + "%.1f ms of that host time is device windows, %.1f ms outside "
+                            + "the walk",
+                        wallMilliseconds / Double(walked),
+                        Double(hostNanoseconds) / 1_000_000 / Double(walked),
+                        Double(timing.frontEncodeNanoseconds) / 1_000_000 / Double(walked),
+                        Double(timing.frontWaitNanoseconds) / 1_000_000 / Double(walked),
+                        Double(timing.expertFillNanoseconds) / 1_000_000 / Double(walked),
+                        Double(timing.indexerWaitNanoseconds) / 1_000_000 / Double(walked),
+                        Double(timing.mixtureEncodeNanoseconds) / 1_000_000 / Double(walked),
+                        Double(deviceNanoseconds) / 1_000_000 / Double(walked),
+                        (wallMilliseconds - Double(hostNanoseconds) / 1_000_000)
+                            / Double(walked)
+                    )
+            )
+            print(
+                "🔎 [dsv41 real]   turn wall "
+                    + String(
+                        format: "%.2f s (prefill %.2f + decode %.2f)",
+                        out.prefillSeconds + out.decodeSeconds, out.prefillSeconds,
+                        out.decodeSeconds
+                    )
+                    + String(
+                        format: ", %.1f MB read",
+                        Double(runtime.expertStreamer?.bytesRead ?? 0) / 1_048_576
+                    )
+            )
+            print("🔎 [dsv41 real]   text: \(out.text.debugDescription)")
+
+            // The composer's contract, at whatever size this turn ran: one report per
+            // block when the prompt was chunked, one per position when it was walked.
+            XCTAssertEqual(
+                trace.prefillBlocks.map(\.done).last ?? -1, run,
+                "\(label): the last prefill report must be the positions the turn ran"
+            )
+            XCTAssertEqual(
+                trace.prefillBlocks.map(\.done), trace.prefillBlocks.map(\.done).sorted(),
+                "\(label): progress must be monotonic"
+            )
+            let expected = out.prefixTokensReused == 0
+                ? max(1, (run + blockWidth - 1) / blockWidth)
+                : max(1, run)
+            XCTAssertEqual(
+                trace.prefillBlocks.count, expected,
+                "\(label): one report per block when chunked, per position when walked"
+            )
+            XCTAssertGreaterThan(out.tokensGenerated, 0, "\(label): the turn produced no token")
+            XCTAssertGreaterThan(out.prefillSeconds, 0, "\(label): prefill took no time")
+            XCTAssertGreaterThan(out.decodeSeconds, 0, "\(label): decode took no time")
+        }
+
+        let blockWidth = DeepSeekV41DevicePlan.chunkSlots(
+            config: config, contextLength: contextLength
+        )
+        let first = try runTurn(promptIds)
+        report(
+            "turn 1 thinking off (\(userText.debugDescription))", first,
+            blockWidth: blockWidth
+        )
+        XCTAssertEqual(first.output.prefixTokensReused, 0, "a cold cache cannot reuse anything")
+
+        let continuation = promptIds + first.output.generatedTokenIds
+        let second = try runTurn(continuation)
+        report("turn 2 its continuation", second, blockWidth: blockWidth)
+        XCTAssertEqual(second.output.promptTokens, continuation.count)
+        if first.output.generatedTokenIds.isEmpty {
+            XCTAssertEqual(second.output.prefixTokensReused, 0)
+        } else {
+            XCTAssertEqual(
+                second.output.prefixTokensReused, continuation.count - 1,
+                "a turn that just wrote these tokens can skip all but the last"
+            )
+        }
+
+        let third = try runTurn(thinkingIds)
+        report("turn 3 app default shape", third, blockWidth: blockWidth)
+        XCTAssertEqual(
+            third.output.prefixTokensReused, 0, "a different prompt is a full prefill"
+        )
+        XCTAssertGreaterThan(
+            third.prefillBlocks.count, 1,
+            "the app's default prompt must span more than one block, or it measures nothing"
+        )
+
+        let fourth = try runTurn(thinkingIds + third.output.generatedTokenIds)
+        report("turn 4 its continuation", fourth, blockWidth: blockWidth)
+
+        print(
+            "🔎 [dsv41 real] arena after four turns: "
+                + "\(runtime.arena.residentCount)/\(runtime.arena.capacity) resident, "
+                + String(
+                    format: "%.1f%% hit over %d acquisition(s)",
+                    runtime.arena.hitRate * 100, runtime.arena.acquisitions
+                )
+        )
+        print("🔎 [dsv41 real] \(runtime.expertStreamer?.describe() ?? "no streamer")")
+        withExtendedLifetime(engine) {}
+    }
 }

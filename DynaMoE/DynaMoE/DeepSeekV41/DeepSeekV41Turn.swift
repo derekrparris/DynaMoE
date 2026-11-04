@@ -133,6 +133,18 @@ nonisolated public protocol DeepSeekV41PositionForward: AnyObject {
     /// batch answers by walking, which must produce the same logits, so this is a
     /// performance contract rather than a numeric one.
     func prefillChunk(_ tokens: [Int]) throws -> DeepSeekV41ChunkLogits
+    /// The same pass, reporting how many positions the cache holds as each block
+    /// lands.
+    ///
+    /// A whole prompt is one call, and a call that reports only at the end leaves
+    /// the composer blank for as long as the prompt takes. On this checkpoint that is
+    /// minutes, not seconds: a 128-position prefill is the shape every prefill table
+    /// in this port measures. The count is positions of THIS chunk, so it runs 0...N.
+    ///
+    /// Reporting per block rather than per position is all the batching path can
+    /// honestly say, because a block is one command buffer and the host sees nothing
+    /// inside it. An executor that cannot batch reports once, at the end.
+    func prefillChunk(_ tokens: [Int], onProgress: (Int) -> Void) throws -> DeepSeekV41ChunkLogits
 }
 
 public extension DeepSeekV41PositionForward {
@@ -161,6 +173,17 @@ public extension DeepSeekV41PositionForward {
             }
         }
         return DeepSeekV41ChunkLogits(last: last)
+    }
+
+    /// The chunk form without a batching path reports once, because that is all it
+    /// can see: the walk returns a position at a time and nothing here batches them.
+    func prefillChunk(
+        _ tokens: [Int],
+        onProgress: (Int) -> Void
+    ) throws -> DeepSeekV41ChunkLogits {
+        let result = try prefillChunk(tokens)
+        onProgress(tokens.count)
+        return result
     }
 }
 
@@ -249,7 +272,9 @@ nonisolated public enum DeepSeekV41TurnRunner {
     ///     after each appended token, so generation stops on the token that closes
     ///     the call instead of running on into invented post-call prose.
     ///   - decode: decodes the whole generated sequence so far.
-    ///   - onPrefill: `(positions done, positions total)`, once per position.
+    ///   - onPrefill: `(positions done, positions total)` over THIS turn's
+    ///     positions, once per position on the walk and once per block on the
+    ///     whole-prompt chunk, because a block is one command buffer.
     ///   - onText: `(text so far, tokens generated, elapsed seconds)` at most once
     ///     per token.
     ///   - isCancelled: consulted before every position and every sample.
@@ -334,13 +359,17 @@ nonisolated public enum DeepSeekV41TurnRunner {
             }
             let prompt = promptTokenIds.map { Int($0) }
             do {
-                logits = try forward.prefillChunk(prompt).last
+                // `onProgress` is what makes a whole-prompt prefill visible: the
+                // block executor reports each block as it lands, so the composer
+                // ticks instead of sitting blank until the last position is done.
+                logits = try forward
+                    .prefillChunk(prompt, onProgress: { onPrefill($0, newPositions) })
+                    .last
             } catch {
                 throw DeepSeekV41TurnError.prefillChunkFailed(
                     positions: prompt.count, underlying: "\(error)"
                 )
             }
-            onPrefill(newPositions, newPositions)
         } else {
             for offset in resumeFrom..<promptTokenIds.count {
                 if isCancelled() {

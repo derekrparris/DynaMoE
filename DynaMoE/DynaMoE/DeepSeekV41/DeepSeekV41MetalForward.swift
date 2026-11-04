@@ -2680,6 +2680,22 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         try prefillChunk(tokens, embeddings: [:], capturingLogitsAt: [])
     }
 
+    /// The same pass, reporting positions as each block lands.
+    ///
+    /// A block is one command buffer that drains every layer, so the host has nothing
+    /// finer to report: this fires once per `runBlock`, with the number of positions
+    /// the cache holds afterwards. That is the granularity that makes a prompt longer
+    /// than one block visible in the composer while it runs, and it is also what a
+    /// prefill measurement reads its columns off.
+    public func prefillChunk(
+        _ tokens: [Int],
+        onProgress: (Int) -> Void
+    ) throws -> DeepSeekV41ChunkLogits {
+        try prefillChunk(
+            tokens, embeddings: [:], capturingLogitsAt: [], onProgress: onProgress
+        )
+    }
+
     /// The chunk form with an image span in it: a supplied residual row replaces the
     /// token lookup at the position it names, and that position is DEAD for the n-gram
     /// hashes.
@@ -2726,12 +2742,13 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         try prefillChunk(tokens, embeddings: [:], capturingLogitsAt: capture)
     }
 
-    /// The one chunk pass: tokens, the positions that carry a supplied row, and the
-    /// positions whose logits are kept.
+    /// The one chunk pass: tokens, the positions that carry a supplied row, the
+    /// positions whose logits are kept, and an optional per-block progress hook.
     private func prefillChunk(
         _ tokens: [Int],
         embeddings: [Int: [Float]],
-        capturingLogitsAt capture: Set<Int>
+        capturingLogitsAt capture: Set<Int>,
+        onProgress: (Int) -> Void = { _ in }
     ) throws -> DeepSeekV41ChunkLogits {
         guard !tokens.isEmpty else { return DeepSeekV41ChunkLogits(last: []) }
         // A row outside the prompt or of the wrong width would be dropped or read as
@@ -2776,6 +2793,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 captured[offset + position] = logits
             }
             offset = end
+            onProgress(end)
         }
         return DeepSeekV41ChunkLogits(last: last, captured: captured)
     }

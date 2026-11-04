@@ -589,6 +589,32 @@ public final class CompletionEngine: @unchecked Sendable {
 
                     let startTime = CFAbsoluteTimeGetCurrent()
                     var lastFrameTime = 0.0
+                    // Prefill progress has to be reported while it runs, not when it
+                    // ends. A whole prompt is one chunked call, so this is the
+                    // executor's per-block count, and it is throttled by TIME rather
+                    // than by a count of positions: a resumed turn may compute only a
+                    // handful, and a `% 8` gate turned those into one late jump with
+                    // no evidence anything was happening.
+                    let dsPrefillStartedAt = CFAbsoluteTimeGetCurrent()
+                    var dsLastPrefillEmit = 0.0
+                    func dsPrefillStatus(done: Int, total: Int, rate: Double?) -> String {
+                        var text = "Prefilling \(done)/\(total)"
+                        if reusablePrefix > 0 { text += " (+\(reusablePrefix) resident)" }
+                        if let rate {
+                            text += rate >= 10
+                                ? String(format: " • %.0f pos/s", rate)
+                                : String(format: " • %.1f pos/s", rate)
+                        }
+                        return text + "…"
+                    }
+                    let dsPrefillPositions = max(0, dsPromptIds.count - reusablePrefix)
+                    if dsPrefillPositions > 0 {
+                        emit(.prefillProgress(
+                            status: dsPrefillStatus(done: 0, total: dsPrefillPositions, rate: nil),
+                            speed: nil,
+                            rssGB: WorkingSetManager.shared.effectiveResidentMemoryGB
+                        ))
+                    }
                     let settings = DeepSeekV41TurnRunner.Settings(
                         temperature: dsSampling.temperature,
                         topP: dsSampling.topP,
@@ -648,10 +674,18 @@ public final class CompletionEngine: @unchecked Sendable {
                                 (try? dsTokenizer.decode(ids: ids)) ?? ""
                             },
                             onPrefill: { done, total in
-                                guard done == total || done % 8 == 0 else { return }
+                                let now = CFAbsoluteTimeGetCurrent()
+                                let isFinal = done >= total
+                                guard done == 0 || isFinal || now - dsLastPrefillEmit >= 0.12
+                                else { return }
+                                dsLastPrefillEmit = now
+                                let elapsed = now - dsPrefillStartedAt
+                                let rate: Double? = done > 0 && elapsed > 0.05
+                                    ? Double(done) / elapsed
+                                    : nil
                                 emit(.prefillProgress(
-                                    status: "Prefilling \(done)/\(total)…",
-                                    speed: nil,
+                                    status: dsPrefillStatus(done: done, total: total, rate: rate),
+                                    speed: rate,
                                     rssGB: WorkingSetManager.shared.effectiveResidentMemoryGB
                                 ))
                             },

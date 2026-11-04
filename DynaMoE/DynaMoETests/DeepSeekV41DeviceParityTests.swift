@@ -587,6 +587,25 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         XCTAssertEqual(worstDelta(chunk.last, last), 0, accuracy: 1e-6)
     }
 
+    /// A prefilled chunk reports each block it runs, ending on the whole chunk.
+    ///
+    /// This is the granularity the composer can honestly show, because a block is one
+    /// command buffer and nothing inside it is visible to the host. The counts are
+    /// positions of this chunk: strictly increasing, whole blocks until the last.
+    func testAPrefillReportsEveryBlockItRuns() throws {
+        let runtime = try makeRuntime(checkpoint)
+        let width = DeepSeekV41DevicePlan.chunkSlots(
+            config: checkpoint.config,
+            contextLength: checkpoint.shape.contextLength
+        )
+        XCTAssertGreaterThan(width, 1, "a block of one reports like a walk")
+        let tokens = (0..<(width * 2 + 1)).map { 3 + $0 }
+        var reported: [Int] = []
+        _ = try runtime.forward().prefillChunk(tokens, onProgress: { reported.append($0) })
+        XCTAssertEqual(reported, [width, width * 2, tokens.count])
+        XCTAssertEqual(reported.last, tokens.count)
+    }
+
     /// A capture keeps each position's own logits, not the block's last one.
     ///
     /// A verify checks draft `i` against the target's logits at position `i - 1`, so
