@@ -9126,6 +9126,166 @@ kernel void dsv41_fp8_block32_gemv_rows2(
     }
 }
 
+/// MSL Kernel: `dsv41_fp8_block32_gemv_rows` over a BLOCK of positions, from ONE
+/// request for the weight row.
+///
+/// `dsv41_fp8_block32_gemv_rows` carries a token axis, so a prefill block of eight
+/// positions is eight threadgroups per output row and each of them walks the same
+/// 1.25-8 KB of weight. On the checkpoint's three large attention projections that
+/// repetition IS the dense half: `#73` measured `attn.wq_b` at 3.03, `attn.wo_b` at
+/// 3.07 and `attn.wo_a` at 2.71 ms/position at block width eight -- 58% of the dense
+/// half -- and all three are flat between widths four and eight because every position
+/// re-requests the same bytes (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #73").
+///
+/// Here the row's 32 weight bytes are read ONCE per block iteration and held in
+/// registers while every position's activations are applied to them, so the weight is
+/// requested once instead of `slotCount` times: `bf16_gemv_rows8`'s trade (one
+/// accumulator per position against one weight read) in the FP8 block-scaled form.
+/// The buffers are `dsv41_fp8_block32_gemv_rows`'s plus `slotCount` at 10, the dispatch
+/// is one threadgroup per output row, and the output is `[slot][outDim]`.
+///
+/// IT LOSES, and the measurement is why it is not in the graph: at block width eight
+/// the dense half's device time is 36.6 ms/position through this form against 15.1
+/// through the per-(token, row) one, 2.42x worse and in both submission layouts, while
+/// the per-position form's repetition is served by the caches in front of it. The
+/// stages were never paying for the weight read; what they want is threadgroups, and
+/// this form trades eight of them for one (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1
+/// #73"). It stays as the baseline a probe measures: `enablesFP8SlotGemv` is the
+/// opt-in, off in every production path.
+kernel void dsv41_fp8_block32_gemv_rows_slots(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const uchar* rawScaleBuffer [[buffer(1)]],
+    device const float* inputVector [[buffer(2)]],
+    device float* outputVector [[buffer(3)]],
+    constant uint64_t& weightOffset [[buffer(4)]],
+    constant uint64_t& scaleOffset [[buffer(5)]],
+    constant uint32_t& inDim [[buffer(6)]],
+    constant uint32_t& outDim [[buffer(7)]],
+    constant uint32_t& inputRowStride [[buffer(8)]],
+    constant uint32_t& outputRowStride [[buffer(9)]],
+    constant uint32_t& slotCount [[buffer(10)]],
+    threadgroup float* partials [[threadgroup(0)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint laneCount [[threads_per_threadgroup]],
+    uint laneInSimd [[thread_index_in_simdgroup]],
+    uint simdIdx [[simdgroup_index_in_threadgroup]]
+) {
+    if (inDim == 0u || outDim == 0u || row >= outDim || (inDim % 32u) != 0u) return;
+    if (slotCount == 0u || slotCount > 8u) return;
+
+    uint32_t blockCount = inDim / 32u;
+    uint32_t scaleRowBase = (row / 32u) * blockCount;
+    uint32_t inStride = inputRowStride != 0u ? inputRowStride : inDim;
+    uint32_t outStride = outputRowStride != 0u ? outputRowStride : outDim;
+    device const uchar* wRow = rawWeightBuffer + weightOffset + ((uint64_t)row * (uint64_t)inDim);
+    device const uchar* sRow = rawScaleBuffer + scaleOffset + scaleRowBase;
+
+    // One accumulator pair per position, indexed by a CONSTANT once the loop below is
+    // unrolled: an array indexed by a runtime position would live in local memory and
+    // this form would lose to the one it replaces.
+    float dotLow[8];
+    float dotHigh[8];
+    #pragma unroll
+    for (uint32_t p = 0u; p < 8u; ++p) {
+        dotLow[p] = 0.0f;
+        dotHigh[p] = 0.0f;
+    }
+
+    for (uint32_t block = lane; block < blockCount; block += laneCount) {
+        uint32_t base = block * 32u;
+        float blockScale = decode_e8m0_scale(sRow[block]);
+        uchar4 w0 = *(device const uchar4*)(wRow + base);
+        uchar4 w1 = *(device const uchar4*)(wRow + base + 4u);
+        uchar4 w2 = *(device const uchar4*)(wRow + base + 8u);
+        uchar4 w3 = *(device const uchar4*)(wRow + base + 12u);
+        uchar4 w4 = *(device const uchar4*)(wRow + base + 16u);
+        uchar4 w5 = *(device const uchar4*)(wRow + base + 20u);
+        uchar4 w6 = *(device const uchar4*)(wRow + base + 24u);
+        uchar4 w7 = *(device const uchar4*)(wRow + base + 28u);
+        #pragma unroll
+        for (uint32_t p = 0u; p < 8u; ++p) {
+            if (p >= slotCount) continue;
+            device const float* x = inputVector + ((uint64_t)p * (uint64_t)inStride) + base;
+            float4 x0 = *(device const float4*)(x);
+            float4 x1 = *(device const float4*)(x + 4u);
+            float4 x2 = *(device const float4*)(x + 8u);
+            float4 x3 = *(device const float4*)(x + 12u);
+            float4 x4 = *(device const float4*)(x + 16u);
+            float4 x5 = *(device const float4*)(x + 20u);
+            float4 x6 = *(device const float4*)(x + 24u);
+            float4 x7 = *(device const float4*)(x + 28u);
+            // Two accumulators per position rather than one: the block loop is short
+            // and a single dependent FMA chain is the defect `#17` paid for.
+            float low = 0.0f;
+            float high = 0.0f;
+            low += unpack_e4m3(w0.x) * x0.x;
+            low += unpack_e4m3(w0.y) * x0.y;
+            low += unpack_e4m3(w0.z) * x0.z;
+            low += unpack_e4m3(w0.w) * x0.w;
+            low += unpack_e4m3(w1.x) * x1.x;
+            low += unpack_e4m3(w1.y) * x1.y;
+            low += unpack_e4m3(w1.z) * x1.z;
+            low += unpack_e4m3(w1.w) * x1.w;
+            low += unpack_e4m3(w2.x) * x2.x;
+            low += unpack_e4m3(w2.y) * x2.y;
+            low += unpack_e4m3(w2.z) * x2.z;
+            low += unpack_e4m3(w2.w) * x2.w;
+            low += unpack_e4m3(w3.x) * x3.x;
+            low += unpack_e4m3(w3.y) * x3.y;
+            low += unpack_e4m3(w3.z) * x3.z;
+            low += unpack_e4m3(w3.w) * x3.w;
+            high += unpack_e4m3(w4.x) * x4.x;
+            high += unpack_e4m3(w4.y) * x4.y;
+            high += unpack_e4m3(w4.z) * x4.z;
+            high += unpack_e4m3(w4.w) * x4.w;
+            high += unpack_e4m3(w5.x) * x5.x;
+            high += unpack_e4m3(w5.y) * x5.y;
+            high += unpack_e4m3(w5.z) * x5.z;
+            high += unpack_e4m3(w5.w) * x5.w;
+            high += unpack_e4m3(w6.x) * x6.x;
+            high += unpack_e4m3(w6.y) * x6.y;
+            high += unpack_e4m3(w6.z) * x6.z;
+            high += unpack_e4m3(w6.w) * x6.w;
+            high += unpack_e4m3(w7.x) * x7.x;
+            high += unpack_e4m3(w7.y) * x7.y;
+            high += unpack_e4m3(w7.z) * x7.z;
+            high += unpack_e4m3(w7.w) * x7.w;
+            dotLow[p] += low * blockScale;
+            dotHigh[p] += high * blockScale;
+        }
+    }
+
+    uint32_t simdCount = (laneCount + 31u) / 32u;
+    #pragma unroll
+    for (uint32_t p = 0u; p < 8u; ++p) {
+        if (p >= slotCount) continue;
+        float warpTotal = simd_sum(dotLow[p] + dotHigh[p]);
+        // A 32-lane threadgroup is one SIMD group, so the reduction is complete and
+        // the barrier below would be a full threadgroup sync for nothing.
+        if (laneCount <= 32u) {
+            if (lane == 0u) {
+                outputVector[((uint64_t)p * outStride) + row] = warpTotal;
+            }
+        } else if (laneInSimd == 0u) {
+            partials[p * 8u + simdIdx] = warpTotal;
+        }
+    }
+    if (laneCount <= 32u) return;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) {
+        #pragma unroll
+        for (uint32_t p = 0u; p < 8u; ++p) {
+            if (p >= slotCount) continue;
+            float total = 0.0f;
+            for (uint32_t group = 0u; group < simdCount; ++group) {
+                total += partials[p * 8u + group];
+            }
+            outputVector[((uint64_t)p * outStride) + row] = total;
+        }
+    }
+}
+
 /// MSL Kernel: MXFP4 GEMV (y = W_e2m1 * x, one E8M0 scale per 32 values).
 /// Weight layout: [outDim][inDim/2] bytes (low nibble = even index),
 /// scales [outDim][inDim/32] E8M0. Grid: (outDim, batchSize, 1).

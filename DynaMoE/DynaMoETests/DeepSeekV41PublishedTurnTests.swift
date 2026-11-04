@@ -13384,4 +13384,418 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         }
         withExtendedLifetime(engine) {}
     }
+
+    // MARK: - #73: what a block's dense half is made of
+
+    /// The dense half is 13.4-15.4 ms/position of a ~78-80 ms prefill position at the
+    /// shipped width: the largest bucket that is neither the disk (`#71` closed the fill
+    /// at the disk's own 13.6 GB/s) nor the routed mixture (`#72` closed that at 352
+    /// GB/s with 6 of 384 experts). Every dense stage table this journal holds was taken
+    /// on the SYNTHETIC checkpoint at published widths (`#16`-`#18`), where `writeLatent`
+    /// was 45.5% of the half, `compressPool`/`attention` printed zero because the fixture
+    /// had no compressed layers, and every weight was already resident. The published
+    /// plan is half compressed, so the ranking has never been measured where it ships.
+    ///
+    /// `recordsStageTiming` gives the dense half one command buffer per stage (`#72` did
+    /// the same for the mixture half), so this is a table rather than a change: widths
+    /// eight and four in the app's regime (`wireArena: nil`, `#71`), every front-half
+    /// stage in ms/position beside the weight bytes it reads, so a stage can be read as
+    /// bandwidth or as not-a-GEMV instead of guessed at.
+    func testWhereABlocksDenseHalfGoesOnThePublishedCheckpoint() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_dense_stages"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in dense attribution; touch \(markerPath) to run"
+        )
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+
+        let length = 128
+        let tokens = (0..<length).map { index in
+            let repetition = index / stream.count
+            return stream[(index + repetition * 13) % stream.count]
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: length + 1,
+            allowEngramSkip: false,
+            wireArena: nil
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let executor = runtime.forward()
+        let shippedWidth = DeepSeekV41DevicePlan.prefillBlockWidth(
+            config: config, contextLength: runtime.contextLength, promptTokens: length
+        )
+        var widths = [shippedWidth]
+        if !widths.contains(4) { widths.append(4) }
+        let denseStages = DeepSeekV41DevicePlan.frontHalf.map(\.rawValue)
+        let mixtureStages = DeepSeekV41DevicePlan.backHalf.map(\.rawValue)
+
+        // What each stage reads as a WEIGHT, per layer, resolved from the catalog the
+        // runtime actually bound rather than from the config: a stage that reads none
+        // (a norm, a rope, a mix, the attention itself) is priced at zero and prints
+        // without a rate. The scale companion counts, because an FP8 projection reads
+        // it alongside the values and that is what the pin and the kernel both touch.
+        let stageRoles: [String: [DeepSeekV41TensorRole]] = [
+            "queryDown": [.attnWqA],
+            "queryUp": [.attnWqB],
+            "latentProject": [.attnWkv],
+            "outputDown": [.attnWoA],
+            "outputUp": [.attnWoB],
+            "engram": [.engramWkv],
+            "indexer": [.indexerWqB, .indexerWk, .indexerWeights],
+            "compressPool": [.compressorWkv, .compressorWgate]
+        ]
+        let layers = runtime.plan
+        func weightBytes(_ stage: String) -> Int {
+            guard let roles = stageRoles[stage] else { return 0 }
+            var total = 0
+            for layer in layers {
+                for role in roles {
+                    total += runtime.weights.tensor(role, layer: layer.index)?.byteLength ?? 0
+                    total += runtime.weights.scaleTensor(role, layer: layer.index)?.byteLength ?? 0
+                }
+            }
+            return total
+        }
+
+        let compressedLayers = layers.filter(\.ownsCompressedIndex).count
+        print(
+            String(
+                format: "🔎 [dsv41 real] dense attribution: %d positions, %d layer(s) (%d with "
+                    + "a compressed index), widths %@, arena %d slot(s)",
+                length,
+                layers.count,
+                compressedLayers,
+                String(describing: widths),
+                runtime.arena.capacity
+            )
+        )
+
+        struct DenseSample {
+            var label: String
+            var width: Int
+            var millisecondsPerPosition: Double
+            var stages: [String: Double]
+            var denseDevice: Double
+            var mixtureDevice: Double
+            var frontDrain: Double
+            var frontLateStart: Double
+            var mixtureDrain: Double
+            var megabytes: Double
+            var misses: Int
+            var last: [Float]
+        }
+
+        func arm(width: Int, split: Bool, slots: Bool) throws -> DenseSample {
+            executor.reset()
+            executor.resetBlockTiming()
+            executor.resetStageTiming()
+            executor.recordsBlockTiming = true
+            executor.recordsStageTiming = split
+            executor.enablesFP8SlotGemv = slots
+            let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+            let missesBefore = runtime.expertStreamer?.expertsLoaded ?? 0
+            let started = DispatchTime.now().uptimeNanoseconds
+            let result = try executor.prefillChunk(tokens, blockWidth: width)
+            let wall = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+            executor.recordsStageTiming = false
+            executor.recordsBlockTiming = false
+            let timing = executor.blockTiming
+            let per = timing.millisecondsPerPosition()
+            let divisor = Double(length) * 1_000_000
+            let positionDivisor = Double(max(1, timing.positionCount)) * 1_000_000
+            var stages: [String: Double] = [:]
+            for (stage, nanoseconds) in executor.stageTiming {
+                stages[stage] = Double(nanoseconds) / divisor
+            }
+            let name: String
+            if !split {
+                name = "one buffer"
+            } else {
+                name = slots ? "split slots" : "split per position"
+            }
+            return DenseSample(
+                label: name,
+                width: width,
+                millisecondsPerPosition: wall / Double(length),
+                stages: stages,
+                denseDevice: per.denseDevice,
+                mixtureDevice: per.mixtureDevice,
+                frontDrain: Double(timing.frontDrainNanoseconds) / positionDivisor,
+                frontLateStart: Double(timing.frontLateStartNanoseconds) / positionDivisor,
+                mixtureDrain: Double(timing.mixtureDrainNanoseconds) / positionDivisor,
+                megabytes: Double((runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore) / 1_048_576,
+                misses: (runtime.expertStreamer?.expertsLoaded ?? 0) - missesBefore,
+                last: result.last
+            )
+        }
+
+        // One discarded pass so no arm pays the slot allocations or a cold page cache.
+        executor.reset()
+        runtime.arena.reset()
+        _ = try executor.prefillChunk(Array(stream.prefix(8)))
+
+        var averaged: [String: [DenseSample]] = [:]
+        for width in widths {
+            for round in 0..<3 {
+                // Rotated for the reason `#72` rotates: whoever runs first reads the
+                // colder cache, and the layouts must be compared like for like. The two
+                // stage-split arms differ only in the FP8 projection's form (`#73`), so
+                // the difference between their stage rows IS what that form is worth.
+                let arms = [(split: false, slots: false), (split: true, slots: false),
+                            (split: true, slots: true)]
+                let offset = round % arms.count
+                let order = Array(arms[offset...]) + Array(arms[..<offset])
+                for (split, slots) in order {
+                    let sample = try arm(width: width, split: split, slots: slots)
+                    let label = "\(sample.label) @ \(width)"
+                    print(
+                        String(
+                            format: "🔎 [dsv41 real]   %-18@ round %d wall %7.1f ms/position, "
+                                + "device %.1f (dense %.1f, mixture %.1f), drained front %.1f "
+                                + "(late start %.1f), %.0f MB, %d misses",
+                            label as NSString,
+                            round + 1,
+                            sample.millisecondsPerPosition,
+                            sample.denseDevice + sample.mixtureDevice,
+                            sample.denseDevice,
+                            sample.mixtureDevice,
+                            sample.frontDrain,
+                            sample.frontLateStart,
+                            sample.megabytes,
+                            sample.misses
+                        )
+                    )
+                    // A young process is 1.3-1.6x faster in every bucket (`#53`).
+                    guard round > 0 else { continue }
+                    averaged[label, default: []].append(sample)
+                }
+            }
+        }
+
+        func mean(_ samples: [DenseSample]) -> DenseSample {
+            let count = Double(max(1, samples.count))
+            var stages: [String: Double] = [:]
+            for sample in samples {
+                for (stage, milliseconds) in sample.stages {
+                    stages[stage, default: 0] += milliseconds / count
+                }
+            }
+            func average(_ keyPath: KeyPath<DenseSample, Double>) -> Double {
+                samples.map { $0[keyPath: keyPath] }.reduce(0, +) / count
+            }
+            return DenseSample(
+                label: samples[0].label,
+                width: samples[0].width,
+                millisecondsPerPosition: average(\.millisecondsPerPosition),
+                stages: stages,
+                denseDevice: average(\.denseDevice),
+                mixtureDevice: average(\.mixtureDevice),
+                frontDrain: average(\.frontDrain),
+                frontLateStart: average(\.frontLateStart),
+                mixtureDrain: average(\.mixtureDrain),
+                megabytes: average(\.megabytes),
+                misses: Int(Double(samples.map(\.misses).reduce(0, +)) / count),
+                last: samples[0].last
+            )
+        }
+
+        for width in widths {
+            let oneBuffer = try XCTUnwrap(
+                averaged["one buffer @ \(width)"].map(mean),
+                "the one-buffer arm at width \(width) was never measured"
+            )
+            let split = try XCTUnwrap(
+                averaged["split slots @ \(width)"].map(mean),
+                "the slot-form split arm at width \(width) was never measured"
+            )
+            let perPosition = try XCTUnwrap(
+                averaged["split per position @ \(width)"].map(mean),
+                "the per-position split arm at width \(width) was never measured"
+            )
+            // The split is the same graph in the same order on one in-order queue, so
+            // anything but an identical answer is a hazard the single-buffer layout hid.
+            // The slot form only changes which kernel reads the weight, so it has to
+            // agree with the per-position form to rounding rather than to the bit: the
+            // summation order over the row differs.
+            let scale = max(perPosition.last.map { abs(Double($0)) }.max() ?? 0, 1e-6)
+            let worstLayout = zip(oneBuffer.last, perPosition.last)
+                .map { abs(Double($0) - Double($1)) }
+                .max() ?? 0
+            let worstForm = zip(perPosition.last, split.last)
+                .map { abs(Double($0) - Double($1)) }
+                .max() ?? 0
+            XCTAssertEqual(
+                split.last.count, oneBuffer.last.count, "the two layouts returned no logits"
+            )
+            XCTAssertLessThan(
+                worstLayout / scale, 1e-6,
+                "the stage-split dense order changed the answer at width \(width)"
+            )
+            // The form is rejected on TIME below; this records whether it is even the
+            // same function. It is not bit-identical and cannot be: a different
+            // summation order over every projection moves the router's near-ties, and 40
+            // layers of that reach the logits. The bar is a sanity bound on that
+            // amplification, not a parity claim -- the slot kernel is held to 1e-4
+            // against the host rule on the published shapes with full-range bytes
+            // (`DeepSeekV41FP8GemvKernelTests`).
+            print(
+                String(
+                    format: "🔎 [dsv41 real] width %d: the slot form's logits move %.1e "
+                        + "relative, layout alone %.1e",
+                    width, worstForm / scale, worstLayout / scale
+                )
+            )
+            XCTAssertLessThan(
+                worstForm / scale, 5e-2,
+                "the slot-form projection changed the answer at width \(width)"
+            )
+            XCTAssertEqual(
+                Self.argmax(split.last), Self.argmax(oneBuffer.last),
+                "the stage-split dense order chose a different token at width \(width)"
+            )
+            XCTAssertEqual(
+                Self.argmax(split.last), Self.argmax(perPosition.last),
+                "the slot-form projection chose a different token at width \(width)"
+            )
+            XCTAssertLessThan(
+                abs(split.megabytes - oneBuffer.megabytes),
+                max(oneBuffer.megabytes * 0.02, 1),
+                "the two layouts at width \(width) read different bytes"
+            )
+            for stage in denseStages {
+                XCTAssertNotNil(
+                    split.stages[stage],
+                    "the split layout never reported the dense stage \(stage) at width \(width)"
+                )
+            }
+
+            let denseTotal = denseStages.reduce(0.0) { $0 + (split.stages[$1] ?? 0) }
+            let perPositionTotal = denseStages.reduce(0.0) {
+                $0 + (perPosition.stages[$1] ?? 0)
+            }
+            print(
+                String(
+                    format: "🔎 [dsv41 real] width %d: dense device %.2f ms/position (per "
+                        + "position %.2f, one buffer %.2f), wall %.1f; mixture device %.2f",
+                    width,
+                    split.denseDevice,
+                    perPosition.denseDevice,
+                    oneBuffer.denseDevice,
+                    split.millisecondsPerPosition,
+                    split.mixtureDevice
+                )
+            )
+            print(
+                String(
+                    format: "🔎 [dsv41 real] width %d: dense stages sum to %.2f (slot form) "
+                        + "of %.2f (per position)",
+                    width, denseTotal, perPositionTotal
+                )
+            )
+            // A guard, not a result: a table whose rows do not add up to the half is an
+            // instrument that is not measuring it.
+            XCTAssertGreaterThan(
+                perPositionTotal, perPosition.denseDevice * 0.5,
+                "the dense stages at width \(width) sum to less than half of the half"
+            )
+            for stage in denseStages {
+                let milliseconds = split.stages[stage] ?? 0
+                let previous = perPosition.stages[stage] ?? 0
+                let bytes = Double(weightBytes(stage))
+                var suffix = ""
+                if bytes > 0, previous > 0 {
+                    // Milliseconds in, GB/s out: one division by 1e9, matching
+                    // `blockTiming.describe()`, which prices its fill the same way.
+                    // The bytes are the weight's, i.e. what ONE pass over the row per
+                    // block would be, so the rate is what the per-position form really
+                    // asks the memory system for -- and the ratio beside it is what
+                    // removing that repetition was worth.
+                    let gigabytes = bytes / 1_073_741_824
+                    let rate = gigabytes / (previous / 1_000)
+                    let ratio = String(
+                        format: "%4.2fx", milliseconds / max(previous, 1e-9)
+                    )
+                    suffix = String(
+                        format: "  %.2f GB of weight, per-position form %.0f GB/s",
+                        gigabytes,
+                        rate
+                    ) + ", the slot form costs \(ratio)"
+                } else if stage == "writeLatent" {
+                    // No weight: this stage reads the gathered key block, `heads` times
+                    // over every reachable row, which is why its cost tracks row count
+                    // rather than a matrix (`#17`).
+                    suffix = "  reads the gathered key block, no weight"
+                }
+                print(
+                    String(
+                        format: "🔎 [dsv41 real]   dense %-24@ slots %7.3f  per position %7.3f"
+                            + "  %5.1f%% of the half  %@",
+                        stage as NSString,
+                        milliseconds,
+                        previous,
+                        // Against the PER-POSITION half, because that is the shipped
+                        // table; the slot arm's own half is 2.4x longer and would
+                        // dilute every share.
+                        previous / max(perPosition.denseDevice, 1e-9) * 100,
+                        suffix as NSString
+                    )
+                )
+            }
+            let calibrationKey = split.stages.keys.first { $0.hasPrefix("calibration(") }
+            print(
+                String(
+                    format: "🔎 [dsv41 real] width %d: %d trivial dispatch(es) cost %.3f "
+                        + "ms/position (%.0f%% of the half, so the split pays its own "
+                        + "pickup, `#60`)",
+                    width,
+                    width,
+                    calibrationKey.flatMap { split.stages[$0] } ?? 0,
+                    split.denseDevice > 0
+                        ? (calibrationKey.flatMap { split.stages[$0] } ?? 0)
+                            / split.denseDevice * 100
+                        : 0
+                )
+            )
+            let mixtureTotal = mixtureStages.reduce(0.0) { $0 + (split.stages[$1] ?? 0) }
+            print(
+                String(
+                    format: "🔎 [dsv41 real] width %d: mixture stages sum to %.2f of %.2f "
+                        + "ms/position, front drained %.1f (late start %.1f), mixture "
+                        + "drained %.1f, %.0f MB, %d misses",
+                    width,
+                    mixtureTotal,
+                    split.mixtureDevice,
+                    split.frontDrain,
+                    split.frontLateStart,
+                    split.mixtureDrain,
+                    split.megabytes,
+                    split.misses
+                )
+            )
+        }
+        withExtendedLifetime(engine) {}
+    }
 }

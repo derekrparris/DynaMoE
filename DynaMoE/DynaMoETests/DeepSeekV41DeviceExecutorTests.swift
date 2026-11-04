@@ -2742,6 +2742,235 @@ final class DeepSeekV41FP8GemvKernelTests: XCTestCase {
             inputRowStride: 2_560, outputRowStride: 96
         )
     }
+
+    // MARK: A block of positions from one weight read
+
+    /// One threadgroup per output row, every position of the block inside its own
+    /// position loop, so the row's bytes are read once instead of once per position.
+    private func dispatchSlots(
+        pipeline: MTLComputePipelineState,
+        queue: MTLCommandQueue,
+        weight: MTLBuffer,
+        scale: MTLBuffer,
+        input: MTLBuffer,
+        output: MTLBuffer,
+        inDim: Int,
+        outDim: Int,
+        slots: Int,
+        inputRowStride: Int,
+        outputRowStride: Int,
+        lanes: Int
+    ) throws {
+        guard let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("no command buffer")
+            return
+        }
+        var weightOffset = UInt64(0)
+        var scaleOffset = UInt64(0)
+        var inDimension = UInt32(inDim)
+        var outDimension = UInt32(outDim)
+        var inStride = UInt32(inputRowStride)
+        var outStride = UInt32(outputRowStride)
+        var slotCount = UInt32(slots)
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(weight, offset: 0, index: 0)
+        encoder.setBuffer(scale, offset: 0, index: 1)
+        encoder.setBuffer(input, offset: 0, index: 2)
+        encoder.setBuffer(output, offset: 0, index: 3)
+        encoder.setBytes(&weightOffset, length: 8, index: 4)
+        encoder.setBytes(&scaleOffset, length: 8, index: 5)
+        encoder.setBytes(&inDimension, length: 4, index: 6)
+        encoder.setBytes(&outDimension, length: 4, index: 7)
+        encoder.setBytes(&inStride, length: 4, index: 8)
+        encoder.setBytes(&outStride, length: 4, index: 9)
+        encoder.setBytes(&slotCount, length: 4, index: 10)
+        // The kernel's partials are indexed per (position, SIMD group). The shipped
+        // sizing is the eight positions a prefill block carries over eight groups; the
+        // fixture passes the same shape so the two cannot drift.
+        encoder.setThreadgroupMemoryLength(
+            8 * 8 * MemoryLayout<Float>.stride, index: 0
+        )
+        encoder.dispatchThreadgroups(
+            MTLSize(width: outDim, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+    }
+
+    /// The slot form against the host rule and against the per-(token, row) form, at
+    /// both lane widths, over positions laid out at strides wider than the shape.
+    ///
+    /// The strides matter here more than anywhere else in this file: the slot form's
+    /// position axis is a `slotCount` argument rather than a grid height, so a kernel
+    /// that used `inDim`/`outDim` instead of the strides would write every position on
+    /// top of the first and still produce the right answer for ONE position.
+    private func checkSlots(
+        outDim: Int,
+        inDim: Int,
+        slots: Int,
+        inputRowStride: Int? = nil,
+        outputRowStride: Int? = nil,
+        fullRange: Bool = false
+    ) throws {
+        let (device, library, queue) = try environment()
+        guard let slotFunction = library.makeFunction(
+                  name: DeepSeekV41Kernels.fp8Block32GemvRowsSlots
+              ),
+              let rowsFunction = library.makeFunction(name: DeepSeekV41Kernels.fp8GemvRows),
+              let slotForm = try? device.makeComputePipelineState(function: slotFunction),
+              let rowsForm = try? device.makeComputePipelineState(function: rowsFunction) else {
+            XCTFail("the slot FP8 GEMV kernel is not in the default library")
+            return
+        }
+        let inStride = inputRowStride ?? inDim
+        let outStride = outputRowStride ?? outDim
+        let blocks = inDim / 32
+        // Full-range bytes are the published checkpoint's regime rather than this
+        // file's: every E4M3 exponent, E8M0 scales spanning the whole byte, and
+        // activations that cancel. A block-scaled kernel that mixes up WHICH scale row
+        // it reads agrees with the host rule on the narrow fixture and drifts here.
+        let weight = fullRange
+            ? (0..<(outDim * inDim)).map { UInt8(($0 &* 61 &+ 17) % 127) }
+            : weightBytes(outDim * inDim)
+        let scales = fullRange
+            ? (0..<(((outDim + 31) / 32) * blocks)).map { UInt8(116 + (($0 &* 29 &+ 5) % 17)) }
+            : scaleBytes(((outDim + 31) / 32) * blocks)
+        let input = fullRange
+            ? (0..<(slots * inStride)).map {
+                Float((($0 &* 37 &+ 3) % 2_001) - 1_000) / 997
+            }
+            : values(slots * inStride)
+        guard let weightBuffer = device.makeBuffer(
+                  bytes: weight,
+                  length: weight.count * MemoryLayout<UInt8>.stride,
+                  options: .storageModeShared),
+              let scaleBuffer = device.makeBuffer(
+                  bytes: scales,
+                  length: scales.count * MemoryLayout<UInt8>.stride,
+                  options: .storageModeShared),
+              let inputBuffer = device.makeBuffer(
+                  bytes: input,
+                  length: input.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let slotOutput = device.makeBuffer(
+                  length: slots * outStride * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let rowsOutput = device.makeBuffer(
+                  length: slots * outStride * MemoryLayout<Float>.stride,
+                  options: .storageModeShared) else {
+            XCTFail("the FP8 GEMV buffers did not allocate")
+            return
+        }
+        memset(slotOutput.contents(), 0, slotOutput.length)
+        memset(rowsOutput.contents(), 0, rowsOutput.length)
+
+        try dispatch(
+            pipeline: rowsForm, wideGrid: true, device: device, queue: queue,
+            weight: weightBuffer, scale: scaleBuffer, input: inputBuffer,
+            output: rowsOutput, inDim: inDim, outDim: outDim, tokens: slots,
+            inputRowStride: inStride, outputRowStride: outStride
+        )
+        let expected = reference(
+            weight: weight, scales: scales, inDim: inDim, outDim: outDim, tokens: slots,
+            input: input, inputRowStride: inStride, outputRowStride: outStride
+        )
+        let magnitude = max(1, expected.map { abs($0) }.max() ?? 1)
+
+        for lanes in [32, 64] {
+            memset(slotOutput.contents(), 0, slotOutput.length)
+            try dispatchSlots(
+                pipeline: slotForm, queue: queue, weight: weightBuffer,
+                scale: scaleBuffer, input: inputBuffer, output: slotOutput,
+                inDim: inDim, outDim: outDim, slots: slots,
+                inputRowStride: inStride, outputRowStride: outStride, lanes: lanes
+            )
+            let produced = floats(slotOutput, count: slots * outStride)
+            for slot in 0..<slots {
+                for row in 0..<outDim {
+                    let at = slot * outStride + row
+                    XCTAssertLessThan(
+                        abs(produced[at] - expected[at]), magnitude * 1e-4,
+                        "slot form (lanes \(lanes)) drifted at position \(slot), row \(row) "
+                            + "of \(outDim)x\(inDim)"
+                    )
+                }
+            }
+            // Each position must land in its OWN rows: a kernel that looped the
+            // position axis but wrote slot 0 would pass every comparison above for one
+            // position and differ from its neighbour nowhere.
+            if slots > 1 {
+                let first = (0..<outDim).map { produced[$0] }
+                let second = (0..<outDim).map { produced[outStride + $0] }
+                let differing = zip(first, second).filter { abs($0 - $1) > 1e-6 }.count
+                XCTAssertGreaterThan(
+                    differing, outDim / 4,
+                    "the slot form wrote position 1 over position 0"
+                )
+            }
+        }
+    }
+
+    func testTheSlotFormMatchesTheHostRuleAtAPublishedWidth() throws {
+        try checkSlots(outDim: 96, inDim: 5_120, slots: 8)
+    }
+
+    /// The two shapes the graph actually sends it, with the checkpoint's own dynamic
+    /// range instead of the narrow fixture: `attn.wq_b` (32,768 rows over 1,280
+    /// columns, the largest stage of a block's dense half) and one `attn.wo_a` band.
+    func testTheSlotFormMatchesTheHostRuleOnFullRangeBytes() throws {
+        try checkSlots(outDim: 32_768, inDim: 1_280, slots: 8, fullRange: true)
+        try checkSlots(outDim: 1_024, inDim: 4_096, slots: 8, fullRange: true)
+    }
+
+    /// Three positions rather than eight: the kernel's position loop is a compile-time
+    /// eight, so a short block must skip the positions it does not have instead of
+    /// reading past the input.
+    func testTheSlotFormHandlesAShortBlock() throws {
+        try checkSlots(outDim: 64, inDim: 1_280, slots: 3)
+    }
+
+    /// Strides wider than the shape, which is how `attn.wo_a`'s head-group bands read
+    /// their columns out of the full width.
+    func testTheSlotFormHonoursPositionStrides() throws {
+        try checkSlots(
+            outDim: 64, inDim: 512, slots: 4,
+            inputRowStride: 640, outputRowStride: 96
+        )
+    }
+
+    /// The rule that decides the dispatch: a block takes the slot form at every
+    /// published dense shape, and one position never does.
+    func testTheSlotFormRuleCoversABlockAndNotAPosition() {
+        let published: [(String, Int, Int)] = [
+            ("attn.wo_b", 5_120, 8_192),
+            ("attn.wo_a band", 1_024, 4_096),
+            ("attn.wq_a", 1_280, 5_120),
+            ("attn.wq_b", 32_768, 1_280),
+            ("attn.wkv", 512, 5_120)
+        ]
+        for (name, outDim, inDim) in published {
+            XCTAssertTrue(
+                DeepSeekV41DevicePlan.fp8GemvWantsSlotForm(
+                    outDim: outDim, inDim: inDim, rows: 8
+                ),
+                "\(name) should take the slot form at a block of eight"
+            )
+            XCTAssertFalse(
+                DeepSeekV41DevicePlan.fp8GemvWantsSlotForm(
+                    outDim: outDim, inDim: inDim, rows: 1
+                ),
+                "\(name) has nothing to share the weight read with at one position"
+            )
+        }
+        XCTAssertFalse(
+            DeepSeekV41DevicePlan.fp8GemvWantsSlotForm(outDim: 16, inDim: 5_120, rows: 8),
+            "16 rows is too little work to fill a threadgroup grid"
+        )
+    }
 }
 
 /// The shared expert's two FP8 kernels, in the one-thread form the graph used to run

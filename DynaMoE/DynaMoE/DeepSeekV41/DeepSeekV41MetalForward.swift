@@ -112,6 +112,9 @@ nonisolated public enum DeepSeekV41Kernels {
     public static let fp8SwiGLURowsSlots = "dsv41_fp8_block32_swiglu_gate_up_rows_slots"
     public static let fp8DownAccumulateRowsSlots =
         "dsv41_fp8_block32_down_accumulate_rows_slots"
+    /// The plain FP8 projection over a BLOCK of positions, from one request for the
+    /// weight row (`#73`).
+    public static let fp8Block32GemvRowsSlots = "dsv41_fp8_block32_gemv_rows_slots"
     public static let mxfp4Gemv = "dsv41_mxfp4_gemv"
     public static let mxfp4SwiGLU = "dsv41_mxfp4_swiglu_gate_up"
     public static let mxfp4DownAccumulate = "dsv41_mxfp4_down_accumulate"
@@ -304,6 +307,25 @@ nonisolated public enum DeepSeekV41DevicePlan {
     /// numbers are in `Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #20" and "#21".
     public static func fp8GemvWantsWideGrid(outDim: Int, inDim: Int, rows: Int) -> Bool {
         outDim >= 32 && inDim >= 2_048
+    }
+
+    /// Whether an FP8 projection over a BLOCK of positions takes the slot form.
+    ///
+    /// Both existing forms carry a token axis, so a block of eight positions is eight
+    /// visits per output row and each of them re-requests the same 1.25-8 KB. At the
+    /// checkpoint's three large attention projections that repetition is 58% of the
+    /// dense half and is flat between widths four and eight, i.e. exactly a per-position
+    /// byte cost (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #73"). The slot form keeps the
+    /// row's bytes in registers across the whole block instead, which is
+    /// `bf16_gemv_rows8`'s trade in the FP8 block-scaled shape.
+    ///
+    /// MEASURED AND REJECTED: enabling it takes the dense half from 15.1 to 36.6
+    /// ms/position at block width eight, so the repetition the form removes is served
+    /// by the caches and the threadgroups it consumes are what the stages wanted. The
+    /// rule still describes which shapes WOULD qualify, and `enablesFP8SlotGemv` is the
+    /// only way to reach it, because a rule nobody can run is not a rule.
+    public static func fp8GemvWantsSlotForm(outDim: Int, inDim: Int, rows: Int) -> Bool {
+        rows > 1 && outDim >= 32 && inDim >= 32
     }
 
     /// Which shape of the routed mixture's kernels a dispatch gets.
@@ -1874,6 +1896,16 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// the same arena. Off in every production path — the shipped choice is
     /// `DeepSeekV41DevicePlan.fp8GemvWantsWideGrid`'s.
     public var disablesFP8FusedRows = false
+
+    /// Measurement only: lets a probe time the FP8 projection's slot form on the same
+    /// runtime, over the same token stream, with the same arena.
+    ///
+    /// Off in every production path, and that default is a RESULT rather than a
+    /// conservative choice: at block width eight the slot form costs 2.42x the
+    /// per-(token, row) form's dense device time (36.57 against 15.12 ms/position), i.e.
+    /// the weight repetition it removes was never what the stage was paying for
+    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #73").
+    public var enablesFP8SlotGemv = false
 
     /// Measurement only: the lane width the coalesced FP8 fused forms dispatch at, or 0
     /// for the shipped `gemvLaneWidth`. Two widths reduce in two different tree shapes,
@@ -5980,6 +6012,15 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// Partials a BF16 projection's reduction writes: one slot per SIMD group.
     private static let gemvReductionSlots = 32
 
+    /// Positions the FP8 projection's slot form carries at once, which is the width
+    /// `DeepSeekV41DevicePlan.chunkSlots` caps a prefill block at: the kernel holds one
+    /// accumulator pair per position in registers, so the bound is a compile-time
+    /// constant in the shader rather than a runtime count.
+    private static let fp8SlotGemvMaxSlots = 8
+    /// Partials the slot form's reduction writes per position: one slot per SIMD group,
+    /// sized for the widest threadgroup that form dispatches at.
+    private static let fp8SlotGemvReductionSlots = 8
+
     /// Lanes the routed mixture's row-per-threadgroup kernels run, and the partials
     /// they size threadgroup memory to.
     ///
@@ -6583,9 +6624,18 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 && DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(
                     outDim: outDim, inDim: inDim, rows: rows
                 )
-            switch (format, wideGrid) {
-            case (.fp8Block32, true): encoder.setComputePipelineState(pipelines.fp8Block32GemvRows)
-            case (.fp8Block32, false): encoder.setComputePipelineState(pipelines.fp8Block32Gemv)
+            let slotForm = format == .fp8Block32
+                && enablesFP8SlotGemv
+                && DeepSeekV41DevicePlan.fp8GemvWantsSlotForm(
+                    outDim: outDim, inDim: inDim, rows: rows
+                )
+            switch (format, slotForm, wideGrid) {
+            case (.fp8Block32, true, _):
+                encoder.setComputePipelineState(pipelines.fp8Block32GemvRowsSlots)
+            case (.fp8Block32, false, true):
+                encoder.setComputePipelineState(pipelines.fp8Block32GemvRows)
+            case (.fp8Block32, false, false):
+                encoder.setComputePipelineState(pipelines.fp8Block32Gemv)
             default: encoder.setComputePipelineState(pipelines.mxfp4Gemv)
             }
             encoder.setBuffer(weightBuffer, offset: 0, index: 0)
@@ -6604,6 +6654,27 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             // out of a wider row layout has to think about these.
             encoder.setBytes(&inStride, length: 4, index: 8)
             encoder.setBytes(&outStride, length: 4, index: 9)
+            if slotForm {
+                // The slot kernel's position loop is its own axis, so the grid is ONE
+                // threadgroup per output row rather than `outDim * rows`. Its partials
+                // are indexed per (position, SIMD group), which is the widest shape
+                // `fp8SlotGemvMaxSlots` allows.
+                var slots = UInt32(rows)
+                encoder.setBytes(&slots, length: 4, index: 10)
+                encoder.setThreadgroupMemoryLength(
+                    Self.fp8SlotGemvMaxSlots * Self.fp8SlotGemvReductionSlots
+                        * MemoryLayout<Float>.stride,
+                    index: 0
+                )
+                dispatch(encoder, threadgroups:
+                    MTLSize(width: outDim, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(
+                        width: Self.gemvLaneWidth, height: 1, depth: 1
+                    )
+                )
+                encoder.memoryBarrier(scope: .buffers)
+                return
+            }
             if wideGrid {
                 encoder.setThreadgroupMemoryLength(
                     Self.gemvReductionSlots * MemoryLayout<Float>.stride, index: 0

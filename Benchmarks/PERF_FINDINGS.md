@@ -11538,3 +11538,146 @@ Production changed: two kernels, two pipelines, `DeepSeekV41Kernels` names, `enc
 with one shared-expert dispatch), and `workspace.sharedIntermediate` at one row per slot (8 x 9 KB
 instead of 9 KB). The split layout and `sharedExpertCapture`/`ffnNormed` probes are measurement-only
 and still off in every production path.
+
+## DSV4.1 #73: THE DENSE HALF IS THREE FP8 PROJECTIONS, AND READING THEIR WEIGHT ONCE PER BLOCK INSTEAD OF ONCE PER POSITION COSTS 2.45x
+
+### Question
+
+`#72` closed the mixture half and left the dense half as the largest remaining bucket of a
+128-position prefill at the shipped width: 78-80 ms/position of which fill ~52 (`#71`, at the disk's
+13.6 GB/s), **dense device 13.4-15.4**, mixture device 15.5 (`#72`), indexer wait 11.3, front wait
+43.7. Every dense stage table in this journal was taken on the SYNTHETIC checkpoint at published
+widths (`#16`-`#18`), where the ranking was `writeLatent` 45.5% and then three GEMVs, `compressPool`
+and `attention` printed zero because the fixture had no compressed layers, and every weight was
+already resident. The published plan is half compressed (8 of 40 layers own a compressed index), so
+no table had ever said which stage holds the half where it ships.
+
+### What was added
+
+Measurement only:
+
+- `testWhereABlocksDenseHalfGoesOnThePublishedCheckpoint` (opt-in, `/tmp/dynamoe_dsv41_dense_stages`
+  plus the class's `/tmp/dynamoe_dsv41_real_turn`, ~200 s at `-O`): 128 positions in the app's own
+  regime (`wireArena: nil`, `#71`), widths 8 and 4, three arms -- the shipped one-buffer layout,
+  the per-position stage split, and a third arm that enables the candidate form below -- three
+  rounds with the arm order rotated and round 1 discarded (`#53`). Every front-half stage is priced
+  against the catalog the runtime actually bound: the weights a stage reads (values plus their E8M0
+  scale companion) are resolved by role per layer and summed over the runtime's own plan, so a stage
+  that reads no weight (a norm, a rope, a mix, the attention) prints without a rate instead of with
+  an invented one.
+- A candidate kernel for the one thing the table suggested, and the plumbing to A/B it in situ:
+  `dsv41_fp8_block32_gemv_rows_slots` (one threadgroup per output row, `slotCount` positions inside
+  a compile-time-eight loop, 8 accumulator pairs, the row's 32 weight bytes read once and held in
+  registers), one pipeline entry, `fp8GemvWantsSlotForm`, and `enablesFP8SlotGemv` -- OPT-IN and off
+  in every production path, because the answer was no.
+
+### The table
+
+Milliseconds per position, 128 positions, arena 3,760 slots wired (65.8 GB), the shipped
+per-position form, 40 layers:
+
+| stage | ms/position | share of the half |
+|---|---|---|
+| `queryUp` (`attn.wq_b`) | **2.992** | **19.8%** |
+| `outputUp` (`attn.wo_b`) | **3.028** | **20.0%** |
+| `outputDown` (`attn.wo_a`, 8 bands) | **2.673** | **17.7%** |
+| `indexer` | 1.715 | 11.3% |
+| `queryDown` (`attn.wq_a`) | 0.747 | 4.9% |
+| `engram` | 0.689 | 4.6% |
+| `writeLatent` (attention in the window) | 0.607 | 4.0% |
+| `latentProject` (`attn.wkv`) | 0.472 | 3.1% |
+| `latentNorm` | 0.289 | 1.9% |
+| `attnNorm` | 0.376 | 2.5% |
+| `ffnNorm` | 0.367 | 2.4% |
+| `mixFFNStreams`, `mixAttentionStreams`, `router`, `queryNorm`, `hcAttentionCoefficients`, `hcFFNCoefficients`, `ropeOutput`, `writeAttentionStreams`, `ropeQuery` | 0.100-0.152 each | 0.7-1.0% each |
+| `compressPool`, `attention` | 0.000 | 0.0% |
+| **dense device** | **15.12** (one buffer 11.06) | |
+
+Width 4 is the same table within 3% (`queryUp` 3.090, `outputUp` 3.076, `outputDown` 2.859, half
+16.13). The split layout's own overhead is priced on its own row: 8 trivial dispatches cost 0.219
+ms/position, 1% of the half.
+
+### What it says
+
+- **Three FP8 projections are 58% of the dense half**, and they are stage for stage the ones `#18`
+  and `#20` named from isolated tables. 8.7 of 15.1 ms/position. Everything else in the half is
+  under 1.7 ms, and the two biggest of those (`indexer`, `engram`) have no weight read to speak of.
+- **They do not batch.** 2.992 / 3.028 / 2.673 at width 8 against 3.090 / 3.076 / 2.859 at width 4:
+  +2% to +7% per position when the block halves. Like the mixture's routed half, their cost is per
+  position, which is why the dense half is the one bucket `#70`'s width rule could not shrink.
+- **The journal's predicted ranking does not hold at this prefix, and the reason is the prefix.**
+  `writeLatent` is 4.0% here against 29-45% in `#17`, because at 128 positions attention can only
+  reach 128 rows; `#17` measured 1,024 positions and 1,152 gathered rows. `compressPool` and
+  `attention` print 0.000 because both run inside `writeLatent` (`#16`), and the 8 compressed layers
+  are not visible in this table at all. A long-prefix prefill has a different shape.
+- **`indexer` is 1.68 ms/position with 40 MB of weight**: it is not a weight read, so it is not
+  priced by bytes. Eight of 40 layers own a compressed index, so that is ~0.21 ms per owning layer
+  per position, and the selection readback is booked separately as `indexer wait` (11.3 ms/position
+  in `#71`). It is the one dense stage whose cost is neither a GEMV nor a norm, and it is worth its
+  own slice.
+- **The byte arithmetic fits a ceiling it is not at.** One pass over a stage's weight per POSITION
+  is 1.25-1.56 GB per layer-block at width 8; at the measured windows that is 425-523 GB/s for all
+  three, which is this machine's memory bandwidth and looks like a wall. That is exactly the
+  coincidence `#17` warned about, and the form below is how it was tested.
+
+### The form that was built, measured and rejected
+
+`dsv41_fp8_block32_gemv_rows_slots` reads each weight row once per block instead of once per
+position -- `bf16_gemv_rows8`'s trade (one accumulator per position against one weight read) in the
+FP8 block-scaled form, and the same shape `#72` shipped for the shared expert. Enabled through
+`enablesFP8SlotGemv`, in the same process, over the same tokens and the same arena:
+
+| width | dense device, per-position form | dense device, slot form | ratio |
+|---|---|---|---|
+| 8 | 15.12 | **36.57** | **2.42x worse** |
+| 4 | 16.13 | **38.56** | **2.39x worse** |
+
+and it is not an artefact of the stage-split layout: in the shipped one-buffer layout the same arm
+reads 11.06 without the form and 24.05 with it (2.18x, `/tmp/test73_dense6.log` against
+`/tmp/test73_dense2.log`). Per stage, the slot form costs `queryUp` 3.05x, `outputDown` 2.51x,
+`outputUp` 2.06x, `queryDown` 4.62x, `latentProject` 7.82x its per-position time, while every stage
+that reads no weight is unchanged (0.93-1.00x). It also moves
+the final logits 9.6e-3 relative -- the split layout itself is bit-identical (0.0 difference), so
+that drift is the projection's reordered summation amplifying through 40 layers of router near-ties;
+`DeepSeekV41FP8GemvKernelTests` holds the same kernel to 1e-4 against the host rule on the published
+shapes with full-range bytes, so the form is correct and simply slower.
+
+**So the repetition was free.** Eight visits to the same 1.25-8 KB row are served by the caches in
+front of DRAM, and the eight threadgroups that make those visits are what the stage was using. This
+is `#72`'s lesson one level up: there the removal of the repetition was free and worth 1.19x; here
+the removal costs 2.45x because a plain GEMV has nothing else to overlap with, and it is the one
+place a batching change is a LOSS.
+
+### What it is not (do not re-propose)
+
+- **Rows-per-threadgroup, slot forms or a "read the weight once" variant on the plain FP8 GEMV at a
+  prefill block.** Measured: 2.45x worse, both layouts, both widths, five projections. `#21`
+  forbade it on FP8 until a shape whose INPUT traffic is the measured cost turned up; `#72` found
+  one and it paid 1.19x. This is the other case: the input is 164 KB per layer-block against 39 MB
+  of weight, so the form removes the cheap half and spends its parallelism.
+- **"The dense half is weight-bandwidth bound."** Its 425-523 GB/s is arithmetic that fits a
+  per-position model, not a measurement of traffic; the experiment that would have confirmed it is
+  the one that lost by 2.45x.
+- **`#17`'s 29-45% for `writeLatent` as a short-prefix statement.** At 128 positions it is 4.0%.
+  Prefix length is the variable, and the two tables are not comparable.
+- **Not the width, the fill, the arena or the prompt.** Every arm read the same bytes (56,281 MB /
+  3,139 misses at width 8, 56,963 / 3,177 at width 4), and `#70`/`#71` closed the width and the fill.
+- Everything from `#51`-`#72` still stands.
+
+### Verification
+
+`testWhereABlocksDenseHalfGoesOnThePublishedCheckpoint` in `DeepSeekV41PublishedTurnTests`
+(`/tmp/test73_dense1.log` before the kernel existed, `/tmp/test73_dense6.log` after, every stage
+reproduced within 3%): it asserts the split layout returns bit-identical logits to the one-buffer
+layout (relative 1e-6, measured 0.0), the same argmax, the same bytes within 2%, that every
+front-half stage is reported, and that the slot arm keeps the argmax while drifting no more than
+5e-2 (measured 9.6e-3 at width 8, 5.8e-3 at width 4). `DeepSeekV41FP8GemvKernelTests` is 12 cases,
+0 failures: the four new ones pin the slot form's position strides, a short block of three against
+the compile-time eight, the published width, and both published shapes with FULL-RANGE bytes (every E4M3 exponent, E8M0 scales
+over 2^-11..2^+5, activations that cancel) against the host rule at 1e-4 -- the narrow fixture
+passes a kernel that reads the wrong scale row, and the first version of that test overflowed
+because its scale bytes reached 2^127.
+
+Production changed: nothing. The kernel, pipeline and rule are in the tree as a measured baseline
+behind `enablesFP8SlotGemv`, which is false in every production path; the graph still dispatches
+`dsv41_fp8_block32_gemv` / `dsv41_fp8_block32_gemv_rows` exactly as `#20` and `#21` left them.

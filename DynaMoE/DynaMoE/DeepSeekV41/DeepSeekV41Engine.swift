@@ -353,6 +353,9 @@ nonisolated public struct DeepSeekV41Pipelines {
     /// The same 32x32 ue8m0 dot product with one output row per threadgroup, so a
     /// warp's weight loads are adjacent rather than a row apart.
     public let fp8Block32GemvRows: MTLComputePipelineState
+    /// The same projection over a BLOCK of positions, with the row's weight requested
+    /// once for all of them (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #73").
+    public let fp8Block32GemvRowsSlots: MTLComputePipelineState
     public let mxfp4Gemv: MTLComputePipelineState
     public let mxfp4SwiGLU: MTLComputePipelineState
     public let mxfp4DownAccumulate: MTLComputePipelineState
@@ -433,6 +436,7 @@ nonisolated public struct DeepSeekV41Pipelines {
         }
         self.fp8Block32Gemv = try make("dsv41_fp8_block32_gemv")
         self.fp8Block32GemvRows = try make("dsv41_fp8_block32_gemv_rows")
+        self.fp8Block32GemvRowsSlots = try make("dsv41_fp8_block32_gemv_rows_slots")
         self.mxfp4Gemv = try make("dsv41_mxfp4_gemv")
         self.mxfp4SwiGLU = try make("dsv41_mxfp4_swiglu_gate_up")
         self.mxfp4DownAccumulate = try make("dsv41_mxfp4_down_accumulate")
