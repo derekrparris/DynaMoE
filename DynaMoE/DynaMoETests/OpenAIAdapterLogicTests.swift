@@ -77,7 +77,9 @@ final class OpenAIAdapterLogicTests: XCTestCase {
             OpenAIChatRequest.Message(role: "system", contentText: "sys prompt", name: nil, toolCalls: nil, toolCallId: nil),
             OpenAIChatRequest.Message(role: "user", contentText: "what is 2+2", name: nil, toolCalls: nil, toolCallId: nil),
         ]
-        let (system, turns) = try OpenAIAdapter.splitMessages(messages)
+        let split = try OpenAIAdapter.splitMessages(messages)
+        let system = split.systemPrompt
+        let turns = split.turns
         XCTAssertEqual(system, "sys prompt")
         XCTAssertEqual(turns.count, 1)
         XCTAssertEqual(turns[0].role, .user)
@@ -93,7 +95,9 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         ]}
         """
         let request = try decodeRequest(body)
-        let (system, turns) = try OpenAIAdapter.splitMessages(request.messages)
+        let split = try OpenAIAdapter.splitMessages(request.messages)
+        let system = split.systemPrompt
+        let turns = split.turns
         XCTAssertEqual(system, "")
         XCTAssertEqual(turns.map(\.role), [.user, .assistant, .user], "roles must stay native, not flattened into one user block")
         XCTAssertEqual(turns[0].text, "run the tests")
@@ -282,7 +286,8 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         ]}
         """
         let request = try decodeRequest(body)
-        let (_, turns) = try OpenAIAdapter.splitMessages(request.messages)
+        let split = try OpenAIAdapter.splitMessages(request.messages)
+        let turns = split.turns
         XCTAssertTrue(turns[1].text.contains("call_abc"), "the call id must reach history so results can be matched to calls")
     }
 

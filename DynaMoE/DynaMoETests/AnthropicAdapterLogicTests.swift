@@ -104,7 +104,7 @@ final class AnthropicAdapterLogicTests: XCTestCase {
         let messages = [
             AnthropicMessagesRequest.Message(role: "user", contentText: "what is 2+2", toolUses: nil, toolResults: nil),
         ]
-        let turns = try AnthropicAdapter.splitMessages(messages)
+        let turns = try AnthropicAdapter.splitMessages(messages).turns
         XCTAssertEqual(turns.count, 1)
         XCTAssertEqual(turns[0].role, .user)
         XCTAssertEqual(turns[0].text, "what is 2+2")
@@ -118,7 +118,7 @@ final class AnthropicAdapterLogicTests: XCTestCase {
             {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"all green"}]}
         ]}
         """)
-        let turns = try AnthropicAdapter.splitMessages(request.messages)
+        let turns = try AnthropicAdapter.splitMessages(request.messages).turns
         XCTAssertEqual(turns.map(\.role), [.user, .assistant, .user], "roles must stay native, not flattened into one user block")
         XCTAssertEqual(turns[0].text, "run the tests")
         XCTAssertTrue(turns[1].text.contains("shell_run"))
@@ -175,7 +175,7 @@ final class AnthropicAdapterLogicTests: XCTestCase {
             {"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"shell_run","input":{"cmd":"ls"}}]}
         ]}
         """)
-        let turns = try AnthropicAdapter.splitMessages(request.messages)
+        let turns = try AnthropicAdapter.splitMessages(request.messages).turns
         XCTAssertEqual(turns.map(\.role), [.user, .assistant])
         XCTAssertTrue(turns[1].text.contains("shell_run"))
     }
@@ -321,7 +321,7 @@ final class AnthropicAdapterLogicTests: XCTestCase {
             {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_abc","content":"ok"}]}
         ]}
         """)
-        let turns = try AnthropicAdapter.splitMessages(request.messages)
+        let turns = try AnthropicAdapter.splitMessages(request.messages).turns
         XCTAssertTrue(turns[1].text.contains("toolu_abc"), "the opaque tool_use id must reach history so results can be matched to calls")
     }
 

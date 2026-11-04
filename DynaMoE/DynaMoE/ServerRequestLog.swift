@@ -408,6 +408,10 @@ extension ServerRequestLog {
             var entry: [String: Any] = ["role": message.role]
             if let content = message.contentText { entry["content"] = content }
             if let name = message.name { entry["name"] = name }
+            // A picture is named, never carried: the payload is megabytes and the
+            // row is metadata. Without this a captured body would show a message
+            // with no content and no sign that a picture was in it.
+            if message.hasImagePart { entry["image_parts"] = message.imageParts.count }
             if let reasoning = message.reasoningContent { entry["reasoning_content"] = reasoning }
             if let toolCallId = message.toolCallId { entry["tool_call_id"] = toolCallId }
             if let calls = message.toolCalls {
@@ -450,6 +454,7 @@ extension ServerRequestLog {
             var entry: [String: Any] = ["role": message.role]
             if let content = message.contentText { entry["content"] = content }
             if let reasoning = message.reasoningText { entry["thinking"] = reasoning }
+            if !message.imageBlocks.isEmpty { entry["image_blocks"] = message.imageBlocks.count }
             if let uses = message.toolUses {
                 entry["tool_use"] = uses.map { ["id": $0.id as Any, "name": $0.name, "input": $0.inputJSON as Any] }
             }

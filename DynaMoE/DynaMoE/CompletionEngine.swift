@@ -283,6 +283,10 @@ public final class CompletionEngine: @unchecked Sendable {
         public var path: String?
         public var supportsThinking: Bool
         public var supportsThinkingLevels: Bool
+        /// True when the loaded checkpoint publishes a usable vision tower, i.e.
+        /// an image attachment would be read rather than refused. The server's
+        /// image gate and the composer's attachment button both read this.
+        public var supportsVision: Bool
         public var weightsSizeGB: Double
     }
 
@@ -298,7 +302,15 @@ public final class CompletionEngine: @unchecked Sendable {
             modelPath: path
         )
         let supportsLevels = ModelConfig.supportsThinkingLevels(modelPath: path)
-        return LoadedModelInfo(displayName: modelName, path: path, supportsThinking: supports, supportsThinkingLevels: supportsLevels, weightsSizeGB: summary?.sizeGb ?? 0)
+        let supportsVision = ModelConfig.supportsVision(modelPath: path)
+        return LoadedModelInfo(
+            displayName: modelName,
+            path: path,
+            supportsThinking: supports,
+            supportsThinkingLevels: supportsLevels,
+            supportsVision: supportsVision,
+            weightsSizeGB: summary?.sizeGb ?? 0
+        )
     }
 
     /// Tokenizer bridge for API callers that build their own prompts
@@ -345,6 +357,18 @@ public final class CompletionEngine: @unchecked Sendable {
         guard modelConfig != nil, let tokenizer = tokenizer else {
             stateLock.unlock()
             throw CompletionLaunchError.engineNotReady("❌ Metal or Tokenizer not ready for text generation. Please load model and tokenizer in Settings.")
+        }
+        // Only the DeepSeek V4.1 branch below reads pixels. Every other family
+        // would take the generic loop, which never looks at `request.images`, so an
+        // attachment there would be dropped in silence and the model would answer
+        // about a picture it never saw. Fail closed instead.
+        if let config = modelConfig, !config.isDeepSeekV41Model, !request.images.isEmpty {
+            stateLock.unlock()
+            throw CompletionLaunchError.engineNotReady(
+                "❌ \(request.images.count == 1 ? "An image was" : "\(request.images.count) images were") "
+                    + "attached, but the loaded model has no vision tower, so it cannot see "
+                    + "\(request.images.count == 1 ? "it" : "them")."
+            )
         }
         // DeepSeek V4.1 is detected natively but its forward pass is served by a
         // dedicated runtime (latent CSA2 attention, mHC residual streams, Engram

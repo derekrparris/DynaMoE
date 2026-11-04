@@ -36,11 +36,14 @@ struct AnthropicMessagesRequest: Decodable {
         let toolUses: [ToolUseIn]?
         let toolResults: [ToolResultIn]?
         /// True when the client sent an `image` block (or an image inside a
-        /// tool_result). The local engine has no vision tower, so the server
-        /// refuses these instead of silently dropping them.
+        /// tool_result). Whether the turn can read it is decided at plan time
+        /// from the loaded checkpoint's tower.
         let hasImageBlock: Bool
-        /// True when the client sent a block the text-only engine cannot process
-        /// (`document`, `audio`, or an unknown type). Refused like images rather
+        /// The image blocks this message carried, in the order the client sent
+        /// them, already decoded to the bytes the tower's decoder reads.
+        let imageBlocks: [ServerImagePart]
+        /// True when the client sent a block the engine cannot process at all
+        /// (`document`, `audio`, or an unknown type). Refused explicitly rather
         /// than silently dropped.
         let hasUnsupportedBlock: Bool
 
@@ -51,6 +54,7 @@ struct AnthropicMessagesRequest: Decodable {
             self.toolUses = toolUses
             self.toolResults = toolResults
             self.hasImageBlock = false
+            self.imageBlocks = []
             self.hasUnsupportedBlock = false
         }
 
@@ -61,7 +65,7 @@ struct AnthropicMessagesRequest: Decodable {
             var reasoning: String?
             var toolUses: [ToolUseIn] = []
             var toolResults: [ToolResultIn] = []
-            var hasImage = false
+            var images: [ServerImagePart] = []
             var hasUnsupported = false
             if let s = try? container.decode(String.self, forKey: .content) {
                 text = s.isEmpty ? nil : s
@@ -72,8 +76,7 @@ struct AnthropicMessagesRequest: Decodable {
                 reasoning = thoughts.isEmpty ? nil : thoughts
                 toolUses = blocks.compactMap(\.toolUse)
                 toolResults = blocks.compactMap(\.toolResult)
-                hasImage = blocks.contains(where: \.isImage)
-                    || toolResults.contains(where: \.hasImageBlock)
+                images = blocks.compactMap(\.image)
                 hasUnsupported = blocks.contains(where: \.isUnsupported)
                     || toolResults.contains(where: \.hasUnsupportedBlock)
             }
@@ -81,7 +84,8 @@ struct AnthropicMessagesRequest: Decodable {
             self.reasoningText = reasoning
             self.toolUses = toolUses.isEmpty ? nil : toolUses
             self.toolResults = toolResults.isEmpty ? nil : toolResults
-            self.hasImageBlock = hasImage
+            self.imageBlocks = images
+            self.hasImageBlock = !images.isEmpty || toolResults.contains(where: \.hasImageBlock)
             self.hasUnsupportedBlock = hasUnsupported
         }
 
@@ -93,25 +97,54 @@ struct AnthropicMessagesRequest: Decodable {
         let thinking: String?
         let toolUse: ToolUseIn?
         let toolResult: ToolResultIn?
-        /// An `image` block. It carries no text and no tool payload, but the
-        /// server must know it is there to refuse the turn explicitly.
-        let isImage: Bool
+        /// The decoded `image` block, or nil when this block is not one.
+        let image: ServerImagePart?
         /// True for a block type the engine can neither read as text nor refuse
-        /// by name (an `image` block has its own flag).
+        /// by name (an `image` block has its own payload).
         let isUnsupported: Bool
+
+        var isImage: Bool { image != nil }
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             let type = try container.decodeIfPresent(String.self, forKey: .type) ?? ""
-            self.isImage = type == "image"
             self.isUnsupported = !["", "text", "thinking", "tool_use", "tool_result", "image"].contains(type)
             self.text = type == "text" ? try container.decodeIfPresent(String.self, forKey: .text) : nil
             self.thinking = type == "thinking" ? try container.decodeIfPresent(String.self, forKey: .thinking) : nil
             self.toolUse = type == "tool_use" ? try ToolUseIn(from: decoder) : nil
             self.toolResult = type == "tool_result" ? try ToolResultIn(from: decoder) : nil
+            if type == "image", let source = try? container.decode(ImageSource.self, forKey: .source) {
+                self.image = ServerImageParts.fromAnthropicSource(
+                    type: source.type,
+                    mediaType: source.mediaType,
+                    data: source.data,
+                    url: source.url
+                )
+            } else if type == "image" {
+                // An `image` block with no readable `source` is still an image:
+                // naming it keeps the refusal explicit instead of letting the
+                // block vanish and the model answer about nothing.
+                self.image = ServerImagePart(
+                    payload: .malformed(reason: "the image block carried no source object")
+                )
+            } else {
+                self.image = nil
+            }
         }
 
-        enum CodingKeys: String, CodingKey { case type, text, thinking }
+        struct ImageSource: Decodable {
+            let type: String?
+            let mediaType: String?
+            let data: String?
+            let url: String?
+
+            enum CodingKeys: String, CodingKey {
+                case type, data, url
+                case mediaType = "media_type"
+            }
+        }
+
+        enum CodingKeys: String, CodingKey { case type, text, thinking, source }
     }
 
     struct ToolUseIn: Decodable {
@@ -257,14 +290,15 @@ struct AnthropicMessagesRequest: Decodable {
     /// mode rather than the full choice.
     var toolChoiceType: String? { toolChoice?.type }
 
-    /// True when any message carries an image block. Refused by the server rather
-    /// than stripped: a text-only answer about a screenshot the model never saw
-    /// is worse than an explicit error.
+    /// True when any message carries an image block. The turn planner accepts
+    /// these only when the loaded checkpoint publishes a vision tower, and refuses
+    /// them by name otherwise: a text-only answer about a screenshot the model
+    /// never saw is worse than an explicit error.
     var hasImageContent: Bool {
         messages.contains(where: \.hasImageBlock)
     }
 
-    /// True when any message carries a block the text-only engine cannot process.
+    /// True when any message carries a block the engine cannot process at all.
     var hasUnsupportedContent: Bool {
         messages.contains(where: \.hasUnsupportedBlock)
     }
@@ -635,7 +669,7 @@ enum AnthropicAdapter {
     /// re-tokenizes the whole conversation every turn, so each turn's prompt
     /// can no longer extend the previous turn's pinned prompt+generation and
     /// multi-turn requests fully re-prefill.
-    static func splitMessages(_ messages: [AnthropicMessagesRequest.Message]) throws -> [ChatPromptFormatter.ConversationTurn] {
+    static func splitMessages(_ messages: [AnthropicMessagesRequest.Message]) throws -> ServerPromptSplit {
         guard !messages.isEmpty else {
             throw ServerAPIError.badRequest("messages must contain at least one message")
         }
@@ -648,8 +682,22 @@ enum AnthropicAdapter {
         }
         try rejectUnsupportedPrefill(messages)
 
-        var turns: [ChatPromptFormatter.ConversationTurn] = []
+        var split = ServerPromptSplit()
         for message in messages {
+            // A picture belongs to the turn it was sent with, and only a user turn
+            // has a place to put one. An image inside a tool result is legal on the
+            // wire but has no position in the rendered result text, so it is named
+            // rather than dropped.
+            if message.hasImageBlock, message.role != "user" {
+                throw ServerAPIError.unsupportedContent(
+                    "An image block can only be attached to a user message, not to an \"\(message.role)\" message."
+                )
+            }
+            if (message.toolResults ?? []).contains(where: \.hasImageBlock) {
+                throw ServerAPIError.unsupportedContent(
+                    "An image inside a tool_result is not supported. Send the picture as an image block in a user message instead."
+                )
+            }
             switch message.role {
             case "user":
                 var parts: [String] = []
@@ -661,7 +709,13 @@ enum AnthropicAdapter {
                     parts.append("Tool result (\(label)):\n\(result.content ?? "(no result)")")
                 }
                 let body = parts.joined(separator: "\n\n")
-                turns.append(.init(role: .user, text: body.isEmpty ? "(no content)" : body))
+                if !message.imageBlocks.isEmpty { split.images[split.turns.count] = message.imageBlocks }
+                // An image-only turn still has content: the planner writes the
+                // marker, so the placeholder text would be read as the question.
+                let placeholderText = body.isEmpty
+                    ? (message.imageBlocks.isEmpty ? "(no content)" : "")
+                    : body
+                split.turns.append(.init(role: .user, text: placeholderText))
             case "assistant":
                 var parts: [String] = []
                 // Reasoning a client echoed back is re-rendered ahead of the
@@ -697,17 +751,17 @@ enum AnthropicAdapter {
                     parts.append(ChatPromptFormatter.anthropicToolCallEchoPrefix + "\n" + rendered)
                 }
                 let body = parts.joined(separator: "\n\n")
-                turns.append(.init(role: .assistant, text: body.isEmpty ? "(no content)" : body))
+                split.turns.append(.init(role: .assistant, text: body.isEmpty ? "(no content)" : body))
             default:
                 if let content = message.contentText, !content.isEmpty {
-                    turns.append(.init(role: .user, text: "\(message.role.capitalized): \(content)"))
+                    split.turns.append(.init(role: .user, text: "\(message.role.capitalized): \(content)"))
                 }
             }
         }
-        guard !turns.isEmpty else {
+        guard !split.turns.isEmpty else {
             throw ServerAPIError.badRequest("messages must contain at least one message")
         }
-        return turns
+        return split
     }
 
     /// Stable prefix-cache session key, mirroring the OpenAI adapter scheme:
@@ -718,6 +772,10 @@ enum AnthropicAdapter {
     /// open identically still collide, so reuse is additionally gated on exact
     /// token-prefix equality inside PrefixCacheManager.findCommonPrefix and on
     /// `ServerTurnMemory` re-validating the rendered history.
+    ///
+    /// A picture is part of that identity: two requests can carry the same TEXT
+    /// and different images, and both render to the same list of image token ids,
+    /// so the digest of the anchor's images is folded in here.
     static func sessionKey(for messages: [AnthropicMessagesRequest.Message], model: String?) -> UUID {
         var lane0: UInt64 = 0xcbf29ce484222325
         var lane1: UInt64 = 0x9e3779b97f4a7c15
@@ -741,6 +799,9 @@ enum AnthropicAdapter {
             for result in anchor.toolResults ?? [] {
                 mixString("result:" + (result.toolUseId ?? ""))
                 mixString(result.content ?? "")
+            }
+            if !anchor.imageBlocks.isEmpty {
+                mixString("images:" + ServerImageParts.digest(anchor.imageBlocks))
             }
         }
 

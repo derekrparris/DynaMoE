@@ -940,6 +940,10 @@ final class ServerController: ObservableObject {
 
     struct TurnPlan: Sendable {
         var request: CompletionTurnRequest
+        /// Prompt positions the model will actually attend over, i.e. AFTER an
+        /// attachment's span is expanded. One image renders as one token and runs
+        /// several hundred, so this is not the tokenized prompt's length whenever a
+        /// picture is attached.
         var promptTokenCount: Int
         var modelName: String
         var hasTools: Bool
@@ -1007,6 +1011,11 @@ final class ServerController: ObservableObject {
         var toolDeclaration: String?
         var maskSchemas: [GrammarToolSchema]
         var sessionId: UUID
+        /// Images attached to specific turns, keyed by that turn's index in
+        /// `conversation`. The planner writes one prompt marker per image at the
+        /// head of its turn and hands the decoded pixels to the engine, because
+        /// only it knows whether the loaded checkpoint publishes a tower.
+        var images: [Int: [ServerImagePart]] = [:]
     }
 
     /// Resolves the level a turn renders. Level-capable models always render a
@@ -1022,9 +1031,114 @@ final class ServerController: ObservableObject {
         return requested ?? .high
     }
 
+    /// The one refusal a checkpoint with no tower gets, on every path.
+    nonisolated private static func noVisionTower(_ info: CompletionEngine.LoadedModelInfo) -> ServerAPIError {
+        ServerAPIError.unsupportedContent(
+            "The loaded model (\(info.displayName)) publishes no vision tower, so image content parts "
+                + "cannot be processed. Send text only, or load a vision-capable checkpoint."
+        )
+    }
+
+    /// A turn's attachments, resolved to what the engine consumes.
+    nonisolated struct ResolvedTurnImages {
+        /// The conversation with one prompt marker written at the head of every
+        /// turn that carried a picture.
+        var turns: [ChatPromptFormatter.ConversationTurn]
+        /// The decoded pixels, in prompt order.
+        var images: [TurnImage]
+    }
+
+    /// Writes one marker per attachment into its turn and decodes the pixels.
+    ///
+    /// This is the server's whole image gate. A checkpoint with no tower is refused
+    /// here, by name, rather than downstream where the engine would refuse an
+    /// expanded prompt whose placeholders have no rows; a URL is refused rather
+    /// than fetched; and the marker is the checkpoint's own image token, so the
+    /// prompt the renderer produces is the same one the in-app composer produces.
+    nonisolated private static func resolveTurnImages(
+        _ inputs: TurnPlanInputs,
+        info: CompletionEngine.LoadedModelInfo
+    ) throws -> ResolvedTurnImages {
+        guard inputs.images.values.contains(where: { !$0.isEmpty }) else {
+            return ResolvedTurnImages(turns: inputs.conversation, images: [])
+        }
+        guard info.supportsVision,
+              let marker = ServerImageParts.visionMarker(
+                  modelPath: info.path,
+                  config: CompletionEngine.shared.promptModelConfig
+              ) else {
+            throw noVisionTower(info)
+        }
+        return try attachImageMarkers(turns: inputs.conversation, images: inputs.images, marker: marker)
+    }
+
+    /// The placement half of the gate, split out so it can be tested without a
+    /// loaded model: which turn a marker lands in, how many markers precede a
+    /// turn's text, and what a part that carries no bytes reports.
+    nonisolated static func attachImageMarkers(
+        turns: [ChatPromptFormatter.ConversationTurn],
+        images: [Int: [ServerImagePart]],
+        marker: String
+    ) throws -> ResolvedTurnImages {
+        var turns = turns
+        var decoded: [TurnImage] = []
+        for index in images.keys.sorted() {
+            let parts = images[index] ?? []
+            guard !parts.isEmpty else { continue }
+            guard index >= 0, index < turns.count else {
+                throw ServerAPIError.badRequest("An image was attached to a conversation turn that does not exist.")
+            }
+            var fragment = ""
+            for part in parts {
+                guard let data = part.bytes else {
+                    switch part.payload {
+                    case let .remoteURL(url):
+                        throw ServerAPIError.unsupportedContent(
+                            "This server will not fetch an image from a URL (\(url)). Send the picture "
+                                + "inline as base64 (a `data:image/png;base64,...` URL), which is what the "
+                                + "OpenAI and Anthropic SDKs send."
+                        )
+                    case let .malformed(reason):
+                        throw ServerAPIError.unsupportedContent("An attached image could not be read: \(reason).")
+                    case .inline:
+                        throw ServerAPIError.unsupportedContent("An attached image carried no bytes.")
+                    }
+                }
+                let pixels: DeepSeekV41ImagePixels
+                do {
+                    pixels = try DeepSeekV41ImagePixels.decode(data)
+                } catch {
+                    throw ServerAPIError.unsupportedContent(
+                        "An attached image could not be decoded: \(error.localizedDescription)"
+                    )
+                }
+                // The picture goes FIRST inside its turn: that is where the
+                // checkpoint's own prompts place an image relative to the question
+                // about it, and what the in-app composer writes.
+                fragment += marker + "\n"
+                decoded.append(
+                    TurnImage(
+                        rgb: pixels.rgb,
+                        width: pixels.width,
+                        height: pixels.height,
+                        sha256: ServerImageParts.digest([part])
+                    )
+                )
+            }
+            turns[index].text = fragment + turns[index].text
+        }
+        return ResolvedTurnImages(turns: turns, images: decoded)
+    }
+
     nonisolated private static func buildTurnPlan(_ inputs: TurnPlanInputs) throws -> TurnPlan {
         let engine = CompletionEngine.shared
         let info = try requireLoadedModel()
+
+        // Pictures are resolved first: everything below (the history digest, the
+        // recorded-turn splice, the tokenized prompt and the cache the turn runs
+        // on) has to see the expanded turn rather than the picture-less one.
+        let vision = try resolveTurnImages(inputs, info: info)
+        let conversationTurns = vision.turns
 
         // The temporal context this prompt is rendered with. Threaded through the
         // turn request so the completed turn pins the date its prompt actually
@@ -1075,13 +1189,13 @@ final class ServerController: ObservableObject {
         // sides of the comparison see the same client-authored turns.
         let historyDigest = ServerTurnMemory.historyDigest(
             systemPrompt: memorySystem,
-            turns: inputs.conversation[...]
+            turns: conversationTurns[...]
         )
         // Splice in the raw generation recorded for this session (reasoning
         // included) so the rendered prompt reproduces the pinned
         // prompt+generation; a client's echo of the visible answer alone cannot.
         let conversation = Self.substitutingRecordedTurn(
-            inputs.conversation,
+            conversationTurns,
             sessionId: inputs.sessionId,
             modelName: info.displayName,
             modelConfig: engine.promptModelConfig,
@@ -1129,9 +1243,36 @@ final class ServerController: ObservableObject {
         guard !promptTokenIds.isEmpty else {
             throw ServerAPIError.badRequest("Prompt tokenization produced 0 tokens.")
         }
+        // An image prompt renders one token per attachment and then runs the whole
+        // span, so the number the budget is checked against and the number the
+        // client is told must be the EXPANDED size. `price` reads no weight: the
+        // resize plan alone says how many positions the spans occupy. It also
+        // re-checks the placeholder/image agreement, so a prompt built with a stray
+        // marker is a 400 here instead of an engine error later.
+        var promptTokenCount = promptTokenIds.count
+        if !vision.images.isEmpty {
+            guard let spec = ModelConfig.visionSpec(modelPath: info.path) else {
+                throw noVisionTower(info)
+            }
+            do {
+                promptTokenCount = try DeepSeekV41TurnImages.price(
+                    tokenIds: promptTokenIds,
+                    images: vision.images.map {
+                        DeepSeekV41ImageInput(
+                            rgb: $0.rgb, width: $0.width, height: $0.height, sha256: $0.sha256
+                        )
+                    },
+                    spec: spec
+                ).promptTokens
+            } catch {
+                throw ServerAPIError.badRequest(
+                    "The attached image could not be placed in the prompt: \(error.localizedDescription)"
+                )
+            }
+        }
         let promptTokenCap = Self.resolvedMaxPromptTokens
-        if promptTokenIds.count > promptTokenCap {
-            throw ServerAPIError.badRequest("Prompt is too long: \(promptTokenIds.count) tokens exceeds the server's \(promptTokenCap)-token limit (dynamoe_server_max_prompt_tokens).")
+        if promptTokenCount > promptTokenCap {
+            throw ServerAPIError.badRequest("Prompt is too long: \(promptTokenCount) tokens exceeds the server's \(promptTokenCap)-token limit (dynamoe_server_max_prompt_tokens).")
         }
 
         let defaults = UserDefaults.standard
@@ -1174,14 +1315,15 @@ final class ServerController: ObservableObject {
             forceSynthesis: false,
             isSplicedContinuation: false,
             stopSequences: stopSequences,
-            asOfDate: renderedAsOfDate
+            asOfDate: renderedAsOfDate,
+            images: vision.images
         )
         return TurnPlan(
             request: turnRequest,
-            promptTokenCount: promptTokenIds.count,
+            promptTokenCount: promptTokenCount,
             modelName: info.displayName,
             hasTools: inputs.hasTools,
-            historyTurnCount: inputs.conversation.count,
+            historyTurnCount: conversationTurns.count,
             historyDigest: historyDigest,
             maskSchemas: inputs.maskSchemas
         )
@@ -1207,20 +1349,19 @@ final class ServerController: ObservableObject {
     }
 
     nonisolated private static func buildTurnPlan(_ apiRequest: OpenAIChatRequest) throws -> TurnPlan {
-        // Refuse non-text parts before touching engine state. The loaded weights
-        // model has no vision tower, and silently dropping a picture, file, or
-        // audio part would let the model answer confidently about content it
-        // never received.
+        // Refuse content parts the engine cannot process at all, before touching
+        // engine state. Images are not on this list: whether they can be read is a
+        // property of the loaded checkpoint, which the shared planner checks.
         if apiRequest.hasUnsupportedContent {
             throw ServerAPIError.unsupportedContent(
-                "This server is serving a local weights model, which understands text only, so image, file, and audio content parts cannot be processed. Send text only, or attach images to a vision-capable cloud model in the DynaMoE app."
+                "This server is serving a local weights model, which has no reader for file or audio content parts. Send text and images only."
             )
         }
         // Reject a forced tool choice before touching engine state, so the
         // client gets a clear error instead of a silently unconstrained turn.
         let toolsEnabled = try OpenAIAdapter.toolUseEnabled(apiRequest.toolChoice)
         let info = try requireLoadedModel()
-        let (systemPrompt, turns) = try OpenAIAdapter.splitMessages(apiRequest.messages)
+        let split = try OpenAIAdapter.splitMessages(apiRequest.messages)
         let hasTools = !(apiRequest.tools ?? []).isEmpty && toolsEnabled
         let thinkingRequested = apiRequest.enableThinking ?? true
         let thinkingEffort = try OpenAIAdapter.thinkingEffort(
@@ -1229,8 +1370,8 @@ final class ServerController: ObservableObject {
             thinkingRequested: thinkingRequested
         )
         return try buildTurnPlan(TurnPlanInputs(
-            systemPrompt: systemPrompt,
-            conversation: turns,
+            systemPrompt: split.systemPrompt,
+            conversation: split.turns,
             temperature: apiRequest.temperature,
             topP: apiRequest.topP,
             topK: apiRequest.topK,
@@ -1246,7 +1387,8 @@ final class ServerController: ObservableObject {
             maskSchemas: hasTools ? (apiRequest.tools ?? []).filter { ($0.type ?? "function") == "function" }.map {
                 GrammarToolSchema(name: $0.function.name, schemaJSON: $0.function.parametersData)
             } : [],
-            sessionId: OpenAIAdapter.sessionKey(for: apiRequest.messages, model: info.displayName)
+            sessionId: OpenAIAdapter.sessionKey(for: apiRequest.messages, model: info.displayName),
+            images: split.images
         ))
     }
 
@@ -1254,19 +1396,19 @@ final class ServerController: ObservableObject {
         guard let maxTokens = apiRequest.maxTokens else {
             throw ServerAPIError.badRequest("max_tokens is a required field")
         }
-        // Same explicit refusal as the OpenAI surface: an image, document, or
-        // audio block would be discarded by the text-only prompt builder,
-        // producing an answer about nothing.
+        // Same explicit refusal as the OpenAI surface for the block kinds the
+        // engine has no reader for. Images are resolved by the shared planner,
+        // which knows whether the loaded checkpoint publishes a tower.
         if apiRequest.hasUnsupportedContent {
             throw ServerAPIError.unsupportedContent(
-                "This server is serving a local weights model, which understands text only, so image, document, and audio content blocks cannot be processed. Send text only, or attach images to a vision-capable cloud model in the DynaMoE app."
+                "This server is serving a local weights model, which has no reader for document or audio content blocks. Send text and images only."
             )
         }
         // Reject a forced tool choice before touching engine state, so the
         // client gets a clear error instead of a silently unconstrained turn.
         let toolsEnabled = try AnthropicAdapter.toolUseEnabled(apiRequest.toolChoice)
         let info = try requireLoadedModel()
-        let turns = try AnthropicAdapter.splitMessages(apiRequest.messages)
+        let split = try AnthropicAdapter.splitMessages(apiRequest.messages)
         let hasTools = !(apiRequest.tools ?? []).isEmpty && toolsEnabled
         let thinkingRequested = apiRequest.thinking?.type == "enabled"
         let thinkingEffort = try AnthropicAdapter.thinkingEffort(
@@ -1275,7 +1417,7 @@ final class ServerController: ObservableObject {
         )
         return try buildTurnPlan(TurnPlanInputs(
             systemPrompt: apiRequest.systemText ?? "",
-            conversation: turns,
+            conversation: split.turns,
             temperature: apiRequest.temperature,
             topP: apiRequest.topP,
             topK: apiRequest.topK,
@@ -1291,7 +1433,8 @@ final class ServerController: ObservableObject {
             maskSchemas: hasTools ? (apiRequest.tools ?? []).map {
                 GrammarToolSchema(name: $0.name, schemaJSON: $0.inputSchemaData)
             } : [],
-            sessionId: AnthropicAdapter.sessionKey(for: apiRequest.messages, model: info.displayName)
+            sessionId: AnthropicAdapter.sessionKey(for: apiRequest.messages, model: info.displayName),
+            images: split.images
         ))
     }
 

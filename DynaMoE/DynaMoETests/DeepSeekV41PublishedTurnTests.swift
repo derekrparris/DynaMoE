@@ -3386,6 +3386,112 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         )
     }
 
+    /// The API path's prompt, from a real request body to the checkpoint's ids.
+    ///
+    /// Slice #77 lets the local server accept image content parts, and the traffic it
+    /// sees is a different shape from the composer's: the picture arrives base64 in an
+    /// `image_url` part, the request may carry a history, and the prompt is rendered by
+    /// `formatConversation` rather than `formatPrompt`. Two things have to hold, and
+    /// neither is visible from the pure-logic tests: the marker must survive BOTH
+    /// renderers (a marker that tokenized into pieces here would leave literal text in
+    /// the prompt and bind no rows), and the number of image tokens must equal the
+    /// number of attachments, because `TurnImages.price` refuses the turn when the
+    /// placeholder count and the image count disagree.
+    ///
+    /// Like its neighbour this needs the checkpoint's tokenizer and config, not its
+    /// weights, so it runs in milliseconds.
+    func testAnAPIRequestWithAnImageCarriesOneImageToken() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let spec = try XCTUnwrap(config.vision)
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let modelConfig = try JSONDecoder().decode(
+            ModelConfig.self,
+            from: Data(contentsOf: snapshot.appendingPathComponent("config.json"))
+        )
+        let dialect = DeepSeekV41PromptDialect.resolve(snapshotDir: snapshot)
+        let markers = DeepSeekV41VisionMarkers.familyDefault
+
+        // A real 2x2 PNG, base64-encoded: the smallest thing ImageIO will decode, and
+        // the shape an SDK actually sends.
+        let space = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
+        let context = try XCTUnwrap(CGContext(
+            data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 8,
+            space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ))
+        context.setFillColor(red: 0.8, green: 0.2, blue: 0.1, alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
+        let image = try XCTUnwrap(context.makeImage())
+        let base64 = try XCTUnwrap(
+            NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
+        ).base64EncodedString()
+
+        let body = """
+        {"model":"any","messages":[
+            {"role":"user","content":"hello"},
+            {"role":"assistant","content":"hi"},
+            {"role":"user","content":[
+                {"type":"text","text":"what is in this picture?"},
+                {"type":"image_url","image_url":{"url":"data:image/png;base64,\(base64)"}}
+            ]}
+        ]}
+        """
+        let request = try JSONDecoder().decode(OpenAIChatRequest.self, from: Data(body.utf8))
+        let split = try OpenAIAdapter.splitMessages(request.messages)
+        XCTAssertEqual(split.orderedImages.count, 1, "the request carries one picture")
+        let resolved = try ServerController.attachImageMarkers(
+            turns: split.turns, images: split.images, marker: markers.imagePlaceholder
+        )
+        XCTAssertEqual(resolved.images.count, 1)
+        XCTAssertTrue(
+            resolved.turns[2].text.hasPrefix(markers.imagePlaceholder),
+            "the marker must head the turn that carried the picture"
+        )
+        XCTAssertFalse(
+            resolved.turns[0].text.contains(markers.imagePlaceholder),
+            "no other turn may carry a marker"
+        )
+
+        let rendered = ChatPromptFormatter.formatConversation(
+            turns: resolved.turns,
+            cleanSystem: "",
+            thinkingEnabled: false,
+            modelSupportsThinking: true,
+            modelConfig: modelConfig,
+            thinkingEffort: nil,
+            promptDialect: dialect
+        )
+        let ids = try tokenizer.encode(text: rendered)
+        let imageTokens = ids.filter { Int($0) == spec.imageTokenID }.count
+        XCTAssertEqual(imageTokens, 1, "one attachment must render as exactly one image token")
+
+        // And the engine's own gate agrees: one placeholder for one image, so the
+        // price/render it computes accepts the turn.
+        let priced = try DeepSeekV41TurnImages.price(
+            tokenIds: ids,
+            images: resolved.images.map {
+                DeepSeekV41ImageInput(rgb: $0.rgb, width: $0.width, height: $0.height, sha256: $0.sha256)
+            },
+            spec: spec
+        )
+        XCTAssertGreaterThan(priced.promptTokens, ids.count)
+        print(
+            "🔎 [dsv41 real] API image request: \(ids.count) prompt tokens with "
+                + "\(imageTokens) image token(s); priced \(priced.promptTokens) after expansion "
+                + "(+\(priced.extraPositions)), \(priced.estimates.count) estimate(s), "
+                + String(format: "%.2f s", priced.seconds) + " of tower"
+        )
+    }
+
     /// The chat UI's history, at the checkpoint's own tokenizer.
     ///
     /// `DeepSeekV41ChatPromptFormatterTests` pins the rendered SHAPE. This pins the

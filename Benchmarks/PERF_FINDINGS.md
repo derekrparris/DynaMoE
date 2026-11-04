@@ -12069,3 +12069,185 @@ probe is inert). `DeepSeekV41DeviceGraphParityTests`, `DeepSeekV41DeviceParityTe
 (`/tmp/test76_parity1.log`). Production defaults are unchanged (`recordsBlockGaps = false`,
 `recordsMixtureStartProbe = false`); the shared probe helper is the walk's old body verbatim, and the
 only shipped-path change is that a probe buffer can now carry a `blockGaps` index.
+
+## DSV4.1 #77: THE SERVER NOW ACCEPTS THE PICTURES THE APP ALREADY COULD, BECAUSE THE BLOCKER WAS A STALE SENTENCE AND NOT A MISSING CAPABILITY
+
+### The question
+
+`#76` closed the last unattributed term in a prefill position, which left the prefill path with
+nothing worth a slice: the remaining named levers (`sharedExpert`'s rows-per-threadgroup form at
+~2.4 ms/position, `select`'s slot dimension with a ceiling of 0.82, `pool`'s 0.401 at 85 GB/s
+already coalesced) total **~3.5 ms of a 78 ms position, about 4.5%**, and the dominant terms are at
+measured hardware ceilings (the fill at the disk's 13-14 GB/s, the mixture pickup as the reading
+machine's cost). So this slice asked the next question rather than the next measurement: what is
+still MISSING for the model, on a branch called `64-complete-full-deepseek-support`?
+
+The answer was in two comments that had stopped being true. `ServerController.buildTurnPlan` refused
+every image content part with
+
+> This server is serving a local weights model, which understands text only, so image, file, and
+> audio content parts cannot be processed.
+
+and the same sentence shaped `OpenAIAdapter.Message.hasUnsupportedPart`, which counted an image part
+as unsupported. Both were written when no local family had a tower. Since `#35`, `#38` and `#43` the
+DeepSeek V4.1 checkpoint **does** have one: the composer attaches pictures, the engine prices the
+expanded prompt before provisioning, the device tower encodes a smallest image in 0.32 s, and a real
+turn reads the rows. The same model, in the same app, saw images in the chat window and refused them
+over the API.
+
+Routing agreed without reservation: `next_slice` = `api_images` **0.987 @ 0.981** against
+`prefill_micro` 0.010 and `journal_reconcile` 0.003, `gap_is_real` **0.999**,
+`perf_exhausted` **0.9995**. That last one is the honest justification for a slice that measures
+nothing: the perf path is closed, and this is a hole rather than a percentage.
+
+### What was there already
+
+The engine seam was complete and unused by the server:
+
+- `CompletionTurnRequest.images: [TurnImage]` — decoded RGB plus a content digest.
+- `DeepSeekV41TurnImages.price` — prompt positions from the resize plan alone, no weight read, and
+  the placeholder/image agreement check.
+- `DeepSeekV41TurnImages.bind` — runs the tower and places its rows, failing closed five ways.
+- `DeepSeekV41ImagePixels.decode` — any ImageIO format, EXIF-oriented, capped at 4,096 pixels a side.
+- The span cache in `CompletionEngine.launchTurn`, keyed on `snapshot path | sha256`.
+- `ContentView` writing one marker per attachment at the head of the user turn.
+
+Every piece of the picture path existed. What did not exist was a decoder for the two wire spellings
+and a planner that knew which model was loaded.
+
+### What landed
+
+**`ServerImageParts.swift` (new)** — the one form both protocols decode into:
+
+- `ServerImagePart.Payload` is `.inline(Data, mediaType:)`, `.remoteURL(String)` or
+  `.malformed(reason:)`. The refusal cases are payloads rather than thrown errors because a model
+  with **no tower** should answer "this checkpoint cannot see images" before the request is rejected
+  for its base64.
+- `fromOpenAIURL` takes a `data:` URL, a bare base64 payload (llama.cpp and several hand-rolled
+  clients send that), or a plain URL. **A scheme is checked before base64 is attempted**: every
+  character of `https://host/a.png` except `:` and `/` is legal base64, so a lenient decode turns a
+  URL into plausible-looking garbage and the tower reads noise. There is a test for exactly that.
+- `fromAnthropicSource` takes `base64` (the only source this server can read), `url` (a reference),
+  and names any other type.
+- `digest(_:)` is a SHA-256 over the parts plus their order, for the session key.
+- `visionMarker(modelPath:config:)` is the gate: DeepSeek V4.1 **and**
+  `ModelConfig.supportsVision`, which reads the shard index for a block, the aligner and the three
+  marker embeddings. A half-finished download keeps the answer "no".
+
+**Both decoders.** `OpenAIAdapter.ContentPart` gained `imageURL` decoded from BOTH shapes (an object
+in Chat Completions, a bare string in the Responses spelling — a client using the other one must not
+have the whole body rejected), and `Message.imageParts`. `AnthropicAdapter.ContentBlockIn` gained the
+`source` object and `Message.imageBlocks`. `hasUnsupportedPart`/`hasUnsupportedBlock` no longer count
+a picture, so `file`, `input_audio` and `document` keep their explicit 400 and images do not.
+
+**`splitMessages` returns `ServerPromptSplit`** (`systemPrompt`, `turns`, `images` keyed by TURN
+INDEX) instead of a tuple. A picture belongs to the message it came with, and the turn text is what
+gets rendered — a raw picture is not text — so it travels beside the turns. Four roles are refused by
+name rather than moved: an image on an assistant or tool turn, and an image nested inside an
+Anthropic `tool_result`.
+
+**`ServerController.resolveTurnImages` + `attachImageMarkers`.** The gate is split from the
+placement so the placement can be tested without a loaded model. The gate reads
+`CompletionEngine.LoadedModelInfo.supportsVision` (a new field the server and the composer now
+share) and `ModelConfig.visionSpec`, and refuses a checkpoint with no tower. The placement writes one
+marker per attachment at the **head** of its own turn — where the checkpoint's own prompts put an
+image relative to the question about it, and what the in-app composer writes — and decodes the pixels
+into `TurnImage`s carrying `ServerImageParts.digest([part])`, which is what the engine's span cache
+and the session identity both key on.
+
+This had to run **first in the planner**, before `historyDigest`, before
+`substitutingRecordedTurn`, before tokenizing: everything below has to see the expanded turn.
+
+**The prompt budget moved to the expanded size.** The renderer emits ONE token per attachment and the
+turn runs several hundred, so the number checked against `dynamoe_server_max_prompt_tokens` and the
+number the client is told (`plan.promptTokenCount` → usage and the request-log row) is now
+`DeepSeekV41TurnImages.price(...).promptTokens`. It costs no weight read, and it moved the
+placeholder/image agreement check into the planner, where a stray marker is a 400 instead of an
+engine error.
+
+**The three correctness traps accepting images would otherwise have introduced:**
+
+1. **The session key had to learn about the picture.** Two requests can carry the same TEXT and
+   different images; both render to the same list of identical image token ids, so neither the
+   anchor's text nor `findCommonPrefix`'s token-prefix equality can separate them. Without the digest
+   folded into `sessionKey`, a follow-up about a second picture would splice the first one's recorded
+   generation (`ServerTurnMemory`) and reuse its pinned KV prefix. Both adapters now mix
+   `"images:" + digest` of the anchor message. Pinned by
+   `testTheOpenAISessionKeySeparatesTwoPicturesWithTheSameText` and its Anthropic twin.
+2. **The engine was silently dropping pixels for every other family.** `launchTurn`'s generic path
+   never reads `request.images`; only the DeepSeek branch does. A non-vision model would have
+   answered about a picture it never saw. `launchTurn` now refuses the turn by name before it touches
+   anything (`CompletionEngine.swift`, the guard right after the tokenizer check).
+3. **A request-log row would have shown a message with no content and no sign of a picture.** The
+   summaries now name the count (`image_parts` / `image_blocks`) and never carry the payload.
+
+**Remote URLs are refused, not fetched.** `https://...` inside an `image_url` or an Anthropic `url`
+source is an outbound connection the caller chose — a privacy surface and an SSRF one — so the turn
+is refused with the URL named and the fix spelled out ("send it inline as base64, which is what the
+SDKs do").
+
+### Evidence
+
+The permanent tests, all model-free:
+
+| suite | tests |
+|---|---|
+| `ServerImagePartsTests` (new) | 26 |
+| `OpenAIAdapterLogicTests` | 21 |
+| `AnthropicAdapterLogicTests` | 21 |
+| `ReasoningRoundTripTests` | 13 |
+| `ServerHardeningLogicTests` | 42 |
+| `ServerRequestLogLogicTests` | 29 |
+| `ServerStreamSafetyTests`, `ServerToolArgumentTests`, `PrefixAsOfDateTests` | 10 |
+| **total** | **162, 0 failures** (`/tmp/test77_logic3.log`) |
+
+The new class pins both wire spellings (data URL, bare base64, line-wrapped base64, the Responses
+bare-string form), the four refusals (a URL that must not be fetched, a non-base64 payload, a
+non-base64 data URL, an unknown Anthropic source type), the Anthropic `base64` and `url` sources, the
+digest's order sensitivity, both session keys, the assistant-turn and `tool_result` refusals, the
+marker placement (its own turn only, one per picture, in order), and the three ways
+`attachImageMarkers` fails closed.
+
+The prompt itself, at the checkpoint's own tokenizer (no weights, milliseconds):
+
+```
+🔎 [dsv41 real] API image request: 18 prompt tokens with 1 image token(s); priced 201 after
+   expansion (+183), 1 estimate(s), 0.32 s of tower
+```
+
+`DeepSeekV41PublishedTurnTests.testAnAPIRequestWithAnImageCarriesOneImageToken` starts from a real
+OpenAI request body with a real 2x2 PNG, runs `splitMessages` → `attachImageMarkers` →
+`ChatPromptFormatter.formatConversation`, and asserts the marker heads its own turn and no other,
+that the rendered prompt tokenizes to exactly one image token, and that `TurnImages.price` accepts
+the result. A marker that tokenized into pieces here would leave literal text in the prompt and bind
+no rows, which looks exactly like a model ignoring pictures — the same failure `#35` guarded against
+for the composer, now guarded for the API surface.
+
+### What it does not mean
+
+- **Not a faster image turn, and not a cheaper one.** The tower is untouched (`#43`'s 0.32-6.90 s
+  range stands) and the prefill of the expanded span is still the cost: `#46`'s largest picture is
+  1,005 positions, and at `#75`/`#76`'s ~78 ms/position that is ~78 s of prefill behind a
+  0.32-6.90 s encode. An API image request is a minutes-long turn, not a seconds-long one.
+- **No capability advertisement.** `/v1/models` still returns only an id and a created stamp; there
+  is no vision field in the OpenAI model list and none was invented. A client must know its model
+  from the app.
+- **Not an acceptance of files, audio or documents.** Those keep their `unsupported_content` 400 with
+  the message narrowed to what is actually missing.
+- **Not a claim about a full generated turn over the API.** The assembly, the ids, the price and the
+  placement are pinned; the generation is not, because an app-hosted test has no model loaded and the
+  published-turn harness drives `TurnRunner` directly rather than through the server.
+- **Not a re-opening of any perf question.** Nothing in this slice dispatches a kernel.
+
+### Verification
+
+`xcodebuild build-for-testing` at `-O` into `/tmp/dd_dsv41_77`, then `test-without-building` for the
+nine server-logic classes (`/tmp/test77_logic3.log`, 162/0). The checkpoint-gated prompt case ran with
+`touch /tmp/dynamoe_dsv41_real_turn` (`/tmp/test77_apiimg1.log`, 2/0) and printed the line above.
+`DeepSeekV41LogicTests`, `DeepSeekV41TurnLoopTests`, `DeepSeekV41SlotWiringTests` and
+`DeepSeekV41DeviceParityTests` are green (`/tmp/test77_ds1.log`, 31/0).
+
+One suite-order note, which is the documented pattern and not this slice: `ServerQueueLogicTests`
+loses 4-6 of 13 when it shares a process with the adapter suites (`/tmp/test77_logic2.log`,
+`/tmp/test77_queue2.log`) and is **13/13 alone** (`/tmp/test77_queue1.log`). It also loses them
+without the new test class in the same batch, so the new file is not the cause.

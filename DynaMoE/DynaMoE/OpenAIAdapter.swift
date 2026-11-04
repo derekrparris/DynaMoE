@@ -26,14 +26,16 @@ struct OpenAIChatRequest: Decodable {
         /// String form, or the concatenated text parts when the client sends
         /// the multi-part content array. Nil for assistant tool-call turns.
         let contentText: String?
-        /// True when the client sent an image part (`image_url`, `input_image`).
-        /// The local engine has no vision tower, so the server refuses these
-        /// instead of silently stripping them and answering about a picture the
-        /// model never saw.
+        /// True when the client sent an image part (`image_url`, `input_image`,
+        /// `image`). Whether the turn can actually read it is decided at plan
+        /// time from the loaded checkpoint's tower, not here.
         let hasImagePart: Bool
-        /// True when the client sent any non-text content part at all. The local
-        /// engine only understands text, so `file` and `input_audio` parts are
-        /// refused the same way images are, instead of being silently dropped.
+        /// The image parts this message carried, in the order the client sent
+        /// them, already decoded to the bytes the vision tower's decoder reads.
+        let imageParts: [ServerImagePart]
+        /// True when the client sent a content part the engine cannot process at
+        /// all (`file`, `input_audio`, an unknown type). Refused explicitly, so a
+        /// caller is never answered about a document nobody read.
         let hasUnsupportedPart: Bool
         /// Reasoning a client echoed back (the `reasoning_content` extension
         /// this server emits). Clients that keep it let the next turn
@@ -59,21 +61,23 @@ struct OpenAIChatRequest: Decodable {
             self.reasoningContent = try container.decodeIfPresent(String.self, forKey: .reasoningContent)
             if let s = try? container.decode(String.self, forKey: .content) {
                 self.contentText = s
+                self.imageParts = []
                 self.hasImagePart = false
                 self.hasUnsupportedPart = false
             } else if let parts = try? container.decode([ContentPart].self, forKey: .content) {
                 let joined = parts.compactMap(\.text).filter { !$0.isEmpty }.joined(separator: "\n")
                 self.contentText = joined.isEmpty ? nil : joined
-                self.hasImagePart = parts.contains { part in
-                    let type = (part.type ?? "").lowercased()
-                    return type == "image_url" || type == "input_image" || type == "image"
+                self.imageParts = parts.filter(\.isImage).map { part in
+                    ServerImageParts.fromOpenAIURL(part.imageURL ?? "")
                 }
+                self.hasImagePart = !self.imageParts.isEmpty
                 self.hasUnsupportedPart = parts.contains { part in
                     let type = (part.type ?? "").lowercased()
-                    return !type.isEmpty && type != "text"
+                    return !type.isEmpty && type != "text" && !part.isImage
                 }
             } else {
                 self.contentText = nil
+                self.imageParts = []
                 self.hasImagePart = false
                 self.hasUnsupportedPart = false
             }
@@ -87,6 +91,7 @@ struct OpenAIChatRequest: Decodable {
             self.name = name
             self.toolCalls = toolCalls
             self.toolCallId = toolCallId
+            self.imageParts = []
             self.hasImagePart = false
             self.hasUnsupportedPart = false
         }
@@ -95,6 +100,42 @@ struct OpenAIChatRequest: Decodable {
     struct ContentPart: Decodable {
         let type: String?
         let text: String?
+        /// The `image_url` value. Chat Completions spells it as an object
+        /// (`{"url": "..."}`) and the Responses API as a bare string, so both
+        /// shapes decode here rather than failing the whole body.
+        let imageURL: String?
+
+        enum CodingKeys: String, CodingKey {
+            case type, text
+            case imageURL = "image_url"
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.type = try container.decodeIfPresent(String.self, forKey: .type)
+            self.text = try container.decodeIfPresent(String.self, forKey: .text)
+            if let bare = try? container.decode(String.self, forKey: .imageURL) {
+                self.imageURL = bare
+            } else if let object = try? container.decode(ImageURLObject.self, forKey: .imageURL) {
+                self.imageURL = object.url
+            } else {
+                self.imageURL = nil
+            }
+        }
+
+        struct ImageURLObject: Decodable {
+            let url: String?
+        }
+
+        /// The content-part types that name a picture: `image_url` is the Chat
+        /// Completions spelling, `input_image` the Responses one, `image` the
+        /// shorthand several clients send.
+        static let imageTypes: Set<String> = ["image_url", "input_image", "image"]
+
+        var isImage: Bool {
+            if Self.imageTypes.contains((type ?? "").lowercased()) { return true }
+            return imageURL != nil
+        }
     }
 
     struct AssistantToolCallIn: Decodable {
@@ -223,16 +264,17 @@ struct OpenAIChatRequest: Decodable {
         self.reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
     }
 
-    /// True when any message carries an image content part. Refused by the
-    /// server rather than stripped: the loaded weights model has no vision tower,
-    /// and a silently text-only answer about a screenshot is worse than an error.
+    /// True when any message carries an image content part. The turn planner
+    /// accepts these only when the loaded checkpoint publishes a vision tower and
+    /// refuses them by name otherwise, because dropping them would answer a
+    /// question about a picture the model never saw.
     var hasImageContent: Bool {
         messages.contains(where: { $0.hasImagePart })
     }
 
-    /// True when any message carries a content part the text-only engine cannot
-    /// process (an image, a file attachment, or audio). Refused rather than
-    /// stripped, for the same reason as `hasImageContent`.
+    /// True when any message carries a content part the engine cannot process at
+    /// all (a file attachment or audio). Refused rather than stripped, for the
+    /// same reason as `hasImageContent`.
     var hasUnsupportedContent: Bool {
         messages.contains(where: { $0.hasUnsupportedPart })
     }
@@ -479,7 +521,7 @@ enum OpenAIAdapter {
     /// re-tokenizes the whole conversation every turn, so each turn's prompt
     /// can no longer extend the previous turn's pinned prompt+generation and
     /// multi-turn requests fully re-prefill.
-    static func splitMessages(_ messages: [OpenAIChatRequest.Message]) throws -> (systemPrompt: String, turns: [ChatPromptFormatter.ConversationTurn]) {
+    static func splitMessages(_ messages: [OpenAIChatRequest.Message]) throws -> ServerPromptSplit {
         let systemTexts = messages
             .filter { $0.role == "system" || $0.role == "developer" }
             .compactMap(\.contentText)
@@ -491,11 +533,20 @@ enum OpenAIAdapter {
             throw ServerAPIError.badRequest("messages must contain at least one non-system message")
         }
 
-        var turns: [ChatPromptFormatter.ConversationTurn] = []
+        var split = ServerPromptSplit(systemPrompt: systemPrompt)
         for message in conversation {
+            // A picture belongs to the turn it was sent with. Only a user turn can
+            // carry one: an image on an assistant or tool message has no position
+            // in the rendered template, so it is refused rather than moved.
+            if message.hasImagePart, message.role != "user" {
+                throw ServerAPIError.unsupportedContent(
+                    "An image part can only be attached to a user message, not to a \"\(message.role)\" message."
+                )
+            }
             switch message.role {
             case "user":
-                turns.append(.init(role: .user, text: message.contentText ?? ""))
+                if message.hasImagePart { split.images[split.turns.count] = message.imageParts }
+                split.turns.append(.init(role: .user, text: message.contentText ?? ""))
             case "assistant":
                 var lines: [String] = []
                 // Reasoning a client echoed back is re-rendered ahead of the
@@ -531,21 +582,21 @@ enum OpenAIAdapter {
                     lines.append(ChatPromptFormatter.openAIToolCallEchoPrefix + "\n" + rendered)
                 }
                 let body = lines.joined(separator: "\n\n")
-                turns.append(.init(role: .assistant, text: body.isEmpty ? "(no content)" : body))
+                split.turns.append(.init(role: .assistant, text: body.isEmpty ? "(no content)" : body))
             case "tool", "function":
                 let label = message.name ?? message.toolCallId ?? "tool"
                 let args = message.contentText ?? "(no result)"
-                turns.append(.init(role: .user, text: "Function result (\(label)):\n\(args)"))
+                split.turns.append(.init(role: .user, text: "Function result (\(label)):\n\(args)"))
             default:
                 if let content = message.contentText, !content.isEmpty {
-                    turns.append(.init(role: .user, text: "\(message.role.capitalized): \(content)"))
+                    split.turns.append(.init(role: .user, text: "\(message.role.capitalized): \(content)"))
                 }
             }
         }
-        guard !turns.isEmpty else {
+        guard !split.turns.isEmpty else {
             throw ServerAPIError.badRequest("messages must contain at least one non-system message")
         }
-        return (systemPrompt, turns)
+        return split
     }
 
     /// Stable prefix-cache session key. The OpenAI protocol is stateless, so
@@ -558,6 +609,12 @@ enum OpenAIAdapter {
     /// identically still collide, so reuse is additionally gated on exact
     /// token-prefix equality inside PrefixCacheManager.findCommonPrefix and on
     /// `ServerTurnMemory` re-validating the rendered history.
+    ///
+    /// A picture is part of that identity. Two requests can carry the same TEXT
+    /// and different images, and both render to the same list of image token ids,
+    /// so neither the anchor's text nor token-prefix equality can separate them:
+    /// without the digest folded in here, the second picture's turn would splice
+    /// the first one's recorded generation and reuse its pinned prefix.
     static func sessionKey(for messages: [OpenAIChatRequest.Message], model: String?) -> UUID {
         var lane0: UInt64 = 0xcbf29ce484222325
         var lane1: UInt64 = 0x9e3779b97f4a7c15
@@ -579,6 +636,9 @@ enum OpenAIAdapter {
                 mixString(call.function.arguments ?? "")
             }
             mixString(anchor.name ?? "")
+            if !anchor.imageParts.isEmpty {
+                mixString("images:" + ServerImageParts.digest(anchor.imageParts))
+            }
         }
 
         var bytes = [UInt8](repeating: 0, count: 16)
