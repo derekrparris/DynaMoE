@@ -10565,3 +10565,135 @@ table above), `/tmp/test66_census1.log` (the cold-arm first cut). The instrument
 `countsDispatches` / `resetDispatchCensus()` and `injectedDispatchRepeats`, both off in every
 production path; the dispatch wrapper is a load and a compare, and the control's 63.7-63.9 ms/position
 matches `#65`'s 63.5, so the census costs nothing measurable.
+
+## DSV4.1 #67: THE EXPERT STREAM IS A FLOOR, NOT A LEVER — AND EVERY MILLISECOND OF IT IS NOW NAMED
+
+`#66` closed the dispatch floor and left the ranking it could not settle: a warm walked position is
+36.7 ms of device work, a mixture late start of 11.6, an indexer drain of 9.4, an encode of 4.6 and a
+fill of **4.2 ms**. `#22` and `#49` had measured a live turn's fill at 67 ms and 556 MB/position with
+86-93 ms of hand-off idle behind it, and `#59` at 301-307 MB/position. Four probes, four fills, and
+every later slice quotes whichever one it happened to run. The handover routed the next slice to the
+expert read volume and told it to re-measure the live regime first; SubQ agreed
+(`expert_read_volume` 0.814, confidence 0.751; "price it before building it" 0.917).
+
+### Question
+
+What does a live turn's expert fill actually cost, in the regime a live turn is in, and is any part of
+it a lever rather than the disk's own floor?
+
+### The trap in every earlier number
+
+A probe that re-walks one stream is warm in **two** independent ways, and a turn's text is warm in
+neither:
+
+1. **The arena.** `#59` showed a cold pass is 95.3% compulsory first touches while a warm pass
+   re-fetches 83-100% of its misses. The same bytes, with different causes, and only the second is a
+   replacement question.
+2. **Slot wiring.** `#57`'s shipping policy `mlock`s a slot when it is allocated, so the pass that
+   creates the arena pays for it and the passes after it do not.
+
+`#66`'s 4.2 ms was the fifth pass of seven over one stream, with three discarded warm-ups in front of
+it: its expert bytes came out of the page cache and its slots were already wired. It is the *warmest*
+number the journal has, quoted as if it were a live one.
+
+### The run
+
+One runtime through the app's own loading path, the `#52`-`#66` 128-position rotated stream, the
+shipping `leastFrequentlyUsed` rule and the shipping wiring grant (`wireArena: nil`), `-O`, one
+process. Four arms, each recording every position's layer records (`recordsLayerGaps`, which carry the
+fill's own bytes, misses, resolve, `pread` and placement seconds beside the four intervals that tile a
+position), with the arena's miss classifier on:
+
+| arm | ms/pos | dense | hand-off | expert | reads | misses | 1st touch | GB/s | evictions |
+|---|---|---|---|---|---|---|---|---|---|
+| **cold** (reset arena, unread bytes) | **121.8** | 17.9 | 79.5 | 17.4 | 701 MB | 39.1 | **95.8%** | 15.1 | 1,248 |
+| **warm** (same stream again) | **82.2** | 17.6 | 41.3 | 16.4 | 280 MB | 15.6 | 0.0% | 13.2 | 2,001 |
+| **floor** (eight-token cycle, already resident) | **54.8** | 17.4 | 14.6 | 16.0 | 101 MB | 5.6 | 0.0% | 46.6 | 723 |
+
+The hand-off decomposes exactly, which is what makes the rest of this section possible:
+
+| arm | routing | allocate | wire | resolve | pread | place | idle | encode | unattributed |
+|---|---|---|---|---|---|---|---|---|---|
+| cold | 0.0 | 0.3 | **11.1** | 0.3 | **45.5** | 0.5 | **16.5** | 2.3 | 3.0 |
+| warm | 0.0 | 0.0 | 0.0 | 0.1 | **20.8** | 0.2 | 14.8 | 2.3 | 3.0 |
+| floor | 0.0 | 0.0 | 0.0 | 0.1 | 2.1 | 0.1 | 7.0 | 2.2 | 3.0 |
+
+So **hiding the entire expert fill would take a cold position from 121.8 to 54.8 ms — 67.1 ms, 55% —
+and a warm one from 82.2 to 54.8, 27.4 ms, 33%.** That is the largest single prize this port has
+measured. It is also, component by component, already closed.
+
+### What it says
+
+- **The read volume is compulsory and the rate is the ceiling.** 701 MB/position in 45.5 ms is 15.1
+  GB/s, the machine's own limit (13.6-15.2 in `#56`-`#59`), and 95.8% of a cold pass's misses are
+  pairs this arena never held. `#21` found the same at 53 positions, `#59` at 128, and `#58` priced the
+  capacity that would hold them (81.19 GB wired left 0 GB free and fell to 6.4 GB/s). Fewer bytes is
+  closed on every side: the arena (`#58`, `#59`), the read form, the fan-out, `F_NOCACHE` and the disk
+  (`#51`), and the fact that all six ranges of an expert are read by a kernel that wants them.
+- **The 11.1 ms of wiring is the shipping policy paying for itself in the arm that creates the
+  slots.** 0.28 ms per miss, ~1.1 ms per newly wired 17.9 MB slot, i.e. `mlock` page-touching at
+  ~15.7 GB/s. `#57` measured 17-18 ms/position for a pass that wires all 65.84 GB and showed the
+  alternative: P4, wired withdrawn, was **222.4 ms/position with 4.6M decompressions**. This is a cost
+  that pays back on the next pass and it is not a lever.
+- **Resolving a miss is nearly free — 0.006-0.011 ms each.** The bucket that looked like "catalog
+  lookups per expert" (a 12.0 ms cold arm, 120x the warm one) was wiring, not resolution. Worth
+  stating because the opposite was the plausible reading of the first cut.
+- **The idle does not scale with the bytes.** 16.5 / 14.8 / 7.0 ms against 45.5 / 20.8 / 2.1 of read.
+  `#49` fit 1.2-2.3x of the byte time; here the read-heavy part is at most 0.2, and most of the bucket
+  is a ~7 ms per-position floor present with no I/O at all. `#48`-`#50` closed the causes (not the
+  submission shape, not CPU cache writeback, not the resource count) and `#65` closed the one remedy
+  that would have removed it (the deferred gate, measured at matched read volume).
+- **The remaining GPU work is at ceilings.** dense 17.9 + expert halves 17.4 = 35.3 ms of the 121.8,
+  and `#60`-`#66` put every stage of both halves within tens of a percent of the best measured GEMV
+  rate. Against a floor of 54.8 ms, a cold position is 35.3 ms of work under 74 ms of streaming.
+
+**So the expert stream is a floor, and the only lever of any size left is to stop paying it once per
+position.** That is batching, and it is priced on both sides: `#22` measured a block of eight at 70.9
+ms/position against a 153.3 ms walk (2.16x, 7.6x less I/O), and `#26` measured the width sweep that
+makes it unusable — acceptance roughly doubles at widths two and three but a narrow verify is only
+0.83-0.89x a walk per position, and a width-2 round emits 2.05 tokens for 420 ms against 399 ms of
+walking. Note how that arithmetic moves with this slice: our *cold* walk is 121.8, so a verify of eight
+would need ~47% acceptance to break even, and `#25` measured 31% at width five. Do not re-propose a
+verify of width 2-3 without a new acceptance number, and do not re-propose the read itself.
+
+### What it is not (do not re-propose)
+
+- **Not a bigger or differently-sized arena.** `#58`'s B1 and `#59`'s replacement A/B, re-confirmed
+  here: 1,248 evictions in the cold arm and 2,001 in the warm one, all refetches, with capacity
+  already priced.
+- **Not dropping or partially applying slot wiring.** `#56`-`#58`, and P4's 222.4 ms above.
+- **Not the resolve path.** 0.006-0.011 ms per miss; the tempting 12 ms was `mlock`.
+- **Not the hand-off idle alone.** `#48`-`#50` closed its causes and `#65` closed the deferred gate.
+- **Not a page-cache argument for the warm arm.** 13.2 GB/s is disk rate, not cache rate; the floor
+  arm is the one served from cache, at 46.6 GB/s, which is what makes it a floor for time rather than
+  for bytes.
+
+### Verification
+
+`testWhatALiveTurnsExpertFillCosts` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_live_fill`, plus the class's own `/tmp/dynamoe_dsv41_real_turn`), 51 s at `-O`.
+Runs: `/tmp/test67_live3.log` (the cold/warm/quiet cut), `/tmp/test67_live4.log` (the decomposed
+cut), `/tmp/test67_live5.log` (the quoted one), `/tmp/test67_live6.log` (the committed one). Four runs
+of the same arms: cold **121.8-125.0**, warm **82.2-83.4**, floor **54.8-55.4** ms/position, i.e. 2.6%
+apart end to end and 0.5% apart on the floor. Quote the range: the decomposition reproduces to ~0.3 ms
+a bucket (wire 10.4-11.1, pread 45.5-48.6, idle 16.5-17.2) while the cold arm's absolute figure moves
+with the machine, which is why the prize is stated as 55-56% of it and not as 67.1 ms. It asserts the cold and warm arms return bit-identical
+logits, that a cold arm is >90% compulsory first touches, that the floor arm misses <25% as often and
+reads at a higher rate, that the dense halves and expert halves move <2 ms between arms, and that
+every position's layer records tile it and that the miss composition covers every miss.
+
+The instrument is `DeepSeekV41ExpertStreamer.prepareTiming` (new: wall time inside `placeResident`
+short of the arena's own placement, billed through a `defer` so a throw is counted too) plus two new
+`DeepSeekV41LayerGapSample` fields, `fillAllocateSeconds` and `fillWireSeconds`, which split it into
+per-new-slot and per-miss halves. All are behind `recordsLayerGaps`, off in every production path.
+
+A fully zero-byte floor arm is not reachable under the shipping rule and the assertion says so
+instead of pretending otherwise: `leastFrequentlyUsed`'s aging halves every count once a
+capacity-worth of misses has gone by, so even an eight-token cycle's own set is retired and re-read —
+101 MB at 46.6 GB/s, 2.3 ms. That is a floor for the position's time without being a floor for bytes.
+
+The full `DynaMoETests` target ran 1,497 tests with 99 skipped and 33 failures in 124.1 s on the final
+`-O` build (`/tmp/test67_suite2.log`). Zero `DeepSeekV41*` failures. 30 are the known pre-existing
+environmental set (5 XCTest failures in 4 `DynaMoETests` cases, 25 in 9 `ModelDogfoodAndPrefixCacheTests`
+cases); the other 3 are `ServerQueueLogicTests`, which pass in isolation (13/13,
+`/tmp/test67_queue.log`) and are the timing flake `#58` recorded.

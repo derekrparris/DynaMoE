@@ -1393,6 +1393,18 @@ nonisolated public struct DeepSeekV41LayerGapSample: Sendable, Equatable {
     /// Wall time inside the fill's `pread` batches, and inside the arena's placement.
     public let fillReadSeconds: Double
     public let fillPlacementSeconds: Double
+    /// Host time the fill spent inside `placeResident` short of the arena's own
+    /// placement: creating the slot buffer, wiring it, and resolving the six tensor refs
+    /// and read ranges a missed expert needs (`#67`). The three are recorded apart
+    /// because only the last is per MISS:
+    ///
+    ///   * `fillAllocateSeconds` and `fillWireSeconds` are paid once per slot the arena
+    ///     has never held, so they belong to a cold arena and to nothing else;
+    ///   * `fillResolveSeconds` is catalog lookups, range construction and binding
+    ///     assembly, which every miss pays whether its slot is new or recycled.
+    public let fillPrepareSeconds: Double
+    public let fillAllocateSeconds: Double
+    public let fillWireSeconds: Double
     /// Host time in the routing readback and in encoding the expert half.
     public let routingNanoseconds: UInt64
     public let mixtureEncodeNanoseconds: UInt64
@@ -1419,6 +1431,9 @@ nonisolated public struct DeepSeekV41LayerGapSample: Sendable, Equatable {
         fillSlotsAllocated: Int,
         fillReadSeconds: Double,
         fillPlacementSeconds: Double,
+        fillPrepareSeconds: Double,
+        fillAllocateSeconds: Double,
+        fillWireSeconds: Double,
         routingNanoseconds: UInt64,
         mixtureEncodeNanoseconds: UInt64,
         expertCount: Int,
@@ -1437,11 +1452,19 @@ nonisolated public struct DeepSeekV41LayerGapSample: Sendable, Equatable {
         self.fillSlotsAllocated = fillSlotsAllocated
         self.fillReadSeconds = fillReadSeconds
         self.fillPlacementSeconds = fillPlacementSeconds
+        self.fillPrepareSeconds = fillPrepareSeconds
+        self.fillAllocateSeconds = fillAllocateSeconds
+        self.fillWireSeconds = fillWireSeconds
         self.routingNanoseconds = routingNanoseconds
         self.mixtureEncodeNanoseconds = mixtureEncodeNanoseconds
         self.expertCount = expertCount
         self.compressed = compressed
         self.probes = probes
+    }
+
+    /// The part of `fillPrepareSeconds` that is per miss rather than per new slot.
+    public var fillResolveSeconds: Double {
+        max(0, fillPrepareSeconds - fillAllocateSeconds - fillWireSeconds)
     }
 
     /// How long the layer's dense half ran on the device.
@@ -1977,8 +2000,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// One snapshot of the expert streamer's own counters, so a layer's fill is
     /// measured as a delta rather than as a running total.
     private func streamerCounters()
-        -> (bytes: Int, misses: Int, slots: Int, reading: Double, placing: Double) {
-        guard let streamer else { return (0, 0, 0, 0, 0) }
+        -> (bytes: Int, misses: Int, slots: Int, reading: Double, placing: Double,
+            preparing: Double, allocating: Double, wiring: Double) {
+        guard let streamer else { return (0, 0, 0, 0, 0, 0, 0, 0) }
         let timing = streamer.timing
         let placement = streamer.placementTiming
         return (
@@ -1986,7 +2010,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             streamer.expertsLoaded,
             timing.slotsAllocated,
             timing.reading,
-            placement.seconds
+            placement.seconds,
+            streamer.prepareTiming.seconds,
+            timing.allocating,
+            timing.wiring
         )
     }
 
@@ -2002,6 +2029,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         let fillSlotsAllocated: Int
         let fillReadSeconds: Double
         let fillPlacementSeconds: Double
+        let fillPrepareSeconds: Double
+        let fillAllocateSeconds: Double
+        let fillWireSeconds: Double
         let routingNanoseconds: UInt64
         let mixtureEncodeNanoseconds: UInt64
         let expertCount: Int
@@ -4386,6 +4416,12 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 fillReadSeconds: (streamedAfter?.reading ?? 0) - (streamedBefore?.reading ?? 0),
                 fillPlacementSeconds: (streamedAfter?.placing ?? 0)
                     - (streamedBefore?.placing ?? 0),
+                fillPrepareSeconds: (streamedAfter?.preparing ?? 0)
+                    - (streamedBefore?.preparing ?? 0),
+                fillAllocateSeconds: (streamedAfter?.allocating ?? 0)
+                    - (streamedBefore?.allocating ?? 0),
+                fillWireSeconds: (streamedAfter?.wiring ?? 0)
+                    - (streamedBefore?.wiring ?? 0),
                 routingNanoseconds: routingEnded - routingStarted,
                 mixtureEncodeNanoseconds: pendingFill == nil
                     ? mixtureEncoded - filled
@@ -6188,6 +6224,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                     fillSlotsAllocated: gap.fillSlotsAllocated,
                     fillReadSeconds: gap.fillReadSeconds,
                     fillPlacementSeconds: gap.fillPlacementSeconds,
+                    fillPrepareSeconds: gap.fillPrepareSeconds,
+                    fillAllocateSeconds: gap.fillAllocateSeconds,
+                    fillWireSeconds: gap.fillWireSeconds,
                     routingNanoseconds: gap.routingNanoseconds,
                     mixtureEncodeNanoseconds: gap.mixtureEncodeNanoseconds,
                     expertCount: gap.expertCount,

@@ -10865,4 +10865,524 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
                 + "\(samples.count) layer(s)"
         )
     }
+
+    // MARK: - The live turn's expert fill
+
+    /// What a live turn's expert fill costs, measured in the regime a live turn is
+    /// actually in, and what hiding it could be worth.
+    ///
+    /// `#66` closed the dispatch floor and left a walked position as 36.7 ms of device
+    /// work, a mixture late start of 11.6, an indexer drain of 9.4, an encode of 4.6 and
+    /// a fill of **4.2 ms** -- measured on a stream the probe had already walked three
+    /// times, so its expert bytes looked cheap. `#22` and `#49` both measured a live
+    /// turn's fill an order of magnitude larger (67 ms, and 556 MB a position with
+    /// 86-93 ms of hand-off idle behind it). Three probes, three fills, and every later
+    /// slice quotes whichever one it happened to run.
+    ///
+    /// The difference is the regime, not the model. A probe that re-walks one stream is
+    /// warm in two independent ways and a live turn's text is warm in neither:
+    ///
+    ///   1. **The arena** -- `#59` showed a cold pass is 95.3% compulsory first touches
+    ///      while a warm pass re-fetches 83-100% of its misses, so the two are the same
+    ///      bytes with different causes and only the second is a replacement question.
+    ///   2. **The page cache** -- the first read of an expert's bytes comes off the disk
+    ///      at 3.7-4.0 GB/s and every read after it, while it lasts, out of the cache.
+    ///
+    /// So this case walks four arms on ONE runtime and reports each arm's whole budget,
+    /// per position, from the layer records `#49` built. Those carry the fill's own
+    /// bytes, misses, `pread` seconds and placement seconds beside the four intervals
+    /// that tile a position, which is what makes the hand-off decomposable:
+    ///
+    ///   `hand-off = routing readback + pread + placement + mixture encode + idle`
+    ///
+    ///   * `cold` -- a stream this process has never walked, starting from
+    ///     `arena.reset()`. A live turn's first positions in both senses.
+    ///   * `warm` -- the same stream walked again. `#59`'s steady state, and what every
+    ///     table from `#60` on has actually been measuring.
+    ///   * `cycled` -- an eight-token cycle, discarded: it loads its own small working
+    ///     set so the arm after it can measure a fill that reads nothing.
+    ///   * `floor` -- the same cycle again, every pair resident. `#49`'s zero-byte-fill
+    ///     arm, and the control the other arms are priced against.
+    ///
+    /// The deliverable is the number the handover asked for and no table in this journal
+    /// carries: **what hiding the whole expert fill behind the GPU would be worth**, read
+    /// as `wall(cold) - wall(floor)` and `wall(warm) - wall(floor)` -- the read, the
+    /// hand-off idle it induces, and nothing else, at one submission shape and one
+    /// machine. It is a ceiling: it assumes the read becomes free rather than merely
+    /// overlapped.
+    ///
+    /// Opt-in (`/tmp/dynamoe_dsv41_live_fill`, plus the class's own marker).
+    func testWhatALiveTurnsExpertFillCosts() throws {
+        let markerPath = "/tmp/dynamoe_dsv41_live_fill"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in live-fill probe; touch \(markerPath) to run"
+        )
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        // The 128-position stream every assembly from `#52` on measured, so this arm's
+        // numbers are line-for-line comparable with that table's.
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+        let positions = 128
+        let tokens = (0..<positions).map { index in
+            let repetition = index / stream.count
+            return stream[(index + repetition * 7) % stream.count]
+        }
+        // Eight tokens cycling: the arena can hold every pair this walk asks for, so once
+        // it has been walked the fill has nothing to read.
+        let cycled = (0..<positions).map { index -> Int in
+            stream[(index % 8) % stream.count]
+        }
+        // The process warm-up: a third stream, so slot creation, wiring, the pipeline
+        // caches and the shard mappings are paid before any arm is timed, and none of the
+        // measured arms' bytes are in the page cache because of it.
+        let seed = (0..<16).map { index in
+            stream[(index * 5 + 3) % stream.count]
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: positions + 1,
+            allowEngramSkip: false,
+            wireArena: nil
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        // The shipping rule, and the miss classifier `#59` added: a miss that is a first
+        // touch is a floor no replacement rule can remove, and only the rest is
+        // reclaimable.
+        runtime.arena.victimPolicy = .leastFrequentlyUsed
+        runtime.arena.recordsMissComposition = true
+        let executor = runtime.forward()
+
+        _ = try liveFillArm(
+            runtime: runtime,
+            executor: executor,
+            tokens: seed,
+            resetArena: false,
+            label: "warm-up (discarded)"
+        )
+        print(
+            String(
+                format: "🔎 [dsv41 real] live fill: %d positions, arena %d slots, "
+                    + "%@ rule, warm-up done",
+                positions,
+                runtime.arena.capacity,
+                runtime.arena.victimPolicy == .leastFrequentlyUsed ? "frequency" : "LRU"
+            )
+        )
+
+        let cold = try liveFillArm(
+            runtime: runtime,
+            executor: executor,
+            tokens: tokens,
+            resetArena: true,
+            label: "cold (live turn)"
+        )
+        let warm = try liveFillArm(
+            runtime: runtime,
+            executor: executor,
+            tokens: tokens,
+            resetArena: false,
+            label: "warm (steady state)"
+        )
+        _ = try liveFillArm(
+            runtime: runtime,
+            executor: executor,
+            tokens: cycled,
+            resetArena: false,
+            label: "cycled (discarded: loads its own set)"
+        )
+        let floor = try liveFillArm(
+            runtime: runtime,
+            executor: executor,
+            tokens: cycled,
+            resetArena: false,
+            label: "floor (no fill)"
+        )
+
+        for arm in [cold, warm, floor] { reportLiveFill(arm) }
+
+        // The arms are the same weights and the same stream, so the two stream-A arms
+        // have to return the same logits to the bit; only the arena and the page cache
+        // differ. That is the control that says this instrument measures the fill rather
+        // than having changed the graph.
+        XCTAssertEqual(
+            cold.lastLogits, warm.lastLogits,
+            "the second walk of the same stream moved the last position's logits"
+        )
+        print(
+            "🔎 [dsv41 real] live fill control: the cold and warm arms' logits are "
+                + "bit-identical at the last position"
+        )
+
+        // A cold pass is compulsory (`#59`: 95.3% first touches), so it is what a live
+        // turn pays and no rule can take it away. Asserted rather than assumed, because a
+        // probe whose warm-up leaked its pairs into the arena would read like the warm
+        // arm and quietly retire the conclusion.
+        let coldShare = Double(cold.firstTouch) / Double(max(1, cold.misses))
+        XCTAssertGreaterThan(
+            coldShare, 0.9,
+            "a cold arm must be compulsory first touches, not re-fetches"
+        )
+        // The floor has to actually be a floor, or the prize is priced against a phantom.
+        // It cannot be a ZERO-byte one under the shipping rule: `leastFrequentlyUsed`'s
+        // aging halves every count once a capacity-worth of misses has gone by, so even an
+        // eight-token cycle's own small set is retired and re-read. What makes it a floor
+        // anyway is that those bytes are in the page cache -- it reads them at tens of
+        // GB/s -- so its fill is a couple of milliseconds and the prize is priced against
+        // a position that has one.
+        XCTAssertLessThan(
+            floor.preadPerPosition, 0.25 * cold.preadPerPosition,
+            "the floor arm must spend far less on the fill than the cold one"
+        )
+        XCTAssertLessThan(
+            Double(floor.misses), 0.25 * Double(cold.misses),
+            "the floor arm must miss far less often than the cold one"
+        )
+        XCTAssertGreaterThan(
+            floor.gigabytesPerSecond, cold.gigabytesPerSecond,
+            "the floor arm's bytes must be served faster than the cold arm's"
+        )
+        // Everything except the fill is held fixed across the arms, so the difference in
+        // the dense halves and the expert halves is measurement noise rather than a
+        // second cause. Stated as a bound: 2 ms of a ~18 ms half.
+        XCTAssertLessThan(
+            abs(cold.densePerPosition - floor.densePerPosition), 2.0,
+            "the dense halves moved between arms, so the arms are not comparable"
+        )
+        XCTAssertLessThan(
+            abs(cold.mixturePerPosition - floor.mixturePerPosition), 2.0,
+            "the expert halves moved between arms, so the arms are not comparable"
+        )
+
+        let coldPrize = cold.wallPerPosition - floor.wallPerPosition
+        let warmPrize = warm.wallPerPosition - floor.wallPerPosition
+        print(
+            String(
+                format: "🔎 [dsv41 real] live fill prize: a cold position reads %.0f MB "
+                    + "at %.1f GB/s (%.1f ms of pread) and spends %.1f ms in the "
+                    + "hand-off, so hiding the whole fill is %.1f ms of a %.1f ms "
+                    + "position (%.0f%%); the warm arena's %.0f MB is %.1f ms of %.1f "
+                    + "(%.0f%%), against a floor of %.1f ms",
+                cold.megabytesPerPosition,
+                cold.gigabytesPerSecond,
+                cold.preadPerPosition,
+                cold.handoffPerPosition,
+                coldPrize,
+                cold.wallPerPosition,
+                100 * coldPrize / max(cold.wallPerPosition, 0.0001),
+                warm.megabytesPerPosition,
+                warmPrize,
+                warm.wallPerPosition,
+                100 * warmPrize / max(warm.wallPerPosition, 0.0001),
+                floor.wallPerPosition
+            )
+        )
+        print(String(format: "🔎 [dsv41 real] %@", runtime.describe()))
+        runtime.shutdown()
+        withExtendedLifetime(engine) {}
+    }
+
+    /// One arm's per-position record: the four intervals that tile the position, the
+    /// hand-off broken into the pieces that sum to it, and what the layer read.
+    private struct LiveFillPosition {
+        let position: Int
+        let wallMilliseconds: Double
+        let denseMilliseconds: Double
+        let handoffMilliseconds: Double
+        let mixtureMilliseconds: Double
+        let routingMilliseconds: Double
+        let idleMilliseconds: Double
+        let encodeMilliseconds: Double
+        let misses: Int
+        let bytes: Int
+        let preadMilliseconds: Double
+        let placementMilliseconds: Double
+        let prepareMilliseconds: Double
+        let allocateMilliseconds: Double
+        let wireMilliseconds: Double
+
+        var tiledMilliseconds: Double {
+            denseMilliseconds + handoffMilliseconds + mixtureMilliseconds
+        }
+
+        /// What the fill costs the position: the bytes, plus how long the GPU sat idle
+        /// waiting for them. The readback and the encode are the graph's own work and are
+        /// not the fill's.
+        var fillMilliseconds: Double {
+            prepareMilliseconds + preadMilliseconds + placementMilliseconds
+                + idleMilliseconds
+        }
+
+        /// The per-miss half of the preparation: catalog lookups, read ranges, bindings.
+        var resolveMilliseconds: Double {
+            max(0, prepareMilliseconds - allocateMilliseconds - wireMilliseconds)
+        }
+    }
+
+    private struct LiveFillArm {
+        let label: String
+        let records: [LiveFillPosition]
+        let misses: Int
+        let firstTouch: Int
+        let refetch: Int
+        let bytes: Int
+        let evictions: Int
+        let resident: Int
+        let capacity: Int
+        let lastLogits: [Float]
+
+        private func mean(_ value: (LiveFillPosition) -> Double) -> Double {
+            guard !records.isEmpty else { return 0 }
+            return records.map(value).reduce(0, +) / Double(records.count)
+        }
+
+        var wallPerPosition: Double { mean { $0.wallMilliseconds } }
+        var densePerPosition: Double { mean { $0.denseMilliseconds } }
+        var handoffPerPosition: Double { mean { $0.handoffMilliseconds } }
+        var mixturePerPosition: Double { mean { $0.mixtureMilliseconds } }
+        var routingPerPosition: Double { mean { $0.routingMilliseconds } }
+        var idlePerPosition: Double { mean { $0.idleMilliseconds } }
+        var encodePerPosition: Double { mean { $0.encodeMilliseconds } }
+        var fillPerPosition: Double { mean { $0.fillMilliseconds } }
+        var missesPerPosition: Double { mean { Double($0.misses) } }
+        var megabytesPerPosition: Double { mean { Double($0.bytes) / 1_048_576 } }
+        var preadPerPosition: Double { mean { $0.preadMilliseconds } }
+        var placementPerPosition: Double { mean { $0.placementMilliseconds } }
+        var preparePerPosition: Double { mean { $0.prepareMilliseconds } }
+        var allocatePerPosition: Double { mean { $0.allocateMilliseconds } }
+        var wirePerPosition: Double { mean { $0.wireMilliseconds } }
+        var resolvePerPosition: Double { mean { $0.resolveMilliseconds } }
+
+        /// What the `pread` achieved, which is what tells a disk read from a page-cache
+        /// hit: 3.7-4.0 GB/s on a first read against 13-14 through the cache.
+        var gigabytesPerSecond: Double {
+            let seconds = records.map { $0.preadMilliseconds }.reduce(0, +) / 1000
+            return seconds > 0 ? Double(bytes) / 1_073_741_824 / seconds : 0
+        }
+    }
+
+    /// Walks `tokens` once with the hand-off recorder on for every position, and checks
+    /// the records tile the positions they came from before returning them.
+    private func liveFillArm(
+        runtime: DeepSeekV41Runtime,
+        executor: DeepSeekV41MetalForward,
+        tokens: [Int],
+        resetArena: Bool,
+        label: String
+    ) throws -> LiveFillArm {
+        executor.reset()
+        executor.recordsWalkTiming = false
+        executor.recordsWalkStageTiming = false
+        if resetArena { runtime.arena.reset() }
+
+        let missesBefore = runtime.arena.acquisitions - runtime.arena.hits
+        let firstBefore = runtime.arena.firstTouchMisses
+        let refetchBefore = runtime.arena.refetchMisses
+        let evictionsBefore = runtime.arena.evictions
+        let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+
+        executor.recordsLayerGaps = true
+        var records: [LiveFillPosition] = []
+        var logits: [Float] = []
+        for (position, token) in tokens.enumerated() {
+            logits = try executor.forwardToken(token, position: position)
+            let gaps = executor.layerGaps
+            let wall = executor.layerGapPositions.last?.wallMilliseconds ?? 0
+            records.append(
+                LiveFillPosition(
+                    position: position,
+                    wallMilliseconds: wall,
+                    denseMilliseconds: gaps.map { $0.frontWindowMilliseconds }.reduce(0, +),
+                    handoffMilliseconds: gaps
+                        .map { $0.hostGapMilliseconds + $0.idleMilliseconds }
+                        .reduce(0, +),
+                    mixtureMilliseconds: gaps.map { $0.mixtureWindowMilliseconds }.reduce(0, +),
+                    routingMilliseconds: 1e-6
+                        * Double(gaps.map { $0.routingNanoseconds }.reduce(0, +)),
+                    idleMilliseconds: gaps.map { $0.idleMilliseconds }.reduce(0, +),
+                    encodeMilliseconds: 1e-6
+                        * Double(gaps.map { $0.mixtureEncodeNanoseconds }.reduce(0, +)),
+                    misses: gaps.map { $0.fillMisses }.reduce(0, +),
+                    bytes: gaps.map { $0.fillBytes }.reduce(0, +),
+                    preadMilliseconds: 1e3 * gaps.map { $0.fillReadSeconds }.reduce(0, +),
+                    placementMilliseconds: 1e3
+                        * gaps.map { $0.fillPlacementSeconds }.reduce(0, +),
+                    prepareMilliseconds: 1e3
+                        * gaps.map { $0.fillPrepareSeconds }.reduce(0, +),
+                    allocateMilliseconds: 1e3
+                        * gaps.map { $0.fillAllocateSeconds }.reduce(0, +),
+                    wireMilliseconds: 1e3
+                        * gaps.map { $0.fillWireSeconds }.reduce(0, +)
+                )
+            )
+            XCTAssertEqual(
+                gaps.count, executor.plan.count,
+                "\(label) position \(position) recorded \(gaps.count) layer(s), not one per layer"
+            )
+            XCTAssertTrue(
+                gaps.allSatisfy { $0.hasWindow },
+                "\(label) position \(position) left an expert half with no device window"
+            )
+        }
+        executor.recordsLayerGaps = false
+
+        let misses = (runtime.arena.acquisitions - runtime.arena.hits) - missesBefore
+        let firstTouch = runtime.arena.firstTouchMisses - firstBefore
+        let refetch = runtime.arena.refetchMisses - refetchBefore
+        let bytes = (runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore
+
+        // The instruments' own contracts, so a broken recorder cannot be read as a
+        // result: the misses decompose, the layers' fills are the arena's misses, and the
+        // four intervals tile the positions rather than overlapping them.
+        XCTAssertEqual(
+            firstTouch + refetch, misses,
+            "\(label): the miss composition does not cover the arena's misses"
+        )
+        XCTAssertEqual(
+            records.map { $0.misses }.reduce(0, +), misses,
+            "\(label): the layers' recorded misses differ from the arena's"
+        )
+        let wall = records.map { $0.wallMilliseconds }.reduce(0, +)
+        let tiled = records.map { $0.tiledMilliseconds }.reduce(0, +)
+        XCTAssertLessThanOrEqual(
+            tiled, wall * 1.02,
+            "\(label): the layer records exceed the positions they came from"
+        )
+        XCTAssertGreaterThanOrEqual(
+            tiled, wall * 0.8,
+            "\(label): the layer records account for too little of the positions"
+        )
+
+        return LiveFillArm(
+            label: label,
+            records: records,
+            misses: misses,
+            firstTouch: firstTouch,
+            refetch: refetch,
+            bytes: bytes,
+            evictions: runtime.arena.evictions - evictionsBefore,
+            resident: runtime.arena.residentCount,
+            capacity: runtime.arena.capacity,
+            lastLogits: logits
+        )
+    }
+
+    /// One arm's budget, its hand-off decomposed, then its per-position curve: a miss
+    /// rate that decays with the position is a cold-start fill a longer turn would not
+    /// pay, and one that plateaus is a steady state no sequence length improves.
+    private func reportLiveFill(_ arm: LiveFillArm) {
+        let positions = arm.records.count
+        print(
+            String(
+                format: "🔎 [dsv41 real] live fill (%@): %.1f ms/position = dense %.1f + "
+                    + "hand-off %.1f + expert halves %.1f; reads %.0f MB in %.1f miss(es) "
+                    + "at %.1f GB/s",
+                arm.label,
+                arm.wallPerPosition,
+                arm.densePerPosition,
+                arm.handoffPerPosition,
+                arm.mixturePerPosition,
+                arm.megabytesPerPosition,
+                arm.missesPerPosition,
+                arm.gigabytesPerSecond
+            )
+        )
+        let prepare = arm.preparePerPosition
+        let fill = arm.preparePerPosition + arm.preadPerPosition + arm.placementPerPosition
+        let named = arm.routingPerPosition + fill + arm.idlePerPosition
+            + arm.encodePerPosition
+        print(
+            String(
+                format: "🔎 [dsv41 real]   %@ hand-off %.1f ms = routing %.1f + fill %.1f "
+                    + "(prepare %.1f = allocate %.1f + wire %.1f + resolve %.1f, "
+                    + "pread %.1f, place %.1f) + idle %.1f + encode %.1f "
+                    + "-> %.1f ms unattributed",
+                arm.label,
+                arm.handoffPerPosition,
+                arm.routingPerPosition,
+                fill,
+                prepare,
+                arm.allocatePerPosition,
+                arm.wirePerPosition,
+                arm.resolvePerPosition,
+                arm.preadPerPosition,
+                arm.placementPerPosition,
+                arm.idlePerPosition,
+                arm.encodePerPosition,
+                arm.handoffPerPosition - named
+            )
+        )
+        // Resolving a miss is host bookkeeping that a faster disk would not shorten, so
+        // it is worth a number per miss rather than a bucket: allocate and wire are paid
+        // once per NEW slot, and whatever preparation is left tracks the miss count.
+        print(
+            String(
+                format: "🔎 [dsv41 real]   %@: %.3f ms of resolve per miss, %.3f ms of "
+                    + "allocate+wiring per miss, %.1f miss(es)/position",
+                arm.label,
+                arm.missesPerPosition > 0
+                    ? arm.resolvePerPosition / arm.missesPerPosition : 0,
+                arm.missesPerPosition > 0
+                    ? (arm.allocatePerPosition + arm.wirePerPosition)
+                        / arm.missesPerPosition : 0,
+                arm.missesPerPosition
+            )
+        )
+        print(
+            String(
+                format: "🔎 [dsv41 real]   %@: %d miss(es) over %d position(s), %d first "
+                    + "touch (%.1f%%), %d re-fetch (%.1f%%), %d eviction(s); arena "
+                    + "%d/%d resident",
+                arm.label,
+                arm.misses,
+                positions,
+                arm.firstTouch,
+                positions > 0 ? 100 * Double(arm.firstTouch) / Double(max(1, arm.misses)) : 0,
+                arm.refetch,
+                positions > 0 ? 100 * Double(arm.refetch) / Double(max(1, arm.misses)) : 0,
+                arm.evictions,
+                arm.resident,
+                arm.capacity
+            )
+        )
+        for record in arm.records where record.position % 32 == 0 || record.position == positions - 1 {
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   %@ position %3d: wall %.1f ms "
+                        + "(dense %.1f, hand-off %.1f, expert %.1f), %d miss(es), "
+                        + "%.0f MB, pread %.1f ms, idle %.1f ms",
+                    String(arm.label.prefix(5)),
+                    record.position,
+                    record.wallMilliseconds,
+                    record.denseMilliseconds,
+                    record.handoffMilliseconds,
+                    record.mixtureMilliseconds,
+                    record.misses,
+                    Double(record.bytes) / 1_048_576,
+                    record.preadMilliseconds,
+                    record.idleMilliseconds
+                )
+            )
+        }
+    }
 }

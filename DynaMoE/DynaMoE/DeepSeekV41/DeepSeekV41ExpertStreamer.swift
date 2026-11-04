@@ -550,6 +550,17 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
     /// read time so choosing slots is a number rather than an assumption.
     private var secondsPlacing: Double = 0
     public private(set) var placements: Int = 0
+    /// Wall time a fill spends in `placeResident` outside the arena's own placement.
+    ///
+    /// That covers three different things and they do not behave alike (`#67`): creating
+    /// a slot's `MTLBuffer`, wiring it with `mlock`, and resolving the six tensor refs and
+    /// read ranges a missed expert needs. Only the last is per MISS -- 0.006-0.011 ms --
+    /// so the caller reads this figure beside `timing.allocating` and `timing.wiring` and
+    /// subtracts them. Billed through a `defer` in `placeResident` so a throw is counted
+    /// too: a failed resolve still did its lookups, and leaving those out would make
+    /// preparation look cheap exactly when the fill is going badly.
+    private var secondsPreparing: Double = 0
+    public private(set) var preparations: Int = 0
     /// Keeps the optional read-back's loads alive so the compiler cannot drop them.
     private var touchSink: Int = 0
     /// The arena's residency policy: whether its slots may be wired, and what that
@@ -598,6 +609,16 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return (secondsPlacing, placements)
+    }
+
+    /// Time spent preparing a fill short of its placement, and how many fills that
+    /// covered. Read beside `placementTiming`, `timing.allocating`, `timing.wiring` and
+    /// `timing.reading`: together they say every millisecond of a fill is one of choosing
+    /// a slot, creating it, wiring it, resolving its bytes, or reading them.
+    public var prepareTiming: (seconds: Double, preparations: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (secondsPreparing, preparations)
     }
 
     /// How much of the arena has been wired with `mlock`, and how many slots refused.
@@ -907,14 +928,28 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
                 requested: experts.count, capacity: capacity
             )
         }
-        let placementStarted = DispatchTime.now().uptimeNanoseconds
+        // The whole call minus the arena's own placement. A `defer` rather than a stamp
+        // before the return so a throw is billed too: a failed resolve still did its
+        // catalog lookups, and leaving those out would make preparation look cheap
+        // exactly when the fill is going badly.
+        let prepareStarted = DispatchTime.now().uptimeNanoseconds
+        var placementNanoseconds: UInt64 = 0
+        defer {
+            let elapsed = DispatchTime.now().uptimeNanoseconds - prepareStarted
+            if elapsed > placementNanoseconds {
+                lock.lock()
+                secondsPreparing += Double(elapsed - placementNanoseconds) / 1_000_000_000
+                preparations += 1
+                lock.unlock()
+            }
+        }
+        let placementStarted = prepareStarted
         let reservations = arena.acquireDetailed(
             experts.map { (layer: layer, expert: $0) }
         )
+        placementNanoseconds = DispatchTime.now().uptimeNanoseconds - placementStarted
         lock.lock()
-        secondsPlacing += Double(
-            DispatchTime.now().uptimeNanoseconds - placementStarted
-        ) / 1_000_000_000
+        secondsPlacing += Double(placementNanoseconds) / 1_000_000_000
         placements += reservations.count
         lock.unlock()
 
