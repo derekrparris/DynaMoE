@@ -40,23 +40,36 @@ enum QueuedTurnEvent: @unchecked Sendable {
 
 /// FIFO queue over the engine's single-flight generation slot. Each request
 /// enqueues its whole turn; the work only begins once every earlier turn has
-/// fully drained AND the engine's one generation slot is free — the chat UI
-/// and the agent harness launch turns straight through the engine, so they
-/// hold that slot without appearing in this FIFO and a request waits for them
-/// the same way it waits for its predecessor. Cancellation propagates to the
-/// owner task, which cancels the engine turn handle. Queue-wait timeouts are
-/// delivered at their deadline even when a predecessor is stalled; the
+/// fully drained AND the engine's one generation slot has been CLAIMED — the chat
+/// UI and the agent harness launch turns straight through the engine, so they
+/// occupy that slot without appearing in this FIFO and a request waits for them
+/// the same way it waits for its predecessor. The claim is taken in the same step
+/// that decides the slot is free and is handed to the turn's launch, so the
+/// preparation between the two cannot lose the slot to a chat turn that starts in
+/// between (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #84"). Cancellation propagates
+/// to the owner task, which cancels the engine turn handle. Queue-wait timeouts
+/// are delivered at their deadline even when a predecessor is stalled; the
 /// timed-out turn leaves the queue without running work, while turns queued
 /// behind it still wait for their predecessors' drain.
 actor TurnExecutionQueue {
     /// How the queue asks whether the engine's single-flight generation slot is
     /// free. A probe rather than a direct read so the wait for an in-app
     /// generation can be tested without loading a model; production passes the
-    /// default.
+    /// default. It exists only to tell the two queue-wait timeouts apart — the
+    /// claim below is what actually decides.
     private let slotProbe: @Sendable () async -> Bool
 
-    init(slotProbe: @escaping @Sendable () async -> Bool = TurnExecutionQueue.engineSlotIsFree) {
+    /// How the queue takes the slot. Nil means somebody else holds it, in which
+    /// case the turn keeps waiting rather than failing: the request has already
+    /// invested its queue wait and a claim is bounded work, not a refusal.
+    private let slotReserve: @Sendable () async -> TurnSlotClaim?
+
+    init(
+        slotProbe: @escaping @Sendable () async -> Bool = TurnExecutionQueue.engineSlotIsFree,
+        slotReserve: @escaping @Sendable () async -> TurnSlotClaim? = TurnExecutionQueue.claimEngineSlot
+    ) {
         self.slotProbe = slotProbe
+        self.slotReserve = slotReserve
     }
 
     /// Chain element for successor turns: resolves only once every earlier
@@ -96,8 +109,8 @@ actor TurnExecutionQueue {
 
     /// Why a turn stopped waiting for the engine's generation slot.
     private enum SlotWaitOutcome {
-        /// Nothing holds the slot: run the work.
-        case opened
+        /// The slot was claimed: run the work with this claim.
+        case opened(TurnSlotClaim)
         /// An earlier SERVER turn was still draining at the deadline.
         case timedOutBehindTurns
         /// The deadline passed with a generation the app started holding the slot.
@@ -109,10 +122,19 @@ actor TurnExecutionQueue {
     /// Read through the engine rather than tracked here, because the chat UI and
     /// the agent harness call `CompletionEngine.launchTurn` directly and never
     /// route through this queue — so a slot this queue believes free is not
-    /// necessarily free.
+    /// necessarily free. A claim another caller holds reads as busy here too.
     nonisolated private static func engineSlotIsFree() async -> Bool {
         let active = await CompletionEngine.shared.isActive
         return !active
+    }
+
+    /// Takes the engine's generation slot, or nil if a turn already holds it.
+    ///
+    /// This is the queue's only way in: the turn is launched with the claim it
+    /// returns, so the slot stays ours across the preparation between here and
+    /// `CompletionEngine.launchTurn`.
+    nonisolated private static func claimEngineSlot() async -> TurnSlotClaim? {
+        await CompletionEngine.shared.reserveTurnSlot()
     }
 
     /// Waits for the engine's single-flight generation slot to be free: first for
@@ -130,7 +152,8 @@ actor TurnExecutionQueue {
     nonisolated private static func waitForSlot(
         _ previous: Task<Void, Never>,
         deadline: Date?,
-        slotProbe: @Sendable () async -> Bool
+        slotProbe: @Sendable () async -> Bool,
+        slotReserve: @Sendable () async -> TurnSlotClaim?
     ) async throws -> SlotWaitOutcome {
         let drained = DrainFlag()
         let watcher = Task.detached(priority: .utility) { [previous, drained] in
@@ -154,10 +177,15 @@ actor TurnExecutionQueue {
             await previous.value
         }
         // Same deadline, same cadence: only reached while a generation is actually
-        // running, so the idle case costs one MainActor hop.
+        // running, so the idle case costs one MainActor hop. A probe that says free
+        // followed by a claim that fails means somebody else took the slot in
+        // between — that caller now owns it, so this one goes back to waiting
+        // instead of launching into a refusal.
         while true {
             try Task.checkCancellation()
-            if await slotProbe() { return .opened }
+            if await slotProbe(), let claim = await slotReserve() {
+                return .opened(claim)
+            }
             if let deadline, Date() >= deadline {
                 return .timedOutBehindInAppTurn
             }
@@ -179,8 +207,12 @@ actor TurnExecutionQueue {
     /// through the hook — at the producer — because the relay can deliver an
     /// event late, so an SSE writer blocked on an earlier heartbeat would
     /// otherwise stamp generation time as queue wait.
+    ///
+    /// The work closure receives the engine-slot claim the queue took on its
+    /// behalf; a turn launched from here must pass it to
+    /// `CompletionEngine.launchTurn(_:claim:)` or the launch will be refused.
     func streamTurn(
-        _ work: @escaping @Sendable (_ emit: @escaping @Sendable (QueuedTurnEvent) -> Void) async -> Void,
+        _ work: @escaping @Sendable (_ claim: TurnSlotClaim, _ emit: @escaping @Sendable (QueuedTurnEvent) -> Void) async -> Void,
         queueWaitTimeout: TimeInterval? = nil,
         onSlotOpened: (@Sendable () -> Void)? = nil
     ) -> (AsyncStream<QueuedTurnEvent>, Task<Void, Never>) {
@@ -210,8 +242,13 @@ actor TurnExecutionQueue {
                 continuation.yield(.ping(comment: nil))
             }
         }
-        let task = Task<Void, Never> { [previous, heartbeat, deadline, onSlotOpened, slotProbe, drained] in
+        let task = Task<Void, Never> { [previous, heartbeat, deadline, onSlotOpened, slotProbe, slotReserve, drained] in
+            var heldClaim: TurnSlotClaim?
             defer {
+                // A claim this turn never redeemed (a timeout, a cancellation, a
+                // work closure that threw first) goes back here; one the launch
+                // already released is a no-op.
+                heldClaim?.release()
                 // The heartbeat also serves the RUNNING turn: cancel it here, not
                 // right after the previous turn drains, so the SSE stream keeps
                 // emitting ping frames while a long prefill runs and clients
@@ -221,12 +258,13 @@ actor TurnExecutionQueue {
                 heartbeat.cancel()
                 drained.resolve()
             }
+            let claim: TurnSlotClaim
             do {
                 switch try await Self.waitForSlot(
-                    previous, deadline: deadline, slotProbe: slotProbe
+                    previous, deadline: deadline, slotProbe: slotProbe, slotReserve: slotReserve
                 ) {
-                case .opened:
-                    break
+                case .opened(let opened):
+                    claim = opened
                 case .timedOutBehindTurns:
                     continuation.yield(.launchFailed(ServerAPIError.requestTimeout(
                         "Request timed out waiting in the generation queue")))
@@ -243,12 +281,13 @@ actor TurnExecutionQueue {
                 continuation.finish()
                 return
             }
+            heldClaim = claim
             guard !Task.isCancelled else {
                 continuation.finish()
                 return
             }
             onSlotOpened?()
-            await work { continuation.yield($0) }
+            await work(claim) { continuation.yield($0) }
             continuation.finish()
         }
         cancelBox.set { task.cancel() }
@@ -268,8 +307,12 @@ actor TurnExecutionQueue {
     /// Cancelling the caller cancels the queued work: a cancelled request
     /// neither launches after its predecessor drains nor leaves a running
     /// engine turn unreachable by the work's own cancellation hook.
+    ///
+    /// The work closure receives the engine-slot claim the queue took on its
+    /// behalf; a turn launched from here must pass it to
+    /// `CompletionEngine.launchTurn(_:claim:)` or the launch will be refused.
     func perform<T: Sendable>(
-        _ work: @escaping @Sendable () async throws -> T,
+        _ work: @escaping @Sendable (_ claim: TurnSlotClaim) async throws -> T,
         queueWaitTimeout: TimeInterval? = nil,
         onSlotOpened: (@Sendable () -> Void)? = nil
     ) async throws -> T {
@@ -292,18 +335,24 @@ actor TurnExecutionQueue {
 
         let cancelBox = ServerTurnCancelBox()
         let hookID = registerCancelBox(cancelBox)
-        let task = Task<T, Error> { [previous, deadline, slotProbe, drained] in
+        let task = Task<T, Error> { [previous, deadline, slotProbe, slotReserve, drained] in
+            var heldClaim: TurnSlotClaim?
             defer {
+                // A claim this turn never redeemed — a timeout, a cancellation, a
+                // work closure that threw — goes back here; one the launch already
+                // released is a no-op.
+                heldClaim?.release()
                 self.completedOperations += 1
                 self.deregisterCancelBox(hookID)
                 drained.resolve()
             }
             let outcome = try await Self.waitForSlot(
-                previous, deadline: deadline, slotProbe: slotProbe
+                previous, deadline: deadline, slotProbe: slotProbe, slotReserve: slotReserve
             )
+            let claim: TurnSlotClaim
             switch outcome {
-            case .opened:
-                break
+            case .opened(let opened):
+                claim = opened
             case .timedOutBehindTurns:
                 throw ServerAPIError.requestTimeout("Request timed out waiting in the generation queue")
             case .timedOutBehindInAppTurn:
@@ -311,9 +360,10 @@ actor TurnExecutionQueue {
                     "Request timed out waiting for a generation running in the DynaMoE app"
                 )
             }
+            heldClaim = claim
             try Task.checkCancellation()
             onSlotOpened?()
-            return try await work()
+            return try await work(claim)
         }
         cancelBox.set { task.cancel() }
         return try await withTaskCancellationHandler {
@@ -1644,11 +1694,11 @@ final class ServerController: ObservableObject {
     /// both adapters' non-streaming paths. The slot-open signal stamps the
     /// box's queue wait so it can be split from generation time.
     nonisolated private static func runTurn(plan: TurnPlan, queue: TurnExecutionQueue, logBox: ServerRequestLogBox?) async throws -> TurnResult {
-        try await queue.perform({ () async throws -> TurnResult in
+        try await queue.perform({ claim in
             try await withTurnToolMask(plan.maskSchemas) {
                 let launch: CompletionLaunch
                 do {
-                    launch = try CompletionEngine.shared.launchTurn(plan.request)
+                    launch = try CompletionEngine.shared.launchTurn(plan.request, claim: claim)
                 } catch {
                     throw wireLaunchError(error)
                 }
@@ -1895,7 +1945,7 @@ final class ServerController: ObservableObject {
                 let close = TurnTextSplitter.canonicalReasoningCloseTag
                 try await sse(chunkBuffer(.init(role: nil, content: close + "\n\n", reasoningContent: nil, toolCalls: nil), finishReason: nil))
             }
-            let (relay, task) = await queue.streamTurn({ emit in
+            let (relay, task) = await queue.streamTurn({ claim, emit in
                 do {
                     let plan = try ServerController.buildTurnPlan(apiRequest)
                     promptTokensBox.set(plan.promptTokenCount)
@@ -1908,7 +1958,7 @@ final class ServerController: ObservableObject {
                         row.model = plan.modelName
                     }
                     try await ServerController.withTurnToolMask(plan.maskSchemas) {
-                        let launch = try CompletionEngine.shared.launchTurn(plan.request)
+                        let launch = try CompletionEngine.shared.launchTurn(plan.request, claim: claim)
                         if Task.isCancelled {
                             launch.handle.cancel()
                             return
@@ -2240,7 +2290,7 @@ final class ServerController: ObservableObject {
                 }
             }
 
-            let (relay, task) = await queue.streamTurn({ emit in
+            let (relay, task) = await queue.streamTurn({ claim, emit in
                 do {
                     let plan = try ServerController.buildTurnPlan(apiRequest)
                     promptTokensBox.set(plan.promptTokenCount)
@@ -2251,7 +2301,7 @@ final class ServerController: ObservableObject {
                         row.model = plan.modelName
                     }
                     try await ServerController.withTurnToolMask(plan.maskSchemas) {
-                        let launch = try CompletionEngine.shared.launchTurn(plan.request)
+                        let launch = try CompletionEngine.shared.launchTurn(plan.request, claim: claim)
                         if Task.isCancelled {
                             launch.handle.cancel()
                             return

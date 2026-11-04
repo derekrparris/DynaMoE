@@ -226,6 +226,13 @@ public final class CompletionEngine: @unchecked Sendable {
     private var currentGenerationId: UInt64 = 0
     private var generationCounter: UInt64 = 0
 
+    /// Ownership of the single-flight slot while a turn is being PREPARED, i.e.
+    /// after a caller has been told the slot is free and before `launchTurn` mints
+    /// the turn. See `EngineTurnSlot.swift`: it is what lets the server queue hold
+    /// the slot across a turn's preparation instead of losing it to a chat turn
+    /// that starts in between (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #84").
+    private let turnSlotLedger = TurnSlotLedger()
+
     // Loaded-model state; `configure` is called by the model load/switch path.
     private var summary: ModelSummary?
     private var modelConfig: ModelConfig?
@@ -258,10 +265,15 @@ public final class CompletionEngine: @unchecked Sendable {
 
     private init() {}
 
+    /// True while a turn is running OR one is being prepared under a claim.
+    ///
+    /// The second half matters to the server queue: it asks this before deciding to
+    /// launch, and a claim taken by another caller is exactly as busy as a running
+    /// turn.
     public var isActive: Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return currentGenerationTask != nil
+        return currentGenerationTask != nil || turnSlotLedger.isClaimed
     }
 
     public var hasLoadedModel: Bool {
@@ -349,8 +361,40 @@ public final class CompletionEngine: @unchecked Sendable {
         return summary
     }
 
-    func launchTurn(_ request: CompletionTurnRequest) throws -> CompletionLaunch {
+    /// Claims the single-flight generation slot for a caller that is about to spend
+    /// real time preparing a turn — tokenizing, rendering the prompt, resolving the
+    /// prefix — before `launchTurn` can be called. Nil when a turn is already
+    /// running or another caller holds the slot.
+    ///
+    /// The claim is redeemed by `launchTurn(_:claim:)`, which honours it, and must
+    /// be released if that launch never happens. Holding one makes `isActive` true,
+    /// so a caller that is merely preparing looks busy to everyone else: that is
+    /// the point — see `EngineTurnSlot.swift`.
+    func reserveTurnSlot() -> TurnSlotClaim? {
         stateLock.lock()
+        defer { stateLock.unlock() }
+        guard currentGenerationTask == nil else { return nil }
+        return turnSlotLedger.tryClaim()
+    }
+
+    /// Launches one turn, taking the single-flight slot on the way in.
+    ///
+    /// `claim` is a reservation the caller already holds (`reserveTurnSlot`); with
+    /// none, the slot is taken here in one step, so a launch can never be raced by
+    /// another launch. Either way the claim is released when this returns: from
+    /// then on `currentGenerationTask` is what occupies the slot.
+    func launchTurn(
+        _ request: CompletionTurnRequest,
+        claim: TurnSlotClaim? = nil
+    ) throws -> CompletionLaunch {
+        stateLock.lock()
+        guard let held = claim ?? turnSlotLedger.tryClaim() else {
+            stateLock.unlock()
+            throw CompletionLaunchError.engineNotReady(
+                "❌ The local API server is starting a generation; one turn may run at a time. Try again in a moment."
+            )
+        }
+        defer { held.release() }
         if currentGenerationTask != nil {
             stateLock.unlock()
             throw CompletionLaunchError.engineNotReady("❌ A generation is already active; one turn may run at a time.")

@@ -12962,3 +12962,141 @@ handlers this slice did not touch). `test-without-building` with the same `-deri
 
 The pre-fix arm is a real A/B, not an estimate: the parent commit's `ServerController.swift`
 was restored, built into `/tmp/dd_dsv41_pre`, and the burst case run against it five times.
+
+## DSV4.1 #84: THE SLOT IS NOW HELD, NOT JUST LOOKED AT, AND THE QUEUE'S LAST 503 WINDOW IS CLOSED
+
+### The question
+
+`#83` closed with the seam it could not close: "a request can still hit it if an in-app turn
+starts in the microseconds between the slot opening and `launchTurn` — a hop, not a wait. That
+window is a design seam (the queue cannot reserve the engine slot), and it is rare; closing it
+would mean giving `launchTurn` a reservation API."
+
+Two things in that sentence turned out to be wrong, and they are the reason this slice was
+worth doing.
+
+1. **The window is not microseconds.** Between the probe and the launch sits the queue's
+   whole `work` closure: `buildTurnPlan` renders the prompt and tokenizes it, the turn memory
+   is looked up, the prefix pin is consulted, images are priced. On a long API prompt that is
+   not a hop, it is the preparation. The seam was as wide as a turn's setup, not as wide as a
+   scheduling hop. (Unmeasured — this is a code fact about what sits between the two calls, and
+   it is why the fix had to hold the slot rather than shorten the gap.)
+2. **The party that paid for it was the wrong one.** The client that lost was the one that had
+   already waited out the FIFO, its queue timeout, and its heartbeats, and got `503` at the
+   end of it; the chat turn that caused it ran to completion. A seam that fails the caller who
+   has invested the most waiting is the worst available ordering.
+
+Routing: `next_slice` = `reservation_api` at **0.518 @ 0.438**, with `image_cost_ceiling` at
+0.296 and every perf candidate under 0.12; and `measurement_slice_is_worth_it` = **0.045**,
+decisively against spending the session on another stage table. The choice was mid-band and
+low-confidence, so it was taken on the second answer plus the reasoning above rather than on
+the probability: what is left of the perf journal is each under ~1% of a prefill position
+(`#73`'s three FP8 projections are the dense half, `#74`'s `select` rail is 1.1% of a
+position, `#72`'s shared-expert lever is under 1%), while this is a correctness hole in the
+contract `#83` had just shipped.
+
+### What was added
+
+**One new primitive** (`EngineTurnSlot.swift`):
+
+- `TurnSlotClaim` — a hold on the engine's single-flight generation slot. Only one can be
+  outstanding, `release()` is idempotent, and it is a ticket rather than a flag so a claim that
+  was already given back cannot release the slot out from under whoever holds it now (both the
+  queue and the launch path release on their way out).
+- `TurnSlotLedger` — the lock box that grants the one claim. `nonisolated`, like the queue's
+  other boxes: this target builds with `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, and a
+  release that had to hop to the main actor could land after the next turn had already looked.
+
+**On the engine** (`CompletionEngine.swift`):
+
+- `reserveTurnSlot() -> TurnSlotClaim?` — nil when a turn is running or another caller holds
+  the slot. This is the queue's only way in.
+- `isActive` is `currentGenerationTask != nil || turnSlotLedger.isClaimed`: a turn being
+  PREPARED occupies the slot exactly like a running one, which is what makes the claim
+  visible to every other prober (the queue's own, `MCPManager`'s config-reload deferral, the
+  UI's busy state).
+- `launchTurn(_:claim:)` takes the slot on the way in — the caller's claim if it has one, or
+  one of its own, in the same step, so two launches can never both see a free slot. A launch
+  that holds no claim while one is outstanding is refused with its own message ("the local API
+  server is starting a generation"), and a `defer` gives the claim back on every one of the
+  function's many early throws, which is what keeps a refused turn from wedging the server.
+
+**On the queue** (`ServerController.swift`):
+
+- `slotReserve` joins `slotProbe` as an injectable `@Sendable` closure (so the whole seam is
+  testable with no model, the way `#83`'s probe already was), and `SlotWaitOutcome.opened` now
+  carries the claim.
+- A probe that says free followed by a claim that FAILS is a retry, not a refusal: somebody
+  else took the slot in that instant, so the turn goes back to waiting inside
+  `waitForSlot`, still bounded by its deadline. Nothing about the request is thrown away.
+- `perform`/`streamTurn` hand the claim to the work closure and release it in the same `defer`
+  that drains the queue, so a claim the turn never redeemed (a timeout, a cancellation, a work
+  closure that threw) goes back. `runTurn` and both streaming writers now pass it to
+  `launchTurn`.
+
+### What it says
+
+- **Reserving converts a lost race into a wait, provided the loser is still waiting.** That is
+  the whole shape of the fix: `#83` made the queue wait for the slot, and the wait was undone
+  by a check-then-take pair. Taking the slot in one step is all it needed.
+- **The seam could not be closed by retrying the work closure.** That is the alternative that
+  looks free and is not: `work` is opaque to the queue, so "the slot was gone" arrives as an
+  `engineNotReady` that is indistinguishable from "no model is loaded" or "this checkpoint
+  cannot run", and re-running the closure would re-render the prompt, re-tokenize it and
+  re-record the request-log box. The claim is what makes the loss distinguishable and
+  non-fatal, and it makes `work` run exactly once.
+- **The fix moves who can lose, it does not remove losing.** An in-app turn that arrives while
+  a server request is being prepared is now refused at its own launch with a message naming
+  the server, where before it would have won and the request would have failed. That is a
+  real, deliberate trade and it is scoped as narrowly as it can be: the losing case is a chat
+  send landing inside another turn's setup, it is immediate rather than after a wait, and it
+  is retryable by pressing send again. It is also not a new class of failure for the user —
+  a chat turn sent while a server turn was RUNNING already failed with `engineNotReady`.
+- **Every early throw in `launchTurn` had to give the claim back.** The function has dozens of
+  refusal paths (no model, no tokenizer, an image on a family with no tower, a checkpoint that
+  cannot be provisioned, a prompt that priced differently than it bound). One `defer` covers
+  all of them, and `testARefusedLaunchWithoutAClaimGivesTheSlotBack` is what says so.
+
+### What it is not (do not re-propose)
+
+- **Not a change to what a `503` means.** A launch that fails for the model's own reasons is
+  still a `503` through `wireLaunchError`, and `ServerControllerSmokeTests` still pins those
+  envelopes. What no longer produces a `503` is *winning the probe and losing the slot*.
+- **Not a new knob.** No setting, no timeout, no queue policy: the claim is invisible to
+  clients and the existing `dynamoe_server_queue_timeout` still bounds the wait.
+- **Not the queue owning the engine slot.** The queue observes and holds a claim; `stop()`
+  still cancels exactly the server-owned boxes and still cannot touch the app's turn.
+- **Not proof of race-freedom.** The invariant is stated and pinned ("one claim at a time, and
+  every path gives it back"), not proven. The 24-enqueue burst case now also runs through the
+  real ledger, which is the closest thing to a proof this suite offers.
+- **Not the last word on the in-app side.** A chat turn whose own preparation (prompt
+  formatting in `ContentView`) straddles a server claim still loses, because that preparation
+  happens before `launchTurn` and there is nowhere to hold a slot for it. Making the chat path
+  reserve early means making `startAutoregressiveGeneration` async; it is not needed while the
+  loss is bounded by a turn's setup, and it is the obvious next step if it ever bites.
+- Everything from `#51`-`#83` still stands.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_84` (status 0). The warning set is
+**identical** to `#83`'s build, line for line — 1,773 warnings, `diff` clean — so this slice
+introduced none, despite touching the actor-isolation-sensitive part of `ServerController`.
+
+`test-without-building` with the same `-derivedDataPath`:
+
+| suite | result |
+|---|---|
+| `EngineTurnSlotTests` (new: the ledger's one-at-a-time rule, a stale ticket, the engine looking busy under a claim, an in-app launch refused while a server claim is held, a claim-carrying launch honoured, and a refused launch giving the slot back) | **7 cases, 0 failures** |
+| `ServerQueueLogicTests` (30 cases: `#83`'s 19 plus 4 for the claim — a lost claim retried rather than reported, the claim held for the whole turn, released when the work throws, and a claim another caller holds waited for rather than refused) | **30 cases, 0 failures** |
+| `OpenAIAdapterLogicTests`, `AnthropicAdapterLogicTests`, `ServerStreamSafetyTests`, `ServerToolArgumentTests`, `ServerHardeningLogicTests`, `TurnToolMaskTests`, `ChatPromptFormatterConversationTests`, `ReasoningRoundTripTests`, `PrefixAsOfDateTests` | 119 cases, 0 failures |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787) | 17 cases, 0 failures — including the `503` envelopes, which is what says the claim did not swallow the model-not-loaded path |
+
+The live arm is `DeepSeekV41PublishedTurnTests.testAnAPIRequestWithAnImageAnswersOverTheLocalServer`
+(opt-in, `/tmp/dynamoe_dsv41_real_turn`): a real request through the real server, whose launch
+now carries the queue's claim into `launchTurn`. It passes (117 s, `/tmp/test84_live2.log`): the
+checkpoint indexed as 96,085 tensors over 48 mapped segments (475.25 GB), the server came up on
+127.0.0.1:8791, and two requests answered `200` — the plain prompt in 33.1 s (queue 77 ms) and
+the same prompt with one attachment in 80.9 s (queue 76 ms), 190 prompt tokens against 375, a
+span of 184 positions over 1,521 patch tokens from 0.32 s of tower, the model describing the
+picture it was sent. So the claim travels from the queue through `work` and `withTurnToolMask`
+into the engine and back, and the queue-wait stamps the server already logged are unchanged.
