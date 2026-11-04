@@ -12600,3 +12600,112 @@ and `/tmp/test80_run2.log` after it, `Executed 2 tests, with 0 failures` in both
 `passed` line present. Bundle freshness checked with
 `strings … | grep -c "testAStreamedAPI…\|testAStreamedAnthropic…"` (2) before running, because `#78`'s
 silent-zero trap is a green run that executes nothing.
+## DSV4.1 #81: THE MODELS LIST NOW SAYS WHAT THE MODEL CAN DO, FROM THE SAME FACTS THE PLANNER GATES ON
+
+### The question
+
+Three consecutive slices ended by naming the same hole. `#78` proved a non-streaming image turn answers;
+`#79` did it for the Anthropic route; `#80` did it for both streaming transports. Each of them then had to
+write down that **a client had no way to learn any of it**: `GET /v1/models` answered with
+
+```json
+{"object":"list","data":[{"id":"<snapshot hash>","object":"model","created":1793830186,"owned_by":"dynamoe"}]}
+```
+
+An id and a timestamp. So the only way to discover that the served checkpoint reads pictures was to send
+one and see whether it came back as an answer or a 400, and the only way to discover the prompt ceiling was
+to exceed it, and the only way to discover whether a reasoning request would be honoured was to ask and
+watch.
+
+That is not a cosmetic gap on this branch. The capability exists, is exercised end to end on both
+protocols and both transports, and was undiscoverable.
+
+Routing: `next_slice` = `models_vision_capability` **0.986 @ 0.983** against a larger "capability plus
+image-cost metadata" slice 0.011, a docs pass 0.0017, single-flight queueing 0.0014 and the three remaining
+prefill terms at 0.0002, 0.0002 and 0.0001. `declare_vision_before_it_is_device_verified` **0.998**: the
+capability is real for a client today (a picture is accepted and answered), only slower than text, and
+`#43`'s encode is a device pass, so advertising it is not an overclaim.
+
+### What landed
+
+`OpenAIModelList.Model` gained three additive fields and a factory, and the route that builds it stayed six
+lines:
+
+- **`capabilities: { vision, thinking, thinking_levels }`** — copied from `LoadedModelInfo`, which is the
+  same snapshot of facts `buildTurnPlan` reads. `vision` is `ModelConfig.supportsVision`, whose own gate is
+  the tower's files rather than the model row's flag, so a half-downloaded checkpoint cannot advertise a
+  tower it cannot run. Deliberately NOT a hand-written list: a capability the planner does not gate on
+  would be marketing, and a swapped flag here is silent on the wire.
+- **`context_length`** — the checkpoint's own architectural ceiling, `effectiveMaxPositionEmbeddings`
+  (1,048,576 here). Not this machine's KV budget: a client asking "how much fits" wants the weights'
+  answer, and the two numbers are far apart on purpose.
+- **`max_prompt_tokens`** — the prompt length the server actually refuses
+  (`dynamoe_server_max_prompt_tokens`, 262,144 by default), so a client can tell the weights' ceiling from
+  the server's. The "no cap" sentinel `Int.max` is reported as **nil**, because a client's JSON float
+  conversion would show `9.22e18` as a number rather than as "unlimited".
+- `OpenAIModelList.entry(for:contextLength:maxPromptTokens:created:)` is the same three-line mapping as a
+  free function of the facts, so it is testable with no loaded model.
+
+Nothing about the id changed: it is still the snapshot directory's own name (a hash). That is a real
+discoverability wart of its own, but it is what every response's `model` field carries and what the
+turn-memory digest and prefix session keys are built from, so renaming it would invalidate recorded turns
+across an update. Recorded here as a known limitation rather than changed inside a slice about
+capabilities.
+
+### Evidence
+
+The live check, on the published checkpoint (`testTheServerAdvertisesWhatTheLoadedCheckpointCanDo`):
+
+```
+🔎 [dsv41 real] live server: 96085 tensors in 48 shard(s), mapped 48/48 segment(s), 475.2508442029357 GB
+🔎 [dsv41 real] /v1/models: {"object":"list","data":[{"context_length":1048576,"created":1793830186,
+   "object":"model","owned_by":"dynamoe","capabilities":{"vision":true,"thinking_levels":true,
+   "thinking":true},"max_prompt_tokens":262144,"id":"1bae0e1088993b9b82de08f59de5be5a34e42170"}]}
+Test Case '…testTheServerAdvertisesWhatTheLoadedCheckpointCanDo' passed (1.716 seconds).
+```
+
+**1.716 seconds for the whole case** — the app-order load, the server start and the GET. That is the first
+place the numbers say something new about the harness itself: the load of a 475 GB, 96,085-tensor
+checkpoint is ~1.5 s (it indexes shard headers through the mmap rather than reading weights), so
+`#78`/`#79`/`#80`'s ~115 s per case is the TURNS and essentially none of it is the load. A capability check
+therefore costs nothing and belongs in the suite rather than in a one-off.
+
+The three assertions that matter are cross-checks against something outside the wire, not against a second
+copy of the mapping: `context_length` against `modelConfig.effectiveMaxPositionEmbeddings` from the
+config on disk, `thinking_levels` against `ModelConfig.supportsThinkingLevels(modelPath:)` (the planner's
+own gate), and `max_prompt_tokens` against `ServerController.resolvedMaxPromptTokens` (what the server
+enforces). `vision` is asserted true because this checkpoint publishes a tower, which is exactly the fact
+`#78`-`#80` spend their turns proving.
+
+Two pure cases pin the mapping without a model
+(`testModelListAdvertisesTheCapabilitiesThePlannerGatesOn`,
+`testModelListCapabilitiesFollowTheLoadedModelRatherThanTheWire`): the snake_case keys a client sees, that
+Swift property names do not leak (`thinkingLevels`), that a tower-less model reports `vision: false` rather
+than a hardcoded true, and that "no ceiling" and "no cap" both encode as absent rather than as sentinels.
+
+### What it does not mean
+
+- **Not a promise that the context is servable.** `context_length` is the weights' ceiling; the KV budget
+  still decides what a given machine affords, and a request past `max_prompt_tokens` is still a 400 with
+  `code: "context_length_exceeded"`.
+- **Not an image price.** Nothing advertises that a picture costs 184-1,005 prompt positions or 0.32-6.90 s
+  of tower. That was the larger slice this one beat on routing, and it needs the resize plan's own
+  arithmetic rather than a constant.
+- **Not an id change.** Still the snapshot hash; see above.
+- **Not a per-model list.** Exactly one entry, because the app serves exactly one loaded model; no loaded
+  model is still `{"object":"list","data":[]}`.
+- **Not an Anthropic-shaped models route.** `GET /v1/models` answers in the OpenAI shape on both protocols,
+  as it always has.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_81` (status 0, only the two pre-existing
+`ContentView.swift` Swift-6 actor warnings), then `test-without-building` with the same `-derivedDataPath`:
+the two pure cases from `/tmp/test81_run1.log` (`Executed 2 tests, with 0 failures`) and the live case from
+`/tmp/test81_run2.log`, gated on `touch /tmp/dynamoe_dsv41_real_turn` and removed in the same command.
+Bundle freshness checked with `strings … | grep -c testTheServerAdvertisesWhatTheLoadedCheckpointCanDo`
+(1) before running.
+
+The existing app-hosted smoke case (`ServerControllerSmokeTests.testModelsEndpointServesOpenAIListShape`,
+0.943 s) still passes unchanged: it asserts the list shape and the id, which is exactly the part this slice
+left alone.

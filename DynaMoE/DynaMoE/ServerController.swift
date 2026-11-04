@@ -835,12 +835,25 @@ final class ServerController: ObservableObject {
             ServerController.healthBody()
         }
 
-        router.get("v1/models") { request, context in
+        router.get("v1/models") { request, _ in
             try ServerController.authorizeOrThrow(request)
-            if let info = CompletionEngine.shared.loadedModelInfo {
-                return OpenAIModelList(data: [OpenAIModelList.Model(id: info.displayName, created: Int(Date().timeIntervalSince1970))])
+            guard let info = CompletionEngine.shared.loadedModelInfo else {
+                return OpenAIModelList(data: [])
             }
-            return OpenAIModelList(data: [])
+            // What this server refuses is a fact about the server, and what the
+            // weights support is a fact about the checkpoint; `Int.max` (the "no
+            // cap" sentinel) is reported as nil so neither is mistaken for the
+            // other after a client's JSON float conversion.
+            let promptCap = ServerController.resolvedMaxPromptTokens
+            return OpenAIModelList(data: [
+                OpenAIModelList.entry(
+                    for: info,
+                    contextLength: CompletionEngine.shared.promptModelConfig?
+                        .effectiveMaxPositionEmbeddings,
+                    maxPromptTokens: promptCap == Int.max ? nil : promptCap,
+                    created: Int(Date().timeIntervalSince1970)
+                )
+            ])
         }
 
         router.post("v1/chat/completions") { request, context in

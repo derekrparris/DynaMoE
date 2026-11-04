@@ -4349,6 +4349,71 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         }
     }
 
+    /// The server advertises what the loaded checkpoint can actually do.
+    ///
+    /// `#78`, `#79` and `#80` each proved a picture reaches the model, and none of
+    /// them could show how a client is supposed to FIND THAT OUT: `GET /v1/models`
+    /// answered with an id and a timestamp. The capability object is now composed
+    /// from the same facts the planner gates on, so this case reads it back through
+    /// the wire, on the real checkpoint, and cross-checks it against the config on
+    /// disk rather than against a second copy of the mapping.
+    func testTheServerAdvertisesWhatTheLoadedCheckpointCanDo() async throws {
+        let snapshot = try snapshotDirectory()
+        let modelConfig = try XCTUnwrap(
+            ModelConfig.load(from: snapshot),
+            "the checkpoint's config.json did not decode as a ModelConfig"
+        )
+        let engine = try loadPublishedCheckpointIntoTheSharedEngine(snapshot)
+        defer {
+            unloadSharedEngine()
+            withExtendedLifetime(engine) {}
+        }
+
+        let port = 8795
+        try await withLocalServer(on: port) { _ in
+            let (data, response) = try await URLSession.shared.data(
+                from: URL(string: "http://127.0.0.1:\(port)/v1/models")!
+            )
+            XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+            print("🔎 [dsv41 real] /v1/models: \(String(decoding: data, as: UTF8.self))")
+            let json = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: data) as? [String: Any],
+                "the models list was not a JSON object"
+            )
+            XCTAssertEqual(json["object"] as? String, "list")
+            let models = try XCTUnwrap(json["data"] as? [[String: Any]])
+            XCTAssertEqual(models.count, 1, "a loaded model must be advertised exactly once")
+            let model = try XCTUnwrap(models.first)
+            XCTAssertEqual(
+                model["id"] as? String, snapshot.lastPathComponent,
+                "the advertised id must be the loaded snapshot's own name"
+            )
+            XCTAssertEqual(model["object"] as? String, "model")
+            XCTAssertEqual(model["owned_by"] as? String, "dynamoe")
+            let capabilities = try XCTUnwrap(model["capabilities"] as? [String: Any])
+            // This checkpoint publishes a tower, so an attachment is read rather
+            // than refused: that is the whole point of advertising the flag.
+            XCTAssertEqual(capabilities["vision"] as? Bool, true)
+            XCTAssertEqual(capabilities["thinking"] as? Bool, true)
+            XCTAssertEqual(
+                capabilities["thinking_levels"] as? Bool,
+                ModelConfig.supportsThinkingLevels(modelPath: snapshot.path),
+                "the advertised levels flag must be the planner's own gate"
+            )
+            // The ceiling is the CHECKPOINT's, not this machine's KV budget.
+            XCTAssertEqual(
+                model["context_length"] as? Int,
+                modelConfig.effectiveMaxPositionEmbeddings
+            )
+            let cap = ServerController.resolvedMaxPromptTokens
+            XCTAssertEqual(
+                model["max_prompt_tokens"] as? Int,
+                cap == Int.max ? nil : cap,
+                "the server's own refusal threshold must be the one it enforces"
+            )
+        }
+    }
+
     /// The smallest thing ImageIO will decode.
     ///
     /// The checkpoint's own `min_pixels` floor (544x544) turns this 2x2 into its

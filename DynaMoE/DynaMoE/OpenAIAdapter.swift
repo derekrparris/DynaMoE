@@ -379,16 +379,73 @@ struct OpenAIChatChunk: Encodable {
 }
 
 struct OpenAIModelList: ResponseEncodable {
+    /// What a client may ask this model to do.
+    ///
+    /// Every field is copied from the fact the turn planner reads, never written
+    /// by hand, so what is advertised cannot drift from what a request is refused
+    /// for: `vision` decides whether an attachment is read or answered with a 400,
+    /// and `thinking`/`thinkingLevels` decide whether a reasoning request is
+    /// honoured or quietly ignored. A client that reads them can predict its own
+    /// rejection instead of discovering it. The object is additive to the OpenAI
+    /// schema on purpose; clients ignore keys they do not know.
+    struct Capabilities: Encodable {
+        var vision: Bool
+        var thinking: Bool
+        /// True when the family renders a graded effort level (High/Low/Off) into
+        /// its system block, rather than a plain on/off switch.
+        var thinkingLevels: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case vision, thinking
+            case thinkingLevels = "thinking_levels"
+        }
+    }
+
     struct Model: Encodable {
         let id: String
         let object: String = "model"
         let created: Int
         let ownedBy: String = "dynamoe"
+        /// The checkpoint's own architectural ceiling (`max_position_embeddings`),
+        /// not what this machine's KV budget affords. A client asking "how much
+        /// fits" wants the weights' answer; the server's own refusal threshold
+        /// travels separately as `max_prompt_tokens`.
+        let contextLength: Int?
+        /// The prompt length this server refuses outright
+        /// (`dynamoe_server_max_prompt_tokens`). Nil when the server has no cap.
+        let maxPromptTokens: Int?
+        let capabilities: Capabilities?
 
         enum CodingKeys: String, CodingKey {
-            case id, object, created
+            case id, object, created, capabilities
             case ownedBy = "owned_by"
+            case contextLength = "context_length"
+            case maxPromptTokens = "max_prompt_tokens"
         }
+    }
+
+    /// The one entry this server advertises for a loaded checkpoint.
+    ///
+    /// Kept a function of the facts so the mapping is testable without a loaded
+    /// model: a swapped flag here is silent on the wire and would tell a client
+    /// the opposite of what the planner does.
+    static func entry(
+        for info: CompletionEngine.LoadedModelInfo,
+        contextLength: Int?,
+        maxPromptTokens: Int?,
+        created: Int
+    ) -> Model {
+        Model(
+            id: info.displayName,
+            created: created,
+            contextLength: contextLength,
+            maxPromptTokens: maxPromptTokens,
+            capabilities: Capabilities(
+                vision: info.supportsVision,
+                thinking: info.supportsThinking,
+                thinkingLevels: info.supportsThinkingLevels
+            )
+        )
     }
 
     let object: String = "list"

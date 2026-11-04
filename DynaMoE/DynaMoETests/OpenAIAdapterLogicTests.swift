@@ -161,6 +161,77 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         XCTAssertFalse(json.contains("toolCalls"), "Swift property name must not leak into the payload")
     }
 
+    // MARK: - GET /v1/models
+
+    /// A load row of a vision-capable family, as `CompletionEngine` publishes it.
+    private func loadedInfo(
+        vision: Bool, thinking: Bool, levels: Bool
+    ) -> CompletionEngine.LoadedModelInfo {
+        CompletionEngine.LoadedModelInfo(
+            displayName: "DeepSeek-V4.1-Flash-1017",
+            path: "/nonexistent/snapshot",
+            supportsThinking: thinking,
+            supportsThinkingLevels: levels,
+            supportsVision: vision,
+            weightsSizeGB: 475.25
+        )
+    }
+
+    private func encodedModel(_ model: OpenAIModelList.Model) throws -> [String: Any] {
+        try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try JSONEncoder().encode(model)) as? [String: Any]
+        )
+    }
+
+    /// `/v1/models` is the only way a client can learn that an attachment will be
+    /// read rather than refused, so the capability it reports has to be the fact
+    /// the planner uses. `#78`/`#79`/`#80` each flagged its absence.
+    func testModelListAdvertisesTheCapabilitiesThePlannerGatesOn() throws {
+        let json = try encodedModel(OpenAIModelList.entry(
+            for: loadedInfo(vision: true, thinking: true, levels: true),
+            contextLength: 163_840,
+            maxPromptTokens: 262_144,
+            created: 1_700_000_000
+        ))
+        XCTAssertEqual(json["id"] as? String, "DeepSeek-V4.1-Flash-1017")
+        XCTAssertEqual(json["object"] as? String, "model")
+        XCTAssertEqual(json["owned_by"] as? String, "dynamoe")
+        XCTAssertEqual(json["created"] as? Int, 1_700_000_000)
+        XCTAssertEqual(json["context_length"] as? Int, 163_840)
+        XCTAssertEqual(json["max_prompt_tokens"] as? Int, 262_144)
+        let capabilities = try XCTUnwrap(json["capabilities"] as? [String: Any])
+        XCTAssertEqual(capabilities["vision"] as? Bool, true)
+        XCTAssertEqual(capabilities["thinking"] as? Bool, true)
+        XCTAssertEqual(capabilities["thinking_levels"] as? Bool, true)
+        // The wire must not leak Swift property names.
+        XCTAssertFalse(
+            String(decoding: try JSONEncoder().encode(OpenAIModelList.entry(
+                for: loadedInfo(vision: true, thinking: true, levels: true),
+                contextLength: nil, maxPromptTokens: nil, created: 0
+            )), as: UTF8.self).contains("thinkingLevels")
+        )
+    }
+
+    /// The flags must be copied, not hardcoded: a tower-less family must advertise
+    /// `vision: false` or a client sends a picture that is refused with a 400, and
+    /// a family with a plain on/off switch must not claim graded levels.
+    func testModelListCapabilitiesFollowTheLoadedModelRatherThanTheWire() throws {
+        let json = try encodedModel(OpenAIModelList.entry(
+            for: loadedInfo(vision: false, thinking: true, levels: false),
+            contextLength: nil,
+            maxPromptTokens: nil,
+            created: 0
+        ))
+        let capabilities = try XCTUnwrap(json["capabilities"] as? [String: Any])
+        XCTAssertEqual(capabilities["vision"] as? Bool, false)
+        XCTAssertEqual(capabilities["thinking"] as? Bool, true)
+        XCTAssertEqual(capabilities["thinking_levels"] as? Bool, false)
+        // A model with no architectural ceiling and a server with no cap both
+        // report nothing rather than a sentinel a client would read as a number.
+        XCTAssertNil(json["context_length"])
+        XCTAssertNil(json["max_prompt_tokens"])
+    }
+
     // MARK: - Tool declarations
 
     func testToolDeclarationEmbedsSchemasAsValidJSON() throws {
