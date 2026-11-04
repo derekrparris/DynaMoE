@@ -3524,18 +3524,6 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             contentsOf: snapshot.appendingPathComponent("config.json")
         )
         let spec = try XCTUnwrap(config.vision, "the checkpoint must publish a vision config")
-        guard let tokenizer = try? DynaMoeTokenizer(
-            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
-        ) else {
-            throw XCTSkip("the checkpoint's tokenizer could not be opened")
-        }
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            throw XCTSkip("no Metal device")
-        }
-        let modelConfig = try XCTUnwrap(
-            ModelConfig.load(from: snapshot),
-            "the checkpoint's config.json did not decode as a ModelConfig"
-        )
         // The server's own gate, asserted first: when it is false the request below
         // is refused before a pixel is read, which is a different failure from a
         // broken image path and must not be read as one.
@@ -3543,67 +3531,15 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             ModelConfig.supportsVision(modelPath: snapshot.path),
             "the loaded checkpoint must advertise the tower the request will use"
         )
-
-        // The load the app performs, in the app's order: index the checkpoint, split
-        // any shard past the device's buffer limit, map every segment zero-copy, then
-        // publish it to the shared engine the server's turns run on. The engine owns
-        // the mappings every buffer points into, so it has to outlive the whole case.
-        let engine = try DynaMoeEngine(filePath: snapshot.path)
-        let indexed = try engine.getSummary()
-        let summary = try InferenceEngine.segmentShardsForMetal(
-            indexed, maxBufferLength: UInt64(device.maxBufferLength)
-        )
-        var buffers: [UInt32: MTLBuffer] = [:]
-        for shard in summary.shards {
-            let length = Int(shard.length)
-            guard length > 0, length <= Int(device.maxBufferLength),
-                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)),
-                  let buffer = device.makeBuffer(
-                      bytesNoCopy: pointer,
-                      length: length,
-                      options: .storageModeShared,
-                      deallocator: nil
-                  )
-            else { continue }
-            buffers[shard.index] = buffer
-        }
-        print(
-            "🔎 [dsv41 real] live server: \(indexed.tensors.count) tensors in "
-                + "\(indexed.shards.count) shard(s), mapped \(buffers.count)/"
-                + "\(summary.shards.count) segment(s), \(indexed.sizeGb) GB"
-        )
-        CompletionEngine.shared.configure(
-            summary: summary,
-            modelConfig: modelConfig,
-            tokenizer: tokenizer,
-            shardBuffers: buffers,
-            activeLoadedModelPath: snapshot.path
-        )
+        // The checkpoint reaches the engine the way the app does, and the engine is
+        // held until this scope ends: every shard buffer points into its mappings.
+        let engine = try loadPublishedCheckpointIntoTheSharedEngine(snapshot)
         defer {
-            CompletionEngine.shared.configure(
-                summary: nil,
-                modelConfig: nil,
-                tokenizer: nil,
-                shardBuffers: [:],
-                activeLoadedModelPath: nil
-            )
+            unloadSharedEngine()
+            withExtendedLifetime(engine) {}
         }
 
-        // The smallest thing ImageIO will decode, which the checkpoint's own
-        // `min_pixels` floor turns into its smallest admissible encode. That floor,
-        // not this 2x2, is what the turn pays for: 1,521 patch tokens on a 13x13
-        // aligner grid, i.e. 184 prompt positions.
-        let space = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
-        let context = try XCTUnwrap(CGContext(
-            data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 8,
-            space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-        ))
-        context.setFillColor(red: 0.9, green: 0.15, blue: 0.1, alpha: 1)
-        context.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
-        let cgImage = try XCTUnwrap(context.makeImage())
-        let png = try XCTUnwrap(
-            NSBitmapImageRep(cgImage: cgImage).representation(using: .png, properties: [:])
-        )
+        let png = try smallestRedSquarePNG()
         let pixels = try DeepSeekV41ImagePixels.decode(png)
         let estimate = try XCTUnwrap(
             DeepSeekV41VisionPricing.estimate(
@@ -3667,7 +3603,6 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
                     + "picture: \(logged.map { "\($0.inputTokens ?? -1) \($0.requestBody ?? "")" })"
             )
         }
-        withExtendedLifetime(engine) {}
     }
 
     /// Runs `body` with the local server listening on `port`, then puts everything
@@ -3810,6 +3745,269 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             promptTokens: usage["prompt_tokens"] as? Int ?? -1,
             completionTokens: usage["completion_tokens"] as? Int ?? -1,
             finishReason: choice["finish_reason"] as? String
+        )
+    }
+
+    /// The Anthropic surface's image block, end to end over real HTTP.
+    ///
+    /// `#77` pinned the adapter's decoding of an `image` block, and `#78` proved the
+    /// engine seam underneath BOTH protocols with the OpenAI `image_url` shape. What
+    /// neither could show is the wire: `/v1/messages` has its own decoder, its own
+    /// entry point into the turn planner, its own response shape and its own row key
+    /// (`image_blocks`), and a picture one protocol accepts can still die on the
+    /// other's path. This drives the same fixture, the same question and the same
+    /// delta contract through the Anthropic route, which is the only place the
+    /// `image_blocks` row can be read back.
+    ///
+    /// No `thinking` block is sent, so this turn's prompt is the family's
+    /// thinking-off shape and the generation answers immediately. `#78` had to raise
+    /// its token budget out of the reasoning channel for exactly that reason; the
+    /// delta contract is independent of which shape the prompt takes.
+    func testAnAnthropicRequestWithAnImageAnswersOverTheLocalServer() async throws {
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let spec = try XCTUnwrap(config.vision, "the checkpoint must publish a vision config")
+        XCTAssertTrue(
+            ModelConfig.supportsVision(modelPath: snapshot.path),
+            "the loaded checkpoint must advertise the tower the request will use"
+        )
+        let engine = try loadPublishedCheckpointIntoTheSharedEngine(snapshot)
+        defer {
+            unloadSharedEngine()
+            withExtendedLifetime(engine) {}
+        }
+
+        let png = try smallestRedSquarePNG()
+        let pixels = try DeepSeekV41ImagePixels.decode(png)
+        let estimate = try XCTUnwrap(
+            DeepSeekV41VisionPricing.estimate(
+                width: pixels.width, height: pixels.height, spec: spec
+            ),
+            "the resize plan must price an image the decoder accepted"
+        )
+        XCTAssertGreaterThan(
+            estimate.spanPositions, 1,
+            "the span has to exceed the placeholder it replaces or there is nothing to check"
+        )
+
+        // A different private port from `#78`'s, so neither case can inherit the
+        // other's listening socket if a stop ever leaves one behind.
+        let port = 8792
+        let question = "what is in this picture?"
+        try await withLocalServer(on: port) { store in
+            let plain = try await postMessages(port: port, text: question, imageBase64: nil)
+            let pictured = try await postMessages(
+                port: port, text: question, imageBase64: png.base64EncodedString()
+            )
+            print(
+                "🔎 [dsv41 real] anthropic image turn: plain \(plain.inputTokens) input tokens / "
+                    + "\(plain.outputTokens) generated, pictured \(pictured.inputTokens) / "
+                    + "\(pictured.outputTokens), span \(estimate.spanPositions) position(s) over "
+                    + "\(estimate.patchTokens) patch token(s), "
+                    + String(format: "%.2f s", estimate.seconds) + " of tower"
+            )
+            print(
+                "🔎 [dsv41 real] anthropic image answer: \(pictured.content.debugDescription) "
+                    + "(stop \(pictured.stopReason ?? "nil"), \(pictured.thinking.count) chars "
+                    + "of thinking)"
+            )
+            // The same delta contract `#78` uses: the server renders its own prompt,
+            // so only the attachment's own contribution is checkable, and both of its
+            // terms come from outside the server.
+            XCTAssertEqual(
+                pictured.inputTokens - plain.inputTokens,
+                2 + estimate.spanPositions - 1,
+                "the attachment must add its marker plus its span; plain "
+                    + "\(plain.inputTokens), pictured \(pictured.inputTokens), span "
+                    + "\(estimate.spanPositions)"
+            )
+            XCTAssertGreaterThan(
+                pictured.outputTokens, 0, "the image turn generated no token at all"
+            )
+            XCTAssertFalse(
+                pictured.content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                "the image turn returned no text (stop \(pictured.stopReason ?? "nil"))"
+            )
+
+            // The row is where the two protocols differ most: the same picture is
+            // named `image_blocks` on this route and `image_parts` on the other, and a
+            // count that only ever appeared on one of them would be a dashboard that
+            // silently under-reports half its pictures.
+            let rows = await store.fetch(limit: 20)
+            let logged = rows.filter { $0.path == "/v1/messages" }
+            XCTAssertEqual(logged.count, 2, "both turns must be logged")
+            XCTAssertTrue(
+                logged.contains {
+                    $0.inputTokens == pictured.inputTokens
+                        && ($0.requestBody ?? "").contains("\"image_blocks\":1")
+                },
+                "the image turn's row must carry the expanded prompt length and name its "
+                    + "picture: \(logged.map { "\($0.inputTokens ?? -1) \($0.requestBody ?? "")" })"
+            )
+        }
+    }
+
+    /// What one non-streaming `/v1/messages` turn reported back.
+    private struct AnthropicTurn {
+        var content: String
+        var thinking: String
+        var inputTokens: Int
+        var outputTokens: Int
+        var stopReason: String?
+    }
+
+    /// Posts one Anthropic message to the local server, text or text+image.
+    ///
+    /// The picture goes in as a base64 `source` object, which is what the Anthropic
+    /// SDKs and the `claude` clients send; a `url` source is refused by design
+    /// (`ServerImageParts`), so it is not what this case spends a turn proving.
+    private func postMessages(
+        port: Int, text: String, imageBase64: String?
+    ) async throws -> AnthropicTurn {
+        var content = ["{\"type\":\"text\",\"text\":\"\(text)\"}"]
+        if let imageBase64, !imageBase64.isEmpty {
+            content.append(
+                "{\"type\":\"image\",\"source\":{\"type\":\"base64\","
+                    + "\"media_type\":\"image/png\",\"data\":\"\(imageBase64)\"}}"
+            )
+        }
+        let body = """
+        {"model":"any","max_tokens":24,"messages":[
+            {"role":"user","content":[\(content.joined(separator: ","))]}
+        ]}
+        """
+        var request = URLRequest(
+            url: URL(string: "http://127.0.0.1:\(port)/v1/messages")!
+        )
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data(body.utf8)
+        request.timeoutInterval = 900
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any],
+            "the server's reply was not a JSON object: "
+                + String(decoding: data, as: UTF8.self)
+        )
+        guard http.statusCode == 200 else {
+            XCTFail("\(http.statusCode) from the local server: \(json)")
+            return AnthropicTurn(
+                content: "", thinking: "", inputTokens: -1, outputTokens: -1, stopReason: nil
+            )
+        }
+        let blocks = json["content"] as? [[String: Any]] ?? []
+        // Anthropic splits reasoning from text into separate blocks, so "did it say
+        // anything about the picture" is the text blocks only.
+        let visible = blocks
+            .filter { ($0["type"] as? String) == "text" }
+            .compactMap { $0["text"] as? String }
+            .joined()
+        let thinking = blocks
+            .filter { ($0["type"] as? String) == "thinking" }
+            .compactMap { $0["thinking"] as? String }
+            .joined()
+        let usage = json["usage"] as? [String: Any]
+        return AnthropicTurn(
+            content: visible,
+            thinking: thinking,
+            inputTokens: usage?["input_tokens"] as? Int ?? -1,
+            outputTokens: usage?["output_tokens"] as? Int ?? -1,
+            stopReason: json["stop_reason"] as? String
+        )
+    }
+
+    /// The smallest thing ImageIO will decode.
+    ///
+    /// The checkpoint's own `min_pixels` floor (544x544) turns this 2x2 into its
+    /// smallest admissible encode, so what a turn pays for is the floor and not the
+    /// fixture: 1,521 patch tokens on a 13x13 aligner grid, i.e. 184 prompt
+    /// positions (`#35`).
+    private func smallestRedSquarePNG() throws -> Data {
+        let space = try XCTUnwrap(CGColorSpace(name: CGColorSpace.sRGB))
+        let context = try XCTUnwrap(CGContext(
+            data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 8,
+            space: space, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ))
+        context.setFillColor(red: 0.9, green: 0.15, blue: 0.1, alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: 2, height: 2))
+        let cgImage = try XCTUnwrap(context.makeImage())
+        return try XCTUnwrap(
+            NSBitmapImageRep(cgImage: cgImage).representation(using: .png, properties: [:])
+        )
+    }
+
+    /// Loads the published checkpoint into the shared engine the way the app does.
+    ///
+    /// The order is the app's own load sequence: index the checkpoint, split any
+    /// shard past the device's buffer limit, map every segment zero-copy, then
+    /// publish the summary to `CompletionEngine.shared`, which is what the server's
+    /// turns run on. Building a second summary or a second set of buffers here would
+    /// exercise a graph the app never runs, which is the hole `#78` closed.
+    ///
+    /// The caller holds the returned engine until its scope ends (pairing
+    /// `unloadSharedEngine()` with `withExtendedLifetime` in one `defer`): every
+    /// shard buffer points into the engine's mappings, so ARC would otherwise be
+    /// free to release it right after `getSummary()`.
+    private func loadPublishedCheckpointIntoTheSharedEngine(
+        _ snapshot: URL
+    ) throws -> DynaMoeEngine {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("no Metal device")
+        }
+        guard let tokenizer = try? DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        ) else {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let modelConfig = try XCTUnwrap(
+            ModelConfig.load(from: snapshot),
+            "the checkpoint's config.json did not decode as a ModelConfig"
+        )
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let indexed = try engine.getSummary()
+        let summary = try InferenceEngine.segmentShardsForMetal(
+            indexed, maxBufferLength: UInt64(device.maxBufferLength)
+        )
+        var buffers: [UInt32: MTLBuffer] = [:]
+        for shard in summary.shards {
+            let length = Int(shard.length)
+            guard length > 0, length <= Int(device.maxBufferLength),
+                  let pointer = UnsafeMutableRawPointer(bitPattern: UInt(shard.baseAddress)),
+                  let buffer = device.makeBuffer(
+                      bytesNoCopy: pointer,
+                      length: length,
+                      options: .storageModeShared,
+                      deallocator: nil
+                  )
+            else { continue }
+            buffers[shard.index] = buffer
+        }
+        print(
+            "🔎 [dsv41 real] live server: \(indexed.tensors.count) tensors in "
+                + "\(indexed.shards.count) shard(s), mapped \(buffers.count)/"
+                + "\(summary.shards.count) segment(s), \(indexed.sizeGb) GB"
+        )
+        CompletionEngine.shared.configure(
+            summary: summary,
+            modelConfig: modelConfig,
+            tokenizer: tokenizer,
+            shardBuffers: buffers,
+            activeLoadedModelPath: snapshot.path
+        )
+        return engine
+    }
+
+    /// Retires whatever the shared engine was serving.
+    private func unloadSharedEngine() {
+        CompletionEngine.shared.configure(
+            summary: nil,
+            modelConfig: nil,
+            tokenizer: nil,
+            shardBuffers: [:],
+            activeLoadedModelPath: nil
         )
     }
 

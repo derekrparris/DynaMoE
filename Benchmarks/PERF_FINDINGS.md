@@ -12381,3 +12381,111 @@ silently used the default DerivedData bundle, which predates `#77` — the suite
 listed 39 names with neither of the two newest API cases among them. The `status=0` and the "passed"
 line are exactly the shape of a real pass, which is the same silent-zero trap the repo already
 documents for `-destination` and for the two-part `-only-testing` form.
+## DSV4.1 #79: THE ANTHROPIC ROUTE CARRIES A PICTURE TOO, AND IT RENDERS A DIFFERENT PROMPT THAN THE OPENAI ONE
+
+### The question
+
+The image path was proven in three pieces and one of them was still the wrong shape. `#77` pinned both
+wire spellings without a model (the OpenAI `image_url` object, the Anthropic `source` object, the marker
+placement, the image-token count, the expanded budget, the session digest). `#78` then ran one turn end
+to end over real HTTP — but through `/v1/chat/completions` only, on the argument that the engine seam
+beneath both adapters is protocol-independent.
+
+That argument is true about the seam and false about everything above it. `/v1/messages` has its own
+`Decodable` (`AnthropicMessagesRequest`, built by hand in `init(from:)` around a `ContentBlockIn`), its
+own entry into the planner (`buildTurnPlan(_ apiRequest: AnthropicMessagesRequest)`), its own response
+type (`AnthropicMessageResponse`, with reasoning and text as separate blocks), its own required field
+(`max_tokens` is not optional here, unlike OpenAI's), and its own request-row key: the same picture is
+`image_parts` on one protocol and `image_blocks` on the other. `image_blocks` had never been written by
+a real request in a test — only by a hand-built `AnthropicMessagesRequest` value.
+
+Routing was decisive without being unanimous: `next_slice` = `anthropic_image_wire` **0.778 @ 0.741**
+against advertising vision in `/v1/models` 0.178, a docs pass 0.020, serve-side queueing 0.017, and the
+three remaining prefill terms at 0.0032, 0.0021 and 0.0013. `perf_work_worth_doing` **0.012** — the
+perf question is settled and one more A/B on a sub-1% term would not unsettle it.
+
+### What landed
+
+One opt-in case, `testAnAnthropicRequestWithAnImageAnswersOverTheLocalServer`, plus `postMessages` (the
+wire helper) and `AnthropicTurn`. It reuses `#78`'s `withLocalServer` unchanged — same private-port
+server, same saved-and-restored defaults, same in-memory store — on port **8792** so neither case can
+inherit the other's listening socket if a `stop()` ever leaves one behind.
+
+Two extractions came out of it, because the alternative was a third copy of a load sequence that has to
+stay identical to the app's:
+
+- `smallestRedSquarePNG()` — the 2x2 fixture whose floor-expanded encode costs 184 prompt positions.
+- `loadPublishedCheckpointIntoTheSharedEngine(_:)` + `unloadSharedEngine()` — the app-order load
+  (`DynaMoeEngine` → `getSummary()` → `segmentShardsForMetal` → one `makeBuffer(bytesNoCopy:)` per
+  segment → `CompletionEngine.shared.configure`), with the `DynaMoeEngine` handed back so the caller
+  holds the mappings every buffer points into. `#78`'s case now calls both instead of carrying its own
+  copy, so there is one load in the file rather than two.
+
+The request is a base64 `source` object, which is what the Anthropic SDKs send
+(`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"…"}}`). No `thinking` block
+is sent, and that is the only deliberate difference from `#78`'s body.
+
+### Evidence
+
+```
+🔎 [dsv41 real] live server: 96085 tensors in 48 shard(s), mapped 48/48 segment(s), 475.2508442029357 GB
+🔎 [dsv41 real] anthropic image turn: plain 165 input tokens / 23 generated, pictured 350 / 23,
+   span 184 position(s) over 1521 patch token(s), 0.32 s of tower
+🔎 [dsv41 real] anthropic image answer: "The image you shared appears to be completely solid red with
+   no visible content, shapes, text, or objects. It" (stop max_tokens, 0 chars of thinking)
+Test Case '…testAnAnthropicRequestWithAnImageAnswersOverTheLocalServer' passed (112.144 seconds).
+🔎 [dsv41 real] live server: 96085 tensors in 48 shard(s), mapped 48/48 segment(s), 475.2508442029357 GB
+🔎 [dsv41 real] live image turn: plain 190 prompt tokens / 23 generated, pictured 375 / 23,
+   span 184 position(s) over 1521 patch token(s), 0.32 s of tower
+🔎 [dsv41 real] live image answer: "The user has shared an image that appears to be entirely
+   red/crimson colored with no visible content — it looks…" (finish length)
+Test Case '…testAnAPIRequestWithAnImageAnswersOverTheLocalServer' passed (117.866 seconds).
+	 Executed 2 tests, with 0 failures (0 unexpected) in 230.010 seconds
+```
+
+The delta holds on both routes and is the same number: `350 - 165 = 185` and `375 - 190 = 185`, each
+`= 2 + 184 - 1`. The picture is a solid red square and both answers say so, on a route neither had run
+before.
+
+### The two protocols render a 25-token difference for "the same" request, and the adapters' thinking defaults are why
+
+The one number nobody would have guessed: the plain turn is **165** input tokens on the Anthropic route
+and **190** on the OpenAI one, from a byte-identical question and the same loaded checkpoint.
+
+It is not a bug in either. `OpenAIAdapter`'s planner takes `enableThinking ?? true` — a request that says
+nothing about reasoning gets thinking **on**, which is what the app itself does. `AnthropicAdapter`'s
+takes `apiRequest.thinking?.type == "enabled"` — a request with no `thinking` block gets thinking **off**,
+because Anthropic's protocol makes it an explicit opt-in and honouring that is the whole point of reading
+the field. The 25 tokens are the family's graded-effort scaffold: the `Reasoning Effort: N (range 1-100…)`
+line and the reasoning channel's opening marker are rendered for a thinking-on prompt and omitted for a
+thinking-off one.
+
+So a prompt length is not portable across the two protocols, and the delta check has to stay inside one
+route — which is exactly what both cases do. It also means an unqualified "the prompt is N tokens" claim
+about the server is incomplete: the same body is two different prompts, and the difference is 25 tokens
+of scaffold.
+
+### What it does not mean
+
+- **Not the streaming path.** `anthropicStreamingResponse` is a separate writer with its own block
+  lifecycle, and no case here streams.
+- **Not `/v1/models`.** It still advertises no vision capability, so a client has no way to discover
+  that the served model accepts pictures. That is the next completeness gap, not this one.
+- **Not a queue or lifecycle change.** Single-flight is untouched: a request during an in-app turn still
+  gets a 503 rather than queueing.
+- **Not asserted on content.** As in `#78`, the colour is printed and the assertions are the delta, the
+  non-emptiness and the row's `input_tokens`.
+- **Not a second engine path.** Both protocols reach the same `attachImageMarkers`, the same
+  `DeepSeekV41TurnImages.bind`, the same expanded-prompt cache provisioning. There is one image
+  implementation with two front doors, and now both doors have been walked through.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_79` (status 0, only the two pre-existing
+`ContentView.swift` Swift-6 actor warnings), then `test-without-building` **with the same
+`-derivedDataPath`** and both cases in one run, gated on `touch /tmp/dynamoe_dsv41_real_turn` and removed
+in the same command (`/tmp/test79_build1.log`, `/tmp/test79_run1.log`). Bundle freshness checked with
+`strings …/DynaMoETests | grep -c testAnAnthropicRequestWithAnImageAnswersOverTheLocalServer` (1) before
+running, because `#78`'s silent-zero trap is a green run that executes nothing. `Executed 2 tests, with 0
+failures`, and each case's `passed` line is present, which is the only thing that distinguishes a real
+run from that trap.
