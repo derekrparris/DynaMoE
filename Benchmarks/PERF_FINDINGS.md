@@ -11287,6 +11287,10 @@ app runs:
 | - mixture half | 18.0 | 18.54 | 19.99 |
 | mixture late start | 22.9 | 19.3 | 17.9 |
 
+`#75` retargets one row: `front wait` is one `settlePending`, so 63-65% of it is the previous layer's
+mixture still on the queue -- already billed in `- mixture half` above -- and only the remainder is the
+dense half's own drain. Read the two together, never add them.
+
 Read it against `#70`'s unwired table and every bucket moves, because the fill is what the
 whole layer was waiting on: the indexer split falls 30.2 → 11.2 (it drains the previous
 mixture, which is now cheap), the mixture's late start 82.8 → 19.3 (the queue is idle for a
@@ -11395,7 +11399,9 @@ first cut, which asserted a block count the engine no longer produced.
 `#71` closed the fill and listed what is left of a 128-position prefill at the shipped width:
 99.7 ms/position of which fill 52.2 (read 51.8 at 13.6 GB/s), **mixture device 19.3-20.0**, dense
 device 13.4, indexer wait 11.3, front wait 43.7. The mixture half is the largest bucket that is not
-the disk, and it is the one bucket that did NOT fall with the block width -- `#71`'s table had it
+the disk (`#75` later showed ~63-65% of that 43.7 IS the mixture half's own device time, drained inside
+the next layer's front wait, so the two rows overlap), and it is the one bucket that did NOT fall with
+the block width -- `#71`'s table had it
 rising 18.0 (walk) -> 18.5 (width 4) -> 20.0 (width 8). Every stage table in this journal before now
 covers the DENSE half (`#52` measured one on a real block; `#60` did the walk's), because
 `recordsStageTiming` only ever gave those stages a command buffer each. So "the mixture half costs
@@ -11546,7 +11552,8 @@ and still off in every production path.
 `#72` closed the mixture half and left the dense half as the largest remaining bucket of a
 128-position prefill at the shipped width: 78-80 ms/position of which fill ~52 (`#71`, at the disk's
 13.6 GB/s), **dense device 13.4-15.4**, mixture device 15.5 (`#72`), indexer wait 11.3, front wait
-43.7. Every dense stage table in this journal was taken on the SYNTHETIC checkpoint at published
+43.7 (of which `#75` later found ~63-65% is the mixture's own device time, drained inside the wait).
+Every dense stage table in this journal was taken on the SYNTHETIC checkpoint at published
 widths (`#16`-`#18`), where the ranking was `writeLatent` 45.5% and then three GEMVs, `compressPool`
 and `attention` printed zero because the fixture had no compressed layers, and every weight was
 already resident. The published plan is half compressed (8 of 40 layers own a compressed index), so
@@ -11812,3 +11819,146 @@ bit-identical logits to the one-buffer layout (measured 0.0 at a 1e-6 bar), the 
 2%, that all four rail rows are reported, and that they sum to the stage row. The rule test pins
 4,096x1,280 to the coalesced form, 32,768x1,280 to the one-thread form at both row counts, a 16x512
 projection to neither, and the threshold constant itself.
+
+## DSV4.1 #75: THE FRONT WAIT IS THE PREVIOUS LAYER'S MIXTURE, AND A PREFILL POSITION IS 63% GPU IDLE
+
+### Question
+
+`#73` and `#74` left the prefill bucket table as: wall 99.7 ms/position = fill 52.2 (the disk, closed
+at its ceiling by `#71`) + mixture device 19.3-20.0 (`#72`) + dense device 13.4 (`#73`, its one
+unattributed stage closed by `#74`) + indexer wait 11.3 + **front wait 43.7**. The front wait was the
+largest term that is neither the disk nor a named stage, and every candidate fix starts from knowing
+whether it is the GPU, the driver, or the host. The instrument already split a drain into `late start
++ device window + tail`, so the question was narrow: which of the three, and how much of it is work
+another bucket already bills?
+
+### What was added
+
+Measurement only, off in every production path:
+
+- `DeepSeekV41BlockTiming.frontBusyNanoseconds` — how much of `frontWaitNanoseconds` was the
+  PREVIOUS layer's mixture still on the queue. `frontWait` is one `settlePending`, and the queue is in
+  order, so the mixture the layer before committed is drained inside it and then the dense half is.
+  Accumulated at the settle that measured the wait, not over every settle the layer made, because a
+  compressed layer's dense half is two submissions and only the second one's drain is inside
+  `frontWait` (`#66`'s footnote, now exact).
+- `frontOwnDrainNanoseconds` (`frontWait - frontBusy`), `frontTailNanoseconds` and
+  `mixtureTailNanoseconds` (the third term of a drain, which `#22` named and no field held).
+- `DeepSeekV41BlockTiming.deviceUnionNanoseconds` — the UNION of every measured window, so a block's
+  wall can be split into busy and idle. The half sums are sums of busy TIME; the union is the busy
+  SPAN, and `wall - union` is the one number no host interval names. Plus
+  `frontUnwindowedBuffers`/`mixtureUnwindowedBuffers`, so a union with a hole in it says so.
+- `recordsBlockGaps` + `DeepSeekV41BlockGap`: one clock record per block LAYER pass with that layer's
+  own buffers' windows attached, so the wait divides per layer instead of per span. This is the block
+  side of `#48`'s `DeepSeekV41LayerGapSample`.
+- **A correction to the dense device column.** The shipped layout submits twice on the eight layers
+  that split at the indexer, and only the SECOND submission reached `timingBuffers`: `denseDevice`
+  silently omitted the work in front of the split. Every front buffer is recorded now, which is what
+  makes `drained front = late start + window + tail` tie out (it did not before: `#71` reported 18.4
+  drained against 13.67 of window and 1.2 of late start).
+- `testWhatTheFrontWaitIsMadeOfOnThePublishedCheckpoint` (opt-in, `/tmp/dynamoe_dsv41_front_wait`,
+  102 s): 128 positions in the app's regime (`wireArena: nil`), the shipped width and half of it,
+  three rounds with the arm order rotated and round 1 discarded (`#53`). It prints the decomposition,
+  the per-layer partition of one block, and the union, and asserts the classification: `busy > 0`,
+  `busy < frontWait`, the pickup under half a millisecond, the tail under half a millisecond, the
+  mixture drain at least the busy it absorbed, `union <= wall <= sum of windows`, and that the
+  settle-level `frontBusy` agrees with the records taken per layer.
+
+### The table
+
+Milliseconds per position, width 8, `wireArena: nil`, three arms after the discarded round:
+
+| | arm 1 | arm 2 | arm 3 |
+|---|---|---|---|
+| **wall** | 78.0 | **77.7** | 78.3 |
+| expert fill | 33.6 | **33.7** | 33.6 |
+| indexer wait | 8.3 | **9.0** | 8.0 |
+| routing + dense encode + mixture encode | 0.01 + 0.98 + 1.38 | **0.01 + 0.97 + 1.37** | 0.01 + 0.98 + 1.38 |
+| **front wait** | 32.5 | **31.7** | 33.5 |
+| = busy (the previous layer's mixture) | **21.1** | **20.4** | **21.9** |
+| + own (the dense half and its hand-off) | 11.4 | 11.3 | 11.6 |
+| every dense drain | 14.2 = 0.3 late + 13.5 window + 0.3 tail | 14.0 = 0.3 + 13.4 + 0.3 | 14.2 = 0.3 + 13.5 + 0.3 |
+| every mixture drain | 27.8 = 11.9 late + 15.5 window + 0.3 tail | 27.5 = 11.8 + 15.4 + 0.3 | 28.1 = 12.2 + 15.6 + 0.3 |
+| device (dense / mixture) | 29.0 (13.5 / 15.5) | 28.8 (13.4 / 15.4) | 29.1 (13.5 / 15.6) |
+| **device union** | 29.0 | **28.8** | 29.1 |
+| **idle (`wall - union`)** | 49.0 | **48.9** | 49.2 |
+
+At half the width (measured in the same rounds, 83.1 / 83.0 / 82.8 ms of wall): front wait 35.4 / 35.2
+/ 34.4 = busy 23.0 / 22.8 / 22.0 + own 12.4; mixture drain 29.7 = 13.3 late + 15.8 window + 0.7 tail;
+dense drain 14.4 = 0.3 + 14.4 + 0.7; union 30.2 / 30.1 / 30.0 of the wall, i.e. idle 52.9 / 53.0 /
+52.8. The first block of a prefill is excluded from every partition below: it is the cold one (101.6
+ms/position, 68.3 GB read, 3,812 misses against 55.2 GB and 3,152 once the arena is warm).
+
+The per-layer records, one block of 39 layer passes (the second block, `recordsBlockGaps`), in the
+units the totals use — milliseconds per position across the block's 39 layers:
+
+| term | ms/position | share of the wait |
+|---|---|---|
+| wait = busy + pickup + window + tail | 2.17 = 1.32 + **0.00** + 0.82 + **0.02** | 100% |
+| gap between the two dense submissions, inside the span | 0.04 | 2% |
+| mixture gate idle (commit to its own window start) | 0.72 | — |
+
+Per layer pass that is a front wait of ~7.1 ms: **4.3 of the previous layer's mixture, 2.7 of the
+dense half, 0.00 of pickup and 0.07 of tail.**
+
+### What it says
+
+- **The front wait is a settle, not a stall.** 63-65% of it (20.4-21.9 of 31.7-33.5 ms/position) is
+  the mixture the layer before committed, and that same work is already billed as
+  `mixtureDeviceNanoseconds`. So `#71`'s bucket list counts ~21 ms/position twice: the honest front
+  wait is **11.3-11.6**, and the largest non-disk term in a prefill position is the mixture half's
+  device time, not the wait for it. This was flagged as a hazard in `#60` and `#65` ("front wait
+  includes draining the previous layer's mixture") and never quantified until now.
+- **The hand-off itself is closed at a block's front.** The pickup is 0.00 ms/position and the tail
+  0.02 over 39 layer passes — the queue starts the dense half before the host finishes asking and the
+  host notices its last buffer in 70 us per layer. `#48`'s 2.1-2.3 ms/layer of hand-off idle is a
+  WALK's boundary (one position, two buffers, no fill in between); a block commits 2.7 ms of dense
+  work behind 4.3 ms of finished mixture, so there is nothing for the driver to be slow about. That is
+  the interleaving `#52` predicted and no table had shown.
+- **Both drains now decompose exactly**: dense 14.2 = 0.3 + 13.5 + 0.3 and mixture 27.8 = 11.9 + 15.5
+  + 0.3. The 3.5 ms/position that used to be unexplained between `drained front` (18.4) and
+  `window + late start` (14.9) was the instrument's missing pre-indexer submission, not the machine.
+- **A prefill position is 37% GPU work.** The union is 28.8-29.1 of a 77.7-78.3 wall: 13.4-13.5 dense
+  plus 15.4-15.6 mixture, with **no overlap at all** (the sum equals the union, so the queue never has
+  two windows open). The idle is 48.9-49.0 ms/position, and it tiles: fill 33.6 + the mixture's own
+  late start 11.9 + the two encodes 2.35 + routing and the indexer's host readback ~1.1 = 48.9. Three
+  of those four terms are already closed or named — the fill at the disk (`#71`), the encodes
+  (`#60`/`#66`), and the mixture's late start as the machine after reading (`#50`, `#65`). What is NOT
+  closed is that the mixture's late start is 11.8-12.2 ms/position in a BLOCK, i.e. ~2.4 ms per layer
+  pass, where a walked position pays 1.2 (`#22`) — a worse pickup after a 34 ms host gap than after a
+  2 ms one, which is the opposite of what `#22`'s isolated sweep predicted.
+- **Width moves the answer only through the dense half.** `busy` is 20.4-21.9 at width 8 and 22.0-23.0
+  at width 4: the mixture's work per position does not depend on the block width. `own` falls 12.4 ->
+  11.3, which is the dense batching. Wall 77.7-78.3 against 82.8-83.1, so width eight wins 5-6
+  ms/position, of which ~1.5 is device and the rest is the fill amortising over twice as many
+  positions (33.6 against 34.9).
+
+### What is not
+
+- **The front wait is not idle**, so there is nothing in it to reclaim. Do not propose a fix for the
+  pickup (0.00) or the tail (0.02) on the strength of `#48`'s walk figure: at a block's front they are
+  already zero.
+- **The mixture's 11.8-12.2 ms/position pickup is the one unexplained term left**, and it is not a new
+  lever until it is measured as one. `#50` (the expert buffer's resource list and CPU-dirtied arena
+  memory), `#65` (a deferred bind and an event gate, a wash) and `#22` (no kernel change recovers it,
+  because the readback empties the queue) all closed the WALK's version of exactly this. A block's
+  regime differs in the one variable those slices could not hold: the gap is 34 ms, not 2, and the
+  pickup is twice as expensive. Anyone re-proposing the gate needs that A/B first — a real mixture
+  buffer committed behind a 34 ms host gap, in a block, against the shipped order — and it is a
+  measurement, not a build.
+- **The 12.4 -> 11.3 `own` is not a licence to widen further.** `#70` swept the width on the wall and
+  eight won everywhere; this table agrees, and `#18`/`#20` explain why a wider block costs more input
+  traffic than it saves weight. Nothing here reopens it.
+- **`indexer wait` (8.0-9.0 ms/position) is mostly this same mixture device time**, drained by the
+  pre-indexer settle. Read it beside `busy`, never as the indexer's own cost (`#74`).
+
+### Verification
+
+`/tmp/test75_front3.log` (three rounds, arms rotated, round 1 discarded, all assertions green) and
+`/tmp/test75_front2.log`/`/tmp/test75_front1.log` (the two cuts before the per-settle attribution and
+the probe's per-layer-per-pass units). `DeepSeekV41DeviceGraphParityTests` 37, `DeepSeekV41DeviceParityTests`,
+`DeepSeekV41TurnLoopTests` 26, `DeepSeekV41SlotWiringTests`, `DeepSeekV41ExpertStreamTests`,
+`DeepSeekV41FP8GemvKernelTests`, `DeepSeekV41FP8SharedExpertKernelTests`,
+`DeepSeekV41IndexerKernelTests`, `DeepSeekV41LogicTests` — 89 tests, 0 failures
+(`/tmp/test75_parity1.log`). Production default is `recordsBlockGaps = false`, and the only line that
+changed in a shipped path is `DeepSeekV41BlockTiming.describe()`, which is diagnostic text.

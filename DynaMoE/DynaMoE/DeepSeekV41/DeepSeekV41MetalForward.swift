@@ -1097,8 +1097,54 @@ nonisolated public struct DeepSeekV41BlockTiming: Sendable, Equatable {
     /// had not begun the buffer when the host asked for it.
     public var frontLateStartNanoseconds: UInt64 = 0
     public var mixtureLateStartNanoseconds: UInt64 = 0
+    /// How much of `frontWaitNanoseconds` was draining the PREVIOUS layer's mixture.
+    ///
+    /// `frontWait` is one `settlePending`, and the queue is in order, so the mixture the
+    /// layer before committed is drained inside it and then the dense half is. That work
+    /// is already billed as `mixtureDeviceNanoseconds` and named in `mixtureDrain`, so a
+    /// bucket list that adds `frontWait` to `mixtureDrain` counts it twice, and one that
+    /// reads `frontWait` as idle reads real device time as a stall
+    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #75"). This is the part to subtract.
+    public var frontBusyNanoseconds: UInt64 = 0
+    /// The union of every measured device window, so a block's wall can be split into
+    /// busy and idle rather than into host buckets that overlap each other.
+    ///
+    /// The half sums above are sums of BUSY TIME, not of busy SPAN: a block's mixture of
+    /// one layer can still be running while the next layer's dense half sits queued
+    /// behind it, and `sum - union` is that overlap. `wall - union` is the one number no
+    /// host bucket names.
+    public var deviceUnionNanoseconds: UInt64 = 0
+    /// Measured buffers whose device window came back empty, so the union is a floor
+    /// whenever either is non-zero.
+    public var frontUnwindowedBuffers: Int = 0
+    public var mixtureUnwindowedBuffers: Int = 0
 
     public init() {}
+
+    /// The part of `frontDrainNanoseconds` that is neither the queue starting the dense
+    /// half late nor the dense half running: the host noticing it had finished, plus
+    /// whatever the tail of the drain cannot attribute.
+    public var frontTailNanoseconds: UInt64 {
+        let accounted = frontLateStartNanoseconds
+            + min(denseDeviceNanoseconds, frontDrainNanoseconds)
+        guard frontDrainNanoseconds > accounted else { return 0 }
+        return frontDrainNanoseconds - accounted
+    }
+
+    /// The dense half's own share of `frontWaitNanoseconds`: the wait minus the previous
+    /// layer's mixture that was drained inside it.
+    public var frontOwnDrainNanoseconds: UInt64 {
+        frontWaitNanoseconds > frontBusyNanoseconds
+            ? frontWaitNanoseconds - frontBusyNanoseconds : 0
+    }
+
+    /// The same three terms for the mixture half.
+    public var mixtureTailNanoseconds: UInt64 {
+        let accounted = mixtureLateStartNanoseconds
+            + min(mixtureDeviceNanoseconds, mixtureDrainNanoseconds)
+        guard mixtureDrainNanoseconds > accounted else { return 0 }
+        return mixtureDrainNanoseconds - accounted
+    }
 
     public var encodedNanoseconds: UInt64 { denseEncodeNanoseconds + mixtureEncodeNanoseconds }
 
@@ -1159,13 +1205,45 @@ nonisolated public struct DeepSeekV41BlockTiming: Sendable, Equatable {
         let missesPerFill = layers > 0 ? Double(fillMisses) / Double(layers) : 0
         let seconds = Double(expertFillNanoseconds) / 1_000_000_000
         let rate = seconds > 0 ? Double(fillBytes) / 1_073_741_824 / seconds : 0
+        // The front wait read three ways, because the same total means three different
+        // things: `busy` is the previous layer's mixture still on the queue, `own drain`
+        // is this layer's dense half plus the hand-off, and the three terms after it are
+        // the hand-off's own split — over EVERY dense drain, including the ones the
+        // indexer split takes out of this wait, which is why they are labelled apart
+        // (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #75").
+        let waitBreakdown = String(
+            format: "front wait %.1f = busy %.1f + own %.1f; over every dense drain, "
+                + "late start %.1f, window %.1f, tail %.1f; mixture drain %.1f = late "
+                + "start %.1f, window %.1f, tail %.1f",
+            per.frontWait,
+            Double(frontBusyNanoseconds) / blockDivisor,
+            Double(frontOwnDrainNanoseconds) / blockDivisor,
+            Double(frontLateStartNanoseconds) / blockDivisor,
+            per.denseDevice,
+            Double(frontTailNanoseconds) / blockDivisor,
+            Double(mixtureDrainNanoseconds) / blockDivisor,
+            Double(mixtureLateStartNanoseconds) / blockDivisor,
+            per.mixtureDevice,
+            Double(mixtureTailNanoseconds) / blockDivisor
+        )
+        let union = String(
+            format: "device union %.1f of a %.1f wall (idle %.1f, overlap %.1f, %d/%d "
+                + "unwindowed)",
+            Double(deviceUnionNanoseconds) / blockDivisor,
+            per.wall,
+            per.wall - Double(deviceUnionNanoseconds) / blockDivisor,
+            device - Double(deviceUnionNanoseconds) / blockDivisor,
+            frontUnwindowedBuffers,
+            mixtureUnwindowedBuffers
+        )
         return String(
             format: "block %.1f ms/position over %d position(s) in %d block(s) of %.1f, "
                 + "%d layer pass(es): embedding %.2f, dense encode %.2f, indexer wait %.2f, "
                 + "front wait %.2f, routing %.2f, expert fill %.2f, mixture encode %.2f, "
                 + "device %.2f (dense %.2f, mixture %.2f); host sums to %.0f%% of wall; "
                 + "drained front %.1f, mixture %.1f, late start front %.1f, mixture %.1f "
-                + "(per position); fill %.1f misses/layer at %.1f GB/s (%.1f GB, %d misses)",
+                + "(per position); fill %.1f misses/layer at %.1f GB/s (%.1f GB, %d misses);"
+                + " %@; %@",
             per.wall,
             positionCount,
             blocks,
@@ -1189,7 +1267,9 @@ nonisolated public struct DeepSeekV41BlockTiming: Sendable, Equatable {
             missesPerFill,
             rate,
             Double(fillBytes) / 1_073_741_824,
-            fillMisses
+            fillMisses,
+            waitBreakdown,
+            union
         )
     }
 
@@ -1214,6 +1294,146 @@ nonisolated public struct DeepSeekV41BlockTiming: Sendable, Equatable {
             milliseconds(denseDeviceNanoseconds),
             milliseconds(mixtureDeviceNanoseconds)
         )
+    }
+}
+
+/// One block layer pass's clock, end to end, so a bucket that spans two layers can be
+/// divided by the layer boundary it actually crossed.
+///
+/// `DeepSeekV41BlockTiming` bills host intervals, and a block's host intervals do not
+/// tile: the wait that opens a layer drains the mixture the PREVIOUS layer committed, so
+/// "front wait" as a total is one settle that contains another bucket's device time
+/// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #75"). Summing cannot undo that, because the
+/// overlap is per layer and the layers differ (eight of forty split their dense half at
+/// the indexer, which changes which settle drains what). This record is one layer pass
+/// with its marks and its own buffers' windows attached, so the partition can be taken
+/// per layer and then aggregated.
+///
+/// Every field is an absolute `DispatchTime` reading or a sum of device windows, so two
+/// records can be compared without knowing when they started. Zero unless
+/// `DeepSeekV41MetalForward.recordsBlockGaps` is on, and off in every production path:
+/// it retains a command buffer per layer until `recordDeviceTiming` reads its window.
+nonisolated public struct DeepSeekV41BlockGap: Sendable, Equatable {
+    public let layer: Int
+    /// The block's first position, and its width, so a per-position figure divides by
+    /// `count` and a per-layer one does not.
+    public let position: Int
+    public let count: Int
+    /// Host marks, in the order they were taken: the layer's start, the end of the dense
+    /// encode, the end of the settle that drains the dense half, the end of the routing
+    /// readback, the end of the fill, and the end of the mixture encode.
+    public let layerStartNanoseconds: UInt64
+    public let denseEncodedNanoseconds: UInt64
+    public let frontWaitedNanoseconds: UInt64
+    public let routingDoneNanoseconds: UInt64
+    public let fillDoneNanoseconds: UInt64
+    public let mixtureEncodedNanoseconds: UInt64
+    /// The indexer split's drain plus its host readback, taken out of the dense encode
+    /// because it is a round trip and not the host's own work.
+    public let indexerWaitNanoseconds: UInt64
+    /// Window of the FIRST dense buffer and of the LAST one. A compressed layer splits
+    /// its dense half into two submissions, so the span and the sum differ by whatever
+    /// ran in the gap between them.
+    public var frontWindowStartNanoseconds: UInt64 = 0
+    public var frontWindowEndNanoseconds: UInt64 = 0
+    public var frontWindowNanoseconds: UInt64 = 0
+    public var frontBufferCount: Int = 0
+    /// The same for the mixture half, which the block commits as one buffer per stage in
+    /// the split layout and one per layer otherwise.
+    public var mixtureWindowStartNanoseconds: UInt64 = 0
+    public var mixtureWindowEndNanoseconds: UInt64 = 0
+    public var mixtureWindowNanoseconds: UInt64 = 0
+    public var mixtureBufferCount: Int = 0
+
+    public init(
+        layer: Int,
+        position: Int,
+        count: Int,
+        layerStartNanoseconds: UInt64,
+        denseEncodedNanoseconds: UInt64,
+        frontWaitedNanoseconds: UInt64,
+        routingDoneNanoseconds: UInt64,
+        fillDoneNanoseconds: UInt64,
+        mixtureEncodedNanoseconds: UInt64,
+        indexerWaitNanoseconds: UInt64
+    ) {
+        self.layer = layer
+        self.position = position
+        self.count = count
+        self.layerStartNanoseconds = layerStartNanoseconds
+        self.denseEncodedNanoseconds = denseEncodedNanoseconds
+        self.frontWaitedNanoseconds = frontWaitedNanoseconds
+        self.routingDoneNanoseconds = routingDoneNanoseconds
+        self.fillDoneNanoseconds = fillDoneNanoseconds
+        self.mixtureEncodedNanoseconds = mixtureEncodedNanoseconds
+        self.indexerWaitNanoseconds = indexerWaitNanoseconds
+    }
+
+    /// Host time blocked on this layer's dense half: one settle, which drains the
+    /// previous layer's mixture first when that mixture is still on the queue.
+    public var frontWaitNanoseconds: UInt64 {
+        frontWaitedNanoseconds > denseEncodedNanoseconds
+            ? frontWaitedNanoseconds - denseEncodedNanoseconds : 0
+    }
+
+    /// The dense half's span on the device, first buffer's start to last buffer's end.
+    public var frontSpanNanoseconds: UInt64 {
+        frontWindowEndNanoseconds > frontWindowStartNanoseconds
+            ? frontWindowEndNanoseconds - frontWindowStartNanoseconds : 0
+    }
+
+    /// The mixture half's span on the device.
+    public var mixtureSpanNanoseconds: UInt64 {
+        mixtureWindowEndNanoseconds > mixtureWindowStartNanoseconds
+            ? mixtureWindowEndNanoseconds - mixtureWindowStartNanoseconds : 0
+    }
+
+    /// The previous layer's mixture still running when this layer asked for its dense
+    /// half: the part of `frontWaitNanoseconds` another bucket already bills.
+    ///
+    /// `upstream` is the previous record's `mixtureWindowEndNanoseconds`; nil for the
+    /// first layer of a block, whose front wait has nothing in front of it in this block.
+    public func priorWorkNanoseconds(upstream: UInt64?) -> UInt64 {
+        guard let upstream, upstream > denseEncodedNanoseconds else { return 0 }
+        return upstream - denseEncodedNanoseconds
+    }
+
+    /// The queue's own cost to start the dense half, counted only from the moment
+    /// nothing was left running: a late start that is prior work is not a pickup.
+    public func pickupNanoseconds(upstream: UInt64?) -> UInt64 {
+        let ready = max(denseEncodedNanoseconds, upstream ?? 0)
+        guard frontWindowStartNanoseconds > ready else { return 0 }
+        return frontWindowStartNanoseconds - ready
+    }
+
+    /// Host time after the dense half's last buffer retired, i.e. how long the host took
+    /// to notice.
+    public func frontTailNanoseconds() -> UInt64 {
+        guard frontWaitedNanoseconds > frontWindowEndNanoseconds else { return 0 }
+        return frontWaitedNanoseconds - frontWindowEndNanoseconds
+    }
+
+    /// Wall time inside `waitUntilCompleted` on the mixture half's last buffer, counted
+    /// from the commit because a block does not wait for it: the next layer's settle does.
+    public func mixtureLateStartNanoseconds() -> UInt64 {
+        guard mixtureWindowStartNanoseconds > mixtureEncodedNanoseconds else { return 0 }
+        return mixtureWindowStartNanoseconds - mixtureEncodedNanoseconds
+    }
+
+    /// The GPU idle between the dense half retiring (or the mixture being committed, if
+    /// later) and the mixture starting. `DeepSeekV41LayerGapSample.idleMilliseconds` is
+    /// the same figure for a walked position; this is the block's.
+    public func mixtureIdleNanoseconds() -> UInt64 {
+        let ready = max(frontWindowEndNanoseconds, mixtureEncodedNanoseconds)
+        guard mixtureWindowStartNanoseconds > ready else { return 0 }
+        return mixtureWindowStartNanoseconds - ready
+    }
+
+    /// The layer's wall, first mark to last commit, so the partition can be checked
+    /// against it.
+    public var wallNanoseconds: UInt64 {
+        mixtureEncodedNanoseconds > layerStartNanoseconds
+            ? mixtureEncodedNanoseconds - layerStartNanoseconds : 0
     }
 }
 
@@ -1730,9 +1950,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     private var pending: [(buffer: MTLCommandBuffer, stage: String, isMixture: Bool)] = []
 
     /// Command buffers whose device time `recordDeviceTiming` still has to read, with
-    /// the half they belong to (0 dense, 1 mixture). Only filled while
-    /// `recordsBlockTiming` is on, and only in the block path.
-    private var timingBuffers: [(buffer: MTLCommandBuffer, bucket: Int)] = []
+    /// the half they belong to (0 dense, 1 mixture) and, when `recordsBlockGaps` is on,
+    /// the `blockGaps` record whose window they belong to.
+    private var timingBuffers: [(buffer: MTLCommandBuffer, bucket: Int, gap: Int?)] = []
     /// One front-half buffer per stage, filled only while `recordsStageTiming` is on.
     private var stageBuffers: [(stage: String, buffer: MTLCommandBuffer)] = []
     /// Measurement-only scratch the calibration stage dispatches into.
@@ -1782,6 +2002,26 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// census (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #3").
     public var recordsBlockTiming = false
     public private(set) var blockTiming = DeepSeekV41BlockTiming()
+
+    /// One clock record per block LAYER pass, with the layer's own buffers' windows.
+    ///
+    /// Off by default and off in every production path. `recordsBlockTiming` bills host
+    /// intervals, and in a block those do not tile: a layer's front wait drains the
+    /// previous layer's mixture, so a total cannot say which layer is idle and which is
+    /// paying for its predecessor. This retains one command buffer per layer until the
+    /// block's `recordDeviceTiming` reads its window, which is why it is a separate
+    /// switch rather than part of `recordsBlockTiming`.
+    public var recordsBlockGaps = false
+    public private(set) var blockGaps: [DeepSeekV41BlockGap] = []
+    /// How many layer passes to record before it stops. A block is forty; the default
+    /// holds one block, so a probe reads a timeline rather than a megabyte of windows.
+    public var blockGapLimit = 40
+    /// Layer passes recorded so far, so the limit is not re-derived from the array.
+    public private(set) var blockGapCount = 0
+    /// Mixture drain inside the settle that just finished, so a front wait can be read
+    /// as `busy + its own drain` for the ONE settle it measured rather than as a sum over
+    /// every settle the layer made (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #75").
+    private var lastSettleMixtureDrainNanoseconds: UInt64 = 0
 
     /// Device time per dense-half stage, in nanoseconds, by stage name.
     ///
@@ -1833,6 +2073,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// everything the executor has ever run.
     public func resetBlockTiming() {
         blockTiming = DeepSeekV41BlockTiming()
+        blockGaps.removeAll(keepingCapacity: true)
+        blockGapCount = 0
+        timingBuffers.removeAll(keepingCapacity: true)
+        stageBuffers.removeAll(keepingCapacity: true)
     }
 
     /// Captures the DSpark conditioning row as the walk and the block run.
@@ -3084,8 +3328,19 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         // keeps that single wait but gives each stage its own command buffer, so the
         // queue's submission order (and every hazard it protects) is unchanged while
         // each stage reports its own device window.
+        //
+        // Every front buffer is collected in BOTH layouts, because the shipped one
+        // submits twice on the layers that split at the indexer and only the second half
+        // used to reach `timingBuffers` -- so `denseDeviceNanoseconds` omitted the work
+        // in front of the split on eight of forty layers (`Benchmarks/PERF_FINDINGS.md`,
+        // "DSV4.1 #75").
+        var frontBuffers: [MTLCommandBuffer] = []
+        // The record is only appended while the marks are being taken, so a runtime with
+        // the gap switch on and the timing switch off would index the same slot forty
+        // times; the `measuring` clause is what keeps the two switches in step.
+        let gapIndex = (measuring && recordsBlockGaps && blockGapCount < blockGapLimit)
+            ? blockGapCount : nil
         if recordsStageTiming {
-            var frontBuffers: [MTLCommandBuffer] = []
             for stage in DeepSeekV41DevicePlan.frontHalf {
                 if stage == .indexer {
                     // `.indexer` is three unrelated rails in one buffer (`#74`): the
@@ -3202,8 +3457,12 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             recordStageTiming()
             if measuring {
                 frontWaited = DispatchTime.now().uptimeNanoseconds
+                // The mixture the layer before committed is drained INSIDE this settle,
+                // so it is part of the wait without being part of the dense half
+                // (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #75").
+                blockTiming.frontBusyNanoseconds += lastSettleMixtureDrainNanoseconds
                 for buffer in frontBuffers {
-                    timingBuffers.append((buffer: buffer, bucket: 0))
+                    timingBuffers.append((buffer: buffer, bucket: 0, gap: gapIndex))
                 }
             }
         } else {
@@ -3226,6 +3485,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                         commandBuffer,
                         stage: "layer \(layer.index) indexer (block \(count))"
                     )
+                    frontBuffers.append(commandBuffer)
                     try readIndexSelections(
                         layer: layer, startPosition: startPosition, count: count
                     )
@@ -3239,9 +3499,16 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             encoder.endEncoding()
             if measuring { denseEncoded = DispatchTime.now().uptimeNanoseconds }
             try commit(commandBuffer, stage: "layer \(layer.index) attention (block \(count))")
+            frontBuffers.append(commandBuffer)
             if measuring {
                 frontWaited = DispatchTime.now().uptimeNanoseconds
-                timingBuffers.append((buffer: commandBuffer, bucket: 0))
+                // The mixture the layer before committed is drained INSIDE this settle,
+                // so it is part of the wait without being part of the dense half
+                // (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #75").
+                blockTiming.frontBusyNanoseconds += lastSettleMixtureDrainNanoseconds
+                for buffer in frontBuffers {
+                    timingBuffers.append((buffer: buffer, bucket: 0, gap: gapIndex))
+                }
             }
         }
 
@@ -3319,7 +3586,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             let mixtureEncoded = measuring ? DispatchTime.now().uptimeNanoseconds : 0
             if measuring {
                 for buffer in mixtureBuffers {
-                    timingBuffers.append((buffer: buffer, bucket: 1))
+                    timingBuffers.append((buffer: buffer, bucket: 1, gap: gapIndex))
                 }
             }
             if recordsStageTiming {
@@ -3332,6 +3599,19 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 recordStageTiming()
             }
             blockMixtureSubmissions += 1
+            recordBlockGap(
+                index: gapIndex,
+                layer: layer,
+                startPosition: startPosition,
+                count: count,
+                layerStart: layerStart,
+                denseEncoded: denseEncoded,
+                frontWaited: frontWaited,
+                routingDone: routingDone,
+                fillDone: fillDone,
+                mixtureEncoded: mixtureEncoded,
+                indexerWaited: indexerWaited
+            )
             recordLayerTiming(
                 from: layerStart,
                 denseEncoded: denseEncoded,
@@ -3387,9 +3667,24 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 waiting: true,
                 mixture: true
             )
-            if measuring { timingBuffers.append((buffer: expertCommand, bucket: 1)) }
+            if measuring {
+                timingBuffers.append((buffer: expertCommand, bucket: 1, gap: gapIndex))
+            }
         }
         let mixtureEncoded = measuring ? DispatchTime.now().uptimeNanoseconds : 0
+        recordBlockGap(
+            index: gapIndex,
+            layer: layer,
+            startPosition: startPosition,
+            count: count,
+            layerStart: layerStart,
+            denseEncoded: denseEncoded,
+            frontWaited: frontWaited,
+            routingDone: routingDone,
+            fillDone: fillDone,
+            mixtureEncoded: mixtureEncoded,
+            indexerWaited: indexerWaited
+        )
         recordLayerTiming(
             from: layerStart,
             denseEncoded: denseEncoded,
@@ -3407,6 +3702,42 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             try settlePending()
             hook(layer.index, startPosition, count)
         }
+    }
+
+    /// Appends one layer pass's clock record, unless the gap switch is off or the limit
+    /// is spent.
+    ///
+    /// The windows are filled in later, by `recordDeviceTiming`, because
+    /// `gpuStartTime`/`gpuEndTime` are only meaningful once the queue has run the
+    /// buffer. That is why the record is appended here (the marks are only in scope at
+    /// this point) but completed there.
+    private func recordBlockGap(
+        index: Int?,
+        layer: DeepSeekV41LayerPlan,
+        startPosition: Int,
+        count: Int,
+        layerStart: UInt64,
+        denseEncoded: UInt64,
+        frontWaited: UInt64,
+        routingDone: UInt64,
+        fillDone: UInt64,
+        mixtureEncoded: UInt64,
+        indexerWaited: UInt64
+    ) {
+        guard let index, layerStart > 0 else { return }
+        blockGaps.append(DeepSeekV41BlockGap(
+            layer: layer.index,
+            position: startPosition,
+            count: count,
+            layerStartNanoseconds: layerStart,
+            denseEncodedNanoseconds: denseEncoded,
+            frontWaitedNanoseconds: frontWaited,
+            routingDoneNanoseconds: routingDone,
+            fillDoneNanoseconds: fillDone,
+            mixtureEncodedNanoseconds: mixtureEncoded,
+            indexerWaitNanoseconds: indexerWaited
+        ))
+        blockGapCount += 1
     }
 
     /// Folds one layer's measurement marks into `blockTiming`.
@@ -3453,19 +3784,90 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// a buffer that started early because the queue was still draining the previous
     /// layer reports its own window, which is exactly the attribution a host-side
     /// wait cannot give.
+    ///
+    /// It computes the union of the windows as well as their sum, because in a block the
+    /// two are different questions: the sum is how much device work a position contains,
+    /// the union is how much of the wall the queue was busy for. `wall - union` is the
+    /// only bucket no host interval names, and it is what says whether a block is
+    /// throughput-bound or has a hole in it (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #75").
     private func recordDeviceTiming() {
+        var windows: [(start: UInt64, end: UInt64)] = []
+        windows.reserveCapacity(timingBuffers.count)
         for entry in timingBuffers {
             let start = entry.buffer.gpuStartTime
             let end = entry.buffer.gpuEndTime
-            guard end > start else { continue }
+            guard end > start else {
+                if entry.bucket == 0 {
+                    blockTiming.frontUnwindowedBuffers += 1
+                } else {
+                    blockTiming.mixtureUnwindowedBuffers += 1
+                }
+                continue
+            }
             let nanoseconds = UInt64((end - start) * 1_000_000_000)
+            let startNanoseconds = UInt64(max(0, start) * 1_000_000_000)
             if entry.bucket == 0 {
                 blockTiming.denseDeviceNanoseconds += nanoseconds
             } else {
                 blockTiming.mixtureDeviceNanoseconds += nanoseconds
             }
+            windows.append((start: startNanoseconds, end: startNanoseconds + nanoseconds))
+            guard let gap = entry.gap, gap < blockGaps.count else { continue }
+            if entry.bucket == 0 {
+                var record = blockGaps[gap]
+                if record.frontBufferCount == 0
+                    || startNanoseconds < record.frontWindowStartNanoseconds {
+                    record.frontWindowStartNanoseconds = startNanoseconds
+                }
+                let recordEnd = startNanoseconds + nanoseconds
+                if recordEnd > record.frontWindowEndNanoseconds {
+                    record.frontWindowEndNanoseconds = recordEnd
+                }
+                record.frontWindowNanoseconds += nanoseconds
+                record.frontBufferCount += 1
+                blockGaps[gap] = record
+            } else {
+                var record = blockGaps[gap]
+                if record.mixtureBufferCount == 0
+                    || startNanoseconds < record.mixtureWindowStartNanoseconds {
+                    record.mixtureWindowStartNanoseconds = startNanoseconds
+                }
+                let recordEnd = startNanoseconds + nanoseconds
+                if recordEnd > record.mixtureWindowEndNanoseconds {
+                    record.mixtureWindowEndNanoseconds = recordEnd
+                }
+                record.mixtureWindowNanoseconds += nanoseconds
+                record.mixtureBufferCount += 1
+                blockGaps[gap] = record
+            }
         }
+        blockTiming.deviceUnionNanoseconds += Self.unionNanoseconds(windows)
         timingBuffers.removeAll(keepingCapacity: true)
+    }
+
+    /// The length of the union of a set of intervals: how much wall the device was busy
+    /// for, counted once even when two windows touch or overlap.
+    ///
+    /// A walk's two halves never overlap, so for a walked position this equals the sum
+    /// and there was never a question to ask. In a block the mixture of one layer and the
+    /// dense half of the next are both on the queue at the same time, so the two differ
+    /// and the difference is the overlap the sum overstates by.
+    static func unionNanoseconds(_ windows: [(start: UInt64, end: UInt64)]) -> UInt64 {
+        guard !windows.isEmpty else { return 0 }
+        let sorted = windows.sorted { $0.start < $1.start }
+        var total: UInt64 = 0
+        var cursor = sorted[0].start
+        var end = sorted[0].end
+        for window in sorted.dropFirst() {
+            if window.start > end {
+                total += end - cursor
+                cursor = window.start
+                end = window.end
+            } else if window.end > end {
+                end = window.end
+            }
+        }
+        return total + (end - cursor)
     }
 
     /// Reads each stage's own device window, after the wait that covered them all.
@@ -6571,6 +6973,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     private func settlePending() throws {
         let outstanding = pending
         pending.removeAll(keepingCapacity: true)
+        var settleMixtureDrain: UInt64 = 0
         for entry in outstanding {
             let begin = (recordsWalkTiming || recordsWalkTimeline || recordsBlockTiming)
                 ? DispatchTime.now().uptimeNanoseconds : 0
@@ -6620,6 +7023,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 if entry.isMixture {
                     blockTiming.mixtureDrainNanoseconds += end - begin
                     blockTiming.mixtureLateStartNanoseconds += lateStart
+                    settleMixtureDrain += end - begin
                 } else {
                     blockTiming.frontDrainNanoseconds += end - begin
                     blockTiming.frontLateStartNanoseconds += lateStart
@@ -6667,6 +7071,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                     }
                 ))
             }
+        }
+        if recordsBlockTiming {
+            lastSettleMixtureDrainNanoseconds = settleMixtureDrain
         }
     }
 

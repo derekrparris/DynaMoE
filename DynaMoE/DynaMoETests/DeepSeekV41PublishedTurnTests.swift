@@ -14136,4 +14136,320 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         )
         withExtendedLifetime(engine) {}
     }
+
+    // MARK: - #75: what the front wait is made of
+
+    /// `#71`'s bucket table reads `front wait` as 43.7 of a 99.7 ms/position prefill, the
+    /// largest term that is not the disk, and every attempt to fix a bucket that size has
+    /// to know whether it is the GPU, the driver, or the host. It is one
+    /// `settlePending`, and the queue is in order, so the mixture the PREVIOUS layer
+    /// committed is drained inside it: the bucket is a settle, not a stall.
+    ///
+    /// This decomposes it on the published checkpoint. `recordsBlockGaps` keeps one
+    /// clock record per layer pass with that layer's own buffers' windows attached, so
+    /// each layer's wait splits exactly into
+    ///
+    ///     busy     the previous layer's mixture still on the queue (already billed)
+    ///   + pickup   the queue's own cost to start the dense half once nothing is running
+    ///   + window   the dense half's own device time
+    ///   + tail     the host noticing the last buffer had finished
+    ///
+    /// and `recordDeviceTiming` unions every window so the whole block can be split into
+    /// busy and idle rather than into host intervals that overlap. Three arms (width 8,
+    /// width 4, width 8 again) so the width question is answered rather than inferred.
+    func testWhatTheFrontWaitIsMadeOfOnThePublishedCheckpoint() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_front_wait"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in front-wait attribution; touch \(markerPath) to run"
+        )
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+        let length = 128
+        let tokens = (0..<length).map { index in
+            let repetition = index / stream.count
+            return stream[(index + repetition * 13) % stream.count]
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: length + 1,
+            allowEngramSkip: false,
+            wireArena: nil
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let executor = runtime.forward()
+        let shippedWidth = DeepSeekV41DevicePlan.prefillBlockWidth(
+            config: config, contextLength: runtime.contextLength, promptTokens: length
+        )
+        XCTAssertGreaterThanOrEqual(shippedWidth, 2, "a width of one is the walk")
+        print(
+            String(
+                format: "🔎 [dsv41 real] front wait attribution: %d positions, shipped "
+                    + "width %d, %d layer(s), %d of them compressed, arena %d slot(s)",
+                length,
+                shippedWidth,
+                runtime.plan.count,
+                runtime.plan.filter(\.ownsCompressedIndex).count,
+                runtime.arena.capacity
+            )
+        )
+
+        struct Arm {
+            var label: String
+            var width: Int
+            var wall: Double
+            var timing: DeepSeekV41BlockTiming
+            var gaps: [DeepSeekV41BlockGap]
+            var megabytes: Double
+            var misses: Int
+            var last: [Float]
+        }
+
+        func measure(label: String, width: Int) throws -> Arm {
+            executor.reset()
+            executor.resetBlockTiming()
+            executor.recordsBlockTiming = true
+            executor.recordsBlockGaps = true
+            // Two blocks' worth, because the FIRST block of a prefill is the one that
+            // allocates every arena slot it fills and reads a cold page cache. It is
+            // recorded (so its layer zero has a neighbour to compare against) and then
+            // dropped from the partition, which reads the second block instead.
+            executor.blockGapLimit = 80
+            let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+            let missesBefore = runtime.expertStreamer?.expertsLoaded ?? 0
+            let started = DispatchTime.now().uptimeNanoseconds
+            let result = try executor.prefillChunk(tokens, blockWidth: width)
+            let wall = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+            executor.recordsBlockTiming = false
+            executor.recordsBlockGaps = false
+            return Arm(
+                label: label,
+                width: width,
+                wall: wall / Double(length),
+                timing: executor.blockTiming,
+                gaps: executor.blockGaps,
+                megabytes: Double((runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore)
+                    / 1_048_576,
+                misses: (runtime.expertStreamer?.expertsLoaded ?? 0) - missesBefore,
+                last: result.last
+            )
+        }
+
+        func perPosition(_ nanoseconds: UInt64) -> Double {
+            Double(nanoseconds) / Double(length) / 1_000_000
+        }
+
+        // One discarded pass so no arm pays slot creation or a cold page cache.
+        executor.reset()
+        runtime.arena.reset()
+        _ = try executor.prefillChunk(Array(stream.prefix(8)))
+
+        let arms = [(label: "shipped", width: shippedWidth),
+                    (label: "half", width: max(2, shippedWidth / 2)),
+                    (label: "shipped again", width: shippedWidth)]
+        var measured: [Arm] = []
+        for round in 1...3 {
+            let offset = (round - 1) % arms.count
+            let order = Array(arms[offset...]) + Array(arms[..<offset])
+            for arm in order {
+                let sample = try measure(label: arm.label, width: arm.width)
+                print(
+                    String(
+                        format: "🔎 [dsv41 real]   %-14@ width %2d round %d wall %6.1f "
+                            + "ms/position, %.0f MB, %d misses",
+                        sample.label as NSString,
+                        sample.width,
+                        round,
+                        sample.wall,
+                        sample.megabytes,
+                        sample.misses
+                    )
+                )
+                print("🔎 [dsv41 real]     \(sample.timing.describe())")
+                // A young process is 1.3-1.6x faster in every bucket (`#53`), and the
+                // first arm of the first round also pays the coldest page cache.
+                guard round > 1 else { continue }
+                measured.append(sample)
+            }
+        }
+
+        // The decomposition, read back off the per-layer records rather than off the
+        // totals: `busy` is the previous layer's mixture still running, and it is the
+        // term that makes the front wait look like idle when it is device time.
+        for arm in measured where arm.label == "shipped again" {
+            let divisor = Double(length) * 1_000_000
+            // The second block: the first pays every slot allocation and a cold page
+            // cache, so its per-layer busy is a quarter high.
+            let records = arm.gaps.count > 40 ? Array(arm.gaps.suffix(40)) : arm.gaps
+            var busy: UInt64 = 0
+            var pickup: UInt64 = 0
+            var span: UInt64 = 0
+            var windows: UInt64 = 0
+            var tail: UInt64 = 0
+            var mixtureIdle: UInt64 = 0
+            var mixtureLate: UInt64 = 0
+            var layersReported = 0
+            var previousMixtureEnd: UInt64?
+            for (index, gap) in records.enumerated() {
+                // The first layer of a block has an upstream the record cannot see: the
+                // mixture of the PREVIOUS block's last layer. It is left out of the
+                // partition rather than folded into `pickup`, which is what would happen
+                // if it were counted with no upstream to compare against.
+                if index > 0 {
+                    busy += gap.priorWorkNanoseconds(upstream: previousMixtureEnd)
+                    pickup += gap.pickupNanoseconds(upstream: previousMixtureEnd)
+                    span += gap.frontSpanNanoseconds
+                    windows += gap.frontWindowNanoseconds
+                    tail += gap.frontTailNanoseconds()
+                    mixtureIdle += gap.mixtureIdleNanoseconds()
+                    mixtureLate += gap.mixtureLateStartNanoseconds()
+                    layersReported += 1
+                }
+                if gap.mixtureWindowEndNanoseconds > 0 {
+                    previousMixtureEnd = gap.mixtureWindowEndNanoseconds
+                }
+            }
+            XCTAssertGreaterThan(layersReported, 2, "too few layers to partition")
+            // The totals are per position over the whole span, so the partition is put in
+            // per-layer-pass units before it can be compared with them.
+            let owned = Double(layersReported) / Double(max(1, arm.gaps.count))
+            print(
+                String(
+                    format: "🔎 [dsv41 real] width %d, one block's %d layer pass(es), "
+                        + "ms/position: wait %.2f = busy %.2f + pickup %.2f + window "
+                        + "%.2f + tail %.2f; of the dense span, %.2f is the gap between "
+                        + "two submissions",
+                    arm.width,
+                    layersReported,
+                    Double(busy + pickup + span + tail) / divisor,
+                    Double(busy) / divisor,
+                    Double(pickup) / divisor,
+                    Double(span) / divisor,
+                    Double(tail) / divisor,
+                    Double(span - min(span, windows)) / divisor
+                )
+            )
+            print(
+                String(
+                    format: "🔎 [dsv41 real] width %d, the same layers: mixture gate idle "
+                        + "%.2f ms/position (%.2f of it after its own commit), and the "
+                        + "front wait the totals report for them is %.2f (%.0f%% of the "
+                        + "block's %.2f)",
+                    arm.width,
+                    Double(mixtureIdle) / divisor,
+                    Double(mixtureLate) / divisor,
+                    Double(arm.timing.frontWaitNanoseconds) / divisor * owned,
+                    owned * 100,
+                    Double(arm.timing.frontWaitNanoseconds) / divisor
+                )
+            )
+            print(
+                String(
+                    format: "🔎 [dsv41 real] width %d, the block: device union %.1f of a "
+                        + "%.1f wall, %.1f idle; frontBusy %.2f against the records' "
+                        + "%.2f; %d/%d buffers reported no window",
+                    arm.width,
+                    Double(arm.timing.deviceUnionNanoseconds) / divisor,
+                    arm.wall,
+                    arm.wall - Double(arm.timing.deviceUnionNanoseconds) / divisor,
+                    Double(arm.timing.frontBusyNanoseconds) / divisor,
+                    Double(busy) / divisor,
+                    arm.timing.frontUnwindowedBuffers,
+                    arm.timing.mixtureUnwindowedBuffers
+                )
+            )
+
+            // The classification the slice rests on: most of the wait is another
+            // bucket's device time, and the dense half's own share still has room to be
+            // the larger of the two only if the mixture had already retired.
+            XCTAssertGreaterThan(
+                arm.timing.frontBusyNanoseconds, 0,
+                "no mixture drain was attributed to a front wait"
+            )
+            XCTAssertLessThan(
+                arm.timing.frontBusyNanoseconds, arm.timing.frontWaitNanoseconds,
+                "the previous layer's mixture cannot outlast the whole front wait"
+            )
+            // The hand-off itself is closed: the queue starts the dense half in well
+            // under a millisecond of a several-millisecond wait, and the host notices its
+            // last buffer in a fraction of one (#48, #50, and now here).
+            XCTAssertLessThan(
+                Double(pickup) / Double(max(1, layersReported)) / 1_000_000, 0.5,
+                "the dense half's pickup is not the immediate start #48 measured"
+            )
+            XCTAssertLessThan(
+                Double(tail) / Double(max(1, layersReported)) / 1_000_000, 0.5,
+                "the host did not notice the dense half finishing promptly"
+            )
+            // `busy` is the mixture's share of the same settles, so it cannot exceed the
+            // mixture drain the totals report.
+            XCTAssertGreaterThanOrEqual(
+                arm.timing.mixtureDrainNanoseconds, busy,
+                "the front wait absorbed more mixture drain than the mixture half reports"
+            )
+            // A block's windows cannot add up to more wall than the block took.
+            let union = Double(arm.timing.deviceUnionNanoseconds) / divisor
+            XCTAssertGreaterThanOrEqual(
+                arm.wall, union,
+                "the device union is larger than the block's own wall"
+            )
+            XCTAssertGreaterThanOrEqual(
+                Double(arm.timing.denseDeviceNanoseconds + arm.timing.mixtureDeviceNanoseconds)
+                    / divisor,
+                union,
+                "a union of overlapping windows is larger than their sum"
+            )
+            // The two routes to the same number: `frontBusy` is accumulated at the
+            // settle, the records are read back per layer. Both are per layer pass here.
+            let settlePerLayer = Double(arm.timing.frontBusyNanoseconds)
+                / Double(max(1, arm.timing.layers))
+            let recordsPerLayer = Double(busy) / Double(max(1, layersReported))
+            print(
+                String(
+                    format: "🔎 [dsv41 real] width %d, frontBusy per layer pass: settle "
+                        + "%.2f ms, the block's records %.2f ms",
+                    arm.width,
+                    settlePerLayer / 1_000_000,
+                    recordsPerLayer / 1_000_000
+                )
+            )
+            XCTAssertEqual(
+                settlePerLayer, recordsPerLayer,
+                accuracy: max(settlePerLayer * 0.35, 500_000),
+                "the settle-level `frontBusy` disagrees with the per-layer records"
+            )
+        }
+
+        // Width must not move the answer, and the two arms that differ only in width do
+        // read different bytes, so this is a guard rather than a result.
+        let first = try XCTUnwrap(measured.first)
+        let repeatArm = try XCTUnwrap(measured.last)
+        let scale = max(first.last.map { abs(Double($0)) }.max() ?? 0, 1e-6)
+        let drift = zip(first.last, repeatArm.last)
+            .map { abs(Double($0) - Double($1)) }
+            .max() ?? 0
+        XCTAssertLessThan(drift / scale, 1e-6, "two prefills of one stream disagree")
+        withExtendedLifetime(engine) {}
+    }
 }
