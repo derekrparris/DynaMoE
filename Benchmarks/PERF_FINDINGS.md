@@ -10697,3 +10697,154 @@ The full `DynaMoETests` target ran 1,497 tests with 99 skipped and 33 failures i
 environmental set (5 XCTest failures in 4 `DynaMoETests` cases, 25 in 9 `ModelDogfoodAndPrefixCacheTests`
 cases); the other 3 are `ServerQueueLogicTests`, which pass in isolation (13/13,
 `/tmp/test67_queue.log`) and are the timing flake `#58` recorded.
+
+## DSV4.1 #68: THE BAR FOR A DRAFT IS 45-75% EVEN IF DRAFTING WERE FREE, AND #22's 2.16x WAS A WARM-ARENA ARTIFACT
+
+#67 closed the expert stream as a floor and left one lever standing: a decode step cannot batch, so
+speculative decoding is the only structure that stops paying the stream once per position. #22 had
+priced it at 2.16x per position and 7.6x less I/O, which put the bar at ~47% acceptance over eight
+drafts; #25 and #26 measured the checkpoint's own drafter at 31% and then at 50-55% when the block was
+narrowed, and closed it. This slice asks the one question that ordering never had to answer -- what
+acceptance would a draft need, AT ALL, against the walk a live turn actually pays -- and the answer
+invalidates the premise under the 47%: a block does not read fewer bytes, and the bar is 45-75% before
+a drafter has spent a millisecond.
+
+### The run
+
+One runtime, the published checkpoint, the shipping arena rule, `arena.reset()` before every arm so
+every arm is compulsory (100% first touches, asserted) and no arm inherits another's pairs or its
+page-cache lines. Arms of 48 positions, rotated between rounds, two measured rounds after a discarded
+warm-up: a WALK arm and a VERIFY arm at widths 2, 3, 5 and 8, each on its own disjoint slice of the
+token pool. `testWhatAcceptanceADraftWouldHaveToReachToPayForItsVerify`, logs `/tmp/test68_bar1.log`
+and `/tmp/test68_bar2.log`.
+
+| arm | ms/position | MB/position | misses/position | first touch |
+|---|---|---|---|---|
+| walk | 96.8-100.9 | 876-928 | 48.8-51.8 | 100% |
+| w2 | 89.1-92.7 | 967-973 | 53.9-54.3 | 100% |
+| w3 | 75.7-79.0 | 911-939 | 50.8-52.4 | 100% |
+| w5 | 79.8-81.2 | 966-972 | 53.9-54.2 | 100% |
+| w8 | 83.1-84.4 | 999-1022 | 55.7-57.0 | 100% |
+
+Two runs, and the byte columns reproduce exactly while the walls move ~1%: w2 0.95/0.96x a walk, w3
+0.78/0.79x, w5 0.82/0.84x, w8 0.86/0.87x. That is the whole saving batching has -- 4.5 to 22.2 ms of a
+~98 ms position, one host round trip per layer that a block does not pay per position.
+
+### The 7.6x was never there
+
+Against a walk's 928 MB, the blocks read **1.01-1.10x as much**: w2 973 MB, w3 939, w5 972, w8 1,022.
+Not fewer. `#22`'s "one expert union per block instead of one set per position" is not what a resident
+arena does, because the arena is already the union: a walked position hits ~80% of the time (48.8-51.8
+misses against ~280 requests) since the positions before it in the same turn read the same experts, so
+the set a block fills up front is very nearly the set the walks would have read anyway -- and the block
+pays for its union's whole width in ONE burst, which is why `#26` measured width three reading 55% MORE
+per position than walking it.
+
+Where `#22`'s 1,357 MB came from is visible in its own test: it walks runs 0, 1 and 2 first, then
+blocks runs **1, 2 and 3** -- two of the three block runs are runs the walk arm had just loaded. The
+block byte count is the walk's own bytes served from the arena, which is precisely the trap `#22`
+recorded for a different fixture and then walked into. Its 2.16x is therefore mostly warm-arena, and
+every projection resting on it -- including the ~47% bar for a verify of eight -- is withdrawn.
+
+### The bar, at last without a premise
+
+A round costs `draft + width * verify * W` and emits `1 + a` tokens against `(1 + a) * W` of walking,
+so it pays when
+
+    a >= draft/W + width * verify_ratio - 1
+
+and with a FREE drafter that is `width * ratio - 1` accepted drafts:
+
+| width | verify ratio | saves | free bar | at #26's drafting | #26 measured |
+|---|---|---|---|---|---|
+| 2 | 0.95-0.96 | 4.5 ms/pos | **45-46%** | 82% (73 ms) | 52% |
+| 3 | 0.78-0.79 | 22.2 | **45-46%** | 71% (78.5 ms) | 38% |
+| 5 | 0.82-0.84 | 17.9 | **62-64%** | 93% (154.5 ms) | 31% |
+| 8 | 0.86-0.87 | 14.3 | **73-75%** | not measured | not measured |
+
+Read down the free column: a drafter that costs NOTHING has to be right 45-46% of the time at width
+two or three and 62-75% at five or eight, because a verify only ever buys back the per-layer round
+trip and the batching that would have bought more is worth nothing here. Width two is the only
+configuration with any headroom, and the checkpoint's own drafter delivers 52% there -- ABOVE the free
+bar. What kills it is its own forward: 73 ms of a 98 ms walk position. Break-even at width two needs
+`draft <= (1.05 - 0.91) * W`, i.e. **~14 ms per round**, which is 4-6x cheaper than the 56-90 ms `#26`
+measured and still 2x cheaper than the ~25-30 ms that slice projected if the draft mixture were made
+fully arena-resident. At widths three and five the round cannot break even at ANY draft cost, since the
+free bar already exceeds the acceptance the checkpoint delivers.
+
+### The one drafter that costs nothing
+
+So the remaining candidate is a drafter with no model in it: the continuation of the nearest earlier
+occurrence of the turn's own last n tokens. It is scored EXACTLY rather than approximately -- the
+protocol advances a round by `width` whatever was accepted (which is what `dsparkAcceptance` does, so
+the two drafters face the same target path) and acceptance always stops at the first disagreement, so
+every position before it is the model's own greedy path and a single walked continuation answers the
+question offline. The continuation is a real 96-token greedy generation from a rendered prompt, not
+fixture text.
+
+| width | 2-token lookup | 3-token lookup | free bar |
+|---|---|---|---|
+| 2 | 3/12 (25%), drafted in 6 of 48 rounds | 1/6 (17%), 3 of 48 | 46% |
+| 3 | 4/12 (33%), 4 of 32 | 0/3 (0%), 1 of 32 | 45% |
+| 5 | 0/5 (0%), 1 of 19 | 0/5 (0%), 1 of 19 | 62% |
+| 8 | 0/0, 0 of 12 | 0/0, 0 of 12 | 75% |
+
+On ordinary prose it does not have a draft to offer: it proposed one in 11 of 111 rounds across the
+four widths, and the ones it proposed were right a quarter to a third of the time. Its expected
+accepted tokens per round is a fortieth of what width two needs. Reproducible to the token across both
+runs.
+
+### What it says
+
+Speculative decoding is closed on this port at every width, and now for a reason that does not depend
+on any one drafter: the verify's whole prize is the per-layer host round trip (0.78-0.96x), the bar
+that prize sets is 45-75% with no drafting cost at all, and no drafter measured here -- the
+checkpoint's own chain at 31-52%, or a free n-gram lookup at 0-33% on prose -- comes within reach
+except at width two, where the checkpoint's 52% clears a 46% bar and its 73 ms of drafting moves the
+bar to 82%.
+
+The relationship is worth stating because it generalises: **the faster the walk, the higher the bar**,
+since `draft/W` grows as `W` falls and the round-trip saving it is chasing shrinks with it. `#67`
+pushed `W` down to 121.8 ms/position cold and 55 to the floor; a verify that could not pay at 153-194
+therefore cannot pay at 122, and at the 55 ms floor there is nothing to batch at all because the fill
+has already left the critical path. Speculative decoding and the expert stream are the same lever
+pointing in opposite directions.
+
+### What it is not (do not re-propose)
+
+- **A batched verify as a way to read fewer expert bytes.** It does not read fewer; it reads
+  1.01-1.10x as many, because the arena already amortises the stream across positions. Do not quote
+  `#22`'s 7.6x again.
+- **A width-2 verify on the strength of 52% acceptance.** 52% clears the free bar by 6 points and the
+  drafter's own 56-90 ms of forward turns that into a 82% bar. The number that would have to move is
+  the draft cost, to under ~14 ms/round, and `#26`'s best projection for a fully resident mixture is
+  double that.
+- **Widths 3, 5 and 8 at any drafting cost.** The free bar exceeds the measured acceptance, so no
+  optimisation of the drafter helps.
+- **An n-gram or prompt-lookup drafter on prose.** 11 drafts in 111 rounds; it is a no-op that would
+  still have to be verified. (It may be worth revisiting only for text that repeats by construction,
+  and then it must be priced on that text and not on this one.)
+- **Per-position logits in `finishBlock` and cache rewind for a rejected suffix.** Still exactly what
+  `#25` and `#26` said: the losing half of a design the measurement rejects.
+- Everything `#22`, `#26` and `#67` already closed: the fill's read form, fan-out, `F_NOCACHE`, disk
+  and page cache (`#51`); arena capacity and replacement (`#58`/`#59`); slot wiring and its withdrawal
+  (`#56`/`#57`); the hand-off idle, deferred bind, event gate and second command queue (`#48`-`#50`,
+  `#65`, `#67`); dispatch count and fusion (`#66`); the resolve path (`#67`); the dense GEMVs and the
+  wider block (`#60`); the shared expert, mHC and router kernels (`#61`-`#63`).
+
+### Verification
+
+Ranges over `/tmp/test68_bar1.log` and `/tmp/test68_bar2.log`: the walls agree to ~1% between runs and
+the byte columns to the megabyte, and the width ratios (0.95/0.96, 0.78/0.79, 0.82/0.84, 0.86/0.87) are
+the quoted figures. The case asserts that every arm is >80% compulsory first touches (so no arm read
+another's pairs), that a round records exactly one walk arm and one arm per width, and that the
+required-acceptance arithmetic reproduces the printed bar. It reports the bar at the measured walk and
+quotes `#26`'s two drafter numbers rather than re-running them, because the draft width sizes buffers at
+construction and a sweep needs one runtime per width.
+
+The regime differs from `#26`'s in one deliberate way and it is worth knowing which is which: `#26`
+walked a 14-position prefix and then timed ONE round against it, which is a round whose experts are
+almost all cold, while these arms are 48 positions long so each block is filled against the arena the
+turn so far left -- the ~80% hit rate `#67` measured on a live turn. That is why width three reads
+0.78x here and 1.08x there: neither is wrong, and the one that answers "does a verify pay in a live
+turn" is this one.

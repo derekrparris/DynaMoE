@@ -11385,4 +11385,431 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             )
         }
     }
+
+    // MARK: - What acceptance a draft would have to reach
+
+    /// The widths the bar is priced at: the two a chain's acceptance curve can fill,
+    /// the checkpoint's declared block, and the eight `#22` measured a batched verify.
+    private static let verifyBarWidths = [2, 3, 5, 8]
+
+    /// The two numbers `#26` measured for the checkpoint's own drafter, per width: how
+    /// often its chain agrees with the target across both continuations, and what one
+    /// round of drafting costs. They are quoted rather than re-run because they are a
+    /// property of the drafter, not of the walk's regime, and re-measuring them needs a
+    /// runtime per width (`dsparkBlockSize` sizes buffers at construction).
+    private static let dsparkMeasured: [Int: (acceptance: Double, draftMilliseconds: Double)] = [
+        2: (0.525, 73), 3: (0.385, 78.5), 5: (0.31, 154.5)
+    ]
+
+    /// What a drafter's acceptance would have to be for its verify to pay for itself,
+    /// at every width, against the walk a live turn actually pays -- and the one
+    /// drafter that costs the model nothing, measured against the same bar.
+    ///
+    /// `#26` closed a narrow verify with both sides measured: acceptance is 50-55% at
+    /// width two against a verify at 0.83-0.89x a walk, which loses, and 37-40% at
+    /// width three against 1.08x, which loses worse. `#22`'s batched block of eight is
+    /// 2.16x cheaper per position, but it needs ~47% acceptance over eight drafts and
+    /// the checkpoint's own chain dies at its second step.
+    ///
+    /// Both were priced against a walk of 153.3-194.8 ms/position. `#67` then measured
+    /// the walk a live turn pays -- 121.8 ms/position cold, 82 warm, 55 once the fill
+    /// is served from the page cache -- and the arithmetic runs the wrong way with a
+    /// faster walk: a verify's ENTIRE advantage is batching the expert fill, so the
+    /// less fill there is to batch, the more acceptance a round needs to break even.
+    /// `#26`'s conclusion therefore holds with more room than it could show, and the
+    /// only question left open is whether any drafter can be cheap enough to live
+    /// above the bar.
+    ///
+    /// That is what this case prices. In the regime `#67` established -- the arena
+    /// reset before every arm, so every arm is compulsory first touches -- it measures
+    /// a WALK arm and a VERIFY arm at widths 2, 3, 5 and 8 on one runtime, rotated and
+    /// interleaved, and turns them into the bar
+    ///
+    ///     a_required = draft/walk + width * verify_ratio - 1
+    ///
+    /// -- the expected number of accepted drafts a round needs, from
+    /// `draft + width*verify*W <= (1 + a)*W`. Every width also reports the bar with a
+    /// FREE drafter, which is the floor no drafter can go below, and beside it the
+    /// acceptance `#26` measured for the one this checkpoint ships.
+    ///
+    /// Then it measures the only drafter whose cost is genuinely zero: an n-gram
+    /// lookup over the turn's own history, which needs no model. It generates a real
+    /// greedy continuation and scores that drafter offline, exactly rather than
+    /// approximately, because acceptance always stops at the first disagreement and
+    /// every position before it is the model's own path.
+    ///
+    /// Opt-in (`/tmp/dynamoe_dsv41_verify_bar`, plus the class's own marker).
+    func testWhatAcceptanceADraftWouldHaveToReachToPayForItsVerify() throws {
+        let markerPath = "/tmp/dynamoe_dsv41_verify_bar"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in verify-bar probe; touch \(markerPath) to run"
+        )
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        guard let tokenizer = try? DynaMoeTokenizer(
+            tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+        ) else {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let widths = Self.verifyBarWidths
+        // A live turn walks ONE position per round and verifies a short run, so an arm
+        // of 48 positions is already longer than the thing being priced. Every arm and
+        // every round draws a DIFFERENT slice of the pool, because a token this process
+        // already read is a token the page cache already holds, and `#67` showed how
+        // much a warm read flatters a fill.
+        let positions = 48
+        let rounds = 3
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the model, \
+            and the fraction is chosen by a router rather than by the layout. The router \
+            is small and is trained jointly with everything else, so which experts a \
+            token reaches is a property of the weights and not of a schedule somebody \
+            wrote down. That is why the same sentence decoded twice reads the same rows, \
+            and why a different sentence does not, and why the disk's throughput is the \
+            number that decides how fast a decode step can be.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 32, "the pool text tokenized to too little")
+        let arms = widths.count + 1
+        let pool = (0..<(positions * arms * rounds)).map { index in
+            stream[(index * 37) % stream.count]
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: 256,
+            allowEngramSkip: false,
+            wireArena: nil
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        runtime.arena.victimPolicy = .leastFrequentlyUsed
+        runtime.arena.recordsMissComposition = true
+        let executor = runtime.forward()
+        executor.recordsWalkTiming = false
+        executor.recordsWalkStageTiming = false
+        executor.recordsLayerGaps = false
+        print(
+            String(
+                format: "🔎 [dsv41 real] verify bar: %d positions per arm, %d round(s) "
+                    + "after a discarded warm-up, widths %@, arena %d slots",
+                positions, rounds - 1,
+                widths.map(String.init).joined(separator: "/"),
+                runtime.arena.capacity
+            )
+        )
+
+        var walks: [VerifyBarArm] = []
+        var verifies: [Int: [VerifyBarArm]] = [:]
+        for round in 0..<rounds {
+            for offset in 0..<arms {
+                // Rotate, so no width always inherits the previous arm's leftovers and
+                // no width is always the first to pay for a cold pipeline.
+                let slot = (offset + round) % arms
+                let index = round * arms + slot
+                let tokens = Array(pool[(index * positions)..<((index + 1) * positions)])
+                let width: Int? = slot == 0 ? nil : widths[slot - 1]
+                let arm = try verifyBarArm(
+                    runtime: runtime,
+                    executor: executor,
+                    tokens: tokens,
+                    chunkWidth: width,
+                    label: width.map { "w\($0)" } ?? "walk"
+                )
+                // The warm-up round is discarded whole: it pays the pipeline encoders,
+                // the slot wiring of whatever it touches and the shard mappings.
+                guard round > 0 else { continue }
+                if let width { verifies[width, default: []].append(arm) } else { walks.append(arm) }
+            }
+        }
+        XCTAssertEqual(walks.count, rounds - 1, "a round did not record exactly one walk")
+        for width in widths {
+            XCTAssertEqual(
+                verifies[width]?.count, rounds - 1,
+                "width \(width) did not record one arm per measured round"
+            )
+        }
+        // Every arm resets the arena, so every arm must be compulsory: a miss that is a
+        // first touch is what a live turn's new positions pay, and a warm arm would
+        // read like the regime `#67` spent a slice debunking.
+        let everyArm = walks + widths.flatMap { verifies[$0] ?? [] }
+        for arm in everyArm {
+            XCTAssertGreaterThan(
+                arm.firstTouchShare, 0.8,
+                "\(arm.label) was not compulsory (first-touch share \(arm.firstTouchShare))"
+            )
+        }
+
+        func median(_ values: [Double]) -> Double {
+            guard !values.isEmpty else { return 0 }
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+        let walk = median(walks.map(\.msPerPosition))
+        for arm in walks {
+            print(
+                String(
+                    format: "🔎 [dsv41 real]   %@: %.1f ms/position, %.0f MB/position, "
+                        + "%.1f miss(es)/position, %.0f%% first touch",
+                    arm.label, arm.msPerPosition, arm.megabytesPerPosition,
+                    arm.missesPerPosition, 100 * arm.firstTouchShare
+                )
+            )
+        }
+        // The ratio is taken ROUND BY ROUND and then reduced, which is `#26`'s fix: the
+        // absolute level of this machine moves between runs by more than any effect
+        // being chased, so only a verify and a walk measured seconds apart can be
+        // divided.
+        for width in widths {
+            let arms = verifies[width] ?? []
+            for arm in arms {
+                print(
+                    String(
+                        format: "🔎 [dsv41 real]   %@: %.1f ms/position, %.0f MB/position, "
+                            + "%.1f miss(es)/position, %.0f%% first touch",
+                        arm.label, arm.msPerPosition, arm.megabytesPerPosition,
+                        arm.missesPerPosition, 100 * arm.firstTouchShare
+                    )
+                )
+            }
+            let ratios = zip(arms, walks).map { $0.msPerPosition / max(1e-9, $1.msPerPosition) }
+            let ratio = median(ratios)
+            let barFree = Self.verifyBarRequiredRate(width: width, ratio: ratio, draft: 0, walk: walk)
+            var measured = ", and nothing was ever measured at this width"
+            if let draft = Self.dsparkMeasured[width] {
+                let barDraft = Self.verifyBarRequiredRate(
+                    width: width, ratio: ratio, draft: draft.draftMilliseconds, walk: walk
+                )
+                measured = String(
+                    format: ", or %.0f%% at #26's %.0f ms of drafting, which delivers %.0f%%",
+                    100 * barDraft, draft.draftMilliseconds, 100 * draft.acceptance
+                )
+            }
+            print(
+                String(
+                    format: "🔎 [dsv41 real] width %d: verify %.2fx a walk (rounds %@), so "
+                        + "one expert union replaces %d per-position sets and saves %.1f "
+                        + "ms/position; break-even needs %.1f of %d drafts = %.0f%% FREE%@",
+                    width,
+                    ratio,
+                    ratios.map { String(format: "%.2f", $0) }.joined(separator: "/"),
+                    width,
+                    (1 - ratio) * walk,
+                    barFree * Double(width),
+                    width,
+                    100 * barFree,
+                    measured
+                )
+            )
+        }
+
+        // What batching actually saves, which is not what `#22` said it did. That slice
+        // priced a block of eight at 7.6x fewer read bytes on the reasoning that "one
+        // expert union" replaces "one set per position" -- but the arena IS that union
+        // already: a walked position hits ~80% of the time because the positions before
+        // it in the same turn read the same experts, so the union a block fills up front
+        // is very nearly the set the walks would have read anyway. The byte column is
+        // what says so, and the per-layer host round trip is all a block removes.
+        let walkBytes = median(walks.map(\.megabytesPerPosition))
+        let bytes = widths.map { width -> String in
+            let value = median((verifies[width] ?? []).map(\.megabytesPerPosition))
+            return String(format: "w%d %.0f MB (%.2fx)", width, value, value / max(1, walkBytes))
+        }
+        print(
+            String(
+                format: "🔎 [dsv41 real] read bytes per position against the walk's "
+                    + "%.0f MB: %@",
+                walkBytes, bytes.joined(separator: ", ")
+            )
+        )
+
+        // The one drafter that costs no model at all, scored against a real greedy
+        // continuation. `#22` measured kernels instead of the fill before; this is the
+        // same trap's mirror image, so the continuation is a genuine generation from a
+        // rendered prompt rather than any text the fixture chose.
+        executor.reset()
+        let dialect = DeepSeekV41PromptDialect.resolve(snapshotDir: snapshot)
+        let prompt = dialect.render(
+            turns: [.init(isUser: true, text: Self.verifyBarQuestion)],
+            cleanSystem: "",
+            thinkingEnabled: false,
+            effort: nil
+        )
+        let promptIds = try tokenizer.encode(text: prompt).map { Int($0) }
+        let continuation = 96
+        var path = promptIds
+        var logits = try executor.prefillChunk(promptIds).last
+        XCTAssertFalse(logits.isEmpty, "the prompt prefill returned no logits")
+        for _ in 0..<continuation {
+            let token = Int(Self.argmax(logits))
+            path.append(token)
+            logits = try executor.forwardToken(token, position: path.count - 1)
+        }
+        let generated = Array(path[promptIds.count...])
+        print(
+            "🔎 [dsv41 real] n-gram target: \(promptIds.count) prompt token(s) and "
+                + "\(generated.count) generated greedily; \(generated.prefix(16))"
+        )
+        for order in [2, 3] {
+            let scored = ngramAcceptance(
+                path: path, promptCount: promptIds.count, widths: widths, order: order
+            )
+            let lines = widths.map { width -> String in
+                let entry = scored[width] ?? (0, 0, 0, 0)
+                let rate = entry.drafted > 0
+                    ? Double(entry.accepted) / Double(entry.drafted) : 0
+                let armsForWidth = verifies[width] ?? []
+                let ratio = median(
+                    zip(armsForWidth, walks).map { $0.msPerPosition / max(1e-9, $1.msPerPosition) }
+                )
+                let bar = Self.verifyBarRequiredRate(width: width, ratio: ratio, draft: 0, walk: walk)
+                return String(
+                    format: "w%d %d/%d (%.0f%%) in %d of %d round(s) vs a %.0f%% bar%@",
+                    width, entry.accepted, entry.drafted, 100 * rate,
+                    entry.draftedRounds, entry.rounds, 100 * bar,
+                    rate >= bar && entry.drafted > 0 ? " -- CLEARS" : ""
+                )
+            }
+            print(
+                "🔎 [dsv41 real] n-gram drafter, \(order)-token lookup, "
+                    + "\(widths.count) width(s) over \(continuation) drafted position(s): "
+                    + lines.joined(separator: ", ")
+            )
+        }
+        print(String(format: "🔎 [dsv41 real] %@", runtime.describe()))
+        runtime.shutdown()
+        withExtendedLifetime(engine) {}
+    }
+
+    /// A question whose answer is ordinary prose, so the continuation the n-gram
+    /// drafter is scored on is the kind of text a turn actually produces rather than a
+    /// list or a template that repeats itself.
+    private static let verifyBarQuestion =
+        "Explain in a short paragraph why reading from a solid state drive is slower "
+        + "than reading from memory."
+
+    /// One arm's per-position cost, what it read, and whether that read was compulsory.
+    private struct VerifyBarArm {
+        let label: String
+        let msPerPosition: Double
+        let megabytesPerPosition: Double
+        let missesPerPosition: Double
+        let firstTouchShare: Double
+    }
+
+    /// Runs `tokens` once, from an empty cache and an empty arena, either as a walk or
+    /// as `tokens.count / width` blocks of `width`.
+    private func verifyBarArm(
+        runtime: DeepSeekV41Runtime,
+        executor: DeepSeekV41MetalForward,
+        tokens: [Int],
+        chunkWidth: Int?,
+        label: String
+    ) throws -> VerifyBarArm {
+        executor.reset()
+        runtime.arena.reset()
+        let missesBefore = runtime.arena.acquisitions - runtime.arena.hits
+        let firstBefore = runtime.arena.firstTouchMisses
+        let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+        let began = DispatchTime.now().uptimeNanoseconds
+        if let width = chunkWidth {
+            var offset = 0
+            while offset < tokens.count {
+                let end = min(offset + width, tokens.count)
+                _ = try executor.prefillChunk(Array(tokens[offset..<end]))
+                offset = end
+            }
+        } else {
+            for (position, token) in tokens.enumerated() {
+                _ = try executor.forwardToken(token, position: position)
+            }
+        }
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - began) / 1_000_000
+        let misses = (runtime.arena.acquisitions - runtime.arena.hits) - missesBefore
+        let firstTouch = runtime.arena.firstTouchMisses - firstBefore
+        let bytes = (runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore
+        let count = Double(tokens.count)
+        return VerifyBarArm(
+            label: label,
+            msPerPosition: elapsed / count,
+            megabytesPerPosition: Double(bytes) / 1_048_576 / count,
+            missesPerPosition: Double(misses) / count,
+            firstTouchShare: misses > 0 ? Double(firstTouch) / Double(misses) : 0
+        )
+    }
+
+    /// The acceptance a round needs, as a rate per drafted token, from
+    /// `draft + width*ratio*walk <= (1 + a)*walk`.
+    ///
+    /// A negative bar is a round that wins with nothing accepted, which happens once a
+    /// block is cheaper per position than `1/width` of a walk.
+    private static func verifyBarRequiredRate(
+        width: Int, ratio: Double, draft: Double, walk: Double
+    ) -> Double {
+        guard width > 0, walk > 0 else { return 1 }
+        let required = draft / walk + Double(width) * ratio - 1
+        return required / Double(width)
+    }
+
+    /// Every width's agreement, for a drafter that costs nothing: the tokens that
+    /// followed the most recent earlier occurrence of the history's last `order`
+    /// tokens.
+    ///
+    /// The round advances by `width` and not by `accepted + 1`, because that is what
+    /// `DeepSeekV41DSpark`'s protocol does (`dsparkAcceptance` walks `steps` positions
+    /// per round whatever the drafts did), so the two drafters are scored against the
+    /// same target path and their rates can be compared.
+    private func ngramAcceptance(
+        path: [Int],
+        promptCount: Int,
+        widths: [Int],
+        order: Int
+    ) -> [Int: (accepted: Int, drafted: Int, rounds: Int, draftedRounds: Int)] {
+        var result: [Int: (accepted: Int, drafted: Int, rounds: Int, draftedRounds: Int)] = [:]
+        for width in widths {
+            var accepted = 0
+            var drafted = 0
+            var roundCount = 0
+            var draftedRounds = 0
+            var position = promptCount
+            while position + width <= path.count {
+                let draft = ngramDraft(
+                    history: path[0..<position], width: width, order: order
+                )
+                accepted += DeepSeekV41DSpark.acceptedCount(
+                    draft: draft,
+                    targetChoices: Array(path[position..<(position + width)])
+                )
+                drafted += draft.count
+                roundCount += 1
+                if !draft.isEmpty { draftedRounds += 1 }
+                position += width
+            }
+            result[width] = (accepted, drafted, roundCount, draftedRounds)
+        }
+        return result
+    }
+
+    /// The tokens that followed the most recent earlier occurrence of the history's
+    /// last `order` tokens, or nothing when there is none -- a round that drafts
+    /// nothing and therefore accepts nothing.
+    private func ngramDraft(history: ArraySlice<Int>, width: Int, order: Int) -> [Int] {
+        guard history.count > order else { return [] }
+        let suffix = Array(history.suffix(order))
+        var start = history.count - order - 1
+        while start >= 0 {
+            let candidate = Array(history[start..<(start + order)])
+            if candidate == suffix, start + order + width <= history.count {
+                return Array(history[(start + order)..<(start + order + width)])
+            }
+            start -= 1
+        }
+        return []
+    }
 }
