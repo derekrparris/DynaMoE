@@ -1331,6 +1331,19 @@ nonisolated public struct DeepSeekV41BlockGap: Sendable, Equatable {
     /// The indexer split's drain plus its host readback, taken out of the dense encode
     /// because it is a round trip and not the host's own work.
     public let indexerWaitNanoseconds: UInt64
+    /// What this layer pass's fill actually read.
+    ///
+    /// The mixture's pickup is the price of reading at all (`#50`), so it can only be
+    /// read per layer if the bytes that layer read are beside it: `#50` priced a walked
+    /// position's hand-off at 0.088-0.117 ms of GPU idle per MB read, and a block reads an
+    /// order of magnitude more per layer pass (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1
+    /// #76").
+    public let fillBytes: Int
+    public let fillMisses: Int
+    /// The trivial buffers committed immediately before this layer pass's mixture, in
+    /// commit order, when `recordsMixtureStartProbe` is on. Their windows are filled in by
+    /// `recordDeviceTiming`, the same way the two halves' windows are.
+    public var probes: [DeepSeekV41GapProbe] = []
     /// Window of the FIRST dense buffer and of the LAST one. A compressed layer splits
     /// its dense half into two submissions, so the span and the sum differ by whatever
     /// ran in the gap between them.
@@ -1355,7 +1368,10 @@ nonisolated public struct DeepSeekV41BlockGap: Sendable, Equatable {
         routingDoneNanoseconds: UInt64,
         fillDoneNanoseconds: UInt64,
         mixtureEncodedNanoseconds: UInt64,
-        indexerWaitNanoseconds: UInt64
+        indexerWaitNanoseconds: UInt64,
+        fillBytes: Int,
+        fillMisses: Int,
+        probes: [DeepSeekV41GapProbe] = []
     ) {
         self.layer = layer
         self.position = position
@@ -1367,6 +1383,9 @@ nonisolated public struct DeepSeekV41BlockGap: Sendable, Equatable {
         self.fillDoneNanoseconds = fillDoneNanoseconds
         self.mixtureEncodedNanoseconds = mixtureEncodedNanoseconds
         self.indexerWaitNanoseconds = indexerWaitNanoseconds
+        self.fillBytes = fillBytes
+        self.fillMisses = fillMisses
+        self.probes = probes
     }
 
     /// Host time blocked on this layer's dense half: one settle, which drains the
@@ -1386,6 +1405,25 @@ nonisolated public struct DeepSeekV41BlockGap: Sendable, Equatable {
     public var mixtureSpanNanoseconds: UInt64 {
         mixtureWindowEndNanoseconds > mixtureWindowStartNanoseconds
             ? mixtureWindowEndNanoseconds - mixtureWindowStartNanoseconds : 0
+    }
+
+    /// Commit to device start for this layer pass's mixture, in milliseconds: the number
+    /// a probe committed in front of it has to be compared against.
+    public var mixturePickupMilliseconds: Double {
+        Double(mixtureLateStartNanoseconds()) / 1_000_000
+    }
+
+    /// The same for each probe, in commit order, so a depth-three arm can say whether the
+    /// queue starts the first buffer quickly and the cadence is the problem, or stalls all
+    /// of them.
+    public var probePickupMilliseconds: [Double] {
+        probes.map(\.pickupMilliseconds)
+    }
+
+    /// Megabytes this layer pass's fill read, so the pickup behind it can be priced per
+    /// byte instead of per layer.
+    public var fillMegabytes: Double {
+        Double(fillBytes) / 1_048_576
     }
 
     /// The previous layer's mixture still running when this layer asked for its dense
@@ -1950,9 +1988,13 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     private var pending: [(buffer: MTLCommandBuffer, stage: String, isMixture: Bool)] = []
 
     /// Command buffers whose device time `recordDeviceTiming` still has to read, with
-    /// the half they belong to (0 dense, 1 mixture) and, when `recordsBlockGaps` is on,
-    /// the `blockGaps` record whose window they belong to.
-    private var timingBuffers: [(buffer: MTLCommandBuffer, bucket: Int, gap: Int?)] = []
+    /// the half they belong to (0 dense, 1 mixture, 2 a mixture-start probe) and, when
+    /// `recordsBlockGaps` is on, the `blockGaps` record whose window they belong to. A
+    /// probe also carries its index within that record's `probes`, because its commit
+    /// stamp is the reference its pickup is measured from.
+    private var timingBuffers: [
+        (buffer: MTLCommandBuffer, bucket: Int, gap: Int?, probe: Int?)
+    ] = []
     /// One front-half buffer per stage, filled only while `recordsStageTiming` is on.
     private var stageBuffers: [(stage: String, buffer: MTLCommandBuffer)] = []
     /// Measurement-only scratch the calibration stage dispatches into.
@@ -3462,7 +3504,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 // (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #75").
                 blockTiming.frontBusyNanoseconds += lastSettleMixtureDrainNanoseconds
                 for buffer in frontBuffers {
-                    timingBuffers.append((buffer: buffer, bucket: 0, gap: gapIndex))
+                    timingBuffers.append((buffer: buffer, bucket: 0, gap: gapIndex, probe: nil))
                 }
             }
         } else {
@@ -3507,7 +3549,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 // (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #75").
                 blockTiming.frontBusyNanoseconds += lastSettleMixtureDrainNanoseconds
                 for buffer in frontBuffers {
-                    timingBuffers.append((buffer: buffer, bucket: 0, gap: gapIndex))
+                    timingBuffers.append((buffer: buffer, bucket: 0, gap: gapIndex, probe: nil))
                 }
             }
         }
@@ -3520,6 +3562,27 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         // one term that can make a block SLOWER than a walk despite doing less work.
         let residents = try blockResidents(layer: layer, routings: routings)
         let fillDone = measuring ? DispatchTime.now().uptimeNanoseconds : 0
+
+        // Measurement only (`recordsMixtureStartProbe`): the same trivial buffers the walk
+        // commits in front of its expert half, committed here in front of the block's
+        // mixture. `#75` measured this hand-off at ~2.4 ms per layer pass, about twice what
+        // `#22` measured on a walked position's ~1.2, after a 34 ms fill gap instead of a
+        // 2 ms one; a probe handed the same empty queue a few microseconds earlier is what
+        // separates "the queue will not start anything" from "it will not start this"
+        // (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #76").
+        var probes: [(buffer: MTLCommandBuffer, commitNanoseconds: UInt64)] = []
+        if measuring, recordsBlockGaps, recordsMixtureStartProbe, let gapIndex {
+            probes = try commitMixtureStartProbes(residents: residents?.first ?? nil)
+            for (index, probe) in probes.enumerated() {
+                timingBuffers.append((
+                    buffer: probe.buffer, bucket: 2, gap: gapIndex, probe: index
+                ))
+            }
+        }
+        let fillBytes = measuring
+            ? (streamer?.bytesRead ?? 0) - bytesBefore : 0
+        let fillMisses = measuring
+            ? (streamer?.expertsLoaded ?? 0) - missesBefore : 0
 
         // The mixture as one submission, which is what makes a block cheaper than a
         // walk: one arena fill for the block's expert union instead of one per
@@ -3586,7 +3649,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             let mixtureEncoded = measuring ? DispatchTime.now().uptimeNanoseconds : 0
             if measuring {
                 for buffer in mixtureBuffers {
-                    timingBuffers.append((buffer: buffer, bucket: 1, gap: gapIndex))
+                    timingBuffers.append((buffer: buffer, bucket: 1, gap: gapIndex, probe: nil))
                 }
             }
             if recordsStageTiming {
@@ -3610,7 +3673,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 routingDone: routingDone,
                 fillDone: fillDone,
                 mixtureEncoded: mixtureEncoded,
-                indexerWaited: indexerWaited
+                indexerWaited: indexerWaited,
+                fillBytes: fillBytes,
+                fillMisses: fillMisses,
+                probes: probes
             )
             recordLayerTiming(
                 from: layerStart,
@@ -3668,7 +3734,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 mixture: true
             )
             if measuring {
-                timingBuffers.append((buffer: expertCommand, bucket: 1, gap: gapIndex))
+                timingBuffers.append((buffer: expertCommand, bucket: 1, gap: gapIndex, probe: nil))
             }
         }
         let mixtureEncoded = measuring ? DispatchTime.now().uptimeNanoseconds : 0
@@ -3683,7 +3749,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             routingDone: routingDone,
             fillDone: fillDone,
             mixtureEncoded: mixtureEncoded,
-            indexerWaited: indexerWaited
+            indexerWaited: indexerWaited,
+            fillBytes: fillBytes,
+            fillMisses: fillMisses,
+            probes: probes
         )
         recordLayerTiming(
             from: layerStart,
@@ -3722,7 +3791,10 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         routingDone: UInt64,
         fillDone: UInt64,
         mixtureEncoded: UInt64,
-        indexerWaited: UInt64
+        indexerWaited: UInt64,
+        fillBytes: Int,
+        fillMisses: Int,
+        probes: [(buffer: MTLCommandBuffer, commitNanoseconds: UInt64)]
     ) {
         guard let index, layerStart > 0 else { return }
         blockGaps.append(DeepSeekV41BlockGap(
@@ -3735,7 +3807,16 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             routingDoneNanoseconds: routingDone,
             fillDoneNanoseconds: fillDone,
             mixtureEncodedNanoseconds: mixtureEncoded,
-            indexerWaitNanoseconds: indexerWaited
+            indexerWaitNanoseconds: indexerWaited,
+            fillBytes: fillBytes,
+            fillMisses: fillMisses,
+            probes: probes.map {
+                DeepSeekV41GapProbe(
+                    commitNanoseconds: $0.commitNanoseconds,
+                    windowStartNanoseconds: 0,
+                    windowEndNanoseconds: 0
+                )
+            }
         ))
         blockGapCount += 1
     }
@@ -3799,13 +3880,31 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             guard end > start else {
                 if entry.bucket == 0 {
                     blockTiming.frontUnwindowedBuffers += 1
-                } else {
+                } else if entry.bucket == 1 {
                     blockTiming.mixtureUnwindowedBuffers += 1
                 }
                 continue
             }
             let nanoseconds = UInt64((end - start) * 1_000_000_000)
             let startNanoseconds = UInt64(max(0, start) * 1_000_000_000)
+            // A probe carries no work of its own, so it is neither half's device time nor
+            // part of the busy union: it exists only to say when the queue was willing to
+            // begin (`#50`, `#76`).
+            if entry.bucket == 2 {
+                if let gap = entry.gap, gap < blockGaps.count,
+                   let index = entry.probe,
+                   index < blockGaps[gap].probes.count {
+                    var record = blockGaps[gap]
+                    let probe = record.probes[index]
+                    record.probes[index] = DeepSeekV41GapProbe(
+                        commitNanoseconds: probe.commitNanoseconds,
+                        windowStartNanoseconds: startNanoseconds,
+                        windowEndNanoseconds: startNanoseconds + nanoseconds
+                    )
+                    blockGaps[gap] = record
+                }
+                continue
+            }
             if entry.bucket == 0 {
                 blockTiming.denseDeviceNanoseconds += nanoseconds
             } else {
@@ -4995,75 +5094,9 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
             ? DispatchTime.now().uptimeNanoseconds : 0
         var streamedAfter = gapMeasuring ? streamerCounters() : nil
 
-        // Measurement only (`recordsMixtureStartProbe`): one or more one-dispatch
-        // buffers committed immediately before the expert half. If they wait as long as
-        // the expert half does, the delay belongs to the queue or the process; if they
-        // start at once, the delay belongs to the expert half itself. More than one
-        // separates the cadence from the buffer (`#50`).
         var probes: [(buffer: MTLCommandBuffer, commitNanoseconds: UInt64)] = []
         if gapMeasuring, recordsMixtureStartProbe {
-            if calibrationScratch == nil {
-                calibrationScratch = device.makeBuffer(length: 1024, options: .storageModeShared)
-            }
-            if let scratch = calibrationScratch {
-                // What the probe BINDS is the question (`#50`). A probe that binds only
-                // its own scratch starts in a tenth of a millisecond while the expert half
-                // behind it waits milliseconds, so the difference is somewhere in the
-                // expert buffer's resource list; a probe that binds one of those resources
-                // and does nothing with it is what says so.
-                var bound: (buffer: MTLBuffer, offset: Int)?
-                if mixtureStartProbeBinding == 1, let first = residents?.first {
-                    bound = (first.buffer, Int(first.gateWeightOffset))
-                } else if mixtureStartProbeBinding == 2 {
-                    bound = (workspace.gathered, 0)
-                }
-                // `3`: a long resource list, which is the one difference between the
-                // probes above and the expert half that no single binding reproduces.
-                let wideBuffers: [MTLBuffer] = mixtureStartProbeBinding == 3
-                    ? shardBuffers.sorted { $0.key < $1.key }.map(\.value)
-                    : []
-                // `4`: a large shared buffer the HOST just wrote. The arena slots are the
-                // same kind of memory in the same state, and no other probe is.
-                if mixtureStartProbeBinding == 4, probeScratch == nil {
-                    probeScratch = device.makeBuffer(
-                        length: 16 << 20, options: .storageModeShared
-                    )
-                }
-                if mixtureStartProbeBinding == 4, let dirty = probeScratch {
-                    let bytes = min(max(0, mixtureStartProbeDirtyBytes), dirty.length)
-                    if bytes > 0 { memset(dirty.contents(), 0x5a, bytes) }
-                    bound = (dirty, 0)
-                }
-                for _ in 0..<max(1, mixtureStartProbeDepth) {
-                    let probe = try makeCommandBuffer()
-                    let probeEncoder = try makeEncoder(probe)
-                    for _ in 0..<max(1, mixtureStartProbeDispatches) {
-                        if let bound {
-                            // Copy rather than clear: an 8-float read leaves the expert's
-                            // own bytes alone, and it binds the allocation the way the
-                            // mixture does.
-                            try encodeCopy(
-                                probeEncoder,
-                                from: bound.buffer,
-                                to: scratch,
-                                count: 8,
-                                sourceByteOffset: bound.offset
-                            )
-                        } else {
-                            try encodeClear(probeEncoder, buffer: scratch, count: 4)
-                        }
-                        // Indices the copy/clear kernels do not declare: the encoder still
-                        // records the resource, which is the point of the arm.
-                        for (slot, buffer) in wideBuffers.enumerated().prefix(28) {
-                            probeEncoder.setBuffer(buffer, offset: 0, index: slot + 2)
-                        }
-                    }
-                    probeEncoder.endEncoding()
-                    probe.commit()
-                    lastCommitNanoseconds = DispatchTime.now().uptimeNanoseconds
-                    probes.append((buffer: probe, commitNanoseconds: lastCommitNanoseconds))
-                }
-            }
+            probes = try commitMixtureStartProbes(residents: residents)
         }
 
         // The layout flag splits this half too, which is the only way to say whether a
@@ -6928,6 +6961,85 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
                 threadsPerThreadgroup: threadgroup(4)
             )
         }
+    }
+
+    /// Commits one or more trivial buffers immediately before an expert half, and returns
+    /// each one's commit stamp in commit order.
+    ///
+    /// Measurement only (`recordsMixtureStartProbe`). If a probe waits as long as the
+    /// expert half behind it, the delay belongs to the queue or to the machine's state; if
+    /// it starts at once, the delay belongs to the expert half itself. More than one
+    /// separates the cadence from the buffer, and what a probe BINDS separates the
+    /// buffer's content from the machine (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #50" and
+    /// "#65").
+    ///
+    /// Shared by the walk and the block on purpose: `#76` asks whether a mixture committed
+    /// behind a block's 34 ms fill gap starts as quickly as a walked position's does behind
+    /// a 2 ms one, and the two regimes can only be compared if the probe between them is
+    /// the same code.
+    private func commitMixtureStartProbes(
+        residents: [DeepSeekV41ResidentExpert]?
+    ) throws -> [(buffer: MTLCommandBuffer, commitNanoseconds: UInt64)] {
+        var probes: [(buffer: MTLCommandBuffer, commitNanoseconds: UInt64)] = []
+        if calibrationScratch == nil {
+            calibrationScratch = device.makeBuffer(length: 1024, options: .storageModeShared)
+        }
+        guard let scratch = calibrationScratch else { return probes }
+        // What the probe BINDS is the question (`#50`). A probe that binds only its own
+        // scratch starts in a tenth of a millisecond while the expert half behind it waits
+        // milliseconds, so the difference is somewhere in the expert buffer's resource
+        // list; a probe that binds one of those resources and does nothing with it is what
+        // says so.
+        var bound: (buffer: MTLBuffer, offset: Int)?
+        if mixtureStartProbeBinding == 1, let first = residents?.first {
+            bound = (first.buffer, Int(first.gateWeightOffset))
+        } else if mixtureStartProbeBinding == 2 {
+            bound = (workspace.gathered, 0)
+        }
+        // `3`: a long resource list, which is the one difference between the probes above
+        // and the expert half that no single binding reproduces.
+        let wideBuffers: [MTLBuffer] = mixtureStartProbeBinding == 3
+            ? shardBuffers.sorted { $0.key < $1.key }.map(\.value)
+            : []
+        // `4`: a large shared buffer the HOST just wrote. The arena slots are the same kind
+        // of memory in the same state, and no other probe is.
+        if mixtureStartProbeBinding == 4, probeScratch == nil {
+            probeScratch = device.makeBuffer(length: 16 << 20, options: .storageModeShared)
+        }
+        if mixtureStartProbeBinding == 4, let dirty = probeScratch {
+            let bytes = min(max(0, mixtureStartProbeDirtyBytes), dirty.length)
+            if bytes > 0 { memset(dirty.contents(), 0x5a, bytes) }
+            bound = (dirty, 0)
+        }
+        for _ in 0..<max(1, mixtureStartProbeDepth) {
+            let probe = try makeCommandBuffer()
+            let probeEncoder = try makeEncoder(probe)
+            for _ in 0..<max(1, mixtureStartProbeDispatches) {
+                if let bound {
+                    // Copy rather than clear: an 8-float read leaves the expert's own
+                    // bytes alone, and it binds the allocation the way the mixture does.
+                    try encodeCopy(
+                        probeEncoder,
+                        from: bound.buffer,
+                        to: scratch,
+                        count: 8,
+                        sourceByteOffset: bound.offset
+                    )
+                } else {
+                    try encodeClear(probeEncoder, buffer: scratch, count: 4)
+                }
+                // Indices the copy/clear kernels do not declare: the encoder still records
+                // the resource, which is the point of the arm.
+                for (slot, buffer) in wideBuffers.enumerated().prefix(28) {
+                    probeEncoder.setBuffer(buffer, offset: 0, index: slot + 2)
+                }
+            }
+            probeEncoder.endEncoding()
+            probe.commit()
+            lastCommitNanoseconds = DispatchTime.now().uptimeNanoseconds
+            probes.append((buffer: probe, commitNanoseconds: lastCommitNanoseconds))
+        }
+        return probes
     }
 
     private func commit(

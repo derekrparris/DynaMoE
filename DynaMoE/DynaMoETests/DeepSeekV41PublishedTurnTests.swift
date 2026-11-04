@@ -14452,4 +14452,305 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         XCTAssertLessThan(drift / scale, 1e-6, "two prefills of one stream disagree")
         withExtendedLifetime(engine) {}
     }
+
+    // MARK: - #76: what a block's mixture pickup is made of
+
+    /// `#75`'s idle tiling left exactly one term it could not place: a block's mixture is
+    /// committed with the GPU idle, and it does not start for ~2.4 ms per layer pass, i.e.
+    /// 11.8-12.2 ms of every prefill position. `#22` measured a walked position's hand-off
+    /// at ~1.2 ms/layer after a 2 ms fill gap and `#65` closed the deferred bind that could
+    /// have moved it, but a block's gap is 34 ms and its pickup is twice as expensive, which
+    /// is the opposite of what `#22`'s isolated idle-gap sweep predicts. So the question is
+    /// narrow: is the queue refusing to start ANY work at that moment, or is it refusing to
+    /// start THIS buffer?
+    ///
+    /// Four things are measured, all on the published checkpoint in the app's own regime:
+    ///
+    ///   * a trivial one-dispatch buffer committed immediately before the mixture, the same
+    ///     probe `#50` used on the walk (shared code, so the two regimes are comparable);
+    ///   * a depth-three arm, because three commits in a row separate a cadence from a
+    ///     buffer;
+    ///   * a probe binding 16 MB of shared memory the HOST has just written, which is the
+    ///     one state an arena slot is in that a scratch buffer is not;
+    ///   * the layer's own fill bytes beside its own pickup, so the term can be priced per
+    ///     byte (`#50`'s 0.088-0.117 ms of idle per MB) rather than per layer, and a
+    ///     width-one arm, which hands the same code eight times less to read.
+    func testWhatABlocksMixturePickupIsMadeOfOnThePublishedCheckpoint() async throws {
+        let markerPath = "/tmp/dynamoe_dsv41_mixture_pickup"
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: markerPath),
+            "opt-in mixture-pickup attribution; touch \(markerPath) to run"
+        )
+        let snapshot = try snapshotDirectory()
+        let config = try DeepSeekV41Config.decode(
+            contentsOf: snapshot.appendingPathComponent("config.json")
+        )
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let text = """
+            A mixture of experts layer routes each token to a small subset of its \
+            parameters, so the memory a decode step touches is a fraction of the \
+            model, and the fraction is chosen by a router rather than by the layout.
+            """
+        let stream = try tokenizer.encode(text: text).map { Int($0) }
+        XCTAssertGreaterThan(stream.count, 8, "the stream must span more than one block")
+        let length = 128
+        let tokens = (0..<length).map { index in
+            let repetition = index / stream.count
+            return stream[(index + repetition * 13) % stream.count]
+        }
+
+        let engine = try DynaMoeEngine(filePath: snapshot.path)
+        let runtime = try makeRuntime(
+            snapshot: snapshot,
+            engine: engine,
+            config: config,
+            contextLength: length + 1,
+            allowEngramSkip: false,
+            wireArena: nil
+        )
+        XCTAssertTrue(runtime.isRunnable, runtime.describe())
+        let executor = runtime.forward()
+        let shippedWidth = DeepSeekV41DevicePlan.prefillBlockWidth(
+            config: config, contextLength: runtime.contextLength, promptTokens: length
+        )
+        XCTAssertGreaterThanOrEqual(shippedWidth, 2, "a width of one is the walk")
+        print(
+            String(
+                format: "🔎 [dsv41 real] mixture pickup: %d positions, shipped width %d, "
+                    + "%d layer(s), arena %d slot(s)",
+                length,
+                shippedWidth,
+                runtime.plan.count,
+                runtime.arena.capacity
+            )
+        )
+
+        struct Arm {
+            var label: String
+            var width: Int
+            var wall: Double
+            var gaps: [DeepSeekV41BlockGap]
+            var megabytes: Double
+            var misses: Int
+            var last: [Float]
+        }
+
+        struct Probe {
+            var depth: Int
+            var binding: Int
+        }
+
+        func measure(label: String, width: Int, probe: Probe?) throws -> Arm {
+            executor.reset()
+            executor.resetBlockTiming()
+            executor.recordsBlockTiming = true
+            executor.recordsBlockGaps = true
+            executor.recordsMixtureStartProbe = probe != nil
+            executor.mixtureStartProbeDepth = probe?.depth ?? 1
+            executor.mixtureStartProbeBinding = probe?.binding ?? 0
+            executor.mixtureStartProbeDispatches = 1
+            executor.mixtureStartProbeDirtyBytes = 16 << 20
+            // 80 records is two blocks at the shipped width, so the second one can be
+            // partitioned while the cold first is still recorded (`#75`). At width one it is
+            // the first eighty positions, which is the same cold-to-warm ramp.
+            executor.blockGapLimit = 80
+            let bytesBefore = runtime.expertStreamer?.bytesRead ?? 0
+            let missesBefore = runtime.expertStreamer?.expertsLoaded ?? 0
+            let started = DispatchTime.now().uptimeNanoseconds
+            let result = try executor.prefillChunk(tokens, blockWidth: width)
+            let wall = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+            executor.recordsBlockTiming = false
+            executor.recordsBlockGaps = false
+            executor.recordsMixtureStartProbe = false
+            return Arm(
+                label: label,
+                width: width,
+                wall: wall / Double(length),
+                gaps: executor.blockGaps,
+                megabytes: Double((runtime.expertStreamer?.bytesRead ?? 0) - bytesBefore)
+                    / 1_048_576,
+                misses: (runtime.expertStreamer?.expertsLoaded ?? 0) - missesBefore,
+                last: result.last
+            )
+        }
+
+        /// One block's layer records: the second one recorded, which is the warm arm.
+        func lastBlock(_ arm: Arm) -> [DeepSeekV41BlockGap] {
+            let layers = max(1, runtime.plan.count)
+            if arm.width == 1 {
+                // One position per block, so the warm block is the last one recorded.
+                return Array(arm.gaps.suffix(layers))
+            }
+            return arm.gaps.count > layers ? Array(arm.gaps.suffix(layers)) : arm.gaps
+        }
+
+        func mean(_ values: [Double]) -> Double {
+            values.isEmpty ? 0 : values.reduce(0, +) / Double(values.count)
+        }
+
+        func median(_ values: [Double]) -> Double {
+            guard !values.isEmpty else { return 0 }
+            let sorted = values.sorted()
+            return sorted[sorted.count / 2]
+        }
+
+        /// Pearson's correlation, so "does this layer's own read predict its own pickup"
+        /// is a number rather than an impression (`#50` reported +0.05 on the walk).
+        func correlation(_ a: [Double], _ b: [Double]) -> Double {
+            guard a.count == b.count, a.count > 2 else { return 0 }
+            let meanA = mean(a)
+            let meanB = mean(b)
+            var covariance = 0.0
+            var varianceA = 0.0
+            var varianceB = 0.0
+            for index in a.indices {
+                let da = a[index] - meanA
+                let db = b[index] - meanB
+                covariance += da * db
+                varianceA += da * da
+                varianceB += db * db
+            }
+            let denominator = (varianceA * varianceB).squareRoot()
+            return denominator > 0 ? covariance / denominator : 0
+        }
+
+        // One discarded pass so no arm pays slot creation or a cold page cache.
+        executor.reset()
+        runtime.arena.reset()
+        _ = try executor.prefillChunk(Array(stream.prefix(8)))
+
+        let arms: [(label: String, width: Int, probe: Probe?)] = [
+            (label: "control", width: shippedWidth, probe: nil),
+            (label: "probe", width: shippedWidth, probe: Probe(depth: 1, binding: 0)),
+            (label: "probe x3", width: shippedWidth, probe: Probe(depth: 3, binding: 0)),
+            (label: "probe dirty", width: shippedWidth, probe: Probe(depth: 1, binding: 4)),
+            (label: "width 1", width: 1, probe: nil)
+        ]
+        var measured: [Arm] = []
+        for round in 1...4 {
+            let offset = (round - 1) % arms.count
+            let order = Array(arms[offset...]) + Array(arms[..<offset])
+            for arm in order {
+                let sample = try measure(label: arm.label, width: arm.width, probe: arm.probe)
+                print(
+                    String(
+                        format: "🔎 [dsv41 real]   %-12@ width %2d round %d wall %6.1f "
+                            + "ms/position, %.0f MB, %d misses",
+                        sample.label as NSString,
+                        sample.width,
+                        round,
+                        sample.wall,
+                        sample.megabytes,
+                        sample.misses
+                    )
+                )
+                guard round > 1 else { continue }
+                measured.append(sample)
+            }
+        }
+
+        for arm in measured {
+            let records = lastBlock(arm)
+            XCTAssertGreaterThan(records.count, 2, "too few layers to partition")
+            let pickup = records.map(\.mixturePickupMilliseconds)
+            let bytes = records.map(\.fillMegabytes)
+            let windows = records.filter { $0.mixtureBufferCount > 0 }
+            XCTAssertEqual(
+                windows.count, records.count,
+                "every recorded layer pass must report a mixture window"
+            )
+            let read = bytes.reduce(0, +)
+            // Per position as well as per layer pass: the totals bill a position, and a
+            // block's layer pass covers `count` of them.
+            let perPosition = mean(pickup) * Double(records.count)
+                / Double(max(1, records.first?.count ?? 1))
+            print(
+                String(
+                    format: "🔎 [dsv41 real] %-12@ mixture pickup %.2f ms/layer pass "
+                        + "(median %.2f, %.2f ms/position), fill %.1f MB/layer pass "
+                        + "(%d misses), %.4f ms per MB",
+                    arm.label as NSString,
+                    mean(pickup),
+                    median(pickup),
+                    perPosition,
+                    read / Double(records.count),
+                    records.map(\.fillMisses).reduce(0, +) / records.count,
+                    read > 0 ? mean(pickup) * Double(records.count) / read : 0
+                )
+            )
+            // Whether the queue would start anything at that moment. `#50` found a walked
+            // position's probe starting in a tenth of a millisecond while the expert half
+            // behind it waited a millisecond and a half; if a block's probe starts at once
+            // too, the pickup belongs to the mixture buffer and not to the gap.
+            if !arm.gaps.isEmpty, let probeCount = records.first?.probes.count, probeCount > 0 {
+                var pickups: [Double] = []
+                var started: [Double] = []
+                for record in records {
+                    for probe in record.probes {
+                        pickups.append(probe.pickupMilliseconds)
+                        XCTAssertTrue(probe.hasWindow, "a probe reported no window")
+                    }
+                    let first = record.probes[0]
+                    if first.windowStartNanoseconds > 0,
+                       record.mixtureWindowStartNanoseconds > 0 {
+                        started.append(
+                            Double(
+                                Int64(record.mixtureWindowStartNanoseconds)
+                                    - Int64(first.windowStartNanoseconds)
+                            ) / 1_000_000
+                        )
+                    }
+                }
+                print(
+                    String(
+                        format: "🔎 [dsv41 real] %-12@ probes: %d per layer pass, pickup "
+                            + "mean %.2f / median %.2f ms, and the mixture starts %.2f ms "
+                            + "after the first probe (mean)",
+                        arm.label as NSString,
+                        probeCount,
+                        mean(pickups),
+                        median(pickups),
+                        mean(started)
+                    )
+                )
+                XCTAssertLessThan(
+                    median(pickups),
+                    max(0.5, median(pickup)),
+                    "a trivial buffer committed at the same moment waited as long as the mixture"
+                )
+            }
+            // The mechanism question: is the stall proportional to what the layer read?
+            let previous = [0.0] + Array(bytes.dropLast())
+            print(
+                String(
+                    format: "🔎 [dsv41 real] %-12@ pickup against bytes: r = %+.2f own, "
+                        + "%+.2f previous layer's",
+                    arm.label as NSString,
+                    correlation(bytes, pickup),
+                    correlation(previous, pickup)
+                )
+            )
+        }
+
+        // The guard every arm shares: the pickup must not have moved the answer.
+        let control = try XCTUnwrap(measured.first { $0.label == "control" })
+        for arm in measured where arm.width == control.width {
+            let scale = max(control.last.map { abs(Double($0)) }.max() ?? 0, 1e-6)
+            let drift = zip(control.last, arm.last)
+                .map { abs(Double($0) - Double($1)) }
+                .max() ?? 0
+            XCTAssertLessThan(
+                drift / scale, 1e-6,
+                "\(arm.label) moved the logits, so a probe is not inert"
+            )
+        }
+        withExtendedLifetime(engine) {}
+    }
 }

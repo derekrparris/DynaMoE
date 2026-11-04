@@ -11962,3 +11962,110 @@ the probe's per-layer-per-pass units). `DeepSeekV41DeviceGraphParityTests` 37, `
 `DeepSeekV41IndexerKernelTests`, `DeepSeekV41LogicTests` — 89 tests, 0 failures
 (`/tmp/test75_parity1.log`). Production default is `recordsBlockGaps = false`, and the only line that
 changed in a shipped path is `DeepSeekV41BlockTiming.describe()`, which is diagnostic text.
+
+## DSV4.1 #76: THE MIXTURE'S PICKUP IS A PROBE'S PICKUP PLUS TWO MILLISECONDS, AND NEITHER THE GAP NOR THE BYTES THIS LAYER READ MOVES IT
+
+### Question
+
+`#75`'s idle tiling left one term it could not place. A prefill position is 37% GPU work, and after
+the fill (the disk, `#71`), the two encodes (`#60`/`#66`) and the indexer's host readback (`#74`) are
+subtracted, the remainder is the mixture's own late start: **11.8-12.2 ms of a 77.7 ms position**,
+i.e. ~2.4 ms per block layer pass. `#22` measured a walked position's hand-off at ~1.2 ms/layer after
+a **2 ms** fill gap, and a block's gap is **34 ms**; `#75` read the doubling as "the opposite of what
+`#22`'s isolated idle-gap sweep predicted" and asked for an A/B before anyone re-proposed the deferred
+bind `#65` closed.
+
+### What was added (measurement only, every flag off in production)
+
+- **The walk's mixture-start probe, at a block's commit.** `#50`'s one-dispatch probe buffers are now
+  built by one shared helper (`commitMixtureStartProbes`), so the walk and the block are measured by
+  the same code rather than by two that look alike. `runBlockLayer` commits them immediately after the
+  union fill and before the mixture, exactly where the walk commits its own.
+- `DeepSeekV41BlockGap.fillBytes`/`fillMisses` — what THAT layer pass's fill read, so the pickup can
+  be priced per byte the way `#50` priced the walk's (`0.088-0.117` ms of GPU idle per MB) instead of
+  per layer.
+- `DeepSeekV41BlockGap.probes` (a `DeepSeekV41GapProbe` per committed probe, windows filled in later),
+  `mixturePickupMilliseconds`, `probePickupMilliseconds` and `fillMegabytes`.
+- `timingBuffers` grew a fourth field: a probe buffer is bucket `2` and carries its index within the
+  gap's `probes`, because its pickup is measured from its OWN commit stamp. Probes are deliberately
+  not part of `denseDevice`/`mixtureDevice` or of the busy union — they do no work.
+- `testWhatABlocksMixturePickupIsMadeOfOnThePublishedCheckpoint` (opt-in,
+  `/tmp/dynamoe_dsv41_mixture_pickup`, 224 s): 128 positions in the app's regime (`wireArena: nil`),
+  five arms in a rotation, four rounds with round 1 discarded (`#53`) — control, probe depth 1, probe
+  depth 3, probe binding 16 MB of host-dirtied shared memory, and a width-one arm.
+
+### The table
+
+Milliseconds per block layer pass (8 positions), `wireArena: nil`, three measured rounds each:
+
+| arm | mixture pickup (mean / median) | ms/position | fill MB/layer pass | misses | ms per MB | probe pickup (median) |
+|---|---|---|---|---|---|---|
+| control | 2.50 / 1.63, 2.40 / 1.47, 2.69 / 1.42 | 12.5, 12.0, 13.5 | 83.4 | 4 | 0.0300 / 0.0288 / 0.0323 | — |
+| probe ×1 | 2.24 / 1.42, 1.99 / 1.51, 2.75 / 1.53 | 11.2, 10.0, 13.8 | 84.3 | 4 | 0.0269 / 0.0237 / 0.0327 | **0.55 / 0.57 / 0.56** |
+| probe ×3 | 2.74 / 1.35, 1.97 / 1.45, 2.56 / 1.52 | 13.7, 9.9, 12.8 | 84.3 | 4 | 0.0325 / 0.0234 / 0.0304 | **0.57 / 0.57 / 0.60** |
+| probe, 16 MB dirty | 2.10 / 1.46, 2.91 / 1.50, 2.44 / 1.52 | 10.5, 14.5, 12.2 | 84.3 | 4 | 0.0249 / 0.0345 / 0.0289 | **0.58 / 0.55 / 0.57** |
+| width 1 | 1.01 / 0.60, 0.93 / 0.58, 1.21 / 0.58 | 40.3, 37.2, 48.3 | **43.9** | 2 | 0.0230 / 0.0212 / 0.0275 | — |
+
+The mixture starts **2.03 / 2.45 / 1.68 ms after the first probe started** (depth-one arms),
+**2.44 / 1.72 / 2.26** (depth three), **1.79 / 2.63 / 2.13** (the dirty arm). Walls: control 78.4 /
+78.5 / 78.6, probe 78.7 / 78.9 / 78.7, ×3 79.3 / 78.2 / 79.1, dirty 78.5 / 79.6 / 79.1, width 1
+103.8 / 103.2 / 103.9 ms/position — so a probe per layer is free within 1%, and the first control of
+round 1 read 101.5 ms, which is `#75`'s cold-first-block 101.6 to the tenth.
+
+### What it says
+
+- **The queue is willing at a block's hand-off, and `#48`'s idle-gap curve already covers it.** A
+  trivial buffer committed right there starts in **0.55-0.60 ms**, every arm, every round. That is not
+  a tenth of a millisecond (which is what the same probe reads on a walk, `#50`) and it is not
+  unexplained: `#48`'s isolated sweep measured **0.57-0.84 ms after 10-50 ms of host idle** and 0.07-
+  0.08 ms with the queue fed. A block's gap is 34 ms, so the probe is exactly where that curve says it
+  should be. `#75`'s "the opposite of what the sweep predicted" is withdrawn: the sweep predicted
+  0.55, and it got 0.55.
+- **The other ~2 ms is the mixture and nothing else.** Three commits in a row (depth three), a long
+  resource list, and 16 MB of shared memory the host has just `memset` all leave the probe at 0.55-0.60
+  and the mixture starting 1.7-2.6 ms later, so the extra wait is attached to the mixture buffer
+  itself rather than to the act of committing into an empty queue. `#50`'s walk arm has the same shape
+  with different constants (probe 0.10, expert half 1.5 ms after its own commit).
+- **What this layer read does not predict its own pickup (r = -0.17 to +0.60, mean ≈ +0.13), and the
+  previous layer's read predicts it even less (r ≈ 0.03).** That is `#50`'s conclusion at a block:
+  "what predicts the gap is that the WALK is reading, not that this LAYER read". What does move it is
+  the ARM's own read volume: the width-one arm hands the same code **43.9 MB per layer pass against
+  84.3**, and its pickup falls from ~2.4 ms to ~1.0 — the **same 0.021-0.035 ms per MB** as the block's
+  full width, and the same slope the walk's own hand-off shows across its fill levels.
+- **And that slope is the finding: a block already pays 3-4x less per byte than a walk.** `#50`'s walk
+  scaled at 0.088-0.117 ms of GPU idle per MB read; a block's mixture pays 0.021-0.035 on the same
+  measurement. So the term is not an anomaly of the batched path — it is the reading machine's cost,
+  amortised by batching exactly as the fill is. The 11.8-12.2 ms/position is the price of reading
+  439 MB per position, and the only lever on it is fewer bytes, which `#58`, `#59` and `#71` closed.
+- **The block's pickup reproduces `#75` to the tenth** (10.0-14.5 against 11.8-12.2 ms/position) on a
+  second instrument, which is the check `#75` never got: its number came from `blockTiming`, this one
+  from the per-layer records read against each layer's own commit stamp.
+
+### What is not (do not re-propose)
+
+- **Not the commit, the gap, the depth, the resource list or dirty memory.** One arm each above, plus
+  `#50`'s four bindings and `#65`'s event gate. A deferred bind moves WHICH call hands the work over;
+  the probe starts in a half millisecond either way.
+- **Not this layer's bytes.** r ≈ +0.13, and the zero-read layers inside a full-fill arm idle the same
+  as their neighbours (`#50`).
+- **Not the mixture's shape.** `#48`'s twenty arms: 1-128 launches, a million-lane grid, 2 GiB bound,
+  512 named resources, a barrier per launch, zero-copy mapped memory. `#66` priced fusion at ≤1.06 ms
+  and it is device time, not start.
+- **Not a wider or narrower block.** Width moves the pickup per position only through bytes read; the
+  width-one arm is eight times worse per position (37-48 ms) for half the bytes per layer pass, and
+  `#70` closed the width question on the wall.
+- **Nothing here reopens the two-stream idea.** There is no work to feed a second queue: the next
+  layer's dense half reads what this mixture writes.
+
+### Verification
+
+`/tmp/test76_pickup1.log` (four rounds, five arms rotated, round 1 discarded, all assertions green:
+every recorded layer pass reported a mixture window, every probe reported one, a probe's median pickup
+stayed under the mixture's, and four arms' last logits matched the control's to 1e-6 relative, so a
+probe is inert). `DeepSeekV41DeviceGraphParityTests`, `DeepSeekV41DeviceParityTests`,
+`DeepSeekV41TurnLoopTests`, `DeepSeekV41SlotWiringTests`, `DeepSeekV41ExpertStreamTests`,
+`DeepSeekV41FP8GemvKernelTests`, `DeepSeekV41FP8SharedExpertKernelTests`,
+`DeepSeekV41IndexerKernelTests`, `DeepSeekV41LogicTests` — 89 tests, 0 failures
+(`/tmp/test76_parity1.log`). Production defaults are unchanged (`recordsBlockGaps = false`,
+`recordsMixtureStartProbe = false`); the shared probe helper is the walk's old body verbatim, and the
+only shipped-path change is that a probe buffer can now carry a `blockGaps` index.
