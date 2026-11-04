@@ -1127,6 +1127,22 @@ public struct ModelConfig: Codable {
         return DeepSeekV41VisionPricing.estimate(width: width, height: height, spec: spec)
     }
 
+    /// What ONE attachment can cost, at either end of the images this checkpoint
+    /// accepts, from the resize plan alone.
+    ///
+    /// The per-image `visionCostEstimate` above answers "what will this picture
+    /// cost"; a client that has not been sent a picture yet needs "what can a
+    /// picture cost me", which is a range because the resize plan prices an aspect
+    /// ratio as well as a pixel count. Nil for a model with no tower and for a plan
+    /// with no `max_image_tokens`, because an uncapped span has no upper bound to
+    /// report rather than a large one.
+    nonisolated public static func visionCostBounds(
+        modelPath: String?
+    ) -> DeepSeekV41VisionPricing.Bounds? {
+        guard let spec = visionSpec(modelPath: modelPath) else { return nil }
+        return DeepSeekV41VisionPricing.bounds(spec: spec)
+    }
+
     private final class VisionSpecBox: NSObject {
         let spec: DeepSeekV41VisionSpec
         init(_ spec: DeepSeekV41VisionSpec) { self.spec = spec }

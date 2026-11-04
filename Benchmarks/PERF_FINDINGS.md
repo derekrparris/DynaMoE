@@ -11926,7 +11926,11 @@ dense half, 0.00 of pickup and 0.07 of tail.**
   (`#60`/`#66`), and the mixture's late start as the machine after reading (`#50`, `#65`). What is NOT
   closed is that the mixture's late start is 11.8-12.2 ms/position in a BLOCK, i.e. ~2.4 ms per layer
   pass, where a walked position pays 1.2 (`#22`) — a worse pickup after a 34 ms host gap than after a
-  2 ms one, which is the opposite of what `#22`'s isolated sweep predicted.
+  2 ms one, which this section read as the opposite of what `#22`'s isolated sweep predicted.
+  **Withdrawn by `#76`** (prose reconciled in `#82`): that sweep measured 0.57-0.84 ms after 10-50 ms
+  of host idle, so it predicted 0.55 and the block's probe measured 0.55-0.60. The block is exactly
+  where the curve says it should be; what differs is the mixture buffer behind the probe, not the
+  pickup.
 - **Width moves the answer only through the dense half.** `busy` is 20.4-21.9 at width 8 and 22.0-23.0
   at width 4: the mixture's work per position does not depend on the block width. `own` falls 12.4 ->
   11.3, which is the dense batching. Wall 77.7-78.3 against 82.8-83.1, so width eight wins 5-6
@@ -11951,6 +11955,15 @@ dense half, 0.00 of pickup and 0.07 of tail.**
   traffic than it saves weight. Nothing here reopens it.
 - **`indexer wait` (8.0-9.0 ms/position) is mostly this same mixture device time**, drained by the
   pre-indexer settle. Read it beside `busy`, never as the indexer's own cost (`#74`).
+- **The 11.3 in `#71`/`#72`/`#73` and the 8.0-9.0 here are the same stop, not a change in the
+  indexer** (reconciled in `#82`, which found the two figures standing side by side unexplained).
+  The stop bills whatever the queue had not finished when the host asked, so the number follows the
+  layout and the order of what was encoded ahead of it rather than the indexer's own work: `#64`
+  split the split-layout form at **2.5 ms/position of indexer and the rest a drain of the dense
+  half**, and the 2.5 is what the stage actually costs (`#30`-`#32` priced its kernels separately).
+  The two runs also sat at different walls, 99.7 against 77.7-78.3 ms/position, so nothing here says
+  the drain shrank -- only that it was measured over less work. It is the reason `#74` forbids
+  reading this row as the indexer stage, and the reason `#82` did not chase the difference.
 
 ### Verification
 
@@ -12708,4 +12721,137 @@ Bundle freshness checked with `strings … | grep -c testTheServerAdvertisesWhat
 
 The existing app-hosted smoke case (`ServerControllerSmokeTests.testModelsEndpointServesOpenAIListShape`,
 0.943 s) still passes unchanged: it asserts the list shape and the id, which is exactly the part this slice
+left alone.
+
+## DSV4.1 #82: A PICTURE'S PRICE IS A RANGE, BECAUSE THE PLAN PRICES ITS SHAPE AND NOT JUST ITS PIXELS
+
+### The question
+
+`#81` made `GET /v1/models` say what the served checkpoint can do, and left one hole in it standing:
+`vision: true` says a picture is accepted and nothing about what it costs. That is not a marketing
+detail on this model. The same slot in a prompt costs a client **184 positions and 0.32 s** or
+**994 positions and 6.95 s** depending only on which picture is put in it (`#35`, `#43`), and a
+client choosing a request timeout, or deciding whether a near-full prompt has room for an
+attachment, cannot tell from a boolean which end it is sizing for. The composer has shown this
+per-image since `#38` (`ModelConfig.visionCostEstimate` at the point of attach); the wire had no
+equivalent.
+
+Routing: `next_slice` = `image_cost_metadata` **0.900 @ 0.880**, ahead of a docs-only reconciliation
+0.084, single-flight queueing 0.010, and the three remaining prefill terms at 0.0021, 0.0019 and
+0.0015. `docs_is_a_slice` **0.666** put the prose repairs in the mid-band, so they rode along on this
+commit instead of taking one of their own. `serve_queueing_should_change` **0.059**: the single-flight
+`503` stays.
+
+### What was added
+
+| | where | what it is |
+|---|---|---|
+| `DeepSeekV41VisionPricing.Bounds` + `bounds(spec:costModel:)` | `DeepSeekV41VisionCost.swift` | the cost envelope of one attachment, from the resize plan alone |
+| `ModelConfig.visionCostBounds(modelPath:)` | `ModelConfig.swift` | the same per checkpoint, beside the per-image estimate the composer uses |
+| `LoadedModelInfo.visionCost` | `CompletionEngine.swift` | the fact, snapshotted with the other `/v1/models` facts |
+| `Capabilities.VisionCost` / `vision_cost` | `OpenAIAdapter.swift` | the wire form, six keys, additive to the OpenAI schema |
+
+```json
+"capabilities": {"vision": true, "thinking": true, "thinking_levels": true,
+  "vision_cost": {"min_prompt_positions": 184, "max_prompt_positions": 1024,
+                  "min_patch_tokens": 1521, "max_patch_tokens": 9216,
+                  "min_encode_seconds": 0.32, "max_encode_seconds": 7.84}}
+```
+
+### The finding: a single price is not derivable, and the plan's own cap is the ceiling
+
+`estimate(width:height:)` prices ONE picture. A client that has not been sent one needs the envelope,
+and the envelope is not the price of the largest square: **the resize plan prices an aspect ratio as
+well as a pixel count**, because the cap is applied in TOKEN space (`fit` trims the aligner grid until
+`imageTokenCount` fits `max_image_tokens`) and the floor is applied in PIXEL space, with both sides
+rounded up to a patch first. Two images of identical area therefore cost different amounts.
+
+What makes a bound possible without a search is that `fit` trims until the **span** fits, not until
+a grid area fits, so:
+
+- no picture can put more than `max_image_tokens` positions in a prompt, and a one-row span reaches
+  that exactly (`42,882x42` → a 1,021x1 grid → span **1,024**);
+- patches never exceed `downsample_ratio^2` per aligner cell, so that widest span carries at most
+  `3^2 * 1,024 = 9,216` of them (`42,882x42` → **9,189**);
+- the smallest accepted image is a one-pixel one raised to `min_pixels`, and a square needs the
+  fewest patches: `fit(1,1)` → 546x546 → **1,521** patches on a 13x13 aligner grid → **184**
+  positions (`#35`'s own measurement).
+
+Both patch ends are then priced with `DeepSeekV41VisionCostModel.measured`, the same model the
+composer quotes, so the wire range cannot disagree with the per-image chip: 0.32 s and 7.84 s.
+
+### What it does not mean
+
+- **Not the tightest number the server can produce.** The span ceiling of 1,024 is the plan's, and
+  the plan alone can reach it; the app's image decoder refuses a source wider than
+  `DeepSeekV41ImagePixels.maximumSourceSide` (4,096 px a side), and the 1,021:1 strip that attains it
+  is 42,882 px wide. Through the server the ceiling is the largest square, 8,649 patches and 994
+  positions (`#37`) — so the advertised bound is 3% high on positions and 6.5% high on patches. It is
+  a ceiling by construction; erring high is the direction that keeps a client's timeout honest.
+  Deriving the decoder-limited maximum would need a search over aspect ratios for a 3% tighter number.
+- **Not a per-request price.** It says what an attachment CAN cost, not what the one in a given turn
+  does; the engine still prices the actual picture before it provisions anything, via
+  `TurnImages.price`, and for the largest accepted image that is 994 of a 1,048,576-position context.
+- **Not rounded because it is unknown.** Two decimals on the seconds, because the model is a fit to
+  three measured points on one machine class rather than a measurement of the client's hardware; the
+  positions and patch counts are exact integers from the plan.
+- **Not advertised for a tower-less model.** A checkpoint can publish a `vision_config` (and so a
+  resize plan) without shipping the tower's weights, which is exactly the half-downloaded case
+  `supportsVision` refuses for the composer. `entry(for:)` gates the cost block on `supportsVision`,
+  so the two cannot disagree about whether an attachment will be read.
+- **Not a change to the single-flight contract.** A request that arrives during an in-app turn still
+  gets a `503` rather than queueing (0.059 against changing it).
+
+### The two prose repairs that rode along
+
+Both were standing side by side in this journal, contradicting one another:
+
+- **`indexer wait` 11.3 against 8.0-9.0** is now reconciled at `#75`, where the second figure is
+  tabulated: it is one stop billing whatever the queue had not finished, so it follows the layout and
+  the order of what was encoded ahead of it. `#64` split the same stop at 2.5 ms/position of indexer
+  and the rest a drain of the dense half, and the two runs sat at different walls (99.7 against
+  77.7-78.3 ms/position), so the difference is not the indexer shrinking.
+- **`#75`'s "the opposite of what `#22`'s sweep predicted"** now carries its withdrawal in its own
+  section, not only in `#76`'s: that sweep measured 0.57-0.84 ms after 10-50 ms of host idle, so it
+  predicted 0.55 and the block's probe measured 0.55-0.60.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_82` three times (status 0 each), then
+`test-without-building` with the same `-derivedDataPath` every time. The full build (`build2`) reports
+no error and no warning in any touched file: the only diagnostics against them are
+`ModelConfig.swift:1110`'s actor-isolated `VisionSpecBox` call, which is present in `#81`'s logs too.
+One warning this slice did introduce was fixed rather than recorded: passing the mapping as a
+function value (`info.visionCost.map(Capabilities.VisionCost.init)`) took the init in a nonisolated
+context and warned, so it is a closure. Bundle freshness verified with
+`strings … | grep -c <case>` (1 for all six cases) before running.
+
+New pure cases: `DeepSeekV41VisionCostTests.testTheAdvertisedBoundsComeFromThePlansOwnFloorAndCap`,
+`testNoAdmissibleImageEscapesTheAdvertisedBounds` (ten shapes including both thin extremes, every one
+asserted inside all six bounds, and the cap asserted REACHED so the ceiling is not a direction nothing
+can reach), `testAnUncappedPlanAdvertisesNothing`; and in `OpenAIAdapterLogicTests` the two `#81` cases,
+extended to assert the six wire keys, the two-decimal rounding and that no Swift name leaks at either
+nesting level, plus the tower-less case where a resize plan exists and `vision_cost` must be absent.
+`DeepSeekV41PublishedTurnTests.testTheServerAdvertisesWhatTheLoadedCheckpointCanDo` gained the live
+cross-check: `min_prompt_positions` 184 and `min_patch_tokens` 1,521 against `#35`'s measurement,
+`max_prompt_positions` against the checkpoint's own `max_image_tokens`, the patch ceiling against
+`downsample_ratio^2 * max_image_tokens`, and the second ceiling against
+`DeepSeekV41VisionCostModel.measured` (a same-number check, not an inequality, because the wire
+rounds).
+
+Measured on the published checkpoint (`/tmp/test82_run2.log`, 1.683 s for the load, the server start and
+the request together — the 475 GB load is header indexing, so a capability check is cheap and belongs in
+the suite):
+
+```json
+{"object":"list","data":[{"id":"1bae0e1088993b9b82de08f59de5be5a34e42170","capabilities":
+ {"thinking":true,"thinking_levels":true,"vision":true,"vision_cost":
+  {"max_prompt_positions":1024,"min_patch_tokens":1521,"min_prompt_positions":184,
+   "max_patch_tokens":9216,"min_encode_seconds":0.32,"max_encode_seconds":7.84}},
+ "context_length":1048576,"created":1793831591,"owned_by":"dynamoe","object":"model",
+ "max_prompt_tokens":262144}]}
+```
+
+and `ServerControllerSmokeTests.testModelsEndpointServesOpenAIListShape` still passes unchanged
+(0.948 s, `/tmp/test82_run3.log`): it asserts the list shape and the id, which is the part this slice
 left alone.

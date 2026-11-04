@@ -276,6 +276,75 @@ final class DeepSeekV41VisionCostTests: XCTestCase {
         XCTAssertNil(DeepSeekV41VisionPricing.estimate(width: 0, height: 10, spec: spec))
         XCTAssertNil(DeepSeekV41VisionPricing.estimate(width: 10, height: 0, spec: spec))
     }
+
+    /// The bounds a client is told, against the plan that produces them: the floor
+    /// is a one-pixel image raised to `min_pixels`, and the ceiling is the cap
+    /// itself, because `fit` trims until the SPAN fits and the span is what a
+    /// prompt pays for.
+    func testTheAdvertisedBoundsComeFromThePlansOwnFloorAndCap() throws {
+        let bounds = try XCTUnwrap(DeepSeekV41VisionPricing.bounds(spec: spec))
+        XCTAssertEqual(bounds.minPatchTokens, 1_521)
+        XCTAssertEqual(bounds.minSpanPositions, 184)
+        XCTAssertEqual(bounds.minSeconds, 0.32, accuracy: 0.01)
+        XCTAssertEqual(bounds.maxSpanPositions, spec.maxImageTokens)
+        // Patches per aligner cell is `downsample_ratio^2`, so the widest span the
+        // cap allows cannot carry more than this many of them.
+        XCTAssertEqual(bounds.maxPatchTokens, 9 * spec.maxImageTokens)
+        XCTAssertEqual(
+            bounds.maxSeconds,
+            DeepSeekV41VisionCostModel.measured.seconds(patchTokens: bounds.maxPatchTokens),
+            accuracy: 1e-9
+        )
+    }
+
+    /// The bounds are a claim about EVERY image, so check them against images rather
+    /// than restating the arithmetic above: a square, both thin extremes, a portrait,
+    /// a landscape and an image wide enough to reach the cap.
+    ///
+    /// An aspect ratio, not a pixel count, is what the plan prices, which is why a
+    /// single `estimate` cannot stand in for this.
+    func testNoAdmissibleImageEscapesTheAdvertisedBounds() throws {
+        let bounds = try XCTUnwrap(DeepSeekV41VisionPricing.bounds(spec: spec))
+        let shapes = [
+            (1, 1), (2, 2), (546, 546), (1_000, 1_000), (2_000, 2_000),
+            (20_000, 20_000), (5_000, 100), (100, 5_000), (42_882, 14), (42_882, 42),
+        ]
+        var reachedTheCap = false
+        for (width, height) in shapes {
+            let label = "\(width)x\(height)"
+            let estimate = try XCTUnwrap(
+                DeepSeekV41VisionPricing.estimate(width: width, height: height, spec: spec),
+                label
+            )
+            XCTAssertGreaterThanOrEqual(estimate.patchTokens, bounds.minPatchTokens, label)
+            XCTAssertLessThanOrEqual(estimate.patchTokens, bounds.maxPatchTokens, label)
+            XCTAssertGreaterThanOrEqual(estimate.spanPositions, bounds.minSpanPositions, label)
+            XCTAssertLessThanOrEqual(estimate.spanPositions, bounds.maxSpanPositions, label)
+            XCTAssertGreaterThanOrEqual(estimate.seconds, bounds.minSeconds - 1e-9, label)
+            XCTAssertLessThanOrEqual(estimate.seconds, bounds.maxSeconds + 1e-9, label)
+            if estimate.spanPositions == bounds.maxSpanPositions { reachedTheCap = true }
+        }
+        // A ceiling nothing can reach is not a bound a client can size against.
+        XCTAssertTrue(reachedTheCap, "a one-row span must reach the cap exactly")
+    }
+
+    /// An uncapped plan has no upper bound, and reporting a large one would be a lie
+    /// in the same shape as a right answer. The published checkpoint caps at 1,024,
+    /// so this is the path a future checkpoint would take.
+    func testAnUncappedPlanAdvertisesNothing() {
+        let uncapped = DeepSeekV41VisionSpec(
+            patchSize: 14,
+            downsampleRatio: 3,
+            minPixels: 295_936,
+            maxImageTokens: 0,
+            numHiddenLayers: 32,
+            hiddenSize: 1_024,
+            numAttentionHeads: 16,
+            intermediateSize: 2_816,
+            imageTokenID: 129_264
+        )
+        XCTAssertNil(DeepSeekV41VisionPricing.bounds(spec: uncapped))
+    }
 }
 
 final class DeepSeekV41ImagePixelsTests: XCTestCase {

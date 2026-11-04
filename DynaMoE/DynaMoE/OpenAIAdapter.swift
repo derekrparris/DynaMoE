@@ -394,10 +394,53 @@ struct OpenAIModelList: ResponseEncodable {
         /// True when the family renders a graded effort level (High/Low/Off) into
         /// its system block, rather than a plain on/off switch.
         var thinkingLevels: Bool
+        /// What one attachment is expected to cost, when this family reads them.
+        ///
+        /// `vision` alone says a picture is accepted and nothing about whether that
+        /// picture is 184 prompt positions and a third of a second or 994 and seven.
+        /// A client picking a request timeout, or deciding whether a near-full
+        /// prompt has room, has to know which. Nil beside `vision: false`, and
+        /// rounded because it is a model of a machine class rather than a promise.
+        var visionCost: VisionCost?
 
         enum CodingKeys: String, CodingKey {
             case vision, thinking
             case thinkingLevels = "thinking_levels"
+            case visionCost = "vision_cost"
+        }
+
+        struct VisionCost: Encodable {
+            var minPromptPositions: Int
+            var maxPromptPositions: Int
+            var minPatchTokens: Int
+            var maxPatchTokens: Int
+            var minEncodeSeconds: Double
+            var maxEncodeSeconds: Double
+
+            enum CodingKeys: String, CodingKey {
+                case minPromptPositions = "min_prompt_positions"
+                case maxPromptPositions = "max_prompt_positions"
+                case minPatchTokens = "min_patch_tokens"
+                case maxPatchTokens = "max_patch_tokens"
+                case minEncodeSeconds = "min_encode_seconds"
+                case maxEncodeSeconds = "max_encode_seconds"
+            }
+
+            init(_ bounds: DeepSeekV41VisionPricing.Bounds) {
+                minPromptPositions = bounds.minSpanPositions
+                maxPromptPositions = bounds.maxSpanPositions
+                minPatchTokens = bounds.minPatchTokens
+                maxPatchTokens = bounds.maxPatchTokens
+                minEncodeSeconds = VisionCost.rounded(bounds.minSeconds)
+                maxEncodeSeconds = VisionCost.rounded(bounds.maxSeconds)
+            }
+
+            /// Two decimals, so a client sees an estimate rather than a fabricated
+            /// microsecond. The composer's own chip ("about 2.9 s") is the same
+            /// posture.
+            private static func rounded(_ seconds: Double) -> Double {
+                (seconds * 100).rounded() / 100
+            }
         }
     }
 
@@ -443,7 +486,10 @@ struct OpenAIModelList: ResponseEncodable {
             capabilities: Capabilities(
                 vision: info.supportsVision,
                 thinking: info.supportsThinking,
-                thinkingLevels: info.supportsThinkingLevels
+                thinkingLevels: info.supportsThinkingLevels,
+                visionCost: info.supportsVision
+                    ? info.visionCost.map { Capabilities.VisionCost($0) }
+                    : nil
             )
         )
     }

@@ -163,9 +163,25 @@ final class OpenAIAdapterLogicTests: XCTestCase {
 
     // MARK: - GET /v1/models
 
+    /// A cost block as `CompletionEngine` publishes it for a real tower, carrying
+    /// the published checkpoint's own numbers (`DeepSeekV41VisionCostTests` holds
+    /// those to the resize plan). Rounding is the wire layer's job, so these stay
+    /// unrounded.
+    private func visionBounds() -> DeepSeekV41VisionPricing.Bounds {
+        DeepSeekV41VisionPricing.Bounds(
+            minPatchTokens: 1_521,
+            maxPatchTokens: 9_216,
+            minSpanPositions: 184,
+            maxSpanPositions: 1_024,
+            minSeconds: 0.3202,
+            maxSeconds: 7.8407
+        )
+    }
+
     /// A load row of a vision-capable family, as `CompletionEngine` publishes it.
     private func loadedInfo(
-        vision: Bool, thinking: Bool, levels: Bool
+        vision: Bool, thinking: Bool, levels: Bool,
+        visionCost: DeepSeekV41VisionPricing.Bounds? = nil
     ) -> CompletionEngine.LoadedModelInfo {
         CompletionEngine.LoadedModelInfo(
             displayName: "DeepSeek-V4.1-Flash-1017",
@@ -173,6 +189,7 @@ final class OpenAIAdapterLogicTests: XCTestCase {
             supportsThinking: thinking,
             supportsThinkingLevels: levels,
             supportsVision: vision,
+            visionCost: visionCost,
             weightsSizeGB: 475.25
         )
     }
@@ -186,13 +203,21 @@ final class OpenAIAdapterLogicTests: XCTestCase {
     /// `/v1/models` is the only way a client can learn that an attachment will be
     /// read rather than refused, so the capability it reports has to be the fact
     /// the planner uses. `#78`/`#79`/`#80` each flagged its absence.
+    ///
+    /// `vision: true` is not by itself actionable: a picture can be 184 prompt
+    /// positions and a third of a second or 1,024 and nearly eight, and a client
+    /// cannot tell from a boolean which end it is sizing for. So the cost rides
+    /// beside the flag, on the keys a client would query.
     func testModelListAdvertisesTheCapabilitiesThePlannerGatesOn() throws {
-        let json = try encodedModel(OpenAIModelList.entry(
-            for: loadedInfo(vision: true, thinking: true, levels: true),
+        let model = OpenAIModelList.entry(
+            for: loadedInfo(
+                vision: true, thinking: true, levels: true, visionCost: visionBounds()
+            ),
             contextLength: 163_840,
             maxPromptTokens: 262_144,
             created: 1_700_000_000
-        ))
+        )
+        let json = try encodedModel(model)
         XCTAssertEqual(json["id"] as? String, "DeepSeek-V4.1-Flash-1017")
         XCTAssertEqual(json["object"] as? String, "model")
         XCTAssertEqual(json["owned_by"] as? String, "dynamoe")
@@ -203,21 +228,36 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         XCTAssertEqual(capabilities["vision"] as? Bool, true)
         XCTAssertEqual(capabilities["thinking"] as? Bool, true)
         XCTAssertEqual(capabilities["thinking_levels"] as? Bool, true)
-        // The wire must not leak Swift property names.
-        XCTAssertFalse(
-            String(decoding: try JSONEncoder().encode(OpenAIModelList.entry(
-                for: loadedInfo(vision: true, thinking: true, levels: true),
-                contextLength: nil, maxPromptTokens: nil, created: 0
-            )), as: UTF8.self).contains("thinkingLevels")
-        )
+        let cost = try XCTUnwrap(capabilities["vision_cost"] as? [String: Any])
+        XCTAssertEqual(cost["min_prompt_positions"] as? Int, 184)
+        XCTAssertEqual(cost["max_prompt_positions"] as? Int, 1_024)
+        XCTAssertEqual(cost["min_patch_tokens"] as? Int, 1_521)
+        XCTAssertEqual(cost["max_patch_tokens"] as? Int, 9_216)
+        // Two decimals: it is a model of a machine class, not a promise, and a
+        // client must not read 0.32020000000000004 as a measurement.
+        XCTAssertEqual(cost["min_encode_seconds"] as? Double, 0.32)
+        XCTAssertEqual(cost["max_encode_seconds"] as? Double, 7.84)
+        // The wire must not leak Swift property names, at either level.
+        let encoded = String(decoding: try JSONEncoder().encode(model), as: UTF8.self)
+        for leaked in ["thinkingLevels", "visionCost", "minPromptPositions",
+                       "maxPatchTokens", "minEncodeSeconds", "minSpanPositions"] {
+            XCTAssertFalse(encoded.contains(leaked), "\(leaked) leaked into the payload")
+        }
     }
 
     /// The flags must be copied, not hardcoded: a tower-less family must advertise
     /// `vision: false` or a client sends a picture that is refused with a 400, and
     /// a family with a plain on/off switch must not claim graded levels.
+    ///
+    /// The cost block follows the same rule, and it is the case that matters here:
+    /// a checkpoint can publish a `vision_config` and a resize plan and still not
+    /// ship the tower's weights, so the bounds exist while `supportsVision` is
+    /// false. Advertising them would sell an attachment the server refuses.
     func testModelListCapabilitiesFollowTheLoadedModelRatherThanTheWire() throws {
         let json = try encodedModel(OpenAIModelList.entry(
-            for: loadedInfo(vision: false, thinking: true, levels: false),
+            for: loadedInfo(
+                vision: false, thinking: true, levels: false, visionCost: visionBounds()
+            ),
             contextLength: nil,
             maxPromptTokens: nil,
             created: 0
@@ -226,6 +266,7 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         XCTAssertEqual(capabilities["vision"] as? Bool, false)
         XCTAssertEqual(capabilities["thinking"] as? Bool, true)
         XCTAssertEqual(capabilities["thinking_levels"] as? Bool, false)
+        XCTAssertNil(capabilities["vision_cost"], "no tower, no cost to advertise")
         // A model with no architectural ceiling and a server with no cap both
         // report nothing rather than a sentinel a client would read as a number.
         XCTAssertNil(json["context_length"])

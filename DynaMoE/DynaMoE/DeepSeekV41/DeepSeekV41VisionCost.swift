@@ -77,6 +77,76 @@ nonisolated public enum DeepSeekV41VisionPricing {
         public let seconds: Double
     }
 
+    /// What one attachment can cost, at either end of the images a checkpoint accepts.
+    ///
+    /// A client sizing a prompt or a timeout needs the worst case, not a sample, and
+    /// a single `estimate` cannot give it: the cost depends on the picture's aspect
+    /// ratio, not only on its pixel count. The resize plan bounds it, though, and it
+    /// bounds it without decoding a weight:
+    ///
+    /// - The span is what the cap applies to, so no picture can take more than
+    ///   `maxImageTokens` positions, and a one-row span reaches that exactly.
+    /// - Patches never exceed `downsampleRatio^2` per aligner cell, so the widest
+    ///   span above covers at most `downsampleRatio^2 * maxImageTokens` of them.
+    /// - The smallest accepted image is a one-pixel one raised to `minPixels`, and a
+    ///   square needs the fewest patches, so `fit(width: 1, height: 1)` is the floor.
+    ///
+    /// Both ends are then priced with the same cost model the engine prices with, so
+    /// a range here cannot disagree with the number the composer shows.
+    public struct Bounds: Sendable, Equatable {
+        public let minPatchTokens: Int
+        public let maxPatchTokens: Int
+        public let minSpanPositions: Int
+        public let maxSpanPositions: Int
+        public let minSeconds: Double
+        public let maxSeconds: Double
+
+        public init(
+            minPatchTokens: Int,
+            maxPatchTokens: Int,
+            minSpanPositions: Int,
+            maxSpanPositions: Int,
+            minSeconds: Double,
+            maxSeconds: Double
+        ) {
+            self.minPatchTokens = minPatchTokens
+            self.maxPatchTokens = maxPatchTokens
+            self.minSpanPositions = minSpanPositions
+            self.maxSpanPositions = maxSpanPositions
+            self.minSeconds = minSeconds
+            self.maxSeconds = maxSeconds
+        }
+    }
+
+    /// The bounds above for one checkpoint's plan.
+    ///
+    /// Nil when the plan sets no `max_image_tokens`: with no cap the span is
+    /// unbounded and any number returned here would be a lie rather than a bound.
+    public static func bounds(
+        spec: DeepSeekV41VisionSpec,
+        costModel: DeepSeekV41VisionCostModel = .measured
+    ) -> Bounds? {
+        guard spec.maxImageTokens > 0, spec.downsampleRatio > 0,
+              let smallest = estimate(width: 1, height: 1, spec: spec, costModel: costModel)
+        else { return nil }
+
+        let ratio = max(1, spec.downsampleRatio)
+        // `fit` trims until the SPAN fits, so the span is the quantity the cap
+        // bounds; the patch count it can carry follows from the downsample factor.
+        let maxSpanPositions = max(spec.maxImageTokens, smallest.spanPositions)
+        let maxPatchTokens = max(
+            ratio * ratio * spec.maxImageTokens, smallest.patchTokens
+        )
+        return Bounds(
+            minPatchTokens: smallest.patchTokens,
+            maxPatchTokens: maxPatchTokens,
+            minSpanPositions: smallest.spanPositions,
+            maxSpanPositions: maxSpanPositions,
+            minSeconds: smallest.seconds,
+            maxSeconds: costModel.seconds(patchTokens: maxPatchTokens)
+        )
+    }
+
     /// Prices an image from the checkpoint's own resize plan, without decoding a
     /// single weight: `fit` is the same function the tower calls, so the grid here
     /// is the grid the encode will use.

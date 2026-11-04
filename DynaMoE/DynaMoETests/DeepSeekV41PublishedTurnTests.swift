@@ -4411,6 +4411,45 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
                 cap == Int.max ? nil : cap,
                 "the server's own refusal threshold must be the one it enforces"
             )
+            // `vision: true` says a picture is accepted and nothing about what it
+            // costs, which is what `#81` left a client unable to ask. Both ends are
+            // checked against numbers measured OUTSIDE this mapping rather than
+            // against a second copy of it: the floor is the `#35` encode of a 2x2
+            // image raised to the checkpoint's `min_pixels`, and the ceiling is the
+            // cap in the checkpoint's own `vision_config`.
+            let spec = try XCTUnwrap(
+                ModelConfig.visionSpec(modelPath: snapshot.path),
+                "the checkpoint publishes a tower, so it must publish a resize plan"
+            )
+            let cost = try XCTUnwrap(
+                capabilities["vision_cost"] as? [String: Any],
+                "a tower was advertised with no cost beside it"
+            )
+            XCTAssertEqual(cost["min_prompt_positions"] as? Int, 184, "the #35 measurement")
+            XCTAssertEqual(cost["min_patch_tokens"] as? Int, 1_521, "the #35 measurement")
+            XCTAssertEqual(
+                cost["max_prompt_positions"] as? Int, spec.maxImageTokens,
+                "the span is the quantity the cap bounds, so the cap is the ceiling"
+            )
+            XCTAssertEqual(
+                cost["max_patch_tokens"] as? Int,
+                spec.downsampleRatio * spec.downsampleRatio * spec.maxImageTokens,
+                "patches per aligner cell times the widest span the cap permits"
+            )
+            let minSeconds = try XCTUnwrap(cost["min_encode_seconds"] as? Double)
+            let maxSeconds = try XCTUnwrap(cost["max_encode_seconds"] as? Double)
+            XCTAssertEqual(minSeconds, 0.32, accuracy: 0.01, "the #43 smallest-image point")
+            XCTAssertGreaterThan(maxSeconds, minSeconds)
+            // The wire rounds to two decimals, so this is a same-number check, not
+            // an inequality: a ceiling below the model it is priced from would be
+            // the one direction that misleads a client picking a timeout.
+            XCTAssertEqual(
+                DeepSeekV41VisionCostModel.measured.seconds(
+                    patchTokens: try XCTUnwrap(cost["max_patch_tokens"] as? Int)
+                ),
+                maxSeconds,
+                accuracy: 0.01
+            )
         }
     }
 

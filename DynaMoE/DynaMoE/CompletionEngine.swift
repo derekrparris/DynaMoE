@@ -287,6 +287,10 @@ public final class CompletionEngine: @unchecked Sendable {
         /// an image attachment would be read rather than refused. The server's
         /// image gate and the composer's attachment button both read this.
         public var supportsVision: Bool
+        /// What one attachment can cost this model, at either end of what the
+        /// checkpoint accepts. Nil when there is no tower, so the models list omits
+        /// the block rather than advertising a zero cost it cannot honour.
+        public var visionCost: DeepSeekV41VisionPricing.Bounds?
         public var weightsSizeGB: Double
     }
 
@@ -309,6 +313,7 @@ public final class CompletionEngine: @unchecked Sendable {
             supportsThinking: supports,
             supportsThinkingLevels: supportsLevels,
             supportsVision: supportsVision,
+            visionCost: ModelConfig.visionCostBounds(modelPath: path),
             weightsSizeGB: summary?.sizeGb ?? 0
         )
     }
