@@ -370,6 +370,12 @@ public final class CompletionEngine: @unchecked Sendable {
     /// be released if that launch never happens. Holding one makes `isActive` true,
     /// so a caller that is merely preparing looks busy to everyone else: that is
     /// the point — see `EngineTurnSlot.swift`.
+    ///
+    /// Two callers reserve: the API server's queue, so a chat turn cannot take the
+    /// slot the queue is preparing for, and `ContentView.startAutoregressiveGeneration`,
+    /// so a server turn cannot take the slot while a chat prompt is being rendered
+    /// and tokenized. Whichever reserves first keeps the slot; the other goes on
+    /// waiting or is told why.
     func reserveTurnSlot() -> TurnSlotClaim? {
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -383,6 +389,11 @@ public final class CompletionEngine: @unchecked Sendable {
     /// none, the slot is taken here in one step, so a launch can never be raced by
     /// another launch. Either way the claim is released when this returns: from
     /// then on `currentGenerationTask` is what occupies the slot.
+    ///
+    /// Both callers in the app reserve before they prepare a turn — the API server's
+    /// queue, and the in-app send path — because preparation is where the slot used
+    /// to be lost. A claim handed in here that is no longer held is refused rather
+    /// than honoured: see `EngineTurnSlot.swift`.
     func launchTurn(
         _ request: CompletionTurnRequest,
         claim: TurnSlotClaim? = nil
@@ -395,6 +406,16 @@ public final class CompletionEngine: @unchecked Sendable {
             )
         }
         defer { held.release() }
+        // A claim is what authorises the launch, so one that has already been given
+        // back must not: its ticket no longer names the ledger's outstanding claim,
+        // and launching on it would run a turn while the slot reads free to
+        // everyone else.
+        guard held.isHeld else {
+            stateLock.unlock()
+            throw CompletionLaunchError.engineNotReady(
+                "❌ This turn's reservation on the generation slot was given back before it could start. Try again in a moment."
+            )
+        }
         if currentGenerationTask != nil {
             stateLock.unlock()
             throw CompletionLaunchError.engineNotReady("❌ A generation is already active; one turn may run at a time.")

@@ -6021,6 +6021,18 @@ struct ContentView: View {
             return
         }
 
+        // The single-flight slot is taken HERE, before the preparation below, not
+        // left to the launch at the end. A server turn can claim the slot while
+        // this turn is still rendering and tokenizing the prompt, and the launch
+        // would then lose that race and report it as a refusal — the same turn
+        // lost, one step earlier. Holding the claim makes the server's own claim
+        // fail instead, which its queue already handles by going back to waiting.
+        // Nil means somebody already holds the slot; the launch below then reports
+        // it exactly the way it always has. See `EngineTurnSlot.swift` and
+        // `Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #85".
+        let turnSlotClaim = CompletionEngine.shared.reserveTurnSlot()
+        defer { turnSlotClaim?.release() }
+
         let generationDate: Date
         if let sId = sessionId, let sess = sessions.first(where: { $0.id == sId }) {
             generationDate = sess.createdAt
@@ -6129,7 +6141,7 @@ struct ContentView: View {
 
         let launch: CompletionLaunch
         do {
-            launch = try CompletionEngine.shared.launchTurn(request)
+            launch = try CompletionEngine.shared.launchTurn(request, claim: turnSlotClaim)
         } catch {
             let err = (error as? CompletionLaunchError)?.errorDescription ?? "❌ Failed to launch generation: \(error.localizedDescription)"
             isGeneratingText = false

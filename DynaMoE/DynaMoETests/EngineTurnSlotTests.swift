@@ -157,4 +157,73 @@ final class EngineTurnSlotTests: XCTestCase {
         XCTAssertThrowsError(try engine.launchTurn(makeRequest()))
         XCTAssertFalse(engine.isActive, "a launch that took the slot and refused must not keep it")
     }
+
+    // MARK: - The in-app send path reserves too
+
+    /// The mirror of `testAnInAppLaunchIsRefusedWhileAServerTurnHoldsTheSlot`, and
+    /// the reason `ContentView.startAutoregressiveGeneration` reserves before it
+    /// renders anything: a chat turn that holds the slot makes the SERVER's claim
+    /// fail, and the queue answers a failed claim by going back to waiting instead
+    /// of losing the request it had already prepared. The chat turn is the one that
+    /// runs, and it runs because of the order, not because of who asked first.
+    @MainActor
+    func testAnInAppReservationKeepsAServerTurnFromClaimingMidPreparation() throws {
+        let engine = CompletionEngine.shared
+        XCTAssertFalse(engine.isActive, "the slot must be free at the start of the case")
+
+        let inApp = try XCTUnwrap(engine.reserveTurnSlot())
+        defer { inApp.release() }
+
+        XCTAssertTrue(engine.isActive, "a chat turn being prepared occupies the slot like a running one")
+        XCTAssertNil(
+            engine.reserveTurnSlot(),
+            "the server's claim must fail, which its queue turns into another wait rather than a refusal"
+        )
+        XCTAssertTrue(inApp.isHeld, "and the failed attempt must not have taken the slot from the chat turn")
+    }
+
+    /// A claim is what authorises a launch, so one that was given back must not
+    /// authorise anything. Without this the launch would run a turn while the slot
+    /// read free to every other caller.
+    @MainActor
+    func testAReleasedClaimCannotAuthoriseALaunch() throws {
+        let engine = CompletionEngine.shared
+        XCTAssertFalse(engine.isActive, "the slot must be free at the start of the case")
+
+        let spent = try XCTUnwrap(engine.reserveTurnSlot())
+        spent.release()
+
+        XCTAssertThrowsError(try engine.launchTurn(makeRequest(), claim: spent)) { error in
+            let text = message(error)
+            XCTAssertTrue(
+                text.contains("reservation"),
+                "the refusal must be about the claim, not about a missing model: \(text)"
+            )
+        }
+        XCTAssertFalse(engine.isActive, "and a launch refused for its claim must not have taken the slot")
+    }
+
+    /// The claim the in-app path holds across its preparation is the same claim its
+    /// launch redeems: past the claim check, on to the missing model, and given back
+    /// on the way out. This is the pair `startAutoregressiveGeneration` performs.
+    @MainActor
+    func testAnInAppClaimIsRedeemedByItsLaunchAndGivenBack() throws {
+        let engine = CompletionEngine.shared
+        let claim = try XCTUnwrap(engine.reserveTurnSlot())
+
+        XCTAssertThrowsError(try engine.launchTurn(makeRequest(), claim: claim)) { error in
+            let text = message(error)
+            XCTAssertFalse(
+                text.contains("API server"),
+                "a launch holding the chat turn's claim must not be refused for the server: \(text)"
+            )
+            XCTAssertFalse(text.contains("reservation"), "the claim was live: \(text)")
+            XCTAssertTrue(
+                text.contains("Metal or Tokenizer"),
+                "it must reach the missing model, which is the real reason it cannot run: \(text)"
+            )
+        }
+        XCTAssertFalse(claim.isHeld, "the launch released the claim when it refused")
+        XCTAssertFalse(engine.isActive, "and nothing is left occupying the slot")
+    }
 }

@@ -13100,3 +13100,144 @@ the same prompt with one attachment in 80.9 s (queue 76 ms), 190 prompt tokens a
 span of 184 positions over 1,521 patch tokens from 0.32 s of tower, the model describing the
 picture it was sent. So the claim travels from the queue through `work` and `withTurnToolMask`
 into the engine and back, and the queue-wait stamps the server already logged are unchanged.
+
+## DSV4.1 #85: THE CHAT PATH RESERVES TOO, SO THE SEAM #84 CLOSED IS CLOSED FROM BOTH SIDES
+
+### The question
+
+`#84` gave the engine a reservation API and wired exactly one caller into it: the API server's
+queue, so a chat turn could not take the slot a queued request was preparing for. `#84`'s own
+journal named the asymmetry it left standing:
+
+> A chat turn whose own preparation (prompt formatting in `ContentView`) straddles a server claim
+> still loses, because that happens before `launchTurn`.
+
+That is the same seam as `#84`'s, seen from the other side. `ContentView.startAutoregressiveGeneration`
+builds the effective system block, renders the dialect, encodes the prompt and assembles the
+request — `ModelConfig.buildEffectiveSystemPrompt`, `ChatPromptFormatter.formatPrompt`,
+`tokenizer.encode` — and only then launches. Every one of those is a chance for the server's
+`claimEngineSlot` to take the ledger, because the ledger is an `NSLock` box: a server turn claims
+from its own task, not from the main actor, and it does not need the chat turn to yield. The chat
+turn's preparation is synchronous on the main actor, but that does not exclude a background
+claim.
+
+So the owner of the slot changed mid-preparation and the party that paid was, again, the wrong
+one: the person who typed a message and pressed send got an error bubble naming the API server,
+while the server request ran.
+
+Routing: `next_slice` = `reserved_inapp_launch` **0.663 @ 0.596**, ahead of `vision_device_encode`
+0.303, `image_cost_ceiling` 0.028, `model_id` 0.004 and the three remaining prefill terms under
+0.002. `slice_should_be_measured` = **0.052**, decisively against another stage table: every perf
+candidate left in this journal is under ~1.2% of a prefill position against a 5-30% spread
+between runs on this machine, so nothing there can be resolved. The second answer is what carried
+the decision again, as it did for `#84`.
+
+### What was added
+
+Three lines of behaviour, one guard, and the tests that pin them.
+
+**The chat path reserves before it prepares** (`ContentView.startAutoregressiveGeneration`, after
+the empty-prompt guard and before the system block is built):
+
+```swift
+let turnSlotClaim = CompletionEngine.shared.reserveTurnSlot()
+defer { turnSlotClaim?.release() }
+```
+
+with the existing launch site becoming `launchTurn(request, claim: turnSlotClaim)`.
+
+Two properties make this three lines rather than a rework:
+
+- **A nil reservation is not a new error path.** `reserveTurnSlot()` returns nil when a turn is
+  running or another caller holds the slot, and the launch below then reports that exactly the
+  way it always has — `launchTurn` with no claim is the pre-`#84` call, and it refuses with the
+  same two messages. So a chat send that cannot reserve behaves as it does today; a chat send
+  that CAN reserve now closes the window. No message text moved, and the queued-prompt path
+  (`dequeueAndRunNextPromptIfNeeded`, which removes the prompt from the queue before sending)
+  gains no new way to lose an entry.
+- **`defer` covers every early return**, and `release()` is idempotent, so the claim is given
+  back whether the turn launches, is refused for a missing model, is refused for an image on a
+  graph without a tower, or dies in the tokenizer. `launchTurn`'s own `defer` releases the same
+  claim on its way out; neither side needs to know about the other.
+
+**A claim that was given back no longer authorises a launch** (`CompletionEngine.launchTurn`).
+`claim ?? turnSlotLedger.tryClaim()` treats a non-nil claim as proof the slot is held, and it
+was not: a caller that released its claim and then launched on it would skip the `tryClaim`
+guard entirely and run a turn while the ledger read FREE to everyone else — the precise state the
+ledger exists to prevent. The guard is one `held.isHeld` check, taken under `stateLock` (lock
+order is `stateLock` then the ledger's, which is the order `reserveTurnSlot` and `isActive`
+already use, so the new read cannot invert it), and the refusal names the reservation rather
+than the model.
+
+This one is defensive, not a live defect: no caller in the app releases before it launches
+today. It is included because `#85` makes `launchTurn(claim:)` take claims from a second
+caller type, and "the claim is what authorises the turn" is now the invariant two subsystems
+depend on rather than one.
+
+### The finding: the order is the whole feature, and the loser now waits instead of failing
+
+Reserving is not about who asked first — it is about who holds the slot when it is spent. With
+the chat path reserving:
+
+- a server turn that wants the slot during a chat preparation gets `nil` from
+  `claimEngineSlot()`, and `TurnExecutionQueue.waitForSlot` already treats a probe that says
+  free followed by a failed claim as a **retry, not a refusal** (`#84`'s explicit decision). The
+  request goes back to waiting with its deadline and its heartbeats intact, exactly as if it had
+  found the slot busy a moment earlier;
+- a chat send during a server turn is still refused, and should be — one turn at a time is the
+  contract. What changed is that it is now refused for a reason that is true at the moment it is
+  reported, and the refusal no longer depends on losing a race during formatting.
+
+The invariant, stated: **the slot is taken in the same step that decides it is free,
+by every caller that then spends real time preparing.** `#84` said that for the server;
+`#85` makes it true for both halves of the app, which is what lets the sentence be an invariant
+rather than a note about one path.
+
+### What it is not (do not re-propose)
+
+- **Not a wait for the chat path.** Making the in-app send block until the server's turn ends
+  would put a suspension in the middle of a main-actor function that then builds a request from
+  `@State`, and it would be unbounded — a server turn is a minute. Refusing immediately with a
+  true reason is the correct behaviour for an interactive surface.
+- **Not a fix for a send that straddles a MODEL LOAD.** `handleSendMessage` can `await`
+  `ensureModelLoaded` before it reaches `startAutoregressiveGeneration`, and that suspension is
+  upstream of the reserve. Closing it means reserving before the load, which would hold the slot
+  across a multi-second model load and refuse the API server for the duration. Left alone
+  deliberately.
+- **Not a claim on the queued-prompt path.** `dequeueAndRunNextPromptIfNeeded` already requeues
+  rather than running a second generation, and it re-checks `isGeneratingText` after every
+  suspension. It reaches the same reserve as any other send.
+- **Not a change to the 503 contract.** A request that arrives during an in-app turn still
+  queues and waits (`#83`); a request whose deadline expires still gets the queue-timeout
+  envelope. Nothing here touches the wire.
+- **Not measured, and not measurable here.** The window is a code fact (what sits between the
+  reserve and the launch), not a timing. The machine's run-to-run spread is 5-30%; a
+  "chat-send-during-preparation" histogram would be noise, and the property is structural.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_85` (status 0), then `test-without-building`
+with the same `-derivedDataPath` throughout. The build's warning set is **identical to `#84`'s**:
+1,773 diagnostics, `diff` clean, so the two touched files introduced none. Bundle freshness
+checked with `strings … | grep -c <case>` (3 for the three new cases) before running.
+
+| suite | result |
+|---|---|
+| `EngineTurnSlotTests` (10 cases: `#84`'s 7 plus three for this slice — the in-app reservation keeping a server turn from claiming mid-preparation, a released claim refused rather than honoured, and an in-app claim redeemed by its launch and given back) | **10 cases, 0 failures** |
+| `ServerQueueLogicTests` | 30 cases, 0 failures |
+| `OpenAIAdapterLogicTests`, `AnthropicAdapterLogicTests`, `ServerStreamSafetyTests`, `ServerToolArgumentTests`, `ServerHardeningLogicTests`, `TurnToolMaskTests`, `ChatPromptFormatterConversationTests`, `ReasoningRoundTripTests`, `PrefixAsOfDateTests` | 142 cases, 0 failures |
+| `ServerControllerSmokeTests` (app-hosted, real server) | 17 cases, 0 failures |
+
+The three new cases are the ones that can be pinned without a UI driver, and each is about a
+fact the ledger is supposed to guarantee rather than about the chat view: that a chat claim makes
+the server's claim fail (so the queue re-waits), that the failed attempt does not take the slot,
+and that a spent claim is refused instead of authorising a turn.
+
+The live arm is `#84`'s own `DeepSeekV41PublishedTurnTests.testAnAPIRequestWithAnImageAnswersOverTheLocalServer`
+(opt-in, `/tmp/dynamoe_dsv41_real_turn`), re-run because this slice changed the launch call and
+added a guard on the launch path. It passes unchanged (117.5 s, `/tmp/test85_live.log`): 96,085
+tensors over 48 segments, server on 127.0.0.1:8791, two requests `200` — the plain prompt in
+33.0 s (queue 77 ms) and the same prompt with one attachment in 81.3 s (queue 74 ms), 190 and 375
+prompt tokens, a span of 184 positions over 1,521 patch tokens from 0.32 s of tower, and the
+model describing the picture. Same numbers to the tenth of a second as `#84`'s run, which is what
+a four-line change to who holds a lock should look like.
