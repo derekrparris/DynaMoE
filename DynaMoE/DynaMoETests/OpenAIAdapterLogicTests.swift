@@ -454,6 +454,41 @@ final class OpenAIAdapterLogicTests: XCTestCase {
 
     // MARK: - Request fields this server cannot honour
 
+    /// The last three OpenAI chat keys this decoder had never carried. `prediction` is a
+    /// latency hint and `service_tier` a routing preference for a fleet, so neither can
+    /// move an answer and both are decoded to be documented as ignored. The third is not
+    /// a hint: the reply would be ungrounded prose where the client asked for a grounded
+    /// one, so it is refused by name.
+    func testTheHintFieldsAreIgnoredAndWebSearchIsRefused() throws {
+        let hints = try decodeRequest("""
+        {"messages":[{"role":"user","content":"hi"}],
+         "prediction":{"type":"content","content":"Paris"},
+         "service_tier":"flex"}
+        """)
+        XCTAssertNil(hints.webSearchOptions)
+        XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedResponseShape(hints))
+
+        let search = try decodeRequest("""
+        {"messages":[{"role":"user","content":"hi"}],
+         "web_search_options":{"search_context_size":"high"}}
+        """)
+        XCTAssertEqual(search.webSearchOptions?.searchContextSize, "high")
+        XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedResponseShape(search)) { error in
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("web_search_options"), "got: \(message)")
+            XCTAssertTrue(message.contains("high"), "the refusal must say what was asked for, got: \(message)")
+        }
+
+        // Presence is the trigger, not a non-default body: an empty object is the default
+        // SEARCH here, unlike `modalities: ["text"]`, which names the protocol's default
+        // and is served.
+        let empty = try decodeRequest(
+            #"{"messages":[{"role":"user","content":"hi"}],"web_search_options":{}}"#
+        )
+        XCTAssertNotNil(empty.webSearchOptions)
+        XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedResponseShape(empty))
+    }
+
     func testTheFieldsTheServerCannotHonourAreDecodedRatherThanIgnored() throws {
         // Before `#88` these keys were absent from the decoder, so Swift's
         // unknown-key tolerance dropped them and the turn was built as if the client

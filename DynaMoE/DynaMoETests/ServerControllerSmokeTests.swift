@@ -239,6 +239,7 @@ final class ServerControllerSmokeTests: XCTestCase {
             #""top_logprobs":3"#,
             #""modalities":["text","audio"]"#,
             #""audio":{"voice":"alloy","format":"mp3"}"#,
+            #""web_search_options":{}"#,
         ] {
             var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/chat/completions")!)
             request.httpMethod = "POST"

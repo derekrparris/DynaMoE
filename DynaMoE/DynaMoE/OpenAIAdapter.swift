@@ -291,9 +291,30 @@ struct OpenAIChatRequest: Decodable {
     /// never see. They can never move an answer, so they are recorded rather than
     /// refused or obeyed.
     let metadata: [String: String]?
+    /// OpenAI's `web_search_options`, carried only by its search-preview models: the
+    /// backend runs a web search and grounds the answer in the results. Decoded so
+    /// `refuseUnsupportedResponseShape` can refuse it by name, because this server does
+    /// not search the web for a chat turn and dropping the field answered with
+    /// ungrounded prose where the client had asked for a grounded one. It is refused on
+    /// PRESENCE: the field exists only to ask for search, so carrying it at all is a
+    /// request this server cannot serve (an empty object is the default search, not the
+    /// default silence, which is the difference from `modalities: ["text"]`). Only the
+    /// context size is kept, so the refusal can say what scale of search was asked for.
+    let webSearchOptions: WebSearchOptions?
 
     struct ResponseFormat: Decodable {
         let type: String?
+    }
+
+    /// `web_search_options`: the user's location and how much search context to pull.
+    /// Only the context size is kept, because those two describe a search this server
+    /// will not run, so there is nothing else the refusal needs to name.
+    struct WebSearchOptions: Decodable {
+        let searchContextSize: String?
+
+        enum CodingKeys: String, CodingKey {
+            case searchContextSize = "search_context_size"
+        }
     }
 
     /// `audio`: everything a client needs to describe a spoken reply this server
@@ -371,6 +392,9 @@ struct OpenAIChatRequest: Decodable {
         case seed, user
         case functions
         case functionCall = "function_call"
+        case webSearchOptions = "web_search_options"
+        case prediction
+        case serviceTier = "service_tier"
     }
 
     init(from decoder: Decoder) throws {
@@ -448,6 +472,19 @@ struct OpenAIChatRequest: Decodable {
         // why the pair is refused instead of mapped onto `tools`/`tool_choice`.
         self.legacyFunctions = try container.decodeIfPresent([Tool.Function].self, forKey: .functions)
         self.legacyFunctionCall = try container.decodeIfPresent(LegacyFunctionCall.self, forKey: .functionCall)
+        // The one hint field that changes the answer rather than its speed: see the
+        // field notes above. `prediction` and `service_tier` are the other two OpenAI
+        // chat keys this decoder had never carried, and they are decoded to be
+        // documented as ignored rather than obeyed. `prediction` is a latency hint (a
+        // hosted backend pre-computes part of the expected answer) and `service_tier` is
+        // a routing preference for a fleet (this server has one tier), so neither can
+        // move an answer and a 400 for either would break clients that always send them.
+        // Left out of the decoder, all three were dropped by unknown-key tolerance,
+        // which is the mechanism that made every field in this file a potential silent
+        // substitution.
+        self.webSearchOptions = try container.decodeIfPresent(WebSearchOptions.self, forKey: .webSearchOptions)
+        _ = try container.decodeIfPresent(AnyCodable.self, forKey: .prediction)
+        _ = try container.decodeIfPresent(String.self, forKey: .serviceTier)
     }
 
     /// True when any message carries an image content part. The turn planner
@@ -1118,6 +1155,24 @@ enum OpenAIAdapter {
                     + "this server produces text only, so the reply would arrive without the output the "
                     + "request asked for. Send {\"modalities\": [\"text\"]} or omit modalities.",
                 logSafeMessage: "modalities names an output this server cannot produce"
+            )
+        }
+        // Not a response SHAPE, but the same posture and the same pre-gate site: this is
+        // a request for an answer this server cannot produce. `web_search_options` only
+        // exists to ask the backend to search the web and ground the reply in the
+        // results, and this server does not search for a chat turn, so dropping the
+        // field answered with ungrounded prose whose citations the client renders as
+        // absent. Keyed on presence rather than on a non-default body: an empty object is
+        // the default SEARCH, not the default silence, which is the difference from
+        // `modalities: ["text"]`.
+        if let search = request.webSearchOptions {
+            throw ServerAPIError.badRequest(
+                "web_search_options is not supported: it asks the backend to search the web and ground "
+                    + "the answer in the results, and this server does not search for a chat turn"
+                    + (search.searchContextSize.map { " (it asked for \($0) context)" } ?? "")
+                    + ". Ask the model without grounding, or fetch the sources yourself and send them in the "
+                    + "prompt; the in-app agent has its own web_search tool for its own turns.",
+                logSafeMessage: "web_search_options asks the backend to search the web"
             )
         }
         switch request.responseFormat?.type ?? "text" {

@@ -14807,3 +14807,92 @@ instances 1,554 -> **1,554**, no new kinds (the new set is `nonisolated` from th
 |---|---|
 | `AnthropicAdapterLogicTests` (30 -> 31: an echoed `redacted_thinking` block no longer refuses the turn, the readable thinking and text around it still render, none of the opaque bytes reach the prompt, a `document` block is still refused, and a redacted-only trailing assistant turn is not a response prefill) | **31 cases, 0 failures** |
 | adjacent logic suites: `ChatPromptFormatterConversationTests` 20, `ReasoningRoundTripTests` 18, `ServerStreamSafetyTests` 13, `ServerHardeningLogicTests` 6 | **57 cases, 0 failures** |
+
+## DSV4.1 #100: THE OPENAI FIELD AUDIT CLOSED, AND ONE OF THE LAST THREE "HINTS" TURNED OUT NOT TO BE ONE
+
+### The question
+
+`#96` and `#97` listed five OpenAI chat keys the decoder had never carried. `#97` closed the two that could
+change an answer (`functions`, `function_call`). The remaining three (`prediction`, `web_search_options`,
+`service_tier`) had been described in every hand-off since as "documentation-only: nothing in a response
+changes". The question for this slice was whether that description was true of all three.
+
+### What was found
+
+1. **Two of the three are what the hand-off said.** `prediction` is OpenAI's predicted-output hint (a hosted
+   backend pre-computes part of the expected answer to cut latency) and `service_tier` is a routing
+   preference for a hosted fleet (`auto`, `default`, `flex`, `priority`). This server pre-computes nothing
+   and has exactly one tier, so neither can move an answer, and each one is a 400 waiting to break a client
+   that always sends it.
+2. **The third is not.** `web_search_options` is carried by OpenAI's search-preview models and asks the
+   ordering backend to run a web search and ground the answer in the results. Dropping it returns an
+   ungrounded answer where the client asked for a grounded one, and a client that renders citations gets
+   none. SubQ put that at 0.9984 against "it is another performance hint", so the lumped description was
+   wrong about one of its three members.
+3. **The right treatment for it follows from the branch's own rule.** `mcp_servers` in `#98` was refused for
+   exactly this reason: the client named tools the model would not have. `web_search_options` names sources
+   the model will not consult. Both answered a different question than the one asked, with a 200.
+4. **Presence is the trigger, not a non-default body.** SubQ 0.9983. An empty `web_search_options: {}` is the
+   default SEARCH, so carrying the field at all is a request this server cannot serve. This is the opposite
+   of the `modalities: ["text"]` decision in `#94`, where naming the default is served because it asks for
+   exactly what silence would have got, and the two rules are reconcileable only by asking what the field's
+   presence MEANS rather than what its value is.
+5. **The three keys were the last of the OpenAI chat audit.** With them decoded, `OpenAIChatRequest` now
+   carries every key in the protocol's chat schema that this server has an opinion about, and the ones it
+   does not carry are the ones that do not exist.
+
+### What was added
+
+- `OpenAIChatRequest.webSearchOptions` (`WebSearchOptions`, keeping `search_context_size` so the refusal can
+  name the scale that was asked for), and `prediction`/`service_tier` decoded and discarded with a comment,
+  which is the treatment `seed` and `user` already had.
+- One more refusal in `refuseUnsupportedResponseShape`, with a note in the comment that it is not a
+  response SHAPE but the same posture at the same pre-gate site: a request for an answer this server cannot
+  produce.
+- One pure case in `OpenAIAdapterLogicTests` (the hints decode and are not refused, a search request is
+  refused naming the field and the context size, and an empty object is refused too) and one more entry in
+  the smoke suite's pre-gate field loop, which is what proves the refusal happens before the model gate.
+- The guide's Request Options bullet and two README rows.
+
+### The finding
+
+1. **A hand-off's summary is not an audit, and the cheap members of a list can hide an expensive one.**
+   Three fields were grouped as documentation-only for four slices because two of them were. The grouping
+   was made by their PRICE at the time (they could not move an answer) rather than by their semantics, and
+   one member did not belong. The check that would have caught it costs one sentence per field: write down
+   what the answer looks like if the field is dropped.
+2. **"Cannot move an answer" has to be tested against the answer's GROUNDING, not just its shape.** A schema
+   field changes what the output is; a search field changes what it is based on. Both are answer-changing,
+   and only the first shows up in a parser. `#96`'s `reasoning_effort` was the first field in this series
+   whose absence changed the answer's content rather than its envelope, and this is the second.
+3. **Presence-versus-value is a per-field decision, and both answers are defensible.** `modalities:
+   ["text"]` is served and `web_search_options: {}` is refused, which looks inconsistent until the question
+   is asked properly: does the field's presence mean anything on its own? A default-valued modalities field
+   is a client being explicit about nothing; a default-valued search field is a client asking for a search.
+4. **Decoding a field to discard it is not busywork.** It is what makes the decision visible and testable: a
+   `_ = try container.decodeIfPresent(...)` with a comment is a written claim that this field cannot move the
+   answer, and the test beside it says so out loud. Unknown-key tolerance hides fields; a decoder entry with
+   a comment cannot.
+
+### What it is not (do not re-propose)
+
+- **Not a web-search implementation for API turns.** The in-app agent has its own `web_search` tool for its
+  own turns; wiring an app tool into a client's turn is a feature, not a decode fix, and it would need a
+  policy for whose search budget and whose sources the answer cites.
+- **Not a refusal for `prediction` or `service_tier`.** See finding 1.
+- **Not `disable_parallel_tool_use`/`context_management`/`mcp_servers`/`output_config`.** Closed on the
+  Anthropic side in `#98`.
+- **Not `POST /v1/responses`.** Routed at 0.0024 against a level-0 bar of about 0.2, so it stays a
+  documented non-goal.
+- **Not `/v1/embeddings`.** Blocked on which vector to return, which is a product decision.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath`, three-part `-only-testing` identifiers and `-parallel-testing-enabled NO`. Warning
+instances 1,554 -> **1,554**, no new kinds.
+
+| suite | result |
+|---|---|
+| `OpenAIAdapterLogicTests` (43 -> 44: `prediction` and `service_tier` decode without refusing, `web_search_options` decodes its context size and is refused naming both, and an empty object is refused because presence is the trigger) | **44 cases, 0 failures** |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787) (30 cases, unchanged count: the pre-gate field loop gained `web_search_options` as an eighth entry and still asserts a 400 naming the field) | **30 cases, 0 failures, 1 skipped** |
