@@ -14188,3 +14188,81 @@ The legacy-row case is worth calling out: `testLegacyRowsDecodeWithNoSource` fai
 because a stored payload written before this slice has no `retentionWithheldByClient` key, and a
 non-optional field with a default value does NOT make a synthesized `Codable` key optional. The field is
 `Bool?` for that reason, exactly as `source` is.
+
+## DSV4.1 #94: A REQUEST FOR A SPOKEN REPLY WAS ANSWERED WITH PROSE, AND THE CLIENT WAITED FOR AN `audio` FIELD NOTHING SENT
+
+### The question
+
+Routed with SubQ in one call (`audio_handling` = **`audio_refuse` 0.9950 @ 0.9934**, against
+`audio_ignore_document` 0.0035, `metadata_echo` 0.0010, `audio_partial` 0.0005;
+`refusal_breaks_clients` = **0.0117**, i.e. a 400 here is not a regression risk).
+
+`#93`'s field audit left seven OpenAI chat keys undecoded and named `modalities`/`audio` as the one pair
+that is a real gap rather than an ignorable one. Both were confirmed absent from `OpenAIChatRequest`, so
+Swift's unknown-key tolerance dropped them.
+
+### What was found
+
+OpenAI's `modalities` names the outputs the reply may use (`["text"]` is the default, `["text","audio"]`
+adds a spoken one) and `audio` carries the settings for it (`{voice, format, speed?}`). Together they
+promise `choices[].message.audio` = `{id, data, transcript, expires_at}` in the response, and `delta.audio`
+frames while streaming. This server has no text-to-speech of any kind — no voice, no vocoder, no encoder for
+wav/mp3/flac/opus/pcm16 — so a request for audio was answered with prose, no error, and no audio object: the
+client's parser then waited for a field nothing would ever send. That is exactly the shape `#88` opened this
+run of slices on, one layer further out: the silent narrowing was of the response's SHAPE rather than of a
+sampler.
+
+### What was added
+
+| file | change |
+|---|---|
+| `OpenAIAdapter` | `OpenAIChatRequest.modalities: [String]?` and `.audio: AudioSettings?` (`voice`/`format`/`speed`), both decoded |
+| `OpenAIAdapter.unservableModalities(_:)` | the requested modalities the engine cannot produce: everything but `text`, case-insensitively. `text` is the protocol DEFAULT, so a client naming it — SDKs do send `["text"]` explicitly — is served rather than refused |
+| `refuseUnsupportedResponseShape` | refuses BOTH, first in the function, with the `logSafeMessage` convention every refusal that embeds client text uses. An `audio` object with no `modalities` is refused too: the settings only mean something for a reply the client was promised |
+| `openAISummary` | records `modalities` and `audio` — a refused request's row has the summary as its only body, so without them the 400 it carries is unexplainable from the log |
+| `HelpAndSettingsGuideView` | the Request Options bullet says which of the two is refused and why, and that `["text"]` is served |
+
+### The finding
+
+1. **The rule is "text or nothing", not "not audio".** Refusing only the literal `"audio"` value would
+   answer a request for `"image"` output with the same silent prose, so the predicate is what the engine HAS
+   rather than what it lacks; `modalities: ["text","image"]` is refused and named.
+2. **The default must stay servable, or the refusal becomes a regression.** `["text"]` is what a client
+   sends when it has nothing to say about modality, so a naive `modalities != nil ⇒ 400` would break
+   integrations that never asked for anything. Routing put `refusal_breaks_clients` at 0.0117 precisely
+   because the arm is scoped this way, and the smoke case proves `["text"]` reaches the model gate (503)
+   where `["text","audio"]` is a 400.
+3. **The refusal runs before the model gate, so it is observable with no weights loaded.** That is what lets
+   the smoke case assert both arms over real HTTP on 8787 without a model: ordering, envelope
+   (`error.type == "invalid_request_error"`), and the field named in the message.
+4. **A transcript-only "partial honour" was rejected as dishonest.** `data` is the payload the client
+   actually plays; filling `transcript` and leaving `data` empty is worse than a 400 because it looks like a
+   successful audio response. `audio_partial` scored 0.0005.
+
+### What it is not (do not re-propose)
+
+- **Not a text-to-speech implementation.** Nothing here synthesises anything; the slice makes the server
+  tell the truth about what it cannot do.
+- **Not `modalities` on the legacy route.** `/v1/completions` has no such field in the protocol; only the
+  chat route carries it.
+- **Not ignoring them with a guide note.** That is `audio_ignore_document`, 0.0035, and it is the class of
+  silent narrowing `#88`/`#90`/`#91`/`#93` removed.
+- **Not `metadata` echo.** Still open, still a candidate: it cannot change a response, and this protocol has
+  no field to echo it into.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath` and `-parallel-testing-enabled NO`. Bundle freshness checked with `strings … | grep -c`
+before running. Warning instances 1,554 -> **1,554** (unchanged), no new warning KINDS.
+
+| suite | result |
+|---|---|
+| `OpenAIAdapterLogicTests` (+2: audio refused by name for both wire shapes while `["text"]` is served, a non-audio modality is refused too, and the captured summary carries the refused fields) | **40 cases, 0 failures** |
+| `ServerControllerSmokeTests` (+2 arms in the existing pre-gate refusal case: `modalities:["text","audio"]` and an `audio` object are 400 with `error.type`, and `modalities:["text"]` reaches the gate as 503) | **27 cases, 0 failures, 1 skipped** |
+| `ServerRequestLogLogicTests` | **43 cases, 0 failures** |
+| `AnthropicAdapterLogicTests` | **28 cases, 0 failures** |
+
+One assertion had to be loosened and the reason is worth keeping: `"\(error)"` renders a `ServerAPIError`
+through its reflection, so an embedded `"image"` arrives escaped as `\"image\"`. Assert on the substring the
+message actually contains, not on a quoted literal.

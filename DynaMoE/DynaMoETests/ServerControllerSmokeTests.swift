@@ -237,6 +237,8 @@ final class ServerControllerSmokeTests: XCTestCase {
             #""n":2"#,
             #""logprobs":true"#,
             #""top_logprobs":3"#,
+            #""modalities":["text","audio"]"#,
+            #""audio":{"voice":"alloy","format":"mp3"}"#,
         ] {
             var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/chat/completions")!)
             request.httpMethod = "POST"
@@ -262,7 +264,7 @@ final class ServerControllerSmokeTests: XCTestCase {
         // 400 naming both, before the model gate, rather than a choice the server made
         // for the client. `max_completion_tokens` alone is a field this server honours,
         // so it must reach the gate (503) instead.
-        func postBudget(_ fields: String) async throws -> (status: Int, text: String) {
+        func postFields(_ fields: String) async throws -> (status: Int, text: String) {
             var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/chat/completions")!)
             request.httpMethod = "POST"
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -276,14 +278,20 @@ final class ServerControllerSmokeTests: XCTestCase {
             )
         }
 
-        let (conflictStatus, conflictText) = try await postBudget(
+        let (conflictStatus, conflictText) = try await postFields(
             #""max_tokens":64,"max_completion_tokens":512"#
         )
         XCTAssertEqual(conflictStatus, 400, "two disagreeing budgets are a bad request: \(conflictText)")
         XCTAssertTrue(conflictText.contains("max_completion_tokens"), "got: \(conflictText)")
 
-        let (newerStatus, newerText) = try await postBudget(#""max_completion_tokens":512"#)
+        let (newerStatus, newerText) = try await postFields(#""max_completion_tokens":512"#)
         XCTAssertEqual(newerStatus, 503, "the newer reply-budget field is honoured, not refused: \(newerText)")
+
+        // `["text"]` is the protocol's default, so a client that says it out loud is
+        // asking for exactly what it would have got by staying silent, and must reach
+        // the model gate rather than a new 400.
+        let (textOnlyStatus, textOnlyBody) = try await postFields(#""modalities":["text"]"#)
+        XCTAssertEqual(textOnlyStatus, 503, "text is the modality this server has: \(textOnlyBody)")
     }
 
     /// The same refusal on the streaming route keeps that route's own contract: the

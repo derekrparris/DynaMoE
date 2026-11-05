@@ -260,9 +260,28 @@ struct OpenAIChatRequest: Decodable {
     /// entitled to have kept. `true` cannot force capture: retention on this Mac is
     /// the operator's own decision, and a client may not overrule it.
     let store: Bool?
+    /// The output modalities the client asked for: `["text"]` is the protocol's
+    /// default, `["text","audio"]` asks for a spoken reply as well. Decoded so
+    /// `refuseUnsupportedResponseShape` can refuse a non-text one by name — this
+    /// server has no text-to-speech, and a dropped field answered a request for
+    /// audio with text and no `message.audio` for the client's parser to find.
+    let modalities: [String]?
+    /// The settings for that spoken reply (`{voice, format, speed?}`). Decoded for
+    /// the same reason as `modalities`, and its two named fields so the refusal can
+    /// say which voice and format the client asked for.
+    let audio: AudioSettings?
 
     struct ResponseFormat: Decodable {
         let type: String?
+    }
+
+    /// `audio`: everything a client needs to describe a spoken reply this server
+    /// cannot produce. Every member is optional because the refusal is keyed on the
+    /// object's presence, not on its contents.
+    struct AudioSettings: Decodable {
+        let voice: String?
+        let format: String?
+        let speed: Float?
     }
 
     struct StreamOptions: Decodable {
@@ -294,6 +313,7 @@ struct OpenAIChatRequest: Decodable {
         case topLogprobs = "top_logprobs"
         case streamOptions = "stream_options"
         case store
+        case modalities, audio
         case seed, user
     }
 
@@ -352,6 +372,11 @@ struct OpenAIChatRequest: Decodable {
         // answer: dropped, `store: false` was answered exactly as if the client had
         // asked for the request to be kept.
         self.store = try container.decodeIfPresent(Bool.self, forKey: .store)
+        // The two output-modality fields join that list for the same reason: a
+        // request asking for a spoken reply was answered as text with no error and
+        // no `message.audio`, so the client waited for a field nothing sent.
+        self.modalities = try container.decodeIfPresent([String].self, forKey: .modalities)
+        self.audio = try container.decodeIfPresent(AudioSettings.self, forKey: .audio)
     }
 
     /// True when any message carries an image content part. The turn planner
@@ -941,6 +966,28 @@ enum OpenAIAdapter {
     /// sampling. Validating rather than refusing keeps a new 400 off the path
     /// clients already drive daily.
     nonisolated static func refuseUnsupportedResponseShape(_ request: OpenAIChatRequest) throws {
+        // Output modalities first: they describe what the RESPONSE should be, so a
+        // request that asks for audio is answered before any other field is weighed.
+        // `modalities: ["text"]` is the protocol's default and is served, because a
+        // client naming the default is not asking for anything this server lacks.
+        if let audio = request.audio {
+            throw ServerAPIError.badRequest(
+                "audio output is not supported: this server runs a text model and has no "
+                    + "text-to-speech, so the spoken reply your client would wait for is never produced"
+                    + (audio.format.map { " (it asked for \($0))" } ?? "")
+                    + ". Omit audio and modalities, and synthesise speech on your side if you need it.",
+                logSafeMessage: "audio output requested; this server has no text-to-speech"
+            )
+        }
+        let unservable = unservableModalities(request)
+        if !unservable.isEmpty {
+            throw ServerAPIError.badRequest(
+                "modalities \(unservable.map { "\"\($0)\"" }.joined(separator: ", ")) not supported: "
+                    + "this server produces text only, so the reply would arrive without the output the "
+                    + "request asked for. Send {\"modalities\": [\"text\"]} or omit modalities.",
+                logSafeMessage: "modalities names an output this server cannot produce"
+            )
+        }
         switch request.responseFormat?.type ?? "text" {
         case "text":
             break
@@ -985,6 +1032,15 @@ enum OpenAIAdapter {
             maxTokens: request.maxTokens,
             maxCompletionTokens: request.maxCompletionTokens
         )
+    }
+
+    /// The requested output modalities this server cannot produce, in the order the
+    /// client named them. `text` is the one modality the engine has, and it is also
+    /// the protocol's DEFAULT (SDKs send `["text"]` explicitly), so naming it is not
+    /// a request for anything and never refuses; every other value is a promise the
+    /// response cannot keep.
+    nonisolated static func unservableModalities(_ request: OpenAIChatRequest) -> [String] {
+        (request.modalities ?? []).filter { $0.lowercased() != "text" }
     }
 
     /// The same posture for the legacy text-completions route, over that route's

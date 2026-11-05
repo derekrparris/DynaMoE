@@ -445,6 +445,17 @@ extension ServerRequestLog {
         // for it, and a reader who sees captured bodies needs to know the client
         // never forbade them.
         payload["store"] = request.store
+        // A request refused for asking for audio leaves this summary as its whole
+        // body, so the fields the refusal was about have to be in it or the row
+        // could not explain the 400 it carries.
+        payload["modalities"] = request.modalities
+        if let audio = request.audio {
+            var entry: [String: Any] = [:]
+            entry["voice"] = audio.voice
+            entry["format"] = audio.format
+            entry["speed"] = audio.speed
+            payload["audio"] = entry
+        }
         // The sampler fields that move the DISTRIBUTION belong in the row: a row that
         // omitted them could not explain why two requests with one prompt differ.
         payload["presence_penalty"] = request.presencePenalty

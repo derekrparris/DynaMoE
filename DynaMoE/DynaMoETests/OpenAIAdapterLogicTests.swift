@@ -686,6 +686,66 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         XCTAssertEqual(legacyObject?["store"] as? Bool, false)
     }
 
+    /// OpenAI's two output-modality fields promise a SPOKEN reply, and this server has
+    /// no text-to-speech at all: left out of the decoder they were dropped by unknown
+    /// key tolerance, so a request for audio was answered as prose with no error and no
+    /// `message.audio` for the client's parser to find. They are refused by name
+    /// instead, and the one value the engine DOES produce is served rather than refused
+    /// — a client naming `["text"]`, the protocol's default, must not meet a new 400.
+    func testAudioOutputIsRefusedByNameAndPlainTextModalitiesIsServed() throws {
+        // Silent, and explicit about the default: both are served.
+        XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedResponseShape(try decodeRequest(#"{"messages":[]}"#)))
+        let explicitText = try decodeRequest(#"{"messages":[],"modalities":["text"]}"#)
+        XCTAssertEqual(explicitText.modalities, ["text"])
+        XCTAssertTrue(OpenAIAdapter.unservableModalities(explicitText).isEmpty)
+        XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedResponseShape(explicitText))
+
+        // A spoken reply, in the shape the SDKs actually send.
+        let spoken = try decodeRequest("""
+        {"messages":[],"modalities":["text","audio"],"audio":{"voice":"alloy","format":"mp3","speed":1.1}}
+        """)
+        XCTAssertEqual(spoken.audio?.voice, "alloy")
+        XCTAssertEqual(spoken.audio?.format, "mp3")
+        XCTAssertEqual(OpenAIAdapter.unservableModalities(spoken), ["audio"])
+        XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedResponseShape(spoken)) { error in
+            let text = "\(error)"
+            XCTAssertTrue(text.contains("audio output is not supported"), "got: \(text)")
+            XCTAssertTrue(text.contains("mp3"), "the refusal should name the format the client asked for, got: \(text)")
+            XCTAssertTrue(text.contains("text-to-speech"), "the refusal should say why, got: \(text)")
+        }
+
+        // An `audio` object with no `modalities` is the same request: the settings are
+        // only meaningful for a reply the client has been promised.
+        let audioOnly = try decodeRequest(#"{"messages":[],"audio":{"voice":"nova"}}"#)
+        XCTAssertEqual(OpenAIAdapter.unservableModalities(audioOnly), [])
+        XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedResponseShape(audioOnly)) { error in
+            XCTAssertTrue("\(error)".contains("audio output is not supported"), "got: \(error)")
+        }
+
+        // Any non-text modality, not just audio: the engine has exactly one output, so
+        // the rule is "text or nothing" rather than a list of known audio values.
+        let image = try decodeRequest(#"{"messages":[],"modalities":["text","image"]}"#)
+        XCTAssertEqual(OpenAIAdapter.unservableModalities(image), ["image"])
+        XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedResponseShape(image)) { error in
+            XCTAssertTrue("\(error)".contains("image"), "the refusal must name the modality, got: \(error)")
+        }
+    }
+
+    /// A refused request still gets a row, and that row's only body is the request
+    /// summary — so the fields the refusal was ABOUT have to survive into it, or the
+    /// 400 is unexplainable from the log.
+    func testTheCapturedRequestSummaryRecordsTheRefusedModalityFields() throws {
+        let spoken = try decodeRequest("""
+        {"messages":[],"modalities":["text","audio"],"audio":{"voice":"alloy","format":"mp3"}}
+        """)
+        let summary = try XCTUnwrap(ServerRequestLog.openAISummary(spoken))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(summary.utf8)) as? [String: Any])
+        XCTAssertEqual(object["modalities"] as? [String], ["text", "audio"])
+        let audio = try XCTUnwrap(object["audio"] as? [String: Any])
+        XCTAssertEqual(audio["voice"] as? String, "alloy")
+        XCTAssertEqual(audio["format"] as? String, "mp3")
+    }
+
     /// The two sampler fields OpenAI defines and this engine can honour are decoded,
     /// range-checked and resolved into the turn's sampling instead of ignored.
     ///
