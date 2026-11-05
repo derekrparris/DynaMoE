@@ -14947,3 +14947,65 @@ past tense about what exists.
 Comment-only change: `xcodebuild build-for-testing` into `/tmp/dd_dsv41_status` stays green and the warning
 count is unchanged, and `DeepSeekV41PromptEffortTests` (which pins `effortBudget`'s behaviour, including the
 range refusals) is part of the suite already run in this session.
+
+## DSV4.1 #102: THE TWO ROUTES THIS SERVER DOES NOT SERVE, CLOSED AS DECISIONS RATHER THAN LEFT AS TODOS
+
+### The question
+
+Every hand-off since `#88` ended with the same two open items: `POST /v1/responses` and `POST /v1/embeddings`.
+Neither had ever been given a verdict, so both were re-proposed every session, routed low, and left open
+again. The question here was not how to build them but whether they should exist at all.
+
+### What was found
+
+1. **`/v1/responses` is a second protocol surface, not a route.** It carries its own request shape (`input`
+   items rather than `messages`), its own response shape (`output` items and `output_text`), and its own SSE
+   event vocabulary (`response.output_text.delta` and friends). Everything below it is already built and
+   shared: one turn engine, one queue, one prefix cache. Routed again at **0.0024** against a level-0 bar of
+   about 0.2, which is the third time it has come back below the bar.
+2. **`/v1/embeddings` is blocked on a product choice, and the choice is real.** Three sources exist here and
+   they are not interchangeable: the loaded model's own representations (a prefill and a pool, which on a
+   single-flight engine waits behind a chat turn), the model's static token-embedding rows averaged
+   (instant, a bag of words that cannot distinguish word order), and Apple's `NaturalLanguage` vectors the
+   codebase index already uses (instant and good, but a different model, so not comparable with either of
+   the others). Vectors from different sources cannot be mixed, so serving one of them without saying which
+   is serving a number whose meaning nobody wrote down.
+3. **The operator chose to skip it**, which settles the question the same way the other one settled: no
+   vector is better than a vector with an undocumented provenance.
+4. **The behaviour was already correct.** An unserved path answers `404`, which is the honest reply. Nothing
+   needed to be built; what was missing was a record that this state is chosen rather than unfinished.
+
+### What was added
+
+- A "deliberately not served" note in the README under the endpoint table, naming both paths and the reason
+  for each.
+- The same decision recorded in `AGENTS.md`, which is what the next session reads first, so the two items
+  stop arriving in hand-offs.
+- This section, which is the third piece of that record.
+
+### The finding
+
+1. **An item that is never decided costs every session it survives.** Two routes were re-routed, re-scored
+   and re-deferred across a dozen slices, and the cost was paid in tokens and attention rather than in code.
+   The cheapest way to close an item is usually to write down why it is closed, not to build it.
+2. **"Below the bar" is a decision, and it has to be written somewhere a future reader looks.** The routing
+   number lived only in a chat transcript and one journal section; the hand-off list kept re-listing the
+   item because nothing in the repo said no. A non-goal is a deliverable.
+3. **A blocked item needs the blocking QUESTION, not the blocking field.** "Which vector" is one sentence and
+   answerable in a minute, but it was recorded for three slices as "needs a product decision", which says
+   nothing about what to decide. Writing the three concrete options down is what got an answer.
+
+### What it is not (do not re-propose)
+
+- **Not a `/v1/responses` implementation.** See finding 1 of "what was found"; the bar is unchanged.
+- **Not a `/v1/embeddings` implementation.** The operator's answer was "skip it". Re-open only with a
+  concrete consumer that needs one of the three sources named above, and say which.
+- **Not a 501 or a documented error envelope for either path.** A `404` is what an HTTP client expects from a
+  path a server does not implement, and inventing an error body for it would be noise on every wrong URL.
+
+### Verification
+
+Documentation only, so the check is that nothing moved: `git status` is clean after the commit, no source
+file changed, and the suites run earlier in this session (`OpenAIAdapterLogicTests` 44,
+`AnthropicAdapterLogicTests` 31, `ServerRequestLogLogicTests` 44, `ServerControllerSmokeTests` 30) already
+cover the refusal set these two non-goals sit beside.

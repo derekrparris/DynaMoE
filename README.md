@@ -318,6 +318,11 @@ The server drives the same headless turn engine as the chat UI, so a client gets
 | `GET /v1/models` | OpenAI model list | Lists the model loaded in the app |
 | `GET /health` | Liveness/readiness | `status`, `model_loaded`, `model`, `engine_active` |
 
+Two paths are deliberately **not** served, and answer a plain `404`: `POST /v1/responses` (a whole second
+protocol surface over the same engine, which nothing here asks for) and `POST /v1/embeddings` (returning
+vectors is a choice between the model's own representations, its static word vectors, or a different model
+entirely, and those are not comparable, so no vector is served rather than one nobody documented).
+
 ### Server behavior
 
 * **One turn at a time, in arrival order**: the engine is single-flight, so concurrent requests are queued; queued streaming clients receive SSE heartbeats so they never idle-timeout while waiting, and each request's own queue deadline is enforced (see the tuning keys below).
