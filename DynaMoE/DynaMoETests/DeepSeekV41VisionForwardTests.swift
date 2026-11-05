@@ -252,4 +252,208 @@ final class DeepSeekV41VisionForwardTests: XCTestCase {
             )
         }
     }
+
+    // MARK: The GEMM forms
+
+    /// A linear is one dot product per output row, and the tower runs the same thing
+    /// as one GEMM over the whole block of tokens. The two must agree to float
+    /// rounding, or the tower's numbers are no longer the definition's numbers.
+    func testTheBatchedLinearMatchesItsDefinition() {
+        // An odd shape on purpose: three tokens into 7 rows of 5, so a transposed
+        // matrix or an `lda` that assumed one token per row cannot cancel out.
+        let weight = matrix(7, 5)
+        let inputs: [[Float]] = (0..<3).map { token in
+            (0..<5).map { dimension in entry(token, dimension) + Float(token) * 0.25 }
+        }
+        let bias = vector(7, offset: 2)
+        let batched = DeepSeekV41VisionForward.linearBatched(inputs, weight: weight, bias: bias)
+        let scalar = DeepSeekV41VisionForward.linearRowByRow(inputs, weight: weight, bias: bias)
+        XCTAssertEqual(batched.count, scalar.count)
+        XCTAssertEqual(batched.first?.count, 7)
+        for token in inputs.indices {
+            for unit in 0..<7 {
+                XCTAssertEqual(
+                    batched[token][unit], scalar[token][unit], accuracy: 1e-5,
+                    "token \(token) unit \(unit)"
+                )
+            }
+        }
+    }
+
+    /// A block of ONE token is the decode shape, and it goes through the same GEMM
+    /// rather than a separate path, so it has to agree with the definition too.
+    func testTheBatchedLinearHandlesASingleToken() {
+        let weight = matrix(6, 4)
+        let inputs: [[Float]] = [[0.5, -0.25, 0.75, 0]]
+        let batched = DeepSeekV41VisionForward.linearBatched(inputs, weight: weight, bias: nil)
+        let scalar = DeepSeekV41VisionForward.linearRowByRow(inputs, weight: weight, bias: nil)
+        XCTAssertEqual(batched.count, 1)
+        for unit in 0..<6 {
+            XCTAssertEqual(batched[0][unit], scalar[0][unit], accuracy: 1e-6, "unit \(unit)")
+        }
+    }
+
+    /// Attention as one GEMM for the scores and one for the weighted sum. The scale
+    /// rides on the score GEMM's alpha, so a missing `1/sqrt(d)` shows up here.
+    func testTheBatchedAttentionMatchesItsDefinition() {
+        let inputs: [[Float]] = (0..<4).map { token in
+            (0..<(3 * hidden)).map { dimension in entry(token, dimension) + Float(token) * 0.1 }
+        }
+        let headDim = hidden / heads
+        let rotary = DeepSeekV41VisionForward.rotaryTables(
+            rows: 2, columns: 2, ropeDim: headDim / 2, theta: 100
+        )
+        let scalar = DeepSeekV41VisionForward.attention(
+            qkv: inputs, heads: heads, headDim: headDim, ropeDim: headDim / 2,
+            cosine: rotary.cosine, sine: rotary.sine
+        )
+        let batched = DeepSeekV41VisionForward.attentionBatched(
+            qkv: inputs, heads: heads, headDim: headDim, ropeDim: headDim / 2,
+            cosine: rotary.cosine, sine: rotary.sine
+        )
+        XCTAssertEqual(batched.count, scalar.count)
+        for token in inputs.indices {
+            for dimension in 0..<hidden {
+                XCTAssertEqual(
+                    batched[token][dimension], scalar[token][dimension], accuracy: 1e-5,
+                    "token \(token) dimension \(dimension)"
+                )
+            }
+        }
+    }
+
+    /// No rotary table is the "this prompt does not rotate" path, and it must not be
+    /// mistaken for a rotation by zero (which would collapse every q and k pair).
+    func testTheBatchedAttentionWithoutRotationMatchesItsDefinition() {
+        let inputs: [[Float]] = (0..<3).map { token in
+            (0..<(3 * hidden)).map { dimension in Float((token + dimension) % 4) * 0.5 - 0.5 }
+        }
+        let headDim = hidden / heads
+        let scalar = DeepSeekV41VisionForward.attention(
+            qkv: inputs, heads: heads, headDim: headDim, ropeDim: headDim / 2,
+            cosine: [], sine: []
+        )
+        let batched = DeepSeekV41VisionForward.attentionBatched(
+            qkv: inputs, heads: heads, headDim: headDim, ropeDim: headDim / 2,
+            cosine: [], sine: []
+        )
+        XCTAssertEqual(batched.count, scalar.count)
+        for token in inputs.indices {
+            for dimension in 0..<hidden {
+                XCTAssertEqual(
+                    batched[token][dimension], scalar[token][dimension], accuracy: 1e-6,
+                    "token \(token) dimension \(dimension)"
+                )
+            }
+        }
+    }
+
+    /// A patch row that is not the projection's width would make the GEMM read past
+    /// its own values, so the tower refuses it instead of zeroing that row.
+    func testARaggedPatchRowIsRefused() throws {
+        var ragged = patches()
+        ragged[2] = Array(ragged[2].dropLast())
+        XCTAssertThrowsError(try forward().encode(patches: ragged, rows: 2, columns: 3)) { error in
+            guard case .shapeMismatch(let detail)? = error as? DeepSeekV41VisionForwardError else {
+                return XCTFail("expected a shape mismatch, got \(error)")
+            }
+            XCTAssertTrue(detail.contains("input row"), detail)
+        }
+    }
+}
+
+/// The tower's checkpoint weights are BF16 and the widening is a bit shift, not a
+/// conversion: a bfloat16 IS the high half of the float it came from. These bytes
+/// are what the shards hold, so a decoder that rounds or sign-extends loses values.
+final class DeepSeekV41VisionWeightDecodeTests: XCTestCase {
+
+    private func decode(_ halves: [UInt16], dtype: String = "BF16") -> [Float] {
+        let bytes = halves.withUnsafeBytes { Array($0) }
+        return bytes.withUnsafeBytes {
+            DeepSeekV41VisionWeights.decode($0, dtype: dtype, count: halves.count)
+        }
+    }
+
+    func testBF16IsTheHighHalfOfItsFloat() {
+        // 1.0 is 0x3F80, -2.0 is 0xC000, 0.5 is 0x3F00, and zero is zero.
+        XCTAssertEqual(decode([0x3F80, 0xC000, 0x3F00, 0x0000]), [1, -2, 0.5, 0])
+    }
+
+    /// The truncated low half is NOT reconstructed: 1.00390625 (0x3F808000) is
+    /// published as 0x3F80, and widening it must give exactly 1, not the original.
+    func testTheDiscardedLowHalfIsNotReinvented() {
+        XCTAssertEqual(decode([0x3F80])[0], 1)
+        XCTAssertEqual(Float(bitPattern: 0x3F808000), 1 + 1 / 256)
+        XCTAssertEqual(decode([0x0080])[0], Float.leastNormalMagnitude)
+    }
+
+    func testFP32PassesThroughBitForBit() {
+        let words: [UInt32] = [Float(1.5).bitPattern, Float(-0.25).bitPattern]
+        let bytes = words.withUnsafeBytes { Array($0) }
+        let decoded = bytes.withUnsafeBytes {
+            DeepSeekV41VisionWeights.decode($0, dtype: "F32", count: words.count)
+        }
+        XCTAssertEqual(decoded, [1.5, -0.25])
+    }
+
+    /// A short buffer is a broken read, not a licence to read past it.
+    func testAShortBufferYieldsZeros() {
+        let bytes = [UInt8](repeating: 0x80, count: 4)
+        let decoded = bytes.withUnsafeBytes {
+            DeepSeekV41VisionWeights.decode($0, dtype: "BF16", count: 8)
+        }
+        XCTAssertEqual(decoded.count, 8)
+        XCTAssertEqual(decoded, [Float](repeating: 0, count: 8))
+    }
+
+    func testAnUnknownDtypeIsWidenedAsBF16() {
+        XCTAssertEqual(DeepSeekV41VisionWeights.bytesPerValue("BF16"), 2)
+        XCTAssertEqual(DeepSeekV41VisionWeights.bytesPerValue("F32"), 4)
+        XCTAssertNil(DeepSeekV41VisionWeights.bytesPerValue("I8"))
+    }
+
+    /// FP16 and BF16 are both two bytes and are NOT the same encoding. `0x3C00`
+    /// is 1.0 as an IEEE half and 0.0078125 as the high half of a float, so a
+    /// decoder that widens an accepted FP16 tensor with a shift corrupts every
+    /// projection it reads, silently and in the direction of "the model answers
+    /// something plausible about the wrong picture".
+    func testFP16IsDecodedAsFP16() {
+        // 1.0, -2.0, 0.5, 0.0 in IEEE half bit patterns.
+        let halves: [UInt16] = [0x3C00, 0xC000, 0x3800, 0x0000]
+        XCTAssertEqual(decode(halves, dtype: "F16"), [1, -2, 0.5, 0])
+        XCTAssertEqual(decode(halves, dtype: "FLOAT16"), [1, -2, 0.5, 0])
+        // The same bytes read as bf16 are a different number, and that is the
+        // whole point: the two readings must not be interchangeable.
+        XCTAssertEqual(decode([0x3C00], dtype: "BF16")[0], Float(bitPattern: 0x3C000000))
+        XCTAssertNotEqual(decode([0x3C00], dtype: "BF16")[0], 1)
+    }
+
+    /// Values with no exact bf16 representation are where the two decoders
+    /// diverge hardest: 1/3 rounds to a different float, and the smallest
+    /// subnormal half is 2^-24 where the shift reading gives 3.6e-41.
+    func testFP16CarriesMantissaAndSubnormalsThatBF16WouldDrop() {
+        let third = Float16(1.0 / 3.0)
+        XCTAssertEqual(decode([third.bitPattern], dtype: "F16")[0], Float(third))
+        XCTAssertNotEqual(
+            decode([third.bitPattern], dtype: "F16")[0],
+            decode([third.bitPattern], dtype: "BF16")[0]
+        )
+        XCTAssertEqual(decode([0x0001], dtype: "F16")[0], Float(bitPattern: 0x33800000))
+        // Negative zero and both infinities survive the conversion.
+        XCTAssertEqual(decode([0x8000], dtype: "F16")[0].bitPattern, Float(-0.0).bitPattern)
+        XCTAssertEqual(decode([0x7C00], dtype: "F16")[0], Float.infinity)
+        XCTAssertEqual(decode([0xFC00], dtype: "F16")[0], -Float.infinity)
+    }
+
+    func testTheStorageFormatClassifiesEverySpellingTheTowerPublishes() {
+        XCTAssertEqual(DeepSeekV41VisionWeights.storageFormat("BF16"), .bf16)
+        XCTAssertEqual(DeepSeekV41VisionWeights.storageFormat("F16"), .fp16)
+        XCTAssertEqual(DeepSeekV41VisionWeights.storageFormat("FLOAT16"), .fp16)
+        XCTAssertEqual(DeepSeekV41VisionWeights.storageFormat("F32"), .fp32)
+        XCTAssertNil(DeepSeekV41VisionWeights.storageFormat("I8"))
+        // A bf16 spelling must not be captured by the "16" half's rules: the
+        // order of the two tests is what keeps `BF16` out of the FP16 branch.
+        XCTAssertEqual(DeepSeekV41VisionWeights.bytesPerValue("F16"), 2)
+        XCTAssertEqual(DeepSeekV41VisionWeights.bytesPerValue("BF16"), 2)
+    }
 }

@@ -225,6 +225,15 @@ nonisolated public final class DeepSeekV41ExpertShardReader: @unchecked Sendable
                 "\(url.lastPathComponent): fstat failed, errno \(code)"
             )
         }
+        // Deliberately NOT `F_NOCACHE`. The arena holds ~70 GB of whole experts and
+        // makes a read per miss, so bypassing the unified buffer cache looks like a
+        // way to stop the two caches competing for RAM. Measured on the published
+        // checkpoint it is a 2.2x loss: a fill runs at 13.4-13.9 GB/s through the file
+        // cache and 2-4 GB/s with `F_NOCACHE`, and the loss lands on the GPU sides too
+        // because the reads stall while pages are allocated one at a time
+        // (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #20"). A cold read of the same
+        // ranges through a plain buffer measures 13.8 GB/s either way, so the cost is
+        // this destination — Metal's shared memory — not the disk.
         self.descriptor = fd
         self.path = url.lastPathComponent
         self.fileSize = Int(status.st_size)
@@ -244,9 +253,21 @@ nonisolated public final class DeepSeekV41ExpertShardReader: @unchecked Sendable
 
     /// Reads every range, in parallel once there are enough of them for queue depth
     /// to matter. Returns the bytes read. Throws the first failure, naming the range.
+    ///
+    /// `chunkBytes` splits each range into pieces of at most that size and fans the
+    /// PIECES out instead of the ranges. A fill that misses one expert asks for six
+    /// ranges and no more, so the queue is six deep however large those ranges are; a
+    /// page-cache miss is a round trip, so six requests of 3 MB answer in about the
+    /// time one of them takes and the depth, not the size, is what turns a round trip
+    /// into throughput. Zero keeps the shipped one-read-per-range form.
     @discardableResult
-    public func read(_ ranges: [Range]) throws -> Int {
+    public func read(
+        _ ranges: [Range],
+        chunkBytes: Int = 0,
+        sequential: Bool = false
+    ) throws -> Int {
         guard !ranges.isEmpty else { return 0 }
+        let pieces = chunkBytes > 0 ? Self.pieces(of: ranges, chunkBytes: chunkBytes) : ranges
         lock.lock()
         defer { lock.unlock() }
         guard !isClosed else {
@@ -254,7 +275,7 @@ nonisolated public final class DeepSeekV41ExpertShardReader: @unchecked Sendable
         }
         // Checked before any read: `pread` past the end returns a short count, and a
         // short count in the middle of a matrix is a silently wrong weight row.
-        for range in ranges {
+        for range in pieces {
             guard range.fileOffset >= 0, range.length >= 0,
                   range.fileOffset + range.length <= fileSize else {
                 throw DeepSeekV41ExpertStreamError.shortRead(
@@ -271,18 +292,41 @@ nonisolated public final class DeepSeekV41ExpertShardReader: @unchecked Sendable
         let context = DeepSeekV41RangeReadContext(
             fd: fd,
             path: path,
-            ranges: ranges,
+            ranges: pieces,
             failures: failures
         )
 
         let readOne: @Sendable (Int) -> Void = { index in context.read(index) }
-        if ranges.count >= 2 {
-            DispatchQueue.concurrentPerform(iterations: ranges.count, execute: readOne)
+        if pieces.count >= 2, !sequential {
+            DispatchQueue.concurrentPerform(iterations: pieces.count, execute: readOne)
         } else {
-            for index in ranges.indices { readOne(index) }
+            for index in pieces.indices { readOne(index) }
         }
         if let first = failures.first { throw first }
-        return ranges.reduce(0) { $0 + $1.length }
+        return pieces.reduce(0) { $0 + $1.length }
+    }
+
+    /// Splits every range into pieces of at most `chunkBytes`, in file order, so each
+    /// byte is still read exactly once and lands in its own place in the destination.
+    /// Two pieces of one range never overlap, which is what makes the fan-out safe
+    /// without any coordination: the parallel reads write disjoint bytes.
+    static func pieces(of ranges: [Range], chunkBytes: Int) -> [Range] {
+        guard chunkBytes > 0 else { return ranges }
+        var out: [Range] = []
+        out.reserveCapacity(ranges.count * 4)
+        for range in ranges {
+            var offset = 0
+            while offset < range.length {
+                let length = min(chunkBytes, range.length - offset)
+                out.append(Range(
+                    fileOffset: range.fileOffset + offset,
+                    destination: range.destination.advanced(by: offset),
+                    length: length
+                ))
+                offset += length
+            }
+        }
+        return out
     }
 }
 
@@ -352,6 +396,23 @@ nonisolated private struct DeepSeekV41ShardBatchContext: @unchecked Sendable {
     let batches: [(shard: UInt32, ranges: [DeepSeekV41ExpertShardReader.Range])]
     let readers: [UInt32: DeepSeekV41ExpertShardReader]
     let failures: DeepSeekV41ReadFailureBox
+    /// Zero for one read per range; otherwise each range is split into pieces this
+    /// large so the fan-out is deeper than the range count.
+    let chunkBytes: Int
+    /// True to issue this shard's ranges one at a time, i.e. no fan-out at all.
+    let sequential: Bool
+
+    /// Ranges as the fill listed them, before any splitting.
+    var rangeCount: Int {
+        batches.reduce(0) { $0 + $1.ranges.count }
+    }
+
+    /// The bytes the fill actually asks the file for.
+    var byteCount: Int {
+        batches.reduce(0) { total, batch in
+            total + batch.ranges.reduce(0) { $0 + $1.length }
+        }
+    }
 
     func run(_ index: Int) {
         let batch = batches[index]
@@ -360,12 +421,76 @@ nonisolated private struct DeepSeekV41ShardBatchContext: @unchecked Sendable {
             return
         }
         do {
-            try reader.read(batch.ranges)
+            try reader.read(
+                batch.ranges, chunkBytes: chunkBytes, sequential: sequential
+            )
         } catch let error as DeepSeekV41ExpertStreamError {
             failures.record(error)
         } catch {
             failures.record(.cannotOpen("\(error)"))
         }
+    }
+}
+
+// MARK: - Fill form
+
+/// How a fill's reads are issued.
+///
+/// The shipped form groups the misses by shard and lets each file fan its own ranges
+/// out. `#50` measured a walk's fill at 5.5-7.3 GB/s where the same disk serves 13.8,
+/// and a one-miss layer offers exactly one shard's six ranges, so the queue is six
+/// deep at best. The alternatives exist so the fan-out can be measured rather than
+/// argued about: `chunked` splits each range into pieces (a deeper queue for the same
+/// bytes), and `serial` issues one read at a time (the file's own rate with no
+/// concurrency at all, which is the number that says whether the walk is paying for
+/// bandwidth or for latency).
+nonisolated public enum DeepSeekV41FillForm: Sendable, Equatable {
+    case shardBatched
+    case chunked(bytes: Int)
+    case serial
+
+    /// Zero means "do not split a range".
+    public var chunkBytes: Int {
+        switch self {
+        case .shardBatched, .serial: return 0
+        case .chunked(let bytes): return max(bytes, 4096)
+        }
+    }
+
+    /// True when the form issues no read concurrently with another.
+    public var isSequential: Bool {
+        self == .serial
+    }
+}
+
+/// One fill, as the streamer issued it.
+///
+/// Measurement only (`#51`). `bytes` is what the file was asked for, not what a slot
+/// is sized to: a slot is padded to the arena's alignment, so pricing bytes off the
+/// slot count overstates the traffic and makes a throughput comparison against the
+/// disk's own rate meaningless.
+nonisolated public struct DeepSeekV41FillSample: Sendable, Equatable {
+    public let misses: Int
+    public let shards: Int
+    public let ranges: Int
+    /// True bytes requested from the file.
+    public let bytes: Int
+    public let seconds: Double
+
+    public init(misses: Int, shards: Int, ranges: Int, bytes: Int, seconds: Double) {
+        self.misses = misses
+        self.shards = shards
+        self.ranges = ranges
+        self.bytes = bytes
+        self.seconds = seconds
+    }
+
+    public var milliseconds: Double {
+        seconds * 1000
+    }
+
+    public var gigabytesPerSecond: Double {
+        seconds > 0 ? Double(bytes) / seconds / 1_000_000_000 : 0
     }
 }
 
@@ -406,6 +531,167 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
     /// arena is sized sanely instead of guessing from wall time.
     public private(set) var expertsLoaded: Int = 0
     public private(set) var bytesRead: Int = 0
+    /// Wall time spent inside `pread` batches. Reported beside the byte count so a
+    /// slow turn can be told apart from a slow disk without a profiler.
+    private var secondsReading: Double = 0
+    /// Wall time spent creating a slot's `MTLBuffer`, and how many were created.
+    ///
+    /// A slot is allocated on first use, and allocating 19 MB is not free: the pages
+    /// are committed and faulted as the pread writes them, so the cost lands inside
+    /// the token loop rather than at load. Kept separate from `secondsReading` because
+    /// it is the one part of a fill that a bigger arena would not repeat.
+    private var secondsAllocating: Double = 0
+    private var slotsAllocated: Int = 0
+    /// Wall time spent inside `mlock`, which a shipping policy pays inside the fill
+    /// that creates a slot rather than up front (`#57`).
+    private var secondsWiring: Double = 0
+    /// Wall time spent inside the arena's placement call: a lookup per resident pair
+    /// plus one pass over the slot array for each miss. Exposed separately from the
+    /// read time so choosing slots is a number rather than an assumption.
+    private var secondsPlacing: Double = 0
+    public private(set) var placements: Int = 0
+    /// Wall time a fill spends in `placeResident` outside the arena's own placement.
+    ///
+    /// That covers three different things and they do not behave alike (`#67`): creating
+    /// a slot's `MTLBuffer`, wiring it with `mlock`, and resolving the six tensor refs and
+    /// read ranges a missed expert needs. Only the last is per MISS -- 0.006-0.011 ms --
+    /// so the caller reads this figure beside `timing.allocating` and `timing.wiring` and
+    /// subtracts them. Billed through a `defer` in `placeResident` so a throw is counted
+    /// too: a failed resolve still did its lookups, and leaving those out would make
+    /// preparation look cheap exactly when the fill is going badly.
+    private var secondsPreparing: Double = 0
+    public private(set) var preparations: Int = 0
+    /// Keeps the optional read-back's loads alive so the compiler cannot drop them.
+    private var touchSink: Int = 0
+    /// The arena's residency policy: whether its slots may be wired, and what that
+    /// actually did. Guarded by `lock` like the rest of the mutable state.
+    private var slotWiring = DeepSeekV41SlotWiring.system
+    /// True when `slotBuffer` applies the policy to every slot it allocates.
+    ///
+    /// Off until `enableSlotWiring` says otherwise, so the `#56` retroactive seam
+    /// keeps measuring what it measured: a rung that wires existing slots must not
+    /// silently wire the ones the next pass allocates.
+    private var wiresAllocatedSlots = false
+
+    /// How a fill's reads are issued. `.shardBatched` is what ships; the others exist
+    /// so the fan-out is a measurement instead of an opinion (`#51`).
+    public var fillForm: DeepSeekV41FillForm = .shardBatched
+
+    /// One record per fill, when on. Off in every production path.
+    public var recordsFillSamples = false
+    public private(set) var fillSamples: [DeepSeekV41FillSample] = []
+
+    public func clearFillSamples() {
+        lock.lock()
+        fillSamples.removeAll(keepingCapacity: true)
+        lock.unlock()
+    }
+
+    /// Read, allocation and page-lock time so far, for the walk instrumentation.
+    public var timing: (reading: Double, allocating: Double, slotsAllocated: Int, wiring: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (secondsReading, secondsAllocating, slotsAllocated, secondsWiring)
+    }
+
+    /// Reads every page of a fill back on the CALLING thread, after the parallel reads
+    /// have returned.
+    ///
+    /// Measurement only (`#49`). The fill writes from `concurrentPerform`'s worker
+    /// threads, so the lines a command buffer is about to read are dirty in OTHER
+    /// cores' caches. Reading them here moves every line to the thread that is about to
+    /// commit, which is the difference between "the gap is this layer's pread" and "the
+    /// gap is the writeback that pread left behind". Off in every production path.
+    public var touchesFilledRanges = false
+
+    /// Time spent choosing slots, and how many (layer, expert) pairs that covered.
+    public var placementTiming: (seconds: Double, placements: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (secondsPlacing, placements)
+    }
+
+    /// Time spent preparing a fill short of its placement, and how many fills that
+    /// covered. Read beside `placementTiming`, `timing.allocating`, `timing.wiring` and
+    /// `timing.reading`: together they say every millisecond of a fill is one of choosing
+    /// a slot, creating it, wiring it, resolving its bytes, or reading them.
+    public var prepareTiming: (seconds: Double, preparations: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (secondsPreparing, preparations)
+    }
+
+    /// How much of the arena has been wired with `mlock`, and how many slots refused.
+    ///
+    /// The two counters that answer the compressor question directly: a wired page can
+    /// be neither evicted nor compressed, so this is the one in-process way to ask
+    /// whether the fill's write rate is the compressor working on its own destination
+    /// (`#56`). `#57` turned the thing that fills them from a measurement into the
+    /// shipping policy; `wiringState` carries the rest of what it did.
+    public var wiring: (bytes: Int, failures: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (slotWiring.status.bytes, slotWiring.status.failures)
+    }
+
+    /// What the arena's residency policy has done, as one value (`#57`).
+    public var wiringState: DeepSeekV41SlotWiring.Status {
+        lock.lock()
+        defer { lock.unlock() }
+        return slotWiring.status
+    }
+
+    /// Applies the arena's residency policy to every slot this arena allocates, up
+    /// to `budgetBytes`.
+    ///
+    /// This is the shipping half of `#56`: rather than wiring the slots a pass has
+    /// already allocated, each slot is wired when it is created, so a pass pays the
+    /// lock once per slot and every later pass reads pages the compressor has never
+    /// been able to take. `budgetBytes` is the arena's own size, granted by the
+    /// memory plan; the policy is all-or-nothing, so a `mlock` refusal hands the
+    /// already-wired slots back and leaves the arena in the unwired regime instead
+    /// of a partly wired one (`#56` measured that as the worst of the three).
+    public func enableSlotWiring(budgetBytes: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        wiresAllocatedSlots = true
+        slotWiring.enable(budgetBytes: budgetBytes)
+    }
+
+    /// Hands every wired slot back and turns the policy off.
+    public func disableSlotWiring() {
+        lock.lock()
+        defer { lock.unlock() }
+        wiresAllocatedSlots = false
+        slotWiring.disable()
+    }
+
+    /// Wires the pages of the slots this arena already holds, up to `budgetBytes`.
+    ///
+    /// Measurement only (`#56`), and the reason it exists is `#55`: a fill writes the
+    /// same bytes at 0.8-6.4 GB/s into a machine with no free memory, against 90-97
+    /// into slots the process already owns, and the only counters that move with it are
+    /// the process's and the machine's compressor. A wired slot cannot become
+    /// compressor input, so wiring a measured fraction of the arena is how the question
+    /// "is the destination the cost" stops being a correlation. It returns the wiring
+    /// state so a caller reports what it actually wired rather than what it asked for;
+    /// `mlock` can refuse, and its refusal (a machine with no room to keep the pages)
+    /// is itself the answer. Production never calls this: the shipping path is
+    /// `enableSlotWiring`, which wires each slot as it is allocated.
+    ///
+    /// A later call with a larger budget raises it and wires the slots allocated
+    /// since; one that was already wired is not locked or counted twice.
+    @discardableResult
+    public func wireResidentSlots(budgetBytes: Int) -> (bytes: Int, failures: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        slotWiring.enable(budgetBytes: budgetBytes)
+        for buffer in slotBuffers {
+            guard let buffer else { continue }
+            slotWiring.wire(buffer.contents(), length: buffer.length)
+        }
+        return (slotWiring.status.bytes, slotWiring.status.failures)
+    }
 
     public init(
         device: MTLDevice,
@@ -536,12 +822,15 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
     }
 
     public func close() {
+        // The slots are about to go with this streamer, and until they do the machine
+        // should not have to treat them as pinned (`#57`).
+        disableSlotWiring()
         for reader in readers.values { reader.closeNow() }
     }
 
     /// One-line residency report for the load log.
     public func describe() -> String {
-        String(
+        let line = String(
             format: "experts: streamed into %d arena slots of %.1f MB (%@, %d loaded, %.2f GB read, %.0f%% hit rate)",
             capacity,
             Double(geometry.slotBytes) / 1_048_576,
@@ -550,6 +839,30 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
             Double(bytesRead) / 1_073_741_824,
             arena.hitRate * 100
         )
+        let rate = secondsReading > 0
+            ? String(
+                format: " at %.0f MB/s", Double(bytesRead) / 1_048_576 / secondsReading
+            )
+            : ""
+        let wiring = wiringState
+        let residency: String
+        if wiring.isRefused {
+            residency = String(
+                format: ", arena wiring refused after %d MB (%d refusal(s))",
+                wiring.bytes / 1_048_576,
+                wiring.failures
+            )
+        } else if wiring.isEnabled {
+            residency = String(
+                format: ", arena wired %.2f of %.2f GB (%d slots)",
+                Double(wiring.bytes) / 1_073_741_824,
+                Double(wiring.budgetBytes) / 1_073_741_824,
+                wiring.slots
+            )
+        } else {
+            residency = ""
+        }
+        return line + rate + residency
     }
 
     /// Makes every requested expert resident and returns its bindings, in the order
@@ -562,15 +875,83 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
         layer: Int,
         experts: [Int]
     ) throws -> [DeepSeekV41ResidentExpert] {
-        guard !experts.isEmpty else { return [] }
+        let fill = try placeResident(layer: layer, experts: experts)
+        try fill.read()
+        return fill.residents
+    }
+
+    /// A fill whose slots have been CHOSEN and whose bindings are final, but whose
+    /// bytes are still on disk.
+    ///
+    /// The split from `ensureResident` is what a deferred bind needs: a caller can encode
+    /// and commit the expert half against the arena slots while the reads are still
+    /// outstanding, and release it with an event the read signals. It is safe because the
+    /// bindings are final at PLACEMENT — every slot is decided by the arena before a
+    /// single byte moves — and it was built to price exactly that
+    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #65"), which found the gate buys nothing:
+    /// a gated buffer resumes through the same driver path a commit uses. It stays
+    /// because it is that idea's baseline, and because `ensureResident` is the two halves
+    /// composed.
+    public struct DeepSeekV41PendingFill {
+        /// One entry per requested expert, in the order requested.
+        public let residents: [DeepSeekV41ResidentExpert]
+        private let readBytes: () throws -> Void
+
+        init(residents: [DeepSeekV41ResidentExpert], readBytes: @escaping () throws -> Void) {
+            self.residents = residents
+            self.readBytes = readBytes
+        }
+
+        /// Blocks the calling thread until every missing slot holds its bytes.
+        ///
+        /// Throws after vacating the slots it touched, so a caller that fails here must
+        /// still release anything it committed against those slots.
+        public func read() throws {
+            try readBytes()
+        }
+    }
+
+    /// Places every requested expert in the arena and resolves its bindings, WITHOUT
+    /// reading the misses.
+    ///
+    /// Placement is the half the expert kernels bind; `read()` is the half that needs
+    /// the disk, so a caller with work to hand the GPU in between separates them.
+    public func placeResident(
+        layer: Int,
+        experts: [Int]
+    ) throws -> DeepSeekV41PendingFill {
+        guard !experts.isEmpty else {
+            return DeepSeekV41PendingFill(residents: [], readBytes: {})
+        }
         guard experts.count <= capacity else {
             throw DeepSeekV41ExpertStreamError.tooManyExperts(
                 requested: experts.count, capacity: capacity
             )
         }
+        // The whole call minus the arena's own placement. A `defer` rather than a stamp
+        // before the return so a throw is billed too: a failed resolve still did its
+        // catalog lookups, and leaving those out would make preparation look cheap
+        // exactly when the fill is going badly.
+        let prepareStarted = DispatchTime.now().uptimeNanoseconds
+        var placementNanoseconds: UInt64 = 0
+        defer {
+            let elapsed = DispatchTime.now().uptimeNanoseconds - prepareStarted
+            if elapsed > placementNanoseconds {
+                lock.lock()
+                secondsPreparing += Double(elapsed - placementNanoseconds) / 1_000_000_000
+                preparations += 1
+                lock.unlock()
+            }
+        }
+        let placementStarted = prepareStarted
         let reservations = arena.acquireDetailed(
             experts.map { (layer: layer, expert: $0) }
         )
+        placementNanoseconds = DispatchTime.now().uptimeNanoseconds - placementStarted
+        lock.lock()
+        secondsPlacing += Double(placementNanoseconds) / 1_000_000_000
+        placements += reservations.count
+        lock.unlock()
 
         // Group the misses by shard so each file takes one batch of ranges, which is
         // the only way the reads reach queue depth.
@@ -629,26 +1010,7 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
             misses.append((slot: reservation.slot, expert: expert))
         }
 
-        if !misses.isEmpty {
-            let failures = DeepSeekV41ReadFailureBox()
-            let context = DeepSeekV41ShardBatchContext(
-                batches: batches.map { (shard: $0.key, ranges: $0.value) },
-                readers: readers,
-                failures: failures
-            )
-            let runOne: @Sendable (Int) -> Void = { index in context.run(index) }
-            DispatchQueue.concurrentPerform(iterations: context.batches.count, execute: runOne)
-            if let failure = failures.first {
-                vacate(misses.map(\.slot))
-                throw failure
-            }
-            lock.lock()
-            expertsLoaded += misses.count
-            bytesRead += misses.count * geometry.slotBytes
-            lock.unlock()
-        }
-
-        return reservations.map { reservation in
+        let residents = reservations.map { reservation in
             let buffer = slotBuffers[reservation.slot]
             guard let buffer else {
                 // Unreachable: every miss allocated its buffer above and every hit
@@ -665,6 +1027,74 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
             }
             return DeepSeekV41ResidentExpert(buffer: buffer, geometry: geometry)
         }
+        return DeepSeekV41PendingFill(residents: residents) { [self] in
+            try readMisses(batches: batches, misses: misses)
+        }
+    }
+
+    /// Reads every missing slot, on the calling thread.
+    private func readMisses(
+        batches: [UInt32: [DeepSeekV41ExpertShardReader.Range]],
+        misses: [(slot: Int, expert: Int)]
+    ) throws {
+        guard !misses.isEmpty else { return }
+        let readStarted = DispatchTime.now().uptimeNanoseconds
+        let failures = DeepSeekV41ReadFailureBox()
+        let form = fillForm
+        let context = DeepSeekV41ShardBatchContext(
+            batches: batches.map { (shard: $0.key, ranges: $0.value) },
+            readers: readers,
+            failures: failures,
+            chunkBytes: form.chunkBytes,
+            sequential: form.isSequential
+        )
+        let runOne: @Sendable (Int) -> Void = { index in context.run(index) }
+        switch form {
+        case .serial:
+            // One read at a time, in batch order. The file's own rate.
+            for index in context.batches.indices { runOne(index) }
+        case .shardBatched, .chunked:
+            DispatchQueue.concurrentPerform(
+                iterations: context.batches.count, execute: runOne
+            )
+        }
+        if let failure = failures.first {
+            vacate(misses.map(\.slot))
+            throw failure
+        }
+        if touchesFilledRanges {
+            // One load per page, from the thread that will commit the expert half.
+            // A short sum rather than a barrier, because the question is which core
+            // owns the line, not what the line holds.
+            var sink = 0
+            for ranges in batches.values {
+                for range in ranges {
+                    var offset = 0
+                    while offset < range.length {
+                        sink &+= Int(range.destination.load(fromByteOffset: offset, as: UInt8.self))
+                        offset += 4096
+                    }
+                }
+            }
+            touchSink &+= sink
+        }
+        lock.lock()
+        expertsLoaded += misses.count
+        bytesRead += misses.count * geometry.slotBytes
+        let readSeconds = Double(
+            DispatchTime.now().uptimeNanoseconds - readStarted
+        ) / 1_000_000_000
+        secondsReading += readSeconds
+        if recordsFillSamples {
+            fillSamples.append(DeepSeekV41FillSample(
+                misses: misses.count,
+                shards: context.batches.count,
+                ranges: context.rangeCount,
+                bytes: context.byteCount,
+                seconds: readSeconds
+            ))
+        }
+        lock.unlock()
     }
 
     private func vacate(_ slots: [Int]) {
@@ -678,6 +1108,7 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
             throw DeepSeekV41ExpertStreamError.allocationFailed(slot: slot, bytes: geometry.slotBytes)
         }
         if let existing = slotBuffers[slot] { return existing }
+        let allocationStarted = DispatchTime.now().uptimeNanoseconds
         guard let buffer = device.makeBuffer(
             length: max(geometry.slotBytes, 16),
             options: .storageModeShared
@@ -688,6 +1119,20 @@ nonisolated public final class DeepSeekV41ExpertStreamer: @unchecked Sendable {
         }
         buffer.label = "dsv41.expert.slot.\(slot)"
         slotBuffers[slot] = buffer
+        secondsAllocating += Double(
+            DispatchTime.now().uptimeNanoseconds - allocationStarted
+        ) / 1_000_000_000
+        slotsAllocated += 1
+        // The shipping policy wires each slot as it is created, not retroactively:
+        // the pages exist now, and the next pass is the one that should never see
+        // them compressible (`#56`, `#57`).
+        if wiresAllocatedSlots {
+            let wiringStarted = DispatchTime.now().uptimeNanoseconds
+            slotWiring.wire(buffer.contents(), length: buffer.length)
+            secondsWiring += Double(
+                DispatchTime.now().uptimeNanoseconds - wiringStarted
+            ) / 1_000_000_000
+        }
         return buffer
     }
 }

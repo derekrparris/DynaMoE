@@ -2273,6 +2273,21 @@ struct SettingsSheetView: View {
                     if let tools = log.toolCalls, !tools.isEmpty {
                         serverRequestLogDetailLine("Tool Calls", tools.map(\.name).joined(separator: ", "))
                     }
+                    // Says WHY a row has no bodies when the Store Request Content
+                    // switch was on: the client asked for that (`store: false`), so a
+                    // reader never files it as the switch having failed.
+                    if log.retentionWithheldByClient == true {
+                        serverRequestLogDetailLine("Content", "withheld at the client's request (store: false)")
+                    }
+                    // The client's labels survive the switch, so they are shown even
+                    // when both bodies read "withheld": this is the one line that still
+                    // says which request the caller was asking about.
+                    if let labels = log.clientMetadata, !labels.isEmpty {
+                        serverRequestLogDetailLine(
+                            "Client Labels",
+                            labels.keys.sorted().map { "\($0)=\(labels[$0] ?? "")" }.joined(separator: ", ")
+                        )
+                    }
                 }
 
                 serverRequestLogBodySection("Request", log.requestBody)
@@ -2459,7 +2474,7 @@ struct SettingsSheetView: View {
     private func refreshServerDashboard() {
         let engine = CompletionEngine.shared
         serverDashboardEngineActive = engine.isActive
-        serverDashboardModelName = engine.loadedModelInfo?.displayName
+        serverDashboardModelName = engine.loadedModelInfo?.servedID
         let stats = ServerController.stats.snapshot()
         serverDashboardActiveRequests = stats.activeRequests
         serverDashboardTotalRequests = stats.totalRequests

@@ -226,6 +226,13 @@ public final class CompletionEngine: @unchecked Sendable {
     private var currentGenerationId: UInt64 = 0
     private var generationCounter: UInt64 = 0
 
+    /// Ownership of the single-flight slot while a turn is being PREPARED, i.e.
+    /// after a caller has been told the slot is free and before `launchTurn` mints
+    /// the turn. See `EngineTurnSlot.swift`: it is what lets the server queue hold
+    /// the slot across a turn's preparation instead of losing it to a chat turn
+    /// that starts in between (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #84").
+    private let turnSlotLedger = TurnSlotLedger()
+
     // Loaded-model state; `configure` is called by the model load/switch path.
     private var summary: ModelSummary?
     private var modelConfig: ModelConfig?
@@ -244,12 +251,29 @@ public final class CompletionEngine: @unchecked Sendable {
     /// a longer turn needs a larger cache.
     private var cachedDeepSeekRuntime: (path: String, contextLength: Int, runtime: DeepSeekV41Runtime)?
 
+    /// Encoded image spans, keyed by `snapshot path | image sha256`.
+    ///
+    /// A chat turn re-renders the whole conversation, so a picture that stays in
+    /// context would otherwise re-run the vision tower on every turn: 0.32 s for the
+    /// smallest image the checkpoint accepts and 6.95 s for the largest on the
+    /// shipped device encode, measured (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #43").
+    /// The rows are the expensive part (a smallest image's span is 3.8 MB of
+    /// `Float`), so the cache is small and drops everything once it outgrows it
+    /// rather than growing without bound.
+    private var cachedImageSpans: [String: DeepSeekV41ImagePrompt.ImageSpan] = [:]
+    private static let imageSpanCacheLimit = 4
+
     private init() {}
 
+    /// True while a turn is running OR one is being prepared under a claim.
+    ///
+    /// The second half matters to the server queue: it asks this before deciding to
+    /// launch, and a claim taken by another caller is exactly as busy as a running
+    /// turn.
     public var isActive: Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return currentGenerationTask != nil
+        return currentGenerationTask != nil || turnSlotLedger.isClaimed
     }
 
     public var hasLoadedModel: Bool {
@@ -271,7 +295,32 @@ public final class CompletionEngine: @unchecked Sendable {
         public var path: String?
         public var supportsThinking: Bool
         public var supportsThinkingLevels: Bool
+        /// True when the loaded checkpoint publishes a usable vision tower, i.e.
+        /// an image attachment would be read rather than refused. The server's
+        /// image gate and the composer's attachment button both read this.
+        public var supportsVision: Bool
+        /// What one attachment can cost this model, at either end of what the
+        /// checkpoint accepts. Nil when there is no tower, so the models list omits
+        /// the block rather than advertising a zero cost it cannot honour.
+        public var visionCost: DeepSeekV41VisionPricing.Bounds?
         public var weightsSizeGB: Double
+
+        /// The id both protocols serve for this checkpoint, and the identity a
+        /// session key hashes.
+        ///
+        /// Derived rather than stored, because it is a fact about the path and a
+        /// stored copy could drift from what the routes answer. `displayName` is
+        /// the snapshot directory's own name, which for a hub checkpoint is a
+        /// commit hash: unique, human-unreadable, not a path segment, and
+        /// different every time the same model is re-resolved. The repository name
+        /// the path already carries is none of those, so it is what the id is made
+        /// of (`ModelServingID`).
+        /// `nonisolated` because a stored property of a `Sendable` struct is, and
+        /// the routes read this from their own nonisolated contexts; a computed one
+        /// otherwise inherits the default main-actor isolation and warns at each.
+        nonisolated public var servedID: String {
+            ModelServingID.servedID(from: path, fallback: displayName)
+        }
     }
 
     public var loadedModelInfo: LoadedModelInfo? {
@@ -286,7 +335,16 @@ public final class CompletionEngine: @unchecked Sendable {
             modelPath: path
         )
         let supportsLevels = ModelConfig.supportsThinkingLevels(modelPath: path)
-        return LoadedModelInfo(displayName: modelName, path: path, supportsThinking: supports, supportsThinkingLevels: supportsLevels, weightsSizeGB: summary?.sizeGb ?? 0)
+        let supportsVision = ModelConfig.supportsVision(modelPath: path)
+        return LoadedModelInfo(
+            displayName: modelName,
+            path: path,
+            supportsThinking: supports,
+            supportsThinkingLevels: supportsLevels,
+            supportsVision: supportsVision,
+            visionCost: ModelConfig.visionCostBounds(modelPath: path),
+            weightsSizeGB: summary?.sizeGb ?? 0
+        )
     }
 
     /// Tokenizer bridge for API callers that build their own prompts
@@ -320,8 +378,73 @@ public final class CompletionEngine: @unchecked Sendable {
         return summary
     }
 
-    func launchTurn(_ request: CompletionTurnRequest) throws -> CompletionLaunch {
+    /// Claims the single-flight generation slot for a caller that is about to spend
+    /// real time preparing a turn — tokenizing, rendering the prompt, resolving the
+    /// prefix — before `launchTurn` can be called. Nil when a turn is already
+    /// running or another caller holds the slot.
+    ///
+    /// The claim is redeemed by `launchTurn(_:claim:)`, which honours it, and must
+    /// be released if that launch never happens. Holding one makes `isActive` true,
+    /// so a caller that is merely preparing looks busy to everyone else: that is
+    /// the point — see `EngineTurnSlot.swift`.
+    ///
+    /// Three callers reserve: the API server's queue, so a chat turn cannot take the
+    /// slot the queue is preparing for; `ContentView.startAutoregressiveGeneration`,
+    /// so a server turn cannot take the slot while a chat prompt is being rendered
+    /// and tokenized; and the model-load task, so a turn cannot start while the
+    /// shard buffers and the DeepSeek runtime are being replaced. Whichever reserves
+    /// first keeps the slot; the other goes on waiting or is told why.
+    ///
+    /// `nonisolated` because the load task is detached and the claim is a lock box:
+    /// the only state it touches is `stateLock` and the ledger, both guarded.
+    nonisolated func reserveTurnSlot() -> TurnSlotClaim? {
         stateLock.lock()
+        defer { stateLock.unlock() }
+        guard currentGenerationTask == nil else { return nil }
+        return turnSlotLedger.tryClaim()
+    }
+
+    /// Launches one turn, taking the single-flight slot on the way in.
+    ///
+    /// `claim` is a reservation the caller already holds (`reserveTurnSlot`); with
+    /// none, the slot is taken here in one step, so a launch can never be raced by
+    /// another launch. Either way the claim is released when this returns: from
+    /// then on `currentGenerationTask` is what occupies the slot.
+    ///
+    /// Both callers in the app reserve before they prepare a turn — the API server's
+    /// queue, and the in-app send path — because preparation is where the slot used
+    /// to be lost. A claim handed in here that is no longer held is refused rather
+    /// than honoured: see `EngineTurnSlot.swift`.
+    ///
+    /// A MODEL SWAP holds the same claim for the length of the load, which is the
+    /// other half of the same invariant: `configure` replaces the shard buffers and
+    /// retires the DeepSeek runtime, so a turn that started in between would be
+    /// running on mappings that no longer exist. Because the ledger does not know
+    /// who holds a claim, the refusal names both possibilities instead of blaming a
+    /// turn that is not there.
+    func launchTurn(
+        _ request: CompletionTurnRequest,
+        claim: TurnSlotClaim? = nil
+    ) throws -> CompletionLaunch {
+        stateLock.lock()
+        guard let held = claim ?? turnSlotLedger.tryClaim() else {
+            stateLock.unlock()
+            throw CompletionLaunchError.engineNotReady(
+                "❌ Another caller is holding the generation slot — a turn being prepared, or "
+                    + "a model load. One turn may run at a time; try again in a moment."
+            )
+        }
+        defer { held.release() }
+        // A claim is what authorises the launch, so one that has already been given
+        // back must not: its ticket no longer names the ledger's outstanding claim,
+        // and launching on it would run a turn while the slot reads free to
+        // everyone else.
+        guard held.isHeld else {
+            stateLock.unlock()
+            throw CompletionLaunchError.engineNotReady(
+                "❌ This turn's reservation on the generation slot was given back before it could start. Try again in a moment."
+            )
+        }
         if currentGenerationTask != nil {
             stateLock.unlock()
             throw CompletionLaunchError.engineNotReady("❌ A generation is already active; one turn may run at a time.")
@@ -333,6 +456,18 @@ public final class CompletionEngine: @unchecked Sendable {
         guard modelConfig != nil, let tokenizer = tokenizer else {
             stateLock.unlock()
             throw CompletionLaunchError.engineNotReady("❌ Metal or Tokenizer not ready for text generation. Please load model and tokenizer in Settings.")
+        }
+        // Only the DeepSeek V4.1 branch below reads pixels. Every other family
+        // would take the generic loop, which never looks at `request.images`, so an
+        // attachment there would be dropped in silence and the model would answer
+        // about a picture it never saw. Fail closed instead.
+        if let config = modelConfig, !config.isDeepSeekV41Model, !request.images.isEmpty {
+            stateLock.unlock()
+            throw CompletionLaunchError.engineNotReady(
+                "❌ \(request.images.count == 1 ? "An image was" : "\(request.images.count) images were") "
+                    + "attached, but the loaded model has no vision tower, so it cannot see "
+                    + "\(request.images.count == 1 ? "it" : "them")."
+            )
         }
         // DeepSeek V4.1 is detected natively but its forward pass is served by a
         // dedicated runtime (latent CSA2 attention, mHC residual streams, Engram
@@ -367,11 +502,49 @@ public final class CompletionEngine: @unchecked Sendable {
                     "⚠️ DeepSeek V4.1 Flash config.json could not be decoded: \(error)"
                 )
             }
-            // The cache is provisioned for the prompt plus the turn's token budget,
-            // capped at what the checkpoint says it can address.
+            // Images are priced BEFORE the runtime is provisioned and encoded after
+            // it exists: the resize plan alone says how many prompt positions the
+            // spans will occupy, and the cache has to be sized for the expanded
+            // prompt, not for the placeholders. This also rejects the mismatches
+            // (no tower, an image with no placeholder, a placeholder with no image)
+            // while nothing has been allocated.
+            let turnImages = request.images.map {
+                DeepSeekV41ImageInput(
+                    rgb: $0.rgb, width: $0.width, height: $0.height, sha256: $0.sha256
+                )
+            }
+            // A continuation splices the previous turn's ids forward verbatim, so it
+            // arrives already expanded. There is no marker count to price that with —
+            // an expanded span is a RUN of image tokens, so counting them reads one
+            // picture as hundreds of placeholders — and the recorded layout is what
+            // the length and the row placement come from instead.
+            let carriedSpans = request.imageSpans
+            let pricedPromptTokens: Int
+            if carriedSpans.isEmpty {
+                pricedPromptTokens = try DeepSeekV41TurnImages.price(
+                    tokenIds: request.promptTokenIds,
+                    images: turnImages,
+                    spec: dsConfig.vision
+                ).promptTokens
+            } else {
+                pricedPromptTokens = try DeepSeekV41TurnImages.priceCarried(
+                    tokenIds: request.promptTokenIds,
+                    ranges: carriedSpans.map(\.range),
+                    spec: dsConfig.vision
+                )
+            }
+            // The cache is provisioned for the prompt plus the turn's token budget, PLUS
+            // the one position the last generated token is forwarded at, capped at what
+            // the checkpoint says it can address. The runner's own cap reserves that
+            // position (`limit - prompt - 1`), so provisioning the bare budget made every
+            // budgeted turn answer one token short of what the client asked for: a
+            // `max_tokens` of 3 produced 2 tokens here, and 8 produced 7 in `#89`.
             let contextLength = max(
                 1,
-                min(dsConfig.maxPositionEmbeddings, request.sampling.maxTokens + request.promptTokenIds.count)
+                min(
+                    dsConfig.maxPositionEmbeddings,
+                    request.sampling.maxTokens + pricedPromptTokens + 1
+                )
             )
             // Reuse the runtime a previous turn built when it was provisioned for at
             // least this much context. The engine is single-flight (checked at the
@@ -433,6 +606,131 @@ public final class CompletionEngine: @unchecked Sendable {
                     )
                 }
 
+                // Encode the attachments now that the tower can be reached, and bind
+                // its rows to the placeholders. This is the slow part of an image turn
+                // (0.32 s for the smallest image the checkpoint accepts, 6.95 s for
+                // the largest on the device encode, measured), and it happens before
+                // the turn starts so the first streamed frame is still the first
+                // generated token. An attachment this engine already encoded is
+                // reused: a conversation that keeps a picture in context re-renders it
+                // every turn.
+                stateLock.lock()
+                let cachedSpans = cachedImageSpans
+                stateLock.unlock()
+                var freshSpans: [String: DeepSeekV41ImagePrompt.ImageSpan] = [:]
+                func spanKey(_ image: DeepSeekV41ImageInput) -> String {
+                    "\(snapshotDir.path)|\(image.sha256)"
+                }
+                func encodeImage(_ input: DeepSeekV41ImageInput) throws
+                    -> DeepSeekV41ImagePrompt.ImageSpan {
+                    let key = spanKey(input)
+                    if let hit = cachedSpans[key] { return hit }
+                    if let hit = freshSpans[key] { return hit }
+                    let span = try runtime.imageSpan(
+                        rgb: input.rgb, width: input.width, height: input.height
+                    )
+                    freshSpans[key] = span
+                    return span
+                }
+                // An attachment this engine already encoded can be reused by digest
+                // alone, which is what lets a continuation rebind its spans without
+                // being handed the pixels again.
+                func encodedSpan(for span: TurnImageSpan) throws -> DeepSeekV41ImagePrompt.ImageSpan {
+                    let key = "\(snapshotDir.path)|\(span.sha256)"
+                    if let hit = cachedSpans[key] ?? freshSpans[key] { return hit }
+                    throw CompletionLaunchError.engineNotReady(
+                        "⚠️ This turn continues a prompt that already carries an image, but "
+                            + "that image's rows are no longer encoded and its pixels were "
+                            + "not sent again, so they cannot be rebuilt."
+                    )
+                }
+                // Everything downstream — the prefix pin, the provisioned length,
+                // the sampler's context — has to see the EXPANDED ids: a placeholder
+                // is one token and the rows live at the span's positions.
+                let expandedPromptIds: [UInt32]
+                let boundRows: [Int: [Float]]
+                // The layout a continuation has to hand back so the NEXT turn can put
+                // the same rows at the same positions: the prompt's ids alone cannot
+                // say it, because an expanded span is a run of one repeated token.
+                let imageSpans: [TurnImageSpan]
+                if carriedSpans.isEmpty {
+                    let bound = try DeepSeekV41TurnImages.bind(
+                        tokenIds: request.promptTokenIds,
+                        images: turnImages,
+                        spec: dsConfig.vision,
+                        rowWidth: dsConfig.hiddenSize,
+                        encode: encodeImage
+                    )
+                    guard bound.tokenIds.count == pricedPromptTokens else {
+                        throw CompletionLaunchError.engineNotReady(
+                            "⚠️ Image expansion produced \(bound.tokenIds.count) prompt tokens, "
+                                + "but the resize plan priced \(pricedPromptTokens)."
+                        )
+                    }
+                    expandedPromptIds = bound.tokenIds
+                    boundRows = bound.rows
+                    imageSpans = zip(turnImages, bound.spans).map { image, range in
+                        TurnImageSpan(
+                            sha256: image.sha256,
+                            width: image.width,
+                            height: image.height,
+                            range: range
+                        )
+                    }
+                } else {
+                    // The prompt already holds its spans, so nothing is expanded and
+                    // nothing is re-tokenized: the recorded layout decides where the
+                    // rows go, and the same picture has to be the one that went there.
+                    if !turnImages.isEmpty {
+                        guard turnImages.count == carriedSpans.count else {
+                            throw CompletionLaunchError.engineNotReady(
+                                "⚠️ This continuation carries \(carriedSpans.count) image span(s) "
+                                    + "but \(turnImages.count) image(s) were attached."
+                            )
+                        }
+                        for (index, span) in carriedSpans.enumerated()
+                        where !span.sha256.isEmpty && !turnImages[index].sha256.isEmpty
+                            && span.sha256 != turnImages[index].sha256 {
+                            throw CompletionLaunchError.engineNotReady(
+                                "⚠️ Image \(index + 1) of this continuation is not the picture its "
+                                    + "prompt was built with, so its rows cannot be reused."
+                            )
+                        }
+                    }
+                    var spans: [DeepSeekV41ImagePrompt.ImageSpan] = []
+                    spans.reserveCapacity(carriedSpans.count)
+                    for (index, carried) in carriedSpans.enumerated() {
+                        if !turnImages.isEmpty {
+                            spans.append(try encodeImage(turnImages[index]))
+                        } else {
+                            spans.append(try encodedSpan(for: carried))
+                        }
+                    }
+                    let placed = try DeepSeekV41TurnImages.place(
+                        tokenIds: request.promptTokenIds,
+                        spans: spans,
+                        at: carriedSpans.map(\.range),
+                        spec: dsConfig.vision,
+                        rowWidth: dsConfig.hiddenSize
+                    )
+                    expandedPromptIds = placed.tokenIds
+                    boundRows = placed.rows
+                    // The layout passes straight through: nothing about it changed,
+                    // and the validation above is what makes trusting it safe.
+                    imageSpans = carriedSpans
+                }
+                if !freshSpans.isEmpty {
+                    stateLock.lock()
+                    for (key, span) in freshSpans { cachedImageSpans[key] = span }
+                    if cachedImageSpans.count > Self.imageSpanCacheLimit {
+                        // Keep the most recent encodes: a conversation addresses the
+                        // same few pictures over and over, and an unbounded cache of
+                        // multi-megabyte row sets is a leak.
+                        cachedImageSpans = freshSpans
+                    }
+                    stateLock.unlock()
+                }
+
                 // Same ordering as the generic loop: KV reset (in the turn loop) ->
                 // grammar token -> turn id. A superseded turn still holds its old
                 // token, so its late mask writes are dropped instead of corrupting
@@ -451,15 +749,15 @@ public final class CompletionEngine: @unchecked Sendable {
                 // sequence this cache never saw.
                 let reusablePrefix = forward.reusablePrefix(
                     proposedPrefix: PrefixCacheManager.shared.findCommonPrefix(
-                        promptTokenIds: request.promptTokenIds,
+                        promptTokenIds: expandedPromptIds,
                         sessionId: request.sessionId
                     ),
-                    promptTokenIds: request.promptTokenIds.map { Int($0) }
+                    promptTokenIds: expandedPromptIds.map { Int($0) }
                 )
 
                 let prep = TurnPrepInfo(
                     prefixTokensReused: reusablePrefix,
-                    promptTokenCount: request.promptTokenIds.count,
+                    promptTokenCount: expandedPromptIds.count,
                     effectiveKVPrecision: runtime.cachePrecision == .fp16 ? .fp16 : .fp8,
                     provisionedSequenceLength: runtime.contextLength
                 )
@@ -467,25 +765,28 @@ public final class CompletionEngine: @unchecked Sendable {
                 let engineSelf = self
                 let dsTokenizer = tokenizer
                 let dsSampling = request.sampling
-                let dsPromptIds = request.promptTokenIds
+                let dsPromptIds = expandedPromptIds
                 let dsFormattedPrompt = request.formattedPrompt
                 let dsStopSequences = request.stopSequences
                 let dsSessionId = request.sessionId
                 let dsAsOfDate = request.asOfDate
                 let dsEosIDs = dsConfig.eosTokenIDs.map { UInt32(clamping: $0) }
-                // Agent turns get the same two guards the generic loop installs: a
-                // grammar mask that makes a malformed tool call unsamplable, and the
-                // mid-stream freeze that stops generation on the token which closes
-                // the call. Both are the app-wide, Qwen-shaped components, so they
-                // only act once this checkpoint's tool dialect is understood;
-                // installed and idle is the intended state until then, because a
-                // mask keyed on markers the model never emits cannot corrupt it.
+                // The checkpoint's own markers, resolved once: the freeze test, the
+                // call rewrite and the result turn all use the same spelling.
+                let dsDialect = DeepSeekV41PromptDialect.resolve(snapshotDir: snapshotDir)
+                // Agent turns keep the mid-stream freeze, now keyed on this
+                // checkpoint's own call syntax (`#27` measured it: the DSML tags its
+                // agent-shaped prompt produces, not the vocabulary's `tool`-`call`
+                // special tokens, which it never emits). The grammar mask is NOT
+                // installed: its marker vocabulary is Qwen's, and it would force a
+                // `<function=>` shape this model was not post-trained to emit.
                 let dsRunAgentTools = request.agentToolsEnabled && !request.forceSynthesis
-                let dsGrammarMaskActive = dsRunAgentTools
-                    && (UserDefaults.standard.object(forKey: "dynamoe_agent_grammar_masking") == nil
-                        ? true
-                        : UserDefaults.standard.bool(forKey: "dynamoe_agent_grammar_masking"))
-                    && !UserDefaults.standard.bool(forKey: "dynamoe_disable_grammar")
+                // Deliberately OFF for this family. The mask's marker vocabulary is
+                // Qwen's and this checkpoint writes its own tags; activating it would
+                // force a `<function=>` shape the model was not post-trained to emit.
+                // Its own dialect is parsed by `DeepSeekV41ToolDialect` instead, and
+                // argument validation still happens at execution.
+                let dsGrammarMaskActive = false
                 let (stream, continuation) = AsyncStream.makeStream(
                     of: CompletionEvent.self, bufferingPolicy: .unbounded
                 )
@@ -503,6 +804,32 @@ public final class CompletionEngine: @unchecked Sendable {
 
                     let startTime = CFAbsoluteTimeGetCurrent()
                     var lastFrameTime = 0.0
+                    // Prefill progress has to be reported while it runs, not when it
+                    // ends. A whole prompt is one chunked call, so this is the
+                    // executor's per-block count, and it is throttled by TIME rather
+                    // than by a count of positions: a resumed turn may compute only a
+                    // handful, and a `% 8` gate turned those into one late jump with
+                    // no evidence anything was happening.
+                    let dsPrefillStartedAt = CFAbsoluteTimeGetCurrent()
+                    var dsLastPrefillEmit = 0.0
+                    func dsPrefillStatus(done: Int, total: Int, rate: Double?) -> String {
+                        var text = "Prefilling \(done)/\(total)"
+                        if reusablePrefix > 0 { text += " (+\(reusablePrefix) resident)" }
+                        if let rate {
+                            text += rate >= 10
+                                ? String(format: " • %.0f pos/s", rate)
+                                : String(format: " • %.1f pos/s", rate)
+                        }
+                        return text + "…"
+                    }
+                    let dsPrefillPositions = max(0, dsPromptIds.count - reusablePrefix)
+                    if dsPrefillPositions > 0 {
+                        emit(.prefillProgress(
+                            status: dsPrefillStatus(done: 0, total: dsPrefillPositions, rate: nil),
+                            speed: nil,
+                            rssGB: WorkingSetManager.shared.effectiveResidentMemoryGB
+                        ))
+                    }
                     let settings = DeepSeekV41TurnRunner.Settings(
                         temperature: dsSampling.temperature,
                         topP: dsSampling.topP,
@@ -519,6 +846,7 @@ public final class CompletionEngine: @unchecked Sendable {
                             forward: forward,
                             promptTokenIds: dsPromptIds,
                             prefixTokens: reusablePrefix,
+                            imageEmbeddings: boundRows,
                             settings: settings,
                             sample: { logits, generated in
                                 var scratch = logits
@@ -533,6 +861,8 @@ public final class CompletionEngine: @unchecked Sendable {
                                         topK: dsSampling.topK,
                                         repetitionPenalty: dsSampling.repetitionPenalty,
                                         presencePenalty: dsSampling.presencePenalty,
+                                        frequencyPenalty: dsSampling.frequencyPenalty,
+                                        logitBias: dsSampling.logitBias,
                                         eosTokenIds: dsEosIDs
                                     )
                                 }
@@ -553,22 +883,39 @@ public final class CompletionEngine: @unchecked Sendable {
                             },
                             shouldFreeze: { text in
                                 guard dsRunAgentTools else { return false }
-                                return StreamingToolParser.shared.shouldFreezeGeneration(
-                                    accumulatedText: text,
-                                    deltaText: "",
-                                    format: ToolCallFormat.forModel(isGemma4: false)
+                                return DeepSeekV41ToolDialect.shouldFreeze(
+                                    text, markers: dsDialect.markers
                                 )
                             },
                             decode: { ids in
                                 (try? dsTokenizer.decode(ids: ids)) ?? ""
                             },
                             onPrefill: { done, total in
-                                guard done == total || done % 8 == 0 else { return }
+                                let now = CFAbsoluteTimeGetCurrent()
+                                let isFinal = done >= total
+                                guard done == 0 || isFinal || now - dsLastPrefillEmit >= 0.12
+                                else { return }
+                                dsLastPrefillEmit = now
+                                let elapsed = now - dsPrefillStartedAt
+                                let rate: Double? = done > 0 && elapsed > 0.05
+                                    ? Double(done) / elapsed
+                                    : nil
                                 emit(.prefillProgress(
-                                    status: "Prefilling \(done)/\(total)…",
-                                    speed: nil,
+                                    status: dsPrefillStatus(done: done, total: total, rate: rate),
+                                    speed: rate,
                                     rssGB: WorkingSetManager.shared.effectiveResidentMemoryGB
                                 ))
+                                // Retire the prefill pill the moment prefill ends, not
+                                // at the turn's tail. This family reasons for hundreds
+                                // of tokens after ingestion, and the composer keys its
+                                // "Ingesting Prompt..." / "Thinking..." heading off a
+                                // nil status, so leaving the clear to the post-`run`
+                                // emit below left the whole reasoning pass reading as
+                                // prefill. The generic path clears between prefill and
+                                // decode for exactly this reason.
+                                if isFinal {
+                                    emit(.prefillProgress(status: nil, speed: nil, rssGB: nil))
+                                }
                             },
                             onText: { text, tokens, elapsed in
                                 let now = CFAbsoluteTimeGetCurrent()
@@ -643,6 +990,33 @@ public final class CompletionEngine: @unchecked Sendable {
                                 dsFormattedPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
                             )
                         )
+                        // Agent calls arrive in this checkpoint's own dialect (DSML
+                        // for the agent prompt, plain tags for a schematic one).
+                        // Rewriting into the canonical block keeps the executor, HITL
+                        // gating, timeline and history on the one shared path.
+                        var dsParsedCalls: [ParsedToolCall] = []
+                        var dsGestureNotices: [Int: String] = [:]
+                        var dsActionable: [Int] = []
+                        var dsBroken: [String] = []
+                        if dsRunAgentTools {
+                            let canonical = DeepSeekV41ToolDialect.canonicalized(
+                                output.text, markers: dsDialect.markers
+                            )
+                            let parsed = StreamingToolParser.shared.parseStreamingToolCalls(
+                                from: canonical, format: .qwenXML
+                            )
+                            let gestures = AgentHarness.splitGestureCalls(parsed.calls)
+                            dsParsedCalls = parsed.calls
+                            dsGestureNotices = gestures.skipNotices
+                            dsActionable = gestures.actionableIndices
+                            dsBroken = parsed.brokenFragments
+                        }
+                        if !dsParsedCalls.isEmpty || !dsBroken.isEmpty {
+                            print(
+                                "🧰 [DSV41] parsed \(dsParsedCalls.map(\.name)) "
+                                    + "actionable=\(dsActionable) broken=\(dsBroken.count)"
+                            )
+                        }
                         let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000
                         emit(.finished(TurnResult(
                             finishReason: output.finishReason,
@@ -668,11 +1042,12 @@ public final class CompletionEngine: @unchecked Sendable {
                             prefetchEfficiencyPercent: 0,
                             pagingLatencyMs: 0,
                             prefixTokensReused: output.prefixTokensReused,
-                            parsedToolCalls: [],
-                            actionableCallIndices: [],
-                            gestureSkipNotices: [:],
-                            brokenFragments: [],
-                            matchedStopSequence: output.matchedStopSequence
+                            parsedToolCalls: dsParsedCalls,
+                            actionableCallIndices: dsActionable,
+                            gestureSkipNotices: dsGestureNotices,
+                            brokenFragments: dsBroken,
+                            matchedStopSequence: output.matchedStopSequence,
+                            imageSpans: imageSpans
                         )))
                     } catch {
                         emit(.prefillProgress(status: nil, speed: nil, rssGB: nil))
@@ -1609,6 +1984,8 @@ public final class CompletionEngine: @unchecked Sendable {
         let topKVal = sampling.topK
         let repPen = sampling.repetitionPenalty
         let presPen = sampling.presencePenalty
+        let freqPen = sampling.frequencyPenalty
+        let bias = sampling.logitBias
         var maxTokens = sampling.maxTokens
         let buffers = shardBuffers
         let effMode = memory.executionMode.resolveEffectiveMode(modelFootprintGB: summary.sizeGb)
@@ -10368,6 +10745,8 @@ if layer.attnGateProjTensor != nil,
                         topK: topKVal,
                         repetitionPenalty: repPen,
                         presencePenalty: presPen,
+                        frequencyPenalty: freqPen,
+                        logitBias: bias,
                         eosTokenIds: modelConfig?.effectiveEosTokenIds.map { UInt32($0) } ?? [eosTokenId],
                         grammarMask: isGrammarActive && !UserDefaults.standard.bool(forKey: "dynamoe_disable_grammar") ? { maskLogits, maskVocab in
                             GrammarConstrainedSampler.shared.updateStateAndApplyLogitMask(
@@ -10735,13 +11114,32 @@ if layer.attnGateProjTensor != nil,
     }
 
     /// Suspends until no turn is active (model switch/load safety).
+    ///
+    /// "Active" is `isActive`, not just the registered task. A turn is UNREGISTERED
+    /// for the whole of its preparation — `launchTurn` builds the DeepSeek runtime,
+    /// prices the attachments and runs the vision tower before it ever mints the
+    /// task, and a caller that watched `currentGenerationTask` alone saw a free
+    /// engine in the middle of exactly that window and then replaced the shard
+    /// buffers and retired the runtime the turn was using.
+    ///
+    /// The slot claim is what covers it: `launchTurn` redeems the caller's claim or
+    /// takes its own as its first statement and gives it back only after the task
+    /// is registered, so an outstanding claim IS a turn in preparation. A claim has
+    /// no completion to await, so that half of the wait polls — the load path this
+    /// guards is a multi-second operation on the main actor and the poll yields,
+    /// which is what lets the preparation it is waiting for finish.
     public func awaitIdle() async {
         while true {
             stateLock.lock()
             let pending = currentGenerationTask
+            let preparing = turnSlotLedger.isClaimed
             stateLock.unlock()
-            guard let task = pending else { break }
-            _ = await task.value
+            if let task = pending {
+                _ = await task.value
+                continue
+            }
+            guard preparing else { break }
+            try? await Task.sleep(nanoseconds: 5_000_000)
         }
     }
 
@@ -10781,8 +11179,12 @@ if layer.attnGateProjTensor != nil,
         self.cachedPromptDialect = nil
         // A model switch retires the DeepSeek runtime with the checkpoint it was
         // built for; its mapped shards and open tables must not outlive the load.
+        // The encoded image spans go with it: their keys carry the old snapshot's
+        // path, and holding a conversation's rows across a model switch buys
+        // nothing while costing tens of megabytes.
         let retired = cachedDeepSeekRuntime
         cachedDeepSeekRuntime = nil
+        cachedImageSpans.removeAll()
         stateLock.unlock()
         retired?.runtime.shutdown()
     }

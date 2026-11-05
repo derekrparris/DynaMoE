@@ -42,6 +42,16 @@ nonisolated public struct DeepSeekV41PromptMarkers: Sendable, Equatable {
     public let toolCallsBegin: String
     public let toolCallSeparator: String
     public let toolCallsEnd: String
+    /// The per-call pair inside the container. The checkpoint's tokenizer carries
+    /// both (`128808`/`128809`), and a multi-call turn nests one pair per call.
+    public let toolCallBegin: String
+    public let toolCallEnd: String
+    /// A tool RESULT's pair, and the container a batch of them sits in. These are
+    /// the spellings the history renderer needs; the calls container is not one.
+    public let toolOutputBegin: String
+    public let toolOutputEnd: String
+    public let toolOutputsBegin: String
+    public let toolOutputsEnd: String
     /// The reasoning channel the template opens and closes. Defaults come from
     /// the checkpoint's declared special tokens, not from a renderer constant.
     public let reasoningOpen: String
@@ -59,13 +69,30 @@ nonisolated public struct DeepSeekV41PromptMarkers: Sendable, Equatable {
         endOfSentence: "<" + "\u{FF5C}" + "end" + "\u{2581}" + "of" + "\u{2581}" + "sentence" + "\u{FF5C}" + ">",
         user: "<" + "\u{FF5C}" + "User" + "\u{FF5C}" + ">",
         assistant: "<" + "\u{FF5C}" + "Assistant" + "\u{FF5C}" + ">",
-        toolCallsBegin: "<" + "\u{FF5C}" + "tool" + "\u{2581}" + "calls" + "\u{2581}" + "begin" + "\u{FF5C}" + ">",
-        toolCallSeparator: "<" + "\u{FF5C}" + "tool" + "\u{2581}" + "sep" + "\u{FF5C}" + ">",
-        toolCallsEnd: "<" + "\u{FF5C}" + "tool" + "\u{2581}" + "calls" + "\u{2581}" + "end" + "\u{FF5C}" + ">",
+        toolCallsBegin: DeepSeekV41PromptMarkers.marker("tool", "calls", "begin"),
+        toolCallSeparator: DeepSeekV41PromptMarkers.marker("tool", "sep"),
+        toolCallsEnd: DeepSeekV41PromptMarkers.marker("tool", "calls", "end"),
+        toolCallBegin: DeepSeekV41PromptMarkers.marker("tool", "call", "begin"),
+        toolCallEnd: DeepSeekV41PromptMarkers.marker("tool", "call", "end"),
+        toolOutputBegin: DeepSeekV41PromptMarkers.marker("tool", "output", "begin"),
+        toolOutputEnd: DeepSeekV41PromptMarkers.marker("tool", "output", "end"),
+        toolOutputsBegin: DeepSeekV41PromptMarkers.marker("tool", "outputs", "begin"),
+        toolOutputsEnd: DeepSeekV41PromptMarkers.marker("tool", "outputs", "end"),
         system: DeepSeekV41PromptMarkers.defaultSystem,
         reasoningOpen: DeepSeekV41PromptMarkers.defaultReasoningOpen,
         reasoningClose: DeepSeekV41PromptMarkers.defaultReasoningClose
     )
+
+    /// Builds a fullwidth-bar marker from its parts. Never spell one by hand in a
+    /// source file: a rendered view strips the bars, so the result looks right and
+    /// tokenizes wrong.
+    public static func marker(_ parts: String...) -> String {
+        marker(parts)
+    }
+
+    public static func marker(_ parts: [String]) -> String {
+        "<" + "\u{FF5C}" + parts.joined(separator: "\u{2581}") + "\u{FF5C}" + ">"
+    }
 
     public init(
         beginOfSentence: String,
@@ -75,6 +102,12 @@ nonisolated public struct DeepSeekV41PromptMarkers: Sendable, Equatable {
         toolCallsBegin: String,
         toolCallSeparator: String,
         toolCallsEnd: String,
+        toolCallBegin: String = DeepSeekV41PromptMarkers.familyDefault.toolCallBegin,
+        toolCallEnd: String = DeepSeekV41PromptMarkers.familyDefault.toolCallEnd,
+        toolOutputBegin: String = DeepSeekV41PromptMarkers.familyDefault.toolOutputBegin,
+        toolOutputEnd: String = DeepSeekV41PromptMarkers.familyDefault.toolOutputEnd,
+        toolOutputsBegin: String = DeepSeekV41PromptMarkers.familyDefault.toolOutputsBegin,
+        toolOutputsEnd: String = DeepSeekV41PromptMarkers.familyDefault.toolOutputsEnd,
         system: String = DeepSeekV41PromptMarkers.defaultSystem,
         reasoningOpen: String = DeepSeekV41PromptMarkers.defaultReasoningOpen,
         reasoningClose: String = DeepSeekV41PromptMarkers.defaultReasoningClose
@@ -87,6 +120,12 @@ nonisolated public struct DeepSeekV41PromptMarkers: Sendable, Equatable {
         self.toolCallsBegin = toolCallsBegin
         self.toolCallSeparator = toolCallSeparator
         self.toolCallsEnd = toolCallsEnd
+        self.toolCallBegin = toolCallBegin
+        self.toolCallEnd = toolCallEnd
+        self.toolOutputBegin = toolOutputBegin
+        self.toolOutputEnd = toolOutputEnd
+        self.toolOutputsBegin = toolOutputsBegin
+        self.toolOutputsEnd = toolOutputsEnd
         self.reasoningOpen = reasoningOpen
         self.reasoningClose = reasoningClose
     }
@@ -195,6 +234,12 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
         var toolBegin = DeepSeekV41PromptMarkers.familyDefault.toolCallsBegin
         var toolSep = DeepSeekV41PromptMarkers.familyDefault.toolCallSeparator
         var toolEnd = DeepSeekV41PromptMarkers.familyDefault.toolCallsEnd
+        var callBegin = DeepSeekV41PromptMarkers.familyDefault.toolCallBegin
+        var callEnd = DeepSeekV41PromptMarkers.familyDefault.toolCallEnd
+        var outputBegin = DeepSeekV41PromptMarkers.familyDefault.toolOutputBegin
+        var outputEnd = DeepSeekV41PromptMarkers.familyDefault.toolOutputEnd
+        var outputsBegin = DeepSeekV41PromptMarkers.familyDefault.toolOutputsBegin
+        var outputsEnd = DeepSeekV41PromptMarkers.familyDefault.toolOutputsEnd
         var reasoningOpen = DeepSeekV41PromptMarkers.defaultReasoningOpen
         var reasoningClose = DeepSeekV41PromptMarkers.defaultReasoningClose
         var matched = 0
@@ -214,10 +259,22 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
                     assistant = literal
                 case "toolcallsbegin", "toolcalls":
                     toolBegin = literal
+                case "toolcallbegin":
+                    callBegin = literal
+                case "toolcallend":
+                    callEnd = literal
                 case "toolsep", "toolseparator":
                     toolSep = literal
                 case "toolcallsend":
                     toolEnd = literal
+                case "tooloutputbegin":
+                    outputBegin = literal
+                case "tooloutputend":
+                    outputEnd = literal
+                case "tooloutputsbegin":
+                    outputsBegin = literal
+                case "tooloutputsend":
+                    outputsEnd = literal
                 default:
                     continue
                 }
@@ -245,6 +302,12 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
                 toolCallsBegin: toolBegin,
                 toolCallSeparator: toolSep,
                 toolCallsEnd: toolEnd,
+                toolCallBegin: callBegin,
+                toolCallEnd: callEnd,
+                toolOutputBegin: outputBegin,
+                toolOutputEnd: outputEnd,
+                toolOutputsBegin: outputsBegin,
+                toolOutputsEnd: outputsEnd,
                 system: system,
                 reasoningOpen: reasoningOpen,
                 reasoningClose: reasoningClose
@@ -319,13 +382,28 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
         return Self.effortInstruction(budget: budget)
     }
 
+    /// The checkpoint's own effort line, including the range note and the blank
+    /// line that separates it from the caller's system text. The encoder in
+    /// `encoding/encoding.py` writes exactly this string, and a prompt that leaves
+    /// the note out still names a budget the model was never shown that way.
     public static func effortInstruction(budget: Int) -> String {
         let clamped = min(max(budget, effortBounds.lowerBound), effortBounds.upperBound)
-        return "Reasoning Effort: \(clamped)"
+        return "Reasoning Effort: \(clamped) "
+            + "(range 1-100, the higher the value, the more thorough the reasoning)\n\n"
     }
 
-    /// Parses an effort budget out of arbitrary client text so the API adapters
-    /// can accept `reasoning_effort: 60` as well as `"high"`.
+    /// Parses an effort budget out of arbitrary text: a number in this checkpoint's
+    /// range, or one of the words the menu and the API adapters already use.
+    ///
+    /// This is deliberately NOT what the API adapters call, and the reason is a type
+    /// rather than an oversight. `ThinkingEffort` carries two levels, so a client's
+    /// `reasoning_effort` is resolved onto low or high by
+    /// `OpenAIAdapter.thinkingEffortLevel` and a NUMBER never reaches this function
+    /// (`#96`). The words above are the same vocabulary that mapping uses, which is why
+    /// `minimal` is 25 here and `.low` there: keeping the two in step is the point of
+    /// saying it twice. A caller that does hold a budget (a stored profile, or a numeric
+    /// surface if the enum ever grows one) gets the number back, or nil outside the range
+    /// the checkpoint publishes.
     public static func effortBudget(from raw: String?) -> Int? {
         guard let raw else { return nil }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -375,16 +453,32 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
         public var text: String
         /// Reasoning text, when the turn carried any.
         public var reasoning: String?
+        /// The turn is a tool RESULT, not a role turn. The checkpoint places a
+        /// result in its own `tool▁output` pair directly after the call turn's
+        /// end-of-sentence marker, with no role marker of its own, so it is
+        /// rendered as a bare pair rather than as `<|User|>text`.
+        public var isToolOutput: Bool
 
-        public init(isUser: Bool, text: String, reasoning: String? = nil) {
+        public init(
+            isUser: Bool,
+            text: String,
+            reasoning: String? = nil,
+            isToolOutput: Bool = false
+        ) {
             self.isUser = isUser
             self.text = text
             self.reasoning = reasoning
+            self.isToolOutput = isToolOutput
         }
     }
 
-    /// The system turn body: the caller's system prompt, with the effort
-    /// instruction appended when thinking is on.
+    /// The system turn body: the effort instruction when thinking is on, then the
+    /// caller's system prompt.
+    ///
+    /// The order is the checkpoint encoder's, not a preference: the effort line is
+    /// the first thing after `<|System|>` and ends with a blank line, so a prompt
+    /// that appends it after the system text puts the budget where the model reads
+    /// it as part of the last instruction instead of ahead of everything.
     public func systemBody(
         cleanSystem: String,
         thinkingEnabled: Bool,
@@ -393,13 +487,14 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
         let instruction = effortInstruction(effort, thinkingEnabled: thinkingEnabled)
         let base = cleanSystem.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let instruction else { return base }
-        return base.isEmpty ? instruction : base + "\n\n" + instruction
+        return base.isEmpty ? instruction : instruction + base
     }
 
-    /// Renders a whole conversation. The trailing assistant marker leaves the
-    /// reasoning channel open only when thinking is on, which mirrors what the
-    /// template does: with thinking off the model emits the close marker itself,
-    /// so the prompt must not pre-open the channel.
+    /// Renders a whole conversation. The trailing assistant marker opens the
+    /// reasoning channel when thinking is on and closes it when thinking is off,
+    /// exactly as the checkpoint's encoder does: in chat mode the model is trained
+    /// to answer after `<|Assistant|> endslash think`, and leaving that token out
+    /// asks a thinking model for an answer it was never told to start.
     public func render(
         turns: [Turn],
         cleanSystem: String,
@@ -417,7 +512,13 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
             out += m.system + system
         }
         for turn in turns {
-            if turn.isUser {
+            if turn.isToolOutput {
+                // A tool result rides the call turn's own closer, in the family's
+                // output pair: `<|end▁of▁sentence|>` then the payload. The role
+                // marker belongs to the NEXT assistant turn, which is what the
+                // agent loop appends after a result.
+                out += m.toolOutputBegin + escaped(turn.text) + m.toolOutputEnd
+            } else if turn.isUser {
                 out += m.user + escaped(turn.text)
             } else {
                 out += assistantBody(for: turn, thinkingEnabled: thinkingEnabled)
@@ -435,16 +536,21 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
         let m = markers
         var body = m.assistant
         if let reasoning = turn.reasoning, !reasoning.isEmpty {
-            body += m.reasoningOpen
-            body += "\n"
-            body += reasoning
-            body += m.reasoningClose
-            body += "\n\n"
+            // The channel's own content, exactly as it was generated. The
+            // checkpoint's encoder inserts no whitespace around it, and neither
+            // does this: a reasoning trace already begins and ends with what the
+            // model emitted, and padding it here would re-render a pinned turn
+            // differently from the text the cache was built on.
+            body += m.reasoningOpen + reasoning + m.reasoningClose
         } else if thinkingEnabled {
             // An earlier turn generated with thinking on but no recorded
             // reasoning still has to carry an empty channel: the marker belongs
             // to the turn, not to the setting that happens to be on now.
-            body += m.reasoningOpen + "\n\n" + m.reasoningClose + "\n\n"
+            body += m.reasoningOpen + m.reasoningClose
+        } else {
+            // Chat mode: the assistant turn opens closed, which is the token the
+            // encoder writes before every answer.
+            body += m.reasoningClose
         }
         body += turn.text
         body += m.endOfSentence
@@ -453,11 +559,7 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
 
     /// The prefix the next assistant turn starts from.
     func assistantPrefix(thinkingEnabled: Bool) -> String {
-        var out = markers.assistant
-        if thinkingEnabled {
-            out += markers.reasoningOpen + "\n"
-        }
-        return out
+        markers.assistant + (thinkingEnabled ? markers.reasoningOpen : markers.reasoningClose)
     }
 
     /// Re-renders a tool result for the history. DeepSeek takes tool output inside
@@ -480,7 +582,9 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
         let literals = [
             markers.beginOfSentence, markers.endOfSentence, markers.system,
             markers.user, markers.assistant, markers.toolCallsBegin,
-            markers.toolCallSeparator, markers.toolCallsEnd,
+            markers.toolCallSeparator, markers.toolCallsEnd, markers.toolCallBegin,
+            markers.toolCallEnd, markers.toolOutputBegin, markers.toolOutputEnd,
+            markers.toolOutputsBegin, markers.toolOutputsEnd,
             markers.reasoningOpen, markers.reasoningClose
         ]
         .filter { !$0.isEmpty }

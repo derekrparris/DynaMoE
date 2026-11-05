@@ -76,9 +76,9 @@ final class ServerQueueLogicTests: XCTestCase {
         let queue = TurnExecutionQueue()
         let gate = Gate()
 
-        let first = Task { try await queue.perform { await gate.wait(); return 1 } }
+        let first = Task { try await queue.perform { _ in await gate.wait(); return 1 } }
         try await waitUntil { await queue.pendingCount == 1 }
-        let second = Task { try await queue.perform { return 2 } }
+        let second = Task { try await queue.perform { _ in return 2 } }
 
         try await waitUntil { await queue.pendingCount == 2 }
         let observedPending = await queue.pendingCount
@@ -98,11 +98,11 @@ final class ServerQueueLogicTests: XCTestCase {
         let gate = Gate()
 
         // Turn 1 runs immediately and hangs on the gate; turn 2 queues behind it.
-        let (firstStream, firstTask) = await queue.streamTurn { _ in
+        let (firstStream, firstTask) = await queue.streamTurn { _, _ in
             await gate.wait()
         }
         _ = firstStream
-        let (secondStream, secondTask) = await queue.streamTurn { _ in }
+        let (secondStream, secondTask) = await queue.streamTurn { _, _ in }
         _ = secondStream
         let twoQueued = await queue.pendingCount
         XCTAssertEqual(twoQueued, 2, "both the running and the queued turn count as pending")
@@ -125,9 +125,9 @@ final class ServerQueueLogicTests: XCTestCase {
         // Turn 1 runs immediately and hangs on the gate; turn 2 queues behind
         // it with a short queue-wait timeout. Await the leader's enqueue first so
         // the two are never ordered the wrong way under scheduler load.
-        let first = Task { try await queue.perform { await gate.wait(); return 1 } }
+        let first = Task { try await queue.perform { _ in await gate.wait(); return 1 } }
         try await waitUntil { await queue.pendingCount == 1 }
-        let second = Task { try await queue.perform({ () async throws -> Int in 2 }, queueWaitTimeout: 0.2) }
+        let second = Task { try await queue.perform({ _ in 2 }, queueWaitTimeout: 0.2) }
 
         try await waitUntil { await queue.pendingCount == 2 }
 
@@ -154,11 +154,11 @@ final class ServerQueueLogicTests: XCTestCase {
 
         // Turn 1 runs immediately and hangs on the gate; turn 2 queues behind
         // it with a short queue-wait timeout.
-        let (firstStream, firstTask) = await queue.streamTurn { _ in
+        let (firstStream, firstTask) = await queue.streamTurn { _, _ in
             await gate.wait()
         }
         _ = firstStream
-        let (secondStream, secondTask) = await queue.streamTurn({ _ in }, queueWaitTimeout: 0.2)
+        let (secondStream, secondTask) = await queue.streamTurn({ _, _ in }, queueWaitTimeout: 0.2)
 
         try await waitUntil { await queue.pendingCount == 2 }
 
@@ -181,9 +181,9 @@ final class ServerQueueLogicTests: XCTestCase {
         let queue = TurnExecutionQueue()
         let gate = Gate()
 
-        let first = Task { try await queue.perform { await gate.wait(); return 1 } }
+        let first = Task { try await queue.perform { _ in await gate.wait(); return 1 } }
         try await waitUntil { await queue.pendingCount == 1 }
-        let second = Task { try await queue.perform({ () async throws -> Int in 2 }, queueWaitTimeout: 0.2) }
+        let second = Task { try await queue.perform({ _ in 2 }, queueWaitTimeout: 0.2) }
         try await waitUntil { await queue.pendingCount == 2 }
 
         // The leader's gate stays shut well past the follower's deadline: the
@@ -209,15 +209,15 @@ final class ServerQueueLogicTests: XCTestCase {
         let gate = Gate()
         let box = FlagBox()
 
-        let first = Task { try await queue.perform { () async throws -> Int in
+        let first = Task { try await queue.perform { _ in
             await gate.wait()
             box.set(true)
             return 1
         } }
         try await waitUntil { await queue.pendingCount == 1 }
-        let second = Task { try await queue.perform({ () async throws -> Int in 2 }, queueWaitTimeout: 0.2) }
+        let second = Task { try await queue.perform({ _ in 2 }, queueWaitTimeout: 0.2) }
         try await waitUntil { await queue.pendingCount == 2 }
-        let third = Task { try await queue.perform { () async throws -> Int in
+        let third = Task { try await queue.perform { _ in
             guard box.get() else {
                 XCTFail("the successor must not run before the leader's work drained")
                 return -1
@@ -247,9 +247,9 @@ final class ServerQueueLogicTests: XCTestCase {
         let gate = Gate()
         let box = FlagBox()
 
-        let first = Task { try await queue.perform { await gate.wait(); return 1 } }
+        let first = Task { try await queue.perform { _ in await gate.wait(); return 1 } }
         try await waitUntil { await queue.pendingCount == 1 }
-        let second = Task { try await queue.perform { () async throws -> Int in
+        let second = Task { try await queue.perform { _ in
             box.set(true)
             return 2
         } }
@@ -282,7 +282,7 @@ final class ServerQueueLogicTests: XCTestCase {
         // The running turn models the engine contract: its work observes
         // cancellation through a cancellation handler (like runTurn's
         // onCancel → engine handle cancel).
-        let first = Task { try await queue.perform { () async throws -> Int in
+        let first = Task { try await queue.perform { _ in
             try await withTaskCancellationHandler {
                 await gate.wait()
                 try Task.checkCancellation()
@@ -293,7 +293,7 @@ final class ServerQueueLogicTests: XCTestCase {
             }
         } }
         try await waitUntil { await queue.pendingCount == 1 }
-        let second = Task { try await queue.perform { () async throws -> Int in
+        let second = Task { try await queue.perform { _ in
             workRan.set(true)
             return 2
         } }
@@ -347,10 +347,10 @@ final class ServerQueueLogicTests: XCTestCase {
         let hookRanBeforeWork = FlagBox()
 
         // Turn 1 runs immediately and hangs on the gate; turn 2 queues behind it.
-        let (firstStream, firstTask) = await queue.streamTurn { _ in
+        let (firstStream, firstTask) = await queue.streamTurn { _, _ in
             await gate.wait()
         }
-        let (secondStream, secondTask) = await queue.streamTurn({ emit in
+        let (secondStream, secondTask) = await queue.streamTurn({ _, emit in
             // The queue invokes the hook immediately before the work runs,
             // so it must already be true here — and this records the ordering
             // without racing the producer task.
@@ -385,11 +385,11 @@ final class ServerQueueLogicTests: XCTestCase {
         let workRan = FlagBox()
         let slotOpened = FlagBox()
 
-        let (firstStream, firstTask) = await queue.streamTurn { _ in
+        let (firstStream, firstTask) = await queue.streamTurn { _, _ in
             await gate.wait()
         }
         let (secondStream, secondTask) = await queue.streamTurn(
-            { emit in
+            { _, emit in
                 workRan.set(true)
                 emit(.ping(comment: "work began"))
             },
@@ -422,9 +422,9 @@ final class ServerQueueLogicTests: XCTestCase {
         let gate = Gate()
         let slotOpened = FlagBox()
 
-        let first = Task { try await queue.perform { await gate.wait(); return 1 } }
+        let first = Task { try await queue.perform { _ in await gate.wait(); return 1 } }
         try await waitUntil { await queue.pendingCount == 1 }
-        let second = Task { try await queue.perform({ () async throws -> Int in 2 }, onSlotOpened: { slotOpened.set(true) }) }
+        let second = Task { try await queue.perform({ _ in 2 }, onSlotOpened: { slotOpened.set(true) }) }
 
         try await waitUntil { await queue.pendingCount == 2 }
         XCTAssertFalse(slotOpened.get(), "the hook must not fire while the leader holds the slot")
@@ -443,9 +443,9 @@ final class ServerQueueLogicTests: XCTestCase {
         let gate = Gate()
         let slotOpened = FlagBox()
 
-        let first = Task { try await queue.perform { await gate.wait(); return 1 } }
+        let first = Task { try await queue.perform { _ in await gate.wait(); return 1 } }
         try await waitUntil { await queue.pendingCount == 1 }
-        let second = Task { try await queue.perform({ () async throws -> Int in 2 }, queueWaitTimeout: 0.2, onSlotOpened: { slotOpened.set(true) }) }
+        let second = Task { try await queue.perform({ _ in 2 }, queueWaitTimeout: 0.2, onSlotOpened: { slotOpened.set(true) }) }
         try await waitUntil { await queue.pendingCount == 2 }
 
         do {
@@ -459,6 +459,347 @@ final class ServerQueueLogicTests: XCTestCase {
         gate.open()
         let firstValue = try await first.value
         XCTAssertEqual(firstValue, 1)
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
+
+    /// Tracks how many turns were inside their work at the same time.
+    private final class OverlapBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var live = 0
+        private var peak = 0
+        private var finished = 0
+
+        func enter() {
+            lock.lock()
+            live += 1
+            peak = max(peak, live)
+            lock.unlock()
+        }
+
+        func leave() {
+            lock.lock()
+            live -= 1
+            finished += 1
+            lock.unlock()
+        }
+
+        func stats() -> (peak: Int, finished: Int) {
+            lock.lock()
+            defer { lock.unlock() }
+            return (peak, finished)
+        }
+    }
+
+    /// The queue's chain is READ AND ADVANCED WITHOUT A SUSPENSION in between, and
+    /// that atomicity IS the queue: a turn that read a half-advanced tail would chain
+    /// off the turn before it and run alongside it. The engine then refuses the second
+    /// as "a generation is already active", so the symptom is a 503 under load rather
+    /// than anything visible in this queue.
+    ///
+    /// A burst of independent enqueues is the case that exposes it, and the property
+    /// it pins is peak concurrency rather than timing: the pre-fix queue reached a
+    /// peak above 1 here, and the shipped one stays at 1 over five consecutive runs.
+    func testConcurrentEnqueuesNeverRunTwoTurnsAtOnce() async throws {
+        // Both paths through the wait, because they get their exclusivity from
+        // different places: no deadline relies on the chain alone, and a deadline
+        // adds the engine-slot probe on top.
+        for queueWaitTimeout in [nil, 5.0] as [TimeInterval?] {
+            let queue = TurnExecutionQueue(slotProbe: { true })
+            let box = OverlapBox()
+            let turns = 24
+
+            await withTaskGroup(of: Void.self) { group in
+                for _ in 0..<turns {
+                    group.addTask {
+                        _ = try? await queue.perform({ _ in
+                            box.enter()
+                            // Long enough for a second turn to overlap if the chain
+                            // lets it, short enough to keep the case fast.
+                            try? await Task.sleep(nanoseconds: 1_000_000)
+                            box.leave()
+                            return 0
+                        }, queueWaitTimeout: queueWaitTimeout)
+                    }
+                }
+                await group.waitForAll()
+            }
+
+            let stats = box.stats()
+            let label = queueWaitTimeout == nil ? "unbounded" : "deadline"
+            XCTAssertEqual(stats.finished, turns, "\(label): every enqueued turn must run")
+            XCTAssertEqual(
+                stats.peak, 1,
+                "\(label): two turns must never hold the engine at once"
+            )
+            try await waitUntil { await queue.pendingCount == 0 }
+        }
+    }
+
+    // MARK: An in-app generation holding the engine slot
+
+    /// Stands in for `CompletionEngine.isActive` in the queue's slot probe.
+    private final class SlotBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var free = false
+
+        func setFree(_ newValue: Bool) {
+            lock.lock()
+            free = newValue
+            lock.unlock()
+        }
+
+        func isFree() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return free
+        }
+    }
+
+    /// Lock-guarded list so the order turns actually ran in can be asserted from
+    /// the test task while the queue's tasks append.
+    private final class OrderBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var items: [Int] = []
+
+        func append(_ value: Int) {
+            lock.lock()
+            items.append(value)
+            lock.unlock()
+        }
+
+        func snapshot() -> [Int] {
+            lock.lock()
+            defer { lock.unlock() }
+            return items
+        }
+    }
+
+    /// Lock-guarded counter, for a slot claim that has to be observed losing the
+    /// race a known number of times.
+    private final class CounterBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+
+        /// Increments and returns the new value.
+        func next() -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            count += 1
+            return count
+        }
+
+        func value() -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return count
+        }
+    }
+
+    /// The chat UI launches turns straight through `CompletionEngine.launchTurn`
+    /// and never routes them through this queue, so an in-app generation holds the
+    /// engine's ONE generation slot where the FIFO cannot see it. A request that
+    /// arrives mid-answer must therefore queue behind it: the client asked first,
+    /// the resource is busy for a bounded time, and the queue already has a
+    /// deadline and a heartbeat. Before this, such a request was refused with 503
+    /// before it had waited at all.
+    func testPerformWaitsForAnInAppGenerationInsteadOfRefusing() async throws {
+        let slot = SlotBox()
+        let queue = TurnExecutionQueue(slotProbe: { slot.isFree() })
+        let ran = FlagBox()
+
+        let turn = Task { try await queue.perform { _ in ran.set(true); return 7 } }
+        try await waitUntil { await queue.pendingCount == 1 }
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        XCTAssertFalse(ran.get(), "the work must not run while the app holds the engine slot")
+        XCTAssertFalse(turn.isCancelled)
+
+        slot.setFree(true)
+        let value = try await turn.value
+        XCTAssertEqual(value, 7, "the queued request runs once the app's generation ends")
+        XCTAssertTrue(ran.get())
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
+
+    /// The wait is bounded by the same deadline as every other queue wait, and it
+    /// says which of the two things it waited on: a client debugging a 408 needs
+    /// to know whether the queue was long or the app was busy.
+    func testPerformTimesOutWaitingForAnInAppGeneration() async throws {
+        let slot = SlotBox()
+        let queue = TurnExecutionQueue(slotProbe: { slot.isFree() })
+        let ran = FlagBox()
+        let slotOpened = FlagBox()
+
+        do {
+            _ = try await queue.perform(
+                { _ in ran.set(true); return 1 },
+                queueWaitTimeout: 0.2,
+                onSlotOpened: { slotOpened.set(true) }
+            )
+            XCTFail("the request must be told it could not get the slot")
+        } catch let error as ServerAPIError {
+            XCTAssertEqual(error.status, .requestTimeout)
+            XCTAssertTrue(error.message.contains("timed out"), "the timeout error must explain itself")
+            XCTAssertTrue(
+                error.message.contains("DynaMoE app"),
+                "the message must name the in-app generation, not a queue of other requests"
+            )
+        }
+        XCTAssertFalse(ran.get(), "a timed-out request never reaches the engine")
+        XCTAssertFalse(slotOpened.get(), "no queue wait is billed, because no turn ran")
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
+
+    /// The same rule on the streaming path, where the refusal travels as an error
+    /// frame rather than an HTTP status.
+    func testStreamTurnEmitsLaunchFailedWhileAnInAppGenerationHoldsTheSlot() async throws {
+        let slot = SlotBox()
+        let queue = TurnExecutionQueue(slotProbe: { slot.isFree() })
+        let ran = FlagBox()
+
+        let (stream, _) = await queue.streamTurn({ _, _ in ran.set(true) }, queueWaitTimeout: 0.2)
+        var failure: ServerAPIError?
+        for await event in stream {
+            if case .launchFailed(let apiError) = event { failure = apiError }
+        }
+        XCTAssertEqual(failure?.status, .requestTimeout)
+        XCTAssertTrue(failure?.message.contains("DynaMoE app") == true)
+        XCTAssertFalse(ran.get())
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
+
+    /// Queue wait is measured from request arrival, and the wait for an in-app
+    /// generation is queue wait: the slot-open hook is what the log rows stamp
+    /// `queueWaitMs` from, so firing it early would count the app's generation as
+    /// this request's own.
+    func testSlotOpenedHookWaitsForTheInAppGenerationToo() async throws {
+        let slot = SlotBox()
+        let queue = TurnExecutionQueue(slotProbe: { slot.isFree() })
+        let slotOpened = FlagBox()
+
+        let turn = Task {
+            try await queue.perform(
+                { _ in 3 },
+                onSlotOpened: { slotOpened.set(true) }
+            )
+        }
+        try await waitUntil { await queue.pendingCount == 1 }
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(slotOpened.get(), "the hook must not fire while the app holds the slot")
+
+        slot.setFree(true)
+        let value = try await turn.value
+        XCTAssertEqual(value, 3)
+        XCTAssertTrue(slotOpened.get(), "the hook fires when the slot genuinely opens")
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
+
+    /// One slot, two ways to hold it: a turn queued behind an in-app generation
+    /// still queues behind the earlier SERVER turn first, and the FIFO order among
+    /// requests survives the new wait.
+    func testFIFOOrderSurvivesWaitingForAnInAppGeneration() async throws {
+        let slot = SlotBox()
+        let queue = TurnExecutionQueue(slotProbe: { slot.isFree() })
+        let order = OrderBox()
+
+        let first = Task { try await queue.perform { _ in order.append(1); return 1 } }
+        try await waitUntil { await queue.pendingCount == 1 }
+        let second = Task { try await queue.perform { _ in order.append(2); return 2 } }
+        try await waitUntil { await queue.pendingCount == 2 }
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(order.snapshot(), [], "nothing runs while the app holds the slot")
+
+        slot.setFree(true)
+        _ = try await first.value
+        _ = try await second.value
+        XCTAssertEqual(order.snapshot(), [1, 2], "requests keep the order they arrived in")
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
+
+    // MARK: - The engine-slot claim
+
+    /// A probe that says free and a claim that fails is not a refusal: somebody
+    /// else took the slot in the instant between them, so this turn goes back to
+    /// waiting. Before the claim existed that instant was a 503 for a request that
+    /// had already waited its turn in the queue.
+    func testATurnKeepsWaitingWhenTheSlotIsTakenBetweenTheProbeAndTheClaim() async throws {
+        let ledger = TurnSlotLedger()
+        let attempts = CounterBox()
+        // Two losses before the slot is genuinely free, which is the shape of the
+        // defect: the queue has no way to hold what it just probed.
+        let queue = TurnExecutionQueue(
+            slotProbe: { true },
+            slotReserve: {
+                if attempts.next() <= 2 { return nil }
+                return ledger.tryClaim()
+            }
+        )
+        let ran = FlagBox()
+
+        let value = try await queue.perform { _ in ran.set(true); return 11 }
+        XCTAssertEqual(value, 11, "the turn must run rather than fail")
+        XCTAssertTrue(ran.get())
+        XCTAssertGreaterThanOrEqual(attempts.value(), 3, "a lost claim must be retried, not reported")
+        try await waitUntil { await queue.pendingCount == 0 }
+    }
+
+    /// The claim is the queue's for the WHOLE turn, not just for its first
+    /// statement: that is what makes the preparation between "the slot is free" and
+    /// `launchTurn` safe from a chat turn starting in it.
+    func testTheSlotStaysClaimedForTheWholeTurnAndIsReleasedAfterIt() async throws {
+        let ledger = TurnSlotLedger()
+        let claimedInsideWork = FlagBox()
+        let queue = TurnExecutionQueue(slotProbe: { true }, slotReserve: { ledger.tryClaim() })
+
+        _ = try await queue.perform { _ in
+            claimedInsideWork.set(ledger.isClaimed)
+            return 0
+        }
+        XCTAssertTrue(claimedInsideWork.get(), "the claim must still be held while the work runs")
+        XCTAssertFalse(ledger.isClaimed, "and given back once the turn is over")
+    }
+
+    /// A claim that was never redeemed — the turn threw, timed out or was
+    /// cancelled — must not strand the slot for every later request.
+    func testAClaimIsReleasedWhenTheWorkThrows() async throws {
+        struct Boom: Error {}
+        let ledger = TurnSlotLedger()
+        let queue = TurnExecutionQueue(slotProbe: { true }, slotReserve: { ledger.tryClaim() })
+
+        do {
+            _ = try await queue.perform { _ -> Int in throw Boom() }
+            XCTFail("the work's error must reach the caller")
+        } catch {}
+        XCTAssertFalse(ledger.isClaimed, "a failed turn gives the slot back")
+
+        let ran = FlagBox()
+        let value = try await queue.perform { _ in ran.set(true); return 2 }
+        XCTAssertEqual(value, 2, "and the next request can take it")
+        XCTAssertTrue(ran.get())
+    }
+
+    /// The same rule the in-app generation gets, applied to a claim another caller
+    /// holds: wait, do not fail.
+    func testAClaimAnotherCallerHoldsIsWaitedForRatherThanRefused() async throws {
+        let ledger = TurnSlotLedger()
+        let held = try XCTUnwrap(ledger.tryClaim())
+        let queue = TurnExecutionQueue(
+            slotProbe: { !ledger.isClaimed },
+            slotReserve: { ledger.tryClaim() }
+        )
+        let ran = FlagBox()
+
+        let turn = Task { try await queue.perform { _ in ran.set(true); return 5 } }
+        try await waitUntil { await queue.pendingCount == 1 }
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertFalse(ran.get(), "the work must not run while another caller holds the claim")
+        XCTAssertFalse(turn.isCancelled)
+
+        held.release()
+        let value = try await turn.value
+        XCTAssertEqual(value, 5)
+        XCTAssertTrue(ran.get())
         try await waitUntil { await queue.pendingCount == 0 }
     }
 }

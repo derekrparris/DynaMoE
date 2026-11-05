@@ -20,6 +20,12 @@ internal struct TurnSampling: Sendable {
     var topK: Int
     var repetitionPenalty: Float
     var presencePenalty: Float
+    /// OpenAI's `frequency_penalty`: charged per OCCURRENCE of a recent token,
+    /// where `presencePenalty` is charged once per distinct one.
+    var frequencyPenalty: Float
+    /// OpenAI's `logit_bias`: additive on a named token id, applied whether or not
+    /// the context holds it. Negative values suppress, positive values promote.
+    var logitBias: [Int32: Float]
     var maxTokens: Int
 
     init(
@@ -29,6 +35,8 @@ internal struct TurnSampling: Sendable {
         topK: Int,
         repetitionPenalty: Float,
         presencePenalty: Float = 0.0,
+        frequencyPenalty: Float = 0.0,
+        logitBias: [Int32: Float] = [:],
         maxTokens: Int
     ) {
         self.temperature = temperature
@@ -37,6 +45,8 @@ internal struct TurnSampling: Sendable {
         self.topK = topK
         self.repetitionPenalty = repetitionPenalty
         self.presencePenalty = presencePenalty
+        self.frequencyPenalty = frequencyPenalty
+        self.logitBias = logitBias
         self.maxTokens = maxTokens
     }
 }
@@ -115,6 +125,22 @@ internal struct CompletionTurnRequest: Sendable {
     /// split the common token prefix and force a full re-prefill, which a
     /// hybrid (GDN) session cannot rewind.
     var asOfDate: Date?
+    /// Images the caller attached to this turn, in prompt order, already decoded
+    /// to the RGB a vision tower reads. The prompt text carries one placeholder
+    /// per image and the engine binds the tower's rows to them; a family without
+    /// a tower refuses the turn rather than dropping pixels.
+    var images: [TurnImage]
+    /// Spans the prompt ALREADY carries, when it was spliced from a previous
+    /// turn's expanded ids rather than tokenized from text.
+    ///
+    /// An image is one placeholder in the rendered text and a run of image tokens
+    /// in the prompt, so a continuation that reuses the previous turn's ids reuses
+    /// the EXPANSION too. Re-deriving it would count every span position as a new
+    /// placeholder and refuse the turn; ignoring it would let the rows land
+    /// somewhere else. So the expansion travels as data: where each span sits, how
+    /// long it is, and which picture it came from. Empty means "not expanded yet",
+    /// which is every turn tokenized from a prompt string.
+    var imageSpans: [TurnImageSpan]
 
     init(
         promptTokenIds: [UInt32],
@@ -128,7 +154,9 @@ internal struct CompletionTurnRequest: Sendable {
         forceSynthesis: Bool = false,
         isSplicedContinuation: Bool = false,
         stopSequences: [String] = [],
-        asOfDate: Date? = nil
+        asOfDate: Date? = nil,
+        images: [TurnImage] = [],
+        imageSpans: [TurnImageSpan] = []
     ) {
         self.promptTokenIds = promptTokenIds
         self.formattedPrompt = formattedPrompt
@@ -142,6 +170,48 @@ internal struct CompletionTurnRequest: Sendable {
         self.isSplicedContinuation = isSplicedContinuation
         self.stopSequences = stopSequences
         self.asOfDate = asOfDate
+        self.images = images
+        self.imageSpans = imageSpans
+    }
+}
+
+/// Where one attachment's expanded span sits in a prompt that already carries it.
+///
+/// Once expanded, an image is indistinguishable from text in the token stream: the
+/// checkpoint writes the same `image_token_id` at every position of the span, with
+/// the start / image / newline / end distinction kept in a parallel type array the
+/// prompt does not carry. So the ids alone cannot say how many pictures produced
+/// them or where one ends and the next begins — `sha256` is what stops a
+/// continuation landing a different picture's rows on an existing span, and
+/// `range` is what puts them back where they were.
+internal struct TurnImageSpan: Sendable, Equatable {
+    /// Content digest of the picture this span came from. Empty only for a caller
+    /// that never had one, which the engine reads as "identity unknown".
+    var sha256: String
+    var width: Int
+    var height: Int
+    /// The span's positions in the turn's prompt ids, in prompt order.
+    var range: Range<Int>
+
+    var tokenCount: Int { range.count }
+}
+
+/// One attached image, decoded to row-major 8-bit RGB.
+///
+/// Decoded by the caller rather than by the engine because a bad file has to fail
+/// while the composer still holds the attachment, so the draft and the chips
+/// survive. `isWellFormed` is what the engine checks: a buffer whose size does not
+/// match its dimensions is a decoder bug, not something to sample.
+internal struct TurnImage: Sendable, Equatable {
+    var rgb: [UInt8]
+    var width: Int
+    var height: Int
+    /// Content digest from the asset store, used to reuse an encoded span instead
+    /// of re-running the vision tower for a picture that is already in context.
+    var sha256: String = ""
+
+    var isWellFormed: Bool {
+        width > 0 && height > 0 && rgb.count == width * height * 3
     }
 }
 
@@ -318,6 +388,14 @@ internal struct TurnResult: @unchecked Sendable {
     /// The configured stop sequence that ended the turn (when `finishReason`
     /// is `.stoppedBySequence`); protocol adapters surface it to clients.
     var matchedStopSequence: String?
+    /// Where this turn's attachments sit inside `promptTokenIds`, which is the
+    /// EXPANDED prompt. Empty for a text-only turn.
+    ///
+    /// The ids alone cannot express this: an expanded span is a run of identical
+    /// image tokens, so a consumer that splices them forward into the next turn
+    /// has to be told where they came from or the rows would have to be
+    /// re-derived from a marker count that no longer means one per picture.
+    var imageSpans: [TurnImageSpan]
 
     init(
         finishReason: TurnFinishReason,
@@ -347,7 +425,8 @@ internal struct TurnResult: @unchecked Sendable {
         actionableCallIndices: [Int],
         gestureSkipNotices: [Int: String],
         brokenFragments: [String],
-        matchedStopSequence: String? = nil
+        matchedStopSequence: String? = nil,
+        imageSpans: [TurnImageSpan] = []
     ) {
         self.finishReason = finishReason
         self.formattedPrompt = formattedPrompt
@@ -377,6 +456,7 @@ internal struct TurnResult: @unchecked Sendable {
         self.gestureSkipNotices = gestureSkipNotices
         self.brokenFragments = brokenFragments
         self.matchedStopSequence = matchedStopSequence
+        self.imageSpans = imageSpans
     }
 }
 

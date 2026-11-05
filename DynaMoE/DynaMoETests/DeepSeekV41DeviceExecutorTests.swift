@@ -21,7 +21,9 @@ import XCTest
 final class DeepSeekV41LinearFormatTests: XCTestCase {
 
     private func tensor(_ dtype: String) -> DeepSeekV41DeviceTensor {
-        DeepSeekV41DeviceTensor(shardIndex: 0, byteOffset: 0, rows: 8, columns: 8, dtype: dtype)
+        DeepSeekV41DeviceTensor(
+            shardIndex: 0, byteOffset: 0, rows: 8, columns: 8, dtype: dtype, byteLength: 64
+        )
     }
 
     func testFP8WithAnE8M0ScaleIsThe32x32Grid() {
@@ -147,7 +149,7 @@ final class DeepSeekV41AttentionRowPlanTests: XCTestCase {
         XCTAssertEqual(rows.totalRows, 3)
     }
 
-    func testCompressedLayerReadsTheMostRecentRowsAscending() throws {
+    func testANilSelectionReadsEveryReachableRow() throws {
         let config = try DeepSeekV41TestFixtures.config()
         let plan = try config.makeLayerPlan()
         let geometry = DeepSeekV41CacheGeometry.make(
@@ -165,7 +167,8 @@ final class DeepSeekV41AttentionRowPlanTests: XCTestCase {
             geometry: geometry
         )
         XCTAssertEqual(plan[1].flavor, .compressed)
-        XCTAssertEqual(rows.compressedRows, [1, 2, 3, 4])
+        // Nil is the reference's no-indexer case: every row, not the newest few.
+        XCTAssertEqual(rows.compressedRows, [0, 1, 2, 3, 4])
         XCTAssertEqual(rows.compressedRows, rows.compressedRows.sorted())
     }
 
@@ -192,6 +195,18 @@ final class DeepSeekV41AttentionRowPlanTests: XCTestCase {
         XCTAssertTrue(rows.compressedRows.allSatisfy { $0 < 2 })
     }
 
+    /// The rows the walk itself selected, so the plan and the keys are compared
+    /// against the same list rather than against a rule restated in the test.
+    private func consent(
+        forward: DeepSeekV41CPUForward,
+        layer: DeepSeekV41LayerPlan,
+        position: Int
+    ) -> [Int]? {
+        guard let rows = forward.indexSelections[layer.compressedIndexSource],
+              rows.indices.contains(position) else { return nil }
+        return rows[position]
+    }
+
     func testReferenceAndPlanReadTheSameRowCount() throws {
         let config = try DeepSeekV41TestFixtures.config()
         let plan = try config.makeLayerPlan()
@@ -201,16 +216,20 @@ final class DeepSeekV41AttentionRowPlanTests: XCTestCase {
 
         for position in 0..<7 {
             for layer in plan {
+                let selection = consent(forward: forward, layer: layer, position: position)
                 let planRows = DeepSeekV41CacheAddressing.attentionRowPlan(
                     layer: layer,
                     position: position,
                     config: config,
                     plan: plan,
-                    geometry: forward.geometry
+                    geometry: forward.geometry,
+                    selection: selection
                 )
                 // The reference drops a row it has not written yet; before position 0
                 // there are none, and past it every planned row exists.
-                let keys = forward.attentionKeys(layer: layer, position: position)
+                let keys = forward.attentionKeys(
+                    layer: layer, position: position, selection: selection
+                )
                 XCTAssertEqual(
                     keys.count,
                     planRows.totalRows,
@@ -928,6 +947,214 @@ final class DeepSeekV41AttentionKernelTests: XCTestCase {
     }
 }
 
+// MARK: - Indexer score kernel
+
+/// The GPU half of the sparse-attention rule.
+///
+/// Every assertion about WHICH compressed rows a query reads rests on the score
+/// vector this kernel writes: the executor reads it back and hands it to
+/// `DeepSeekV41Indexer.selectedRows`, so a kernel that scored differently would
+/// silently select differently while the host rule's own tests kept passing. It is
+/// checked against `DeepSeekV41Indexer.positionScores`, which is the function the
+/// reference vectors pin.
+final class DeepSeekV41IndexerKernelTests: XCTestCase {
+
+    private func makePipeline() throws -> (MTLDevice, MTLComputePipelineState, MTLCommandQueue) {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        guard let library = device.makeDefaultLibrary(),
+              let function = library.makeFunction(name: "dsv41_indexer_scores_f32"),
+              let pipeline = try? device.makeComputePipelineState(function: function),
+              let queue = device.makeCommandQueue() else {
+            XCTFail("Could not build the indexer score pipeline")
+            throw XCTSkip("no indexer score pipeline")
+        }
+        return (device, pipeline, queue)
+    }
+
+    private func floats(_ buffer: MTLBuffer, count: Int) -> [Float] {
+        Array(UnsafeBufferPointer(
+            start: buffer.contents().assumingMemoryBound(to: Float.self),
+            count: count
+        ))
+    }
+
+    /// Runs one dispatch and returns the score vector it wrote.
+    private func scores(
+        query: [Float],
+        keys: [Float],
+        weights: [Float],
+        headCount: Int,
+        headWidth: Int,
+        rowCount: Int,
+        visibleRows: Int,
+        weightScale: Float,
+        pipeline: MTLComputePipelineState,
+        device: MTLDevice,
+        queue: MTLCommandQueue
+    ) throws -> [Float] {
+        guard let queryBuffer = device.makeBuffer(
+                  bytes: query,
+                  length: query.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let keyBuffer = device.makeBuffer(
+                  bytes: keys,
+                  length: keys.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let weightBuffer = device.makeBuffer(
+                  bytes: weights,
+                  length: weights.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let scoreBuffer = device.makeBuffer(
+                  length: rowCount * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("Could not allocate the indexer score buffers")
+            return []
+        }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(queryBuffer, offset: 0, index: 0)
+        encoder.setBuffer(keyBuffer, offset: 0, index: 1)
+        encoder.setBuffer(weightBuffer, offset: 0, index: 2)
+        encoder.setBuffer(scoreBuffer, offset: 0, index: 3)
+        var heads = UInt32(headCount)
+        var width = UInt32(headWidth)
+        var rows = UInt32(rowCount)
+        var visible = UInt32(visibleRows)
+        var scale = weightScale
+        encoder.setBytes(&heads, length: 4, index: 4)
+        encoder.setBytes(&width, length: 4, index: 5)
+        encoder.setBytes(&rows, length: 4, index: 6)
+        encoder.setBytes(&visible, length: 4, index: 7)
+        encoder.setBytes(&scale, length: 4, index: 8)
+        encoder.dispatchThreads(
+            MTLSize(width: rowCount, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: min(rowCount, pipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+        return floats(scoreBuffer, count: rowCount)
+    }
+
+    /// The rectifier is PER HEAD and comes BEFORE the weight, so a head whose weight
+    /// is negative turns a positive dot negative and a head that votes against a row
+    /// contributes nothing rather than subtracting. Both halves of that sentence are
+    /// load-bearing and both are invisible to a fixture whose weights are all
+    /// positive: on the published checkpoint most rows score exactly zero and the
+    /// cut lands in the negative tail, which only happens if negative weights reach
+    /// the sum.
+    func testTheScoreKernelRanksLikeTheRuleWithNegativeWeights() throws {
+        let (device, pipeline, queue) = try makePipeline()
+        let heads = 5
+        // Ten wide on purpose: the published `index_head_dim` is 128, so the kernel's
+        // remainder loop never runs in production and only a width that is not a
+        // multiple of four exercises it.
+        let width = 10
+        let rows = 13
+        let query: [Float] = (0..<(heads * width)).map { index in
+            Float((index * 7) % 11 - 5) / 4
+        }
+        let keys: [Float] = (0..<(rows * width)).map { index in
+            // The last row is an all-zero key, so every head's dot with it is zero and
+            // the row lands on exactly 0.0 instead of a small number that might or
+            // might not survive the rectifier.
+            index >= (rows - 1) * width ? 0 : Float((index * 5) % 13 - 6) / 4
+        }
+        // A mix of signs, so some rows lose a head's contribution by rectification
+        // and others are pushed negative by a negative weight.
+        let weights: [Float] = [-0.75, 0.5, -0.25, 1.25, 0.0]
+
+        let got = try scores(
+            query: query, keys: keys, weights: weights,
+            headCount: heads, headWidth: width, rowCount: rows, visibleRows: rows,
+            weightScale: 0.5, pipeline: pipeline, device: device, queue: queue
+        )
+        let want = DeepSeekV41Indexer.positionScores(
+            queryHeads: (0..<heads).map { head in
+                Array(query[(head * width)..<((head + 1) * width)])
+            },
+            keys: (0..<rows).map { row in
+                Array(keys[(row * width)..<((row + 1) * width)])
+            },
+            headWeights: weights.map { $0 * 0.5 }
+        )
+        XCTAssertEqual(got.count, want.count)
+        let scale = want.map(abs).max() ?? 1
+        for index in 0..<want.count {
+            XCTAssertEqual(
+                got[index], want[index], accuracy: max(scale, 1) * 1e-5,
+                "the score kernel disagrees with the rule at row \(index)"
+            )
+        }
+        // The vectors are only evidence if they reach both states: a negative score
+        // proves a rectified dot met a negative weight, and a zero proves a head
+        // voting against a row removed only its own contribution.
+        XCTAssertTrue(want.contains { $0 < 0 }, "no row scored negative, so the sign mix is untested")
+        XCTAssertTrue(want.contains { $0 == 0 }, "no row scored exactly zero")
+    }
+
+    /// A row past the query's frontier is silenced rather than scored, because the
+    /// rule drops such rows AFTER the cut and a finite score would let one take a
+    /// slot the query cannot attend to. The rows the query can see are untouched by
+    /// that, and a visible row that scores zero keeps a zero rather than the
+    /// sentinel.
+    func testTheScoreKernelSilencesOnlyTheRowsPastTheFrontier() throws {
+        let (device, pipeline, queue) = try makePipeline()
+        let heads = 3
+        let width = 8
+        let rows = 20
+        let visible = 11
+        let query: [Float] = (0..<(heads * width)).map { index in
+            Float((index * 3) % 7 - 3) / 4
+        }
+        let keys: [Float] = (0..<(rows * width)).map { index in
+            Float((index * 11) % 17 - 8) / 8
+        }
+        let weights: [Float] = [0.5, -0.5, 0.25]
+
+        let got = try scores(
+            query: query, keys: keys, weights: weights,
+            headCount: heads, headWidth: width, rowCount: rows, visibleRows: visible,
+            weightScale: 1, pipeline: pipeline, device: device, queue: queue
+        )
+        let want = DeepSeekV41Indexer.positionScores(
+            queryHeads: (0..<heads).map { head in
+                Array(query[(head * width)..<((head + 1) * width)])
+            },
+            keys: (0..<rows).map { row in
+                Array(keys[(row * width)..<((row + 1) * width)])
+            },
+            headWeights: weights
+        )
+        let scale = want.map(abs).max() ?? 1
+        for row in 0..<visible {
+            XCTAssertEqual(
+                got[row], want[row], accuracy: max(scale, 1) * 1e-5,
+                "row \(row) is reachable but the kernel scored it differently"
+            )
+        }
+        for row in visible..<rows {
+            XCTAssertEqual(
+                got[row], -.infinity,
+                "row \(row) is past the frontier and must be silenced, not scored"
+            )
+        }
+        // The selection the executor then makes is the reason this matters: with the
+        // reachable half ranked, the silenced tail can never displace a visible row
+        // no matter how high its score came out.
+        let selected = DeepSeekV41Indexer.selectedRows(scores: got, visibleRows: visible, topK: 5)
+        XCTAssertEqual(selected.count, 5)
+        XCTAssertTrue(
+            selected.allSatisfy { $0 < visible },
+            "the cut selected a row past the frontier: \(selected)"
+        )
+    }
+}
+
 // MARK: - Router kernel
 
 final class DeepSeekV41RouterKernelTests: XCTestCase {
@@ -1033,6 +1260,167 @@ final class DeepSeekV41RouterKernelTests: XCTestCase {
         // would multiply its share by over a hundred.
         let selectionValue = DeepSeekV41Router.sigmoid(-3) + 5
         XCTAssertNotEqual(weights[0], selectionValue / total * scaling, accuracy: 0.1)
+    }
+
+    /// The lane-parallel top-k returns exactly what the one-thread scan does.
+    ///
+    /// `#63` measured the one-thread scan at 72 us per position, because each of 384
+    /// experts costs three transcendentals on a single lane and the top-`k` arrays are
+    /// declared at their bound. The lane form splits the scan across a SIMD group and
+    /// merges each lane's candidates with the SAME total order (score descending,
+    /// expert id ascending), so nothing is re-associated and the requirement is
+    /// equality rather than a tolerance — which also means a wrong merge cannot hide
+    /// inside a rounding bar. The last case is shorter than one SIMD group, so the
+    /// lanes that own no expert must publish nothing that can be selected.
+    func testTheLaneFormOfTheTopKIsTheOneThreadFormsResult() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        let library = try XCTUnwrap(device.makeDefaultLibrary())
+        let slowFunction = try XCTUnwrap(library.makeFunction(name: "dsv41_router_topk"))
+        let laneFunction = try XCTUnwrap(library.makeFunction(name: "dsv41_router_topk_lanes"))
+        let slow = try device.makeComputePipelineState(function: slowFunction)
+        let lanes = try device.makeComputePipelineState(function: laneFunction)
+        let queue = try XCTUnwrap(device.makeCommandQueue())
+
+        func run(
+            _ pipeline: MTLComputePipelineState,
+            lanesPerSlot: Int,
+            slots: Int,
+            expertCount: Int,
+            topK: Int,
+            logits: [Float],
+            bias: [Float]
+        ) throws -> (indices: [UInt32], weights: [Float]) {
+            let indexStride = max(4 * topK, 16)
+            let logitsBuffer = try XCTUnwrap(
+                device.makeBuffer(
+                    bytes: logits, length: logits.count * MemoryLayout<Float>.stride,
+                    options: .storageModeShared
+                )
+            )
+            let biasBuffer = try XCTUnwrap(
+                device.makeBuffer(
+                    bytes: bias, length: bias.count * MemoryLayout<Float>.stride,
+                    options: .storageModeShared
+                )
+            )
+            let indexBuffer = try XCTUnwrap(
+                device.makeBuffer(
+                    length: slots * indexStride * MemoryLayout<UInt32>.stride,
+                    options: .storageModeShared
+                )
+            )
+            let weightBuffer = try XCTUnwrap(
+                device.makeBuffer(
+                    length: slots * topK * MemoryLayout<Float>.stride, options: .storageModeShared
+                )
+            )
+            let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+            let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(logitsBuffer, offset: 0, index: 0)
+            encoder.setBuffer(biasBuffer, offset: 0, index: 1)
+            encoder.setBuffer(indexBuffer, offset: 0, index: 2)
+            encoder.setBuffer(weightBuffer, offset: 0, index: 3)
+            var experts = UInt32(expertCount)
+            var count = UInt32(topK)
+            var scaling: Float = 2.5
+            var normalise: UInt32 = 1
+            var scoring: UInt32 = 1  // sqrtsoftplus, the checkpoint's
+            var temperature: Float = 1
+            var stride = UInt32(indexStride)
+            var slotCount = UInt32(slots)
+            encoder.setBytes(&experts, length: 4, index: 4)
+            encoder.setBytes(&count, length: 4, index: 5)
+            encoder.setBytes(&scaling, length: 4, index: 6)
+            encoder.setBytes(&normalise, length: 4, index: 7)
+            encoder.setBytes(&scoring, length: 4, index: 8)
+            encoder.setBytes(&temperature, length: 4, index: 9)
+            encoder.setBytes(&stride, length: 4, index: 10)
+            encoder.setBytes(&slotCount, length: 4, index: 11)
+            if lanesPerSlot > 1 {
+                for index in 0..<3 {
+                    encoder.setThreadgroupMemoryLength(
+                        lanesPerSlot * 8 * MemoryLayout<Float>.stride, index: index
+                    )
+                }
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: slots, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: lanesPerSlot, height: 1, depth: 1)
+                )
+            } else {
+                encoder.dispatchThreads(
+                    MTLSize(width: slots, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
+                )
+            }
+            encoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            XCTAssertNil(commandBuffer.error)
+            let indexPointer = indexBuffer.contents().assumingMemoryBound(to: UInt32.self)
+            let weightPointer = weightBuffer.contents().assumingMemoryBound(to: Float.self)
+            var indices: [UInt32] = []
+            var weights: [Float] = []
+            for slot in 0..<slots {
+                indices.append(contentsOf: (0..<topK).map { indexPointer[slot * indexStride + $0] })
+                weights.append(contentsOf: (0..<topK).map { weightPointer[slot * topK + $0] })
+            }
+            return (indices, weights)
+        }
+
+        // Deterministic logits with mixed signs plus a DUPLICATE pair, so the
+        // tie-break (a lower expert id wins) has to be the same in both merges.
+        func logits(_ count: Int, shift: Int) -> [Float] {
+            (0..<count).map { index in
+                let at = (index + shift) % count
+                if at == 17 || at == 200 { return 1.25 }
+                let wave = Float((at * 41) % 29) / 29 - 0.5
+                return wave * 6 + (at % 3 == 0 ? 0.4 : 0)
+            }
+        }
+        func bias(_ count: Int) -> [Float] {
+            (0..<count).map { Float(($0 * 13) % 11) / 22 - 0.25 }
+        }
+
+        let shapes: [(experts: Int, topK: Int, slots: Int)] = [
+            (384, 6, 1),
+            (384, 6, 8),
+            (5, 3, 1),
+        ]
+        for shape in shapes {
+            var allLogits: [Float] = []
+            for slot in 0..<shape.slots {
+                allLogits.append(contentsOf: logits(shape.experts, shift: slot * 7))
+            }
+            let byThread = try run(
+                slow, lanesPerSlot: 1, slots: shape.slots, expertCount: shape.experts,
+                topK: shape.topK, logits: allLogits, bias: bias(shape.experts)
+            )
+            let byLane = try run(
+                lanes, lanesPerSlot: 32, slots: shape.slots, expertCount: shape.experts,
+                topK: shape.topK, logits: allLogits, bias: bias(shape.experts)
+            )
+            for rank in 0..<(shape.slots * shape.topK) {
+                XCTAssertEqual(
+                    byLane.indices[rank], byThread.indices[rank],
+                    "\(shape.experts) experts, \(shape.topK) of them, rank \(rank) selected "
+                        + "a different expert"
+                )
+                XCTAssertEqual(
+                    byLane.weights[rank], byThread.weights[rank],
+                    "\(shape.experts) experts, \(shape.topK) of them, rank \(rank) got a "
+                        + "different weight"
+                )
+            }
+        }
+        XCTAssertTrue(DeepSeekV41DevicePlan.routerTopKWantsLanes(topK: 6))
+        XCTAssertTrue(DeepSeekV41DevicePlan.routerTopKWantsLanes(topK: 1))
+        XCTAssertFalse(
+            DeepSeekV41DevicePlan.routerTopKWantsLanes(topK: 9),
+            "a wider top-k must fall back to the one-thread scan rather than spill the merge"
+        )
     }
 }
 
@@ -1780,5 +2168,2844 @@ final class DeepSeekV41HyperConnectionKernelTests: XCTestCase {
         for index in 0..<streams.count {
             XCTAssertEqual(residual[index], sentinel[index], "residual \(index)")
         }
+    }
+
+    /// The register-resident Sinkhorn computes the same split as the device-memory
+    /// one.
+    ///
+    /// `#62` found the split's schedule costing 3.0 us per Sinkhorn iteration and 59 us
+    /// for the checkpoint's twenty, because the 4x4 matrix makes a round trip to device
+    /// memory on every one of ~160 normalization passes, on ONE thread. The replacement
+    /// keeps it in registers and folds every sum in the same order, so the bar is a
+    /// rounding one rather than a tolerance: the seed's product+add rounds once in a
+    /// register where a store rounds it twice, which moves the coefficients by a single
+    /// ulp, and the schedule is contractive afterwards. Both `mult == 4` (the fast path)
+    /// and `mult == 2` (the general helper the kernel falls back to) are checked, and 20
+    /// iterations is the checkpoint's own `hc_sinkhorn_iters`.
+    func testTheRegisterResidentSinkhornComputesTheSameSplit() throws {
+        let (device, library, queue) = try environment()
+        let devicePipeline = try pipeline("dsv41_hc_split_f32", library, device)
+        let registerPipeline = try pipeline("dsv41_hc_split_f32_regs", library, device)
+
+        func run(
+            copies: Int,
+            logits: [Float],
+            scale: [Float],
+            base: [Float],
+            iterations: Int,
+            pipeline: MTLComputePipelineState
+        ) throws -> (pre: [Float], post: [Float], comb: [Float]) {
+            let logitsBuffer = try buffer(device, logits)
+            let scaleBuffer = try buffer(device, scale)
+            let baseBuffer = try buffer(device, base)
+            let preBuffer = try XCTUnwrap(
+                device.makeBuffer(
+                    length: copies * MemoryLayout<Float>.stride, options: .storageModeShared
+                )
+            )
+            let postBuffer = try XCTUnwrap(
+                device.makeBuffer(
+                    length: copies * MemoryLayout<Float>.stride, options: .storageModeShared
+                )
+            )
+            let combBuffer = try XCTUnwrap(
+                device.makeBuffer(
+                    length: copies * copies * MemoryLayout<Float>.stride,
+                    options: .storageModeShared
+                )
+            )
+            let commandBuffer = try XCTUnwrap(queue.makeCommandBuffer())
+            let encoder = try XCTUnwrap(commandBuffer.makeComputeCommandEncoder())
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(logitsBuffer, offset: 0, index: 0)
+            encoder.setBuffer(scaleBuffer, offset: 0, index: 1)
+            encoder.setBuffer(baseBuffer, offset: 0, index: 2)
+            encoder.setBuffer(preBuffer, offset: 0, index: 3)
+            encoder.setBuffer(postBuffer, offset: 0, index: 4)
+            encoder.setBuffer(combBuffer, offset: 0, index: 5)
+            var mult = UInt32(copies)
+            var schedule = UInt32(iterations)
+            var epsilon: Float = 1e-6
+            var slots: UInt32 = 1
+            encoder.setBytes(&mult, length: 4, index: 6)
+            encoder.setBytes(&schedule, length: 4, index: 7)
+            encoder.setBytes(&epsilon, length: 4, index: 8)
+            encoder.setBytes(&slots, length: 4, index: 9)
+            encoder.dispatchThreads(
+                MTLSize(width: 1, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
+            )
+            encoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            XCTAssertNil(commandBuffer.error)
+            func read(_ buffer: MTLBuffer, _ count: Int) -> [Float] {
+                Array(
+                    UnsafeBufferPointer(
+                        start: buffer.contents().assumingMemoryBound(to: Float.self), count: count
+                    )
+                )
+            }
+            return (
+                read(preBuffer, copies),
+                read(postBuffer, copies),
+                read(combBuffer, copies * copies)
+            )
+        }
+
+        // Deterministic logits with mixed signs, so no row or column is uniform and a
+        // transposed index or a wrong fold order cannot cancel out.
+        func logits(_ count: Int) -> [Float] {
+            (0..<count).map { index in
+                let wave = Float((index * 37) % 23) / 23 - 0.5
+                return wave * 4 + (index % 2 == 0 ? 0.3 : -0.2)
+            }
+        }
+        let scale: [Float] = [0.7, -0.3, 0.5]
+        for copies in [4, 2] {
+            let count = (2 + copies) * copies
+            let base = logits(count).map { $0 * 0.25 }
+            let values = logits(count)
+            for iterations in [0, 1, 3, 20] {
+                let byDevice = try run(
+                    copies: copies, logits: values, scale: scale, base: base,
+                    iterations: iterations, pipeline: devicePipeline
+                )
+                let byRegister = try run(
+                    copies: copies, logits: values, scale: scale, base: base,
+                    iterations: iterations, pipeline: registerPipeline
+                )
+                for index in 0..<copies {
+                    XCTAssertEqual(
+                        byRegister.pre[index], byDevice.pre[index],
+                        accuracy: 1e-6,
+                        "pre \(index) moved at mult \(copies), \(iterations) iteration(s)"
+                    )
+                    XCTAssertEqual(
+                        byRegister.post[index], byDevice.post[index],
+                        accuracy: 1e-6,
+                        "post \(index) moved at mult \(copies), \(iterations) iteration(s)"
+                    )
+                }
+                for index in 0..<(copies * copies) {
+                    // `comb` is a normalized matrix: every value is in (0, 1], so an
+                    // absolute bar is also a relative one.
+                    XCTAssertEqual(
+                        byRegister.comb[index], byDevice.comb[index],
+                        accuracy: 1e-7,
+                        "comb \(index) moved at mult \(copies), \(iterations) iteration(s)"
+                    )
+                }
+            }
+        }
+    }
+}
+
+// MARK: - FP8 block-scaled GEMV forms
+
+/// The two shapes of one 32x32 ue8m0 dot product, checked against each other and
+/// against the host rule.
+///
+/// `dsv41_fp8_block32_gemv` walks a row in one lane; `dsv41_fp8_block32_gemv_rows`
+/// strides the row across a threadgroup. They must agree to rounding, and both must
+/// agree with the arithmetic the checkpoint's scale grid describes, because a lane
+/// reading the wrong scale row (the grid is 32x32, so 32 consecutive rows share one)
+/// still produces numbers of a plausible size.
+final class DeepSeekV41FP8GemvKernelTests: XCTestCase {
+
+    private func environment() throws -> (MTLDevice, MTLLibrary, MTLCommandQueue) {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        guard let library = device.makeDefaultLibrary() else {
+            XCTFail("the default library is missing")
+            throw XCTSkip("no default library")
+        }
+        guard let queue = device.makeCommandQueue() else {
+            XCTFail("no compute queue")
+            throw XCTSkip("no compute queue")
+        }
+        return (device, library, queue)
+    }
+
+    /// E4M3 bytes whose exponents stay in the finite range, so a decoded value is a
+    /// plain number: exponent 0 is subnormal and 15 is NaN/Inf territory.
+    private func weightBytes(_ count: Int) -> [UInt8] {
+        (0..<count).map { index in
+            let sign: UInt8 = (index % 7 == 3) ? 0x80 : 0
+            let exponent = UInt8((index / 5) % 9)
+            let mantissa = UInt8(index % 8)
+            return sign | (exponent << 3) | mantissa
+        }
+    }
+
+    /// Block scales near 2^0, so the block sums stay in a range where a relative bar
+    /// means something.
+    private func scaleBytes(_ count: Int) -> [UInt8] {
+        (0..<count).map { index in UInt8(124 + (index % 7)) }
+    }
+
+    private func values(_ count: Int) -> [Float] {
+        (0..<count).map { index in Float((index &* 29 &+ 7) % 17 - 8) / 16 }
+    }
+
+    /// The host rule: per 32-value block, the dot product scaled by that block's
+    /// E8M0 byte, summed over the row. The scale row is `row / 32` because the
+    /// checkpoint's grid is 32x32.
+    private func reference(
+        weight: [UInt8],
+        scales: [UInt8],
+        inDim: Int,
+        outDim: Int,
+        tokens: Int,
+        input: [Float],
+        inputRowStride: Int,
+        outputRowStride: Int
+    ) -> [Float] {
+        let blocks = max(1, inDim / 32)
+        var out = [Float](repeating: 0, count: tokens * outputRowStride)
+        for token in 0..<tokens {
+            for row in 0..<outDim {
+                var total: Float = 0
+                for block in 0..<blocks {
+                    let scale = DeepSeekV41EngramRowDequantizer.e8m0(
+                        scales[(row / 32) * blocks + block]
+                    )
+                    var blockDot: Float = 0
+                    for index in 0..<32 {
+                        let at = row * inDim + block * 32 + index
+                        blockDot += DeepSeekV41EngramRowDequantizer.e4m3(weight[at])
+                            * input[token * inputRowStride + block * 32 + index]
+                    }
+                    total += blockDot * scale
+                }
+                out[token * outputRowStride + row] = total
+            }
+        }
+        return out
+    }
+
+    /// Runs the shipped shape and the coalesced one over the same bytes.
+    private func dispatch(
+        pipeline: MTLComputePipelineState,
+        wideGrid: Bool,
+        device: MTLDevice,
+        queue: MTLCommandQueue,
+        weight: MTLBuffer,
+        scale: MTLBuffer,
+        input: MTLBuffer,
+        output: MTLBuffer,
+        inDim: Int,
+        outDim: Int,
+        tokens: Int,
+        inputRowStride: Int,
+        outputRowStride: Int
+    ) throws {
+        guard let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("no command buffer")
+            return
+        }
+        var weightOffset = UInt64(0)
+        var scaleOffset = UInt64(0)
+        var inDimension = UInt32(inDim)
+        var outDimension = UInt32(outDim)
+        var inStride = UInt32(inputRowStride)
+        var outStride = UInt32(outputRowStride)
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(weight, offset: 0, index: 0)
+        encoder.setBuffer(scale, offset: 0, index: 1)
+        encoder.setBuffer(input, offset: 0, index: 2)
+        encoder.setBuffer(output, offset: 0, index: 3)
+        encoder.setBytes(&weightOffset, length: 8, index: 4)
+        encoder.setBytes(&scaleOffset, length: 8, index: 5)
+        encoder.setBytes(&inDimension, length: 4, index: 6)
+        encoder.setBytes(&outDimension, length: 4, index: 7)
+        encoder.setBytes(&inStride, length: 4, index: 8)
+        encoder.setBytes(&outStride, length: 4, index: 9)
+        if wideGrid {
+            encoder.setThreadgroupMemoryLength(
+                32 * MemoryLayout<Float>.stride, index: 0
+            )
+            encoder.dispatchThreadgroups(
+                MTLSize(width: outDim * tokens, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+            )
+        } else {
+            encoder.dispatchThreads(
+                MTLSize(width: outDim, height: tokens, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 64, height: 1, depth: 1)
+            )
+        }
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+    }
+
+    private func floats(_ buffer: MTLBuffer, count: Int) -> [Float] {
+        let pointer = buffer.contents().assumingMemoryBound(to: Float.self)
+        return Array(UnsafeBufferPointer(start: pointer, count: count))
+    }
+
+    /// One shape through all three: the host rule, the one-thread form, the
+    /// coalesced form. `inDim` 1,280 is 40 blocks against 64 lanes, so most lanes
+    /// read one block and the tail of the threadgroup has nothing to do — the case a
+    /// reduction across SIMD groups gets wrong if it reads an unwritten partial.
+    private func check(
+        outDim: Int,
+        inDim: Int,
+        tokens: Int,
+        inputRowStride: Int? = nil,
+        outputRowStride: Int? = nil
+    ) throws {
+        let (device, library, queue) = try environment()
+        guard let perRowFunction = library.makeFunction(
+                  name: DeepSeekV41Kernels.fp8Gemv
+              ),
+              let rowsFunction = library.makeFunction(
+                  name: DeepSeekV41Kernels.fp8GemvRows
+              ),
+              let perRow = try? device.makeComputePipelineState(function: perRowFunction),
+              let rows = try? device.makeComputePipelineState(function: rowsFunction) else {
+            XCTFail("the FP8 GEMV kernels are not in the default library")
+            return
+        }
+        let inStride = inputRowStride ?? inDim
+        let outStride = outputRowStride ?? outDim
+        let blocks = inDim / 32
+        let weight = weightBytes(outDim * inDim)
+        let scales = scaleBytes((outDim / 32) * blocks)
+        let input = values(tokens * inStride)
+        guard let weightBuffer = device.makeBuffer(
+                  bytes: weight,
+                  length: weight.count * MemoryLayout<UInt8>.stride,
+                  options: .storageModeShared),
+              let scaleBuffer = device.makeBuffer(
+                  bytes: scales,
+                  length: scales.count * MemoryLayout<UInt8>.stride,
+                  options: .storageModeShared),
+              let inputBuffer = device.makeBuffer(
+                  bytes: input,
+                  length: input.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let perRowOutput = device.makeBuffer(
+                  length: tokens * outStride * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let rowsOutput = device.makeBuffer(
+                  length: tokens * outStride * MemoryLayout<Float>.stride,
+                  options: .storageModeShared) else {
+            XCTFail("the FP8 GEMV buffers did not allocate")
+            return
+        }
+        memset(perRowOutput.contents(), 0, perRowOutput.length)
+        memset(rowsOutput.contents(), 0, rowsOutput.length)
+
+        try dispatch(
+            pipeline: perRow, wideGrid: false, device: device, queue: queue,
+            weight: weightBuffer, scale: scaleBuffer, input: inputBuffer,
+            output: perRowOutput, inDim: inDim, outDim: outDim, tokens: tokens,
+            inputRowStride: inStride, outputRowStride: outStride
+        )
+        try dispatch(
+            pipeline: rows, wideGrid: true, device: device, queue: queue,
+            weight: weightBuffer, scale: scaleBuffer, input: inputBuffer,
+            output: rowsOutput, inDim: inDim, outDim: outDim, tokens: tokens,
+            inputRowStride: inStride, outputRowStride: outStride
+        )
+
+        let expected = reference(
+            weight: weight, scales: scales, inDim: inDim, outDim: outDim, tokens: tokens,
+            input: input, inputRowStride: inStride, outputRowStride: outStride
+        )
+        let shipped = floats(perRowOutput, count: tokens * outStride)
+        let coalesced = floats(rowsOutput, count: tokens * outStride)
+        var worstExpected: Float = 0
+        var worstShipped: Float = 0
+        for token in 0..<tokens {
+            for row in 0..<outDim {
+                let at = token * outStride + row
+                worstExpected = max(worstExpected, abs(coalesced[at] - expected[at]))
+                worstShipped = max(worstShipped, abs(shipped[at] - expected[at]))
+            }
+        }
+        // The two forms sum the same products in a different order, and the host rule
+        // in a third; a bar scaled to the values keeps it a rounding check.
+        let magnitude = max(1, expected.map { abs($0) }.max() ?? 1)
+        XCTAssertLessThan(
+            worstExpected, magnitude * 1e-4,
+            "coalesced form drifted from the host rule at \(outDim)x\(inDim), \(tokens) token(s)"
+        )
+        XCTAssertLessThan(
+            worstShipped, magnitude * 1e-4,
+            "the shipped form drifted from the host rule at \(outDim)x\(inDim)"
+        )
+    }
+
+    func testTheCoalescedFormMatchesTheHostRuleAtAPublishedWidth() throws {
+        try check(outDim: 96, inDim: 1_280, tokens: 1)
+    }
+
+    /// A block of positions addresses its rows with strides wider than the shape, so
+    /// a kernel that ignores them writes every position on top of the first.
+    func testTheCoalescedFormHonoursPositionStrides() throws {
+        try check(
+            outDim: 64, inDim: 2_304, tokens: 3,
+            inputRowStride: 2_560, outputRowStride: 96
+        )
+    }
+
+    /// Rows shorter than the block count of a lane: 512 values is 16 blocks against
+    /// 64 lanes, so 48 lanes contribute a zero partial.
+    func testTheCoalescedFormHandlesAShortRow() throws {
+        try check(outDim: 96, inDim: 1_024, tokens: 1)
+    }
+
+    /// The rule that decides the dispatch: every published dense projection except
+    /// `attn.wq_b` is wide enough to amortize the reduction barrier, and the two
+    /// shapes that lose keep the one-thread form.
+    func testTheFormRuleCoversThePublishedDenseShapes() {
+        let published = [
+            ("attn.wo_b", 5_120, 8_192),
+            ("attn.wo_a band", 1_024, 4_096),
+            ("attn.wq_a", 1_280, 5_120),
+            ("attn.wkv", 512, 5_120),
+            ("shared_experts.w1", 2_304, 5_120),
+            ("shared_experts.w2", 5_120, 2_304)
+        ]
+        for (name, outDim, inDim) in published {
+            XCTAssertTrue(
+                DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(
+                    outDim: outDim, inDim: inDim, rows: 1
+                ),
+                "\(name) should take the coalesced form"
+            )
+        }
+        // 40 blocks against 64 lanes: the one-thread form measured 1.07-1.6x faster
+        // here, at one position and at a block of eight.
+        XCTAssertFalse(
+            DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(outDim: 32_768, inDim: 1_280, rows: 1),
+            "attn.wq_b has fewer blocks than lanes and keeps the one-thread form"
+        )
+        XCTAssertFalse(
+            DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(outDim: 32_768, inDim: 1_280, rows: 8),
+            "attn.wq_b loses the coalesced form at a block width too"
+        )
+        XCTAssertFalse(
+            DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(outDim: 16, inDim: 512, rows: 1),
+            "16 rows over 512 columns is too little work to pay for a barrier"
+        )
+        // The same short row as `attn.wq_b`, with an eighth of the rows: 4,096 threads
+        // cannot fill the machine, so the coalesced form measured 0.61x the one-thread
+        // form's time there (`#74`) and the occupancy clause sends it that way.
+        XCTAssertTrue(
+            DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(outDim: 4_096, inDim: 1_280, rows: 1),
+            "attn.indexer.wq_b is starved in the one-thread form and takes the wide grid"
+        )
+        XCTAssertEqual(
+            DeepSeekV41DevicePlan.fp8WideGridThreadThreshold, 16_384,
+            "the occupancy clause's threshold is the measurement, not a guess"
+        )
+    }
+
+    // MARK: Two rows per threadgroup
+
+    /// One threadgroup per (row pair, token), which is the form that halves the
+    /// threadgroup count and the input reads per row.
+    private func dispatchPair(
+        pipeline: MTLComputePipelineState,
+        queue: MTLCommandQueue,
+        weight: MTLBuffer,
+        scale: MTLBuffer,
+        input: MTLBuffer,
+        output: MTLBuffer,
+        inDim: Int,
+        outDim: Int,
+        tokens: Int,
+        inputRowStride: Int,
+        outputRowStride: Int,
+        lanes: Int
+    ) throws {
+        guard let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("no command buffer")
+            return
+        }
+        var weightOffset = UInt64(0)
+        var scaleOffset = UInt64(0)
+        var inDimension = UInt32(inDim)
+        var outDimension = UInt32(outDim)
+        var inStride = UInt32(inputRowStride)
+        var outStride = UInt32(outputRowStride)
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(weight, offset: 0, index: 0)
+        encoder.setBuffer(scale, offset: 0, index: 1)
+        encoder.setBuffer(input, offset: 0, index: 2)
+        encoder.setBuffer(output, offset: 0, index: 3)
+        encoder.setBytes(&weightOffset, length: 8, index: 4)
+        encoder.setBytes(&scaleOffset, length: 8, index: 5)
+        encoder.setBytes(&inDimension, length: 4, index: 6)
+        encoder.setBytes(&outDimension, length: 4, index: 7)
+        encoder.setBytes(&inStride, length: 4, index: 8)
+        encoder.setBytes(&outStride, length: 4, index: 9)
+        // Two floats per SIMD group of partials, which is the most a 64-lane
+        // threadgroup can need.
+        encoder.setThreadgroupMemoryLength(
+            2 * 32 * MemoryLayout<Float>.stride, index: 0
+        )
+        encoder.dispatchThreadgroups(
+            MTLSize(width: ((outDim + 1) / 2) * tokens, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+    }
+
+    /// The pair form against the host rule at both lane shapes.
+    private func checkPair(
+        outDim: Int,
+        inDim: Int,
+        tokens: Int,
+        inputRowStride: Int? = nil,
+        outputRowStride: Int? = nil
+    ) throws {
+        let (device, library, queue) = try environment()
+        guard let pairFunction = library.makeFunction(name: DeepSeekV41Kernels.fp8GemvRows2),
+              let pair = try? device.makeComputePipelineState(function: pairFunction) else {
+            XCTFail("the pair FP8 GEMV kernel is not in the default library")
+            return
+        }
+        let inStride = inputRowStride ?? inDim
+        let outStride = outputRowStride ?? outDim
+        let blocks = inDim / 32
+        let weight = weightBytes(outDim * inDim)
+        // The checkpoint's scale grid is 32x32, so a row count that is not a multiple
+        // of 32 has a partial group whose scale row must exist for the host rule and
+        // the kernel to read. Every published shape is a multiple of 32; padding here
+        // is what lets the odd-row case run at all.
+        let scaleGroups = (outDim + 31) / 32
+        let scales = scaleBytes(scaleGroups * blocks)
+        let input = values(tokens * inStride)
+        guard let weightBuffer = device.makeBuffer(
+                  bytes: weight,
+                  length: weight.count * MemoryLayout<UInt8>.stride,
+                  options: .storageModeShared),
+              let scaleBuffer = device.makeBuffer(
+                  bytes: scales,
+                  length: scales.count * MemoryLayout<UInt8>.stride,
+                  options: .storageModeShared),
+              let inputBuffer = device.makeBuffer(
+                  bytes: input,
+                  length: input.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared) else {
+            XCTFail("the FP8 GEMV buffers did not allocate")
+            return
+        }
+
+        let expected = reference(
+            weight: weight, scales: scales, inDim: inDim, outDim: outDim, tokens: tokens,
+            input: input, inputRowStride: inStride, outputRowStride: outStride
+        )
+        let magnitude = max(1, expected.map { abs($0) }.max() ?? 1)
+
+        for lanes in [32, 64] {
+            guard let output = device.makeBuffer(
+                length: tokens * outStride * MemoryLayout<Float>.stride,
+                options: .storageModeShared) else {
+                XCTFail("no pair output buffer")
+                return
+            }
+            memset(output.contents(), 0, output.length)
+            try dispatchPair(
+                pipeline: pair, queue: queue, weight: weightBuffer, scale: scaleBuffer,
+                input: inputBuffer, output: output, inDim: inDim, outDim: outDim,
+                tokens: tokens, inputRowStride: inStride, outputRowStride: outStride,
+                lanes: lanes
+            )
+            let produced = floats(output, count: tokens * outStride)
+            for token in 0..<tokens {
+                for row in 0..<outDim {
+                    let at = token * outStride + row
+                    XCTAssertLessThan(
+                        abs(produced[at] - expected[at]), magnitude * 1e-4,
+                        "pair form (lanes \(lanes)) drifted at row \(row) of \(outDim)x\(inDim)"
+                    )
+                }
+            }
+        }
+    }
+
+    func testThePairFormMatchesTheHostRuleAtAPublishedWidth() throws {
+        try checkPair(outDim: 96, inDim: 1_280, tokens: 1)
+    }
+
+    /// An odd row count leaves the last pair with no second row: the form must write
+    /// that row once and not read material for a row past the buffer.
+    func testThePairFormHandlesAnOddRowCount() throws {
+        try checkPair(outDim: 2_305, inDim: 1_024, tokens: 2)
+    }
+
+    func testThePairFormHonoursPositionStrides() throws {
+        try checkPair(
+            outDim: 64, inDim: 2_304, tokens: 3,
+            inputRowStride: 2_560, outputRowStride: 96
+        )
+    }
+
+    // MARK: A block of positions from one weight read
+
+    /// One threadgroup per output row, every position of the block inside its own
+    /// position loop, so the row's bytes are read once instead of once per position.
+    private func dispatchSlots(
+        pipeline: MTLComputePipelineState,
+        queue: MTLCommandQueue,
+        weight: MTLBuffer,
+        scale: MTLBuffer,
+        input: MTLBuffer,
+        output: MTLBuffer,
+        inDim: Int,
+        outDim: Int,
+        slots: Int,
+        inputRowStride: Int,
+        outputRowStride: Int,
+        lanes: Int
+    ) throws {
+        guard let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            XCTFail("no command buffer")
+            return
+        }
+        var weightOffset = UInt64(0)
+        var scaleOffset = UInt64(0)
+        var inDimension = UInt32(inDim)
+        var outDimension = UInt32(outDim)
+        var inStride = UInt32(inputRowStride)
+        var outStride = UInt32(outputRowStride)
+        var slotCount = UInt32(slots)
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(weight, offset: 0, index: 0)
+        encoder.setBuffer(scale, offset: 0, index: 1)
+        encoder.setBuffer(input, offset: 0, index: 2)
+        encoder.setBuffer(output, offset: 0, index: 3)
+        encoder.setBytes(&weightOffset, length: 8, index: 4)
+        encoder.setBytes(&scaleOffset, length: 8, index: 5)
+        encoder.setBytes(&inDimension, length: 4, index: 6)
+        encoder.setBytes(&outDimension, length: 4, index: 7)
+        encoder.setBytes(&inStride, length: 4, index: 8)
+        encoder.setBytes(&outStride, length: 4, index: 9)
+        encoder.setBytes(&slotCount, length: 4, index: 10)
+        // The kernel's partials are indexed per (position, SIMD group). The shipped
+        // sizing is the eight positions a prefill block carries over eight groups; the
+        // fixture passes the same shape so the two cannot drift.
+        encoder.setThreadgroupMemoryLength(
+            8 * 8 * MemoryLayout<Float>.stride, index: 0
+        )
+        encoder.dispatchThreadgroups(
+            MTLSize(width: outDim, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        XCTAssertNil(commandBuffer.error)
+    }
+
+    /// The slot form against the host rule and against the per-(token, row) form, at
+    /// both lane widths, over positions laid out at strides wider than the shape.
+    ///
+    /// The strides matter here more than anywhere else in this file: the slot form's
+    /// position axis is a `slotCount` argument rather than a grid height, so a kernel
+    /// that used `inDim`/`outDim` instead of the strides would write every position on
+    /// top of the first and still produce the right answer for ONE position.
+    private func checkSlots(
+        outDim: Int,
+        inDim: Int,
+        slots: Int,
+        inputRowStride: Int? = nil,
+        outputRowStride: Int? = nil,
+        fullRange: Bool = false
+    ) throws {
+        let (device, library, queue) = try environment()
+        guard let slotFunction = library.makeFunction(
+                  name: DeepSeekV41Kernels.fp8Block32GemvRowsSlots
+              ),
+              let rowsFunction = library.makeFunction(name: DeepSeekV41Kernels.fp8GemvRows),
+              let slotForm = try? device.makeComputePipelineState(function: slotFunction),
+              let rowsForm = try? device.makeComputePipelineState(function: rowsFunction) else {
+            XCTFail("the slot FP8 GEMV kernel is not in the default library")
+            return
+        }
+        let inStride = inputRowStride ?? inDim
+        let outStride = outputRowStride ?? outDim
+        let blocks = inDim / 32
+        // Full-range bytes are the published checkpoint's regime rather than this
+        // file's: every E4M3 exponent, E8M0 scales spanning the whole byte, and
+        // activations that cancel. A block-scaled kernel that mixes up WHICH scale row
+        // it reads agrees with the host rule on the narrow fixture and drifts here.
+        let weight = fullRange
+            ? (0..<(outDim * inDim)).map { UInt8(($0 &* 61 &+ 17) % 127) }
+            : weightBytes(outDim * inDim)
+        let scales = fullRange
+            ? (0..<(((outDim + 31) / 32) * blocks)).map { UInt8(116 + (($0 &* 29 &+ 5) % 17)) }
+            : scaleBytes(((outDim + 31) / 32) * blocks)
+        let input = fullRange
+            ? (0..<(slots * inStride)).map {
+                Float((($0 &* 37 &+ 3) % 2_001) - 1_000) / 997
+            }
+            : values(slots * inStride)
+        guard let weightBuffer = device.makeBuffer(
+                  bytes: weight,
+                  length: weight.count * MemoryLayout<UInt8>.stride,
+                  options: .storageModeShared),
+              let scaleBuffer = device.makeBuffer(
+                  bytes: scales,
+                  length: scales.count * MemoryLayout<UInt8>.stride,
+                  options: .storageModeShared),
+              let inputBuffer = device.makeBuffer(
+                  bytes: input,
+                  length: input.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let slotOutput = device.makeBuffer(
+                  length: slots * outStride * MemoryLayout<Float>.stride,
+                  options: .storageModeShared),
+              let rowsOutput = device.makeBuffer(
+                  length: slots * outStride * MemoryLayout<Float>.stride,
+                  options: .storageModeShared) else {
+            XCTFail("the FP8 GEMV buffers did not allocate")
+            return
+        }
+        memset(slotOutput.contents(), 0, slotOutput.length)
+        memset(rowsOutput.contents(), 0, rowsOutput.length)
+
+        try dispatch(
+            pipeline: rowsForm, wideGrid: true, device: device, queue: queue,
+            weight: weightBuffer, scale: scaleBuffer, input: inputBuffer,
+            output: rowsOutput, inDim: inDim, outDim: outDim, tokens: slots,
+            inputRowStride: inStride, outputRowStride: outStride
+        )
+        let expected = reference(
+            weight: weight, scales: scales, inDim: inDim, outDim: outDim, tokens: slots,
+            input: input, inputRowStride: inStride, outputRowStride: outStride
+        )
+        let magnitude = max(1, expected.map { abs($0) }.max() ?? 1)
+
+        for lanes in [32, 64] {
+            memset(slotOutput.contents(), 0, slotOutput.length)
+            try dispatchSlots(
+                pipeline: slotForm, queue: queue, weight: weightBuffer,
+                scale: scaleBuffer, input: inputBuffer, output: slotOutput,
+                inDim: inDim, outDim: outDim, slots: slots,
+                inputRowStride: inStride, outputRowStride: outStride, lanes: lanes
+            )
+            let produced = floats(slotOutput, count: slots * outStride)
+            for slot in 0..<slots {
+                for row in 0..<outDim {
+                    let at = slot * outStride + row
+                    XCTAssertLessThan(
+                        abs(produced[at] - expected[at]), magnitude * 1e-4,
+                        "slot form (lanes \(lanes)) drifted at position \(slot), row \(row) "
+                            + "of \(outDim)x\(inDim)"
+                    )
+                }
+            }
+            // Each position must land in its OWN rows: a kernel that looped the
+            // position axis but wrote slot 0 would pass every comparison above for one
+            // position and differ from its neighbour nowhere.
+            if slots > 1 {
+                let first = (0..<outDim).map { produced[$0] }
+                let second = (0..<outDim).map { produced[outStride + $0] }
+                let differing = zip(first, second).filter { abs($0 - $1) > 1e-6 }.count
+                XCTAssertGreaterThan(
+                    differing, outDim / 4,
+                    "the slot form wrote position 1 over position 0"
+                )
+            }
+        }
+    }
+
+    func testTheSlotFormMatchesTheHostRuleAtAPublishedWidth() throws {
+        try checkSlots(outDim: 96, inDim: 5_120, slots: 8)
+    }
+
+    /// The two shapes the graph actually sends it, with the checkpoint's own dynamic
+    /// range instead of the narrow fixture: `attn.wq_b` (32,768 rows over 1,280
+    /// columns, the largest stage of a block's dense half) and one `attn.wo_a` band.
+    func testTheSlotFormMatchesTheHostRuleOnFullRangeBytes() throws {
+        try checkSlots(outDim: 32_768, inDim: 1_280, slots: 8, fullRange: true)
+        try checkSlots(outDim: 1_024, inDim: 4_096, slots: 8, fullRange: true)
+    }
+
+    /// Three positions rather than eight: the kernel's position loop is a compile-time
+    /// eight, so a short block must skip the positions it does not have instead of
+    /// reading past the input.
+    func testTheSlotFormHandlesAShortBlock() throws {
+        try checkSlots(outDim: 64, inDim: 1_280, slots: 3)
+    }
+
+    /// Strides wider than the shape, which is how `attn.wo_a`'s head-group bands read
+    /// their columns out of the full width.
+    func testTheSlotFormHonoursPositionStrides() throws {
+        try checkSlots(
+            outDim: 64, inDim: 512, slots: 4,
+            inputRowStride: 640, outputRowStride: 96
+        )
+    }
+
+    /// The rule that decides the dispatch: a block takes the slot form at every
+    /// published dense shape, and one position never does.
+    func testTheSlotFormRuleCoversABlockAndNotAPosition() {
+        let published: [(String, Int, Int)] = [
+            ("attn.wo_b", 5_120, 8_192),
+            ("attn.wo_a band", 1_024, 4_096),
+            ("attn.wq_a", 1_280, 5_120),
+            ("attn.wq_b", 32_768, 1_280),
+            ("attn.wkv", 512, 5_120)
+        ]
+        for (name, outDim, inDim) in published {
+            XCTAssertTrue(
+                DeepSeekV41DevicePlan.fp8GemvWantsSlotForm(
+                    outDim: outDim, inDim: inDim, rows: 8
+                ),
+                "\(name) should take the slot form at a block of eight"
+            )
+            XCTAssertFalse(
+                DeepSeekV41DevicePlan.fp8GemvWantsSlotForm(
+                    outDim: outDim, inDim: inDim, rows: 1
+                ),
+                "\(name) has nothing to share the weight read with at one position"
+            )
+        }
+        XCTAssertFalse(
+            DeepSeekV41DevicePlan.fp8GemvWantsSlotForm(outDim: 16, inDim: 5_120, rows: 8),
+            "16 rows is too little work to fill a threadgroup grid"
+        )
+    }
+}
+
+/// The shared expert's two FP8 kernels, in the one-thread form the graph used to run
+/// and the coalesced form `#61` wired.
+///
+/// `#60` attributed a decoded position's device time and found the shared expert the
+/// largest single stage at 109-113 GB/s, about a third of what the routed experts
+/// read on the same bytes. The cause was the dispatch shape: `dsv41_fp8_block32_gemv`
+/// had a coalesced sibling but the FUSED swiglu and the down accumulate did not, so
+/// the one projection the model runs on every layer of every token still gave a
+/// thread a whole row. This pins the two new kernels against the host rule, at both
+/// lane widths, on the published shapes and on shapes that exercise the 32x32 scale
+/// grid's partial group.
+final class DeepSeekV41FP8SharedExpertKernelTests: XCTestCase {
+
+    private func environment() throws -> (MTLDevice, MTLLibrary, MTLCommandQueue) {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        guard let library = device.makeDefaultLibrary() else {
+            XCTFail("the default library is missing")
+            throw XCTSkip("no default library")
+        }
+        guard let queue = device.makeCommandQueue() else {
+            XCTFail("no compute queue")
+            throw XCTSkip("no compute queue")
+        }
+        return (device, library, queue)
+    }
+
+    /// E4M3 bytes whose exponents stay in the finite range, so a decoded value is a
+    /// plain number: exponent 0 is subnormal and 15 is NaN/Inf territory.
+    private func weightBytes(_ count: Int) -> [UInt8] {
+        (0..<count).map { index in
+            let sign: UInt8 = (index % 7 == 3) ? 0x80 : 0
+            let exponent = UInt8((index / 5) % 9)
+            let mantissa = UInt8(index % 8)
+            return sign | (exponent << 3) | mantissa
+        }
+    }
+
+    /// Block scales near 2^0, so a block sum stays in a range where a relative bar
+    /// means something.
+    private func scaleBytes(_ count: Int) -> [UInt8] {
+        (0..<count).map { index in UInt8(124 + (index % 7)) }
+    }
+
+    private func values(_ count: Int) -> [Float] {
+        (0..<count).map { index in Float((index &* 29 &+ 7) % 17 - 8) / 16 }
+    }
+
+    /// The host rule for the fused pair: per 32-value block, the gate and up dots
+    /// scaled by that block's E8M0 byte, summed over the row, then the checkpoint's
+    /// clip and `silu(gate) * up`. The scale row is `row / 32` because the grid is
+    /// 32x32, and rows past `outDim` are skipped.
+    private func swigluReference(
+        gate: [UInt8],
+        up: [UInt8],
+        gateScales: [UInt8],
+        upScales: [UInt8],
+        inDim: Int,
+        outDim: Int,
+        tokens: Int,
+        input: [Float],
+        limit: Float
+    ) -> [Float] {
+        let blocks = max(1, inDim / 32)
+        var out = [Float](repeating: 0, count: tokens * outDim)
+        for token in 0..<tokens {
+            for row in 0..<outDim {
+                var gateTotal: Float = 0
+                var upTotal: Float = 0
+                for block in 0..<blocks {
+                    let scaleIndex = (row / 32) * blocks + block
+                    let gateScale = DeepSeekV41EngramRowDequantizer.e8m0(gateScales[scaleIndex])
+                    let upScale = DeepSeekV41EngramRowDequantizer.e8m0(upScales[scaleIndex])
+                    var gateDot: Float = 0
+                    var upDot: Float = 0
+                    for index in 0..<32 {
+                        let at = row * inDim + block * 32 + index
+                        let x = input[token * inDim + block * 32 + index]
+                        gateDot += DeepSeekV41EngramRowDequantizer.e4m3(gate[at]) * x
+                        upDot += DeepSeekV41EngramRowDequantizer.e4m3(up[at]) * x
+                    }
+                    gateTotal += gateDot * gateScale
+                    upTotal += upDot * upScale
+                }
+                var gateValue = gateTotal
+                var upValue = upTotal
+                if limit > 0 {
+                    gateValue = min(gateValue, limit)
+                    upValue = min(max(upValue, -limit), limit)
+                }
+                out[token * outDim + row] = gateValue / (1 + exp(-gateValue)) * upValue
+            }
+        }
+        return out
+    }
+
+    /// The host rule for the down accumulate: the same block dot, then
+    /// `output[row] += routingWeight * total`.
+    private func downReference(
+        weight: [UInt8],
+        scales: [UInt8],
+        inDim: Int,
+        outDim: Int,
+        activation: [Float],
+        routing: Float
+    ) -> [Float] {
+        let blocks = max(1, inDim / 32)
+        var out = [Float](repeating: 0, count: outDim)
+        for row in 0..<outDim {
+            var total: Float = 0
+            for block in 0..<blocks {
+                let scale = DeepSeekV41EngramRowDequantizer.e8m0(
+                    scales[(row / 32) * blocks + block]
+                )
+                var blockDot: Float = 0
+                for index in 0..<32 {
+                    let at = row * inDim + block * 32 + index
+                    blockDot += DeepSeekV41EngramRowDequantizer.e4m3(weight[at])
+                        * activation[block * 32 + index]
+                }
+                total += blockDot * scale
+            }
+            out[row] = routing * total
+        }
+        return out
+    }
+
+    private func buffer(_ device: MTLDevice, bytes: [UInt8]) -> MTLBuffer? {
+        device.makeBuffer(bytes: bytes, length: bytes.count, options: .storageModeShared)
+    }
+
+    private func floats(_ buffer: MTLBuffer, count: Int) -> [Float] {
+        let pointer = buffer.contents().assumingMemoryBound(to: Float.self)
+        return Array(UnsafeBufferPointer(start: pointer, count: count))
+    }
+
+    /// One shape's fused pair through the host rule, the one-thread form and the
+    /// coalesced form at both lane widths. `outDim` is allowed to be off the 32-row
+    /// scale boundary, which is the case a lane's scale-index arithmetic gets wrong.
+    /// Returns the coalesced output so a caller can compare two limits.
+    @discardableResult
+    private func checkSwiGLU(
+        outDim: Int,
+        inDim: Int,
+        tokens: Int = 1,
+        limit: Float = 0
+    ) throws -> [Float] {
+        let (device, library, queue) = try environment()
+        guard let perRowFunction = library.makeFunction(name: DeepSeekV41Kernels.fp8SwiGLU),
+              let rowsFunction = library.makeFunction(name: DeepSeekV41Kernels.fp8SwiGLURows),
+              let perRow = try? device.makeComputePipelineState(function: perRowFunction),
+              let rows = try? device.makeComputePipelineState(function: rowsFunction) else {
+            XCTFail("the FP8 shared-expert kernels are not in the default library")
+            return []
+        }
+        let blocks = inDim / 32
+        // A row count off the 32-row grid needs its partial scale group published, or
+        // the host rule and both kernels read past the companion.
+        let scaleGroups = (outDim + 31) / 32
+        let gate = weightBytes(outDim * inDim)
+        let up = weightBytes(outDim * inDim).reversed()
+        let upBytes = Array(up)
+        let gateScales = scaleBytes(scaleGroups * blocks)
+        let upScales = scaleBytes(scaleGroups * blocks)
+        let input = values(tokens * inDim)
+
+        guard let gateBuffer = buffer(device, bytes: gate),
+              let upBuffer = buffer(device, bytes: upBytes),
+              let gateScaleBuffer = buffer(device, bytes: gateScales),
+              let upScaleBuffer = buffer(device, bytes: upScales),
+              let inputBuffer = device.makeBuffer(
+                  bytes: input,
+                  length: input.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared) else {
+            XCTFail("the shared-expert buffers did not allocate")
+            return []
+        }
+
+        let expected = swigluReference(
+            gate: gate, up: upBytes, gateScales: gateScales, upScales: upScales,
+            inDim: inDim, outDim: outDim, tokens: tokens, input: input, limit: limit
+        )
+        let magnitude = max(1, expected.map { abs($0) }.max() ?? 1)
+
+        func dispatch(
+            pipeline: MTLComputePipelineState,
+            coalesced: Bool,
+            lanes: Int
+        ) -> [Float] {
+            guard let output = device.makeBuffer(
+                length: tokens * outDim * MemoryLayout<Float>.stride,
+                options: .storageModeShared
+            ) else { return [] }
+            memset(output.contents(), 0, output.length)
+            guard let commandBuffer = queue.makeCommandBuffer(),
+                  let encoder = commandBuffer.makeComputeCommandEncoder() else {
+                XCTFail("no command buffer")
+                return []
+            }
+            var gateWeightOffset = UInt64(0)
+            var gateScaleOffset = UInt64(0)
+            var upWeightOffset = UInt64(0)
+            var upScaleOffset = UInt64(0)
+            var inDimension = UInt32(inDim)
+            var outDimension = UInt32(outDim)
+            var swiglu = limit
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(gateBuffer, offset: 0, index: 0)
+            encoder.setBuffer(gateScaleBuffer, offset: 0, index: 1)
+            encoder.setBuffer(upBuffer, offset: 0, index: 2)
+            encoder.setBuffer(upScaleBuffer, offset: 0, index: 3)
+            encoder.setBuffer(inputBuffer, offset: 0, index: 4)
+            encoder.setBuffer(output, offset: 0, index: 5)
+            encoder.setBytes(&gateWeightOffset, length: 8, index: 6)
+            encoder.setBytes(&gateScaleOffset, length: 8, index: 7)
+            encoder.setBytes(&upWeightOffset, length: 8, index: 8)
+            encoder.setBytes(&upScaleOffset, length: 8, index: 9)
+            encoder.setBytes(&inDimension, length: 4, index: 10)
+            encoder.setBytes(&outDimension, length: 4, index: 11)
+            encoder.setBytes(&swiglu, length: 4, index: 12)
+            if coalesced {
+                encoder.setThreadgroupMemoryLength(
+                    2 * 32 * MemoryLayout<Float>.stride, index: 0
+                )
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: outDim * tokens, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+                )
+            } else {
+                encoder.dispatchThreads(
+                    MTLSize(width: outDim, height: tokens, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: min(outDim, 64), height: 1, depth: 1)
+                )
+            }
+            encoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            XCTAssertNil(commandBuffer.error)
+            return floats(output, count: tokens * outDim)
+        }
+
+        let oneThread = dispatch(pipeline: perRow, coalesced: false, lanes: 64)
+        var lastProduced: [Float] = []
+        for lanes in [32, 64] {
+            let produced = dispatch(pipeline: rows, coalesced: true, lanes: lanes)
+            lastProduced = produced
+            for index in 0..<(tokens * outDim) {
+                XCTAssertLessThan(
+                    abs(produced[index] - expected[index]), magnitude * 1e-4,
+                    "coalesced swiglu (lanes \(lanes)) drifted at \(index) of "
+                        + "\(outDim)x\(inDim)"
+                )
+                XCTAssertLessThan(
+                    abs(oneThread[index] - produced[index]), magnitude * 1e-4,
+                    "the two forms disagree at \(index) of \(outDim)x\(inDim)"
+                )
+            }
+        }
+        return lastProduced
+    }
+
+    /// The same for the down accumulate, from a zeroed output so the `+=` is the
+    /// whole result.
+    private func checkDown(outDim: Int, inDim: Int, routing: Float = 0.75) throws {
+        let (device, library, queue) = try environment()
+        guard let perRowFunction = library.makeFunction(name: DeepSeekV41Kernels.fp8DownAccumulate),
+              let rowsFunction = library.makeFunction(name: DeepSeekV41Kernels.fp8DownAccumulateRows),
+              let perRow = try? device.makeComputePipelineState(function: perRowFunction),
+              let rows = try? device.makeComputePipelineState(function: rowsFunction) else {
+            XCTFail("the FP8 shared-expert kernels are not in the default library")
+            return
+        }
+        let blocks = inDim / 32
+        let scaleGroups = (outDim + 31) / 32
+        let weight = weightBytes(outDim * inDim)
+        let scales = scaleBytes(scaleGroups * blocks)
+        let activation = values(inDim)
+
+        guard let weightBuffer = buffer(device, bytes: weight),
+              let scaleBuffer = buffer(device, bytes: scales),
+              let activationBuffer = device.makeBuffer(
+                  bytes: activation,
+                  length: activation.count * MemoryLayout<Float>.stride,
+                  options: .storageModeShared) else {
+            XCTFail("the shared-expert buffers did not allocate")
+            return
+        }
+
+        let expected = downReference(
+            weight: weight, scales: scales, inDim: inDim, outDim: outDim,
+            activation: activation, routing: routing
+        )
+        let magnitude = max(1, expected.map { abs($0) }.max() ?? 1)
+
+        func dispatch(
+            pipeline: MTLComputePipelineState,
+            coalesced: Bool,
+            lanes: Int
+        ) -> [Float] {
+            guard let output = device.makeBuffer(
+                length: outDim * MemoryLayout<Float>.stride,
+                options: .storageModeShared
+            ) else { return [] }
+            memset(output.contents(), 0, output.length)
+            guard let commandBuffer = queue.makeCommandBuffer(),
+                  let encoder = commandBuffer.makeComputeCommandEncoder() else {
+                XCTFail("no command buffer")
+                return []
+            }
+            var weightOffset = UInt64(0)
+            var scaleOffset = UInt64(0)
+            var inDimension = UInt32(inDim)
+            var outDimension = UInt32(outDim)
+            var routingWeight = routing
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(weightBuffer, offset: 0, index: 0)
+            encoder.setBuffer(scaleBuffer, offset: 0, index: 1)
+            encoder.setBuffer(activationBuffer, offset: 0, index: 2)
+            encoder.setBuffer(output, offset: 0, index: 3)
+            encoder.setBytes(&weightOffset, length: 8, index: 4)
+            encoder.setBytes(&scaleOffset, length: 8, index: 5)
+            encoder.setBytes(&inDimension, length: 4, index: 6)
+            encoder.setBytes(&outDimension, length: 4, index: 7)
+            encoder.setBytes(&routingWeight, length: 4, index: 8)
+            if coalesced {
+                encoder.setThreadgroupMemoryLength(
+                    32 * MemoryLayout<Float>.stride, index: 0
+                )
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: outDim, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: lanes, height: 1, depth: 1)
+                )
+            } else {
+                encoder.dispatchThreads(
+                    MTLSize(width: outDim, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: min(outDim, 64), height: 1, depth: 1)
+                )
+            }
+            encoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            XCTAssertNil(commandBuffer.error)
+            return floats(output, count: outDim)
+        }
+
+        let oneThread = dispatch(pipeline: perRow, coalesced: false, lanes: 64)
+        for lanes in [32, 64] {
+            let produced = dispatch(pipeline: rows, coalesced: true, lanes: lanes)
+            for index in 0..<outDim {
+                XCTAssertLessThan(
+                    abs(produced[index] - expected[index]), magnitude * 1e-4,
+                    "coalesced down (lanes \(lanes)) drifted at row \(index) of "
+                        + "\(outDim)x\(inDim)"
+                )
+                XCTAssertLessThan(
+                    abs(oneThread[index] - produced[index]), magnitude * 1e-4,
+                    "the two down forms disagree at row \(index)"
+                )
+            }
+        }
+    }
+
+    func testTheCoalescedFusedPairMatchesTheHostRuleAtThePublishedShape() throws {
+        try checkSwiGLU(outDim: 2_304, inDim: 5_120)
+    }
+
+    func testTheCoalescedDownMatchesTheHostRuleAtThePublishedShape() throws {
+        try checkDown(outDim: 5_120, inDim: 2_304)
+    }
+
+    /// A row count off the 32-row scale boundary, and a row shorter than a lane's
+    /// block count (1,024 values is 32 blocks against 64 lanes), so the partial
+    /// group and the idle lanes are both exercised.
+    func testTheCoalescedPairHandlesAPartialScaleGroupAndAShortRow() throws {
+        try checkSwiGLU(outDim: 65, inDim: 1_024)
+        try checkDown(outDim: 65, inDim: 1_024)
+    }
+
+    /// The fused kernel carries the token axis: the flat grid's token is
+    /// `groupIdx / outDim`, so a row-major mix-up would give token 1 the rows of
+    /// token 0.
+    func testTheCoalescedFusedPairCarriesTheTokenAxis() throws {
+        try checkSwiGLU(outDim: 96, inDim: 1_280, tokens: 3)
+    }
+
+    /// `swiglu_limit` is part of the trained function, so it has to survive the move:
+    /// the clipped pair must match the host rule AND differ from the unlimited run, or
+    /// a kernel that dropped the clip would pass.
+    func testTheCoalescedFusedPairAppliesTheSwiGLULimit() throws {
+        let unlimited = try checkSwiGLU(outDim: 96, inDim: 1_280)
+        let clipped = try checkSwiGLU(outDim: 96, inDim: 1_280, limit: 0.25)
+        let changed = zip(unlimited, clipped).filter { abs($0 - $1) > 1e-6 }.count
+        XCTAssertGreaterThan(
+            changed, unlimited.count / 4,
+            "a 0.25 limit should clip most of a 40-block row, not \(changed) values"
+        )
+    }
+
+    /// The plan rule sends both published shared-expert shapes to the coalesced form.
+    func testTheRuleSendsThePublishedSharedExpertToTheCoalescedForm() {
+        XCTAssertTrue(
+            DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(outDim: 2_304, inDim: 5_120, rows: 1),
+            "the shared gate+up is 160 blocks over 64 lanes"
+        )
+        XCTAssertTrue(
+            DeepSeekV41DevicePlan.fp8GemvWantsWideGrid(outDim: 5_120, inDim: 2_304, rows: 1),
+            "the shared down is 72 blocks over 64 lanes"
+        )
+    }
+
+    /// The slot forms project a BLOCK of positions from one read of the row, which is
+    /// what a prefill block needs from the shared expert: its weight is the same for
+    /// every position, and `#72` measured the per-position form reading it `width`
+    /// times at the machine's ceiling, i.e. all of it redundant
+    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #72").
+    ///
+    /// What they must reproduce is the per-slot `_rows` form: the same bytes, the same
+    /// arithmetic, one pass over the weight instead of `slotCount`. Five slots, so no
+    /// form can assume a width of four or eight, and the published shapes, so the
+    /// comparison is at the width that ships.
+    func testTheSlotFormsProjectEveryPositionFromOneWeightRead() throws {
+        let (device, library, queue) = try environment()
+        guard
+            let rowsFunction = library.makeFunction(name: DeepSeekV41Kernels.fp8SwiGLURows),
+            let slotsFunction = library.makeFunction(
+                name: DeepSeekV41Kernels.fp8SwiGLURowsSlots
+            ),
+            let downRowsFunction = library.makeFunction(
+                name: DeepSeekV41Kernels.fp8DownAccumulateRows
+            ),
+            let downSlotsFunction = library.makeFunction(
+                name: DeepSeekV41Kernels.fp8DownAccumulateRowsSlots
+            ),
+            let rowsPipeline = try? device.makeComputePipelineState(function: rowsFunction),
+            let slotsPipeline = try? device.makeComputePipelineState(function: slotsFunction),
+            let downRowsPipeline = try? device.makeComputePipelineState(
+                function: downRowsFunction
+            ),
+            let downSlotsPipeline = try? device.makeComputePipelineState(
+                function: downSlotsFunction
+            )
+        else {
+            XCTFail("the shared-expert slot kernels are not in the default library")
+            return
+        }
+        let slots = 5
+        let floatStride = MemoryLayout<Float>.stride
+
+        /// Runs `body` in one command buffer on `queue` and waits for it.
+        func run(_ body: (MTLComputeCommandEncoder) -> Void) {
+            guard let commandBuffer = queue.makeCommandBuffer(),
+                  let encoder = commandBuffer.makeComputeCommandEncoder() else {
+                XCTFail("no command buffer")
+                return
+            }
+            body(encoder)
+            encoder.endEncoding()
+            commandBuffer.commit()
+            commandBuffer.waitUntilCompleted()
+            XCTAssertNil(commandBuffer.error)
+        }
+
+        func check(outDim: Int, inDim: Int, againstHost: Bool) throws {
+            let blocks = inDim / 32
+            let scaleGroups = (outDim + 31) / 32
+            let gate = weightBytes(outDim * inDim)
+            let upBytes = Array(weightBytes(outDim * inDim).reversed())
+            let gateScales = scaleBytes(scaleGroups * blocks)
+            let upScales = scaleBytes(scaleGroups * blocks)
+            let inputs = values(slots * inDim)
+            guard let gateBuffer = buffer(device, bytes: gate),
+                  let upBuffer = buffer(device, bytes: upBytes),
+                  let gateScaleBuffer = buffer(device, bytes: gateScales),
+                  let upScaleBuffer = buffer(device, bytes: upScales),
+                  let inputBuffer = device.makeBuffer(
+                      bytes: inputs,
+                      length: inputs.count * floatStride,
+                      options: .storageModeShared
+                  ),
+                  let perSlot = device.makeBuffer(
+                      length: slots * outDim * floatStride,
+                      options: .storageModeShared
+                  ),
+                  let batched = device.makeBuffer(
+                      length: slots * outDim * floatStride,
+                      options: .storageModeShared
+                  ) else {
+                XCTFail("the shared-expert buffers did not allocate")
+                return
+            }
+            memset(perSlot.contents(), 0, perSlot.length)
+            memset(batched.contents(), 0, batched.length)
+
+            let bound: (MTLComputeCommandEncoder) -> Void = { encoder in
+                var gateWeightOffset = UInt64(0)
+                var gateScaleOffset = UInt64(0)
+                var upWeightOffset = UInt64(0)
+                var upScaleOffset = UInt64(0)
+                var inDimension = UInt32(inDim)
+                var outDimension = UInt32(outDim)
+                var limit: Float = 0.5
+                encoder.setBuffer(gateBuffer, offset: 0, index: 0)
+                encoder.setBuffer(gateScaleBuffer, offset: 0, index: 1)
+                encoder.setBuffer(upBuffer, offset: 0, index: 2)
+                encoder.setBuffer(upScaleBuffer, offset: 0, index: 3)
+                encoder.setBytes(&gateWeightOffset, length: 8, index: 6)
+                encoder.setBytes(&gateScaleOffset, length: 8, index: 7)
+                encoder.setBytes(&upWeightOffset, length: 8, index: 8)
+                encoder.setBytes(&upScaleOffset, length: 8, index: 9)
+                encoder.setBytes(&inDimension, length: 4, index: 10)
+                encoder.setBytes(&outDimension, length: 4, index: 11)
+                encoder.setBytes(&limit, length: 4, index: 12)
+            }
+
+            // The reference: one threadgroup per row, one dispatch per position.
+            run { encoder in
+                for slot in 0..<slots {
+                    encoder.setComputePipelineState(rowsPipeline)
+                    bound(encoder)
+                    encoder.setBuffer(
+                        inputBuffer, offset: slot * inDim * floatStride, index: 4
+                    )
+                    encoder.setBuffer(
+                        perSlot, offset: slot * outDim * floatStride, index: 5
+                    )
+                    encoder.setThreadgroupMemoryLength(2 * 32 * floatStride, index: 0)
+                    encoder.dispatchThreadgroups(
+                        MTLSize(width: outDim, height: 1, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+                    )
+                }
+            }
+            // The block form: one dispatch, the position loop inside the threadgroup.
+            run { encoder in
+                encoder.setComputePipelineState(slotsPipeline)
+                bound(encoder)
+                encoder.setBuffer(inputBuffer, offset: 0, index: 4)
+                encoder.setBuffer(batched, offset: 0, index: 5)
+                var slotCount = UInt32(slots)
+                encoder.setBytes(&slotCount, length: 4, index: 13)
+                encoder.setThreadgroupMemoryLength(2 * 32 * floatStride, index: 0)
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: outDim, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+                )
+            }
+            let reference = floats(perSlot, count: slots * outDim)
+            let produced = floats(batched, count: slots * outDim)
+            let magnitude = max(1, reference.map { abs($0) }.max() ?? 1)
+            for index in 0..<(slots * outDim) {
+                XCTAssertLessThan(
+                    abs(produced[index] - reference[index]), magnitude * 1e-4,
+                    "the slot fused pair drifted at \(index) of \(outDim)x\(inDim)"
+                )
+            }
+            // Every position must land in its OWN row: a kernel that wrote slot 0 five
+            // times would pass a comparison against a reference that did the same. The
+            // clip saturates about half of a row at these fixture magnitudes, so this is
+            // "some rows move" rather than "most", and the equality above is what
+            // carries the correctness.
+            for slot in 1..<slots {
+                let moved = (0..<outDim).filter {
+                    abs(produced[slot * outDim + $0] - produced[$0]) > 1e-5
+                }.count
+                XCTAssertGreaterThan(
+                    moved, outDim / 4,
+                    "slot \(slot) of \(outDim)x\(inDim) matched slot 0"
+                )
+            }
+            if againstHost {
+                let expected = swigluReference(
+                    gate: gate, up: upBytes, gateScales: gateScales, upScales: upScales,
+                    inDim: inDim, outDim: outDim, tokens: slots, input: inputs, limit: 0.5
+                )
+                for index in 0..<(slots * outDim) {
+                    XCTAssertLessThan(
+                        abs(produced[index] - expected[index]), magnitude * 1e-4,
+                        "the slot fused pair drifted from the host rule at \(index)"
+                    )
+                }
+            }
+
+            // The same for the down projection, which accumulates into the slot's row.
+            let weight = weightBytes(outDim * inDim)
+            let scales = scaleBytes(scaleGroups * blocks)
+            let activations = values(slots * inDim)
+            guard let weightBuffer = buffer(device, bytes: weight),
+                  let scaleBuffer = buffer(device, bytes: scales),
+                  let activationBuffer = device.makeBuffer(
+                      bytes: activations,
+                      length: activations.count * floatStride,
+                      options: .storageModeShared
+                  ),
+                  let downPerSlot = device.makeBuffer(
+                      length: slots * outDim * floatStride,
+                      options: .storageModeShared
+                  ),
+                  let downBatched = device.makeBuffer(
+                      length: slots * outDim * floatStride,
+                      options: .storageModeShared
+                  ) else {
+                XCTFail("the down buffers did not allocate")
+                return
+            }
+            memset(downPerSlot.contents(), 0, downPerSlot.length)
+            memset(downBatched.contents(), 0, downBatched.length)
+
+            let downBound: (MTLComputeCommandEncoder) -> Void = { encoder in
+                var weightOffset = UInt64(0)
+                var scaleOffset = UInt64(0)
+                var inDimension = UInt32(inDim)
+                var outDimension = UInt32(outDim)
+                var routing: Float = 0.75
+                encoder.setBuffer(weightBuffer, offset: 0, index: 0)
+                encoder.setBuffer(scaleBuffer, offset: 0, index: 1)
+                encoder.setBytes(&weightOffset, length: 8, index: 4)
+                encoder.setBytes(&scaleOffset, length: 8, index: 5)
+                encoder.setBytes(&inDimension, length: 4, index: 6)
+                encoder.setBytes(&outDimension, length: 4, index: 7)
+                encoder.setBytes(&routing, length: 4, index: 8)
+            }
+            run { encoder in
+                for slot in 0..<slots {
+                    encoder.setComputePipelineState(downRowsPipeline)
+                    downBound(encoder)
+                    encoder.setBuffer(
+                        activationBuffer, offset: slot * inDim * floatStride, index: 2
+                    )
+                    encoder.setBuffer(
+                        downPerSlot, offset: slot * outDim * floatStride, index: 3
+                    )
+                    encoder.setThreadgroupMemoryLength(32 * floatStride, index: 0)
+                    encoder.dispatchThreadgroups(
+                        MTLSize(width: outDim, height: 1, depth: 1),
+                        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+                    )
+                }
+            }
+            run { encoder in
+                encoder.setComputePipelineState(downSlotsPipeline)
+                downBound(encoder)
+                encoder.setBuffer(activationBuffer, offset: 0, index: 2)
+                encoder.setBuffer(downBatched, offset: 0, index: 3)
+                var slotCount = UInt32(slots)
+                encoder.setBytes(&slotCount, length: 4, index: 9)
+                encoder.setThreadgroupMemoryLength(32 * floatStride, index: 0)
+                encoder.dispatchThreadgroups(
+                    MTLSize(width: outDim, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+                )
+            }
+            let downExpected = floats(downPerSlot, count: slots * outDim)
+            let downProduced = floats(downBatched, count: slots * outDim)
+            let downMagnitude = max(1, downExpected.map { abs($0) }.max() ?? 1)
+            for index in 0..<(slots * outDim) {
+                XCTAssertLessThan(
+                    abs(downProduced[index] - downExpected[index]),
+                    downMagnitude * 1e-4,
+                    "the slot down projection drifted at \(index) of \(outDim)x\(inDim)"
+                )
+            }
+            for slot in 1..<slots {
+                let moved = (0..<outDim).filter {
+                    abs(downProduced[slot * outDim + $0] - downProduced[$0]) > 1e-5
+                }.count
+                XCTAssertGreaterThan(
+                    moved, outDim / 4,
+                    "down slot \(slot) of \(outDim)x\(inDim) matched slot 0"
+                )
+            }
+            if againstHost {
+                for slot in 0..<slots {
+                    let row = Array(activations[(slot * inDim)..<((slot + 1) * inDim)])
+                    let expected = downReference(
+                        weight: weight,
+                        scales: scales,
+                        inDim: inDim,
+                        outDim: outDim,
+                        activation: row,
+                        routing: 0.75
+                    )
+                    for index in 0..<outDim {
+                        XCTAssertLessThan(
+                            abs(downProduced[slot * outDim + index] - expected[index]),
+                            downMagnitude * 1e-4,
+                            "the slot down projection drifted from the host rule at "
+                                + "slot \(slot) row \(index)"
+                        )
+                    }
+                }
+            }
+        }
+
+        try check(outDim: 96, inDim: 1_280, againstHost: true)
+        try check(outDim: 2_304, inDim: 5_120, againstHost: false)
+        try check(outDim: 5_120, inDim: 2_304, againstHost: false)
+    }
+}
+
+/// What a committed command buffer costs to START once the queue has gone idle.
+///
+/// The walk's mixture drain is ~2.5 ms/layer against a ~0.7 ms device window, and
+/// the late start (the gap between the host beginning to wait and the buffer's own
+/// window opening) carries most of the difference. This separates the two possible
+/// causes: what the queue costs when it is already fed, and what an idle gap adds
+/// before the next buffer is picked up. No model, no metrics, just the driver.
+final class DeepSeekV41CommandStartCostTests: XCTestCase {
+
+    func testWhatAnIdleGapCostsACommandBuffer() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        guard let library = device.makeDefaultLibrary() else {
+            throw XCTSkip("no default library")
+        }
+        guard let function = library.makeFunction(name: "clear_vector_f32") else {
+            throw XCTSkip("clear_vector_f32 is missing")
+        }
+        guard let queue = device.makeCommandQueue() else {
+            throw XCTSkip("no compute queue")
+        }
+        let pipeline = try device.makeComputePipelineState(function: function)
+        guard let target = device.makeBuffer(length: 4096, options: .storageModeShared) else {
+            throw XCTSkip("no scratch buffer")
+        }
+
+        /// One buffer, committed after the queue has been idle for `idleMilliseconds`,
+        /// reporting how long after the wait began its window opened and how long the
+        /// wait itself took.
+        func measure(idleMilliseconds: Double, attempts: Int = 41) -> (start: Double, drain: Double) {
+            var starts: [Double] = []
+            var drains: [Double] = []
+            for _ in 0..<attempts {
+                guard let buffer = queue.makeCommandBuffer(),
+                      let encoder = buffer.makeComputeCommandEncoder() else { continue }
+                encoder.setComputePipelineState(pipeline)
+                encoder.setBuffer(target, offset: 0, index: 0)
+                encoder.dispatchThreads(
+                    MTLSize(width: 16, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 16, height: 1, depth: 1)
+                )
+                encoder.endEncoding()
+                if idleMilliseconds > 0 {
+                    Thread.sleep(forTimeInterval: idleMilliseconds / 1000)
+                }
+                buffer.commit()
+                let begin = DispatchTime.now().uptimeNanoseconds
+                buffer.waitUntilCompleted()
+                let end = DispatchTime.now().uptimeNanoseconds
+                let windowStart = Double(buffer.gpuStartTime) * 1_000_000_000
+                starts.append(max(0, (windowStart - Double(begin)) / 1_000_000))
+                drains.append(Double(end - begin) / 1_000_000)
+            }
+            func median(_ values: [Double]) -> Double {
+                let sorted = values.sorted()
+                return sorted.isEmpty ? 0 : sorted[sorted.count / 2]
+            }
+            return (median(starts), median(drains))
+        }
+
+        // Warm the pipeline up so the first arm is not paying for shader setup.
+        _ = measure(idleMilliseconds: 0, attempts: 5)
+
+        let fed = measure(idleMilliseconds: 0)
+        let shortGap = measure(idleMilliseconds: 2)
+        let longGap = measure(idleMilliseconds: 10)
+        print(
+            String(
+                format: "🔎 [dsv41 command start] fed: late start %.3f ms, drain %.3f ms; "
+                    + "2 ms gap: late start %.3f ms, drain %.3f ms; "
+                    + "10 ms gap: late start %.3f ms, drain %.3f ms",
+                fed.start, fed.drain,
+                shortGap.start, shortGap.drain,
+                longGap.start, longGap.drain
+            )
+        )
+    }
+
+    /// Whether an event-gated commit lets the GPU pick the buffer up WHILE the host is
+    /// still working, instead of after it stops. It does not: the answer is no.
+    ///
+    /// The walk commits its expert half once a fill has landed in the arena: the queue
+    /// has been empty for the length of the fill, and the buffer's window opens ~0.29 ms
+    /// after the commit (`DeepSeekV41WalkTiming.mixtureLateStartNanoseconds`, `#64`).
+    /// If the buffer could be committed BEFORE the fill and gated on an event the fill
+    /// signals, that pickup would be paid under the fill instead of after it, worth
+    /// `mixture late start` per position — but only if the driver submits a gated buffer
+    /// early. A gate that defers submission defeats itself (`Benchmarks/PERF_FINDINGS.md`,
+    /// "DSV4.1 #65").
+    ///
+    /// Two arms at each gap: `idle` is the walk's shape today (queue empty, host sleeps,
+    /// then commits), `gated` commits first and signals when the same sleep ends. Both
+    /// report the delay from the moment the DATA was ready — the commit for `idle`, the
+    /// signal for `gated` — so the two are comparable at the only instant that matters.
+    ///
+    /// **The gated arm does not start earlier**: at a 0.6 ms gap, 1 dispatch costs 0.122
+    /// (idle) against 0.112 (gated), 20 dispatches 0.161 against 0.163, and 64
+    /// dispatches 0.155 against 0.144. The gate changes WHICH call hands the work over,
+    /// not how long the machine takes to begin it, which is why the walk's in-situ arm
+    /// (the same experiment, on the real graph) is also a wash.
+    ///
+    /// Two traps this arm hit, both of which made a gate look better than it is: a wait
+    /// encoded after the dispatches does not hold them, and a shared event's value never
+    /// goes back down, so an arm that restarts its values at 1 finds its gate already
+    /// satisfied and measures the UNGATED path under the gated arm's name. `dispatches`
+    /// is swept because the walk's half is ~20, and a one-dispatch arm cannot speak for it.
+    func testWhatAnEventGateSavesOnACommitIntoAnEmptyQueue() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        guard let library = device.makeDefaultLibrary() else {
+            throw XCTSkip("no default library")
+        }
+        guard let function = library.makeFunction(name: "clear_vector_f32") else {
+            throw XCTSkip("clear_vector_f32 is missing")
+        }
+        guard let queue = device.makeCommandQueue() else {
+            throw XCTSkip("no compute queue")
+        }
+        guard let event = device.makeSharedEvent() else {
+            throw XCTSkip("no shared event")
+        }
+        let pipeline = try device.makeComputePipelineState(function: function)
+        guard let target = device.makeBuffer(length: 4096, options: .storageModeShared) else {
+            throw XCTSkip("no scratch buffer")
+        }
+
+        /// `dispatches` copies of one tiny kernel, separated by a barrier the way a
+        /// real half's stages are. The walk's expert half is ~20 dispatches over ~200
+        /// bindings, so a one-dispatch arm cannot answer whether a gate helps a buffer
+        /// that takes the driver real work to hand over.
+        func encode(into buffer: MTLCommandBuffer, dispatches: Int = 1) {
+            guard let encoder = buffer.makeComputeCommandEncoder() else { return }
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(target, offset: 0, index: 0)
+            for _ in 0..<max(1, dispatches) {
+                encoder.dispatchThreads(
+                    MTLSize(width: 16, height: 1, depth: 1),
+                    threadsPerThreadgroup: MTLSize(width: 16, height: 1, depth: 1)
+                )
+                encoder.memoryBarrier(scope: .buffers)
+            }
+            encoder.endEncoding()
+        }
+
+        /// One counter for the WHOLE test, because a shared event's value never goes
+        /// back down: an arm that restarted at 1 would find its gate already satisfied
+        /// and measure the ungated path under the gated arm's name.
+        var nextGateValue: UInt64 = 0
+
+        /// Median of `attempts` runs of one arm. `readyToWindow` is measured from the
+        /// commit (idle arm) or the signal (gated arm) to the buffer's own window
+        /// opening; `readyToDone` from the same instant to the host leaving the wait, so
+        /// the host's own sleep is inside neither.
+        func measure(
+            gapMilliseconds: Double,
+            gated: Bool,
+            dispatches: Int = 1,
+            attempts: Int = 41
+        ) -> (readyToWindow: Double, readyToDone: Double, window: Double) {
+            var starts: [Double] = []
+            var drains: [Double] = []
+            var windows: [Double] = []
+            for _ in 0..<attempts {
+                guard let buffer = queue.makeCommandBuffer() else { continue }
+                nextGateValue += 1
+                let value = nextGateValue
+                if gated { buffer.encodeWaitForEvent(event, value: value) }
+                encode(into: buffer, dispatches: dispatches)
+                if !gated, gapMilliseconds > 0 {
+                    // The walk's shape: the host has been reading (`pread`) and the
+                    // queue has been idle for the whole fill, so the commit is what
+                    // hands the driver work after a gap.
+                    Thread.sleep(forTimeInterval: gapMilliseconds / 1000)
+                }
+                buffer.commit()
+                if gated, gapMilliseconds > 0 {
+                    Thread.sleep(forTimeInterval: gapMilliseconds / 1000)
+                }
+                let ready = DispatchTime.now().uptimeNanoseconds
+                if gated { event.signaledValue = value }
+                buffer.waitUntilCompleted()
+                let returned = DispatchTime.now().uptimeNanoseconds
+                let windowStart = Double(buffer.gpuStartTime) * 1_000_000_000
+                let windowEnd = Double(buffer.gpuEndTime) * 1_000_000_000
+                starts.append(max(0, (windowStart - Double(ready)) / 1_000_000))
+                drains.append(Double(returned - ready) / 1_000_000)
+                if windowEnd > windowStart {
+                    windows.append((windowEnd - windowStart) / 1_000_000)
+                }
+            }
+            func median(_ values: [Double]) -> Double {
+                let sorted = values.sorted()
+                return sorted.isEmpty ? 0 : sorted[sorted.count / 2]
+            }
+            return (median(starts), median(drains), median(windows))
+        }
+
+        // Warm up so the first arm is not paying for shader setup.
+        _ = measure(gapMilliseconds: 0, gated: false, attempts: 5)
+        _ = measure(gapMilliseconds: 0, gated: true, attempts: 5)
+
+        for dispatches in [1, 20, 64] {
+            for gap in [0.0, 0.6] {
+                let idle = measure(
+                    gapMilliseconds: gap, gated: false, dispatches: dispatches
+                )
+                let gated = measure(
+                    gapMilliseconds: gap, gated: true, dispatches: dispatches
+                )
+                print(
+                    String(
+                        format: "🔎 [dsv41 gate] %d dispatch(es), gap %.1f ms: idle "
+                            + "ready->window %.3f ms, ready->done %.3f ms, window %.3f ms; "
+                            + "gated ready->window %.3f ms, ready->done %.3f ms, "
+                            + "window %.3f ms",
+                        dispatches,
+                        gap,
+                        idle.readyToWindow, idle.readyToDone, idle.window,
+                        gated.readyToWindow, gated.readyToDone, gated.window
+                    )
+                )
+            }
+        }
+    }
+}
+
+// MARK: - Where a committed buffer's start delay comes from
+
+/// One committed buffer's time, split into the places it can go.
+///
+/// The walk commits 88 buffers a position and each one starts 2.1-2.9 ms after
+/// `commit()` while the GPU has nothing else to do (`Benchmarks/PERF_FINDINGS.md`,
+/// "DSV4.1 #47"). That single number admits three different causes, and they do not
+/// share a fix, so the probe below reports all four terms for every arm instead of
+/// the drain alone.
+struct DeepSeekV41CommitSample {
+    /// `commit()` returning to the buffer's own device window opening.
+    var pickupMilliseconds: Double = 0
+    /// The device window itself.
+    var windowMilliseconds: Double = 0
+    /// The GPU finishing to the host leaving `waitUntilCompleted`. This is the part of
+    /// a blocked wait that is notification rather than device work.
+    var tailMilliseconds: Double = 0
+    /// `commit()` returning to the host leaving `waitUntilCompleted`.
+    var drainMilliseconds: Double = 0
+    /// `commit()` returning to Metal's `scheduled` handler, nil when it never fired.
+    var scheduledMilliseconds: Double?
+    /// The device window's own bounds, so consecutive buffers can be lined up: what a
+    /// follower pays is the gap from its predecessor's end, not from its own commit.
+    var windowStartNanoseconds: UInt64 = 0
+    var windowEndNanoseconds: UInt64 = 0
+
+    var hasWindow: Bool { windowMilliseconds > 0 }
+}
+
+/// Drives command buffers of chosen shapes through one queue and reports where each
+/// one's time went. Nothing here is on a production path.
+///
+/// A fixed cost per BUFFER is fixed by merging buffers; a cost per DISPATCH is fixed
+/// by cutting dispatches; a cost of the QUEUE HAVING GONE EMPTY is fixed by keeping
+/// more than one buffer in flight. Only the last two are cheaper than the first, so
+/// the arms have to tell them apart before anything is changed.
+nonisolated final class DeepSeekV41CommitStartupProbe {
+    /// The widest grid any arm dispatches, so every arm writes inside its buffer.
+    static let widestGrid = 4_194_304
+
+    let device: MTLDevice
+    private let queue: MTLCommandQueue
+    private let pipeline: MTLComputePipelineState
+    /// A kernel that READS two buffers, because every other arm here writes: if a
+    /// submission starts late only for memory the host has just written, a write-only
+    /// probe cannot see it.
+    private let readPipeline: MTLComputePipelineState
+    private let target: MTLBuffer
+
+    static func make() throws -> DeepSeekV41CommitStartupProbe {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw XCTSkip("No Metal GPU device")
+        }
+        guard let library = device.makeDefaultLibrary() else {
+            throw XCTSkip("no default library")
+        }
+        guard let function = library.makeFunction(name: "clear_vector_f32") else {
+            throw XCTSkip("clear_vector_f32 is missing")
+        }
+        guard let readFunction = library.makeFunction(name: "vector_add_f32") else {
+            throw XCTSkip("vector_add_f32 is missing")
+        }
+        return try DeepSeekV41CommitStartupProbe(
+            device: device, function: function, readFunction: readFunction
+        )
+    }
+
+    init(device: MTLDevice, function: MTLFunction, readFunction: MTLFunction) throws {
+        guard let queue = device.makeCommandQueue() else {
+            throw XCTSkip("no compute queue")
+        }
+        guard let target = device.makeBuffer(
+            length: Self.widestGrid * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ) else {
+            throw XCTSkip("no scratch buffer")
+        }
+        self.device = device
+        self.queue = queue
+        self.pipeline = try device.makeComputePipelineState(function: function)
+        self.readPipeline = try device.makeComputePipelineState(function: readFunction)
+        self.target = target
+    }
+
+    /// One submission whose kernels READ `source`, with the option to have the host
+    /// write every page of that memory first, the way a `pread` fills an arena slot.
+    func readSample(
+        source: [MTLBuffer],
+        lanes: Int,
+        destination: MTLBuffer,
+        hostWritesFirst: Bool
+    ) -> DeepSeekV41CommitSample? {
+        guard !source.isEmpty else { return nil }
+        if hostWritesFirst {
+            for buffer in source {
+                let pointer = buffer.contents().assumingMemoryBound(to: Float.self)
+                for page in 0..<max(1, buffer.length / 16_384) { pointer[page * 4_096] = 1 }
+            }
+        }
+        guard let buffer = queue.makeCommandBuffer(),
+              let encoder = buffer.makeComputeCommandEncoder() else { return nil }
+        encoder.setComputePipelineState(readPipeline)
+        encoder.setBuffer(source[0], offset: 0, index: 0)
+        encoder.setBuffer(source[1 % source.count], offset: 0, index: 1)
+        encoder.setBuffer(destination, offset: 0, index: 2)
+        var dim = UInt32(max(1, min(lanes, source[0].length / 4)))
+        encoder.setBytes(&dim, length: 4, index: 3)
+        let width = Int(dim)
+        encoder.dispatchThreads(
+            MTLSize(width: width, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: max(1, min(width, readPipeline.maxTotalThreadsPerThreadgroup)),
+                height: 1,
+                depth: 1
+            )
+        )
+        encoder.endEncoding()
+        buffer.commit()
+        let commit = DispatchTime.now().uptimeNanoseconds
+        buffer.waitUntilCompleted()
+        let returned = DispatchTime.now().uptimeNanoseconds
+        return enriched(buffer, commit: commit, returned: returned, stamp: CommitStamp())
+    }
+
+    /// A buffer holding `dispatches` copies of the clear kernel over `threads` lanes.
+    ///
+    /// `pool` mimics the walk, where every dispatch binds its own weight slice out of
+    /// one of ~57 shard buffers rather than re-binding a shared scratch vector: what
+    /// grows is the command buffer's resource list, not the number of launches.
+    ///
+    /// `residency` is declared with `useResource`, which puts it on the command
+    /// buffer's resource list without giving it a binding slot. That is the one axis a
+    /// binding slot cannot measure on this shader (the clear kernel reads buffer 0
+    /// only), and it is the axis a real half layer has: dozen of dispatches whose union
+    /// is every workspace buffer, gain vector and expert slot the layer touches.
+    func makeCommandBuffer(
+        dispatches: Int = 1,
+        threads: Int = 16,
+        pool: [MTLBuffer] = [],
+        residency: [MTLBuffer] = [],
+        barrier: Bool = false
+    ) -> MTLCommandBuffer? {
+        guard let buffer = queue.makeCommandBuffer(),
+              let encoder = buffer.makeComputeCommandEncoder() else { return nil }
+        encoder.setComputePipelineState(pipeline)
+        let grid = MTLSize(width: max(1, min(threads, Self.widestGrid)), height: 1, depth: 1)
+        let group = MTLSize(
+            width: max(1, min(grid.width, pipeline.maxTotalThreadsPerThreadgroup)),
+            height: 1,
+            depth: 1
+        )
+        for resource in residency { encoder.useResource(resource, usage: .read) }
+        for index in 0..<max(1, dispatches) {
+            encoder.setBuffer(pool.isEmpty ? target : pool[index % pool.count], offset: 0, index: 0)
+            encoder.dispatchThreads(grid, threadsPerThreadgroup: group)
+            if barrier { encoder.memoryBarrier(scope: .buffers) }
+        }
+        encoder.endEncoding()
+        return buffer
+    }
+
+    /// `count` buffers of `bytes` each in shared memory, held by the caller so they stay
+    /// alive for the life of an arm.
+    func residentPool(count: Int, bytes: Int) -> [MTLBuffer] {
+        var pool: [MTLBuffer] = []
+        for _ in 0..<max(1, count) {
+            guard let buffer = device.makeBuffer(length: bytes, options: .storageModeShared) else {
+                continue
+            }
+            // Touch one float a page so the allocation is backed before it is measured,
+            // otherwise the first arm pays the kernel's own page faults.
+            let pointer = buffer.contents().assumingMemoryBound(to: Float.self)
+            for page in 0..<max(1, bytes / 16_384) { pointer[page * 4_096] = 0 }
+            pool.append(buffer)
+        }
+        return pool
+    }
+
+    /// `count` buffers of `bytes` each wrapped over a sparse temp file with no copy,
+    /// which is how the checkpoint's shards reach the GPU. `maps` owns the mappings.
+    func mappedPool(count: Int, bytes: Int) -> (pool: [MTLBuffer], maps: [UnsafeMutableRawPointer]) {
+        let path = NSTemporaryDirectory() + "dsv41_commit_probe_mapping"
+        let fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0o600)
+        guard fd >= 0 else { return ([], []) }
+        defer { close(fd) }
+        guard ftruncate(fd, off_t(bytes)) == 0 else { return ([], []) }
+        var pool: [MTLBuffer] = []
+        var maps: [UnsafeMutableRawPointer] = []
+        for _ in 0..<max(1, count) {
+            guard let raw = mmap(nil, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0),
+                  raw != UnsafeMutableRawPointer(bitPattern: -1),
+                  let buffer = device.makeBuffer(
+                      bytesNoCopy: raw, length: bytes, options: .storageModeShared,
+                      deallocator: nil
+                  ) else { continue }
+            pool.append(buffer)
+            maps.append(raw)
+        }
+        return (pool, maps)
+    }
+
+    /// One buffer, committed on its own and waited immediately. This is the walk's
+    /// shape: the host has nothing else queued when the driver is handed the work.
+    ///
+    /// `recordsSchedule` registers a `scheduled` handler so the arm can separate "the
+    /// driver had not submitted it yet" from "the driver submitted it and the GPU was
+    /// slow to open the window"; turning it off is the control that says whether
+    /// registering a handler perturbs the commit path it is measuring.
+    func serialSample(
+        dispatches: Int = 1,
+        threads: Int = 16,
+        idleGapMilliseconds: Double = 0,
+        recordsSchedule: Bool = true,
+        pool: [MTLBuffer] = [],
+        residency: [MTLBuffer] = [],
+        barrier: Bool = false
+    ) -> DeepSeekV41CommitSample? {
+        let stamp = CommitStamp()
+        guard let buffer = makeCommandBuffer(
+            dispatches: dispatches, threads: threads, pool: pool,
+            residency: residency, barrier: barrier
+        ) else {
+            return nil
+        }
+        if recordsSchedule {
+            buffer.addScheduledHandler { _ in stamp.stamp(DispatchTime.now().uptimeNanoseconds) }
+        }
+        if idleGapMilliseconds > 0 {
+            Thread.sleep(forTimeInterval: idleGapMilliseconds / 1_000)
+        }
+        buffer.commit()
+        let commit = DispatchTime.now().uptimeNanoseconds
+        buffer.waitUntilCompleted()
+        let returned = DispatchTime.now().uptimeNanoseconds
+        return enriched(buffer, commit: commit, returned: returned, stamp: stamp)
+    }
+
+    /// `depth` buffers encoded up front and committed back to back with no wait
+    /// between them, then waited in order. A depth of one is the serial arm; anything
+    /// wider is the queue fed before it is emptied.
+    func pipelinedRound(
+        depth: Int,
+        dispatches: Int = 1,
+        threads: Int = 16,
+        pool: [MTLBuffer] = []
+    ) -> [DeepSeekV41CommitSample] {
+        var built: [(buffer: MTLCommandBuffer, stamp: CommitStamp)] = []
+        for _ in 0..<max(1, depth) {
+            let stamp = CommitStamp()
+            guard let buffer = makeCommandBuffer(
+                dispatches: dispatches, threads: threads, pool: pool
+            ) else {
+                continue
+            }
+            buffer.addScheduledHandler { _ in stamp.stamp(DispatchTime.now().uptimeNanoseconds) }
+            built.append((buffer, stamp))
+        }
+        var commits: [UInt64] = []
+        commits.reserveCapacity(built.count)
+        for entry in built {
+            entry.buffer.commit()
+            commits.append(DispatchTime.now().uptimeNanoseconds)
+        }
+        var samples: [DeepSeekV41CommitSample] = []
+        samples.reserveCapacity(built.count)
+        for (index, entry) in built.enumerated() {
+            entry.buffer.waitUntilCompleted()
+            let returned = DispatchTime.now().uptimeNanoseconds
+            samples.append(
+                enriched(entry.buffer, commit: commits[index], returned: returned, stamp: entry.stamp)
+            )
+        }
+        return samples
+    }
+
+    /// A mixture-shaped buffer running a DIFFERENT kernel from the front's: the walk
+    /// switches pipeline state between the two halves of every layer, and no arm above
+    /// ever submits more than one pipeline.
+    func makeReadCommandBuffer(source: [MTLBuffer], destination: MTLBuffer, lanes: Int)
+        -> MTLCommandBuffer? {
+        guard !source.isEmpty,
+              let buffer = queue.makeCommandBuffer(),
+              let encoder = buffer.makeComputeCommandEncoder() else { return nil }
+        encoder.setComputePipelineState(readPipeline)
+        encoder.setBuffer(source[0], offset: 0, index: 0)
+        encoder.setBuffer(source[1 % source.count], offset: 0, index: 1)
+        encoder.setBuffer(destination, offset: 0, index: 2)
+        var dim = UInt32(max(1, min(lanes, source[0].length / 4)))
+        encoder.setBytes(&dim, length: 4, index: 3)
+        let width = max(1, min(Int(dim), readPipeline.maxTotalThreadsPerThreadgroup))
+        encoder.dispatchThreads(
+            MTLSize(width: Int(dim), height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        return buffer
+    }
+
+    /// One position's submission pattern, exactly as `runLayer` writes it: a front half
+    /// committed and waited immediately (the routing readback needs it finished), then a
+    /// mixture half committed and left in flight, drained by the next front half's wait.
+    ///
+    /// `hostBytes` stands in for the host work between the two halves (the routing
+    /// readback and the expert fill), written into the scratch buffer so the submission
+    /// follows a real host write the way a mixture follows `pread`s.
+    func alternatingRound(
+        layers: Int,
+        dispatches: Int = 20,
+        frontPool: [MTLBuffer] = [],
+        mixturePool: [MTLBuffer] = [],
+        hostBytes: Int = 0,
+        mixtureIsRead: Bool = false
+    ) -> [DeepSeekV41CommitSample] {
+        var samples: [DeepSeekV41CommitSample] = []
+        var pending: [(buffer: MTLCommandBuffer, stamp: CommitStamp, commit: UInt64)] = []
+        func settle() {
+            for entry in pending {
+                entry.buffer.waitUntilCompleted()
+                let returned = DispatchTime.now().uptimeNanoseconds
+                samples.append(
+                    enriched(entry.buffer, commit: entry.commit, returned: returned, stamp: entry.stamp)
+                )
+            }
+            pending.removeAll(keepingCapacity: true)
+        }
+        for _ in 0..<max(1, layers) {
+            if let front = makeCommandBuffer(dispatches: dispatches, pool: frontPool) {
+                let stamp = CommitStamp()
+                front.addScheduledHandler { _ in stamp.stamp(DispatchTime.now().uptimeNanoseconds) }
+                front.commit()
+                pending.append((front, stamp, DispatchTime.now().uptimeNanoseconds))
+            }
+            settle()
+            if hostBytes > 0 {
+                // Written into the buffers the MIXTURE binds, not into a scratch vector:
+                // a mixture follows `pread`s that land in the expert arena, so the
+                // quantity under test is host writes into memory the next submission
+                // reads, not host work in general.
+                if mixturePool.isEmpty {
+                    memset(target.contents(), 0, min(hostBytes, target.length))
+                } else {
+                    let each = max(1, hostBytes / mixturePool.count)
+                    for buffer in mixturePool {
+                        memset(buffer.contents(), 0, min(each, buffer.length))
+                    }
+                }
+            }
+            let mixture = mixtureIsRead
+                ? makeReadCommandBuffer(
+                    source: mixturePool.isEmpty ? [target] : mixturePool,
+                    destination: target,
+                    lanes: 4_000_000
+                )
+                : makeCommandBuffer(dispatches: dispatches, pool: mixturePool)
+            if let mixture {
+                let stamp = CommitStamp()
+                mixture.addScheduledHandler { _ in stamp.stamp(DispatchTime.now().uptimeNanoseconds) }
+                mixture.commit()
+                pending.append((mixture, stamp, DispatchTime.now().uptimeNanoseconds))
+            }
+        }
+        settle()
+        return samples
+    }
+
+    /// The idle a run of submissions actually pays: the GPU with no window open. Time a
+    /// buffer spends waiting behind work that is already queued is NOT idle, and a
+    /// per-buffer "commit to start" figure counts it as though it were -- which is why
+    /// the walk's 206.7 ms of commit-to-start is not 206.7 ms of idle.
+    static func idle(_ samples: [DeepSeekV41CommitSample]) -> Double {
+        let windowed = samples
+            .filter { $0.hasWindow }
+            .sorted { $0.windowStartNanoseconds < $1.windowStartNanoseconds }
+        var total = 0.0
+        var previousEnd: UInt64 = 0
+        for entry in windowed {
+            if previousEnd > 0, entry.windowStartNanoseconds > previousEnd {
+                total += Double(entry.windowStartNanoseconds - previousEnd) / 1_000_000
+            }
+            previousEnd = max(previousEnd, entry.windowEndNanoseconds)
+        }
+        return total
+    }
+
+    /// Everything the GPU was busy for, likewise in window order.
+    static func busy(_ samples: [DeepSeekV41CommitSample]) -> Double {
+        samples.filter { $0.hasWindow }.reduce(0) { $0 + $1.windowMilliseconds }
+    }
+
+    /// `gpuStartTime` and `gpuEndTime` share mach's clock, which `DispatchTime` reads,
+    /// so all four terms are comparable without a conversion.
+    private func enriched(
+        _ buffer: MTLCommandBuffer,
+        commit: UInt64,
+        returned: UInt64,
+        stamp: CommitStamp
+    ) -> DeepSeekV41CommitSample {
+        var sample = DeepSeekV41CommitSample()
+        let start = UInt64(max(0, Double(buffer.gpuStartTime) * 1_000_000_000))
+        let end = UInt64(max(0, Double(buffer.gpuEndTime) * 1_000_000_000))
+        sample.windowStartNanoseconds = start
+        sample.windowEndNanoseconds = end
+        if start > commit { sample.pickupMilliseconds = Double(start - commit) / 1_000_000 }
+        if end > start { sample.windowMilliseconds = Double(end - start) / 1_000_000 }
+        if returned > end { sample.tailMilliseconds = Double(returned - end) / 1_000_000 }
+        if returned > commit { sample.drainMilliseconds = Double(returned - commit) / 1_000_000 }
+        if let scheduled = stamp.value {
+            sample.scheduledMilliseconds = scheduled > commit
+                ? Double(scheduled - commit) / 1_000_000 : 0
+        }
+        return sample
+    }
+}
+
+/// The first `scheduled` stamp Metal reports for one buffer, written from Metal's own
+/// thread and read by the test after the buffer completed.
+private nonisolated final class CommitStamp: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: UInt64?
+
+    func stamp(_ nanoseconds: UInt64) {
+        lock.lock()
+        if stored == nil { stored = nanoseconds }
+        lock.unlock()
+    }
+
+    var value: UInt64? {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+}
+
+private func commitMedian(_ values: [Double]) -> Double {
+    let sorted = values.sorted()
+    guard !sorted.isEmpty else { return 0 }
+    return sorted[sorted.count / 2]
+}
+
+/// What a committed buffer's start delay is proportional to.
+final class DeepSeekV41CommitPickupCostTests: XCTestCase {
+
+    private struct Anatomy {
+        var pickup: Double = 0
+        var window: Double = 0
+        var tail: Double = 0
+        var drain: Double = 0
+        var scheduled: Double = 0
+    }
+
+    private func anatomy(
+        _ probe: DeepSeekV41CommitStartupProbe,
+        label: String,
+        dispatches: Int = 1,
+        threads: Int = 16,
+        idleGapMilliseconds: Double = 0,
+        attempts: Int = 21,
+        recordsSchedule: Bool = true,
+        pool: [MTLBuffer] = [],
+        residency: [MTLBuffer] = [],
+        barrier: Bool = false
+    ) -> Anatomy {
+        var samples: [DeepSeekV41CommitSample] = []
+        for _ in 0..<attempts {
+            if let sample = probe.serialSample(
+                dispatches: dispatches,
+                threads: threads,
+                idleGapMilliseconds: idleGapMilliseconds,
+                recordsSchedule: recordsSchedule,
+                pool: pool,
+                residency: residency,
+                barrier: barrier
+            ) {
+                samples.append(sample)
+            }
+        }
+        XCTAssertEqual(samples.count, attempts, "\(label) dropped samples")
+        XCTAssertTrue(
+            samples.allSatisfy { $0.hasWindow },
+            "\(label) reported a buffer that never opened a window"
+        )
+        // Structural, not numeric: the host cannot leave the wait before the GPU has
+        // finished, so the drain has to cover the pickup and the window.
+        XCTAssertTrue(
+            samples.allSatisfy {
+                $0.drainMilliseconds + 0.3 >= $0.pickupMilliseconds + $0.windowMilliseconds
+            },
+            "\(label) drained faster than it was picked up and ran"
+        )
+        XCTAssertTrue(
+            samples.allSatisfy {
+                !recordsSchedule || $0.scheduledMilliseconds != nil
+            },
+            "\(label) never reported its buffer scheduled"
+        )
+        let result = Anatomy(
+            pickup: commitMedian(samples.map { $0.pickupMilliseconds }),
+            window: commitMedian(samples.map { $0.windowMilliseconds }),
+            tail: commitMedian(samples.map { $0.tailMilliseconds }),
+            drain: commitMedian(samples.map { $0.drainMilliseconds }),
+            scheduled: commitMedian(samples.compactMap { $0.scheduledMilliseconds })
+        )
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] %@: pickup %.3f ms, window %.3f ms, "
+                    + "tail %.3f ms, drain %.3f ms, scheduled %.3f ms",
+                label, result.pickup, result.window, result.tail, result.drain, result.scheduled
+            )
+        )
+        return result
+    }
+
+    /// A pickup that does not move with the work inside the buffer is a per-buffer
+    /// cost; one that grows with the dispatch count is per-dispatch.
+    func testWhatACommittedBuffersPickupIsProportionalTo() throws {
+        let probe = try DeepSeekV41CommitStartupProbe.make()
+
+        // Warm the pipeline, the queue and the driver's own shader setup.
+        for _ in 0..<5 { _ = probe.serialSample() }
+
+        let idle = anatomy(probe, label: "one dispatch, queue idle")
+        let noHandler = anatomy(
+            probe, label: "one dispatch, no scheduled handler", recordsSchedule: false
+        )
+        let gap2 = anatomy(probe, label: "one dispatch, 2 ms idle gap first", idleGapMilliseconds: 2)
+        let gap10 = anatomy(
+            probe, label: "one dispatch, 10 ms idle gap first", idleGapMilliseconds: 10
+        )
+        // The curve, not a point: the walk commits a mixture half ~1.5 ms after the GPU
+        // went idle for the expert fill, so what a gap of that length costs is the
+        // number that has to line up with the walk's own pickups.
+        let gap5 = anatomy(
+            probe, label: "one dispatch, 5 ms idle gap first",
+            idleGapMilliseconds: 5, attempts: 41
+        )
+        let gap20 = anatomy(
+            probe, label: "one dispatch, 20 ms idle gap first",
+            idleGapMilliseconds: 20, attempts: 21
+        )
+        let gap50 = anatomy(
+            probe, label: "one dispatch, 50 ms idle gap first",
+            idleGapMilliseconds: 50, attempts: 11
+        )
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] idle-gap curve: 0 ms %.3f, 2 ms %.3f, 5 ms "
+                    + "%.3f, 10 ms %.3f, 20 ms %.3f, 50 ms %.3f (pickup, ms)",
+                idle.pickup, gap2.pickup, gap5.pickup, gap10.pickup, gap20.pickup, gap50.pickup
+            )
+        )
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] instrument check: pickup is %.3f ms with a "
+                    + "scheduled handler and %.3f ms without it, so the handler costs %.3f ms",
+                idle.pickup, noHandler.pickup, idle.pickup - noHandler.pickup
+            )
+        )
+
+        var byDispatch: [(Int, Anatomy)] = []
+        for dispatches in [8, 32, 128] {
+            byDispatch.append((dispatches, anatomy(
+                probe, label: "\(dispatches) dispatches", dispatches: dispatches
+            )))
+        }
+        for (dispatches, result) in byDispatch {
+            print(
+                String(
+                    format: "🔎 [dsv41 commit startup] %d dispatches: pickup %.3f ms for a "
+                        + "%.3f ms window (%.3f ms of pickup per dispatch)",
+                    dispatches, result.pickup, result.window, result.pickup / Double(dispatches)
+                )
+            )
+        }
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] a buffer with no work at all costs %.3f ms to "
+                    + "start; one with 128 dispatches costs %.3f ms",
+                idle.pickup, byDispatch.last?.1.pickup ?? 0
+            )
+        )
+
+        var byGrid: [(Int, Anatomy)] = []
+        for threads in [65_536, 1_048_576] {
+            byGrid.append((threads, anatomy(
+                probe, label: "one dispatch over \(threads) lanes",
+                threads: threads, attempts: 11
+            )))
+        }
+        for (threads, result) in byGrid {
+            print(
+                String(
+                    format: "🔎 [dsv41 commit startup] one dispatch over %d lanes: pickup %.3f ms, "
+                        + "window %.3f ms",
+                    threads, result.pickup, result.window
+                )
+            )
+        }
+
+        // The idle-gap arms are the control for the surprising direction: if an idle
+        // host makes the pickup WORSE, the delay is the driver's deferral of work it
+        // does not have to start yet. If it does not move, the delay is per launch.
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] verdict: pickup %.3f ms fed, %.3f ms after 2 ms "
+                    + "idle, %.3f ms after 10 ms idle; %.3f ms with 128 dispatches inside one "
+                    + "buffer, so the delay tracks %@",
+                idle.pickup, gap2.pickup, gap10.pickup, byDispatch.last?.1.pickup ?? 0,
+                idle.pickup > 0.5 * (byDispatch.last?.1.pickup ?? 0) ? "the buffer" : "the work"
+            )
+        )
+    }
+
+    /// Committing several buffers before waiting on any of them: if a follower starts
+    /// as its predecessor retires, the pickup is the queue having gone empty and no
+    /// per-buffer merge is needed to remove it.
+    func testWhetherQueueDepthHidesACommittedBuffersPickup() throws {
+        let probe = try DeepSeekV41CommitStartupProbe.make()
+
+        for _ in 0..<5 { _ = probe.serialSample() }
+        _ = probe.pipelinedRound(depth: 4)
+
+        for depth in [1, 2, 4, 8] {
+            var rounds: [[DeepSeekV41CommitSample]] = []
+            for _ in 0..<11 {
+                let round = probe.pipelinedRound(depth: depth)
+                XCTAssertEqual(round.count, depth, "a round of \(depth) buffers built \(round.count)")
+                XCTAssertTrue(
+                    round.allSatisfy { $0.hasWindow },
+                    "a round of \(depth) reported a buffer that never opened a window"
+                )
+                // One in-order queue, so a follower cannot start before its
+                // predecessor retires. A violation means the windows are misread.
+                for index in 1..<max(1, round.count) {
+                    XCTAssertGreaterThanOrEqual(
+                        Double(round[index].windowStartNanoseconds) + 200_000,
+                        Double(round[index - 1].windowEndNanoseconds),
+                        "buffer \(index) of \(depth) started before its predecessor finished"
+                    )
+                }
+                rounds.append(round)
+            }
+            var pickups: [Double] = []
+            var gaps: [Double] = []
+            var windows: [Double] = []
+            for index in 0..<depth {
+                pickups.append(commitMedian(rounds.map { $0[index].pickupMilliseconds }))
+                windows.append(commitMedian(rounds.map { $0[index].windowMilliseconds }))
+                if index == 0 {
+                    gaps.append(pickups[0])
+                } else {
+                    gaps.append(commitMedian(rounds.map { round in
+                        let previousEnd = round[index - 1].windowEndNanoseconds
+                        let start = round[index].windowStartNanoseconds
+                        return start > previousEnd
+                            ? Double(start - previousEnd) / 1_000_000 : 0
+                    }))
+                }
+            }
+            let wall = commitMedian(rounds.map { $0.map { $0.drainMilliseconds }.reduce(0, +) })
+            print(
+                String(
+                    format: "🔎 [dsv41 commit startup] depth %d: total %.3f ms; first buffer "
+                        + "pickup %.3f ms; followers' pickups %@; followers' gap from the "
+                        + "predecessor's end %@; windows %@",
+                    depth, wall, pickups[0],
+                    pickups.dropFirst().map { String(format: "%.3f", $0) }.joined(separator: ", "),
+                    gaps.dropFirst().map { String(format: "%.3f", $0) }.joined(separator: ", "),
+                    windows.map { String(format: "%.3f", $0) }.joined(separator: ", ")
+                )
+            )
+        }
+
+        // The shape a pipelined walk would have: a predecessor still running when its
+        // followers are committed. Followers cannot pay a pickup for an empty queue
+        // because the queue was never empty.
+        let long = probe.pipelinedRound(depth: 8, dispatches: 96, threads: 1_048_576)
+        XCTAssertEqual(long.count, 8, "the long-predecessor arm built \(long.count) buffers")
+        var longGaps: [Double] = []
+        for index in 1..<long.count {
+            let previousEnd = long[index - 1].windowEndNanoseconds
+            let start = long[index].windowStartNanoseconds
+            longGaps.append(start > previousEnd ? Double(start - previousEnd) / 1_000_000 : 0)
+        }
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] fed queue, 96 dispatches a buffer: windows %@; "
+                    + "followers' pickups %@; followers' gap from the predecessor's end %@",
+                long.map { String(format: "%.3f", $0.windowMilliseconds) }.joined(separator: ", "),
+                long.dropFirst().map { String(format: "%.3f", $0.pickupMilliseconds) }
+                    .joined(separator: ", "),
+                longGaps.map { String(format: "%.3f", $0) }.joined(separator: ", ")
+            )
+        )
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] verdict: a buffer waited on at once costs "
+                    + "%.3f ms before it starts; the same buffer committed behind a running one "
+                    + "starts %.3f ms after its predecessor retires",
+                long.first?.pickupMilliseconds ?? 0,
+                commitMedian(longGaps)
+            )
+        )
+    }
+
+    /// What a command buffer has to carry before a submission stops starting at once.
+    ///
+    /// A trivial launch starts in a tenth of a millisecond, so the walk's 2-3 ms has to
+    /// come from something its buffers have: dozens of launches (a half layer), or a
+    /// resource list spread over every shard the layer reads, or memory the driver has
+    /// to make resident at submit time. The arms below separate those three, because
+    /// only the first is affected by how many buffers a position is cut into.
+    func testWhatACommandBufferHasToCarryToStartSlowly() throws {
+        let probe = try DeepSeekV41CommitStartupProbe.make()
+        for _ in 0..<5 { _ = probe.serialSample() }
+
+        // 1. The control: one launch, one 16 MB scratch buffer.
+        _ = anatomy(probe, label: "1 launch, 1 small resource", attempts: 11)
+
+        // 2. Launches alone, all binding the same vector — a half layer's launch count.
+        _ = anatomy(probe, label: "64 launches, 1 small resource", dispatches: 64, attempts: 11)
+        _ = anatomy(
+            probe, label: "64 launches at a published-width grid, 1 small resource",
+            dispatches: 64, threads: 73_728, attempts: 11
+        )
+
+        // 3. Resources alone, at a constant 4 GiB: 64 slices of 64 MiB against 8 slices
+        //    of 512 MiB tells resource COUNT apart from resource BYTES.
+        let many = probe.residentPool(count: 64, bytes: 64 << 20)
+        XCTAssertEqual(many.count, 64, "the 64-slice pool allocated \(many.count) buffers")
+        _ = anatomy(
+            probe, label: "64 launches, 64 resident resources of 64 MiB",
+            dispatches: 64, attempts: 11, pool: many
+        )
+        let few = probe.residentPool(count: 8, bytes: 512 << 20)
+        XCTAssertEqual(few.count, 8, "the 8-slice pool allocated \(few.count) buffers")
+        _ = anatomy(
+            probe, label: "64 launches, 8 resident resources of 512 MiB",
+            dispatches: 64, attempts: 11, pool: few
+        )
+
+        // 4. The same shape with no copy, over a sparse file: pageable memory, which is
+        //    what a shard mapping is and what the pinned chunks are not.
+        let mapped = probe.mappedPool(count: 64, bytes: 64 << 20)
+        XCTAssertEqual(mapped.pool.count, 64, "the mapped pool wrapped \(mapped.pool.count) buffers")
+        _ = anatomy(
+            probe, label: "64 launches, 64 mapped resources of 64 MiB",
+            dispatches: 64, attempts: 11, pool: mapped.pool
+        )
+
+        // 5. Does feeding the queue still hide it once the buffer is heavy?
+        var rounds: [[DeepSeekV41CommitSample]] = []
+        for _ in 0..<11 {
+            rounds.append(probe.pipelinedRound(depth: 4, dispatches: 64, pool: many))
+        }
+        var gaps: [Double] = []
+        for index in 1..<4 {
+            gaps.append(commitMedian(rounds.map { round in
+                let previousEnd = round[index - 1].windowEndNanoseconds
+                let start = round[index].windowStartNanoseconds
+                return start > previousEnd ? Double(start - previousEnd) / 1_000_000 : 0
+            }))
+        }
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] fed queue, 64 launches over 64 resident "
+                    + "resources: first pickup %.3f ms, followers' gap from the predecessor's "
+                    + "end %@",
+                commitMedian(rounds.map { $0[0].pickupMilliseconds }),
+                gaps.map { String(format: "%.3f", $0) }.joined(separator: ", ")
+            )
+        )
+
+        for map in mapped.maps { munmap(map, 64 << 20) }
+        try? FileManager.default.removeItem(
+            atPath: NSTemporaryDirectory() + "dsv41_commit_probe_mapping"
+        )
+    }
+
+    /// The one axis a binding slot cannot measure: how many DISTINCT resources a
+    /// submission names. A half layer's union is every workspace buffer, gain vector,
+    /// expert slot and shard slice it touches, and Metal builds that list per command
+    /// buffer however few of them any single launch binds.
+    func testWhatTheResourceListCostsACommittedBuffer() throws {
+        let probe = try DeepSeekV41CommitStartupProbe.make()
+        for _ in 0..<5 { _ = probe.serialSample() }
+
+        // 512 slices of 4 MiB: 2 GiB in total, so raising the count does not raise the
+        // bytes and the two cannot be confused.
+        let slices = probe.residentPool(count: 512, bytes: 4 << 20)
+        XCTAssertEqual(slices.count, 512, "the slice pool allocated \(slices.count) buffers")
+
+        var curve: [(Int, Anatomy)] = []
+        for count in [0, 32, 64, 128, 256, 512] {
+            curve.append((count, anatomy(
+                probe,
+                label: "20 launches naming \(count) resources",
+                dispatches: 20,
+                attempts: 11,
+                residency: Array(slices.prefix(count))
+            )))
+        }
+        for (count, result) in curve {
+            print(
+                String(
+                    format: "🔎 [dsv41 commit startup] 20 launches, %d resources of 4 MiB: "
+                        + "pickup %.3f ms, window %.3f ms, drain %.3f ms",
+                    count, result.pickup, result.window, result.drain
+                )
+            )
+        }
+        let first = curve.first?.1.pickup ?? 0
+        let last = curve.last?.1.pickup ?? 0
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] resource-list curve: %.3f ms with no "
+                    + "resources, %.3f ms with 512, i.e. %.3f ms of pickup per resource",
+                first, last, (last - first) / 512
+            )
+        )
+
+        // Same 2 GiB, eight resources instead of 512: bytes cannot be the cause.
+        let wide = probe.residentPool(count: 8, bytes: 256 << 20)
+        XCTAssertEqual(wide.count, 8, "the wide pool allocated \(wide.count) buffers")
+        let wideAnatomy = anatomy(
+            probe, label: "20 launches naming 8 resources of 256 MiB",
+            dispatches: 20, attempts: 11, residency: wide
+        )
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] 2 GiB as 8 resources: pickup %.3f ms "
+                    + "against %.3f ms as 512 resources and %.3f ms as none",
+                wideAnatomy.pickup, last, first
+            )
+        )
+
+        // A real half layer also fences between dispatches, and it does both at once.
+        let fenced = anatomy(
+            probe, label: "20 launches, 128 resources, a barrier after each dispatch",
+            dispatches: 20, attempts: 11,
+            residency: Array(slices.prefix(128)), barrier: true
+        )
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] 20 launches, 128 resources, 20 buffer "
+                    + "barriers: pickup %.3f ms, window %.3f ms",
+                fenced.pickup, fenced.window
+            )
+        )
+
+        // And fed: a deep queue used to hide everything measured so far.
+        var rounds: [[DeepSeekV41CommitSample]] = []
+        for _ in 0..<11 {
+            rounds.append(probe.pipelinedRound(
+                depth: 4, dispatches: 20,
+                pool: Array(slices.prefix(128))
+            ))
+        }
+        var gaps: [Double] = []
+        for index in 1..<4 {
+            gaps.append(commitMedian(rounds.map { round in
+                let previousEnd = round[index - 1].windowEndNanoseconds
+                let start = round[index].windowStartNanoseconds
+                return start > previousEnd ? Double(start - previousEnd) / 1_000_000 : 0
+            }))
+        }
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] fed queue of 4, 20 launches each naming "
+                    + "128 resources: followers' gap from the predecessor's end %@",
+                gaps.map { String(format: "%.3f", $0) }.joined(separator: ", ")
+            )
+        )
+    }
+
+    /// Whether a submission starts late because someone else is using the GPU.
+    ///
+    /// Every arm above starts in a tenth of a millisecond, so the walk's 2.3 ms has to
+    /// come from something that is not the submission. The last candidate that a single
+    /// process cannot rule out by shape is a co-tenant: the walk shares the GPU with
+    /// the compositor and with whatever else the machine is doing, and a queue that is
+    /// not the only one submitting can wait behind work no command buffer of ours
+    /// accounts for.
+    func testWhetherASecondQueueDelaysACommittedBuffersStart() throws {
+        let measured = try DeepSeekV41CommitStartupProbe.make()
+        let tenant = try DeepSeekV41CommitStartupProbe.make()
+
+        func pickup(attempts: Int = 21) -> (median: Double, worst: Double) {
+            var values: [Double] = []
+            for _ in 0..<attempts {
+                if let sample = measured.serialSample(dispatches: 20) {
+                    values.append(sample.pickupMilliseconds)
+                }
+            }
+            return (commitMedian(values), values.max() ?? 0)
+        }
+
+        // Warm both queues before either is measured.
+        for _ in 0..<5 {
+            _ = measured.serialSample()
+            _ = tenant.pipelinedRound(depth: 2, dispatches: 64, threads: 1_048_576)
+        }
+        let alone = pickup()
+
+        // A co-tenant whose own buffers take a few hundred microseconds, submitted
+        // back to back the way a compositor submits one frame after another. It holds
+        // the GPU for most of each millisecond without owning our queue.
+        let flag = CoTenantFlag()
+        Thread.detachNewThread {
+            while flag.isRunning {
+                _ = tenant.pipelinedRound(depth: 2, dispatches: 64, threads: 1_048_576)
+            }
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+        let shared = pickup()
+        flag.stop()
+        Thread.sleep(forTimeInterval: 0.05)
+
+        let after = pickup()
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] alone: pickup %.3f ms (worst %.3f); "
+                    + "with a co-tenant on another queue: %.3f ms (worst %.3f); after it "
+                    + "stopped: %.3f ms",
+                alone.median, alone.worst, shared.median, shared.worst, after.median
+            )
+        )
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] the co-tenant arm reads %.3f ms against "
+                    + "%.3f ms alone, i.e. a busy GPU starts a submission %@ than an idle one "
+                    + "(clock ramp, not contention)",
+                shared.median, alone.median,
+                shared.median < alone.median ? "sooner" : "later"
+            )
+        )
+    }
+
+    /// The walk's own submission pattern, with none of its work: 40 layers of a front
+    /// half committed and waited, then a mixture half committed and left in flight.
+    ///
+    /// Every arm above measures one submission in isolation or a queue fed before it is
+    /// emptied. This one measures the alternation itself, which is the only thing left
+    /// that a microbenchmark of the walk's own shapes has not covered.
+    func testWhetherTheWalksAlternationCostsWhatNoSingleBufferDoes() throws {
+        let probe = try DeepSeekV41CommitStartupProbe.make()
+
+        // Pools shaped like the two halves' working sets, not like the checkpoint's
+        // sizes: what is under test is the pattern, not the weights.
+        let frontPool = probe.residentPool(count: 8, bytes: 16 << 20)
+        let mixturePool = probe.residentPool(count: 6, bytes: 32 << 20)
+        for _ in 0..<3 { _ = probe.alternatingRound(layers: 4) }
+
+        func report(_ label: String, _ samples: [DeepSeekV41CommitSample]) {
+            let windowed = samples.filter { $0.hasWindow }
+            let first = windowed.map { $0.windowStartNanoseconds }.min() ?? 0
+            let last = windowed.map { $0.windowEndNanoseconds }.max() ?? 0
+            let wall = last > first ? Double(last - first) / 1_000_000 : 0
+            let idle = DeepSeekV41CommitStartupProbe.idle(samples)
+            print(
+                String(
+                    format: "🔎 [dsv41 commit startup] %@ (%d buffer(s)): GPU busy %.1f ms, "
+                        + "GPU idle %.1f ms of %.1f ms (%.0f%%), per-buffer drain %.3f ms, "
+                        + "per-buffer pickup %.3f ms",
+                    label, samples.count,
+                    DeepSeekV41CommitStartupProbe.busy(samples), idle, wall,
+                    100 * idle / max(0.001, wall),
+                    samples.reduce(0.0) { $0 + $1.drainMilliseconds }
+                        / Double(max(1, samples.count)),
+                    commitMedian(samples.map { $0.pickupMilliseconds })
+                )
+            )
+        }
+
+        report(
+            "the walk's pattern, no host work",
+            probe.alternatingRound(layers: 40, dispatches: 20)
+        )
+        report(
+            "the walk's pattern, 8 KB of host writes a layer",
+            probe.alternatingRound(
+                layers: 40, dispatches: 20,
+                frontPool: frontPool, mixturePool: mixturePool, hostBytes: 8 << 10
+            )
+        )
+        report(
+            "the walk's pattern, 1 MB of host writes a layer",
+            probe.alternatingRound(
+                layers: 40, dispatches: 20,
+                frontPool: frontPool, mixturePool: mixturePool, hostBytes: 1 << 20
+            )
+        )
+        // The mixture's own shape: the host fills the buffers it is about to read. The
+        // expert arena slot is ~17.9 MB, six of them are read per layer, and the fill
+        // writes all of it from `pread` before the mixture is encoded.
+        report(
+            "the walk's pattern, 128 MB of host writes into the mixture's own buffers",
+            probe.alternatingRound(
+                layers: 40, dispatches: 20,
+                frontPool: frontPool, mixturePool: mixturePool, hostBytes: 128 << 20
+            )
+        )
+
+        // The control: the same 80 buffers committed before any of them is waited on.
+        var fed: [DeepSeekV41CommitSample] = []
+        for _ in 0..<2 { fed += probe.pipelinedRound(depth: 40, dispatches: 20) }
+        // The one difference left between the two halves of a layer: they run different
+        // kernels. The front half and the expert half never share a pipeline, so every
+        // layer switches pipeline state between them.
+        report(
+            "the walk's pattern, a different pipeline for the mixture",
+            probe.alternatingRound(
+                layers: 40, dispatches: 20,
+                frontPool: frontPool, mixturePool: mixturePool, mixtureIsRead: true
+            )
+        )
+        report("the same buffers, all queued first", fed)
+    }
+
+    /// Whether a submission starts late for memory the host has just written.
+    ///
+    /// A layer's expert half is the only place the walk leaves the GPU idle, and it is
+    /// the one submission that follows a `pread` into the very bytes its first kernel
+    /// reads. Every arm above submits kernels that only WRITE, so this is the last
+    /// difference between a probe submission and a walk submission that a probe can
+    /// hold constant.
+    func testWhetherReadingWhatTheHostJustWroteDelaysAStart() throws {
+        let probe = try DeepSeekV41CommitStartupProbe.make()
+        let source = probe.residentPool(count: 2, bytes: 32 << 20)
+        guard let destination = probe.residentPool(count: 1, bytes: 32 << 20).first else {
+            XCTFail("no destination buffer")
+            return
+        }
+        XCTAssertEqual(source.count, 2, "the source pool allocated \(source.count) buffers")
+        let lanes = (32 << 20) / MemoryLayout<Float>.stride
+
+        func arm(_ label: String, hostWrites: Bool, attempts: Int = 21) -> Double {
+            for _ in 0..<5 {
+                _ = probe.readSample(
+                    source: source, lanes: lanes, destination: destination,
+                    hostWritesFirst: false
+                )
+            }
+            var pickups: [Double] = []
+            var windows: [Double] = []
+            for _ in 0..<attempts {
+                guard let sample = probe.readSample(
+                    source: source, lanes: lanes, destination: destination,
+                    hostWritesFirst: hostWrites
+                ) else { continue }
+                pickups.append(sample.pickupMilliseconds)
+                windows.append(sample.windowMilliseconds)
+            }
+            XCTAssertEqual(pickups.count, attempts, "\(label) dropped samples")
+            XCTAssertTrue(
+                windows.allSatisfy { $0 > 0 },
+                "\(label) reported a buffer that never opened a window"
+            )
+            let pickup = commitMedian(pickups)
+            print(
+                String(
+                    format: "🔎 [dsv41 commit startup] %@: pickup %.3f ms, window %.3f ms",
+                    label, pickup, commitMedian(windows)
+                )
+            )
+            return pickup
+        }
+
+        let cold = arm("64 MB read, nothing touched", hostWrites: false)
+        let warm = arm("64 MB read, every page written by the host first", hostWrites: true)
+        print(
+            String(
+                format: "🔎 [dsv41 commit startup] verdict: a submission over memory the host "
+                    + "just wrote starts in %.3f ms against %.3f ms for the same submission "
+                    + "over untouched memory",
+                warm, cold
+            )
+        )
+    }
+}
+
+/// A stop flag a detached thread can read without touching an actor.
+private nonisolated final class CoTenantFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var running = true
+
+    var isRunning: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return running
+    }
+
+    func stop() {
+        lock.lock()
+        running = false
+        lock.unlock()
     }
 }

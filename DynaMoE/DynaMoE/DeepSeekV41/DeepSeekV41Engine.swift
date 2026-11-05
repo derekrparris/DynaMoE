@@ -44,6 +44,11 @@ nonisolated public struct DeepSeekV41DeviceTensor: Sendable, Equatable {
     public let rows: Int
     public let columns: Int
     public let dtype: String
+    /// Bytes this tensor occupies in its shard, which is what the dense pin reads
+    /// and what a range check needs. Not derivable from `rows * columns`: an
+    /// E4M3 tensor is one byte per value and a packed MXFP4 one is half, and the
+    /// scale companion is a separate tensor.
+    public let byteLength: Int
 
     public var isFP8: Bool {
         let upper = dtype.uppercased()
@@ -65,6 +70,19 @@ nonisolated public struct DeepSeekV41DeviceTensor: Sendable, Equatable {
     /// Elements in one matrix row, which is the count a `gemv` binds as `inDim`.
     public var inDimension: Int { columns }
     public var outDimension: Int { rows }
+
+    /// The same tensor, addressed somewhere else. Used by the dense pin, which
+    /// moves a tensor's bytes into a resident buffer and has to repoint it.
+    public func addressing(shardIndex: UInt32, byteOffset: Int) -> DeepSeekV41DeviceTensor {
+        DeepSeekV41DeviceTensor(
+            shardIndex: shardIndex,
+            byteOffset: byteOffset,
+            rows: rows,
+            columns: columns,
+            dtype: dtype,
+            byteLength: byteLength
+        )
+    }
 }
 
 // MARK: - Device weights
@@ -130,7 +148,8 @@ nonisolated public final class DeepSeekV41DeviceWeights: @unchecked Sendable {
                 byteOffset: Int(tensor.offsetStart),
                 rows: rows,
                 columns: columns,
-                dtype: tensor.dtype
+                dtype: tensor.dtype,
+                byteLength: Int(tensor.offsetEnd - tensor.offsetStart)
             )
             if tensor.name.contains("scale") || tensor.name.contains("scales") {
                 scales[tensor.name] = device
@@ -216,12 +235,22 @@ nonisolated public final class DeepSeekV41DeviceWeights: @unchecked Sendable {
         self.engramLayouts = layouts
     }
 
+    /// A tensor by role.
+    ///
+    /// The namespace is a parameter for the same reason it is on the catalog: the
+    /// DSpark stages under `mtp.N.*` are full blocks with the same stage names and
+    /// their own layer indices, so `mtp.0.attn.wkv` and `layers.0.attn.wkv` are two
+    /// different tensors under one `(role, layer)` pair. The default is the backbone
+    /// because that is the graph every existing call site belongs to.
     public func tensor(
         _ role: DeepSeekV41TensorRole,
+        scope: DeepSeekV41TensorScope = .backbone,
         layer: Int? = nil,
         expert: Int? = nil
     ) -> DeepSeekV41DeviceTensor? {
-        guard let slot = catalog.tensor(role, layer: layer, expert: expert) else { return nil }
+        guard let slot = catalog.tensor(role, scope: scope, layer: layer, expert: expert) else {
+            return nil
+        }
         return tensors[slot.name]
     }
 
@@ -241,6 +270,78 @@ nonisolated public final class DeepSeekV41DeviceWeights: @unchecked Sendable {
     public func close() {
         for reader in engramReaders.values { reader.closeNow() }
     }
+
+    /// The tensors the dense pin may move, in the catalog's own terms.
+    ///
+    /// The exclusions are the reason this is here rather than at the call site:
+    /// whether a tensor is streamed, an expert, or part of a graph nothing runs
+    /// is a property of its ROLE, and a name-prefix rule would get the Engram
+    /// table's neighbours wrong the way it did for the summary (`engram.wkv` is a
+    /// dense 157 MB matrix, not a table).
+    public func pinnableTensors() -> [DeepSeekV41DensePinCandidate] {
+        var slots: [String: DeepSeekV41TensorSlot] = [:]
+        for slot in catalog.slots { slots[slot.ref.name] = slot }
+        var candidates: [DeepSeekV41DensePinCandidate] = []
+        candidates.reserveCapacity(tensors.count + scales.count)
+        for (name, tensor) in tensors {
+            guard let slot = slots[name], Self.isPinnable(slot) else { continue }
+            candidates.append(Self.candidate(name: name, tensor: tensor))
+        }
+        for (name, tensor) in scales {
+            guard let slot = slots[name], Self.isPinnable(slot) else { continue }
+            candidates.append(Self.candidate(name: name, tensor: tensor))
+        }
+        return candidates
+    }
+
+    /// Repoints every pinned tensor at the buffer that now holds its bytes.
+    ///
+    /// Only the address changes: the shape, dtype and byte length stay what the
+    /// summary said, so every kernel binds the same offsets it did before.
+    @discardableResult
+    public func pin(_ plan: DeepSeekV41DensePinPlan) -> Int {
+        var moved = 0
+        for range in plan.ranges {
+            let index = plan.pinnedShardIndex(chunk: range.chunk)
+            if let tensor = tensors[range.tensorName] {
+                tensors[range.tensorName] = tensor.addressing(
+                    shardIndex: index, byteOffset: range.chunkOffset
+                )
+                moved += 1
+            } else if let tensor = scales[range.tensorName] {
+                scales[range.tensorName] = tensor.addressing(
+                    shardIndex: index, byteOffset: range.chunkOffset
+                )
+                moved += 1
+            }
+        }
+        return moved
+    }
+
+    private static func candidate(
+        name: String,
+        tensor: DeepSeekV41DeviceTensor
+    ) -> DeepSeekV41DensePinCandidate {
+        DeepSeekV41DensePinCandidate(
+            name: name,
+            shardIndex: tensor.shardIndex,
+            byteOffset: tensor.byteOffset,
+            byteLength: tensor.byteLength
+        )
+    }
+
+    private static func isPinnable(_ slot: DeepSeekV41TensorSlot) -> Bool {
+        // The Engram table is streamed row by row and never becomes a buffer.
+        guard !slot.role.isStreamed else { return false }
+        // Routed experts live in the arena, which the streamer fills.
+        guard slot.expert == nil else { return false }
+        // Nothing in the text graph reads the vision tower or the draft block.
+        guard !slot.role.isVision, !slot.role.isDraft else { return false }
+        // The embedding is read one row at a time, so pinning 1.3 GB to save two
+        // page faults per token is memory spent for nothing.
+        guard slot.role != .tokenEmbedding else { return false }
+        return true
+    }
 }
 
 // MARK: - Pipelines
@@ -249,9 +350,18 @@ nonisolated public final class DeepSeekV41DeviceWeights: @unchecked Sendable {
 /// hard load failure rather than a silently skipped stage.
 nonisolated public struct DeepSeekV41Pipelines {
     public let fp8Block32Gemv: MTLComputePipelineState
+    /// The same 32x32 ue8m0 dot product with one output row per threadgroup, so a
+    /// warp's weight loads are adjacent rather than a row apart.
+    public let fp8Block32GemvRows: MTLComputePipelineState
+    /// The same projection over a BLOCK of positions, with the row's weight requested
+    /// once for all of them (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #73").
+    public let fp8Block32GemvRowsSlots: MTLComputePipelineState
     public let mxfp4Gemv: MTLComputePipelineState
     public let mxfp4SwiGLU: MTLComputePipelineState
     public let mxfp4DownAccumulate: MTLComputePipelineState
+    /// The same two with one output row per threadgroup (coalesced weight loads).
+    public let mxfp4SwiGLURows: MTLComputePipelineState
+    public let mxfp4DownAccumulateRows: MTLComputePipelineState
     public let engramDequantRows: MTLComputePipelineState
     /// The Engram gate and residual add, one threadgroup per hyper-connection copy.
     public let engramGate: MTLComputePipelineState
@@ -259,10 +369,20 @@ nonisolated public struct DeepSeekV41Pipelines {
     /// The mHC rule: project the flattened stack, split the logits, collapse with a
     /// mix, expand back through `comb`.
     public let hcProject: MTLComputePipelineState
+    /// The four-accumulator form of the projection, which a decode step ships: the
+    /// walk's 24-threadgroup grid has one load in flight per lane without it
+    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #62").
+    public let hcProjectX4: MTLComputePipelineState
     public let hcSplit: MTLComputePipelineState
+    /// The same split with the `mult == 4` Sinkhorn held in registers, which is the
+    /// form a decode step ships (`#62`).
+    public let hcSplitRegs: MTLComputePipelineState
     public let hcPre: MTLComputePipelineState
     public let hcPost: MTLComputePipelineState
     public let hcIdentityMix: MTLComputePipelineState
+    /// The router's top-k with one SIMD group per position, which a decode step
+    /// ships: the one-thread scan is a `sqrtsoftplus` per expert (`#63`).
+    public let routerTopKLanes: MTLComputePipelineState
     public let rope: MTLComputePipelineState
     public let storeLatent: MTLComputePipelineState
     public let gatherLatents: MTLComputePipelineState
@@ -270,6 +390,11 @@ nonisolated public struct DeepSeekV41Pipelines {
     /// half-key kernel; the FP32 form is kept in the shader library as the baseline
     /// the measurement A/Bs against (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #17").
     public let attention: MTLComputePipelineState
+    /// The same graph over FP32 keys. The DSpark draft block reads its own ring,
+    /// which the seed writes as floats, so it takes this form: a half-key ring would
+    /// put an fp16 rounding floor under the parity bar that hides which row or which
+    /// rope slice a mistake is in.
+    public let attentionF32: MTLComputePipelineState
     public let poolLatents: MTLComputePipelineState
     public let indexerScores: MTLComputePipelineState
     public let router: MTLComputePipelineState
@@ -284,6 +409,13 @@ nonisolated public struct DeepSeekV41Pipelines {
     /// half needs its own two.
     public let fp8SwiGLU: MTLComputePipelineState
     public let fp8DownAccumulate: MTLComputePipelineState
+    /// The same pair with one output row per threadgroup (coalesced weight loads).
+    public let fp8SwiGLURows: MTLComputePipelineState
+    public let fp8DownAccumulateRows: MTLComputePipelineState
+    /// The same pair over a BLOCK of positions, with the row's weight requested once:
+    /// the shared expert is the one weight every position of a block reads.
+    public let fp8SwiGLURowsSlots: MTLComputePipelineState
+    public let fp8DownAccumulateRowsSlots: MTLComputePipelineState
     /// BF16 fallback for a checkpoint whose FFN was not quantized.
     public let bf16Gemv: MTLComputePipelineState
     public let bf16GemvRows: MTLComputePipelineState
@@ -303,21 +435,29 @@ nonisolated public struct DeepSeekV41Pipelines {
             return try device.makeComputePipelineState(function: function)
         }
         self.fp8Block32Gemv = try make("dsv41_fp8_block32_gemv")
+        self.fp8Block32GemvRows = try make("dsv41_fp8_block32_gemv_rows")
+        self.fp8Block32GemvRowsSlots = try make("dsv41_fp8_block32_gemv_rows_slots")
         self.mxfp4Gemv = try make("dsv41_mxfp4_gemv")
         self.mxfp4SwiGLU = try make("dsv41_mxfp4_swiglu_gate_up")
         self.mxfp4DownAccumulate = try make("dsv41_mxfp4_down_accumulate")
+        self.mxfp4SwiGLURows = try make("dsv41_mxfp4_swiglu_gate_up_rows")
+        self.mxfp4DownAccumulateRows = try make("dsv41_mxfp4_down_accumulate_rows")
         self.engramDequantRows = try make("dsv41_engram_dequant_rows")
         self.engramGate = try make("dsv41_engram_gate_f32")
         self.hcSinkhorn = try make("dsv41_hc_sinkhorn")
         self.hcProject = try make("dsv41_hc_project_f32")
+        self.hcProjectX4 = try make("dsv41_hc_project_f32_x4")
         self.hcSplit = try make("dsv41_hc_split_f32")
+        self.hcSplitRegs = try make("dsv41_hc_split_f32_regs")
         self.hcPre = try make("dsv41_hc_pre_f32")
         self.hcPost = try make("dsv41_hc_post_f32")
         self.hcIdentityMix = try make("dsv41_hc_identity_mix_f32")
+        self.routerTopKLanes = try make("dsv41_router_topk_lanes")
         self.rope = try make("dsv41_rope_latent")
         self.storeLatent = try make("dsv41_store_latent_f16")
         self.gatherLatents = try make("dsv41_gather_latents_f16")
         self.attention = try make("dsv41_attention_csa2_f16")
+        self.attentionF32 = try make("dsv41_attention_csa2_f32")
         self.poolLatents = try make("dsv41_pool_latents_f32")
         self.indexerScores = try make("dsv41_indexer_scores_f32")
         self.router = try make("dsv41_router_topk")
@@ -327,6 +467,10 @@ nonisolated public struct DeepSeekV41Pipelines {
         self.rmsNormGain = try make("dsv41_rmsnorm_f32_gain")
         self.fp8SwiGLU = try make("dsv41_fp8_block32_swiglu_gate_up")
         self.fp8DownAccumulate = try make("dsv41_fp8_block32_down_accumulate")
+        self.fp8SwiGLURows = try make("dsv41_fp8_block32_swiglu_gate_up_rows")
+        self.fp8DownAccumulateRows = try make("dsv41_fp8_block32_down_accumulate_rows")
+        self.fp8SwiGLURowsSlots = try make("dsv41_fp8_block32_swiglu_gate_up_rows_slots")
+        self.fp8DownAccumulateRowsSlots = try make("dsv41_fp8_block32_down_accumulate_rows_slots")
         self.bf16Gemv = try make("bf16_gemv")
         self.bf16GemvRows = try make("bf16_gemv_rows")
         self.bf16GemvBlock = try make("bf16_gemv_rows8")
@@ -348,8 +492,12 @@ nonisolated public enum DeepSeekV41EngineError: Error, CustomStringConvertible {
     case unsupportedDtype(String, String)
     case contextTooLong(Int, Int)
     case outOfOrderPosition(Int, Int)
+    /// A supplied residual row is not the model's hidden width.
+    case embeddingWidthMismatch(expected: Int, actual: Int)
     /// A resumed turn found resident state that is not this prompt's.
     case prefixStateMismatch(position: Int)
+    /// The checkpoint cannot turn pixels into residual rows.
+    case visionUnavailable(String)
     case unsupportedStage(String)
     case commandFailed(String)
 
@@ -371,8 +519,13 @@ nonisolated public enum DeepSeekV41EngineError: Error, CustomStringConvertible {
             return "DeepSeek V4.1 turn needs \(requested) positions but the cache was provisioned for \(maximum)"
         case let .outOfOrderPosition(requested, stored):
             return "DeepSeek V4.1 forward was asked for position \(requested) while the cache holds \(stored)"
+        case let .embeddingWidthMismatch(expected, actual):
+            return "DeepSeek V4.1 was given a \(actual)-wide residual row where the model is "
+                + "\(expected) wide"
         case .prefixStateMismatch(let position):
             return "DeepSeek V4.1 cannot continue the cached sequence: its token history diverges at position \(position)"
+        case .visionUnavailable(let detail):
+            return "DeepSeek V4.1 cannot see images here: \(detail)"
         case .unsupportedStage(let stage):
             return "DeepSeek V4.1 stage '\(stage)' has no device implementation"
         case .commandFailed(let detail):
@@ -421,6 +574,12 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
     /// Why there is no streamer, so the readiness line names a reason instead of
     /// leaving "no streaming" to be read as "streaming is fine here".
     public let expertStreamerProblem: String?
+    /// The dense backbone pread into resident buffers, or nil when those tensors
+    /// are still read through the shard mappings. See `DeepSeekV41DensePin`.
+    public let densePin: DeepSeekV41DensePinPlan?
+    /// Wall time the pin's reads took, and why there is no pin when there is none.
+    public let densePinSeconds: Double
+    public let densePinProblem: String?
     public let dspark: DeepSeekV41DSparkPlan
     public let contextLength: Int
     /// The precision the KV cache is actually allocated at. The checkpoint's
@@ -448,12 +607,26 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
     public let device: MTLDevice
     public let commandQueue: MTLCommandQueue
     public let pipelines: DeepSeekV41Pipelines
-    /// The zero-copy shard mappings the executor binds tensors through.
+    /// The zero-copy shard mappings the executor binds tensors through, plus one
+    /// entry per dense-pin chunk when the backbone was pinned. The pinned entries
+    /// live at `DeepSeekV41DensePinPlan.pinnedShardBase` and up.
     public let shardBuffers: [UInt32: MTLBuffer]
 
     /// The device executor, built on first use: resolving every norm gain and
     /// RoPE table is load work a turn needs and a pure diagnostic does not.
     private var cachedForward: DeepSeekV41MetalForward?
+
+    /// The vision tower, built on first use. Kept for its weight resolver and its
+    /// device pass: the host encode is per call and cache-free, because one encode
+    /// reads each tensor exactly once, while the device pass uploads the tower's
+    /// weights once and keeps the token matrix on the GPU across all blocks.
+    private var cachedVision: DeepSeekV41VisionForward?
+    /// Why the device tower was not built, when one was asked for. Nil means either
+    /// the device pass is in use or no image has needed the tower yet.
+    public private(set) var visionDeviceProblem: String?
+    /// The directory the shards were indexed from, which the tower's `pread` reads
+    /// need. Nil for a runtime built without one (a test fixture).
+    public let snapshotDir: URL?
 
     /// Reused per-token workspace, allocated once. Public because the device
     /// executor binds it directly rather than re-allocating per turn.
@@ -476,6 +649,58 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         UserDefaults.standard.bool(forKey: engramOffDefaultKey)
     }
 
+    /// `defaults write DRP.DynaMoE dynamoe_dsv41_pin_dense_off -bool YES`
+    ///
+    /// Debug-only opt-out: read the dense backbone through the shard mappings
+    /// instead of pinning it. The pin is the difference between DRAM traffic and
+    /// a GPU page fault per 16 KB, so this exists to A/B it, not to be shipped
+    /// as a setting.
+    public static let densePinOffDefaultKey = "dynamoe_dsv41_pin_dense_off"
+
+    public static var densePinDisabled: Bool {
+        UserDefaults.standard.bool(forKey: densePinOffDefaultKey)
+    }
+
+    /// `defaults write DRP.DynaMoE dynamoe_dsv41_arena_fraction -float 0.72`
+    ///
+    /// Debug-only seam for A/B-ing how much of RAM the expert arena may hold. The arena
+    /// is a cache, so a bigger one means fewer experts a token pays the SSD for; the
+    /// counterweight is memory pressure, which is exactly what a measurement has to
+    /// settle rather than assume. Not a shipped setting.
+    public static let arenaFractionDefaultKey = "dynamoe_dsv41_arena_fraction"
+
+    public static var arenaFractionOverride: Double? {
+        let value = UserDefaults.standard.double(forKey: arenaFractionDefaultKey)
+        return value > 0 ? value : nil
+    }
+
+    /// `defaults write DRP.DynaMoE dynamoe_dsv41_wire_arena_off -bool YES`
+    ///
+    /// Debug-only opt-out from the arena's residency policy. Wiring the slots is the
+    /// `#56` lever: a wired page cannot become compressor input, which took a
+    /// 128-position prefill of this checkpoint from 330-375 to 171-174 ms/position.
+    /// It is on where the memory plan can afford it, so this exists to A/B the
+    /// policy and to get an unwired machine back, not to be a setting.
+    public static let wireArenaOffDefaultKey = "dynamoe_dsv41_wire_arena_off"
+
+    public static var wireArenaDisabled: Bool {
+        UserDefaults.standard.bool(forKey: wireArenaOffDefaultKey)
+    }
+
+    /// `defaults write DRP.DynaMoE dynamoe_dsv41_arena_lru -bool YES`
+    ///
+    /// Debug-only opt-out from the arena's frequency replacement rule. `#58` measured
+    /// the rule on a warm 128-position prefill: 2,190-2,394 misses and 38.3-41.9 GB read
+    /// against LRU's 3,117-3,239 and 54.6-56.7 GB at the same 3,760 slots, i.e. 13-14%
+    /// of the pass. It is on because the cold pass is unaffected -- routing does not
+    /// consult the arena, so a first touch is a miss under any rule -- so this exists to
+    /// get the old order back for an A/B, not to be a setting.
+    public static let arenaLRUDefaultKey = "dynamoe_dsv41_arena_lru"
+
+    public static var arenaLRUForced: Bool {
+        UserDefaults.standard.bool(forKey: arenaLRUDefaultKey)
+    }
+
     private static let initializationError = InitErrorBox()
 
     static func record(_ reason: String) {
@@ -489,7 +714,13 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         shardBuffers: [UInt32: MTLBuffer],
         contextLength: Int,
         cachePrecision: DeepSeekV41CachePrecision = .fp16,
-        allowEngramSkip: Bool = false
+        allowEngramSkip: Bool = false,
+        pinDenseWeights: Bool? = nil,
+        wireArena: Bool? = nil,
+        // How much of RAM the expert arena may hold, resolved ahead of the
+        // `dynamoe_dsv41_arena_fraction` seam. `#58` needs two capacities in one
+        // process, one runtime at a time, without writing the developer's defaults.
+        arenaFraction: Double? = nil
     ) {
         guard let plan = try? config.makeLayerPlan() else {
             DeepSeekV41Runtime.record("the per-layer plan could not be built from config.json")
@@ -540,6 +771,13 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
                   shapes: shapes,
                   config: config,
                   compressedOwners: plan.filter(\.ownsCompressedKV).count,
+                  // The widest owner's row count, not the geometry's base one: the
+                  // base is sized from the WIDEST ratio, and a ratio-1 owner pools
+                  // one row per token, so it needs the whole context.
+                  indexerRows: plan
+                      .filter(\.ownsCompressedIndex)
+                      .map { layout.geometry.compressedRows(forRatio: max(1, $0.compressRatio)) }
+                      .max() ?? 0,
                   // Prefill runs a block of positions per dispatch, so every
                   // per-position vector is replicated for the block. The ring
                   // caps the block: it holds `window` rows, and a wider block
@@ -566,10 +804,57 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         )
         let physicalGB = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824
         let slotCount = min(
-            DeepSeekV41MemoryPlan.affordableExpertSlots(plan: memoryPlan, physicalGB: physicalGB),
+            DeepSeekV41MemoryPlan.affordableExpertSlots(
+                plan: memoryPlan,
+                physicalGB: physicalGB,
+                fraction: arenaFraction ?? DeepSeekV41Runtime.arenaFractionOverride ?? 0.6
+            ),
             max(1, config.numRoutedExperts * max(1, config.numHiddenLayers))
         )
         let arena = DeepSeekV41ExpertArena(slotCount: slotCount)
+        // `#58`: a warm pass misses mostly on pairs the arena already loaded and evicted,
+        // so the replacement rule is a lever at a fixed capacity. The frequency rule
+        // ships; this is the one debug seam back to LRU.
+        if DeepSeekV41Runtime.arenaLRUForced { arena.victimPolicy = .leastRecentlyUsed }
+
+        // The dense backbone is read in full on every token. Through the shard
+        // mappings that is a GPU page fault per 16 KB, and the expert stream
+        // evicts those pages between tokens, so the same few gigabytes are
+        // re-faulted every step. Pinning it once makes it DRAM traffic. The
+        // budget is a third of RAM: the memory plan already prices these bytes as
+        // resident, so this is the same claim on memory expressed as a cap, and a
+        // machine too small to hold the whole backbone pins a prefix of it rather
+        // than refusing to load.
+        var buffers = shardBuffers
+        var densePin: DeepSeekV41DensePinPlan?
+        var densePinSeconds: Double = 0
+        var densePinProblem: String?
+        if pinDenseWeights ?? !DeepSeekV41Runtime.densePinDisabled {
+            if let snapshotDir {
+                let pinPlan = DeepSeekV41DensePinPlan.make(
+                    summary: summary,
+                    candidates: weights.pinnableTensors(),
+                    budgetBytes: Int(physicalGB * 0.3 * 1_073_741_824),
+                    chunkLimit: min(1 << 30, Int(device.maxBufferLength)),
+                    bufferLimit: Int(device.maxBufferLength)
+                )
+                do {
+                    let loaded = try DeepSeekV41DensePinLoader.load(
+                        plan: pinPlan, snapshotDir: snapshotDir, device: device
+                    )
+                    buffers.merge(loaded.buffers) { current, _ in current }
+                    weights.pin(pinPlan)
+                    densePin = pinPlan
+                    densePinSeconds = loaded.seconds
+                } catch {
+                    densePinProblem = "\(error)"
+                }
+            } else {
+                densePinProblem = "the snapshot directory is unknown, so the backbone cannot be read"
+            }
+        } else {
+            densePinProblem = "disabled by \(DeepSeekV41Runtime.densePinOffDefaultKey)"
+        }
 
         // The routed mixture is a working set this machine reads, not a weight it
         // holds: 15,360 whole-expert pairs at ~19 MB each. Filling the arena from
@@ -598,15 +883,33 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
             streamerProblem = "the snapshot directory is unknown, so the expert shards cannot be read"
         }
 
+        // The arena's slots are the destination a fill writes, and `#56` measured the
+        // same bytes into them at 4.6-6.7 GB/s unwired against 13.0 wired, i.e. the
+        // page compressor reconstructing every page a pass rewrote. The policy is
+        // all-or-nothing and the budget is the arena's own size, granted only when the
+        // memory plan says the rest of the machine still fits beside it.
+        if let streamer, wireArena ?? !DeepSeekV41Runtime.wireArenaDisabled {
+            let arenaBytes = streamer.capacity * streamer.geometry.slotBytes
+            if memoryPlan.wireBudgetBytes(
+                arenaBytes: arenaBytes, physicalGB: physicalGB
+            ) > 0 {
+                streamer.enableSlotWiring(budgetBytes: arenaBytes)
+            }
+        }
+
         self.config = config
         self.plan = plan
         self.catalog = weights.catalog
         self.weights = weights
+        self.snapshotDir = snapshotDir
         self.cache = cache
         self.memoryPlan = memoryPlan
         self.arena = arena
         self.expertStreamer = streamer
         self.expertStreamerProblem = streamerProblem
+        self.densePin = densePin
+        self.densePinSeconds = densePinSeconds
+        self.densePinProblem = densePinProblem
         self.dspark = DeepSeekV41DSparkPlan.make(config: config)
         self.contextLength = contextLength
         self.cachePrecision = cachePrecision
@@ -638,7 +941,7 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         self.commandQueue = commandQueue
         self.pipelines = pipelines
         self.workspace = workspace
-        self.shardBuffers = shardBuffers
+        self.shardBuffers = buffers
     }
 
     public var isRunnable: Bool { weights.problems.isEmpty }
@@ -652,6 +955,75 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
         return built
     }
 
+    /// The vision tower over the checkpoint's own weights, built on first use.
+    ///
+    /// Nil when `config.json` publishes no `vision_config`, the snapshot directory is
+    /// unknown, or the tower's tensors could not be resolved from the shards. The
+    /// tower carries a device pass when Metal can build one: its weights are read
+    /// once and the whole encode stays on the GPU, which is what makes #41's and
+    /// #42's measured stages pay. `dynamoe_dsv41_vision_device_off` forces the host
+    /// path, and a device tower that cannot be built leaves `visionDeviceProblem`
+    /// set rather than failing the image.
+    public func visionForward() -> DeepSeekV41VisionForward? {
+        if let cachedVision { return cachedVision }
+        guard let spec = config.vision, let snapshotDir else { return nil }
+        guard let source = DeepSeekV41VisionWeights(
+            snapshotDir: snapshotDir, catalog: catalog
+        ), let textHidden = source.textHiddenSize else { return nil }
+        var deviceTower: DeepSeekV41VisionEncodeDevice?
+        if UserDefaults.standard.bool(forKey: "dynamoe_dsv41_vision_device_off") {
+            visionDeviceProblem = "disabled by dynamoe_dsv41_vision_device_off"
+        } else {
+            do {
+                deviceTower = try DeepSeekV41VisionEncodeDevice(
+                    spec: spec, weights: source, textHiddenSize: textHidden
+                )
+            } catch {
+                visionDeviceProblem = "\(error)"
+            }
+        }
+        let built = DeepSeekV41VisionForward(
+            spec: spec, weights: source, textHiddenSize: textHidden, device: deviceTower
+        )
+        cachedVision = built
+        return built
+    }
+
+    /// Pixels to the residual rows an image span puts in the prompt.
+    ///
+    /// The span's length is the prompt cost (`rows * (columns + 1) + 2`), and
+    /// `DeepSeekV41ImagePrompt.expand` is what binds those rows to positions.
+    public func imageSpan(
+        rgb: [UInt8],
+        width: Int,
+        height: Int
+    ) throws -> DeepSeekV41ImagePrompt.ImageSpan {
+        guard let tower = visionForward() else {
+            throw DeepSeekV41EngineError.visionUnavailable(
+                config.vision == nil
+                    ? "config.json publishes no vision_config"
+                    : "the tower's weights could not be read from the snapshot"
+            )
+        }
+        let fitted = DeepSeekV41VisionLayout.fit(width: width, height: height, spec: tower.spec)
+        let rows = try tower.imageSpan(rgb: rgb, width: width, height: height)
+        return DeepSeekV41ImagePrompt.ImageSpan(
+            rows: rows, columns: fitted.columns, gridRows: fitted.rows
+        )
+    }
+
+    /// What an image of this size would cost, without running the tower.
+    ///
+    /// The resize plan is the checkpoint's own (`plan_image_grid` then `safe_resize`),
+    /// so this is the number the prompt and the KV pricing must agree on. It is split
+    /// out because pricing an image must not require decoding 970 MB of weights.
+    public func imageSpanPlan(width: Int, height: Int) -> (
+        width: Int, height: Int, columns: Int, rows: Int, tokens: Int
+    )? {
+        guard let spec = config.vision else { return nil }
+        return DeepSeekV41VisionLayout.fit(width: width, height: height, spec: spec)
+    }
+
     /// Releases the descriptors and slot buffers this runtime owns.
     ///
     /// Called when a new runtime replaces it (a different checkpoint, or a turn that
@@ -659,6 +1031,10 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
     /// stay open for the life of the process.
     public func shutdown() {
         cachedForward = nil
+        // The tower's resolver holds one descriptor per shard it reads from; dropping
+        // it here is what closes them with everything else this runtime owns.
+        cachedVision = nil
+        visionDeviceProblem = nil
         weights.close()
         expertStreamer?.close()
         arena.reset()
@@ -675,6 +1051,26 @@ nonisolated public final class DeepSeekV41Runtime: @unchecked Sendable {
             lines.append(
                 "experts: read through the shard mappings (\(expertStreamerProblem ?? "no streamer"))"
             )
+        }
+        if let densePin {
+            let gb = String(format: "%.2f", Double(densePin.totalBytes) / 1_073_741_824)
+            let rate = densePinSeconds > 0
+                ? String(
+                    format: " at %.0f MB/s",
+                    Double(densePin.totalBytes) / 1_048_576 / densePinSeconds
+                )
+                : ""
+            let left = densePin.skipped.isEmpty
+                ? ""
+                : ", \(densePin.skipped.count) left on the mapping ("
+                    + densePin.skipped.prefix(3).joined(separator: "; ")
+                    + (densePin.skipped.count > 3 ? "; ..." : "") + ")"
+            lines.append(
+                "dense: pinned \(gb) GB into \(densePin.chunkLengths.count) buffer(s), "
+                    + "\(densePin.ranges.count) tensors\(rate)\(left)"
+            )
+        } else {
+            lines.append("dense: read through the shard mappings (\(densePinProblem ?? "no pin"))")
         }
         lines.append(
             "dspark: " + (dspark.isEnabled
@@ -830,6 +1226,20 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
     public let compressorGroups: Int
     /// Slots one owner's compressor block holds, i.e. the widest compress ratio.
     public let compressorGroupWidth: Int
+    /// The indexer's own query for the position being scored, `indexHeadDim` wide
+    /// per index head, rotated. One copy per slot.
+    public let indexQuery: MTLBuffer
+    /// `weights_proj(x)` for the position, one weight per index head, unscaled: the
+    /// kernel multiplies by these, so the `index_head_dim ** -0.5 *
+    /// index_n_heads ** -0.5` factor is applied on the way in.
+    public let indexWeights: MTLBuffer
+    /// One index key while it is being built from a pooled latent.
+    public let indexKey: MTLBuffer
+    /// The indexer's score for every compressed row, one block per slot. Shared so
+    /// the host can read the selection it implies.
+    public let indexScores: MTLBuffer
+    /// Rows `indexScores` holds per slot.
+    public let indexerRows: Int
     /// The `wq_a` / `wo_a` rank-width scratch.
     public let reduced: MTLBuffer
     public let moeOut: MTLBuffer
@@ -896,6 +1306,7 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
         shapes: DeepSeekV41TensorShapes,
         config: DeepSeekV41Config,
         compressedOwners: Int,
+        indexerRows: Int = 0,
         slots: Int = 1
     ) {
         let mult = max(1, config.hcMult)
@@ -942,13 +1353,24 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
               let expertIndices = make(max(4 * config.numActivatedExperts, 16) * slots),
               let expertWeights = make(slotBytes(config.numActivatedExperts)),
               let intermediate = make(float4(shapes.expertIntermediate)),
-              let sharedIntermediate = make(float4(shapes.sharedIntermediate)),
+              // One staging row per position: a block's shared expert projects every
+              // slot's normed input in one dispatch, so this block is slot-sized rather
+              // than one position wide.
+              let sharedIntermediate = make(slotBytes(shapes.sharedIntermediate)),
               let pooled = make(float4(shapes.latentWidth)),
               let compressorLatents = make(
                   float4(maxCompressed * compressorGroups * shapes.latentWidth)
               ),
               let compressorScores = make(
                   float4(maxCompressed * compressorGroups * shapes.latentWidth)
+              ),
+              let indexQuery = make(
+                  slotBytes(max(1, config.indexNHeads * config.indexHeadDim))
+              ),
+              let indexWeights = make(slotBytes(max(1, config.indexNHeads))),
+              let indexKey = make(float4(max(1, config.indexHeadDim))),
+              let indexScores = make(
+                  float4(max(1, indexerRows) * slots)
               ),
               let reduced = make(slotBytes(max(1, max(shapes.qLoraRank, shapes.outputReducedWidth)))),
               let moeOut = make(slotBytes(shapes.hidden)),
@@ -962,7 +1384,10 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
               let hcFFNPost = make(slotBytes(mult)),
               let hcFFNComb = make(slotBytes(mult * mult)),
               let hcResidual = make(slotBytes(mult * shapes.hidden)),
-              let logits = make(float4(config.vocabSize)),
+              // One vocabulary vector per position, because a block that captures
+              // its logits runs the head over every slot at once and leaves them
+              // side by side. A decode step and a plain prefill only read slot 0.
+              let logits = make(float4(config.vocabSize * slots)),
               let rowIndices = make(4 * gather * slots),
               // One token id per position: a prefilled block writes its whole
               // prompt slice here and binds one id per embedding dispatch, so a
@@ -994,6 +1419,11 @@ nonisolated public final class DeepSeekV41Workspace: @unchecked Sendable {
         self.compressorScores = compressorScores
         self.compressorGroups = compressorGroups
         self.compressorGroupWidth = maxCompressed
+        self.indexQuery = indexQuery
+        self.indexWeights = indexWeights
+        self.indexKey = indexKey
+        self.indexScores = indexScores
+        self.indexerRows = max(1, indexerRows)
         self.reduced = reduced
         self.moeOut = moeOut
         self.streams = streams

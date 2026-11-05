@@ -133,6 +133,114 @@ final class CompletionEngineLogicTests: XCTestCase {
         XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: 50, promptTokenCount: 100, prefixTokensReused: 140), 50)
     }
 
+    // MARK: - Sampler penalties (frequency_penalty / logit_bias)
+
+    /// A logits vector with two candidates and a floor everywhere else, so a greedy
+    /// draw returns the winner of the ARITHMETIC rather than of a sample.
+    private static let samplerVocabSize = 2_000
+
+    private func withSamplerLogits(
+        _ body: (UnsafeMutablePointer<Float>) throws -> Void
+    ) rethrows {
+        let logits = UnsafeMutablePointer<Float>.allocate(capacity: Self.samplerVocabSize)
+        logits.initialize(repeating: -20, count: Self.samplerVocabSize)
+        logits[1000] = 20.0
+        logits[1005] = 19.5
+        defer {
+            logits.deinitialize(count: Self.samplerVocabSize)
+            logits.deallocate()
+        }
+        try body(logits)
+    }
+
+    private func greedy(
+        _ logits: UnsafeMutablePointer<Float>,
+        context: [UInt32],
+        repetition: Float = 1.0,
+        presence: Float = 0.0,
+        frequency: Float = 0.0,
+        bias: [Int32: Float] = [:]
+    ) -> UInt32 {
+        InferenceEngine.sampleNextToken(
+            logits: logits,
+            vocabSize: Self.samplerVocabSize,
+            contextTokens: context,
+            temperature: 0,
+            topP: 1,
+            minP: 0,
+            topK: 20,
+            repetitionPenalty: repetition,
+            presencePenalty: presence,
+            frequencyPenalty: frequency,
+            logitBias: bias
+        )
+    }
+
+    /// `frequency_penalty` is charged per OCCURRENCE, `presence_penalty` once per
+    /// distinct token. The same context and the same magnitude must therefore pick
+    /// opposite candidates here, which is the one thing that separates the two knobs.
+    func testFrequencyPenaltyIsChargedPerOccurrenceNotPerPresence() {
+        withSamplerLogits { logits in
+            let repeated: [UInt32] = [1000, 1000, 1000]
+
+            // 20.0 - 0.2 = 19.8 against 19.5: presence cannot demote it.
+            XCTAssertEqual(greedy(logits, context: repeated, presence: 0.2), 1000)
+            // 20.0 - 0.2 * 3 = 19.4 against 19.5: three occurrences can.
+            XCTAssertEqual(greedy(logits, context: repeated, frequency: 0.2), 1005)
+            XCTAssertEqual(logits[1000], 20.0, "the penalty must be restored by the defer")
+            XCTAssertEqual(logits[1005], 19.5)
+        }
+    }
+
+    /// A negative frequency penalty rewards repetition, as upstream defines it.
+    func testANegativeFrequencyPenaltyRewardsRepetition() {
+        withSamplerLogits { logits in
+            logits[1000] = 19.0
+            logits[1005] = 19.2
+            let repeated: [UInt32] = [1000, 1000]
+            XCTAssertEqual(greedy(logits, context: repeated), 1005, "unpenalised, 19.2 wins")
+            // 19.0 + 0.2 * 2 = 19.4, which overtakes 19.2.
+            XCTAssertEqual(greedy(logits, context: repeated, frequency: -0.2), 1000)
+            XCTAssertEqual(logits[1000], 19.0, "a negative penalty must be restored too")
+        }
+    }
+
+    /// `logit_bias` is additive on a named id whether or not the context holds it,
+    /// which is how a client bans a token it has not seen yet.
+    func testLogitBiasSuppressesAndPromotesTokensOutsideTheContext() {
+        withSamplerLogits { logits in
+            let unrelated: [UInt32] = [7, 8]
+            XCTAssertEqual(greedy(logits, context: unrelated), 1000)
+            // 20.0 - 1.0 = 19.0 against 19.5.
+            XCTAssertEqual(greedy(logits, context: unrelated, bias: [1000: -1.0]), 1005)
+            // 19.5 + 1.0 = 20.5 against 20.0.
+            XCTAssertEqual(greedy(logits, context: unrelated, bias: [1005: 1.0]), 1005)
+            XCTAssertEqual(logits[1000], 20.0)
+            XCTAssertEqual(logits[1005], 19.5, "a biased logit must be restored exactly")
+        }
+    }
+
+    /// The bias composes with the penalties on the same id, and the restore is not
+    /// applied twice (a double restore would put the un-biased value back first and
+    /// then "restore" the biased one, leaving the vector changed).
+    func testLogitBiasComposesWithThePenaltiesOnTheSameToken() {
+        withSamplerLogits { logits in
+            // 20.0 - 0.2 (presence) - 1.0 (bias) = 18.8 against 19.5.
+            let chosen = greedy(logits, context: [1000], presence: 0.2, bias: [1000: -1.0])
+            XCTAssertEqual(chosen, 1005)
+            XCTAssertEqual(logits[1000], 20.0, "penalty and bias must both be undone")
+        }
+    }
+
+    /// An id the loaded checkpoint cannot emit has no candidate to bias, so it is
+    /// skipped rather than treated as an error.
+    func testLogitBiasOnAnIdOutsideTheVocabularyChangesNothing() {
+        withSamplerLogits { logits in
+            XCTAssertEqual(greedy(logits, context: [], bias: [999_999: -1_000]), 1000)
+            XCTAssertEqual(greedy(logits, context: [], bias: [-5: 1_000]), 1000)
+        }
+    }
+
     // MARK: - Tag assembly (codepoint-exact)
 
     /// openTags[0] from TurnTextSplitter, assembled from codepoints:

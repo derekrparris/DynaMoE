@@ -36,11 +36,14 @@ struct AnthropicMessagesRequest: Decodable {
         let toolUses: [ToolUseIn]?
         let toolResults: [ToolResultIn]?
         /// True when the client sent an `image` block (or an image inside a
-        /// tool_result). The local engine has no vision tower, so the server
-        /// refuses these instead of silently dropping them.
+        /// tool_result). Whether the turn can read it is decided at plan time
+        /// from the loaded checkpoint's tower.
         let hasImageBlock: Bool
-        /// True when the client sent a block the text-only engine cannot process
-        /// (`document`, `audio`, or an unknown type). Refused like images rather
+        /// The image blocks this message carried, in the order the client sent
+        /// them, already decoded to the bytes the tower's decoder reads.
+        let imageBlocks: [ServerImagePart]
+        /// True when the client sent a block the engine cannot process at all
+        /// (`document`, `audio`, or an unknown type). Refused explicitly rather
         /// than silently dropped.
         let hasUnsupportedBlock: Bool
 
@@ -51,6 +54,7 @@ struct AnthropicMessagesRequest: Decodable {
             self.toolUses = toolUses
             self.toolResults = toolResults
             self.hasImageBlock = false
+            self.imageBlocks = []
             self.hasUnsupportedBlock = false
         }
 
@@ -61,19 +65,25 @@ struct AnthropicMessagesRequest: Decodable {
             var reasoning: String?
             var toolUses: [ToolUseIn] = []
             var toolResults: [ToolResultIn] = []
-            var hasImage = false
+            var images: [ServerImagePart] = []
             var hasUnsupported = false
             if let s = try? container.decode(String.self, forKey: .content) {
                 text = s.isEmpty ? nil : s
             } else if let blocks = try? container.decode([ContentBlockIn].self, forKey: .content) {
-                let joined = blocks.compactMap(\.text).filter { !$0.isEmpty }.joined(separator: "\n")
-                text = joined.isEmpty ? nil : joined
+                // Blocks are ordered and the order is meaning, so a picture keeps
+                // its place in the text as a sentinel rather than being collected
+                // beside it (`ServerImageParts.interleave`). Reasoning and tool
+                // blocks render separately and are not part of that order.
+                let pieces = blocks.map { block -> ServerImageParts.Piece in
+                    if let image = block.image { return .image(image) }
+                    return .text(block.text ?? "")
+                }
+                text = ServerImageParts.interleave(pieces)
                 let thoughts = blocks.compactMap(\.thinking).filter { !$0.isEmpty }.joined(separator: "\n")
                 reasoning = thoughts.isEmpty ? nil : thoughts
                 toolUses = blocks.compactMap(\.toolUse)
                 toolResults = blocks.compactMap(\.toolResult)
-                hasImage = blocks.contains(where: \.isImage)
-                    || toolResults.contains(where: \.hasImageBlock)
+                images = ServerImageParts.images(in: pieces)
                 hasUnsupported = blocks.contains(where: \.isUnsupported)
                     || toolResults.contains(where: \.hasUnsupportedBlock)
             }
@@ -81,7 +91,8 @@ struct AnthropicMessagesRequest: Decodable {
             self.reasoningText = reasoning
             self.toolUses = toolUses.isEmpty ? nil : toolUses
             self.toolResults = toolResults.isEmpty ? nil : toolResults
-            self.hasImageBlock = hasImage
+            self.imageBlocks = images
+            self.hasImageBlock = !images.isEmpty || toolResults.contains(where: \.hasImageBlock)
             self.hasUnsupportedBlock = hasUnsupported
         }
 
@@ -93,25 +104,67 @@ struct AnthropicMessagesRequest: Decodable {
         let thinking: String?
         let toolUse: ToolUseIn?
         let toolResult: ToolResultIn?
-        /// An `image` block. It carries no text and no tool payload, but the
-        /// server must know it is there to refuse the turn explicitly.
-        let isImage: Bool
+        /// The decoded `image` block, or nil when this block is not one.
+        let image: ServerImagePart?
         /// True for a block type the engine can neither read as text nor refuse
-        /// by name (an `image` block has its own flag).
+        /// by name (an `image` block has its own payload).
         let isUnsupported: Bool
+
+        /// The block types this protocol may put in a message that this engine can
+        /// handle. `redacted_thinking` is on the list precisely because it carries
+        /// nothing to handle: Anthropic returns it when part of a reasoning trace is
+        /// withheld, and the protocol requires a client to pass it back verbatim to the
+        /// model that issued it. Its payload is opaque bytes with no readable text, so
+        /// accepting it and rendering nothing from it is the same turn this server would
+        /// run without the block at all, while refusing it costs the user the whole
+        /// conversation over a block that adds nothing locally. EVERY other type is
+        /// still refused by name, which is what keeps a `document` from vanishing.
+        nonisolated static let handledTypes: Set<String> = [
+            "", "text", "thinking", "tool_use", "tool_result", "image", "redacted_thinking"
+        ]
+
+        var isImage: Bool { image != nil }
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             let type = try container.decodeIfPresent(String.self, forKey: .type) ?? ""
-            self.isImage = type == "image"
-            self.isUnsupported = !["", "text", "thinking", "tool_use", "tool_result", "image"].contains(type)
+            self.isUnsupported = !Self.handledTypes.contains(type)
             self.text = type == "text" ? try container.decodeIfPresent(String.self, forKey: .text) : nil
             self.thinking = type == "thinking" ? try container.decodeIfPresent(String.self, forKey: .thinking) : nil
             self.toolUse = type == "tool_use" ? try ToolUseIn(from: decoder) : nil
             self.toolResult = type == "tool_result" ? try ToolResultIn(from: decoder) : nil
+            if type == "image", let source = try? container.decode(ImageSource.self, forKey: .source) {
+                self.image = ServerImageParts.fromAnthropicSource(
+                    type: source.type,
+                    mediaType: source.mediaType,
+                    data: source.data,
+                    url: source.url
+                )
+            } else if type == "image" {
+                // An `image` block with no readable `source` is still an image:
+                // naming it keeps the refusal explicit instead of letting the
+                // block vanish and the model answer about nothing.
+                self.image = ServerImagePart(
+                    payload: .malformed(reason: "the image block carried no source object")
+                )
+            } else {
+                self.image = nil
+            }
         }
 
-        enum CodingKeys: String, CodingKey { case type, text, thinking }
+        struct ImageSource: Decodable {
+            let type: String?
+            let mediaType: String?
+            let data: String?
+            let url: String?
+
+            enum CodingKeys: String, CodingKey {
+                case type, data, url
+                case mediaType = "media_type"
+            }
+        }
+
+        enum CodingKeys: String, CodingKey { case type, text, thinking, source }
     }
 
     struct ToolUseIn: Decodable {
@@ -188,6 +241,17 @@ struct AnthropicMessagesRequest: Decodable {
         }
     }
 
+    /// The `thinking` block's own configuration.
+    ///
+    /// `budget_tokens` is a graded LEVEL, not a token cut: `AnthropicAdapter.thinkingEffort`
+    /// maps it to `.low` below 4096 and `.high` at or above it on a level-capable
+    /// checkpoint, refuses a non-positive value by name, and the request-log row records
+    /// what was asked. It cannot bound the reasoning channel at a token count, because
+    /// that channel closes when the model emits the family's close tag and the only cut
+    /// available mid-channel would be a forced tag emission the sampler cannot express.
+    /// The turn is bounded by `max_tokens` either way, so a budget can be exceeded only
+    /// INSIDE the total the client also named, and refusing it would fail every SDK that
+    /// sends one by default.
     struct ThinkingConfig: Decodable {
         let type: String?
         let budgetTokens: Int?
@@ -198,9 +262,75 @@ struct AnthropicMessagesRequest: Decodable {
         }
     }
 
+    /// Anthropic's request metadata, of which only `user_id` has any meaning (an
+    /// abuse-monitoring label, the same idea as OpenAI's `user`). Recorded on the
+    /// request log's row under the protocol's own spelling, so a caller's label
+    /// survives even when the bodies do not: see `ServerRequestLog.clientMetadata`.
+    nonisolated struct Metadata: Decodable {
+        let userId: String?
+
+        enum CodingKeys: String, CodingKey {
+            case userId = "user_id"
+        }
+
+        /// The recorded labels: the protocol's own key for the one value it carries.
+        /// Kept here rather than at the route so the spelling cannot drift from the
+        /// decoder's.
+        var labels: [String: String] {
+            guard let userId, !userId.isEmpty else { return [:] }
+            return ["user_id": userId]
+        }
+    }
+
     struct ToolChoice: Decodable {
         let type: String?
         let name: String?
+        /// Anthropic's `disable_parallel_tool_use`, decoded to be documented as
+        /// ignored for the reason OpenAI's `parallel_tool_calls` is: honouring it means
+        /// emitting at most one call, which this engine's sampler cannot express, and
+        /// a 400 would put a new refusal on a path SDKs drive daily. The turn may
+        /// therefore emit several calls, which every client recovers from.
+        let disableParallelToolUse: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case type, name
+            case disableParallelToolUse = "disable_parallel_tool_use"
+        }
+    }
+
+    /// `output_config`: Anthropic's structured-outputs setting. Only the format's
+    /// `type` is kept, because the refusal names it and parsing the schema would only
+    /// be a way to accept a promise this server cannot keep.
+    nonisolated struct OutputConfig: Decodable {
+        let formatType: String?
+
+        enum CodingKeys: String, CodingKey { case format }
+        enum FormatKeys: String, CodingKey { case type }
+
+        init(from decoder: Decoder) throws {
+            var type: String?
+            if let container = try? decoder.container(keyedBy: CodingKeys.self),
+               let format = try? container.nestedContainer(keyedBy: FormatKeys.self, forKey: .format) {
+                type = (try? format.decodeIfPresent(String.self, forKey: .type)) ?? nil
+            }
+            self.formatType = type
+        }
+    }
+
+    /// One entry of `mcp_servers`. Only the name is kept, so the refusal can say which
+    /// servers the client expected the model to have.
+    nonisolated struct MCPServerRef: Decodable {
+        let name: String?
+        let type: String?
+    }
+
+    /// `context_management`. Its edits are kept only to name their kinds in tests and
+    /// docs; nothing in this server performs them.
+    nonisolated struct ContextManagement: Decodable {
+        nonisolated struct Edit: Decodable {
+            let type: String?
+        }
+        let edits: [Edit]?
     }
 
     /// Top-level `system` field: bare string or array of text blocks.
@@ -216,15 +346,42 @@ struct AnthropicMessagesRequest: Decodable {
     let tools: [Tool]?
     let toolChoice: ToolChoice?
     let thinking: ThinkingConfig?
+    /// Recorded on the request log's row and never obeyed: an abuse label cannot move
+    /// a local answer, and a 400 for one would break every SDK that sends it by
+    /// default (the posture `seed` and `user` get on the OpenAI routes). Dropping it
+    /// entirely was the one thing it could not afford to do: see `Metadata.labels`.
+    let metadata: Metadata?
+    /// Decoded for the same reason: a service tier is a routing preference for a
+    /// hosted fleet, and this server has exactly one tier.
+    let serviceTier: String?
+    /// Anthropic's structured-outputs setting. Decoded so the planner can refuse it by
+    /// name, the way OpenAI's `response_format` is refused: it asks the server to
+    /// constrain decoding to a schema, this engine cannot, and ignoring it answered a
+    /// request for JSON with prose whose shape the client's parser then rejects.
+    let outputConfig: OutputConfig?
+    /// Anthropic's per-turn remote MCP servers. Decoded so the planner can refuse it:
+    /// a request cannot install tools here, because this app's MCP client is driven by
+    /// a local config file with its own per-call approval. Ignoring it ran the turn
+    /// without the tools the client had just named.
+    let mcpServers: [MCPServerRef]?
+    /// Anthropic's server-side context editing. Decoded to be documented as ignored:
+    /// not doing the housekeeping leaves more of the conversation in the prompt rather
+    /// than changing what the model is told, and the KV budget is where a prompt that
+    /// grew too long surfaces (`context_length_exceeded`).
+    let contextManagement: ContextManagement?
 
     enum CodingKeys: String, CodingKey {
-        case system, model, messages, stream, tools, thinking
+        case system, model, messages, stream, tools, thinking, metadata
         case maxTokens = "max_tokens"
         case temperature
         case topP = "top_p"
         case topK = "top_k"
         case stopSequences = "stop_sequences"
         case toolChoice = "tool_choice"
+        case serviceTier = "service_tier"
+        case outputConfig = "output_config"
+        case mcpServers = "mcp_servers"
+        case contextManagement = "context_management"
     }
 
     init(from decoder: Decoder) throws {
@@ -251,20 +408,33 @@ struct AnthropicMessagesRequest: Decodable {
         // (silently dropping the name would make it behave like `auto`).
         self.toolChoice = try? container.decode(ToolChoice.self, forKey: .toolChoice)
         self.thinking = try container.decodeIfPresent(ThinkingConfig.self, forKey: .thinking)
+        // Decoded to be documented as ignored, not obeyed: see the field notes above.
+        // Left out of the decoder they were dropped by `Decodable`'s unknown-key
+        // tolerance, which is the mechanism that made every field in this file a
+        // potential silent substitution.
+        self.metadata = try container.decodeIfPresent(Metadata.self, forKey: .metadata)
+        self.serviceTier = try container.decodeIfPresent(String.self, forKey: .serviceTier)
+        // The two the planner refuses by name, and the one it documents as ignored,
+        // join that list for the same reason: unknown-key tolerance made every field
+        // in this file a potential silent substitution.
+        self.outputConfig = try container.decodeIfPresent(OutputConfig.self, forKey: .outputConfig)
+        self.mcpServers = try container.decodeIfPresent([MCPServerRef].self, forKey: .mcpServers)
+        self.contextManagement = try container.decodeIfPresent(ContextManagement.self, forKey: .contextManagement)
     }
 
     /// The `tool_choice.type` value, for callers (and tests) that only need the
     /// mode rather than the full choice.
     var toolChoiceType: String? { toolChoice?.type }
 
-    /// True when any message carries an image block. Refused by the server rather
-    /// than stripped: a text-only answer about a screenshot the model never saw
-    /// is worse than an explicit error.
+    /// True when any message carries an image block. The turn planner accepts
+    /// these only when the loaded checkpoint publishes a vision tower, and refuses
+    /// them by name otherwise: a text-only answer about a screenshot the model
+    /// never saw is worse than an explicit error.
     var hasImageContent: Bool {
         messages.contains(where: \.hasImageBlock)
     }
 
-    /// True when any message carries a block the text-only engine cannot process.
+    /// True when any message carries a block the engine cannot process at all.
     var hasUnsupportedContent: Bool {
         messages.contains(where: \.hasUnsupportedBlock)
     }
@@ -279,6 +449,61 @@ struct AnthropicUsage: Encodable {
     enum CodingKeys: String, CodingKey {
         case inputTokens = "input_tokens"
         case outputTokens = "output_tokens"
+    }
+}
+
+/// The whole body of `POST /v1/messages/count_tokens`: the protocol's pre-flight
+/// answers one field and nothing else. The number is the prompt the messages
+/// route would report as `usage.input_tokens` for the same body, i.e. AFTER an
+/// attachment's span is expanded, because the span is what the model attends over
+/// and what the budget is checked against.
+struct AnthropicTokenCount: ResponseEncodable {
+    let inputTokens: Int
+
+    enum CodingKeys: String, CodingKey {
+        case inputTokens = "input_tokens"
+    }
+}
+
+/// One model in this protocol's own models list.
+///
+/// Anthropic's model object is not OpenAI's. It is `type`/`id`/`display_name`/
+/// `created_at`, where `id` is the string every response's `model` field carries
+/// and `display_name` is the human form a UI shows, and `created_at` is an RFC
+/// 3339 timestamp rather than an epoch second, so a client formats it instead of
+/// converting it. Both SDKs' model types decode these four fields and ignore the
+/// rest, so nothing beyond them is invented here.
+struct AnthropicModel: ResponseEncodable {
+    let id: String
+    let displayName: String
+    let createdAt: String
+    let type: String = "model"
+
+    enum CodingKeys: String, CodingKey {
+        case id, type
+        case displayName = "display_name"
+        case createdAt = "created_at"
+    }
+}
+
+/// The body of `GET /v1/models` under this protocol.
+///
+/// One entry, because this app serves one loaded checkpoint, so the pagination
+/// cursors describe a page that is always the whole list: `has_more` is false and
+/// both cursors name the only model. They are carried rather than omitted because
+/// the protocol's list type requires them, and a client that pages on a missing
+/// cursor sees a decode failure rather than the end of the list.
+struct AnthropicModelList: ResponseEncodable {
+    let data: [AnthropicModel]
+    let hasMore: Bool
+    let firstId: String?
+    let lastId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case data
+        case hasMore = "has_more"
+        case firstId = "first_id"
+        case lastId = "last_id"
     }
 }
 
@@ -528,6 +753,47 @@ enum AnthropicAdapter {
         }
     }
 
+    /// Refuses the Anthropic request fields this server cannot honour, by name.
+    ///
+    /// `output_config` asks for schema-constrained decoding and this engine cannot
+    /// constrain it, so ignoring the field answered a request for JSON with prose whose
+    /// shape the client's parser then rejected. `mcp_servers` asks THIS server to
+    /// connect remote MCP servers for the turn and offer their tools; this app's MCP
+    /// client is driven by a local config file with its own per-call approval, so a
+    /// request cannot install tools, and ignoring the field ran the turn without the
+    /// tools the client had just named.
+    ///
+    /// Both refusals are keyed on presence, and both run before the model gate so a
+    /// test can prove the ordering. `context_management` and
+    /// `tool_choice.disable_parallel_tool_use` are documented as ignored instead, in the
+    /// field notes, because neither changes what the model is told: the first is
+    /// housekeeping whose absence lengthens the prompt (and the KV budget is where that
+    /// surfaces), and the second is a sampling constraint the engine cannot express,
+    /// exactly like OpenAI's `parallel_tool_calls`.
+    nonisolated static func refuseUnsupportedRequestFields(_ request: AnthropicMessagesRequest) throws {
+        if let output = request.outputConfig {
+            throw ServerAPIError.badRequest(
+                "output_config is not supported: it asks this server to constrain decoding to a schema, "
+                    + "and this engine cannot"
+                    + (output.formatType.map { " (it asked for \"\($0)\")" } ?? "")
+                    + ". Ask for the JSON shape in the prompt and validate it on your side, or omit output_config.",
+                logSafeMessage: "output_config asks for schema-constrained decoding"
+            )
+        }
+        if let servers = request.mcpServers, !servers.isEmpty {
+            let named = servers.prefix(3).compactMap(\.name).filter { !$0.isEmpty }
+                .map { "\"\($0)\"" }.joined(separator: ", ")
+            throw ServerAPIError.badRequest(
+                "mcp_servers is not supported: it asks this server to connect remote MCP servers for the "
+                    + "turn, and this app's MCP client is configured locally with its own per-call approval "
+                    + "rather than driven by a request"
+                    + (named.isEmpty ? "" : " (it named \(named))")
+                    + ". Declare the tools you need in tools, or configure the server in the app's MCP settings.",
+                logSafeMessage: "mcp_servers asks this server to connect a remote MCP server"
+            )
+        }
+    }
+
     /// Maps Anthropic's `thinking` config onto a graded level. A token budget
     /// is an upper bound rather than a level, so budgets below 4096 map to
     /// low and larger budgets to high; omitting the budget keeps the
@@ -635,7 +901,7 @@ enum AnthropicAdapter {
     /// re-tokenizes the whole conversation every turn, so each turn's prompt
     /// can no longer extend the previous turn's pinned prompt+generation and
     /// multi-turn requests fully re-prefill.
-    static func splitMessages(_ messages: [AnthropicMessagesRequest.Message]) throws -> [ChatPromptFormatter.ConversationTurn] {
+    static func splitMessages(_ messages: [AnthropicMessagesRequest.Message]) throws -> ServerPromptSplit {
         guard !messages.isEmpty else {
             throw ServerAPIError.badRequest("messages must contain at least one message")
         }
@@ -648,8 +914,22 @@ enum AnthropicAdapter {
         }
         try rejectUnsupportedPrefill(messages)
 
-        var turns: [ChatPromptFormatter.ConversationTurn] = []
+        var split = ServerPromptSplit()
         for message in messages {
+            // A picture belongs to the turn it was sent with, and only a user turn
+            // has a place to put one. An image inside a tool result is legal on the
+            // wire but has no position in the rendered result text, so it is named
+            // rather than dropped.
+            if message.hasImageBlock, message.role != "user" {
+                throw ServerAPIError.unsupportedContent(
+                    "An image block can only be attached to a user message, not to an \"\(message.role)\" message."
+                )
+            }
+            if (message.toolResults ?? []).contains(where: \.hasImageBlock) {
+                throw ServerAPIError.unsupportedContent(
+                    "An image inside a tool_result is not supported. Send the picture as an image block in a user message instead."
+                )
+            }
             switch message.role {
             case "user":
                 var parts: [String] = []
@@ -661,7 +941,13 @@ enum AnthropicAdapter {
                     parts.append("Tool result (\(label)):\n\(result.content ?? "(no result)")")
                 }
                 let body = parts.joined(separator: "\n\n")
-                turns.append(.init(role: .user, text: body.isEmpty ? "(no content)" : body))
+                if !message.imageBlocks.isEmpty { split.images[split.turns.count] = message.imageBlocks }
+                // An image-only turn still has content: the planner writes the
+                // marker, so the placeholder text would be read as the question.
+                let placeholderText = body.isEmpty
+                    ? (message.imageBlocks.isEmpty ? "(no content)" : "")
+                    : body
+                split.turns.append(.init(role: .user, text: placeholderText))
             case "assistant":
                 var parts: [String] = []
                 // Reasoning a client echoed back is re-rendered ahead of the
@@ -697,17 +983,56 @@ enum AnthropicAdapter {
                     parts.append(ChatPromptFormatter.anthropicToolCallEchoPrefix + "\n" + rendered)
                 }
                 let body = parts.joined(separator: "\n\n")
-                turns.append(.init(role: .assistant, text: body.isEmpty ? "(no content)" : body))
+                split.turns.append(.init(role: .assistant, text: body.isEmpty ? "(no content)" : body))
             default:
                 if let content = message.contentText, !content.isEmpty {
-                    turns.append(.init(role: .user, text: "\(message.role.capitalized): \(content)"))
+                    split.turns.append(.init(role: .user, text: "\(message.role.capitalized): \(content)"))
                 }
             }
         }
-        guard !turns.isEmpty else {
+        guard !split.turns.isEmpty else {
             throw ServerAPIError.badRequest("messages must contain at least one message")
         }
-        return turns
+        return split
+    }
+
+    /// The one model entry this server advertises for a loaded checkpoint.
+    ///
+    /// Kept a function of the facts, mirroring `OpenAIModelList.entry`, so the
+    /// mapping is testable with no loaded model and so the id a client sees here
+    /// is the same string every response's `model` field carries.
+    nonisolated static func entry(
+        id: String,
+        displayName: String,
+        createdAt: Date
+    ) -> AnthropicModel {
+        AnthropicModel(id: id, displayName: displayName, createdAt: createdAtString(createdAt))
+    }
+
+    /// RFC 3339 as this protocol spells it: second precision, `Z` rather than an
+    /// offset. A client parses this into its own date type, so minutes or a
+    /// numeric offset would both decode and both be a different value than the
+    /// one sent.
+    nonisolated static func createdAtString(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        return formatter.string(from: date)
+    }
+
+    /// The human-readable name for the served checkpoint.
+    ///
+    /// The `id` beside it is the repository's short name (`ModelServingID`), which
+    /// is stable across a re-resolve; `display_name` is the same repository spelled
+    /// the way a human writes it, author included, because this protocol has a
+    /// field for exactly that while the id has to survive as a path segment. The
+    /// repository directory carries both, so
+    /// `.../hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/<hash>`
+    /// advertises `deepseek-ai/DeepSeek-V4.1-Flash-1017`. A checkpoint that is not
+    /// a hub snapshot has no repository name to recover, so its own directory name
+    /// is the display name rather than nothing.
+    nonisolated static func displayName(servedId: String, snapshotPath: String?) -> String {
+        ModelServingID.repository(from: snapshotPath) ?? servedId
     }
 
     /// Stable prefix-cache session key, mirroring the OpenAI adapter scheme:
@@ -718,6 +1043,10 @@ enum AnthropicAdapter {
     /// open identically still collide, so reuse is additionally gated on exact
     /// token-prefix equality inside PrefixCacheManager.findCommonPrefix and on
     /// `ServerTurnMemory` re-validating the rendered history.
+    ///
+    /// A picture is part of that identity: two requests can carry the same TEXT
+    /// and different images, and both render to the same list of image token ids,
+    /// so the digest of the anchor's images is folded in here.
     static func sessionKey(for messages: [AnthropicMessagesRequest.Message], model: String?) -> UUID {
         var lane0: UInt64 = 0xcbf29ce484222325
         var lane1: UInt64 = 0x9e3779b97f4a7c15
@@ -741,6 +1070,9 @@ enum AnthropicAdapter {
             for result in anchor.toolResults ?? [] {
                 mixString("result:" + (result.toolUseId ?? ""))
                 mixString(result.content ?? "")
+            }
+            if !anchor.imageBlocks.isEmpty {
+                mixString("images:" + ServerImageParts.digest(anchor.imageBlocks))
             }
         }
 

@@ -3557,6 +3557,8 @@ knowable here. Two honest consequences:
 
 - Do not flip the `batchedDevicePrefill` conformance gate on the strength of
   this: it is port-against-port parity, not a number from real weights.
+  **Updated in `#33`:** the gate was flipped on a real-weight comparison, not on
+  this synthetic one (`#33`, "The real-weight comparison").
 - The next lever on this path is batching the **mixture** — an arena that holds
   a block's expert union (or deduplicates residency across the block's
   routings), so one submission covers the block instead of one per position.
@@ -3655,6 +3657,8 @@ another measurement, not another rewrite.
 - The `batchedDevicePrefill` conformance gate still stays `.unverified`: this is
   port-against-port parity on a synthetic model, with no real-weight number
   anywhere on the machine.
+  **Updated in `#33`:** it is now `.verifiedAgainstReference`, on the published
+  checkpoint's own weights; this bullet describes the state before `#33`.
 - Everything from `#1` about the walk paying a per-position logits readback,
   window rows not being comparable to each other, and the absent compressed /
   Engram / DSpark stages still holds.
@@ -5043,3 +5047,9965 @@ fails it with 14 assertion failures. `testTheWideGemvGridIsChosenByHowMuchWorkTh
 now asserts the form rule's new parameter: a 1,536-wide block stays `.block`, an 8,192-wide
 block takes `.blockPair`, and a short batch still falls back to the two-way rule. Whole
 DeepSeek suite: 422 tests, 15 skipped, 0 failures.
+
+## DSV4.1 #19: THE DENSE BACKBONE WAS A PAGE-FAULT WALK, NOT A COMPUTE COST
+
+Every entry above measured the device graph on `DeepSeekV41SyntheticCheckpoint`, which
+publishes a whole model as one aligned blob. That is the right fixture for ranking kernels
+and the wrong one for asking where a real turn's seconds go: a synthetic blob is already
+resident, so no measurement in this journal had ever priced the *address* a tensor lives at.
+On the published checkpoint the dense backbone is ~170 MB per layer plus a 1.32 GB output
+head, mapped zero-copy out of 48 shards that are 99% routed experts, and those pages do not
+survive a token: the expert stream reads 23 GB of them in between.
+
+The first real turn (`#none`, before this entry) was 60.7 s of prefill and 348 s of decode
+for seven tokens — ~58 s/token, i.e. 1.45 s per layer for ~200 MB of dense reads, or
+~140 MB/s. That is the GPU page-fault path, not DRAM, and it is 160x off what the same
+weights cost once resident.
+
+**The fix** is the one the packed-format families already use, generalised:
+`DeepSeekV41DensePin` packs the non-expert, non-streamed backbone into 1 GiB resident
+`.storageModeShared` buffers at load (a tensor wider than a chunk gets its own), rewrites
+each tensor's `(shardIndex, byteOffset)` to address its new home, and merges the chunks into
+the buffer registry the executor binds through. Nothing in the graph changed: a GEMV still
+binds a buffer at offset 0 and passes its `byteOffset` as an argument, so a rewritten
+address is indistinguishable from a shard address.
+
+**What is pinned** (measured from the index, not assumed):
+
+| category | bytes | tensors | pinned |
+|---|---:|---:|---|
+| routed experts | 296.0 GB | 94,464 | no, the arena streams them |
+| Engram tables | 202.8 GB | 4 | no, read row by row |
+| dense layers (40) | 6.8 GB | 1,236 | yes |
+| output head | 1.32 GB | 1 | yes |
+| embedding | 1.32 GB | 1 | no, read as single rows |
+| vision tower + draft block | 1.68 GB | 360 | no, the text graph never reads them |
+
+**Load** (`testAPublishedPromptCompletesATurn`, "hey"):
+
+```
+dense: pinned 8.11 GB into 8 buffer(s), 1335 tensors at 27921 MB/s,
+       8 left on the mapping (layers.1.engram.k_weight: no shard names
+       model-00047-of-00048.safetensors at file offset 0; ...)
+```
+
+27.9 GB/s is the parallel pread of 8 files at once; the pin costs a few seconds of load and
+nothing afterwards. The eight tensors left on the mapping are the two Engram shards' dense
+half: those files are 94.56 GiB and `segmentShardsForMetal` collapses each to ONE segment
+(a ~100 GB streamed table plus a few hundred MB that maps), so the segment's start in the
+file is not in the summary. Recovering it needs the safetensors header, which is a follow-up
+worth ~314 MB of 8.4 GB, i.e. 3.7%.
+
+**The turn**, same prompt, same machine, only the address of the weights differing:
+
+| | mapping | pinned, head skipped | pinned, head included |
+|---|---:|---:|---:|
+| prefill (5 positions) | 60.7 s | 3.12 s | **1.18 s** |
+| decode (6 steps) | 348 s | 4.01 s | **2.19 s** |
+| whole test (load + turn) | ~700 s | 13.06 s | **8.43 s** |
+| answer | "Hey! How's it going?" | same | same |
+
+~58 s/token → 0.37 s/token. The middle column isolates the head: 1.32 GB read in full once
+per token cost 0.30 s/token on its own (4.4 GB/s, faster than the layer path because one
+contiguous gigabyte faults more sequentially), which is why it is pinned first in the plan's
+order and gets a dedicated chunk.
+
+**Why it was not the GPU.** `#13`-`#18` put the whole dense half of a block at 0.32
+ms/position on the synthetic fixture, i.e. 40 layers ≈ 13 ms/token. The real turn was 1,450
+ms/layer. The gap was never in the kernels, and no amount of block-width or row-sharing work
+would have found it: every table in this journal was taken on weights that were already in
+RAM.
+
+**Tests.** `DeepSeekV41DensePinPlanTests` pins the packing (alignment, no chunk straddle,
+segment file offsets, the budget, the head-first order, a dedicated buffer for a tensor
+wider than a chunk, refusal past the buffer limit). The end-to-end guarantee is
+`testAPinnedRuntimeComputesTheSameLogitsAsTheMappedOne`: two runtimes over the same
+synthetic shard file, one pinned and one mapped, must return BIT-IDENTICAL logits for three
+decode positions — a dropped tensor, a forgotten segment start or a misaligned slot moves
+them by O(1). Whole DeepSeek suite: 450 tests, 20 skipped, 0 failures.
+
+**Caveats.** The pinned bytes are dirty pages rather than clean file-backed ones, which is
+why the budget is a third of RAM and why the memory plan already prices them as resident; on
+a machine that cannot hold the whole backbone the plan pins a prefix (head first) instead of
+refusing to load. And the numbers above are one turn of seven tokens on an M5 Max, so they
+say the fault path is gone, not what the new steady state is. What is left is visible in the
+same log: the turn read 23.25 GB of experts at 8.6 GB/s with a 40.5% arena hit rate, i.e.
+~2.6 GB of expert misses per token, about 0.30 s of the 0.37 s/token. The dense half is no
+longer the cost; the arena's hit rate is, and that is the next measurement rather than
+another kernel.
+
+## DSV4.1 #20: THE DECODE STEP WAS TWO KERNEL SHAPES, NOT THE DISK
+
+`#19` closed by naming the expert arena's hit rate as the next lever, on the strength of a
+turn that spent 0.30 s of 0.37 s/token waiting on 2.6 GB of expert misses. Measuring it said
+something else, and the difference matters because it sends the next slice somewhere else
+entirely.
+
+**The instrument.** The block path had `DeepSeekV41BlockTiming`; a decode step runs the walk,
+which commits two command buffers per layer and blocks on the host twice, so a token's cost
+can sit anywhere between the host and the GPU. `DeepSeekV41WalkTiming` (off unless
+`DeepSeekV41MetalForward.recordsWalkTiming` is on) now splits it into front encode, front
+wait, expert fill, mixture encode, and each half's own `gpuStartTime`/`gpuEndTime` window, and
+`DeepSeekV41PublishedTurnTests.testWhatADecodePositionCosts` runs the real checkpoint over a
+53-token prompt+answer sequence and prints the split. Per decoded position, before anything
+below was changed:
+
+| bucket | ms/position |
+|---|---:|
+| front encode (host) | 4.9 |
+| front wait (host, blocked) | 253.3 |
+| expert fill (host, pread) | 136.2 |
+| mixture encode (host) | 3.6 |
+| front half, device | 38.7 |
+| mixture half, device | 39.1 |
+| whole position | 398.0 |
+
+**The disk was already at its ceiling.** A raw measurement of the same read pattern
+against `model-00047` (5.9 MB ranges, distinct spans, `F_NOCACHE`): 13.43 GB/s at concurrency
+1, 13.84 at 4, 16, and 36; 13.19 GB/s for a batch of only 36 ranges (0.18 GB); 13.79 for
+0.5 GB. The streamer's own pread timers report 13-14 GB/s over a fill at the start of a
+sequence. A fill is therefore worth exactly the bytes it moves, and the bytes are the arena's
+hit rate — but the fill was 136 ms of 398, not 300 of 370: the token had moved on.
+
+**What the token was actually spending.** Each half read its weights through a kernel that
+gives a thread a WHOLE OUTPUT ROW and walks it block by block. With 32 lanes per warp a row
+apart, every lane's load pulls a 32-byte sector for one to sixteen useful bytes, and the
+reduction is one dependent chain per row. This is the same defect `#10`, `#13` and `#17`
+fixed for BF16 and for attention, and it had simply never been fixed for the two
+block-scaled formats this checkpoint actually ships.
+
+Isolated A/B of the new forms (`threadgroup` per output row, lanes striding the blocks,
+`simd_sum` reduction, threadgroup memory sized one float per SIMD group), one dispatch
+amortized over six distinct weight regions in one command buffer, best of 8:
+
+FP8 32x32 ue8m0, decode (one position):
+
+| projection | one thread/row | coalesced, 32 lanes | coalesced, 64 lanes |
+|---|---:|---:|---:|
+| `attn.wq_b` 32,768x1,280 | **0.308 ms** | 0.394 (0.78x) | 0.351 (0.88x) |
+| `attn.wo_b` 5,120x8,192 | 0.261 | **0.108 (2.42x, 370 GB/s)** | 0.110 (2.37x) |
+| `attn.wo_a` band 1,024x4,096 | 0.128 | **0.033 (3.93x)** | 0.033 (3.94x) |
+| `attn.wq_a` 1,280x5,120 | 0.156 | 0.039 (4.00x) | **0.038 (4.13x)** |
+| `attn.wkv` 512x5,120 | 0.153 | 0.032 (4.74x) | **0.028 (5.41x)** |
+| `shared_experts.w1` 2,304x5,120 | 0.174 | 0.052 (3.38x) | **0.045 (3.88x)** |
+
+MXFP4 routed expert, decode:
+
+| kernel | one thread/row | coalesced, 32 lanes | coalesced, 64 lanes |
+|---|---:|---:|---:|
+| fused gate+up 2,304x5,120 | 0.472 ms (48 GB/s) | **0.075 (6.33x, 300 GB/s)** | 0.092 (5.13x) |
+| down 5,120x2,304 | 0.133 (42 GB/s) | **0.057 (2.32x)** | 0.059 (2.26x) |
+
+Two things the table says that a rule needs:
+
+- **`wq_b` keeps the one-thread form.** It is 32,768 rows over 1,280 columns: 40 blocks, so a
+  32-lane row has one of them and only 40 lanes of a 64-lane group are ever busy, while the
+  grid becomes 32,768 threadgroups of almost no work. At a block of eight positions it is
+  worse still (0.588 → 0.850 ms, 0.69x). `fp8GemvWantsWideGrid` therefore requires
+  `inDim >= 1,024` AND leaves tall-narrow shapes on the old form until a rows-per-threadgroup
+  kernel exists; `wq_b` is ~12 ms/token of the dense half, so that is worth doing.
+- **32 lanes wins for the mixture and 64 for FP8.** A 32-lane group is one SIMD group, so
+  `simd_sum` finishes the reduction and the kernel returns without touching threadgroup
+  memory or a barrier at all; the fused gate+up pays for four accumulators, which is where the
+  wider group's barrier hurts most. Both widths measured, both shipped as measured
+  (`mixtureLaneWidth` 32, `gemvLaneWidth` 64).
+
+**After.** Same sequence, same tokens, only the kernels differing:
+
+| bucket | before | after |
+|---|---:|---:|
+| front half, device | 38.7 ms | **28.7 ms** |
+| mixture half, device | 39.1 ms | **27.0 ms** |
+| expert fill | 136.2 ms | 67.1 ms |
+| whole position | 398.0 ms | **204.6 ms** |
+| 53 positions, average | 315.6 ms | **220.1 ms** |
+
+The fill moved too, and not because of the kernels: the run above had the page cache serving
+part of it. The honest reading is that the GPU halves fell by 2.7x and 1.5x and the fill is a
+function of the arena's hit rate on the day.
+
+**The turn**, `Write three sentences about why the ocean is salty.`, greedy, 39 tokens:
+
+| | before | after |
+|---|---:|---:|
+| prefill (14 positions) | 7.15 s | **2.49 s** (2.04 s on an idle machine) |
+| decode (39 tokens) | 19.02 s (**488 ms/token**) | **8.35 s (214 ms/token)** |
+| answer | identical | identical |
+
+A second run immediately after another app-hosted test measured 12.42 s of decode, i.e. 318
+ms/token, with identical read counts — the difference is machine state (a 70 GB arena being
+released by the previous process and the page cache reclaiming), which is why the tables
+above are A/Bs inside one run rather than comparisons across runs.
+
+**`F_NOCACHE` on the expert descriptors was implemented, measured, and REVERTED.** The arena
+is the expert cache (~70 GB of whole pairs) and each pread also inserts its bytes into the
+unified buffer cache, so bypassing it looks like a way to stop two caches competing for the
+same RAM. It is a 2.2x loss: fills ran at 2-4 GB/s against 13.4-13.9 through the page cache,
+and the GPU halves slowed to 60 ms each as well, so the time was going somewhere other than
+the disk. A cold read of the same ranges through a plain buffer measures 13.8 GB/s either way,
+which says the cost is this destination (Metal shared memory), not the file cache. Do not
+re-propose it without a number that beats 13.9.
+
+**Tests.** `DeepSeekV41FP8GemvKernelTests` pins the coalesced FP8 form against a host rule
+(including the 32x32 scale grid, where 32 consecutive rows share one scale row), against the
+one-thread form, on a batch with input/output strides wider than the shape, and on a row
+shorter than the block count of a lane. `testWhatTheCoalescedFP8FormIsWorth` and
+`testWhatTheCoalescedMixtureIsWorth` are the A/Bs above, opt-in like the rest of the
+measurement file. The published turn answers identically and runs clean under
+`MTL_DEBUG_LAYER=1`; whole DeepSeek suite 457 tests, 23 skipped, 0 failures.
+
+**What is left, in the order the buckets now rank.** The expert fill is the largest single
+item (67 ms of 205) and it is disk-bound at 13-14 GB/s, so what improves it is fewer misses:
+the arena is `0.6 * RAM` (3,760 slots on 128 GB, ~71 GB) against 15,360 pairs, and one run
+measured the fill degrading from 13.9 GB/s to 8 GB/s as the arena filled, which is memory
+pressure rather than the disk. Second is `front wait` (130 ms of which ~56 ms is the two
+halves' own device time): a decode step makes 80 host round trips per token, and the queue's
+turnaround at ~1.9 ms/layer is now larger than the work it is waiting for. Third is the two
+shapes the rules deliberately left alone: `wq_b` (~12 ms/token) and the shared experts'
+FP8 swiglu and down (~21 ms/token), both of which want the same treatment with several rows
+per threadgroup rather than one.
+
+## DSV4.1 #21: THE TWO-ROW FP8 FORM IS A WASH, AND THE ARENA NEVER EVICTS
+
+#20 left two named candidates: the shapes the coalesced form still lost on (`attn.wq_b`
+and the shared experts' FFN), which looked like the `bf16_gemv_rows8x2` "several rows per
+threadgroup" fix, and the expert arena's hit rate, which looked like an eviction-policy
+problem. Both were measured. Neither was what it looked like, and the second question
+turned out to have no eviction in it at all.
+
+### Two rows per threadgroup, on FP8
+
+`dsv41_fp8_block32_gemv_rows2` gives a threadgroup two consecutive output rows and one
+input token: each lane reads its input floats once, then both rows' weight bytes and
+scales, and the grid halves from `outDim * tokens` to `ceil(outDim / 2) * tokens`. Same
+buffer indices as the one-row form, two floats per SIMD group of partials, the 32-lane
+fast path still returns without a barrier. `DeepSeekV41FP8GemvKernelTests` pins it against
+the host rule at both lane widths, on an odd row count (the last pair has no second row),
+and on a batch with input/output strides wider than the shape.
+
+The A/B runs three arms — one-thread, one-row, pair — interleaved inside each of eight
+repetitions, six distinct weight regions per command buffer, and refuses to time a pair
+whose outputs disagree. One decode position (ms):
+
+| shape | one-thread | one-row | pair 32 | pair 64 |
+|---|---:|---:|---:|---:|
+| `attn.wq_b` 32,768x1,280 | **0.140** | 0.151 (0.93x) | 0.148 | 0.146 |
+| `shared_experts.w1` 2,304x5,120 | 0.170 | **0.049 (3.48x)** | 0.051 | 0.055 |
+| `shared_experts.w2` 5,120x2,304 | 0.087 | **0.052 (1.67x)** | 0.061 | 0.059 |
+| `attn.wo_b` 5,120x8,192 | 0.279 | **0.108 (2.59x)** | 0.124 | 0.113 |
+
+and a block of eight positions:
+
+| shape | one-thread | one-row | pair 32 | pair 64 |
+|---|---:|---:|---:|---:|
+| `attn.wq_b` | **0.585** | 0.934 (0.63x) | 0.849 | 0.893 |
+| `shared_experts.w1` | 0.239 | **0.192 (1.24x)** | 0.190 | 0.196 |
+| `shared_experts.w2` | **0.205** | 0.238 (0.86x) | 0.230 | 0.234 |
+| `attn.wo_b` | 0.644 | **0.583 (1.10x)** | 0.585 | 0.584 |
+
+The pair form is between 0.85x and 1.10x of the one-row form everywhere, i.e. inside the
+noise of the thing it was meant to replace. The reason is the opposite of the BF16 result:
+there, a block of eight positions re-reads every position's activation once per output row
+(1.9 GB of READ requests per block on `outputUp`), so halving the input traffic halved the
+stage. Here the input is a single 5 KB vector that every threadgroup reads from cache; what
+the pair form adds instead is four more accumulators and twice the E4M3 unpack per lane. Do
+not wire it, and do not re-propose "more rows per threadgroup" for FP8 without a shape whose
+input traffic is the measured cost. It stays in the shader library as the baseline the
+sweep measures, and it is deliberately not in `DeepSeekV41Pipelines`.
+
+**The rule moved instead.** A width sweep at a fixed 5,120 rows puts the one-thread form
+ahead below 64 blocks (1,024 values: one-row still wins 1.42x at one position but loses at
+eight; 1,280 loses at both) and the coalesced form clearly ahead from 2,048 up. That is one
+32-value block per lane at 64 lanes, which is now the rule: `inDim >= 2_048` rather than
+`1_024`. The published shape this changes is `attn.wq_b` (40 blocks), the one projection
+where #20's own numbers already said the coalesced form was 0.78x — it now takes the
+one-thread form, worth 1.07x at one position and 1.6x at eight.
+
+The GB/s column in the measurement prints was also wrong by a factor of a million: it
+divided a MILLISECOND figure by 1e9 twice. Both helpers are fixed, so the printed number is
+now the number the journal quotes.
+
+### The arena has no evictions to tune
+
+#20 ranked the fill first and asked whether the arena's degradation was reclaim, and whether
+a smaller arena or a different eviction order would fill faster. Instrumenting
+`DeepSeekV41ExpertStreamer` answered the question before it was optimised: over a 53-position
+walk of the published checkpoint, 12,720 acquisitions at a 70.6% hit rate touched 3,739
+distinct pairs against a capacity of 3,760. **Every miss was a first touch and nothing was
+ever evicted.** Raising the budget from 0.6 to 0.72 of RAM (3,760 -> 4,637 slots) left the
+per-position read byte-for-byte identical (806.8 MB at position 52 in both arms) and the hit
+rate identical (70.6%), because the extra capacity was never needed. A 15-draw turn at 0.72
+ends at 1,790 of 4,637 resident.
+
+So the fill is cold-start bound, not capacity bound: a token routes six of 384 experts in
+each of forty layers, and after a few dozen tokens most of what it asks for is still new.
+The steady-state cost over these runs is 900-950 MB/token at 78% hit, which the disk serves
+at 10-13.7 GB/s (13.8 is the machine's measured ceiling), i.e. 70-90 ms of a ~270 ms
+position. The earlier "13.9 -> 8 GB/s as the arena filled" was machine state, not eviction:
+two runs of the same token list read exactly the same bytes and varied by 2x in wall time.
+
+Two changes came out of the investigation anyway. Placement is now a dictionary lookup
+(`(layer, expert) -> slot`) plus one pass for a free slot or the LRU victim, instead of
+`slots.firstIndex(where:)` twice per miss over 3,760 elements; the timings printed by the
+walk are 75.7 us per pair before and 72.0 after in a Debug test build, which says the scan
+was not the cost in that build (Release would be a fraction of a millisecond per token) —
+the instrument is what proves it rather than the optimisation being assumed. And
+`dynamoe_dsv41_arena_fraction` is the debug seam the A/B above used, alongside the existing
+`dynamoe_dsv41_pin_dense_off`.
+
+**What is left.** The two GPU halves are ~57 ms of a 270 ms position and read ~9.4 GB at
+190-230 GB/s, so their remaining headroom over the best measured GEMV rate (~370 GB/s) is
+tens of milliseconds at most, and the shapes that are left are single-percent slices. The
+host is the story: `front wait` is 2.4-3.2 ms per layer against ~1.4 ms of device work, and
+the fill is 70-90 ms that no kernel overlaps because the routing readback sits between the
+two halves. A decode step is 80 host round trips whose turnaround is now larger than the
+work it waits for, and the fill cannot move off the critical path without either a second
+arena whose slots the previous layer's mixture is not reading, or a way to know layer N's
+routing before layer N's attention has run. Neither is a kernel change; both are a graph
+change and both need their own measurement.
+
+## DSV4.1 #22: THE DECODE STEP IS 72 ms OF WORK AND ~190 ms OF WAITING, AND A BATCHED VERIFY IS 2.16x CHEAPER
+
+#21 ranked the host round trip first and named two graph changes. This slice measured
+where the round trip actually goes before building either, and the answer moved the
+target: the walk's cost is not the wait as such, it is that a decode step cannot batch.
+
+### What the round trip is made of
+
+`DeepSeekV41WalkTiming` already split a position into encode, wait, fill and device
+windows. What it could not say is whether `front wait` (126-207 ms of a ~270 ms position)
+was the GPU still working or the CPU and GPU handing the queue back and forth. Three
+counters now answer it, all off unless `recordsWalkTiming` is on:
+
+- `frontDrainNanoseconds` / `mixtureDrainNanoseconds` — wall time inside each
+  `waitUntilCompleted`, split by the half the buffer belongs to.
+- `frontLateStartNanoseconds` / `mixtureLateStartNanoseconds` — how long after the host
+  began waiting the buffer's own `gpuStartTime` was stamped, i.e. a drain decomposed into
+  late start + device window + tail.
+- `frontUnwindowedBuffers` / `mixtureUnwindowedBuffers` — buffers Metal reported an empty
+  window for, so the device totals can be read as a floor rather than a measurement.
+
+One published 52-position walk, position 48 (`/tmp/walk_late.log`):
+
+| bucket | ms/position |
+|---|---|
+| front encode | 4.5 |
+| front wait | 100.6 |
+| — drained front | 29.5 |
+| — drained mixture | 78.5 |
+| — late start, front | **0.0** |
+| — late start, mixture | **49.0** |
+| expert fill | 69.2 |
+| mixture encode | 3.6 |
+| front device | 27.5 |
+| mixture device | 26.0 |
+
+The dense half's wait is its own device window: the host never catches that buffer
+unstarted. The mixture half's wait is 78.5 ms against a 26.0 ms window, and **49.0 ms of
+the difference is the buffer not having started when the host asked for it** — 1.2 ms per
+layer. That is the fill's shadow: the routing readback needs the dense half finished, the
+fill runs on the host for ~1.7 ms per layer with nothing on the GPU, and then the next
+commit is picked up late.
+
+A microbenchmark (`DeepSeekV41CommandStartCostTests`) prices that pickup on its own, with
+no model in the way — one trivial dispatch, committed after an idle gap:
+
+| queue state | late start | drain |
+|---|---|---|
+| fed | 0.09 ms | 0.17 ms |
+| idle 2 ms | 0.46 ms | 0.53 ms |
+| idle 10 ms | 0.59 ms | 0.68 ms |
+
+So a ~2 ms idle gap costs ~0.5 ms before the next buffer starts, and the walk's 1.2 ms is
+that same effect on a buffer that binds an arena, an index list and a dozen vectors. The
+number matters because it is **not** recoverable by rearranging dispatches: no kernel
+change can keep a queue fed across a readback that has to happen.
+
+### The walk with nothing to read
+
+The same walk, timed over tokens the arena already held (zero expert misses), costs
+**71.8 ms/position** against 263 ms with a realistic miss rate. Everything above the
+72 ms is the expert stream and the stalls it causes, so a decode step is ~72 ms of work
+and ~190 ms of paying for one position at a time. Per layer: one readback, one ~1.7 ms
+fill, one late commit.
+
+### What batching is worth
+
+Speculative decoding is the only structure that lets a decode step batch, and the block
+path it would verify through already exists (`prefillChunk`, compared with the walk on the
+published checkpoint). `testWhatABatchedVerifyWouldSaveOverAWalk` prices both arms on the
+published checkpoint over eight drafted positions, each arm on its own token runs so
+neither is served by what the other already read:
+
+```
+batched verify vs walk, 8 drafted positions:
+  walk  1226.6 ms (153.3 ms/position, 10256 MB read),
+  block  567.4 ms ( 70.9 ms/position,  1357 MB read) -> 2.16x
+```
+
+The block reads **7.6x fewer bytes**: one expert union per block instead of one set per
+position, which is the steady-state ~1 GB/token this model streams at a 70-78% arena hit
+rate. The wall-clock win is 2.16x rather than 7.6x because the block still pays the head
+and the same kernels.
+
+That ratio is also the acceptance bar: a verify of eight costs 567 ms, so it beats
+walking the same eight (1226 ms) once **more than ~3.7 of the eight are accepted**, i.e.
+above a ~47% acceptance rate. The number is what a draft head has to clear, and it is the
+first measured bar this port has for DSpark.
+
+Two earlier fixtures are worth recording as traps. A block/walk A/B over tokens the
+arena already held read **0 MB in both arms** and priced only kernel work: 47.7 vs
+71.8 ms/position, 1.51x, with the fill that batching actually amortizes absent. And the
+same test re-timed over the same tokens reads nothing at all, because the arena is shared
+by the whole runtime — hence one token run per arm per repetition.
+
+### What landed
+
+`prefillChunk` now starts at the cache's own position instead of 0, so a chunk CONTINUES a
+sequence rather than only opening one. That is the verify seam, and the position is what
+makes it correct: the ring slot, the compressor's group slot (`position % compress_ratio`,
+filled by the positions that ran before the call) and whether the group completes are all
+derived from the absolute position, so a mid-sequence chunk is the same graph as a
+mid-sequence walk. `testAChunkContinuesFromTheCacheLikeTheWalk` pins it on a fixture with
+a compressed layer, starting the continuation one position INTO a group so the chunk has
+to read a slot an earlier position left behind.
+
+Nothing else changed: the verify still needs the draft head on the device (the target
+layers' `mainHidden` capture), per-position logits capture in the block (`finishBlock`
+currently writes the last slot's), and cache rewind on rejection. This slice measured the
+prize and opened the seam.
+
+**What is left.** The batched verify, now with a bar to clear (~47% acceptance over eight
+drafts) and a measured multiplier (2.16x per position, 7.6x less I/O). The other two
+levers #21 named are dead ends for the same reason the numbers here show: the per-layer
+round trip is dominated by the idle gap the fill leaves, which only batching removes, and
+the arena's capacity has already been shown not to be the constraint.
+
+## DSV4.1 #23: THE DRAFTER'S CONDITIONING ROW, CAPTURED ON THE DEVICE
+
+#22 measured the prize a batched verify is playing for and left one question open:
+whether the checkpoint's own drafter clears the bar. Answering it needs the draft
+block's forward, and the first thing that forward consumes is `main_hidden` — the
+target layers' block inputs, means over the hyper-connection copies, concatenated in
+ascending layer order. That row did not exist anywhere but the host reference, so it is
+now captured as the walk runs.
+
+### What the row is, and why the capture point is the whole rule
+
+The reference appends to `Model.forward`'s `main_hiddens` between the Engram write and
+the layer's own work, so the row is the BLOCK INPUT of each of `dspark_target_layer_ids`
+(`[37, 38, 39]` on this checkpoint) and not the layer's output: an output-captured row
+conditions every draft on a state the target had already moved past, and nothing about
+the result looks wrong until an acceptance rate comes out near zero. The mean is over
+the hyper-connection copies (`h.mean(dim=2)`), which is a plain average and not the
+attention sub-layer's weighted collapse.
+
+On the device that average needs no new kernel: `dsv41_hc_pre_f32` computes
+`sum_copy mix[copy] * x[copy][dim]`, so a mix of `1 / hc_mult` IS the mean. The capture
+is one dispatch of that kernel per target layer per position, encoded at the top of
+`.hcAttentionCoefficients` — the first stage that reads the streams without writing
+them, i.e. the buffer still holds exactly the block input. It is off unless
+`capturesDraftInput` is set, and the buffer is `[slot][target][hidden]` (60 KB for
+3 x 5,120, times the block width), allocated at load only when the checkpoint names
+target layers.
+
+### Verified against the host, not against itself
+
+`testTheDeviceCapturesTheDraftersConditioningRow` runs the same tokens through
+`DeepSeekV41CPUForward` and the executor on a synthetic checkpoint whose target list is
+written DESCENDING (`[1, 0]`), so a capture that followed the config's spelling instead
+of the sorted order would come out swapped, and compares `mainHidden(position:)` with
+the captured row for every position of a walk and for every slot of a block. The block
+half is the one that catches a shared offset: one row written to slot 0 for all slots
+passes the walk and leaves the block holding its last position only.
+
+The bar is relative and 5e-4, which is where the measurement put the noise: 1.4e-4 at
+the first position and 6e-5 after, against the 2e-3 the walk's own logits are held to.
+Every way of getting this row WRONG is definitional — the output instead of the input, a
+weighted collapse instead of the mean, the config's order instead of the sorted one —
+and each of those is O(1), not O(1e-4).
+
+### On the published checkpoint
+
+`testWhatTheDraftersConditioningRowHoldsOnThePublishedCheckpoint` prints the row for 14
+prompt positions. Its width is `3 x 5,120 = 15,360`, which is exactly what
+`mtp.0.main_proj` is published as ([5120, 15360]), so the geometry agrees with the
+weights the drafter will actually read.
+
+The magnitudes are worth recording because they are NOT uniform, and a drafter fed the
+raw row has to cope with that:
+
+| position | layer 37 \|x\| | layer 37 max | top logit |
+|---|---|---|---|
+| 0 | 906,452 | 278,807 | 13.2 |
+| 1 | 148 | 7.98 | 23.1 |
+| 2 | 429,057 | 117,249 | 12.9 |
+| 3 | 156 | 12.97 | 21.5 |
+| 6 | 187 | 20.35 | 22.6 |
+
+A residual stream two to three orders of magnitude wider than its neighbours' is not a
+capture artifact — the synthetic fixture matches the host to 1e-4 — and it is not a
+broken graph either: the logits at those positions are in the same 13-24 range as
+everywhere else, which is what the per-sub-layer RMSNorm is for. The scale lives in the
+residual stream alone, each sub-layer normalizes it away, and the mHC mixes are
+Sinkhorn-normalized rows, so the graph is scale-robust by construction. The drafter is
+too: `main_proj` is linear and `main_norm` is an RMSNorm, so the row can be fed as-is.
+Anything that compares rows by magnitude (a similarity, a distance, a threshold) would
+not be, which is why this is written down.
+
+**What is left.** The draft block's forward, which is where the acceptance number comes
+from: `mtp.N.*` is a full `Block` with its own window-cache attention, and on the device
+that means a `main_proj`/`main_norm` stage, the draft attention (a seeded ring plus the
+block's own rows, one shared index list, not causal within the block), the MoE under the
+draft expert counts (128 routed, 3 active), and the last stage's head plus the Markov
+bias and confidence head. The host route is not available at this size: the draft stage
+is 5,120 wide with a 129,280-row head, so its matrices do not fit the in-memory
+`DeepSeekV41DenseWeightSource` the host reference reads, and the host has no shard-backed
+source at all.
+
+## DSV4.1 #24: THE DRAFTER'S WINDOW RING IS SEEDED ON THE DEVICE, AND A TOKEN'S WORTH COSTS 0.46 ms
+
+#23 captured the row the drafter conditions on. This slice makes the row usable, and
+it turned up two collisions that would have made every draft silently wrong rather than
+slow.
+
+### What the checkpoint actually publishes under `mtp.N.*`
+
+The host block reads roles; the checkpoint publishes names. 2,401 `mtp.*` tensors, and
+the split is not uniform:
+
+| under `mtp.0` | count | under `mtp.2` | count |
+|---|---|---|---|
+| `attn.*` (wq_a/wq_b/wkv/wo_a/wo_b/sink/norms) | 13 | `attn.*` | 13 |
+| `ffn.experts.E.w1/w2/w3` (+ scales) | 768 | `ffn.experts.E.*` | 768 |
+| `ffn.gate.{weight,bias,bias_vl}` | 3 | `ffn.gate.*` | 3 |
+| `ffn.shared_experts.w1/w2/w3` | 6 | `ffn.shared_experts.*` | 6 |
+| `hc_attn_*`, `hc_ffn_*` | 6 | `hc_*` | 6 |
+| `attn_norm`, `ffn_norm` | 2 | `attn_norm`, `ffn_norm` | 2 |
+| `main_proj`, `main_norm` | 2 | `norm`, `markov_head.embed/head`, `confidence_head.proj` | 4 |
+
+That is `DSparkBlock.__init__`: stage 0 owns the target projection, the LAST stage owns
+the output norm and both heads, and `embed`/`head` are the backbone's own modules aliased
+into every stage (`self.mtp[-1].embed = self.embed`). The catalog already classified all
+of it — the names resolve, nothing was missing — so this was a mapping to confirm rather
+than a mapping to invent.
+
+### Two collisions, both silent
+
+`DeepSeekV41DeviceWeights.tensor(_:layer:expert:)` had no namespace. `mtp.0.attn.wkv`
+and `layers.0.attn.wkv` are two tensors under one `(role, layer)` pair, and every draft
+lookup would have resolved to the backbone's bytes: the same shape, no error, a draft
+conditioned on the wrong matrix.
+
+The vector bank keyed gains by `role|layer` as well, so `mtp.0.attn_norm` and
+`layers.0.attn_norm` shared one buffer — whichever was stored last won, and the norm
+before every draft attention would have used the backbone's gain.
+
+Both now carry a scope. The device lookup defaults to `.backbone`, so every existing call
+site is unchanged, and the bank's draft entries are staged from the CATALOG's stage list
+rather than the config's count, because the two disagree in exactly the case that
+matters (a checkpoint that publishes `mtp.N.*` without declaring the stages).
+
+### `main_x`, and a ring instead of a slot
+
+`main_x = main_norm(main_proj(main_hidden))` is one FP8 block-scaled GEMV (5,120 x 15,360
+on the published checkpoint) plus an RMSNorm, both already proven by the backbone. The
+input is the capture itself: `main_proj` reads the target layers' means laid end to end,
+which is how the capture stores them.
+
+`testTheDeviceProjectsTheDraftersConditioningRow` checks it against
+`DeepSeekV41DSparkBlock.mainX` on a two-stage synthetic checkpoint whose draft expert
+counts differ from the backbone's (3 routed / 2 active), and whose `mtp.0` tensors are
+byte-distinct from `layers.0`'s, so a lookup that ignored the namespace fails at the
+first position rather than at the first draft. Relative 5e-4, the same bar the capture
+uses.
+
+The capture itself had to change shape to serve the ring. It held one row per BLOCK
+slot; the seed needs the last `window_size` positions, which is 128 on the published
+checkpoint and far more than a block. It is now `[position % window][target][hidden]`
+(7.9 MB at the published widths), and `capturedDraftInput(atPosition:)` returns nil for a
+position the ring no longer holds rather than a row from an earlier turn.
+
+### The seed is one rule, not two
+
+`DSparkAttention.forward`'s `start_pos == 0` branch writes the prefix's latents and
+returns, and for a prefix longer than the window it splits the tail around a cut of
+`seqlen % window`. Written as a position walk, both cases are the same statement: ring
+slot `p % window` holds `kv_norm(wkv(main_x[p]))` with its trailing rope payload rotated
+at `p`. The rotation in the reference exists only because it fills the ring in one shot.
+
+A device run is therefore "for each position the rings do not hold, project and store",
+and a run that crosses the end of the ring becomes two runs because a run is contiguous
+in both the ring and the positions. `testTheDeviceSeedsTheDraftRingsFromTheTargetsLatents`
+seeds six positions over a four-row window — so the wrap is exercised, not assumed — and
+compares every slot of every stage against `DeepSeekV41DSparkBlock.seed`, relative 5e-4.
+
+### On the published checkpoint
+
+`testWhatTheDraftRingsHoldOnThePublishedCheckpoint` walks eight positions, seeds, and
+prints each stage's ring. The geometry checks itself: `mtp.0.main_proj` is [5120, 15360]
+for three 5,120-wide targets, `attn.wkv` is [512, 5120] with an E8M0 companion, so the
+seed takes the block-32 path the synthetic (bf16, 64 x 48) cannot reach.
+
+| stage | slot 0 \|x\| | slot 0 max | slot 7 \|x\| | slot 7 max |
+|---|---|---|---|---|
+| 0 | 10.08 | 2.94 | 11.06 | 4.09 |
+| 1 | 11.21 | 1.70 | 11.65 | 1.90 |
+| 2 | 10.82 | 1.85 | 12.22 | 1.82 |
+
+Over 512 values that is an RMS of 0.44-0.54, i.e. the latents of a normalized record —
+and unlike the conditioning row (#23, magnitudes to 906,452), these are uniform, which is
+what an RMSNorm applied before the rope should produce.
+
+Timing: the window is **128**, not the 640 the measurement fixtures use, so a ring is
+256 KB per stage and three stages hold 768 KB. A cold seed of 8 rows costs 14.76 ms
+(first dispatches, pipeline warm-up, first touch of every buffer); one WARM row costs
+**0.46 ms**, which is the number a live turn pays, because a decode step adds exactly one
+position. Against a ~150 ms decode step, maintaining the drafter's ring is free.
+
+**What is left.** The draft attention itself (the ring plus the block's own five rows,
+one shared index list for every query, not causal within the block), the MoE under the
+draft expert counts, and the last stage's head plus the Markov bias — then an acceptance
+rate, which is the number that decides whether any of this ships.
+
+## DSV4.1 #24b: THE DRAFT BLOCK'S ATTENTION, AND WHY ITS INDEX LIST IS THE WHOLE RULE
+
+The draft attention is the one attention in this file that reads no cache. Its keys
+are the stage's own ring (`seedDraftRings`, #24) followed by the block's five rows, and
+ONE list serves every query: `get_dspark_topk_idxs` builds `arange(min(window,
+start_pos + 1)) ++ window + arange(block_size)` once and expands it across the block, so
+draft position 0 attends over draft position 4. Every other attention here is causal
+within a position's own write, which is exactly the assumption a port carries in by
+habit.
+
+Three consequences, all of them load-bearing:
+
+- **The block's rows come from the draft stack, not the ring.** The ring holds what the
+  TARGET saw (`kv_norm(wkv(main_x))`); the block's rows are
+  `kv_norm(wkv(attn_norm(hc_pre(stack))))` of the drafter's own tokens. Mixing them up
+  is a silent swap of one 512-wide record for another.
+- **Ring order, not position order.** After a wrapped seed, slot order and position
+  order disagree. The reference gathers slots `0..<min(win, start_pos + 1)`, so the port
+  copies the ring from slot 0. The parity fixture runs six positions over a four-row
+  window for exactly this: its ring at the draft's position is slots 0-3 = positions
+  4, 5, 2, 3, and a position-ordered copy fails.
+- **Every slot reads the SAME rows.** The kernel's slot dimension exists so a block can
+  share one launch, and `keyRowStride` is what separates slots when they read different
+  rows. The draft's index list is identical for every query, so the stride is ZERO and
+  the per-slot row count repeats. That is a real use of the kernel, not a workaround:
+  the alternative is five launches of the same dispatch.
+
+The block is `dspark_block_size` positions (5 on the published checkpoint), and their
+query positions are `start_pos + 1 ..< start_pos + 1 + block_size` because the ring row
+for `start_pos` is already written when the drafter runs.
+
+### Verified against the host block
+
+`testTheDraftAttentionMatchesTheHostBlock` compares the stack `hc_post` leaves behind
+(what the host records as `Trace.postAttention`) for every position and every
+hyper-connection copy, relative 5e-4, on a fixture with a 4-row window so the ring is
+wrapped and out of position order. That one comparison covers the query path
+(`wq_a` → `q_norm` → `wq_b` → rope), the block's own latents (`wkv` → `kv_norm` → rope),
+the key block's two halves, the attention, the output's rope conjugate and the grouped
+`wo_a`/`wo_b`. It passed first try, which is the point of having built the seed and the
+projection in the two slices before it.
+
+The device takes the FP32 attention kernel (`dsv41_attention_csa2_f32`, now registered as
+`pipelines.attentionF32`) rather than the shipping FP16 one: the ring is floats, and an
+fp16 key block would put a rounding floor under the parity bar that hides which row or
+which rope slice a mistake is in. The ring is 128 x 512 x 4 = 256 KB per stage, so the
+bytes are not the issue; if a later slice wants the half-key kernel it is a drop-in once
+the ring is stored as halves.
+
+### On the published checkpoint
+
+The ring probe now also runs one draft attention: 5 positions over an 8-row prefix in
+**1.72 ms**, all finite, |x| 15-19 per 5,120-wide copy for the noise positions and 132 for
+the first (which embeds the real token, where the others embed
+`dspark_noise_token_id` 128,799). That is the shipped 64-head, 512-wide geometry against
+the 128-row ring, i.e. the shape the acceptance number will be taken with.
+
+**What is left.** The stage's FFN (`hc_ffn_fn` coefficients, `ffn_norm`, the router under
+`draftExpertCounts` — 128 routed, 3 active — and the MXFP4 mixture), the chaining of the
+three stages, and the last stage's head plus the additive Markov bias and confidence
+head. Then the acceptance rate.
+
+## DSV4.1 #24c: THE DRAFT BLOCK'S MIXTURE, AND THE ORDERING BUG THE PARITY CHECK FOUND
+
+With the attention in place (#24b) the draft block is one feed-forward short of a full
+round: `hc_ffn_fn` coefficients, the FFN's `hc_pre`, `ffn_norm`, the router under
+`draftExpertCounts`, the routed mixture, the shared expert, and the `pre` mix the next
+stage collapses with. All of it is a backbone layer's machinery with two deliberate
+differences.
+
+### Two differences, both from the checkpoint
+
+- **The counts are DSpark's.** The published stages route 128 experts and activate 3,
+  against the backbone's 384 and 6. `encodeRouter` and `readRouting` now take them as
+  parameters instead of reading the backbone's, and the parity fixture sets 3/2 against
+  a backbone of 4/2 so a stage that read the wrong pair routes differently and says so.
+- **The experts come straight from the shard mappings, not the arena.** The arena is
+  keyed by `(layer, expert)`, and a draft stage's layer 0 IS the backbone's layer 0 — one
+  key, two different matrices. Sharing it would serve one model's expert to the other,
+  which is the same class of bug as the two namespaced lookups #24 removed. The draft
+  therefore passes `residents: nil` and pays the mmap fault path; at 9 experts a round
+  (3 stages x 3 active x 17.7 MB) it is a cost to revisit only if the drafter ships.
+
+### The bug: the router reads the FFN's NORMED input, not the attention's
+
+The first version of `draftStageOutputs` ran the router as its own step before the
+feed-forward, which put it BEFORE `hc_pre`/`ffnNorm` — so the router scored the drafter's
+attention input. The symptom was not an exception or a wrong shape: the mixture came out
+0.05 off on a 0.37 scale, which reads like a kernel rounding problem, and the routing
+carried it: device `[2, 0]` against the host's `[0, 1]`.
+
+The bisect that found it is worth keeping: `Trace.ffnInputs` matched the device's
+`workspace.normed` to 6e-8 (so the mix, the coefficient and the norm were right), while
+`Trace.ffnOutputs` was 0.05 off (so the mixture was wrong), and printing both sides'
+router logits showed the device's logits for the last two slots were IDENTICAL — the same
+input row, twice. A stack dump read after a two-stage run is useless here, by the way:
+`workspace.normed` and `moeOut` are reused by every stage, so the dump has to be taken
+with a one-stage fixture.
+
+The fix is the backbone's own pipeline order, split into two command buffers so the
+readback still lands between them: coefficients, mix and norm first, then the router,
+then the mixture.
+
+### Verified
+
+`testTheDraftBlockChainsItsStagesLikeTheHostBlock` compares every stage's residual
+(`Trace.stageOutputs`) for every position and copy at relative 5e-4, with shared experts
+published on both the backbone and the draft side so `encodeSharedExpert`'s namespaced
+lookup is exercised too. The mixture itself lands at 1.6e-8 against the host, i.e. float
+rounding rather than a rule difference.
+
+**What is left.** The last stage's head — `hc_pre` with the final mix, `norm`, the
+129,280-row projection (the backbone's own `head.weight`), the additive Markov bias at
+each step and the confidence head — and then the acceptance rate this was all for.
+
+## DSV4.1 #25: THE DRAFTER ACCEPTS 31%, AND THE BLOCK IS TOO WIDE FOR IT
+
+This was the number the last three slices were built to reach, and it is a NO for the
+drafter as the checkpoint declares it.
+
+### The full round is on the device and matches the reference
+
+Everything the acceptance number needed now runs on the GPU: the block's attention
+(#24b), its mixture and the three-stage chain (#24c), and — `#25` — the head. The head is
+two pieces a port gets wrong separately, and both are now pinned:
+
+- **It is the backbone's head.** `DSparkBlock.forward_head` normalizes the LAST stage's
+  collapse with the mix that stage's feed-forward handed on and projects with the shared
+  `head` module: nothing is published under `mtp.N.head`. The logits are kept for every
+  position (a verify needs all five), unlike `finishBlock`, which only reads the last.
+- **The collapse is scored BEFORE the norm.** `confidence_head` reads `x =
+  hc_pre(h, pre_mix)` — the pre-norm vector — so the head must normalize into a different
+  buffer. Normalizing in place passes the logits comparison and then reports every
+  confidence as ~0.7 off, which is how this was found.
+
+`testTheDraftHeadAndItsChainMatchTheHostBlock` compares the five logits rows against
+`Trace.logits` (relative 5e-4) and then the CHAIN — the drawn tokens and every confidence
+— against `DeepSeekV41DSparkBlock.draft`. The chain assertion is the one that catches a
+bias applied to the wrong step: a Markov bias from the target's token instead of the
+draft's own choice changes which token wins, and the tokens diverge.
+
+### The measurement
+
+`testWhatDSparkAcceptsOnThePublishedCheckpoint` drafts a round, walks the target greedily
+over the same five positions, and counts the agreeing prefix. Two continuations, ten
+rounds each, so 100 drafts:
+
+| continuation | accepted | per step (s0..s4) | gated | draft cost |
+|---|---|---|---|---|
+| p0 | 14/50 (28%) | 80%, 30%, 10%, 10%, 10% | 35% | 155 ms/round |
+| p1 | 17/50 (34%) | 80%, 60%, 30%, 0%, 0% | 38% | 158 ms/round |
+
+**31% overall against a ~47% bar.** The bar is `#22`'s: a batched verify costs 70.9
+ms/position against a walk's 153.3, so a round of five drafts needs ~2.3 accepted to pay
+for the verify alone — and 155 ms of drafting on top moves it further.
+
+Three things in that table matter more than the total:
+
+- **The first draft is accepted 80% of the time on BOTH continuations.** That is the one
+  content-independent number here, and it is high.
+- **The curve dies at step 2.** s1 is 30% on one continuation and 60% on the other, s2 is
+  10-30%, and s3/s4 are at the floor. A five-wide chain spends 60% of its drafting and
+  80% of its verification on positions that almost never land.
+- **The confidence gate helps but does not save it.** Restricting to rounds
+  `shouldSubmit` keeps moves 28% → 35% and 34% → 38%: the gate is selecting real signal
+  and still an order of magnitude short of the bar.
+
+### What the numbers say to do instead
+
+The value is in the first one or two drafts, so the question is what a NARROW verify
+costs. `testWhatAVerifyCostsAtTheWidthsAChainWouldSubmit` prices `prefillChunk` at
+widths 1-8 on the same runtime, and it does not settle it — three runs of the same
+procedure, the last interleaved one-sample-per-arm:
+
+| run | w1 | w2 | w3 | w4 | w5 | w8 |
+|---|---|---|---|---|---|---|
+| sequential | — | 154.5 | 56.5 | — | 61.6 | 59.0 |
+| sequential | 147.9 | 62.9 | 56.6 | 58.9 | 59.1 | 57.5 |
+| interleaved | 111.3 | 105.8 | 85.5 | 88.4 | 86.2 | 79.2 |
+
+Two things are stable and one is not. Stable: width 1 gets NOTHING from batching (a
+one-position block is a walk with different bookkeeping — 111-148 ms/position), and
+width 3 and up sit on a roofline well under the walk's 153.3 (57-86 ms/position
+depending on the run). Not stable: width 2, which one run puts at 2.35x faster than
+width 1 and another at 5% faster. The absolute levels also move ~40% between runs, which
+is larger than the effect being chased, so the width-2 question needs better
+instrumentation before anyone acts on it - the arms have to be isolated (each on its own
+runtime, interleaved, several samples) rather than measured in one sequence against a
+shared arena.
+
+So the honest economics use the roofline and the acceptance curve, and both sides are
+now measured facts rather than projections:
+
+- B=3 costs 3 x 57-86 ms of verify plus ~93 ms of drafting and emits `E[accepted] + 1`
+  = ~2.45 tokens, against 2.45 x 153.3 = 376 ms of walking. That is 1.3-1.5x FASTER.
+- B=5 costs 5 x 59-86 ms plus 155 ms and emits ~2.55 tokens, against 391 ms. That is
+  between a wash and 15% slower, with the acceptance rate (31%) as the reason.
+- B=2 is the case the curve likes most and the case the verify measurement cannot
+  resolve.
+
+What is NOT in doubt is the direction: the drafter's declared block is wider than its
+acceptance curve can fill, and the useful configuration is one the checkpoint's own
+`dspark_block_size` does not describe. Running a 2- or 3-wide block is legal — the block
+size only decides how many positions the draft block runs — but it changes the graph
+(the block's own rows are part of every query's key list, so a narrower block attends
+over a shorter list and its acceptance is NOT the per-step rate measured at width 5).
+That measurement is the next step, not the verify.
+
+The drafting cost is also pessimistic as measured: the draft mixture reads experts
+through the shard mappings with `residents: nil` rather than from the arena, because the
+arena is keyed by `(layer, expert)` and collides with the backbone (see #24c). That is
+worth 100 ms of the 155 and would be the first thing to fix if the drafter ships.
+
+**What was deliberately NOT built.** Per-position logits in `finishBlock` and a cache
+rewind for a rejected suffix. Both exist only to serve a verify, and a verify at the
+declared width loses ~30% against walking. Building them now would be building the losing
+half of a design the measurement has already rejected.
+
+## DSV4.1 #26: A TWO-WIDE DRAFT ACCEPTS 50-55%, AND STILL LOSES TO WALKING
+
+`#25` ended on a question the accept curve made: the chain dies at its second step, so a
+narrower block should accept a larger share of what it drafts. It does. It then loses to
+walking anyway, because a two-wide verify buys almost nothing and the drafter's own
+forward costs more than it buys. This slice measured both halves on the published
+checkpoint and the answer is a NO for every width, not just the declared one.
+
+### The acceptance, by width
+
+`testWhatANarrowerDraftBlockAcceptsOnThePublishedCheckpoint` runs `#25`'s protocol at
+widths 2, 3 and 5. Each width gets its OWN runtime, because the width sizes the draft key
+block, the head's logits buffer and every block workspace at construction: the config's
+`dspark_block_size` is overridden before the runtime is built, which is exactly the graph
+a checkpoint declaring that width produces. Width 5 is in the sweep as the control.
+
+| width | p0 | p1 | p0 per step | p1 per step | gated | draft ms/round |
+|---|---|---|---|---|---|---|
+| 2 | 10/20 (50%) | 11/20 (55%) | 70%, 30% | 60%, 50% | 67% of 12, 69% of 16 | 90, 56 |
+| 3 | 11/30 (37%) | 12/30 (40%) | 60%, 30%, 20% | 60%, 30%, 30% | 42% of 24, 50% of 24 | 73, 84 |
+| 5 | 14/50 (28%) | 17/50 (34%) | 80%, 30%, 10%, 10%, 10% | 80%, 60%, 30%, 0%, 0% | 35% of 40, 38% of 45 | 155, 154 |
+
+The width-5 row reproduces `#25` exactly, which is what makes the narrow rows comparable:
+same protocol, same prompts, same rounds, one variable.
+
+Two things in that table matter more than the totals:
+
+- **The first draft gets WORSE when the block narrows** — 70%/60% at width two against
+  80%/80% at width five. This is not noise; it is the graph. The block attends over its
+  own rows as well as the ring (it is not causal inside itself), so removing siblings
+  changes what position 0 sees. A narrow block is a different drafter, not a truncation
+  of the wide one.
+- **The aggregate still roughly doubles**, 31% to 50-55%, because the tail the curve dies
+  in no longer exists. The win is where the chain stops, not a better first token. The
+  second step is 30-50% at width two and 30-60% at width five — statistically the same
+  marginal draft.
+
+The confidence gate is much stronger here: it keeps 67-69% acceptance among the rounds it
+would submit, against 35-38% at width five. It still only submits 60-80% of rounds.
+
+### The verify, measured like-for-like
+
+`#25`'s width sweep printed width-2 and width-3 verify costs of 105.8 and 85.5 ms/position
+and invited the reading "a narrow verify is 2x cheaper than a walk". That reading was
+wrong, and `#26` shows why: those blocks ran over a 24-token list the arena already held
+after the first round, so they read no expert bytes at all, while the 153.3 ms/position
+baseline they were compared against was a realistic walk WITH misses. It is the trap `#22`
+recorded, and it cost a projection.
+
+`testWhatANarrowVerifyCostsAgainstAWalkInTheSameRuntime` fixes the procedure: every sample
+resets the executor and re-walks the same prefix, the arm order rotates, and each round
+times a one-position WALK so every width is reported as a ratio to a walk measured in the
+same state. Medians of six samples:
+
+| arm | ms/pos | ratio to walk | MB/pos |
+|---|---|---|---|
+| walk | 64.8 | 1.00 | 0 |
+| w2 | 53.5 | 0.83 | 0 |
+| w3 | 52.0 | 0.80 | 0 |
+
+That is the ZERO-MISS regime — the byte counter reads 0 in both arms, as it must, because
+the arm tokens repeat. A live turn never repeats a position, so
+`testWhatANarrowVerifyCostsWhenItsExpertsAreCold` prices the same two arms over DISTINCT
+two- and three-token runs (a fixed list, not a continuation the test just walked, which
+would pre-load exactly the experts the arms are supposed to miss), re-walking the same
+prompt and seed each sample so both arms start from identical cache and arena state:
+
+| arm | ms/pos | ratio to walk | MB/pos |
+|---|---|---|---|
+| walk | 194.8 | 1.00 | 645 |
+| w2 | 173.6 | 0.89 | 601 |
+| w3 | 211.0 | 1.08 | 998 |
+
+Both regimes agree on the ratio to within a few percent (0.83-0.89 at width two), which is
+the useful part: **a two-wide block is ~11-17% cheaper per position than walking it, not
+2.16x cheaper.** `#22`'s 2.16x is a property of width EIGHT, where one expert union
+replaces eight per-position sets and the block reads 7.6x fewer bytes. Width two has two
+positions to amortize one round trip over, and width three is actively worse than walking
+(1.08x, 55% MORE bytes per position) because the union it fills up front is wider than the
+per-position sets it replaces. The byte model in `#17` warned that the block's traffic is
+what to watch; here it goes the wrong way.
+
+### The economics, at last with both sides measured
+
+A round emits `1 + E[accepted]` tokens and costs `draft + width x verify`. Walking the same
+tokens costs `(1 + E[accepted]) x walk`.
+
+| width | emits/round | round cost | walking the same | result |
+|---|---|---|---|---|
+| 2 | 2.05 | 73 + 2x173.6 = 420 ms | 2.05 x 194.8 = 399 ms | 1.05x SLOWER |
+| 3 | 2.15 | 78.5 + 3x211.0 = 712 ms | 2.15 x 194.8 = 419 ms | 1.70x SLOWER |
+
+At the zero-miss walk (64.8 ms) width two is 1.4x slower. Break-even for width two needs a
+walk of ~270 ms/position — beyond any walk this port has measured (153.3 realistic at
+`#22`, 194.8 here, 263 at the very coldest) — and that is with the drafting cost as
+measured, which is itself the pessimistic one (see below).
+
+So the answer is not "the block is too wide". Narrowing the block DOES raise acceptance,
+roughly doubles it, and the round still loses, because the batching it gives up is worth
+more than the acceptance it gains. `#25`'s B=3 projection of 1.3-1.5x came from the
+mixed-regime verify number and is withdrawn.
+
+### What this means and what was NOT built
+
+The drafter would need BOTH of these to break even at width two, and neither is close:
+
+- The draft's own forward cut from 56-90 ms to under ~50 ms per round. Its mixture reads
+  experts through the shard mappings with `residents: nil` (the arena collides on
+  `(layer, expert)`, `#24c`), which is most of its cost; making that resident might reach
+  ~25-30 ms.
+- A walk slower than ~270 ms/position in the steady state, i.e. persistent arena misses.
+
+Even with both, the margin is single-digit percent, which is not worth per-position logits
+in `finishBlock` plus a cache rewind for a rejected suffix (`noteStored` only appends; ring
+position, `tokenHistory`, `deadTokens` and the compressor group phase would all have to
+rewind together). Those two pieces were already deliberately unbuilt at `#25`; the narrower
+block does not change that, it closes the question.
+
+What is now on record: DSpark's greedy chain verification is a NO at widths 2, 3 and 5 on
+an M5 Max with this SSD, and the reason is not acceptance (50-55% is fine) but that a
+narrow batch is the regime where batching stops paying. The drafter's remaining value would
+have to come from somewhere other than a linear chain's verify, and no such use is
+proposed here.
+
+## DSV4.1 #27: THE TOOL DIALECT IS MEASURED, AND IT IS NOT THE ONE THE VOCABULARY SUGGESTS
+
+The open item was "the tool dialect". Nothing in the checkpoint defines it: `tokenizer_config.json`
+carries no `chat_template`, `encoding/` has no tool path, and the README says nothing about tools.
+What the checkpoint DOES carry is a vocabulary: nine `tool`-joined special tokens (calls begin/end,
+call begin/end, sep, outputs begin/end, output begin/end, ids 128806-128814) and one bare DSML token
+(128825, U+FF5C "DSML" U+FF5C). Which of those the model actually uses, and what grammar surrounds
+them, is a question about weights, so it was answered by asking the model.
+
+### The outbound half: the PROMPT SHAPE picks the dialect
+
+`testWhatToolDialectTheCheckpointEmits` renders four prompts over one tool (`get_current_time`,
+`city` required) and runs a greedy turn on each. Three of them hand the model a call SCHEMATIC built
+from the marker strings; the fourth hands it the instruction block this app actually ships. Same
+catalogue, same `## Tools` header, same preamble, same question: only the call grammar differs.
+
+| variant | prompt tokens | finish | generated | emitted |
+|---|---|---|---|---|
+| schematic+chat | 168 | eos | 42 | plain `tool_call_name` / `tool_call_arguments` tags |
+| no-schematic | 86 | eos | 37 | `tool_call` tag around `{"name": …, "arguments": …}` |
+| schematic+think | 168 | eos | 51 | reasoning, then the plain tags |
+| **instructions-only** | 306 | eos | 38 | **the DSML tags** |
+
+The first three reproduce what they were shown, which is what a chat prompt with a template in it is
+supposed to do: a model shown a schematic copies the schematic. The fourth is the one that matters,
+because it is the prompt this app builds, and it answers in DSML. The generated pieces of that turn,
+one token each, are the proof of how the tag is assembled:
+
+```
+"\n\n" "<" "<bar>DSML<bar>" " calls" ">\n" "<" "<bar>DSML<bar>" " invoke" " name" "=\"" …
+```
+
+So an opening DSML tag is `<`, then ONE vocabulary id, then ordinary text with a LEADING SPACE
+(`" invoke name=\""`). The closer is `</`, the same id, then `" invoke>"`. The id is the whole tag
+machinery; everything else is spelled out as text, which means the tags cannot be matched by token
+id and must be matched as strings. (`<bar>` stands for U+FF5C, written that way here because a
+rendered view strips it.)
+
+### The discovery: an agent turn does not freeze on an eos
+
+`testAnAgentTurnFreezesOnAToolCall` runs the whole agent path (the harness-shaped system prompt, the
+turn runner, the engine's freeze hook, the call rewrite) on real weights. Before this slice the
+dialect knew only the plain-text form, and the turn came back `eos` after 41 tokens with zero calls
+parsed:
+
+```
+\n\n<calls>\n<invoke name="shell_run">\n<parameter name="command" string="true">ls -la /tmp</parameter>\n</invoke>\n</calls>
+```
+
+(also with the DSML id elided). It is a MULTI-CALL container: one `calls` wrapper holding one
+`invoke` per tool, each carrying `parameter` elements whose `name` is the argument's JSON name and
+whose `string="true"` marks a literal value (`string="false"` marks JSON, so a number stays a
+number). That is a richer grammar than the plain-text form: typed arguments, no JSON-in-text
+parsing, and a name that cannot be confused with prose.
+
+The failure is the reason the test exists. A parser that only parses its own fixture is a parser for
+the fixture: this one parsed every hand-written plain-text case and then dropped the generation it
+was written for.
+
+### The inbound half: not discriminating
+
+`testWhatToolResultShapeTheCheckpointReads` gives the same conversation the same payload
+(`{"local_time": "14:05"}`) inside five different containers: the vocabulary's `output` pair, its
+`outputs` pair, a plain `tool_call_output` tag, a `tool_response` tag, and bare JSON. All five
+produced the IDENTICAL answer, "It's currently **14:05 (2:05 PM)** in Paris.", in 16 tokens each.
+The checkpoint reads the payload wherever it is, so the container is free to be the one that costs
+least: the family's own `output` pair, one id on each side.
+
+Note what this does NOT support: an earlier note in `AGENTS.md` claimed the model's tool results are
+`<tool_result>…</tool_result>` inside a user turn. That spelling appears nowhere in the checkpoint's
+files (no `.py`, no `.md`), and the measurement above shows the model does not need it.
+
+### What was wired
+
+All of it is a daisy-chain into the canonical call block
+`<tool_call><function=NAME>JSON</function></tool_call>`, because that is the only shape every
+downstream consumer (executor, HITL gate, gesture split, timeline, history) understands.
+
+- `DeepSeekV41ToolDialect` grew the DSML grammar: `dsmlTag` / `dsmlCallsOpen` / `dsmlInvokeTag(name:)`
+  / `dsmlParameterTag(name:isString:)`, a `canonicalizeDSMLBlocks` scan that turns each `invoke` into
+  a canonical block and then drops the container tags, and a parameter reader that keeps
+  `string="false"` values as JSON. The tag constants are BUILDERS, never literals: a rendered view
+  strips U+FF5C, so a typed tag looks right and matches nothing.
+- Truncation still does not execute. An invoke with no closer, or a parameter with no closer, is left
+  as text: a call the model never finished asking for must not run with a half-built argument list.
+- `shouldFreeze` now stops on the `calls` closer, or on an `invoke` closer when the model wrote a
+  single call with no container. The container close is one token after the last invoke close, which
+  is the cheapest complete point (`#26`'s economics: a token costs ~263 ms).
+- `instructions()` now TEACHES DSML, built from the tag builders. Teaching a dialect the model was
+  not post-trained on is how a call becomes prose, and the measurement says which one it was
+  post-trained on.
+- The grammar mask stays OFF for this family. Its marker vocabulary is Qwen's, and forcing a
+  `<function=>` shape on a model that writes DSML tags is how a valid call becomes unsamplable.
+  Argument validation happens at execution instead.
+- The chat bubble truncates at the first DSML tag, beside the existing plain-tag strip.
+- The plain-text and JSON forms remain PARSEABLE (they are what the schematic prompt draws), they are
+  just no longer what the instructions ask for.
+
+After the change the same agent turn ends `toolFreeze` after 41 tokens and reports
+`shell_run["command": ls -la /tmp]`. The 41 tokens are unchanged: freezing on the container close
+costs nothing here because the container close IS the model's last token.
+
+### The numbers that are worth remembering
+
+| item | value |
+|---|---|
+| DSML token id | 128825, U+FF5C "DSML" U+FF5C, no word-joining space inside |
+| tool special tokens (unused by the model) | 128806-128814, one id each |
+| schematic prompt → | 42 tokens, plain-text tags (37 with no schematic) |
+| shipped instruction block → | 38 tokens, DSML |
+| inbound container | five shapes, all read, 16 tokens each |
+| agent turn after the fix | `toolFreeze`, 41 tokens, 1 call parsed |
+
+
+## DSV4.1 #28: THE COMPRESSED ROWS A QUERY READS ARE A SCORED TOP-K, AND THE PORT WAS READING THE NEWEST ONES
+
+**Question.** `attentionRowPlan` selected compressed rows with a rule that never
+looked at a value: read the newest `index_topk` rows, because those are the ones a
+position can see. `DeepSeekV41Conformance.candidateSelection` was `.unverified`
+and the note next to it said the reference "keeps `candidateScores`" — but nothing
+compared the two. Does the reference select the newest rows?
+
+**Answer: no, and the difference starts at ordinary context.**
+
+`inference/model.py` `Indexer.forward` is a small side attention: it projects the
+layer's own `qr` into `index_n_heads` of `index_head_dim`, scores every compressed
+key with `(relu(dot) * weight).sum(heads)`, masks the rows the query has not
+reached yet, and keeps the best `index_topk`. `select_candidate_blocks` is the
+level above it, and only the candidate source runs it.
+
+| rule | published value | when it starts to bind |
+| --- | --- | --- |
+| `index_topk` (level two) | 512 | position 513 on the twenty ratio-1 layers, 1025 on the ratio-2 half |
+| `candidate_topk_blocks` (level one) | 2048 blocks x 8 rows | 16,384 compressed positions, i.e. 16,384 tokens on the ratio-1 half |
+
+So the level the port got wrong is the one that binds first, and the level it
+never implemented (blocks) is inert on this checkpoint for any ordinary context.
+That is worth stating plainly: 20 of the 40 layers read one compressed row per
+token, so "newest 512" and "best 512" diverge from token 513.
+
+**What changed.**
+
+* `DeepSeekV41Indexer` is now an exact port of the reference: `positionScores`
+  (per-head rectified dot, weighted, summed), `candidateBlocks` (block score is
+  the block's best row, and the partly-filled frontier block is pinned at `+inf`
+  so it cannot lose to an older full block), and `selectedRows` (the cut, then the
+  reach filter — in that order, which can leave the selection one row short).
+* `Tools/dsv41_goldens.py indexer` runs `Indexer.forward` and
+  `select_candidate_blocks` at a tiny config for four cases: a prefill chunk whose
+  queries reach different prefixes, a decode step, a candidate source publishing a
+  mask, and the next layer rescoring inside it. `DeepSeekV41IndexerGoldenTests`
+  pins the scores AND the selections.
+* The host reference computes the index keys at the pooling point (`k_norm(wk(latent))`
+  on the RoPE-free latent, rotated at the group's first position), scores per
+  position, and reuses the source's list for the layers between two sources.
+* The device path does the same with `dsv41_indexer_scores_f32` (rewritten: it was
+  the Qwen max-over-heads block scorer and nothing called it), and reads the score
+  vector back. That readback is the cost the old note was avoiding, and it is one
+  wait per index-source layer: the dense half now ends after the indexer and a
+  second submission carries the gather, because the row list the gather binds is a
+  host value.
+
+**Numbers worth remembering.**
+
+| | value |
+| --- | --- |
+| index sources on the published checkpoint | 8 (`[2, 8, 14, 20, 24, 28, 32, 36]`), of which 4 own the keys |
+| first position where the old rule is wrong | 513 (ratio-1 layers), 1,025 (ratio-2) |
+| level one binds at | 16,384 compressed positions — never at ordinary context |
+| golden fixture tie rows | 0 (a tie would be a row every head voted against) |
+| DeepSeek suite | 479 passed, 0 failed, 35 skipped across 82 classes |
+| Metal validation | 0 errors on the same 479 |
+
+**Two things the golden caught that a fixture would not.** The cut runs before the
+reach filter, so a row a query cannot see can take a slot and then be dropped: with
+three visible rows and `topk` 2 the reference selects ONE row, not two. And the
+source layer does not mask itself — `is_candidate_source` publishes the blocks and
+`uses_candidates` (strictly later layers) applies them, which is why a consumer's
+selection differs from its source's on the same keys.
+
+**Still open.** The indexer's FP4 query/key quantization is skipped like every other
+activation quantization in the dense path, and exactly equal scores break to the
+lower row index where `torch.topk` is unspecified. Neither was measured against real
+weights: the whole slice is synthetic-checkpoint coverage, and the published
+geometry's first real run has not happened.
+
+## DSV4.1 #29: THE INDEXER'S KEY CACHE WAS PRICED IN HALF THE WIDTH IT IS ADDRESSED IN
+
+**Question.** `#28` replaced the port's invented "the newest `index_topk` compressed
+rows" scorer with the checkpoint reference's two-level rule, and pinned that rule
+against `Indexer.forward` and `select_candidate_blocks`. Every vector behind it was
+generated at a six-wide config: `index_topk` 3 over 8 produced rows. Below the
+budget every reachable row is selected, so the scored cut is invisible there. Does
+the rule still change the answer at the published geometry, where `index_topk` is
+512 and a ratio-1 layer produces one row per position?
+
+**Answer: it does from position 512, and the first real-weight run found a cache bug
+that no synthetic fixture could see.**
+
+The probe prefills 576 positions of the real checkpoint through the block path and
+reads back, per index-source layer, the score vector and the row list the gather
+bound. The first run scored **exactly zero for 287 of the 576 rows, at all five
+ratio-1 sources, at the same rows** — and the number of *distinct* scores was 290 at
+every layer, which no learned arithmetic produces. That is a region with nothing
+written in it, not a rectifier.
+
+The cause is one number in two files. `DeepSeekV41CacheGeometry.indexerKeyBytes`
+priced an index key at `MemoryLayout<UInt16>.stride` while every access used four
+bytes: `dsv41_copy_f32` writes `k_norm(wk(latent))` as floats and
+`dsv41_indexer_scores_f32` reads the region as `device const float*`. So each key
+row overran its own 256-byte slot by half into the next row's, the last row of every
+owner wrote past the end of its region, and the score kernel read half-widths back as
+floats, which are denormals. `DeepSeekV41MemoryPlan` priced the same two bytes, so
+the load log agreed with the allocation and both disagreed with the traffic. The
+synthetic checkpoint never noticed because its rows still fit inside the region it
+was given.
+
+Fixed by pricing the cache at the width both kernels address, in both files, and
+pinned by `DeepSeekV41IndexerKeyLayoutTests`: one key is `index_head_dim` floats, the
+stride between rows is that width, the last row ends exactly at its owner's region
+boundary, and the memory plan's price equals the layout's allocation.
+
+**Where it bites.** Nothing on this model is optional about it: a compressed layer's
+gather binds the row list the scores produce, so before the fix the port was reading
+287 rows nobody had written plus aliased halves of written ones. On the twenty
+ratio-1 layers the whole history beyond row 288 was effectively invisible.
+
+**Numbers, after the fix** (576 positions, one prefill, `M5 Max`, 475 GB checkpoint):
+
+| | value |
+| --- | --- |
+| prefill of 576 positions | 105 s (~0.18 s/position) |
+| index sources recorded | 5 ratio-1 (`20, 24, 28, 32, 36`) of 8; total 8 with the ratio-2 half |
+| positions past the budget | 64 (position 512 onward) x 5 layers = 320 selections |
+| those that are not the newest 512 rows | **320 of 320** |
+| exact-zero scores per layer | 287 before the fix, **0** after |
+| distinct scores per layer | 290 before the fix, **576** after (no ties anywhere) |
+| score range, layer 20 at position 575 | -3.331 .. 3.802, median -1.011, 135 positive / 441 negative |
+| rank of the newest row, layer 20 / 24 at 575 | 62 / 464 (of 576) |
+| rank of row 0, layer 20 / 24 at 575 | 43 / 39 |
+| distinct selections at position 575 | 6 across 8 sources (the 3 ratio-2 sources keep every row) |
+| probe run | 1 test, 0 failures, 111.8 s |
+
+What the selection actually does at 576 rows is less dramatic than "it reads the
+oldest rows" and more useful: the cut keeps 512 of 576, the 64 it drops are the
+lowest-scoring rows wherever they sit, and the oldest rows survive on their scores
+(row 0 ranks 43rd, the newest row 62nd at layer 20). The set differs from a recency
+window at **every** budget-exceeding position, which is the property `#28` claimed and
+this run is the first evidence for.
+
+Level one is confirmed inert at this checkpoint rather than assumed inert: the
+candidate source's mask came back all-`true` at every position, because 2,048 blocks
+of 8 rows is 16,384 rows and the run reaches 576.
+
+**A second blind spot, in the fixture rather than the port.** With the stride fixed,
+the device/host parity case for compressed rows failed at position 5 of
+`compressedSmall` — the first position where `index_topk` 2 binds over 3 produced
+rows. The cause was the fixture: it published
+`layers.N.attn.indexer.wk.weight` as `[index_head_dim, hidden]`, where the checkpoint
+publishes `[128, 512]` and the reference builds `wk = Linear(head_dim,
+index_head_dim)` over the compressor's pooled LATENT. `DeepSeekV41Matrix.apply`
+returns zeros when the vector is narrower than the matrix row (deliberately, so a
+plan-level bug reads as a zero block rather than an out-of-range read), so the host's
+index keys were all zero and its scores were noise around 1e-4. Every fixture before
+this one had `index_topk` at or above the produced row count, so the cut never bound
+and a zero score vector selected exactly the rows a real one would. The fixture now
+publishes the latent width, and the parity case compares a binding cut, which is the
+comparison it always meant to make.
+
+**Two things the run now asserts that a fixture cannot.** The newest row is not
+preferred: it ranks 62nd of 576 at one source and 464th at another, so a query at
+position 575 does not weight its own newest compressed row above everything older.
+And two index sources over the same key cache choose different rows at the same
+position (6 distinct lists across 8 sources), so the selection depends on the query
+rather than on the row geometry.
+
+**Still open.** The indexer's FP4 query/key quantization is still skipped, exactly
+equal scores still break to the lower row index where `torch.topk` is unspecified
+(the real run has no ties to break), and `candidateSelection`'s golden vectors remain
+synthetic: this contribution is the rule and the cache it reads, not a comparison of
+the port's scores against the checkpoint's own `Indexer.forward` at real weights.
+
+## DSV4.1 #30: THE INDEXER'S SCORES ARE THE REFERENCE'S, AND TWO LONG PREFILLS DO NOT AGREE
+
+**Question.** `#29` proved the port now reads the rows its own scores rank first on the
+real checkpoint. It did not prove those scores are `Indexer.forward`'s: every vector
+behind the rule was generated at a six-wide config, where `index_topk` 3 over 8 rows
+makes the cut invisible, and `Indexer.forward`'s own FP4 activation quantization was
+never measured either. So: on the checkpoint's tensors and a real prefill's
+activations, does the port score what the reference scores -- and does the
+quantization the port skips change which rows it reads?
+
+**Answer: yes to the first (worst |delta| 2.4e-6 over 576 rows, the selected 512 rows
+identical), 3 of 512 rows to the second, and along the way the forward pass turned out
+not to be reproducible at 576 positions.**
+
+### The comparison
+
+`Indexer.forward` cannot be run end to end here: 475 GB does not fit, so the reference
+cannot produce `x`, `qr` or the pooled latents itself. It CAN be handed them.
+`DeepSeekV41MetalForward.indexerInputRequest` is an opt-in probe that copies one
+layer's pooled latent per position into a caller's buffer as each group completes, and
+`indexerInputDump` carries the two query-side vectors. `DeepSeekV41PublishedTurnTests`
+`testWhatTheIndexerWasGivenOnThePublishedCheckpoint` prefills 576 positions of the real
+checkpoint, dumps layer 20, and `Tools/dsv41_goldens.py indexer_real` reads the
+checkpoint's own `layers.20.attn.indexer.{wq_b, weights_proj, wk, k_norm}` out of the
+shards, dequantizes `wq_b`'s FP8/E8M0 32x32 blocks, and runs the reference's `Indexer`
+at the published geometry on those activations. Both sides then see the SAME numbers,
+which is the only way the difference between them can be the indexer's arithmetic.
+
+Two independent dumps were scored, because the forward is not reproducible (below),
+and the agreement is the same both times:
+
+| | dump A | dump B |
+|---|---|---|
+| layer / position | 20 / 575, of 576 prefilled | same |
+| produced rows | 576 | 576 |
+| worst absolute score delta | **2.380e-6** (row 385; reference -2.881097, port -2.881099) | **2.149e-6** |
+| rows differing by more than 1e-5 | **0** of 576 | **0** of 576 |
+| worst relative delta | 1.195e-4 | 1.264e-4, both at near-zero scores: a cancellation, not a mismatch |
+| selected rows | **512 vs 512, identical** | **512 vs 512, identical** |
+| port score range | -3.3318 .. 3.8019 | -3.3509 .. 3.7777 |
+| cut score (512th) | -2.2896 | -2.2631 |
+
+The remaining 2.4e-6 is the summation order: the port's kernel multiplies each head's
+`relu(dot)` by `weight * (128**-0.5 * 32**-0.5)` inside the sum while the reference
+folds the scale into the weights first, its 128-wide dot product uses four
+accumulators where `einsum` uses another order, and `wq_b` runs as a dequantized GEMV
+here against an FP8 GEMM there. Nothing about the selection depends on any of it.
+
+### What the FP4 quantization is worth
+
+`Indexer.forward` rounds both the index keys and the index query to E2M1 with one
+power-of-two E8M0 scale per 32-value block (`fp4_act_quant`), in place, before
+scoring. The port skips every activation quantization in this model, so this is a
+real and documented deviation -- and now a measured one. `fp4_act_quant` is a tilelang
+kernel that cannot run on this machine, but its arithmetic is not ambiguous:
+`2 ** ceil(log2(amax / 6))` per block and then round-to-nearest-even into
+`{0, .5, 1, 1.5, 2, 3, 4, 6}`. `_fp4_quantizer` in `Tools/dsv41_goldens.py` is that,
+in torch, and the case runs a second arm through it.
+
+| arm | dump A | dump B |
+|---|---|---|
+| identity quant (what the port implements) | **0** of 512 rows differ | **0** of 512 |
+| the reference's FP4 quant | **3** of 512 (163, 436, 491 out for 289, 305, 464) | **5** of 512 (163, 379, 436, 470, 491 out for 236, 289, 339, 464, 487) |
+
+So skipping the quantization costs 3 to 5 of 512 rows at the deepest position of one
+source, and every row involved sits within 0.17 of the cut score: the quantization
+moves scores enough to reshuffle rows that are already tied with the boundary, and
+nothing else. Individual scores move much further (up to 1.9 relative) among rows that
+nearly cancel across heads, which is why a relative delta is the wrong statistic here
+and the row list is the right one. That range is the whole justification for the port
+skipping the quantization rather than a guess; a future slice that wants the last
+0.6-1% has a target and a test. The count moved between dumps because the activations
+moved between runs -- the FP4 error lands on rows that are near the boundary, so which
+of them cross depends on the boundary's exact position. **Updated in `#31` and `#32`:** the
+activations moved because of the reduction race, not the boundary. With it fixed two dumps
+are byte-identical and both move the SAME three rows, so the range above is 3 of 512 and
+the rows are 163 / 436 / 491 in for 289 / 305 / 464 out.
+
+### The defect this found
+
+Two prefills of the same 576 tokens through the same executor, with `reset()` between
+them, do not agree. All 576 layer-20 scores move, worst |delta| 1.84e-3 against a
+3.80 maximum, and the selected rows with them. Two separate processes differ the same
+way, so it is not state carried across a `reset()`.
+
+The first position whose pooled latent differs is 86, and its latent differs by
+**0.4886** against a 4.24 maximum -- a discrete jump, not accumulating rounding. From
+87 on the differences are ~1e-2, which is what a single wrong residual write
+downstream of an attention would leave behind. Block width is 8, so position 86 is
+slot 6 of block 10, and slots 0-5 of that block are bit-identical.
+
+**The same test is bit-identical under Metal's debug layer with shader validation**
+(`MTL_DEBUG_LAYER=1`, `MTL_DEBUG_LAYER_ERROR_MODE=assert`,
+`MTL_DEBUG_LAYER_VALIDATE_ENABLE=1`, `MTL_DEBUG_LAYER_VALIDATE_LOAD_ACTIONS=1`,
+`MTL_SHADER_VALIDATION=1`): 0 of 576 moved. The value it settles on, 3.8018694, is a
+third distinct answer, which is what a read of memory nothing wrote looks like when
+the validation layer pins the contents. At 128 positions the same test is
+bit-identical WITHOUT validation, in one process and across two, so whatever is read
+unwritten is reached past the sliding window rather than in it.
+
+Not localised yet, and the reason this is written down rather than fixed: every
+ordering the code relies on was re-read and holds. `commit` waits with
+`waitUntilCompleted` on every pending buffer, so `ensureResident`'s preads cannot land
+under a live kernel in either the walk or the block path; every `encodeGemv` form and
+`encodeNorm` ends with `memoryBarrier(scope: .buffers)`; the gather's host row list
+is filled before its command buffer is committed; the arena's LRU is a counter, not a
+hash. What is left is a region some kernel reads and no kernel writes, and the
+validation layer is the tool that will point at it: run
+`DeepSeekV41PublishedTurnTests/testTheIndexerSelectsPastItsBudgetOnThePublishedCheckpoint`
+or the 576-position form of the determinism test under the flags above and watch for
+the first stage that reports differently.
+
+The reason this matters beyond bookkeeping: every real-weight numeric claim in `#28`
+and `#29` is a single run, and a single run of this forward is one sample. The
+structural results in `#29` (320/320 budget-exceeding selections differing from the
+newest window, 0 zero-score rows, 576 distinct scores) reproduce across runs; the
+exact score census does not, and the difference between runs is larger than the
+difference between the port and the reference on a fixed set of activations. That is
+why the parity work above is done on a dump: comparing two live runs would have
+measured this defect instead of the indexer.
+
+**Solved in `#31`.** The nondeterminism was a threadgroup reduction race in the Engram
+gate, not a read of unwritten memory: see below. The FP4 count above is still a range
+for its own reason -- those rows sit on the cut, so which of them cross depends on
+where the boundary lands -- and the rule arm does not have that problem, which is the
+shape the two results should have: an arithmetic comparison survives a moving input, a
+which-rows-cross-the-cut claim does not.
+
+## DSV4.1 #31: THE 576-POSITION PREFILL IS REPRODUCIBLE, AND THE RACE THAT MADE IT NOT
+
+`#30` ended with an open defect: two prefills of the same 576 tokens through the same
+executor did not agree. All 576 layer-20 scores moved (worst |delta| 1.84e-3 on the run
+that found it, 0.4195 on one taken later), the selected rows with them; at 128 positions
+the same test was bit-identical, and under Metal's validation layer it was bit-identical
+at 576 but settled on a third distinct value. That last part is what made it read like a
+peek at memory nothing wrote. It was not.
+
+### Localising it
+
+The instrument is `DeepSeekV41MetalForward.slotDigests` plus three diagnostic hooks:
+`onBlockEmbedded`, `onBlockStageFinished` and `onBlockLayerFinished`. The digests hash the
+workspace one POSITION SLOT at a time, so two runs compare equal only if every value in a
+slot is bit-identical -- a whole-buffer hash cannot say which position moved, and a
+position is what names the stage. The stage hook needs the `recordsStageTiming` layout,
+the only one where a stage is complete before the next one is encoded.
+
+Three runs, each one narrowing the answer:
+
+| Observation | What it ruled out |
+|---|---|
+| At block ends everything was bit-identical except three per-slot scratch TAILS: `gathered` rows past a slot's row count, `indexScores` past the rows a position produced, `rowIndices` past theirs | A wrong value anywhere the graph reads: those tails are never read, at any row count |
+| The first live divergence was always at an `.engram` stage (layers 1 and 14) | Every path except the Engram write |
+| `engramRaw[T]` (the host pread), `engramValues[T]` (the dequant) and `engramKV` (the `wkv` projection) were identical at that stage, while `engramGates` and `streams` moved | The retrieved rows, their decode and their projection: the gate's own arithmetic was what moved |
+| The onset moved between runs (block 0 slots 6-7, then block 15, then block 28) and always left slot 0 alone | Anything geometric: slot 0 is the dispatch that has the queue to itself |
+
+The same probe also retracted an earlier reading of our own. `#30`'s first measurement
+put the first divergent pooled latent at position 86, slot 6 of block 10; that was a
+single run of a moving target, and with the position-level digests in place the onset
+was somewhere else every time. A session that had kept chasing position 86 would have
+chased a coincidence.
+
+### The race
+
+`threadgroup_reduce_sum` ended by having every thread read `sharedWarpSums[0]` after its
+trailing barrier. That barrier orders this call's WRITE before every thread passes;
+nothing then stops a fast thread from entering the next call and overwriting
+`sharedWarpSums[warpIdx]` -- for warp 0, element 0 again -- while a slow thread is still
+reading this call's result. A kernel that reduces once per dispatch cannot hit it, which
+is why rmsnorm and the GEMVs were never affected. The Engram gate is the port's only
+kernel that reduces three times in a row:
+
+    streamSquares = threadgroup_reduce_sum(localStream, ...)
+    keySquares    = threadgroup_reduce_sum(localKey,    ...)
+    dot           = threadgroup_reduce_sum(localDot,    ...)
+
+so `keySquares` could return a partial of `dot`, or `streamSquares` one of `keySquares`.
+The gate then differs, the residual it writes differs, and every layer downstream differs
+-- which is why the reported first divergence kept moving and why all 576 scores moved
+together rather than one region's worth of them.
+
+The fix is one barrier at the START of the helper, before the partials are written: it
+orders "read the previous result" against "write the next reduction's partials" for every
+caller, at the cost of a barrier a single-call kernel will not notice.
+
+### What it is worth
+
+| | before | after |
+|---|---|---|
+| `testTwoPrefillsOfOneStreamAgreeOnTheIndexScores`, 576 positions | 576/576 scores moved, worst \|delta\| 0.4195 | **0/576, worst 0.0** |
+| `testEveryStageOfTwoPrefillsOfOneStreamAgrees`, 192 positions, every stage of every layer | first divergence at an `.engram` stage | **0 differences** |
+
+The parity results in `#30` do not move: they were taken on a dump, where both sides
+score the same activations. What changes is what a LIVE run means. `#29`'s score census
+moving between runs (cut score -2.2880 -> -2.2704 -> -2.2442, layer-24 newest-row rank
+464 -> 476 -> 483) was this race and not the checkpoint, so a single real-weight run is
+now a sample of a stable distribution. The FP4 row count in `#30` (3 of 512 on one dump,
+5 on another) was left here as a range because it still needed two dumps to be honest.
+`#32` took them: two dumps after the fix are byte-identical and both count 3.
+
+The validation layer's apparent determinism was a timing artefact, not a shield: making
+the racing thread consistently early or late makes the SAME wrong partial get picked
+every time, so the run looks correct and reproducible. That is the general lesson and the
+reason this entry exists -- a wrong threadgroup partial looks exactly like garbage memory,
+and a debug layer that changes timing will hide it rather than report it.
+
+## DSV4.1 #32: TWO DUMPS ARE ONE FILE NOW, AND THE FP4 COUNT IS ONE NUMBER
+
+**Question.** `#31` fixed the reduction race that made a long prefill unreproducible.
+`#30` had measured the reference's FP4 activation quantization at "3 of 512 rows on one
+dump, 5 on another" and left that range standing, because those rows sit on the cut and
+the boundary was moving. Now that it should not move: is the spread gone (i.e. was the
+range the race?), and are the real-weight numbers quotable as single values?
+
+**Answer: two dumps written by two separate processes are byte-identical, the FP4 arm
+moves exactly 3 of 512 rows on both, and `#29`'s census reproduces exactly.**
+
+### The dumps
+
+`testWhatTheIndexerWasGivenOnThePublishedCheckpoint` prefills the real checkpoint's 576
+positions and writes layer 20's activations. Run twice, in two processes, with
+`DSV41_INDEXER_INPUT_DUMP` pointed at two paths (through the xctestrun's
+`EnvironmentVariables`, since xcodebuild does not forward the shell's):
+
+| | value |
+|---|---|
+| size | 3,740,641 bytes, both |
+| sha256 | `08095c9e61871f07cdaf79fd6a722cece4adc3b302a305e7b7cadab0561581c1`, both |
+| `cmp` | identical |
+| cost | 93.7 s and 98.0 s, one prefill each |
+
+That is a stronger statement than `#31`'s: it is not the derived score vector that agrees
+but every byte, across 576 pooled latents plus the normed input and rank-normed query at
+the deepest position.
+
+### The reference on the deterministic dump
+
+`Tools/dsv41_goldens.py indexer_real` on either file gives one set of numbers:
+
+| | value |
+|---|---|
+| layer / position | 20 / 575, of 576 prefilled |
+| produced rows | 576 |
+| worst absolute score delta | **2.621e-6** (row 153: reference 1.778044701, port 1.778042080) |
+| rows over 1e-5 / over 1e-6 | **0** / 134 |
+| port score range | -3.330896 .. 3.801967 |
+| reference score range | -3.330895 .. 3.801969 |
+| selected rows | **512 vs 512, identical** |
+| cut score | -2.287968 (port) against -2.287969 (reference); the next row down is -2.290512 |
+| top row | 41: port 3.801966670 against 3.801968575 |
+
+### The FP4 count
+
+| arm | rows moved |
+|---|---|
+| identity quant (what the port implements) | 0 of 512 |
+| the reference's `fp4_act_quant` | **3 of 512**: selects 163 / 436 / 491, drops 289 / 305 / 464 |
+
+The same three rows on both dumps, which is the answer: `#30`'s 3-then-5 was the race
+changing the activations, not the boundary landing somewhere else.
+
+The mechanism is worth stating precisely, because `#30` described the affected rows as
+"sitting within 0.17 of the cut" and that understates what happens. The cut separates the
+kept rows from the dropped ones by 0.0025. Quantizing moves those six rows by 0.074 to
+0.206:
+
+| row | unquantized | quantized | moved | side of the cut |
+|---|---|---|---|---|
+| 289 | -2.173703 | -2.379647 | -0.206 | kept, 0.114 above |
+| 305 | -2.037593 | -2.171350 | -0.134 | kept, 0.250 above |
+| 464 | -2.207995 | -2.281592 | -0.074 | kept, 0.080 above |
+| 163 | -2.327516 | -2.213908 | +0.114 | dropped, 0.040 below |
+| 436 | -2.305418 | -2.151766 | +0.154 | dropped, 0.017 below |
+| 491 | -2.364699 | -2.177117 | +0.188 | dropped, 0.077 below |
+
+Across all 576 rows the quantization error has a median of 0.066 and a p90 of 0.161, so
+569 of 576 rows move by more than the 0.0025 the cut separates its neighbours by -- yet
+only three rows cross, because the error is correlated across rows (it perturbs the query
+and the keys, so scores shift together rather than independently). The deviation is
+therefore not a tie-break artifact: the frontier sits deep inside the quantization error,
+and only the rank correlation keeps the damage to three rows of 512.
+
+### The re-scare
+
+`#30` declined to check the reference's scores into the suite, because the activations were
+not reproducible and a literal would have pinned one sample of a moving quantity. They are
+reproducible now, so `DeepSeekV41RealIndexerReScareTests` carries the reference's 576
+rule-arm scores and the 64 rows it drops, and re-checks the port against them in 25 ms for
+all three cases. It skips when the dump is absent (producing it needs the checkpoint and
+the opt-in marker), and its doc comment says what a failure can mean: the scoring rule
+moved, or something upstream of the dump did. Two negative controls were run before it was
+committed -- a dump with one score moved by 0.01 fails it and names the row, and no dump at
+all skips it -- because an assertion that has never failed is not yet evidence.
+
+### The census, as one value
+
+`testWhatTheIndexerSelectsPastItsBudgetOnThePublishedCheckpoint`, run twice after the fix
+(96.9 s and 97.9 s), printed the same lines both times:
+
+| layer at position 575 | cut score | range | median | positive / negative | row 0 ranks | newest row ranks |
+|---|---|---|---|---|---|---|
+| 20 | -2.2880 | -3.331 .. 3.802 | -1.0109 | 135 / 441 | 43 | 62 |
+| 24 | -2.6140 | -3.073 .. 3.127 | -2.2484 | 59 / 517 | 39 | 464 |
+| 28 | -1.8919 | -2.360 .. 3.997 | -1.0060 | 130 / 446 | 47 | 94 |
+| 32 | -1.8990 | -2.677 .. 3.980 | -0.7575 | 175 / 401 | 46 | 110 |
+| 36 | -1.9725 | -3.059 .. 4.487 | -0.6498 | 190 / 386 | 62 | 66 |
+
+576 distinct scores at every source, 0 zero-score rows of 576, and 320 of 320
+budget-exceeding selections differ from the newest 512 rows. These are `#29`'s FIRST-run
+numbers exactly -- cut -2.2880, layer-24 newest rank 464, layer-20 row-0 rank 43 -- so the
+two runs that moved were corrupted by the race and the original census was the correct
+one. `#29`'s table can be quoted as it stands; the `+/-` range `#30` introduced is what is
+retired.
+
+### What it leaves
+
+Nothing numeric is open any more: the rule arm matches the reference to 2.6e-6, the cut is
+identical, the deviation the port accepts by skipping the activation quantization is three
+rows of 512 and pinned by name, and both a live prefill and the numbers derived from it
+are reproducible. `batchedDevicePrefill` remains the only unverified gate and it needs real
+weights, not another dump.
+
+## DSV4.1 #33: THE BATCHED PREFILL RUNS ON THE PUBLISHED CHECKPOINT, AND THE LAST GATE CLOSES
+
+The only conformance rule still open was `batchedDevicePrefill`, and its stated reason was
+not a rule: the block graph had been compared with the host on a synthetic checkpoint, but
+never on the real one, where the tensor shapes, the 128-row ring, the ratio-2 compressor and
+the expert arena are the checkpoint's own. `#26` had already closed the performance question
+(a narrow verify loses to walking at widths 2, 3 and 5), so this slice's target was the gate,
+not a faster decode.
+
+### What changed
+
+- `prefillChunk` gained `capturingLogitsAt:`, relative to the chunk like the CPU forward's
+  argument. It maps each named position into the block that owns it and returns the usual
+  `last` beside a `captured` dictionary. A chunk that continues the cache is the same path,
+  so a verify can ask for a drafted run in one pass.
+- `finishBlock(rows:)` now normalizes and projects a whole block in one grid instead of one
+  slot: the final norm loops its rows and the `vocabSize` head runs with a row stride. The
+  head is the one stage whose cost grows with the capture, and a per-position dispatch would
+  read its 1.3 GB matrix once per position; one row grid reads it once for the block.
+- `workspace.logits` is one vocabulary vector per position slot, so a block's logits sit
+  side by side and a decode step still reads slot 0.
+
+### The real-weight comparison
+
+`DeepSeekV41PublishedTurnTests.testABatchedPrefillMatchesTheWalkOnThePublishedCheckpoint`
+runs 16 positions as two consecutive blocks of eight, asks for every slot, and compares each
+position with a per-position walk. The second block continues a cache the first filled, so
+the ring slot and the compressor's group slot are derived from the absolute position.
+
+```
+batched prefill vs walk: 16 positions in two blocks of 8,
+  worst relative delta 1.701e-04 at position 12 (scale 20.184);
+  plain blocks (no capture) worst 1.147e-04 at position 12 (scale 20.184)
+```
+
+Under the full Metal validation layer the same case printed 1.500e-04 and 1.339e-04, so the
+delta is not a fixed offset: it is what a re-associated reduction costs at this dynamic
+range.
+
+The residual is float re-association, and the control says so: the capture-free block path,
+which keeps the walk's one-row head, is already at 1.15e-4, and the batched head moves it by
+another 0.55e-4 on the normal run (less when the validation layer changes the timing). Both
+are far below the 5e-4 bar, which is itself four times below the
+graph's 2e-3 decode tolerance; a wrong row list or a head that wrote every slot to slot 0
+would be orders of magnitude larger. The synthetic cases still carry the bit-exact contract
+(`1e-6` at the chunk seam) because their reductions are small enough for the orders to
+coincide.
+
+### What it means
+
+`batchedDevicePrefill` flips to `verifiedAgainstReference`; `unverifiedSummary` is empty for
+the first time. The port's conformance ledger now has no open rule: every gate is either a
+reference vector from `Tools/dsv41_goldens.py` or, for the batched graph, a real-checkpoint
+comparison against the path the turn loop already uses.
+
+What this does NOT mean: DSpark is not wired into the turn loop. `#26`'s economics still
+hold, and the two pieces a verify still needs are cache rewind for a rejected suffix and the
+accept/emit loop itself. The per-position logits are now the easy half; rewind (ring
+position, `tokenHistory`, `deadTokens` and the compressor group phase together) remains
+deliberately unbuilt because it buys a feature that loses to walking at every width measured.
+`DeepSeekV41Availability.isRuntimeAvailable` was also still false here, and that was a
+separate question about what the flag promises, not about the graph. **Updated in `#34`:**
+it is now true, with the promise scoped to text turns (see below).
+
+## DSV4.1 #34: THE FLAG NOW SAYS TEXT TURNS, AND THE EFFORT CONTROL IT SWITCHES ON REACHES THE PROMPT
+
+### The question
+
+`DeepSeekV41Availability.isRuntimeAvailable` had been `false` since the family was first
+detected. Its comment said the flag existed so "a user is not invited to download a ~510 GB
+checkpoint that can only fail closed" — a premise `#33` retired: every conformance gate is
+verified, `DeepSeekV41TurnRunner` runs the published checkpoint, and a real prompt answers.
+So the question was not "can it run" but "what does advertising it promise?".
+
+### What changed
+
+- `isRuntimeAvailable` is `true`, and its doc states the promise as TEXT turns and names what
+  is outside it: the vision tower has no device path, DSpark is unwired, cache rewind is
+  unbuilt, and the composer still refuses images because no local model advertises vision.
+  It stays a constant rather than being derived from `unverifiedSummary`: a gate records how
+  far to trust a number, and one open rule for a stage the text path never runs must not
+  disable a working text turn. It is also not a download gate; discovery lists the hub cache
+  either way.
+- The model row's `, runtime not available` caveat is now gated off by the flag (the string
+  stays for a future regression).
+- `ModelConfig.supportsThinkingLevels` detects DeepSeek V4.1 from the checkpoint identity
+  while the runtime is advertised, because its formatter renders the family's own
+  `Reasoning Effort:` line. That switches on the High/Low/Off menu Spark already had; every
+  prompt path (chat, agent continuation, both API adapters) was already threading the level
+  into the dialect.
+- The server's turn-memory digest now covers the rendered system block for V4.1 too.
+  `ChatPromptFormatter.renderedSystemBody` is the single authority for "the system text the
+  model saw" (Spark's body is unchanged by the extraction), so switching High to Low
+  invalidates a recorded raw turn instead of trusting one generated under a different system
+  prompt.
+- The DSV4.1 load log gains a `runtime: text turns (...)` line, so the promise is visible at
+  the same place the checkpoint's plan is printed.
+
+### Evidence at real weights
+
+`testAPublishedPromptCompletesATurn` now runs both shapes on one runtime: the thinking-off
+prompt it always ran, and the app's default (thinking on, effort high), whose 31-token prompt
+carries the effort instruction and opens the reasoning channel.
+
+```
+turn 1 (thinking off): lengthCapped after 8 token(s), prefill 1.85 s, decode 2.13 s
+  text: "Hey! How's it going? What"
+thinking turn (effort 100): lengthCapped after 7 token(s), prefill 9.27 s, decode 2.09 s
+  text: "The user just said \"hey\"."
+```
+
+The second turn is a fresh prefill because the effort line changes the prompt's first
+tokens; the generated text is the reasoning channel's own opening, which is what the
+checkpoint's encoder asks a thinking turn to produce. Its 9.27 s against the first prompt's
+1.85 s is not the flag's cost: the prompt is 31 tokens instead of 5 and starts over at
+position 0.
+
+Pure logic pins the wiring: `testTheRuntimeAdvertisesTextTurnsAndTheirEffortLevels` (flag
+true, the published config advertises levels, a plain `llama` config still does not),
+`ModelConfigThinkingLevelTests.testDeepSeekV41IsDetectedWithoutATemplateKnob`, and
+`ChatPromptFormatterConversationTests.testRenderedSystemBodyCarriesTheGradedEffortLevel`
+(High and Low differ, thinking off emits nothing, the block is a substring of the actually
+rendered prompt, and Spark's block is byte-identical to `sparkSystemBody`).
+
+### What it does not mean
+
+Vision is still CPU-reference only: no device tower, no image span reaches a turn, and the
+composer refuses attachments for every local model. **Updated in `#35`:** an image span now
+DOES reach a real turn (`DeepSeekV41TurnRunner.run(imageEmbeddings:)`), and the host tower
+measures ~10.4 hours for the smallest image the checkpoint accepts, so the composer still
+refuses attachments — for a measured reason now, not an assumed one. DSpark is still unwired,
+still a measured loss at every width (`#26`), and cache rewind is still unbuilt. The flag
+advertises the text path that exists, not every head the checkpoint publishes.
+
+## DSV4.1 #35: AN IMAGE SPAN NOW REACHES A REAL TURN, AND THE HOST TOWER MEASURES AT TEN HOURS A PICTURE
+
+### The question
+
+`#34` advertised text turns and named vision as outside the promise. The remaining
+candidates were a second indexer source, the image path, the device vision tower, and the
+shelved drafter. `image_prefill` was chosen: the tower's CPU reference was already matched
+against the checkpoint's own `ViT`/`Aligner`, `imageSpan(rgb:width:height:)` was verified,
+and the image token was pinned to the tokenizer's own added token 129,264, so what was
+missing looked like plumbing. The open question was whether plumbing is all it is.
+
+### What changed
+
+- **The device executor takes a supplied residual row.** `DeepSeekV41MetalForward
+  .forwardEmbedding(_:token:position:)` uploads the row into the workspace's embedding slot,
+  seeds every hyper-connection copy from it, records the position DEAD for the Engram hashes,
+  and then walks exactly what `forwardToken` walks. This is the seam every future vision path
+  enters through, device tower or not.
+- **The turn loop carries rows.** `DeepSeekV41TurnRunner.run(imageEmbeddings:)` walks a
+  prompt that has any, and `DeepSeekV41PositionForward` grew the matching requirement with a
+  default that REFUSES: an executor that cannot take a row says so, because silently running
+  the token embedding would answer about nothing.
+- **An image prompt never resumes a prefix.** The app-wide pin is keyed on token ids, and
+  every position of an image carries the same id whatever the pixels were. A resumed span
+  would keep a previous picture's rows in the cache. This is a deliberate cost (a follow-up
+  turn re-prefills) until the span is hashed into the pin.
+- **`DeepSeekV41ImagePrompt`** expands one placeholder id into its span and binds a row to
+  each position, reporting an image with no placeholder and a placeholder with no image
+  instead of dropping either, because dropping one shifts every position after it.
+- **`DeepSeekV41VisionWeights`** reads the tower's 266 tensors (263 block tensors plus the
+  three markers) by name out of the shard headers, decodes BF16/FP32 on demand, and never
+  pins: one encode touches each tensor once.
+- **The CPU forward's two entry points now share one walk.** `forwardToken` used to delegate
+  to `forwardEmbedding`, so making a supplied row dead-by-construction made EVERY token dead
+  and 70 tests failed on Engram hashes. They now both call a private `runPosition(dead:)`.
+
+### Evidence at real weights
+
+The first time the tower has run on the published weights at all (every previous vision test
+is a synthetic fixture against a numpy mirror). `testAnImageEntersAPublishedTurn`, behind
+`/tmp/dynamoe_dsv41_real_turn`:
+
+```
+🔎 [dsv41 real] image prompt: 12 tokens, image id 129264
+🔎 [dsv41 real] vision weights: 266 tensors
+🔎 [dsv41 real] tower: 4 patch tokens in 127.11 s, 16 in 422.55 s; span 4 rows for the 2x2
+   grid, prompt 12 -> 15 tokens
+🔎 [dsv41 real] image turn: lengthCapped after 2 token(s), prompt 15, reused 0,
+   prefill 4.07 s
+🔎 [dsv41 real] image turn text: "This picture"
+```
+
+The placeholder tokenized to ONE token (id 129,264) out of 12, the span expanded the prompt
+from 12 to 15 tokens, the turn walked all 15 with the supplied row at its own position, and
+`reused 0` is the no-resume rule holding even though a 11-token prefix was proposed.
+
+### What the tower costs, and why this is the headline
+
+Two patch grids, same weights, same process:
+
+| patch tokens | encode |
+|---|---|
+| 4 (2x2) | 127.11 s |
+| 16 (4x4) | 422.55 s |
+
+That is **24.6 s per marginal patch token** and a fixed **~29 s** (the 970 MB of BF16 read
+and widened into 1.9 GB of `Float`, once per encode). The checkpoint's own floor is
+`min_pixels` 295,936, i.e. at least 544x544, which the patch grid rounds up to 546x546 =
+**1,521 patch tokens** for the smallest image it will accept: 28.6 + 1521 * 24.6 = **~10.4 hours** of host tower before the span's
+184 positions even reach the backbone (which then costs ~50 s at the measured ~270 ms a
+position). The shape is the problem, not the CPU: a projection re-reads its whole matrix per
+token through bounds-checked scalar dots, which is a GEMM being done as `rows` dot products.
+
+So `image_prefill` is DONE and vision is NOT shippable on it. Two ways forward, in order of
+cost: give the host tower a real GEMM (Accelerate is already linked; the same arithmetic at
+~100 GFLOP/s turns a picture into tens of seconds), or build the device tower (`vision_device`
+as originally scoped). The composer must keep refusing attachments until one of them lands;
+the `supportsVision` flag stays false.
+
+Pure logic pins the wiring: `DeepSeekV41ImagePromptTests` (span length is the grid plus its
+delimiters, one placeholder expands to its span and binds every row, two images keep their
+order, a placeholder with no image survives, an image with no placeholder is reported, a
+wrong span length and a wrong row width are refused, a text-only prompt is untouched), the
+five new `DeepSeekV41TurnLoopTests` cases (row runs only at its own position, an image turn
+does not resume even when the prefix matches, a text-only turn still resumes and chunks, an
+out-of-range row is refused, an executor without image support refuses the row), and
+`DeepSeekV41DeviceGraphParityTests.testASuppliedRowComputesTheSameLogitsAsTheHost` (the
+supplied row AND the text position after it, `2e-3` normalized).
+
+### What it does not mean
+
+The image path exists end to end and is unusably slow. No `supportsVision` flag was turned on,
+no composer path was opened, no chat or API request can carry an image yet: the engine seam is
+proven, the serving cost is not. `vision_device` is now justified by a number rather than a
+premise, and the cheaper alternative (a host GEMM) is named above so it can be chosen first.
+**Updated in `#36`:** the host GEMM was chosen and shipped. The same harness measures the
+smallest image at 68.06 s (from ~10.4 h), the slope falls from 24.6 s to 20.8 ms per marginal
+patch token, and an isolated `-O` mirror prices the tower's arithmetic at 2.00 s, so what is
+left of the harness number is the `-Onone` widen. `vision_device` survives as an optimisation,
+not a prerequisite.
+
+## DSV4.1 #36: ONE GEMM PER BLOCK TURNS TEN HOURS INTO SECONDS, AND WHAT IS LEFT IS A `-Onone` ARTIFACT
+
+### The question
+
+`#35` priced the host vision tower at **~10.4 hours for the smallest image the checkpoint
+accepts** and named the shape rather than the CPU: `DeepSeekV41VisionForward.linear` re-read
+its whole matrix once per token and reduced it through bounds-checked scalar dots, which is a
+GEMM being done as `rows` dot products (24.6 s per marginal patch token). Two ways forward
+were named: give the host tower a real GEMM, or build the device tower. Routing put
+`vision_gemm` at 0.99 (confidence 0.99) and "GEMM before device" at 0.999, on the ground that
+the CPU tower already has an oracle (the checkpoint's own `ViT`, and the pinned aligner rows
+from `#34`) while the device tower has no device code at all.
+
+### What changed
+
+- **`linearBatched`**: one `cblas_sgemm` for the whole block of tokens,
+  `CblasRowMajor/NoTrans/Trans` because `DeepSeekV41Matrix` is row-major `[out][in]`, with the
+  bias folded into the copy-out. `linearRowByRow` keeps the definition beside it as the oracle.
+- **`attentionBatched`**: two GEMMs per head (`alpha` carries `1/sqrt(head_dim)` on the score
+  GEMM), and the 2D rotation sliced once per token instead of once per head per token.
+- **`softmaxRow`**: `vDSP_maxv` / `vDSP_vsadd` / `vvexpf` / `vDSP_sve` / `vDSP_vsmul` over one
+  flat row. `softmax` keeps its scalar form for the oracle.
+- **`rmsNorm`** through `vDSP_svesq` + `vDSP_vsmul` + `vDSP_vmul`: it was three bounds-checked
+  scalar passes over every patch, twice a layer.
+- **`DeepSeekV41VisionWeights.decode`** widens through a typed destination instead of two
+  bounds-checked byte loads per value.
+- `encode` still validates every row and now REFUSES a ragged one (`shapeMismatch`) instead of
+  zeroing it, because a GEMM cannot take a short row.
+
+The numeric contract is unchanged: `attention` and `softmax` are untouched, and the
+numpy-pinned aligner rows from `#34` still match at 1e-4. `cblas_sgemm` is deprecated in macOS
+13.3 in favour of the ILP64 interface (`-DACCELERATE_NEW_LAPACK`); the build warns twice, and
+the call is the same one every Accelerate consumer makes.
+
+### Evidence at real weights
+
+`testAnImageEntersAPublishedTurn`, published checkpoint, same harness and machine as `#35`:
+
+```
+🔎 [dsv41 real] image prompt: 12 tokens, image id 129264
+🔎 [dsv41 real] indexed 96085 tensors in 48 shard(s), 475.2508442029357 GB
+🔎 [dsv41 real] mapped 48/48 segment(s), 286.4 GB
+🔎 [dsv41 real] vision weights: 266 tensors
+🔎 [dsv41 real] tower: 4 patch tokens in 25.35 s, 16 in 25.60 s, 1521 in 68.06 s; span 4 rows for the 2x2 grid, prompt 12 -> 15 tokens
+🔎 [dsv41 real] tower floor: 20.3 ms per marginal patch token, smallest image 68.06 s (184 span positions)
+🔎 [dsv41 real] image turn: lengthCapped after 2 token(s), prompt 15, reused 0, prefill 2.53 s
+🔎 [dsv41 real] image turn text: This picture
+```
+
+| patch tokens | `#35` | `#36` |
+|---|---|---|
+| 4 (2x2) | 127.11 s | 25.35 s |
+| 16 (4x4) | 422.55 s | 25.60 s |
+| 1,521 (39x39, the smallest admissible image) | ~10.4 h, extrapolated | **68.06 s** |
+
+The slope between the two small grids falls from **24.6 s to 20.8 ms per marginal patch
+token** (1,180x). The 1,521-token point implies 28.2 ms/token rather than 20.8, which is the
+attention: its cost per token grows with the token count, so a slope measured at 16 tokens
+understates the picture. The whole smallest image goes from ~10.4 hours to **68 seconds** in
+the same harness, and the turn's prefill beside it from 4.07 s to 2.53 s.
+
+### What the remaining 68 seconds are made of
+
+Two constants, both measured in isolation rather than inferred from the slope, because the
+test bundle is a `-Onone` build: BLAS and vDSP are precompiled and their numbers are
+Build-settings-independent, while every Swift per-element loop pays the Debug penalty.
+
+**The fixed cost is the BF16 widen.** The same widening loop over 960 MB (480 million values),
+built both ways:
+
+| form | `-Onone` (the test bundle) | `-O` (the shipped build) |
+|---|---|---|
+| old: two bounds-checked byte loads per value | 27.35 s (35 MB/s) | 0.05 s (17 GB/s) |
+| new: typed destination + `loadUnaligned` | 23.93 s (40 MB/s) | **0.03 s (34 GB/s)** |
+
+So the ~25 s that does not move with patch count IS the widen, and at `-O` it is nothing.
+
+**The arithmetic is 2 seconds.** A standalone `-O` mirror of the tower at the shipped shapes
+(1,521 tokens, hidden 1,024, 16 heads of 64, intermediate 2,816, 32 layers):
+
+| stage | time |
+|---|---|
+| linear GEMMs (qkv, wo, w1, w2 per layer) | 0.86 s |
+| attention GEMMs (scores + context per head) | 0.49 s |
+| softmax (vDSP) | 0.53 s |
+| norms (vDSP) | 0.01 s |
+| glue (SiLU, copy-out, residual adds) | 0.11 s |
+| **total** | **2.00 s** |
+
+One `w1` GEMM at this shape runs at **1,608 GFLOP/s**, which is what a real GEMM buys: the
+same product that `#35` measured at ~17 MMAC/s.
+
+The rest of the harness's 68 s is `-Onone` per-element Swift: the q/k/v fill and copy-out
+(~200 million values per encode), the gate/up activation (~137 million), and the residual adds
+(~100 million) all run at the 40 MB/s the widen table shows, and the mirror measures the same
+work at 0.11 s when it is compiled.
+
+### What it means
+
+The scaling law is fixed, so the next slice is **`composer_image_attachment`**, not
+`vision_device`. At `-O` the smallest image is ~2 s of arithmetic plus one 970 MB read of the
+tower's shards per encode; a turn that already spends ~270 ms per backbone position can afford
+that. `vision_device` is now an optimisation with a named prize rather than a prerequisite:
+it would replace the per-encode read with a bind and the 2 s of CPU arithmetic with GPU
+dispatches, and it is the only way to serve the LARGEST admissible image, because the cap is
+1,024 aligner tokens, about 9,216 patch tokens, six times the floor, and attention is
+quadratic (0.49 s becomes ~18 s).
+
+Caching the widened weights is not justified either: 1.9 GB of pinned `Float` would buy 0.03 s.
+
+### What it does not mean
+
+Nothing was opened in the app: `supportsVision` is still false, the composer still refuses
+attachments, and no chat or API request can carry an image. The 2.00 s is a standalone `-O`
+mirror of the same shapes and the same calls, not a Release build of the app, whose own glue
+was not timed; the 68.06 s is the number the harness actually measured.
+
+**Updated in `#37`:** both gaps are closed. The app's own build, compiled `-O`, measures the
+smallest accepted image at **2.74 s** (24.8x the 68.06 s above), the largest image the
+checkpoint accepts at **41.71 s**, and 76% of that 41.71 s is the quadratic attention term. The
+2.00 s mirror was 21% optimistic against the 2.52 s of measured arithmetic; see `#37`.
+
+Pure-logic pins: `DeepSeekV41VisionForwardTests.testTheBatchedLinearMatchesItsDefinition` (an
+odd 3x7x5 shape so a transposed matrix or a wrong `lda` cannot cancel out),
+`testTheBatchedLinearHandlesASingleToken`, `testTheBatchedAttentionMatchesItsDefinition`,
+`testTheBatchedAttentionWithoutRotationMatchesItsDefinition` (a missing table must not become a
+rotation by zero), `testARaggedPatchRowIsRefused`, and the new
+`DeepSeekV41VisionWeightDecodeTests` (BF16 is the high half of its float, the discarded low
+half is not reinvented, FP32 passes through bit for bit, a short buffer yields zeros, the dtype
+widths). The suite is **556 tests, 0 failures, 41 skipped**, and 0 Metal validation errors
+under `MTL_DEBUG_LAYER`.
+
+## DSV4.1 #37: THE REAL TOWER AT `-O` TAKES 2.74 s, AND THE LARGEST IMAGE THE CHECKPOINT ACCEPTS IS 76% ATTENTION
+
+### The question
+
+`#36` left one claim in this journal that was a mirror rather than a measurement: it priced the
+tower's arithmetic at **2.00 s** by compiling a standalone `-O` harness of the same shapes and
+calls, while the 68.06 s everyone would actually see came from a `-Onone` test bundle. Two
+things were therefore unknown, and a third was named but unmeasured: what the app's OWN code
+costs per image at `-O` (its glue inside `encode` was never timed there), and what the LARGEST
+image the checkpoint accepts costs, which `#36` could only extrapolate from a quadratic
+attention term (0.49 s at 1,521 patch tokens becomes ~18 s at 9,216). Routing put
+`vision_release_measure` at **0.84** (confidence 0.80), "measure at `-O` before opening the
+composer" at **0.98**, and "the app's untimed glue is a real risk" at 0.81.
+
+### What changed
+
+Test-only. Production code is untouched, so every number below is the code that shipped in
+`#36` — just compiled the way a release build compiles it.
+
+- **The `-O` run is the app's own build**, not a mirror: `build-for-testing` with
+  `SWIFT_OPTIMIZATION_LEVEL=-O` into a SEPARATE derived data directory
+  (`-derivedDataPath /tmp/dd_dsv41_opt`), so the Debug products other runs depend on are left
+  alone. It produced a single 127 MB `DynaMoE` binary instead of the Debug configuration's
+  59 KB launcher plus 154 MB `DynaMoE.debug.dylib`, and a 19.0 MB `DynaMoETests` bundle against
+  Debug's 23.0 MB. That the flag took effect is not inferred from the size: the same test that
+  took 126.57 s takes 63.24 s.
+- **`testAnImageEntersAPublishedTurn` grew an opt-in tail** gated on
+  `/tmp/dynamoe_dsv41_vision_max`, because the quadratic term makes the big grids a
+  many-minute measurement at `-Onone`. It measures the largest image the checkpoint accepts
+  **through `fit`** (a 20,000 pixel square collapses onto the token budget) rather than
+  hard-coding a grid, so the measurement cannot drift from what an oversized real image would
+  become; it re-times the 4-token encode to get the fixed cost with the page cache warm; it
+  times a middle grid; and it solves `seconds = fixed + perToken * tokens + squared * tokens^2`
+  through the three points by Cramer's rule (`costModel(tokens:seconds:)`), returning nil rather
+  than inventing a split when the points cannot separate the growth terms.
+- The three small grids (`2x2`, `4x4`, `39x39`) still run on every invocation, so the `#36`
+  series stays comparable line for line.
+
+### Evidence at real weights
+
+Published checkpoint, `-O` build, `/tmp/slice37_o2.log`:
+
+```
+🔎 [dsv41 real] image prompt: 12 tokens, image id 129264
+🔎 [dsv41 real] vision weights: 266 tensors
+🔎 [dsv41 real] tower: 4 patch tokens in 0.24 s, 16 in 0.24 s, 1521 in 2.74 s; span 4 rows for the 2x2 grid, prompt 12 -> 15 tokens
+🔎 [dsv41 real] tower warm: a repeated 4-token call in 0.22 s (the first call pays the cold read, so this is the fixed cost)
+🔎 [dsv41 real] tower cap: 8649 patch tokens (93x93) -> 31x31 aligner grid, 994 span positions in 41.71 s (15.2x the smallest image, 4.82 ms per patch token)
+🔎 [dsv41 real] tower cost model: 0.22 s fixed + 1.126 ms per token + 4.245e-07 s per token^2; at 8649 tokens the quadratic term is 76% of the 41.71 s (mid grid 63x63 = 3969 tokens in 11.38 s)
+🔎 [dsv41 real] image turn: lengthCapped after 2 token(s), prompt 15, reused 0, prefill 2.15 s
+🔎 [dsv41 real] image turn text: This picture
+Test Case '...testAnImageEntersAPublishedTurn' passed (63.240 seconds)
+```
+
+| patch tokens | aligner grid | span positions | `#36` `-Onone` | `#37` `-O` |
+|---|---|---|---|---|
+| 4 (2×2) | 1×1 | 4 | 25.35 s | 0.24 s |
+| 16 (4×4) | 2×2 | 8 | 25.60 s | 0.24 s |
+| 1,521 (39×39) | 13×13 | 184 | 68.06 s | **2.74 s** |
+| 3,969 (63×63) | 21×21 | 464 | not measured | 11.38 s |
+| 8,649 (93×93) | 31×31 | 994 | not measured | **41.71 s** |
+
+The smallest image the checkpoint accepts is **24.8x** faster than the number `#36` published,
+and the whole test — three small towers, the warm repeat, the middle grid, the largest grid and
+a real image turn with 2 decoded tokens — goes 126.57 s → **63.24 s**.
+
+A second clean run reproduces every point: 2.75 s smallest, 0.22 s warm, 11.43 s middle,
+41.51 s largest, 2.14 s prefill, 62.71 s wall clock, and a model of
+`0.22 s + 1.170 ms/token + 4.167e-07 s/token^2` with the quadratic term at 75%. The spread is
+1% on the cache-warm points. A third run, taken while the same machine was busy with another
+process, read 3.82 s and 43.71 s — **+39% on the smallest image and +5% on the largest** — so
+the numbers quoted above are the quiet pair, and `-O` does not make the measurement immune to
+contention, only much faster than it. The image turn's own
+prefill (2.15 s against Debug's 2.53 s) is the backbone's Metal path and barely moves, which is
+the expected shape: `-O` cannot improve GPU dispatches.
+
+### The cost model, and three checks that it is not curve fitting
+
+`0.22 s fixed + 1.126 ms per token + 4.245e-07 s per token^2` is solved exactly through the
+4-token, 3,969-token and 8,649-token points, so it reproduces those three by construction. The
+checks are the parts it does NOT fit:
+
+1. **The fixed term is independently measured.** It comes out at 0.22 s, and the repeated
+   4-token encode — a separate call, timed for exactly this reason — is 0.22 s. It is the
+   tower's 970 MB of weights being `pread` once per encode (4.4 GB/s), not the widen, which
+   `#36` measured at 0.03 s when compiled.
+2. **An unused point agrees.** 1,521 tokens is not one of the three fit points; the model
+   predicts 0.22 + 1.71 + 0.98 = 2.91 s against 2.74 s measured, 6% high.
+3. **The quadratic term matches `#36`'s mirror.** The model attributes 0.98 s of the 1,521-token
+   encode to the `t^2` term, and the standalone mirror measured attention GEMMs at 0.49 s plus
+   softmax at 0.53 s, i.e. 1.02 s — 4% apart, from two completely different code paths.
+
+So the tower is three things at real weights: a 0.22 s weight read, 1.126 ms per patch token
+(35 µs/token/layer across 32 layers) of linear GEMM, norm and glue work, and attention plus
+softmax growing with the square of the token count.
+
+### What it means
+
+**The composer is now a measured decision, not an estimate.** The smallest accepted image is
+2.74 s of tower plus 2.15 s of prefill — about 5 s to the first token — and the largest
+admissible one is 41.71 s plus its prefill, about 45 s. That is a 15x range across legal
+images, so the composer should price an attachment from `DeepSeekV41Runtime.imageSpanPlan`
+before encoding it and say what it will cost, rather than discovering it afterwards.
+
+**`vision_device` now has a number instead of an adjective.** Its prize is the `t^2` term:
+31.75 s of a 41.71 s cap image, 0.98 s of a 2.74 s floor image. It does not touch the 0.22 s
+read and does not touch the 9.7 s linear term (unless the weights are also bound instead of
+`pread`). So the device tower is worth ~76% of a large image and ~36% of the smallest — a real
+prize for a big picture, a small one for a thumbnail. That is the honest ranking, and it keeps
+`vision_device` an optimisation rather than a prerequisite.
+
+**An image is encoded per ATTACHMENT, not per turn, and nothing caches that yet.** Every
+`imageSpan` call re-reads the 970 MB and re-runs the tower, and an image prompt never resumes a
+prefix, so a conversation that keeps a picture in context re-prefills every turn. The composer
+slice should cache the span by `ImageAttachmentRef`; nothing in the current code does.
+
+**Pinning the widened weights is still not justified**: 1.9 GB of `Float` buys 0.03 s, and the
+0.22 s fixed term is the read, which pinning would remove. That trade is 1.9 GB of resident
+memory for 0.22 s per image; worth revisiting only if the tower ever runs per turn.
+
+### What it does not mean
+
+- **`-O` here is the Debug configuration compiled with `SWIFT_OPTIMIZATION_LEVEL=-O`**, which is
+  the same sources and the same optimizer as a Release build of these paths. No Release build of
+  the app was archived or notarized, and the shipped Release configuration was not run.
+- **Nothing was opened.** `supportsVision` is still false, the composer still refuses
+  attachments, and no chat or API request can carry an image.
+- **8,649 patch tokens is the largest a SQUARE image becomes.** A non-square image gets a
+  smaller `columns * (rows + 1) + 2`, so it is the worst case, not the only case.
+- **What a developer runs from Xcode still costs 68 s**, because Debug is `-Onone`. Both numbers
+  are real; they belong to different builds.
+- The `-Onone` gate on the marker is load-bearing: at `-Onone` the largest grid would be tens of
+  minutes of interpreter overhead and would say nothing about the tower.
+
+### Verification
+
+The full DeepSeek suite is **556 tests, 0 failures, 41 skipped** on the Debug build, and 0 Metal
+validation errors under `MTL_DEBUG_LAYER` (`dsv41_validation43.xctestrun`). The vision suites
+(`DeepSeekV41VisionForwardTests`, `DeepSeekV41VisionWeightDecodeTests`,
+`DeepSeekV41VisionGoldenTests`, 25 tests) also pass in the `-O` build, which is the non-obvious
+one: `-O` must not move the GEMM parity bars, and it does not. Production code was not touched
+in this slice, so those bars are `#36`'s.
+
+
+## DSV4.1 #38: THE COMPOSER CAN SEND A PICTURE, AND THE PATH IS FOUR SEAMS
+
+### The question
+
+`#37` measured what an image costs and left the composer as the next slice, on the ground that
+the cost objection was retired and the UI half of the seam already existed. Routing agreed
+(`composer_image_attachment` 0.993, confidence 0.99; "probe the app's own tokenizer path first"
+0.998; "price the attachment in the composer" 0.996). Four gaps stood between a staged
+`PreparedImage` and a turn the model can see: the request had no image field, the engine never
+called the tower, the app's prompt text carried no placeholder, and no local model reported
+`supportsVision`.
+
+### What changed
+
+- **The probe came first, and it was worth it.**
+  `testTheComposedPromptCarriesOneImageTokenPerAttachment` renders a user turn through
+  `ChatPromptFormatter.formatPrompt` (the app's path, not `dialect.render`), tokenizes it with
+  the checkpoint's own tokenizer, and expands it: **10 tokens plain, 12 with one image, 14 with
+  two**; the marker alone tokenizes to exactly `[129264]`; `expand` binds 8 rows with 0
+  unfilled and 0 unused. The first two fixtures were wrong in the same instructive way —
+  a newline is its own token, and *two adjacent newlines are one* — so the control is now one
+  ordinary token placed where the marker goes, which is the only comparison that isolates the
+  marker.
+- **`DeepSeekV41ImagePixels`** turns encoded bytes into the row-major RGB the tower samples:
+  ImageIO decode with EXIF orientation applied and a 4,096-pixel side cap (the token budget is
+  a 1,344-pixel box, so the cap refuses a 100-megapixel photo that would cost 300 MB of RGB to
+  end up as 31x31 cells). A 24-bit sRGB `CGContext` is refused by Core Graphics on this OS
+  (measured), so the draw goes through 32-bit RGBA and is compacted.
+- **`DeepSeekV41TurnImages`** splits the two halves the engine needs in that order: `price`
+  answers "how many prompt positions will this become" from `DeepSeekV41VisionLayout.fit` alone,
+  and `bind` runs the tower and places its rows. Both fail closed on no tower, an image with no
+  placeholder, a placeholder with no image, a malformed buffer, and a span whose row count
+  disagrees with its grid.
+- **The engine prices before provisioning and binds after.** The KV cache has to be sized for the
+  *expanded* prompt, which is why the price cannot wait for the tower; the bind then runs with
+  the runtime in hand and its length is asserted against the price, because a disagreement means
+  a cache sized for one sequence and a turn run on another. The expanded ids feed the prefix pin,
+  the prepared-length bookkeeping and the sampler's context. Any family without a tower now
+  refuses a turn that carries images instead of dropping them.
+- **`ModelConfig.supportsVision(modelPath:)`** is the composer's gate, backed by
+  `DeepSeekV41VisionWeights.directoryHasTower`, which reads the shard index for a block, the
+  aligner and the three marker embeddings — the markers live in a different shard from the
+  blocks, so a partial download fails this check rather than advertising a tower it cannot run.
+- **The composer prices the attachment.** `DeepSeekV41VisionPricing` turns the resize plan into
+  span positions and seconds on the model `#37` measured, and the chip reads
+  `546×546 · 12 KB · about 2.9 s`.
+- **One encode per attachment, not per turn.** A chat turn re-renders the whole conversation, so
+  a picture in context would re-run the tower every turn; the engine now caches encoded spans by
+  `snapshot path | sha256`, bounded to four, and drops them with the checkpoint.
+
+### Evidence at real weights
+
+`testAnRGBImagePricesAndBindsOnThePublishedWeights`, published checkpoint, `-Onone` harness:
+
+```
+🔎 [dsv41 real] rgb bind: 56x56 pixels -> 1521 patch tokens, 184 span positions, priced 2.91 s against 68.52 s measured
+```
+
+2.91 s is the estimate `#37`'s model gives for 1,521 patch tokens; 68.52 s is what the same grid
+costs in the debug harness, which `#37` measured at **2.74 s** when the app's own code is
+compiled `-O`. So the estimate is a release number, and the harness number is a debug one — said
+out loud because they differ by 25x.
+
+### What it means
+
+The composer's path is now measurable end to end: stage a picture, see what it will cost, send,
+and the tower runs once, the rows land at the placeholder's positions, and a follow-up turn
+reuses the cached span. **Vision is no longer blocked on anything numeric.**
+
+What it is still blocked on is a prompt renderer. For a DeepSeek V4.1 chat turn the app builds a
+chatml transcript and `formatPrompt` then wraps that transcript inside ONE V4.1 user turn, so an
+attachment's markers land inside a nested blob rather than in the checkpoint's own turn
+structure. The rows bind and the model sees the picture, but the surrounding text is not what the
+checkpoint was trained on. That is a pre-existing rendering gap (`#34` exercised the API path and
+the formatter, not `ContentView`'s builder), and it is the next slice: the family should render
+through `ChatPromptFormatter.formatConversation`, as the server path already does.
+
+### What it does not mean
+
+- The API server does not carry images. A stateless request re-renders its conversation, so it
+  would need the same span cache to avoid re-encoding per request; out of scope here.
+- Nothing was measured on a full-size photograph. The largest image the checkpoint accepts was
+  priced in `#37` (41.71 s at the cap) and is what the chip reports, but only the 56x56 smallest
+  admissible case was bound here.
+- A turn that carries a picture never resumes a prefix, by design; the cache saves the *encode*,
+  not the prefill.
+
+### Verification
+
+`DeepSeekV41TurnImagesTests` (9), `DeepSeekV41VisionCostTests` (5), `DeepSeekV41ImagePixelsTests`
+(5) and `DeepSeekV41VisionDirectoryTests` (1) are the new pure-logic pins: the price equals the
+bound length, a stray placeholder is refused, a span that disagrees with its grid is refused, the
+decoded buffer starts at the image's top-left (an off-diagonal white pixel, so a flip, a
+transpose and a BGR decode each fail differently), the cost model reproduces the measured points,
+the cap is 31x31 cells, and a snapshot without the marker shards is not vision-capable. The full
+suite is **578 tests, 0 failures, 43 skipped**, and 0 Metal validation errors under
+`MTL_DEBUG_LAYER`.
+
+## DSV4.1 #39: THE CHAT UI NOW RENDERS THE CHECKPOINT'S OWN TURNS, AND THE CONTINUATION WAS MISSING ITS ASSISTANT MARKER
+
+### The question
+
+`#38` closed the composer and named the next gap in its own journal section: for a DeepSeek V4.1
+chat turn, `ContentView.handleSendMessage` builds a chatml transcript (`<|im_start|>user\n…`) for
+every family in its `else` branch, and only then calls `formatPrompt`. The V4.1 branch of
+`formatPrompt` probes `isAlreadyDeepSeekTemplated` — does the prompt *begin* with one of the
+checkpoint's own role markers — and chatml begins with `<|im_start|>system`, so the probe is
+false and the entire transcript is wrapped inside ONE V4.1 user turn. The API server has always
+rendered through `ChatPromptFormatter.formatConversation` (`ServerController.swift:1107`), so the
+two entry paths disagreed about what the model reads. Routing was decisive (`chat_prompt_renderer`
+0.986, confidence 0.98; scope `full` 0.863/0.79; "does converting tool history risk regressing the
+measured tool loop" 0.44, i.e. not a reason to defer).
+
+### What changed
+
+- **The chat builder has a V4.1 branch.** It walks the session's messages into
+  `ChatPromptFormatter.ConversationTurn`s and calls `formatConversation`, the same function the
+  server calls, with the live dialect (`CompletionEngine.shared.promptDialect`, resolved from the
+  checkpoint's own `chat_template.jinja`). The rendered string begins with the checkpoint's
+  begin-of-sentence marker, so `formatPrompt`'s passthrough probe returns it untouched: the
+  prompt is templated exactly once.
+- **A completed turn is flattened the way the API path records it** —
+  `thinkingContent + canonicalReasoningCloseTag + content` — because the renderer's job is to
+  split reasoning back out. That is what makes the rebuild reproduce a turn that was generated
+  with thinking on even after thinking is switched off.
+- **A tool result is not a role turn.** The checkpoint has no tool role: a result is the family's
+  `tool▁output` pair, placed after the call turn's end-of-sentence marker, and the *next*
+  assistant turn opens after it. `ConversationTurn` therefore gained a `kind` (`.text` /
+  `.toolResult(name:)`) and `DeepSeekV41PromptDialect.Turn` gained `isToolOutput`; the other
+  families ignore both and keep rendering `role` + `text` exactly as before, which is why a tool
+  result still carries `role == .user`.
+- **A stored call the content no longer carries is rebuilt in DSML.**
+  `DeepSeekV41ToolDialect.callBlock(name:arguments:)` emits the container the model itself
+  writes, from the dialect's own tag builders, and neutralizes a parameter value that spells the
+  parameter closer. Every turn this app produced keeps its raw call in `content`, so this is the
+  reload/foreign-turn path.
+- **The live continuation was missing its assistant prefix — found while making the two paths
+  agree.** `#27`'s probe builds "the continuation the app would build" as
+  `…call + endOfSentence + result + <|Assistant|><|end|>`, and production emitted only the result
+  pair. The comment beside the call site claimed `startAutoregressiveGeneration` would re-render
+  the turn and add the marker; it does not, because the prompt already begins with the dialect's
+  marker and `formatPrompt` passes it through verbatim. So the loop was asking the model to
+  continue immediately after `</tool▁output>` with no assistant turn opened.
+  `formatDeepSeekV41ToolResponseTurn` now appends `assistantPrefix(thinkingEnabled:)` and takes
+  the live dialect, and the history rebuild ends a tool-using turn the same way — which is what
+  lets a post-tool chat turn extend its pin instead of re-prefilling.
+
+### Evidence
+
+Pure logic (`DeepSeekV41ChatPromptFormatterTests`, 7 new cases): no chatml reaches the checkpoint;
+a completed turn closes with the checkpoint's sentence marker; a tool result sits between the
+call turn's closer and the next assistant prefix and is never rendered as a user turn; a rebuilt
+`callBlock` parses back into the same call through `canonicalized` + `StreamingToolParser`; a
+rendered history is not wrapped a second time; and the live continuation's suffix is *identical*
+to the history render's, including a payload that spells a role marker (so the escaping half is
+compared too). `ChatPromptFormatterConversationTests`'s family list gained `deepseek_v41`, which
+immediately put it under the single-turn equivalence, prefix-extension and effort tests that every
+other family already had — and exposed one stale premise: `testNonSparkFamiliesIgnoreThinkingEffort`
+asserted that only Spark consumes the level, which was never true of V4.1 (it renders a graded
+budget), and had only passed because the family was absent from the list.
+
+At the checkpoint's own tokenizer (`testAChatTurnsTokensExtendThePreviousPromptPlusGeneration`,
+snapshot-gated):
+
+```
+🔎 [dsv41 real] chat turn: 13 prompt ids + 2 generated, turn 2 is 21
+🔎 [dsv41 real] chat turn: 13 prompt ids + 7 generated, turn 2 is 26
+```
+
+That is the property the prefix pin needs at the level it is actually used: turn 2's ids extend
+turn 1's prompt ids *plus the generation ids*, not merely the same string. The boundary is a
+special token, which is why no BPE merge crosses it.
+
+Suite: **542 passed, 0 failed, 44 skipped** (586 executed; the 8 new cases are 7 here plus the
+snapshot-gated one), and **0 Metal validation errors** under `MTL_DEBUG_LAYER` on the same run.
+
+### What it means
+
+An in-app DeepSeek V4.1 turn is now the same shape as an API turn: one system turn, one turn per
+message with the checkpoint's own markers, a per-turn reasoning channel, and tool results in the
+output pair. The model reads its own history instead of a foreign transcript nested inside a
+single request, and a second chat turn re-encodes to the same ids as the first prompt plus its
+generation, so the resident prefix is reusable.
+
+### What it does not mean
+
+- The continuation-after-a-tool-result shape was never run against the real model. It now matches
+  `#27`'s probe helper, which is the only reference for it, and it is pinned as a string and as a
+  token prefix; an end-to-end generated turn after a tool result is still unmeasured.
+- A `tools_load`/`tools_unload` result carries a `[TOOL_REGISTRATION]` line that the live loop
+  prepends from the raw JSON, and a recorded turn stores only the rendered output, so a rebuild
+  cannot reproduce that one line. The turn still carries the registration's schema as metadata;
+  the effect is a lost prefix on the next turn, and every family's history rebuild has the same
+  gap.
+- The two emergency injections (the tool-loop synthesis directive and the subagent relay
+  directive) still append a `<system>…</system>` block as plain text after the assistant turn.
+  They are fallback paths, they are chatml-flavoured, and they were left alone rather than
+  re-shaped without a measurement.
+- The API server still renders a client's tool result as a plain user turn
+  (`Function result (name): …`). That is a protocol-adapter choice, not this renderer's, and it
+  is unchanged.
+- The composer's image-only turn still survives on the marker keeping the prompt non-empty; the
+  guard at `startAutoregressiveGeneration` was not touched.
+
+### Verification
+
+`DeepSeekV41ChatPromptFormatterTests` (11), `ChatPromptFormatterConversationTests` (20),
+`DeepSeekV41ToolDialectTests` (28) pass; the full suite is 542/0/44 and the Metal-validation run
+is clean.
+
+## DSV4.1 #40: A TURN AFTER A TOOL RESULT READS IT, AND THE CONTINUATION IS THE TURN'S OWN TOKEN STREAM
+
+### The question
+
+`#39` closed the continuation-after-a-tool-result SHAPE and named what it had not done in its own
+section: the shape was pinned as a string (`testTheLiveContinuationSuffixMatchesTheHistoryRender`)
+and as a token prefix (`testAChatTurnsTokensExtendThePreviousPromptPlusGeneration`), and `#27` had
+measured which result container the checkpoint can READ, but no token had been generated from the
+continuation the app actually builds. A model that answers five containers in a probe is not a loop
+that answers one. Routing was decisive (`tool_result_end_to_end` 0.876, confidence 0.855; "measure
+before build" 0.969), so this slice measured rather than built.
+
+### What was measured
+
+One walk of the loop the app walks, on the published checkpoint:
+
+- the checkpoint is asked for a shell command with `DeepSeekV41ToolDialect.instructions()` in the
+  system prompt, and it freezes on its OWN call rather than a hand-written one;
+- the response is `shell_run`'s JSON, rendered by `renderToolResultForModel` and wrapped by
+  `AgentHarness.formatDeepSeekV41ToolResponseTurn` — the same call `ContentView` makes;
+- the continuation is `formattedPrompt + closed call turn + the result turn`, and the answer is
+  generated from it.
+
+### Evidence
+
+`DeepSeekV41PublishedTurnTests.testATurnAnswersAfterAToolResultOnThePublishedCheckpoint`:
+
+```
+🔎 [dsv41 real] tool continuation: 299 prompt + 41 generated + 1 end + 75 suffix = 416 spliced, 416 re-encoded, splice==reencode true
+🔎 [dsv41 real] tool continuation resumes 339 of 416
+🔎 [dsv41 real] tool answer: lengthCapped after 64 token(s), reused 339, prefill 24.72 s, decode 20.78 s
+🔎 [dsv41 real] tool answer text: "Here are the files in `/tmp`:\n\n| Permissions | Owner | Group | Size | Date | Name |\n|---|---|---|---|---|---|\n| `-rw-r--r--` | derek | wheel | 42 B | Oct 31 09:14 | `file_a.txt` |\n| `-rw"
+```
+
+Three things are asserted, not printed:
+
+- the continuation the app splices (prompt ids + the real generation ids + the closure + the
+  suffix) IS the re-encoded string, 416 ids both ways, so the pin and the prompt agree token for
+  token;
+- the cache resumes 339 of 416, which is the prompt plus 40 of the 41 generated ids (the freeze
+  token is drawn and never forwarded), so a post-tool turn pays a 77-position walk rather than a
+  full prefill;
+- the answer names `file_a.txt`, which the question never mentioned: it read the result.
+
+Two runs produced the same 64 ids and the same text, at temperature 0.
+
+### What it means
+
+The live loop answers after a tool result with the shape `#39` shipped: the checkpoint reads the
+result the app renders, the assistant turn the continuation opens is the one the model answers in,
+and the pin extends by exactly the ids that went through the cache. On this machine a continued
+turn costs ~0.32 s for each of its 77 prefilled positions and ~0.32 s per generated token
+(24.72 s + 20.78 s for the 64-token answer above).
+
+### What it does not mean
+
+- Only the thinking-off continuation was generated. The thinking-on suffix differs by its last
+  marker only, but a branch whose prompt is SHORTER than the resident cache cannot reuse a partial
+  prefix (`reusablePrefix` refuses when the stored sequence is longer than the prompt), so measuring
+  it after the thinking-off turn would pay a full 416-position prefill for one special token. The
+  marker itself is pinned in `#39`.
+- The API path still renders a client's tool result as a plain user turn (`Function result
+  (name): …`). That is a protocol-adapter choice, and it is unchanged.
+- A `tools_load`/`tools_unload` result still cannot reproduce its `[TOOL_REGISTRATION]` line on a
+  history rebuild; the gap is every family's, not this checkpoint's.
+- The turn was length-capped at the test's own 64-token budget while writing its table. That is the
+  budget, not the model failing to stop.
+
+### Verification
+
+`testATurnAnswersAfterAToolResultOnThePublishedCheckpoint` is new and opt-in (it reads the 475 GB
+checkpoint) and passes in 144.5 s. The full DeepSeek suite is **542 passed / 0 failed / 45 skipped**
+(587 executed; the new case skips without the marker), and the Metal-validation run is the same
+with **0 validation errors**. The new case also ran under `MTL_DEBUG_LAYER` with the marker and
+reproduced the same 64 ids and text; its timings roughly double there (48.85 s + 39.22 s), which is
+the validation layer and not the model.
+
+## DSV4.1 #41: THE VISION TOWER'S QUADRATIC TERM RUNS ON THE GPU, 5.05x FASTER
+
+### The question
+
+`#37` priced the host vision tower on the app's own `-O` build: 2.74 s for the smallest
+admissible image and 41.71 s for the largest, split `0.22 s + 1.126 ms/token +
+4.245e-07 s/token^2`, with attention plus softmax **76% of the large one** (31.75 s). The host
+attention keeps a `tokens * tokens` score block per head while it computes a bidirectional
+softmax, so the largest image is 74.8 million (query, key) pairs per head per block and the
+score block alone is 299 MB. That term is the whole prize, and it is exactly what a GPU should
+not be doing with a score matrix. Routing was decisive: `vision_scope` chose `attention_first`
+at 0.959 with 0.945 confidence, and the alternatives (`whole_tower` 0.002,
+`linear_stages_first` 0.007, `not_vision` 0.032) were not close.
+
+### What landed
+
+- **`dsv41_vision_rope_split_f32`** turns the tower's interleaved `3 * hidden` row per patch
+  token into three `[heads, tokens, headDim]` planes, applying the checkpoint's split-half
+  rotation to q and k and copying v untouched. One thread per (token, head, pair), so a pair's
+  two halves are written by the same thread.
+- **`dsv41_vision_attention_f32`** is the stage itself, in 32-key tiles. The dot product needs
+  one lane per key; the value sum needs one lane per output dimension. A tile is what makes
+  both true at once: the tile's 32 scores are reduced with `simd_max` and `simd_sum`, and each
+  lane's weight is broadcast with `simd_shuffle` so every lane folds all 32 value rows into the
+  two dimensions it owns. The running maximum and denominator are uniform, a new tile maximum
+  rescales the two lane-local accumulators, no score row is stored, and no dot product is
+  computed twice.
+- **`DeepSeekV41VisionAttentionDevice`** is the stage runner: `splitAndRotate` builds the
+  planes, `attention` runs the stage, and `runAttention(_:into:)` returns the dispatch's GPU
+  time without the readback (the readback of a `tokens * hidden` matrix costs more than the
+  dispatch it describes, and `gpuEndTime - gpuStartTime` keeps that out of the number).
+
+### Evidence
+
+Parity, small shapes, against the host definition (`DeepSeekV41VisionForward.attention`) and the
+batched form the tower actually calls:
+
+```
+🔎 [dsv41 vision] attention parity: worst 2.98e-07 against the serial rule, 2.38e-07 against the batched one
+🔎 [dsv41 vision] narrow-head parity: worst 1.79e-07
+```
+
+The published geometry, one block's attention (`runsAttention` GPU time, three attempts, best):
+
+```
+🔎 [dsv41 vision] attention smallest: 1521 tokens per head, 6.72 ms per block, 0.21 s for 32 blocks
+🔎 [dsv41 vision] attention smallest row 0: worst 1.25e-06 against the host rule
+🔎 [dsv41 vision] attention smallest row 760: worst 1.61e-06 against the host rule
+🔎 [dsv41 vision] attention largest: 8649 tokens per head, 196.66 ms per block, 6.29 s for 32 blocks
+🔎 [dsv41 vision] attention largest row 0: worst 2.21e-06 against the host rule
+🔎 [dsv41 vision] attention largest row 4324: worst 2.38e-06 against the host rule
+```
+
+So the term `#37` measured at **31.75 s** now costs **6.29 s** for the 8,649-token image
+(**5.05x**) and the 0.98 s term for the 1,521-token image costs **0.21 s** (4.55x), with a
+host-row check at each size so the timing is of the right kernel and not of a fast wrong one.
+If the surrounding path were unchanged and the transfers free, the largest image's encode would
+go from 41.71 s to about 16.25 s; that is an estimate, not a measurement, and the wiring is not
+in yet.
+
+Two defects stood between the first draft and that number, and both were caught by the cases
+rather than by inspection:
+
+1. **The first design summed value accumulators ACROSS lanes**, which added dimension `l` to
+   dimension `m`; every output row came back constant across its dimensions. The tile plus
+   `simd_shuffle` is the fix, and it is why the kernel looks like flash attention.
+2. **A lane with no output dimension still wrote its accumulator.** `laneInSimd` is a dimension
+   index only while it is below `headDim`; at a 12-wide head lanes 12..31 wrote into the next
+   head's row. The published 64-wide head has a dimension for every lane, so this was invisible
+   at the shape that ships and fatal at the narrow one. The write, the first-dimension value
+   read and the accumulate are all guarded now.
+
+### What it means
+
+The vision tower has a device path for the stage that actually costs the money, and it is
+checked against the host rule at both the shape that ships and the shapes that break lane
+assumptions. The GPU number is a kernel number, not an integration number.
+
+### What it does not mean
+
+- The rest of the tower -- patch embed, the block projections, pixel-unshuffle, the aligner --
+  is still on the host. An encode would still pay those costs and would add the marshal of
+  `qkv` and the readback per block, which is why the 16.25 s figure is an estimate.
+- 196.66 ms is 1.56 TFLOP/s of arithmetic, well under what the GPU can do; the stage is likely
+  limited by re-reading each head's key and value planes for every query block. That is the next
+  measurement if the stage is ever integrated, not a claim that this is the fastest form.
+- The unit is one block at the published geometry on synthetic values; the tower's real sequence
+  of 32 blocks shares nothing across blocks, so 32x is the right extrapolation, but the number
+  was not taken with the tower in the loop.
+- The validation layer runs the same kernel about 6.7x slower (1,310.39 ms at the largest size).
+  Those are debug-layer numbers and must not be quoted as the stage's cost.
+
+### Verification
+
+`DeepSeekV41VisionDeviceTests` is new: three parity cases run with the default suite (2.98e-07
+and 1.79e-07 worst differences) and the published-geometry timing is opt-in behind
+`/tmp/dynamoe_dsv41_vision_measure`. The full DeepSeek suite is **545 passed / 0 failed / 46
+skipped** (591 executed) without the marker; with it, under `MTL_DEBUG_LAYER`, **546 passed / 0
+failed / 45 skipped and 0 validation errors**.
+
+## DSV4.1 #42: THE VISION TOWER'S PROJECTIONS RUN ON THE GPU, 11.16x FASTER
+
+### The question
+
+`#41` left the largest image at an estimated 16.25 s, with the per-token term -- `1.126 ms/token`
+over 8,649 tokens, i.e. **9.74 s** -- the majority of what was left. That term was never split by
+stage: it came out of `#37`'s three-point solve, and `#37` only checked it against the fixed and
+quadratic terms, not against its own parts. What the tower calls there is not scalar Swift:
+`DeepSeekV41VisionForward.linearBatched` flattens the token block and runs **one
+`cblas_sgemm`** per projection, so at 838 MFLOP per patch token in 1.126 ms the host is running
+near **744 GFLOP/s**. Moving that to the GPU is therefore a bet on device headroom, not a repair,
+and it is also what any device-resident tower needs -- a token matrix that leaves for the host
+between blocks costs a transfer per stage.
+
+Router: `vision_priority` (is the tower the highest-value target ahead of the protocol surfaces?)
+came back **0.933**; the first `next_slice` request was mid-band (`vision_device_linear_stages`
+0.395 at 0.308 confidence) and was re-filed with the measured costs in `state`, which raised it to
+**0.578** and put `new_kernel_worth_it` at **0.819** -- a decisive "a GEMM kernel is justified".
+The smaller alternatives were `attention_queries_per_group` 0.098, `wire_the_shipped_kernel_only`
+0.115 and `host_stage_split_first` 0.209.
+
+### What landed
+
+- **`dsv41_vision_gemm_f32`** computes `C = A * Bᵀ + bias` over a whole block of patch tokens.
+  `A` is `[rows][depth]`, `B` is `[outputs][depth]` (exactly how a `Linear`'s weight is stored), `C`
+  is `[rows][outputs]` -- the host GEMM's own layout, so neither operand is transposed.
+  - One threadgroup owns a **64x64** output tile. Its 256 threads are eight SIMD groups laid out
+    2x4, and each group owns 32 rows by 16 columns, i.e. **eight `simdgroup_float8x8`
+    accumulators**; a 64x16 chunk of each operand is staged once per depth step and read by all
+    eight groups.
+  - The weight tile is `[output][depth]`, so the 8x8 the accumulator needs is its TRANSPOSE and the
+    fragment is loaded with `simdgroup_load`'s transpose flag rather than by staging a second copy.
+  - Bounds are handled by **zero-filling the staged tiles** and guarding only the write-out, which
+    is what lets a ragged `rows`, `outputs` or `depth` take the same path: a zero outside the matrix
+    contributes nothing to a dot product. The bias is added on the write, where the guards are.
+- **`DeepSeekV41VisionLinearDevice`** is the stage runner: `runLinear` takes device buffers and
+  returns `gpuEndTime - gpuStartTime` (no readback), `linear` takes the tower's `[[Float]]` and a
+  `DeepSeekV41Matrix` and returns rows, and `readRows`/`makeBuffer` are the plumbing a measurement
+  needs. A ragged input row is REFUSED, because the kernel would read the next row's values for
+  the missing tail.
+
+### The tile had to be BOUND, not declared, and the validation layer is how that was found
+
+The first form declared its three tiles in the kernel body. On the app's own build the offline
+`metal` compiler allocated **49,152 bytes** for a kernel that names **24,576** -- it duplicates the
+whole set: `xcrun metal` + `metallib` on the same source reports 49,152 while
+`makeLibrary(source:)` at runtime reports 24,576, and a minimal kernel with the same three
+declarations reports 24,576 through the offline compiler too, so it is this kernel's shape rather
+than the declarations. The driver ran it anyway and produced correct numbers -- the three `-O`
+measurement runs below passed before the fix -- but `MTL_DEBUG_LAYER` refused the dispatch against
+the device's `maxThreadgroupMemoryLength` of **32,768** and killed the test process, which is
+exactly the class of defect the validation run exists for. The tiles are now
+`[[threadgroup(0..2)]]` parameters sized by the host (`setThreadgroupMemoryLength`, 4 KB + 4 KB +
+16 KB = 24,576), so `staticThreadgroupMemoryLength` is **0** and the number in the shader is the
+number the device sees. It is also faster, because the compiler is no longer carrying a duplicate
+set: `wo` at the largest size went 6.88 ms -> 1.71 ms.
+
+### Evidence
+
+Parity, `-O`, against both host forms (relative, and the definition is the only check that would
+catch a shared transposed operand):
+
+```
+🔎 [dsv41 vision] linear parity (ragged): worst relative 0.0
+🔎 [dsv41 vision] linear parity (definition): worst relative 1.1920929e-07
+🔎 [dsv41 vision] linear parity (published width): worst relative 0.0
+🔎 [dsv41 vision] linear threadgroup memory: declared 0, bound 24576, device limit 32768
+```
+
+The four block projections at the two published token counts, app's own `-O` build
+(`/tmp/dd_dsv41_opt`), device arm = `runLinear` GPU time on pre-uploaded buffers, host arm =
+`linearBatched` as the tower calls it (flatten and slice included), best of three:
+
+| shape | smallest (1,521 tokens) | largest (8,649 tokens) |
+|---|---|---|
+| qkv `1024 -> 3072` | 3.52 ms vs 9.16 ms (2.60x) | 4.38 ms vs 55.31 ms (12.63x) |
+| wo `1024 -> 1024` | 0.57 ms vs 3.66 ms (6.43x) | 1.71 ms vs 18.78 ms (10.97x) |
+| w1 `1024 -> 5632` | 3.10 ms vs 16.06 ms (5.19x) | 7.92 ms vs 99.21 ms (12.53x) |
+| w2 `2816 -> 1024` | 3.57 ms vs 6.58 ms (1.84x) | 4.81 ms vs 36.66 ms (7.63x) |
+| **32 blocks** | **0.34 s vs 1.13 s (3.30x)** | **0.60 s vs 6.72 s (11.16x)** |
+
+Runs before the tile was bound, same harness, read 0.36 s vs 1.11 s (3.12x) and 0.91 s vs 6.38 s
+(7.04x), and a second after it read 3.30x and 11.16x; the device arm moves 12-27% between runs
+because the machine was carrying a load average of 2-7, so the honest statement is **3.1-3.9x at
+the smallest image and 7.0-11.2x at the largest**.
+
+The same test on a DEBUG build reports the host arm at 34.76 s and 197.14 s, because the flatten
+and the per-token slice are `-Onone` while `cblas` is not. That is a build artifact and the reason
+every host number here and in `#37` is quoted from `-O`.
+
+### What it means
+
+The per-token term is now SPLIT, which it had never been: the four block projections are **6.72 s
+of the 9.74 s** at the largest image -- 69%, independently confirming the three-point solve -- and
+the device runs them in **0.60 s**. Arithmetic on measured parts, not a measured encode: with
+`#41`'s attention also in place the largest image would be `0.22 + (9.74 - 6.72 + 0.60) + 6.29` =
+**10.13 s** against the 41.71 s that ships, i.e. 4.1x. Nothing is wired, so that number is a sum of
+three measurements of different things and must not be quoted as an encode.
+
+### What it does not mean
+
+- **`encode` still calls `linearBatched`.** This is a stage with an oracle. Swapping the stage in
+  without moving the rest of the tower would be a LOSS: at the largest size `w1`'s product is
+  8,649 x 5,632 floats (195 MB) and its input 35 MB, so a host<->device round trip per projection
+  costs more than the 99 ms host GEMM it replaces. The win requires keeping the token matrix
+  device-resident across all 32 blocks, which is a device encode, not a substitution.
+- A device encode still needs four things this file does not have: an FP32 gelu and silu, the fused
+  `silu(gate) * up` split of the 2x-intermediate projection (the MLP emits gate and up halves in
+  one matrix), the residual add (an FP32 `vector_add_f32` exists, but nothing fuses it with a
+  projection), and pixel-unshuffle into the aligner's channel-major cells. `dsv41_rmsnorm_f32_gain`
+  already exists for the two norms per block.
+- The weight upload is outside the timed arm, which is the steady state an integrated tower would
+  create (970 MB of BF16 tower weights, 1.9 GB once decoded to FP32, uploaded once and not per
+  block). A per-call uploader would add a read plus a copy to every encode and the table would not
+  describe it.
+- `wo`'s host rate at the smallest size is the weakest of the four (1.84x on `w2`, 2.60x on `qkv`
+  against 12.63x at the large size): the same kernel, so it is the shape -- 16 column tiles against
+  88, i.e. 2,176 threadgroups against 11,968 on a machine with ~40 cores. Named as the next tuning
+  target if the tower is ever integrated, not fixed here.
+- These are kernel numbers on one block's projection at synthetic values; the tower's 32 blocks
+  share nothing but the weight, so 32x is the right extrapolation for the DISPATCH, and no run took
+  it with the tower in the loop.
+
+### Verification
+
+`DeepSeekV41VisionLinearDeviceTests` is new: five parity/refusal cases and the threadgroup-memory
+guard run with the default suite, and the published-geometry timing is opt-in behind
+`/tmp/dynamoe_dsv41_linear_measure`. The class is now in `/tmp/args41m37.txt` (93 entries), so the
+full DeepSeek suite is **551 passed / 0 failed / 47 skipped** (598 executed) without the marker,
+and **551 passed / 0 failed / 47 skipped with 0 validation errors** under `MTL_DEBUG_LAYER`. The
+run BEFORE the tiles were bound is the one that exposed the 49,152-byte allocation: it lost the
+four parity cases and killed the process each time.
+
+
+## DSV4.1 #43: THE WHOLE VISION TOWER RUNS IN ONE DEVICE PASS, 8.81x TO 6.02x FASTER
+
+### The question
+
+`#41` and `#42` measured the tower's two expensive halves on the GPU and left both as STAGE
+runners: `encode` still called `linearBatched`, so neither stage ran in a turn. `#42`'s own
+journal said why wiring alone would be a LOSS -- at the largest image `w1`'s product is 195 MB, so
+a host<->device round trip per projection costs more than the host GEMM it replaces -- and the
+prize only exists if the token matrix stays on the GPU across all 32 blocks. That is a device
+encode: patch embed, the two norms, the four projections, the split-and-rotate, the attention, the
+gated MLP, the final norm, the pixel-unshuffle and the aligner, all in one command buffer.
+
+Routing agreed decisively. The first request (`/tmp/route43.json`) put `vision_device_encode` at
+**0.954 @ 0.947**, `device_encode_now` at **0.989** and `measure_before_build` at **0.935**; every
+other candidate was below 0.04. The last of those three is why this section opens with a host
+stage split: the middle 3.02 s of the per-token term had never been seen.
+
+### What landed
+
+Three elementwise kernels in `ComputeShaders.metal`, all FP32 and all `dsv41_vision_*`:
+
+- `dsv41_vision_gelu_f32` -- the aligner's activation. MSL has no `erf`, so the kernel carries
+  Abramowitz & Stegun 7.1.26 (`|error| <= 1.5e-7`), which is far below the parity bar and is the
+  only approximation the device pass introduces.
+- `dsv41_vision_silu_mul_f32` -- one thread per output unit, reading the gate and up halves of one
+  `w1` row.
+- `dsv41_vision_unshuffle_f32` -- channel-major cells with the padded rows and columns written as
+  zero.
+
+`DeepSeekV41VisionEncodeDevice` composes those with the two existing stage runners
+(`dsv41_vision_gemm_f32`, `dsv41_vision_rope_split_f32` + `dsv41_vision_attention_f32`) and the
+existing `dsv41_rmsnorm_f32_gain` / `vector_add_f32`. One command buffer per encode, one
+`waitUntilCompleted`, no host round trip between stages. The weights are read through the same
+`DeepSeekV41VisionWeights` resolver the host path uses and uploaded once per tower (0.35 s), and
+the token-sized workspace is reused while the patch grid does not change. `encodeOnHost` gained an
+`onStage` closure (nil in every production path) so the host split could be measured without
+perturbing the oracle; the host path itself is unchanged.
+
+The device pass is now what `DeepSeekV41VisionForward.encode` calls when it carries one, and the
+engine builds one in `visionForward()`. `dynamoe_dsv41_vision_device_off` forces the host path.
+
+### The host split, measured (`-O`, load average ~2.7)
+
+The two smaller sizes exist to separate the quadratic term; the largest is the one that matters.
+Each number is the sum over 32 blocks of `encodeOnHost`'s stage clock, from the first of the two
+runs (the second moved the host total by 0.9%).
+
+| stage | 39x39 / 1,521 tokens | 63x63 / 3,969 tokens | 93x93 / 8,649 tokens |
+|---|---|---|---|
+| attention | 1.241 s (44.0%) | 7.822 s (67.9%) | 34.034 s (81.4%) |
+| w1 | 0.418 s | 0.946 s | 1.954 s |
+| qkv | 0.355 s | 0.833 s | 1.745 s |
+| silu(gate) * up | 0.215 s | 0.564 s | 1.237 s |
+| w2 | 0.212 s | 0.488 s | 1.019 s |
+| wo | 0.132 s | 0.290 s | 0.611 s |
+| residual add 2 | 0.075 s | 0.200 s | 0.439 s |
+| residual add 1 | 0.076 s | 0.196 s | 0.439 s |
+| norm1 | 0.016 s | 0.044 s | 0.102 s |
+| norm2 | 0.014 s | 0.037 s | 0.082 s |
+| aligner w1 | 0.036 s | 0.051 s | 0.081 s |
+| aligner w2 | 0.020 s | 0.029 s | 0.049 s |
+| unshuffle | 0.003 s | 0.007 s | 0.017 s |
+| patch embed | 0.003 s | 0.007 s | 0.016 s |
+| aligner gelu | 0.001 s | 0.003 s | 0.007 s |
+| final norm | 0.001 s | 0.001 s | 0.003 s |
+| **host total** | **2.82 s** | **11.52 s** | **41.83 s** |
+
+The answer to the measurement question: at 8,649 tokens the host's non-attention work is **7.80 s**,
+of which the four projections are **5.33 s** and the elementwise stages (silu * up, the two
+residual adds, unshuffle and gelu) are **2.13 s**, with the norms at 0.18 s. The elementwise stages
+were not negligible -- 5.1% of a largest-image encode -- and the three new kernels were worth
+writing.
+
+### The measured encode
+
+Same run, same tower, same checkpoint (`-O`, app's own code):
+
+| image | patch tokens | host | device (GPU) | speedup | parity (relative) |
+|---|---|---|---|---|---|
+| 546x546 (the pixel floor) | 1,521 | 2.82-2.84 s | **0.32 s** | **8.81-8.93x** | 1.7e-4 |
+| 882x882 | 3,969 | 11.52-11.76 s | **1.70 s** | **6.78-6.90x** | 4.0e-5 |
+| the largest admissible | 8,649 | 41.83-42.20 s | **6.90-6.95 s** | **6.02-6.12x** | 4.8e-5 |
+
+The ranges are two runs of the same test: the first before and the second after a barrier was
+added at each stage boundary (a no-op on the values, and the device arm moved under 1%). The
+weight upload is 0.35-0.36 s once per tower and is outside the device arm. Across the two runs the
+device three-point solve reads `-0.06 to -0.08 s + 0.13-0.15 ms/token + 7.6-7.9e-08 s/token^2`, and
+the host `-0.11 to -0.28 s + 1.30-1.44 ms/token + 4.0-4.1e-07 s/token^2`. The negative constant is
+the fit's noise (the GPU time excludes the upload), so `DeepSeekV41VisionCostModel.measured` is
+fitted with a zero constant from the two extreme points -- `8.4e-5 * t + 8.32e-8 * t^2` -- which
+reproduces 0.32 s, 1.70 s and 6.90-6.95 s to within 4%. The `#37` host constants are kept as
+`hostReference`.
+
+### What it means
+
+- **The tower's shipped range is now 0.32-6.90 s, not 2.82-41.83 s.** The composer's estimate
+  moved with it; the smallest image is under a third of a second and the largest under seven.
+- **The device total is almost entirely #41's attention.** 6.90-6.95 s at the largest size against
+  `#41`'s measured 6.29 s of attention, i.e. everything else -- patch embed, all 128 projections,
+  all 64 norms, the elementwise work, the unshuffle and the aligner -- is **~0.6-0.7 s**. The
+  ceiling for this pass is now the attention kernel, not the graph around it.
+- **The speedup FALLS as the image grows** (8.93x -> 6.12x) precisely because the host's attention
+  share rises (44.0% -> 81.4%): the already-device half cannot be accelerated twice. Quoting one
+  number for the tower without the size is not meaningful.
+- **The elementwise stages cost the device tens of milliseconds, not seconds.** The host paid
+  2.13 s for silu * up, two residual adds, unshuffle and gelu at the largest size; the device's
+  whole non-attention remainder is smaller than that.
+
+### What it does not mean
+
+- **Not a 6x faster image TURN.** The encode is one part of an image turn; prefill and decode of
+  the expanded prompt are untouched.
+- **Not a faster attention kernel.** #41's 6.29 s is the floor this pass inherits, and the attention
+  is 81.4% of the largest host encode.
+- **Not the isolated #42 projection numbers.** #42 timed `linearBatched` alone on warm synthetic
+  weights and read 6.72 s for 32 blocks; the in-situ host tower reads 5.33 s for the same
+  projections at the same size, because the isolated harness also timed the `[[Float]]`
+  materialization around each GEMM. The encode table is the number to quote for the tower.
+- **The parity bars are relative to the row scale, not absolute.** 1.7e-4 at the smallest size and
+  4.8e-5 at the largest are the host's own summation-order difference from a device pass, through
+  32 blocks, including the erf approximation.
+- **The 0.35 s upload is a real first-image cost.** It is not in the GPU time and not in the cost
+  model, which prices a warm tower; a session's first picture pays it.
+- These numbers are from one `-O` build on an M5 Max at load average ~2.7. The device arm was
+  reproducible to under 1% across two runs; the host arm moved with load.
+
+### Verification
+
+`DeepSeekV41VisionEncodeDeviceTests` is new: seven parity/refusal cases run with the default
+suite (the whole small tower against the host, a padded grid, two blocks, workspace reuse across
+grids, a ragged patch row, a missing weight, and a text-width mismatch), and the published-
+geometry measurement is opt-in behind `/tmp/dynamoe_dsv41_vision_encode_measure` or
+`DYNAMOE_DSV41_VISION_ENCODE_MEASURE=1`. The tiny tower agrees with the host to **2.2e-7
+relative**, and every timed published arm checks one grid of rows against the host before
+printing. `DeepSeekV41PublishedTurnTests.testAnRGBImagePricesAndBindsOnThePublishedWeights` now
+drives the engine's own tower (`runtime.visionForward()`), asserts it carries a device pass, and
+therefore exercises the wiring and the one-time upload end to end; a Debug bundle reports that
+upload at `-Onone` (~26 s for 1.9 GB of FP32), which is why the app's `-O` figure is the only one
+quoted.
+
+The full DeepSeek suite on this code is **556 passed / 0 failed / 51 skipped** (607 executed),
+and the same run under `MTL_DEBUG_LAYER` is **556 / 0 / 51 with 0 validation errors**.
+
+## DSV4.1 #44: THE VISION ATTENTION IS AT 10% OF THIS GPU'S FP32 RATE, AND NOTHING THAT RESHAPES ITS LANES MOVES IT
+
+### Question
+
+`#43` left one kernel as the tower's floor: `dsv41_vision_attention_f32` is 6.29 s of a 6.90 s
+device encode at the largest admissible image, and everything else -- patch embed, all 128
+projections, all 64 norms, the elementwise work, the unshuffle and the aligner -- is ~0.6-0.7 s.
+The kernel was written for two reasons (one load instruction per key row is `headDim` floats wide,
+i.e. 32 cache lines for 128 bytes of use; and a threadgroup's several query SIMD groups can share a
+staged tile), and neither had been tested. So the question for this slice was: which shape should
+that kernel have, and is it even off the machine's pace?
+
+### What was measured
+
+Six shape arms at the published geometry (16 heads of 64, 1,521 and 8,649 patch tokens), best of
+three, on the app's own `-O` build, load average ~2.6:
+
+| arm | 1,521 tokens | 8,649 tokens |
+|---|---|---|
+| `direct/128` (shipped, 4 queries per threadgroup) | 6.15 ms/block, 1.54 TFLOP/s | 194.1 ms/block, 1.58 TFLOP/s |
+| `direct/256` (8 queries) | 6.11 ms, 1.55 | 194.2 ms, 1.58 |
+| `direct/512` (16 queries) | 6.11 ms, 1.55 | 195.6 ms, 1.57 |
+| `staged/128` (key tile in threadgroup memory) | 9.90 ms, 0.96 | 303.7 ms, 1.02 |
+| `staged/256` | 7.86 ms, 1.21 | 244.9 ms, 1.25 |
+| `staged/512` | 7.42 ms, 1.28 | 229.6 ms, 1.33 |
+
+- **Staging the key tile LOSES** 18% at its best (229.6 against 194.1) and 55% at its worst. It
+  fixes the coalescing it was built for and pays two threadgroup barriers per tile for it, and a
+  threadgroup of four queries does not reuse the tile enough to get that back.
+- **The threadgroup width is irrelevant** -- 4, 8 and 16 queries per threadgroup are the same
+  kernel to within 1%. So the dispatch is not limited by how many queries share a key/value read,
+  which is what kills every "more reuse" hypothesis before it is built (including a retry of `#6`).
+- Every staged arm agrees with the shipped one **bit for bit** (worst 0) on the whole
+  `tokens x heads x headDim` output, so the negative is a measurement of the right rule.
+
+### Where the dispatch actually goes
+
+The ablation kernel runs the two halves of a step separately. `mode` 2 runs both and reproduces the
+shipped kernel bit for bit (asserted), so the split is of this kernel and not another:
+
+| 8,649 tokens | ms/block | share |
+|---|---|---|
+| dot product + row softmax | 83-89 | 30-34% |
+| value fold (over a synthetic score) | 161-171 | 66-70% |
+| both | 196-207 | |
+
+Solving the three arms together (`both`, `dot+softmax`, `fold`) puts the per-tile softmax and loop
+overhead at **~53 ms**, the dot's arithmetic at **~36 ms** and the fold's at **~119 ms**. The fold
+is the stage.
+
+Then two more probes on the fold alone, which is what made this slice's answer unambiguous:
+
+- **removing the weight broadcast** (`simd_shuffle` for all 32 keys) is **1.00x** -- the broadcast is
+  free;
+- **removing half the row's loads** (one scalar instead of two) is **1.04-1.05x** -- the loads are
+  nearly free.
+
+### The machine's pace, measured
+
+`dsv41_vision_fma_peak_f32` is eight independent FMA chains per thread and no memory traffic at
+all, 34.4 GFLOP over 1,048,576 threads: **15.23-15.74 TFLOP/s**. The attention's 1.56 TFLOP/s is
+therefore **10% of this GPU's SIMT FP32 rate**, not 90% of it -- four reshapes landing within 5% of
+each other was not the ceiling, it was a shared defect those reshapes do not touch. What survives
+that list is a per-lane cost that every arm pays: the fold's per-key addressing (a 64-bit
+multiply-add and a 64-bit pointer add per key), its load instruction issue, and the loop itself.
+
+### What it means
+
+- **One reshape does ship.** `dsv41_vision_attention_pairfold_f32` gives a lane two ADJACENT
+  dimensions of the fold -- so its pair is one aligned `float2` -- and splits the tile across four
+  accumulator pairs instead of one 32-long dependent chain. At 1,521 tokens it is **1.28-1.39x**
+  (6.69 -> 5.24, 6.29 -> 4.52 across runs); at 8,649 it is **1.03-1.15x** (195.5 -> 189.2,
+  196.8 -> 191.3, 217.5 -> 189.2 under load). It is never slower. It is the default form now, and
+  the attention the tower runs measures **5.14 ms/block at 1,521 tokens (0.16 s for 32 blocks) and
+  184.6 ms at 8,649 (5.91 s)** against `#41`'s 6.29 s.
+- **The tower's own encode moves with it.** Re-measured on the shipped path at load average 1.5:
+  39x39 **0.31 s** device (host 3.03 s, 9.73x), 63x63 **1.60 s** (12.32 s, 7.68x), 93x93 **6.74 s**
+  (44.91 s, 6.66x), parity 1.4e-4 / 3.5e-5 / 8.2e-5, upload 0.37 s -- against `#43`'s
+  0.32 / 1.70 / 6.90 s.
+- **The 4-way split alone bought nothing.** The first version of that kernel made the split a
+  runtime `foldUnroll` branch and measured 1.02x, which measured a branch: the shipped form is
+  unconditionally four-way with no data-dependent exit from the body.
+- **The variable that does NOT matter is how a lane's dimensions are laid out away from
+  memory-width terms, or how many queries a threadgroup holds.** Both were the kernel's stated
+  reasons for its shape, and both are now measured dead.
+- **The next lever is not a SIMT shape.** At 10% of the FP32 rate with the loads, the broadcast and
+  the chain all cleared, the remaining cost is per-element instruction issue, and the matrix units
+  do 512 multiply-adds per instruction. That is a different kernel (8x8 score tiles in registers,
+  P x V as an MMA), not another reshape of this one, and it is its own slice.
+
+### What it does not mean
+
+- **Not a faster image turn.** The tower's encode is 6.9 s at the largest image and this takes
+  ~0.4 s of it; prefill and decode of the 994-position span are untouched.
+- **Not a claim that the fold is understood.** Removing the loads, the broadcast, the vectorization
+  and the dependency chain each failed to move it, which is a measurement of what it is NOT, not an
+  explanation of what it is. Do not build a fifth SIMT shape on a theory from this table.
+- **Not stable to the last digit.** The 8,649-token arm moved 195 -> 217 between a quiet and a
+  loaded run (`uptime` 2.6 against 4.4); every range above is quoted as a range for that reason.
+- **Not a `float2` win alone or an unroll win alone.** They landed in one kernel.
+
+### Two device faults this exposed
+
+- **`simd_shuffle` is a group collective and cannot be run by part of a group.** The paired fold
+  guards its accumulation on `ownsPair`, and a narrow head leaves most lanes owning nothing; with
+  the broadcast inside that guard, participating lanes were handed another lane's weight. Full
+  width (64 dimensions, every lane owns a pair) was exact, so the bug only appeared on the 8- and
+  32-wide heads: **0.62 and 0.705 absolute error where the shipped kernel was 2.4e-7**. The
+  broadcast is unconditional now and only the load and the accumulation are guarded.
+- **A refused dispatch must still close its encoder.** `runAttention` created an encoder and let a
+  `shapeMismatch` escape before `endEncoding`, and Metal asserts on release: a Debug-build abort
+  inside a test that was only asking for a refusal.
+
+### Verification
+
+The default suite gains `testTheShippedPairedFoldMatchesTheDirectKernelAndTheHost` -- three shapes
+(narrow head 8 at 37 tokens, full width 64 at 5 tokens, 32 at 33 tokens) against both the direct
+kernel and the serial host rule, worst **2.4e-7 / 1.2e-7 / 3.0e-7** -- and
+`testThePairedFoldRefusesAnOddHeadDimension`, which also asserts the direct form still runs the odd
+head it always ran. Four opt-in cases join the published-geometry harness behind
+`/tmp/dynamoe_dsv41_vision_measure`: the six-arm shape sweep, the ablation, the fold probes and the
+FMA peak, and every timed arm checks rows against the host before it prints. The parity case of the
+existing narrow-head test still passes through the new default.
+
+The full DeepSeek suite on this code is **558 passed / 0 failed / 55 skipped** (613 executed, 94
+classes), and the same run under `MTL_DEBUG_LAYER` is **558 / 0 / 55 with 0 validation errors** and
+no failed assertions -- which is what a new kernel and a changed default form have to survive before
+they are trusted.
+
+## DSV4.1 #45: THE MATRIX UNITS RUN AT THE FMA RATE, SO AN MMA ATTENTION LOSES BY ARITHMETIC
+
+### Question
+
+`#44` closed with a named next lever: the attention runs at 1.56 TFLOP/s, 10% of this GPU's SIMT
+FP32 peak, the loads / the broadcast / the dependency chain had all been measured away, so "the
+remaining cost is per-element instruction issue, and the matrix units do 512 multiply-adds per
+instruction". That is a theory about a number nobody had measured -- whether Apple's FP32 matrix
+units actually run FASTER than the FP32 FMA pipes -- plus a cost model that ignores what a fragment
+cannot do (it cannot be indexed, so it cannot be rescaled). This slice measured both before writing
+the kernel, then wrote it and swept its two shape knobs.
+
+### The units' own rate, measured first
+
+`dsv41_vision_mma_peak_f32`: eight independent `simdgroup_multiply_accumulate` chains per SIMD
+group and nothing else, 8,192 groups, 256 iterations, 17.2 GFLOP, best of three. `dsv41_vision_
+fma_peak_f32` was re-run beside it in the same process so the two are comparable:
+
+| probe | run 1 (load 2.2) | run 2 (load 2.0) |
+|---|---|---|
+| FP32 matrix units, product only | 2.19 ms, **7.84 TFLOP/s** | 2.33 ms, **7.38 TFLOP/s** |
+| the same loop fed from threadgroup memory | 2.19 ms (1.00x) | 2.19 ms (1.06x) |
+| SIMT FP32 FMA chains | **8.58 TFLOP/s** | **7.73 TFLOP/s** |
+
+**A matrix unit is not a faster pipe on this part: it is 0.91-0.95x the FMA pipes.** Feeding it from
+threadgroup memory is free, so the units themselves are not the constraint. (The absolute numbers
+moved by ~2x between this session and `#44`'s 15.2-15.7 TFLOP/s for the same FMA kernel -- 8.58
+against 15.74 in a run whose load average was 2.2 -- which is why only the ratio is quoted here.
+Both arms were measured in the same process, in the same run, back to back.)
+
+That fixes the ceiling before any kernel exists. An 8x8 score or value tile needs 64 dimensions of
+reduction per 8x8 output, and a fragment accumulator cannot be indexed -- so a raised row maximum
+cannot rescale it the way flash attention does, and the keys have to be walked **twice** (pass one
+for the row maximum and denominator, pass two for the weights and the fold). That is 24 products per
+tile where 16 suffice: **1.5x the multiply-adds at 0.95x the rate, i.e. a hard ceiling of 0.63x the
+shipped form**, whichever way the kernel is written.
+
+### What the kernel actually measured
+
+`dsv41_vision_attention_mma_f32` is that form: one SIMD group per (head, 8-query tile), 8x8 f32
+fragments for both products, lanes 0-7 carrying a query row's running maximum and sum in registers,
+`simdgroup_load`'s transpose flag turning the staged `[key][dim]` tile into the `[dim][key]` the
+score product needs. Two knobs were swept at the published geometry (16 heads of 64, 1,521 and 8,649
+patch tokens, best of three, app's own `-O` build, load average 2.94):
+
+| arm | 1,521 tokens | 8,649 tokens |
+|---|---|---|
+| `pairedFold` (shipped) | **4.65 ms/block** | **190.39 ms/block** |
+| staged tiles, 1 group (32 lanes) | 14.97 ms (0.31x) | 443.94 ms (0.43x) |
+| direct fragment reads, 1 group | 11.72 ms (0.40x) | 343.41 ms (0.55x) |
+| staged, 4 groups (128 lanes) | 13.04 ms (0.36x) | 364.90 ms (0.52x) |
+| direct, 4 groups | 11.82 ms (0.39x) | 339.38 ms (0.56x) |
+| staged, 8 groups (256 lanes) | 12.09 ms (0.38x) | 358.97 ms (0.53x) |
+| direct, 8 groups | 12.46 ms (0.37x) | 348.31 ms (0.55x) |
+
+Every arm agrees with the host rule (worst 1.73e-6 at the smallest image, 2.98e-6 at the largest), so
+the negatives are measurements of the right rule. An earlier run with only the staged arm landed at
+0.32x / 0.44x, which is the same story.
+
+- **The form loses everywhere, and the best arm is 84% of its own arithmetic ceiling** (0.56x against
+  the 0.63-0.67x the product count allows). So the kernel is not badly written; the arithmetic it
+  multiplies by is against it.
+- **Per multiply-add, the matrix unit is 0.84x the hand-written fold** (0.56 x 1.5): even after
+  deleting the fold's shuffle, its 64-bit addressing and its loads, a matrix product does LESS per
+  MAC than the shipped kernel does. That is the finding, and it kills the variant that would have
+  avoided the second pass: a one-pass MMA using a diagonal-fragment rescale does the same products at
+  the same rate, so its ceiling is parity and its measured per-MAC rate puts it at ~0.84x.
+- **Staging is a 10-20% tax, not the reason it loses.** Reading fragments straight out of the plane
+  beats staging the tile and sharing it: 0.55x against 0.43x at the largest image with one group.
+  Staging pays (device read -> threadgroup write -> threadgroup read) for the same bytes and buys the
+  next group's reuse; at 4-8 groups that reuse recovers only 0.09x (0.43 -> 0.52).
+- **Group width helps the staged arm and does nothing for the direct one** (0.55 -> 0.56 -> 0.55
+  across 1, 4 and 8 groups), which is what sharing a staged tile between groups should look like.
+- **The smallest image is where the form is worst** (0.40x against 0.55x). Fewer keys per query tile
+  means the once-per-threadgroup query staging and the two passes over a short key row are a larger
+  share of the work.
+
+### What it means
+
+- **Do not build a fifth SIMT shape, and do not build an MMA one either.** `#44`'s "the next lever is
+  the matrix units" is now falsified by measurement, and the falsification is arithmetic rather than
+  a bad kernel: same rate per pipe, 1.5x the products, and a per-MAC deficit even when the pass count
+  is free.
+- **The shipped `pairedFold` stays the default** and is untouched. `.matrixTiles` joins
+  `.stagedKeyTile` as a measured negative kept in `AttentionForm`, with its numbers in its own doc
+  comment: the two knobs are `threadgroupWidth` (SIMD groups sharing a staged tile) and
+  `stagesTiles` (stage a tile, or read fragments straight from the plane).
+- **The attention's 10% of peak is not an instruction-issue defect that a bigger instruction fixes.**
+  What is left for that stage is fewer bytes or fewer products -- and the byte hypotheses are already
+  dead (`#17`'s record halving, `#44`'s load halving, both ~1.0x), which leaves the algorithm: a
+  query tile that shares one head's key rows with another head's, or a cheaper score rule.
+- **Planes now carry one zeroed tile of tail.** A direct `simdgroup_load` reads 8 rows at a time, so
+  the last partial tile of the last head runs past `tokens * heads * headDim`. `allocatePlanes`
+  allocates one extra 8-row tile (zeroed, `matrixTile * headDim` floats) and the addressing formula is
+  unchanged, so every other form and the rope split are unaffected.
+
+### Verification
+
+The default suite gains `testTheMatrixTileAttentionMatchesTheDirectKernelAndTheHost` (heads 3/dim 8
+at 37 tokens, 2/64 at 5, 4/32 at 33, and 2/64 at 16 -- a partial last key tile, a single-tile prompt,
+a single-fragment head and the published head, worst **8.2e-7** against the direct kernel and
+**4.2e-7** against the serial host rule) and `testTheMatrixTileAttentionRefusesAHeadThatIsNotAFragment`
+(dim 12 is refused by the tile form and still runs on every SIMT form). Two opt-in cases join the
+published-geometry harness behind `/tmp/dynamoe_dsv41_vision_measure`:
+`testWhatThisGPUsFP32MatrixUnitsReach` and `testWhatTheMatrixTileAttentionCostsAtThePublishedGeometry`
+(seven arms, every timed arm's rows checked against the host before it prints).
+
+The full DeepSeek suite on this code is **560 passed / 0 failed / 57 skipped** (617 executed, 94
+classes), and the same run under `MTL_DEBUG_LAYER` is **560 / 0 / 57 with 0 validation errors** and no
+failed assertions -- which a new kernel and a changed plane allocation have to survive before they are
+trusted.
+
+## DSV4.1 #46: THE LARGEST IMAGE COSTS FIVE MINUTES, NOT SEVEN SECONDS, AND THE PREFILL IS 98% OF IT
+
+### Question
+
+Routing picked this slice at 0.963 with 0.957 confidence, and it was the largest unmeasured number
+left in the port: what does the biggest picture the composer accepts actually cost the person who
+attached it? The tower's own cost is published (`#43`: 6.74 s for the largest admissible span) and
+every mechanical lever on its attention is measured dead (`#44`, `#45`), so the open question was not
+the tower at all -- it was the rest of the turn.
+
+### What the largest picture actually costs
+
+The composer's path is `price` (no weight read) -> provision the cache for the EXPANDED prompt ->
+`runtime.imageSpan` (the device tower) -> `TurnImages.bind` -> the turn loop. A 4,096x4,096 image is
+the largest `ImagePixels.decode` lets through (one side above that is refused before the tower sees
+it), and every side from there up collapses onto the checkpoint's own token budget, so it is the
+worst case an attachment can reach:
+
+| stage | measured |
+|---|---|
+| resize plan | 8,649 patch tokens, 31x31 aligner grid, **994 span positions**, prompt 12 -> 1,005 tokens |
+| price | **6.95 s** estimated, in 0.0001 s (no weight read) |
+| encode (device, cold process: weight upload included) | **7.23 s** |
+| encode (device, repeated) | **6.88 s** |
+| prefill of the 1,005-position prompt | **255.98 / 268.05 / 297.98 s** in three runs (254.7 / 266.7 / 296.5 ms/position, 218,886 MB of experts, 95% hit) |
+| first generated token | 0.00 s |
+| **to the first visible token** | **263.29 / 275.28 / 305.20 s** |
+
+**The encode is 2.4-2.6% of the wait; the prefill of the span is 97-98%.** A reader who trusts the
+published 6.74 s would predict a seven-second picture and be wrong by a factor of 39-45.
+
+### Why the prefill walked
+
+`DeepSeekV41TurnRunner` hands a whole prompt to `prefillChunk` only when every position is a token,
+so an image prompt was WALKED: one full layer pass and one expert set per position. Two separate
+reasons, and the second one was a latent bug:
+
+- the chunk form had **no way to take a supplied row** (`prefillChunk(_ tokens: [Int])`);
+- the dead flag was a **single pending mark** per call, and the block's Engram stage gated on
+  `deadTokens.last` -- the block's LAST position. A block that mixes image and text positions could
+  not say which position was dead, so the whole block inherited one position's answer.
+
+### The batched image prefill
+
+- `DeepSeekV41PositionForward.prefillChunk(_:embeddings:)`, with a protocol default that WALKS. A
+  partial executor owes correct numbers here rather than a refusal, because the walk and the block are
+  the same graph.
+- Device: each block gets only its own rows; the host copy happens BEFORE the block's command buffer
+  exists (a shared buffer written from the host is not ordered against work that has not executed, and
+  here the copy simply precedes every dispatch that reads the slot); a supplied row REPLACES the token
+  lookup instead of adding to it; a row that is out of range or the wrong width is refused.
+- Dead flags are read off the row map, one per position: **a supplied residual row IS an image
+  position and takes no part in an n-gram**.
+- `encodeEngram` gained the per-position dead test (`position: Int?`), which is the fix for the latent
+  bug above: a walk names none and reads `deadTokens.last`, a block names each position it carries.
+- The CPU oracle's `prefillChunk(_:embeddings:)` replaces `embed(token)` with the row and derives the
+  dead flag the same way, so the device has a reference that is not itself.
+
+### The latent Engram bug, caught by the parity test
+
+`testABatchedImagePrefillMatchesTheWalkOnThePublishedCheckpoint` compares a two-block image prefill
+with a walk of the same positions on the checkpoint's own weights and tower rows. With the block-level
+Engram gate it measured **2.81e-01 relative** at a logit scale of 22.0 -- the live text positions at
+the front of the span lost their memory contribution because the block's last position was an image
+position. With the gate moved per position the same case measures **1.08e-04**. The synthetic fixture
+could not have found it: it publishes no Engram layers at all.
+
+### Where batching pays, and where it does not
+
+Same runtime, same prompt, one arm each, arena reset before every arm, `block`/`per-position` counting
+which mixture layout actually ran (5,040 block, 0 per-position in every arm below). The prompt is the
+span alone at four lengths:
+
+| positions | batched | walk | ratio | expert bytes (batched / walk) | hit rate |
+|---|---|---|---|---|---|
+| 16 | 2,180.8 ms (136.3 ms/pos) | 1,656.3 ms (103.5 ms/pos) | 0.76x | 26,052 / 26,016 MB | 21% / 62% |
+| 128 | 9,220.9 ms (72.0 ms/pos) | 17,731.9 ms (138.5 ms/pos) | **1.92x** | 47,836 / 47,514 MB | 78% / 91% |
+| 512 | 47,184.0 ms (92.2 ms/pos) | 76,360.7 ms (149.1 ms/pos) | **1.62x** | 74,211 / 73,691 MB | 92% / 97% |
+| 997 | 121,980.2 ms (122.3 ms/pos) | 153,242.6 ms (153.7 ms/pos) | **1.26x** | 99,546 / 99,062 MB | 95% / 98% |
+
+The sixteen-position arm is the outlier in the other direction and it is not a result: the first arm of
+a process pays the arena's slot allocations and the page cache. The sweep warms up on a discarded
+eight-position chunk for exactly that reason, and 16 still reads 0.76x because it is next.
+
+Then the composer's own largest image, same protocol:
+
+| prompt | batched | walk (shipped) | ratio | expert bytes | hit rate |
+|---|---|---|---|---|---|
+| 1,005 positions, 4,096x4,096 pixels | 345.62 / 355.22 / 386.90 s | **255.98 / 268.05 / 278.38 s** | **0.75x / 0.74x / 0.72x** | 218,312 / 218,886 MB | 91% / 95% |
+
+So the same span is 1.26x faster batched at 997 positions and 0.74x faster walked at 1,005 -- and the
+difference is not the length, it is the **working set**. The bare-span prompt reads 99,546 MB over 997
+positions; the composer's prompt reads 218,886 MB over the same span, i.e. it touches 2.2x as many
+distinct `(layer, expert)` pairs (a different picture and eight extra text positions at the front move
+the routing). Against an arena of 3,760 slots the ratio tracks the working set monotonically:
+
+| distinct pairs touched | working set vs arena | ratio |
+|---|---|---|
+| 2,660 | 0.71x | 1.92x |
+| 4,118 | 1.10x | 1.62x |
+| 5,533 | 1.47x | 1.26x |
+| 12,228 | 3.25x | 0.74x |
+
+That is the mechanism: when the working set fits, the block form replaces eight per-position fills
+with one and wins; when it does not, EVERY fill evicts, and a union fill evicts 20-48 pairs at once
+where the walk's 6-pair fill keeps what it just used -- the hit rate falls from 95% to 91% and the
+bulk eviction costs more than the round trips save.
+
+### What it means
+
+- **The walk stays the shipped path for an image prompt**, and `DeepSeekV41TurnRunner` says so with
+  this table in its comment. `testAnImageRowRunsOnlyAtItsOwnPosition` pins the decision, and the
+  end-to-end case asserts the batched form is SLOWER at the largest span, so a later change to either
+  has to re-measure.
+- **The batched image prefill stays, as a capability with a number.** It is correct (1.08e-04 against
+  the walk on real weights), it is 1.26-1.92x faster while the span's expert working set fits the
+  arena, and the entry point is one call. What it needs next is not more batching but a fill policy
+  that does not discard the locality the walk had -- which is a targeted-invalidation question for
+  `DeepSeekV41ExpertArena`, not a prefill-layout one.
+- **The composer's estimate is right about the wrong thing.** `DeepSeekV41VisionCostModel.measured`
+  prices the TOWER (6.95 s predicted, 6.88-7.23 s measured), and the tower is 2% of the wait. Anything
+  user-facing that quotes a picture's cost from that model is quoting the encode.
+- **The 6.74 s encode is not the problem, and neither is anything `#44`/`#45` measured.** The two
+  levers that would move this number are the expert fill's behaviour above the arena's capacity and
+  the per-position work of a long prompt -- both outside the vision tower entirely.
+
+### Verification
+
+The default suite gains `testABatchedImageSpanMatchesTheWalk` (one block, rows at every other
+position, against the host's own `forwardEmbedding` walk AND against the host's chunk form, so a bug
+in the oracle's new entry point cannot cancel a bug in the device's) and
+`testABatchedImageSpanMapsItsRowsIntoTheRightBlocks` (two blocks, rows only from the second, which a
+per-block slice that dropped its offset would answer with the block's first slot). Both run on the
+synthetic checkpoint; `DeepSeekV41TurnLoopTests` is unchanged in shape and pins that an image prompt
+still walks.
+
+The published-checkpoint cases are opt-in with the rest of that file:
+`testABatchedImagePrefillMatchesTheWalkOnThePublishedCheckpoint` (16 positions, real tower rows, the
+Engram bug above), `testWhatBatchingAnImagePrefillSavesAtLength` (the four-length sweep, gated on
+`/tmp/dynamoe_dsv41_vision_max_turn`) and `testWhatTheLargestImageCostsEndToEnd` (gated on the same
+marker, ~10 minutes at `-O`).
+
+The end-to-end numbers above are the app's own `-O` build (`/tmp/dd_dsv41_opt`), load average
+3.2-4.8, and the two arms of every pair were measured in one process back to back.
+
+The full DeepSeek suite on this code is **562 passed / 0 failed / 60 skipped** (622 executed, 94
+classes), and the same run under `MTL_DEBUG_LAYER` is **562 / 0 / 60 with 0 validation errors** and no
+failed assertions. That run matters more than usual here: a per-position Engram gate and a host write
+into a shared buffer before a command buffer exists are exactly the two changes a validation layer
+catches and nothing else does.
+
+## DSV4.1 #47: A WALKED POSITION IS 200 ms OF IDLE GPU, AND THE EXPERT STREAM IS ONLY A FIFTH OF IT
+
+### Question
+
+`#46` established the number a person actually waits for -- the largest picture the composer accepts
+costs 255.98-297.98 s of prefill, i.e. 254-297 ms per position -- and named the arena's fill policy as
+the lever. That name was an inference from a byte count, not an observation: 218,886 MB at the disk's
+13-14 GB/s ceiling is seventeen seconds, so 250 of those 255 milliseconds per position had to be
+somewhere else. Routing picked this slice at 0.900 (confidence 0.886) to find out where, and closed the
+shared path to behavioural change for the round (0.43): measure first.
+
+### What a walked position costs, in buckets
+
+Four arms, one runtime, one process, each from a reset arena and a cleared accumulator, each printing
+its own bytes, misses and evictions. The prompt is the composer's own (12 text tokens then a
+994-position span, 1,005 positions), rows from the device tower on a 4,096x4,096 picture, app's `-O`
+build, load average 3.2-3.4:
+
+| arm | positions | ms/position | MB read | hit | misses | evictions | pread | front encode | front wait | indexer wait | fill | mix encode | device |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| the shipped walk, real image rows | 1,005 | **269.4** | 218,886 | 94.9% | 12,208 | 8,448 | 57.4 s (3,812 MB/s) | 2.8 | 160.6 | 39.3 | 57.5 | 3.0 | 37.5+31.2 |
+| the same arm again | 1,005 | **275.7** | 218,886 | 94.9% | 12,208 | 8,448 | 60.6 s (3,615 MB/s) | 2.7 | 162.8 | 40.2 | 60.6 | 3.0 | 37.3+31.3 |
+| the same length, TEXT tokens | 1,005 | **228.2** | 111,415 | 97.4% | 6,214 | 2,454 | 30.2 s (3,690 MB/s) | 3.6 | 144.6 | 39.6 | 30.3 | 2.9 | 37.4+30.5 |
+| `#46`'s sweep fixture, synthetic rows | 997 | **149.0** | 99,062 | 97.7% | 5,525 | 1,765 | 25.7 s (3,860 MB/s) | 2.4 | 92.8 | 21.0 | 25.9 | 2.8 | 33.2+27.1 |
+
+An earlier run of the same four arms, before the indexer split was separated into its own bucket, read
+244.7 / 257.0 / 194.9 / 139.5 ms, so quote the ranges: **245-276 ms for the real span, 195-228 ms for
+a text walk of the same length, 140-149 ms for the synthetic fixture.** The byte columns are identical
+across runs to the megabyte, because routing is a deterministic function of the activations.
+
+Three facts fall out of the table before anything else:
+
+- **The host's own encoding is 2.4-3.6 ms per position for all forty layers** (about 70 microseconds a
+  layer). Every "fewer dispatches per layer" argument in this port's history is arguing over 1% of a
+  position.
+- **The expert fill is 21% of a walked position** (57.5 of 269.4), and the indexer readback another
+  15% (39.3, i.e. 4.9 ms on each of the eight compressed-index layers).
+- **A same-length text walk costs 195-228 ms with the identical shape**, so an image span is 1.18-1.26x
+  a text walk of its own length and nothing more. The difference is the real tower rows' routing
+  breadth: 12,208 misses against 6,214 at the same position count.
+
+### Where the idle actually sits
+
+Buckets say how long the host blocked, not what the GPU was doing, so `recordsWalkTimeline` now keeps
+each committed buffer's commit time, the moment the host began waiting on it, and its own device
+window. A steady-state position (400 of a walked text run, i.e. after warm-up) is 88 committed buffers:
+40 front halves, 40 mixtures and 8 indexer splits.
+
+| | position 400 | position 401 |
+|---|---|---|
+| wall | 297.5 ms | 224.3 ms |
+| device windows | 94.3 ms (32%) | **68.0 ms (30%)** |
+| host blocked in `waitUntilCompleted` | 205.5 ms (69%) | 148.7 ms (66%) |
+| GPU idle between buffers | 200.3 ms | 153.8 ms |
+| commit-to-start, summed | 257.2 ms | 184.4 ms |
+| commit-to-start, per buffer | 2.92 ms | **2.10 ms** |
+
+**A committed buffer's device window opens 2.1-2.9 ms after `commit()` returns, while the GPU has
+nothing else to do.** The first ten buffers of position 400, in order:
+
+```
+layer 0 attention: committed  0.00 ms, started at  0.02 for 1.14 ms, host waited 1.141 ms
+layer 0 experts:   committed 14.40 ms, started at 16.26 for 0.95 ms, host waited 2.270 ms
+layer 1 attention: committed 15.02 ms, started at 17.21 for 1.43 ms, host waited 1.408 ms
+layer 1 experts:   committed 18.78 ms, started at 22.96 for 0.96 ms, host waited 5.184 ms
+layer 2 indexer:   committed 18.81 ms, started at 23.93 for 0.61 ms, host waited 0.614 ms
+layer 2 attention: committed 24.70 ms, started at 24.79 for 0.71 ms, host waited 0.842 ms
+layer 2 experts:   committed 25.61 ms, started at 29.61 for 0.89 ms, host waited 4.928 ms
+layer 3 attention: committed 25.66 ms, started at 30.50 for 0.98 ms, host waited 0.953 ms
+layer 3 experts:   committed 37.64 ms, started at 38.38 for 1.12 ms, host waited 1.878 ms
+layer 4 attention: committed 37.70 ms, started at 39.51 for 1.58 ms, host waited 1.577 ms
+```
+
+Layer 1's mixture is handed to the driver at 18.78 ms, the GPU is idle (layer 1's front window ended
+at 18.64), and it starts at 22.96: **4.2 ms for a buffer holding one layer's mixture kernels.** That is
+not the fill -- the gap between that front's window ending and the mixture's commit is 0.14 ms, against
+the arm's 1.4 ms a layer average -- and it is not the host, whose entire front encode for the layer is
+30 microseconds.
+
+So a walked position decomposes as, per position at the real span:
+
+| | ms | share |
+|---|---|---|
+| device windows (front + mixture) | 68.7 | 26% |
+| GPU idle inside a wait, between buffers | ~131 | ~49% |
+| GPU idle during the expert fill | 57.5 | 21% |
+| host encoding (both halves) | 5.8 | 2% |
+
+**Seventy percent of a walked position the GPU does nothing at all**, and only a fifth of that idle is
+the disk.
+
+### Why `#46`'s sweep table was twice as fast as the composer's turn
+
+The sweep fixture reproduces `#46` exactly: 99,062 MB read (the same megabyte count), 97.7% hit
+against 98%, 140-149 ms/position against 154. It was a real measurement of a real graph on real
+weights. What it was not is a measurement of a real picture: its rows come from
+`imageSpan(patches:)` over a deterministic sawtooth, whose routing is 5,525 distinct pairs where the
+tower's own rows are 12,208. Both touch a 3,760-slot arena that cannot hold either working set, so the
+fixture's misses (and therefore its fill) are 45% of the real span's. That is why the sweep's
+`1.26x`-`1.92x` block-vs-walk ratios and the composer's `0.74x` are both true statements about
+different working sets, and why the composer's number is the one that describes a picture.
+
+### What it means (and what is not the lever)
+
+- **The lever is the number of command buffers per position, not the expert stream.** 88 buffers at
+  2.1-2.9 ms of startup each is 184-257 ms, against 63-94 ms of actual device work. Nothing in the
+  kernels touches this; it is a property of how many submissions a position is cut into.
+- **The fill is real but second-order**: 57.5 ms, and a fifth of the position. `#46`'s "the next lever
+  is the arena's fill policy" was directionally right and quantitatively wrong -- halving the misses
+  would buy at most ~29 ms and would not touch the 131 ms of restart idle.
+- **A surgical, unmeasured candidate**: `runLayer` commits the mixture of layer L and then the front of
+  layer L+1 as two buffers, with nothing between them but 30 microseconds of encoding. Merging them
+  into one submission halves the buffer count (the eight compressed-index layers keep an extra split),
+  and the two halves are adjacent in time anyway. That is a pure host-side change, it needs no new
+  kernel, and by this table it addresses half of the largest term.
+- **Batching already removes the restart term entirely and still loses.** The chunk form runs 5,040
+  mixture submissions for the same 1,005 positions -- about 5 buffers a position -- so the 184-257 ms
+  of restarts is nearly gone, and yet it measured 345.62-386.90 s against the walk's 255.98-297.98 s.
+  Whatever the block form's own cost is, it is therefore at least the restart saving plus its 84 ms
+  deficit: **~215 ms/position that `#47` has not explained.** That, not the fill, is where the next
+  measurement belongs.
+- **The vision cost model still prices 2% of a turn** (`#46`), and this slice does not change that: an
+  image attachment's user-visible cost is the walk of its span, and the walk is CPU/GPU hand-off.
+
+### Verification
+
+Two new opt-in published-checkpoint cases (`/tmp/dynamoe_dsv41_walk_cost`, on top of that class's
+`/tmp/dynamoe_dsv41_real_turn` gate): `testWhereAWalkedImagePrefillSpendsItsTime` (the four arms above,
+943 s at `-O`) and `testWhereAWalkedPositionsIdleTimeSits` (the timeline at positions 400-401, 101 s).
+The instruments themselves are pinned on the synthetic checkpoint by
+`testTheWalkInstrumentCoversEveryBufferOfAPosition`, which asserts that a position produces exactly two
+timeline entries per layer in commit order, that no window starts before its commit, that the device
+total cannot exceed the wall, and that the new indexer bucket is zero on a shape with no compressed
+index source and non-zero on one that has it -- because both instruments are off in every production
+path, and a bucket that silently stops covering part of a position would still print.
+
+The full DeepSeek suite on this code is **563 passed / 0 failed / 62 skipped** (94 classes; one new
+case plus the two new opt-in published ones, which skip without their markers), and the same run under
+`MTL_DEBUG_LAYER` is **563 / 0 / 62 with 0 validation errors and no failed assertions**. The `-O` arms
+are the app's own optimized build in `/tmp/dd_dsv41_opt`, load average 3.2-3.4; the same arms read
+245-276 ms under lighter load, which is why every number in this section is a range.
+
+One pre-existing warning is untouched: `DeepSeekV41IndexerInputRequest.latents` holds an `MTLBuffer` in
+a `Sendable` struct, which the Swift 6 language mode will make an error. It is not from this slice.
+
+## DSV4.1 #48: A SUBMITTED BUFFER STARTS IN A TENTH OF A MILLISECOND, SO THE WALK'S IDLE IS NOT ITS SUBMISSION COUNT
+
+### Question
+
+`#47` measured a walked position at 245-276 ms with the GPU executing 63-94 ms of it, attributed the
+difference to `88 command buffers per position, each starting 2.1-2.9 ms after it was handed over`, and
+named the submission count as the lever -- with the surgical candidate being a merge of layer L's
+mixture buffer into layer L+1's front buffer. Before anything was changed, the question this slice had
+to answer was whether a committed buffer really costs 2-3 ms to start, and if so what it is
+proportional to: a fixed cost per BUFFER (merge them), a cost per DISPATCH (cut dispatches), or a cost
+of the QUEUE HAVING GONE EMPTY (keep more than one buffer in flight). Those have three different
+fixes and the walk's own numbers could not tell them apart.
+
+Two instruments answer it. `DeepSeekV41CommitPickupCostTests` drives command buffers of chosen shapes
+through one queue and splits each one's time four ways; the published timeline case sums the same
+split by boundary class over a real position.
+
+### What the walk's idle actually is
+
+`#47`'s per-buffer figure was `commit -> the buffer's own device window opening`, and that is not idle:
+a buffer committed while another is still queued "pays" the predecessor's remaining window. The
+published case now reports both, so the same two positions read:
+
+| | position 400 | position 401 |
+|---|---|---|
+| wall | 232.2 ms | 218.3 ms |
+| device windows (88 buffers) | 67.3 ms (29%) | 66.3 ms (30%) |
+| host blocked in `waitUntilCompleted` | 162.2 ms (70%) | 154.6 ms (71%) |
+| **idle with nothing queued** | **93.7 ms (40%)** | **87.4 ms (40%)** |
+| commit-to-start, summed over 88 buffers | 212.9 ms (2.42/buffer) | 197.8 ms (2.25/buffer) |
+| idle into the front half (40 boundaries) | 2.2 ms (0.05/buffer) | 2.9 ms (0.07/buffer) |
+| idle into the indexer split (8) | 0.0 ms | 0.0 ms |
+| **idle into the mixture half (40)** | **91.5 ms (2.29/buffer)** | **84.5 ms (2.11/buffer)** |
+| queue wait, front half | 94.2 ms (2.36/buffer) | 98.2 ms (2.46/buffer) |
+| host gap before the mixture commit | 0.15-0.21 ms/layer | 0.15-0.21 ms/layer |
+
+So the position has 87-94 ms of genuine idle, **97% of it in one gap per layer, immediately before the
+expert half starts**, and the host is already finished when that gap opens: it commits the mixture
+0.2 ms after the front half retires and then blocks on it. The 2.36 ms of "commit to start" the front
+half reports is queue wait behind that same mixture, i.e. real GPU work, not idle.
+
+That is the correction `#47` needs, and it changes what a fix has to do: there are not 88 late starts,
+there are 40, and they are all in the same place. (The timeline covers the layers' two buffers each;
+the embedding and output-head commits are not in `walkBuffers`, so the device column understates a
+position by those two submissions and would read a few milliseconds higher with them in.)
+
+### What a submission costs to start, across every shape a probe can hold
+
+Medians, `-O`-free Debug test build, load average 3.2-4.0, `gpuStartTime` against the mach clock the
+commit stamp is taken from:
+
+| arm | pickup | window |
+|---|---|---|
+| 1 launch, 1 small resource, queue idle | 0.080 ms | 0.002 ms |
+| the same, with no `scheduled` handler registered (instrument control) | 0.083 ms | 0.004 ms |
+| the same, after 2 ms of host idle | 0.071 ms | 0.005 ms |
+| the same, after 5 / 10 / 20 / 50 ms of host idle | 0.682 / 0.572 / 0.768 / 0.843 ms | 0.011 ms |
+| 8 / 32 / 128 launches in one buffer | 0.166 / 0.668 / 0.561 ms | 0.032 / 0.119 / 0.455 ms |
+| one launch over a 1,048,576-lane grid | 0.134 ms | 0.020 ms |
+| 64 launches over 64 resident 64 MiB resources | 0.470 ms | 0.236 ms |
+| 64 launches over 8 resident 512 MiB resources (same 4 GiB) | 0.495 ms | 0.238 ms |
+| 64 launches over 64 zero-copy mapped 64 MiB resources | 0.088 ms | 0.221 ms |
+| 20 launches naming 0 / 8 / 64 / 128 / 256 / 512 resources | 0.110 / 0.087 / 0.086 / 0.110 / 0.136 / 0.173 ms | 0.07 -> 0.04 ms |
+| 20 launches, 128 resources, a buffer barrier after each launch | 0.101 ms | 0.043 ms |
+| queue fed with 2 / 4 / 8 buffers before any wait: follower's gap from its predecessor's end | **0.001 ms** | |
+| a co-tenant saturating the GPU on another queue, 2 buffers at a time | **0.009 ms** (0.078 alone) | |
+| the walk's own alternation: 40 layers of front-commit-and-wait, host work, mixture committed and left in flight (80 buffers) | idle 6.6 ms of 12.3 (0.08/boundary) | |
+| ... with 128 MB of host writes into the mixture's own buffers every layer | pickup 0.088 ms (the added idle is the host's own `memset`) | |
+| ... with a different pipeline for the mixture than for the front | idle 8.5 ms of 15.3 (0.11/boundary) | |
+| ... (one merged pattern) all 80 buffers queued before any is waited on | idle 0.6 ms of 6.4 | |
+| a 64 MB read of memory the host had just written, every page touched | 0.096 ms (0.110 untouched) | 0.316 ms |
+
+Nothing reproduces 2.3 ms. The delay is not the submission's shape (launch count 1-128, grids to a
+million lanes, 2 GiB of bound memory, 512 named resources, buffer barriers), not its size, not the
+pipeline switch between halves, not the host's own writes into the memory the next submission reads,
+not the queue having gone empty (a fed queue starts a follower 1 microsecond after its predecessor
+retires), and not the machine state a 402-position walk leaves behind: **the same probe run in the
+walk's process, after the walk, still reads 0.053-0.073 ms.**
+
+### What it is not, and what it means
+
+- **The submission count is not the lever, and merging buffers would not buy the idle.** The 2.3 ms is
+  one gap per layer, before the expert half. Merging layer L's mixture into layer L+1's front would
+  remove one of the two submissions per layer and turn the front half's 2.36 ms of queue wait into
+  work inside a longer buffer -- but the merged buffer would still start where the mixture starts, so
+  the 91.5 ms of idle stays. `#47`'s surgical candidate is measured dead before it was built.
+- **The one lever the probe does confirm is keeping the queue fed**: a follower committed before its
+  predecessor retires starts 1 microsecond later, i.e. 2000x sooner than an isolated submission's
+  0.08 ms and 2000x sooner than the walk's 2.3 ms. Whether the walk can be arranged that way is a
+  different question from how many buffers it commits, but it is the shape with a measured payoff.
+- **What is left unexplained is specific and narrow**: one submission per layer, the expert half, is
+  the only submission in the port that (a) follows a `pread` into the memory it reads and (b) runs the
+  expert kernels. Both were held constant in a probe and neither moved the number, at 128 MB of write
+  and 64 MB of read. The next instrument therefore has to be inside the walk rather than beside it:
+  a GPU-side split of the buffer's own start (`MTLCounterSampleBuffer`, or the first launch's
+  timestamp) plus the layer's fill/eviction counts, so the 40 gaps can be correlated with what the
+  layer did -- 40 samples, one per layer, is a correlation the timeline can already carry.
+
+### Verification
+
+`DeepSeekV41CommitPickupCostTests` (seven cases, all default-suite, all on the GPU with no model): the
+pickup decomposition with the `scheduled`-handler control and the idle-gap curve, the queue-depth
+sweep with its in-order invariant, the dispatch/grid/residency sweep, the co-tenant arm, the walk's
+alternation with its host-write and pipeline variants, and the read-after-host-write arm. Each asserts
+its sample count, that every buffer opened a window, that `drain >= pickup + window` (the one
+structural relation the clocks guarantee), that a follower in a one-queue round never starts before its
+predecessor finished, and that the `scheduled` handler fired for every completed buffer -- because the
+first version of `#47`'s timeline stamped `waitEnd` before the wait and reported a clean 0.000 ms.
+
+The published case grew the boundary attribution (idle, queue wait and window per class, plus a
+twenty-boundary sequence) and the post-walk probe arm; it is still opt-in behind
+`/tmp/dynamoe_dsv41_walk_cost` on top of the class's `/tmp/dynamoe_dsv41_real_turn`.
+
+The full DeepSeek suite on this code is **570 passed / 0 failed / 62 skipped** (95 classes), and the
+same run under `MTL_DEBUG_LAYER` is **570 / 0 / 62 with 0 validation errors and no failed assertions**.
+The published numbers are the app's own `-O` build in `/tmp/dd_dsv41_opt` (positions 400-401, 102 s),
+load average 3.2-3.6; the probe arms are Debug and run in under 3 s together.
+
+Nothing in the production path changed: no kernel, no encoder, no submission pattern.
+
+## DSV4.1 #49: THE GAP BEFORE A LAYER'S EXPERT HALF IS THE WALK'S I/O, AND IT COSTS A SECOND READING OF THE SAME BYTES
+
+### Question
+
+`#48` left the port with exactly one unexplained number. A walked position's genuine idle --
+the GPU with nothing queued -- was 87-94 ms of a 218-232 ms position, and 97% of it sat at a
+single boundary per layer: the hand-off from the layer's dense half to its expert half, 2.11-
+2.29 ms across 40 boundaries, with the host already finished. A probe beside the walk could not
+reproduce it in any shape it could hold (1-128 launches, a million-lane grid, 2 GiB of bound
+memory, 512 named resources, a barrier per launch, zero-copy mapped memory, a 64 MB read of what
+the host had just written, the walk's own alternation, a co-tenant saturating the GPU, and the
+same probe inside this process after 402 positions): every arm started in a tenth of a
+millisecond. The one thing a probe beside the walk cannot reproduce is the LAYER.
+
+So this slice instrumented the layer. Three instruments, none of them beside the walk:
+
+1. `DeepSeekV41MetalForward.recordsLayerGaps` -- one `DeepSeekV41LayerGapSample` per layer, closed
+   when that layer's expert half is drained by the next layer's dense half, carrying the dense
+   half's window end, the expert half's commit stamp and window, and the layer's own fill numbers
+   (bytes, misses, slots allocated, pread seconds, placement seconds) plus its routing read and
+   its encode.
+2. A zero-byte-fill arm: the same 40 boundaries and the same submissions over an eight-token
+   cycle, which leaves the arena holding every pair the walk asks for, so the fill reads nothing.
+3. A one-dispatch command buffer committed immediately before each expert half, carrying its own
+   commit stamp, which separates "the queue will not start work" from "this buffer will not
+   start".
+
+A fourth instrument -- reading every page of the fill back on the committing thread, to move the
+dirty lines to the core that commits -- was built, measured, and WITHDRAWN (below).
+
+### The gap tracks how much the walk read, and nothing else about the layer
+
+Four fill levels, one runtime, one process, one `-O` build (`/tmp/dd_dsv41_opt`), each arm
+recording one steady-state position's 40 boundaries. `idle` is the GPU with nothing queued, from
+the later of the dense half's retirement and the expert half's commit:
+
+| arm | fill / layer | idle mean | idle median | idle total over 40 layers | host gap mean |
+|---|---|---|---|---|---|
+| zero-byte fill (8-token cycle) | 0.0 MB | **0.145 ms** | **0.091 ms** | 5.8 ms | 0.167 ms |
+| partial fill (96-token cycle) | 7.2 MB | 1.343 ms | 0.932 ms | 53.7 ms | 1.381 ms |
+| full fill, plain A | 13.9 MB | 2.146 ms | 1.318 ms | 85.9 ms | 2.581 ms |
+| full fill, plain B | 13.9 MB | 2.314 ms | 1.410 ms | 92.6 ms | 2.357 ms |
+
+Two points can only say "the gap needs I/O". Three say it scales with it, and the fit is
+uncomfortably tight to the disk: the median slope is **0.088-0.117 ms of GPU idle per MB read**,
+and one MB off a 13.8 GB/s disk is 0.0725 ms. So the hand-off after a fill idles for **1.2-1.6x
+the time the bytes themselves took**, and the mean slope (0.144-0.166 ms/MB) says up to 2.3x
+because the distribution is spiky rather than smooth.
+
+What the layer itself did barely matters. Within a full-fill arm, 19 of the 40 layers read
+NOTHING -- their pairs were resident -- and they still idle 1.56-1.65 ms each, against 0.091 ms
+for the same boundary with no I/O anywhere in the walk. The correlation between a layer's own
+fill and its gap is +0.24. What predicts the gap is that the WALK is reading, not that this LAYER
+read.
+
+### It is not the submission, and it is not the writeback
+
+The probe settles the first half. A one-dispatch clear carrying 16 bytes, committed into the same
+empty queue a few hundred microseconds before the expert half, starts in **0.1019 ms** (max 0.645)
+while the expert half takes **1.573 ms** in the same position; in 0 of 40 layers did the probe
+still be running when the expert half started. `#48` was right that the queue is willing: a
+trivial buffer committed at that exact moment starts at once. What does not start at once is the
+expert half itself -- and no bound resource, grid, barrier or memory kind makes a buffer slow to
+start (`#48`), so what is left is the state the machine is in, not the shape of the work.
+
+The writeback hypothesis was the obvious second suspect: the fill writes from
+`DispatchQueue.concurrentPerform`'s worker threads, so the lines the expert half reads are dirty
+in other cores' caches, and `#21` had already learned that `F_NOCACHE` on these descriptors is a
+2.2x LOSS. `DeepSeekV41ExpertStreamer.touchesFilledRanges` reads every page of a fill back on the
+calling thread, and the arms were run as an ALTERNATING PAIR (off, on, off, on) on the same
+tokens and a warm page cache, because the first attempt at this comparison was confounded: a
+read-back arm that ran fourth looked 39% better than a cold arm that ran first, and most of that
+was the page cache, not the read-back.
+
+| paired arm | idle mean | idle median |
+|---|---|---|
+| plain A | 2.146 ms | 1.318 ms |
+| read-back A | 2.453 ms | 1.531 ms |
+| plain B | 2.314 ms | 1.410 ms |
+| read-back B | 2.421 ms | 1.813 ms |
+
+**The read-back is a measured negative.** The two read-back-off arms differ from each other by
+0.168 ms, and read-back moves the mean the WRONG way by 0.207 ms (2.230 -> 2.437, 0.91x). Medians
+agree: 1.318/1.410 without against 1.531/1.813 with. So the delay is not CPU cache ownership, and
+the same is true of an explicit flush or fence -- do not re-propose either without a new
+argument.
+
+### What it means
+
+The expert stream costs about **twice its own byte time**, and only half of that is the `pread`.
+At this arm's fill (13.9 MB/layer, 556 MB/position) the 40 hand-offs idle 85.9-92.6 ms on top of
+the host's own 94-103 ms gap, against 29.8-30.6 ms of expert-half device time and (from `#48`) a
+~66 ms device total for the position. The zero-fill arm's floor is 5.8 ms, so essentially all of
+that idle is the stream.
+
+Applying the median slope to `#21`'s measured steady state of 900-950 MB/token gives **79-111 ms
+of hand-off idle per position**, which is the number `#48` measured by a completely different
+route (87-94 ms). So the two agree, and the consequence is a correction to `#21`'s priority:
+halving the arena's misses does not buy the ~29 ms of `pread` that `#21` credited it with. It buys
+that, AND a comparable amount of the idle that follows it -- roughly **78 ms of a 205-260 ms
+position, or 1.5-1.6x decode**, which is the largest single lever measured on this port so far
+and it is the arena's hit rate, not a kernel.
+
+### What it is not (do not re-propose)
+
+- **Not the submission shape.** `#48`'s twenty arms, plus this slice's probe at 0.1019 ms in the
+  walk's own process.
+- **Not the CPU cache writeback, and not a flush/fence.** Measured negative in an alternating
+  pair with a noise estimate.
+- **Not the layer's own bytes.** 19 zero-read layers in a full-fill arm idle 1.56-1.65 ms.
+- **Not merging buffers.** `#48` measured that dead before it was built.
+- **Not `F_NOCACHE`.** 2.2x loss, `#21`.
+
+### Verification
+
+`DeepSeekV41PublishedTurnTests.testWhatEachLayersExpertHalfHandoffCosts` is opt-in behind
+`/tmp/dynamoe_dsv41_layer_gaps` on top of the class's `/tmp/dynamoe_dsv41_real_turn`, because it
+walks the real checkpoint eight times: a discarded warm-up (so the paired arms are not the
+first-read arm paying for a cold disk), the alternating read-back pair, the zero-fill arm, the
+partial-fill arm, and the probe arm. It asserts every layer produced a window (`40/40 windowed`
+in all eight arms), that the probe was dispatched and ran (`40 one-dispatch buffer(s)`), and it
+prints each arm's per-layer rows so the correlations above can be recomputed from the log rather
+than trusted.
+
+Nothing in the production path changed: no kernel, no encoder, no submission pattern, no arena
+policy. The three new flags (`recordsLayerGaps`, `recordsMixtureStartProbe`,
+`touchesFilledRanges`) are off everywhere, and the clock reads they gate are inside
+`commit()`/`settlePending()` behind them, so a turn pays nothing -- mechanism 7's rule from
+`#47`, kept.
+
+The full DeepSeek suite on this code is **570 passed / 0 failed / 63 skipped** (95 classes, 633
+cases: `#48`'s 632 plus this slice's new opt-in case), and the same run under `MTL_DEBUG_LAYER`
+is **570 / 0 / 63 with 0 validation errors and no failed assertions**. The published numbers are
+the app's own `-O` build in `/tmp/dd_dsv41_opt`, eight arms of 202 positions each in ~5.5 minutes,
+load average 2.6-3.8. One caveat worth carrying: the suite reads **573 / 0 / 60** whenever
+`/tmp/dsv41_indexer_inputs.json` is present, because the three `DeepSeekV41RealIndexerReScareTests`
+cases run instead of skipping -- an opt-in published case writes that dump as a side effect, so a
+suite count that moves by three is that file, not a regression.
+
+## DSV4.1 #50: THE HAND-OFF IS 71-75% OF A WALKED POSITION, IT ACCOUNTS FOR ITSELF, AND NO COMMAND BUFFER A PROBE CAN BUILD REPRODUCES THE STALL AFTER THE COMMIT
+
+### Question
+
+`#49` attributed the walk's last unexplained stall to the walk's I/O and priced the expert stream at
+about twice its own byte time. Three things were still unmeasured when it closed, and one of them was
+an assumption rather than a number:
+
+1. **Nothing had checked that forty layer records add up to the position they came from.** `#49`
+   reported 85.9-92.6 ms of post-commit idle and 94-103 ms of pre-commit host gap for one arm, plus
+   29.8-30.6 ms of expert-half device time; with `#48`'s ~66 ms of dense device time that is a 285 ms
+   position, and `#48` measured 218-232 ms for one. Two of those numbers had to be the same interval,
+   and only a per-position clock can say which.
+2. **`#49`'s single probe localised the stall to "the expert buffer" by elimination**, and a probe
+   that binds nothing is not the expert half. `#48` had already failed to make a buffer slow to start
+   in twenty arms, so "the expert buffer's own content" was the surviving candidate by default.
+3. **The fill's throughput inside a walk had never been compared against `#21`'s isolated 13.8 GB/s.**
+
+### What was added (measurement only, every flag off in production)
+
+`recordsLayerGaps` grew four things; no kernel, encoder, submission pattern or arena policy changed:
+
+- `layerGapPositions` -- one `DeepSeekV41GapPositionSample` per recorded position: its WALL time and
+  how many layer records were taken during it. This is the control.
+- `frontWindowStartNanoseconds` on the layer record, so the dense half's own device time is separable
+  from the hand-off (only its end was recorded before).
+- `mixtureStartProbeDepth` and `mixtureStartProbeDispatches` -- how many trivial buffers to commit
+  back to back, and how many trivial dispatches each holds.
+- `mixtureStartProbeBinding` / `mixtureStartProbeDirtyBytes` -- what a probe BINDS: nothing, one
+  resident expert's arena slot, the workspace's gathered rows, thirty distinct shard allocations, or
+  a 16 MB shared buffer the host has just `memset`.
+
+### The parts tile the position, and the hand-off is most of it
+
+Fourteen arms, one runtime, one process, one `-O` build (`/tmp/dd_dsv41_opt`), each recording one
+steady-state position's 40 boundaries. `hand-off` is the host's gap (dense retire -> expert commit)
+plus the pickup (commit -> expert window start). They TILE rather than overlap: the host is blocked on
+the dense half until it retires, so `mixtureCommitNanoseconds` is always the later of the two and
+`idleMilliseconds` IS `pickupMilliseconds` -- the `max` in it never binds.
+
+| arm | position | dense halves | hand-off | expert halves | accounted |
+|---|---|---|---|---|---|
+| zero-byte fill (8-token cycle) | 71.0 ms | 26.5 | **12.7** | 24.3 | 89.3% |
+| partial fill (96-token cycle) | 211.9 ms | 30.6 | **142.5** | 30.5 | 96.1% |
+| full fill, plain A | 275.0 ms | 30.1 | **205.0** | 30.7 | 96.7% |
+| full fill, plain B | 241.4 ms | 28.1 | **176.5** | 27.9 | 96.3% |
+| eight probe arms (below) | 236.7-281.9 ms | 28.6-34.3 | **171.1-208.7** | 28.9-33.0 | 96.3-96.8% |
+
+So `#49`'s accounting is sound: the four pieces tile a position to 96-97%, and the remainder is the
+host's own work between one layer's expert half and the next layer's dense half -- ~8-9 ms of a
+position, and 7.5 ms of it is visible even in the zero-fill arm. What the control adds is that the
+hand-off is **167-209 ms of a 236-305 ms position (71-75%)** on this arm's fill, against 61-66 ms of
+device time in total. `#48`'s 40% was a lighter arm; this one reads 556 MB/position.
+
+### The walk's fill does not reach the disk
+
+555.8 MB per position in 74.2-97.8 ms of `pread` is **5.5-7.3 GB/s**, where `#21` measured an isolated
+fill at 13-14 GB/s against a 13.8 GB/s ceiling. One miss (17.9 MB, one shard, six ranges) takes 3.8-
+4.7 ms and three misses across three shards take 10.2-10.7 ms. `DeepSeekV41ExpertStreamer` accumulates
+`secondsReading` as the WALL time of the concurrent batch, so this is not a per-thread sum showing up
+as wall time. The host's half of the hand-off is 74-98 ms of the position and it is running at about
+half the disk.
+
+### Every probe starts in a tenth of a millisecond, whatever it binds
+
+The probe's own pickup against the expert half's, per arm, median over the 40 layers of one position:
+
+| probe | window | probe pickup | the expert half behind it |
+|---|---|---|---|
+| one clear, nothing bound | 0.0027 ms | **0.1040 ms** | 1.7743 ms |
+| three of them, back to back | 0.0025 ms each | **0.1040 / 0.1018 / 0.0968** | 1.6418 ms |
+| one, eight dispatches | 0.0093 ms | **0.1072 ms** | 1.4803 ms |
+| one, reading a resident expert's arena slot | 0.0027 ms | **0.1094 ms** | 1.6229 ms |
+| one, reading the gathered key rows | 0.0025 ms | **0.1033 ms** | 1.3044 ms |
+| one, binding thirty shard allocations | 0.0027 ms | **0.1000 ms** | 1.2872 ms |
+| one, reading 4 KB the host just wrote | 0.0025 ms | **0.0993 ms** | 1.6303 ms |
+| one, reading 16 MB the host just wrote | 0.0027 ms | **0.1026 ms** | 1.4455 ms |
+
+Read that as a set of eliminations. The stall after the commit is not the queue (a probe is handed the
+same empty one), not the cadence of committing into it (three commits in a row, each 0.1 ms), not how
+much work the buffer carries (eight dispatches, a 3.4x wider window), not one arena binding, not the
+workspace, not the length of the resource list (thirty allocations against a probe's two), and not
+CPU-dirtied shared memory (16 MB `memset` on the host immediately before the commit). In 0 of 40
+layers was any probe still running when the expert half started -- so the queue was idle again, in
+both senses, before the expert half was.
+
+### And it is still the walk's I/O
+
+The same arm separates the two sides. A layer whose experts were all resident reads NOTHING and still
+shows a host gap of 0.15-0.20 ms and a pickup of 1.14-2.76 ms, while in the zero-fill ARM -- where no
+layer of the position reads anything at all -- all forty pickups are 0.069-0.547 ms (median 0.095).
+Within a reading arm a layer's own fill predicts nothing: correlation +0.05 with its own bytes, -0.19
+with the previous layer's, +0.07 with its own read seconds, +0.00 with slots allocated (plain A).
+
+So the stall is a property of the MACHINE while the walk has been reading, not of the buffer that
+waits in front of it. That is `#49`'s own closing sentence -- "what is left is the state the machine
+is in, not the shape of the work" -- now with the "shape of the work" half measured instead of
+assumed.
+
+### What it means
+
+- **The stream's price is confirmed, and it is larger than `#49`'s headline.** On this arm the hand-off
+  is 205 ms of a 275 ms position: 98 ms of host gap (90 ms of it `pread`) and 107 ms of post-commit
+  stall. Any miss the arena stops making is worth its bytes AND the stall that follows them.
+- **The fill has a second lever nobody has priced: it runs at 5.5-7.3 GB/s in a walk.** Its reads are
+  issued per shard batch, `concurrentPerform` over the batches, and a one-miss layer is one batch of
+  six ranges -- so a layer that misses one expert reads 17.9 MB at 3.8-4.7 GB/s where the disk serves
+  13.8. That is 40-50 ms of a position, and unlike the arena's hit rate it needs no policy.
+- **The post-commit stall has no in-buffer lever left.** Every shape a probe can hold starts in a
+  tenth of a millisecond; the only remaining attacks on it are structural -- fewer hand-offs per
+  position (the batched block path), or giving the GPU work from somewhere else while a hand-off
+  happens (two streams).
+
+### What it is not (do not re-propose)
+
+- **Not the submission, the cadence, the dispatch count or the resource list.** Measured above, one
+  arm each.
+- **Not one arena binding, not the gathered rows, not CPU-dirtied shared memory.**
+- **Not the CPU cache writeback or a flush/fence.** `#49`'s alternating pair.
+- **Not `F_NOCACHE`.** 2.2x loss, `#21`. **Not merging buffers.** `#48`.
+
+### Verification
+
+`DeepSeekV41PublishedTurnTests.testWhatEachLayersExpertHalfHandoffCosts` is opt-in behind
+`/tmp/dynamoe_dsv41_layer_gaps` on top of the class's `/tmp/dynamoe_dsv41_real_turn`. It now walks the
+real checkpoint fifteen times -- a discarded warm-up, the alternating read-back pair, the zero-fill
+arm, the partial-fill arm, and eight probe arms -- asserting 40/40 windows in every arm and printing
+each arm's per-layer rows and its parts-versus-wall line, so every number here can be recomputed from
+the log rather than trusted.
+
+The full DeepSeek suite is **570 passed / 0 failed / 63 skipped** (95 classes, 633 cases), and the same
+run under `MTL_DEBUG_LAYER` is **570 / 0 / 63 with 0 validation errors and no failed assertions**. The
+published numbers are the app's own `-O` build in `/tmp/dd_dsv41_opt`, fourteen arms of 202 positions
+in ~11 minutes, load average 2.4-3.7. The usual caveat stands: the suite reads **573 / 0 / 60**
+whenever `/tmp/dsv41_indexer_inputs.json` is present, so a count that moves by three is that file.
+
+## DSV4.1 #51: THE FILL'S FAN-OUT IS NOT WHY A WALK'S FILL IS SLOW -- THE SHIPPED FORM IS THE FASTEST ONE, AND EVERY DEEPER QUEUE LOSES 1.3-2.7x IN SITU
+
+`#50` closed with one lever nobody had priced: a walk's expert fill runs at **5.5-7.3 GB/s** in
+555.8 MB per position, where the isolated fill the arena was tuned against measures 13-14 GB/s
+(`#21`), and a one-miss layer's 17.9 MB takes 3.8-4.7 ms where the disk would take 1.3. The
+hypothesis that followed from the code was the fan-out's depth: `ensureResident` groups misses by
+shard and one shard's ranges fan out inside the reader, so a layer that misses ONE expert issues
+**six** requests of 5.5 MB and no more, however large they are.
+
+### Question
+
+Is the walk's fill slow because it is too shallow, or because of the machine it runs on?
+
+### What was added
+
+- **`DeepSeekV41FillForm`** (`.shardBatched` shipped, `.chunked(bytes:)`, `.serial`) on
+  `DeepSeekV41ExpertStreamer.fillForm`, and `chunkBytes`/`sequential` on
+  `DeepSeekV41ExpertShardReader.read`. `.chunked` splits each range into pieces and fans the PIECES
+  out (deeper queue for the same bytes); `.serial` issues one read at a time. `chunkBytes = 0` is the
+  shipped path, unchanged.
+- **`DeepSeekV41FillSample`** (`misses`, `shards`, `ranges`, **true bytes requested from the file**,
+  `seconds`) behind `recordsFillSamples`. The byte count is the ranges' own lengths, not the slot's:
+  pricing traffic off the slot count (17.93 MB) instead of the bytes asked for (17.5 MB) makes a
+  comparison against the disk's rate wrong by 2%.
+- `DeepSeekV41FillThroughputTests`, opt-in behind `/tmp/dynamoe_dsv41_fill_measure`, two cases: the
+  isolated decomposition and the in-walk A/B.
+
+### The harness's own control caught the harness first
+
+The first sweep ran the arms in a **fixed order** and reported the shipped form at 4.26 ms for
+17.9 MB while `.chunk 8 MB` reported 1.30 ms. Those are the **same code path**: every published range
+is smaller than 8 MB, so splitting is the identity. The difference was position in the round — the
+first arm of each round reads against a colder page cache. With the order **rotated by the round** and
+six rounds (one per arm, so every arm is measured at every position) the two agree exactly:
+
+| form (identity pair) | misses 1 best | misses 1 median | misses 6 best |
+|---|---|---|---|
+| `.shardBatched` (shipped) | 0.86 ms (21.8 GB/s) | 1.67 ms (10.8) | 2.63 ms (42.8) |
+| `.chunk 8 MB` (the identity) | 0.80 ms (23.6 GB/s) | 1.70 ms (10.5) | 2.58 ms (43.7) |
+
+That pair is kept in the table on purpose. **Any A/B of a fill form that does not reproduce it is
+measuring the order.**
+
+### The isolated decomposition
+
+Same distinct `(layer, expert)` pairs, same rounds, same reader, into a Metal arena slot
+(`.shardBatched`) and into a malloc'd host buffer (the control), best of six rounds:
+
+| arm | misses 1 | misses 3 | misses 6 |
+|---|---|---|---|
+| `.shardBatched` (shipped) | 0.86 ms (21.8 GB/s) | 1.57 (35.9) | 2.63 (42.8) |
+| `.serial` | 1.24 (15.2) | 3.84 (14.7) | 7.32 (15.4) |
+| `.chunk 2 MB` | 1.33 (14.1) | 2.64 (21.4) | 4.23 (26.7) |
+| `.chunk 512 KB` | 1.46 (12.9) | 3.72 (15.2) | 7.28 (15.5) |
+| `.chunk 128 KB` | 1.42 (13.2) | 4.16 (13.5) | 8.35 (13.5) |
+| host fan-out (6) | | | 6.74 ms (16.7) |
+| host serial (6) | | | 11.35 (9.9) |
+| host chunk 512 KB (6) | | | 5.97 (18.9) |
+
+Three things fall out. **Concurrency helps** (serial is 2-3x slower), **deeper is not better** (128 KB
+is the worst arm at every count), and the **destination is not the problem**: the same ranges into a
+malloc'd buffer through the same reader are not faster than into an arena slot at the same shape.
+
+### In situ, the shipped form wins every round
+
+Three walks of 42 positions per arm, one arm order per round, a real tokenized text stream per walk
+(distinct streams, because the arena serves a second walk over the same tokens for free -- `#26`):
+
+| round | `.shardBatched` | `.chunk 2 MB` | `.chunk 512 KB` |
+|---|---|---|---|
+| 0 | **12.8 GB/s, 205.0 ms/position** | 7.3, 331.2 | 4.8, 448.3 |
+| 1 | **5.9, 387.8** | 6.0, 357.8 | 4.6, 476.9 |
+| 2 | **6.7, 339.0** | 6.0, 353.6 | 4.8, 405.3 |
+
+`.chunk 512 KB` is 1.4-2.7x slower per byte and costs the walk **240 ms per position** in round 0.
+The mechanism is the one the isolated table hints at and the walk makes obvious: a 5.5 MB `pread` gets
+the file's sequential coalescing and readahead, and 512 KB of it does not. **Deepening the queue
+trades coalescing for parallelism on a device where the parallelism was already there.**
+
+### What the numbers say the fill's rate actually is
+
+Rate is a function of **misses per fill**, not of the form. In the walk, `.shardBatched` at 1.7-2.2
+misses per fill reads at 5.9-15.2 GB/s; in the same walk at 1 miss it reads at 3.8-4.7 GB/s (`#50`).
+The isolated arms say the same thing from the other side: 1 miss 11-22 GB/s, 3 misses 15-36, 6 misses
+16-43. A fill is **latency-bound while it carries one expert and bandwidth-bound once it carries
+three**, and that is a property of how many experts the router picked, not of the code that reads them.
+
+### What it means
+
+- **The fill's fan-out is closed.** The shipped form is the fastest form measured, in isolation and in
+  a walk, and the deeper forms lose 1.3-2.7x. The seam stays (`.chunked`/`.serial` are the baselines
+  those numbers were taken against) and `.shardBatched` stays the default.
+- **`#50`'s "5.5-7.3 GB/s" is not a code defect.** It is what a one-miss fill costs on a machine whose
+  page cache is being consumed by the arena's own reads. There is no form of that read that makes it
+  faster; there is only **fewer of them**, which is the batched block path's 2.16x and 7.6x less I/O
+  (`#22`) and is unchanged as the next lever.
+- **A probe that reports a rate must report misses per fill beside it.** Every fill number in this
+  project before this slice was an average over fills carrying between one and six experts, which is
+  the one variable that moves the rate by 3x.
+
+### What it is not (do not re-propose)
+
+- **Not the fan-out's depth.** Measured, isolated and in situ, both directions.
+- **Not the destination.** Arena slots and malloc'd host memory read at the same rate at the same
+  shape (16.7 against 16.6 GB/s for six experts); `#20`'s "the cost is this destination" is refined,
+  not contradicted: the cost is the machine's state, and `F_NOCACHE` (2.2x loss, `#21`) is still dead.
+- **Not the arena's slot allocation.** `#21` measured ~1 ms/position; it is inside the "total" column
+  here and never inside the fill's own seconds.
+- **Not thread-pool wake-up.** `.serial` exists so that claim could be checked: no concurrency is
+  *slower*, so the shipped path is not paying for a thread to be scheduled.
+
+### Verification
+
+`DeepSeekV41FillThroughputTests` (opt-in, `/tmp/dynamoe_dsv41_fill_measure`) runs
+`testWhatAFillsShapeCostsOnThePublishedCheckpoint` -- six forms x three miss counts x six rotated
+rounds, plus three host-buffer arms each with its own pairs -- and
+`testWhatAFillFormIsWorthInAWalk` -- three arms x three rounds of 42 real positions, reporting each
+walk's own bytes, fills, misses per fill, fill seconds and wall. The isolated case costs 4 s; the
+walk case 145 s at `-O`.
+
+The full DeepSeek suite is **570 passed / 0 failed / 65 skipped** (96 classes, 635 cases; the new
+class's two cases skip without the marker), and the same run under `MTL_DEBUG_LAYER` is
+**570 / 0 / 65 with 0 validation errors and no failed assertions**. Two harness bugs were found and
+fixed on the way, both worth carrying: an engine returned out of scope unmaps the `bytesNoCopy` shard
+buffers under the runtime, which surfaces as a SIGSEGV at an address in the middle of nowhere (484 GB
+here) inside a gain-vector widen; and a stale test bundle in `-derivedDataPath /tmp/dd_dsv41_opt`
+reported a line number from the pre-edit source, which is what made a build look like a crash.
+
+## DSV4.1 #52: A BATCHED PREFILL'S TIME IS NOW FULLY ACCOUNTED, AND IT IS STILL 57-77% WAITING
+
+### Question
+
+Routing picked `block_prefill_cost` at 0.997 / 0.996, on `#51`'s conclusion that the only remaining
+lever on the expert stream is FEWER fills, and on the fact that `DeepSeekV41BlockTiming` had never
+run on a published span. That type had three host buckets, folded the routing readback, the union
+fill and the mixture encode into one, carried no block wall time, and had none of the
+drain/late-start attribution `#50` gave the walk -- so "~215 ms per position of the batched form's
+own cost is unexplained" was a statement about the INSTRUMENT as much as about the code.
+
+### What was added
+
+Additive, off in every production path, and nothing in the shipped walk changed:
+
+- `DeepSeekV41BlockTiming` gained `wallNanoseconds` (the block's own wall, embedding pass included),
+  `embeddingNanoseconds`, `routingReadbackNanoseconds`, `expertFillNanoseconds` (split out of
+  `mixtureEncodeNanoseconds`), `fillMisses`/`fillBytes` (from the streamer's own counters),
+  `blocks`, `positionCount`, and the four drain/late-start fields -- the same attribution the walk
+  got in `#48`/`#50`, computed in `settlePending` under `recordsBlockTiming`. The block path commits
+  its mixture WITHOUT a wait, so a mixture's drain lands in the next layer's settle: that is the
+  block's hand-off, and a bucket total cannot say so.
+- Two published-checkpoint cases: `testWhereABatchedPrefillsTimeGoesOnThePublishedCheckpoint` (a
+  tokenized text stream at 128 and 1,005 positions, both layouts, two rounds with the arm order
+  rotated) and `testWhereAPicturesPrefillGoesOnThePublishedCheckpoint` (the composer's own largest
+  picture, real pixels through the tower, one round -- each arm reads 218 GB, larger than this
+  machine's RAM, so there is no page cache for the rotation to protect against).
+
+### The block's whole cost, on the checkpoint's own weights
+
+Three regimes, `-O`, load 2.6-3.7. Every figure is ms per position; "host" is the sum of the host
+buckets, which is also the harness's own whole-vs-parts control:
+
+| regime | block | walk | ratio | host/wall | dense encode | front wait | expert fill | mixture encode | device |
+|---|---|---|---|---|---|---|---|---|---|
+| 128 text positions, 39 misses/pos | **197.0** | 288.4 | 1.46x | 98% | 28.6 | 96.3 | 65.9 | 1.6 | 52.3 |
+| 1,005 text positions, 8.5 misses/pos | **128.7** | 159.2 | 1.24x | 98% | 23.0 | 77.5 | 23.7 | 1.6 | 46.0 |
+| 1,005 positions, largest picture, 12 misses/pos | **117.1** | 183.8 | 1.57x | 98% | 17.6 | 67.3 | 28.5 | 1.6 | 41.5 |
+
+**Nothing is unexplained.** The buckets sum to 98% of the block's wall in all three regimes -- the
+same tile the walk got in `#50` (96-97%) -- and the answer to the open question is that the batched
+form spends 57-77% of a position in `frontWait`, not in its kernels. The mixture's own device work is
+25-38 ms of that position; the rest is the hand-off.
+
+**The mixture's LATE START survives batching.** Per position: 65.4 ms at 128 text positions, 50.2 at
+1,005 text, 40.5 on the picture -- i.e. 33%, 39% and 35% of the block's whole position is time the
+queue had not yet begun the mixture after the host started waiting. `#48` found the same stall on a
+walked position (69-101 ms) and `#49`/`#50` traced it to the expert half and ruled out every command
+buffer a probe can build. Batching removes dispatches, round trips and (below) bytes; it does not
+touch this, because the readback that empties the queue is still between the two halves.
+
+**Batching's real, attributable win is the fill's shape.** The union fill carries 1.1-2.4 misses per
+fill where a walk's carries ~0.3, and `#51`'s law says a fill reads faster the more it carries: the
+picture's 213.2 GB costs **28.5 ms/position batched at 7.4 GB/s against 39.2 ms/position walked at
+5.4 GB/s**, on byte counts that differ by 0.3% (218,312 against 218,886 MB). That is 10.7 ms/position
+of the 66.7 ms gap, measured rather than argued.
+
+### `#46`'s 0.74x does not reproduce, and that is the finding
+
+`#46` measured the composer's largest picture at 345.62 / 355.22 / 386.90 s batched against
+255.98 / 268.05 / 278.38 s walked -- 0.74x -- and that number is why the turn still WALKS an image
+prompt. This run reproduces the prompt exactly (1,005 positions, 994 image rows, 12,176 against
+12,208 misses, 218,312 against 218,886 MB) and gets **117.7 s batched against 184.8 s walked, 1.57x**.
+Both arms here are ~2x faster in absolute terms than in `#46`, on the same bytes.
+
+The order argument cannot rescue either number, and it is why this matters:
+
+| run | first arm | second arm | result |
+|---|---|---|---|
+| `#46` | walk | block (cache-warm) | block 0.74x |
+| `#52` | block (cache-cold) | walk (cache-warm) | block 1.57x |
+
+The arm that ran second had the page-cache advantage in both, and the outcome reversed. So the ratio
+at this span is not stable across runs, and **the shipped-path decision rests on a measurement that
+flipped sign between two runs of the same prompt** -- not on a mechanism. Until a single process
+alternates the arms over several rounds and reports both, neither layout can claim this span, and the
+`DeepSeekV41TurnRunner` comment that cites 0.74x should be read as "measured once, under one machine
+state".
+
+What the regime table DOES show is that `#46`'s mechanism was wrong in a way that matters: it
+attributed the loss to bulk eviction costing more than the round trips save, but the two layouts read
+the same bytes on that prompt (0.3% apart), so no eviction count can explain an 84 ms/position gap.
+The gap batched wins is the fill's rate plus the round trips, and the gap it pays is a wider union.
+
+### The first real-weight per-stage table
+
+On one block of eight positions, the dense half's own device windows, largest first (ms for the whole
+block, share of the dense half):
+
+| stage | ms | share |
+|---|---|---|
+| `queryUp` | 45.1 | 20.0% |
+| `outputUp` | 43.3 | 19.2% |
+| `outputDown` | 37.8 | 16.8% |
+| `indexer` | 24.3 | 10.8% |
+| `queryDown` | 10.6 | 4.7% |
+| `latentProject` | 8.7 | 3.9% |
+| `engram` | 8.7 | 3.8% |
+| `router` | 8.0 | 3.5% |
+| `writeLatent` | 4.3 | 1.9% |
+
+Every stage table in this journal before now was taken on the synthetic fixture, where `writeLatent`
+was 29.4% of the dense half. On the checkpoint's own weights it is 1.9%, and 67% sits in three BF16
+GEMVs plus the indexer. Two caveats, both measured: the table is not additive into the block table
+(its total is ~2x the in-situ dense device, because each stage now owns a command buffer and pays its
+own pickup -- `#16`'s warning), and its `calibration(8 dispatch)` row (1.15 ms) is a floor the table
+cannot be corrected by, only read beside.
+
+### What it means
+
+- **The batched prefill's cost is accounted, and it is not the batched prefill's kernels.** 57-77% of
+  a batched position is the same hand-off the walk pays. A change that removes dispatches from the
+  dense or mixture halves cannot move these numbers; only fewer hand-offs or another stream's work
+  can (mechanism 109, unchanged).
+- **`#46`'s shipped-path decision is unstable, not wrong-when-measured.** Do not flip the turn to the
+  batched path on this run either: alternate the arms inside one process, several rounds, and require
+  the same sign twice.
+- **Any future block number must quote misses per fill and misses per position beside its rate**, for
+  the same reason `#51` requires it on a fill: the block's fill reads at 6.3-10.4 GB/s across these
+  three regimes purely because the router put 1.1-2.4 experts in each of them.
+
+### What it is not (do not re-propose)
+
+- Not a denser dense half: `denseEncode` is 12-22% of a batched position and part of that is the
+  indexer's second submission, which is a host value by contract (mechanism 11).
+- Not a wider block: width is capped at 8 by `chunkSlots`, and `#18` measured sixteen positions
+  losing per position on the synthetic fixture.
+- Not the arena: `#21` moved capacity 3,760 -> 4,637 with identical bytes on a walk, and this run's
+  union fills (1.1-2.4 misses each) are already the shape `#51` says reads fastest.
+- Not the vision tower: it is 6.9 s of a 118-185 s prefill on the largest picture, and its mechanical
+  levers are closed in `#44`/`#45`.
+
+### Verification
+
+Two new cases in `DeepSeekV41PublishedTurnTests`, both opt-in:
+`testWhereABatchedPrefillsTimeGoesOnThePublishedCheckpoint` (`/tmp/dynamoe_dsv41_block_span`, 128
+positions, 152 s; `/tmp/dynamoe_dsv41_block_span_long` adds the 1,005-position arm, 728 s) and
+`testWhereAPicturesPrefillGoesOnThePublishedCheckpoint`
+(`/tmp/dynamoe_dsv41_block_span_picture`, 315 s). The shipped walk and the block path are byte-identical
+in behaviour: the additions are clock reads behind `recordsBlockTiming`, which is off in production,
+plus an `if let residents {` that binds the same value the old `if let residents = try ...` did.
+
+Two unit bugs were caught by the harness's own control rather than by the numbers looking wrong, and
+both are worth carrying: `millisecondsPerPosition()` divided by `positions`, which counts one entry per
+LAYER per position, so every bucket read as "ms per position-layer" (5.3 against a wall of 197.0, i.e.
+40x low); and the fix, deriving the position count from `positions / layers`, truncated on a
+1,004-position prefill's short last block and inflated the 1,005-position arm by 14%. `positionCount`
+is stored now, and `describe()` prints both the wall it must tile and the share it tiles.
+
+## DSV4.1 #53: THE PREFILL DECISION REPRODUCES, THE MARGINS DO NOT, AND A FIRST PASS IN A YOUNG PROCESS IS WORTH MORE THAN EITHER LAYOUT
+
+### Question
+
+`#52` left the turn's walk-vs-block decision resting on a number that flipped sign between two runs of
+the same prompt: `#46` measured the composer's largest picture at 0.74x batched (walk first in the
+process), `#52` re-ran it at 1.57x (block first), on the same 1,005 positions, the same misses and the
+same 213 GB. Routing picked `prefill_decision_revalidation` at 0.961 / 0.952 and said do not touch a
+shipped path (0.010), so this slice alternates the two layouts inside ONE process over four rounds on
+that exact prompt, prints every round instead of a best-of, and adds the identity pairs the harness
+needs to know its own noise floor.
+
+### What was added
+
+`testWhetherTheBatchedPrefillDecisionHoldsInsideOneProcess` (the composer's own largest picture) and
+`testWhetherBatchingATextPrefillPaysInsideOneProcess` (the `#52` text stream at 128 positions, plus
+1,005 behind a second marker), both opt-in, sharing one private `measurePrefillSign` helper: arm order
+alternates every round, every round is printed, each arm prints its own whole-vs-parts line, and the
+harness prints its identity pairs, its per-arm spread, its byte check and, from `#53` on, the slot
+`MTLBuffer`s each pass created. No shipped path changed.
+
+### The result, three processes
+
+`walk / block`, so a figure above 1 means the batched form won. Round 1 of each case is marked: it is
+the pass that ran first on a freshly created runtime, and it is the one both earlier measurements
+quoted.
+
+| prompt | round 1 | rounds 2-4 | steady state | spread (block / walk) |
+|---|---|---|---|---|
+| text, 128 positions (3 runs) | 1.39-1.42 | 1.03-1.07 | **1.04-1.05** | 1.48x / 1.11-1.13x |
+| text, 1,005 positions (young process) | 1.25 | 1.24, 1.24, 1.23 | **1.24** | 1.04x / 1.02x |
+| text, 1,005 positions (aged process) | 1.26 | 1.05, 0.95, 0.95 | 0.98 | 1.66x / 1.26x |
+| largest picture, 1,005 positions (run A) | 1.55 | 1.00, 0.96, 0.92 | **0.96** | 1.73x / 1.04x |
+| largest picture, 1,005 positions (run C) | 0.87 | 0.84, 0.77, 0.79 | **0.80** | 1.07x / 1.12x |
+
+- **The text prefill decision holds, at 4-24% rather than 46%.** At 128 positions three independent
+  processes agree on 1.04, 1.05 and 1.05, in every round after the first. At 1,005 positions one
+  process measured 1.23-1.25 in all four rounds with identity pairs of 0.98 and 0.99; `#52`'s 1.24x
+  reproduces exactly, and so does its 1.46x -- as the 128-position arm's ROUND ONE.
+- **The image prefill decision holds, at 4-20% rather than 26%.** The walk is ahead in every round of
+  both picture runs once past the first pass (0.92-1.00 and 0.77-0.87), so `#46`'s direction was right
+  and `#52` was wrong to overturn it. The block's only win on that prompt (1.55x) is a round one.
+- **`#46`'s 0.74x understated it and `#52`'s 1.57x overstated the other way; both are first-pass
+  numbers.** 0.74x is close to run C's steady 0.80; 1.57x is close to run A's round-one 1.55.
+
+### A first pass in a young process is 1.3-1.6x faster, in every bucket of the batched arm
+
+The batched arm's own clock, per position, first pass against the same arm later in the same runtime:
+
+| case | dense encode | expert fill | device | fill rate |
+|---|---|---|---|---|
+| text 128, round 1 -> 2 | 31.5 -> 42.0 ms | 66.2 -> 102.9 ms | 54.0 -> 69.0 ms | 10.4 -> 6.7 GB/s |
+| largest picture, run A round 1 -> 2 | 17.8 -> 29.0 | 28.5 -> 41.4 | 42.3 -> 55.4 | 7.4 -> 5.1 GB/s |
+
+Every bucket moves together -- host command encoding, pread throughput and the GPU's own windows -- on
+byte counts and miss counts that are identical to the digit (218,312 MB and 12,176 misses in all four
+picture rounds; 90,025 MB and 5,021 at 128 text positions). The walk is nearly insensitive to it
+(device 62.3-63.9 flat, fill 38.7-41.3 flat on the picture), because its wall is the per-layer
+hand-off rather than a throughput term, so the artefact always hands the win to whichever arm runs
+first. That is exactly what `#46` (walk first) and `#52` (block first) each measured.
+
+The slot counters close one hypothesis and leave another open. A runtime allocates its 3,760 slot
+`MTLBuffer`s lazily on first write and never frees them, so a fresh runtime's first prefill creates
+them: 2,554 at 128 text positions, 2,913 on the picture, and **0 in every later pass**. But run C's
+picture case created 2,913 of them in round one and was NOT fast (316.5 ms/position, 3.5 GB/s), while
+run A's identical round one was (119.3 ms/position, 7.4 GB/s). The difference between the two runs is
+the process's age (5 minutes against 45), so the state that matters is the process's, not the
+runtime's, and what turns it is not established here. What is established is that quoting a runtime's
+first prefill as a layout's ratio is invalid.
+
+### What it means
+
+- **Both shipped decisions survive.** Text prefills batch (1.04-1.05x at 128 positions, 1.23-1.25x at
+  1,005); image prefills walk (the walk is ahead by 4-20%). Neither margin is what the code comments
+  claimed, and the comments now quote this table.
+- **A prefill A/B needs three things this one now has**: every runtime's first pass discarded,
+  arm order alternated per round, and the identity pairs printed beside the ratio. The identity pairs
+  here range 0.60-0.68x for a batched arm and 0.79-1.12x for a walked one, i.e. wider than every
+  effect measured -- so a single-pass comparison cannot resolve the layout at ANY of these spans.
+- **The margins are single-digit on the picture and on 128-position text, and 24% at length.** That
+  reframes what a batching change is worth: not the 1.5-2x `#46` reported at short spans, but a few
+  percent there and ~20% on a long prompt whose working set still fits the arena.
+
+### What it is not (do not re-propose)
+
+- Not a reason to flip either shipped path. The routed instruction was measurement-only, and the
+  steady state agrees with what ships.
+- Not thermal: `ProcessInfo.thermalState` read `nominal` in all twelve rounds.
+- Not the page cache: the two layouts read within 0.26-0.63% of the same bytes in every case, and the
+  runs whose bytes exceed RAM show the same first-pass effect as the ones that fit.
+- Not the arena's capacity or its eviction policy (`#21`), and not the fill's form or fan-out (`#51`).
+
+### Verification
+
+Both cases are opt-in and both skip without their markers:
+`testWhetherTheBatchedPrefillDecisionHoldsInsideOneProcess` (`/tmp/dynamoe_dsv41_prefill_sign`, 1,495 s
+and 2,365 s across two runs) and `testWhetherBatchingATextPrefillPaysInsideOneProcess`
+(`/tmp/dynamoe_dsv41_prefill_sign_text`, 302-1,754 s; `_text_long` adds the 1,005-position arm;
+`_quick` halves the rounds for a harness check). Every run used `touch` and `rm -f` in the same
+command. Three processes over ~70 minutes: `/tmp/test53_sign3.log` (text 128 + picture),
+`/tmp/test53_sign4.log` (text 128 + 1,005) and `/tmp/test53_sign5.log` (all three, with the slot
+counters).
+
+## DSV4.1 #54: THE FIRST-PASS ADVANTAGE IS NOT THE PROMPT, NOT THE ALLOCATION, AND NOT THERMAL, SWAP OR THE PAGE CACHE
+
+### Question
+
+`#53` found every throughput bucket of a batched prefill 1.3-1.6x slower once a process had warmed,
+gave the effect a precise magnitude and left its cause open. The app lives in the slow state for every
+prefill after its first, so a cause here is worth 30-60% on every batched prefill. Routing picked
+`first_pass_state_cause` at 0.992 / 0.990 and said do not touch a shipped path (0.008), so this slice
+reads the kernel's own memory accounting (`task_vm_info` plus `host_statistics64`) beside the
+existing buckets and tests each candidate with a controlled pass sequence.
+
+### The passes, on one runtime, on identical work
+
+Every pass below reads the same prompt, and every one of them reads 90,025 MB in 5,021 misses, i.e.
+7.8 misses per fill (`#51`'s law held fixed by design). Two prompts (P and Q, the same paragraph
+rotated differently) alternate so a pass never carries the previous pass's expert set. Run A
+(`/tmp/test54_state4.log`):
+
+| pass | ms/position | dense encode | front wait | expert fill | fill rate | device | slot buffers created |
+|---|---|---|---|---|---|---|---|
+| P, 1st | **234.1** | 33.3 | 117.9 | 75.2 | **9.1 GB/s** | 60.0 | 3,760 |
+| Q, 1st | 310.7 | 41.5 | 139.5 | 119.4 | 5.7 GB/s | 63.6 | 0 |
+| P, 2nd | 308.5 | 46.9 | 142.8 | 110.4 | 6.2 GB/s | 65.0 | 0 |
+| Q, 2nd | 314.8 | 46.4 | 144.6 | 114.9 | 6.0 GB/s | 63.9 | 0 |
+
+Two more runs of the same case reproduce the shape with different absolute levels: 9.6 -> 7.4 -> 6.9
+-> 6.7 GB/s (`/tmp/test54_state3.log`) and 8.6 -> 6.4 -> 6.2 -> 5.4 under the layer hook
+(`/tmp/test54_state5.log`). The first pass of a fresh runtime has measured 197.1, 232.4, 234.1, 301.6
+and 316.5 ms/position on this identical work, i.e. a 1.6x spread BETWEEN processes, while the decay
+inside a process is always 1.3-1.5x.
+
+### What the candidates do
+
+| candidate | test | verdict |
+|---|---|---|
+| the prompt / its expert set | a second pass on a DIFFERENT prompt (Q) is as slow as a second pass on P; misses 4,998 against 5,021 | **out** |
+| the arena's slot allocation | the allocating pass is not reliably fast: first passes created 2,554-3,760 slot buffers and ranged 197-317 ms/position, and the aged picture pass in `#53` created 2,913 and was the slowest of its set | **out** |
+| thermal throttling | `ProcessInfo.thermalState` read `nominal` in every round of every run | **out** |
+| swapping | 0 swapins in run A and 131,072 in another; swap used 2.0-2.1 GB unchanged across passes | **out** |
+| the page cache | every pass reads the same 90,025 MB from the shards; the byte count does not move | **out** |
+| misses per fill (`#51`) | 7.8 per fill in every 128-position pass, 5,021 misses each | **ruled constant** |
+| the arena's size | the quarter-arena control (1,202 slots) doubles misses per fill to 16.2 and read 6.0-6.5 GB/s at HIGHER compression and pressure 2, so its rate says nothing about compression | **withdrawn, uninterpretable** |
+| unified-memory compression | every memory counter is FLAT or FALLING while throughput falls: task `compressed` 37.5 -> 36.4 GB and the GRAPHICS ledger's compressed share 13.1 -> 11.9 GB in one run, 53.4 -> 51.6 and 29.7 -> 25.3 GB in the other, the machine's compressor 13.8 -> 12.5 and 30.1 -> 25.8 GB | **out** |
+
+The process's memory is genuinely squeezed, and that is worth knowing on its own: after one pass the
+footprint is 74.5 GB, 36-53 GB of it compressed, the machine's compressor holds 12-30 GB, and every
+128-position pass costs 4.7-8.4 MILLION decompressions. But the squeeze eases as the run proceeds
+while throughput falls, in both runs that carry the counters, so the decompressions are a consequence
+of the arena existing rather than what the fill pays for.
+
+**What the decay is made of is the FILL, and almost only the fill.** The last run's buckets, per
+position: expert fill 91.3 -> 120.2 -> 124.3 -> 123.3 ms (+35%), front wait 31.3 -> 36.6 -> 36.2 ->
+35.9 (+17%), device 60.6 -> 67.0 -> 63.8 -> 64.6 (+7%). So the same 90,025 MB is re-read at 7.5 GB/s
+on a runtime's first pass and at 5.5 GB/s on its fourth, in one process, with the same 5,021 misses and
+the same 7.8 misses per fill. That is a disk-path term, not a memory term and not a kernel term.
+
+### Two things worth carrying
+
+- **A per-block split cannot be taken with the existing hook, and the hook is not free.** It ends with
+  its own `settlePending()`, so installing it serialises the path a layer at a time. Two runs minutes
+  apart, one without the hook and one with it, put the same arm at 234.1 and 232.4 ms/position, so the
+  WALL does not move, but the recorded front wait collapses from 117.9 to 27.1 ms/position, because
+  there is then never queued work to wait on, and the buckets stop tiling the wall (49% against 96%).
+  Its absolute numbers are therefore not comparable with an unhooked run, and its per-block split was
+  noisy enough to disagree with itself between runs, so no block-level claim is made here.
+- **The block path's per-layer `settlePending` is free, and its overlap buys nothing.** The diagnostic
+  hooks settle after every layer, which serialises the path; the same arm's wall time did not move
+  (232.4 against 234.1 ms/position measured both ways) while the recorded front wait collapsed from
+  117.9 to 27.1 ms/position, because there is then never queued work to wait on. That is `#52`'s
+  "57-77% waiting" seen from the other side: the queue is empty anyway, so nothing was being overlapped.
+
+### What it means
+
+- **Do not quote a prefill number without the process's position in it.** A runtime's first pass is a
+  different machine, and the effect is larger than every layout margin `#53` measured.
+- **The next experiment has a shape, and it is about the disk path.** The decay is a pread rate, so
+  the lever is whatever makes the same bytes read 1.35x slower on a runtime's fourth pass than on its
+  first: sample per-fill rates through `recordsFillSamples` across passes (the streamer already records
+  chicken bytes, pread seconds and placement separately), then separate "the volume of I/O this process
+  has issued" from "the file cache's state" by repeating the passes after a rest, and by reading a
+  DIFFERENT set of shard ranges (a prompt whose experts live in other files) so a per-file effect
+  cannot hide behind a per-process one. If the rate recovers after a rest, it is I/O throttling or
+  thermal on the controller rather than anything in this code.
+
+### What it is not (do not re-propose)
+
+- Not the fill's form, fan-out, chunk size, `F_NOCACHE` or destination (`#51`), not the arena's
+  capacity or eviction (`#21`), not a wider block or a denser dense half (`#52`), not the attention's
+  shape (`#17`), not a second command queue without a probe (`#48`).
+- Not a reason to add a shipped knob. The routed instruction was measurement-only and nothing here
+  changes a production path; the probe installs its hook only inside the test.
+- Not unified-memory compression, which was the leading candidate going in and is now ruled out by its
+  own counters falling as throughput falls.
+
+### Verification
+
+`testWhatTurnsABatchedPrefillsStateInsideOneProcess` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_state_probe`), 154-507 s at `-O`. It prints, per pass, the block buckets, the
+streamer's counters and slot allocations, the task's footprint/graphics/compressed/purgeable ledgers,
+decompressions, swapins, the pressure level, `MTLDevice.currentAllocatedSize`, the machine's compressor
+and free pages and swap used, and the first block's cost apart from the rest. Runs:
+`/tmp/test54_state1.log` (8 passes, no machine counters), `_state2.log` (the withdrawn quarter-arena
+phase), `_state3.log` (machine counters), `_state4.log` (the P/Q alternation), `_state5.log` (with the
+layer hook). Every run used `touch` and `rm -f` in the same command, and the quarter-arena phase's
+`UserDefaults` seam was removed with the phase (verified with `defaults read`, which finds no key).
+
+## DSV4.1 #55: THE WARMED PREFILL PENALTY IS THE ARENA'S DESTINATION PAGES, NOT THE DISK -- AND THE FILL DECAYS WITHIN ITS OWN FIRST PASS
+
+`#54` left one sentence standing: the expert fill re-reads the same 90,025 MB at 7.5 GB/s on a
+runtime's first pass and 5.5 on its fourth, with misses per fill unchanged, and no counter the runtime
+owns explains it. Every explanation it could name had been tested from inside the fill. This slice asks
+from outside the fill instead: it probes a fixed 1.1 GB of expert ranges through its own descriptors,
+before the first pass and after every one, into four kinds of destination, and it samples every fill of
+every pass.
+
+### The probe
+
+One runtime, the `#52`/`#53`/`#54` 128-position stream, four passes with the arena reset before each,
+and a 1.1 GB probe (64 fixed `(layer, expert)` pairs, six contiguous ranges each, grouped per shard and
+read concurrently exactly as a fill reads) at six points: before any pass, after each of the first
+three, after a 20 s rest, and after the fourth.
+
+| phase | pass ms/pos | fill GB/s | host cold | host repeat | metal resident | scratch | fresh host | fresh metal | free GB | machine compressor GB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| before any pass | - | - | 14.7 | 96.0 | 75.6 | 16.5 | 55.3 | 59.2 | 64.8 | 0.1 |
+| P1 | 238.2 | **8.4** | | | | | | | | |
+| after P1 | | | 0.7 | 61.7 | 97.7 | 10.5 | 21.2 | **3.4** | 0.1 | 38.9 |
+| P2 | 315.4 | **6.4** | | | | | | | | |
+| after P2 | | | 14.1 | 89.1 | 95.3 | 9.9 | 25.7 | **2.5** | 0.1 | 30.1 |
+| P3 | 368.8 | **5.5** | | | | | | | | |
+| after P3 | | | 15.2 | 86.6 | 90.0 | 10.0 | 27.9 | **0.8** | 0.1 | 44.4 |
+| after a 20 s rest | - | - | 67.1 | 67.2 | 80.8 | 10.2 | 49.9 | **48.2** | 3.4 | 41.1 |
+| P4 | 325.0 | **6.3** | | | | | | | | |
+| after P4 | | | 13.6 | 83.6 | 92.9 | 10.0 | 23.7 | 10.6 | 0.1 | 28.2 |
+
+An earlier run of the same case without the two `fresh` arms reproduced the pass column (274.9, 340.5,
+332.1, 341.6 ms/position at 7.7, 5.9, 6.4, 6.0 GB/s) and the same flat probe columns (host cold 15.6 /
+15.1 / 12.7 / 14.7 / 16.1, host repeat 83-96, metal resident 72-98, scratch 5.6-10.9).
+
+### What it says
+
+- **The decay is inside the first pass, not between passes.** P1's fill runs 15.3 GB/s over its first
+  byte quartile, 13.4 over its second, 4.5 over its third and 8.9 over its fourth (the earlier run:
+  16.7 / 11.1 / 4.6 / 6.5). Every later pass starts where P1 ended (first quartile 10.4, 6.4, 10.0) and
+  stays there (6.4 / 6.0 / 6.3 / 4.2). So "a first pass is 1.3-1.6x faster" is really "the first ~20 GB
+  this process reads are fast, and it never comes back": a fourth pass after a 20 s rest is still 6.3
+  GB/s.
+- **Nothing outside the fill decays.** The checkpoint's own bytes read cold at 13.6-15.2 GB/s at every
+  phase, including after four passes (0.7 once, in a phase whose other arms read 61.7 and 97.7, i.e. a
+  stall rather than a decay). A file this test writes itself reads at 10.0-16.5 GB/s. Warm reads of the
+  same ranges run at 83.6-96.0 and resident Metal slots at 72.4-97.7. The disk, the page cache, the
+  process's read path and the destination TYPE are all flat across the run.
+- **The destination's RESIDENCY is what changed.** The same warm bytes written into fresh arena-shaped
+  slots run at **3.4, 2.5 and 0.8 GB/s** after the first three passes, against 90.0-97.7 into slots this
+  process already owns. Into a fresh HOST buffer the same bytes run at 21.2-27.9. That is the fill's own
+  rate (5.5-6.4) and no other arm is anywhere near it: the fill is reading from a fine source into a
+  destination the kernel has to make available first.
+- **One rest is enough to prove it is memory pressure and not Metal's allocation cost.** After 20 s idle
+  the machine had 3.4 GB free, and the same fresh-slot arm ran at 48.2 GB/s instead of 0.8. The
+  allocation path had not changed; the free memory had.
+- **What the arena costs is the machine's free memory.** Free memory goes 64.8 GB before P1 to 0.1 GB
+  after it, the machine's compressor 0.1 to 28-44 GB, the process's compressed total 0.0 to 53-64 GB,
+  the graphics ledger's compressed share 0.00 to 15-44 GB, and decompressions 3.5M to 27.3M over the
+  four passes. Those are the only counters that move with the fill, and they move with it in the right
+  direction; `#54` compared their TOTALS across passes, which drift either way, and so found them
+  "flat or falling" while the fill slowed.
+- **This is why the walked arm was insensitive in `#53`.** A walk's fill is already at 5.5-7.3 GB/s on
+  its first position (`#50`), because the arena has been filled and the machine squeezed before a single
+  token is decoded; the batched arm was measured while its arena was still growing, so the same decay
+  showed up as a 1.3-1.6x difference between its first round and its later ones.
+
+### What it means
+
+The turn's expert traffic is not waiting on the disk. It is waiting on the kernel to materialize pages in
+`storageModeShared` slot buffers while the machine has no free memory and is compressing those same
+buffers. The lever is therefore the arena's residency, not its capacity, its eviction order, its
+placement, or the read that fills it. The candidate to measure next (NOT to build on this evidence) is
+whether the slots can stay uncompressed or wired: any fix has to survive the two traps `#54` recorded
+(misses per fill must be held constant, and a smaller arena changes the rate by itself) plus the one this
+slice adds (`fresh` and `resident` destinations must both be measured, because they differ by 30x).
+
+### What it is not (do not re-propose)
+
+- Not the disk: 13.6-15.2 GB/s cold at every point in the process's life, and an unrelated file at
+  10.0-16.5.
+- Not the page cache: the same bytes read warm at 83-96 GB/s throughout, and a probe that nothing evicts
+  reads at 88.5 and 67.1 after rests.
+- Not the runtime's identity or its slot allocation: P2 allocates 0 slots and is as slow as P3, and a
+  second runtime built in the aged process ran at 3.3 GB/s (`#54`'s confound applies in reverse here:
+  that phase was at pressure level 2 with 138.7 GB compressed, so it is recorded, not relied on).
+- Not thermal (`nominal` in every round `#54` sampled), not swap (1.9 GB used, unchanged, and 0-131k
+  swapins across runs), not the prompt or its expert set (`#54`).
+- Not `F_NOCACHE`, a deeper fan-out, a different fill form, a wider block, a second queue or the
+  attention's shape (measured negatives, `#20`, `#21`, `#48`, `#50`, `#51`, `#52`).
+
+### Verification
+
+`testWhatMakesAProcessesReadsSlowerThanItsFirst` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_fill_decay`, plus `/tmp/dynamoe_dsv41_fill_decay_fresh` for the second-runtime
+phase), 192 s at `-O` for four passes and six probes. It prints, per pass, the block buckets, the
+streamer's counters, the per-fill minimum/median/maximum and the fill rate bucketed by cumulative bytes
+read; and per probe, six destination arms plus the task and machine memory accounting. Runs:
+`/tmp/test55_decay1.log` (four arms, with the second runtime) and `/tmp/test55_decay2.log` (six arms, no
+second runtime). Both used `touch` and `rm -f` in the same command, and no marker survived either.
+
+## DSV4.1 #56: THE FILL'S DESTINATION IS COMPRESSOR INPUT -- WIRING THE ARENA TAKES A PREFILL FROM 371 TO 172 ms/POSITION AND PUTS THE FILL BACK ON THE DISK'S CEILING
+
+`#55` left one sentence standing: the same warm bytes run at 0.8-3.4 GB/s into freshly made
+`storageModeShared` slots on a squeezed machine and 90-97 into slots the process owns, while the disk, the
+page cache and the process's read path stay flat. Its counters named the compressor, but a counter that
+moves with the fill is a correlation. A wired page is the one destination the compressor cannot take, so
+this slice makes that the variable.
+
+### The probe
+
+One runtime, the `#52`-`#55` 128-position stream, and a fixed 1.12 GB of expert ranges (64 pairs, 17.9 MB
+each) that are read cold once and then WARM for every arm, so the source is constant and only the
+destination differs. The arms: `resident metal` (written at every previous probe, cold to this one),
+`fresh metal` (`#55`'s arm), `touched metal` (the same new slots zeroed before the clock starts), `wired
+host` and `wired metal` (`mmap` + `mlock`, once as plain memory and once as the backing of arena-shaped
+`bytesNoCopy` Metal buffers), `fresh host` and `touched host`, and `resident footprint` (warm bytes
+rotated through a 4.48 GB destination four times the probe's size). Every arm reports the decompressions
+it caused. After each pass the arena's own slots are wired in rungs and the same pass is timed again,
+with misses per fill printed beside the rate.
+
+Two runs, and they agree to the millisecond where it matters. Run A (three rungs) and run B (four):
+
+| pass | run A ms/pos | run A fill GB/s | run B ms/pos | run B fill GB/s | misses/fill | decompressions (run B) |
+|---|---|---|---|---|---|---|
+| P1, unwired | 444.7 | 4.6 | 370.6 | 6.0 | 8.1 | +8.1M |
+| P2, 8 GB wired | 364.6 | 6.0 | 426.9 | 5.2 | 8.2 | +13.2M |
+| P3, 24 GB wired | 361.5 | 6.5 | 330.7 | 6.7 | 8.1 | +8.3M |
+| P4, **whole arena wired** (89.82 GB) | - | - | **173.8** | **13.0** | 8.2 | **+1.4M** |
+
+Run C repeated run B end to end: P1 324.3 / 6.3, P2 412.7 / 5.3, P3 374.6 / 6.2, P4 **171.8 / 13.0** with
+`device` 47.2 ms and `decompressions` +1.3M. So the fully wired pass is reproducible to 1% and the
+intermediate rungs are not: 8 GB of wiring is worse than none in both runs, 24 GB is a wash, and the
+whole arena is a different machine.
+
+The destination arms, after P1 in run B (pressure level 2, 0.1 GB free, compressor 62 GB):
+
+| arm | GB/s | decompressions | what it says |
+|---|---|---|---|
+| cold host (disk) | 12.6 | 0 | the disk is fine |
+| warm host | 84.3 | 0 | the page cache is fine |
+| resident metal | 47.5 | 14,787 | an unwired destination under pressure |
+| fresh metal | **1.9** | 0 | `#55` reproduced; the cost is materializing pages |
+| touched metal | 41.2 | 1 | pre-faulting recovers part of it |
+| wired host | **92.6** | 0 | the same bytes, wired |
+| wired metal | **99.8** | 0 | the same bytes, wired, as Metal slots |
+
+and after P3 in run A, which is the cleaner reading because the arm had been idle through a pass:
+
+| arm | GB/s | decompressions |
+|---|---|---|
+| resident metal | 13.1 | **73,050** |
+| touched metal | 41.8 | 0 |
+| wired host / wired metal | 88.0 / 96.0 | 0 |
+| fresh metal | 1.0 | 0 |
+
+### What it says
+
+- **An unwired destination is compressed between uses, and a rewrite pays to reconstruct it.** 73,050
+  decompressions against 1.12 GB of destination is 1.05 decompressions per 16 KB page: essentially every
+  page of the arm had been compressed since the previous probe and every write reconstructed one. The
+  same arm on a machine with room reads 96.2 GB/s with **0** decompressions (run C, quiet machine). The
+  count tracks pressure, not the code.
+- **A wired destination is untouched by it.** 79.2-99.8 GB/s at every phase in all three runs, including
+  pressure level 2 with 0.1 GB free, and 0 decompressions every time. Host memory and Metal slots agree,
+  so it is not Metal's allocation path; `fresh host` is the noisy arm (5.5-97.9, depending on which freed
+  region a 1.12 GB allocation lands on) but it never beats wired.
+- **Pre-faulting alone is not enough.** A zeroed-but-unwired slot recovers to 24.7-44.4 GB/s (0
+  decompressions), i.e. 1/3 to 1/2 of the gap. The rest is the pages being compressible again.
+- **The footprint decays on its own.** The 4.48 GB resident destination reads 65.7 GB/s in a quiet
+  machine and 59.3 / 31.8 / 19.0 / 19.9 window by window after one pass, so a rate falls with how much
+  destination the process holds, on a destination that is wired to nothing.
+- **The whole arena, wired, is a different regime.** `mlock` took **6.0-6.7 s for 89.82 GB with zero
+  refusals** at 0.1 GB free, and then: fill 13.0 GB/s (against the disk's own 13.6-15.2 from `#55`, i.e.
+  the fill is finally disk-bound), `decompressions` 8.3M -> 1.4M, the machine's compressor 44-71 GB ->
+  11-16 GB, the process's compressed total 58.7 -> 16.5 GB (the graphics ledger's compressed share
+  46.3 -> 8.1 GB), and the pass 330.7-374.6 -> 171.8-173.8
+  ms/position. The **device** halves moved too, 63.9-73.6 -> 47.2-47.7 ms, which is what a GPU reading
+  slot pages that no longer need reconstructing should look like.
+- **Wiring a fraction is not a fraction of the win.** 8 GB is *worse* than none in both full runs (412-427
+  against 324-371 ms/pos), and 24 GB is inside the 5.5-7.5 GB/s band `#55` measured unwired. A pass
+  writes all 90 GB of destinations, so every slot it touches that is still compressible costs a
+  decompression; the rungs do not remove those, they only take room away from the compressor that the
+  rest of the arena then needs (compressor stays 41-52 GB at 24 GB wired). The decompression column says
+  the same thing non-linearly: 6.5-13.2M at 0-24 GB wired, 1.3-1.4M at 90.
+
+### What it means
+
+The turn's expert traffic was never waiting on NVMe. It was waiting on pages the kernel had compressed
+and that the fill then had to reconstruct one by one, and a wired arena removes the mechanism entirely at
+a cost of 6 s and no refusals. That makes the arena's RESIDENCY POLICY the first production-shaped lever
+this port has measured above 2x on the prefill path: 1.9-2.2x against the passes in these runs and
+against `#55`'s unwired 315-369 ms/position.
+
+It is a measurement, not a fix, and three things have to be answered before it ships. A wired arena is
+memory the machine cannot reclaim, so a policy needs a budget derived from the memory plan and a refusal
+path -- `mlock` here claimed 89.82 GB because the evicted thing was the page cache, which is
+re-readable; a machine whose other occupants need it has no such slack. The rungs say the transition is
+not linear, so a partial wiring policy is not obviously worth having. And the wired pass is now disk
+bound, so the next lever behind it is the miss rate, which is where `#21` already stopped.
+
+### What it is not (do not re-propose)
+
+- Not the disk: 12.6-15.3 GB/s cold in every phase of every run, and the wired fill reads at 13.0, at
+  that ceiling.
+- Not the page cache: warm reads 51.4-90.8 throughout, and the same arm reads 96.2 with 0 decompressions
+  when the machine has room.
+- Not Metal's allocation path: a wired HOST destination is just as fast (88.0-94.0), and Metal over the
+  same wired memory reads 91.6-99.8.
+- Not the arena's capacity, eviction order or placement, and not the prompt: misses per fill are printed
+  on every row and are 8.1-8.2 in all four rungs of all three runs (`#54`'s first trap), and no rung
+  changes the arena's size (`#54`'s second).
+- Not the read form, the fan-out, `F_NOCACHE`, the block width, the command queue or the attention
+  (`#20`, `#21`, `#48`, `#50`-`#52`).
+- Not a shipped knob. `wireResidentSlots(budgetBytes:)` and its counters are measurement seams in the
+  streamer, in the style of `recordsFillSamples`/`touchesFilledRanges`; production never calls them and
+  no `UserDefaults` key was added (verified with `defaults read`, which finds none).
+
+### Verification
+
+`testWhetherAnArenasSlotsCanStayOutOfTheCompressor` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_slot_residency`, plus the class's own `/tmp/dynamoe_dsv41_real_turn`), 187 s at `-O`
+for four passes and five probes. It prints, per probe, ten destination arms with each arm's decompression
+count, the footprint windows, and the task and machine memory accounting; and per pass, ms/position, the
+fill rate, bytes, misses and misses per fill, device time, decompressions, compressor before and after,
+and the arena's wired bytes. Runs: `/tmp/test56_residency2.log` (three rungs), `/tmp/test56_residency3.log`
+(four rungs) and `/tmp/test56_residency4.log` (the confirmation). All used `touch` and `rm -f` in the same
+command, and no marker survived any of them.
+
+## DSV4.1 #57: THE RESIDENCY POLICY SHIPS -- WIRING AT ALLOCATION REPRODUCES 108 ms/POSITION, AND WITHDRAWING IT COSTS 2.05x
+
+`#56` ended with one sentence it could not answer: the win was measured by wiring the arena
+RETROACTIVELY, every slot locked before the timed pass, and a shipping policy cannot do that. Slots are
+allocated on first use, so a policy wires each slot inside the fill that creates it, and the first pass
+pays for it. `#56` also said the rungs were not linear and that a budget had to come from the memory plan
+rather than `Int.max / 2`. This slice turns the measurement into that policy and runs it.
+
+### The policy
+
+- **The grant is the whole arena or nothing.** `DeepSeekV41MemoryPlan.wireBudgetBytes(arenaBytes:physicalGB:floorGB:)`
+  answers with the arena's own bytes when the plan's other claims (`cacheBytes + residentWeightBytes +
+  engramStagingBytes`) plus a 16 GB floor for the OS, other applications and the page cache still fit in
+  physical memory, and with 0 otherwise. A partial grant is not offered, because `#56` measured 8 GB
+  wired as worse than none: a pass writes every slot, so a still-compressible slot costs a decompression
+  whichever rung the policy stopped at.
+- **Wiring happens when the slot is allocated.** `DeepSeekV41ExpertStreamer.enableSlotWiring(budgetBytes:)`
+  makes `slotBuffer(_:)` apply `DeepSeekV41SlotWiring` to each buffer it creates. The `#56` retroactive
+  seam (`wireResidentSlots`) stays as the measurement it was, and does not silently wire the slots a
+  later pass allocates.
+- **A refusal is all-or-nothing.** The first `mlock` that refuses hands back every slot already wired and
+  latches the policy off, so the arena is either entirely wired or entirely not. The memory is valid
+  either way; the fill runs in the unwired regime. `DeepSeekV41SlotWiring` takes its page primitives as
+  a parameter, which is the only way a test can make the kernel refuse on purpose, and one case drives
+  the real `mlock`/`munlock` pair as well.
+- **The machine decides, with a debug opt-out.** `DeepSeekV41Runtime` grants the budget when
+  `dynamoe_dsv41_wire_arena_off` is unset; `close()` hands the pages back with the streamer, and the load
+  log names what happened (`arena wired 0.00 of 65.84 GB (0 slots)` at construction, then the running
+  figure in `describe()`).
+
+### The run
+
+One runtime through the app's own loading path, the `#52`-`#56` 128-position rotated stream, a 65.84 GB
+grant (3,760 slots of 17.9 MB), and five passes: three with the policy on, one after `disableSlotWiring()`,
+and one after restoring it retroactively the way `#56` did. Two independent runs:
+
+| pass | run 1 ms/pos | run 1 fill GB/s | run 2 ms/pos | run 2 fill GB/s | decompressions (run 2) | compressor (run 2) |
+|---|---|---|---|---|---|---|
+| P1, policy on (allocates and wires 65.84 GB) | 136.5 | 10.4 | 128.4 | 11.0 | 0 | 1.7 -> 1.8 GB |
+| P2, after wiring | 110.8 | 14.4 | 108.5 | 14.4 | 0 | 1.8 |
+| P3, after wiring | 111.8 | 14.5 | 108.3 | 14.4 | 0 | 1.8 -> 1.7 |
+| P4, policy withdrawn | - | - | **222.4** | **8.8** | **+4,592,426** | 1.7 -> 13.2 GB |
+| P5, retroactively restored (65.84 GB in 2.9 s) | - | - | 123.6 | **14.4** | +59,251 | 4.4 -> 4.1 GB |
+
+`mlock` took **2.16-2.27 s for 65.84 GB with zero refusals**, in both runs, inside P1: 17-18 ms/position
+of the 20-25 ms/position P1 pays over the wired band. So the policy costs one pass and repays it on the
+next; the rest of P1's excess is slot allocation and a cold page cache, which an unwired first pass pays
+too.
+
+### What it says
+
+- **The shipping shape reproduces the wired regime.** P2 and P3 read 14.4-14.5 GB/s in both runs (108.3-111.8
+  ms/position), i.e. at or above the disk's own 13.6-15.2 and the same regime `#56` reached by wiring
+  before the pass (13.0). Across two processes the wired pass is reproducible to 0.3-3%.
+- **Withdrawing the policy is the A/B, and it is 2.05x.** The same runtime, stream, arena and slot
+  contents, with only `disableSlotWiring()` between P3 and P4: fill 8.8 GB/s against 14.4, the pass 222.4
+  against 108.4 ms/position, the device halves 55.3 against 39.6-39.8, and **4.59M decompressions** where
+  the wired passes made none. The machine's compressor grows 1.7 -> 13.2 GB in that one pass. Re-wiring
+  the same 65.84 GB takes 2.9 s and puts the fill rate back at exactly 14.4.
+- **8.8 GB/s is a FLOOR on the unwired arm, not the ceiling.** This machine started P4 with 57 GB free and
+  a 1.7 GB compressor, so the compressor only reached 13.2 GB. `#56`'s squeezed machine (0.1 GB free,
+  compressor 44-71 GB) measured 4.6-6.7 GB/s unwired, i.e. the policy's win grows with the pressure it
+  prevents, and the 2.05x here is what a quiet machine shows.
+- **Wiring at allocation is cheaper than restoring afterwards.** Fresh slots cost 2.16-2.27 s for 65.84 GB;
+  the retroactive restore after P4 compressed them costs 2.9 s. The pages exist and are unshared when the
+  slot is created, which is the moment the policy is designed to take them.
+- **P5's pass is still 14% above the wired band while its fill rate is fully recovered.** The compressor
+  is unwinding the 13 GB P4 made it hold, so the recovery is the fill's and not the whole pass's. No
+  second lever is claimed from that number.
+
+### What it is not
+
+- Not the disk: the wired fill is at or above the disk's 13.6-15.2, and the unwired one is far below it.
+- Not a partial policy: a grant smaller than the arena is not offered, and the refusal path takes the
+  whole policy back. `#56`'s rungs still say why.
+- Not a memory-pressure valve. One was considered and rejected: `#56`'s win exists exactly when pressure
+  is high, so a policy that unwired on `.warning` would undo the fix at the moment it is needed and hand
+  65 GB back to the compressor. The release paths are the static floor gate, the `mlock` refusal, and
+  `close()`.
+- Not a shipped setting: `dynamoe_dsv41_wire_arena_off` exists to A/B the policy, in the style of
+  `dynamoe_dsv41_pin_dense_off`.
+- Not applied to the older measurement harnesses: `DeepSeekV41PublishedTurnTests.makeRuntime` defaults to
+  `wireArena: false` and `DeepSeekV41FillThroughputTests` pins the same regime, because every number
+  `#20`-`#56` logged was taken unwired and a run that silently wired 65 GB would move them.
+
+### Verification
+
+`testWhatTheArenaResidencyPolicyIsWorthIncludingItsLock` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_wired_policy`, plus the class's own `/tmp/dynamoe_dsv41_real_turn`), 98 s at `-O`
+for five passes. It asserts the grant is enabled, every allocated slot is wired, the wired passes read
+above 8 GB/s, and nothing was refused. Policy logic is pinned without a checkpoint by
+`DeepSeekV41SlotWiringTests` (a slot is wired once, a budget is never exceeded, a refusal unlocks exactly
+what it wired and latches, a zero budget is off rather than a refusal, and the system `mlock` pair wires
+a real page) and `DeepSeekV41ArenaWiringBudgetTests` (a whole arena granted, one that would eat the floor
+refused entirely, and the floor proven to be the reason). Runs: `/tmp/test57_policy1.log` (three passes)
+and `/tmp/test57_policy2.log` (the five-pass A/B). Both used `touch` and `rm -f` in the same command, and
+no marker survived.
+
+The full `DynaMoETests` target ran 1,471 tests with 89 skipped and 33 failures in 131.0 s; all 98
+`DeepSeekV41*` suites passed with 0 failures, including the 9 new policy cases and the opt-in case
+skipped. The 14 failed cases are the pre-existing environmental ones (`DynaMoETests`: help-topic count,
+Qwen3.8 Flash Next forward, tool-discover lifecycle, truncated tool-call recovery; `ModelDogfoodAndPrefixCacheTests`:
+the 9 prompt/web-fetch/headless-Chrome cases) plus `ServerQueueLogicTests.testTimedOutTurnKeepsFIFOBarrierForSuccessors`,
+which passes in isolation in 0.24 s and fails only under full-suite load, so it is a timing flake and not
+this change.
+
+## DSV4.1 #58: THE RESIDUAL MISSES ARE THE ARENA'S OWN EVICTIONS -- A WARM PASS RE-READS 54.6-56.7 GB IT ALREADY HAD, AND A FREQUENCY RULE TAKES THAT TO 38.6-39.3
+
+`#57` shipped the residency policy and left one number standing: the wired fill reads at 14.4-14.5
+GB/s, the disk's own 13.6-15.2, with **8.1-8.2 misses per fill** that nothing in the policy moved.
+That made the miss rate the next lever, and `#21` had already closed it -- "the fill is cold-start
+bound, not capacity bound" -- from a 53-position walk whose 3,739 distinct pairs *just* fit the
+3,760 slots. Those two readings are compatible only if a pass's misses are its COMPULSORY working
+set, pairs read once and never needed again, because no replacement rule can remove a read that has
+never happened before. This slice makes that answerable instead of arguable, and the answer is no:
+the cold pass is compulsory, and every warm pass after it is the arena throwing away what it had.
+
+### The instrument
+
+`DeepSeekV41ExpertArena.recordsMissComposition` classifies each miss since the last `reset()` as a
+pair this window had never loaded (`firstTouchMisses`) or one it had loaded and then evicted
+(`refetchMisses`), with `distinctPairs` as the window's working set. It costs one `Set` insert per
+miss and is off in every production path. The two columns are the whole question: the first is the
+floor a perfect oracle would still pay on the same slots, and only the second is what a policy can
+win back. Every arm asserts `firstTouch + refetch == acquisitions - hits` and that the streamer's
+own `fillMisses` equals the arena's, so the decomposition cannot silently miss a miss.
+
+There is a second, policy-free decomposition in the same table: a pass from `arena.reset()` is a
+COLD arena, and a pass without one is the steady state a live turn is in.
+
+### The run
+
+One runtime through the app's own loading path, the `#52`-`#57` 128-position rotated stream, the
+shipped 65.84 GB arena (3,760 slots of 17.9 MB) wired by the shipping policy, and six passes: three
+under LRU and three under frequency, with identical rotations on both sides. Then a seventh and
+eighth pass on a second runtime at a 0.72 arena fraction. `-O`, one process per runtime.
+
+| arm | policy | arena | ms/pos | fill GB/s | read GB | misses | first touch | re-fetch | evictions |
+|---|---|---|---|---|---|---|---|---|---|
+| A1 cold | LRU | 65.84 GB | 126.6 | 10.9 | 87.9 | 5,021 | 4,784 | 237 (4.7%) | 1,261 |
+| A2 warm | LRU | 65.84 GB | **84.2** | 13.8 | 54.6 | 3,117 | 527 | 2,590 (83.1%) | 3,117 |
+| A3 warm | LRU | 65.84 GB | **84.8** | 13.8 | 56.7 | 3,239 | 0 | 3,239 (100%) | 3,239 |
+| C1 cold | frequency | 65.84 GB | 104.3 | 14.5 | 87.9 | 5,022 | 4,784 | 238 (4.7%) | 1,262 |
+| C2 warm | frequency | 65.84 GB | **72.7** | 14.4 | 39.3 | 2,247 | 527 | 1,720 (76.5%) | 2,247 |
+| C3 warm | frequency | 65.84 GB | **73.2** | 14.4 | 38.6 | 2,203 | 0 | 2,203 (100%) | 2,203 |
+| B1 cold | LRU | 81.19 GB | **239.0** | 6.4 | 83.8 | 4,786 | 4,784 | 2 | 149 |
+| B2 warm | LRU | 81.19 GB | 79.5 | 13.1 | 32.4 | 1,852 | 527 | 1,325 (71.5%) | 1,852 |
+
+A1 pays the first pass's slot allocation and `mlock` (2.2 s), which is why its rate is 10.9 against
+the 13.8-14.5 band the passes after it read; that is `#57`'s shape, not a new observation.
+
+### What it says
+
+- **The working set EXCEEDS the arena, and by enough to matter.** A 128-position pass touches 4,784
+  distinct pairs -- 83.8 GB -- against a 3,760-slot arena, 21.4% short. `#21`'s 53-position walk
+  touched 3,739, i.e. it stopped one position short of the regime where capacity starts to bite, and
+  its 0.6-vs-0.72 A/B compared bytes at a position that fit both sizes, so it could not have seen a
+  difference by construction. Quote the working-set column before quoting any capacity conclusion.
+- **A cold pass is compulsory and a policy cannot help it.** 95.3% of A1's misses are first touches
+  (4,784 of 5,021) and the arena's own share of the read is 4.1 GB of 87.9. The frequency rule
+  changes the cold pass by one miss (5,021 against 5,022, 4,784 first touches both), which is also
+  the control that says routing does not consult the arena: the two policies were measured on the
+  same 16,658 acquisitions and the same 4,784 pairs.
+- **A warm pass is almost entirely re-fetches.** 83.1-100% of a warm pass's misses are pairs the
+  arena already held, and A3 is the pure case: a warm arena that has already seen this exact stream
+  re-reads 56.7 GB with **zero** first touches. The arena is not cold, it is thrashing. That is what
+  the 8.1-8.2 misses per fill `#57` left standing actually is.
+- **Capacity fixes the re-fetches, and costs more than they are worth.** At 4,637 slots the cold
+  pass's re-fetch column collapses from 237 to 2 and its evictions from 1,261 to 149, and a warm
+  pass reads 32.4 GB against 54.6. But `mlock` took the whole 81.19 GB with **zero refusals** and
+  left the machine with **0 GB free**, so the cold pass fell to 6.4 GB/s with 1.91M decompressions
+  and 239.0 ms/position against the shipped arena's 126.6 -- everything the process did not wire
+  (the 10.95 GB dense pin, the shard mappings, the workspace) became compressor input. The 40% read
+  win is real and the wall-clock win is 4.7 ms/position, against a 112 ms/position loss on the pass
+  that fills it. The static `wireBudgetBytes` gate granted it, correctly: the bytes do fit. What
+  does not is everything else the machine was holding.
+- **The replacement rule is the cheap lever, and it wins.** At the SAME 3,760 slots and the same
+  stream, frequency takes a warm pass from 84.2-84.8 to 72.7-73.2 ms/position (-13.7%) and its read
+  from 54.6-56.7 GB to 38.6-39.3 (-28%). It is cheaper than capacity on both count and time: 72.7
+  ms/position at 65.84 GB beats 79.5 at 81.19 GB, with no extra memory and no slower first pass.
+- **The rule is what LRU cannot know.** A pass touches its 4,784 pairs 3.5 times each on average, so
+  the recurring set is exactly the one with a count above one. LRU sees only recency, so a singleton
+  evicts a pair this layer-block will want again; frequency evicts the lowest count and breaks ties
+  by LRU, and a capacity-worth of misses halves every count so a stale hot pair is retired instead
+  of pinned forever. 2,203-2,247 misses remain at 3,760 slots, i.e. 1,024 pairs cannot fit whoever
+  chooses the victim -- the floor a policy is measured against.
+
+### What it is not (do not re-propose)
+
+- Not the disk, the page cache, the read form, the fan-out, `F_NOCACHE`, the block width, the
+  command queue or the attention: every arm filled at 13.1-14.5 GB/s in its steady state, at the
+  disk's own rate, and `#51` closed the forms.
+- Not the prompt: both cold passes touched the same 4,784 pairs on the same stream, and the warm
+  passes are the same two rotations.
+- Not a bigger arena by default. The capacity win exists and is measured here, and so is its price;
+  the arena fraction stays at 0.6 and `dynamoe_dsv41_arena_fraction` remains the debug seam.
+- Not a memory-pressure valve, a partial wiring policy, or arena eviction measured without a
+  working-set column: `#56`/`#57` still say why, and this slice says why the column is mandatory.
+- Not `mlock` refusing: the wider arena locked all 81.19 GB with zero refusals. The policy did its
+  job; the machine had nothing left for anything else.
+
+### Verification
+
+`testWhatTheResidualMissesAreMadeOf` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_miss_composition`, plus the class's own `/tmp/dynamoe_dsv41_real_turn`), 126 s
+at `-O` for six passes and two runtime builds. It asserts the decomposition covers every miss and
+matches the streamer, that both cold passes touched an identical working set, that the shipped
+regime's warm passes read above 8 GB/s, and that the wider arena stayed wired with no refusal.
+`DeepSeekV41ExpertArenaTests` pins the policy without a checkpoint: frequency keeps the pair it has
+seen more often, the tie-break among equals is still LRU, aging retires a pair nothing has touched
+since, frequency is the default, and the composition counters classify once each and reset with the
+arena. Runs: `/tmp/test58_probe1.log` (the decomposition), `/tmp/test58_probe2.log` and
+`/tmp/test58_probe3.log` (with residency and the policy arms) and `/tmp/test58_probe4.log` (the
+paired rotations, the green log). Every run used `touch` and `rm -f` in the same command and no
+marker survived any of them.
+
+The frequency rule ships as the arena's default; `dynamoe_dsv41_arena_lru` is the debug opt-out, and
+every measurement harness pins LRU explicitly so `#20`-`#57`'s tables stay comparable. Shipping it
+was a judgment call the numbers only half settled -- SubQ put "should frequency be the default?" at
+0.58 (mid-band, low confidence) and "should the arena fraction be raised?" at 0.005 -- so the record
+is that the decision was made on the mechanism: the cold pass is provably unaffected, the warm pass
+is 13.7% faster on two rotations in two processes, and the rule cannot change what a slot holds,
+only which pair loses one.
+
+The full `DynaMoETests` target ran 1,478 tests with 90 skipped and 34 failures in 132.6 s; all 98
+`DeepSeekV41*` suites passed with 0 failures, including the six new arena cases and the opt-in probe
+skipped. The 14 failed cases are the pre-existing environmental ones (`DynaMoETests`: help-topic
+count, Qwen3.8 Flash Next forward, tool-discover lifecycle, truncated tool-call recovery;
+`ModelDogfoodAndPrefixCacheTests`: the 9 prompt/web-fetch/headless-Chrome cases) plus
+`ServerQueueLogicTests.testTimedOutTurnKeepsFIFOBarrierForSuccessors` and — new to this run's list —
+`ServerQueueLogicTests.testPerformTimeoutFiresWhileLeaderGateClosed`, both of which pass in isolation
+(13/13 in the suite in 2.8 s) and are timing cases under full-suite load.
+
+## DSV4.1 #59: THE REPLACEMENT RULE TRANSFERS TO THE WALK -- A WARM DECODE READS 31.9 GB INSTEAD OF 56.2 AND SAVES 15-19% OF A POSITION
+
+`#58` shipped the frequency rule on a 128-position PREFILL and named its own caveat: a live turn's
+decode loop is the walk, one position at a time through the same arena, and no walk had ever run
+under the rule. `#21` had measured a 53-position walk whose 3,739 distinct pairs *just* fit 3,760
+slots, which is how it concluded there were no evictions to tune; `#58` then showed a 128-position
+working set does not fit. This asks the walk side of that question at the length where the overflow
+exists, with no production change: the rule already ships, and this is what it is worth to a decode.
+
+### The run
+
+One runtime through the app's own loading path, one 128-position token stream (the `#52`-`#58` text,
+one rotation), six walks. Every arm replays the SAME stream from position 0, so every arm issues the
+identical 30,720 acquisitions and only the pair a miss replaces changes. Cold arms `reset()` the
+arena; warm arms do not, which is the steady state a live turn decodes in. `-O`, shipped 65.84 GB
+arena (3,760 slots of 17.9 MB), 128 positions.
+
+| arm | policy | ms/pos | read GB | fill GB/s | misses | first touch | re-fetch | evictions |
+|---|---|---|---|---|---|---|---|---|
+| A1 cold | LRU | 158.3 | 87.6 | 13.8 | 5,005 | 4,790 | 215 (4.3%) | 1,245 |
+| A2 warm | LRU | 121.9 | 56.2 | 12.4 | 3,210 | 0 | 3,210 (100%) | 3,210 |
+| A3 warm | LRU | 122.0 | 56.2 | 12.4 | 3,210 | 0 | 3,210 (100%) | 3,210 |
+| C1 cold | frequency | 140.8 | 87.6 | 13.3 | 5,004 | 4,790 | 214 (4.3%) | 1,244 |
+| C2 warm | frequency | 106.4 | 35.1 | 12.3 | 2,002 | 0 | 2,002 (100%) | 2,002 |
+| C3 warm | frequency | 100.8 | 28.7 | 12.2 | 1,640 | 0 | 1,640 (100%) | 1,640 |
+
+Warm mean: **LRU 122.0 ms/position and 56.2 GB read; frequency 103.6 and 31.9, i.e. -15.0% wall and
+-43.3% read.** The worst frequency warm arm (C2, 106.4 ms and 35.1 GB) still beats the best LRU one
+(121.9 and 56.2), so the ordering does not depend on picking an arm. The probe ran three times; the
+other two gave -14.9% and -19.4% wall with the SAME -43.3% read, so the byte win is the reproducible
+one and the wall win is 15-19%, depending on page-cache state (see the C3 note below).
+
+### What it says
+
+- **A warm walk's misses are re-fetches, all of them.** `firstTouch` is 0 in every warm arm, exactly
+  as `#58`'s prefill A3 found: an arena that has already seen the stream re-reads what it evicted
+  and nothing it has never seen. The compulsory column is the cold pass, and it is untouched.
+- **The rule transfers, and by a wider read margin than on a prefill.** Frequency takes a warm walk
+  from 56.2 to 31.9 GB (-43.3%) against the prefill's 54.6-56.7 to 38.6-39.3 (-28%), and the wall
+  by 14.9-19.4% against the prefill's -13.7%. A decode position draws 240 acquisitions (6 experts x
+  40 layers), so it repeats its working set more often per byte read, which is the direction the rule
+  wins in.
+- **The win is the fill bucket, and the graph is untouched.** Comparing the first warm pass of each
+  policy (A2 against C2): front encode 2.5 + front wait 61.4 + expert fill 38.6 + mixture encode 2.6
+  ms/position under LRU, against 2.5 + 60.5 + 24.5 + 2.7 under frequency (device 53.8 both). The fill
+  drops 38.6 to 24.5, i.e. 14.1 ms/position, and the host round trip and both device halves are flat.
+  Replacement changes how much I/O is repeated, not what is computed.
+- **The fill stays disk-bound in this run: all six arms read at 12.2-13.8 GB/s**, the disk's own
+  rate. One earlier run of the same probe had C3 at 26.0 GB/s, ABOVE the measured 13.8 ceiling, so
+  part of that arm's 28.7 GB came from the page cache rather than the disk; that is an order effect
+  the engine does not control (all six arms replay one stream, so a later arm's bytes may still be
+  cached), and it is why the wall win is quoted as a range. The miss/byte columns are the structural
+  result: they were identical in all three runs (3,210 under LRU against 2,002 and 1,640 under
+  frequency).
+- **The walk's working set is the prefill's regime, not `#21`'s.** 4,790 distinct pairs (85.7 GB)
+  against 3,760 slots (65.84 GB), 27.4% over, and 1,030 pairs cannot fit whoever picks the victim.
+  Frequency leaves 1,640-2,002 misses at that capacity, which is the floor a future rule is measured
+  against.
+- **Frequency converges over warm passes; LRU is flat.** C2 (2,002 misses, 35.1 GB) is the first warm
+  walk after a cold one, C3 (1,640, 28.7 GB) the second, because the use counts a cold pass seeds are
+  all ones. LRU misses the same 3,210 and reads the same 56.2 GB both times. The mean above uses both
+  arms; a reader quoting a single warm arm should say which one. A live turn's arena is warmed by its
+  prefill and then by every position of its answer, so the converged number is the one it reaches,
+  not the one it starts at.
+- **The cold pass is still a control, not a result.** Both cold walks touched the same 4,790 pairs,
+  missed within one of each other (5,005 against 5,004) and read the same 87.6 GB, so the rule does
+  not move compulsory traffic. The 17.5 ms/position wall gap between A1 and C1 is not the policy: A1
+  is the pass that creates and wires the arena's 3,760 slot buffers (fill 72.8 against 56.4
+  ms/position, about 2.1 s over 128 positions; the other two runs gave 22.9-23.9 ms), which is
+  `#57`'s first-pass note that the lock is paid inside the pass that allocates rather than up front.
+  C1 reuses the buffers `arena.reset()` does not free.
+- **What a decode now costs.** 101-122 ms/position on a warm arena, of which 59-63 ms is the host
+  round trip and about 25 ms the mixture's device window. `#22`'s 205-324 ms/position was a colder
+  regime; this is the steady state, and it says the next decode lever is still the round trip
+  (`#22`'s late start) rather than replacement.
+
+### What it is not (do not re-propose)
+
+- Not a production change. No source outside the test harness and this journal moved; the rule
+  shipped in `#58` and this is its decode-side measurement.
+- Not a case for a bigger arena: capacity was priced in `#58`'s B1 (81.19 GB wired, 0 GB free, cold
+  pass at 6.4 GB/s), and this slice varies no capacity.
+- Not a licence to change the host round trip from a replacement result: `front wait` is 59.3-62.9
+  ms/position across the six arms of the quoted run (58.9-65.7 across all three) and does not move
+  with the policy.
+- Not evidence that a cold pass got faster: the arms differ by one miss and identical bytes, and the
+  wall gap is slot creation and wiring in the first arm.
+- Not a page-cache argument: one run's C3 hit the cache at 26.0 GB/s, but the engine does not control
+  that, and the rule's contribution is the 24.3 GB per pass it stops asking the cache for.
+- Not a re-run of `#21`'s capacity A/B and not a partial wiring or memory-pressure valve argument;
+  `#56`-`#58` still say why.
+
+### Verification
+
+`testWhatTheReplacementRuleIsWorthToAWalk` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_walk_policy`, plus the class's own `/tmp/dynamoe_dsv41_real_turn`), 102 s at
+`-O`. It asserts that the composition covers every miss, that the fills the streamer sampled equal
+the arena's misses, that both cold walks touched an identical working set, and that every warm arm
+fills above 8 GB/s. No new unit case: the rule's replacement, aging, composition and default are
+already pinned by `DeepSeekV41ExpertArenaTests` (`#58`), and this slice adds no production code.
+Runs: `/tmp/test59_walk3.log` (the one quoted above), plus `/tmp/test59_walk1.log` and
+`/tmp/test59_walk2.log` for the wall range. Markers were touched and removed in the same command;
+none survived.
+
+The full `DynaMoETests` target ran 1,479 tests with 91 skipped and 30 failures in 119.1 s on the
+final `-O` test build. Every `DeepSeekV41*` suite passed with 0 failures, including the new probe when
+it was skipped and the existing `DeepSeekV41ExpertArenaTests`. The 13 failed cases are exactly the
+pre-existing environmental ones (`DynaMoETests`: help-topic count, Qwen3.8 Flash Next forward,
+tool-discover lifecycle, truncated tool-call recovery; `ModelDogfoodAndPrefixCacheTests`: the 9
+prompt/web-fetch/headless-Chrome cases); both `ServerQueueLogicTests` timing flakes that appeared in
+`#58`'s run passed here. Run: `/tmp/test59_suite2.log`.
+
+## DSV4.1 #60: THE EXPERT STAGES ARE 43% OF A WALKED POSITION'S DEVICE TIME, AND THE BLOCK'S STAGE RANKING DOES NOT TRANSFER
+
+`#59` closed the arena's replacement question and left a warm decode at 101-122 ms/position with
+53.8 ms of device windows -- the largest single bucket, and one no published table had ever attributed.
+Every stage table in this journal comes from a synthetic fixture, and the one table taken on the real
+checkpoint (`#52`) is a BLOCK of eight positions. This asks the walk's side of it, because the block's
+answer cannot be the walk's: its three biggest stages are GEMV projections whose cost there is the
+per-position activation traffic a block re-requests once per output row (`#18` priced it at 1.9 GB of
+requests for one block), and that traffic grows with the block width while a walk asks for one
+position's worth.
+
+### The run
+
+One runtime through the app's own loading path, one 128-position token stream (the `#52`-`#59` text,
+one rotation), the shipping frequency rule, `-O`, the shipped 65.84 GB arena (3,760 slots of 17.9 MB).
+A warm-up pass is discarded (a young process pays slot creation, wiring and a cold page cache), then
+two arms walk the SAME stream without an arena reset between them, so both are in the steady state a
+live turn decodes in -- `#59`'s C2/C3 regime:
+
+1. **baseline**: one command buffer per half, the decomposition `#59` quoted;
+2. **stages**: one command buffer per stage (`recordsWalkStageTiming`), so every stage reports its own
+   `gpuStartTime`/`gpuEndTime`.
+
+| arm | wall | device | dense device | mixture device | misses | read |
+|---|---|---|---|---|---|---|
+| baseline, one buffer per half | 105.6 ms/pos | 54.3 | 28.7 | 25.6 | 2,002 | 35.1 GB |
+| stages, one buffer per stage | 82.1 ms/pos | 58.5 | 32.9 | 25.5 | 1,640 | 28.7 GB |
+
+The two walls are NOT comparable and the difference is not the layout: the second arm's fill came out
+of the page cache (11.1 ms/position against the first's 24.0, 28.7 GB at ~20 GB/s), exactly the order
+effect `#59` saw on its third arm. The miss and byte columns are the structural ones and they are
+`#59`'s own (2,002 / 35.1 then 1,640 / 28.7). Only the device columns are read below.
+
+### The layout is the same graph
+
+- **The answer is unchanged to the bit**: worst logit delta 0.00e+00 absolute on a 24.96 scale, after
+  128 positions. Splitting a half into per-stage buffers changes no kernel, no binding and no
+  submission order.
+- **The mixture's four stages add up to the mixture half**: 25.51 against 25.6, and 24.99 against
+  25.3 in the second run -- 0.4-1.2%. Each carries ~3 ms of device time per layer, so a per-buffer
+  cost is invisible there.
+- **The dense half's twenty stages add up to MORE than its one-buffer total**: 32.9 against 28.7, and
+  32.85 against 28.6 in the second run -- +4.2 ms/position, +14.6%, every time. The one-buffer layout
+  overlaps adjacent dense stages (or the split pays ~5 us per boundary); either way the dense shares
+  below are shares of a SERIALIZED 32.9 ms whose overlapped cost is 28.7, and the table is read as a
+  ranking with that upward bias, not as absolute milliseconds.
+- The per-stage windows sum to exactly the half totals the same arm reported
+  (`stageTotal == frontDevice + mixtureDevice`), which is what makes the division a division of one
+  population rather than of two.
+
+### The table
+
+Milliseconds per walked position and share of the 58.45 ms of serialized device time, 27 stages that
+report a window (`.compressPool` dispatches nothing -- the pool runs inside `.indexer`).
+
+| stage | ms/pos | share | half |
+|---|---|---|---|
+| sharedExpert | 12.963 | 22.2% | mixture |
+| routedExperts | 12.198 | 20.9% | mixture |
+| queryUp | 4.357 | 7.5% | dense |
+| outputDown | 4.165 | 7.1% | dense |
+| hcAttentionCoefficients | 4.105 | 7.0% | dense |
+| router | 3.621 | 6.2% | dense |
+| outputUp | 3.505 | 6.0% | dense |
+| hcFFNCoefficients | 3.373 | 5.8% | dense |
+| latentProject | 1.585 | 2.7% | dense |
+| attention | 1.409 | 2.4% | dense |
+| indexer | 1.170 | 2.0% | dense |
+| queryDown | 0.955 | 1.6% | dense |
+| ropeOutput | 0.900 | 1.5% | dense |
+| ropeQuery | 0.884 | 1.5% | dense |
+| engram | 0.635 | 1.1% | dense |
+| ffnNorm | 0.538 | 0.9% | dense |
+| attnNorm | 0.507 | 0.9% | dense |
+| queryNorm | 0.237 | 0.4% | dense |
+| writeFFNStreams | 0.205 | 0.4% | mixture |
+| ropeLatent | 0.191 | 0.3% | dense |
+| latentNorm | 0.190 | 0.3% | dense |
+| writeLatent | 0.179 | 0.3% | dense |
+| mixFFNStreams | 0.153 | 0.3% | dense |
+| writeAttentionStreams | 0.150 | 0.3% | dense |
+| collapseStreams | 0.143 | 0.2% | mixture |
+| mixAttentionStreams | 0.132 | 0.2% | dense |
+| compressPool | 0.001 | 0.0% | dense |
+
+The second run reproduced every figure within 2% (total 57.84, dense 32.85, mixture 24.99; the top
+eight in the same order), so this is not a one-run table.
+
+### What it says
+
+- **The two expert stages are 43.1% of a walked position's device time and 99% of the mixture half.**
+  The SHARED expert (12.96) is the single largest stage of a decode -- larger than all six routed
+  experts together (12.20). Nothing in the dense half comes close.
+- **The routed experts run at the machine's measured GEMV ceiling; the shared expert does not.** One
+  position reads 240 experts (6 x 40 layers) x 17.9 MB = 4.30 GB in 12.20 ms, i.e. **352 GB/s**,
+  which is `#20`'s 300-370 GB/s in isolation. The shared expert reads 40 x 3 x 5120 x 2304 values =
+  1.42 GB (1.46 GB with its 32x32 block scales) in 12.96 ms, i.e. **109-113 GB/s** -- about a third
+  of the routed kernels on the same shapes and at twice their per-byte rate. `#20` measured the
+  coalesced FP8 form in isolation at 262 GB/s on the shared `w1` alone, so this is an in-situ gap,
+  not a form that was never measured.
+- **The block's ranking does not transfer, and the direction is the one `#18` predicted.** `queryUp`
+  is 20.4% of a block's dense half and 7.5% of a walk's device time; `outputUp` 19.1% -> 6.0%;
+  `outputDown` 17.7% -> 7.1%. Between them 57% -> 20.6%. A block re-reads every position's activation
+  vector once per output row; a walk reads one 20 KB vector and the weight once.
+- **Those three GEMVs are themselves bandwidth-bound.** `queryUp` reads 32,768 x 1,280 values =
+  1.73 GB/position in 4.36 ms (**397 GB/s**), `outputDown` 1.38 GB in 4.17 ms (**332 GB/s**); both are
+  at the ceiling, so their cost is the bytes they must read and no kernel shape will take it away.
+- **The mHC coefficient pair is 7.48 ms/position, 12.8% of device time** -- 4.1 for the attention
+  sub-layer's projection and 3.4 for the FFN's. The block table put the same pair at 1.9 ms/position,
+  and the difference is the batching: a block projects ONCE for eight positions, a walk once per
+  position, 120 dispatches per position of 24 threadgroups each (four slots x six logits).
+- **`router` is 3.62 ms/position, 6.2%**, for the same reason: one dispatch per position scoring 384
+  experts, amortized over a block and paid per token by a walk.
+- **The attention itself is not a target.** `attention` is 1.41 ms (2.4%) and `writeLatent` 0.18 ms
+  (0.3%). `#17` closed the attention at these widths and the walk agrees.
+- **The compressor is free on a walk** (0.001 ms): it runs inside `.indexer`, which is 1.17 ms
+  (2.0%) including the selection.
+- **What is left is a tail of small per-position kernels.** mHC pair 7.48 + router 3.62 + ropes 1.98
+  + norms 1.47 + stream mixes 0.58 = **15.1 ms/position, 26% of device time and 14% of the wall**,
+  all of it latency-bound rather than bandwidth-bound. A block pays each once per eight positions;
+  a walk pays each forty times.
+- **The wall around it** (baseline arm): 101.7 ms/position of host buckets -- front encode 2.5, front
+  wait 60.0, indexer wait 12.5, expert fill 24.0, mixture encode 2.7 -- against a 105.6 ms wall, so
+  ~3.9 ms is outside every bucket. The wait's own split is drained front 32.0 / mixture 44.0 with
+  late starts 0.7 / 14.7 ms; those drains cross window boundaries (the indexer's readback and the
+  token's final settle are settles that are not front waits), so they do not partition the 60.0 and
+  are not a fourth bucket.
+
+### What it is not (do not re-propose)
+
+- **Not a case for the attention, the cache write or the compressor.** 1.41, 0.18 and 0.001
+  ms/position, measured at the published widths.
+- **Not evidence that the three GEMVs are the walk's problem.** They are 20.6% together, and at
+  332-397 GB/s they are already at the ceiling. The block table's 57% is a block property.
+- **Not a rows-per-threadgroup or "wider block" argument for the walk.** `#18` and `#21` both closed
+  those on the shapes they were measured on, and nothing here reopens them.
+- **Not a page-cache or fill result.** The two arms' walls differ by 12-17 ms/position purely because
+  the second arm's fill was served from cache; only the device columns are compared.
+- **Not a capacity or replacement result.** The arena is the shipped one and the policy is the
+  shipping rule; this slice varies neither.
+- **Not a claim that the block table was wrong.** It was a correct table of a block. It is simply
+  not a decode's ranking, and this is the decode's.
+
+### Verification
+
+`testWhereAWalkedPositionsDeviceTimeGoes` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_walk_stages` plus the class's own `/tmp/dynamoe_dsv41_real_turn`), 49-61 s at
+`-O`. It asserts that the two layouts return identical logits, that the stage windows cover every
+position and add up to the half totals, that no half buffer is unwindowed, and that every stage the
+checkpoint dispatches appears in the table. Runs: `/tmp/test60_walk2.log` (the one tabulated above)
+and `/tmp/test60_walk3.log` (the reproduction); `/tmp/test60_walk1.log` is a first cut whose arms were
+arena-reset (cold), and it produced the same ranking. The same case also passes under the Metal debug
+layer (`/tmp/test60_walk_mtl.log`, 50.1 s, no validation errors), where it reports 57.65 ms/position
+of device time (32.77 dense, 24.88 mixture) -- a third run of the same table.
+
+The instrument itself is pinned without the checkpoint by
+`DeepSeekV41DeviceGraphParityTests.testThePerStageWalkLayoutIsTheSameWalk` (synthetic fixture): the
+split layout must return bit-identical logits, its stage windows must equal the half totals, and the
+table must name every stage the fixture dispatches. That case also passes under the debug layer.
+
+The full `DynaMoETests` target ran 1,481 tests with 92 skipped and 30 failures in 119.7 s on the `-O`
+build: every `DeepSeekV41*` suite passed with 0 failures (the two new cases included), and the 13
+failed cases are exactly the pre-existing environmental set (4 in `DynaMoETests`: help-topic count,
+Qwen3.8 Flash Next forward, tool-discover lifecycle, truncated tool-call recovery; 9
+`ModelDogfoodAndPrefixCacheTests` prompt/web-fetch/headless-Chrome cases). Run:
+`/tmp/test60_suite.log`.
+
+No kernel, encoder, dispatch shape or production path changed: `recordsWalkStageTiming` is a flag
+that is off in every production path, and the single-buffer layout a turn uses is byte-for-byte the
+one `#59` measured.
+
+No kernel, encoder, dispatch shape or production path changed: `recordsWalkStageTiming` is a flag
+that is off in every production path, and the single-buffer layout a turn uses is byte-for-byte the
+one `#59` measured.
+
+## DSV4.1 #61: THE SHARED EXPERT WAS ONE THREAD PER ROW, AND IT IS 15% OF A DECODE
+
+`#60` attributed a walked position's device time and found the shared expert the largest single
+stage of a decode: 12.96 ms of 54.3 ms, reading its 1.42 GB/position at 109-113 GB/s while the
+routed experts read 352 GB/s on the same kind of bytes. `#20` had already fixed the shape that
+causes it -- a thread per whole output row, so a warp's 32 lanes sit a full row width apart and
+every lane's load pulls its own sector -- for the plain FP8 GEMV and for the MXFP4 mixture. It had
+never been fixed for the two kernels the shared expert actually calls: `dsv41_fp8_block32_swiglu_gate_up`
+(fused gate+up) and `dsv41_fp8_block32_down_accumulate`. The checkpoint's shared expert is
+`F8_E4M3` `[2304, 5120]` gate and up with `F8_E8M0` `[72, 160]` 32x32 scales, and a `[5120, 2304]`
+down, on forty layers, so this one omission was ~1.4 GB of a decoded token's reads.
+
+**The fix.** Two coalesced siblings, `dsv41_fp8_block32_swiglu_gate_up_rows` and
+`dsv41_fp8_block32_down_accumulate_rows`: one threadgroup per output row, lane `l` covering blocks
+`l, l + lanes, ...`, so a warp's 32 lanes read one contiguous 1 KB window per step, and the
+reduction is a `simd_sum` plus (past 32 lanes) one lane-0 pass over threadgroup memory. Both bind
+the SAME buffer indices as their one-thread siblings, so the call site swaps the pipeline and the
+dispatch shape and nothing else. `fp8GemvWantsWideGrid` already sends both published shapes that
+way (`inDim` 5,120 and 2,304 against its 2,048 crossover); the lanes are the new decision, below.
+
+**Isolated A/B, the checkpoint's own shapes** (six distinct weight regions in one command buffer,
+best of 8, both forms checked against each other first):
+
+| projection | one thread/row | coalesced 32 lanes | coalesced 64 lanes |
+|---|---:|---:|---:|
+| fused gate+up 2,304x5,120 | 0.506 ms (47 GB/s) | **0.123 (4.12x, 192 GB/s)** | 0.122 (4.13x, 193 GB/s) |
+| down 5,120x2,304 | 0.153 (77 GB/s) | **0.084 (1.81x, 140 GB/s)** | 0.092 (1.66x, 128 GB/s) |
+
+The fused row counts BOTH matrices (gate and up are separate 11.2 MB tiles); the traffic numbers
+above include both, which is why they are not the 262-370 GB/s `#20` quoted for a single-matrix
+GEMV. 32 lanes wins the down projection by 9% and ties the fused pair, and 32 is one SIMD group, so
+the kernel returns without touching threadgroup memory at all -- the same argument that made
+`mixtureLaneWidth` 32. `gemvLaneWidth` stays 64 for the plain FP8 GEMV: that kernel measured the
+other way round (`#20`) and it reduces one matrix rather than a fused pair.
+`DeepSeekV41DevicePlan.fp8FusedLaneWidth` is 32 and the GEMV keeps its own.
+
+**In situ, one runtime, one 128-position stream, the shipping frequency rule**, all three arms under
+`recordsWalkStageTiming` so the `sharedExpert` window is measured the same way in each:
+
+| arm | device | mixture device | sharedExpert | misses | read |
+|---|---:|---:|---:|---:|---:|
+| one-thread (what shipped until now) | 58.0 ms/pos | 25.1 | **12.785 ms** | 2,007 | 35.1 GB |
+| coalesced, 32 lanes (shipped) | 49.2 | 16.4 | **4.061 ms** | 1,681 | 29.4 GB |
+| coalesced, 64 lanes (control) | 49.4 | 16.6 | 4.235 | 1,562 | 27.3 GB |
+
+**The shared expert goes from the largest stage of a decode to the fifth**, 12.785 -> 4.061
+ms/position (3.15x, 8.72 ms saved, 15.0% of the one-thread arm's device time), and the mixture half
+of a position goes 25.1 -> 16.4 ms. `routedExperts` (11.97) is the mixture's remaining cost and the
+largest stage again; the new order is routedExperts 11.97, queryUp 4.42, outputDown 4.12,
+hcAttentionCoefficients 4.09, sharedExpert 4.06.
+
+**The answer was checked three ways, because a kernel swap that is 23x noisier than a lane-width
+change has to be explained rather than excused.**
+
+1. *The kernel's own arithmetic on the checkpoint's activations.* `DeepSeekV41ParityProbes` grew
+   `ffnNormed` / `sharedIntermediate` / `sharedExpertCaptureLayer`, which copy the FFN's normed
+   input and the fused pair's output at one layer (off in production). At layer 0, position 0, over
+   a 128-position walk, the two arms feed the shared expert a **bit-identical** normed vector and
+   its fused output differs by **2.98e-07 absolute on a 1.85 scale, 1.61e-07 relative** -- FP32
+   rounding, nothing else.
+2. *A reduction-tree control.* The shipped 32-lane form and the 64-lane form are the same arithmetic
+   with two tree shapes; they drift **6.88e-04 relative** at the last position. The one-thread form
+   drifts **1.58e-02**, 23.0x more, and that is the OLD form's error: it sums 160 blocks in one
+   dependent chain where a threadgroup sums a shallow tree, so its rounding is ~log2(160) times
+   worse, and forty layers of mHC Sinkhorn and routed selection amplify it.
+3. *The decision itself.* The greedy token is identical at every sampled position of the stream
+   (0, 1, 2, 3, 7, 15, 31, 63, 127), so the form changes no answer. The drift is not monotone along
+   the stream (7.8e-04 at position 0, 1.9e-04 at 15, 7.1e-03 at 63), which is what amplification of
+   a 1e-7 stage difference looks like rather than a bias.
+
+`DeepSeekV41FP8SharedExpertKernelTests` pins both kernels against a HOST rule at the published
+shapes, at both lane widths, with a row count off the 32-row scale boundary (65 rows, which needs
+the partial scale group), an input shorter than a lane's block count, the token axis, and
+`swiglu_limit` (a 0.25 limit must change the answer, so a kernel that dropped the clip fails).
+
+### What it says
+
+- **The shared expert was never a bandwidth problem, it was a dispatch shape**, and it was the same
+  defect `#20` named, one kernel family later. The evidence `#20` left behind -- a coalesced A/B of
+  `shared_experts.w1` at 3.88x -- was measured on the plain GEMV, which the shared expert does not
+  call. This closes that gap: the two kernels it DOES call now have their sibling.
+- **What is left of a walked position is the routed mixture and the small per-position kernels.**
+  After this: routedExperts 11.97, queryUp 4.42, outputDown 4.12, hcAttentionCoefficients 4.09,
+  sharedExpert 4.06, router ~3.6, the rest under 2. The dense GEMVs are at 332-397 GB/s (`#60`) and
+  the routed mixture at 352, so the remaining large items are **latency**, not bytes: the mHC
+  coefficient pair and the router are per-position dispatches a block amortizes, and 60 ms of a
+  ~64 ms wall is still `front wait` (41.3) plus the expert fill (6.3) plus two encodes.
+- **32 lanes beat 64 on this pair and lose to it on the plain GEMV**, so the lane width is a property
+  of the kernel family, not of the format.
+
+### What it is not (do not re-propose)
+
+- **Not a claim that the one-thread forms were reading the wrong bytes.** They are arithmetically
+  equivalent (1.6e-7); they are slow, not wrong. Nothing here changes what an answer is.
+- **Not a licence to switch the plain FP8 GEMV to 32 lanes.** It measured 15% the other way (`#20`).
+- **Not a reason to add rows per threadgroup.** `#21` measured that a wash on FP8 (0.85-1.10x) with
+  a different explanation, and this slice does not touch the question: the fused pair's input is
+  one cached 5 KB vector, so sharing it across rows buys nothing.
+- **Not an arena, replacement, fill, page-cache or prompt result.** The arena is the shipped one and
+  the policy is the shipping rule; the arms' miss counts differ (2,007 vs 1,681 vs 1,562) because a
+  rounding-level difference occasionally flips a routing decision, and their walls are not compared
+  across arms for that reason plus the fill's page-cache share (23.2 vs 6.3 vs 4.3 ms/position).
+  Only the `sharedExpert` and device columns are results.
+- **Not a wide-block or batched-verify argument.** A block already amortizes this stage differently
+  (`#18`); this is a decode-shaped fix measured on a decode.
+
+### Verification
+
+`testWhatTheCoalescedSharedExpertIsWorthToAWalk` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_shared_stage` plus the class's own `/tmp/dynamoe_dsv41_real_turn`), ~53 s at
+`-O`. It asserts the layer-0 kernel equivalence (input bit-identical, fused output < 1e-5), the
+greedy token at every sampled position, that both arms' instruments covered all 128 positions, and
+that the stage table reports the shared expert. Runs: `/tmp/test61_walk7.log` (the one tabulated
+above), with `/tmp/test61_walk4.log` and `/tmp/test61_walk5.log` as reproductions of the shape
+(12.73-12.78 -> 4.05-4.26 ms/position, 3.0-3.15x). The isolated form sweep is
+`DeepSeekV41PrefillMeasurementTests.testWhatTheCoalescedSharedExpertIsWorth` (opt-in,
+`/tmp/dynamoe_dsv41_prefill_measure`, 0.09 s): `/tmp/test61_shared2.log`. The kernels are pinned
+without the checkpoint by `DeepSeekV41FP8SharedExpertKernelTests` (6 cases,
+`/tmp/test61_kernels.log`).
+
+Production code changed: two kernels, two pipelines, `DeepSeekV41Kernels`, the selection in
+`encodeSwiGLU`/`encodeDown` (FP8 only; MXFP4 keeps its existing rule and lane width), the
+`fp8FusedLaneWidth` plan constant, and two measurement-only seams on the executor
+(`disablesFP8FusedRows`, `fp8FusedLaneWidthOverride`) plus three `DeepSeekV41ParityProbes` fields,
+all off in every production path.
+## DSV4.1 #62: THE mHC PAIR WAS A ONE-THREAD SINKHORN, NOT A PROJECTION (7.0x)
+
+`#60` attributed a walked position and left the two hyper-connection coefficient stages as the
+largest items not at the machine's ceiling: `hcAttentionCoefficients` 4.09 ms/position and
+`hcFFNCoefficients` 3.37, i.e. 102 us per layer for a 1.97 MB FP32 weight read, **19 GB/s** where
+the dense GEMVs run at 332-397 and the routed experts at 352. `#61` then closed the shared expert,
+which ranked above them, so this pair was what was left.
+
+It is TWO dispatches, and `#60` never separated them: `dsv41_hc_project_f32` (one threadgroup per
+(slot, logit), 24 of them at a walk) and `dsv41_hc_split_f32` (ONE thread per position, running the
+checkpoint's twenty Sinkhorn iterations over a 4x4 matrix). This slice prices each half.
+
+### The run
+
+One runtime through the app's own loading path, one 128-position token stream (the `#52`-`#61`
+text, one rotation), the shipping frequency rule, `-O`, the shipped 65.84 GB arena. A warm-up pass
+is discarded and the measured arms share the arena, as in `#59`-`#61`. Every arm repeats the SAME
+walk; the only difference is which kernel a stage dispatches.
+
+### The projection, isolated
+
+`testWhatOneHyperConnectionProjectionCostsAtThePublishedWidths`, re-run at the checkpoint's own
+geometry (hidden 5,120, `hc_mult` 4, so a 20,480-wide reduction and 24 logits) and with **40
+distinct weight regions cycled per dispatch** (79 MB, close to the 157 MB a position reads), so the
+rate is a read rather than one region's cache hit. Best of five, both forms self-checked against
+the host rule before printing; `ms/marginal` is 20 dispatches in one buffer over 20, i.e. the
+kernel, and `ms/alone` is one dispatch, i.e. kernel plus launch:
+
+| lanes | one chain, 1 slot | four chains, 1 slot | one chain, 8 slots | four chains, 8 slots |
+|---:|---:|---:|---:|---:|
+| 64 | 0.091 ms (21 GB/s) | 0.023 (81) | 0.075 | 0.023 |
+| 128 | 0.040 (47) | 0.013 (145) | 0.039 | 0.016 |
+| 256 | 0.022 (87) | 0.008 (240) | 0.021 | **0.015** |
+| 512 | 0.012 (154) | **0.006 (335)** | 0.018 | 0.014 |
+| 1,024 | 0.008 (234) | **0.006 (337)** | 0.019 | 0.015 |
+
+Two things fall out. At a WALK's occupancy (one slot = 24 threadgroups) the projection is
+0.022 ms one-chain at 256 lanes and 0.006 with four independent accumulator pairs at 512-1,024 —
+**3.7x**, and both halves of that are real (four chains alone is 2.75x at 256 lanes; 1,024 lanes
+alone is 2.75x with one chain) because each buys memory-level parallelism and the second buys less
+once the first is in. At a BLOCK's occupancy (eight slots = 192 threadgroups) four chains are worth
+1.4x and the width is flat — 0.015 ms at 256, 0.014 at 512, 0.015 at 1,024, inside a block's
+eight-way amortization — so 256 stays. **The lane width is a property of the grid, not of the
+kernel**: `hyperConnectionLaneWidth(slots:)` is 1,024 for a walk and 256 for a block.
+
+### The split, in situ
+
+An isolated table cannot price this one honestly, so the split is measured where it runs: a
+*repeat* of its dispatch (idempotent — it writes the same `pre`/`post`/`comb` twice, so the
+graph's answer cannot move) makes the slope of the stage window the dispatch's in-situ cost. The
+same trick on the projection, and on the Sinkhorn's iteration count, separates the chain from the
+launch:
+
+| what | slope per extra dispatch |
+|---|---:|
+| the projection, four chains | 5.0-7.4 us |
+| the split, device-memory Sinkhorn | **75.7 us** |
+| the split, register Sinkhorn (shipped) | 3.3 us |
+| the split at 32 lanes instead of 1 | -0.03 us (nothing) |
+| one Sinkhorn iteration instead of 20 (device-memory form) | 16.8 us for the window (a stage is 73.8) |
+
+So the 20-iteration schedule was 3.0 us per iteration and 59 us of a 74 us stage: the 4x4 matrix
+lives in a `device float*`, so each of the schedule's ~160 normalization passes is a chain of
+dependent 4-byte loads and stores on ONE thread. A threadgroup width of 32 rather than 1 changes
+nothing, which is what says it is the chain and not the dispatch.
+
+**The fix.** `dsv41_hc_split_f32_regs` holds the matrix in REGISTERS for the `mult == 4` path
+(`dsv41_hc_sinkhorn4`, every sum folded in the general helper's order), and falls back to the
+general helper for any other `hc_mult`. `dsv41_hc_project_f32_x4` adds the four accumulator pairs,
+and the lane width comes from the plan above.
+
+### In situ, the pair
+
+Milliseconds per walked position; the pair is 80 dispatches (a projection and a split, once per
+sub-layer, twice per layer, forty layers); all arms under `recordsWalkStageTiming`:
+
+| arm | hcAttn | hcFFN | pair | device |
+|---|---:|---:|---:|---:|
+| one chain, 256 lanes, device-memory split (what shipped) | 4.164 | 3.426 | **7.590** | 49.8 |
+| four chains, 256, device-memory split | 3.413 | 2.732 | 6.145 | 48.7 |
+| one chain, 256, register split | 1.636 | 1.284 | 2.920 | 45.7 |
+| four chains, 512, register split | 0.535 | 0.527 | 1.063 | 43.1 |
+| four chains, 1,024, register split (shipped) | 0.539 | 0.544 | **1.084** | 43.2 |
+
+**7.590 -> 1.084 ms/position: 7.00x, 6.506 ms saved, 13.1% of the one-chain arm's device time.**
+The baseline reproduces `#60`'s 7.48 within half a percent. The two changes are strongly
+interacting — each is worth less than half alone (6.145 and 2.920) because the projection is only
+visible once the Sinkhorn stops dominating, and the register split only shows its full value once
+the projection stops dominating. A stage window is now 13.55 us: ~6 projection, ~4 split, ~4 fixed.
+
+**The production layout agrees**, which is the number that matters: in the arm that commits one
+command buffer per half (no per-stage windows, the layout a turn runs), the dense half goes from
+**28.626 to 23.044 ms/position, 5.582 ms won**, i.e. 86% of the stage-window figure. Of that,
+`Sinkhorn 1 iteration` is only 0.166 ms cheaper than 20 — the chain is gone — and a repeated split
+costs 4.12 us, which is what the register form is worth per dispatch in situ.
+
+### The answer was checked three ways
+
+1. *The projection's own arithmetic on real activations.* `DeepSeekV41ParityProbes` grew
+   `hyperConnectionCaptureLayer` (the coefficient probes previously copied at EVERY layer, so they
+   reported the last layer's values, forty layers of amplification away from the projection being
+   compared). At layer 0 the two arms' logits differ by 3.05e-05 absolute of 374.35 (**8.15e-08
+   relative**) for the attention sub-layer and 2.67e-05 of 155.79 (**1.71e-07**) for the FFN,
+   against a 1e-5 bar.
+2. *A reduction-tree control.* The shipped form against the same kernels at 512 lanes drifts
+   2.17e-04 relative at the last position; the old form drifts 7.83e-04, 3.6x more, and that is
+   the OLD form's error — one dependent chain over 80 blocks where a threadgroup sums a shallow
+   tree.
+3. *The decision itself.* The greedy token is identical at every sampled position of the stream
+   (0, 1, 2, 3, 7, 15, 31, 63, 127).
+
+The split itself is pinned without the checkpoint:
+`DeepSeekV41HyperConnectionKernelTests.testTheRegisterResidentSinkhornComputesTheSameSplit` runs
+both kernels over the same logits at `mult` 4 (the fast path) and 2 (the fallback) and at 0, 1, 3
+and 20 iterations, and requires agreement to 1e-7 on a normalized matrix — the register form is one
+ulp from the device form because the seed's product+add rounds once in a register where a store
+rounds it twice, and the schedule is contractive after that. The projection's general path keeps
+its agreement with `DeepSeekV41HyperConnections` through
+`testProjectionAndSplitMatchTheHostRule`, and both forms are checked against the host rule inside
+the measurement case before it prints.
+
+### What it says
+
+- **The pair's cost was never the projection.** 76 of the 102 us per layer was a Sinkhorn over
+  SIXTEEN numbers, executed by one thread, keeping its matrix in device memory. `#60` called the
+  pair "latency-bound rather than bandwidth-bound" and was right for a reason nobody had priced:
+  not the dispatch count, not the grid, but ~160 dependent device round trips per position.
+- **The projection still needed its own fix, and its cross-over is occupancy.** 24 threadgroups is
+  not enough lanes to cover a 2 MB read's latency, so a walk wants the widest threadgroup it can
+  get and four independent chains, while a block (192 threadgroups) is already covered and prefers
+  256 lanes. `#9`'s lane table was a correct table of a block.
+- **The stage table is a table of the graph, and the production layout agrees with it to 86%.** The
+  remaining 14% is the per-stage buffer boundary `#60` priced at ~5 us.
+- **What is left of a walked position is now the routed mixture and the router.** After this:
+  routedExperts 11.95 (at 352 GB/s), queryUp 4.29 and outputDown 4.16 (at 332-397), sharedExpert
+  4.06 (at the ceiling since `#61`), **router 3.64** — and the mHC pair, which used to be second,
+  is now 1.08 and out of the top five. `router` is the last large item that is not at the ceiling:
+  90 us per layer for a 3.93 MB BF16 GEMV plus a serial top-k scan, i.e. 44 GB/s where the same
+  bytes in `queryUp` run at 397.
+
+### What it is not (do not re-propose)
+
+- **Not a case for the projection's shape.** Four chains and 1,024 lanes are shipped; the sweep
+  above is the record and a block keeps 256 lanes.
+- **Not a case for a wider threadgroup on the split.** 32 lanes instead of 1 measured -0.03 us.
+  The kernel is one thread because the schedule is serial, and that is now correct rather than
+  slow.
+- **Not a case for changing `hc_sinkhorn_iters`.** Twenty is the checkpoint's schedule and the
+  register form makes the other nineteen cost 0.166 ms/position.
+- **Not a dispatch-launch result.** A one-thread dispatch with ONE iteration still costs 16.8 us of
+  window, so the launch/fixed part is ~14 us and the chain was 59.
+- **Not the per-stage instrument.** The one-buffer-per-half arm wins 5.582 of the 6.506.
+- **Not an arena, fill, page-cache or prompt result.** The arena is the shipped one and the policy
+  is the shipping rule; the arms' reads differ by up to 8 GB per position because a rounding-level
+  change occasionally flips a routing decision (`35.1` on the baseline arm against `27.3` on the
+  shipped one), so the walls are NOT compared across arms. Only the stage windows and the device
+  halves are results.
+- **Not a wide-block or batched-verify argument.** A block already amortized this stage (one
+  dispatch per eight positions); this is a decode-shaped fix measured on a decode.
+
+### Verification
+
+`testWhatTheHyperConnectionProjectionAndSplitAreWorthToAWalk` in `DeepSeekV41PublishedTurnTests`,
+opt-in (`/tmp/dynamoe_dsv41_hcwalk_stage` plus the class's own `/tmp/dynamoe_dsv41_real_turn`),
+~3 min at `-O` because it runs fifteen arms. It asserts the layer-0 coefficient equivalence, the
+greedy token at every sampled position, that both instruments covered all 128 positions, and that
+the stage table names both coefficient stages. Runs: `/tmp/test62_walk4.log` (the one tabulated
+above, 7.590 -> 1.084, dense half 28.626 -> 23.044) and `/tmp/test62_walk5.log`, an independent
+reproduction after the doc edits (7.607 -> 1.073, 7.09x, dense half 28.697 -> 23.059, the same
+8.15e-08 / 1.71e-07 layer-0 equivalence and the same 7.83e-04 / 2.17e-04 answer control), with
+`/tmp/test62_walk2.log` and `/tmp/test62_walk3.log` as the instrument's own development (the repeat
+slopes and the Sinkhorn-iteration sweep against the device-memory split).
+The isolated form sweep is
+`DeepSeekV41PrefillMeasurementTests.testWhatOneHyperConnectionProjectionCostsAtThePublishedWidths`
+(opt-in, `/tmp/dynamoe_dsv41_prefill_measure`, 0.16 s): `/tmp/test62_hc2.log`. The kernels are
+pinned without the checkpoint by
+`DeepSeekV41HyperConnectionKernelTests.testTheRegisterResidentSinkhornComputesTheSameSplit`
+(`/tmp/test62_kernels3.log`).
+
+The full `DynaMoETests` target ran 1,491 tests with 95 skipped and 30 failures in 117.5 s on the
+`-O` build: every `DeepSeekV41*` suite passed (594 cases, 0 failures), and the 13 failed cases are
+exactly the pre-existing environmental set (4 in `DynaMoETests`: help-topic count, Qwen3.8 Flash
+Next forward, tool-discover lifecycle, truncated tool-call recovery; 9
+`ModelDogfoodAndPrefixCacheTests` prompt/web-fetch/headless-Chrome cases). Run:
+`/tmp/test62_suite1.log`.
+
+Production code changed: two kernels (`dsv41_hc_project_f32_x4`, `dsv41_hc_split_f32_regs` plus the
+inline `dsv41_hc_sinkhorn4`), two pipelines, `DeepSeekV41DevicePlan.hyperConnectionLaneWidth`, the
+selection in `encodeHyperConnectionCoefficients`, and seven measurement-only seams on the executor
+(`disablesHyperConnectionX4`, `hyperConnectionLaneWidthOverride`,
+`hyperConnectionProjectionRepeats`, `hyperConnectionSplitRepeats`,
+`hyperConnectionSplitLanesOverride`, `hyperConnectionSinkhornIterationsOverride`,
+`disablesHyperConnectionSplitRegisters`) plus one `DeepSeekV41ParityProbes` field, all off in every
+production path.
+## DSV4.1 #63: THE ROUTER'S TOP-K WAS ONE THREAD OF TRANSCENDENTALS (3.5x)
+
+`#62` closed the mHC pair and left `router` as the last large stage of a walked position that is not
+at a bandwidth ceiling: 3.63 ms/position, 91 us per layer for a 3.93 MB BF16 projection plus a top-k
+scan over 384 experts. The stage is two dispatches and nothing had separated them.
+
+### The run
+
+Same harness as `#62`: one runtime, one 128-position stream, the shipping rule, `-O`, and each
+dispatch repeated in place — both are idempotent, so the graph's answer cannot move and the slope of
+the stage window IS the dispatch's in-situ cost. The repeats also make a free correctness check: the
+answer must be **bit-identical** across every arm, and it is.
+
+| arm | router stage |
+|---|---:|
+| one thread, what shipped | 3.632 ms/position (90.81 us/layer) |
+| **lane-parallel top-k (shipped)** | **1.035 (25.88 us/layer)** |
+| projection dispatched twice | 1.322 |
+| projection dispatched four times | 1.736 |
+| top-k dispatched twice | 1.453 |
+
+**The split was 6 us of projection against 72 us of top-k.** The scan is one thread, and each of 384
+experts costs three transcendentals (`sqrtsoftplus` = `exp`, `log`, `sqrt`); on top of that, the
+top-`k` arrays were declared at their bound (64) and indexed dynamically, so they lived in local
+memory. 72 us per layer is 6.6% of a decode's device time for the *selection* of six experts.
+
+**The fix.** `dsv41_router_topk_lanes` gives each position one SIMD group: lane `l` scans experts
+`l, l + lanes, ...` (a coalesced read), keeps its own `count` candidates in registers, and publishes
+them to threadgroup memory. The merge is the k-way one, run by every lane: each round takes the best
+remaining head with `simd_max`, then the winning expert's id with `simd_min` — which resolves a tie
+to the LOWER expert id, exactly the rule the one-thread insertion uses, without needing the lower
+lane to win. The winner's weight comes back through `simd_sum`, and the selection is staged in the
+output buffer's weight slot because lane 0's candidate table is still being read by later rounds.
+`DeepSeekV41DevicePlan.routerTopKWantsLanes(topK:)` caps the lane form at a top-k of eight (the
+published value is six) and sends anything wider to the one-thread scan rather than spilling the
+merge.
+
+The first version of this kernel merged SERIALLY on lane 0 and was only 1.37x (91 -> 67 us/layer):
+the merge's lists are dynamically indexed thread arrays, i.e. local memory, and 192 candidates
+through them cost 48 us. The k-way merge with shuffles is what makes the whole dispatch 10.6 us.
+
+### What it says
+
+- **The router goes 3.632 -> 1.035 ms/position, 3.51x and 2.597 ms saved**, and it leaves the top
+  five: routedExperts 11.85, queryUp 4.32, outputDown 4.13, sharedExpert 4.04, outputUp 3.47.
+- **The production layout agrees**: one command buffer per half puts the dense half at 20.424
+  ms/position against 23.022 before, i.e. **2.598 ms won**, 99.9% of the stage-window figure.
+- **The answer is unchanged to the bit**, which the repeats and the lane form both require and the
+  probe asserts at every sampled position. Nothing is re-associated: each expert's score is computed
+  by whichever lane owns it, with the same expression, and the selection order is a total order.
+- **A dispatch of one SIMD group still costs ~10 us**, of which the projection's 6 is a real weight
+  read and the merge is a few hundred cycles. What is left in the stage is a per-dispatch floor that
+  a block amortizes over eight positions and a walk cannot.
+
+### What it is not (do not re-propose)
+
+- **Not a case for a wider or narrower SIMD group.** 32 lanes is one warp and the merge's shuffles
+  need exactly that; nothing here swept the width.
+- **Not a case for changing the routing rule.** The bias ranks and the weight is unbiased, the
+  normalization is the checkpoint's `1e-20` and not `norm_eps`, and the tie-break is the lower expert
+  id; all of that is `#13`'s rule, untouched, and `DeepSeekV41RouterKernelTests` still pins it.
+- **Not a projection result.** The projection is 6 us in situ, already at ~600 GB/s; the stage was
+  never the GEMV.
+- **Not a reason to parallelize the mHC split the same way.** That kernel is one thread because its
+  schedule is serial, and `#62` fixed it by moving the matrix to registers. Here the work IS
+  parallel (384 independent scores), which is why the shape is different.
+- **Not an arena, fill, page-cache or prompt result.** As in `#62`, the arms' reads differ (35.0
+  against 28.8 GB) because a rounding-level change occasionally flips a routing decision, so the
+  walls are not compared; only the stage windows and the device halves are results.
+
+### Verification
+
+`testWhatARouterStageIsMadeOfOnAWalk` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_router_stage` plus the class's own `/tmp/dynamoe_dsv41_real_turn`), ~2 min at
+`-O`. It asserts that the repeats and the lane form leave the logits bit-identical at the last
+position and at every sampled position, and that the stage table reports the router. Runs:
+`/tmp/test63_router3.log` (the one tabulated above) and `/tmp/test63_router4.log`, an independent
+reproduction after the merge's dead-code cleanup (3.637 -> 1.038, 3.50x, dense half 23.015 ->
+20.410), with `/tmp/test63_router2.log` (the serial-merge form, 1.37x) and `/tmp/test63_router1.log`
+(the instrument's first cut, both dispatches on the one-thread kernels) as its development.
+
+The kernel is pinned without the checkpoint by
+`DeepSeekV41RouterKernelTests.testTheLaneFormOfTheTopKIsTheOneThreadFormsResult`, which runs both
+kernels over the same logits at the published shape (384 experts, top-k 6), at eight slots, and at a
+5-expert shape shorter than a SIMD group, with a deliberate equal-score pair so the tie-break has to
+agree — and requires **exact** equality of both the indices and the weights, because nothing in the
+lane form re-associates a sum. `/tmp/test63_kernels4.log`.
+
+Production code changed: one kernel (`dsv41_router_topk_lanes`), one pipeline,
+`DeepSeekV41DevicePlan.routerTopKWantsLanes`, the selection in `encodeRouter`, and three
+measurement-only seams on the executor (`routerProjectionRepeats`, `routerTopKRepeats`,
+`disablesRouterTopKLanes`), all off in every production path.
+## DSV4.1 #64: THE INDEXER'S DRAIN IS THE GPU, SO A DEVICE SELECTION WOULD BUY NOTHING
+
+After `#61`-`#63` the walked position's device time is **40.35 ms/position** (24.14 dense, 16.21
+mixture) against `#60`'s 58.45, and the stage ordering has changed underneath it: routedExperts
+11.82 (29.3%, 352 GB/s), queryUp 4.33, outputDown 4.13, sharedExpert 4.03, outputUp 3.45 -- all at
+their DRAM ceilings -- then a tail in which nothing is above 1.8 ms: indexer 1.77, attention 1.39,
+queryDown 1.15, latentProject 1.13, router 1.04, ropes 1.80 between them, norms 1.48, the mHC pair
+1.07, the stream mixes 0.88, engram 0.63.
+
+The one item left that is WALL rather than device is the indexer: 20 of the 40 layers own a
+compressed index, and each one stops the dense half for a score readback because the row list the
+attention gathers is a HOST value (`readIndexSelections`). `#60` measured that drain at 12.5
+ms/position and this run at 9.4, of a ~80 ms wall.
+
+So the obvious slice is to compute the selection on the device and remove the round trip. This
+prices the decision before it is taken, by splitting the bucket rather than guessing:
+`DeepSeekV41WalkTiming.indexerSelectNanoseconds` times the host's own work inside the round trip
+(readback + `candidateBlocks` + `selectedRows`), and `describe()` prints it as `indexer host X of
+that wait`.
+
+**The answer is 0.0 ms/position.** The entire 9.4 is `settlePending` waiting for the GPU, i.e. the
+layer's own dense work up to and including the score kernel -- 470 us per index-source layer against
+a 515 us-per-layer dense half, so the drain is not overhead at all, it is the work that the front
+wait would otherwise have covered. A device-side selection would remove the ~0.0-0.1 ms of host CPU
+and nothing else, while reimplementing a selection rule that `#28`-`#32` pinned. **Do not port it
+for this reason.** What it would still buy is *ordering*: the drain serializes the host against the
+GPU, and the pickup after the queue empties is `#22`'s ~0.5-1.2 ms/layer -- but that cost is inside
+the 9.4 and cannot be separated from it by this instrument, and it is bounded by the same GPU work.
+
+The instrument is the whole change. Runs: `/tmp/test64_walk2.log` (indexer wait 9.4, indexer host
+0.0) with `/tmp/test64_walk1.log` as the fresh whole-walk attribution taken the run before (device
+40.35, stage table above; the two runs' walls differ by 1.3 ms for page-cache reasons and the
+indexer wait is 9.4 in both).
+## DSV4.1 #65: A DEFERRED-BIND EXPERT HALF DOES NOT START UNDER THE FILL, SO THE HANDOFF IS THE MACHINE, NOT THE COMMIT
+
+`#64` closed the indexer with a negative and left the walk's structure as the last lever. Every layer
+stops the queue for the routing readback, then streams its experts, and only then hands the GPU the
+half that reads them. The GPU is idle for the whole fill, and by the time the half is committed the
+queue has been empty long enough that its own window opens late: `mixtureLateStartNanoseconds` is
+11.6-12.5 ms/position in the warm regime below, and `#22`/`#50` had already shown that number is not
+the buffer's shape, its bindings, its resource list, or CPU-dirtied memory.
+
+The one change that can move that pickup under the fill is a **deferred bind**. The expert half binds
+only what the arena PLACED, so it can be encoded and committed before its bytes exist, gated on a
+`MTLSharedEvent` the read signals. `DeepSeekV41ExpertStreamer.placeResident` splits placement from the
+read to make that possible (`ensureResident` is literally the two composed), and
+`DeepSeekV41MetalForward.gatesMixtureOnExpertFill` makes the walk use it.
+
+### The answer: the gate buys nothing, and it is priced twice
+
+**On the driver** (`DeepSeekV41CommandStartCostTests.testWhatAnEventGateSavesOnACommitIntoAnEmptyQueue`,
+`/tmp/test65_gate4.log`). Two arms at each gap: `idle` is today's shape (queue empty, host sleeps inside
+a `pread`-shaped gap, then commits), `gated` commits first and signals when the same sleep ends. Both
+are timed from the moment the DATA was ready — the commit for `idle`, the signal for `gated`.
+
+| gap | dispatches | idle ready->window | gated ready->window | window |
+|---|---|---|---|---|
+| 0 ms | 1 | 0.083 ms | 0.099 | 0.007 |
+| 0 ms | 20 | 0.106 | 0.108 | 0.071 |
+| 0 ms | 64 | 0.103 | 0.102 | 0.229 |
+| 0.6 ms | 1 | **0.122** | **0.112** | 0.009 |
+| 0.6 ms | 20 | **0.161** | **0.163** | 0.074 |
+| 0.6 ms | 64 | **0.155** | **0.144** | 0.238 |
+
+**On the graph** (`DeepSeekV41PublishedTurnTests.testWhatAGatedMixtureCommitSavesOnAWalk`,
+`/tmp/test65_gatewalk3.log`). One runtime, one arena, the 128-position stream `#52`-`#64` used, four
+arms in a rotation so the page cache cannot be read as a win:
+
+| arm | wall | device | misses | read | fill | mixture late start |
+|---|---|---|---|---|---|---|
+| control, arm 1 (cold) | 82.4 | 36.9 | 2001 | 35.0 GB | 21.7 | 12.5 |
+| gated, arm 1 | 64.4 | 36.7 | 1646 | 28.8 GB | 5.0 | 11.6 |
+| gated, arm 2 | 63.8 | 36.6 | 1559 | 27.3 GB | 4.3 | 11.7 |
+| control, arm 2 | **63.5** | 36.5 | **1559** | **27.3 GB** | 4.2 | **11.6** |
+
+The two SECOND arms are the comparison: they run back to back, so they read the same 1,559 misses and
+the same 27.3 GB, and the wall differs by 0.2 ms — in the CONTROL's favour. The gated arms' apparent
+win is entirely the cold arm's 35.0 GB. And the answer is bit-identical at every sampled position of
+all four arms, so the gate is correctly ordered (see the two traps below); it simply has nothing to
+recover.
+
+### What it says
+
+- **The pickup is not a handover delay.** A gate changes WHICH call hands the work over and not how
+  long the machine takes to begin it. An ungated commit into an empty queue and a gated buffer whose
+  event has just fired cost the same 0.11-0.16 ms for a trivial buffer, and the same 0.3 ms/layer on
+  the real graph. `#50`'s reading — a property of the machine after it has been reading, not of the
+  buffer — survives the one structural change that could have explained it away.
+- **Do not re-propose the deferred bind, an event gate, or a second command queue for the expert
+  half.** All three change when the host hands the work over; the number that matters is the machine's
+  cost to start it, and this slice measured it from both sides.
+- **What is left is the dispatch floor, and it is device time.** The sweep shows the START is flat in
+  dispatch count (0.083-0.163 ms for 1, 20 or 64 dispatches) while the WINDOW grows by ~3.5 us per
+  dispatch (0.007 -> 0.071 -> 0.229). A walked position issues ~20 dispatches per expert half and
+  ~1,080 overall, so ~3.8 ms/position of the 36.6 ms of device time is per-dispatch overhead. That is
+  a FUSION question (fewer, larger kernels), not a scheduling one.
+- The warm position's remaining wall is 63.5 ms: device 36.5, mixture late start 11.6, indexer wait
+  9.4 (GPU drain, `#64`), fill 4.2, encodes 4.6, front late start 0.7.
+
+### Two traps, both of which make a gate look good
+
+1. **A wait encoded after the dispatches does not hold them.** `encodeWaitForEvent` orders everything
+   encoded AFTER it in the buffer, so the first cut of the production change appended the wait at the
+   commit and every dispatch in front of it ran free. The walk caught it as a RACE (three positions of
+   128 off, 10-88% relative on the logits, `/tmp/test65_gatewalk1.log`), which is why the probe asserts
+   BIT-identical logits rather than a tolerance: a scheduling change that moves a logit is a bug.
+2. **A shared event's value never goes back down.** An arm that restarts its values at 1 finds its gate
+   already satisfied and measures the UNGATED path under the gated arm's name — which is how the first
+   version of the driver's sweep "measured" a gate that started work 0.001 ms after the signal. The
+   event needs one monotonic counter for the whole test (`/tmp/test65_gate2.log` and
+   `/tmp/test65_gate3.log` are the two wrong versions, kept by name so the mistake is recognisable).
+
+### Verification
+
+`/tmp/test65_gate4.log` (driver sweep, monotonic event), `/tmp/test65_gatewalk3.log` (the walk, four
+arms, bit-identical logits), `/tmp/test65_gatewalk1.log` (the racy first cut). Production default is
+`gatesMixtureOnExpertFill = false`: the seam and its probe stay as the baseline any future deferred-bind
+idea has to beat, and `DeepSeekV41ExpertStreamer.placeResident` is the split that idea would need.
+
+## DSV4.1 #66: THE DISPATCH FLOOR IS 2,072 DISPATCHES AT ~1.07 us EACH, SO FUSION CAN RETURN AT MOST 1.06 ms
+
+`#65` closed the deferred-bind expert half and handed the next slice a lever with two inferences
+behind it: "fuse kernels rather than reschedule them", priced at ~1,080 dispatches/position (27
+pipeline stages x 40 layers) and ~3.5 us per dispatch of WINDOW growth from a driver sweep. The
+first is a stage count, not a dispatch count — `.routedExperts` issues one clear plus two per active
+expert — and the second was measured with trivial dispatches going into an EMPTY queue, where nothing
+can hide their cost. So both were measured in the graph, on the 128-position stream `#52`-`#65` used.
+
+**The count is 2,071.8 dispatches per walked position**, identical in every arm and in both runs
+(265,195 per 128 positions), i.e. 1.9x the estimate. `countsDispatches` counts at the encoder call
+itself — every dispatch in the file now goes through a `dispatch(encoder, threads:/threadgroups:)`
+wrapper — so this is what the GPU is handed, not what the stage switch happens to name.
+
+| stage | dispatches/position | share | device ms | of which dispatch |
+|---|---|---|---|---|
+| routedExperts | 520.0 | 25.1% | 11.831 | 0.56 |
+| outputDown | 320.0 | 15.4% | 4.130 | 0.34 |
+| attention | 117.9 | 5.7% | 1.394 | 0.13 |
+| hcFFNCoefficients | 80.0 | 3.9% | 0.540 | 0.09 |
+| sharedExpert | 80.0 | 3.9% | 4.030 | 0.09 |
+| writeFFNStreams | 80.0 | 3.9% | 0.186 | 0.09 |
+| router | 80.0 | 3.9% | 1.038 | 0.09 |
+| hcAttentionCoefficients | 80.0 | 3.9% | 0.533 | 0.09 |
+| indexer | 59.0 | 2.8% | 1.780 | 0.06 |
+| 16 stages at 40.0 each | 640.0 | 30.9% | 17.117 | 0.68 |
+| embedding / engram / head | 15.0 | 0.7% | 0.631 | 0.02 |
+
+(`routedExperts` is 1 clear + 2 x 6 experts; `outputDown` is one dispatch per block-diagonal group,
+8 per layer; `attention` is ~3 per layer because the compressed layers also gather and store. The
+16 stages at exactly 40.0 are the ones that issue one dispatch per layer.)
+
+**The marginal dispatch costs ~1.07 us**, not 3.5. `injectedDispatchRepeats` adds K clears of a
+4-float scratch buffer to every stage's own command buffer, so an injected arm's census is the
+control's plus exactly 27 x 40 x K — asserted, not assumed — and the slope across three arms is the
+per-dispatch cost:
+
+| arm | wall ms/position | device ms/position | misses | read |
+|---|---|---|---|---|
+| control | 63.9 | 36.7 | 1,559 | 27.3 GB |
+| +1 clear/stage (3,151.8 dispatches) | 65.0 | 38.0 | 1,559 | 27.3 GB |
+| +4 clears/stage (6,391.8 dispatches) | 68.9 | 41.0 | 1,559 | 27.3 GB |
+| control again | 63.9 | 36.7 | 1,559 | 27.3 GB |
+
+That is **1.03 and 1.17 us of wall, 1.18 and 0.98 us of device** per dispatch (a second run:
+0.83/1.18 wall, 1.16/0.98 device; control 63.7 both times). The two arms agree, the repeated control
+lands on the first to 0.1 ms, and every arm returns bit-identical logits because the extra dispatches
+write a buffer nobody reads.
+
+**So the whole dispatch floor is 2,072 x 1.07 us = 2.2 ms** of a 36.7 ms device position and 2.1 ms
+of a 63.7 ms wall, 3.3%. Fusing every stage of every layer into a SINGLE dispatch — the bound no
+kernel can beat — returns **1.06 ms**, 1.7% of a walked position. The driver sweep's 3.5 us would
+have predicted 7.25 ms and a redesign; in the graph a marginal dispatch costs a third of that
+because it hides under the work already in its buffer, which is the same lesson `#65` learned about
+a commit: the queue's own state is what the isolated instrument cannot see.
+
+What that reframes: a warm walked position's 36.7 ms of device time is 34.5 ms of WORK and 2.2 of
+dispatch. There is nothing structural left in the kernel count. The remaining wall (63.7 against
+36.7) is the buckets `#65` named and none of them is a dispatch: mixture late start 11.6, indexer
+drain 9.4 (which `#64` showed is the GPU's own work), fill ~4, encodes ~4.6.
+
+**What it is not.** It is not a reason to fuse the eight `outputDown` band dispatches: `#11` tried
+exactly that, measured 29% slower in isolation and no change in place, and the census now explains
+why — the whole stage's dispatch overhead is 0.34 ms and the bands are 4.1 ms of weight traffic.
+It is not a reason to fuse the mHC pair or the router either: 0.09 ms each. And it does not say a
+fusion can never pay — it says a fusion has to remove WORK (bytes read, a redundant residual read,
+a barrier-separated pass over the same vector), because the dispatches themselves are worth 1.7%.
+
+**Two traps, both of which produced a plausible win.** (1) The first run compared a control that ran
+FIRST, so it paid the arena's cold fill (2,001 misses, 35.0 GB) against arms at 1,559 misses and
+27.3 GB, and the injected arms "won" 20 ms by reading 7 GB less; `#65` recorded the same shape. The
+probe now runs three discarded warm-ups, asserts equal miss counts and equal bytes, and repeats the
+control last. (2) The per-dispatch figure was first divided by `count * 1_000` instead of
+`count`, which printed 0.001 us and made the floor look like 0.02 ms — a units error that agreed
+with the "dispatches are free" hypothesis, so nothing looked wrong.
+
+Verification: `/tmp/test66_census2.log` and `/tmp/test66_census3.log` (two full runs, arms and stage
+table above), `/tmp/test66_census1.log` (the cold-arm first cut). The instrument lives behind
+`countsDispatches` / `resetDispatchCensus()` and `injectedDispatchRepeats`, both off in every
+production path; the dispatch wrapper is a load and a compare, and the control's 63.7-63.9 ms/position
+matches `#65`'s 63.5, so the census costs nothing measurable.
+
+## DSV4.1 #67: THE EXPERT STREAM IS A FLOOR, NOT A LEVER — AND EVERY MILLISECOND OF IT IS NOW NAMED
+
+`#66` closed the dispatch floor and left the ranking it could not settle: a warm walked position is
+36.7 ms of device work, a mixture late start of 11.6, an indexer drain of 9.4, an encode of 4.6 and a
+fill of **4.2 ms**. `#22` and `#49` had measured a live turn's fill at 67 ms and 556 MB/position with
+86-93 ms of hand-off idle behind it, and `#59` at 301-307 MB/position. Four probes, four fills, and
+every later slice quotes whichever one it happened to run. The handover routed the next slice to the
+expert read volume and told it to re-measure the live regime first; SubQ agreed
+(`expert_read_volume` 0.814, confidence 0.751; "price it before building it" 0.917).
+
+### Question
+
+What does a live turn's expert fill actually cost, in the regime a live turn is in, and is any part of
+it a lever rather than the disk's own floor?
+
+### The trap in every earlier number
+
+A probe that re-walks one stream is warm in **two** independent ways, and a turn's text is warm in
+neither:
+
+1. **The arena.** `#59` showed a cold pass is 95.3% compulsory first touches while a warm pass
+   re-fetches 83-100% of its misses. The same bytes, with different causes, and only the second is a
+   replacement question.
+2. **Slot wiring.** `#57`'s shipping policy `mlock`s a slot when it is allocated, so the pass that
+   creates the arena pays for it and the passes after it do not.
+
+`#66`'s 4.2 ms was the fifth pass of seven over one stream, with three discarded warm-ups in front of
+it: its expert bytes came out of the page cache and its slots were already wired. It is the *warmest*
+number the journal has, quoted as if it were a live one.
+
+### The run
+
+One runtime through the app's own loading path, the `#52`-`#66` 128-position rotated stream, the
+shipping `leastFrequentlyUsed` rule and the shipping wiring grant (`wireArena: nil`), `-O`, one
+process. Four arms, each recording every position's layer records (`recordsLayerGaps`, which carry the
+fill's own bytes, misses, resolve, `pread` and placement seconds beside the four intervals that tile a
+position), with the arena's miss classifier on:
+
+| arm | ms/pos | dense | hand-off | expert | reads | misses | 1st touch | GB/s | evictions |
+|---|---|---|---|---|---|---|---|---|---|
+| **cold** (reset arena, unread bytes) | **121.8** | 17.9 | 79.5 | 17.4 | 701 MB | 39.1 | **95.8%** | 15.1 | 1,248 |
+| **warm** (same stream again) | **82.2** | 17.6 | 41.3 | 16.4 | 280 MB | 15.6 | 0.0% | 13.2 | 2,001 |
+| **floor** (eight-token cycle, already resident) | **54.8** | 17.4 | 14.6 | 16.0 | 101 MB | 5.6 | 0.0% | 46.6 | 723 |
+
+The hand-off decomposes exactly, which is what makes the rest of this section possible:
+
+| arm | routing | allocate | wire | resolve | pread | place | idle | encode | unattributed |
+|---|---|---|---|---|---|---|---|---|---|
+| cold | 0.0 | 0.3 | **11.1** | 0.3 | **45.5** | 0.5 | **16.5** | 2.3 | 3.0 |
+| warm | 0.0 | 0.0 | 0.0 | 0.1 | **20.8** | 0.2 | 14.8 | 2.3 | 3.0 |
+| floor | 0.0 | 0.0 | 0.0 | 0.1 | 2.1 | 0.1 | 7.0 | 2.2 | 3.0 |
+
+So **hiding the entire expert fill would take a cold position from 121.8 to 54.8 ms — 67.1 ms, 55% —
+and a warm one from 82.2 to 54.8, 27.4 ms, 33%.** That is the largest single prize this port has
+measured. It is also, component by component, already closed.
+
+### What it says
+
+- **The read volume is compulsory and the rate is the ceiling.** 701 MB/position in 45.5 ms is 15.1
+  GB/s, the machine's own limit (13.6-15.2 in `#56`-`#59`), and 95.8% of a cold pass's misses are
+  pairs this arena never held. `#21` found the same at 53 positions, `#59` at 128, and `#58` priced the
+  capacity that would hold them (81.19 GB wired left 0 GB free and fell to 6.4 GB/s). Fewer bytes is
+  closed on every side: the arena (`#58`, `#59`), the read form, the fan-out, `F_NOCACHE` and the disk
+  (`#51`), and the fact that all six ranges of an expert are read by a kernel that wants them.
+- **The 11.1 ms of wiring is the shipping policy paying for itself in the arm that creates the
+  slots.** 0.28 ms per miss, ~1.1 ms per newly wired 17.9 MB slot, i.e. `mlock` page-touching at
+  ~15.7 GB/s. `#57` measured 17-18 ms/position for a pass that wires all 65.84 GB and showed the
+  alternative: P4, wired withdrawn, was **222.4 ms/position with 4.6M decompressions**. This is a cost
+  that pays back on the next pass and it is not a lever.
+- **Resolving a miss is nearly free — 0.006-0.011 ms each.** The bucket that looked like "catalog
+  lookups per expert" (a 12.0 ms cold arm, 120x the warm one) was wiring, not resolution. Worth
+  stating because the opposite was the plausible reading of the first cut.
+- **The idle does not scale with the bytes.** 16.5 / 14.8 / 7.0 ms against 45.5 / 20.8 / 2.1 of read.
+  `#49` fit 1.2-2.3x of the byte time; here the read-heavy part is at most 0.2, and most of the bucket
+  is a ~7 ms per-position floor present with no I/O at all. `#48`-`#50` closed the causes (not the
+  submission shape, not CPU cache writeback, not the resource count) and `#65` closed the one remedy
+  that would have removed it (the deferred gate, measured at matched read volume).
+- **The remaining GPU work is at ceilings.** dense 17.9 + expert halves 17.4 = 35.3 ms of the 121.8,
+  and `#60`-`#66` put every stage of both halves within tens of a percent of the best measured GEMV
+  rate. Against a floor of 54.8 ms, a cold position is 35.3 ms of work under 74 ms of streaming.
+
+**So the expert stream is a floor, and the only lever of any size left is to stop paying it once per
+position.** That is batching, and it is priced on both sides: `#22` measured a block of eight at 70.9
+ms/position against a 153.3 ms walk (2.16x, 7.6x less I/O), and `#26` measured the width sweep that
+makes it unusable — acceptance roughly doubles at widths two and three but a narrow verify is only
+0.83-0.89x a walk per position, and a width-2 round emits 2.05 tokens for 420 ms against 399 ms of
+walking. Note how that arithmetic moves with this slice: our *cold* walk is 121.8, so a verify of eight
+would need ~47% acceptance to break even, and `#25` measured 31% at width five. Do not re-propose a
+verify of width 2-3 without a new acceptance number, and do not re-propose the read itself.
+
+### What it is not (do not re-propose)
+
+- **Not a bigger or differently-sized arena.** `#58`'s B1 and `#59`'s replacement A/B, re-confirmed
+  here: 1,248 evictions in the cold arm and 2,001 in the warm one, all refetches, with capacity
+  already priced.
+- **Not dropping or partially applying slot wiring.** `#56`-`#58`, and P4's 222.4 ms above.
+- **Not the resolve path.** 0.006-0.011 ms per miss; the tempting 12 ms was `mlock`.
+- **Not the hand-off idle alone.** `#48`-`#50` closed its causes and `#65` closed the deferred gate.
+- **Not a page-cache argument for the warm arm.** 13.2 GB/s is disk rate, not cache rate; the floor
+  arm is the one served from cache, at 46.6 GB/s, which is what makes it a floor for time rather than
+  for bytes.
+
+### Verification
+
+`testWhatALiveTurnsExpertFillCosts` in `DeepSeekV41PublishedTurnTests`, opt-in
+(`/tmp/dynamoe_dsv41_live_fill`, plus the class's own `/tmp/dynamoe_dsv41_real_turn`), 51 s at `-O`.
+Runs: `/tmp/test67_live3.log` (the cold/warm/quiet cut), `/tmp/test67_live4.log` (the decomposed
+cut), `/tmp/test67_live5.log` (the quoted one), `/tmp/test67_live6.log` (the committed one). Four runs
+of the same arms: cold **121.8-125.0**, warm **82.2-83.4**, floor **54.8-55.4** ms/position, i.e. 2.6%
+apart end to end and 0.5% apart on the floor. Quote the range: the decomposition reproduces to ~0.3 ms
+a bucket (wire 10.4-11.1, pread 45.5-48.6, idle 16.5-17.2) while the cold arm's absolute figure moves
+with the machine, which is why the prize is stated as 55-56% of it and not as 67.1 ms. It asserts the cold and warm arms return bit-identical
+logits, that a cold arm is >90% compulsory first touches, that the floor arm misses <25% as often and
+reads at a higher rate, that the dense halves and expert halves move <2 ms between arms, and that
+every position's layer records tile it and that the miss composition covers every miss.
+
+The instrument is `DeepSeekV41ExpertStreamer.prepareTiming` (new: wall time inside `placeResident`
+short of the arena's own placement, billed through a `defer` so a throw is counted too) plus two new
+`DeepSeekV41LayerGapSample` fields, `fillAllocateSeconds` and `fillWireSeconds`, which split it into
+per-new-slot and per-miss halves. All are behind `recordsLayerGaps`, off in every production path.
+
+A fully zero-byte floor arm is not reachable under the shipping rule and the assertion says so
+instead of pretending otherwise: `leastFrequentlyUsed`'s aging halves every count once a
+capacity-worth of misses has gone by, so even an eight-token cycle's own set is retired and re-read —
+101 MB at 46.6 GB/s, 2.3 ms. That is a floor for the position's time without being a floor for bytes.
+
+The full `DynaMoETests` target ran 1,497 tests with 99 skipped and 33 failures in 124.1 s on the final
+`-O` build (`/tmp/test67_suite2.log`). Zero `DeepSeekV41*` failures. 30 are the known pre-existing
+environmental set (5 XCTest failures in 4 `DynaMoETests` cases, 25 in 9 `ModelDogfoodAndPrefixCacheTests`
+cases); the other 3 are `ServerQueueLogicTests`, which pass in isolation (13/13,
+`/tmp/test67_queue.log`) and are the timing flake `#58` recorded.
+
+## DSV4.1 #68: THE BAR FOR A DRAFT IS 45-75% EVEN IF DRAFTING WERE FREE, AND #22's 2.16x WAS A WARM-ARENA ARTIFACT
+
+#67 closed the expert stream as a floor and left one lever standing: a decode step cannot batch, so
+speculative decoding is the only structure that stops paying the stream once per position. #22 had
+priced it at 2.16x per position and 7.6x less I/O, which put the bar at ~47% acceptance over eight
+drafts; #25 and #26 measured the checkpoint's own drafter at 31% and then at 50-55% when the block was
+narrowed, and closed it. This slice asks the one question that ordering never had to answer -- what
+acceptance would a draft need, AT ALL, against the walk a live turn actually pays -- and the answer
+invalidates the premise under the 47%: a block does not read fewer bytes, and the bar is 45-75% before
+a drafter has spent a millisecond.
+
+### The run
+
+One runtime, the published checkpoint, the shipping arena rule, `arena.reset()` before every arm so
+every arm is compulsory (100% first touches, asserted) and no arm inherits another's pairs or its
+page-cache lines. Arms of 48 positions, rotated between rounds, two measured rounds after a discarded
+warm-up: a WALK arm and a VERIFY arm at widths 2, 3, 5 and 8, each on its own disjoint slice of the
+token pool. `testWhatAcceptanceADraftWouldHaveToReachToPayForItsVerify`, logs `/tmp/test68_bar1.log`
+and `/tmp/test68_bar2.log`.
+
+| arm | ms/position | MB/position | misses/position | first touch |
+|---|---|---|---|---|
+| walk | 96.8-100.9 | 876-928 | 48.8-51.8 | 100% |
+| w2 | 89.1-92.7 | 967-973 | 53.9-54.3 | 100% |
+| w3 | 75.7-79.0 | 911-939 | 50.8-52.4 | 100% |
+| w5 | 79.8-81.2 | 966-972 | 53.9-54.2 | 100% |
+| w8 | 83.1-84.4 | 999-1022 | 55.7-57.0 | 100% |
+
+Two runs, and the byte columns reproduce exactly while the walls move ~1%: w2 0.95/0.96x a walk, w3
+0.78/0.79x, w5 0.82/0.84x, w8 0.86/0.87x. That is the whole saving batching has -- 4.5 to 22.2 ms of a
+~98 ms position, one host round trip per layer that a block does not pay per position.
+
+### The 7.6x was never there
+
+Against a walk's 928 MB, the blocks read **1.01-1.10x as much**: w2 973 MB, w3 939, w5 972, w8 1,022.
+Not fewer. `#22`'s "one expert union per block instead of one set per position" is not what a resident
+arena does, because the arena is already the union: a walked position hits ~80% of the time (48.8-51.8
+misses against ~280 requests) since the positions before it in the same turn read the same experts, so
+the set a block fills up front is very nearly the set the walks would have read anyway -- and the block
+pays for its union's whole width in ONE burst, which is why `#26` measured width three reading 55% MORE
+per position than walking it.
+
+Where `#22`'s 1,357 MB came from is visible in its own test: it walks runs 0, 1 and 2 first, then
+blocks runs **1, 2 and 3** -- two of the three block runs are runs the walk arm had just loaded. The
+block byte count is the walk's own bytes served from the arena, which is precisely the trap `#22`
+recorded for a different fixture and then walked into. Its 2.16x is therefore mostly warm-arena, and
+every projection resting on it -- including the ~47% bar for a verify of eight -- is withdrawn.
+
+### The bar, at last without a premise
+
+A round costs `draft + width * verify * W` and emits `1 + a` tokens against `(1 + a) * W` of walking,
+so it pays when
+
+    a >= draft/W + width * verify_ratio - 1
+
+and with a FREE drafter that is `width * ratio - 1` accepted drafts:
+
+| width | verify ratio | saves | free bar | at #26's drafting | #26 measured |
+|---|---|---|---|---|---|
+| 2 | 0.95-0.96 | 4.5 ms/pos | **45-46%** | 82% (73 ms) | 52% |
+| 3 | 0.78-0.79 | 22.2 | **45-46%** | 71% (78.5 ms) | 38% |
+| 5 | 0.82-0.84 | 17.9 | **62-64%** | 93% (154.5 ms) | 31% |
+| 8 | 0.86-0.87 | 14.3 | **73-75%** | not measured | not measured |
+
+Read down the free column: a drafter that costs NOTHING has to be right 45-46% of the time at width
+two or three and 62-75% at five or eight, because a verify only ever buys back the per-layer round
+trip and the batching that would have bought more is worth nothing here. Width two is the only
+configuration with any headroom, and the checkpoint's own drafter delivers 52% there -- ABOVE the free
+bar. What kills it is its own forward: 73 ms of a 98 ms walk position. Break-even at width two needs
+`draft <= (1.05 - 0.91) * W`, i.e. **~14 ms per round**, which is 4-6x cheaper than the 56-90 ms `#26`
+measured and still 2x cheaper than the ~25-30 ms that slice projected if the draft mixture were made
+fully arena-resident. At widths three and five the round cannot break even at ANY draft cost, since the
+free bar already exceeds the acceptance the checkpoint delivers.
+
+### The one drafter that costs nothing
+
+So the remaining candidate is a drafter with no model in it: the continuation of the nearest earlier
+occurrence of the turn's own last n tokens. It is scored EXACTLY rather than approximately -- the
+protocol advances a round by `width` whatever was accepted (which is what `dsparkAcceptance` does, so
+the two drafters face the same target path) and acceptance always stops at the first disagreement, so
+every position before it is the model's own greedy path and a single walked continuation answers the
+question offline. The continuation is a real 96-token greedy generation from a rendered prompt, not
+fixture text.
+
+| width | 2-token lookup | 3-token lookup | free bar |
+|---|---|---|---|
+| 2 | 3/12 (25%), drafted in 6 of 48 rounds | 1/6 (17%), 3 of 48 | 46% |
+| 3 | 4/12 (33%), 4 of 32 | 0/3 (0%), 1 of 32 | 45% |
+| 5 | 0/5 (0%), 1 of 19 | 0/5 (0%), 1 of 19 | 62% |
+| 8 | 0/0, 0 of 12 | 0/0, 0 of 12 | 75% |
+
+On ordinary prose it does not have a draft to offer: it proposed one in 11 of 111 rounds across the
+four widths, and the ones it proposed were right a quarter to a third of the time. Its expected
+accepted tokens per round is a fortieth of what width two needs. Reproducible to the token across both
+runs.
+
+### What it says
+
+Speculative decoding is closed on this port at every width, and now for a reason that does not depend
+on any one drafter: the verify's whole prize is the per-layer host round trip (0.78-0.96x), the bar
+that prize sets is 45-75% with no drafting cost at all, and no drafter measured here -- the
+checkpoint's own chain at 31-52%, or a free n-gram lookup at 0-33% on prose -- comes within reach
+except at width two, where the checkpoint's 52% clears a 46% bar and its 73 ms of drafting moves the
+bar to 82%.
+
+The relationship is worth stating because it generalises: **the faster the walk, the higher the bar**,
+since `draft/W` grows as `W` falls and the round-trip saving it is chasing shrinks with it. `#67`
+pushed `W` down to 121.8 ms/position cold and 55 to the floor; a verify that could not pay at 153-194
+therefore cannot pay at 122, and at the 55 ms floor there is nothing to batch at all because the fill
+has already left the critical path. Speculative decoding and the expert stream are the same lever
+pointing in opposite directions.
+
+### What it is not (do not re-propose)
+
+- **A batched verify as a way to read fewer expert bytes.** It does not read fewer; it reads
+  1.01-1.10x as many, because the arena already amortises the stream across positions. Do not quote
+  `#22`'s 7.6x again.
+- **A width-2 verify on the strength of 52% acceptance.** 52% clears the free bar by 6 points and the
+  drafter's own 56-90 ms of forward turns that into a 82% bar. The number that would have to move is
+  the draft cost, to under ~14 ms/round, and `#26`'s best projection for a fully resident mixture is
+  double that.
+- **Widths 3, 5 and 8 at any drafting cost.** The free bar exceeds the measured acceptance, so no
+  optimisation of the drafter helps.
+- **An n-gram or prompt-lookup drafter on prose.** 11 drafts in 111 rounds; it is a no-op that would
+  still have to be verified. (It may be worth revisiting only for text that repeats by construction,
+  and then it must be priced on that text and not on this one.)
+- **Per-position logits in `finishBlock` and cache rewind for a rejected suffix.** Still exactly what
+  `#25` and `#26` said: the losing half of a design the measurement rejects.
+- Everything `#22`, `#26` and `#67` already closed: the fill's read form, fan-out, `F_NOCACHE`, disk
+  and page cache (`#51`); arena capacity and replacement (`#58`/`#59`); slot wiring and its withdrawal
+  (`#56`/`#57`); the hand-off idle, deferred bind, event gate and second command queue (`#48`-`#50`,
+  `#65`, `#67`); dispatch count and fusion (`#66`); the resolve path (`#67`); the dense GEMVs and the
+  wider block (`#60`); the shared expert, mHC and router kernels (`#61`-`#63`).
+
+### Verification
+
+Ranges over `/tmp/test68_bar1.log` and `/tmp/test68_bar2.log`: the walls agree to ~1% between runs and
+the byte columns to the megabyte, and the width ratios (0.95/0.96, 0.78/0.79, 0.82/0.84, 0.86/0.87) are
+the quoted figures. The case asserts that every arm is >80% compulsory first touches (so no arm read
+another's pairs), that a round records exactly one walk arm and one arm per width, and that the
+required-acceptance arithmetic reproduces the printed bar. It reports the bar at the measured walk and
+quotes `#26`'s two drafter numbers rather than re-running them, because the draft width sizes buffers at
+construction and a sweep needs one runtime per width.
+
+The regime differs from `#26`'s in one deliberate way and it is worth knowing which is which: `#26`
+walked a 14-position prefix and then timed ONE round against it, which is a round whose experts are
+almost all cold, while these arms are 48 positions long so each block is filled against the arena the
+turn so far left -- the ~80% hit rate `#67` measured on a live turn. That is why width three reads
+0.78x here and 1.08x there: neither is wrong, and the one that answers "does a verify pay in a live
+turn" is this one.
+
+## DSV4.1 #69: WHAT A WHOLE TURN COSTS, END TO END — AND WHY THE PREFILL BAR NEVER MOVED
+
+### Question
+
+Every slice from `#60` on measured a PIECE of a decoded position: one stage of the dense
+half (`#60`-`#63`), the indexer's wait (`#64`), the deferred bind (`#65`), a dispatch
+(`#66`), the expert fill (`#67`), a verify that turned out not to pay (`#68`). The only
+end-to-end figure anywhere in this journal is `#22`'s 205-324 ms/position, and it was
+taken before the dense pin, the coalesced FP8/MXFP4 GEMV family, the arena's replacement
+rule and `#67`'s re-measurement of its own regime -- so nothing since is comparable with
+it, or with each other. There was no common reference.
+
+There was also a user-visible symptom of the same gap. In the chat UI the prefill status
+did not appear on the first prompt at all, and on a follow-up turn it appeared as a single
+late count. Both came from the same place: a whole prompt is ONE call into the executor.
+
+### The run
+
+`DeepSeekV41PublishedTurnTests.testWhatAWholeTurnActuallyCosts` runs
+`DeepSeekV41TurnRunner` exactly as `CompletionEngine.launchTurn` does -- one chunked
+prefill from position 0, then a walk per drawn token -- over the published checkpoint,
+and reuses the runtime across turns so the arena's behaviour is the app's. Two prompt
+shapes, each followed by its own continuation (the prompt the model saw plus what it
+wrote, which is what the app's pin proposes):
+
+| turn | prompt | reused | run | prefill | steps | decode | ms/position | first token |
+|---|---|---|---|---|---|---|---|---|
+| 1 thinking off ("hey") | 5 | 0 | 5 | 1.41 s (281 ms/pos) | 1 | 1.29-1.32 s | 161.6-164.4 | 1.41 s |
+| 2 its continuation | 13 | 12 | 1 | 0.14 s (136-138) | 1 | 0.97-0.98 s | 138.5-139.7 | 0.14 s |
+| 3 app default (thinking on, high) | 31 | 0 | 31 | 5.79-5.85 s (187-189) | 4 (8,8,8,7) | 1.40-1.46 s | 175.2-182.6 | 5.79-5.85 s |
+| 4 its continuation | 39 | 38 | 1 | 0.18 s (177-182) | 1 | 1.32-1.36 s | 164.9-169.7 | 0.18 s |
+
+The decode, decomposed by the executor's own buckets, per walked position (host buckets
+are mutually exclusive; the device windows are a SUBSET of the host waits, so they are
+reported as "of that host time" rather than added):
+
+| turn | wall | host | encode | front wait | expert fill | indexer wait | mixture encode | device windows | outside the walk |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 184.7-187.9 | 180.8-184.2 | 3.1 | 52.4-52.9 | 112.0-112.6 | 10.4-13.8 | 2.4 | 42.0-43.8 | 3.7-3.8 |
+| 3 | 200.2-208.7 | 195.4-204.4 | 3.5-3.6 | 79.5-88.9 | 90.5-92.3 | 17.2-18.8 | 2.8 | 44.0-47.3 | 4.2-4.8 |
+
+Four turns read 81.35 GB into 4,646 slots, ended 3,760/3,760 resident at 62.0% hit over
+12,224 acquisitions, and the streamer served it at 11.7-11.8 GB/s.
+
+### What it says
+
+**1. The composer's blank prefill was plumbing, and it is fixed.** A whole prompt goes
+through one `prefillChunk` call, and the turn loop reported progress only AFTER that call
+returned (`onPrefill(newPositions, newPositions)`), while the app's own `done % 8 == 0`
+guard dropped every report a short turn produced. So the first prompt emitted nothing
+until the prefill was over and then jumped to a finished count, and a resumed turn -- one
+or two positions -- emitted exactly one line. Both are the same defect: a report with no
+granularity behind it. `DeepSeekV41PositionForward` now carries
+`prefillChunk(_:onProgress:)`; the device executor fires it once per `runBlock` (a block
+is one command buffer, so that is the honest granularity), the walk-based executors
+report once at the end, and the app emits a 0/N line before the call and then a
+time-throttled, rate-bearing status (`Prefilling 24/31 (+38 resident) • 5.3 pos/s`). The
+cost of the fix is one closure call per block.
+
+**2. A 31-token default prompt is 5.8 seconds of nothing.** That is the number the user
+stares at, and it is now on the screen as it happens. `user waits 5.79-5.85 s for the
+first token` is the column to watch for any future prefill work.
+
+**3. The batched prefill buys essentially nothing on a prompt of this size, measured
+through the app rather than in an arm.** Its per-position cost is 187-189 ms against a
+cold decode position's 175-183 ms, i.e. **1.02-1.07x**, which is `#53`'s 1.05x at 128
+positions arriving from the app's own path. The block form's win was never per-position
+expert traffic (`#68` withdrew that premise); it is the per-layer host round trip, and a
+31-position prompt has four of them to amortise. There is nothing here to speed up by
+batching harder.
+
+**4. A live decode position is the expert fill plus the routing round trip, and nothing
+else.** Of turn 3's ~205 ms: 90-92 ms is the fill (44%), 80-89 ms is the front wait
+(39-43%, of which ~44-47 ms is device windows), 17-19 ms is the indexer's second wait,
+and 6 ms is host encoding. **3.4-5.2 ms is outside the walk altogether** -- the head, the
+sampling, the text decode and the stream hop together -- so no amount of work on the
+non-walk path is worth measuring. This is `#67`'s conclusion (the fill is the floor) and
+`#22`'s conclusion (the readback empties the queue and the next commit is picked up late)
+arriving through a third instrument, and it is the first time either has been shown on
+the path the chat UI actually runs.
+
+**5. The resumed turn is nearly free, which is the prefix cache working.** 12 of 13 and
+38 of 39 prompt positions were skipped, so a follow-up's first token arrives in 0.14-0.18 s
+against a first prompt's 5.8 s, and that single walked position costs the same as any
+other (136-182 ms).
+
+### What it is not (do not re-propose)
+
+- **Not a contradiction of `#67`.** Its arms were 48-position walks against a 14-position
+  prefix; these turns start at an empty arena and fill it as they go (62% hit by the end
+  of the fourth). The 162-183 ms/position here is what a turn pays from cold, which is
+  why it sits above `#67`'s 121.8. Both are right and neither is the other's regime.
+- **Not a case for a different prefill shape.** 1.02-1.07x is `#53`'s number; a wider
+  block, a narrower one or a device-side pool all have to beat that, and `#53` already
+  measured the first two.
+- **Not a target in the 3-5 ms outside the walk.** The head, sampling and text decode
+  together are 2% of a position.
+- Everything `#60`-`#68` closed: the dense GEMVs and the wider block, the shared expert,
+  mHC and router kernels, the indexer's host work, the deferred bind, the dispatch count
+  and fusion, the expert read and arena, the hand-off idle, and speculative decoding at
+  every width.
+
+### Verification
+
+`/tmp/test69_turn_run1.log` and `/tmp/test69_turn_run2.log` (two runs of the same case in
+the same process order): every wall agrees to 1-3%, every byte column is IDENTICAL
+(24,563.7 / 32,112.1 / 74,282.7 / 83,301.3 MB), and the generated text is token-identical
+in both. The case asserts, per turn, that prefill reports are monotonic, that the last one
+equals the positions the turn actually ran, and that the count is one per block when
+chunked (3's four reports for 31 positions at a block width of 8) and one per position
+when walked (a resumed turn's single position) -- which is the composer's contract, and
+was the thing that was broken. Run with the class marker and the opt-in file:
+
+```bash
+touch /tmp/dynamoe_dsv41_real_turn && DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcodebuild test-without-building -project DynaMoE.xcodeproj -scheme DynaMoE \
+  -destination 'platform=macOS,arch=arm64' -derivedDataPath /tmp/dd_dsv41_61_opt \
+  -parallel-testing-enabled NO \
+  -only-testing:DynaMoETests/DeepSeekV41PublishedTurnTests/testWhatAWholeTurnActuallyCosts
+```
+
+The progress plumbing is pinned without any model as well:
+`DeepSeekV41TurnLoopTests.testAWholePromptReportsProgressBlockByBlock` (a scripted
+forward that reports per block, asserting the counts climb and end on the chunk) and
+`DeepSeekV41DeviceGraphParityTests.testAPrefillReportsEveryBlockItRuns` (the real device
+executor over 9 positions at a 4-wide block, asserting `[4, 8, 9]`).
+## DSV4.1 #70: A PREFILL POSITION IS ONLY CHEAPER THAN A DECODE ONE WHEN ITS WORKING SET FITS — AND THE WIDTH THAT WINS FOLLOWS THAT, NOT THE LAYOUT
+
+### Question
+
+`#69` measured the app's own turn and found a prefill position costs what a decode position
+costs (187-281 against 138-183 ms), on a layout that pays ONE dense-half wait, ONE routing
+readback, ONE indexer split and ONE union fill per layer for a whole block of eight. Eight
+positions for the price of one should be a large win; the numbers say the layout is worth
+2-5%, and nothing since `#53` has measured the SHAPE of that. Every prefill table in this
+journal is also older than the dozen optimisations from `#56` to `#67`, all of which tuned
+the WALK a turn resumes into rather than the block a prompt is prefilled with.
+
+Routing asked which prefill slice was worth the next machine hour and ranked a width-scale
+attribution at 0.84 (confidence 0.80) over instrumenting the block's encode (0.07), a
+16-slot block form (0.02) and batching the per-slot dispatches (0.06). It also put "is the
+width already saturated at eight" at 0.80, which turned out to be the one thing this slice
+overturned.
+
+### What was added
+
+Nothing on a shipped path until the last section; three instrument repairs and one probe:
+
+- `DeepSeekV41BlockTiming` gained `indexerWaitNanoseconds`. `encodeBlockStage` submits the
+  dense half in two parts around the indexer, because the row selection is a HOST value,
+  and that drain plus readback was being counted as `denseEncode`. It made a block read
+  28.6 ms of "encode" per position against a walked position's 3.5. The walk has kept the
+  same column separate since `#48`; the two layouts' tables can now be read side by side.
+  `describe()` prints it and includes it in its own whole-vs-parts control.
+- The dispatch census learned the block path. `encodeBlockStage` never labelled its stages
+  (so every block dispatch was attributed to whatever the walk set last) and
+  `dispatchCensusPositions` never counted a block's positions.
+- `prefillChunk(_:blockWidth:)` — a public overload naming the block width, so a sweep can
+  compare widths without changing what production runs at. `prefillChunk`'s private form
+  takes it and falls back to `DeepSeekV41DevicePlan.prefillBlockWidth`.
+- `testWhereATextPrefixsPerPositionCostGoesOnThePublishedCheckpoint` (opt-in,
+  `/tmp/dynamoe_dsv41_prefix_time`): the `#52`-`#59` 128-token stream, the walk and widths
+  1, 2, 4 and 8, three rounds with the arm order rotated, arena reset before every arm, and
+  the same instruments on each. Then the same comparison at 31 positions (the app's own
+  DEFAULT prompt, which `#69` measured at 2.9 s of prefill) and at 64 (to bracket the
+  crossover), then the two widths again with the arena left WARM, which a follow-up turn
+  meets and a cold arm cannot see.
+
+### The width curve: four wins on a long prompt, eight wins on a short one
+
+Cold arena, steady state (rounds 2-3, round 1 discarded), ms per position. The first table
+is one process that had the machine to itself and swept all three lengths; the second is
+how three earlier processes reproduced it, because a prefill arm is cheap enough to repeat
+and every earlier prefill table in this journal was a single pass:
+
+| positions | walk | width 1 | width 2 | width 4 | width 8 |
+|---|---|---|---|---|---|
+| 128 | 266.7 | 258.9 | 235.1 | **222.9** | 264.2 |
+| 64 | 306.5 | - | - | **278.4** | 345.8 |
+| 31 | 372.1 | - | - | 422.6 | **399.9** |
+
+| process | 128 walk / w1 / w2 / w4 / w8 | 64 walk / w4 / w8 | 31 walk / w4 / w8 |
+|---|---|---|---|
+| run 1 | 273.7 / 266.1 / 250.1 / 232.3 / 269.1 | - | - |
+| run 2 | 276.7 / 282.8 / 249.7 / 242.4 / 270.9 | - | 390.8 / 411.6 / 406.5 |
+| run 3 | 280.7 / 273.5 / 253.9 / 238.2 / 263.7 | - | 402.3 / 463.7 / 418.6 |
+
+Every arm at a given length reads the same bytes (89,971-90,545 MB over 5,018-5,050 misses
+at 128; 67,541 MB over 3,767 at 64; 47,352 MB over 2,641 at 31), which is what makes the
+columns comparable at all. Run 4's 64-position arms are left out on purpose: they overlapped
+builds and a parity suite and read every arm 10-15% slow while keeping the order, which is
+the failure mode the rotation rule exists to catch and cannot always catch on its own.
+
+- **Eight is not the optimum, and it is barely better than walking.** At 128 positions width
+  eight is 1.01-1.05x the walk across four processes — `#53`'s 1.04-1.05 reproduced exactly —
+  while width four is 1.18-1.20x. A width-1 block, which batches nothing, is 2-4% ahead of
+  the walk, so the block path's own overhead is small and the curve is about width.
+- **The curve is not monotonic, and it turns over between 31 and 64 positions.** At 31
+  positions width eight beats width four by 6-12% and both are slightly BEHIND the walk
+  (0.88-0.93x); at 64 four is 1.10x ahead of the walk and 1.24x ahead of eight; at 128 four
+  is 1.19-1.20x ahead of the walk and 1.18x ahead of eight.
+- **The crossover is the working set, not the length and not the warmness.** A prompt's
+  routed `(layer, expert)` pairs saturate as it lengthens — 2,641 at 31 positions, 3,767 at
+  64, 5,045 at 128 — against an arena of 3,760 slots, so 64 positions is exactly where a
+  prompt stops fitting. Before that, a prefill is pure per-layer overhead and the widest
+  block amortises it best. After it, every block pays a fill and a wider block costs more
+  per layer than its extra positions buy back.
+- **A warm arena does not change which width wins, only how much is left to win.** With the
+  arena left as the previous pass filled it, at 31 positions (0 MB read, pure compute) width
+  eight is still ahead, 1.05-1.19x across two processes (83.1 against 86.9, and 69.4 against
+  84.4 ms/position), and at 128 positions even a warm pass still reads 56 GB and width four
+  is 1.09-1.12x ahead (189.7 against 212.8, and 184.1 against 201.1). That matters because
+  it is the arm that killed the obvious guess: a short prompt is warm, so eight is right
+  there, and a long prompt cannot be warm, so four is right there.
+
+### Where a block's position actually goes
+
+Same 128-position stream, round 2 of run 3, per position in ms (this is the whole answer
+to "why does batching not amortise"):
+
+| bucket | walk | w1 | w2 | w4 | w8 |
+|---|---|---|---|---|---|
+| **wall** | 259.5 | 248.3 | 230.8 | **218.5** | 265.6 |
+| dense encode (host) | 3.0 | 3.00 | 1.91 | 1.38 | 0.98 |
+| indexer wait | 33.8 | 29.4 | 30.0 | 30.2 | 35.4 |
+| front wait | 125.7 | 117.0 | 107.6 | 99.8 | 129.6 |
+| expert fill | 94.2 | 89.6 | 84.5 | 81.1 | 87.0 |
+| mixture encode (host) | 2.8 | 2.95 | 2.37 | 1.91 | 1.64 |
+| **device, both halves** | 51.9 | 46.5 | 43.7 | 42.1 | 50.7 |
+| - dense half | 28.1 | 23.1 | 19.4 | **17.3** | 20.9 |
+| - mixture half | 23.8 | 23.3 | 24.3 | 24.9 | **29.8** |
+| mixture late start | 105.2 | 93.5 | 88.3 | 82.8 | 103.0 |
+| dispatches / position | 2,072 | 2,072 | 1,630 | 1,410 | 1,299 |
+
+- **The dense weight read is the only thing that amortises.** Its device half goes 28.1 →
+  17.3 ms per position from walk to width four, −39%, because the dense backbone is resident
+  and read once per block instead of once per position. That is the entire prize: ~11 ms of
+  260, and half of it goes back at width eight (20.9).
+- **The mixture half gets WORSE with width, monotonically.** 23.8 walked, 23.3 at width one,
+  24.3 at two, 24.9 at four, 29.8 at eight. Batching the mixture was supposed to be its win
+  (`#52` measured the union fill carrying 1.1-2.4 experts where a walk's carries 0.3); on
+  this checkpoint the per-position expert computation is what a mixture costs, and a wider
+  block spreads it over more slots per submission without making it cheaper.
+- **The fill is the largest single bucket at every width and it barely moves.** 94.2 ms
+  walked, 81.1 at width four, 87.0 at eight, on identical bytes: 88-90 GB per 128-position
+  prefill at 7.7-8.5 GB/s. `#67` measured this machine's ceiling at 13-14 GB/s, so a cold
+  text prefill sits at ~60% of it, and the layout moves it by 14%.
+- **The hand-off stops improving past width four.** The mixture's late start falls 105 →
+  82.8 from walk to four and then rises to 103.0 at eight: past four the block's own mixture
+  takes long enough that the next layer's dense half is waiting for it again.
+- **Every bucket tiles.** The block's host buckets sum to 96-98% of its own wall in all six
+  regimes, the same control `#50` and `#52` used.
+
+### The block path's own dispatch census, for the first time
+
+At width eight over 128 positions: 166,299 dispatches, 1,299 per position, and 56.2% of them
+are the router (93,440). Then `writeLatent` 9.5%, `indexer` 4.5%, and eight stages at 3.1%
+each (`attnNorm`, `queryNorm`, `latentNorm`, `ffnNorm`, `mixAttentionStreams`,
+`mixFFNStreams`, `writeAttentionStreams`, `outputDown`).
+
+- **The per-slot stages are emitted once per position, so the count per position falls only
+  37% across an eight-fold width** (2,072 → 1,299). A width-1 block and a walk emit exactly
+  the same 2,072, which is the block path's overhead and nothing else.
+- **It buys nothing to care.** The encode bucket at width eight is 0.98 ms per position and
+  at width one 3.00, i.e. those dispatches cost ~0.5 µs each, already under `#66`'s 1.07 µs
+  floor. Batching the per-slot dispatches is not where a prefill's time is; the journal's
+  `#15` note that "the gathers are the remaining candidates and unmeasured" is answered:
+  measured, they are 9.5% of a dispatch count that is itself 1% of a position.
+
+### What it means
+
+- **Batching a text prefill is worth 0-20% per position, not 2x**, and where the optimum
+  sits is decided by whether the prompt's expert working set fits the arena.
+- **The shipped width was eight, which is right for the app's own prompt and ~19% off for a
+  long one.** `prefillBlockWidth` now returns the workspace's width below
+  `prefillFillBound` (64) positions and four above it. The threshold is where the measured
+  working set stops fitting (3,767 distinct pairs at 64 against 3,760 slots), so it is a
+  derivation rather than a tuned constant, and it is `min`-capped by the workspace so a
+  narrow-context fixture cannot ask for a block its buffers do not hold.
+- **A prefill position is a decode position because the mixture is a decode position.** The
+  dense half does amortise; the experts do not, and they are 33-37% of the wall plus most of
+  the device half.
+- **The fill is at ~60% of the disk's ceiling on a cold text prefill** (7.7-8.5 against
+  `#67`'s 13-14 GB/s). `#67` named every millisecond of a walked position's fill and found
+  it at the ceiling; a block's union fill, at 3.9-7.8 misses per fill, does not reach it.
+  That is a ~31 ms/position gap at width four and it is the largest single open number this
+  slice leaves.
+
+### What it is not (do not re-propose)
+
+- Not the bytes: every width reads within 0.6% of the same expert bytes on the same stream.
+- Not the dispatch count or fusion (`#66`): the block path's encode is 1.0-1.4 ms/position
+  at every width past one.
+- Not a block wider than the workspace's eight: measured, it is 10% worse at 128 positions
+  and only wins when the working set fits.
+- Not the arena's capacity or eviction policy (`#21`, `#58`, `#59`), not a second command
+  queue or a deferred bind (`#65`), not the indexer (`#64`), and not the mixture's kernels
+  (`#60`-`#63`).
+- Not warm-versus-cold as the discriminator for width: measured both ways at both ends of
+  the threshold, and the sign is the same in both regimes at each length.
+
+### Verification
+
+`testWhereATextPrefixsPerPositionCostGoesOnThePublishedCheckpoint` is opt-in and skips
+without `/tmp/dynamoe_dsv41_prefix_time`; it draws no slot `MTLBuffer` beyond what a normal
+prefill allocates and changes no shipped path. Five processes over ~100 minutes:
+`/tmp/test70_prefix_run1.log` (128 positions, three rounds), `run2.log` (128 + 31),
+`run3.log` (128 + 31 + the warm arms), `run4.log` (adds 64, overlapped other work) and
+`final2.log` (the three-length sweep every table above is taken from).
+
+The word "clean" matters here, and one run had to be killed for it. A second process left
+running from an earlier invocation put two runtimes over one machine, which is 2 x 74 GB
+against 128 and 52 GB of swap: the affected sweep read 1,040 ms/position against a normal
+176-266, i.e. 4-6x, and every arm kept its ORDER. A rotated sweep only protects against an
+effect that moves with arm position; it cannot see a constant load, so quote one only from a
+process that had the machine and say so.
+
+Two unit bugs were caught by the harness's own controls rather than by the numbers looking
+wrong, and both are worth carrying: the arms identified themselves by `width`, which is 1
+for a walk, so the walk's census assertion read the block-1 arm's; and the parity bar was
+5e-4, taken from `#33`'s block-versus-walk comparison at 16 positions, where legitimate
+widths on this stream disagree by 5.3e-3 at 128 positions and 1.1e-2 at 31. The bar is 5e-2
+with an exact argmax check beside it, and a skipped stage or a slot reading another
+position's rows is orders of magnitude larger than either.
+
+Shipped path: one rule (`prefillBlockWidth`) plus the seam it is decided through. Pinned by
+`DeepSeekV41DeviceGraphParityTests.testThePrefillWidthFollowsTheWorkingSet` (the rule at
+both ends of the threshold, and the report cadence it produces driven through a real
+prefill) and `testEveryPositionOfABlockAttendsOverItsOwnRows` now names its width
+explicitly, because its subject is a block as wide as the workspace and not what a prompt
+ships at. `DeepSeekV41DeviceGraphParityTests` 37 tests pass; `DeepSeekV41TurnLoopTests` 26
+pass; `testWhatAWholeTurnActuallyCosts` is unchanged where it counts: the app's 31-token prompt
+still prefills in FOUR reports at width eight, with the same 74,282.7 MB read, the same
+12,224 arena acquisitions at the same 62.0% hit rate and the same generated text as `#69`.
+Its wall moved from 5.79-5.85 s to 8.57 s and back to 6.69 s on a build that ran the same
+work at width four, because that turn is 74 GB of cold expert read and the disk's rate is
+what varies (11,368 against 9,995 MB/s reported by the streamer on the same bytes). Quote
+that turn's wall as a range or not at all.
+
+## DSV4.1 #71: THE PREFILL FILL IS AT THE DISK'S CEILING — #70's 31 ms GAP WAS THE HARNESS'S UNWIRED ARENA, AND THE WIDTH THRESHOLD IT SHIPPED DOES NOT SURVIVE
+
+`#70` closed by naming one open number: at the best prefill width a 128-position prompt
+spends 81.1 ms/position filling the expert arena, 703 MB/position at **7.7-8.5 GB/s**
+against this machine's measured 13-14 GB/s ceiling, i.e. ~31 ms/position of apparent
+headroom, and the largest single open figure the journal had. The same journal had already
+measured a cold WALKED position — same bytes, same misses — at **15.1 GB/s** (`#67`), and
+`#70` itself recorded the app's own turn moving 5.79 s to 8.57 s to 6.69 s on
+byte-identical reads. Two processes, one workload, 2x apart, and nobody had asked which
+process was normal.
+
+### Question
+
+Is a prefill's fill slower than a walk's, or is the bucket not the read, or is the number
+a property of the process that measured it?
+
+### What was added
+
+Nothing on a shipped path except the rule at the end. One probe, and the seam it needs:
+
+- `testWhatRegimeAPrefillsFillIsMeasuredInOnThePublishedCheckpoint` (opt-in,
+  `/tmp/dynamoe_dsv41_fill_regime`): one runtime through the app's own loading path, the
+  `#52`-`#70` 128-token stream, `recordsFillSamples` on, the walk and widths 4 and 8 at 128
+  and at 31 positions, three rounds with the arm order rotated and round 1 discarded, the
+  arena dropped before every arm so every arm reads the same bytes.
+- It bills each arm TWICE. The outer bucket is `DeepSeekV41BlockTiming.expertFillNanoseconds`
+  (or the walk's), the wall around `ensureResident` — which is what `#70` divided its bytes
+  by. The inner one is the streamer's own clocks: `readMisses`'s wall (`timing.reading`),
+  placement (`placementTiming`), the rest of `placeResident` (`prepareTiming`, which
+  CONTAINS allocation and wiring), the true bytes of the ranges, and one
+  `DeepSeekV41FillSample` per fill (`misses`, `shards`, `ranges`, true `bytes`, `seconds`),
+  which also gives the rate per fill SHAPE.
+- And it CALIBRATES: the same `ensureResident` the prefill calls, cold, eight fills of six
+  experts and eight of twenty-four, from distinct pairs so nothing is read twice. The only
+  honest ceiling for an in-situ rate is one the same process measured.
+
+### The answer is the arena's wiring, and it is not close
+
+The first cut ran the harness's default runtime — `makeRuntime(wireArena: false)` — and got
+`#70`'s numbers. The same probe with the app's own runtime, which wires every slot
+(`wireArena: nil`), gets:
+
+| 128 positions | wall | fill bucket | read | GB/s | bytes | misses |
+|---|---|---|---|---|---|---|
+| walk | 132.9 | 58.4 | 57.8 | **12.2** | 90,455 MB | 5,045 |
+| width 4 | **114.0** | 54.1 | 53.5 | **13.2** | 90,025 MB | 5,021 |
+| width 8 | 113.6 | 55.0 | 54.5 | **12.9** | 89,971 MB | 5,018 |
+
+| 31 positions | wall | fill bucket | read | GB/s | bytes | misses |
+|---|---|---|---|---|---|---|
+| walk | 207.5 | 122.8 | 121.7 | **12.6** | 47,352 MB | 2,641 |
+| width 4 | 182.5 | 114.7 | 113.7 | **13.4** | 47,352 MB | 2,641 |
+| width 8 | 187.0 | 112.2 | 111.4 | **13.7** | 47,406 MB | 2,644 |
+
+(Those are process 1's walls. Three processes measured the same arms and the fill read rate
+is stable across them — 12.2-13.9 GB/s at every width and length — while the walls move
+5-30% with the machine, which is why the width comparison below is per process.)
+
+Both sides are the same bytes and the same misses, so the only difference between these
+rows and `#70`'s is the regime:
+
+| regime | prefill fill rate (128 positions) | same-process calibration |
+|---|---|---|
+| harness, `wireArena: false` (`#70`, and a fresh process of this probe) | 5.9-8.5 GB/s | — |
+| app, `wireArena: nil` (this probe, three processes) | **12.2-13.9 GB/s** | **13.2-17.0 GB/s** at 6 experts, **14.8-17.0** at 24 |
+
+`#56` had already measured it and said so: the same bytes into the same slots run at
+**4.6-6.7 GB/s unwired against 13.0 wired**, because an unwired slot is a page the
+compressor reconstructs after every pass that rewrote it. Every prefill table in this
+journal since `#20` was taken unwired — the harness default exists so `#20`-`#56` compare
+like with like — and the app wires. `#67`'s 15.1 was the shipping regime; `#70`'s 7.7-8.5
+was not.
+
+**So the 31 ms/position is withdrawn, and with the wiring on the bucket is 99% read:**
+at width four on the 128-position stream, placement is 0.29 ms/position, preparation 0.28
+(and allocation and wiring inside it are 0.00, because the slots exist by then), and 0.13
+is unaccounted — 0.70 ms of 54.1. The fill's bookkeeping is not a lever because there is
+none to find. At 77-87% of what the same process can do in an isolated fill, with 100% of
+its misses compulsory (5,021 misses against 5,045 distinct pairs), a prefill's expert read
+is the disk doing its job.
+
+### Where a wired prefill position actually goes
+
+128 positions, round 2, per position, ms — the same table `#70` printed, in the regime the
+app runs:
+
+| bucket | walk | width 4 | width 8 |
+|---|---|---|---|
+| **wall** | 132.9 | **114.0** | **113.6** |
+| dense encode (host) | 2.8 | 1.38 | 1.10 |
+| indexer wait | 11.9 | 11.24 | 11.44 |
+| front wait | 52.5 | 43.87 | 43.73 |
+| expert fill | 59.0 | 53.48 | 54.93 |
+| mixture encode (host) | 2.4 | 1.75 | 1.51 |
+| **device, both halves** | 39.7 | 31.78 | 33.66 |
+| - dense half | 21.7 | **13.24** | 13.67 |
+| - mixture half | 18.0 | 18.54 | 19.99 |
+| mixture late start | 22.9 | 19.3 | 17.9 |
+
+`#75` retargets one row: `front wait` is one `settlePending`, so 63-65% of it is the previous layer's
+mixture still on the queue -- already billed in `- mixture half` above -- and only the remainder is the
+dense half's own drain. Read the two together, never add them.
+
+Read it against `#70`'s unwired table and every bucket moves, because the fill is what the
+whole layer was waiting on: the indexer split falls 30.2 → 11.2 (it drains the previous
+mixture, which is now cheap), the mixture's late start 82.8 → 19.3 (the queue is idle for a
+1.3 ms fill instead of a 2 ms one), and the dense half's device window 17.3 → 13.2. What
+does NOT move is the shape: the fill is still the largest single bucket, the mixture's
+device half is still the second, and the dense half is still the only thing batching
+amortises.
+
+### The width curve in the app's regime, and the rule
+
+Three processes, cold arena, arm order rotated, round 1 discarded, mean of the measured
+rounds, ms per position. The winner column is the two widths against each other:
+
+| positions | process | walk | width 4 | width 8 | winner |
+|---|---|---|---|---|---|
+| 128 | 1 | 133.0 | 114.0 | **113.6** | eight, 0.4% |
+| 128 | 2 | 120.2 | 102.1 | **97.0** | eight, 5.3% |
+| 128 | 3 | 121.5 | 102.6 | **99.7** | eight, 2.9% |
+| 64 | 3 | 154.5 | 133.7 | 133.4 | tied, 0.3% |
+| 31 | 1 | 207.5 | **182.5** | 187.0 | four, 2.5% |
+| 31 | 2 | 252.2 | 183.8 | **180.5** | eight, 1.8% |
+| 31 | 3 | 190.4 | 173.6 | **165.7** | eight, 4.8% |
+
+Both widths beat the walk everywhere, by 1.10-1.22x, which is the same prize `#70` found
+for width four. Between the widths the whole effect is 0.3-5.3%, eight is ahead in five of
+the six comparisons, and the one loss is the app's own 31-token prompt in process 1, the
+process whose machine state was slowest (its walk is 207.5 against 190.4 in process 3).
+
+`#70` shipped a threshold on the strength of the opposite reading: the workspace width below
+64 positions and four above, on the theory that a short prompt's routed experts fit the
+arena so per-layer overhead dominates and the widest block amortises it best. In the
+shipping regime that theory has nothing left to explain, and the threshold's crossover is
+where the two widths are closest (64 positions: 133.7 against 133.4). **So the threshold is
+gone and `prefillBlockWidth` returns the workspace's width at every prompt length** — what
+the engine ran before `#70`, which is the conservative direction to revert in, and what the
+measurements support (eight or tied in five of six). `prefillFillBound` is deleted; the
+function stays as the seam a future sweep can move without touching `prefillChunk`.
+
+The first cut of this slice shipped a CONSTANT FOUR on process 1's numbers alone, where
+four was 2.5% ahead at 31 positions and 0.4% behind at 128. Processes 2 and 3 reversed both
+readings. That is the honest lesson about a 2-5% effect measured on one machine: n=1 is not
+a measurement, and the only defensible rule at this margin is the one with the best central
+tendency across processes.
+
+### What it means for the app
+
+`#69`'s live-turn numbers are this regime's counterpart and are ~2x pessimistic. Re-run
+with the app's arena, the same 31-token default prompt prefills in **6.67 s** (215.3
+ms/position over 31, four reports at the shipped width) and the whole turn is **7.74 s of
+wall for 74,283 MB read** with 133.4 ms per decoded token, against `#69`'s 8.57 s unwired
+on the same bytes; a second shipping process at width four prefilled in 5.80 s and turned in
+6.85 s, which is the same 5-30% machine variance the width table shows. The 5-token `"hey"`
+prompt prefills in 1.80 s and turns in 3.29 s. The streamer's own report over those four
+turns is **14,084 MB/s** with the arena wired 65.84 of 65.84 GB, which is the same rate the
+probe measured and the same policy `#57` shipped.
+
+The lesson that generalises past this slice: `makeRuntime` defaults to the unwired regime,
+so **a test that prices the app must pass `wireArena: nil`**, and `#69`'s turn case now
+does. Anything else is a number about the harness.
+
+### What it is not (do not re-propose)
+
+- **Not the fill's bookkeeping.** 0.70 ms of a 54.1 ms bucket at width four: placement,
+  preparation, allocation, wiring and resolve are all accounted for and all under 1.5%.
+- **Not the bytes, the arena or the layout.** 5,021 misses against 5,045 distinct pairs on
+  a 128-position prompt is 100% compulsory; there is no refetch left for capacity, policy
+  or a different block shape to remove.
+- **Not the wiring policy.** It is the shipping default, it is worth 2x on every fill, and
+  `#57` already showed the alternative (P4, unwired, 222.4 ms/position).
+- **Not a narrower block.** The two widths are within 0.3-5.3% in the shipping regime and
+  eight leads in five of six comparisons, so a rule that narrows a prompt is buying noise.
+  The workspace's eight is both the ceiling on the buffers and the running width.
+- **Not a second arena in one process.** The unwired arm, run after a wired one in the same
+  process, collapsed to 0.9 GB/s (3,108 ms/position): that is 2 x 65.84 GB against 128 GB,
+  not a regime. The probe runs one regime per process for that reason.
+- **Not the disk.** 12.2-13.7 GB/s in situ against 15.2-15.9 isolated is the machine, and
+  the streamer's own four-turn report agrees at 13,479 MB/s.
+
+### Verification
+
+`testWhatRegimeAPrefillsFillIsMeasuredInOnThePublishedCheckpoint` is opt-in and draws no
+slot `MTLBuffer` beyond what a normal prefill allocates. Runs: `/tmp/test71_fill1.log` (the
+first cut, unwired, which is where 5.9-6.9 GB/s came from), `/tmp/test71_regime1.log` (the
+shipping regime every table above is taken from, and the contaminated unwired arm it
+replaced) and `/tmp/test71_turn2.log` (the live turn). It asserts, per arm: that the fill
+samples cover every miss the bucket was charged for, that the read is shorter than the
+bucket that contains it, that the ranges and the slot count agree on the bytes within 5%,
+that every arm read the same bytes across rounds, and that widths 4 and 8 land on the
+walk's token (relative 5e-2, exact argmax). The calibration asserts it read every pair it
+asked for.
+
+Shipped: `DeepSeekV41DevicePlan.prefillBlockWidth` returns the workspace's width at every
+prompt length, and `prefillFillBound` is deleted. Pinned by
+`DeepSeekV41DeviceGraphParityTests.testThePrefillWidthIsTheWorkspaceWidth`, which checks
+the rule at seven prompt lengths and at a workspace narrower than the ceiling, and drives a
+real prefill at 3, 9, 64 and 128 positions to assert the report cadence.
+`DeepSeekV41DeviceGraphParityTests` 37 tests pass and `DeepSeekV41TurnLoopTests` 26 pass.
+`testWhatAWholeTurnActuallyCosts` passes with its cadence expectation derived from the
+shipped rule instead of from `chunkSlots` directly; the indirection is what caught the
+first cut, which asserted a block count the engine no longer produced.
+
+## DSV4.1 #72: THE MIXTURE HALF DOES NOT AMORTISE WITH WIDTH BECAUSE BOTH ITS BIG STAGES ARE PER POSITION -- AND THE SHARED EXPERT'S REPETITION WAS REQUESTS, NOT BYTES
+
+### Question
+
+`#71` closed the fill and listed what is left of a 128-position prefill at the shipped width:
+99.7 ms/position of which fill 52.2 (read 51.8 at 13.6 GB/s), **mixture device 19.3-20.0**, dense
+device 13.4, indexer wait 11.3, front wait 43.7. The mixture half is the largest bucket that is not
+the disk (`#75` later showed ~63-65% of that 43.7 IS the mixture half's own device time, drained inside
+the next layer's front wait, so the two rows overlap), and it is the one bucket that did NOT fall with
+the block width -- `#71`'s table had it
+rising 18.0 (walk) -> 18.5 (width 4) -> 20.0 (width 8). Every stage table in this journal before now
+covers the DENSE half (`#52` measured one on a real block; `#60` did the walk's), because
+`recordsStageTiming` only ever gave those stages a command buffer each. So "the mixture half costs
+19-20 ms and does not batch" was a statement about a bucket, not about a stage.
+
+### What was added
+
+Measurement only, off in every production path:
+
+- `recordsStageTiming` now splits a BLOCK's mixture half the same way it already split its dense
+  half: one command buffer per back-half stage, every position of the block inside it. The order
+  becomes stage-major rather than position-major, and that is safe rather than
+  equivalent-by-luck: the slots are disjoint, and the only cross-stage hazard (`routedExperts`
+  clears and accumulates `moeOut`, `writeFFNStreams` reads it) stays ordered because every buffer
+  is on one in-order queue. The probe asserts the two layouts return the same answer.
+- `testWhereABlocksMixtureTimeGoesOnThePublishedCheckpoint` (opt-in,
+  `/tmp/dynamoe_dsv41_mixture_stages`, 135 s): 128 positions in the app's own regime
+  (`wireArena: nil`), widths 8 and 4, three rounds with the arm order rotated and round 1 discarded
+  (`#53`), the shipped one-buffer layout beside the stage split. It prints the four mixture stages
+  per width and asserts: identical logits between layouts (relative 1e-6), the same argmax, all four
+  stages reported, and that the two layouts read the same bytes (a guard, not a result).
+
+### The table, before any change
+
+Milliseconds per position, 128 positions, arena 3,760 slots wired (65.8 GB), two layouts measured in
+the same process:
+
+| width | mixture device (split / one buffer) | routedExperts | sharedExpert | writeFFNStreams | collapseStreams |
+|---|---|---|---|---|---|
+| 8 | 16.17 / 17.06 | **12.272 (75.9%)** | **3.655 (22.6%)** | 0.152 | 0.095 |
+| 4 | 16.37 / 17.32 | **12.409 (75.8%)** | **3.703 (22.6%)** | 0.157 | 0.100 |
+
+Two stages are 98.5% of the half. Their bytes say what they are:
+
+- **`routedExperts` is the machine's GEMV ceiling and is per position by construction.** One
+  position routes 6 of 384 experts on each of 40 layers, 6 x 17.93 MB x 40 = 4.30 GB, read in
+  12.22 ms -- **352 GB/s**, which is `#20`'s 300-370 GB/s and `#60`/`#61`'s 352 reproduced at a
+  block. Eight positions of a block touch about 45 DISTINCT experts of the 48 they route (a 6%
+  union saving), so batching can remove almost nothing: the bytes are the routing.
+- **`sharedExpert` reads the same 33.8 MB per layer for every position** -- 1.32 GB/position -- and
+  it was doing so at 390 GB/s, i.e. at the ceiling, once per position. That is the one repetition
+  in the mixture half that batching can remove.
+
+**`#71`'s "it rises with width" does not reproduce.** The same instrument in two processes puts the
+mixture half at 15.5 (width 8) and 15.8 (width 4); the 18.0 -> 18.5 -> 20.0 row was instrument
+spread in the bucket table, not a width effect.
+
+### The batched shared expert, and what it is actually worth
+
+Two additive kernels, `dsv41_fp8_block32_swiglu_gate_up_rows_slots` and
+`dsv41_fp8_block32_down_accumulate_rows_slots`: one threadgroup per output row with the POSITION
+loop inside it, so the row's bytes are requested once and the later positions' passes come from the
+caches in front of DRAM. Buffer indices are their `_rows` siblings' plus `slotCount`; the output is
+`[slot][outDim]`, and lane 0 accumulates each slot's row exactly as the `_rows` form accumulates
+one. The block path now encodes the mixture stage-major and hands `.sharedExpert` ONE dispatch with
+`rows: count`; every other format (and a narrow fixture, where `fp8GemvWantsWideGrid` is false)
+keeps the per-position loop. `workspace.sharedIntermediate` is one row per slot.
+
+Predicted from the byte model: `(1 - 1/8) x 3.66 = 3.2 ms/position`. Measured:
+
+| width | sharedExpert before | sharedExpert after | mixture device after (split / one buffer) |
+|---|---|---|---|
+| 8 | 3.655 | **3.060 (1.19x)** | 15.53 / 15.50 |
+| 4 | 3.703 | **3.177 (1.17x)** | 15.78 / 15.90 |
+
+**So 84% of the predicted saving was not there, and the reason matters more than the number.** If
+those 1.32 GB/position had been DRAM traffic, removing 7/8 of them would have taken 3.2 ms.
+Removing them took 0.56 ms, which means the per-position re-reads were being served by the caches
+in front of DRAM: a layer's shared expert is 33.8 MB, and eight consecutive passes over it fit.
+The stage was never bandwidth-bound on its WEIGHT.
+
+What it IS bound on is its INPUT. A threadgroup owns one output row and reads EVERY position's
+normed vector for the length of that row:
+
+    outDim x slots x inDim x 4 bytes = 2,304 x 8 x 5,120 x 4 = 377 MB per layer-block
+
+which is 1.88 GB per position, 14x the weight, and 377 MB in the 0.61 ms a layer-block takes is
+**616 GB/s**. That is the stage, and batching the weight does not touch it. `#18` found exactly this
+for the block's BF16 GEMVs (a block of sixteen was WORSE than eight because the input, not the
+weight, is what a threadgroup re-requests per output row); this is the same defect in the shared
+expert, which is the one stage of the mixture that all eight positions share.
+
+In situ, the shipped layout's wall moved with it, in two processes and at both widths: width 8
+82.6 / 80.7 -> 78.5 / 77.7, width 4 88.6 / 87.4 -> 83.6 / 84.7 ms/position, i.e. **~3.5
+ms/position, 4%**. Part of that is the stage (0.56) and part is the layout (the mixture half is now
+15.50 one-buffer against 17.06, and the two layouts agree after the change where they differed by
+0.9 before), so quote the stage number as the result and the wall as the direction. The live turn
+agrees in size: the app's 31-position default prompt went 6.67 s (215.3 ms/position, `#71`) to
+**6.29 s (203.0 ms/position)**, turn 7.74 -> 7.35 s, on a machine whose absolute walls move 5-30%
+between processes.
+
+### What it says
+
+- **The mixture half's floor is `routedExperts` + whatever the shared expert's input traffic
+  costs**, and at a block that is 12.2 + ~3.1 of a 15.5 ms half. Neither is a kernel-form
+  question: the routed bytes are the routing, and the shared expert's stage is its activations.
+- **A block does not amortise the routed mixture, and that is a property of the model.** Six of 384
+  experts per position means two positions share an expert about 1.5% of the time.
+- **The one lever left inside the mixture half is rows per threadgroup on the shared expert**, and
+  `#21`'s prohibition has an exception written into it: "do not re-propose rows-per-threadgroup for
+  FP8 without a shape whose INPUT traffic is the measured cost". This is such a shape (616 GB/s of
+  activation re-reads). `#18` measured the two-row form at 1.20-1.34x on `attn.wo_a`/`attn.wo_b`,
+  which here would put the stage at ~2.4 ms/position -- under 1% of a prefill. It is a named,
+  unbuilt lever with a size, not a recommendation.
+
+### What it is not (do not re-propose)
+
+- **Not evidence that the mixture half should fall with width.** It is flat (15.5 at 8, 15.8 at 4)
+  because both its stages are per-position; `#71`'s rising row was spread.
+- **Not a batching argument for the routed experts.** The union dedup saves 6% of the slots and
+  nothing of the bytes, and the bytes are at the ceiling.
+- **Not a caller-side fix.** The block already submits its mixture as one command buffer with no
+  round trip between positions (`#52`).
+- **Not the dispatch count or fusion.** `writeFFNStreams` and `collapseStreams` are 0.25 ms/position
+  together; `#66` already put the whole graph's dispatch floor at ~1.06 ms.
+- **Not the arena, the fill, the page cache or the width.** Every arm here read the same bytes
+  (56,281 MB / 3,139 misses at width 8, 56,963 / 3,177 at width 4 across all layouts and rounds)
+  and the fill was closed in `#71`.
+- **Not a reason to touch the walk.** The batched form is a block form; a decode step has one
+  position and `rows: 1` keeps the `_rows` kernel it already shipped.
+
+### Verification
+
+`testWhereABlocksMixtureTimeGoesOnThePublishedCheckpoint` in `DeepSeekV41PublishedTurnTests`
+(opt-in, `/tmp/dynamoe_dsv41_mixture_stages` plus the class's `/tmp/dynamoe_dsv41_real_turn`, 135 s
+at `-O`): runs `/tmp/test72_mix1.log` (before), `/tmp/test72_mix2.log` and `/tmp/test72_mix3.log`
+(after, reproducing every stage within 2%). The kernel change is pinned without the checkpoint by
+`DeepSeekV41FP8SharedExpertKernelTests.testTheSlotFormsProjectEveryPositionFromOneWeightRead`:
+five slots (so no form can assume four or eight), the published shapes, the batched output against
+the per-slot `_rows` form AND -- at a small shape -- the host rule, plus a check that each slot lands
+in its own row. The class's 7 cases pass. `DeepSeekV41DeviceGraphParityTests`,
+`DeepSeekV41DeviceParityTests`, `DeepSeekV41TurnLoopTests`, `DeepSeekV41SlotWiringTests` and
+`DeepSeekV41ExpertStreamTests` pass, 68 cases with 0 failures; those compare the device block and
+walk against `DeepSeekV41CPUForward`, which is what makes the stage-major reorder and the batched
+shared expert checked against the host graph rather than against themselves. The live turn is
+`/tmp/test72_turn1.log`.
+
+Production changed: two kernels, two pipelines, `DeepSeekV41Kernels` names, `encodeSwiGLU` /
+`encodeDown`'s `rows:`, `encodeSharedExpert`'s batch decision, `encodeBlockMixtureStage` (stage-major
+with one shared-expert dispatch), and `workspace.sharedIntermediate` at one row per slot (8 x 9 KB
+instead of 9 KB). The split layout and `sharedExpertCapture`/`ffnNormed` probes are measurement-only
+and still off in every production path.
+
+## DSV4.1 #73: THE DENSE HALF IS THREE FP8 PROJECTIONS, AND READING THEIR WEIGHT ONCE PER BLOCK INSTEAD OF ONCE PER POSITION COSTS 2.42x
+
+### Question
+
+`#72` closed the mixture half and left the dense half as the largest remaining bucket of a
+128-position prefill at the shipped width: 78-80 ms/position of which fill ~52 (`#71`, at the disk's
+13.6 GB/s), **dense device 13.4-15.4**, mixture device 15.5 (`#72`), indexer wait 11.3, front wait
+43.7 (of which `#75` later found ~63-65% is the mixture's own device time, drained inside the wait).
+Every dense stage table in this journal was taken on the SYNTHETIC checkpoint at published
+widths (`#16`-`#18`), where the ranking was `writeLatent` 45.5% and then three GEMVs, `compressPool`
+and `attention` printed zero because the fixture had no compressed layers, and every weight was
+already resident. The published plan is half compressed (8 of 40 layers own a compressed index), so
+no table had ever said which stage holds the half where it ships.
+
+### What was added
+
+Measurement only:
+
+- `testWhereABlocksDenseHalfGoesOnThePublishedCheckpoint` (opt-in, `/tmp/dynamoe_dsv41_dense_stages`
+  plus the class's `/tmp/dynamoe_dsv41_real_turn`, ~200 s at `-O`): 128 positions in the app's own
+  regime (`wireArena: nil`, `#71`), widths 8 and 4, three arms -- the shipped one-buffer layout,
+  the per-position stage split, and a third arm that enables the candidate form below -- three
+  rounds with the arm order rotated and round 1 discarded (`#53`). Every front-half stage is priced
+  against the catalog the runtime actually bound: the weights a stage reads (values plus their E8M0
+  scale companion) are resolved by role per layer and summed over the runtime's own plan, so a stage
+  that reads no weight (a norm, a rope, a mix, the attention) prints without a rate instead of with
+  an invented one.
+- A candidate kernel for the one thing the table suggested, and the plumbing to A/B it in situ:
+  `dsv41_fp8_block32_gemv_rows_slots` (one threadgroup per output row, `slotCount` positions inside
+  a compile-time-eight loop, 8 accumulator pairs, the row's 32 weight bytes read once and held in
+  registers), one pipeline entry, `fp8GemvWantsSlotForm`, and `enablesFP8SlotGemv` -- OPT-IN and off
+  in every production path, because the answer was no.
+
+### The table
+
+Milliseconds per position, 128 positions, arena 3,760 slots wired (65.8 GB), the shipped
+per-position form, 40 layers:
+
+| stage | ms/position | share of the half |
+|---|---|---|
+| `queryUp` (`attn.wq_b`) | **2.992** | **19.8%** |
+| `outputUp` (`attn.wo_b`) | **3.028** | **20.0%** |
+| `outputDown` (`attn.wo_a`, 8 bands) | **2.673** | **17.7%** |
+| `indexer` | 1.715 | 11.3% |
+| `queryDown` (`attn.wq_a`) | 0.747 | 4.9% |
+| `engram` | 0.689 | 4.6% |
+| `writeLatent` (attention in the window) | 0.607 | 4.0% |
+| `latentProject` (`attn.wkv`) | 0.472 | 3.1% |
+| `latentNorm` | 0.289 | 1.9% |
+| `attnNorm` | 0.376 | 2.5% |
+| `ffnNorm` | 0.367 | 2.4% |
+| `mixFFNStreams`, `mixAttentionStreams`, `router`, `queryNorm`, `hcAttentionCoefficients`, `hcFFNCoefficients`, `ropeOutput`, `writeAttentionStreams`, `ropeQuery` | 0.100-0.152 each | 0.7-1.0% each |
+| `compressPool`, `attention` | 0.000 | 0.0% |
+| **dense device** | **15.12** (one buffer 11.06) | |
+
+Width 4 is the same table within 3% (`queryUp` 3.090, `outputUp` 3.076, `outputDown` 2.859, half
+16.13). The split layout's own overhead is priced on its own row: 8 trivial dispatches cost 0.219
+ms/position, 1% of the half.
+
+### What it says
+
+- **Three FP8 projections are 58% of the dense half**, and they are stage for stage the ones `#18`
+  and `#20` named from isolated tables. 8.7 of 15.1 ms/position. Everything else in the half is
+  under 1.7 ms, and the two biggest of those (`indexer`, `engram`) have no weight read to speak of.
+- **They do not batch.** 2.992 / 3.028 / 2.673 at width 8 against 3.090 / 3.076 / 2.859 at width 4:
+  +2% to +7% per position when the block halves. Like the mixture's routed half, their cost is per
+  position, which is why the dense half is the one bucket `#70`'s width rule could not shrink.
+- **The journal's predicted ranking does not hold at this prefix, and the reason is the prefix.**
+  `writeLatent` is 4.0% here against 29-45% in `#17`, because at 128 positions attention can only
+  reach 128 rows; `#17` measured 1,024 positions and 1,152 gathered rows. `compressPool` and
+  `attention` print 0.000 because both run inside `writeLatent` (`#16`), and the 8 compressed layers
+  are not visible in this table at all. A long-prefix prefill has a different shape.
+- **`indexer` is 1.68 ms/position with 40 MB of weight**: it is not a weight read, so it is not
+  priced by bytes. Eight of 40 layers own a compressed index, so that is ~0.21 ms per owning layer
+  per position, and the selection readback is booked separately as `indexer wait` (11.3 ms/position
+  in `#71`). It is the one dense stage whose cost is neither a GEMV nor a norm, and it is worth its
+  own slice.
+- **The byte arithmetic fits a ceiling it is not at.** One pass over a stage's weight per POSITION
+  is 1.25-1.56 GB per layer-block at width 8; at the measured windows that is 425-523 GB/s for all
+  three, which is this machine's memory bandwidth and looks like a wall. That is exactly the
+  coincidence `#17` warned about, and the form below is how it was tested.
+
+### The form that was built, measured and rejected
+
+`dsv41_fp8_block32_gemv_rows_slots` reads each weight row once per block instead of once per
+position -- `bf16_gemv_rows8`'s trade (one accumulator per position against one weight read) in the
+FP8 block-scaled form, and the same shape `#72` shipped for the shared expert. Enabled through
+`enablesFP8SlotGemv`, in the same process, over the same tokens and the same arena:
+
+| width | dense device, per-position form | dense device, slot form | ratio |
+|---|---|---|---|
+| 8 | 15.12 | **36.57** | **2.42x worse** |
+| 4 | 16.13 | **38.56** | **2.39x worse** |
+
+and it is not an artefact of the stage-split layout: in the shipped one-buffer layout the same arm
+reads 11.06 without the form and 24.05 with it (2.18x, `/tmp/test73_dense6.log` against
+`/tmp/test73_dense2.log`). Per stage, the slot form costs `queryUp` 3.05x, `outputDown` 2.51x,
+`outputUp` 2.06x, `queryDown` 4.62x, `latentProject` 7.82x its per-position time, while every stage
+that reads no weight is unchanged (0.93-1.00x). It also moves
+the final logits 9.6e-3 relative -- the split layout itself is bit-identical (0.0 difference), so
+that drift is the projection's reordered summation amplifying through 40 layers of router near-ties;
+`DeepSeekV41FP8GemvKernelTests` holds the same kernel to 1e-4 against the host rule on the published
+shapes with full-range bytes, so the form is correct and simply slower.
+
+**So the repetition was free.** Eight visits to the same 1.25-8 KB row are served by the caches in
+front of DRAM, and the eight threadgroups that make those visits are what the stage was using. This
+is `#72`'s lesson one level up: there the removal of the repetition was free and worth 1.19x; here
+the removal costs 2.42x because a plain GEMV has nothing else to overlap with, and it is the one
+place a batching change is a LOSS.
+
+### What it is not (do not re-propose)
+
+- **Rows-per-threadgroup, slot forms or a "read the weight once" variant on the plain FP8 GEMV at a
+  prefill block.** Measured: 2.42x worse, both layouts, both widths, five projections. `#21`
+  forbade it on FP8 until a shape whose INPUT traffic is the measured cost turned up; `#72` found
+  one and it paid 1.19x. This is the other case: the input is 164 KB per layer-block against 39 MB
+  of weight, so the form removes the cheap half and spends its parallelism.
+- **"The dense half is weight-bandwidth bound."** Its 425-523 GB/s is arithmetic that fits a
+  per-position model, not a measurement of traffic; the experiment that would have confirmed it is
+  the one that lost by 2.42x.
+- **`#17`'s 29-45% for `writeLatent` as a short-prefix statement.** At 128 positions it is 4.0%.
+  Prefix length is the variable, and the two tables are not comparable.
+- **Not the width, the fill, the arena or the prompt.** Every arm read the same bytes (56,281 MB /
+  3,139 misses at width 8, 56,963 / 3,177 at width 4), and `#70`/`#71` closed the width and the fill.
+- Everything from `#51`-`#72` still stands.
+
+### Verification
+
+`testWhereABlocksDenseHalfGoesOnThePublishedCheckpoint` in `DeepSeekV41PublishedTurnTests`
+(`/tmp/test73_dense1.log` before the kernel existed, `/tmp/test73_dense6.log` after, every stage
+reproduced within 3%): it asserts the split layout returns bit-identical logits to the one-buffer
+layout (relative 1e-6, measured 0.0), the same argmax, the same bytes within 2%, that every
+front-half stage is reported, and that the slot arm keeps the argmax while drifting no more than
+5e-2 (measured 9.6e-3 at width 8, 5.8e-3 at width 4). `DeepSeekV41FP8GemvKernelTests` is 12 cases,
+0 failures: the four new ones pin the slot form's position strides, a short block of three against
+the compile-time eight, the published width, and both published shapes with FULL-RANGE bytes (every E4M3 exponent, E8M0 scales
+over 2^-11..2^+5, activations that cancel) against the host rule at 1e-4 -- the narrow fixture
+passes a kernel that reads the wrong scale row, and the first version of that test overflowed
+because its scale bytes reached 2^127.
+
+Production changed: nothing. The kernel, pipeline and rule are in the tree as a measured baseline
+behind `enablesFP8SlotGemv`, which is false in every production path; the graph still dispatches
+`dsv41_fp8_block32_gemv` / `dsv41_fp8_block32_gemv_rows` exactly as `#20` and `#21` left them.
+
+## DSV4.1 #74: THE INDEXER STAGE IS THREE RAILS, AND ITS PROJECTION RAIL WAS STARVED OF THREADS
+
+### Question
+
+`#73` billed `.indexer` at 1.715 ms/position, 11.3% of a prefill position's dense half and the
+fourth largest row of it, and stopped there: the stage is ONE command buffer holding three
+unrelated rails. Four of forty layers own a compressed KV cache and run the compressor, eight own
+a compressed index and run the query-side projections, and only the row scores depend on how many
+rows a position can see. 40 MB of weight is all the stage touches, so "1.7 ms" had no mechanism
+behind it and no way to tell a wall from a shape.
+
+### What was added
+
+- `DeepSeekV41IndexerSection` (`.pool` / `.project` / `.select`) and `encodeIndexerSection`.
+  Production is unchanged in shape and in order: `encodeIndexerStage` loops the three sections into
+  the one encoder it always used.
+- Under `recordsStageTiming` each rail gets its own command buffer, and only on the layers that RUN
+  it. The other thirty-two of forty encode none of the three, and an empty buffer reports no device
+  window at all, so giving them one would have billed nothing while pretending to. They are labelled
+  `indexer.idle` and measure 0.000, which is the finding that retires a hypothesis rather than
+  confirming one: `#73`'s single `indexer` window was NOT thirty-two empty windows (see below).
+- `forcesFP8WideGrid`, a measurement-only flag, so the coalesced form could be priced on a shape the
+  plan rule refuses without changing what the rule decides for everything else.
+- `testWhatTheIndexerStageIsMadeOfOnThePublishedCheckpoint` in `DeepSeekV41PublishedTurnTests`
+  (`touch /tmp/dynamoe_dsv41_indexer_stages`): 128 positions at the shipped width, the app's regime
+  (`wireArena: nil`), three arms rotated and round 1 discarded — shipped split, forced-coalesced
+  split, and the one-buffer production layout for the answer and the byte count.
+- One shape, `attn.indexer.wq_b` at 4,096 rows over 1,280 columns, in the existing FP8 form A/B
+  (`testWhatTwoRowsPerThreadgroupSavesOnTheFP8Gemv`), which is the isolated comparison the plan
+  rule's `inDim` clause had never been measured against.
+
+### The table (128 positions, width 8, split layout, ms/position)
+
+| rail | ms/position | of the stage | of the dense half | per layer that runs it | read per position | rate |
+|---|---|---|---|---|---|---|
+| `indexer.pool` | 0.401 | 21.7% | 2.6% | 0.100 | 35.00 MB | 85 GB/s |
+| `indexer.project` | **0.741 → 0.631** | 34.1% | 4.1% | 0.093 → 0.079 | 42.54 MB | 56 → 66 GB/s |
+| `indexer.select` | **0.818** | 44.2% | 5.3% | 0.102 | 0.20 MB | — |
+| `indexer.idle` | 0.000 | 0.0% | 0.0% | — | — | — |
+| **sum** | 1.982 → **1.850** | | 12.9 → 12.1% | | | |
+
+Dense device 15.24 → 15.30 in the split layout and 10.93 → 11.07 in the one-buffer layout, which is
+the first sign that the whole change is smaller than the process-to-process spread. `indexer wait`
+(the host round trip the split still pays) is 2.5 ms/position in the split layout against 7.7-8.8 in
+the one-buffer layout: in production the host waits at `.indexer` for EVERYTHING encoded before it,
+so most of that 8 is the dense half's drain and only the 2.5 is the indexer's own. `#71`'s `indexer
+wait` figure is the same quantity in a different layout and is not the stage.
+
+### What it says
+
+1. **Three rails, roughly a third each.** Nothing owns the stage, so there was no single fix to
+   find; `#73`'s row was the sum of a compressor, two projections and a score kernel.
+2. **`select` is neither bandwidth nor FLOP bound.** 0.20 MB and ~1.6M multiply-adds per position,
+   eight dispatches of 64-128 threads — a fortieth of the machine per dispatch. That is a latency and
+   occupancy row, and its ceiling is its own 0.82 ms.
+3. **`project` was one thread per row over 4,096 rows.** 42.54 MB of weight per position read at
+   56 GB/s where the coalesced form measures 132-133 GB/s on the same bytes: the plan rule sent it to
+   `dsv41_fp8_block32_gemv` because 1,280 columns is under its 2,048, and that clause is a
+   lane-per-block argument derived on `attn.wq_b`, whose 32,768 rows fill the machine on their own.
+4. **`pool` is four layers' worth of two BF16 `[512, 5120]` projections per position** at 85 GB/s.
+   Already coalesced, so its rate is a shape question rather than a rule question, and the whole rail
+   is 0.4 ms.
+5. **The split overstates the stage.** Its three windows sum to 1.982 against `#73`'s single window
+   of 1.715, i.e. the two extra submissions per owning layer cost ~0.27. The SHARES are the result;
+   the sum is not the shipped wall, the same bias as `#60` and `#73`.
+6. **The whole stage is ~1.85 ms of a ~78 ms position, 2.4%.** That is the ceiling on any indexer
+   work, and it is why the rule change below is priced as a rounding error in situ and shipped on an
+   isolated number instead.
+
+### What shipped: an occupancy clause in the FP8 wide-grid rule
+
+`fp8GemvWantsWideGrid` gained a second clause, `outDim * rows < 16_384`, and
+`fp8WideGridThreadThreshold` names it. The isolated A/B on the published shapes (six distinct weight
+regions per dispatch, best of 8, arms interleaved) is what supports it:
+
+| shape | tokens | one-thread | one row per threadgroup | winner |
+|---|---|---|---|---|
+| `attn.indexer.wq_b` 4,096x1,280 | 1 | 0.058 ms (90 GB/s) | **0.040 ms (132 GB/s)** | coalesced 1.46x |
+| `attn.wq_b` 32,768x1,280 | 1 | **0.135 ms (310 GB/s)** | 0.142 ms | one-thread 1.05x |
+| `attn.indexer.wq_b` 4,096x1,280 | 8 | **0.107 ms (49 GB/s)** | 0.141 ms | one-thread 1.32x |
+| row width 1,024-4,096, 5,120 rows | 1 | 0.055-0.139 | **0.037-0.064 (1.49-2.17x)** | coalesced at every width |
+| row width 1,024 / 1,536 | 8 | **0.102 / 0.147** | 0.108 / 0.175 | one-thread below 2,048 |
+| row width 2,048-4,096 | 8 | 0.182-0.334 | **0.178-0.317 (1.01-1.05x)** | coalesced at and above 2,048 |
+
+Every cell of that table falls out of the one clause: at one position the grid is `outDim` threads
+and 5,120 or 4,096 of them cannot fill the machine, so the coalesced form wins at ANY width; at a
+block of eight the grid is `outDim * 8` and the old `inDim >= 2,048` crossover is the right one
+again. The indexer's projections are encoded per slot (`rows: 1`), which is the row that wins 1.46x,
+and the clause catches the batched case for any future caller.
+
+In situ the change moves `indexer.project` 0.741 → 0.631 and the stage 1.982 → 1.850 ms/position,
+i.e. 0.13-0.29 ms of a ~78 ms position (0.2-0.4%), which is under what two processes resolve on this
+machine: quote the isolated 1.46x as the result and the in-situ figure as direction. Forcing the
+coalesced form on EVERY FP8 projection costs the dense half 1.8 ms/position (15.30 → 17.08), which is
+what makes the rule a rule rather than a code change.
+
+Narrower rows also want the coalesced form at a decode step (`row width 1,024` and `1,536` at one
+token, 1.49x), so the clause corrects a miscellany of shapes, not only the indexer's: no other
+published FP8 projection sits in the region, because every one of them either reaches 2,048 columns
+or has an `outDim` that fills the machine on its own.
+
+### What it is not (do not re-propose)
+
+- **The host selection.** `readIndexSelections` is inside the round trip, not the stage; the stage
+  table is device windows only. A device-side top-k is a different slice (`#28`/`#30` closed the
+  arithmetic).
+- **The compressed-row gather.** It runs in `writeLatent`, which `#73` priced at 4.0% of the half.
+- **A bandwidth wall on either projection rail.** Both are below what the same bytes reach under a
+  better shape, and `pool`'s 85 GB/s is a 512-row projection rather than DRAM.
+- **Empty `.indexer` windows as an explanation of `#73`'s 1.715.** `indexer.idle` measures 0.000: a
+  command buffer with no dispatch reports no device window, so thirty-two of forty layers contribute
+  nothing to the row. The inflation is the two extra submissions on the eight that do.
+- **A slot dimension in the scores kernel, for now.** It is the select rail's only lever and its
+  ceiling is that rail's own 0.82 ms/position (1.1% of a position); `#73`'s rejection of slot forms
+  does not transfer (this kernel reads no weight), but neither is there a measured win to point at.
+  Build it only with an isolated A/B in hand, the way this slice built the wide-grid question.
+- Everything from `#51`-`#73` still stands.
+
+### Verification
+
+`DeepSeekV41DeviceGraphParityTests`, `DeepSeekV41DeviceParityTests`, `DeepSeekV41TurnLoopTests`,
+`DeepSeekV41SlotWiringTests`, `DeepSeekV41ExpertStreamTests`, `DeepSeekV41FP8GemvKernelTests`,
+`DeepSeekV41FP8SharedExpertKernelTests`, `DeepSeekV41IndexerKernelTests`: 89 tests, 0 failures
+(`/tmp/test74_parity1.log`). The compressed block parity cases (`testACompressedBlockPrefillsLikeTheWalk`,
+`testTheDeviceAndTheHostAgreeOnCompressedRows`, `testEveryPositionOfABlockAttendsOverItsOwnRows`)
+drive the refactored sections against the host. The probe asserts the split layout returns
+bit-identical logits to the one-buffer layout (measured 0.0 at a 1e-6 bar), the same bytes within
+2%, that all four rail rows are reported, and that they sum to the stage row. The rule test pins
+4,096x1,280 to the coalesced form, 32,768x1,280 to the one-thread form at both row counts, a 16x512
+projection to neither, and the threshold constant itself.
+
+## DSV4.1 #75: THE FRONT WAIT IS THE PREVIOUS LAYER'S MIXTURE, AND A PREFILL POSITION IS 63% GPU IDLE
+
+### Question
+
+`#73` and `#74` left the prefill bucket table as: wall 99.7 ms/position = fill 52.2 (the disk, closed
+at its ceiling by `#71`) + mixture device 19.3-20.0 (`#72`) + dense device 13.4 (`#73`, its one
+unattributed stage closed by `#74`) + indexer wait 11.3 + **front wait 43.7**. The front wait was the
+largest term that is neither the disk nor a named stage, and every candidate fix starts from knowing
+whether it is the GPU, the driver, or the host. The instrument already split a drain into `late start
++ device window + tail`, so the question was narrow: which of the three, and how much of it is work
+another bucket already bills?
+
+### What was added
+
+Measurement only, off in every production path:
+
+- `DeepSeekV41BlockTiming.frontBusyNanoseconds` — how much of `frontWaitNanoseconds` was the
+  PREVIOUS layer's mixture still on the queue. `frontWait` is one `settlePending`, and the queue is in
+  order, so the mixture the layer before committed is drained inside it and then the dense half is.
+  Accumulated at the settle that measured the wait, not over every settle the layer made, because a
+  compressed layer's dense half is two submissions and only the second one's drain is inside
+  `frontWait` (`#66`'s footnote, now exact).
+- `frontOwnDrainNanoseconds` (`frontWait - frontBusy`), `frontTailNanoseconds` and
+  `mixtureTailNanoseconds` (the third term of a drain, which `#22` named and no field held).
+- `DeepSeekV41BlockTiming.deviceUnionNanoseconds` — the UNION of every measured window, so a block's
+  wall can be split into busy and idle. The half sums are sums of busy TIME; the union is the busy
+  SPAN, and `wall - union` is the one number no host interval names. Plus
+  `frontUnwindowedBuffers`/`mixtureUnwindowedBuffers`, so a union with a hole in it says so.
+- `recordsBlockGaps` + `DeepSeekV41BlockGap`: one clock record per block LAYER pass with that layer's
+  own buffers' windows attached, so the wait divides per layer instead of per span. This is the block
+  side of `#48`'s `DeepSeekV41LayerGapSample`.
+- **A correction to the dense device column.** The shipped layout submits twice on the eight layers
+  that split at the indexer, and only the SECOND submission reached `timingBuffers`: `denseDevice`
+  silently omitted the work in front of the split. Every front buffer is recorded now, which is what
+  makes `drained front = late start + window + tail` tie out (it did not before: `#71` reported 18.4
+  drained against 13.67 of window and 1.2 of late start).
+- `testWhatTheFrontWaitIsMadeOfOnThePublishedCheckpoint` (opt-in, `/tmp/dynamoe_dsv41_front_wait`,
+  102 s): 128 positions in the app's regime (`wireArena: nil`), the shipped width and half of it,
+  three rounds with the arm order rotated and round 1 discarded (`#53`). It prints the decomposition,
+  the per-layer partition of one block, and the union, and asserts the classification: `busy > 0`,
+  `busy < frontWait`, the pickup under half a millisecond, the tail under half a millisecond, the
+  mixture drain at least the busy it absorbed, `union <= wall <= sum of windows`, and that the
+  settle-level `frontBusy` agrees with the records taken per layer.
+
+### The table
+
+Milliseconds per position, width 8, `wireArena: nil`, three arms after the discarded round:
+
+| | arm 1 | arm 2 | arm 3 |
+|---|---|---|---|
+| **wall** | 78.0 | **77.7** | 78.3 |
+| expert fill | 33.6 | **33.7** | 33.6 |
+| indexer wait | 8.3 | **9.0** | 8.0 |
+| routing + dense encode + mixture encode | 0.01 + 0.98 + 1.38 | **0.01 + 0.97 + 1.37** | 0.01 + 0.98 + 1.38 |
+| **front wait** | 32.5 | **31.7** | 33.5 |
+| = busy (the previous layer's mixture) | **21.1** | **20.4** | **21.9** |
+| + own (the dense half and its hand-off) | 11.4 | 11.3 | 11.6 |
+| every dense drain | 14.2 = 0.3 late + 13.5 window + 0.3 tail | 14.0 = 0.3 + 13.4 + 0.3 | 14.2 = 0.3 + 13.5 + 0.3 |
+| every mixture drain | 27.8 = 11.9 late + 15.5 window + 0.3 tail | 27.5 = 11.8 + 15.4 + 0.3 | 28.1 = 12.2 + 15.6 + 0.3 |
+| device (dense / mixture) | 29.0 (13.5 / 15.5) | 28.8 (13.4 / 15.4) | 29.1 (13.5 / 15.6) |
+| **device union** | 29.0 | **28.8** | 29.1 |
+| **idle (`wall - union`)** | 49.0 | **48.9** | 49.2 |
+
+At half the width (measured in the same rounds, 83.1 / 83.0 / 82.8 ms of wall): front wait 35.4 / 35.2
+/ 34.4 = busy 23.0 / 22.8 / 22.0 + own 12.4; mixture drain 29.7 = 13.3 late + 15.8 window + 0.7 tail;
+dense drain 14.4 = 0.3 + 14.4 + 0.7; union 30.2 / 30.1 / 30.0 of the wall, i.e. idle 52.9 / 53.0 /
+52.8. The first block of a prefill is excluded from every partition below: it is the cold one (101.6
+ms/position, 68.3 GB read, 3,812 misses against 55.2 GB and 3,152 once the arena is warm).
+
+The per-layer records, one block of 39 layer passes (the second block, `recordsBlockGaps`), in the
+units the totals use — milliseconds per position across the block's 39 layers:
+
+| term | ms/position | share of the wait |
+|---|---|---|
+| wait = busy + pickup + window + tail | 2.17 = 1.32 + **0.00** + 0.82 + **0.02** | 100% |
+| gap between the two dense submissions, inside the span | 0.04 | 2% |
+| mixture gate idle (commit to its own window start) | 0.72 | — |
+
+Per layer pass that is a front wait of ~7.1 ms: **4.3 of the previous layer's mixture, 2.7 of the
+dense half, 0.00 of pickup and 0.07 of tail.**
+
+### What it says
+
+- **The front wait is a settle, not a stall.** 63-65% of it (20.4-21.9 of 31.7-33.5 ms/position) is
+  the mixture the layer before committed, and that same work is already billed as
+  `mixtureDeviceNanoseconds`. So `#71`'s bucket list counts ~21 ms/position twice: the honest front
+  wait is **11.3-11.6**, and the largest non-disk term in a prefill position is the mixture half's
+  device time, not the wait for it. This was flagged as a hazard in `#60` and `#65` ("front wait
+  includes draining the previous layer's mixture") and never quantified until now.
+- **The hand-off itself is closed at a block's front.** The pickup is 0.00 ms/position and the tail
+  0.02 over 39 layer passes — the queue starts the dense half before the host finishes asking and the
+  host notices its last buffer in 70 us per layer. `#48`'s 2.1-2.3 ms/layer of hand-off idle is a
+  WALK's boundary (one position, two buffers, no fill in between); a block commits 2.7 ms of dense
+  work behind 4.3 ms of finished mixture, so there is nothing for the driver to be slow about. That is
+  the interleaving `#52` predicted and no table had shown.
+- **Both drains now decompose exactly**: dense 14.2 = 0.3 + 13.5 + 0.3 and mixture 27.8 = 11.9 + 15.5
+  + 0.3. The 3.5 ms/position that used to be unexplained between `drained front` (18.4) and
+  `window + late start` (14.9) was the instrument's missing pre-indexer submission, not the machine.
+- **A prefill position is 37% GPU work.** The union is 28.8-29.1 of a 77.7-78.3 wall: 13.4-13.5 dense
+  plus 15.4-15.6 mixture, with **no overlap at all** (the sum equals the union, so the queue never has
+  two windows open). The idle is 48.9-49.0 ms/position, and it tiles: fill 33.6 + the mixture's own
+  late start 11.9 + the two encodes 2.35 + routing and the indexer's host readback ~1.1 = 48.9. Three
+  of those four terms are already closed or named — the fill at the disk (`#71`), the encodes
+  (`#60`/`#66`), and the mixture's late start as the machine after reading (`#50`, `#65`). What is NOT
+  closed is that the mixture's late start is 11.8-12.2 ms/position in a BLOCK, i.e. ~2.4 ms per layer
+  pass, where a walked position pays 1.2 (`#22`) — a worse pickup after a 34 ms host gap than after a
+  2 ms one, which this section read as the opposite of what `#22`'s isolated sweep predicted.
+  **Withdrawn by `#76`** (prose reconciled in `#82`): that sweep measured 0.57-0.84 ms after 10-50 ms
+  of host idle, so it predicted 0.55 and the block's probe measured 0.55-0.60. The block is exactly
+  where the curve says it should be; what differs is the mixture buffer behind the probe, not the
+  pickup.
+- **Width moves the answer only through the dense half.** `busy` is 20.4-21.9 at width 8 and 22.0-23.0
+  at width 4: the mixture's work per position does not depend on the block width. `own` falls 12.4 ->
+  11.3, which is the dense batching. Wall 77.7-78.3 against 82.8-83.1, so width eight wins 5-6
+  ms/position, of which ~1.5 is device and the rest is the fill amortising over twice as many
+  positions (33.6 against 34.9).
+
+### What is not
+
+- **The front wait is not idle**, so there is nothing in it to reclaim. Do not propose a fix for the
+  pickup (0.00) or the tail (0.02) on the strength of `#48`'s walk figure: at a block's front they are
+  already zero.
+- **The mixture's 11.8-12.2 ms/position pickup is the one unexplained term left**, and it is not a new
+  lever until it is measured as one. `#50` (the expert buffer's resource list and CPU-dirtied arena
+  memory), `#65` (a deferred bind and an event gate, a wash) and `#22` (no kernel change recovers it,
+  because the readback empties the queue) all closed the WALK's version of exactly this. A block's
+  regime differs in the one variable those slices could not hold: the gap is 34 ms, not 2, and the
+  pickup is twice as expensive. Anyone re-proposing the gate needs that A/B first — a real mixture
+  buffer committed behind a 34 ms host gap, in a block, against the shipped order — and it is a
+  measurement, not a build.
+- **The 12.4 -> 11.3 `own` is not a licence to widen further.** `#70` swept the width on the wall and
+  eight won everywhere; this table agrees, and `#18`/`#20` explain why a wider block costs more input
+  traffic than it saves weight. Nothing here reopens it.
+- **`indexer wait` (8.0-9.0 ms/position) is mostly this same mixture device time**, drained by the
+  pre-indexer settle. Read it beside `busy`, never as the indexer's own cost (`#74`).
+- **The 11.3 in `#71`/`#72`/`#73` and the 8.0-9.0 here are the same stop, not a change in the
+  indexer** (reconciled in `#82`, which found the two figures standing side by side unexplained).
+  The stop bills whatever the queue had not finished when the host asked, so the number follows the
+  layout and the order of what was encoded ahead of it rather than the indexer's own work: `#64`
+  split the split-layout form at **2.5 ms/position of indexer and the rest a drain of the dense
+  half**, and the 2.5 is what the stage actually costs (`#30`-`#32` priced its kernels separately).
+  The two runs also sat at different walls, 99.7 against 77.7-78.3 ms/position, so nothing here says
+  the drain shrank -- only that it was measured over less work. It is the reason `#74` forbids
+  reading this row as the indexer stage, and the reason `#82` did not chase the difference.
+
+### Verification
+
+`/tmp/test75_front3.log` (three rounds, arms rotated, round 1 discarded, all assertions green) and
+`/tmp/test75_front2.log`/`/tmp/test75_front1.log` (the two cuts before the per-settle attribution and
+the probe's per-layer-per-pass units). `DeepSeekV41DeviceGraphParityTests` 37, `DeepSeekV41DeviceParityTests`,
+`DeepSeekV41TurnLoopTests` 26, `DeepSeekV41SlotWiringTests`, `DeepSeekV41ExpertStreamTests`,
+`DeepSeekV41FP8GemvKernelTests`, `DeepSeekV41FP8SharedExpertKernelTests`,
+`DeepSeekV41IndexerKernelTests`, `DeepSeekV41LogicTests` — 89 tests, 0 failures
+(`/tmp/test75_parity1.log`). Production default is `recordsBlockGaps = false`, and the only line that
+changed in a shipped path is `DeepSeekV41BlockTiming.describe()`, which is diagnostic text.
+
+## DSV4.1 #76: THE MIXTURE'S PICKUP IS A PROBE'S PICKUP PLUS TWO MILLISECONDS, AND NEITHER THE GAP NOR THE BYTES THIS LAYER READ MOVES IT
+
+### Question
+
+`#75`'s idle tiling left one term it could not place. A prefill position is 37% GPU work, and after
+the fill (the disk, `#71`), the two encodes (`#60`/`#66`) and the indexer's host readback (`#74`) are
+subtracted, the remainder is the mixture's own late start: **11.8-12.2 ms of a 77.7 ms position**,
+i.e. ~2.4 ms per block layer pass. `#22` measured a walked position's hand-off at ~1.2 ms/layer after
+a **2 ms** fill gap, and a block's gap is **34 ms**; `#75` read the doubling as "the opposite of what
+`#22`'s isolated idle-gap sweep predicted" and asked for an A/B before anyone re-proposed the deferred
+bind `#65` closed.
+
+### What was added (measurement only, every flag off in production)
+
+- **The walk's mixture-start probe, at a block's commit.** `#50`'s one-dispatch probe buffers are now
+  built by one shared helper (`commitMixtureStartProbes`), so the walk and the block are measured by
+  the same code rather than by two that look alike. `runBlockLayer` commits them immediately after the
+  union fill and before the mixture, exactly where the walk commits its own.
+- `DeepSeekV41BlockGap.fillBytes`/`fillMisses` — what THAT layer pass's fill read, so the pickup can
+  be priced per byte the way `#50` priced the walk's (`0.088-0.117` ms of GPU idle per MB) instead of
+  per layer.
+- `DeepSeekV41BlockGap.probes` (a `DeepSeekV41GapProbe` per committed probe, windows filled in later),
+  `mixturePickupMilliseconds`, `probePickupMilliseconds` and `fillMegabytes`.
+- `timingBuffers` grew a fourth field: a probe buffer is bucket `2` and carries its index within the
+  gap's `probes`, because its pickup is measured from its OWN commit stamp. Probes are deliberately
+  not part of `denseDevice`/`mixtureDevice` or of the busy union — they do no work.
+- `testWhatABlocksMixturePickupIsMadeOfOnThePublishedCheckpoint` (opt-in,
+  `/tmp/dynamoe_dsv41_mixture_pickup`, 224 s): 128 positions in the app's regime (`wireArena: nil`),
+  five arms in a rotation, four rounds with round 1 discarded (`#53`) — control, probe depth 1, probe
+  depth 3, probe binding 16 MB of host-dirtied shared memory, and a width-one arm.
+
+### The table
+
+Milliseconds per block layer pass (8 positions), `wireArena: nil`, three measured rounds each:
+
+| arm | mixture pickup (mean / median) | ms/position | fill MB/layer pass | misses | ms per MB | probe pickup (median) |
+|---|---|---|---|---|---|---|
+| control | 2.50 / 1.63, 2.40 / 1.47, 2.69 / 1.42 | 12.5, 12.0, 13.5 | 83.4 | 4 | 0.0300 / 0.0288 / 0.0323 | — |
+| probe ×1 | 2.24 / 1.42, 1.99 / 1.51, 2.75 / 1.53 | 11.2, 10.0, 13.8 | 84.3 | 4 | 0.0269 / 0.0237 / 0.0327 | **0.55 / 0.57 / 0.56** |
+| probe ×3 | 2.74 / 1.35, 1.97 / 1.45, 2.56 / 1.52 | 13.7, 9.9, 12.8 | 84.3 | 4 | 0.0325 / 0.0234 / 0.0304 | **0.57 / 0.57 / 0.60** |
+| probe, 16 MB dirty | 2.10 / 1.46, 2.91 / 1.50, 2.44 / 1.52 | 10.5, 14.5, 12.2 | 84.3 | 4 | 0.0249 / 0.0345 / 0.0289 | **0.58 / 0.55 / 0.57** |
+| width 1 | 1.01 / 0.60, 0.93 / 0.58, 1.21 / 0.58 | 40.3, 37.2, 48.3 | **43.9** | 2 | 0.0230 / 0.0212 / 0.0275 | — |
+
+The mixture starts **2.03 / 2.45 / 1.68 ms after the first probe started** (depth-one arms),
+**2.44 / 1.72 / 2.26** (depth three), **1.79 / 2.63 / 2.13** (the dirty arm). Walls: control 78.4 /
+78.5 / 78.6, probe 78.7 / 78.9 / 78.7, ×3 79.3 / 78.2 / 79.1, dirty 78.5 / 79.6 / 79.1, width 1
+103.8 / 103.2 / 103.9 ms/position — so a probe per layer is free within 1%, and the first control of
+round 1 read 101.5 ms, which is `#75`'s cold-first-block 101.6 to the tenth.
+
+### What it says
+
+- **The queue is willing at a block's hand-off, and `#48`'s idle-gap curve already covers it.** A
+  trivial buffer committed right there starts in **0.55-0.60 ms**, every arm, every round. That is not
+  a tenth of a millisecond (which is what the same probe reads on a walk, `#50`) and it is not
+  unexplained: `#48`'s isolated sweep measured **0.57-0.84 ms after 10-50 ms of host idle** and 0.07-
+  0.08 ms with the queue fed. A block's gap is 34 ms, so the probe is exactly where that curve says it
+  should be. `#75`'s "the opposite of what the sweep predicted" is withdrawn: the sweep predicted
+  0.55, and it got 0.55.
+- **The other ~2 ms is the mixture and nothing else.** Three commits in a row (depth three), a long
+  resource list, and 16 MB of shared memory the host has just `memset` all leave the probe at 0.55-0.60
+  and the mixture starting 1.7-2.6 ms later, so the extra wait is attached to the mixture buffer
+  itself rather than to the act of committing into an empty queue. `#50`'s walk arm has the same shape
+  with different constants (probe 0.10, expert half 1.5 ms after its own commit).
+- **What this layer read does not predict its own pickup (r = -0.17 to +0.60, mean ≈ +0.13), and the
+  previous layer's read predicts it even less (r ≈ 0.03).** That is `#50`'s conclusion at a block:
+  "what predicts the gap is that the WALK is reading, not that this LAYER read". What does move it is
+  the ARM's own read volume: the width-one arm hands the same code **43.9 MB per layer pass against
+  84.3**, and its pickup falls from ~2.4 ms to ~1.0 — the **same 0.021-0.035 ms per MB** as the block's
+  full width, and the same slope the walk's own hand-off shows across its fill levels.
+- **And that slope is the finding: a block already pays 3-4x less per byte than a walk.** `#50`'s walk
+  scaled at 0.088-0.117 ms of GPU idle per MB read; a block's mixture pays 0.021-0.035 on the same
+  measurement. So the term is not an anomaly of the batched path — it is the reading machine's cost,
+  amortised by batching exactly as the fill is. The 11.8-12.2 ms/position is the price of reading
+  439 MB per position, and the only lever on it is fewer bytes, which `#58`, `#59` and `#71` closed.
+- **The block's pickup reproduces `#75` to the tenth** (10.0-14.5 against 11.8-12.2 ms/position) on a
+  second instrument, which is the check `#75` never got: its number came from `blockTiming`, this one
+  from the per-layer records read against each layer's own commit stamp.
+
+### What is not (do not re-propose)
+
+- **Not the commit, the gap, the depth, the resource list or dirty memory.** One arm each above, plus
+  `#50`'s four bindings and `#65`'s event gate. A deferred bind moves WHICH call hands the work over;
+  the probe starts in a half millisecond either way.
+- **Not this layer's bytes.** r ≈ +0.13, and the zero-read layers inside a full-fill arm idle the same
+  as their neighbours (`#50`).
+- **Not the mixture's shape.** `#48`'s twenty arms: 1-128 launches, a million-lane grid, 2 GiB bound,
+  512 named resources, a barrier per launch, zero-copy mapped memory. `#66` priced fusion at ≤1.06 ms
+  and it is device time, not start.
+- **Not a wider or narrower block.** Width moves the pickup per position only through bytes read; the
+  width-one arm is eight times worse per position (37-48 ms) for half the bytes per layer pass, and
+  `#70` closed the width question on the wall.
+- **Nothing here reopens the two-stream idea.** There is no work to feed a second queue: the next
+  layer's dense half reads what this mixture writes.
+
+### Verification
+
+`/tmp/test76_pickup1.log` (four rounds, five arms rotated, round 1 discarded, all assertions green:
+every recorded layer pass reported a mixture window, every probe reported one, a probe's median pickup
+stayed under the mixture's, and four arms' last logits matched the control's to 1e-6 relative, so a
+probe is inert). `DeepSeekV41DeviceGraphParityTests`, `DeepSeekV41DeviceParityTests`,
+`DeepSeekV41TurnLoopTests`, `DeepSeekV41SlotWiringTests`, `DeepSeekV41ExpertStreamTests`,
+`DeepSeekV41FP8GemvKernelTests`, `DeepSeekV41FP8SharedExpertKernelTests`,
+`DeepSeekV41IndexerKernelTests`, `DeepSeekV41LogicTests` — 89 tests, 0 failures
+(`/tmp/test76_parity1.log`). Production defaults are unchanged (`recordsBlockGaps = false`,
+`recordsMixtureStartProbe = false`); the shared probe helper is the walk's old body verbatim, and the
+only shipped-path change is that a probe buffer can now carry a `blockGaps` index.
+
+## DSV4.1 #77: THE SERVER NOW ACCEPTS THE PICTURES THE APP ALREADY COULD, BECAUSE THE BLOCKER WAS A STALE SENTENCE AND NOT A MISSING CAPABILITY
+
+### The question
+
+`#76` closed the last unattributed term in a prefill position, which left the prefill path with
+nothing worth a slice: the remaining named levers (`sharedExpert`'s rows-per-threadgroup form at
+~2.4 ms/position, `select`'s slot dimension with a ceiling of 0.82, `pool`'s 0.401 at 85 GB/s
+already coalesced) total **~3.5 ms of a 78 ms position, about 4.5%**, and the dominant terms are at
+measured hardware ceilings (the fill at the disk's 13-14 GB/s, the mixture pickup as the reading
+machine's cost). So this slice asked the next question rather than the next measurement: what is
+still MISSING for the model, on a branch called `64-complete-full-deepseek-support`?
+
+The answer was in two comments that had stopped being true. `ServerController.buildTurnPlan` refused
+every image content part with
+
+> This server is serving a local weights model, which understands text only, so image, file, and
+> audio content parts cannot be processed.
+
+and the same sentence shaped `OpenAIAdapter.Message.hasUnsupportedPart`, which counted an image part
+as unsupported. Both were written when no local family had a tower. Since `#35`, `#38` and `#43` the
+DeepSeek V4.1 checkpoint **does** have one: the composer attaches pictures, the engine prices the
+expanded prompt before provisioning, the device tower encodes a smallest image in 0.32 s, and a real
+turn reads the rows. The same model, in the same app, saw images in the chat window and refused them
+over the API.
+
+Routing agreed without reservation: `next_slice` = `api_images` **0.987 @ 0.981** against
+`prefill_micro` 0.010 and `journal_reconcile` 0.003, `gap_is_real` **0.999**,
+`perf_exhausted` **0.9995**. That last one is the honest justification for a slice that measures
+nothing: the perf path is closed, and this is a hole rather than a percentage.
+
+### What was there already
+
+The engine seam was complete and unused by the server:
+
+- `CompletionTurnRequest.images: [TurnImage]` — decoded RGB plus a content digest.
+- `DeepSeekV41TurnImages.price` — prompt positions from the resize plan alone, no weight read, and
+  the placeholder/image agreement check.
+- `DeepSeekV41TurnImages.bind` — runs the tower and places its rows, failing closed five ways.
+- `DeepSeekV41ImagePixels.decode` — any ImageIO format, EXIF-oriented, capped at 4,096 pixels a side.
+- The span cache in `CompletionEngine.launchTurn`, keyed on `snapshot path | sha256`.
+- `ContentView` writing one marker per attachment at the head of the user turn.
+
+Every piece of the picture path existed. What did not exist was a decoder for the two wire spellings
+and a planner that knew which model was loaded.
+
+### What landed
+
+**`ServerImageParts.swift` (new)** — the one form both protocols decode into:
+
+- `ServerImagePart.Payload` is `.inline(Data, mediaType:)`, `.remoteURL(String)` or
+  `.malformed(reason:)`. The refusal cases are payloads rather than thrown errors because a model
+  with **no tower** should answer "this checkpoint cannot see images" before the request is rejected
+  for its base64.
+- `fromOpenAIURL` takes a `data:` URL, a bare base64 payload (llama.cpp and several hand-rolled
+  clients send that), or a plain URL. **A scheme is checked before base64 is attempted**: every
+  character of `https://host/a.png` except `:` and `/` is legal base64, so a lenient decode turns a
+  URL into plausible-looking garbage and the tower reads noise. There is a test for exactly that.
+- `fromAnthropicSource` takes `base64` (the only source this server can read), `url` (a reference),
+  and names any other type.
+- `digest(_:)` is a SHA-256 over the parts plus their order, for the session key.
+- `visionMarker(modelPath:config:)` is the gate: DeepSeek V4.1 **and**
+  `ModelConfig.supportsVision`, which reads the shard index for a block, the aligner and the three
+  marker embeddings. A half-finished download keeps the answer "no".
+
+**Both decoders.** `OpenAIAdapter.ContentPart` gained `imageURL` decoded from BOTH shapes (an object
+in Chat Completions, a bare string in the Responses spelling — a client using the other one must not
+have the whole body rejected), and `Message.imageParts`. `AnthropicAdapter.ContentBlockIn` gained the
+`source` object and `Message.imageBlocks`. `hasUnsupportedPart`/`hasUnsupportedBlock` no longer count
+a picture, so `file`, `input_audio` and `document` keep their explicit 400 and images do not.
+
+**`splitMessages` returns `ServerPromptSplit`** (`systemPrompt`, `turns`, `images` keyed by TURN
+INDEX) instead of a tuple. A picture belongs to the message it came with, and the turn text is what
+gets rendered — a raw picture is not text — so it travels beside the turns. Four roles are refused by
+name rather than moved: an image on an assistant or tool turn, and an image nested inside an
+Anthropic `tool_result`.
+
+**`ServerController.resolveTurnImages` + `attachImageMarkers`.** The gate is split from the
+placement so the placement can be tested without a loaded model. The gate reads
+`CompletionEngine.LoadedModelInfo.supportsVision` (a new field the server and the composer now
+share) and `ModelConfig.visionSpec`, and refuses a checkpoint with no tower. The placement writes one
+marker per attachment at the **head** of its own turn — where the checkpoint's own prompts put an
+image relative to the question about it, and what the in-app composer writes — and decodes the pixels
+into `TurnImage`s carrying `ServerImageParts.digest([part])`, which is what the engine's span cache
+and the session identity both key on.
+
+This had to run **first in the planner**, before `historyDigest`, before
+`substitutingRecordedTurn`, before tokenizing: everything below has to see the expanded turn.
+
+**The prompt budget moved to the expanded size.** The renderer emits ONE token per attachment and the
+turn runs several hundred, so the number checked against `dynamoe_server_max_prompt_tokens` and the
+number the client is told (`plan.promptTokenCount` → usage and the request-log row) is now
+`DeepSeekV41TurnImages.price(...).promptTokens`. It costs no weight read, and it moved the
+placeholder/image agreement check into the planner, where a stray marker is a 400 instead of an
+engine error.
+
+**The three correctness traps accepting images would otherwise have introduced:**
+
+1. **The session key had to learn about the picture.** Two requests can carry the same TEXT and
+   different images; both render to the same list of identical image token ids, so neither the
+   anchor's text nor `findCommonPrefix`'s token-prefix equality can separate them. Without the digest
+   folded into `sessionKey`, a follow-up about a second picture would splice the first one's recorded
+   generation (`ServerTurnMemory`) and reuse its pinned KV prefix. Both adapters now mix
+   `"images:" + digest` of the anchor message. Pinned by
+   `testTheOpenAISessionKeySeparatesTwoPicturesWithTheSameText` and its Anthropic twin.
+2. **The engine was silently dropping pixels for every other family.** `launchTurn`'s generic path
+   never reads `request.images`; only the DeepSeek branch does. A non-vision model would have
+   answered about a picture it never saw. `launchTurn` now refuses the turn by name before it touches
+   anything (`CompletionEngine.swift`, the guard right after the tokenizer check).
+3. **A request-log row would have shown a message with no content and no sign of a picture.** The
+   summaries now name the count (`image_parts` / `image_blocks`) and never carry the payload.
+
+**Remote URLs are refused, not fetched.** `https://...` inside an `image_url` or an Anthropic `url`
+source is an outbound connection the caller chose — a privacy surface and an SSRF one — so the turn
+is refused with the URL named and the fix spelled out ("send it inline as base64, which is what the
+SDKs do").
+
+### Evidence
+
+The permanent tests, all model-free:
+
+| suite | tests |
+|---|---|
+| `ServerImagePartsTests` (new) | 26 |
+| `OpenAIAdapterLogicTests` | 21 |
+| `AnthropicAdapterLogicTests` | 21 |
+| `ReasoningRoundTripTests` | 13 |
+| `ServerHardeningLogicTests` | 42 |
+| `ServerRequestLogLogicTests` | 29 |
+| `ServerStreamSafetyTests`, `ServerToolArgumentTests`, `PrefixAsOfDateTests` | 10 |
+| **total** | **162, 0 failures** (`/tmp/test77_logic3.log`) |
+
+The new class pins both wire spellings (data URL, bare base64, line-wrapped base64, the Responses
+bare-string form), the four refusals (a URL that must not be fetched, a non-base64 payload, a
+non-base64 data URL, an unknown Anthropic source type), the Anthropic `base64` and `url` sources, the
+digest's order sensitivity, both session keys, the assistant-turn and `tool_result` refusals, the
+marker placement (its own turn only, one per picture, in order), and the three ways
+`attachImageMarkers` fails closed.
+
+The prompt itself, at the checkpoint's own tokenizer (no weights, milliseconds):
+
+```
+🔎 [dsv41 real] API image request: 18 prompt tokens with 1 image token(s); priced 201 after
+   expansion (+183), 1 estimate(s), 0.32 s of tower
+```
+
+`DeepSeekV41PublishedTurnTests.testAnAPIRequestWithAnImageCarriesOneImageToken` starts from a real
+OpenAI request body with a real 2x2 PNG, runs `splitMessages` → `attachImageMarkers` →
+`ChatPromptFormatter.formatConversation`, and asserts the marker heads its own turn and no other,
+that the rendered prompt tokenizes to exactly one image token, and that `TurnImages.price` accepts
+the result. A marker that tokenized into pieces here would leave literal text in the prompt and bind
+no rows, which looks exactly like a model ignoring pictures — the same failure `#35` guarded against
+for the composer, now guarded for the API surface.
+
+### What it does not mean
+
+- **Not a faster image turn, and not a cheaper one.** The tower is untouched (`#43`'s 0.32-6.90 s
+  range stands) and the prefill of the expanded span is still the cost: `#46`'s largest picture is
+  1,005 positions, and at `#75`/`#76`'s ~78 ms/position that is ~78 s of prefill behind a
+  0.32-6.90 s encode. An API image request is a minutes-long turn, not a seconds-long one.
+- **No capability advertisement.** `/v1/models` still returns only an id and a created stamp; there
+  is no vision field in the OpenAI model list and none was invented. A client must know its model
+  from the app.
+- **Not an acceptance of files, audio or documents.** Those keep their `unsupported_content` 400 with
+  the message narrowed to what is actually missing.
+- **Not a claim about a full generated turn over the API.** The assembly, the ids, the price and the
+  placement are pinned; the generation is not, because an app-hosted test has no model loaded and the
+  published-turn harness drives `TurnRunner` directly rather than through the server.
+- **Not a re-opening of any perf question.** Nothing in this slice dispatches a kernel.
+
+### Verification
+
+`xcodebuild build-for-testing` at `-O` into `/tmp/dd_dsv41_77`, then `test-without-building` for the
+nine server-logic classes (`/tmp/test77_logic3.log`, 162/0). The checkpoint-gated prompt case ran with
+`touch /tmp/dynamoe_dsv41_real_turn` (`/tmp/test77_apiimg1.log`, 2/0) and printed the line above.
+`DeepSeekV41LogicTests`, `DeepSeekV41TurnLoopTests`, `DeepSeekV41SlotWiringTests` and
+`DeepSeekV41DeviceParityTests` are green (`/tmp/test77_ds1.log`, 31/0).
+
+One suite-order note, which is the documented pattern and not this slice: `ServerQueueLogicTests`
+loses 4-6 of 13 when it shares a process with the adapter suites (`/tmp/test77_logic2.log`,
+`/tmp/test77_queue2.log`) and is **13/13 alone** (`/tmp/test77_queue1.log`). It also loses them
+without the new test class in the same batch, so the new file is not the cause.
+
+## DSV4.1 #78: AN IMAGE REQUEST NOW ANSWERS OVER THE REAL SERVER, AND THE MODEL DESCRIBES THE PICTURE IT WAS SENT
+
+### The question
+
+`#77` let the local server accept image content parts and pinned everything it could reach without a
+loaded model: the two wire spellings, the marker placement, the image-token count, the expanded prompt
+budget, the session-key digest. It said so in its own section —
+
+> **Not a claim about a full generated turn over the API.** The assembly, the ids, the price and the
+> placement are pinned; the generation is not, because an app-hosted test has no model loaded and the
+> published-turn harness drives `TurnRunner` directly rather than through the server.
+
+That left the largest untested stretch in the whole image path, and not a small one. Everything below
+`TurnPlan.request.images` is the code that runs in production and nothing else: `launchTurn` prices the
+spans from the resize plan, provisions the KV cache for the **expanded** prompt (not the
+placeholders), builds or reuses the DeepSeek runtime, calls `DeepSeekV41TurnImages.bind` which runs the
+tower and places its rows, asserts the bound length equals the priced one, hands the expanded ids to the
+prefix pin and the sampler, and streams the turn. A mistake anywhere along it is a refusal or a 500 —
+never a wrong token — so no arithmetic test can see it and no unit test had ever executed it.
+
+It is also worth stating plainly: `CompletionEngine.shared.configure` appears **nowhere** in the test
+target before this slice. Every DeepSeek case in `DeepSeekV41PublishedTurnTests` builds its own
+`DeepSeekV41Runtime` and calls `DeepSeekV41TurnRunner.run`. The app's own turn path had never run on
+the published checkpoint at all, with text or with pictures.
+
+Routing put it first without reservation: `next_slice` = `live_image_turn` **0.991 @ 0.989** against
+shared-expert rows 0.0016, `select`'s slots 0.0003, `pool`'s BF16 pair 0.0001 and a docs pass 0.0069;
+`gap_is_real` **0.9996**; `perf_exhausted` **0.9997** (the named remainders are ~4.5% of a position and
+every dominant term is at a measured ceiling).
+
+### What landed
+
+One opt-in case, `testAnAPIRequestWithAnImageAnswersOverTheLocalServer`, and three helpers:
+
+- **The load is the app's own sequence**, not a shortcut: `DynaMoeEngine(filePath:)` →
+  `getSummary()` → `InferenceEngine.segmentShardsForMetal` at the device's buffer limit → one
+  `makeBuffer(bytesNoCopy: .storageModeShared)` per segment → `CompletionEngine.shared.configure`.
+  The `DynaMoeEngine` is held for the life of the case, because the buffers point into its mappings.
+  A test that built its own summary would not be exercising the load path the server's turns run on.
+- **The server is the real one** — `ServerController.shared.start()` on a private port (8791, so a
+  developer's own DynaMoE on 8787 cannot turn a bind failure into a connection error), hit with
+  `URLSession` exactly as a client would. Every default the server consults (`enabled`, `port`,
+  `api_key`, body capture) is saved, set and restored, and the request log is pointed at an
+  `inMemory()` store so an app-hosted run never appends to the developer's log.
+- **The request is a real one**: `content: [{"type":"text"}, {"type":"image_url"}]` with a real PNG
+  base64'd into a `data:` URL, `max_tokens: 24`, no auth.
+
+### The check is a delta, because the server renders its own prompt
+
+The prompt the server tokenizes includes the app's whole system block — identity, date, the
+checkpoint's own instruction shape — which is 190 tokens for a one-line question. A test that
+re-derived that string would be pinning a second copy of the template, and the first time the two
+drifted it would fail for the wrong reason. So the same question is sent twice, plain and with one
+attachment, and the counted prompt tokens must differ by exactly
+
+```
+marker + newline   (2 tokens at this checkpoint's tokenizer, measured by #35's 10 -> 12)
++ spanPositions - 1   (the span replaces the marker's single token)
+```
+
+Both numbers come from outside the server: the span is `DeepSeekV41VisionPricing.estimate` — the same
+function the engine prices with — applied to the pixels `DeepSeekV41ImagePixels.decode` produces, and
+the marker cost is `#35`'s. A prompt that never saw the marker counts the same as the plain one, and a
+span that bound nothing costs one token; both fail this assertion by 183.
+
+### Evidence
+
+```
+🔎 [dsv41 real] live server: 96085 tensors in 48 shard(s), mapped 48/48 segment(s), 475.2508442029357 GB
+🔎 [dsv41 real] live image turn: plain 190 prompt tokens / 23 generated, pictured 375 / 23,
+   span 184 position(s) over 1521 patch token(s), 0.32 s of tower
+🔎 [dsv41 real] live image answer: "The user has shared an image that appears to be entirely
+   red/maroon colored with no visible content. Let me"
+Test Case '…testAnAPIRequestWithAnImageAnswersOverTheLocalServer' passed (117.739 seconds).
+```
+
+`375 - 190 = 185 = 2 + 184 - 1`. The 2x2 fixture is the smallest thing ImageIO decodes, and the
+checkpoint's `min_pixels` floor turns it into 1,521 patch tokens on a 13x13 aligner grid, i.e. 184
+prompt positions — the same span `#38` priced and `#43` encodes.
+
+The answer is the point of the slice. The picture is a **solid red square**, and the model says so:
+*"an image that appears to be entirely red/maroon colored with no visible content."* Nothing upstream
+of the tower could have produced that sentence — the pixels went through `ImagePixels.decode`, the
+device tower, the span bind, the expanded prompt and the cache in the order `launchTurn` prescribes,
+and came out as a description of the right colour.
+
+The first arm ran the same request at `max_tokens: 8` and stopped mid-sentence (*"The user has shared
+an image that"*, 7 tokens), which is why the budget is 24: a truncated reasoning channel hides the one
+observation worth printing. Two runs of the finished case agree on every number and vary only in
+wording — *"entirely red/maroon colored with no visible content"* and *"entirely solid red/crimson
+colored with no discernible content"* — which is the server's default sampler doing what a `min_p`
+filter at temperature 0 allows. So the case asserts only that the answer is non-empty and that the
+token accounting is exact; the colour is the model's evidence and not the port's contract.
+
+Cost: **117.7 s** for the load plus both turns — a 375-position image prefill, a 190-position text
+prefill and 46 decoded tokens — behind a 0.32 s encode. That is the API image turn `#77` priced at
+~78 ms/position and it lands where the price said.
+
+The row contract is asserted too: both turns log a `/v1/chat/completions` row, the image row's
+`input_tokens` is the **expanded** 375 (not the 191 the placeholders would count), and its captured
+body names the picture (`"image_parts":1`) rather than carrying it.
+
+### What it does not mean
+
+- **Not a faster image turn.** Nothing here dispatches a new kernel; the tower is `#43`'s and the
+  prefill is `#75`/`#76`'s. A largest image is still ~1,005 positions of prefill.
+- **Not asserted on content.** The answer describing red is evidence the pixels arrived, not a test
+  the model must keep passing: a wording change is not a regression, so the case prints it and asserts
+  only non-emptiness plus the token accounting.
+- **Only the OpenAI protocol is driven end to end.** The Anthropic adapter's image blocks share
+  `attachImageMarkers` and `ServerImageParts`, and `#77` pins their decoding and their turn placement;
+  what this case adds is the engine seam beneath both, which is protocol-independent.
+- **Not a queue or lifecycle change.** `TurnExecutionQueue`'s single-flight behaviour, the 503 for a
+  concurrent in-app turn, and `/v1/models`' silence about vision are all as `#77` left them.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_78`, then `test-without-building` **with the same
+`-derivedDataPath`** for the single case, gated on `touch /tmp/dynamoe_dsv41_real_turn` and removed in
+the same command (`/tmp/test78_run2.log`, `/tmp/test78_run3.log`, 1/0 each). Bundle freshness checked
+with `strings … | grep -c testAnAPIRequestWithAnImageAnswersOverTheLocalServer` (1).
+
+One trap worth recording, because it produced a green run that proved nothing: **`-derivedDataPath`
+has to be passed to `test-without-building` as well as to `build-for-testing`.** Omitted, the run
+silently used the default DerivedData bundle, which predates `#77` — the suite reported
+`Test Suite 'DeepSeekV41PublishedTurnTests' passed` with **0 tests executed**, and a class-wide run
+listed 39 names with neither of the two newest API cases among them. The `status=0` and the "passed"
+line are exactly the shape of a real pass, which is the same silent-zero trap the repo already
+documents for `-destination` and for the two-part `-only-testing` form.
+## DSV4.1 #79: THE ANTHROPIC ROUTE CARRIES A PICTURE TOO, AND IT RENDERS A DIFFERENT PROMPT THAN THE OPENAI ONE
+
+### The question
+
+The image path was proven in three pieces and one of them was still the wrong shape. `#77` pinned both
+wire spellings without a model (the OpenAI `image_url` object, the Anthropic `source` object, the marker
+placement, the image-token count, the expanded budget, the session digest). `#78` then ran one turn end
+to end over real HTTP — but through `/v1/chat/completions` only, on the argument that the engine seam
+beneath both adapters is protocol-independent.
+
+That argument is true about the seam and false about everything above it. `/v1/messages` has its own
+`Decodable` (`AnthropicMessagesRequest`, built by hand in `init(from:)` around a `ContentBlockIn`), its
+own entry into the planner (`buildTurnPlan(_ apiRequest: AnthropicMessagesRequest)`), its own response
+type (`AnthropicMessageResponse`, with reasoning and text as separate blocks), its own required field
+(`max_tokens` is not optional here, unlike OpenAI's), and its own request-row key: the same picture is
+`image_parts` on one protocol and `image_blocks` on the other. `image_blocks` had never been written by
+a real request in a test — only by a hand-built `AnthropicMessagesRequest` value.
+
+Routing was decisive without being unanimous: `next_slice` = `anthropic_image_wire` **0.778 @ 0.741**
+against advertising vision in `/v1/models` 0.178, a docs pass 0.020, serve-side queueing 0.017, and the
+three remaining prefill terms at 0.0032, 0.0021 and 0.0013. `perf_work_worth_doing` **0.012** — the
+perf question is settled and one more A/B on a sub-1% term would not unsettle it.
+
+### What landed
+
+One opt-in case, `testAnAnthropicRequestWithAnImageAnswersOverTheLocalServer`, plus `postMessages` (the
+wire helper) and `AnthropicTurn`. It reuses `#78`'s `withLocalServer` unchanged — same private-port
+server, same saved-and-restored defaults, same in-memory store — on port **8792** so neither case can
+inherit the other's listening socket if a `stop()` ever leaves one behind.
+
+Two extractions came out of it, because the alternative was a third copy of a load sequence that has to
+stay identical to the app's:
+
+- `smallestRedSquarePNG()` — the 2x2 fixture whose floor-expanded encode costs 184 prompt positions.
+- `loadPublishedCheckpointIntoTheSharedEngine(_:)` + `unloadSharedEngine()` — the app-order load
+  (`DynaMoeEngine` → `getSummary()` → `segmentShardsForMetal` → one `makeBuffer(bytesNoCopy:)` per
+  segment → `CompletionEngine.shared.configure`), with the `DynaMoeEngine` handed back so the caller
+  holds the mappings every buffer points into. `#78`'s case now calls both instead of carrying its own
+  copy, so there is one load in the file rather than two.
+
+The request is a base64 `source` object, which is what the Anthropic SDKs send
+(`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"…"}}`). No `thinking` block
+is sent, and that is the only deliberate difference from `#78`'s body.
+
+### Evidence
+
+```
+🔎 [dsv41 real] live server: 96085 tensors in 48 shard(s), mapped 48/48 segment(s), 475.2508442029357 GB
+🔎 [dsv41 real] anthropic image turn: plain 165 input tokens / 23 generated, pictured 350 / 23,
+   span 184 position(s) over 1521 patch token(s), 0.32 s of tower
+🔎 [dsv41 real] anthropic image answer: "The image you shared appears to be completely solid red with
+   no visible content, shapes, text, or objects. It" (stop max_tokens, 0 chars of thinking)
+Test Case '…testAnAnthropicRequestWithAnImageAnswersOverTheLocalServer' passed (112.144 seconds).
+🔎 [dsv41 real] live server: 96085 tensors in 48 shard(s), mapped 48/48 segment(s), 475.2508442029357 GB
+🔎 [dsv41 real] live image turn: plain 190 prompt tokens / 23 generated, pictured 375 / 23,
+   span 184 position(s) over 1521 patch token(s), 0.32 s of tower
+🔎 [dsv41 real] live image answer: "The user has shared an image that appears to be entirely
+   red/crimson colored with no visible content — it looks…" (finish length)
+Test Case '…testAnAPIRequestWithAnImageAnswersOverTheLocalServer' passed (117.866 seconds).
+	 Executed 2 tests, with 0 failures (0 unexpected) in 230.010 seconds
+```
+
+The delta holds on both routes and is the same number: `350 - 165 = 185` and `375 - 190 = 185`, each
+`= 2 + 184 - 1`. The picture is a solid red square and both answers say so, on a route neither had run
+before.
+
+### The two protocols render a 25-token difference for "the same" request, and the adapters' thinking defaults are why
+
+The one number nobody would have guessed: the plain turn is **165** input tokens on the Anthropic route
+and **190** on the OpenAI one, from a byte-identical question and the same loaded checkpoint.
+
+It is not a bug in either. `OpenAIAdapter`'s planner takes `enableThinking ?? true` — a request that says
+nothing about reasoning gets thinking **on**, which is what the app itself does. `AnthropicAdapter`'s
+takes `apiRequest.thinking?.type == "enabled"` — a request with no `thinking` block gets thinking **off**,
+because Anthropic's protocol makes it an explicit opt-in and honouring that is the whole point of reading
+the field. The 25 tokens are the family's graded-effort scaffold: the `Reasoning Effort: N (range 1-100…)`
+line and the reasoning channel's opening marker are rendered for a thinking-on prompt and omitted for a
+thinking-off one.
+
+So a prompt length is not portable across the two protocols, and the delta check has to stay inside one
+route — which is exactly what both cases do. It also means an unqualified "the prompt is N tokens" claim
+about the server is incomplete: the same body is two different prompts, and the difference is 25 tokens
+of scaffold.
+
+### What it does not mean
+
+- **Not the streaming path.** `anthropicStreamingResponse` is a separate writer with its own block
+  lifecycle, and no case here streams.
+- **Not `/v1/models`.** It still advertises no vision capability, so a client has no way to discover
+  that the served model accepts pictures. That is the next completeness gap, not this one.
+- **Not a queue or lifecycle change.** Single-flight is untouched: a request during an in-app turn still
+  gets a 503 rather than queueing.
+- **Not asserted on content.** As in `#78`, the colour is printed and the assertions are the delta, the
+  non-emptiness and the row's `input_tokens`.
+- **Not a second engine path.** Both protocols reach the same `attachImageMarkers`, the same
+  `DeepSeekV41TurnImages.bind`, the same expanded-prompt cache provisioning. There is one image
+  implementation with two front doors, and now both doors have been walked through.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_79` (status 0, only the two pre-existing
+`ContentView.swift` Swift-6 actor warnings), then `test-without-building` **with the same
+`-derivedDataPath`** and both cases in one run, gated on `touch /tmp/dynamoe_dsv41_real_turn` and removed
+in the same command (`/tmp/test79_build1.log`, `/tmp/test79_run1.log`). Bundle freshness checked with
+`strings …/DynaMoETests | grep -c testAnAnthropicRequestWithAnImageAnswersOverTheLocalServer` (1) before
+running, because `#78`'s silent-zero trap is a green run that executes nothing. `Executed 2 tests, with 0
+failures`, and each case's `passed` line is present, which is the only thing that distinguishes a real
+run from that trap.
+## DSV4.1 #80: THE STREAMING ROUTES CARRY A PICTURE TOO, AND A STREAMED REFUSAL WEARS A 200
+
+### The question
+
+`#78` and `#79` proved the image path end to end over real HTTP on both protocols, and both drove the
+**non-streaming** route. The streaming route is a different program above the same engine seam:
+
+- The plan is built *inside* `TurnExecutionQueue.streamTurn`'s closure, after the FIFO hands the turn the
+  engine's single-flight slot — not on the request path. A picture is resolved by
+  `buildTurnPlan` either way, but on a different call site, at a different time, in a `do`/`catch` whose
+  failure path is a frame rather than an HTTP error.
+- The expanded prompt length reaches the client through `promptTokensBox`: the OpenAI writer puts it in a
+  final usage chunk with `choices: []`, the Anthropic writer in `message_start.message.usage.input_tokens`.
+  Neither is the non-streaming `usage` object, and neither had ever been asked for an image's number.
+- **A streamed failure wears a 200.** Both routes answer `200 text/event-stream` before the turn is
+  planned, so a refused attachment arrives as an error frame and then a terminal marker. A test that only
+  asserts "status 200 and some text" cannot tell a picture the model saw from a picture the server refused.
+
+Routing: `next_slice` = `streaming_image_turn` **0.844 @ 0.819** against advertising vision in
+`/v1/models` 0.140, single-flight queueing 0.007, a docs pass 0.004 and the three remaining prefill terms
+at 0.0021, 0.0012 and 0.0011; `perf_still_worth_a_slice` **0.0014**.
+
+### What landed
+
+Two opt-in cases, `testAStreamedAPIRequestWithAnImageAnswersOverTheLocalServer` (port 8793) and
+`testAStreamedAnthropicRequestWithAnImageAnswersOverTheLocalServer` (8794), plus five helpers:
+`parseSSEFrames`, `postStreaming`, `streamChat`, `streamMessages` and `waitForLogRows`.
+
+- `parseSSEFrames` splits the transcript the way the spec does: a frame is a block of lines ended by a
+  blank line, `event:` names it, `data:` carries the payload (multi-line payloads joined), and a block with
+  no field but a leading `:` is a comment heartbeat.
+- `postStreaming` reads the chunked SSE body to EOF with `data(for:)` and asserts the two things a
+  streaming route promises regardless of the turn's fate: `200` and `Content-Type: text/event-stream`.
+- `waitForLogRows` polls the in-memory store, because a streaming row is recorded by the body closure's
+  `defer` as the response finishes and can trail the client's EOF by a few milliseconds. `#78`'s
+  single `fetch` was safe only because a non-streaming row is recorded before the route returns.
+- Both cases reuse `#78`'s `withLocalServer` and `#79`'s `loadPublishedCheckpointIntoTheSharedEngine`
+  unchanged, and keep the delta contract: plain turn and pictured turn, same question, same body.
+
+Two deliberate differences from the non-streaming cases, both recorded in the code:
+
+- **`max_tokens: 48` rather than 24.** On the OpenAI route reasoning is streamed into its own
+  `reasoning_content` field (`resolvedInlineReasoning` is off by default), so the visible answer needs
+  tokens the non-streaming case spent on the pre-amble it printed as content. 48 leaves room for both.
+- **The error frame is collected and asserted nil.** That is the only signal a streamed refusal leaves.
+
+### Evidence
+
+```
+🔎 [dsv41 real] live server: 96085 tensors in 48 shard(s), mapped 48/48 segment(s), 475.2508442029357 GB
+🔎 [dsv41 real] streamed image turn: plain 190 prompt tokens / 47 generated over 51 frame(s),
+   pictured 375 / 47 over 52, span 184 position(s)
+🔎 [dsv41 real] streamed image answer: "The user has shared an image that appears to be entirely
+   red/crimson colored with no visible content — it looks like a solid color block, possibly a
+   placeholder or an image that failed to load properly. I should describe what I see"
+   (0 chars of reasoning, 264 heartbeat(s), done true)
+Test Case '…testAStreamedAPIRequestWithAnImageAnswersOverTheLocalServer' passed (122.841 seconds).
+🔎 [dsv41 real] live server: 96085 tensors in 48 shard(s), mapped 48/48 segment(s), 475.2508442029357 GB
+🔎 [dsv41 real] streamed anthropic image turn: plain 165 input tokens / 46 generated over
+   79 frame(s), pictured 350 / 32 over 288, span 184 position(s)
+🔎 [dsv41 real] streamed anthropic image answer: "The image you shared appears to be completely
+   solid red with no visible content, shapes, text, or objects—just a uniform red color filling
+   the entire frame." (0 chars of reasoning, 251 heartbeat(s), stopped true)
+Test Case '…testAStreamedAnthropicRequestWithAnImageAnswersOverTheLocalServer' passed (115.401 seconds).
+	 Executed 2 tests, with 0 failures (0 unexpected) in 238.241 seconds
+```
+
+The delta is the same 185 on both routes and on both transports: `375 - 190` and `350 - 165`, each
+`= 2 + 184 - 1`. The rows are the other half of the claim and are asserted as such: both turns logged
+`wasStreaming`, both `streamTermination == .completed`, and the image row's `inputTokens` is the
+**expanded** count the usage frame reported (`"image_parts":1` / `"image_blocks":1` in the captured body).
+
+### The two writers keep the connection warm in two different ways, and the first run's instrument said they did not
+
+The first run printed `0 heartbeat(s)` for the Anthropic pictured turn and `266` for the OpenAI one, on
+turns that took the same ~95 s of image prefill. That read like a real asymmetry, and it was the
+instrument: OpenAI's keep-alive is `writer.write(":\(comment)\n\n")` — an SSE **comment block**, which is
+what `parseSSEFrames` counts as a heartbeat — while the Anthropic writer calls `sse("ping",
+AnthropicPingEvent())`, which emits a named `event: ping` frame with a JSON payload. The parser counted
+those as payload frames, so the Anthropic turn's 251 keep-alives were sitting inside its 288 "frames".
+
+Fixed before anything was written down, by counting `event: ping` as a heartbeat on that route: **264
+keep-alives on the OpenAI route and 251 on the Anthropic one**, against 52 and 288 total frames. So both
+writers do hold a long image prefill open, at roughly a 0.35 s cadence, and the earlier number was a
+parser classifying the two mechanisms differently.
+
+### What it does not mean
+
+- **Not a latency claim.** These cases prove the transcript, not the cadence: the frames are asserted for
+  order and content, and no timing is asserted anywhere.
+- **Not `/v1/models`.** It still advertises no vision capability, so a client cannot discover that the
+  served model accepts pictures. That remains the next completeness gap.
+- **Not a queue or lifecycle change.** Single-flight is untouched: a concurrent request during an in-app
+  turn still gets a 503 rather than queueing behind it, and the streaming routes inherit that as
+  `#77` left it.
+- **Not a second image path.** Both protocols still reach the same `attachImageMarkers`, the same
+  `DeepSeekV41TurnImages.bind` and the same expanded-prompt cache provisioning. Four cases now walk the
+  two protocols on both transports to one implementation.
+- **Not deterministic text.** Two runs of the Anthropic case generated 47 and 32 tokens from the same
+  prompt (`top_p` sampling), so the assertions are the delta, the terminal marker, non-emptiness and the
+  row. The wording is printed as evidence and never asserted.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_80` twice (status 0 both times; only the two
+pre-existing `ContentView.swift` Swift-6 actor warnings), then `test-without-building` **with the same
+`-derivedDataPath`** for both cases in one run each time — `/tmp/test80_run1.log` before the heartbeat fix
+and `/tmp/test80_run2.log` after it, `Executed 2 tests, with 0 failures` in both, with each case's
+`passed` line present. Bundle freshness checked with
+`strings … | grep -c "testAStreamedAPI…\|testAStreamedAnthropic…"` (2) before running, because `#78`'s
+silent-zero trap is a green run that executes nothing.
+## DSV4.1 #81: THE MODELS LIST NOW SAYS WHAT THE MODEL CAN DO, FROM THE SAME FACTS THE PLANNER GATES ON
+
+### The question
+
+Three consecutive slices ended by naming the same hole. `#78` proved a non-streaming image turn answers;
+`#79` did it for the Anthropic route; `#80` did it for both streaming transports. Each of them then had to
+write down that **a client had no way to learn any of it**: `GET /v1/models` answered with
+
+```json
+{"object":"list","data":[{"id":"<snapshot hash>","object":"model","created":1793830186,"owned_by":"dynamoe"}]}
+```
+
+An id and a timestamp. So the only way to discover that the served checkpoint reads pictures was to send
+one and see whether it came back as an answer or a 400, and the only way to discover the prompt ceiling was
+to exceed it, and the only way to discover whether a reasoning request would be honoured was to ask and
+watch.
+
+That is not a cosmetic gap on this branch. The capability exists, is exercised end to end on both
+protocols and both transports, and was undiscoverable.
+
+Routing: `next_slice` = `models_vision_capability` **0.986 @ 0.983** against a larger "capability plus
+image-cost metadata" slice 0.011, a docs pass 0.0017, single-flight queueing 0.0014 and the three remaining
+prefill terms at 0.0002, 0.0002 and 0.0001. `declare_vision_before_it_is_device_verified` **0.998**: the
+capability is real for a client today (a picture is accepted and answered), only slower than text, and
+`#43`'s encode is a device pass, so advertising it is not an overclaim.
+
+### What landed
+
+`OpenAIModelList.Model` gained three additive fields and a factory, and the route that builds it stayed six
+lines:
+
+- **`capabilities: { vision, thinking, thinking_levels }`** — copied from `LoadedModelInfo`, which is the
+  same snapshot of facts `buildTurnPlan` reads. `vision` is `ModelConfig.supportsVision`, whose own gate is
+  the tower's files rather than the model row's flag, so a half-downloaded checkpoint cannot advertise a
+  tower it cannot run. Deliberately NOT a hand-written list: a capability the planner does not gate on
+  would be marketing, and a swapped flag here is silent on the wire.
+- **`context_length`** — the checkpoint's own architectural ceiling, `effectiveMaxPositionEmbeddings`
+  (1,048,576 here). Not this machine's KV budget: a client asking "how much fits" wants the weights'
+  answer, and the two numbers are far apart on purpose.
+- **`max_prompt_tokens`** — the prompt length the server actually refuses
+  (`dynamoe_server_max_prompt_tokens`, 262,144 by default), so a client can tell the weights' ceiling from
+  the server's. The "no cap" sentinel `Int.max` is reported as **nil**, because a client's JSON float
+  conversion would show `9.22e18` as a number rather than as "unlimited".
+- `OpenAIModelList.entry(for:contextLength:maxPromptTokens:created:)` is the same three-line mapping as a
+  free function of the facts, so it is testable with no loaded model.
+
+Nothing about the id changed: it is still the snapshot directory's own name (a hash). That is a real
+discoverability wart of its own, but it is what every response's `model` field carries and what the
+turn-memory digest and prefix session keys are built from, so renaming it would invalidate recorded turns
+across an update. Recorded here as a known limitation rather than changed inside a slice about
+capabilities.
+
+### Evidence
+
+The live check, on the published checkpoint (`testTheServerAdvertisesWhatTheLoadedCheckpointCanDo`):
+
+```
+🔎 [dsv41 real] live server: 96085 tensors in 48 shard(s), mapped 48/48 segment(s), 475.2508442029357 GB
+🔎 [dsv41 real] /v1/models: {"object":"list","data":[{"context_length":1048576,"created":1793830186,
+   "object":"model","owned_by":"dynamoe","capabilities":{"vision":true,"thinking_levels":true,
+   "thinking":true},"max_prompt_tokens":262144,"id":"1bae0e1088993b9b82de08f59de5be5a34e42170"}]}
+Test Case '…testTheServerAdvertisesWhatTheLoadedCheckpointCanDo' passed (1.716 seconds).
+```
+
+**1.716 seconds for the whole case** — the app-order load, the server start and the GET. That is the first
+place the numbers say something new about the harness itself: the load of a 475 GB, 96,085-tensor
+checkpoint is ~1.5 s (it indexes shard headers through the mmap rather than reading weights), so
+`#78`/`#79`/`#80`'s ~115 s per case is the TURNS and essentially none of it is the load. A capability check
+therefore costs nothing and belongs in the suite rather than in a one-off.
+
+The three assertions that matter are cross-checks against something outside the wire, not against a second
+copy of the mapping: `context_length` against `modelConfig.effectiveMaxPositionEmbeddings` from the
+config on disk, `thinking_levels` against `ModelConfig.supportsThinkingLevels(modelPath:)` (the planner's
+own gate), and `max_prompt_tokens` against `ServerController.resolvedMaxPromptTokens` (what the server
+enforces). `vision` is asserted true because this checkpoint publishes a tower, which is exactly the fact
+`#78`-`#80` spend their turns proving.
+
+Two pure cases pin the mapping without a model
+(`testModelListAdvertisesTheCapabilitiesThePlannerGatesOn`,
+`testModelListCapabilitiesFollowTheLoadedModelRatherThanTheWire`): the snake_case keys a client sees, that
+Swift property names do not leak (`thinkingLevels`), that a tower-less model reports `vision: false` rather
+than a hardcoded true, and that "no ceiling" and "no cap" both encode as absent rather than as sentinels.
+
+### What it does not mean
+
+- **Not a promise that the context is servable.** `context_length` is the weights' ceiling; the KV budget
+  still decides what a given machine affords, and a request past `max_prompt_tokens` is still a 400 with
+  `code: "context_length_exceeded"`.
+- **Not an image price.** Nothing advertises that a picture costs 184-1,005 prompt positions or 0.32-6.90 s
+  of tower. That was the larger slice this one beat on routing, and it needs the resize plan's own
+  arithmetic rather than a constant.
+- **Not an id change.** Still the snapshot hash; see above.
+- **Not a per-model list.** Exactly one entry, because the app serves exactly one loaded model; no loaded
+  model is still `{"object":"list","data":[]}`.
+- **Not an Anthropic-shaped models route.** `GET /v1/models` answers in the OpenAI shape on both protocols,
+  as it always has.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_81` (status 0, only the two pre-existing
+`ContentView.swift` Swift-6 actor warnings), then `test-without-building` with the same `-derivedDataPath`:
+the two pure cases from `/tmp/test81_run1.log` (`Executed 2 tests, with 0 failures`) and the live case from
+`/tmp/test81_run2.log`, gated on `touch /tmp/dynamoe_dsv41_real_turn` and removed in the same command.
+Bundle freshness checked with `strings … | grep -c testTheServerAdvertisesWhatTheLoadedCheckpointCanDo`
+(1) before running.
+
+The existing app-hosted smoke case (`ServerControllerSmokeTests.testModelsEndpointServesOpenAIListShape`,
+0.943 s) still passes unchanged: it asserts the list shape and the id, which is exactly the part this slice
+left alone.
+
+## DSV4.1 #82: A PICTURE'S PRICE IS A RANGE, BECAUSE THE PLAN PRICES ITS SHAPE AND NOT JUST ITS PIXELS
+
+### The question
+
+`#81` made `GET /v1/models` say what the served checkpoint can do, and left one hole in it standing:
+`vision: true` says a picture is accepted and nothing about what it costs. That is not a marketing
+detail on this model. The same slot in a prompt costs a client **184 positions and 0.32 s** or
+**994 positions and 6.95 s** depending only on which picture is put in it (`#35`, `#43`), and a
+client choosing a request timeout, or deciding whether a near-full prompt has room for an
+attachment, cannot tell from a boolean which end it is sizing for. The composer has shown this
+per-image since `#38` (`ModelConfig.visionCostEstimate` at the point of attach); the wire had no
+equivalent.
+
+Routing: `next_slice` = `image_cost_metadata` **0.900 @ 0.880**, ahead of a docs-only reconciliation
+0.084, single-flight queueing 0.010, and the three remaining prefill terms at 0.0021, 0.0019 and
+0.0015. `docs_is_a_slice` **0.666** put the prose repairs in the mid-band, so they rode along on this
+commit instead of taking one of their own. `serve_queueing_should_change` **0.059**: the single-flight
+`503` stays.
+
+### What was added
+
+| | where | what it is |
+|---|---|---|
+| `DeepSeekV41VisionPricing.Bounds` + `bounds(spec:costModel:)` | `DeepSeekV41VisionCost.swift` | the cost envelope of one attachment, from the resize plan alone |
+| `ModelConfig.visionCostBounds(modelPath:)` | `ModelConfig.swift` | the same per checkpoint, beside the per-image estimate the composer uses |
+| `LoadedModelInfo.visionCost` | `CompletionEngine.swift` | the fact, snapshotted with the other `/v1/models` facts |
+| `Capabilities.VisionCost` / `vision_cost` | `OpenAIAdapter.swift` | the wire form, six keys, additive to the OpenAI schema |
+
+```json
+"capabilities": {"vision": true, "thinking": true, "thinking_levels": true,
+  "vision_cost": {"min_prompt_positions": 184, "max_prompt_positions": 1024,
+                  "min_patch_tokens": 1521, "max_patch_tokens": 9216,
+                  "min_encode_seconds": 0.32, "max_encode_seconds": 7.84}}
+```
+
+### The finding: a single price is not derivable, and the plan's own cap is the ceiling
+
+`estimate(width:height:)` prices ONE picture. A client that has not been sent one needs the envelope,
+and the envelope is not the price of the largest square: **the resize plan prices an aspect ratio as
+well as a pixel count**, because the cap is applied in TOKEN space (`fit` trims the aligner grid until
+`imageTokenCount` fits `max_image_tokens`) and the floor is applied in PIXEL space, with both sides
+rounded up to a patch first. Two images of identical area therefore cost different amounts.
+
+What makes a bound possible without a search is that `fit` trims until the **span** fits, not until
+a grid area fits, so:
+
+- no picture can put more than `max_image_tokens` positions in a prompt, and a one-row span reaches
+  that exactly (`42,882x42` → a 1,021x1 grid → span **1,024**);
+- patches never exceed `downsample_ratio^2` per aligner cell, so that widest span carries at most
+  `3^2 * 1,024 = 9,216` of them (`42,882x42` → **9,189**);
+- the smallest accepted image is a one-pixel one raised to `min_pixels`, and a square needs the
+  fewest patches: `fit(1,1)` → 546x546 → **1,521** patches on a 13x13 aligner grid → **184**
+  positions (`#35`'s own measurement).
+
+Both patch ends are then priced with `DeepSeekV41VisionCostModel.measured`, the same model the
+composer quotes, so the wire range cannot disagree with the per-image chip: 0.32 s and 7.84 s.
+
+### What it does not mean
+
+- **Not the tightest number the server can produce.** The span ceiling of 1,024 is the plan's, and
+  the plan alone can reach it; the app's image decoder refuses a source wider than
+  `DeepSeekV41ImagePixels.maximumSourceSide` (4,096 px a side), and the 1,021:1 strip that attains it
+  is 42,882 px wide. Through the server the ceiling is the largest square, 8,649 patches and 994
+  positions (`#37`) — so the advertised bound is 3% high on positions and 6.5% high on patches. It is
+  a ceiling by construction; erring high is the direction that keeps a client's timeout honest.
+  Deriving the decoder-limited maximum would need a search over aspect ratios for a 3% tighter number.
+- **Not a per-request price.** It says what an attachment CAN cost, not what the one in a given turn
+  does; the engine still prices the actual picture before it provisions anything, via
+  `TurnImages.price`, and for the largest accepted image that is 994 of a 1,048,576-position context.
+- **Not rounded because it is unknown.** Two decimals on the seconds, because the model is a fit to
+  three measured points on one machine class rather than a measurement of the client's hardware; the
+  positions and patch counts are exact integers from the plan.
+- **Not advertised for a tower-less model.** A checkpoint can publish a `vision_config` (and so a
+  resize plan) without shipping the tower's weights, which is exactly the half-downloaded case
+  `supportsVision` refuses for the composer. `entry(for:)` gates the cost block on `supportsVision`,
+  so the two cannot disagree about whether an attachment will be read.
+- **Not a change to the single-flight contract, in this slice.** A request that arrives during an
+  in-app turn still got a `503` rather than queueing here (0.059 against changing it), which `#83`
+  then took on anyway — on the user's instruction, and it turned up the defect underneath the
+  policy question: the queue was not serializing concurrent enqueues at all. Nothing about the
+  cost metadata above depends on that.
+
+### The two prose repairs that rode along
+
+Both were standing side by side in this journal, contradicting one another:
+
+- **`indexer wait` 11.3 against 8.0-9.0** is now reconciled at `#75`, where the second figure is
+  tabulated: it is one stop billing whatever the queue had not finished, so it follows the layout and
+  the order of what was encoded ahead of it. `#64` split the same stop at 2.5 ms/position of indexer
+  and the rest a drain of the dense half, and the two runs sat at different walls (99.7 against
+  77.7-78.3 ms/position), so the difference is not the indexer shrinking.
+- **`#75`'s "the opposite of what `#22`'s sweep predicted"** now carries its withdrawal in its own
+  section, not only in `#76`'s: that sweep measured 0.57-0.84 ms after 10-50 ms of host idle, so it
+  predicted 0.55 and the block's probe measured 0.55-0.60.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_82` three times (status 0 each), then
+`test-without-building` with the same `-derivedDataPath` every time. The full build (`build2`) reports
+no error and no warning in any touched file: the only diagnostics against them are
+`ModelConfig.swift:1110`'s actor-isolated `VisionSpecBox` call, which is present in `#81`'s logs too.
+One warning this slice did introduce was fixed rather than recorded: passing the mapping as a
+function value (`info.visionCost.map(Capabilities.VisionCost.init)`) took the init in a nonisolated
+context and warned, so it is a closure. Bundle freshness verified with
+`strings … | grep -c <case>` (1 for all six cases) before running.
+
+New pure cases: `DeepSeekV41VisionCostTests.testTheAdvertisedBoundsComeFromThePlansOwnFloorAndCap`,
+`testNoAdmissibleImageEscapesTheAdvertisedBounds` (ten shapes including both thin extremes, every one
+asserted inside all six bounds, and the cap asserted REACHED so the ceiling is not a direction nothing
+can reach), `testAnUncappedPlanAdvertisesNothing`; and in `OpenAIAdapterLogicTests` the two `#81` cases,
+extended to assert the six wire keys, the two-decimal rounding and that no Swift name leaks at either
+nesting level, plus the tower-less case where a resize plan exists and `vision_cost` must be absent.
+`DeepSeekV41PublishedTurnTests.testTheServerAdvertisesWhatTheLoadedCheckpointCanDo` gained the live
+cross-check: `min_prompt_positions` 184 and `min_patch_tokens` 1,521 against `#35`'s measurement,
+`max_prompt_positions` against the checkpoint's own `max_image_tokens`, the patch ceiling against
+`downsample_ratio^2 * max_image_tokens`, and the second ceiling against
+`DeepSeekV41VisionCostModel.measured` (a same-number check, not an inequality, because the wire
+rounds).
+
+Measured on the published checkpoint (`/tmp/test82_run2.log`, 1.683 s for the load, the server start and
+the request together — the 475 GB load is header indexing, so a capability check is cheap and belongs in
+the suite):
+
+```json
+{"object":"list","data":[{"id":"1bae0e1088993b9b82de08f59de5be5a34e42170","capabilities":
+ {"thinking":true,"thinking_levels":true,"vision":true,"vision_cost":
+  {"max_prompt_positions":1024,"min_patch_tokens":1521,"min_prompt_positions":184,
+   "max_patch_tokens":9216,"min_encode_seconds":0.32,"max_encode_seconds":7.84}},
+ "context_length":1048576,"created":1793831591,"owned_by":"dynamoe","object":"model",
+ "max_prompt_tokens":262144}]}
+```
+
+and `ServerControllerSmokeTests.testModelsEndpointServesOpenAIListShape` still passes unchanged
+(0.948 s, `/tmp/test82_run3.log`): it asserts the list shape and the id, which is the part this slice
+left alone.
+
+## DSV4.1 #83: THE FIFO WAS NOT A FIFO UNDER A BURST, AND AN IN-APP GENERATION NOW QUEUES INSTEAD OF REFUSING
+
+### The question
+
+Two things were wrong with the server's turn queueing, and they were the same thing:
+`TurnExecutionQueue` is documented as "a FIFO over the engine's single-flight generation
+slot", and it was neither.
+
+1. **A request that arrived while the app was generating got `503` before it had waited at
+   all.** `CompletionEngine.launchTurn` refuses a second turn (`engineNotReady`), and the
+   server mapped that straight to `503 overloaded`. The queue serialized *server* turns only;
+   the chat UI and the agent harness call `launchTurn` directly, so the one engine slot had a
+   second holder the FIFO could not see. A client that asked while a chat answer was streaming
+   was told the server was overloaded.
+2. **Under a burst, the queue let every request through at once.** `perform`/`streamTurn` read
+   `tail`, then did several things — including constructing and configuring
+   `ServerTurnCancelBox`, a `MainActor`-isolated type in this target — before writing the new
+   chain element. Those calls are hops off the queue actor, so a burst of enqueues could all
+   read the SAME `tail` and chain off a turn that was not the previous one. The engine then
+   refused all but the first as a second active turn: **23 of 24 concurrent requests returned
+   `503`**, and the queue's own bookkeeping never noticed.
+
+Routing: the user asked for this slice after `#82`; the previous run had already put
+`serve_queueing_should_change` at **0.059**, so this is work taken on the user's instruction
+rather than on the routing evidence — which is the right call in hindsight, because what it
+found was not the policy question that ran (should an API turn queue behind an in-app turn)
+but a defect underneath it.
+
+### What was wrong, measured
+
+`ServerQueueLogicTests.testConcurrentEnqueuesNeverRunTwoTurnsAtOnce` is the instrument: 24
+independent enqueues, each turn incrementing a lock-guarded live counter on entry and
+decrementing it on exit, 1 ms of work inside, and the peak recorded.
+
+| arm | peak concurrent turns | finished |
+|---|---|---|
+| pre-fix queue, no deadline | **24** | 24 |
+| pre-fix queue, 5 s deadline | **24** | 24 |
+| shipped queue, either arm | **1** | 24 |
+
+That case failed **5 of 5** runs against the pre-fix queue (`XCTAssertEqual failed: ("24") is
+not equal to ("1")`) and passes 11 of 11 after. It also explains a pre-existing red test that
+had been failing on `main`: `testPerformInvokesSlotOpenedOnlyWhenSlotOpens` asserts the
+slot-open hook does not fire while the leader holds the slot, and failed on a clean baseline
+build of the parent commit — the same stale-chain read, in the single-deadline form.
+
+### What landed
+
+- **The chain is read and advanced with no suspension in between.** A `SlotDrain` (one-shot,
+  nonisolated lock box) is allocated, the gate `Task` is built to await it, `tail = gate`
+  happens immediately, and only THEN are the cancel box, the hook registry and the work task
+  created. The gate waits on `drained` instead of on `Task.value`, which is what lets it exist
+  before the task does. Nothing that can hop actors sits between the read and the write.
+- **`DrainFlag`, `ServerTurnCancelBox` and the new `SlotDrain` are `nonisolated`.** This target
+  compiles with `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, so leaving them bare made them
+  main-actor types called from the queue actor's critical path — the warnings that had been
+  sitting in this region were pointing at exactly the calls that broke the FIFO. Six of them
+  are gone.
+- **The queue waits for the engine slot, not just for its predecessor.** `waitForSlot` now
+  finishes with a poll of `CompletionEngine.isActive`, so an in-app generation is waited out
+  the same way an earlier request is. The wait is bounded by the SAME deadline and fed by the
+  SAME heartbeat, so nothing about the latency promise changes; what changes is that a request
+  inside its budget is served rather than refused. Past the deadline it gets `408` with a
+  message that names which of the two things it waited on — "the generation queue" or "a
+  generation running in the DynaMoE app" — because a client debugging a 408 needs to know.
+- **`slotProbe` is injectable** (`TurnExecutionQueue(slotProbe:)`), so the wait for an in-app
+  turn can be tested without loading a 475 GB model. Production passes the default.
+
+The wait sits BEFORE the `onSlotOpened` hook, deliberately: that hook is where the request log
+rows stamp `queueWaitMs`, and a request that spent 40 s behind a chat answer has been waiting,
+not generating.
+
+### What it does not mean
+
+- **Not a new knob and not unbounded latency.** The bound is the existing
+  `dynamoe_server_queue_timeout` (default 120 s, `0` = wait forever). Nothing new to configure;
+  the semantics of an existing setting simply now cover the case they described.
+- **Not a change to what `stop()` may cancel.** `cancelLiveWork()` still cancels exactly the
+  server-owned boxes, and the app's turn is still untouchable — the queue observes the engine
+  slot, it does not own it.
+- **Not proof that the queue is now race-free.** The invariant is stated and pinned ("no two
+  turns inside the work at once, over 24 concurrent enqueues, on both wait paths"), not proven.
+  What the five consecutive green suite runs do establish is that the burst case that failed
+  5 of 5 now passes 11 of 11.
+- **Not the end of the single-flight `503`.** A request can still hit it if an in-app turn
+  starts in the microseconds between the slot opening and `launchTurn` — a hop, not a wait.
+  That window is a design seam (the queue cannot reserve the engine slot), and it is rare;
+  closing it would mean giving `launchTurn` a reservation API.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_83` (status 0; the queue region's
+actor-isolation warnings have dropped from ten to four, and the remaining ones are in route
+handlers this slice did not touch). `test-without-building` with the same `-derivedDataPath`:
+
+| suite | result |
+|---|---|
+| `ServerQueueLogicTests` (19 cases, now including 5 for the in-app wait and 1 for the burst) | **5 consecutive green runs** after the fix, 3 more after the burst test widened to both wait paths |
+| `ServerStreamSafetyTests`, `ServerHardeningLogicTests`, `ServerToolArgumentTests`, `AnthropicAdapterLogicTests`, `OpenAIAdapterLogicTests`, `TurnToolMaskTests`, `ReasoningRoundTripTests` | 90 cases, 0 failures |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787) | 17 cases, 0 failures |
+
+The pre-fix arm is a real A/B, not an estimate: the parent commit's `ServerController.swift`
+was restored, built into `/tmp/dd_dsv41_pre`, and the burst case run against it five times.
+
+## DSV4.1 #84: THE SLOT IS NOW HELD, NOT JUST LOOKED AT, AND THE QUEUE'S LAST 503 WINDOW IS CLOSED
+
+### The question
+
+`#83` closed with the seam it could not close: "a request can still hit it if an in-app turn
+starts in the microseconds between the slot opening and `launchTurn` — a hop, not a wait. That
+window is a design seam (the queue cannot reserve the engine slot), and it is rare; closing it
+would mean giving `launchTurn` a reservation API."
+
+Two things in that sentence turned out to be wrong, and they are the reason this slice was
+worth doing.
+
+1. **The window is not microseconds.** Between the probe and the launch sits the queue's
+   whole `work` closure: `buildTurnPlan` renders the prompt and tokenizes it, the turn memory
+   is looked up, the prefix pin is consulted, images are priced. On a long API prompt that is
+   not a hop, it is the preparation. The seam was as wide as a turn's setup, not as wide as a
+   scheduling hop. (Unmeasured — this is a code fact about what sits between the two calls, and
+   it is why the fix had to hold the slot rather than shorten the gap.)
+2. **The party that paid for it was the wrong one.** The client that lost was the one that had
+   already waited out the FIFO, its queue timeout, and its heartbeats, and got `503` at the
+   end of it; the chat turn that caused it ran to completion. A seam that fails the caller who
+   has invested the most waiting is the worst available ordering.
+
+Routing: `next_slice` = `reservation_api` at **0.518 @ 0.438**, with `image_cost_ceiling` at
+0.296 and every perf candidate under 0.12; and `measurement_slice_is_worth_it` = **0.045**,
+decisively against spending the session on another stage table. The choice was mid-band and
+low-confidence, so it was taken on the second answer plus the reasoning above rather than on
+the probability: what is left of the perf journal is each under ~1% of a prefill position
+(`#73`'s three FP8 projections are the dense half, `#74`'s `select` rail is 1.1% of a
+position, `#72`'s shared-expert lever is under 1%), while this is a correctness hole in the
+contract `#83` had just shipped.
+
+### What was added
+
+**One new primitive** (`EngineTurnSlot.swift`):
+
+- `TurnSlotClaim` — a hold on the engine's single-flight generation slot. Only one can be
+  outstanding, `release()` is idempotent, and it is a ticket rather than a flag so a claim that
+  was already given back cannot release the slot out from under whoever holds it now (both the
+  queue and the launch path release on their way out).
+- `TurnSlotLedger` — the lock box that grants the one claim. `nonisolated`, like the queue's
+  other boxes: this target builds with `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, and a
+  release that had to hop to the main actor could land after the next turn had already looked.
+
+**On the engine** (`CompletionEngine.swift`):
+
+- `reserveTurnSlot() -> TurnSlotClaim?` — nil when a turn is running or another caller holds
+  the slot. This is the queue's only way in.
+- `isActive` is `currentGenerationTask != nil || turnSlotLedger.isClaimed`: a turn being
+  PREPARED occupies the slot exactly like a running one, which is what makes the claim
+  visible to every other prober (the queue's own, `MCPManager`'s config-reload deferral, the
+  UI's busy state).
+- `launchTurn(_:claim:)` takes the slot on the way in — the caller's claim if it has one, or
+  one of its own, in the same step, so two launches can never both see a free slot. A launch
+  that holds no claim while one is outstanding is refused with its own message ("the local API
+  server is starting a generation"), and a `defer` gives the claim back on every one of the
+  function's many early throws, which is what keeps a refused turn from wedging the server.
+
+**On the queue** (`ServerController.swift`):
+
+- `slotReserve` joins `slotProbe` as an injectable `@Sendable` closure (so the whole seam is
+  testable with no model, the way `#83`'s probe already was), and `SlotWaitOutcome.opened` now
+  carries the claim.
+- A probe that says free followed by a claim that FAILS is a retry, not a refusal: somebody
+  else took the slot in that instant, so the turn goes back to waiting inside
+  `waitForSlot`, still bounded by its deadline. Nothing about the request is thrown away.
+- `perform`/`streamTurn` hand the claim to the work closure and release it in the same `defer`
+  that drains the queue, so a claim the turn never redeemed (a timeout, a cancellation, a work
+  closure that threw) goes back. `runTurn` and both streaming writers now pass it to
+  `launchTurn`.
+
+### What it says
+
+- **Reserving converts a lost race into a wait, provided the loser is still waiting.** That is
+  the whole shape of the fix: `#83` made the queue wait for the slot, and the wait was undone
+  by a check-then-take pair. Taking the slot in one step is all it needed.
+- **The seam could not be closed by retrying the work closure.** That is the alternative that
+  looks free and is not: `work` is opaque to the queue, so "the slot was gone" arrives as an
+  `engineNotReady` that is indistinguishable from "no model is loaded" or "this checkpoint
+  cannot run", and re-running the closure would re-render the prompt, re-tokenize it and
+  re-record the request-log box. The claim is what makes the loss distinguishable and
+  non-fatal, and it makes `work` run exactly once.
+- **The fix moves who can lose, it does not remove losing.** An in-app turn that arrives while
+  a server request is being prepared is now refused at its own launch with a message naming
+  the server, where before it would have won and the request would have failed. That is a
+  real, deliberate trade and it is scoped as narrowly as it can be: the losing case is a chat
+  send landing inside another turn's setup, it is immediate rather than after a wait, and it
+  is retryable by pressing send again. It is also not a new class of failure for the user —
+  a chat turn sent while a server turn was RUNNING already failed with `engineNotReady`.
+- **Every early throw in `launchTurn` had to give the claim back.** The function has dozens of
+  refusal paths (no model, no tokenizer, an image on a family with no tower, a checkpoint that
+  cannot be provisioned, a prompt that priced differently than it bound). One `defer` covers
+  all of them, and `testARefusedLaunchWithoutAClaimGivesTheSlotBack` is what says so.
+
+### What it is not (do not re-propose)
+
+- **Not a change to what a `503` means.** A launch that fails for the model's own reasons is
+  still a `503` through `wireLaunchError`, and `ServerControllerSmokeTests` still pins those
+  envelopes. What no longer produces a `503` is *winning the probe and losing the slot*.
+- **Not a new knob.** No setting, no timeout, no queue policy: the claim is invisible to
+  clients and the existing `dynamoe_server_queue_timeout` still bounds the wait.
+- **Not the queue owning the engine slot.** The queue observes and holds a claim; `stop()`
+  still cancels exactly the server-owned boxes and still cannot touch the app's turn.
+- **Not proof of race-freedom.** The invariant is stated and pinned ("one claim at a time, and
+  every path gives it back"), not proven. The 24-enqueue burst case now also runs through the
+  real ledger, which is the closest thing to a proof this suite offers.
+- **Not the last word on the in-app side.** A chat turn whose own preparation (prompt
+  formatting in `ContentView`) straddles a server claim still loses, because that preparation
+  happens before `launchTurn` and there is nowhere to hold a slot for it. Making the chat path
+  reserve early means making `startAutoregressiveGeneration` async; it is not needed while the
+  loss is bounded by a turn's setup, and it is the obvious next step if it ever bites.
+- Everything from `#51`-`#83` still stands.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_84` (status 0). The warning set is
+**identical** to `#83`'s build, line for line — 1,773 warnings, `diff` clean — so this slice
+introduced none, despite touching the actor-isolation-sensitive part of `ServerController`.
+
+`test-without-building` with the same `-derivedDataPath`:
+
+| suite | result |
+|---|---|
+| `EngineTurnSlotTests` (new: the ledger's one-at-a-time rule, a stale ticket, the engine looking busy under a claim, an in-app launch refused while a server claim is held, a claim-carrying launch honoured, and a refused launch giving the slot back) | **7 cases, 0 failures** |
+| `ServerQueueLogicTests` (30 cases: `#83`'s 19 plus 4 for the claim — a lost claim retried rather than reported, the claim held for the whole turn, released when the work throws, and a claim another caller holds waited for rather than refused) | **30 cases, 0 failures** |
+| `OpenAIAdapterLogicTests`, `AnthropicAdapterLogicTests`, `ServerStreamSafetyTests`, `ServerToolArgumentTests`, `ServerHardeningLogicTests`, `TurnToolMaskTests`, `ChatPromptFormatterConversationTests`, `ReasoningRoundTripTests`, `PrefixAsOfDateTests` | 119 cases, 0 failures |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787) | 17 cases, 0 failures — including the `503` envelopes, which is what says the claim did not swallow the model-not-loaded path |
+
+The live arm is `DeepSeekV41PublishedTurnTests.testAnAPIRequestWithAnImageAnswersOverTheLocalServer`
+(opt-in, `/tmp/dynamoe_dsv41_real_turn`): a real request through the real server, whose launch
+now carries the queue's claim into `launchTurn`. It passes (117 s, `/tmp/test84_live2.log`): the
+checkpoint indexed as 96,085 tensors over 48 mapped segments (475.25 GB), the server came up on
+127.0.0.1:8791, and two requests answered `200` — the plain prompt in 33.1 s (queue 77 ms) and
+the same prompt with one attachment in 80.9 s (queue 76 ms), 190 prompt tokens against 375, a
+span of 184 positions over 1,521 patch tokens from 0.32 s of tower, the model describing the
+picture it was sent. So the claim travels from the queue through `work` and `withTurnToolMask`
+into the engine and back, and the queue-wait stamps the server already logged are unchanged.
+
+## DSV4.1 #85: THE CHAT PATH RESERVES TOO, SO THE SEAM #84 CLOSED IS CLOSED FROM BOTH SIDES
+
+### The question
+
+`#84` gave the engine a reservation API and wired exactly one caller into it: the API server's
+queue, so a chat turn could not take the slot a queued request was preparing for. `#84`'s own
+journal named the asymmetry it left standing:
+
+> A chat turn whose own preparation (prompt formatting in `ContentView`) straddles a server claim
+> still loses, because that happens before `launchTurn`.
+
+That is the same seam as `#84`'s, seen from the other side. `ContentView.startAutoregressiveGeneration`
+builds the effective system block, renders the dialect, encodes the prompt and assembles the
+request — `ModelConfig.buildEffectiveSystemPrompt`, `ChatPromptFormatter.formatPrompt`,
+`tokenizer.encode` — and only then launches. Every one of those is a chance for the server's
+`claimEngineSlot` to take the ledger, because the ledger is an `NSLock` box: a server turn claims
+from its own task, not from the main actor, and it does not need the chat turn to yield. The chat
+turn's preparation is synchronous on the main actor, but that does not exclude a background
+claim.
+
+So the owner of the slot changed mid-preparation and the party that paid was, again, the wrong
+one: the person who typed a message and pressed send got an error bubble naming the API server,
+while the server request ran.
+
+Routing: `next_slice` = `reserved_inapp_launch` **0.663 @ 0.596**, ahead of `vision_device_encode`
+0.303, `image_cost_ceiling` 0.028, `model_id` 0.004 and the three remaining prefill terms under
+0.002. `slice_should_be_measured` = **0.052**, decisively against another stage table: every perf
+candidate left in this journal is under ~1.2% of a prefill position against a 5-30% spread
+between runs on this machine, so nothing there can be resolved. The second answer is what carried
+the decision again, as it did for `#84`.
+
+### What was added
+
+Three lines of behaviour, one guard, and the tests that pin them.
+
+**The chat path reserves before it prepares** (`ContentView.startAutoregressiveGeneration`, after
+the empty-prompt guard and before the system block is built):
+
+```swift
+let turnSlotClaim = CompletionEngine.shared.reserveTurnSlot()
+defer { turnSlotClaim?.release() }
+```
+
+with the existing launch site becoming `launchTurn(request, claim: turnSlotClaim)`.
+
+Two properties make this three lines rather than a rework:
+
+- **A nil reservation is not a new error path.** `reserveTurnSlot()` returns nil when a turn is
+  running or another caller holds the slot, and the launch below then reports that exactly the
+  way it always has — `launchTurn` with no claim is the pre-`#84` call, and it refuses with the
+  same two messages. So a chat send that cannot reserve behaves as it does today; a chat send
+  that CAN reserve now closes the window. No message text moved, and the queued-prompt path
+  (`dequeueAndRunNextPromptIfNeeded`, which removes the prompt from the queue before sending)
+  gains no new way to lose an entry.
+- **`defer` covers every early return**, and `release()` is idempotent, so the claim is given
+  back whether the turn launches, is refused for a missing model, is refused for an image on a
+  graph without a tower, or dies in the tokenizer. `launchTurn`'s own `defer` releases the same
+  claim on its way out; neither side needs to know about the other.
+
+**A claim that was given back no longer authorises a launch** (`CompletionEngine.launchTurn`).
+`claim ?? turnSlotLedger.tryClaim()` treats a non-nil claim as proof the slot is held, and it
+was not: a caller that released its claim and then launched on it would skip the `tryClaim`
+guard entirely and run a turn while the ledger read FREE to everyone else — the precise state the
+ledger exists to prevent. The guard is one `held.isHeld` check, taken under `stateLock` (lock
+order is `stateLock` then the ledger's, which is the order `reserveTurnSlot` and `isActive`
+already use, so the new read cannot invert it), and the refusal names the reservation rather
+than the model.
+
+This one is defensive, not a live defect: no caller in the app releases before it launches
+today. It is included because `#85` makes `launchTurn(claim:)` take claims from a second
+caller type, and "the claim is what authorises the turn" is now the invariant two subsystems
+depend on rather than one.
+
+### The finding: the order is the whole feature, and the loser now waits instead of failing
+
+Reserving is not about who asked first — it is about who holds the slot when it is spent. With
+the chat path reserving:
+
+- a server turn that wants the slot during a chat preparation gets `nil` from
+  `claimEngineSlot()`, and `TurnExecutionQueue.waitForSlot` already treats a probe that says
+  free followed by a failed claim as a **retry, not a refusal** (`#84`'s explicit decision). The
+  request goes back to waiting with its deadline and its heartbeats intact, exactly as if it had
+  found the slot busy a moment earlier;
+- a chat send during a server turn is still refused, and should be — one turn at a time is the
+  contract. What changed is that it is now refused for a reason that is true at the moment it is
+  reported, and the refusal no longer depends on losing a race during formatting.
+
+The invariant, stated: **the slot is taken in the same step that decides it is free,
+by every caller that then spends real time preparing.** `#84` said that for the server;
+`#85` makes it true for both halves of the app, which is what lets the sentence be an invariant
+rather than a note about one path.
+
+### What it is not (do not re-propose)
+
+- **Not a wait for the chat path.** Making the in-app send block until the server's turn ends
+  would put a suspension in the middle of a main-actor function that then builds a request from
+  `@State`, and it would be unbounded — a server turn is a minute. Refusing immediately with a
+  true reason is the correct behaviour for an interactive surface.
+- **Not a fix for a send that straddles a MODEL LOAD.** `handleSendMessage` can `await`
+  `ensureModelLoaded` before it reaches `startAutoregressiveGeneration`, and that suspension is
+  upstream of the reserve. Closing it means reserving before the load, which would hold the slot
+  across a multi-second model load and refuse the API server for the duration. Left alone
+  deliberately.
+- **Not a claim on the queued-prompt path.** `dequeueAndRunNextPromptIfNeeded` already requeues
+  rather than running a second generation, and it re-checks `isGeneratingText` after every
+  suspension. It reaches the same reserve as any other send.
+- **Not a change to the 503 contract.** A request that arrives during an in-app turn still
+  queues and waits (`#83`); a request whose deadline expires still gets the queue-timeout
+  envelope. Nothing here touches the wire.
+- **Not measured, and not measurable here.** The window is a code fact (what sits between the
+  reserve and the launch), not a timing. The machine's run-to-run spread is 5-30%; a
+  "chat-send-during-preparation" histogram would be noise, and the property is structural.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_85` (status 0), then `test-without-building`
+with the same `-derivedDataPath` throughout. The build's warning set is **identical to `#84`'s**:
+1,773 diagnostics, `diff` clean, so the two touched files introduced none. Bundle freshness
+checked with `strings … | grep -c <case>` (3 for the three new cases) before running.
+
+| suite | result |
+|---|---|
+| `EngineTurnSlotTests` (10 cases: `#84`'s 7 plus three for this slice — the in-app reservation keeping a server turn from claiming mid-preparation, a released claim refused rather than honoured, and an in-app claim redeemed by its launch and given back) | **10 cases, 0 failures** |
+| `ServerQueueLogicTests` | 30 cases, 0 failures |
+| `OpenAIAdapterLogicTests`, `AnthropicAdapterLogicTests`, `ServerStreamSafetyTests`, `ServerToolArgumentTests`, `ServerHardeningLogicTests`, `TurnToolMaskTests`, `ChatPromptFormatterConversationTests`, `ReasoningRoundTripTests`, `PrefixAsOfDateTests` | 142 cases, 0 failures |
+| `ServerControllerSmokeTests` (app-hosted, real server) | 17 cases, 0 failures |
+
+The three new cases are the ones that can be pinned without a UI driver, and each is about a
+fact the ledger is supposed to guarantee rather than about the chat view: that a chat claim makes
+the server's claim fail (so the queue re-waits), that the failed attempt does not take the slot,
+and that a spent claim is refused instead of authorising a turn.
+
+The live arm is `#84`'s own `DeepSeekV41PublishedTurnTests.testAnAPIRequestWithAnImageAnswersOverTheLocalServer`
+(opt-in, `/tmp/dynamoe_dsv41_real_turn`), re-run because this slice changed the launch call and
+added a guard on the launch path. It passes unchanged (117.5 s, `/tmp/test85_live.log`): 96,085
+tensors over 48 segments, server on 127.0.0.1:8791, two requests `200` — the plain prompt in
+33.0 s (queue 77 ms) and the same prompt with one attachment in 81.3 s (queue 74 ms), 190 and 375
+prompt tokens, a span of 184 positions over 1,521 patch tokens from 0.32 s of tower, and the
+model describing the picture. Same numbers to the tenth of a second as `#84`'s run, which is what
+a four-line change to who holds a lock should look like.
+
+## DSV4.1 #86: THE ANTHROPIC FRONT DOOR CAN NOW ANSWER WHAT A REQUEST WILL COST, AND ITS NUMBER IS THE TURN'S OWN
+
+### The question
+
+`#77` to `#82` spent six slices making the local server a front door a real client could walk
+through: a picture on both protocols, both transports, the models list advertising the capability
+and then its cost. What that left is not a bug but a hole in the protocol surface. The Anthropic
+API defines two POST routes, and this server had one of them.
+
+`POST /v1/messages/count_tokens` is the pre-flight. A client that manages its own context — Claude
+Code is the one that matters — counts a conversation before sending it, and without the route
+that pre-flight is a 404. So the branch's own theme, "complete full DeepSeek support" as a drop-in
+local server, had exactly one cheap unbuilt piece left, and the price of it is a request with no
+generation in it.
+
+Routing agreed decisively: `next_slice` = `anthropic_count_tokens` **0.995 @ 0.994**, with
+`device_mhc_stages` 0.004, `model_id` 0.001, `openai_responses` 0.0003, `docs_sweep` 0.0003,
+`perf_leftovers` 0.0001 and `image_cost_ceiling` 0.0001. The scope question —
+`count_tokens_scope` "the route alone" against "both protocols" and "route plus docs only" —
+answered **0.947 @ 0.921** for the route alone.
+
+One correction matters more than the routing. The first request put `vision_device_encode` on top
+of the state at 0.94, because that was the largest unbuilt thing this journal used to name — and it
+was **stale**: `#43` built the whole device encode (0.32 s smallest image, 6.90 s largest, 8.81x to
+6.02x), `#44` and `#45` then measured its attention dead as a SIMT *and* a matrix-unit question,
+and `#46` found the encode was 2% of a picture's real cost. The candidate list is only as good as
+the journal it is read from, and the journal says the tower is done.
+
+### What was added
+
+One route, one response type, one parameter.
+
+- **`POST /v1/messages/count_tokens`** (`ServerController.buildRouter`), registered beside
+  `/v1/messages`. It authorizes, decodes the body as `AnthropicMessagesRequest`, prints the same
+  request summary into the same log row, and answers `{"input_tokens": N}`.
+- **`AnthropicTokenCount`** (`AnthropicAdapter.swift`) is the whole body. The protocol answers one
+  field, and a type that could carry more would invite one.
+- **`buildTurnPlan(_:maxTokensRequired:)`** on the Anthropic surface: the messages route requires
+  `max_tokens` and the `count_tokens` body has no such field by protocol. The count path passes
+  `false` and the planner takes the smallest legal budget instead of refusing.
+
+The reason the route is nine lines of behaviour rather than an estimator is the whole point of the
+slice: **it calls the messages route's own planner.** `buildTurnPlan` is where a request becomes a
+prompt — the system block rendered with the session's own date, the recorded turn spliced back in
+when a follow-up reproduces the history, the tokenizer run once, and an attachment's placeholder
+expanded into the span the resize plan predicts. A second estimator here, even a careful one, would
+answer a number the turn it precedes never matches, and that mismatch is the only way this endpoint
+can be wrong.
+
+The reply budget is safe to substitute because it never moves the prompt: `maxTokens` reaches
+`TurnSampling` and nothing else in the planner.
+
+### The finding: the number is a property of the plan, not of the route
+
+Measured on the published checkpoint, one body through both routes (`testTheTokenCountRoutePredictsWhatItsTurnCosts`,
+33.2 s, `/tmp/test86_live.log`):
+
+```
+[server.request] POST /v1/messages/count_tokens → 200 56ms  model=1bae0e10…  in=166
+[server.request] POST /v1/messages/count_tokens → 200 52ms  model=1bae0e10…  in=166
+🔎 [dsv41 real] count_tokens: 166 predicted, 166 reported, 23 generated
+```
+
+166 predicted, 166 reported, and two identical pre-flights agreeing in between. Three separate
+claims are in that line and each one is a thing that could have been wrong:
+
+- **the count is the turn's own `usage.input_tokens`**, not an estimate near it. Both routes render
+  the same prompt because they run the same function, so the equality is structural;
+- **the count is stable**, so the session date the system block carries is minted once per session
+  and not per request (`PrefixCacheManager.asOfDate`). A per-request date would have moved it;
+- **the body it accepts is the protocol's**, i.e. without `max_tokens`, which is the one field the
+  messages route insists on and this one must not.
+
+A pre-flight is also cheap in the way a pre-flight has to be: **56 ms and 52 ms**, against 33 s for
+the turn it predicted. It runs no generation and claims no engine slot, so it answers while a turn
+generates — a client compacting mid-turn is not blocked by the turn it is measuring.
+
+### What it is not (do not re-propose)
+
+- **Not a second estimator.** Any implementation that counts without the planner will drift from
+  the turn, and drift is the entire failure mode. The shared call is the feature.
+- **Not an OpenAI route.** The OpenAI protocol has no pre-flight; a client there sends and reads
+  `usage`, or reads the models list `#82` taught to advertise a picture's cost range. Adding a
+  `/v1/chat/completions/count` would be an invention, not a compatibility fix.
+- **Not a change to `/v1/messages`.** `maxTokensRequired` defaults to `true`, so the generation
+  route's refusal of a body without `max_tokens` is unchanged and still pinned
+  (`testMessagesWithoutMaxTokensReturns400`).
+- **Not a `/health`-style silent route.** `/health` writes no row because polling would flood the
+  store; a pre-flight is a client request that happens once per turn, and its row is what lets a
+  developer read the predicted count beside the turn that followed it. It inherits the Anthropic
+  row key automatically, because `ServerRequestLog.proto(forPath:)` matches `/v1/messages*`.
+- **Not a token budget change.** The prompt cap, the KV `turnFit` check and the 503-when-busy
+  contract all live in the turn path, which this route does not enter.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_86` (status 0, error grep with a leading space so
+source echo lines do not read as errors), then `test-without-building` with the same
+`-derivedDataPath` throughout. Bundle freshness checked with `strings … | grep -c <case>` (4 for the
+four new cases) before running anything.
+
+The build's warning set grew by **25 instances of categories that already fill these files**
+(1,773 → 1,798 diagnostics, `diff` of the `file:line: warning` sets taken against `#85`'s build).
+Every one is the project-wide `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` pattern that the two
+existing route handlers already carry dozens of times — `beginRequest()`/`endRequest()` from a
+nonisolated context, `loadedModelInfo` from a nonisolated context, and the main-actor-isolated
+`Encodable` conformance of a wire type (`AnthropicTokenCount` joins `AnthropicMessageResponse`,
+`OpenAIChatResponse`, `OpenAIErrorEnvelope` in that list). No new kind of diagnostic, so the shape
+of the codebase is unchanged.
+
+| suite | result |
+|---|---|
+| `AnthropicAdapterLogicTests` (25 cases: `#86`'s two are a `count_tokens` body decoding with no `max_tokens`, and the response encoding to exactly one field) | **25 cases, 0 failures** |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787; `#86`'s three are the 503 model gate with a body that carries no `max_tokens`, the Anthropic-shaped 400 on a malformed body, and the credential both ways — 401 anonymous, past-the-gate with `x-api-key`) | **20 cases, 0 failures** (17 before) |
+| `ServerQueueLogicTests`, `OpenAIAdapterLogicTests`, `ServerStreamSafetyTests`, `ServerToolArgumentTests`, `ServerHardeningLogicTests`, `TurnToolMaskTests`, `ChatPromptFormatterConversationTests`, `ReasoningRoundTripTests`, `PrefixAsOfDateTests`, `EngineTurnSlotTests` | 129 cases, 0 failures |
+| `DeepSeekV41PublishedTurnTests.testTheTokenCountRoutePredictsWhatItsTurnCosts` (opt-in, `/tmp/dynamoe_dsv41_real_turn`, private port 8793) | **passed, 33.2 s**, 166/166, rows carry the count |
+
+The three smoke cases are chosen so the route's state machine is pinned without a model: a planner
+that still demanded `max_tokens` would answer 400 where the first case requires 503, and a
+credential path that did not accept `x-api-key` would answer 401 where the third requires 503.
+
+## DSV4.1 #87: THE MODELS ROUTE NOW SPEAKS BOTH PROTOCOLS, AND THE REQUEST'S OWN HEADERS ARE WHAT PAYS FOR IT
+
+### The question
+
+`#81` closed by writing the hole down itself: "**Not an Anthropic-shaped models route.** `GET
+/v1/models` answers in the OpenAI shape on both protocols, as it always has." `#86` then closed the
+Anthropic protocol's second and last POST route.
+
+Between them those two slices leave one asymmetry that is not cosmetic. The Anthropic API defines
+`GET /v1/models` and `GET /v1/models/{model_id}`, and an SDK client calls them by name
+(`client.models.list()`, `client.models.retrieve(id)`) against a typed model. This server answered
+the first in OpenAI's shape — `object: "list"` around entries of `object`/`created`/`owned_by` — and
+the second not at all. So a client's model listing either failed its own decode or produced a model
+whose fields it does not read, and a client that resolved an id from that list had nowhere to take
+it. That is the same class of gap `#86` fixed on the POST side: the capability is real, the route
+is missing, and the failure lands inside a client that did nothing wrong.
+
+Routing agreed decisively: `next_slice` = **`anthropic_models_route` 0.996 @ 0.995** against the
+OpenAI-retrieve-only route 0.0014, `device_mhc_stages` 0.0012, `model_id` 0.0008, `docs_sweep`
+0.0006 and `perf_leftovers` 0.0004. Every remaining perf item is under ~1.2% of a prefill position
+against a 5-30% process-to-process spread and several "obvious" ones were shipped then reverted
+(rows-per-threadgroup 2.42x worse, band collapse 29% slower, `F_NOCACHE` 2.2x loss, a shared record
+row 17% worse, matrix-unit attention 0.31-0.56x, a two-to-five-wide speculative verify losing to a
+walk), so the branch could not go back for one.
+
+The design question — how one path decides which body to answer — was asked separately and answered
+`request_headers` **0.997 @ 0.996** over a distinct path or query parameter (0.003), an
+always-Anthropic body (0.0002) and one body carrying both shapes (0.0003).
+
+### What was added
+
+Two routes, two wire types, one decision.
+
+- **`GET /v1/models`** answers Anthropic's shape for an Anthropic client:
+  `{data:[{type,id,display_name,created_at}], has_more, first_id, last_id}`. `created_at` is RFC
+  3339 (`2026-11-05T11:21:54Z`) because a client PARSES it rather than converting it, and the
+  pagination cursors are present rather than omitted because the protocol's list type requires them
+  — a missing cursor is a decode failure, not an end-of-list.
+- **`GET /v1/models/:model_id`** is the retrieve route both protocols define. It answers the same
+  object the list carries, in the caller's shape. An id this server does not serve is a **404 in the
+  caller's own envelope**, not a silent substitution of the loaded model: that substitution is
+  exactly what hides a typo or a stale config in a client.
+- **`ServerWireProtocol`** (`ServerController.swift`) names the decision once. `wireProtocol(for:)`
+  prefers the path where the paths differ (`/v1/messages*` → Anthropic, `/v1/chat*` and
+  `/v1/completions*` → OpenAI) and falls back to the request's headers on the shared path.
+  `anthropic-version` and `x-api-key` are unambiguous evidence: no OpenAI client sends either, and an
+  Anthropic client sends at least one (the version on every request, the key header whether or not
+  this server requires a key). A client presenting neither gets the OpenAI shape, which is what this
+  route has always answered, so nothing that works today changes.
+- **`AnthropicModel` / `AnthropicModelList`** (`AnthropicAdapter.swift`) are the two bodies, and
+  `AnthropicAdapter.entry`/`createdAtString`/`displayName` are the mapping as free functions of the
+  facts, mirroring `OpenAIModelList.entry`, so all of it is testable with no loaded model.
+- **`ServerAPIError` gained `notFound`** plus `openAIWireType`/`openAICode`. The protocols disagree
+  on how a missing model is named — Anthropic has `not_found_error`, OpenAI keeps
+  `invalid_request_error` and says `model_not_found` in `code` — and the status is 404 either way, so
+  the difference lives in the envelope rather than in the error. Its renderer now asks
+  `wireProtocol(for:)` instead of testing the path, because on the shared path a path check would
+  answer an Anthropic client's 404 in the OpenAI envelope.
+- The route **stamps the log row's protocol** from the same decision, so one path is still two
+  readable protocols in the dashboard, and `rowProtocol` keeps the two spellings in step. It also
+  joins every other client route in `stats.beginRequest()`/`endRequest()`, which the models route
+  never did: a models call is a request, and `#86`'s pre-flight case already asserts that a route
+  with no generation in it is still counted.
+
+### The finding: `display_name` is where a human name belongs, and it is not the id
+
+The served id is the snapshot directory's own name — `1bae0e1088993b9b82de08f59de5be5a34e42170` —
+and `#81` recorded why it must not change casually: every response's `model` field carries it and
+the turn-memory digest and prefix session keys are built from it, so renaming it invalidates
+recorded turns across an update. Anthropic's model object asks for exactly the field that problem
+needs and does not have: **`display_name`**, which nothing keys on.
+
+So the name is recovered from the REPOSITORY directory, which the snapshot path already carries:
+
+```
+hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/<hash>
+  → display_name: "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+```
+
+That makes `#87` the cheap half of the `model_id` candidate the routing scored 0.0008, with none of
+its migration risk: a human name reaches a client, and not one byte of keying moves. A checkpoint
+that is not a hub snapshot has no repository name to recover, so its own directory name is the
+display name rather than nothing.
+
+The two shapes, on the published checkpoint
+(`testTheModelsRouteAnswersEachClientInItsOwnShape`, 1.666 s, `/tmp/test87_live2.log`):
+
+```
+/v1/models (openai):
+  {"data":[{"capabilities":{...,"vision_cost":{...}},"context_length":1048576,"created":1793877714,
+   "id":"1bae0e1088993b9b82de08f59de5be5a34e42170","max_prompt_tokens":262144,"object":"model",
+   "owned_by":"dynamoe"}],"object":"list"}
+/v1/models (anthropic-version):
+  {"data":[{"created_at":"2026-11-05T11:21:54Z","display_name":"deepseek-ai\/DeepSeek-V4.1-Flash-1017",
+   "id":"1bae0e1088993b9b82de08f59de5be5a34e42170","type":"model"}],"first_id":"1bae0e10…",
+   "has_more":false,"last_id":"1bae0e10…"}
+/v1/models/1bae0e10… (anthropic):
+  {"created_at":"2026-11-05T11:21:54Z","display_name":"deepseek-ai\/DeepSeek-V4.1-Flash-1017",
+   "id":"1bae0e1088993b9b82de08f59de5be5a34e42170","type":"model"}
+```
+
+Both Anthropic headers produce byte-identical bodies, which is the point: `anthropic-version` and
+`x-api-key` are the same evidence and the SDKs send them together.
+
+The case costs **1.666 s** end to end — the app-order load of the 475 GB / 96,085-tensor checkpoint,
+the server start, and eight requests — which is `#81`'s 1.716 s to within noise. A models route is
+therefore still free to cover in the suite, and everything expensive about this branch is the turns.
+
+### What it is not (do not re-propose)
+
+- **Not a capability block on the Anthropic object.** Anthropic's model object is the four documented
+  fields, and inventing a `capabilities` sub-object for it would be this server's own dialect. The
+  capability facts `#81`/`#82` advertise stay on the OpenAI shape — which any client can read by
+  asking the SAME path without the Anthropic headers. That is a property of the discriminator, not a
+  gap: the two bodies are one path and two conventions, and a client chooses.
+- **Not an id change.** Still the snapshot hash. `display_name` is additive and unkeyed, which is
+  precisely why it was safe inside this slice.
+- **Not a taxonomy of `anthropic-version` values.** The header is used as evidence of the client's
+  protocol, not parsed, because every value it can carry belongs to the same shape.
+- **Not a models-route 404 for "no model loaded".** The list stays `{"data":[]}` — `#81`'s choice,
+  and a client polling for a model to appear must not read an empty answer as a wrong URL. The
+  retrieve route is where a missing model is a refusal, and there a loaded-nothing server answers
+  **503** rather than 404, because "no model is loaded" and "that id is not served" are different
+  facts and a 404 would claim the wrong one.
+- **Not a `GET /v1/models` limit/cursor implementation.** One entry is the whole list, so
+  `limit`/`after_id`/`before_id` are accepted and ignored rather than honoured against a list that
+  cannot be paged; the cursors this route reports are the model's own id, which is true for the page
+  it actually returns.
+- **Not a perf result.** Nothing here touches the engine, the arena, or the generation path; the
+  slice is protocol surface only.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_87` (status 0; the error grep needs a leading
+space, because source echo lines like `error: .init(message:…)` otherwise read as errors), then
+`test-without-building` with the same `-derivedDataPath` throughout. Bundle freshness checked with
+`strings … | grep -c` over the three new names (**3**) before any run — the first smoke run reported
+one failure purely because the bundle predated the test edits, which is the trap this check exists
+for.
+
+The build's warning set grew from **1,798 to 1,829 instances**, all of categories that already fill
+these files: `beginRequest()`/`endRequest()` and `ServerRequestLogRecorder.shared` from a
+nonisolated context, the main-actor-isolated `Encodable` conformance of a wire type
+(`AnthropicModel`/`AnthropicModelList` join `AnthropicMessageResponse`/`OpenAIModelList`), and
+main-actor-isolated properties read from test autoclosures. One of them was new and was fixed rather
+than recorded: comparing `ServerWireProtocol` in a nonisolated function was a main-actor conformance
+use, so the type is declared `nonisolated` (34 → 31 added instances). No new KIND of diagnostic.
+
+| suite | result |
+|---|---|
+| `AnthropicAdapterLogicTests` (27 cases; the two new ones are the Anthropic body's exact key set, `created_at` in RFC 3339 and the display name recovered from the repository directory) | **27 cases, 0 failures** (25 before) |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787; two new — the shape follows the headers on both Anthropic header spellings and the row records which, and the retrieve route in both shapes with the two 404 envelopes) | **22 cases, 0 failures, 1 skipped** (20 before; the retrieve case skips without a loaded model) |
+| `ServerQueueLogicTests`, `OpenAIAdapterLogicTests`, `ServerStreamSafetyTests`, `ServerToolArgumentTests`, `ServerHardeningLogicTests`, `TurnToolMaskTests`, `ChatPromptFormatterConversationTests`, `ReasoningRoundTripTests`, `PrefixAsOfDateTests`, `EngineTurnSlotTests` | 129 cases, 0 failures |
+| `DeepSeekV41PublishedTurnTests.testTheModelsRouteAnswersEachClientInItsOwnShape` (opt-in, `/tmp/dynamoe_dsv41_real_turn`, private port 8796) | **passed, 1.666 s**, both shapes, both headers, retrieve, and both 404 envelopes |
+
+One existing assertion moved with the change rather than being worked around: `#82`'s
+`testRequestLogModelsEndpointRowHasWireFields` asserted the models row's `proto` was `.other`. It is
+now `.openai` for a header-less call and `.anthropic` for a headed one, which is what makes one path
+two readable protocols in the dashboard, and the assertion was updated to say so.
+
+The new smoke cases are chosen so the decision is pinned without a model: the shape is asserted on
+the key SET (`object` present vs `has_more` present, and never both), because a body that decodes as
+a dictionary proves nothing about which SDK will read it.
+
+## DSV4.1 #88: FOUR REQUEST FIELDS WERE ANSWERED AS IF THEY HAD NOT BEEN SENT
+
+### The question
+
+`#87` closed the last missing ROUTE on either protocol. This slice is about a different hole in the
+same front door: a route can exist, answer 200, and still reply to a request nobody sent.
+
+`OpenAIChatRequest` decoded fifteen fields and none of `response_format`, `n`, `logprobs`,
+`top_logprobs` or `stream_options`. Swift's `Decodable` ignores keys it does not know, which is
+usually the right default and was, here, a silent lie: a client that asked for `response_format:
+{"type": "json_object"}` was answered in prose, one that asked for `n: 2` received one choice, and
+one that asked for `logprobs` received a body with no log-probabilities in it — each with a **200**
+and nothing on the wire to tell it apart from the request it meant to send. Every one of those
+clients then fails somewhere further from the cause than a rejection would have put it: a
+`json.loads` on prose, an index into a missing second choice, a loop over an empty `content`
+array.
+
+Routing agreed decisively on both the slice and its shape: `next_slice` =
+**`structured_output_handling` 0.993 @ 0.991** against the legacy `/v1/completions` route 0.006,
+`model_id` 0.0003, `docs_sweep` 0.0006, `image_cost_ceiling` 0.0001 and `perf_leftovers` 0.0001;
+`response_format_answer` = **`reject_both` 0.993 @ 0.990** over rejecting `json_schema` alone
+(0.006), building real JSON constraint machinery (0.0005) and keeping the fields ignored (0.0004);
+`scope_breadth` = **`all_silent_fields` 0.987 @ 0.980** over `response_format` alone (0.012) and a
+documentation-only pass (0.0009).
+
+### What was added
+
+Five fields decoded, and one rule applied to four of them.
+
+- **`OpenAIChatRequest`** now decodes `response_format` (its `type` only), `n`, `logprobs`,
+  `top_logprobs` and `stream_options` (its `include_usage` only). Decoding them is what makes them
+  refusable; while they were unknown keys nothing downstream could see them at all.
+- **`OpenAIAdapter.refuseUnsupportedResponseShape(_:)`** refuses `json_object`, `json_schema`, any
+  other `response_format` type, `n != 1`, `logprobs: true` and any `top_logprobs`, each with a
+  message that names the field it received and says what this server can do instead. It accepts
+  `response_format: {"type": "text"}` (the protocol's own default), `logprobs: false` (which asks for
+  exactly what this server already does) and `n: 1`.
+- **`buildTurnPlan(_ apiRequest: OpenAIChatRequest)`** calls it beside `toolUseEnabled`, i.e. before
+  the model gate and before any engine state is touched. That ordering is visible from outside: the
+  same bodies answer **400** where the identical request without those fields answers 503.
+- **The streaming writer honours `stream_options.include_usage`** instead of volunteering the chunk.
+  It is the one field in the set that asks for something this server can do, so it is obeyed rather
+  than refused.
+
+### The finding: the usage chunk was the one field whose silence could crash a client
+
+`stream_options.include_usage` looked harmless to ignore — the server sent usage anyway, which is
+more information, not less. It is not harmless. The usage chunk is the ONLY chunk in the stream with
+an **empty `choices` array**, and a good deal of client code does `chunk.choices[0]` on every chunk.
+Against OpenAI that never fires, because the chunk only exists when the caller asked for it; against
+this server it fired for every streaming request, i.e. only against a local server, which is the
+worst place for a client's own bug to surface.
+
+So the field is obeyed, and the two arms are measured on the published checkpoint
+(`testTheStreamedUsageTailIsOptIn`, 53.3 s, `/tmp/test88_live.log`):
+
+```
+🔎 [dsv41 real] streamed usage tail: 187 prompt / 5 generated, unrequested stream carried 0 usage frame(s)
+```
+
+Three separate claims in one line: a stream that never asked carries **zero** chunks with an empty
+`choices` array; a stream that asked carries **exactly one**; and the numbers in it are the turn's own
+(**187** prompt positions for this prompt, **5** generated in a 6-token budget), with
+`total_tokens == prompt + completion` in the same chunk.
+
+The prompt count is the expanded one, which is what `#80` pinned for a picture and what the
+non-streaming route reports for the same body — the cases that read it (`streamChat`) now ask for it
+the way a client does (`, "stream_options": {"include_usage": true}`), and re-running `#80`'s
+`testAStreamedAPIRequestWithAnImageAnswersOverTheLocalServer` unchanged otherwise still passes
+(**123.3 s**) with the expanded-length assertion intact.
+
+### What it is not (do not re-propose)
+
+- **Not JSON-constrained generation.** `GrammarConstrainedSampler` is a tool-call tag state machine
+  with a token trie of tool names; it has no JSON grammar and no schema-to-token-mask compiler.
+  Honouring `json_schema` means building one, which is inference machinery, not protocol surface.
+  Refusing the field is the honest half and it costs a switch statement.
+- **Not a silent `n`-dropping.** Returning one choice when two were asked for is the failure this
+  slice exists to remove; the engine is single-flight per request, so a second choice is a second
+  request and the queue is already the mechanism for that.
+- **Not a log-probability implementation.** The sampler could expose them, but a response field that
+  only sometimes appears must not appear empty; give a client the 400 and let it decide.
+- **Not an Anthropic-side change.** Anthropic's request has no `n`, no `logprobs` and no
+  `response_format`, and its `top_k` was already wired into the turn plan. There is no equivalent
+  hole on that surface.
+- **Not a change to any accepted request.** Every field the adapters already decoded behaves exactly
+  as before, and the four new refusals are all for modes this server never honoured — the only
+  requests that change behaviour are the ones that were being answered wrongly.
+- **Not a rejection of `stream_options`.** Only its one meaningful sub-field is read; unknown
+  sub-fields are ignored as before, because they ask for nothing this server could either honour or
+  contradict.
+- **Not a perf result.** Nothing here touches the engine or the generation path.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_88` (status 0), then `test-without-building` with
+the same `-derivedDataPath` throughout. Bundle freshness checked with `strings … | grep -c` over the
+seven new case names (**7**) before running.
+
+The warning set did not move at all: **1,829 → 1,829**, `diff` of the `file:line: warning` sets
+against `#87`'s build shows zero added instances. The new refusal lives inside the existing
+`nonisolated` adapter surface, which is why it costs no new actor diagnostics.
+
+| suite | result |
+|---|---|
+| `OpenAIAdapterLogicTests` (27 cases; four new — the fields decode rather than vanishing, `json_object`/`json_schema`/an unknown type are refused by name while `text` and absent are accepted, `n`/`logprobs`/`top_logprobs` are refused while `n: 1` and `logprobs: false` are not, and `stream_options` is read and never refused) | **27 cases, 0 failures** (23 before) |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787; two new — five refusal bodies all answer 400 naming their field where the same shape answers 503, and the streaming route answers the same refusal as a 200 SSE error frame) | **24 cases, 0 failures, 1 skipped** (22 before) |
+| `AnthropicAdapterLogicTests`, `ServerQueueLogicTests`, `ServerStreamSafetyTests`, `ServerToolArgumentTests`, `ServerHardeningLogicTests`, `TurnToolMaskTests`, `ChatPromptFormatterConversationTests`, `ReasoningRoundTripTests`, `PrefixAsOfDateTests`, `EngineTurnSlotTests` | **133 cases, 0 failures**, none of them touched by this slice |
+| `DeepSeekV41PublishedTurnTests.testTheStreamedUsageTailIsOptIn` (opt-in, `/tmp/dynamoe_dsv41_real_turn`, private port 8798) | **passed, 53.3 s**, 0 unrequested usage frames, 1 requested, 187/5 |
+| `DeepSeekV41PublishedTurnTests.testAStreamedAPIRequestWithAnImageAnswersOverTheLocalServer` (`#80`'s case, unchanged except that its body now asks for usage) | **passed, 123.3 s**, expanded-length assertion intact |
+
+The smoke cases are deliberately split that way: the 400-vs-503 contrast can only be shown with NO
+model loaded (that is what makes the ordering visible), while the streaming refusal needs no model at
+all because the plan is built inside the stream's own body closure — which is also why a streamed
+refusal wears a 200 and has done since `#80`.
+
+## DSV4.1 #89: THE LEGACY TEXT ROUTE EXISTED IN THE LOG VOCABULARY AND NOWHERE ELSE
+
+### The question
+
+`#87` and `#88` closed the two holes in the server's front door that a real client would hit first:
+a route that answered in the wrong protocol's shape, and four request fields that were answered as if
+they had not been sent. What neither touched is a path the server ALREADY claimed:
+`ServerRequestLog.proto(forPath:)` has classified anything under `/v1/completions` as an OpenAI row
+since long before this branch, and the router served no such path. A client that called it got a 404
+that the app then logged as an OpenAI request.
+
+Routing put this in the mid-band rather than picking it: `next_slice` = **`legacy_completions_route`
+0.497 @ 0.425** against the symmetric Anthropic field audit at 0.447, `openai_responses_route` 0.036,
+`model_id` 0.012, `docs_sweep` 0.005, `device_mhc_stages` 0.002 and `image_cost_ceiling` 0.002 — and
+`docs_worth_a_slice` **0.227**, i.e. the Help-guide repair that has now scored low three times is
+still not a slice of its own. A mid-band answer is decided by reasoning, and two questions settled it:
+`legacy_is_justified` **0.988** (yes: it is part of the OpenAI surface real clients still call, and
+this server already names its path in its own log vocabulary) and `protocol_completeness_bar`
+**level 0 at 0.874** ("every route an in-scope client actually calls exists and answers in that
+client's own shape"), which is why the Responses API is NOT this slice.
+
+The Anthropic audit lost on evidence rather than on probability: `AnthropicMessagesRequest` already
+decodes the whole Messages surface — `system`, `model`, `messages`, `max_tokens`, `temperature`,
+`top_p`, `top_k`, `stop_sequences`, `stream`, `tools`, `tool_choice`, `thinking` — and refuses an
+unknown content block by name (`document`, `audio`). The only fields it ignores are `metadata` and
+`service_tier`, which are an abuse-monitoring label and a cloud routing tier; neither can change an
+answer on a local single-flight engine, so the audit would have produced a paragraph and no code.
+
+Design routing was decisive: `sampler_field_posture` = **`refuse_new_route_only` 0.933 @ 0.910**
+over mirroring the chat route's tolerance (0.061), refusing on both OpenAI routes (0.002) and
+implementing `frequency_penalty` for real (0.004); `prompt_should_be_templated` **0.994** yes;
+`route_is_complete_enough` **0.9995** yes for a one-prompt, one-choice, no-logprob subset.
+
+### What was added
+
+| | where | what it is |
+|---|---|---|
+| `OpenAICompletionsRequest` | `OpenAIAdapter.swift` | this protocol's own request: four `prompt` shapes (string, `[String]`, `[Int]`, `[[Int]]`), `suffix`, `stop` as bare string or array, `echo`, `logprobs` as Int OR Bool, `n`, `best_of`, `logit_bias`, `presence_penalty`, `frequency_penalty`, `seed`, `user`, and this server's `enable_thinking`/`reasoning_effort`/`stream_options` |
+| `OpenAIAdapter.refuseUnsupportedCompletionsShape(_:)` | same | refuses token-id prompts, a prompt batch, an empty prompt, `suffix`, `n != 1`, any `logprobs`, `best_of != 1`, a non-empty `logit_bias` and a non-zero `frequency_penalty`, each naming the field |
+| `OpenAIAdapter.completionsSplit(_:)` / `completionsThinkingRequested(_:)` / `sessionKey(forPrompt:model:)` | same | one user turn with no system prompt, the reasoning default, and a prompt-anchored session key through a shared `uuid(fromLanes:)` with the chat route's |
+| `OpenAICompletionsResponse` / `OpenAICompletionsChunk` | same | `text_completion` with `choices[].text`, an explicit `"logprobs": null`, and an `[DONE]`-terminated stream |
+| `buildTurnPlan(_: OpenAICompletionsRequest)` + `completionsNonStreamingResponse` / `completionsStreamingResponse` / `completionsText` | `ServerController.swift` | the route, its plan, and both writers, all sharing `runTurn`, the queue, the log box, the stop-sequence hold-back and the 200-on-SSE-refusal contract |
+| `ServerRequestLog.openAICompletionsSummary(_:)` | `ServerRequestLog.swift` | the captured-body summary (the prompt IS the body on this route) |
+| `POST /v1/completions` | `ServerController.swift` | registered beside the chat route, with the same stats/log/auth prologue |
+
+### The finding: the route's own default had to be the opposite of the chat route's
+
+The first version of the planner defaulted `thinkingRequested` to `true`, copying the chat route, and
+the live case on the published checkpoint measured what that means for a protocol with no reasoning
+field (`/tmp/test89_live.log`):
+
+```
+"text":"The capital of France isThe user asks a simple factual question</think>"
+```
+
+Eight tokens of budget, all of them reasoning, and **no answer** — the model had not finished thinking
+when the budget ran out, so `choices[0].text` was a trace with an unterminated thought. That is not a
+mapping bug; it is this route having nowhere to put reasoning and therefore no reason to spend budget
+on it. The default is now OFF (a client opts in with this server's own `enable_thinking`, and then
+`completionsText` folds the reasoning into `text` with the canonical close tag rather than dropping
+it), and the same case returns (`/tmp/test89_live2.log`):
+
+```
+"text":"The capital of France isThe capital of France is **Paris"
+```
+
+Three things follow, and all of them are worth keeping:
+
+- **The prompt changes with the default.** The reasoning channel being closed shortens the rendered
+  prompt: **189 → 164 prompt positions** for the same request body. A pinned prefix from a
+  thinking-on request cannot be reused by a thinking-off one, which is already the rule the chat route
+  obeys by rendering the level into the system block.
+- **The model restates the question, so `echo` doubles it.** V4.1 with thinking off answers
+  `The capital of France is **Paris` — the prompt itself is the first thing in its own continuation.
+  An in-app chat turn for the same prompt does the same, so this is the checkpoint's behaviour and not
+  the mapping's; `echo: true` therefore returns the prompt twice, which is what upstream's `echo`
+  means (prompt + completion) and what the case pins.
+- **A legacy stream must not wear the chat route's object.** Every frame is `text_completion`, and the
+  usage tail is opt-in exactly as `#88` made it: the chunk with an empty `choices` array is the one a
+  client that indexes `choices[0]` throws on.
+
+### What it is not (do not re-propose)
+
+- **Not the Responses API.** `POST /v1/responses` is a different and much larger wire surface (items,
+  typed input and output objects, a named streaming event protocol). The completeness bar that decided
+  this slice is level 0 — the routes in-scope clients actually call — and neither Crush nor Claude Code
+  calls it.
+- **Not detokenization.** A token-id prompt is refused by name rather than run, because this server
+  tokenizes but does not detokenize: it could complete an id list and then be unable to say what it
+  completed. Building the reverse map is a real piece of work with no caller here.
+- **Not `frequency_penalty` for real.** The sampler applies `presence_penalty` once per DISTINCT token
+  in the last 256 (`InferenceEngine.sampleNextToken`) and has no occurrence count; honouring the field
+  means threading a count through `TurnSampling`, `CompletionTurnRequest` and three call sites in the
+  hot decode loop. It is refused on this route, which is new, and left ignored on the chat route,
+  which the user's own coding agent drives daily — an asymmetry recorded here rather than hidden,
+  because a new 400 on a live path is a behaviour change and this slice has no measurement that
+  justifies it.
+- **Not `logit_bias`, `best_of` or insertion (`suffix`).** Each asks the engine for something it does
+  not do (per-request logit bias, several candidates, gap filling); each is refused by name here.
+- **Not a change to `seed` or `user`.** Upstream calls `seed` a best-effort determinism hint (this
+  route is greedy at temperature 0, which is already deterministic) and `user` an abuse-monitoring
+  label with no local meaning. Decoding them and documenting them as ignored is the honest half; a
+  400 would break clients that always send them and buy nothing.
+- **Not a perf result.** Nothing here touches the engine, the kernels or the generation path. The two
+  numbers this slice reports (164 prompt positions, 7 generated tokens in an 8-token budget) are the
+  turn's own accounting on the real checkpoint, ~400 ms/token of decode, unchanged.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_89` (status 0, four times), then
+`test-without-building` with the same `-derivedDataPath` throughout. Bundle freshness checked with
+`strings … | grep -c` over the seven new case names (**7**, then **1** for the case added after the
+first live run) before running.
+
+The warning set moved by **+17 instances and 0 kinds**: **1,829 → 1,846**, `diff` of the distinct
+`warning:` texts against `#87`'s baseline shows nothing added and two kinds removed
+(`ChatPromptFormatter.ConversationTurn.Role`'s `Equatable` conformance and its `text` property, which
+went away because `ConversationTurn` is now declared `nonisolated` — it is a pure `Sendable` value
+type and the OpenAI planner reaches it from a `nonisolated` context). The 17 added instances are all
+pre-existing kinds duplicated in `ServerController.swift` by one more route prologue and one more
+streaming body (`beginRequest`, `endRequest`, `cancel`, `PromptCountBox.get`,
+`finishReasonString`). The new wire types are declared `nonisolated` on purpose, which is what keeps
+`OpenAICompletionsRequest`/`Response`/`Chunk` off the conformance diagnostics list.
+
+| suite | result |
+|---|---|
+| `OpenAIAdapterLogicTests` (31 cases, five new: the four prompt shapes decode and an undefined one is a decode error, nine refusals each naming their field while five acceptable bodies pass, one user turn with no system prompt, the prompt-anchored session key, and the reasoning default being OFF) | **31 cases, 0 failures** (27 before) |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787, two new: the route answers **503** with no model loaded instead of 404, and six refused fields plus a prompt batch all answer **400** naming theirs where the same shape answers 503, with the streaming arm answering 200 + an SSE error frame) | **26 cases, 0 failures, 1 skipped** (24 before) |
+| `AnthropicAdapterLogicTests`, `ServerQueueLogicTests`, `ServerStreamSafetyTests`, `ServerToolArgumentTests`, `ServerHardeningLogicTests`, `TurnToolMaskTests`, `ChatPromptFormatterConversationTests`, `ReasoningRoundTripTests`, `PrefixAsOfDateTests`, `EngineTurnSlotTests`, `DeepSeekV41ChatPromptFormatterTests` | **170 cases, 0 failures, 1 skipped** across both runs, none touched by this slice (`DeepSeekV41ChatPromptFormatterTests` runs because `ConversationTurn` changed isolation) |
+| `DeepSeekV41PublishedTurnTests.testTheLegacyCompletionsRouteAnswersOnThePublishedCheckpoint` (opt-in, `/tmp/dynamoe_dsv41_real_turn`, private port 8799, two requests on one runtime) | **passed, 53.8 s then 48.3 s**, `text_completion` object, `cmpl-` id, `echo` prefix, `"logprobs":null`, 189/7 then 164/7 tokens, one usage tail, two `.openai` log rows on `/v1/completions` |
+
+The live case is deliberately two requests rather than one: the non-streaming arm pins the object,
+the echo contract and the accounting, and the streaming arm pins that a legacy stream carries
+`text_completion` frames (never `chat.completion.chunk`) and exactly one usage tail because it asked
+for one.
+
+## DSV4.1 #90: TWO OPENAI SAMPLER FIELDS WERE ANSWERED AS IF THEY HAD NOT BEEN SENT — AND THE ENGINE ALREADY HAD THE HALF THAT WAS MISSING
+
+### The question
+
+Routed with SubQ (`next_slice` = **`sampler_fields` 0.9992 @ 0.9991**, against `responses_route` 0.0002,
+`ui_status` 0.0002, `mhc_device` 0.0002, `model_id` 0.00006, `docs_sweep` 0.00006, `perf_leftovers`
+0.00003; `sampler_posture` = **`implement` 0.9817 @ 0.9726** against refuse-by-name 0.0176 and
+document-only 0.0006; `logit_bias_scope` **0.9206** yes, same slice; `seed_user_posture` =
+**`decode_and_document` 0.9993 @ 0.9989**). Decisive on all four, so no reasoning override was needed.
+
+`#88` and `#89` established the posture: a field the server cannot honour is refused by name rather than
+silently ignored. That left one hole on the route clients actually drive: `OpenAIChatRequest` did not
+decode `frequency_penalty`, `logit_bias`, `seed` or `user` at all, so Swift's unknown-key tolerance
+answered a request that asked for a repetition penalty exactly as if it had not asked — while
+`/v1/completions` refused two of those fields at the same time. `#89`'s journal entry recorded the
+asymmetry and named the reason ("a new 400 on a path the user's own coding agent drives daily is a
+behaviour change with no measurement behind it"). This slice closes it from the other side, which turns
+out to be the cheap side: the engine could already do most of the work.
+
+### What was added
+
+| file | change |
+|---|---|
+| `InferenceEngine.sampleNextToken` | two parameters with no-penalty defaults: `frequencyPenalty` (charged per OCCURRENCE, counted in its own pass because the penalty is a function of the FINAL count) and `logitBias: [Int32: Float]` (additive on a named id whether or not the context holds it), both folded into the same touched-and-restored set the presence penalty already used |
+| `CompletionTypes.TurnSampling` | `frequencyPenalty` and `logitBias` fields with defaults, so every existing construction site is unchanged |
+| `OpenAIAdapter` | `frequency_penalty`/`logit_bias`/`seed`/`user` decoded on the chat route; `logitBias(from:)` converts the wire's string keys and refuses a non-id key or a bias outside -100…100; `frequencyPenalty(_:)` refuses outside -2.0…2.0 and folds a value that is effectively zero to none |
+| `ServerController` | `TurnPlanInputs` carries both, the two OpenAI planners resolve them BEFORE the model gate (the same ordering every refusal keeps), and both routes feed `TurnSampling` |
+| `ServerRequestLog` | both request summaries now carry `frequency_penalty`, `logit_bias` (and the chat route's `presence_penalty`): a row that omitted them could not explain why two requests with one prompt differ |
+| `OpenAIAdapter.refuseUnsupportedCompletionsShape` | the two refusals are gone; the legacy route validates the same two fields instead of naming them unsupported |
+| `HelpAndSettingsGuideView` | the Request Options bullet says what the fields now do and what `seed`/`user` do not; the Refused Requests bullet lists only the ranges that are still refused |
+
+### The finding: the sampler was missing a loop, not a feature
+
+`presence_penalty` already walked the last 256 context tokens once per DISTINCT token. That loop is the
+whole of what `frequency_penalty` needs and the whole of what `logit_bias` needs; the two fields are one
+counted pass and one additive pass over the same touched set the presence penalty was already
+restoring, which is why this is +44 lines in the sampler's file and not the "thread a count through
+three hot-loop call sites" the earlier entry predicted. Two things had to be right, and both are pinned:
+
+- **The count must be taken before the penalty is applied.** The first version counted inside the
+  distinct-token branch and charged on the first occurrence, which reads the count as 1 for every token
+  and makes `frequency_penalty` behave exactly like `presence_penalty` — the unit test caught it
+  immediately (`[1000, 1000, 1000]` with a 0.2 penalty still preferred the penalised token), and the
+  fix is a separate counting pass. A wrong count here is invisible in any single-token context.
+- **The restore must not be applied twice.** A biased id that is ALSO in context records its original
+  once (the `seen` set is shared), so the defer puts back the pre-penalty value rather than the
+  pre-bias one. The composition case is a test of its own.
+
+The clip is on the wire, not on the arithmetic: a bias outside OpenAI's range and a key that is not a
+token id are 400s naming the field, because a clamped bias answers a distribution the client did not
+ask for. An id beyond the LOADED checkpoint's vocabulary is deliberately NOT refused — the vocabulary
+belongs to the model rather than to the protocol, such an id has no candidate logit to bias, and the
+sampler skips it.
+
+### The live number, on the published checkpoint
+
+`testTheChatRouteHonoursLogitBiasOnThePublishedCheckpoint` (opt-in, private port 8801) is three short
+turns on the real checkpoint:
+
+```
+control          "The capital of France is **Paris"      (identical on the repeat)
+banned id 671    = "The"   (the leading token of that answer, taken from the checkpoint's tokenizer)
+biased turn      "Paris."
+```
+
+66.1 s for the three turns including load. The repeat is the control that makes the third turn mean
+something: temperature 0 is greedy here, so a differing answer can only come from the bias reaching the
+sampler. `frequency_penalty` rides the identical `TurnSampling` path, so this pins the plumbing both
+fields share; the occurrence arithmetic is pinned without weights.
+
+### What it is not (do not re-propose)
+
+- **Not a new 400 on the chat route.** The posture `#88`/`#89` built is "refuse what you cannot honour";
+  the corollary this slice adds is "honour what you can". Refusing `frequency_penalty` on
+  `/v1/chat/completions` would have been a behaviour change on the daily-driver path for a capability
+  the engine has.
+- **Not `seed`/`user` semantics.** Both are decoded and discarded, documented: `seed` is a best-effort
+  determinism hint (this engine is already greedy at temperature 0) and `user` is an abuse label with no
+  local meaning. Neither can move an answer.
+- **Not `logit_bias` vocabulary validation.** See above: an out-of-vocabulary id is skipped. Validating
+  it would need the tokenizer's vocab at DECODE time, i.e. a model load inside request decoding.
+- **Not a perf result.** The added work is one count pass over at most 256 tokens when
+  `frequency_penalty` is non-zero and one dictionary walk when `logit_bias` is present. Both are
+  skipped entirely when absent, so the decode loop this repo spends its measurements on is unchanged
+  for every request that does not send them.
+- **Not the Responses API.** Still excluded by the level-0 completeness bar; see `#89`.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status` (status 0 throughout, six times), then
+`test-without-building` with the same `-derivedDataPath`. Bundle freshness checked with
+`strings … | grep -c testTheChatRouteHonoursLogitBiasOnThePublishedCheckpoint` → **1** before the live
+run.
+
+| suite | result |
+|---|---|
+| `OpenAIAdapterLogicTests` (34 cases, two new: both fields decoded and resolved on both routes with a zero bias dropped, and the four refusals by name — out-of-range frequency, out-of-range bias, a non-numeric key, a negative key — plus the effectively-zero no-op) | **34 cases, 0 failures** (31 before) |
+| `CompletionEngineLogicTests` (18 cases, five new on a synthetic 2,000-wide logits vector: frequency charged per occurrence where presence is charged once, a negative frequency penalty rewarding repetition, bias suppressing and promoting ids outside the context, bias composing with the penalties on one id with an exact restore, and an out-of-vocabulary id changing nothing) | **18 cases, 0 failures** (13 before) |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787: the field loop shrank to the four refusals, and two arms were added — the sampler fields reach the MODEL gate as 503, and an out-of-range bias is still a 400 naming the field) | **26 cases, 0 failures, 1 skipped** |
+| `ServerRequestLogLogicTests`, `AnthropicAdapterLogicTests` | **69 cases, 0 failures** across the two, unaffected but sharing the summary path |
+| `DeepSeekV41PublishedTurnTests.testTheChatRouteHonoursLogitBiasOnThePublishedCheckpoint` (opt-in) | **passed, 66.1 s**, control == repeat, banned id 671 (`"The"`), biased answer `"Paris."` |
+
+The live test opens and drives the checkpoint's tokenizer on the main actor: the first version called it
+from the test's own `async` context and added four main-actor-isolation instances, all of which are gone
+from the touched line range in the final build. A full recompile (`touch` over both source trees, then
+`build-for-testing` into the same derived-data path) leaves the warning set at exactly **1,846
+instances, the pre-slice number**: two kinds are renamed rather than added (`sampleNextToken`'s and
+`TurnSampling.init`'s main-actor-isolation texts, which now spell the new parameter list) and nothing
+else moved.
+
+`#89`'s "Not `frequency_penalty` for real" and "Not `logit_bias`" paragraphs are SUPERSEDED by this
+entry: both fields are now honoured on both OpenAI routes, and no route refuses them.
+
+## DSV4.1 #91: OPENAI RENAMED THE REPLY BUDGET AND THIS SERVER NEVER HEARD OF THE NEW NAME — AND THE OLD NAME WAS ONE TOKEN SHORT ON THE REAL CHECKPOINT
+
+### The question
+
+Routed with SubQ (`next_slice` = **`reply_budget_alias` 0.9978 @ 0.9974**, against `device_mhc_stages`
+0.0019, `model_id` 0.0001, `vision_cost` 0.00006, `docs_sweep` 0.00006, `ui_status` 0.00005,
+`responses_route` 0.00003, `perf_leftovers` 0.00001; `alias_conflict` = **`refuse_differing` 0.9556 @
+0.9334** against new-wins 0.0426 and old-wins 0.0018; `ignored_fields` = **`decode_and_document` 0.9715
+@ 0.9572**; `budget_tokens` = **`document_only` 0.8919 @ 0.8378**). Decisive on all four.
+
+With the sampler fields closed (`#90`), the last known silent field lies were the reply budget and the
+fields both protocols accept without honouring. `max_completion_tokens` was not in
+`OpenAIChatRequest`'s decoder AT ALL, so `{"max_completion_tokens": 512}` and no `max_tokens` was
+answered with the app default budget of up to 8192 tokens — the exact class of substitution `#88`
+removed for `response_format` and `n`, on the field that bounds how much the client pays for in time.
+
+### What was added
+
+| file | change |
+|---|---|
+| `OpenAIAdapter.replyBudget(maxTokens:maxCompletionTokens:)` | one pure resolver over the two spellings: either alone is the budget, two that agree is the budget, two that disagree is a `400` naming both, neither means "the app default" (nil) |
+| `OpenAIChatRequest` | decodes `max_completion_tokens` and `parallel_tool_calls` (the latter to document it as ignored) |
+| `refuseUnsupportedResponseShape` | validates the resolved budget, so a disagreeing pair is a `400` BEFORE the model gate, like every other refusal |
+| `ServerController.buildTurnPlan` | the chat planner takes its `maxTokens` from the resolver instead of `request.maxTokens` |
+| `AnthropicMessagesRequest` | decodes `metadata` (`user_id`) and `service_tier`, and `ThinkingConfig` now documents what `budget_tokens` really does (a graded LEVEL, not a token cut) |
+| `CompletionEngine` (DeepSeek path) | the runtime is provisioned for `budget + 1` positions, because the runner reserves one — see the finding |
+| `ServerRequestLog.openAISummary` | the row now records both budget spellings and `parallel_tool_calls`, so a row cannot read as "no budget sent" |
+| `HelpAndSettingsGuideView` | the Request Options and Refused Requests bullets name the two spellings, the conflict rule, and the fields that are accepted and ignored |
+
+### The finding: the budget field was a lie twice over, and the second one needed the real checkpoint
+
+The first half is the mapping, and the pure-logic tests pin it. The second half only shows up when a
+turn actually runs: a request for a THREE-token answer returned **two** tokens. Both spellings did, and
+`#89` had already measured the same shape without anyone reading it as a bug (its live run reported
+"7 generated" for an 8-token budget).
+
+`DeepSeekV41TurnRunner` caps a turn at `limit - promptTokens - 1`, a deliberate reserve for the position
+the last generated token is forwarded at, where `limit` is the executor's `positionLimit`. The engine
+provisions that runtime for `prompt + maxTokens` positions, so the cap collapses to `maxTokens - 1`: every
+budgeted DeepSeek turn answered one token short of what the client asked for, on every route, for as long
+as the path has existed. The cache is now provisioned for `prompt + maxTokens + 1`.
+
+Measured on the published checkpoint, same prompt (a counting task, so nothing stops early):
+
+```
+before: max_completion_tokens=3 -> 2 tokens (length)   max_tokens=3 -> 2 tokens (length)
+after : max_completion_tokens=3 -> 3 tokens (length)   max_tokens=3 -> 3 tokens (length)
+```
+
+The two arms agreeing is what makes the alias honest (they are one budget); the count equalling the
+budget is what makes the budget real. Before this, the only way to tell "the newer field is honoured"
+from "the turn stopped early" was the count.
+
+### What it is not (do not re-propose)
+
+- **Not honouring `parallel_tool_calls: false`.** Obeying it means "emit at most one call", which is a
+  decoding constraint the sampler does not have; refusing it would put a new 400 on the path clients
+  drive daily, for a promise every client recovers from (it processes the calls it gets). Decoded and
+  documented instead.
+- **Not a token-level cut for Anthropic `thinking.budget_tokens`.** It was already doing something real
+  and this slice only documented it: `AnthropicAdapter.thinkingEffort` maps it to `.low` below 4096 and
+  `.high` at or above it on a level-capable checkpoint and refuses a non-positive value by name, so the
+  budget picks the prompt's effort line. What it cannot do is bound the reasoning CHANNEL at a token count,
+  because that channel closes when the model emits the family's close tag and the only mid-channel cut
+  available would be forcing that tag, which the grammar mask cannot express today. A turn is bounded by
+  `max_tokens` either way. Refusing the field would fail every SDK that sends one by default.
+- **Not refusing `metadata` or `service_tier`.** An abuse label and a hosted-fleet routing preference:
+  neither can move a local answer, and both are sent by default by real SDKs. The same posture `seed` and
+  `user` got in `#90`.
+- **Not a KV-budget change.** The `+1` position is the reserve the runner already assumed; it is priced
+  into the same fit check as the rest of the conversation.
+- **Not the Responses API.** Still below the standing level-0 completeness bar; see `#89`.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath`. Bundle freshness checked with `strings … | grep -c` over the new live case name
+before running it.
+
+| suite | result |
+|---|---|
+| `OpenAIAdapterLogicTests` (36 cases, two new: the budget resolver's five arms including the disagreeing pair that must name both fields, and the accept-and-ignore fields decoding on both protocols) | **36 cases, 0 failures** (34 before) |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787: two arms added — a disagreeing pair is a 400 naming `max_completion_tokens` where the newer field alone answers 503) | **26 cases, 0 failures, 1 skipped** |
+| `AnthropicAdapterLogicTests` (28 cases, one new: `metadata`, `service_tier` and `budget_tokens` all survive the decode, and the budget still maps to a graded level) | **28 cases, 0 failures** |
+| adjacent suites, none touched by the slice: `ServerRequestLogLogicTests`, `DeepSeekV41ToolDialectTests`, `DeepSeekV41TurnLoopTests`, `KVCacheProvisioningLogicTests`, `TurnFitLogicTests` (153 cases) and `DeepSeekV41ConfigTests`, `DeepSeekV41MemoryPlanTests`, `DeepSeekV41CacheReuseTests`, `DeepSeekV41TurnImagesTests`, `DeepSeekV41ImagePixelsTests`, `DeepSeekV41PromptRenderTests`, `DeepSeekV41PromptMarkerTests` (63 cases) | **216 cases, 0 failures** |
+| `DeepSeekV41PublishedTurnTests.testTheChatRouteHonoursTheNewerReplyBudgetOnThePublishedCheckpoint` (opt-in, private port 8802, two turns on one runtime) | **failed 50.6 s** (2 tokens for a 3 budget, both arms), then **passed 49.7 s** after the provisioning fix: 3 and 3, both `length` |
+
+## DSV4.1 #92: BOTH PROTOCOLS SERVED A COMMIT HASH AS THE MODEL ID, AND THE NAME THAT WOULD HAVE WORKED WAS ONE FIELD AWAY
+
+### The question
+
+Routed with SubQ (`next_slice` = **`model_id` 0.9933 @ 0.9920**, against `docs_sweep` 0.0051,
+`responses_route` 0.0011, `vision_cost` 0.0002, `ui_status` 0.0002, `perf_leftovers` 0.0001;
+`id_is_a_defect` = 0.9995; `id_shape` = **`slug` 0.9258 @ 0.8886**; `id_migration` = `accept_both_ids`
+0.5570 @ 0.3355, i.e. MID-BAND at low confidence, so it was decided by hand).
+
+Two candidates the hand-off ranked highly were verified against the code BEFORE routing and were already
+done: the four `dsv41_hc_*` kernels are dispatched by `DeepSeekV41MetalForward` (`hcProject`/`hcProjectX4`,
+`hcSplit`/`hcSplitRegs`, `hcPre`, `hcPost`, `hcSinkhorn`, `hcIdentityMix`), and
+`DeepSeekV41VisionCostModel.measured` was already refit to the device encode. `AGENTS.md`'s claim that the
+mHC stages are unwired is stale prose, not a gap — the same stale-prose problem `#87`-`#91` kept hitting,
+and worth remembering before trusting any hand-off candidate list.
+
+### What was found
+
+`LoadedModelInfo.displayName` is `URL(fileURLWithPath: path).lastPathComponent`, and `path` is what
+`ContentView` set from `model.snapshotPath`. For a hub checkpoint that is the commit hash, so every route
+advertised the hash as the model id:
+
+| surface | served before `#92` | serves now |
+|---|---|---|
+| OpenAI `GET /v1/models` `data[].id` | `1bae0e1088993b9b82de08f59de5be5a34e42170` | `DeepSeek-V4.1-Flash-1017` |
+| OpenAI `GET /v1/models/:model_id` match | the hash | the slug, and the hash as an alias |
+| Anthropic `data[].id`, `first_id`, `last_id` | the hash | the slug |
+| Anthropic `display_name` | `deepseek-ai/DeepSeek-V4.1-Flash-1017` | unchanged (it was already right) |
+| response `model` when the request omits one | the hash | the slug |
+| `GET /health` `model` | the hash | the slug |
+| request-log row `model` | the hash | the slug |
+| session-key hash input | the hash | the slug |
+
+The name a client could use was therefore already being read out of the same path, for one field, in
+`AnthropicAdapter.displayName(servedId:snapshotPath:)`, whose own doc comment argued the id "cannot change
+without invalidating recorded turns and pinned prefixes". That was the defensive half of the truth: the id
+cannot change CASUALLY, but a hub snapshot hash changes whenever the same model is re-resolved, so the hash
+was the one identity guaranteed to move, and the repository name is the one guaranteed not to. The display
+name is not a substitute either: `LocalModelManager.formatDisplayName` replaces dashes and underscores with
+SPACES, so the DeepSeek checkpoint's display name is `DeepSeek V4.1 Flash 1017` and needs percent-encoding
+to survive `GET /v1/models/:model_id`.
+
+### What was added
+
+| file | change |
+|---|---|
+| `ModelServingID` (new) | `nonisolated` pure logic: `repository(from:)` (`author/name`), `shortName(from:)` (the author-less part), `slug(_:)` (`[A-Za-z0-9._-]`, runs collapse, no leading/trailing separator, and `.`/`..` cannot survive), and `servedID(from:fallback:)` |
+| `LoadedModelInfo.servedID` | the id, DERIVED from `path` rather than stored so a copy cannot drift from what the routes answer; `nonisolated` because a computed property otherwise inherits the default main-actor isolation and warned at every nonisolated read |
+| `OpenAIAdapter.entry(for:)` | `id:` is the served id |
+| `AnthropicAdapter.displayName(servedId:snapshotPath:)` | now `ModelServingID.repository(...) ?? servedId`, so one parser of the `models--author--name` shape replaced two |
+| `ServerController` | both lists, both retrieves, both protocols' `first_id`/`last_id`, the three response writers' `model` fallback, `/health`, the request-log `model`, all three session-key inputs, `TurnPlan.modelName`, and the family-name hint `buildEffectiveSystemPrompt` sniffs all take the served id; `serves(modelID:info:)` is the retrieve route's one match rule |
+| `SettingsSheetView` | the dashboard's model row is the id clients see |
+| `HelpAndSettingsGuideView` | the Endpoints bullet says which name the id is and that the old one still answers |
+
+### The finding
+
+Three things came out of it that the mapping alone would not have said.
+
+1. **The id has to be one path segment, and the two natural sources are both unusable.** The repository id
+   `deepseek-ai/DeepSeek-V4.1-Flash-1017` carries a slash and the display name carries spaces, so the slug
+   is the author-less repository name and the display name keeps the author. Both facts are pinned
+   (`ModelServingIDTests`, and the Anthropic case asserts the two fields differ).
+2. **A rename of the id is a rename of the session identity.** The session key is
+   FNV-1a over the opening user message AND the model, and turn memory additionally digests the rendered
+   system prompt; feeding it the served id therefore invalidates recorded turns and pinned prefixes exactly
+   once, on the first request after the upgrade. That is the honest cost of the identity being the id, and
+   the alternative (hashing a string the routes no longer serve) is a stale name in a key that outlives
+   every snapshot.
+3. **The alias is what makes the rename safe.** `ServerController.serves(modelID:info:)` answers the
+   snapshot directory's own name as well as the slug, so a config written against the old server — which is
+   every config that ever talked to this one — keeps resolving instead of meeting a 404 on a rename it never
+   made. Planned and measured on the real checkpoint:
+
+```
+🔎 [dsv41 real] model id: advertised=DeepSeek-V4.1-Flash-1017
+   snapshot=1bae0e1088993b9b82de08f59de5be5a34e42170
+   anthropic display_name=deepseek-ai/DeepSeek-V4.1-Flash-1017
+```
+
+The advertised id was then retrieved with no percent-encoding at all, in both protocols, and the snapshot
+name was retrieved too and answered the same object.
+
+### What it is not (do not re-propose)
+
+- **Not validation of a request's own `model` field.** A client sending `"model": "gpt-4"` (or `"any"`, as
+  the live cases here do) is still served. OpenAI answers a name it does not serve with
+  `model_not_found`, but every local-server client sends an arbitrary string by habit, so refusing it would
+  break the drop-in path to enforce a rule the server cannot benefit from: exactly one checkpoint is loaded.
+  The alias is about the retrieve ROUTE, not about the request body.
+- **Not a human display name as the id.** Spaces are not a path segment, and `formatDisplayName` is the
+  chat UI's label, not an identifier.
+- **Not a stored field.** `servedID` is computed from `path`; storing it would add a second source of truth
+  next to the path the routes already read.
+- **Not keeping the old string in the session key.** `pin_key_input` scored 0.0097 in the routing, and it
+  would leave the identity split: one name in the key, another on the wire.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath`. Bundle freshness checked with `strings … | grep -c` over every new case name before
+running. Warning instances 1,846 -> **1,841**, no new warning KINDS (the only kind-level change is the
+`displayName` nonisolated-autoclosure kind at `ServerControllerSmokeTests` being retired by the same
+assertion reading `servedID`; `servedID` itself is `nonisolated`, so it adds none).
+
+| suite | result |
+|---|---|
+| `ModelServingIDTests` (7 cases: the id is the repository name and not the hash, it is a path segment, the repository spelling keeps the author, an off-hub checkpoint uses its own directory name, `.`/`..`/separators can never be an id, runs collapse, and the `models--` shape parses both ways) | **7 cases, 0 failures** |
+| `ServedModelAliasTests` (3 cases: the retrieve rule answers the advertised id and the one it replaced and nothing else, the list entry carries the served id, and the Anthropic id and display name stay different spellings) | **3 cases, 0 failures** |
+| `OpenAIAdapterLogicTests` + `AnthropicAdapterLogicTests` (the load fixture is now a hub path, so the id assertion passes for the right reason) | **64 cases, 0 failures** |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787) | **26 cases, 0 failures, 1 skipped** (the retrieve route needs a loaded model) |
+| prompt rendering, because the family-name hint now gets the checkpoint's name instead of its hash: `ChatPromptFormatterConversationTests`, `DeepSeekV41PromptRenderTests`, `ReasoningRoundTripTests`, `DeepSeekV41ChatPromptFormatterTests`, `ModelConfigThinkingLevelTests` | **67 cases, 0 failures** |
+| adjacent logic suites: `ServerRequestLogLogicTests`, `TurnFitLogicTests`, `KVCacheProvisioningLogicTests`, `PrefixAsOfDateTests`, `ServerHardeningLogicTests`, `TurnToolMaskTests` | **137 cases, 0 failures** |
+| `DeepSeekV41PublishedTurnTests.testThePublishedCheckpointAdvertisesAUsableModelId` (opt-in, private port 8803, the real 475.25 GB checkpoint loaded into the shared engine: list, retrieve, Anthropic retrieve, and the legacy alias) | **passed 1.68 s** after one fix: the retrieve answers the model OBJECT, not a page |
+
+## DSV4.1 #93: A CLIENT THAT SAID "DO NOT RETAIN THIS" WAS RETAINED, BECAUSE THE ONE FIELD WHOSE WHOLE MEANING IS A PROMISE WAS DROPPED BY THE DECODER
+
+### The question
+
+Routed with SubQ in one call (`next_slice` = **`privacy_store` 0.9130 @ 0.9006**, against
+`audio_modalities` 0.0432, `embeddings_route` 0.0302, `doc_hint_fields` 0.0080, `responses_route`
+0.0034, `docs_sweep` 0.0008, `perf_leftovers` 0.0009, `ui_status` 0.0004; `store_is_a_defect` =
+**0.9764**).
+
+The candidate set was built by auditing the OpenAI chat decoder against every key the protocol defines,
+which is the check `#88`/`#90`/`#91` established: `store`, `metadata`, `modalities`, `audio`,
+`prediction`, `web_search_options` and `service_tier` are all absent from `OpenAIChatRequest`, so Swift's
+unknown-key tolerance silently drops all seven. Six of them cannot change anything a local server owes a
+client (`store: true` is the only one that would, and it is the operator's decision — see below).
+`store: false` is the exception, and it was the only candidate whose whole meaning is a promise about the
+SERVER rather than about the answer.
+
+### What was found
+
+`ServerRequestLogRecorder.captureBodiesEnabled` is the operator's "Store Request Content" switch, and when
+it is on the recorder persists the normalized client request — every message's full text, via
+`ServerRequestLog.openAISummary` — and the turn's reasoning plus answer, for 30 days in
+`~/Library/Application Support/DynaMoE/logs/server-requests.sqlite`. `store` was not decoded at all, so a
+request carrying `"store": false` was retained exactly as if it had asked to be kept. The one field in the
+protocol whose entire purpose is "do not retain me" was the one field answered as if it had not been sent —
+the same class of lie `#88`-`#92` exist to remove, except the thing silently dropped is a privacy promise
+rather than a sampler setting.
+
+The asymmetry the fix turns on: retention on this Mac is the OPERATOR's decision, so a client may not
+overrule it in the other direction. `store: true` is therefore decoded, honoured as "no opinion" and
+recorded, but cannot force capture when the switch is off.
+
+### What was added
+
+| file | change |
+|---|---|
+| `OpenAIAdapter` | `OpenAIChatRequest.store` and `OpenAICompletionsRequest.store` (`Bool?`) — both routes take the same promise, and absent stays distinguishable from either value |
+| `ServerRequestLog` | `retentionWithheldByClient: Bool?` on the row (`nil` on payloads persisted before the field, the way `source` decodes, so the log's own legacy rows still open) |
+| `ServerRequestLogBox` | `withholdBodiesForClientRetention()` and `withholdsBodiesForClientRetention` — the per-request refusal lives on the box, so the rule has one home instead of being re-derived at every writer |
+| `capturedRequestBody` / `capturedResponseBody` / `capturedToolCalls` | a `withheldByClient:` parameter (default false) that withholds regardless of the switch; tool ARGUMENTS follow it too, because arguments are content |
+| `ServerController` | both OpenAI routes stamp the refusal straight after the body decodes (before the summary is composed) and skip building the summary when it would be discarded; `recordTurnOutcome` and `recordStreamedPartialOutcome` read the flag off the box |
+| `openAISummary` / `openAICompletionsSummary` | record `store`, so a row with withheld bodies beside a switch that is on reads as the client's request rather than as the switch failing |
+| `SettingsSheetView` | the log detail sheet prints `Content: withheld at the client's request (store: false)` |
+| `HelpAndSettingsGuideView` | the Privacy & Body Capture bullet states the rule and both directions of it |
+
+### The finding
+
+1. **The promise has to be stamped before the first body is composed, not when the turn ends.** Every
+   body field is written by a different owner — the route writes the request summary immediately after
+   decoding, a streaming writer writes a partial's text when a stream dies mid-tail, and the terminal
+   outcome writes reasoning plus answer — and all of them run on the same box. The flag therefore lives on
+   `ServerRequestLogBox` and the writers ASK it, which is why the fix is one call at the route and one
+   parameter at each of three composers rather than three parallel rules that could disagree.
+2. **`store: true` is decoded and NOT obeyed, on purpose.** A local server's retention policy belongs to
+   the person whose disk the rows land on. A client can refuse; a client cannot consent on the operator's
+   behalf. `testAClientRetentionRefusalWithholdsItsRowAndATrueCannotForceCapture` pins that third arm.
+3. **The row has to explain itself.** The withheld marker already says "metadata only"; it cannot say WHO
+   withheld. `retentionWithheldByClient` is what lets the dashboard distinguish "the operator turned the
+   switch off" from "this one client asked, and it was honoured" — the same principle (`withheld` must
+   never read as silence) that made the marker a placeholder instead of `nil` in the first place.
+4. **`ServerRequestLog` is now a `nonisolated` struct.** Its fields are `Date`/`UUID`/`String`/`Int`/
+   `Bool`/arrays of a Sendable record; the project's `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` made them
+   main-actor state for no reason, which is why the recorder, the store and every test that inspects a
+   captured row either hopped or warned. One keyword retired **287 warning instances** and no behaviour.
+
+### What it is not (do not re-propose)
+
+- **Not `store: true` forcing capture.** See finding 2.
+- **Not refusing `store` with a 400.** Retention is a promise the server can keep, so it is kept; a 400
+  would put a new error on a field clients send by default in the newer SDKs.
+- **Not `metadata` echo, `prediction`, `web_search_options`, `service_tier` or `modalities` in this slice.**
+  None can move an answer; `metadata` has no response field in this protocol to echo into (OpenAI exposes
+  it only on the stored object), and `modalities`/`audio` are a real gap of their own (a request asking for
+  spoken output is answered as text today), so they stay named candidates rather than being bundled here.
+- **Not scrubbing rows that already exist.** The switch's own contract is the same: turning retention off
+  never rewrites history.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath` and `-parallel-testing-enabled NO`. Bundle freshness checked with `strings … | grep -c`
+over all four new case names before running. Warning instances 1,841 -> **1,554**, no new warning KINDS.
+
+| suite | result |
+|---|---|
+| `ServerRequestLogLogicTests` (+1: the refusal outranks the switch, every composer obeys it, a streamed partial obeys it, and the control arm still captures) | **43 cases, 0 failures** |
+| `OpenAIAdapterLogicTests` (+2: `store` decodes on both routes with absent distinct from either value, and the captured summary records it) | **38 cases, 0 failures** |
+| `AnthropicAdapterLogicTests` | **28 cases, 0 failures** |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787) (+1: three arms over real HTTP — `store: false` with the switch on gives a withheld row flagged as the client's, no `store` gives a captured body with no `store` key, and `store: true` with the switch off is still withheld) | **27 cases, 0 failures, 1 skipped** |
+| adjacent logic suites: `ServerStreamSafetyTests`, `ServerToolArgumentTests`, `ServerHardeningLogicTests`, `ServerQueueLogicTests`, `TurnFitLogicTests`, `KVCacheProvisioningLogicTests`, `ChatPromptFormatterConversationTests`, `ReasoningRoundTripTests`, `PrefixAsOfDateTests`, `TurnToolMaskTests`, `DeepSeekV41PromptRenderTests`, `DeepSeekV41ChatPromptFormatterTests` | **146 cases, 0 failures** |
+
+The legacy-row case is worth calling out: `testLegacyRowsDecodeWithNoSource` failed on the first run
+because a stored payload written before this slice has no `retentionWithheldByClient` key, and a
+non-optional field with a default value does NOT make a synthesized `Codable` key optional. The field is
+`Bool?` for that reason, exactly as `source` is.
+
+## DSV4.1 #94: A REQUEST FOR A SPOKEN REPLY WAS ANSWERED WITH PROSE, AND THE CLIENT WAITED FOR AN `audio` FIELD NOTHING SENT
+
+### The question
+
+Routed with SubQ in one call (`audio_handling` = **`audio_refuse` 0.9950 @ 0.9934**, against
+`audio_ignore_document` 0.0035, `metadata_echo` 0.0010, `audio_partial` 0.0005;
+`refusal_breaks_clients` = **0.0117**, i.e. a 400 here is not a regression risk).
+
+`#93`'s field audit left seven OpenAI chat keys undecoded and named `modalities`/`audio` as the one pair
+that is a real gap rather than an ignorable one. Both were confirmed absent from `OpenAIChatRequest`, so
+Swift's unknown-key tolerance dropped them.
+
+### What was found
+
+OpenAI's `modalities` names the outputs the reply may use (`["text"]` is the default, `["text","audio"]`
+adds a spoken one) and `audio` carries the settings for it (`{voice, format, speed?}`). Together they
+promise `choices[].message.audio` = `{id, data, transcript, expires_at}` in the response, and `delta.audio`
+frames while streaming. This server has no text-to-speech of any kind — no voice, no vocoder, no encoder for
+wav/mp3/flac/opus/pcm16 — so a request for audio was answered with prose, no error, and no audio object: the
+client's parser then waited for a field nothing would ever send. That is exactly the shape `#88` opened this
+run of slices on, one layer further out: the silent narrowing was of the response's SHAPE rather than of a
+sampler.
+
+### What was added
+
+| file | change |
+|---|---|
+| `OpenAIAdapter` | `OpenAIChatRequest.modalities: [String]?` and `.audio: AudioSettings?` (`voice`/`format`/`speed`), both decoded |
+| `OpenAIAdapter.unservableModalities(_:)` | the requested modalities the engine cannot produce: everything but `text`, case-insensitively. `text` is the protocol DEFAULT, so a client naming it — SDKs do send `["text"]` explicitly — is served rather than refused |
+| `refuseUnsupportedResponseShape` | refuses BOTH, first in the function, with the `logSafeMessage` convention every refusal that embeds client text uses. An `audio` object with no `modalities` is refused too: the settings only mean something for a reply the client was promised |
+| `openAISummary` | records `modalities` and `audio` — a refused request's row has the summary as its only body, so without them the 400 it carries is unexplainable from the log |
+| `HelpAndSettingsGuideView` | the Request Options bullet says which of the two is refused and why, and that `["text"]` is served |
+
+### The finding
+
+1. **The rule is "text or nothing", not "not audio".** Refusing only the literal `"audio"` value would
+   answer a request for `"image"` output with the same silent prose, so the predicate is what the engine HAS
+   rather than what it lacks; `modalities: ["text","image"]` is refused and named.
+2. **The default must stay servable, or the refusal becomes a regression.** `["text"]` is what a client
+   sends when it has nothing to say about modality, so a naive `modalities != nil ⇒ 400` would break
+   integrations that never asked for anything. Routing put `refusal_breaks_clients` at 0.0117 precisely
+   because the arm is scoped this way, and the smoke case proves `["text"]` reaches the model gate (503)
+   where `["text","audio"]` is a 400.
+3. **The refusal runs before the model gate, so it is observable with no weights loaded.** That is what lets
+   the smoke case assert both arms over real HTTP on 8787 without a model: ordering, envelope
+   (`error.type == "invalid_request_error"`), and the field named in the message.
+4. **A transcript-only "partial honour" was rejected as dishonest.** `data` is the payload the client
+   actually plays; filling `transcript` and leaving `data` empty is worse than a 400 because it looks like a
+   successful audio response. `audio_partial` scored 0.0005.
+
+### What it is not (do not re-propose)
+
+- **Not a text-to-speech implementation.** Nothing here synthesises anything; the slice makes the server
+  tell the truth about what it cannot do.
+- **Not `modalities` on the legacy route.** `/v1/completions` has no such field in the protocol; only the
+  chat route carries it.
+- **Not ignoring them with a guide note.** That is `audio_ignore_document`, 0.0035, and it is the class of
+  silent narrowing `#88`/`#90`/`#91`/`#93` removed.
+- **Not `metadata` echo.** Still open, still a candidate: it cannot change a response, and this protocol has
+  no field to echo it into.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath` and `-parallel-testing-enabled NO`. Bundle freshness checked with `strings … | grep -c`
+before running. Warning instances 1,554 -> **1,554** (unchanged), no new warning KINDS.
+
+| suite | result |
+|---|---|
+| `OpenAIAdapterLogicTests` (+2: audio refused by name for both wire shapes while `["text"]` is served, a non-audio modality is refused too, and the captured summary carries the refused fields) | **40 cases, 0 failures** |
+| `ServerControllerSmokeTests` (+2 arms in the existing pre-gate refusal case: `modalities:["text","audio"]` and an `audio` object are 400 with `error.type`, and `modalities:["text"]` reaches the gate as 503) | **27 cases, 0 failures, 1 skipped** |
+| `ServerRequestLogLogicTests` | **43 cases, 0 failures** |
+| `AnthropicAdapterLogicTests` | **28 cases, 0 failures** |
+
+One assertion had to be loosened and the reason is worth keeping: `"\(error)"` renders a `ServerAPIError`
+through its reflection, so an embedded `"image"` arrives escaped as `\"image\"`. Assert on the substring the
+message actually contains, not on a quoted literal.
+## DSV4.1 #95: A CLIENT'S OWN LABELS WERE THE ONE THING IN THE REQUEST THE LOG COULD NEVER SHOW
+
+### The question
+
+Routed with SubQ in one call (`next_slice` = **`metadata_echo` 0.9822 @ 0.9786**, against
+`doc_hint_fields` 0.0110, `embeddings_route` 0.0061, `responses_route` 0.0003, `docs_sweep` 0.0002,
+`perf_leftovers` 0.0002; `is_a_defect` = **0.9994**; `embeddings_is_tractable` = **0.0016**, which is the
+answer that matters for the ranked second candidate: `/v1/embeddings` needs a product decision about WHICH
+vector to return before it is a commit, since the app's own 512-d `NaturalLanguage` index is not the loaded
+model's embedding matrix).
+
+`#93`'s field audit left four OpenAI chat keys undecoded, re-confirmed here by `grep` per key across
+`OpenAIAdapter.swift`, `ServerController.swift`, `CompletionTypes.swift` and `ServerRequestLog.swift`:
+`metadata`, `prediction`, `web_search_options`, `service_tier`. Three of them cannot move anything a local
+server owes a client. `metadata` is the exception, and not because it changes an answer: it is the caller's
+own identity for the request, and Swift's unknown-key tolerance was dropping it one request at a time with
+no error to notice.
+
+### What was found
+
+`OpenAIAdapter` had no `metadata` case at all. `AnthropicAdapter` DID decode its own `metadata`, and then
+threw it away: the property carried a comment saying it was "decoded so it is documented as ignored", which
+is a worse state than not decoding it, because the one label an Anthropic client can send looked handled.
+
+Meanwhile the row was already able to say everything else. `ServerRequestLog` carries model, tokens,
+timings, the retention refusal (`#93`), the tool names, and, when the operator turned content capture on,
+the prompt and the answer. What it could not carry was the client's own correlation data, which is
+precisely the information a reader needs when the bodies read "withheld": in the default configuration,
+every row in the log said what was asked of the engine and nothing about which request a caller meant.
+
+The distinction the fix turns on is the one the log's own vocabulary already draws.
+`contentWithheldMarker` says "[content withheld — metadata only]", so this file reserves "metadata" for
+exactly the class of field a withheld row is still allowed to hold. A client's labels belong in that class
+and nowhere else: they are strings the CALLER wrote about the REQUEST, not text the model saw or produced.
+
+### What was added
+
+| file | change |
+|---|---|
+| `OpenAIAdapter` | `OpenAIChatRequest.metadata` and `OpenAICompletionsRequest.metadata` (`[String: String]?`) on both OpenAI routes, decoded leniently |
+| `AnthropicAdapter` | `Metadata` is now `nonisolated` and exposes `labels`, the protocol's own `user_id` key mapped into the same row vocabulary; the "decoded and ignored" comment is gone because it is no longer true |
+| `ServerRequestLog` | `clientMetadata: [String: String]?` on the row (nil on payloads persisted before the field, the way `source` and `retentionWithheldByClient` decode, so legacy rows still open) |
+| `ServerRequestLog.recordedClientMetadata` | the recorded copy: at most 16 pairs, keys clipped to 64 bytes, values to 512, taken in sorted key order, and nil for an empty map |
+| `ServerController` | all three routes stamp the labels on the box next to the retention stamp, and deliberately NOT inside the request summary |
+| `SettingsSheetView` | the log detail sheet prints `Client Labels` as `key=value, key=value`, which is the line that still identifies the request when both bodies read "withheld" |
+| `HelpAndSettingsGuideView` | Request Options and Privacy & Body Capture both state the rule, and the stale "the Anthropic metadata field is accepted and ignored" clause is corrected |
+
+### The finding
+
+1. **The labels cannot ride on the capture switch, or the fix would be worthless.** Every other
+   client-supplied string in a row arrives through `openAISummary`, which is only composed when the
+   Store Request Content switch is on (and never for a `store: false` request). Folding the labels into
+   that summary would have hidden them in the default configuration, which is the state that was already
+   broken. They are stamped on the row instead, so the row that withheld the prompt still names the
+   request, and `hasCapturedContent` stays false beside them because labels are not content.
+2. **A malformed map costs the labels, not the answer.** Both OpenAI routes decode the map with `try?`
+   rather than `try`: `metadata` was ignored outright before this slice, so a client that puts a number
+   in it must not start meeting a 400. OpenAI's own contract requires strings, but enforcing it here would
+   have been a new refusal on a field nobody could previously fail, which is the trade `#88`-`#94` were
+   built to avoid making in the wrong direction.
+3. **The caps are recording caps, applied in bytes.** 16 pairs / 64-character keys / 512-character values
+   are OpenAI's published limits, and honouring them on the way INTO the row (rather than on the way out of
+   the request) is what stops a client that ignores its own contract from inflating a SQLite payload
+   there is no body-size limit to protect. Clipping is the convention `clippedBody` already sets for an
+   over-long conversation; nothing is refused and nothing can change the answer.
+4. **Sorted key order, so the recorded set is stable.** Over the pair limit the row keeps the first
+   sixteen keys in sorted order, which means the same request always records the same labels whatever
+   order the JSON arrived in. A set chosen by dictionary iteration order would differ between two
+   identical requests, and would then be indistinguishable from the server having lost one.
+5. **The labels stay out of the unified log.** `composeLine` prints a metadata-only `.public` line into
+   Console.app; a client's labels are free-form text a caller wrote, so they go to the row and never to
+   the system log. That is the same line `#93` drew for message content, applied one level out.
+6. **Anthropic's `Metadata` had to become `nonisolated`.** Its `labels` accessor is read from the route's
+   `logBox.modify` closure, which is nonisolated, and the project's default actor isolation made the
+   property main-actor state: one new warning instance appeared on the first build and the keyword
+   retired it. The `ServerRequestLog` struct had already needed the same treatment in `#93`.
+
+### What it is not (do not re-propose)
+
+- **Not an echo in the response.** This protocol exposes `metadata` only on the stored object, which a
+  local server does not have. The row is the honest home.
+- **Not a 400 on a malformed map.** See finding 2.
+- **Not `prediction`, `web_search_options` or `service_tier`.** Still open, still candidates, still
+  unable to move an answer; the guide now says so in one line instead of three stale ones.
+- **Not `user`.** OpenAI's `user` is a single abuse-monitoring identifier with its own doc note, not a
+  map, so folding it into `clientMetadata` would invent a vocabulary. It stays decoded and ignored; the
+  field exists now if that changes.
+- **Not a `/v1/embeddings` route.** Routed at 0.0061, with `embeddings_is_tractable` at 0.0016: which
+  vector to return is a decision, not an implementation detail.
+- **Not scrubbing labels from existing rows.** Same contract as the switch: nothing rewrites history.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath` and `-parallel-testing-enabled NO`. Bundle freshness checked with `strings ... | grep -c`
+over all four new case names before running. Warning instances 1,554 -> **1,554**, no new warning KINDS
+(the first build was 1,555 with one new kind, `main actor-isolated property 'labels' ...`, which finding 6
+retired).
+
+| suite | result |
+|---|---|
+| `OpenAIAdapterLogicTests` (+1: `metadata` decodes on both OpenAI routes, absent stays distinct from an empty map, and a non-string map costs the labels) | **41 cases, 0 failures** |
+| `AnthropicAdapterLogicTests` (+1: `metadata.user_id` decodes and maps to the row's vocabulary; a request with no metadata records nothing) | **29 cases, 0 failures** |
+| `ServerRequestLogLogicTests` (+1: labels are recorded with the capture switch OFF and the row still reports no captured content, an empty map records nothing, twenty pairs record sixteen in sorted order, an over-long value is clipped to the budget) | **44 cases, 0 failures** |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787) (+1: three arms over real HTTP distinguished by `max_tokens` 44/55/66 — with the switch off a labelled request's row carries the labels beside the withheld marker, an unlabelled request records none, and a twenty-pair map records sixteen without refusing the turn) | **28 cases, 0 failures, 1 skipped** |
+| adjacent logic suites: `ServerStreamSafetyTests`, `ServerToolArgumentTests`, `ServerHardeningLogicTests`, `ServerQueueLogicTests`, `TurnFitLogicTests`, `KVCacheProvisioningLogicTests`, `ChatPromptFormatterConversationTests`, `ReasoningRoundTripTests`, `PrefixAsOfDateTests`, `TurnToolMaskTests` | **124 cases, 0 failures** |
+
+One compile trap repeated from `#93` and worth carrying: `try XCTUnwrap(try await f())` is an `'async' call
+in an autoclosure that does not support concurrency`. Bind the awaited value to a local first. The smoke
+case's polling helper needed exactly that in two places.
+
+## DSV4.1 #96: A CLIENT SENDING THE PROTOCOL'S OWN `medium` WAS REFUSED, BECAUSE THE DECODER KNEW ONLY THIS ENGINE'S TWO WORDS
+
+### The question
+
+How many of the `reasoning_effort` values OpenAI documents does this server accept, and what happens to a
+client that sends one of the others? The field is the one request knob that decides whether the model
+reasons at all, so unlike `prediction` or `service_tier` it cannot be quietly ignored, and `#88`-`#95` had
+spent eight slices making the server refuse by name rather than silently answer a different question. The
+suspicion was that the refusal had been pointed at the wrong side.
+
+### What was found
+
+1. **The engine has two levels and the protocol has four.** `ThinkingEffort` (`ChatModels.swift`) is a
+   two-case enum, `low` and `high`, because that is what a level-capable checkpoint's template exposes
+   (Spark X2.6's High/Low/Off menu, and the DeepSeek-V4.1 `Reasoning Effort:` line). `ThinkingEffort.parse`
+   matches exactly those two raw values and nothing else.
+2. **The decoder asked the engine, not the protocol.** `OpenAIAdapter.thinkingEffort` called
+   `ThinkingEffort.parse(raw)` and threw on nil, so `"medium"` and `"minimal"` were both HTTP 400. The
+   message said "Supported values are low and high", which is true of the engine and false of the wire:
+   `low` and `high` are not OpenAI's vocabulary at all, they are this engine's.
+3. **OpenAI documents `minimal`, `low`, `medium` and `high`, and its SDK sends `medium` by default for
+   reasoning models.** A client that followed its own protocol therefore failed against this server on
+   every request, with a 400 that read as the client's mistake. That is the shape `#88` was written to
+   end, arriving through a different door: not a field dropped by `Decodable`'s unknown-key tolerance, but
+   a known field validated against the wrong vocabulary.
+4. **The app already had a rule for the word `medium`.** `ThinkingEffort.clamped` maps a stored or
+   hand-edited `"medium"` to `.high`, and `DynaMoETests` pins that (`object["thinkingEffort"] = "medium"`
+   decodes to `.high`). So the mapping the server needed was not a new decision, it was the decision the
+   chat UI had been making since graded levels shipped.
+5. **`/v1/models` advertised the capability and not the vocabulary.** `#81` added
+   `capabilities: {vision, thinking, thinking_levels}` with the explicit intent that "a client that reads
+   them can predict its own rejection instead of discovering it". `thinking_levels: true` says a graded
+   level is honoured and nothing about which words name one, so a client could read the models route,
+   correctly learn that levels work, and still have no way to know `medium` would be refused.
+6. **The checkpoint's own 1-100 budget is a separate, unreachable surface.**
+   `DeepSeekV41PromptDialect.effortBudget(from:)` parses `minimal`/`low`/`medium`/`mid`/`max`/`maximum` and
+   any numeric budget, and its doc comment says it exists "so the API adapters can accept
+   `reasoning_effort: 60` as well as `"high"`". Nothing in production calls it. That claim is false and
+   stays false after this slice, for the reason in finding 5 of the next section.
+
+### What was added
+
+- `OpenAIAdapter.reasoningEffortVocabulary`: one table of `(value, level)` pairs, `minimal` and `low` to
+  `.low`, `medium` and `high` to `.high`, and `reasoningEffortValues` derived from it. This is the only
+  place the vocabulary lives.
+- `OpenAIAdapter.thinkingEffortLevel(forProtocolValue:)`, which trims and lowercases and then reads that
+  table, returning nil for a word the protocol does not define. `thinkingEffort` now maps through it
+  instead of parsing, and builds its refusal message from the same table, so the 400 now names
+  `minimal, low, medium, high`.
+- `OpenAIModelList.Capabilities.reasoningEffortValues` (wire key `reasoning_effort_values`), copied from
+  the adapter's own list and nil beside `thinking_levels: false`.
+- Two pure cases in `OpenAIAdapterLogicTests` (one replacing
+  `testReasoningEffortAcceptsOnlySupportedLevels`, whose `medium` assertion was the bug written down as a
+  test), the models-route capability cases extended, and the guide's Request Options bullet plus two
+  README rows updated.
+
+### The finding
+
+1. **A vocabulary mismatch is not a capability gap, and the reflex to refuse hid the difference.** The
+   engine genuinely has two levels, so nothing here was unfixable, but the existing code treated "the
+   engine cannot represent this value" as "this request is unanswerable". `#88`'s rule is to refuse what
+   the server cannot honour rather than answer a different question; it does not license refusing what it
+   can honour under another name. A documented value a default-configured client sends is the clearest
+   case: the server was not declining to guess, it was declining to read its own protocol.
+2. **`medium` to high is not a new decision, it is the app's existing one.** `ThinkingEffort.clamped`
+   already resolves a stored `"medium"` to `.high`, and the client path now agrees with it, so the chat UI
+   and an API caller cannot read one word two ways. `minimal` to `.low` is the same argument on the other
+   end: the DeepSeek dialect's own `effortBudget` puts `minimal` at the bottom of its range (25), which is
+   the short budget `.low` renders. Both halves of the mapping were already written down elsewhere in this
+   codebase; nothing was invented.
+3. **One table, three readers.** The mapper, the refusal message and the models-route advertisement all
+   read `reasoningEffortVocabulary`, so the list a client can read is by construction the list it can
+   send. A hand-written array on the wire is the failure mode `#81` called out ("copied from the fact the
+   turn planner reads, never written by hand"), and the test asserts the two are equal rather than
+   comparing each against a third literal.
+4. **The advertisement is nil beside `thinking_levels: false`, for the cost block's reason.** A family with
+   only an on/off switch refuses every graded value with a different message ("not supported by the loaded
+   model"), so announcing a vocabulary it cannot honour would be the same mistake as advertising
+   `vision_cost` for a checkpoint that published a resize plan and not the tower.
+5. **The 1-100 budget is still unreachable, and that is a wider slice.** Widening `ThinkingEffort` to carry
+   a numeric budget would touch the toolbar's High/Low/Off menu, `@AppStorage`/session persistence, every
+   family's template rendering, and the server turn-memory digest that invalidates a recorded turn on a
+   level change. The interoperability failure was the 400, so the 400 is what this slice fixed; a third
+   level is a product change, not a decode fix.
+6. **The thinking-off path is untouched.** `thinkingEffort` returns nil for an absent field or
+   `enable_thinking: false` before it looks at the vocabulary, so a client that disabled thinking and left
+   a stale `reasoning_effort` behind still gets its turn rather than a new 400. The mapping is only
+   consulted when a level would actually be rendered.
+
+### What it is not (do not re-propose)
+
+- **Not a third `ThinkingEffort` case, and not a numeric level on the wire.** See finding 5.
+- **Not `reasoning_effort: "60"`.** The DeepSeek dialect can parse it and no adapter asks, which is
+  recorded above as a false doc comment rather than wired here: the OpenAI protocol types the field as a
+  string enum, and a client that sends a number currently fails at decode with a body error, which is a
+  separate question from the vocabulary.
+- **Not a change to `ThinkingEffort.parse`.** It stays matching only the engine's two words, because it is
+  also what reads `@AppStorage` and session JSON; the coercion belongs to the protocol adapter.
+- **Not a new 400 on the thinking-off path** (finding 6), and not a stricter check before
+  `requireLoadedModel()`. A no-model request with `reasoning_effort: "medium"` answers 503 exactly as
+  before, which is why there is no smoke case for this slice: the mapping is unreachable over real HTTP
+  without a loaded checkpoint, and the smoke harness asserts the no-model path.
+- **Not `prediction`, `web_search_options`, `service_tier`, `functions` or `function_call`.** Still
+  undecoded, still candidates (the last two are the only ones in that list that can move an answer).
+- **Not an Anthropic change.** That protocol already grades through `thinking.budget_tokens`, which is
+  numeric and was already mapped (`<4096` low, else high).
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath`, three-part `-only-testing` identifiers and `-parallel-testing-enabled NO`. Bundle
+freshness confirmed with `strings ... | grep -c` over both new case names before running. Warning
+instances 1,554 -> **1,554**, kinds 506 -> 506 (a first pass added one
+`main actor-isolated conformance of 'OpenAIModelList.Model' to 'Encodable'` instance from an extra
+`JSONEncoder().encode` in the new test, which the existing capability case already performs; the duplicate
+encode was removed rather than the warning tolerated).
+
+| suite | result |
+|---|---|
+| `OpenAIAdapterLogicTests` (41 -> 42: `reasoning_effort` maps all four documented values, case and whitespace ignored, an undefined word still refused with a message that names the four, and `ThinkingEffort.parse` still matching only the engine's two while `clamped("medium")` is `.high`; the models route advertises exactly the resolver's vocabulary, nil beside `thinking_levels: false`, and the Swift property name does not leak) | **42 cases, 0 failures** |
+| `AnthropicAdapterLogicTests` | **29 cases, 0 failures** |
+| `DeepSeekV41PromptEffortTests`, `DeepSeekV41ChatPromptFormatterTests` | **17 cases, 0 failures** |
+| `ChatPromptFormatterConversationTests` | **20 cases, 0 failures** |
+| `KVCacheProvisioningLogicTests` | **16 cases, 0 failures** |
+| `ServerQueueLogicTests` | **23 cases, 0 failures** |
+| `ReasoningRoundTripTests` | **18 cases, 0 failures** |
+| `ServerStreamSafetyTests` | **13 cases, 0 failures** |
+| `TurnFitLogicTests` | **12 cases, 0 failures** |
+| `PrefixAsOfDateTests` | **9 cases, 0 failures** |
+| `ModelConfigThinkingLevelTests` | **7 cases, 0 failures** |
+| `ServerHardeningLogicTests` | **6 cases, 0 failures** |
+| `ServerToolArgumentTests` | **4 cases, 0 failures** |
+| `TurnToolMaskTests` | **3 cases, 0 failures** |
+
+## DSV4.1 #97: A CLIENT ON OPENAI'S DEPRECATED FUNCTION-CALLING SURFACE WAS ANSWERED IN PROSE, WITH NO CALL AND NO ERROR
+
+### The question
+
+`#96` closed because a decoded wire value had been validated against the engine's vocabulary instead of the
+protocol's. The next question was what else the request carries that the planner never sees. The audit that
+settled `#96` had listed five undecoded OpenAI chat keys, and three of them (`prediction`,
+`web_search_options`, `service_tier`) cannot move an answer. The other two are `functions` and
+`function_call`, and those are not hints: they are the tool vocabulary, spelled the way OpenAI spelled it
+before `tools` and `tool_choice` replaced them.
+
+### What was found
+
+1. **The pair was absent from the decoder entirely.** `grep` for `function_call` and the `functions` key
+   across `OpenAIAdapter.swift` and `ServerController.swift` returned zero hits, so `Decodable`'s
+   unknown-key tolerance dropped both. A client on that surface got a 200, prose, no `tool_calls` and no
+   `function_call`, and nothing anywhere said why. That is the exact failure mode `#88` was written to end,
+   on the one surface where the field list looked complete because the modern spelling sat beside it.
+2. **The rest of the tool path was already whole.** `tools` reaches the prompt as a declaration block,
+   installs its schemas into the grammar mask for the turn (so a masked sample cannot rewrite a client's
+   tool name), returns `tool_calls` or `tool_use` blocks, and accepts a `tool` / `tool_result` turn back.
+   The deprecated spelling shares every one of those steps except the two names, which is why the mapping
+   option looked cheap.
+3. **The mapping option is only half available.** `functions` and `function_call` are the request half of
+   the old surface. The response half is the assistant message's `function_call` object, and this server
+   emits `tool_calls`. A client on the old surface parses the old field, so a mapped request would produce
+   a working request whose reply silently had no call in it, which is a different substitution wearing the
+   clothes of a fix.
+4. **The refusal is provable end to end, unlike `#96`'s mapping.** `buildTurnPlan` refuses before
+   `requireLoadedModel()`, so the smoke suite can post a real request on 8787 with no model loaded and get
+   a 400 where the modern spelling of the same body gets a 503. That ordering proof is the one `#88`
+   established for `response_format` and it applies here unchanged.
+5. **`tool_choice` already had this posture.** `toolUseEnabled` refuses `"required"` and a named-function
+   object with a message naming `"auto"` and `"none"`. The legacy pair is the same vocabulary one
+   generation older, so refusing it in the same place and with the same shape is consistency rather than a
+   new rule.
+6. **The Anthropic side has no equivalent hole.** Its content blocks are type-dispatched and an unknown type
+   refuses the turn rather than vanishing, which is why nothing changed there.
+
+### What was added
+
+- `OpenAIChatRequest.legacyFunctions` (`[Tool.Function]?`, reusing the existing function decoder) and
+  `legacyFunctionCall` (`LegacyFunctionCall?`, a `nonisolated` decoder that accepts a bare mode string or
+  `{"name": ...}` and never throws, so an unexpected shape still reaches the refusal instead of failing the
+  body).
+- `OpenAIAdapter.refuseDeprecatedFunctionCalling(_:)`, called from the chat `buildTurnPlan` immediately
+  after `toolUseEnabled` and before `refuseUnsupportedResponseShape`, so both refusals sit ahead of the
+  model gate. The `functions` message names the declared functions (up to three), the `tools` shape to send
+  instead, and the fact that the reply will carry `tool_calls`. The `function_call` message says what it
+  asked for (`"auto"`, `"none"`, or "a call to X") and names `tool_choice`.
+- Both refusals are keyed on the MODERN field being absent, not on the deprecated field alone, so a request
+  that carries `tools` (or `tool_choice`) is served: the modern field is what this server answers, so
+  nothing is substituted and the deprecated one is merely redundant.
+- One pure case in `OpenAIAdapterLogicTests` and one app-hosted case in `ServerControllerSmokeTests` (a
+  400 for each deprecated field, and a 503 for the same request spelled with the modern one), plus the
+  guide's Request Options bullet and two README rows.
+
+### The finding
+
+1. **The absent-field audit has to be repeated per route, and it is not done at five keys.** `#96` listed
+   the undecoded chat keys and ranked them by whether they can move an answer. Two of them can, and they
+   were the two that mattered; the three that could not were ranked correctly and are still open. The
+   lesson is not "audit more", it is that a field which changes the answer and a field which cannot are
+   different slices, and closing the cheap one first is what makes the expensive one visible.
+2. **"Mapping is free" was false, and the reason is the response.** Every other deprecated field this
+   branch has met was request-only, so honouring the modern equivalent cost one dictionary lookup. The
+   function-calling surface has a response shape of its own, and a server that maps the request without
+   emitting it answers a different question than the client asked. Checking where the value lands in the
+   RESPONSE is what separates "map it" from "refuse it", and it is the step the reflex skips.
+3. **Refusing in the shared planner is what makes the claim testable.** Putting the refusal beside
+   `toolUseEnabled` rather than in the route means one code path serves streaming and non-streaming, and
+   sitting before `requireLoadedModel()` means the smoke suite proves the ordering with no checkpoint on
+   the machine. A behaviour that can only be observed with a 475 GB download present is a behaviour that
+   will regress.
+4. **Keying on the modern field's absence is the whole subtlety.** A blanket refusal of `functions` would
+   break every client that sends both spellings for compatibility, which is common, and would be a new
+   400 on a request that works today. The rule is that a request is refused only when the deprecated field
+   is the ONLY vocabulary it carries, because that is the only case where something is actually lost.
+5. **Mixing has to be decided, not left implicit.** A request with `tools` and a legacy `function_call` but
+   no `tool_choice` is refused, and that is deliberate: the mode the client asked for (`"none"`, say)
+   would otherwise be dropped while the tools were offered anyway. The test states it, because it is the
+   one arm of the rule a reader would not predict.
+
+### What it is not (do not re-propose)
+
+- **Not a mapping of `functions` onto `tools`.** See findings 2 and 4. The response half does not exist on
+  this server, and the reply is the half a client parses.
+- **Not an outbound `function_call` echo.** Emitting both shapes would be a second response dialect to
+  keep in step with streaming, the grammar mask and the tool-result loop, for a surface OpenAI retired.
+- **Not a change to `tool_choice`'s own decoding.** An unrecognised string still falls through to `.auto`,
+  which is leniency for an out-of-spec value rather than a documented one being lost, and `"required"` and
+  the named form were already refused.
+- **Not `prediction`, `web_search_options` or `service_tier`.** Still undecoded, still unable to move an
+  answer, still the documentation-only slice.
+- **Not an Anthropic change.** Its block types are dispatched, and an unknown one refuses the turn.
+- **Not the same treatment for the legacy text-completions route.** That protocol has no function
+  vocabulary at all, so there is nothing to drop.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath`, three-part `-only-testing` identifiers and `-parallel-testing-enabled NO`. Bundle
+freshness confirmed with `strings ... | grep -c` over both new case names. Warning instances 1,554 ->
+**1,554**, kinds identical. The first build was 1,556 with two new kinds, both from reading a main-actor
+type out of a `nonisolated` function: `LegacyFunctionCall` became `nonisolated struct` (the fix
+`AnthropicAdapter.Metadata` needed in `#95`) and `request.toolChoice == nil` became `if case nil =
+request.toolChoice` (the `nil` comparison was resolving to the `Equatable` conformance). One test failure
+was mine and worth recording: the "both spellings" arm asserted `XCTAssertNoThrow` while carrying a
+`function_call` with no `tool_choice`, which the mixed rule refuses, so the test disagreed with the rule
+rather than the code.
+
+| suite | result |
+|---|---|
+| `OpenAIAdapterLogicTests` (42 -> 43: both deprecated fields decode, a `function_call` mode string and a named target both read, each field is refused with a message naming its modern replacement and what would be dropped, a request carrying `tools` is served even with `functions` beside it, and mixing `tools` with a bare `function_call` is refused) | **43 cases, 0 failures** |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787) (28 -> 29: `functions` alone is a 400 naming `tools`, `function_call` alone is a 400 naming `tool_choice`, and both requests spelled with the modern field answer 503) | **29 cases, 0 failures, 1 skipped** |
+| adjacent logic suites: `ServerRequestLogLogicTests` 44, `AnthropicAdapterLogicTests` 29, `ServerQueueLogicTests` 23, `ChatPromptFormatterConversationTests` 20, `ReasoningRoundTripTests` 18, `ServerStreamSafetyTests` 13, `TurnFitLogicTests` 12, `ServerHardeningLogicTests` 6, `ServerToolArgumentTests` 4, `TurnToolMaskTests` 3 | **172 cases, 0 failures** |
+
+## DSV4.1 #98: A REQUEST FOR JSON ON THE ANTHROPIC ENDPOINT WAS ANSWERED IN PROSE, BECAUSE THE SCHEMA FIELD WAS NEVER DECODED
+
+### The question
+
+`#97` closed the last OpenAI chat field that could change an answer. The same audit had never been run on
+the Anthropic side, where the request struct was built field by field as clients asked for features. The
+question was which of that protocol's top-level fields are absent from the decoder, and for each one,
+whether losing it changes the answer or only the bookkeeping.
+
+### What was found
+
+1. **Four fields were absent.** `grep` for `output_config`, `mcp_servers`, `context_management` and
+   `disable_parallel_tool_use` across `AnthropicAdapter.swift` returned zero hits each, so unknown-key
+   tolerance dropped all four. (`container` looked like a fifth and is not: all 65 hits are Swift's own
+   `container(keyedBy:)`.)
+2. **`output_config` changes the answer.** It is Anthropic's structured-outputs setting: it asks the server
+   to constrain decoding to a JSON schema. This engine cannot constrain decoding to a schema, so the field
+   was dropped and a client that asked for JSON got prose, with a 200, and its own parser then failed on
+   the shape it had been promised. This is the same defect class as `#88`'s `response_format`, on the same
+   kind of field, one protocol over.
+3. **`mcp_servers` changes the answer too, for a different reason.** It asks THE SERVER to connect a set of
+   remote MCP servers for that turn and offer their tools. This app does have an MCP client, but it is
+   driven by `~/Library/Application Support/DynaMoE/mcp.json` with per-call human approval and a directory
+   watcher that defers while a tool call is live. A request cannot install tools into that model, so the
+   field was dropped and the turn ran without the tools the client had just named, which is a worse
+   substitution than a missing schema: the model answered from memory about a task it had been told to
+   look up.
+4. **`context_management` does not, in the same sense.** It asks for server-side context editing (clearing
+   old tool results, for instance). Not performing that housekeeping leaves MORE of the conversation in the
+   prompt rather than changing what the model is told, and a prompt that grew too long already surfaces as
+   its own `400` with `code: context_length_exceeded` from the KV budget. So it is a hint whose absence is
+   visible, not a promise being broken.
+5. **`tool_choice.disable_parallel_tool_use` cannot be enforced, and the precedent was already set.**
+   `#88`'s survey decoded OpenAI's `parallel_tool_calls` and documented it as ignored rather than refusing
+   it: honouring `false` means emitting at most one call, which this engine's sampler cannot express, and a
+   400 would put a new refusal on a path every SDK drives daily. Anthropic's spelling of the same switch
+   gets the same treatment, and the reasoning transfers unchanged.
+6. **The refusal has somewhere to live, and the ordering proof comes free.** The Anthropic planner already
+   refuses unsupported content blocks and a forced `tool_choice` before `requireLoadedModel()`, so a new
+   refusal beside them is provable over real HTTP with no checkpoint loaded. `max_tokens` is validated
+   first, which is why the smoke body carries one.
+
+### What was added
+
+- `AnthropicMessagesRequest.outputConfig` (`OutputConfig`, keeping only the format's `type` so the refusal
+  can name it), `mcpServers` (`[MCPServerRef]`, keeping the names the refusal quotes) and
+  `contextManagement` (kept to prove it decodes and is ignored), plus
+  `ToolChoice.disableParallelToolUse`.
+- `AnthropicAdapter.refuseUnsupportedRequestFields(_:)`, called in the Anthropic planner immediately after
+  `toolUseEnabled` and before the model gate. `output_config` and `mcp_servers` are refused by name (the
+  latter naming up to three servers and pointing at `tools` and the app's MCP settings);
+  `context_management` and `disable_parallel_tool_use` are documented as ignored in the field notes.
+- One pure case in `AnthropicAdapterLogicTests` and one app-hosted case in `ServerControllerSmokeTests`
+  (400 for each refused field, 503 for the same body with only the ignored ones), plus the guide's Request
+  Options bullet and two README rows.
+
+### The finding
+
+1. **The field audit is per protocol, and doing one does not audit the other.** `#96` and `#97` spent two
+   slices on four OpenAI keys; the Anthropic struct had four of its own and had never been swept. The two
+   protocols were written by the same hand in the same file family, which is exactly why the assumption
+   that one audit covered both survived as long as it did.
+2. **"Cannot honour it" splits into two different defects, and the split is about what the answer becomes.**
+   A dropped schema promise produces output the client's parser rejects; a dropped server list produces an
+   answer about tools the model never had. Both are wrong, both are silent, and both are refusals. A
+   dropped `context_management` produces a longer prompt and the same answer, which is why it is the one
+   that stays accepted: the failure it can cause is already loud and already has its own status code.
+3. **`disable_parallel_tool_use` needed no new judgement.** The posture for it was decided for
+   `parallel_tool_calls` in `#88` (decode, document, do not obey, do not refuse) and the reasoning is
+   identical: the constraint lives in the sampler, the engine cannot express it, and the cost of being
+   wrong is several calls instead of one. Copying a decided rule beats re-deriving it, and re-deriving it
+   is how a codebase ends up with two answers for one field.
+4. **The memberwise initialiser is the hidden cost of adding a property.** Two test call sites constructed
+   `ToolChoice` positionally and broke, which is the compiler doing its job; the alternative (a defaulted
+   parameter) would have silently pinned the new field to nil in the one place a test wanted to set it.
+
+### What it is not (do not re-propose)
+
+- **Not a `mcp_servers` implementation.** Connecting a remote server from a request would bypass the config
+  file that is this app's authority, the per-call approval that gates every MCP call, and the watcher's
+  deferral while a tool is live.
+- **Not a refusal for `context_management` or `disable_parallel_tool_use`.** See findings 2 and 3.
+- **Not `prediction`, `web_search_options` or `service_tier` on the OpenAI routes.** Still the
+  documentation-only slice.
+- **Not `redacted_thinking`.** A different defect (a block type refused rather than a field dropped) and a
+  separate slice.
+- **Not a `POST /v1/responses` route.** Routed again at 0.0024 against a level-0 bar of about 0.2.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath`, three-part `-only-testing` identifiers and `-parallel-testing-enabled NO`. Bundle
+freshness confirmed with `strings ... | grep -c` over both new case names. Warning instances 1,554 ->
+**1,554**, no new kinds: the three new decoders are `nonisolated` from the start, which is the fix `#95`
+and `#97` each had to discover.
+
+| suite | result |
+|---|---|
+| `AnthropicAdapterLogicTests` (29 -> 30: `output_config` decodes its format type and is refused naming both, `mcp_servers` decodes its names and is refused naming them, a request with neither is served, and `context_management` plus `disable_parallel_tool_use` decode without refusing) | **30 cases, 0 failures** |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787) (29 -> 30: a real `/v1/messages` POST is a 400 for `output_config` and for `mcp_servers`, a 503 for a body carrying only the ignored fields, and a 503 for the plain control) | **30 cases, 0 failures, 1 skipped** |
+| `ServerRequestLogLogicTests`, `OpenAIAdapterLogicTests` | **87 cases, 0 failures** |
+
+## DSV4.1 #99: ONE ECHOED REDACTED_THINKING BLOCK COST THE USER THE WHOLE CONVERSATION
+
+### The question
+
+`#98` swept the Anthropic request for fields the decoder dropped. The same protocol can put blocks in a
+MESSAGE, and that list was an allowlist written when the only blocks were text, thinking, tool_use,
+tool_result and image. The question was what happens to a block type that is not on it but is not garbage.
+
+### What was found
+
+1. **The allowlist refused the whole turn.** `ContentBlockIn.isUnsupported` was
+   `!["", "text", "thinking", "tool_use", "tool_result", "image"].contains(type)`, and one unsupported block
+   anywhere in the request raised `unsupportedContent` for the entire turn with a message about documents
+   and audio.
+2. **`redacted_thinking` is neither.** Anthropic returns it when part of a reasoning trace is withheld, and
+   the protocol requires a client to pass such a block back verbatim to the model that issued it. Its
+   payload is opaque bytes in a `data` field with no readable text. So the second turn of a conversation
+   that contained one was refused outright, over bytes this engine would not have read even if it had
+   accepted them.
+3. **This server never emits one**, which is why nothing had caught it: the refusal is only reachable from a
+   transcript produced elsewhere, or from a client that synthesises the block. That made it a real defect
+   with a narrow blast radius, and it is the reason the fix is a list entry rather than a new code path.
+4. **Accepting it renders nothing, which is the same turn.** The block contributes no `text`, no `thinking`,
+   no `tool_use` and no image, so every rendering path already skips it. The only thing the refusal bought
+   was a 400.
+5. **`rejectUnsupportedPrefill` is unaffected.** A trailing assistant turn made only of redacted thinking
+   has no `contentText` and no `reasoningText`, so it is not a response prefill and is treated as an
+   ordinary generation request, which is the behaviour a client resuming after a redaction needs.
+
+### What was added
+
+- `ContentBlockIn.handledTypes`, a named `nonisolated static let` set that now carries
+  `redacted_thinking`, with `isUnsupported` reading it. Naming the set is the point: the decision is a list,
+  it is documented as one, and the next block type has an obvious place to be argued about.
+- One pure case in `AnthropicAdapterLogicTests`: a conversation whose assistant turn holds thinking,
+  redacted thinking and text renders the readable parts and none of the opaque bytes; a `document` is still
+  refused; and a trailing redacted-only assistant turn is not a prefill.
+- The guide's Request Options bullet and the README's Anthropic row.
+
+### The finding
+
+1. **An allowlist of block types is a list of decisions, and it was written as a literal.** The set lived
+   inline in a boolean expression, so there was no name to search for and no place a comment could explain
+   why each member is on it. Extracting it cost nothing and is what made the `redacted_thinking` question
+   askable at all.
+2. **"The engine cannot read it" and "the engine must refuse it" are different claims.** A document block
+   changes the answer if dropped, because the model would answer about a file nobody read, so refusing is
+   correct. An opaque reasoning blob changes nothing if dropped, because there is nothing in it to read, so
+   refusing is pure cost. The distinguishing question is whether the block carries information this engine
+   could otherwise have used, not whether this engine understands the block.
+3. **A protocol that requires an echo is a protocol that requires acceptance.** The block is addressed to
+   the issuer, and a local server is not the issuer. Rejecting it was enforcing a rule about comprehension
+   on a field whose whole purpose is to be carried, not understood. The same reasoning would apply to any
+   future opaque-thought type Anthropic adds.
+4. **The narrow reachability is why this was worth a commit rather than a footnote.** Nothing in this app
+   produces the block, so no local test run would ever have hit the refusal; the users who do hit it hit it
+   on turn two of a conversation they cannot continue, which is the worst place for a 400 to appear.
+
+### What it is not (do not re-propose)
+
+- **Not a rendering of the block.** Its payload is encrypted bytes; there is nothing to render.
+- **Not a relaxation of the allowlist.** Every other unknown type is still refused by name, and the test
+  pins that with a `document` block.
+- **Not an Anthropic-side `ReasoningRoundTrip` change.** `reasoningText` still comes only from readable
+  `thinking` blocks, so an accepted redacted block cannot become prompt text.
+- **Not the OpenAI surface.** It has no block types to allowlist.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath`, three-part `-only-testing` identifiers and `-parallel-testing-enabled NO`. Warning
+instances 1,554 -> **1,554**, no new kinds (the new set is `nonisolated` from the start).
+
+| suite | result |
+|---|---|
+| `AnthropicAdapterLogicTests` (30 -> 31: an echoed `redacted_thinking` block no longer refuses the turn, the readable thinking and text around it still render, none of the opaque bytes reach the prompt, a `document` block is still refused, and a redacted-only trailing assistant turn is not a response prefill) | **31 cases, 0 failures** |
+| adjacent logic suites: `ChatPromptFormatterConversationTests` 20, `ReasoningRoundTripTests` 18, `ServerStreamSafetyTests` 13, `ServerHardeningLogicTests` 6 | **57 cases, 0 failures** |
+
+## DSV4.1 #100: THE OPENAI FIELD AUDIT CLOSED, AND ONE OF THE LAST THREE "HINTS" TURNED OUT NOT TO BE ONE
+
+### The question
+
+`#96` and `#97` listed five OpenAI chat keys the decoder had never carried. `#97` closed the two that could
+change an answer (`functions`, `function_call`). The remaining three (`prediction`, `web_search_options`,
+`service_tier`) had been described in every hand-off since as "documentation-only: nothing in a response
+changes". The question for this slice was whether that description was true of all three.
+
+### What was found
+
+1. **Two of the three are what the hand-off said.** `prediction` is OpenAI's predicted-output hint (a hosted
+   backend pre-computes part of the expected answer to cut latency) and `service_tier` is a routing
+   preference for a hosted fleet (`auto`, `default`, `flex`, `priority`). This server pre-computes nothing
+   and has exactly one tier, so neither can move an answer, and each one is a 400 waiting to break a client
+   that always sends it.
+2. **The third is not.** `web_search_options` is carried by OpenAI's search-preview models and asks the
+   ordering backend to run a web search and ground the answer in the results. Dropping it returns an
+   ungrounded answer where the client asked for a grounded one, and a client that renders citations gets
+   none. SubQ put that at 0.9984 against "it is another performance hint", so the lumped description was
+   wrong about one of its three members.
+3. **The right treatment for it follows from the branch's own rule.** `mcp_servers` in `#98` was refused for
+   exactly this reason: the client named tools the model would not have. `web_search_options` names sources
+   the model will not consult. Both answered a different question than the one asked, with a 200.
+4. **Presence is the trigger, not a non-default body.** SubQ 0.9983. An empty `web_search_options: {}` is the
+   default SEARCH, so carrying the field at all is a request this server cannot serve. This is the opposite
+   of the `modalities: ["text"]` decision in `#94`, where naming the default is served because it asks for
+   exactly what silence would have got, and the two rules are reconcileable only by asking what the field's
+   presence MEANS rather than what its value is.
+5. **The three keys were the last of the OpenAI chat audit.** With them decoded, `OpenAIChatRequest` now
+   carries every key in the protocol's chat schema that this server has an opinion about, and the ones it
+   does not carry are the ones that do not exist.
+
+### What was added
+
+- `OpenAIChatRequest.webSearchOptions` (`WebSearchOptions`, keeping `search_context_size` so the refusal can
+  name the scale that was asked for), and `prediction`/`service_tier` decoded and discarded with a comment,
+  which is the treatment `seed` and `user` already had.
+- One more refusal in `refuseUnsupportedResponseShape`, with a note in the comment that it is not a
+  response SHAPE but the same posture at the same pre-gate site: a request for an answer this server cannot
+  produce.
+- One pure case in `OpenAIAdapterLogicTests` (the hints decode and are not refused, a search request is
+  refused naming the field and the context size, and an empty object is refused too) and one more entry in
+  the smoke suite's pre-gate field loop, which is what proves the refusal happens before the model gate.
+- The guide's Request Options bullet and two README rows.
+
+### The finding
+
+1. **A hand-off's summary is not an audit, and the cheap members of a list can hide an expensive one.**
+   Three fields were grouped as documentation-only for four slices because two of them were. The grouping
+   was made by their PRICE at the time (they could not move an answer) rather than by their semantics, and
+   one member did not belong. The check that would have caught it costs one sentence per field: write down
+   what the answer looks like if the field is dropped.
+2. **"Cannot move an answer" has to be tested against the answer's GROUNDING, not just its shape.** A schema
+   field changes what the output is; a search field changes what it is based on. Both are answer-changing,
+   and only the first shows up in a parser. `#96`'s `reasoning_effort` was the first field in this series
+   whose absence changed the answer's content rather than its envelope, and this is the second.
+3. **Presence-versus-value is a per-field decision, and both answers are defensible.** `modalities:
+   ["text"]` is served and `web_search_options: {}` is refused, which looks inconsistent until the question
+   is asked properly: does the field's presence mean anything on its own? A default-valued modalities field
+   is a client being explicit about nothing; a default-valued search field is a client asking for a search.
+4. **Decoding a field to discard it is not busywork.** It is what makes the decision visible and testable: a
+   `_ = try container.decodeIfPresent(...)` with a comment is a written claim that this field cannot move the
+   answer, and the test beside it says so out loud. Unknown-key tolerance hides fields; a decoder entry with
+   a comment cannot.
+
+### What it is not (do not re-propose)
+
+- **Not a web-search implementation for API turns.** The in-app agent has its own `web_search` tool for its
+  own turns; wiring an app tool into a client's turn is a feature, not a decode fix, and it would need a
+  policy for whose search budget and whose sources the answer cites.
+- **Not a refusal for `prediction` or `service_tier`.** See finding 1.
+- **Not `disable_parallel_tool_use`/`context_management`/`mcp_servers`/`output_config`.** Closed on the
+  Anthropic side in `#98`.
+- **Not `POST /v1/responses`.** Routed at 0.0024 against a level-0 bar of about 0.2, so it stays a
+  documented non-goal.
+- **Not `/v1/embeddings`.** Blocked on which vector to return, which is a product decision.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath`, three-part `-only-testing` identifiers and `-parallel-testing-enabled NO`. Warning
+instances 1,554 -> **1,554**, no new kinds.
+
+| suite | result |
+|---|---|
+| `OpenAIAdapterLogicTests` (43 -> 44: `prediction` and `service_tier` decode without refusing, `web_search_options` decodes its context size and is refused naming both, and an empty object is refused because presence is the trigger) | **44 cases, 0 failures** |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787) (30 cases, unchanged count: the pre-gate field loop gained `web_search_options` as an eighth entry and still asserts a 400 naming the field) | **30 cases, 0 failures, 1 skipped** |
+
+## DSV4.1 #101: A DOC COMMENT CLAIMED THE API ADAPTERS ACCEPTED A NUMERIC EFFORT, AND NOTHING CALLED THE PARSER
+
+### The question
+
+`#96` mapped OpenAI's `reasoning_effort` onto the engine's two levels and left one loose end on the record:
+`DeepSeekV41PromptDialect.effortBudget(from:)` parses `minimal`/`low`/`medium`/`mid`/`max`/`maximum` and any
+numeric budget, is covered by tests, and is called by nothing in production, while its doc comment said it
+existed "so the API adapters can accept `reasoning_effort: 60` as well as `"high"`". A false comment about a
+capability is the kind of thing this branch has been treating as a defect in its own right.
+
+### What was found
+
+1. **The claim was false, and the reason is a type.** `ThinkingEffort` is a two-case enum, so a client's
+   `reasoning_effort` is resolved by `OpenAIAdapter.thinkingEffortLevel` onto `.low` or `.high` before any
+   budget could be consulted. A numeric budget can only become one of two levels, which loses the number the
+   client sent, so wiring the parser would have been a worse answer than refusing an unrecognised value.
+2. **The vocabulary is genuinely duplicated, and the duplication is the point.** `effortBudget` maps
+   `minimal` to 25 (the bottom of the 1-100 range this checkpoint publishes) and `thinkingEffortLevel` maps
+   it to `.low`, which renders 25. Two functions, one rule, deliberately: the adapter's mapper must not
+   depend on a DeepSeek-specific type, and the dialect's parser must not depend on the OpenAI wire.
+3. **Nothing else was wrong with it.** The parser is correct against the range, is tested, and would be the
+   right thing to call from a surface that actually carries a number.
+
+### What was added
+
+- The doc comment now says what the function is for, that the adapters deliberately do not call it, why the
+  reason is a type rather than an oversight, and where the duplicated vocabulary came from. No code changed.
+
+### The finding
+
+**A comment that describes a capability nobody wired is a lie the compiler cannot catch, and it survives
+because it is plausible.** The function was written, tested and reviewed; the only thing missing was the call
+site, which no test can assert the presence of. The two ways out are to delete the function or to describe
+it truthfully, and deleting a correct, tested parser to satisfy a comment would be the wrong trade. The
+general rule this leaves: when a helper is written "so that X can Y", either wire X or write the doc in the
+past tense about what exists.
+
+### What it is not (do not re-propose)
+
+- **Not a numeric `reasoning_effort` on the wire.** `#96` settled that: a third `ThinkingEffort` case would
+  touch the toolbar menu, session storage, every family's template and the server turn-memory digest, and the
+  interoperability failure was the 400, which is closed.
+- **Not a deletion of `effortBudget`.** It is correct, tested, and is what a future numeric surface would
+  call.
+
+### Verification
+
+Comment-only change: `xcodebuild build-for-testing` into `/tmp/dd_dsv41_status` stays green and the warning
+count is unchanged, and `DeepSeekV41PromptEffortTests` (which pins `effortBudget`'s behaviour, including the
+range refusals) is part of the suite already run in this session.
+
+## DSV4.1 #102: THE TWO ROUTES THIS SERVER DOES NOT SERVE, CLOSED AS DECISIONS RATHER THAN LEFT AS TODOS
+
+### The question
+
+Every hand-off since `#88` ended with the same two open items: `POST /v1/responses` and `POST /v1/embeddings`.
+Neither had ever been given a verdict, so both were re-proposed every session, routed low, and left open
+again. The question here was not how to build them but whether they should exist at all.
+
+### What was found
+
+1. **`/v1/responses` is a second protocol surface, not a route.** It carries its own request shape (`input`
+   items rather than `messages`), its own response shape (`output` items and `output_text`), and its own SSE
+   event vocabulary (`response.output_text.delta` and friends). Everything below it is already built and
+   shared: one turn engine, one queue, one prefix cache. Routed again at **0.0024** against a level-0 bar of
+   about 0.2, which is the third time it has come back below the bar.
+2. **`/v1/embeddings` is blocked on a product choice, and the choice is real.** Three sources exist here and
+   they are not interchangeable: the loaded model's own representations (a prefill and a pool, which on a
+   single-flight engine waits behind a chat turn), the model's static token-embedding rows averaged
+   (instant, a bag of words that cannot distinguish word order), and Apple's `NaturalLanguage` vectors the
+   codebase index already uses (instant and good, but a different model, so not comparable with either of
+   the others). Vectors from different sources cannot be mixed, so serving one of them without saying which
+   is serving a number whose meaning nobody wrote down.
+3. **The operator chose to skip it**, which settles the question the same way the other one settled: no
+   vector is better than a vector with an undocumented provenance.
+4. **The behaviour was already correct.** An unserved path answers `404`, which is the honest reply. Nothing
+   needed to be built; what was missing was a record that this state is chosen rather than unfinished.
+
+### What was added
+
+- A "deliberately not served" note in the README under the endpoint table, naming both paths and the reason
+  for each.
+- The same decision recorded in `AGENTS.md`, which is what the next session reads first, so the two items
+  stop arriving in hand-offs.
+- This section, which is the third piece of that record.
+
+### The finding
+
+1. **An item that is never decided costs every session it survives.** Two routes were re-routed, re-scored
+   and re-deferred across a dozen slices, and the cost was paid in tokens and attention rather than in code.
+   The cheapest way to close an item is usually to write down why it is closed, not to build it.
+2. **"Below the bar" is a decision, and it has to be written somewhere a future reader looks.** The routing
+   number lived only in a chat transcript and one journal section; the hand-off list kept re-listing the
+   item because nothing in the repo said no. A non-goal is a deliverable.
+3. **A blocked item needs the blocking QUESTION, not the blocking field.** "Which vector" is one sentence and
+   answerable in a minute, but it was recorded for three slices as "needs a product decision", which says
+   nothing about what to decide. Writing the three concrete options down is what got an answer.
+
+### What it is not (do not re-propose)
+
+- **Not a `/v1/responses` implementation.** See finding 1 of "what was found"; the bar is unchanged.
+- **Not a `/v1/embeddings` implementation.** The operator's answer was "skip it". Re-open only with a
+  concrete consumer that needs one of the three sources named above, and say which.
+- **Not a 501 or a documented error envelope for either path.** A `404` is what an HTTP client expects from a
+  path a server does not implement, and inventing an error body for it would be noise on every wrong URL.
+
+### Verification
+
+Documentation only, so the check is that nothing moved: `git status` is clean after the commit, no source
+file changed, and the suites run earlier in this session (`OpenAIAdapterLogicTests` 44,
+`AnthropicAdapterLogicTests` 31, `ServerRequestLogLogicTests` 44, `ServerControllerSmokeTests` 30) already
+cover the refusal set these two non-goals sit beside.

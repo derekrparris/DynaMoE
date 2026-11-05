@@ -1482,6 +1482,18 @@ struct ContentView: View {
                     thinkingEffort: levelCapable ? thinkingEffortForActiveSession : nil,
                     supportsThinkingLevels: levelCapable,
                     supportsVision: activeModelSupportsVision,
+                    visionCostLabel: { image in
+                        guard let estimate = ModelConfig.visionCostEstimate(
+                            modelPath: activeLoadedModelPath,
+                            width: image.pixelWidth,
+                            height: image.pixelHeight
+                        ) else { return nil }
+                        // An estimate, not a promise: the model behind it was
+                        // measured on this machine class, and the chip says so.
+                        return estimate.seconds < 10
+                            ? String(format: "about %.1f s", estimate.seconds)
+                            : "about \(Int(estimate.seconds.rounded())) s"
+                    },
                     isAgentToolsEnabled: isAgentToolsEnabledForActiveSession,
                     isModelLoaded: (tokenizer != nil && summary != nil) || isAppleFoundationModelActive || isCloudModelActive,
                     isAppleFoundationModelActive: isAppleFoundationModelActive,
@@ -2755,14 +2767,135 @@ struct ContentView: View {
                 modelName: sessionModelName,
                 currentDate: conversationDate,
                 isLingModel: modelConfig?.isLingModel == true,
-                isGemma4Model: modelConfig?.isGemma4Model == true
+                isGemma4Model: modelConfig?.isGemma4Model == true,
+                isDeepSeekV41Model: modelConfig?.isDeepSeekV41Model == true
             )
         }
 
         let isSpark = (modelConfig?.isSparkModel == true)
         let isLing = (modelConfig?.isLingModel == true)
         let isGemma4 = (modelConfig?.isGemma4Model == true)
-        if isSpark {
+        let isDeepSeekV41 = (modelConfig?.isDeepSeekV41Model == true)
+
+        // Pictures in the prompt. Only the family with a vision tower can read
+        // pixels this turn; every other local family keeps the metadata notice,
+        // because a marker there would expand to rows the model never receives.
+        // `turnImages` is what the engine encodes, in prompt order, so it must be
+        // filled by the same walk that writes the markers.
+        let visionMarkers: DeepSeekV41VisionMarkers? = {
+            guard modelConfig?.isDeepSeekV41Model == true,
+                  ModelConfig.supportsVision(modelPath: activeLoadedModelPath) else { return nil }
+            return DeepSeekV41VisionMarkers.familyDefault
+        }()
+        var turnImages: [TurnImage] = []
+        func attachmentFragment(for message: ChatMessage) -> String {
+            guard let refs = message.attachments, !refs.isEmpty else { return "" }
+            guard let visionMarkers else {
+                return Self.localAttachmentNotice(for: message)
+            }
+            var fragment = ""
+            for ref in refs {
+                guard let data = ImageAttachmentStore.shared.data(for: ref),
+                      let pixels = try? DeepSeekV41ImagePixels.decode(data) else { continue }
+                // The picture goes FIRST inside the turn, the way the reference's
+                // prompts place an image before the question about it.
+                fragment += visionMarkers.imagePlaceholder + "\n"
+                turnImages.append(
+                    TurnImage(
+                        rgb: pixels.rgb,
+                        width: pixels.width,
+                        height: pixels.height,
+                        sha256: ref.sha256
+                    )
+                )
+            }
+            // A decode failure leaves the notice rather than an empty turn: the
+            // turn still answers about something, and the user's picture is not
+            // silently claimed to have been seen.
+            return fragment.isEmpty ? Self.localAttachmentNotice(for: message) : fragment
+        }
+        if isDeepSeekV41 {
+            // The checkpoint's own turn structure, rendered by the same function
+            // the API server uses. Building a chatml transcript here and letting
+            // `formatPrompt` wrap it (what the default branch does) hands the
+            // model ONE user turn holding its whole history as prose: it reads
+            // role markers that are not its own, and a tool result arrives as
+            // text instead of the output pair it was trained on.
+            let dialect = CompletionEngine.shared.promptDialect
+            let markers = dialect.markers
+            // Markers a stored turn may still carry from an older render. The
+            // dialect's own role and sentence markers are stripped for the same
+            // reason every other branch strips its own: the renderer re-emits
+            // them, and a stored copy would put a turn boundary inside a turn.
+            func storedTurnText(_ raw: String, isAssistant: Bool) -> String {
+                var text = raw
+                    .replacingOccurrences(of: "<|im_start|>", with: "")
+                    .replacingOccurrences(of: "<|im_end|>", with: "")
+                    .replacingOccurrences(of: "<|endoftext|>", with: "")
+                    .replacingOccurrences(of: markers.endOfSentence, with: "")
+                if isAssistant {
+                    text = text.replacingOccurrences(of: markers.assistant, with: "")
+                }
+                return text.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            var turns: [ChatPromptFormatter.ConversationTurn] = []
+            for msg in sessions[sessionIdx].messages.dropLast() {
+                let cleanMsg = storedTurnText(msg.content, isAssistant: msg.role == .assistant)
+                let hasTools = (msg.toolCalls != nil && !msg.toolCalls!.isEmpty)
+                let hasReasoning = !(msg.thinkingContent ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                let attachmentNotice = Self.localAttachmentNotice(for: msg)
+                guard !cleanMsg.isEmpty || hasReasoning || hasTools || !attachmentNotice.isEmpty else { continue }
+
+                if msg.role == .user {
+                    turns.append(.init(role: .user, text: attachmentFragment(for: msg) + cleanMsg))
+                } else if msg.role == .assistant {
+                    // The stored turn keeps its answer and its reasoning apart; the
+                    // renderer splits them back out of the flattened canonical form
+                    // the API path records, so a turn that carried reasoning keeps
+                    // the channel it was generated in.
+                    var body = cleanMsg
+                    if hasReasoning {
+                        let think = msg.thinkingContent!.trimmingCharacters(in: .whitespacesAndNewlines)
+                        body = think + TurnTextSplitter.canonicalReasoningCloseTag + body
+                    }
+                    // A call the stored content no longer carries is rebuilt from
+                    // its record, in the dialect the model actually emits. The raw
+                    // call survives in `content` for every turn this app produced,
+                    // so this only fires for a turn that came from somewhere else.
+                    if let calls = msg.toolCalls, !calls.isEmpty,
+                       !cleanMsg.contains(DeepSeekV41ToolDialect.dsmlTag),
+                       !cleanMsg.contains("<tool_call") {
+                        for call in calls {
+                            body += "\n" + DeepSeekV41ToolDialect.callBlock(
+                                name: call.name,
+                                arguments: call.arguments
+                            )
+                        }
+                    }
+                    turns.append(.init(role: .assistant, text: body))
+                    // One output pair per executed call, in transcript order. A
+                    // recorded output is already model-facing text, so it is used
+                    // as-is; the live loop applies the same rendering once.
+                    for call in msg.toolCalls ?? [] {
+                        guard let output = call.output ?? call.error, !output.isEmpty else { continue }
+                        turns.append(.init(
+                            role: .user,
+                            text: output,
+                            kind: .toolResult(name: call.name)
+                        ))
+                    }
+                }
+            }
+            promptString = ChatPromptFormatter.formatConversation(
+                turns: turns,
+                cleanSystem: effectiveSystem,
+                thinkingEnabled: thinkingEnabled,
+                modelSupportsThinking: modelSupportsThinking,
+                modelConfig: modelConfig,
+                thinkingEffort: thinkingEffortLevel,
+                promptDialect: dialect
+            )
+        } else if isSpark {
             // Spark 2.5 DeepSeek-style dialect:
             // <｜start▁of▁sentence｜><|System|>\n...<｜end▁of▁sentence｜>
             // <｜start▁of▁sentence｜><|User|>...<｜end▁of▁sentence｜>
@@ -2990,7 +3123,7 @@ struct ContentView: View {
                 guard !cleanMsg.isEmpty || (msg.thinkingContent != nil && !msg.thinkingContent!.isEmpty) || hasTools || !attachmentNotice.isEmpty else { continue }
 
                 if msg.role == .user {
-                    promptString += "<|im_start|>user\n\(cleanMsg)\(attachmentNotice)<|im_end|>\n"
+                    promptString += "<|im_start|>user\n\(attachmentFragment(for: msg))\(cleanMsg)<|im_end|>\n"
                 } else if msg.role == .assistant {
                     var assistantBody = ""
                     if modelSupportsThinking {
@@ -3044,7 +3177,12 @@ struct ContentView: View {
                 promptString += "<|im_start|>assistant\n"
             }
         }
-        startAutoregressiveGeneration(customPrompt: promptString, sessionId: currentSessionId, messageId: assistantMsgId)
+        startAutoregressiveGeneration(
+            customPrompt: promptString,
+            images: turnImages,
+            sessionId: currentSessionId,
+            messageId: assistantMsgId
+        )
         return true
     }
 
@@ -5847,7 +5985,11 @@ struct ContentView: View {
     /// headless CompletionEngine turn, consumes its event stream to drive the
     /// historical UI writes, then runs the agent-orchestration phase (tool
     /// execution, HITL approvals, multi-step recursion) verbatim.
-    private func startAutoregressiveGeneration(customPrompt: String? = nil, promptTokens: [UInt32]? = nil, sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false) {
+    /// `images` are the turn's attachments, already decoded, in prompt order and
+    /// matching the image placeholders the caller wrote into `customPrompt`. Only a
+    /// family with a vision tower consumes them; the engine refuses a turn whose
+    /// placeholder count disagrees with this list rather than dropping pixels.
+    private func startAutoregressiveGeneration(customPrompt: String? = nil, promptTokens: [UInt32]? = nil, images: [TurnImage] = [], carriedImageSpans: [TurnImageSpan] = [], sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false) {
         guard let summary = summary,
               let tokenizer = tokenizer else {
             let err = "❌ Metal or Tokenizer not ready for text generation. Please load model and tokenizer in Settings."
@@ -5878,6 +6020,18 @@ struct ContentView: View {
             generationStatusText = err
             return
         }
+
+        // The single-flight slot is taken HERE, before the preparation below, not
+        // left to the launch at the end. A server turn can claim the slot while
+        // this turn is still rendering and tokenizing the prompt, and the launch
+        // would then lose that race and report it as a refusal — the same turn
+        // lost, one step earlier. Holding the claim makes the server's own claim
+        // fail instead, which its queue already handles by going back to waiting.
+        // Nil means somebody already holds the slot; the launch below then reports
+        // it exactly the way it always has. See `EngineTurnSlot.swift` and
+        // `Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #85".
+        let turnSlotClaim = CompletionEngine.shared.reserveTurnSlot()
+        defer { turnSlotClaim?.release() }
 
         let generationDate: Date
         if let sId = sessionId, let sess = sessions.first(where: { $0.id == sId }) {
@@ -5981,12 +6135,19 @@ struct ContentView: View {
             agentStep: agentStep,
             forceSynthesis: forceSynthesis,
             isSplicedContinuation: (promptTokens?.isEmpty == false),
-            asOfDate: generationDate
+            asOfDate: generationDate,
+            images: images,
+            // Only a spliced continuation reuses ids that already carry an expanded
+            // span. A prompt that had to be RE-ENCODED (the tool section changed, a
+            // synthesis directive was appended) starts from one marker per image
+            // again, so a span carried from the old layout would describe positions
+            // the new prompt does not have.
+            imageSpans: (promptTokens?.isEmpty == false) ? carriedImageSpans : []
         )
 
         let launch: CompletionLaunch
         do {
-            launch = try CompletionEngine.shared.launchTurn(request)
+            launch = try CompletionEngine.shared.launchTurn(request, claim: turnSlotClaim)
         } catch {
             let err = (error as? CompletionLaunchError)?.errorDescription ?? "❌ Failed to launch generation: \(error.localizedDescription)"
             isGeneratingText = false
@@ -6140,6 +6301,11 @@ struct ContentView: View {
                                 // placeholder creation, so a long response would
                                 // look stale to retention as soon as it finishes.
                                 self.sessions[sIdx].messages[mIdx].timestamp = Date()
+                                // No frame can exist before prefill produced a token,
+                                // so the pill retires here even if the backend's own
+                                // clear never arrived — the same belt the Apple
+                                // Foundation path wears on its first visible text.
+                                self.sessions[sIdx].messages[mIdx].prefillStatus = nil
                                 self.sessions[sIdx].messages[mIdx].isThinking = frame.isActivelyThinking
                                 self.sessions[sIdx].messages[mIdx].tokenCount = frame.tokensGenerated
                                 self.sessions[sIdx].messages[mIdx].tokensPerSec = frame.tokensPerSecond
@@ -6259,6 +6425,12 @@ struct ContentView: View {
             let finalResp = result.responseText
             let formattedPrompt = result.formattedPrompt
             let promptTokenIds = result.promptTokenIds
+            // `promptTokenIds` is the EXPANDED prompt: a picture is a run of image
+            // tokens, not one marker. Every continuation below splices those ids
+            // forward, so this layout has to travel with them — re-deriving it from
+            // a marker count reads one picture as hundreds of placeholders and
+            // refuses the turn.
+            let promptImageSpans = result.imageSpans
             let generatedTokenIds = result.generatedTokenIds
             let finalElapsedMs = result.elapsedMs
             let finalTokPerSec = result.tokensPerSecond
@@ -6392,7 +6564,7 @@ struct ContentView: View {
                     }
                 }
                 if shouldForceSynthesis {
-                    let endTag = (modelConfig?.isGemma4Model == true) ? "<turn|>" : ((modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>") )
+                    let endTag = (modelConfig?.isGemma4Model == true) ? "<turn|>" : ((modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : ((modelConfig?.isDeepSeekV41Model == true) ? CompletionEngine.shared.promptDialect.markers.endOfSentence : "<|im_end|>")) )
                     let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: endTag)
                     let synthesisDirective = """
                     \n\n<system>
@@ -6431,6 +6603,8 @@ struct ContentView: View {
                     self.startAutoregressiveGeneration(
                         customPrompt: synthesisPrompt,
                         promptTokens: synthesisToolsChanged ? nil : splicedTokens,
+                        images: images,
+                        carriedImageSpans: promptImageSpans,
                         sessionId: sessionId,
                         messageId: synthesisMsgId,
                         agentStep: agentStep + 1,
@@ -6463,6 +6637,8 @@ struct ContentView: View {
                     self.startAutoregressiveGeneration(
                         customPrompt: formattedPrompt,
                         promptTokens: promptTokenIds,
+                        images: images,
+                        carriedImageSpans: promptImageSpans,
                         sessionId: sessionId,
                         messageId: messageId,
                         agentStep: agentStep,
@@ -6734,18 +6910,32 @@ struct ContentView: View {
                                 includeAssistantPrefix: true,
                                 thinkingEnabled: thinkingEnabled
                             )
+                        } else if modelConfig?.isDeepSeekV41Model == true {
+                            // The payload inside the checkpoint's own `tool▁output` pair. The
+                            // model answered the same from every container measured in `#27`,
+                            // so the family's own spelling is used. The turn it returns ends
+                            // by opening the next assistant turn: `formatPrompt` passes an
+                            // already-templated prompt through verbatim, so nothing
+                            // downstream would add that marker.
+                            toolResponseTurn = AgentHarness.shared.formatDeepSeekV41ToolResponseTurn(
+                                responses: allResponses,
+                                thinkingEnabled: thinkingEnabled,
+                                promptDialect: CompletionEngine.shared.promptDialect
+                            )
                         } else {
                             toolResponseTurn = AgentHarness.shared.formatToolResponseTurn(
                                 responses: allResponses,
                                 includeThinkSuffix: thinkingEnabled
                             )
                         }
-                        let endTag = (modelConfig?.isGemma4Model == true) ? "<turn|>" : ((modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : "<|im_end|>") )
+                        let endTag = (modelConfig?.isGemma4Model == true) ? "<turn|>" : ((modelConfig?.isSparkModel == true) ? "<｜end▁of▁sentence｜>" : ((modelConfig?.isLingModel == true) ? "<|role_end|>" : ((modelConfig?.isDeepSeekV41Model == true) ? CompletionEngine.shared.promptDialect.markers.endOfSentence : "<|im_end|>")) )
                         // Gemma keeps the tool call and its response in one model turn (no
                         // <turn|> between them), so the assistant text is not closed here and
-                        // the response turn is appended with no separator.
+                        // the response turn is appended with no separator. DeepSeek V4.1
+                        // closes the call turn with its end-of-sentence marker and the result
+                        // follows it directly, which is the shape the published probe used.
                         let assistantEndTag = isGemma4Continuation ? "" : endTag
-                        let continuationSeparator = isGemma4Continuation ? "" : "\n"
+                        let continuationSeparator = (isGemma4Continuation || modelConfig?.isDeepSeekV41Model == true) ? "" : "\n"
                         let assistantTurnText = self.closedAssistantTurnText(finalDecoded, endTag: assistantEndTag)
                         let staleNextPrompt = formattedPrompt + assistantTurnText + continuationSeparator + toolResponseTurn
                         // tools_load/tools_unload may have changed the registry THIS step;
@@ -6781,6 +6971,8 @@ struct ContentView: View {
                             self.startAutoregressiveGeneration(
                                 customPrompt: nextPrompt,
                                 promptTokens: toolsSectionChanged ? nil : splicedTokens,
+                                images: images,
+                                carriedImageSpans: promptImageSpans,
                                 sessionId: sessionId,
                                 messageId: nextAssistantMsgId,
                                 agentStep: agentStep + 1
@@ -6838,6 +7030,8 @@ struct ContentView: View {
                                 self.startAutoregressiveGeneration(
                                     customPrompt: synthesisPrompt,
                                     promptTokens: synthesisToolsChanged ? nil : splicedTokens,
+                                    images: images,
+                                    carriedImageSpans: promptImageSpans,
                                     sessionId: sessionId,
                                     messageId: synthesisMsgId,
                                     agentStep: agentStep + 1,
@@ -6897,6 +7091,8 @@ struct ContentView: View {
                                     self.startAutoregressiveGeneration(
                                         customPrompt: relayPrompt,
                                         promptTokens: splicedTokens,
+                                        images: images,
+                                        carriedImageSpans: promptImageSpans,
                                         sessionId: sessionId,
                                         messageId: relayMsgId,
                                         agentStep: agentStep + 1,
@@ -6978,6 +7174,8 @@ struct ContentView: View {
                         self.startAutoregressiveGeneration(
                             customPrompt: nextPrompt,
                             promptTokens: splicedTokens,
+                            images: images,
+                            carriedImageSpans: promptImageSpans,
                             sessionId: sessionId,
                             messageId: nextAssistantMsgId,
                             agentStep: agentStep + 1
@@ -7035,6 +7233,8 @@ struct ContentView: View {
                         self.startAutoregressiveGeneration(
                             customPrompt: nextPrompt,
                             promptTokens: splicedTokens,
+                            images: images,
+                            carriedImageSpans: promptImageSpans,
                             sessionId: sessionId,
                             messageId: nextAssistantMsgId,
                             agentStep: agentStep + 1
@@ -7182,6 +7382,16 @@ struct ContentView: View {
             // waits the generation out before loading; direct callers reach this
             // task without it, so stop and await any generation here too.
             await self.awaitGenerationTeardown()
+            // ...and then HOLD the generation slot for the rest of the load. Waiting
+            // a turn out only covers the turn that was running: `configure` below
+            // replaces the shard buffers and retires the DeepSeek runtime, so a turn
+            // that started in between would be computing on mappings that no longer
+            // exist. The slot is the one thing both callers check, so the load takes
+            // it and gives it back once the new engine is installed. Nil means
+            // another caller got there first, which is no worse than the behaviour
+            // before the claim existed.
+            let swapClaim = CompletionEngine.shared.reserveTurnSlot()
+            defer { swapClaim?.release() }
             // The wait can be long: a newer load may have superseded this one, in
             // which case it must not touch the shared state the newer one owns.
             let superseded = await MainActor.run { self.modelLoadToken != token }

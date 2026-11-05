@@ -98,8 +98,99 @@ final class ServerControllerSmokeTests: XCTestCase {
         XCTAssertTrue(body["data"] is [Any])
         if let info = await MainActor.run(body: { CompletionEngine.shared.loadedModelInfo }) {
             let entries = try XCTUnwrap(body["data"] as? [[String: Any]])
-            XCTAssertEqual(entries.first?["id"] as? String, info.displayName)
+            XCTAssertEqual(entries.first?["id"] as? String, info.servedID)
         }
+    }
+
+    // MARK: - Shared models path, two protocols
+
+    /// `GET /v1/models` is one path and two bodies, so the request's headers are the
+    /// only evidence the route has. A client that sends neither Anthropic header must
+    /// still get the shape this route has always answered.
+    func testTheModelsListAnswersInTheShapeTheClientsHeadersAskFor() async throws {
+        await ensureServerRunning()
+
+        let plain = try await getModels("/v1/models", headers: [:])
+        XCTAssertEqual(plain.status, 200)
+        XCTAssertEqual(plain.body["object"] as? String, "list")
+        XCTAssertNil(plain.body["has_more"], "an OpenAI body must not carry Anthropic pagination")
+
+        // Either Anthropic header is enough: the SDKs send the version on every
+        // request and the key header whether or not this server requires a key.
+        for headers in [["anthropic-version": "2023-06-01"], ["x-api-key": "unused-key"]] {
+            let anthropic = try await getModels("/v1/models", headers: headers)
+            XCTAssertEqual(anthropic.status, 200)
+            XCTAssertNil(anthropic.body["object"], "an Anthropic body is not an OpenAI list")
+            XCTAssertEqual(anthropic.body["has_more"] as? Bool, false)
+            if let info = await MainActor.run(body: { CompletionEngine.shared.loadedModelInfo }) {
+                let entries = try XCTUnwrap(anthropic.body["data"] as? [[String: Any]])
+                let first = try XCTUnwrap(entries.first)
+                XCTAssertEqual(first["type"] as? String, "model")
+                XCTAssertEqual(first["id"] as? String, info.servedID)
+                XCTAssertEqual(anthropic.body["first_id"] as? String, info.servedID)
+                XCTAssertEqual(anthropic.body["last_id"] as? String, info.servedID)
+                let createdAt = try XCTUnwrap(first["created_at"] as? String)
+                XCTAssertTrue(createdAt.hasSuffix("Z"), "the protocol's date is RFC 3339, not an epoch second")
+                // The id is a path segment and the display name is the human
+                // spelling; the two must not collapse into each other again.
+                let displayName = try XCTUnwrap(first["display_name"] as? String)
+                XCTAssertFalse(displayName.isEmpty)
+                XCTAssertFalse(info.servedID.contains(" "), "an id with a space is not a path segment")
+            }
+        }
+
+        // Both shapes are recorded, and the row says which protocol answered, so one
+        // path is still two readable protocols in the dashboard.
+        let rows = await logStore.fetch(limit: 50).filter { $0.path == "/v1/models" }
+        XCTAssertTrue(rows.contains { $0.proto == .openai }, "the plain request is an OpenAI models call")
+        XCTAssertTrue(rows.contains { $0.proto == .anthropic }, "the headed requests are Anthropic models calls")
+    }
+
+    func testTheModelsRetrieveRouteAnswersBothShapesAndRefusesAnUnknownId() async throws {
+        await ensureServerRunning()
+        guard let info = await MainActor.run(body: { CompletionEngine.shared.loadedModelInfo }) else {
+            throw XCTSkip("No model is loaded; there is no served id to retrieve")
+        }
+
+        let openai = try await getModels("/v1/models/\(info.servedID)", headers: [:])
+        XCTAssertEqual(openai.status, 200)
+        XCTAssertEqual(openai.body["object"] as? String, "model")
+        XCTAssertEqual(openai.body["id"] as? String, info.servedID)
+
+        let anthropic = try await getModels(
+            "/v1/models/\(info.servedID)", headers: ["anthropic-version": "2023-06-01"]
+        )
+        XCTAssertEqual(anthropic.status, 200)
+        XCTAssertEqual(anthropic.body["type"] as? String, "model")
+        XCTAssertNil(anthropic.body["has_more"], "a retrieve answers the object, not a page")
+
+        // The snapshot directory's own name was the served id before it became the
+        // checkpoint's repository name. A client configured against the old server
+        // keeps working rather than meeting a 404 on a rename it never made.
+        let legacy = try await getModels("/v1/models/\(info.displayName)", headers: [:])
+        XCTAssertEqual(legacy.status, 200)
+        XCTAssertEqual(
+            legacy.body["id"] as? String, info.servedID,
+            "the alias answers the served object, not the name it was asked by"
+        )
+
+        // An id this server does not serve is a 404 in the caller's own envelope:
+        // OpenAI keeps `invalid_request_error` and names the condition in `code`,
+        // Anthropic has a `not_found_error`.
+        let missing = try await getModels("/v1/models/not-a-served-model", headers: [:])
+        XCTAssertEqual(missing.status, 404)
+        let openAIError = try XCTUnwrap(missing.body["error"] as? [String: Any])
+        XCTAssertEqual(openAIError["type"] as? String, "invalid_request_error")
+        XCTAssertEqual(openAIError["code"] as? String, "model_not_found")
+
+        let missingAnthropic = try await getModels(
+            "/v1/models/not-a-served-model", headers: ["anthropic-version": "2023-06-01"]
+        )
+        XCTAssertEqual(missingAnthropic.status, 404)
+        XCTAssertEqual(missingAnthropic.body["type"] as? String, "error")
+        XCTAssertEqual(
+            (missingAnthropic.body["error"] as? [String: Any])?["type"] as? String, "not_found_error"
+        )
     }
 
     func testCompletionsWithoutModelReturns503ErrorEnvelope() async throws {
@@ -126,6 +217,253 @@ final class ServerControllerSmokeTests: XCTestCase {
             statsBefore.totalRequests + 1,
             "the 503 completion request must be recorded in the server stats"
         )
+    }
+
+    // MARK: - Request fields this server cannot honour
+
+    /// A request asking for JSON, for two choices or for log-probabilities is
+    /// refused BY NAME, and refused before the model gate: the proof is a 400 where
+    /// the same body shape answers 503. Before `#88` these keys were dropped by the
+    /// decoder and the turn ran as if they had not been sent.
+    func testUnsupportedResponseShapeFieldsAreRefusedBeforeTheModelGate() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the pre-gate refusal cannot be isolated from generation")
+        }
+        await ensureServerRunning()
+
+        for field in [
+            #""response_format":{"type":"json_object"}"#,
+            #""response_format":{"type":"json_schema","json_schema":{"name":"x"}}"#,
+            #""n":2"#,
+            #""logprobs":true"#,
+            #""top_logprobs":3"#,
+            #""modalities":["text","audio"]"#,
+            #""audio":{"voice":"alloy","format":"mp3"}"#,
+            #""web_search_options":{}"#,
+        ] {
+            var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/chat/completions")!)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = Data("""
+            {"model":"any",\(field),"messages":[{"role":"user","content":"hello"}]}
+            """.utf8)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let http = try XCTUnwrap(response as? HTTPURLResponse)
+            XCTAssertEqual(http.statusCode, 400, "\(field) must be refused, not ignored")
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let error = try XCTUnwrap(body["error"] as? [String: Any])
+            XCTAssertEqual(error["type"] as? String, "invalid_request_error")
+            let message = try XCTUnwrap(error["message"] as? String)
+            let named = field.split(separator: "\"").first.map(String.init) ?? ""
+            XCTAssertTrue(
+                message.contains(named),
+                "the refusal must name \(named), got: \(message)"
+            )
+        }
+
+        // A reply budget asked for with BOTH spellings and two different values is a
+        // 400 naming both, before the model gate, rather than a choice the server made
+        // for the client. `max_completion_tokens` alone is a field this server honours,
+        // so it must reach the gate (503) instead.
+        func postFields(_ fields: String) async throws -> (status: Int, text: String) {
+            var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/chat/completions")!)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = Data("""
+            {"model":"any",\(fields),"messages":[{"role":"user","content":"hello"}]}
+            """.utf8)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            return (
+                try XCTUnwrap((response as? HTTPURLResponse)?.statusCode),
+                String(decoding: data, as: UTF8.self)
+            )
+        }
+
+        let (conflictStatus, conflictText) = try await postFields(
+            #""max_tokens":64,"max_completion_tokens":512"#
+        )
+        XCTAssertEqual(conflictStatus, 400, "two disagreeing budgets are a bad request: \(conflictText)")
+        XCTAssertTrue(conflictText.contains("max_completion_tokens"), "got: \(conflictText)")
+
+        let (newerStatus, newerText) = try await postFields(#""max_completion_tokens":512"#)
+        XCTAssertEqual(newerStatus, 503, "the newer reply-budget field is honoured, not refused: \(newerText)")
+
+        // `["text"]` is the protocol's default, so a client that says it out loud is
+        // asking for exactly what it would have got by staying silent, and must reach
+        // the model gate rather than a new 400.
+        let (textOnlyStatus, textOnlyBody) = try await postFields(#""modalities":["text"]"#)
+        XCTAssertEqual(textOnlyStatus, 503, "text is the modality this server has: \(textOnlyBody)")
+    }
+
+    /// OpenAI's deprecated `functions` / `function_call` pair was absent from the
+    /// decoder, so a client on that surface was answered in prose with no call and no
+    /// error. It is refused by name, and refused before the model gate: the proof is a
+    /// 400 where the same request spelled with `tools` answers 503. Mapping the pair
+    /// was the alternative and is worse, because the reply would carry `tool_calls`
+    /// while a legacy client parses `function_call`.
+    func testTheDeprecatedFunctionCallingSurfaceIsRefusedBeforeTheModelGate() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the pre-gate refusal cannot be isolated from generation")
+        }
+        await ensureServerRunning()
+
+        func post(_ fields: String) async throws -> (status: Int, text: String) {
+            var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/chat/completions")!)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = Data("""
+            {"model":"any",\(fields),"messages":[{"role":"user","content":"hello"}]}
+            """.utf8)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            return (
+                try XCTUnwrap((response as? HTTPURLResponse)?.statusCode),
+                String(decoding: data, as: UTF8.self)
+            )
+        }
+
+        let (legacyStatus, legacyText) = try await post(#""functions":[{"name":"get_weather"}]"#)
+        XCTAssertEqual(legacyStatus, 400, "functions must be refused, not ignored: \(legacyText)")
+        XCTAssertTrue(legacyText.contains("functions"), "got: \(legacyText)")
+        XCTAssertTrue(legacyText.contains("tools"), "the refusal must name the modern field: \(legacyText)")
+        XCTAssertTrue(legacyText.contains("invalid_request_error"), "got: \(legacyText)")
+
+        let (callStatus, callText) = try await post(#""function_call":"auto""#)
+        XCTAssertEqual(callStatus, 400, "function_call must be refused, not ignored: \(callText)")
+        XCTAssertTrue(callText.contains("function_call"), "got: \(callText)")
+        XCTAssertTrue(callText.contains("tool_choice"), "the refusal must name the modern field: \(callText)")
+
+        // The modern spelling is served, so a client sending both reaches the model gate
+        // rather than a new 400: the deprecated field is then redundant, not lost.
+        let (modernStatus, modernText) = try await post(
+            #""tools":[{"type":"function","function":{"name":"get_weather"}}],"functions":[{"name":"get_weather"}]"#
+        )
+        XCTAssertEqual(modernStatus, 503, "tools is the vocabulary this server serves: \(modernText)")
+
+        let (choiceStatus, choiceText) = try await post(
+            #""tools":[{"type":"function","function":{"name":"get_weather"}}],"tool_choice":"auto","function_call":"none""#
+        )
+        XCTAssertEqual(choiceStatus, 503, "tool_choice is the vocabulary this server serves: \(choiceText)")
+    }
+
+    /// The same refusal on the streaming route keeps that route's own contract: the
+    /// response is a 200 and the refusal travels as an SSE error frame, exactly as
+    /// `#80` pinned for a picture against a model with no tower.
+    func testUnsupportedResponseShapeIsAnSSEErrorOnTheStreamingRoute() async throws {
+        await ensureServerRunning()
+
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data("""
+        {"model":"any","stream":true,"response_format":{"type":"json_schema","json_schema":{"name":"x"}},
+         "messages":[{"role":"user","content":"hello"}]}
+        """.utf8)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        XCTAssertEqual(http.statusCode, 200, "a streaming refusal wears a 200 by contract")
+        let text = String(decoding: data, as: UTF8.self)
+        XCTAssertTrue(
+            text.contains("\"error\""),
+            "the refusal must arrive as an SSE error frame, got: \(text)"
+        )
+        XCTAssertTrue(text.contains("response_format"), "the frame must name the field")
+    }
+
+    // MARK: - The legacy text-completions route
+
+    /// `POST /v1/completions` exists and is the chat route's sibling, not a 404: with
+    /// no model loaded it answers `503` for the same reason `/v1/chat/completions`
+    /// does. Before this route existed the request log already classified the path as
+    /// OpenAI, so the vocabulary named a path the router did not serve.
+    func testTheCompletionsRouteExistsAndIsGatedOnALoadedModel() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the no-model gate cannot be isolated from generation")
+        }
+        await ensureServerRunning()
+
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data(#"{"model":"any","prompt":"The capital of France is","max_tokens":4}"#.utf8)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        XCTAssertEqual(
+            http.statusCode, 503,
+            "a route that exists answers 503 without a model, not 404"
+        )
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let error = try XCTUnwrap(body["error"] as? [String: Any], "the 503 must wear the OpenAI error envelope")
+        XCTAssertFalse((error["message"] as? String ?? "").isEmpty)
+    }
+
+    /// The legacy route refuses the fields it cannot honour by name, and refuses them
+    /// BEFORE the model gate: the proof is a 400 where the same body shape answers 503.
+    /// The sampler fields are no longer on this list: both routes resolve them into the
+    /// sampler, so they are asserted to reach the gate instead.
+    func testTheCompletionsRouteRefusesUnrunnableFieldsBeforeTheModelGate() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the pre-gate refusal cannot be isolated from generation")
+        }
+        await ensureServerRunning()
+
+        func post(_ field: String, stream: Bool = false) async throws -> (status: Int, text: String) {
+            let streaming = stream ? #","stream":true"# : ""
+            var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/completions")!)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = Data("""
+            {"model":"any","max_tokens":4,\(field)\(streaming),"prompt":"hello"}
+            """.utf8)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            return (try XCTUnwrap((response as? HTTPURLResponse)?.statusCode), String(decoding: data, as: UTF8.self))
+        }
+
+        for field in [
+            #""suffix":"tail""#,
+            #""n":2"#,
+            #""logprobs":1"#,
+            #""best_of":2"#,
+        ] {
+            let (status, text) = try await post(field)
+            XCTAssertEqual(status, 400, "\(field) must be refused, not ignored: \(text)")
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+            let error = try XCTUnwrap(body["error"] as? [String: Any])
+            XCTAssertEqual(error["type"] as? String, "invalid_request_error")
+            let message = try XCTUnwrap(error["message"] as? String)
+            let named = field.split(separator: "\"").first.map(String.init) ?? ""
+            XCTAssertTrue(message.contains(named), "the refusal must name \(named), got: \(message)")
+        }
+
+        // The sampler fields are honoured, so they must reach the MODEL gate (503)
+        // rather than the refusal (400): a value this server can apply is not a bad
+        // request, and the opposite answer would break a client that always sends it.
+        let (samplerStatus, samplerText) = try await post(
+            #""frequency_penalty":0.5,"logit_bias":{"50256":-100}"#
+        )
+        XCTAssertEqual(samplerStatus, 503, "a field the sampler honours is not a 400: \(samplerText)")
+
+        // A value outside the range OpenAI defines is still refused by name.
+        let (rangeStatus, rangeText) = try await post(#""logit_bias":{"50256":-500}"#)
+        XCTAssertEqual(rangeStatus, 400, "an out-of-range bias is a bad request: \(rangeText)")
+        XCTAssertTrue(rangeText.contains("logit_bias"), "the refusal must name logit_bias, got: \(rangeText)")
+
+        // A batch of prompts is a body shape rather than a field, so it gets its own
+        // request instead of a field spliced into the loop's fixed body.
+        var batch = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/completions")!)
+        batch.httpMethod = "POST"
+        batch.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        batch.httpBody = Data(#"{"model":"any","max_tokens":4,"prompt":["a","b"]}"#.utf8)
+        let (batchData, batchResponse) = try await URLSession.shared.data(for: batch)
+        XCTAssertEqual((batchResponse as? HTTPURLResponse)?.statusCode, 400, "one prompt per request")
+        XCTAssertTrue(String(decoding: batchData, as: UTF8.self).contains("2 prompts"))
+
+        // The streaming route keeps its own contract: a 200 whose refusal travels as an
+        // SSE error frame, exactly as `#80` pinned for a picture against a model with no
+        // tower.
+        let streamed = try await post(#""suffix":"tail""#, stream: true)
+        XCTAssertEqual(streamed.status, 200, "a streaming refusal wears a 200 by contract")
+        XCTAssertTrue(streamed.text.contains("\"error\""), "got: \(streamed.text)")
+        XCTAssertTrue(streamed.text.contains("suffix"), "the frame must name the field")
     }
 
     func testStreamingCompletionsWithoutModelEmitsSSEErrorThenDone() async throws {
@@ -188,6 +526,55 @@ final class ServerControllerSmokeTests: XCTestCase {
         )
     }
 
+    /// Anthropic's `output_config` and `mcp_servers` were dropped by the decoder, which
+    /// answered a request for JSON in prose and ran a turn without the tools the client
+    /// had just named. Both are refused by name now, and refused before the model gate:
+    /// the proof is a 400 where the same body without them answers 503.
+    func testTheAnthropicStructuredOutputFieldIsRefusedBeforeTheModelGate() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the pre-gate refusal cannot be isolated from generation")
+        }
+        await ensureServerRunning()
+
+        func post(_ fields: String) async throws -> (status: Int, text: String) {
+            let extra = fields.isEmpty ? "" : ",\(fields)"
+            var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/messages")!)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = Data("""
+            {"model":"any","max_tokens":64\(extra),"messages":[{"role":"user","content":"hello"}]}
+            """.utf8)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            return (
+                try XCTUnwrap((response as? HTTPURLResponse)?.statusCode),
+                String(decoding: data, as: UTF8.self)
+            )
+        }
+
+        let (structuredStatus, structuredText) = try await post(
+            #""output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}"#
+        )
+        XCTAssertEqual(structuredStatus, 400, "output_config must be refused, not ignored: \(structuredText)")
+        XCTAssertTrue(structuredText.contains("output_config"), "got: \(structuredText)")
+
+        let (serversStatus, serversText) = try await post(
+            #""mcp_servers":[{"type":"url","url":"https://example.invalid/mcp","name":"weather"}]"#
+        )
+        XCTAssertEqual(serversStatus, 400, "mcp_servers must be refused, not ignored: \(serversText)")
+        XCTAssertTrue(serversText.contains("mcp_servers"), "got: \(serversText)")
+        XCTAssertTrue(serversText.contains("weather"), "the refusal must name the server: \(serversText)")
+
+        // The fields that are decoded to be documented as ignored reach the model gate,
+        // rather than a new 400: neither changes what the model is told.
+        let (ignoredStatus, ignoredText) = try await post(
+            #""context_management":{"edits":[{"type":"clear_tool_uses_20250919"}]},"tool_choice":{"type":"auto","disable_parallel_tool_use":true}"#
+        )
+        XCTAssertEqual(ignoredStatus, 503, "context_management is housekeeping, not a refusal: \(ignoredText)")
+
+        let (plainStatus, plainText) = try await post("")
+        XCTAssertEqual(plainStatus, 503, "the same body without them is gated on the model: \(plainText)")
+    }
+
     func testMessagesWithoutMaxTokensReturns400() async throws {
         await ensureServerRunning()
 
@@ -206,6 +593,104 @@ final class ServerControllerSmokeTests: XCTestCase {
         let error = try XCTUnwrap(body["error"] as? [String: Any])
         XCTAssertEqual(error["type"] as? String, "invalid_request_error")
         XCTAssertFalse((error["message"] as? String ?? "").isEmpty)
+    }
+
+    // MARK: - Token counting
+
+    /// Anthropic's pre-flight, on the real server. The body carries no
+    /// `max_tokens` — the protocol's count_tokens body has no such field — so a
+    /// 503 from the model gate is also the proof that the route does not demand
+    /// one: a planner that still required it would answer 400 first.
+    func testCountTokensWithoutModelReturns503ErrorEnvelope() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the 503 path cannot be exercised")
+        }
+        await ensureServerRunning()
+
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/messages/count_tokens")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data("""
+        {"model":"any","messages":[{"role":"user","content":"hello"}]}
+        """.utf8)
+        let statsBefore = ServerController.stats.snapshot()
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        XCTAssertEqual(http.statusCode, 503, "with no model there is no prompt to render")
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(body["type"] as? String, "error", "the pre-flight answers the Anthropic envelope")
+        XCTAssertFalse(((body["error"] as? [String: Any])?["message"] as? String ?? "").isEmpty)
+        XCTAssertEqual(
+            ServerController.stats.snapshot().totalRequests,
+            statsBefore.totalRequests + 1,
+            "the pre-flight must be counted in the server stats like any other request"
+        )
+
+        let loggedRow = try await waitForLoggedRow { $0.path == "/v1/messages/count_tokens" }
+        let logged = try XCTUnwrap(loggedRow)
+        XCTAssertEqual(logged.method, "POST")
+        XCTAssertEqual(
+            logged.proto, .anthropic,
+            "the pre-flight shares the messages route's protocol, so a dashboard reads it as Anthropic"
+        )
+        XCTAssertEqual(logged.httpStatus, 503)
+        XCTAssertTrue(logged.isError)
+    }
+
+    func testCountTokensErrorResponsesAreAnthropicShaped() async throws {
+        await ensureServerRunning()
+
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/messages/count_tokens")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data(#"{"messages":"not an array"}"#.utf8)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        XCTAssertEqual(http.statusCode, 400, "an unparseable body must be rejected before the model gate")
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(body["type"] as? String, "error")
+        let error = try XCTUnwrap(body["error"] as? [String: Any])
+        XCTAssertEqual(error["type"] as? String, "invalid_request_error")
+        XCTAssertFalse((error["message"] as? String ?? "").isEmpty)
+    }
+
+    /// The pre-flight is a client request like any other, so it carries the same
+    /// credential either a bearer token or Anthropic's `x-api-key`.
+    func testCountTokensRequiresTheAPIKey() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the past-the-gate path cannot be exercised")
+        }
+        let defaults = UserDefaults.standard
+        let savedKey = defaults.object(forKey: ServerController.apiKeyKey)
+        defer {
+            if let savedKey {
+                defaults.set(savedKey, forKey: ServerController.apiKeyKey)
+            } else {
+                defaults.removeObject(forKey: ServerController.apiKeyKey)
+            }
+        }
+        defaults.set("secret-test-key", forKey: ServerController.apiKeyKey)
+        await ensureServerRunning()
+
+        var anonymous = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/messages/count_tokens")!)
+        anonymous.httpMethod = "POST"
+        anonymous.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        anonymous.httpBody = Data("""
+        {"model":"any","messages":[{"role":"user","content":"hello"}]}
+        """.utf8)
+        let (_, anonymousResponse) = try await URLSession.shared.data(for: anonymous)
+        XCTAssertEqual(
+            try XCTUnwrap(anonymousResponse as? HTTPURLResponse).statusCode, 401,
+            "a request with no credential must be refused"
+        )
+
+        var keyed = anonymous
+        keyed.setValue("secret-test-key", forHTTPHeaderField: "x-api-key")
+        let (_, keyedResponse) = try await URLSession.shared.data(for: keyed)
+        XCTAssertEqual(
+            try XCTUnwrap(keyedResponse as? HTTPURLResponse).statusCode, 503,
+            "x-api-key must be accepted, leaving the model gate as the only refusal"
+        )
     }
 
     func testCompletionsErrorResponsesAreOpenAIShaped() async throws {
@@ -295,6 +780,35 @@ final class ServerControllerSmokeTests: XCTestCase {
 
     // MARK: - Request logging
 
+    /// Issues a models-route GET with the given headers and returns the status and
+    /// the decoded body, which is all the shape assertions need.
+    private func getModels(
+        _ path: String,
+        headers: [String: String]
+    ) async throws -> (status: Int, body: [String: Any]) {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:8787\(path)")!)
+        for (field, value) in headers {
+            request.setValue(value, forHTTPHeaderField: field)
+        }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = try XCTUnwrap((response as? HTTPURLResponse)?.statusCode)
+        let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        return (status, body)
+    }
+
+    /// Issues a chat-completions POST with the given body and returns the status.
+    /// With no model loaded every arm answers 503, which is exactly enough to reach
+    /// the row the request logging writes.
+    private func postChat(_ body: [String: Any]) async throws -> Int {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        _ = data
+        return try XCTUnwrap((response as? HTTPURLResponse)?.statusCode)
+    }
+
     /// The logging pipeline appends on a background queue, so assertions poll
     /// briefly instead of sleeping a fixed interval.
     private func waitForLoggedRow(matching predicate: @escaping (ServerRequestLog) -> Bool) async throws -> ServerRequestLog? {
@@ -332,7 +846,7 @@ final class ServerControllerSmokeTests: XCTestCase {
         let row = try XCTUnwrap(logged)
         XCTAssertEqual(row.httpStatus, 200)
         XCTAssertEqual(row.method, "GET")
-        XCTAssertEqual(row.proto, .other)
+        XCTAssertEqual(row.proto, .openai, "a header-less models call is the OpenAI shape, and the row says so")
         XCTAssertFalse(row.isError)
         XCTAssertNil(row.requestBody, "GET rows carry no captured body")
         let after = await logStore.count()
@@ -430,6 +944,143 @@ final class ServerControllerSmokeTests: XCTestCase {
         XCTAssertNil(row.model, "the plan never resolved, so the row has no model")
         XCTAssertEqual(row.requestBody, ServerRequestLog.contentWithheldMarker, "body capture is off; the row must say withheld, not silence")
         XCTAssertNil(row.streamTermination)
+    }
+
+    /// `store: false` is a promise the client is entitled to have kept, and it is
+    /// honoured per request: with body capture ON, that request's row still carries
+    /// the withheld marker and the flag that says the client asked for it. The other
+    /// two arms are the control and the asymmetry — a client that says nothing or
+    /// allows retention gets captured bodies, and `store: true` cannot force capture
+    /// once the operator's switch is off, because retention here is the operator's
+    /// decision. Each arm carries its own `max_tokens` so the rows cannot be
+    /// confused: content is exactly what the withheld arms do not have to match on.
+    func testAClientRetentionRefusalWithholdsItsRowAndATrueCannotForceCapture() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the 503 path cannot be exercised")
+        }
+        await ensureServerRunning()
+        // `captureBodiesKey` is main-actor state, so it is read once here rather than
+        // from this nonisolated context at each use. `tearDown` restores the
+        // developer's saved value; this case needs the switch ON for its first two
+        // arms and OFF for the third.
+        let captureBodiesKey = await MainActor.run { ServerRequestLogRecorder.captureBodiesKey }
+        let defaults = UserDefaults.standard
+        defaults.set(true, forKey: captureBodiesKey)
+
+        func row(maxTokens: Int) async throws -> ServerRequestLog {
+            let logged = try await waitForLoggedRow {
+                $0.path == "/v1/chat/completions" && $0.maxTokens == maxTokens
+            }
+            return try XCTUnwrap(logged)
+        }
+
+        let refusedStatus = try await postChat([
+            "model": "any",
+            "store": false,
+            "max_tokens": 11,
+            "messages": [["role": "user", "content": "a prompt the client asked not to keep"]]
+        ])
+        XCTAssertEqual(refusedStatus, 503)
+        let refused = try await row(maxTokens: 11)
+        XCTAssertEqual(refused.retentionWithheldByClient, true, "the row must say who withheld it, so this never reads as the switch failing")
+        XCTAssertEqual(refused.requestBody, ServerRequestLog.contentWithheldMarker)
+        XCTAssertFalse(refused.hasCapturedContent, "no content field may survive a store: false")
+
+        let capturedStatus = try await postChat([
+            "model": "any",
+            "max_tokens": 22,
+            "messages": [["role": "user", "content": "kept because the client allowed it"]]
+        ])
+        XCTAssertEqual(capturedStatus, 503)
+        let captured = try await row(maxTokens: 22)
+        XCTAssertNil(captured.retentionWithheldByClient, "no retention promise was sent, and nil is not the same claim as store: true")
+        let capturedBody = try XCTUnwrap(captured.requestBody)
+        XCTAssertTrue(
+            capturedBody.contains("kept because the client allowed it"),
+            "the control arm proves capture is on, so the refused arm was proving the flag"
+        )
+        XCTAssertFalse(
+            capturedBody.contains("\"store\""),
+            "a request that sent no retention promise records none, which is what keeps absent distinguishable from store: true"
+        )
+
+        defaults.set(false, forKey: captureBodiesKey)
+        let allowingStatus = try await postChat([
+            "model": "any",
+            "store": true,
+            "max_tokens": 33,
+            "messages": [["role": "user", "content": "the client allowed retention but the switch is off"]]
+        ])
+        XCTAssertEqual(allowingStatus, 503)
+        let stillWithheld = try await row(maxTokens: 33)
+        XCTAssertNil(stillWithheld.retentionWithheldByClient, "the operator withheld this one, not the client, so no client refusal is recorded")
+        XCTAssertEqual(
+            stillWithheld.requestBody, ServerRequestLog.contentWithheldMarker,
+            "store: true cannot force capture: the operator's switch is the stronger authority on their own Mac"
+        )
+    }
+
+    /// The client's own labels are the one thing a fully withheld row can still say, so
+    /// they survive the Store Request Content switch rather than riding on it: a request
+    /// carrying `metadata` records it with the switch OFF (where its body reads
+    /// "withheld") and with the switch ON, and the third arm is the control that proves
+    /// the field rather than the switch is what puts them there. The pair limit is a
+    /// recording bound, applied on the way in, so a client over OpenAI's own limit still
+    /// gets its answer.
+    func testAClientsLabelsSurviveAWithheldRow() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the 503 path cannot be exercised")
+        }
+        await ensureServerRunning()
+        let captureBodiesKey = await MainActor.run { ServerRequestLogRecorder.captureBodiesKey }
+        let defaults = UserDefaults.standard
+
+        func row(maxTokens: Int) async throws -> ServerRequestLog {
+            let logged = try await waitForLoggedRow {
+                $0.path == "/v1/chat/completions" && $0.maxTokens == maxTokens
+            }
+            return try XCTUnwrap(logged)
+        }
+
+        defaults.set(false, forKey: captureBodiesKey)
+        let withheldStatus = try await postChat([
+            "model": "any",
+            "max_tokens": 44,
+            "metadata": ["ticket": "ABC-123", "team": "infra"],
+            "messages": [["role": "user", "content": "which request was this"]]
+        ])
+        XCTAssertEqual(withheldStatus, 503)
+        let withheld = try await row(maxTokens: 44)
+        XCTAssertEqual(withheld.requestBody, ServerRequestLog.contentWithheldMarker, "the switch is off, so the bodies are withheld")
+        XCTAssertEqual(
+            withheld.clientMetadata, ["ticket": "ABC-123", "team": "infra"],
+            "the labels are metadata rather than content, so a withheld row still says which request the caller meant"
+        )
+
+        // Control: the same switch state, no labels sent, nothing recorded.
+        let controlStatus = try await postChat([
+            "model": "any",
+            "max_tokens": 55,
+            "messages": [["role": "user", "content": "no labels sent"]]
+        ])
+        XCTAssertEqual(controlStatus, 503)
+        let control = try await row(maxTokens: 55)
+        XCTAssertNil(control.clientMetadata, "no labels sent records none")
+
+        // Over the pair limit the answer is unaffected and the recorded copy is bounded.
+        defaults.set(true, forKey: captureBodiesKey)
+        var many: [String: String] = [:]
+        for index in 0..<20 { many["key\(String(format: "%02d", index))"] = "v\(index)" }
+        let manyStatus = try await postChat([
+            "model": "any",
+            "max_tokens": 66,
+            "metadata": many,
+            "messages": [["role": "user", "content": "too many labels"]]
+        ])
+        XCTAssertEqual(manyStatus, 503, "an over-long metadata map is recorded in part, never refused")
+        let bounded = try await row(maxTokens: 66)
+        XCTAssertEqual(bounded.clientMetadata?.count, ServerRequestLog.maxClientMetadataPairs)
+        XCTAssertNil(bounded.clientMetadata?["key19"], "the sorted-key cut is what drops the last four")
     }
 
     // MARK: - Lifecycle transitions

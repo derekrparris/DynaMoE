@@ -403,10 +403,13 @@ final class DeepSeekV41ConfigTests: XCTestCase {
         XCTAssertEqual(qwen.resolveArchitectureType(summary: nil), .hybridSsmMoe)
     }
 
-    /// Until the turn loop exists, the family is detected (so the load refuses
-    /// clearly) but discovery must not advertise graded effort.
-    func testGradedEffortIsNotAdvertisedWhileTheRuntimeIsUnavailable() throws {
-        XCTAssertFalse(DeepSeekV41Availability.isRuntimeAvailable)
+    /// The family is advertised as available for text turns, and the graded
+    /// effort control that gates on that availability reaches the prompt. Vision
+    /// is deliberately outside the promise: local models report
+    /// `supportsVision == false`, so the composer refuses an attachment rather
+    /// than sending pixels a turn would drop.
+    func testTheRuntimeAdvertisesTextTurnsAndTheirEffortLevels() throws {
+        XCTAssertTrue(DeepSeekV41Availability.isRuntimeAvailable)
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("dsv41-effort-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -414,7 +417,16 @@ final class DeepSeekV41ConfigTests: XCTestCase {
         try Self.wrapperJSON.write(
             to: dir.appendingPathComponent("config.json"), atomically: true, encoding: .utf8
         )
-        XCTAssertFalse(ModelConfig.supportsThinkingLevels(modelPath: dir.path))
+        XCTAssertTrue(ModelConfig.supportsThinkingLevels(modelPath: dir.path))
+
+        // Level detection still has to be a gate: a directory that is neither
+        // DeepSeek V4.1 nor a Spark template keeps the plain on/off menu.
+        let other = dir.appendingPathComponent("other")
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        try #"{"model_type":"llama"}"#.write(
+            to: other.appendingPathComponent("config.json"), atomically: true, encoding: .utf8
+        )
+        XCTAssertFalse(ModelConfig.supportsThinkingLevels(modelPath: other.path))
     }
 }
 
@@ -969,7 +981,7 @@ final class DeepSeekV41WeightCatalogTests: XCTestCase {
 /// update would otherwise be invisible: the load log is the only place it shows.
 final class DeepSeekV41ConformanceGateTests: XCTestCase {
 
-    func testOnlyTheRulesWithReferenceVectorsAreVerified() {
+    func testEveryConformanceGateIsVerified() {
         // Checked-in vectors, from `Tools/dsv41_goldens.py` and its test suites:
         // Engram indexing, the Engram combination, the compressor's pooling and
         // accumulation, the cache rows a prefill chunk reads, the hyper-connection
@@ -983,24 +995,17 @@ final class DeepSeekV41ConformanceGateTests: XCTestCase {
         XCTAssertEqual(DeepSeekV41Conformance.hyperConnections, .verifiedAgainstReference)
         XCTAssertEqual(DeepSeekV41Conformance.routerScoring, .verifiedAgainstReference)
         XCTAssertEqual(DeepSeekV41Conformance.visionPatching, .verifiedAgainstReference)
-        // Still open: `candidateSelection` needs live cache state, and the batched
-        // device prefill's addressing rule is verified while the multi-position
-        // device graph that would consume it cannot be compared against a walk
-        // without real weights.
-        XCTAssertEqual(DeepSeekV41Conformance.candidateSelection, .unverified)
+        // The compressed-row selection is the indexer's own top-k, matched against
+        // `Indexer.forward`. The batched device graph's addressing rule is verified
+        // against the reference and its positions are now compared with the walk on
+        // the published checkpoint, which is the last gate that was open.
+        XCTAssertEqual(DeepSeekV41Conformance.candidateSelection, .verifiedAgainstReference)
         XCTAssertEqual(DeepSeekV41Conformance.dsparkDrafting, .verifiedAgainstReference)
-        XCTAssertEqual(DeepSeekV41Conformance.batchedDevicePrefill, .unverified)
-        XCTAssertEqual(DeepSeekV41Conformance.unverifiedSummary.count, 2)
-        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("Engram hashing"))
-        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("Engram combination"))
-        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("compressor pooling"))
-        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("compressor accumulation"))
-        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("chunk addressing"))
-        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("hyper-connections"))
-        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("router scoring"))
-        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("vision patching"))
-        XCTAssertTrue(DeepSeekV41Conformance.unverifiedSummary.contains("batched device prefill"))
-        XCTAssertFalse(DeepSeekV41Conformance.unverifiedSummary.contains("DSpark drafting"))
+        XCTAssertEqual(DeepSeekV41Conformance.batchedDevicePrefill, .verifiedAgainstReference)
+        XCTAssertEqual(DeepSeekV41Conformance.unverifiedSummary, [])
+        for (name, gate) in DeepSeekV41Conformance.all {
+            XCTAssertEqual(gate, .verifiedAgainstReference, name)
+        }
     }
 }
 
@@ -1118,13 +1123,15 @@ final class DeepSeekV41MemoryPlanTests: XCTestCase {
         // which is the FP4 design width by default here.
         XCTAssertEqual(memory.windowRingBytes, 40 * 128 * config.fp4CacheRecordBytes)
         // Main caches (576 MB) plus one index key per compressed row (two
-        // owners x 128 FP16 values per row) stays well under 2 GB, which is
-        // what makes a 1M-token context affordable on this machine.
-        // Index keys are per COMPRESSED row, so the ratio-2 owner stores half
-        // as many as the ratio-1 owner.
+        // owners x 128 FP32 values per row) stays under 2 GB, which is what
+        // makes a 1M-token context affordable on this machine. Index keys are
+        // per COMPRESSED row, so the ratio-2 owner stores half as many as the
+        // ratio-1 owner. The width is FP32 because the copy kernel writes them
+        // and the score kernel reads them as floats: pricing them at two bytes
+        // undercounted the cache by half while every access used four.
         XCTAssertEqual(
             memory.indexerBytes,
-            (1_048_576 / 2 + 1) * 128 * 2 + (1_048_576 + 1) * 128 * 2
+            (1_048_576 / 2 + 1) * 128 * 4 + (1_048_576 + 1) * 128 * 4
         )
         XCTAssertLessThan(memory.cacheBytes, 2 * 1_073_741_824, "caches must fit in 2 GB")
     }
@@ -1883,6 +1890,108 @@ final class DeepSeekV41CompressorGroupTests: XCTestCase {
                 owner: 1, slot: 1, groupWidth: 2, width: 4
             )
         )
+    }
+}
+
+// MARK: - Indexer key layout
+
+/// The indexer's key cache is allocated in one file, written by one kernel and read
+/// by another, and all three have to agree on one number: the byte stride of a
+/// single key. They did not. The geometry priced a key at two bytes while
+/// `dsv41_copy_f32` wrote four and `dsv41_indexer_scores_f32` read four, so every
+/// write overran its own slot into the next row's and the last one ran past the end
+/// of the cache, while the score kernel read the misaligned bytes back as floats.
+///
+/// Nothing caught it because both halves are individually self-consistent: the
+/// memory plan agreed with the geometry (both priced two bytes) and the two kernels
+/// agreed with each other (both addressed four). A synthetic checkpoint could not
+/// see it either, because it never fills enough rows for the aliasing to reach
+/// unwritten memory. The real checkpoint did: at 576 rows the score vector came back
+/// with 287 exact zeros at every layer (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #29").
+final class DeepSeekV41IndexerKeyLayoutTests: XCTestCase {
+
+    private let contextLength = 576
+
+    private func fixture() throws -> (
+        config: DeepSeekV41Config,
+        plan: [DeepSeekV41LayerPlan],
+        geometry: DeepSeekV41CacheGeometry,
+        layout: DeepSeekV41CacheLayout
+    ) {
+        let config = try DeepSeekV41Config.decode(
+            jsonData: Data(DeepSeekV41ConfigTests.wrapperJSON.utf8)
+        )
+        let plan = try config.makeLayerPlan()
+        let geometry = DeepSeekV41CacheGeometry.make(
+            config: config, plan: plan, contextLength: contextLength
+        )
+        return (config, plan, geometry, DeepSeekV41CacheLayout(geometry: geometry, plan: plan))
+    }
+
+    /// The stride one key occupies is the width both kernels address it at. If this
+    /// is ever priced per element rather than per traffic, rows overlap.
+    func testAKeyOccupiesTheWidthTheScoreKernelReads() throws {
+        let (config, _, geometry, layout) = try fixture()
+        XCTAssertEqual(
+            geometry.indexerKeyBytes,
+            config.indexHeadDim * MemoryLayout<Float>.stride,
+            "one index key is index_head_dim floats, and both kernels address it at 4 bytes each"
+        )
+        let owner = try XCTUnwrap(
+            layout.indexerRowsByOwner.keys.sorted().first,
+            "no layer owns index keys"
+        )
+        let first = try XCTUnwrap(
+            DeepSeekV41CacheAddressing.indexerByteOffset(layer: owner, row: 0, layout: layout)
+        )
+        let second = try XCTUnwrap(
+            DeepSeekV41CacheAddressing.indexerByteOffset(layer: owner, row: 1, layout: layout)
+        )
+        XCTAssertEqual(
+            second - first, config.indexHeadDim * MemoryLayout<Float>.stride,
+            "consecutive index keys overlap"
+        )
+    }
+
+    /// The last key an owner can write ends exactly at the end of its own region, so
+    /// the final `dsv41_copy_f32` neither spills into the next owner nor past the
+    /// buffer.
+    func testTheLastKeyEndsWhereItsOwnersRegionEnds() throws {
+        let (config, _, geometry, layout) = try fixture()
+        for (owner, rows) in layout.indexerRowsByOwner {
+            let base = try XCTUnwrap(layout.indexerBase[owner])
+            let last = try XCTUnwrap(
+                DeepSeekV41CacheAddressing.indexerByteOffset(
+                    layer: owner, row: rows - 1, layout: layout
+                )
+            )
+            XCTAssertEqual(
+                last + config.indexHeadDim * MemoryLayout<Float>.stride,
+                base + rows * geometry.indexerKeyBytes,
+                "owner \(owner)'s last key does not end at its region boundary"
+            )
+            XCTAssertNil(
+                DeepSeekV41CacheAddressing.indexerByteOffset(layer: owner, row: rows, layout: layout),
+                "owner \(owner) addresses a row past its region"
+            )
+        }
+    }
+
+    /// The memory plan's price and the layout's allocation are the same cache. They
+    /// are computed in different files from the same config, which is exactly how
+    /// they drifted, so they are compared rather than each being checked against its
+    /// own arithmetic.
+    func testTheMemoryPlanPricesTheCacheTheLayoutAllocates() throws {
+        let (config, plan, _, layout) = try fixture()
+        let memory = DeepSeekV41MemoryPlan.make(
+            config: config, plan: plan, catalog: nil, contextLength: contextLength
+        )
+        XCTAssertEqual(
+            memory.indexerBytes, layout.indexerBytes,
+            "the load log prices \(memory.indexerBytes) bytes of index keys for a "
+                + "\(layout.indexerBytes)-byte allocation"
+        )
+        XCTAssertGreaterThan(memory.indexerBytes, 0)
     }
 }
 
@@ -2679,5 +2788,274 @@ final class DeepSeekV41PublishedConfigTests: XCTestCase {
             let warnings = config.warnings(layerPlan: plan)
             XCTAssertTrue(warnings.isEmpty, "unexpected warnings: \(warnings)")
         }
+    }
+}
+
+// MARK: - Dense pin
+
+/// The dense pin moves a tensor's bytes into a resident buffer and repoints it,
+/// so the packing has to be exact: a range that crosses a chunk, an offset that
+/// forgets a segment's start, or a slot that is not aligned all read the wrong
+/// weight row and produce plausible text.
+final class DeepSeekV41DensePinPlanTests: XCTestCase {
+
+    private func summary(
+        shards: [ShardMetadata],
+        tensors: [(name: String, shardIndex: UInt32, start: UInt64, end: UInt64)]
+    ) -> ModelSummary {
+        ModelSummary(
+            sizeGb: 1,
+            tensorCount: UInt32(tensors.count),
+            layerCount: 1,
+            maxExpertId: 0,
+            shards: shards,
+            tensors: tensors.map { tensor in
+                TensorMetadata(
+                    name: tensor.name,
+                    shapeDisplay: "[2, 2]",
+                    dtype: "F8_E4M3",
+                    sizeMb: 0.001,
+                    shardIndex: tensor.shardIndex,
+                    offsetStart: tensor.start,
+                    offsetEnd: tensor.end,
+                    category: "attn",
+                    layerIndex: 0,
+                    expertId: nil
+                )
+            },
+            layers: []
+        )
+    }
+
+    private func candidate(
+        _ name: String,
+        shard: UInt32 = 0,
+        offset: Int,
+        length: Int
+    ) -> DeepSeekV41DensePinCandidate {
+        DeepSeekV41DensePinCandidate(
+            name: name, shardIndex: shard, byteOffset: offset, byteLength: length
+        )
+    }
+
+    func testPacksEveryTensorAndAlignsEachSlot() {
+        let summary = summary(
+            shards: [
+                ShardMetadata(index: 0, filename: "a.safetensors", baseAddress: 0, length: 1 << 20)
+            ],
+            tensors: [
+                ("layers.0.attn.wq_a.weight", 0, 0, 3),
+                ("layers.0.attn.wq_b.weight", 0, 8, 5)
+            ]
+        )
+        let plan = DeepSeekV41DensePinPlan.make(
+            summary: summary,
+            candidates: [
+                candidate("layers.0.attn.wq_a.weight", offset: 0, length: 3),
+                candidate("layers.0.attn.wq_b.weight", offset: 8, length: 5)
+            ],
+            budgetBytes: 1 << 20,
+            alignment: 4096
+        )
+        XCTAssertEqual(plan.ranges.count, 2)
+        XCTAssertEqual(plan.skipped, [])
+        XCTAssertEqual(plan.chunkLengths, [4096 + 5])
+        let first = plan.ranges[0]
+        let second = plan.ranges[1]
+        XCTAssertEqual(first.chunkOffset, 0)
+        XCTAssertEqual(second.chunkOffset, 4096)
+        XCTAssertEqual(first.fileOffset, 0)
+        XCTAssertEqual(second.fileOffset, 8)
+        XCTAssertEqual(plan.totalBytes, 8)
+    }
+
+    /// A segmented shard's `filename` carries a `#n` suffix and its base address
+    /// is the file's plus the segment's start, so the read has to add that start
+    /// back or every pinned tensor is read from the wrong place.
+    func testASegmentedShardIsAddressedByItsFileOffset() throws {
+        let summary = summary(
+            shards: [
+                ShardMetadata(
+                    index: 0, filename: "a.safetensors", baseAddress: 0x1000_0000,
+                    length: 1 << 20
+                ),
+                ShardMetadata(
+                    index: 1, filename: "a.safetensors#0", baseAddress: 0x1000_0000 + 65_536,
+                    length: 1 << 16
+                )
+            ],
+            tensors: [("layers.0.attn.wq_b.weight", 1, 0, 8)]
+        )
+        let plan = DeepSeekV41DensePinPlan.make(
+            summary: summary,
+            candidates: [candidate("layers.0.attn.wq_b.weight", shard: 1, offset: 0, length: 8)],
+            budgetBytes: 1 << 20
+        )
+        let range = try XCTUnwrap(plan.ranges.first)
+        XCTAssertEqual(range.filename, "a.safetensors")
+        XCTAssertEqual(range.fileOffset, 65_536)
+    }
+
+    func testNoTensorStraddlesAChunkBoundary() {
+        let summary = summary(
+            shards: [
+                ShardMetadata(index: 0, filename: "a.safetensors", baseAddress: 0, length: 1 << 20)
+            ],
+            tensors: [
+                ("layers.0.attn.wq_a.weight", 0, 0, 4096),
+                ("layers.0.attn.wq_b.weight", 0, 4096, 12_288)
+            ]
+        )
+        let plan = DeepSeekV41DensePinPlan.make(
+            summary: summary,
+            candidates: [
+                candidate("layers.0.attn.wq_a.weight", offset: 0, length: 4096),
+                candidate("layers.0.attn.wq_b.weight", offset: 4096, length: 8192)
+            ],
+            budgetBytes: 1 << 20,
+            alignment: 4096,
+            chunkLimit: 8192
+        )
+        XCTAssertEqual(plan.chunkLengths, [4096, 8192])
+        XCTAssertEqual(plan.ranges.map(\.chunk), [0, 1])
+        XCTAssertEqual(plan.ranges.map(\.chunkOffset), [0, 0])
+        XCTAssertNotEqual(
+            plan.pinnedShardIndex(chunk: plan.ranges[0].chunk),
+            plan.pinnedShardIndex(chunk: plan.ranges[1].chunk)
+        )
+    }
+
+    func testTheBudgetStopsThePlanAndNamesWhatWasLeft() {
+        let summary = summary(
+            shards: [
+                ShardMetadata(index: 0, filename: "a.safetensors", baseAddress: 0, length: 1 << 20)
+            ],
+            tensors: [
+                ("layers.0.attn.wq_a.weight", 0, 0, 4096),
+                ("layers.0.attn.wq_b.weight", 0, 4096, 8192)
+            ]
+        )
+        let plan = DeepSeekV41DensePinPlan.make(
+            summary: summary,
+            candidates: [
+                candidate("layers.0.attn.wq_a.weight", offset: 0, length: 4096),
+                candidate("layers.0.attn.wq_b.weight", offset: 4096, length: 4096)
+            ],
+            budgetBytes: 4096
+        )
+        XCTAssertEqual(plan.ranges.count, 1)
+        XCTAssertEqual(plan.ranges.first?.tensorName, "layers.0.attn.wq_a.weight")
+        XCTAssertEqual(plan.skipped.count, 1)
+        XCTAssertTrue(plan.skipped[0].contains("layers.0.attn.wq_b.weight"))
+        XCTAssertTrue(plan.skipped[0].contains("budget"))
+    }
+
+    /// The head is read in full once per token and is the largest single tensor
+    /// the graph touches, so a budget that cannot cover the backbone spends
+    /// itself there first.
+    func testTheOutputHeadIsPinnedFirst() {
+        let summary = summary(
+            shards: [
+                ShardMetadata(index: 0, filename: "a.safetensors", baseAddress: 0, length: 1 << 20)
+            ],
+            tensors: [
+                ("layers.0.attn.wq_b.weight", 0, 0, 4096),
+                ("head.weight", 0, 4096, 8192)
+            ]
+        )
+        let plan = DeepSeekV41DensePinPlan.make(
+            summary: summary,
+            candidates: [
+                candidate("layers.0.attn.wq_b.weight", offset: 0, length: 4096),
+                candidate("head.weight", offset: 4096, length: 4096)
+            ],
+            budgetBytes: 4096
+        )
+        XCTAssertEqual(plan.ranges.map(\.tensorName), ["head.weight"])
+    }
+
+    func testATensorPastTheBufferLimitIsSkipped() {
+        let summary = summary(
+            shards: [
+                ShardMetadata(index: 0, filename: "a.safetensors", baseAddress: 0, length: 1 << 20)
+            ],
+            tensors: [("layers.0.attn.wq_b.weight", 0, 0, 8192)]
+        )
+        let plan = DeepSeekV41DensePinPlan.make(
+            summary: summary,
+            candidates: [candidate("layers.0.attn.wq_b.weight", offset: 0, length: 8192)],
+            budgetBytes: 1 << 20,
+            alignment: 4096,
+            chunkLimit: 4096
+        )
+        XCTAssertTrue(plan.isEmpty)
+        XCTAssertEqual(plan.skipped.count, 1)
+        XCTAssertTrue(plan.skipped[0].contains("past what a single buffer"))
+    }
+
+    /// The output head is 1.3 GB, past a packing chunk, and it is the one tensor
+    /// every token reads in full. It gets a buffer of its own rather than being
+    /// refused for being wide.
+    func testATensorWiderThanAChunkGetsItsOwnBuffer() {
+        let summary = summary(
+            shards: [
+                ShardMetadata(index: 0, filename: "a.safetensors", baseAddress: 0, length: 1 << 20)
+            ],
+            tensors: [
+                ("layers.0.attn.wq_a.weight", 0, 0, 4096),
+                ("head.weight", 0, 4096, 16_384),
+                ("layers.0.attn.wq_b.weight", 0, 16_384, 20_480)
+            ]
+        )
+        let plan = DeepSeekV41DensePinPlan.make(
+            summary: summary,
+            candidates: [
+                candidate("layers.0.attn.wq_a.weight", offset: 0, length: 4096),
+                candidate("head.weight", offset: 4096, length: 12_288),
+                candidate("layers.0.attn.wq_b.weight", offset: 16_384, length: 4096)
+            ],
+            budgetBytes: 1 << 20,
+            alignment: 4096,
+            chunkLimit: 8192,
+            bufferLimit: 1 << 20
+        )
+        XCTAssertTrue(plan.skipped.isEmpty, "\(plan.skipped)")
+        // Head first, so its dedicated buffer is chunk 0, then the two small
+        // tensors pack into one chunk after it.
+        XCTAssertEqual(plan.ranges.map(\.tensorName), [
+            "head.weight", "layers.0.attn.wq_a.weight", "layers.0.attn.wq_b.weight"
+        ])
+        XCTAssertEqual(plan.ranges.map(\.chunk), [0, 1, 1])
+        XCTAssertEqual(plan.ranges.map(\.chunkOffset), [0, 0, 4096])
+        XCTAssertEqual(plan.chunkLengths, [12_288, 8192])
+    }
+
+    /// A tensor has to fit the segment it claims to live in; reading past it would
+    /// take the next shard's bytes.
+    func testATensorPastItsSegmentIsSkipped() {
+        let summary = summary(
+            shards: [
+                ShardMetadata(index: 0, filename: "a.safetensors", baseAddress: 0, length: 4096)
+            ],
+            tensors: [("layers.0.attn.wq_b.weight", 0, 0, 8192)]
+        )
+        let plan = DeepSeekV41DensePinPlan.make(
+            summary: summary,
+            candidates: [candidate("layers.0.attn.wq_b.weight", offset: 0, length: 8192)],
+            budgetBytes: 1 << 20
+        )
+        XCTAssertTrue(plan.isEmpty)
+        XCTAssertTrue(plan.skipped.first?.contains("past") ?? false)
+    }
+
+    func testPinnedShardIndicesSitFarAboveEveryRealOne() {
+        XCTAssertGreaterThan(DeepSeekV41DensePinPlan.pinnedShardBase, 1 << 20)
+        let plan = DeepSeekV41DensePinPlan(
+            ranges: [], chunkLengths: [16, 16], skipped: []
+        )
+        XCTAssertEqual(plan.pinnedShardIndex(chunk: 0), DeepSeekV41DensePinPlan.pinnedShardBase)
+        XCTAssertEqual(
+            plan.pinnedShardIndex(chunk: 1), DeepSeekV41DensePinPlan.pinnedShardBase + 1
+        )
     }
 }

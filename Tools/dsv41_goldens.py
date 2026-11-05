@@ -42,12 +42,29 @@ the chunk branch of `Compressor.forward` against its decode branch), `hc`
 the collapse it feeds), `router` (Gate.forward, under both per-logit scorings),
 `dspark` (`DSparkBlock`'s
 `forward_embed` seed plus its `forward_head` chain: the Markov bias, the
-per-step draw, and the confidence ordering), and `vision` (`ViT.forward` +
+per-step draw, and the confidence ordering), `vision` (`ViT.forward` +
 `Aligner.forward` over a given patch grid, plus the spelling and id of the token
-that addresses an image span).
+that addresses an image span), `indexer` (`Indexer.forward` and
+`select_candidate_blocks` at a config that exercises both cuts), and
+`indexer_real` (the same module at the PUBLISHED geometry on the checkpoint's own
+indexer tensors and a device prefill's activations -- the one case that reads
+weights, and the only one that needs `--inputs`).
 
-One gate deliberately has no case yet: `candidateSelection` needs live cache
-state.
+`indexer_real` is the only case that is not self-contained: `Indexer.forward` needs
+`x`, `qr` and one pooled latent per compressed row, the 475 GB model cannot be run
+here to produce them, and scoring a live run would measure run-to-run drift instead
+of the rule. So the activations are dumped by
+`DynaMoETests/DeepSeekV41PublishedTurnTests`
+`testWhatTheIndexerWasGivenOnThePublishedCheckpoint`, and the comparison is offline
+against that dump. It also reports the reference's FP4 activation quantization
+(emulated in torch, since `fp4_act_quant` is a tilelang kernel) as a second arm,
+which is what makes the port skipping that quantization a measured deviation rather
+than an assumption. That arm used to move 3 rows of 512 on one dump and 5 on another,
+which read as "the rows sit on the cut"; it was the forward's nondeterminism, and
+since the reduction race was fixed two dumps are byte-identical and both move the
+same 3 (163 / 436 / 491 in for 289 / 305 / 464 out, layer 20 position 575). The
+reference's rule-arm scores are checked into `DeepSeekV41GoldensTests` so the suite
+re-checks them without torch.
 
 `hc` is the one case that transcribes a reference rule rather than executing it.
 `Block.hc_mixes`, `hc_pre` and `hc_post` run as the reference wrote them, against a
@@ -92,6 +109,7 @@ import glob
 import json
 import os
 import re
+import struct
 import sys
 import types
 
@@ -622,6 +640,146 @@ def _act_quant_identity():
         return x
 
     return quantize
+
+
+# The values E2M1 can hold. Four bits: one sign, two exponent, one mantissa, with
+# the largest exponent reserved for inf/nan, which is why 6 is the top magnitude.
+_FP4_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _fp4_round(torch, values):
+    """Round to the nearest E2M1 magnitude, ties to even.
+
+    `torch.float4_e2m1fn_x2` exists but has no arithmetic and no CPU cast, so the
+    rounding is explicit. Ties go to the even index rather than away from zero
+    because that is what a hardware round-to-nearest-even does; the distances are
+    exact in binary, so `d_low == d_up` is a real test rather than a tolerance.
+    """
+    magnitudes = torch.tensor(_FP4_VALUES, dtype=torch.float32)
+    sign = torch.sign(values)
+    magnitude = values.abs().clamp(max=_FP4_VALUES[-1])
+    lower = torch.searchsorted(magnitudes, magnitude, right=True).clamp(
+        min=0, max=len(_FP4_VALUES) - 1
+    )
+    lower = (lower - 1).clamp(min=0)
+    upper = (lower + 1).clamp(max=len(_FP4_VALUES) - 1)
+    down = magnitudes[lower]
+    up = magnitudes[upper]
+    distance_down = (magnitude - down).abs()
+    distance_up = (up - magnitude).abs()
+    take_upper = distance_up < distance_down
+    tie = distance_up == distance_down
+    take_upper = take_upper | (tie & (upper % 2 == 0))
+    return torch.where(take_upper, up, down) * sign
+
+
+def _fp4_quantizer(torch):
+    """`kernel.py`'s `fp4_act_quant` in torch: E2M1 with one E8M0 scale per block.
+
+    `fp4_quant_kernel` takes the block's `amax`, raises it to a power of two via
+    `2 ** ceil(log2(amax / 6))`, and then quantizes `x / scale` in place. Nothing
+    about that needs the fused kernel: the scale is a power of two, so the division
+    is exact, and the only lossy step is the E2M1 round.
+    """
+
+    def quantize(x, block_size=32, inplace=False, scale_dtype=None):
+        width = x.size(-1)
+        grouped = x.float().reshape(*x.shape[:-1], width // block_size, block_size)
+        amax = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=6 * 2.0**-126)
+        scale = torch.pow(torch.tensor(2.0), torch.ceil(torch.log2(amax / 6.0)))
+        rebuilt = (_fp4_round(torch, grouped / scale) * scale).reshape(x.shape)
+        if inplace:
+            x.copy_(rebuilt.to(x.dtype))
+            return x
+        return rebuilt.to(x.dtype)
+
+    return quantize
+
+
+def _published_config(snapshot: str) -> dict:
+    """The checkpoint's flat `inference/config.json`, which is the published shape."""
+    path = os.path.join(snapshot, "inference", "config.json")
+    if not os.path.isfile(path):
+        raise SystemExit(f"no inference/config.json in {snapshot}")
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _shard_index(snapshot: str) -> dict:
+    path = os.path.join(snapshot, "model.safetensors.index.json")
+    if not os.path.isfile(path):
+        raise SystemExit(f"no model.safetensors.index.json in {snapshot}")
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)["weight_map"]
+
+
+def _raw_tensor(snapshot: str, index: dict, name: str) -> tuple[str, list, bytes]:
+    """One tensor's dtype, shape and bytes, straight out of its shard."""
+    if name not in index:
+        raise SystemExit(f"the checkpoint publishes no {name}")
+    path = os.path.join(snapshot, index[name])
+    with open(path, "rb") as handle:
+        length = struct.unpack("<Q", handle.read(8))[0]
+        header = json.loads(handle.read(length))
+        entry = header[name]
+        start, end = entry["data_offsets"]
+        handle.seek(8 + length + start)
+        raw = handle.read(end - start)
+    return entry["dtype"], list(entry["shape"]), raw
+
+
+def _dequantize(torch, dtype: str, shape: list, raw: bytes):
+    if dtype == "BF16":
+        values = torch.frombuffer(bytearray(raw), dtype=torch.bfloat16).float()
+    elif dtype == "F8_E4M3":
+        values = (
+            torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+            .view(torch.float8_e4m3fn)
+            .float()
+        )
+    elif dtype == "F8_E8M0":
+        values = (
+            torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+            .view(torch.float8_e8m0fnu)
+            .float()
+        )
+    else:
+        raise SystemExit(f"unhandled tensor dtype {dtype}")
+    return values.reshape(shape)
+
+
+def _fp8_block_weight(torch, weight, scale, block: int = 32):
+    """`fp8_gemm`'s dequantization: one E8M0 scale per `block` x `block` tile."""
+    rows, columns = weight.shape
+    expanded = scale.repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)
+    return weight * expanded[:rows, :columns]
+
+
+def _indexer_scores(torch, reference, module, x, qr, keys, start_pos):
+    """`index_score` as `Indexer.forward` builds it, for one chunk at `start_pos`.
+
+    The module publishes only `topk_idxs`, so the matrix behind those rows is
+    recomputed from the module's own submodules -- the same replay `indexer` uses.
+    """
+    seqlen = x.size(1)
+    end_pos = start_pos + seqlen
+    q = module.wq_b(qr).unflatten(-1, (module.n_heads, module.index_head_dim))
+    reference.apply_rotary_emb(
+        q[..., -module.rope_head_dim :], module.freqs_cis[start_pos:end_pos]
+    )
+    weights = module.weights_proj(x) * (module.softmax_scale * module.n_heads**-0.5)
+    scores = torch.einsum("bshd,btd->bsht", q, keys)
+    scores = (scores.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+    if start_pos == 0:
+        compress_lens = (
+            torch.arange(1, seqlen + 1, device=scores.device) // module.compress_ratio
+        ).unsqueeze(-1)
+        scores.masked_fill_(
+            torch.arange(keys.size(1), device=scores.device) >= compress_lens, -torch.inf
+        )
+    else:
+        compress_lens = end_pos // module.compress_ratio
+    return scores, compress_lens
 
 
 def _sparse_attn_for_goldens(torch, record):
@@ -1499,6 +1657,520 @@ def vision_case(torch, reference) -> dict:
     }
 
 
+def indexer_case(torch, reference) -> dict:
+    """`Indexer.forward` and `select_candidate_blocks`: which compressed rows a query reads.
+
+    The port answered this without looking at any value: read the newest `index_topk`
+    compressed rows, because those are the ones a position can see. That is the same
+    answer only while a position has nothing to choose between. `index_topk` is 512 on
+    the published checkpoint, so on the twenty ratio-1 layers the two rules part company
+    at position 513 -- ordinary context, not a long-context curiosity.
+
+    Three things are asked of the reference, and each can be wrong on its own:
+
+      * the SHAPE of a score. `index_score` is the relu of a per-head dot against the
+        shared index key, weighted per head, and SUMMED over heads, with
+        `index_head_dim ** -0.5 * index_n_heads ** -0.5` folded into the weights. A max
+        over heads, or a mean, ranks differently.
+      * which positions a query may score at all. A compressed row only becomes visible
+        once the query has passed its last token, so a prefill chunk scores the whole
+        cache and masks what each query has not reached. That mask is why the first
+        position of a prompt selects nothing rather than a row it cannot see.
+      * the two levels. `select_candidate_blocks` scores a block by its best position,
+        PINS the partly-filled block holding the query's newest position at +inf so it
+        cannot be outscored by an older full block, then hands the survivors to the
+        per-layer top-k. It runs on the candidate source only; the layers after it mask
+        with that source's blocks and score with their own weights.
+
+    `prefill` and `decode` run with `candidate_source_layer=-1`, so they exercise the
+    top-k alone. `blocks` runs a source and then a consumer, so both levels and the
+    reuse between them are in the vectors.
+    """
+    generator = torch.Generator().manual_seed(20251017)
+    # `fp4_act_quant` and `act_quant` are the checkpoint's fused kernels; these
+    # vectors are FP32 throughout, so their faithful form here is the identity.
+    original_quant = reference.act_quant
+    original_fp4 = reference.fp4_act_quant
+    original_shared = reference.shared_attn
+    reference.act_quant = _act_quant_identity()
+    reference.fp4_act_quant = _act_quant_identity()
+
+    # `_compress_kv` passes the window length as the compressed index offset.
+    offset = 2
+
+    def args_for(**overrides):
+        base = dict(
+            dim=6,
+            q_lora_rank=4,
+            head_dim=4,
+            index_n_heads=32,
+            index_head_dim=8,
+            rope_head_dim=4,
+            norm_eps=1e-6,
+            n_layers=3,
+            window_size=2,
+            compress_ratios=(0, 2, 2),
+            kv_source_layers=(1,),
+            index_source_layers=(1, 2),
+            max_batch_size=1,
+            max_seq_len=64,
+            original_seq_len=0,
+        )
+        base.update(overrides)
+        return reference.ModelArgs(**base)
+
+    class Shared:
+        """`SharedAttentionRuntime`, reduced to the three fields the indexer touches."""
+
+        index_k = None
+        candidates = None
+        topk_idxs = None
+
+    def build(args, layer_id):
+        module = fill(reference.Indexer(args, layer_id), torch)
+        # `wk` and `weights_proj` are declared bf16 by the reference, which then
+        # multiplies them by a bf16 activation. These vectors are FP32 throughout, so
+        # the stored (already bf16-rounded) values are upcast rather than the
+        # activations being narrowed: nothing about the rule moves, and the matmul
+        # runs at the precision the port reads.
+        for parameter in module.parameters():
+            if parameter.dtype != torch.float32:
+                parameter.data = parameter.data.float()
+        # `Attention.__init__` hands the indexer `self.freqs_cis`, which for a
+        # compressing layer is built at `compress_rope_theta`.
+        module.freqs_cis = reference.precompute_freqs_cis(
+            args.rope_head_dim,
+            args.max_seq_len,
+            args.original_seq_len,
+            args.compress_rope_theta,
+            args.rope_factor,
+            args.beta_fast,
+            args.beta_slow,
+        )
+        return module
+
+    def scored(module, tensors, start_pos, keys):
+        """`index_score` as `Indexer.forward` computes it, for the record.
+
+        The module returns only `topk_idxs`, so the score matrix is recomputed from the
+        module's own submodules and then checked against what it selected: if the two
+        disagree this raises rather than emitting a matrix nothing ranked.
+        """
+        seqlen = tensors["x"].size(1)
+        end_pos = start_pos + seqlen
+        q = module.wq_b(tensors["qr"]).unflatten(-1, (module.n_heads, module.index_head_dim))
+        reference.apply_rotary_emb(
+            q[..., -module.rope_head_dim :], module.freqs_cis[start_pos:end_pos]
+        )
+        weights = module.weights_proj(tensors["x"]) * (
+            module.softmax_scale * module.n_heads**-0.5
+        )
+        scores = torch.einsum("bshd,btd->bsht", q, keys)
+        scores = (scores.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+        if start_pos == 0:
+            compress_lens = (
+                torch.arange(1, seqlen + 1, device=scores.device) // module.compress_ratio
+            ).unsqueeze(-1)
+            scores.masked_fill_(
+                torch.arange(keys.size(1), device=scores.device) >= compress_lens, -torch.inf
+            )
+        else:
+            compress_lens = end_pos // module.compress_ratio
+        return scores, compress_lens
+
+    def record(module, tensors, start_pos, shared, idxs, name, args):
+        """One case: the module's own selection, plus the score matrix behind it."""
+        ratio = module.compress_ratio
+        keys = shared.index_k[:, : (start_pos + tensors["x"].size(1)) // ratio]
+        scores, compress_lens = scored(module, tensors, start_pos, keys)
+        # `select_candidate_blocks` runs on the source; every layer then masks with the
+        # blocks it published and takes its own top-k.
+        if module.is_candidate_source:
+            shared.candidates = reference.select_candidate_blocks(
+                scores, compress_lens, args.candidate_topk_blocks, args.candidate_block_size
+            )
+            masked = scores
+        elif module.uses_candidates:
+            masked = scores.masked_fill(~shared.candidates, -torch.inf)
+        else:
+            masked = scores
+        topk = min(module.index_topk, (start_pos + tensors["x"].size(1)) // ratio)
+        replay = masked.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+        replay = torch.where(replay < compress_lens, replay + offset, -1).int()
+        if not torch.equal(replay, idxs):
+            raise RuntimeError(
+                f"indexer goldens: the {name} score replay disagrees with the module"
+            )
+        return {
+            "name": name,
+            "start_pos": start_pos,
+            "compress_ratio": ratio,
+            "index_topk": module.index_topk,
+            "candidate_topk_blocks": args.candidate_topk_blocks,
+            "candidate_block_size": args.candidate_block_size,
+            "is_candidate_source": bool(module.is_candidate_source),
+            "uses_candidates": bool(module.uses_candidates),
+            "x": rows_of(tensors["x"][0]),
+            "qr": rows_of(tensors["qr"][0]),
+            "latent": rows_of(tensors["latent"][0]) if tensors["latent"] is not None else None,
+            # [positions][compressed rows]: -1 for a slot the query may not read.
+            "topk_idxs": rows_of(idxs)[0],
+            # [positions][compressed rows]: before the top-k, with the reach mask applied.
+            "scores": rows_of(scores)[0],
+            # [compressed rows]: the block mask the source published, if any.
+            "blocks": (
+                rows_of(shared.candidates[0].int()) if shared.candidates is not None else None
+            ),
+            # [compressed rows][index_head_dim]: the index keys the source published.
+            "index_k": rows_of(keys[0]),
+        }
+
+    def run(args, layer_id, tensors, start_pos, shared=None, k_cache=None):
+        module = build(args, layer_id)
+        # `Indexer.forward` publishes its OWN `k_cache` as `shared_attn.index_k`
+        # whenever the layer owns index keys, so a cache carried over from an earlier
+        # step has to be written into this module rather than handed to it.
+        if k_cache is not None and module.owns_k:
+            module.k_cache.zero_()
+            module.k_cache[:, : k_cache.size(1)] = k_cache
+        shared = shared if shared is not None else Shared()
+        reference.shared_attn = shared
+        with torch.no_grad():
+            idxs = module(tensors["x"], tensors["qr"], tensors["latent"], start_pos, offset)
+        return module, shared, idxs
+
+    cases = []
+    try:
+        # Top-k alone, over a chunk of eight positions at ratio 2: four compressed
+        # rows, reached at different times, so every query sees a different prefix.
+        prefill_args = args_for(candidate_source_layer=-1, index_topk=3)
+        prefill = {
+            "x": torch.randn(1, 8, prefill_args.dim, generator=generator),
+            "qr": torch.randn(1, 8, prefill_args.q_lora_rank, generator=generator),
+            "latent": torch.randn(1, 4, prefill_args.head_dim, generator=generator),
+        }
+        module, shared, idxs = run(prefill_args, 1, prefill, 0)
+        cases.append(record(module, prefill, 0, shared, idxs, "prefill", prefill_args))
+        weights = {
+            "wq_b": rows_of(module.wq_b.weight),
+            "weights_proj": rows_of(module.weights_proj.weight),
+            "wk": rows_of(module.wk.weight),
+            "k_norm": rows_of(module.k_norm.weight),
+        }
+        cache = shared.index_k.clone()
+
+        # The same source one decode step later: one position, no latent (its group is
+        # still incomplete), so the cache is read but not written.
+        decode_args = args_for(candidate_source_layer=-1, index_topk=3)
+        decode = {
+            "x": torch.randn(1, 1, decode_args.dim, generator=generator),
+            "qr": torch.randn(1, 1, decode_args.q_lora_rank, generator=generator),
+            "latent": None,
+        }
+        module, shared, idxs = run(decode_args, 1, decode, 8, k_cache=cache)
+        cases.append(record(module, decode, 8, shared, idxs, "decode", decode_args))
+
+        # Both levels. Sixteen positions at ratio 2 fill eight compressed rows, which
+        # is four blocks of two against `candidate_topk_blocks=2`; the source publishes
+        # the mask and the following layer scores with its own weights inside it.
+        block_args = args_for(
+            candidate_source_layer=1,
+            candidate_topk_blocks=2,
+            candidate_block_size=2,
+            index_topk=3,
+        )
+        chunk = {
+            "x": torch.randn(1, 16, block_args.dim, generator=generator),
+            "qr": torch.randn(1, 16, block_args.q_lora_rank, generator=generator),
+            "latent": torch.randn(1, 8, block_args.head_dim, generator=generator),
+        }
+        source, source_shared, source_idxs = run(block_args, 1, chunk, 0)
+        cases.append(
+            record(source, chunk, 0, source_shared, source_idxs, "blocks_source", block_args)
+        )
+        consumer_input = {
+            "x": torch.randn(1, 16, block_args.dim, generator=generator),
+            "qr": torch.randn(1, 16, block_args.q_lora_rank, generator=generator),
+            "latent": None,
+        }
+        # Layer 2 owns indexer weights but not index keys, so it reads the cache layer
+        # 1 published and re-scores inside the blocks layer 1 selected.
+        reuse = Shared()
+        reuse.index_k = source_shared.index_k
+        reuse.candidates = source_shared.candidates
+        consumer, consumer_shared, consumer_idxs = run(
+            block_args, 2, consumer_input, 0, reuse
+        )
+        cases.append(
+            record(
+                consumer, consumer_input, 0, consumer_shared, consumer_idxs,
+                "blocks_consumer", block_args,
+            )
+        )
+    finally:
+        reference.act_quant = original_quant
+        reference.fp4_act_quant = original_fp4
+        reference.shared_attn = original_shared
+
+    return {
+        "gate": "candidateSelection",
+        "reference": (
+            "inference/model.py Indexer.forward and select_candidate_blocks "
+            f"({snapshot_note()})"
+        ),
+        "config": {
+            "dim": prefill_args.dim,
+            "q_lora_rank": prefill_args.q_lora_rank,
+            "head_dim": prefill_args.head_dim,
+            "index_n_heads": prefill_args.index_n_heads,
+            "index_head_dim": prefill_args.index_head_dim,
+            "rope_head_dim": prefill_args.rope_head_dim,
+            "norm_eps": prefill_args.norm_eps,
+            "compress_rope_theta": prefill_args.compress_rope_theta,
+            "window_size": prefill_args.window_size,
+        },
+        "input": weights,
+        "cases": cases,
+    }
+
+
+def indexer_real_case(torch, reference) -> dict:
+    """`Indexer.forward` on the published checkpoint's OWN tensors and activations.
+
+    The `indexer` case pins the rule at a six-wide config, where `index_topk` 3 over
+    8 rows means every reachable row is selected: the cut is invisible, and so is
+    everything that only appears at width. This one runs the same module at the
+    published geometry (32 heads of 128, `index_topk` 512) with the checkpoint's real
+    `wq_b` / `weights_proj` / `wk` / `k_norm`, on the activations a device prefill
+    actually produced.
+
+    Those activations are the input because the model cannot be run end to end here:
+    475 GB does not fit in RAM, so the reference cannot generate `x`, `qr` or the
+    pooled latents itself. `DeepSeekV41PublishedTurnTests`
+    `testWhatTheIndexerWasGivenOnThePublishedCheckpoint` writes them, and the
+    comparison is offline on purpose -- only the SAME activations can be scored both
+    ways, and a live run's are its own.
+
+    Two reference arms, because the reference quantizes and the port does not:
+
+      * `rule` -- both activation quantizers are the identity. This is the arm the
+        port is claiming to implement, and the one its scores are diffed against.
+      * `fp4`  -- the reference's own `fp4_act_quant` (E2M1 with one power-of-two
+        E8M0 scale per 32-value block) emulated in torch. This is what the
+        checkpoint runs.
+
+    The port's own scores ride along out of the dump, so `summary` is a diff rather
+    than a pair of vectors to eyeball.
+
+    Emulation is exact rather than approximate: the reference's fused kernel computes
+    `2**ceil(log2(amax/6))` per block and then round-to-nearest-even into
+    `{0, .5, 1, 1.5, 2, 3, 4, 6}`, which is the arithmetic below.
+    """
+    if not _INPUTS:
+        raise SystemExit(
+            "indexer_real needs --inputs <dump.json>; produce it with "
+            "DynaMoETests/DeepSeekV41PublishedTurnTests"
+            "/testWhatTheIndexerWasGivenOnThePublishedCheckpoint"
+        )
+    with open(_INPUTS, "r", encoding="utf-8") as handle:
+        dump = json.load(handle)
+
+    layer = dump["layer"]
+    positions = dump["positions"]
+    latent_width = dump["latent_width"]
+    index = _shard_index(_SNAPSHOT)
+
+    def tensor(name, block_scaled=False):
+        dtype, shape, raw = _raw_tensor(_SNAPSHOT, index, name)
+        values = _dequantize(torch, dtype, shape, raw)
+        if block_scaled:
+            scale_name = name.rsplit(".", 1)[0] + ".scale"
+            _, scale_shape, scale_raw = _raw_tensor(_SNAPSHOT, index, scale_name)
+            scale = _dequantize(torch, "F8_E8M0", scale_shape, scale_raw)
+            values = _fp8_block_weight(torch, values, scale)
+        return values
+
+    # Every shape and rope constant comes from the checkpoint's own flat config, so a
+    # re-export cannot leave this case running at last month's geometry. The one
+    # substitution is `compress_ratios`: the published vector is 43 long (40 backbone
+    # layers plus the three draft layers) and the indexer only reads its own layer's
+    # entry, so a uniform ratio-1 vector is the same argument with no layer plan.
+    published = _published_config(_SNAPSHOT)
+    layer_count = published["n_layers"]
+    args = reference.ModelArgs(
+        max_batch_size=1,
+        max_seq_len=max(2 * positions, published["original_seq_len"]),
+        dim=published["dim"],
+        q_lora_rank=published["q_lora_rank"],
+        head_dim=published["head_dim"],
+        rope_head_dim=published["rope_head_dim"],
+        norm_eps=published["norm_eps"],
+        n_layers=layer_count,
+        window_size=published["window_size"],
+        compress_ratios=(1,) * layer_count,
+        kv_source_layers=(layer,),
+        index_source_layers=(layer,),
+        compress_rope_theta=published["compress_rope_theta"],
+        original_seq_len=published["original_seq_len"],
+        rope_theta=published["rope_theta"],
+        rope_factor=published["rope_factor"],
+        beta_fast=published["beta_fast"],
+        beta_slow=published["beta_slow"],
+        index_n_heads=published["index_n_heads"],
+        index_head_dim=published["index_head_dim"],
+        index_topk=published["index_topk"],
+        # The candidate source is a higher index than this one at first glance, but
+        # `uses_candidates` is `0 <= source < layer` and the published source IS the
+        # layer this dump came from, so the masks would be the same list. Off keeps
+        # the case about the per-layer cut.
+        candidate_source_layer=-1,
+        candidate_topk_blocks=0,
+        candidate_block_size=0,
+    )
+    if (args.dim, args.q_lora_rank, args.head_dim) != (
+        dump["hidden"], dump["query_width"], latent_width
+    ):
+        raise SystemExit(
+            f"the dump says {dump['hidden']}/{dump['query_width']}/{latent_width} but "
+            f"{_SNAPSHOT} says {args.dim}/{args.q_lora_rank}/{args.head_dim}"
+        )
+
+    prefixed = f"layers.{layer}.attn.indexer."
+    weights = {
+        "wq_b": tensor(prefixed + "wq_b.weight", block_scaled=True),
+        "weights_proj": tensor(prefixed + "weights_proj.weight"),
+        "wk": tensor(prefixed + "wk.weight"),
+        "k_norm": tensor(prefixed + "k_norm.weight"),
+    }
+
+    class Shared:
+        index_k = None
+        candidates = None
+        topk_idxs = None
+
+    def build():
+        module = reference.Indexer(args, layer)
+        module.wq_b.weight = torch.nn.Parameter(weights["wq_b"].clone())
+        module.weights_proj.weight = torch.nn.Parameter(weights["weights_proj"].clone())
+        module.wk.weight = torch.nn.Parameter(weights["wk"].clone())
+        module.k_norm.weight = torch.nn.Parameter(weights["k_norm"].clone())
+        module.freqs_cis = reference.precompute_freqs_cis(
+            args.rope_head_dim,
+            args.max_seq_len,
+            args.original_seq_len,
+            args.compress_rope_theta,
+            args.rope_factor,
+            args.beta_fast,
+            args.beta_slow,
+        )
+        return module
+
+    latent = torch.tensor(dump["latents"], dtype=torch.float32).reshape(
+        1, positions, latent_width
+    )
+    # Only the deepest position's query is real; the rest are padding, and the rows
+    # they would score are not read.
+    query = torch.zeros(1, positions, dump["hidden"], dtype=torch.float32)
+    query[0, dump["position"]] = torch.tensor(dump["input"], dtype=torch.float32)
+    rank = torch.zeros(1, positions, dump["query_width"], dtype=torch.float32)
+    rank[0, dump["position"]] = torch.tensor(dump["query_input"], dtype=torch.float32)
+
+    original_fp4 = reference.fp4_act_quant
+    original_act = reference.act_quant
+    original_shared = reference.shared_attn
+    reference.act_quant = _act_quant_identity()
+    arms = {}
+    try:
+        for name in ("rule", "fp4"):
+            reference.fp4_act_quant = (
+                _act_quant_identity() if name == "rule" else _fp4_quantizer(torch)
+            )
+            module = build()
+            shared = Shared()
+            reference.shared_attn = shared
+            with torch.no_grad():
+                idxs = module(query, rank, latent, 0, args.window_size)
+            keys = shared.index_k[:, : positions // 1]
+            scores, _ = _indexer_scores(torch, reference, module, query, rank, keys, 0)
+            row = scores[0, dump["position"]].detach().float()
+            selected = idxs[0, dump["position"]]
+            arms[name] = {
+                "scores": row.tolist(),
+                "finite_scores": [float(v) for v in row if v != float("-inf")],
+                "selected": [
+                    int(v) - args.window_size for v in selected.tolist() if int(v) >= 0
+                ],
+                "raw_selected": [int(v) for v in selected.tolist()],
+                "index_k": keys[0].detach().tolist(),
+                "rows": int(row.numel()),
+            }
+    finally:
+        reference.fp4_act_quant = original_fp4
+        reference.act_quant = original_act
+        reference.shared_attn = original_shared
+
+    port = [float(v) for v in dump["scores"]]
+    summary = {}
+    for name in ("rule", "fp4"):
+        reference_scores = arms[name]["scores"]
+        finite = [v for v in reference_scores if v != float("-inf")]
+        if len(finite) != len(port):
+            summary[name] = {
+                "comparable": False,
+                "reference_rows": len(finite),
+                "port_rows": len(port),
+            }
+            continue
+        worst = 0.0
+        worst_at = 0
+        for row, (left, right) in enumerate(zip(finite, port)):
+            denominator = max(abs(left), abs(right), 1e-6)
+            delta = abs(left - right) / denominator
+            if delta > worst:
+                worst = delta
+                worst_at = row
+        port_selected = [int(v) for v in dump["selected"]]
+        shared_rows = sorted(set(port_selected) & set(arms[name]["selected"]))
+        summary[name] = {
+            "comparable": True,
+            "worst_relative_delta": worst,
+            "worst_row": worst_at,
+            "rows": len(finite),
+            "selection_intact": shared_rows == sorted(port_selected),
+            "port_selected": len(port_selected),
+            "reference_selected": len(arms[name]["selected"]),
+            "shared_selected": len(shared_rows),
+            "only_reference": sorted(set(arms[name]["selected"]) - set(port_selected)),
+            "only_port": sorted(set(port_selected) - set(arms[name]["selected"])),
+        }
+
+    return {
+        "gate": "candidateSelection",
+        "reference": (
+            "inference/model.py Indexer.forward at the published widths, on the "
+            f"checkpoint's own tensors and a device dump ({snapshot_note()})"
+        ),
+        "layer": layer,
+        "position": dump["position"],
+        "positions": positions,
+        "config": {
+            "dim": args.dim,
+            "q_lora_rank": args.q_lora_rank,
+            "head_dim": args.head_dim,
+            "index_n_heads": args.index_n_heads,
+            "index_head_dim": args.index_head_dim,
+            "index_topk": args.index_topk,
+            "rope_head_dim": args.rope_head_dim,
+            "compress_rope_theta": args.compress_rope_theta,
+            "original_seq_len": args.original_seq_len,
+            "rope_factor": args.rope_factor,
+        },
+        "port": {"scores": port, "selected": [int(v) for v in dump["selected"]]},
+        "arms": arms,
+        "summary": summary,
+    }
+
+
 CASES = {
     "engram": engram_case,
     "compressor": compressor_case,
@@ -1509,9 +2181,12 @@ CASES = {
     "dspark": dspark_case,
     "dspark_block": dspark_block_case,
     "vision": vision_case,
+    "indexer": indexer_case,
+    "indexer_real": indexer_real_case,
 }
 
 _SNAPSHOT = ""
+_INPUTS = ""
 
 
 def snapshot_note() -> str:
@@ -1525,14 +2200,25 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--snapshot", help="snapshot directory holding inference/")
     parser.add_argument("--json", help="write the vectors here instead of stdout")
+    parser.add_argument(
+        "--inputs",
+        help="device dump a case needs (`indexer_real`): the activations a prefill produced",
+    )
     options = parser.parse_args(argv)
 
-    global _SNAPSHOT
+    global _SNAPSHOT, _INPUTS
     snapshot = find_snapshot(options.snapshot)
     _SNAPSHOT = snapshot
+    _INPUTS = options.inputs or ""
     torch, reference = load_reference(snapshot)
 
-    names = list(CASES) if options.case == "all" else [options.case]
+    # `indexer_real` is the one case that cannot run from the snapshot alone: its
+    # inputs are a device dump, so `all` leaves it out rather than refusing.
+    names = (
+        [name for name in CASES if name != "indexer_real"]
+        if options.case == "all"
+        else [options.case]
+    )
     payload = {
         "meta": {
             "torch": torch.__version__,

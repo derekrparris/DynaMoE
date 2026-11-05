@@ -104,7 +104,7 @@ final class AnthropicAdapterLogicTests: XCTestCase {
         let messages = [
             AnthropicMessagesRequest.Message(role: "user", contentText: "what is 2+2", toolUses: nil, toolResults: nil),
         ]
-        let turns = try AnthropicAdapter.splitMessages(messages)
+        let turns = try AnthropicAdapter.splitMessages(messages).turns
         XCTAssertEqual(turns.count, 1)
         XCTAssertEqual(turns[0].role, .user)
         XCTAssertEqual(turns[0].text, "what is 2+2")
@@ -118,7 +118,7 @@ final class AnthropicAdapterLogicTests: XCTestCase {
             {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"all green"}]}
         ]}
         """)
-        let turns = try AnthropicAdapter.splitMessages(request.messages)
+        let turns = try AnthropicAdapter.splitMessages(request.messages).turns
         XCTAssertEqual(turns.map(\.role), [.user, .assistant, .user], "roles must stay native, not flattened into one user block")
         XCTAssertEqual(turns[0].text, "run the tests")
         XCTAssertTrue(turns[1].text.contains("shell_run"))
@@ -175,7 +175,7 @@ final class AnthropicAdapterLogicTests: XCTestCase {
             {"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"shell_run","input":{"cmd":"ls"}}]}
         ]}
         """)
-        let turns = try AnthropicAdapter.splitMessages(request.messages)
+        let turns = try AnthropicAdapter.splitMessages(request.messages).turns
         XCTAssertEqual(turns.map(\.role), [.user, .assistant])
         XCTAssertTrue(turns[1].text.contains("shell_run"))
     }
@@ -287,6 +287,88 @@ final class AnthropicAdapterLogicTests: XCTestCase {
         XCTAssertEqual(jsonDelta["partial_json"] as? String, #"{"a":1}"#)
     }
 
+    // MARK: - Token counting
+
+    func testACountTokensBodyCarriesNoMaxTokensAndStillDecodes() throws {
+        // The protocol's count_tokens body is the messages body minus the reply
+        // budget. One decodable type serves both, which is why the route needs no
+        // wire type of its own; a body with no `max_tokens` must still arrive.
+        let request = try decodeRequest("""
+        {"model":"m","messages":[{"role":"user","content":"hi"}],
+         "system":"be terse","thinking":{"type":"enabled","budget_tokens":2048}}
+        """)
+        XCTAssertNil(request.maxTokens)
+        XCTAssertEqual(request.messages.count, 1)
+        XCTAssertEqual(request.messages[0].contentText, "hi")
+        XCTAssertEqual(request.systemText, "be terse")
+        XCTAssertEqual(request.thinking?.type, "enabled")
+    }
+
+    func testTokenCountResponseIsExactlyOneField() throws {
+        let data = try JSONEncoder().encode(AnthropicTokenCount(inputTokens: 14))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json.count, 1, "Anthropic's pre-flight answers `input_tokens` and nothing else")
+        XCTAssertEqual(json["input_tokens"] as? Int, 14)
+    }
+
+    // MARK: - Models list
+
+    func testTheModelsListCarriesTheProtocolsOwnShape() throws {
+        // The two protocols share the path and not the body. Anthropic's model
+        // object is `type`/`id`/`display_name`/`created_at` and its list carries
+        // pagination cursors; OpenAI's is `object`/`created` under an
+        // `object: "list"` wrapper. A client's SDK decodes one and fails the other,
+        // so the keys are the contract.
+        let model = AnthropicAdapter.entry(
+            id: "1bae0e10",
+            displayName: "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            createdAt: Date(timeIntervalSince1970: 1_793_830_186)
+        )
+        let entry = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(model)) as? [String: Any])
+        XCTAssertEqual(Set(entry.keys), ["type", "id", "display_name", "created_at"])
+        XCTAssertEqual(entry["type"] as? String, "model")
+        XCTAssertEqual(entry["id"] as? String, "1bae0e10")
+        XCTAssertEqual(entry["display_name"] as? String, "deepseek-ai/DeepSeek-V4.1-Flash-1017")
+        XCTAssertEqual(
+            entry["created_at"] as? String, "2026-11-04T22:09:46Z",
+            "RFC 3339 with second precision and a Z offset is what the protocol's list type parses"
+        )
+
+        let list = AnthropicModelList(
+            data: [model], hasMore: false, firstId: model.id, lastId: model.id
+        )
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(list)) as? [String: Any])
+        XCTAssertEqual(Set(body.keys), ["data", "has_more", "first_id", "last_id"])
+        XCTAssertEqual(body["has_more"] as? Bool, false)
+        XCTAssertEqual(body["first_id"] as? String, "1bae0e10")
+        XCTAssertEqual(body["last_id"] as? String, "1bae0e10")
+        XCTAssertEqual((body["data"] as? [Any])?.count, 1)
+        XCTAssertNil(body["object"], "an OpenAI list key must never appear in an Anthropic body")
+    }
+
+    func testTheModelDisplayNameIsTheRepositoryRatherThanTheSnapshotHash() {
+        // The served id is the snapshot directory's own name and is load-bearing
+        // (recorded turns and pinned prefixes are keyed on it), so the human name is
+        // recovered from the repository directory beside it instead.
+        XCTAssertEqual(
+            AnthropicAdapter.displayName(
+                servedId: "1bae0e1088993b9b82de08f59de5be5a34e42170",
+                snapshotPath: "/Users/x/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170"
+            ),
+            "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+        )
+        XCTAssertEqual(
+            AnthropicAdapter.displayName(servedId: "hash", snapshotPath: "/Models/my-own-checkpoint"),
+            "my-own-checkpoint",
+            "a checkpoint that is not a hub snapshot has no repository name to recover"
+        )
+        XCTAssertEqual(
+            AnthropicAdapter.displayName(servedId: "hash", snapshotPath: nil),
+            "hash",
+            "with no path at all the served id is the only name there is"
+        )
+    }
+
     // MARK: - Tool choice
 
     func testToolChoiceNameIsPreservedAndForcedChoiceIsRejected() throws {
@@ -295,7 +377,7 @@ final class AnthropicAdapterLogicTests: XCTestCase {
         """)
         XCTAssertEqual(auto.toolChoiceType, "auto")
         XCTAssertTrue(try AnthropicAdapter.toolUseEnabled(auto.toolChoice))
-        XCTAssertFalse(try AnthropicAdapter.toolUseEnabled(.init(type: "none", name: nil)))
+        XCTAssertFalse(try AnthropicAdapter.toolUseEnabled(.init(type: "none", name: nil, disableParallelToolUse: nil)))
 
         let forced = try decodeRequest("""
         {"max_tokens":10,"tools":[{"name":"get_weather"}],"tool_choice":{"type":"tool","name":"get_weather"},"messages":[{"role":"user","content":"hi"}]}
@@ -321,7 +403,7 @@ final class AnthropicAdapterLogicTests: XCTestCase {
             {"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_abc","content":"ok"}]}
         ]}
         """)
-        let turns = try AnthropicAdapter.splitMessages(request.messages)
+        let turns = try AnthropicAdapter.splitMessages(request.messages).turns
         XCTAssertTrue(turns[1].text.contains("toolu_abc"), "the opaque tool_use id must reach history so results can be matched to calls")
     }
 
@@ -338,6 +420,27 @@ final class AnthropicAdapterLogicTests: XCTestCase {
     }
 
     // MARK: - Graded thinking levels
+
+    /// The two fields this protocol sends and the engine deliberately does not obey
+    /// now reach the request model, so the help guide and the journal can name them
+    /// instead of `Decodable` dropping them silently.
+    func testTheAcceptedAndIgnoredFieldsAreDecodedRatherThanVanishing() throws {
+        let request = try decodeRequest("""
+        {"max_tokens":32,"messages":[{"role":"user","content":"hi"}],
+         "metadata":{"user_id":"abc"},"service_tier":"auto",
+         "thinking":{"type":"enabled","budget_tokens":1024}}
+        """)
+        XCTAssertEqual(request.metadata?.userId, "abc")
+        XCTAssertEqual(request.serviceTier, "auto")
+        XCTAssertEqual(
+            request.thinking?.budgetTokens, 1024,
+            "the budget selects a graded level and is recorded in the row, so it must survive the decode"
+        )
+        XCTAssertNoThrow(
+            try AnthropicAdapter.thinkingEffort(from: request.thinking, levelCapable: true),
+            "a budget this server can map is never refused"
+        )
+    }
 
     func testThinkingBudgetMapsToGradedLevels() throws {
         let low = AnthropicMessagesRequest.ThinkingConfig(type: "enabled", budgetTokens: 2048)
@@ -359,5 +462,124 @@ final class AnthropicAdapterLogicTests: XCTestCase {
         XCTAssertThrowsError(
             try AnthropicAdapter.thinkingEffort(from: .init(type: "enabled", budgetTokens: 0), levelCapable: true)
         )
+    }
+
+    // MARK: - Client labels
+
+    /// This protocol's `metadata` carries exactly one value, and it used to be decoded
+    /// and thrown away. It now lands in the request log's row under the protocol's own
+    /// spelling, so the one label an Anthropic client can send survives where the bodies
+    /// do not, in the same field the OpenAI routes use.
+    func testTheAnthropicMetadataLabelIsRecordedUnderItsOwnSpelling() throws {
+        let labelled = try decodeRequest("""
+        {"model":"any","max_tokens":16,"metadata":{"user_id":"enduser-42"},"messages":[]}
+        """)
+        XCTAssertEqual(labelled.metadata?.userId, "enduser-42")
+        XCTAssertEqual(labelled.metadata?.labels, ["user_id": "enduser-42"])
+
+        let unlabelled = try decodeRequest(#"{"model":"any","max_tokens":16,"messages":[]}"#)
+        XCTAssertNil(unlabelled.metadata)
+        XCTAssertNil(ServerRequestLog.recordedClientMetadata(unlabelled.metadata?.labels))
+    }
+
+    // MARK: - Request fields this server cannot honour
+
+    /// `output_config` asks for schema-constrained decoding and `mcp_servers` asks this
+    /// server to connect remote MCP servers, and neither was in the decoder, so both
+    /// were dropped by unknown-key tolerance: a request for JSON was answered in prose
+    /// the client's parser rejected, and a turn that named servers ran without the tools
+    /// it had just asked for. They are refused by name now, before the model gate, while
+    /// the two fields that cannot change what the model is told are decoded and ignored.
+    func testTheStructuredOutputAndMCPServerFieldsAreRefusedByName() throws {
+        let structured = try decodeRequest("""
+        {"model":"any","max_tokens":16,"messages":[],
+         "output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}}
+        """)
+        XCTAssertEqual(structured.outputConfig?.formatType, "json_schema")
+        XCTAssertThrowsError(try AnthropicAdapter.refuseUnsupportedRequestFields(structured)) { error in
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("output_config"), "got: \(message)")
+            XCTAssertTrue(message.contains("json_schema"), "the refusal must say what was asked for, got: \(message)")
+        }
+
+        let servers = try decodeRequest("""
+        {"model":"any","max_tokens":16,"messages":[],
+         "mcp_servers":[{"type":"url","url":"https://example.invalid/mcp","name":"weather"},
+                        {"type":"url","url":"https://example.invalid/other","name":"calendar"}]}
+        """)
+        XCTAssertEqual(servers.mcpServers?.compactMap(\.name), ["weather", "calendar"])
+        XCTAssertThrowsError(try AnthropicAdapter.refuseUnsupportedRequestFields(servers)) { error in
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("mcp_servers"), "got: \(message)")
+            XCTAssertTrue(message.contains("weather"), "the refusal must name the servers, got: \(message)")
+            XCTAssertTrue(message.contains("tools"), "the refusal must name the replacement, got: \(message)")
+        }
+
+        // Neither field present is the ordinary case, and it must stay served.
+        let plain = try decodeRequest(#"{"model":"any","max_tokens":16,"messages":[]}"#)
+        XCTAssertNil(plain.outputConfig)
+        XCTAssertNil(plain.mcpServers)
+        XCTAssertNoThrow(try AnthropicAdapter.refuseUnsupportedRequestFields(plain))
+
+        // The two that are decoded to be documented as ignored: housekeeping whose
+        // absence lengthens the prompt rather than changing what the model is told, and
+        // a sampling constraint this engine's sampler cannot express (the posture
+        // OpenAI's `parallel_tool_calls` already has).
+        let ignored = try decodeRequest("""
+        {"model":"any","max_tokens":16,"messages":[],
+         "context_management":{"edits":[{"type":"clear_tool_uses_20250919"}]},
+         "tool_choice":{"type":"auto","disable_parallel_tool_use":true}}
+        """)
+        XCTAssertEqual(ignored.contextManagement?.edits?.compactMap(\.type), ["clear_tool_uses_20250919"])
+        XCTAssertEqual(ignored.toolChoice?.disableParallelToolUse, true)
+        XCTAssertNoThrow(try AnthropicAdapter.refuseUnsupportedRequestFields(ignored))
+        XCTAssertTrue(try AnthropicAdapter.toolUseEnabled(ignored.toolChoice))
+    }
+
+    // MARK: - Echoed redacted thinking
+
+    /// Anthropic returns a `redacted_thinking` block when part of a reasoning trace is
+    /// withheld, and the protocol requires a client to pass it back verbatim. It was on
+    /// the unsupported list, so one echoed block refused the WHOLE turn: a conversation
+    /// could not continue over bytes the engine cannot read anyway. It is accepted and
+    /// rendered as nothing, which is the same turn this server would run without it, and
+    /// every other unreadable type is still refused by name.
+    func testAnEchoedRedactedThinkingBlockIsAcceptedAndRenderedAsNothing() throws {
+        let request = try decodeRequest("""
+        {"model":"any","max_tokens":16,"messages":[
+          {"role":"user","content":"The capital of France?"},
+          {"role":"assistant","content":[
+            {"type":"thinking","thinking":"weighing it","signature":"sig"},
+            {"type":"redacted_thinking","data":"ENCRYPTED-BYTES"},
+            {"type":"text","text":"Paris"}]},
+          {"role":"user","content":"and Italy?"}]}
+        """)
+        XCTAssertFalse(
+            request.hasUnsupportedContent,
+            "an echoed redacted_thinking block must not refuse the turn"
+        )
+        let split = try AnthropicAdapter.splitMessages(request.messages)
+        let rendered = split.turns.map(\.text).joined(separator: "\n")
+        XCTAssertTrue(rendered.contains("weighing it"), "the readable thinking block still renders")
+        XCTAssertFalse(rendered.contains("ENCRYPTED-BYTES"), "the opaque block contributes nothing")
+        XCTAssertTrue(rendered.contains("Paris"))
+        XCTAssertTrue(rendered.contains("and Italy?"))
+
+        // The type list is an allowlist, not a relaxation: a block the engine genuinely
+        // cannot read is still refused, so a document does not vanish either.
+        let document = try decodeRequest("""
+        {"model":"any","max_tokens":16,"messages":[{"role":"user","content":[
+          {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"AA=="}}]}]}
+        """)
+        XCTAssertTrue(document.hasUnsupportedContent)
+
+        // The block alone is not a response prefill: it carries no text of its own, so a
+        // trailing assistant turn of redacted thinking is an ordinary generation request.
+        let onlyRedacted = try decodeRequest("""
+        {"model":"any","max_tokens":16,"messages":[
+          {"role":"user","content":"hi"},
+          {"role":"assistant","content":[{"type":"redacted_thinking","data":"ENCRYPTED"}]}]}
+        """)
+        XCTAssertNoThrow(try AnthropicAdapter.rejectUnsupportedPrefill(onlyRedacted.messages))
     }
 }

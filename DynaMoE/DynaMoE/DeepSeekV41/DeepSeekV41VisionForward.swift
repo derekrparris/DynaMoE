@@ -20,12 +20,18 @@
 //      multiple of the downsample ratio, so a cell's vector is channel-major with
 //      each channel's block row-major inside it.
 //
-//  It is a REFERENCE, not the serving path: attention is O(tokens^2) per head per
-//  block in scalar Swift, which is fine for the handful of tokens a test uses and
-//  far too slow for a 1024-token image. The device path is the kernels; this exists
-//  so the device path has something to be compared against.
+//  The matrix multiplies and the attention run through Accelerate, with the scalar
+//  forms kept beside them as the oracle: one dot product per output row is the
+//  DEFINITION of a linear, one GEMM for the whole block of tokens is what the tower
+//  runs, and a test pins the two together. This file is the DEFINITION and the
+//  oracle; the shipped path is `DeepSeekV41VisionEncodeDevice`, which runs the same
+//  rule as one device pass and is checked against this one. Attention is still
+//  quadratic, but quadratic over a GEMM rather than over scalar Swift: a 1521-patch
+//  image is 2.3 million dots per head per layer, and one lane per dot is what made
+//  the smallest image the checkpoint accepts cost ten hours.
 //
 
+import Accelerate
 import Foundation
 
 nonisolated public enum DeepSeekV41VisionForwardError: Error, Equatable, CustomStringConvertible {
@@ -52,6 +58,12 @@ nonisolated public struct DeepSeekV41VisionForward {
     public let weights: DeepSeekV41WeightSource
     /// The language model's hidden size, which is the aligner's output width.
     public let textHiddenSize: Int
+    /// The device-resident form of this tower, when one was built.
+    ///
+    /// Nil keeps the host path, which is the definition every device stage is
+    /// checked against; the engine builds one for the published checkpoint, and a
+    /// test builds one when it needs to compare the two.
+    public let device: DeepSeekV41VisionEncodeDevice?
 
     /// `RMSNorm.__init__`'s default, which the tower's norms keep: the text tower's
     /// `norm_eps` is 1e-20 and using it here would change every normalized value.
@@ -60,14 +72,20 @@ nonisolated public struct DeepSeekV41VisionForward {
     public init(
         spec: DeepSeekV41VisionSpec,
         weights: DeepSeekV41WeightSource,
-        textHiddenSize: Int
+        textHiddenSize: Int,
+        device: DeepSeekV41VisionEncodeDevice? = nil
     ) {
         self.spec = spec
         self.weights = weights
         self.textHiddenSize = textHiddenSize
+        self.device = device
     }
 
     /// One row per aligner grid cell, `textHiddenSize` wide, in reading order.
+    ///
+    /// When a device tower is attached the whole encode runs in one device pass;
+    /// otherwise this is `encodeOnHost`. The two are pinned against each other by
+    /// `DeepSeekV41VisionEncodeDeviceTests`.
     ///
     /// - Parameters:
     ///   - patches: `rows * columns` vectors of `3 * patchSize^2` values, in the
@@ -79,6 +97,37 @@ nonisolated public struct DeepSeekV41VisionForward {
         rows: Int,
         columns: Int
     ) throws -> [[Float]] {
+        if let device {
+            guard device.textHiddenSize == textHiddenSize else {
+                throw DeepSeekV41VisionForwardError.shapeMismatch(
+                    "the device tower projects to \(device.textHiddenSize), not \(textHiddenSize)"
+                )
+            }
+            return try device.encode(patches: patches, rows: rows, columns: columns)
+        }
+        return try encodeOnHost(patches: patches, rows: rows, columns: columns)
+    }
+
+    /// The CPU tower: the definition, and the oracle every device stage is checked
+    /// against.
+    ///
+    /// `onStage` receives each stage's name and elapsed time as the encode walks
+    /// them. It is nil in every production and parity path, so the only cost is the
+    /// clock read; the measurement test passes a closure and gets the split #37's
+    /// three-point fit could only price as one per-token term.
+    public func encodeOnHost(
+        patches: [[Float]],
+        rows: Int,
+        columns: Int,
+        onStage: ((String, Double) -> Void)? = nil
+    ) throws -> [[Float]] {
+        var stageStart = CFAbsoluteTimeGetCurrent()
+        func mark(_ stage: String) {
+            guard let onStage else { return }
+            let now = CFAbsoluteTimeGetCurrent()
+            onStage(stage, now - stageStart)
+            stageStart = now
+        }
         guard rows > 0, columns > 0, patches.count >= rows * columns else {
             throw DeepSeekV41VisionForwardError.emptyImage
         }
@@ -101,6 +150,7 @@ nonisolated public struct DeepSeekV41VisionForward {
             expectedInput: 3 * spec.patchSize * spec.patchSize,
             expectedOutput: hidden
         )
+        mark("patchEmbed")
 
         // One frequency vector per patch token, shared by every head.
         let rotary = Self.rotaryTables(
@@ -113,6 +163,7 @@ nonisolated public struct DeepSeekV41VisionForward {
                 x, weight: try normWeight(.visionBlockNorm1, layer: block, dimension: hidden),
                 dimension: hidden
             )
+            mark("block.norm1")
             let qkv = try linear(
                 normed,
                 weight: matrix(.visionBlockWqkv, layer: block),
@@ -120,7 +171,8 @@ nonisolated public struct DeepSeekV41VisionForward {
                 expectedInput: hidden,
                 expectedOutput: 3 * hidden
             )
-            let attended = Self.attention(
+            mark("block.qkv")
+            let attended = Self.attentionBatched(
                 qkv: qkv,
                 heads: heads,
                 headDim: headDim,
@@ -128,6 +180,7 @@ nonisolated public struct DeepSeekV41VisionForward {
                 cosine: rotary.cosine,
                 sine: rotary.sine
             )
+            mark("block.attention")
             let projected = try linear(
                 attended,
                 weight: matrix(.visionBlockWo, layer: block),
@@ -135,11 +188,13 @@ nonisolated public struct DeepSeekV41VisionForward {
                 expectedInput: hidden,
                 expectedOutput: hidden
             )
+            mark("block.wo")
             for index in 0..<tokenCount {
                 for dimension in 0..<hidden {
                     x[index][dimension] += projected[index][dimension]
                 }
             }
+            mark("block.residual1")
 
             // x = x + mlp(norm2(x)): `w1` emits gate and up halves, and only the
             // gate goes through the activation.
@@ -147,6 +202,7 @@ nonisolated public struct DeepSeekV41VisionForward {
                 x, weight: try normWeight(.visionBlockNorm2, layer: block, dimension: hidden),
                 dimension: hidden
             )
+            mark("block.norm2")
             let gateAndUp = try linear(
                 normed2,
                 weight: matrix(.visionBlockW1, layer: block),
@@ -154,6 +210,7 @@ nonisolated public struct DeepSeekV41VisionForward {
                 expectedInput: hidden,
                 expectedOutput: 2 * spec.intermediateSize
             )
+            mark("block.w1")
             var activated = [[Float]](repeating: [], count: tokenCount)
             for index in 0..<tokenCount {
                 var value = [Float](repeating: 0, count: spec.intermediateSize)
@@ -164,6 +221,7 @@ nonisolated public struct DeepSeekV41VisionForward {
                 }
                 activated[index] = value
             }
+            mark("block.siluMul")
             let mlp = try linear(
                 activated,
                 weight: matrix(.visionBlockW2, layer: block),
@@ -171,11 +229,13 @@ nonisolated public struct DeepSeekV41VisionForward {
                 expectedInput: spec.intermediateSize,
                 expectedOutput: hidden
             )
+            mark("block.w2")
             for index in 0..<tokenCount {
                 for dimension in 0..<hidden {
                     x[index][dimension] += mlp[index][dimension]
                 }
             }
+            mark("block.residual2")
         }
 
         // `ViT.forward` closes with a norm.
@@ -183,6 +243,7 @@ nonisolated public struct DeepSeekV41VisionForward {
             x, weight: try normWeight(.visionFinalNorm, layer: nil, dimension: hidden),
             dimension: hidden
         )
+        mark("finalNorm")
 
         // Aligner: pixel-unshuffle onto the downsample grid, then two linears.
         let cells = Self.pixelUnshuffle(
@@ -192,6 +253,7 @@ nonisolated public struct DeepSeekV41VisionForward {
             ratio: max(1, spec.downsampleRatio),
             width: hidden
         )
+        mark("unshuffle")
         let unshuffledWidth = hidden * max(1, spec.downsampleRatio) * max(1, spec.downsampleRatio)
         let hiddenCells = try linear(
             cells,
@@ -200,14 +262,18 @@ nonisolated public struct DeepSeekV41VisionForward {
             expectedInput: unshuffledWidth,
             expectedOutput: textHiddenSize
         )
+        mark("aligner1")
         let activatedCells = hiddenCells.map { row in row.map(Self.gelu) }
-        return try linear(
+        mark("alignerGelu")
+        let result = try linear(
             activatedCells,
             weight: matrix(.visionAlignerW2, layer: nil),
             bias: weights.vector(.visionAlignerW2Bias, layer: nil),
             expectedInput: textHiddenSize,
             expectedOutput: textHiddenSize
         )
+        mark("aligner2")
+        return result
     }
 
     /// The whole span an image occupies in the residual stream: the start marker,
@@ -304,6 +370,10 @@ nonisolated public struct DeepSeekV41VisionForward {
     }
 
     /// `Linear`: one row of `weight` per output unit, plus the optional bias.
+    ///
+    /// The whole block of tokens goes through one GEMM. Doing it row by row is the
+    /// same arithmetic in a much worse shape, because the matrix is then re-read for
+    /// every token and the reduction lives in a single lane.
     private func linear(
         _ inputs: [[Float]],
         weight: DeepSeekV41Matrix,
@@ -321,9 +391,71 @@ nonisolated public struct DeepSeekV41VisionForward {
                 "bias has \(bias.count) values, expected \(expectedOutput)"
             )
         }
-        return inputs.map { input in
-            guard input.count == expectedInput else {
-                return [Float](repeating: 0, count: expectedOutput)
+        // A short row would make the GEMM read past that row's own values, so it is
+        // refused: a silently mis-sized input shifts every row after it.
+        for (index, input) in inputs.enumerated() where input.count != expectedInput {
+            throw DeepSeekV41VisionForwardError.shapeMismatch(
+                "input row \(index) has \(input.count) values, expected \(expectedInput)"
+            )
+        }
+        return Self.linearBatched(inputs, weight: weight, bias: bias)
+    }
+
+    // MARK: Matrix multiply
+
+    /// `y = x Wᵀ + bias` for a whole block of tokens in one GEMM.
+    ///
+    /// `DeepSeekV41Matrix` is row-major `[out][in]`, so the matrix is exactly what
+    /// `CblasTrans` on the B argument wants and the inputs need no transpose.
+    nonisolated public static func linearBatched(
+        _ inputs: [[Float]],
+        weight: DeepSeekV41Matrix,
+        bias: [Float]?
+    ) -> [[Float]] {
+        let tokens = inputs.count
+        let outputs = weight.rows
+        let width = weight.columns
+        guard tokens > 0, outputs > 0, width > 0, weight.values.count >= outputs * width else {
+            return [[Float]](repeating: [Float](repeating: 0, count: max(0, outputs)), count: tokens)
+        }
+        // Callers inside the tower validate their rows, so this is the fail-closed
+        // path for a direct call: a ragged row cannot enter a GEMM.
+        guard inputs.allSatisfy({ $0.count == width }) else {
+            return [[Float]](repeating: [Float](repeating: 0, count: outputs), count: tokens)
+        }
+        var source: [Float] = []
+        source.reserveCapacity(tokens * width)
+        for row in inputs { source.append(contentsOf: row) }
+        var product = [Float](repeating: 0, count: tokens * outputs)
+        cblas_sgemm(
+            CblasRowMajor, CblasNoTrans, CblasTrans,
+            Int32(tokens), Int32(outputs), Int32(width),
+            1, source, Int32(width),
+            weight.values, Int32(width),
+            0, &product, Int32(outputs)
+        )
+        var rows: [[Float]] = []
+        rows.reserveCapacity(tokens)
+        for token in 0..<tokens {
+            var row = Array(product[(token * outputs)..<((token + 1) * outputs)])
+            if let bias, bias.count == outputs {
+                for unit in 0..<outputs { row[unit] += bias[unit] }
+            }
+            rows.append(row)
+        }
+        return rows
+    }
+
+    /// The same linear as the definition: one dot product per output row. Kept as
+    /// the oracle the GEMM is pinned against, never called by the tower.
+    nonisolated public static func linearRowByRow(
+        _ inputs: [[Float]],
+        weight: DeepSeekV41Matrix,
+        bias: [Float]?
+    ) -> [[Float]] {
+        inputs.map { input in
+            guard input.count == weight.columns else {
+                return [Float](repeating: 0, count: weight.rows)
             }
             var output = weight.apply(input)
             if let bias, output.count == bias.count {
@@ -393,6 +525,10 @@ nonisolated public struct DeepSeekV41VisionForward {
 
     /// Full bidirectional attention over every patch, per head, scale
     /// `1/sqrt(head_dim)`. `qkv` holds one `3 * hidden` row per token.
+    ///
+    /// This is the DEFINITION, one dot product per score, kept as the oracle for
+    /// `attentionBatched`. The tower does not call it: at 1521 patches it is 2.3
+    /// million dots per head per layer, each in its own lane.
     nonisolated public static func attention(
         qkv: [[Float]],
         heads: Int,
@@ -464,6 +600,119 @@ nonisolated public struct DeepSeekV41VisionForward {
         return output
     }
 
+    /// The same attention as two GEMMs per head: `softmax(q kᵀ * scale) v`.
+    ///
+    /// The rotation is per token and shared by every head, so the angle rows are
+    /// sliced once instead of once per head. An angle row shorter than `ropeDim` is
+    /// left empty, which is the reference's "this token does not rotate".
+    nonisolated public static func attentionBatched(
+        qkv: [[Float]],
+        heads: Int,
+        headDim: Int,
+        ropeDim: Int,
+        cosine: [[Float]],
+        sine: [[Float]]
+    ) -> [[Float]] {
+        let tokens = qkv.count
+        let hidden = heads * headDim
+        guard tokens > 0, heads > 0, headDim > 0 else { return qkv }
+        guard qkv.allSatisfy({ $0.count >= 3 * hidden }) else {
+            return [[Float]](repeating: [Float](repeating: 0, count: hidden), count: tokens)
+        }
+        let scale = 1 / sqrt(Float(headDim))
+
+        var angleRows = [[Float]](repeating: [], count: tokens)
+        var sineRows = [[Float]](repeating: [], count: tokens)
+        if !cosine.isEmpty, !sine.isEmpty, ropeDim > 0 {
+            for token in 0..<tokens {
+                let angles = cosine[min(token, cosine.count - 1)]
+                let angleSines = sine[min(token, sine.count - 1)]
+                guard angles.count >= ropeDim, angleSines.count >= ropeDim else { continue }
+                angleRows[token] = Array(angles.prefix(ropeDim))
+                sineRows[token] = Array(angleSines.prefix(ropeDim))
+            }
+        }
+
+        var queries = [Float](repeating: 0, count: tokens * headDim)
+        var keys = [Float](repeating: 0, count: tokens * headDim)
+        var values = [Float](repeating: 0, count: tokens * headDim)
+        var scores = [Float](repeating: 0, count: tokens * tokens)
+        var attended = [Float](repeating: 0, count: tokens * headDim)
+        var output = [Float](repeating: 0, count: tokens * hidden)
+
+        for head in 0..<heads {
+            let base = head * headDim
+            for token in 0..<tokens {
+                let row = qkv[token]
+                let delay = token * headDim
+                var query = Array(row[base..<(base + headDim)])
+                var key = Array(row[(hidden + base)..<(hidden + base + headDim)])
+                applyRotary(&query, cosine: angleRows[token], sine: sineRows[token])
+                applyRotary(&key, cosine: angleRows[token], sine: sineRows[token])
+                for dimension in 0..<headDim {
+                    queries[delay + dimension] = query[dimension]
+                    keys[delay + dimension] = key[dimension]
+                    values[delay + dimension] = row[2 * hidden + base + dimension]
+                }
+            }
+            // scores = q kᵀ * scale, in one GEMM: `alpha` carries the scale.
+            cblas_sgemm(
+                CblasRowMajor, CblasNoTrans, CblasTrans,
+                Int32(tokens), Int32(tokens), Int32(headDim),
+                scale, queries, Int32(headDim),
+                keys, Int32(headDim),
+                0, &scores, Int32(tokens)
+            )
+            for token in 0..<tokens {
+                softmaxRow(&scores, offset: token * tokens, count: tokens)
+            }
+            // attended = weights * v, in one GEMM.
+            cblas_sgemm(
+                CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                Int32(tokens), Int32(headDim), Int32(tokens),
+                1, scores, Int32(tokens),
+                values, Int32(headDim),
+                0, &attended, Int32(headDim)
+            )
+            for token in 0..<tokens {
+                let source = token * headDim
+                let destination = token * hidden + base
+                for dimension in 0..<headDim {
+                    output[destination + dimension] = attended[source + dimension]
+                }
+            }
+        }
+        return (0..<tokens).map { Array(output[($0 * hidden)..<(($0 + 1) * hidden)]) }
+    }
+
+    /// `softmax` over one row of a flat block, in place, through vForce.
+    nonisolated private static func softmaxRow(
+        _ block: inout [Float],
+        offset: Int,
+        count: Int
+    ) {
+        guard count > 0, offset >= 0, offset + count <= block.count else { return }
+        block.withUnsafeMutableBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            let row = base + offset
+            let length = vDSP_Length(count)
+            var maximum: Float = 0
+            vDSP_maxv(row, 1, &maximum, length)
+            var shift = -maximum
+            vDSP_vsadd(row, 1, &shift, row, 1, length)
+            var exponentials = Int32(count)
+            vvexpf(row, row, &exponentials)
+            var total: Float = 0
+            vDSP_sve(row, 1, &total, length)
+            guard total > 0, total.isFinite else {
+                vDSP_vclr(row, 1, length)
+                return
+            }
+            var inverse = 1 / total
+            vDSP_vsmul(row, 1, &inverse, row, 1, length)
+        }
+    }
+
     nonisolated public static func softmax(_ values: [Float]) -> [Float] {
         guard let maximum = values.max() else { return [] }
         var exponentials = values.map { exp($0 - maximum) }
@@ -474,6 +723,10 @@ nonisolated public struct DeepSeekV41VisionForward {
     }
 
     /// `RMSNorm.forward`: normalize over the last axis with `eps`, then scale.
+    ///
+    /// Three vDSP passes per row: the sum of squares, the scale, and the gain. The
+    /// tower runs this 32 times over every patch, so the scalar version's per-value
+    /// bounds checks were a measurable part of an encode.
     nonisolated public static func rmsNorm(
         _ rows: [[Float]],
         weight: [Float]?,
@@ -484,12 +737,18 @@ nonisolated public struct DeepSeekV41VisionForward {
             guard row.count == dimension, dimension > 0 else {
                 return [Float](repeating: 0, count: max(0, dimension))
             }
+            let length = vDSP_Length(dimension)
             var squares: Float = 0
-            for value in row { squares += value * value }
+            row.withUnsafeBufferPointer { values in
+                guard let base = values.baseAddress else { return }
+                vDSP_svesq(base, 1, &squares, length)
+            }
             let rstd = 1 / sqrt(squares / Float(dimension) + normalizationEpsilon)
             var output = [Float](repeating: 0, count: dimension)
-            for axis in 0..<dimension {
-                output[axis] = row[axis] * rstd * (gain?[axis] ?? 1)
+            var scale = rstd
+            vDSP_vsmul(row, 1, &scale, &output, 1, length)
+            if let gain {
+                vDSP_vmul(output, 1, gain, 1, &output, 1, length)
             }
             return output
         }

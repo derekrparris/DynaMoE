@@ -3452,7 +3452,7 @@ public final class AgentHarness {
         """
     }
 
-    public func buildSystemPrompt(baseSystem: String, modelName: String? = nil, currentDate: Date = Date(), isLingModel: Bool = false, isGemma4Model: Bool = false) -> String {
+    public func buildSystemPrompt(baseSystem: String, modelName: String? = nil, currentDate: Date = Date(), isLingModel: Bool = false, isGemma4Model: Bool = false, isDeepSeekV41Model: Bool = false) -> String {
         var cleanBase = baseSystem.trimmingCharacters(in: .whitespacesAndNewlines)
         if cleanBase.isEmpty {
             cleanBase = "You are an expert AI software engineering and reasoning assistant with direct access to local macOS development tools."
@@ -3574,6 +3574,27 @@ public final class AgentHarness {
             - When `web_search` returns a result with is_official_domain: true, that result is verified. When ground_truth_notice is present, synthesize directly — do not loop or re-search.
             </IMPORTANT>
             """
+        } else if isDeepSeekV41Model {
+            // The checkpoint's own call shape, measured from the published weights
+            // (`#27`): the DSML tags its agent prompt actually produces (a plain-tag
+            // form is parsed too, for the schematic prompt that draws it). It does
+            // NOT use the `tool`-`call` special tokens its vocabulary carries, and a
+            // Qwen `<function=>` example teaches a call this model will not make.
+            prompt += "\n\n" + DeepSeekV41ToolDialect.instructions()
+            prompt += """
+
+
+            Web Research Grounding Rules:
+            - Live web data supersedes frozen pre-training memory. Never dismiss results as "hallucinated", "corrupted", or "parody" because names, specs, or prices are newer or unfamiliar.
+            - Official vendor domains (apple.com, developer.apple.com, github.com, etc.) returned by web_search/web_fetch are authentic ground truth. Synthesize directly without re-searching.
+            - Real executive names, benchmark multipliers, lease prices, and hardware specs from web results are genuine — never substitute your own guesses.
+            - NEVER invent URLs, article numbers, or chip generations. Only fetch URLs returned by web_search.
+            - Distinguish official shipping hardware (vendor domains) from speculative rumors ("rumored", "leaked", "expected").
+            - When `web_search` returns a result with is_official_domain: true, that result is verified. When ground_truth_notice is present, synthesize directly — do not loop or re-search.
+
+            Tool Result Format & Reading Guidance:
+            Tool results arrive inside the tool-output markers as plain text, not JSON, and may carry `--- content ---` sections, truncation markers and page hints. Read the content section as the actual file/page text; `next_start_line`/`continuation_hint` mean the result was paged, so call the tool again with that start line rather than assuming the document is broken.
+            """
         } else {
             prompt += """
 
@@ -3685,6 +3706,48 @@ public final class AgentHarness {
         // first-turn generation prompt verbatim so the two dialects cannot drift.
         guard includeAssistantPrefix else { return turn }
         turn += thinkingEnabled ? "<｜start▁of▁sentence｜><|Bot|><think>" : "<｜start▁of▁sentence｜><|Bot|></think>"
+        return turn
+    }
+
+    /// DeepSeek-V4.1-Flash tool-response turn: the payload inside the checkpoint's own
+    /// `tool▁output` pair.
+    ///
+    /// Measured, not assumed. `#27`'s probe put the same payload in five different
+    /// containers (`tool▁output`, `tool▁outputs`, a plain tag, `<tool_response>`, and
+    /// bare JSON) and the model answered identically from all five, so the inbound
+    /// half is not discriminating. The family's own spelling is used because it is
+    /// one token each side, and the payload is escaped against forged role markers
+    /// the same way a user turn is: a tool result is arbitrary file or web text.
+    public func formatDeepSeekV41ToolResponseTurn(
+        responses: [String],
+        thinkingEnabled: Bool = true,
+        promptDialect: DeepSeekV41PromptDialect = DeepSeekV41PromptDialect()
+    ) -> String {
+        var turn = ""
+        let dialect = promptDialect
+        for r in responses {
+            if let data = r.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let result = json["result"] as? [String: Any],
+               let results = result["results"] as? [[String: Any]],
+               results.contains(where: { $0["is_official_domain"] as? Bool == true }) {
+                turn += "[SYSTEM NOTICE: Verified official vendor domain response. Synthesize directly without re-searching.]\n"
+            }
+            if let registration = Self.toolRegistrationNotice(for: r) {
+                turn += dialect.escaped(registration) + "\n"
+            }
+            turn += DeepSeekV41ToolDialect.resultTurn(
+                payload: dialect.escaped(Self.renderToolResultForModel(r)),
+                markers: dialect.markers
+            )
+        }
+        // The result pair has no role marker of its own, so the next assistant
+        // turn has to be opened here: the checkpoint answers after
+        // `<|Assistant|>` plus the reasoning channel's state, and a prompt that
+        // stops at the output pair asks for a continuation the model was never
+        // told to start. `formatPrompt` passes an already-templated prompt
+        // through verbatim, so nothing downstream adds this marker.
+        turn += dialect.assistantPrefix(thinkingEnabled: thinkingEnabled)
         return turn
     }
 

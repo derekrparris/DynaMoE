@@ -54,6 +54,10 @@ struct ChatDetailView: View {
     /// tower, and the composer refuses an attachment rather than sending pixels
     /// that would be silently dropped.
     var supportsVision: Bool = false
+    /// What the active model's vision tower will cost for a staged image, phrased
+    /// for the chip ("about 5 s"). `nil` when the backend prices nothing, which
+    /// keeps every non-local and non-vision model's chip exactly as it was.
+    var visionCostLabel: ((PreparedImage) -> String?)? = nil
     var isAgentToolsEnabled: Bool = true
     var isModelLoaded: Bool = true
     var isAppleFoundationModelActive: Bool = false
@@ -1355,6 +1359,15 @@ struct ChatDetailView: View {
         attachmentError = nil
     }
 
+    private func attachmentDetailLine(_ image: PreparedImage) -> String {
+        let size = "\(image.pixelWidth)×\(image.pixelHeight) · "
+            + ByteCountFormatter.string(fromByteCount: Int64(image.byteCount), countStyle: .file)
+        // Only a backend that can price an encode adds anything here, and the cost
+        // is measured per machine rather than fixed, so it reads as an estimate.
+        guard let cost = visionCostLabel?(image), !cost.isEmpty else { return size }
+        return size + " · " + cost
+    }
+
     private func attachmentChipsRow() -> some View {
         VStack(alignment: .leading, spacing: 4) {
             ScrollView(.horizontal, showsIndicators: false) {
@@ -1367,7 +1380,7 @@ struct ChatDetailView: View {
                                 Text(image.fileName)
                                     .font(.system(size: max(9, 10.5 * zoomManager.zoomScale), weight: .semibold))
                                     .lineLimit(1)
-                                Text("\(image.pixelWidth)×\(image.pixelHeight) · \(ByteCountFormatter.string(fromByteCount: Int64(image.byteCount), countStyle: .file))")
+                                Text(attachmentDetailLine(image))
                                     .font(.system(size: max(8, 9.5 * zoomManager.zoomScale), design: .monospaced))
                                     .foregroundColor(.secondary)
                                     .lineLimit(1)
@@ -1924,8 +1937,20 @@ struct ChatMessageView: View {
         clean = clean
             .replacingOccurrences(of: "<tool_call>[\\s\\S]*?</tool_call>", with: "", options: .regularExpression)
             .replacingOccurrences(of: "<tool_response>[\\s\\S]*?</tool_response>", with: "", options: .regularExpression)
+            // DeepSeek-V4.1's own call tags (`#27`): the call is executed from the raw
+            // text, so the bubble must not show it as prose.
+            .replacingOccurrences(of: "<tool_call_name>[\\s\\S]*?</tool_call_arguments>", with: "", options: .regularExpression)
         if let toolCallRange = clean.range(of: "<tool_call>") {
             clean = String(clean[..<toolCallRange.lowerBound])
+        }
+        if let deepSeekCall = clean.range(of: "<tool_call_name>") {
+            clean = String(clean[..<deepSeekCall.lowerBound])
+        }
+        // DSML (`#27`) is that same family's other call shape, and the one its agent
+        // prompt actually produces. The call container is the last thing in a tool
+        // turn, so everything from the first DSML tag on is machinery, not answer.
+        if let dsmlCall = clean.range(of: "<" + DeepSeekV41ToolDialect.dsmlTag) {
+            clean = String(clean[..<dsmlCall.lowerBound])
         }
         return clean.trimmingCharacters(in: .whitespacesAndNewlines)
     }

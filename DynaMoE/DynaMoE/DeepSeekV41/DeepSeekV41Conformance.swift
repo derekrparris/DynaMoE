@@ -16,18 +16,36 @@
 //  `Tools/dsv41_probe.py` dumps the checkpoint's own files (it does not compute
 //  reference outputs), and flipping a gate to `.verifiedAgainstReference` is a
 //  one-line change accompanied by a test that carries vectors produced by a real
-//  reference run. The gates are diagnostics rather than switches: a stage the port
-//  has implemented runs whether or not its rule has been matched against a numeric
+//  reference run -- or, for a gate about a PATH rather than a numeric rule, by a
+//  comparison against the walk on the published checkpoint (see
+//  `batchedDevicePrefill`). The gates are diagnostics rather than switches: a stage
+//  the port has implemented runs whether or not its rule has been matched against a
 //  reference, and the gate is how far to trust the numbers it produces.
 //
 
 import Foundation
 
-/// Whether the family can serve a turn yet. Detection and the clear refusal stay
-/// on unconditionally; discovery and the graded-effort UI read this so a user is
-/// not invited to download a ~510 GB checkpoint that can only fail closed.
+/// Whether the family can serve a turn, which it can: a rendered prompt goes
+/// through `DeepSeekV41TurnRunner` on the published checkpoint, and every numeric
+/// rule in the graph it runs has a reference (see `DeepSeekV41Conformance`).
+/// Discovery reads this to omit an "unavailable" caveat from the model row, and
+/// `ModelConfig.supportsThinkingLevels` reads it because the dialect renders the
+/// checkpoint's own `Reasoning Effort:` line.
+///
+/// What it advertises is deliberately TEXT turns: this is the gate discovery and
+/// the thinking-level UI read. The vision tower is a separate promise
+/// (`ModelConfig.supportsVision`), and as of `#43` it runs as one device pass; an
+/// image reaches an in-app turn, but the API path still has no span cache and is
+/// not promised. DSpark is not wired either: `#26` measured the speculative round
+/// losing to walking at every width, so it is an optimization this flag does not
+/// promise, and cache rewind for a rejected suffix is unbuilt.
+///
+/// The value is a constant rather than derived from `unverifiedSummary`: a gate
+/// records how far to trust a number, and one open rule for a stage the text path
+/// never runs must not disable a text turn that works. It is also not a download
+/// gate; discovery lists whatever is in the hub cache either way.
 nonisolated public enum DeepSeekV41Availability {
-    public static let isRuntimeAvailable = false
+    public static let isRuntimeAvailable = true
 }
 
 nonisolated public enum DeepSeekV41Conformance {
@@ -117,17 +135,53 @@ nonisolated public enum DeepSeekV41Conformance {
     /// them is `DeepSeekV41AttentionReference`'s own and is pinned separately.
     public static let chunkAddressing: Gate = .verifiedAgainstReference
 
-    /// How the compressed-row candidate blocks are scored and truncated.
+    /// Which compressed rows a query reads: the indexer's two-level top-k.
     ///
-    /// Both backends currently read rows through
-    /// `DeepSeekV41CacheAddressing.attentionRowPlan`, which is value-free: the
-    /// count a position reads is known on the host before any dispatch. The
-    /// block-score path stays a recorded diagnostic (the reference keeps
-    /// `candidateScores`, the device path does not compute them) because a
-    /// value-dependent selection needs a per-layer readback of the selected count,
-    /// and paying that before the rule is verified would slow every token down to
-    /// reproduce a guess.
-    public static let candidateSelection: Gate = .unverified
+    /// MATCHED AGAINST `Indexer.forward` and `select_candidate_blocks`. Three rules
+    /// decide the answer and each is pinned separately by
+    /// `Tools/dsv41_goldens.py indexer` and `DeepSeekV41IndexerGoldenTests`:
+    ///
+    /// * the score. `(relu(dot) * weight).sum(heads)` against the shared index key,
+    ///   with `index_head_dim ** -0.5 * index_n_heads ** -0.5` on the WEIGHTS. The
+    ///   rectifier is per head, so a head that votes against a row removes only its
+    ///   own contribution, and the heads are summed rather than maxed.
+    /// * the reach mask. A compressed row becomes visible to a query only once the
+    ///   query has passed its last token (`arange(1, seqlen + 1) // ratio`), and the
+    ///   cut runs BEFORE that filter, so a row a query cannot see can take a slot and
+    ///   then leave the selection one short.
+    /// * the two cuts. A block scores as its best row, the partly-filled block at the
+    ///   frontier is pinned at `+inf` so it cannot lose to an older full block, and
+    ///   only the candidate source publishes that mask: the layers after it score
+    ///   with their OWN query and weights inside it.
+    ///
+    /// The port read the newest `index_topk` rows until this was verified, which is
+    /// the same list only while nothing competes for the slots. On the published
+    /// checkpoint `index_topk` is 512 and the twenty ratio-1 layers read one
+    /// compressed row per token, so the two disagreed from position 513 on.
+    ///
+    /// VERIFIED AT THE PUBLISHED GEOMETRY, on the checkpoint's own tensors: a real
+    /// 576-position prefill of layer 20 is dumped through
+    /// `DeepSeekV41MetalForward.indexerInputRequest` and
+    /// `Tools/dsv41_goldens.py indexer_real` runs `Indexer.forward` on those exact
+    /// activations with the real `wq_b` / `weights_proj` / `wk` / `k_norm`. The
+    /// port's 576 scores differ from the reference's by at most 2.6e-6 in absolute
+    /// terms -- float summation order, since the scale is folded into the weights in
+    /// one and onto each term in the other -- and the 512 selected rows are
+    /// identical. `DeepSeekV41RealIndexerReScareTests` carries those numbers, which a
+    /// reproducible dump made worth checking in: two independently prefilled dumps are
+    /// byte-identical.
+    ///
+    /// What it does NOT cover, now measured rather than assumed: the FP4 activation
+    /// quantization of the indexer's query and keys, which the dense path skips
+    /// everywhere else too. Emulating the reference's own `fp4_act_quant` (E2M1, one
+    /// power-of-two E8M0 scale per 32-value block) moves exactly 3 of the 512 selected
+    /// rows at that position and drops 3 others -- the same six on both dumps, and all
+    /// of them by less than a quarter of a score unit, against a cut that separates its
+    /// neighbours by 0.0025 -- so the deviation is real and bounded. The order among
+    /// exactly equal scores is also unspecified: a row every head votes against scores
+    /// zero, and the port breaks that tie to the lower row index
+    /// (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #30" and "#32").
+    public static let candidateSelection: Gate = .verifiedAgainstReference
 
     /// How retrieved Engram rows are combined into the layer's residual.
     ///
@@ -245,8 +299,7 @@ nonisolated public enum DeepSeekV41Conformance {
     /// arena kept below that falls back to one fill-and-wait per position instead of
     /// overwriting a slot a kernel is still reading.
     ///
-    /// What changed about the gate's own reasoning: the local shards are still
-    /// header-only stubs, but the device forward is no longer unrun.
+    /// The device forward was first checked without a checkpoint:
     /// `DeepSeekV41SyntheticCheckpoint` publishes the checkpoint's own tensor names at
     /// widths the config derives, feeds that graph and the host reference identical
     /// values, and `DeepSeekV41DeviceGraphParityTests` compares a block with the walk
@@ -255,39 +308,27 @@ nonisolated public enum DeepSeekV41Conformance {
     /// note predicted nothing could — a byte offset read as floats, a grouped output
     /// projection splitting its rows twice, and a RoPE batch rotating one row.
     ///
-    /// What stays open: no comparison against the checkpoint's own numbers at real
-    /// weights. The pass has been MEASURED four times, and each measurement narrowed
-    /// the remaining reason. The first showed a
-    /// block beating the walk by only 1.0-1.26x with the mixture's per-position round
-    /// trip as ~50-60% of a block's per-position cost; batching the mixture into one
-    /// submission per layer, with one arena fill for the block's union, took it to
-    /// ~2.0x at every width and halved the per-position cost (0.33 -> 0.14
-    /// ms/position/layer). The third split what is left: host encode is only ~20% of
-    /// it, the dense half holds 85% of the device time (the mixture 15%), and inside
-    /// the dense half the per-position stages dominate — `writeLatent` 42%, the two
-    /// mHC coefficient stages 33% — because `dsv41_hc_split_f32` runs its whole
-    /// Sinkhorn schedule on ONE thread, repeated per position. The mHC pair and the
-    /// router now take a slot dimension, so a block runs its positions as grid rows:
-    /// that took the pass to ~2.4x at block width 4 and halved the dense half's
-    /// device time again, leaving `writeLatent` (cache write, gather, attention) as
-    /// the largest remaining per-position stage. The fourth measurement left the
-    /// synthetic model entirely and timed THAT stage's kernel at the widths the
-    /// checkpoint publishes, where it is not a dispatch question at all:
-    /// `dsv41_attention_csa2_f32` ran one thread per head, and a head walks
-    /// `window + index_topk` (128 + 512) records three times over a 512-wide latent,
-    /// so one position of one layer cost 68 ms on an idle GPU. The kernel now gives a
-    /// head a whole threadgroup, keeps the row scores in threadgroup memory so the
-    /// three passes share one dot product, and dispatches one thread per row; the
-    /// same dispatch costs 0.47 ms, and the block pass measures 3.1-3.9x at block
-    /// widths 8-16 against 2.1-2.6x before. So the graph is no longer the question,
-    /// neither is the arena, and neither is the attention kernel: what is left is
-    /// per-position serial work in the cache write, the gather and the mHC pre/post
-    /// mix, and above all the fact that none of this has run against real weights.
-    /// The turn loop already routes a from-position-0 prompt through
-    /// `DeepSeekV41PositionForward.prefillChunk`, so nothing outside the executor has
-    /// to change either way (numbers and caveats in `Benchmarks/PERF_FINDINGS.md`,
-    /// "DSV4.1 #1" to "DSV4.1 #5").
-    public static let batchedDevicePrefill: Gate = .unverified
+    /// THE PUBLISHED CHECKPOINT, which is what closed the gate.
+    /// `DeepSeekV41PublishedTurnTests
+    /// .testABatchedPrefillMatchesTheWalkOnThePublishedCheckpoint` runs two
+    /// consecutive blocks of the real model and asks the head for EVERY slot, then
+    /// compares each position with a per-position walk. The synthetic fixture cannot
+    /// produce the published shapes, the 128-row ring, the ratio-2 compressor or the
+    /// real expert arena; that run does, and it covers a continuation (the second
+    /// block appends to a cache the first filled) rather than only a prompt from
+    /// position 0. The capture is also the shape a verify needs: the target's choice
+    /// for draft `p` comes from the logits at position `p - 1`, so one block returns
+    /// the whole run side by side, with the head projecting all slots in one grid.
+    ///
+    /// What this does NOT claim: that a batched verify is faster than walking. `#26`
+    /// measured the drafter's acceptance and the per-width costs, and a narrow verify
+    /// loses to the walk at the widths a chain actually submits. No drafter is wired
+    /// into the turn loop, and cache rewind for a rejected suffix is still unbuilt,
+    /// because those are costs in service of a negative result. The turn loop keeps
+    /// its one batching use — a from-position-0 prompt through
+    /// `DeepSeekV41PositionForward.prefillChunk` — while a decode step walks
+    /// (numbers in `Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #1" to "#5" and "#33").
+    public static let batchedDevicePrefill: Gate = .verifiedAgainstReference
 
     /// The vision tower's patch grid, image token layout, and the tower forward.
     ///

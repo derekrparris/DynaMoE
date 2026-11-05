@@ -121,6 +121,33 @@ enum DeepSeekV41TestFixtures {
             source.set(generator.matrix(rows: shapes.queryWidth, columns: shapes.hidden), role: .attnWqB, layer: l)
             source.set(generator.matrix(rows: shapes.latentWidth, columns: shapes.hidden), role: .attnWkv, layer: l)
             source.set(generator.vector(shapes.latentWidth, scale: 0.1), role: .attnKvNorm, layer: l)
+            // The indexer's own projections, so the fixture runs the compressed-row
+            // selection instead of falling back to "every reachable row".
+            if layer.ownsCompressedIndex {
+                let reduced = shapes.qLoraRank > 0 ? shapes.qLoraRank : shapes.hidden
+                source.set(
+                    generator.matrix(rows: config.indexNHeads * config.indexHeadDim, columns: reduced),
+                    role: .indexerWqB,
+                    layer: l
+                )
+                source.set(
+                    generator.matrix(rows: config.indexNHeads, columns: shapes.hidden),
+                    role: .indexerWeights,
+                    layer: l
+                )
+                if layer.ownsCompressedKV {
+                    source.set(
+                        generator.matrix(rows: config.indexHeadDim, columns: shapes.latentWidth),
+                        role: .indexerWk,
+                        layer: l
+                    )
+                    source.set(
+                        generator.vector(config.indexHeadDim, scale: 0.1),
+                        role: .indexerKNorm,
+                        layer: l
+                    )
+                }
+            }
             source.set(generator.matrix(rows: shapes.oLoraRank, columns: shapes.attentionOutputWidth), role: .attnWoA, layer: l)
             source.set(generator.matrix(rows: shapes.hidden, columns: shapes.oLoraRank), role: .attnWoB, layer: l)
             source.set(generator.vector(config.numAttentionHeads, scale: 0.5), role: .attnSink, layer: l)
@@ -538,6 +565,79 @@ final class DeepSeekV41CompressorTests: XCTestCase {
 
 // MARK: - Block-diagonal output projection
 
+/// Where each head group's weight and scale bytes start.
+///
+/// The published `attn.wo_a` is `[8192, 4096]` of E4M3 with `[256, 128]` E8M0
+/// scales: one scale row per THIRTY-TWO weight rows. A group's scales therefore
+/// start `1024 / 32` rows in, not `1024`, and advancing by whole weight rows ran
+/// off the end of the companion after the first group. Nothing could report it;
+/// groups 1..7 simply took the bytes that followed as exponents.
+final class DeepSeekV41BlockDiagonalStrideTests: XCTestCase {
+
+    func testThePublishedOutputProjectionAdvancesItsScalesByBlockRows() {
+        let strides = DeepSeekV41DevicePlan.blockDiagonalStrides(
+            outDim: 8192,
+            inDim: 32768,
+            scaleRows: 256,
+            groups: 8,
+            storedBytesPerValue: 1
+        )
+        XCTAssertEqual(strides.weight, 1024 * 4096)
+        XCTAssertEqual(strides.scale, 32 * 128)
+        // The last group's scales have to end at the companion's own end.
+        XCTAssertEqual(strides.scale * 8, 256 * 128)
+    }
+
+    /// An MXFP4 companion is one scale row per weight row, so a group's scales
+    /// still advance by the band's whole row count.
+    func testAPerRowCompanionKeepsOneScaleRowPerWeightRow() {
+        let strides = DeepSeekV41DevicePlan.blockDiagonalStrides(
+            outDim: 2304,
+            inDim: 5120,
+            scaleRows: 2304,
+            groups: 2,
+            storedBytesPerValue: 0.5
+        )
+        XCTAssertEqual(strides.weight, 1152 * 1280)
+        XCTAssertEqual(strides.scale, 1152 * 80)
+    }
+
+    /// The stride is an ADDRESS step, so it uses the stored width of a value. The
+    /// memory-priced width folds the one-E8M0-per-32 payload into the value
+    /// (1.03125 for E4M3); using it here started each band 32 rows late, which made
+    /// groups 1..7 multiply the wrong weights by the wrong scales.
+    func testTheStrideUsesTheStoredWidthNotThePricedOne() {
+        XCTAssertEqual(DeepSeekV41DevicePlan.storedBytesPerValue(.fp8Block32), 1)
+        XCTAssertEqual(DeepSeekV41DevicePlan.storedBytesPerValue(.mxfp4), 0.5)
+        XCTAssertEqual(DeepSeekV41DevicePlan.storedBytesPerValue(.bf16), 2)
+        let addressed = DeepSeekV41DevicePlan.blockDiagonalStrides(
+            outDim: 8192, inDim: 32768, scaleRows: 256, groups: 8,
+            storedBytesPerValue: DeepSeekV41DevicePlan.storedBytesPerValue(.fp8Block32)
+        )
+        let priced = DeepSeekV41DevicePlan.blockDiagonalStrides(
+            outDim: 8192, inDim: 32768, scaleRows: 256, groups: 8,
+            storedBytesPerValue: DeepSeekV41DtypeWidth.bytesPerValue(dtype: "F8_E4M3")
+        )
+        XCTAssertEqual(addressed.weight, 4_194_304)
+        XCTAssertNotEqual(priced.weight, addressed.weight)
+    }
+
+    /// A weight with no companion, or one whose rows do not divide, is read as
+    /// per-row: that is the layout whose stride is the band, so a misclassified
+    /// companion cannot silently shrink the stride instead.
+    func testAnUnknownCompanionIsTreatedAsPerRow() {
+        let strides = DeepSeekV41DevicePlan.blockDiagonalStrides(
+            outDim: 64,
+            inDim: 256,
+            scaleRows: nil,
+            groups: 2,
+            storedBytesPerValue: 2
+        )
+        XCTAssertEqual(strides.weight, 32 * 128 * 2)
+        XCTAssertEqual(strides.scale, 32 * 4)
+    }
+}
+
 final class DeepSeekV41BlockDiagonalProjectionTests: XCTestCase {
 
     /// `attn.wo_a` is `groups` dense blocks stacked along the rows. Reading it as
@@ -604,34 +704,87 @@ final class DeepSeekV41BlockDiagonalProjectionTests: XCTestCase {
 
 final class DeepSeekV41IndexerTests: XCTestCase {
 
-    func testBlockScoreIsTheMaxOverRowsAndHeads() {
-        let queries: [[Float]] = [
-            [1, 0],
-            [-1, 0]
-        ]
-        let keys: [[Float]] = [
-            [0.1, 0],   // block 0 row 0: 0.1 / sqrt(2)
-            [0.9, 0],   // block 0 row 1: 0.9 / sqrt(2)
-            [0, 0],     // block 1 row 0
-            [-0.4, 0]   // block 1 row 1: 0.4 / sqrt(2) via the negated query
-        ]
-        let scores = DeepSeekV41Indexer.blockScores(queries: queries, keys: keys, blockSize: 2, keyWidth: 2)
-        XCTAssertEqual(scores.count, 2)
-        XCTAssertEqual(scores[0], 0.9 / sqrt(2), accuracy: 1e-5)
-        XCTAssertEqual(scores[1], 0.4 / sqrt(2), accuracy: 1e-5)
+    func testAScoreIsTheHeadsSummedAfterTheirOwnRectifier() {
+        // Head 0 likes row 0; head 1 votes against it and likes row 1. Summed, the
+        // rows tie; maxed over heads they would not, and neither would a mean of the
+        // rectified dots (which would put row 0 at half its score).
+        let scores = DeepSeekV41Indexer.positionScores(
+            queryHeads: [[1, 0], [-1, 0]],
+            keys: [[1, 0], [-1, 0]],
+            headWeights: [1, 1]
+        )
+        XCTAssertEqual(scores, [1, 1])
+        // The rectifier is per head, so a head that votes against a row subtracts
+        // nothing: only the positive dot contributes, and it carries its own weight.
+        let weighted = DeepSeekV41Indexer.positionScores(
+            queryHeads: [[1, 0], [1, 0]],
+            keys: [[1, 0], [-1, 0]],
+            headWeights: [0.5, 2]
+        )
+        XCTAssertEqual(weighted, [2.5, 0])
     }
 
-    func testSelectionIsDescendingByScoreButReturnedAscending() {
+    func testTheFrontierBlockIsPinnedAheadOfAnyOlderFullBlock() {
+        // Eight rows in four blocks of two. Block 3 is the frontier for a query that
+        // reaches seven rows, and it holds a single row -- but it is pinned, so it
+        // survives a cut that keeps only two blocks even though its score is the worst.
+        let scores: [Float] = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, -99]
+        let kept = DeepSeekV41Indexer.candidateBlocks(
+            scores: scores, visibleRows: 7, blockSize: 2, topKBlocks: 2
+        )
+        XCTAssertEqual(kept, [true, true, false, false, false, false, true, true])
+        // A cut wider than the block count keeps every block. Rows the query cannot
+        // reach are dropped by the SECOND cut, not here: the mask is about blocks.
+        let all = DeepSeekV41Indexer.candidateBlocks(
+            scores: scores, visibleRows: 7, blockSize: 2, topKBlocks: 99
+        )
+        XCTAssertEqual(all, [Bool](repeating: true, count: 8))
+    }
+
+    func testTheSecondCutRanksByScoreAndDropsRowsPastTheFrontier() {
         let scores: [Float] = [0.1, 0.9, 0.5, 0.7]
-        XCTAssertEqual(DeepSeekV41Indexer.selectedBlocks(scores: scores, topK: 2), [1, 3])
-        XCTAssertEqual(DeepSeekV41Indexer.selectedBlocks(scores: scores, topK: 0), [])
-        XCTAssertEqual(DeepSeekV41Indexer.selectedBlocks(scores: scores, topK: 9), [0, 1, 2, 3])
+        // The cut runs over EVERY produced row and the reach filter runs after it,
+        // so a row the query cannot see can still take a slot and then leave the
+        // selection one short. That is the reference's order, not an optimization:
+        // row 3 outranks row 2 and is dropped, leaving one row rather than two.
+        XCTAssertEqual(
+            DeepSeekV41Indexer.selectedRows(scores: scores, visibleRows: 3, topK: 2),
+            [1]
+        )
+        // With the whole sequence visible the two best survive.
+        XCTAssertEqual(
+            DeepSeekV41Indexer.selectedRows(scores: scores, visibleRows: 4, topK: 2),
+            [1, 3]
+        )
+        // A query at the start of a prompt sees nothing, whatever the scores say.
+        XCTAssertEqual(
+            DeepSeekV41Indexer.selectedRows(scores: scores, visibleRows: 0, topK: 3), []
+        )
+        // A masked row is ranked last rather than removed, so it only survives when
+        // the cut is wider than the rows left in the surviving blocks.
+        let candidates: [Bool] = [true, true, false, false]
+        XCTAssertEqual(
+            DeepSeekV41Indexer.selectedRows(
+                scores: scores, visibleRows: 4, topK: 2, candidates: candidates
+            ),
+            [0, 1]
+        )
+        XCTAssertEqual(
+            DeepSeekV41Indexer.selectedRows(
+                scores: scores, visibleRows: 4, topK: 4, candidates: candidates
+            ),
+            [0, 1, 2, 3]
+        )
     }
 
-    func testRowExpansionCoversWholeBlocksAndTruncatesTheLast() {
-        XCTAssertEqual(DeepSeekV41Indexer.rows(for: [0, 1], blockSize: 2, rowCount: 5), [0, 1, 2, 3])
-        XCTAssertEqual(DeepSeekV41Indexer.rows(for: [2], blockSize: 2, rowCount: 5), [4])
-        XCTAssertEqual(DeepSeekV41Indexer.rows(for: [3], blockSize: 2, rowCount: 5), [])
+    func testTheNewestRowsAreNotWhatTheRuleSelects() {
+        // The rule the port used to implement: read the newest `topK` rows. Here the
+        // oldest row is the one every head likes, which the newest-three rule misses.
+        let scores: [Float] = [5, 0.1, 0.2, 0.3]
+        XCTAssertEqual(
+            DeepSeekV41Indexer.selectedRows(scores: scores, visibleRows: 4, topK: 3),
+            [0, 2, 3]
+        )
     }
 }
 
@@ -841,6 +994,162 @@ final class DeepSeekV41ExpertArenaTests: XCTestCase {
         XCTAssertEqual(arena.residentCount, 0)
         XCTAssertEqual(arena.acquisitions, 0)
         XCTAssertEqual(arena.hitRate, 0)
+    }
+
+    /// The placement index is derived from the slot array, so every path that writes
+    /// one has to write the other. An evicted pair that still answered as resident
+    /// would be served stale bytes, and a vacated slot that did would be served
+    /// nothing at all.
+    func testEvictedAndVacatedPairsAreNoLongerResident() {
+        let arena = DeepSeekV41ExpertArena(slotCount: 2)
+        _ = arena.acquire([(layer: 0, expert: 0), (layer: 0, expert: 1)])
+
+        // Capacity two, both slots taken: the older pair (expert 0) is the victim.
+        let replacement = arena.acquireDetailed([(layer: 2, expert: 2)])
+        XCTAssertEqual(replacement[0].slot, 0)
+        XCTAssertFalse(replacement[0].isHit)
+        XCTAssertNil(arena.slot(forLayer: 0, expert: 0))
+        XCTAssertEqual(arena.slot(forLayer: 0, expert: 1), 1)
+        XCTAssertEqual(arena.residentCount, 2)
+
+        // A vacated slot is a miss the next time, and the pair it held is gone from
+        // the index rather than claiming the empty slot.
+        arena.vacate(slot: 1)
+        XCTAssertNil(arena.slot(forLayer: 0, expert: 1))
+        XCTAssertEqual(arena.residentCount, 1)
+        let refill = arena.acquireDetailed([(layer: 0, expert: 1)])
+        XCTAssertFalse(refill[0].isHit)
+        XCTAssertEqual(refill[0].slot, 1)
+        XCTAssertEqual(arena.residentCount, 2)
+        XCTAssertNotNil(arena.slot(forLayer: 0, expert: 1))
+
+        // And the pair that survived is still a hit on the slot it always had.
+        let resident = arena.acquireDetailed([(layer: 2, expert: 2)])
+        XCTAssertTrue(resident[0].isHit)
+        XCTAssertEqual(resident[0].slot, 0)
+    }
+
+    /// The counter `#58` decides on: only a pair the arena loaded once and then
+    /// evicted can be win back by a replacement rule. A first touch cannot.
+    func testAMissIsAFirstTouchUntilThePairIsEvictedAndNeededAgain() {
+        let arena = DeepSeekV41ExpertArena(slotCount: 2)
+        XCTAssertEqual(arena.describeMisses().hasPrefix("miss composition off"), true)
+
+        arena.recordsMissComposition = true
+        _ = arena.acquire([(layer: 0, expert: 0), (layer: 0, expert: 1)])
+        XCTAssertEqual(arena.missComposition.firstTouch, 2)
+        XCTAssertEqual(arena.missComposition.refetch, 0)
+        XCTAssertEqual(arena.distinctPairs, 2)
+
+        // A hit is neither: the pair was already here and nothing was read.
+        _ = arena.acquire([(layer: 0, expert: 0)])
+        XCTAssertEqual(arena.missComposition.firstTouch, 2)
+        XCTAssertEqual(arena.missComposition.refetch, 0)
+
+        // Capacity two and expert 0 was just touched, so expert 1 is the victim.
+        _ = arena.acquire([(layer: 0, expert: 2)])
+        XCTAssertEqual(arena.missComposition.firstTouch, 3)
+        XCTAssertEqual(arena.missComposition.refetch, 0)
+        XCTAssertEqual(arena.evictions, 1)
+
+        // Expert 1 comes back: a miss again, but not a first touch. This is the only
+        // kind of miss an eviction policy can ever remove.
+        let again = arena.acquireDetailed([(layer: 0, expert: 1)])
+        XCTAssertFalse(again[0].isHit)
+        XCTAssertEqual(arena.missComposition.firstTouch, 3)
+        XCTAssertEqual(arena.missComposition.refetch, 1)
+        XCTAssertEqual(arena.distinctPairs, 3)
+
+        // The instrument's own arithmetic: every miss is exactly one of the two.
+        XCTAssertEqual(
+            arena.missComposition.firstTouch + arena.missComposition.refetch,
+            arena.acquisitions - arena.hits
+        )
+    }
+
+    func testTheCompositionIsNotRecordedUnlessAsked() {
+        let arena = DeepSeekV41ExpertArena(slotCount: 2)
+        _ = arena.acquire([(layer: 0, expert: 0), (layer: 0, expert: 1), (layer: 0, expert: 2)])
+        XCTAssertEqual(arena.missComposition.firstTouch, 0)
+        XCTAssertEqual(arena.missComposition.refetch, 0)
+        XCTAssertEqual(arena.distinctPairs, 0)
+    }
+
+    /// `#58`: a warm pass misses mostly on pairs the arena already had, so the
+    /// replacement rule is a lever at a FIXED capacity. LRU cannot tell a pair a pass
+    /// touches four times from one it touches once, so the singles evict the recurring
+    /// set; frequency can.
+    func testTheFrequencyPolicyKeepsThePairItHasSeenMoreOften() {
+        // Four slots so one aging round (every `slotCount` misses) fits inside the
+        // setup: A ends the setup on two uses after being halved from four, the three
+        // singles on one.
+        let arena = DeepSeekV41ExpertArena(slotCount: 4)
+        // Frequency is what ships as of `#58`; this case pins the rule it implements.
+        XCTAssertEqual(arena.victimPolicy, .leastFrequentlyUsed)
+
+
+        _ = arena.acquire([(layer: 0, expert: 0)])
+        for _ in 0..<3 { _ = arena.acquire([(layer: 0, expert: 0)]) }
+        _ = arena.acquire([(layer: 0, expert: 1)])
+        _ = arena.acquire([(layer: 0, expert: 2)])
+        _ = arena.acquire([(layer: 0, expert: 3)])
+
+        _ = arena.acquire([(layer: 0, expert: 4)])
+        XCTAssertEqual(arena.evictions, 1)
+        // A is the LEAST recently used of the five and LRU would take it; frequency
+        // takes the oldest of the pairs it has seen once.
+        XCTAssertNotNil(arena.slot(forLayer: 0, expert: 0), "the frequent pair was evicted")
+        XCTAssertNil(arena.slot(forLayer: 0, expert: 1), "the singleton survived")
+        XCTAssertNotNil(arena.slot(forLayer: 0, expert: 4))
+    }
+
+    func testTheFrequencyPolicyStillEvictsTheOldestAmongEqualCounts() {
+        let arena = DeepSeekV41ExpertArena(slotCount: 2)
+        arena.victimPolicy = .leastFrequentlyUsed
+        _ = arena.acquire([(layer: 0, expert: 0)])
+        _ = arena.acquire([(layer: 0, expert: 1)])
+        // Both are on one use; the tie-break has to be the LRU order, not the slot.
+        _ = arena.acquire([(layer: 0, expert: 2)])
+        XCTAssertNil(arena.slot(forLayer: 0, expert: 0))
+        XCTAssertNotNil(arena.slot(forLayer: 0, expert: 1))
+    }
+
+    /// Aging is what keeps the first text a process sees from owning the arena forever:
+    /// counts only ever rise, so without halving a stale hot pair outranks every pair a
+    /// later turn touches once.
+    func testFrequencyAgingRetiresAPairThatStopsBeingUsed() {
+        let arena = DeepSeekV41ExpertArena(slotCount: 2)
+        arena.victimPolicy = .leastFrequentlyUsed
+        _ = arena.acquire([(layer: 0, expert: 0)])
+        for _ in 0..<3 { _ = arena.acquire([(layer: 0, expert: 0)]) }
+        _ = arena.acquire([(layer: 0, expert: 1)])
+
+        // A capacity-worth of misses halves every count, so the stale pair decays from
+        // four to one and then loses the tie-break to everything placed after it.
+        for expert in 2...6 {
+            _ = arena.acquire([(layer: 0, expert: expert)])
+        }
+        XCTAssertNil(
+            arena.slot(forLayer: 0, expert: 0),
+            "a pair nothing has touched since is still pinned by its old count"
+        )
+        XCTAssertNotNil(arena.slot(forLayer: 0, expert: 6))
+    }
+
+    func testResetClearsTheCompositionWithTheResidency() {
+        let arena = DeepSeekV41ExpertArena(slotCount: 2)
+        arena.recordsMissComposition = true
+        _ = arena.acquire([(layer: 0, expert: 0), (layer: 0, expert: 1)])
+        _ = arena.acquire([(layer: 0, expert: 2)])
+        _ = arena.acquire([(layer: 0, expert: 0)])
+        XCTAssertGreaterThan(arena.missComposition.refetch, 0)
+
+        arena.reset()
+        XCTAssertEqual(arena.missComposition.firstTouch, 0)
+        XCTAssertEqual(arena.missComposition.refetch, 0)
+        XCTAssertEqual(arena.distinctPairs, 0)
+        // The flag survives a reset: it describes the instrument, not the window.
+        XCTAssertTrue(arena.recordsMissComposition)
     }
 }
 
@@ -1329,18 +1638,20 @@ final class DeepSeekV41CacheLayoutTests: XCTestCase {
         XCTAssertEqual(DeepSeekV41CacheAddressing.poolRange(row: 2, ratio: 2), 4..<6)
     }
 
-    func testCompressedAttentionRangeHonoursTheTopKBudget() {
+    func testTheRowPlanReadsEveryReachableRowWithoutAnIndexer() {
+        // Nil selection is the reference's no-indexer case: every row the owner has
+        // pooled by this position, which at ratio 2 is `(position + 1) / 2`.
         XCTAssertEqual(
-            DeepSeekV41CacheAddressing.compressedRowsForAttention(position: 7, ratio: 2, ownerRowCount: 100, topKRows: 2),
-            2..<4
-        )
-        XCTAssertEqual(
-            DeepSeekV41CacheAddressing.compressedRowsForAttention(position: 7, ratio: 2, ownerRowCount: 100, topKRows: 0),
+            DeepSeekV41CacheAddressing.producedCompressedRows(
+                position: 7, ratio: 2, ownerRowCount: 100
+            ),
             0..<4
         )
         // The owner's own row count caps the range even when the position implies more.
         XCTAssertEqual(
-            DeepSeekV41CacheAddressing.compressedRowsForAttention(position: 99, ratio: 2, ownerRowCount: 3, topKRows: 0),
+            DeepSeekV41CacheAddressing.producedCompressedRows(
+                position: 99, ratio: 2, ownerRowCount: 3
+            ),
             0..<3
         )
     }

@@ -45,11 +45,20 @@ final class ModelConfigThinkingLevelTests: XCTestCase {
     }
 
     func testNonSparkTemplateWithReasoningEffortIsNotDetected() throws {
-        // Detection is deliberately Spark-only: another family advertising the
-        // same token would show a level menu the formatter cannot honor.
+        // Detection only covers families whose formatter can honor the level:
+        // Spark's template knob and DeepSeek V4.1's own effort line. Another
+        // family advertising the same token would show a menu it cannot honor.
         try writeConfig(modelType: "qwen3")
         try write("chat_template.jinja", "reasoning_effort")
         XCTAssertFalse(ModelConfig.supportsThinkingLevels(modelPath: directory.path))
+    }
+
+    func testDeepSeekV41IsDetectedWithoutATemplateKnob() throws {
+        // V4.1 renders the checkpoint's own `Reasoning Effort:` line, so the
+        // level menu follows the family identity (and the advertised runtime)
+        // rather than a template token.
+        try writeConfig(modelType: "deepseek_v41", architecture: "DeepseekV41ForCausalLM")
+        XCTAssertTrue(ModelConfig.supportsThinkingLevels(modelPath: directory.path))
     }
 
     func testSparkTemplateWithoutReasoningEffortIsNotDetected() throws {

@@ -20,6 +20,11 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         return try decoder.decode(OpenAIChatRequest.self, from: Data(json.utf8))
     }
 
+    private func decodeCompletions(_ json: String) throws -> OpenAICompletionsRequest {
+        let decoder = JSONDecoder()
+        return try decoder.decode(OpenAICompletionsRequest.self, from: Data(json.utf8))
+    }
+
     // MARK: - Request decoding
 
     func testDecodesMinimalRequestWithStringContent() throws {
@@ -77,7 +82,9 @@ final class OpenAIAdapterLogicTests: XCTestCase {
             OpenAIChatRequest.Message(role: "system", contentText: "sys prompt", name: nil, toolCalls: nil, toolCallId: nil),
             OpenAIChatRequest.Message(role: "user", contentText: "what is 2+2", name: nil, toolCalls: nil, toolCallId: nil),
         ]
-        let (system, turns) = try OpenAIAdapter.splitMessages(messages)
+        let split = try OpenAIAdapter.splitMessages(messages)
+        let system = split.systemPrompt
+        let turns = split.turns
         XCTAssertEqual(system, "sys prompt")
         XCTAssertEqual(turns.count, 1)
         XCTAssertEqual(turns[0].role, .user)
@@ -93,7 +100,9 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         ]}
         """
         let request = try decodeRequest(body)
-        let (system, turns) = try OpenAIAdapter.splitMessages(request.messages)
+        let split = try OpenAIAdapter.splitMessages(request.messages)
+        let system = split.systemPrompt
+        let turns = split.turns
         XCTAssertEqual(system, "")
         XCTAssertEqual(turns.map(\.role), [.user, .assistant, .user], "roles must stay native, not flattened into one user block")
         XCTAssertEqual(turns[0].text, "run the tests")
@@ -155,6 +164,123 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         let json = try XCTUnwrap(String(data: data, encoding: .utf8))
         XCTAssertTrue(json.contains("\"tool_calls\""), "streaming deltas must use the OpenAI wire key")
         XCTAssertFalse(json.contains("toolCalls"), "Swift property name must not leak into the payload")
+    }
+
+    // MARK: - GET /v1/models
+
+    /// A cost block as `CompletionEngine` publishes it for a real tower, carrying
+    /// the published checkpoint's own numbers (`DeepSeekV41VisionCostTests` holds
+    /// those to the resize plan). Rounding is the wire layer's job, so these stay
+    /// unrounded.
+    private func visionBounds() -> DeepSeekV41VisionPricing.Bounds {
+        DeepSeekV41VisionPricing.Bounds(
+            minPatchTokens: 1_521,
+            maxPatchTokens: 9_216,
+            minSpanPositions: 184,
+            maxSpanPositions: 1_024,
+            minSeconds: 0.3202,
+            maxSeconds: 7.8407
+        )
+    }
+
+    /// A load row of a vision-capable family, as `CompletionEngine` publishes it.
+    private func loadedInfo(
+        vision: Bool, thinking: Bool, levels: Bool,
+        visionCost: DeepSeekV41VisionPricing.Bounds? = nil
+    ) -> CompletionEngine.LoadedModelInfo {
+        CompletionEngine.LoadedModelInfo(
+            displayName: "1bae0e1089",
+            path: "/nonexistent/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1089",
+            supportsThinking: thinking,
+            supportsThinkingLevels: levels,
+            supportsVision: vision,
+            visionCost: visionCost,
+            weightsSizeGB: 475.25
+        )
+    }
+
+    private func encodedModel(_ model: OpenAIModelList.Model) throws -> [String: Any] {
+        try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try JSONEncoder().encode(model)) as? [String: Any]
+        )
+    }
+
+    /// `/v1/models` is the only way a client can learn that an attachment will be
+    /// read rather than refused, so the capability it reports has to be the fact
+    /// the planner uses. `#78`/`#79`/`#80` each flagged its absence.
+    ///
+    /// `vision: true` is not by itself actionable: a picture can be 184 prompt
+    /// positions and a third of a second or 1,024 and nearly eight, and a client
+    /// cannot tell from a boolean which end it is sizing for. So the cost rides
+    /// beside the flag, on the keys a client would query.
+    func testModelListAdvertisesTheCapabilitiesThePlannerGatesOn() throws {
+        let model = OpenAIModelList.entry(
+            for: loadedInfo(
+                vision: true, thinking: true, levels: true, visionCost: visionBounds()
+            ),
+            contextLength: 163_840,
+            maxPromptTokens: 262_144,
+            created: 1_700_000_000
+        )
+        let json = try encodedModel(model)
+        XCTAssertEqual(json["id"] as? String, "DeepSeek-V4.1-Flash-1017")
+        XCTAssertEqual(json["object"] as? String, "model")
+        XCTAssertEqual(json["owned_by"] as? String, "dynamoe")
+        XCTAssertEqual(json["created"] as? Int, 1_700_000_000)
+        XCTAssertEqual(json["context_length"] as? Int, 163_840)
+        XCTAssertEqual(json["max_prompt_tokens"] as? Int, 262_144)
+        let capabilities = try XCTUnwrap(json["capabilities"] as? [String: Any])
+        XCTAssertEqual(capabilities["vision"] as? Bool, true)
+        XCTAssertEqual(capabilities["thinking"] as? Bool, true)
+        XCTAssertEqual(capabilities["thinking_levels"] as? Bool, true)
+        let cost = try XCTUnwrap(capabilities["vision_cost"] as? [String: Any])
+        XCTAssertEqual(cost["min_prompt_positions"] as? Int, 184)
+        XCTAssertEqual(cost["max_prompt_positions"] as? Int, 1_024)
+        XCTAssertEqual(cost["min_patch_tokens"] as? Int, 1_521)
+        XCTAssertEqual(cost["max_patch_tokens"] as? Int, 9_216)
+        // Two decimals: it is a model of a machine class, not a promise, and a
+        // client must not read 0.32020000000000004 as a measurement.
+        XCTAssertEqual(cost["min_encode_seconds"] as? Double, 0.32)
+        XCTAssertEqual(cost["max_encode_seconds"] as? Double, 7.84)
+        // The wire must not leak Swift property names, at either level.
+        let encoded = String(decoding: try JSONEncoder().encode(model), as: UTF8.self)
+        for leaked in ["thinkingLevels", "visionCost", "reasoningEffortValues", "minPromptPositions",
+                       "maxPatchTokens", "minEncodeSeconds", "minSpanPositions"] {
+            XCTAssertFalse(encoded.contains(leaked), "\(leaked) leaked into the payload")
+        }
+    }
+
+    /// The flags must be copied, not hardcoded: a tower-less family must advertise
+    /// `vision: false` or a client sends a picture that is refused with a 400, and
+    /// a family with a plain on/off switch must not claim graded levels, nor the
+    /// `reasoning_effort` vocabulary that only a graded level can honour.
+    ///
+    /// The cost block follows the same rule, and it is the case that matters here:
+    /// a checkpoint can publish a `vision_config` and a resize plan and still not
+    /// ship the tower's weights, so the bounds exist while `supportsVision` is
+    /// false. Advertising them would sell an attachment the server refuses.
+    func testModelListCapabilitiesFollowTheLoadedModelRatherThanTheWire() throws {
+        let json = try encodedModel(OpenAIModelList.entry(
+            for: loadedInfo(
+                vision: false, thinking: true, levels: false, visionCost: visionBounds()
+            ),
+            contextLength: nil,
+            maxPromptTokens: nil,
+            created: 0
+        ))
+        let capabilities = try XCTUnwrap(json["capabilities"] as? [String: Any])
+        XCTAssertEqual(capabilities["vision"] as? Bool, false)
+        XCTAssertEqual(capabilities["thinking"] as? Bool, true)
+        XCTAssertEqual(capabilities["thinking_levels"] as? Bool, false)
+        XCTAssertNil(capabilities["vision_cost"], "no tower, no cost to advertise")
+        XCTAssertNil(
+            capabilities["reasoning_effort_values"],
+            "no graded levels, so no vocabulary to advertise"
+        )
+        // A model with no architectural ceiling and a server with no cap both
+        // report nothing rather than a sentinel a client would read as a number.
+        XCTAssertNil(json["context_length"])
+        XCTAssertNil(json["max_prompt_tokens"])
     }
 
     // MARK: - Tool declarations
@@ -271,6 +397,560 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         XCTAssertTrue(try OpenAIAdapter.toolUseEnabled(auto.toolChoice))
     }
 
+    /// OpenAI's pre-2023 spelling of the same vocabulary, `functions` plus
+    /// `function_call`, was absent from the decoder entirely, so a client on that
+    /// surface was answered in prose with no call and no error. It is decoded now and
+    /// refused by name, because only the request half could be mapped: the reply would
+    /// carry `tool_calls` while a legacy client parses `function_call`.
+    func testTheDeprecatedFunctionCallingSurfaceIsDecodedAndRefusedByName() throws {
+        let legacy = try decodeRequest("""
+        {"messages":[],"functions":[{"name":"get_weather","description":"d","parameters":{"type":"object"}}]}
+        """)
+        XCTAssertEqual(legacy.legacyFunctions?.map(\.name), ["get_weather"])
+        XCTAssertNil(legacy.legacyFunctionCall)
+        XCTAssertThrowsError(try OpenAIAdapter.refuseDeprecatedFunctionCalling(legacy)) { error in
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("functions"), "got: \(message)")
+            XCTAssertTrue(message.contains("tools"), "the refusal must name its replacement, got: \(message)")
+            XCTAssertTrue(message.contains("tool_calls"), "got: \(message)")
+            XCTAssertTrue(message.contains("get_weather"), "got: \(message)")
+        }
+
+        // `function_call` is the old `tool_choice`: a mode string or a named target.
+        let autoCall = try decodeRequest(#"{"messages":[],"tools":[{"type":"function","function":{"name":"f"}}],"function_call":"auto"}"#)
+        XCTAssertEqual(autoCall.legacyFunctionCall?.mode, "auto")
+        XCTAssertNil(autoCall.legacyFunctionCall?.name)
+        let namedCall = try decodeRequest(#"{"messages":[],"tools":[{"type":"function","function":{"name":"f"}}],"function_call":{"name":"find_files"}}"#)
+        XCTAssertEqual(namedCall.legacyFunctionCall?.name, "find_files")
+        XCTAssertThrowsError(try OpenAIAdapter.refuseDeprecatedFunctionCalling(namedCall)) { error in
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("function_call"), "got: \(message)")
+            XCTAssertTrue(message.contains("tool_choice"), "the refusal must name its replacement, got: \(message)")
+            XCTAssertTrue(message.contains("find_files"), "the refusal must say what would be dropped, got: \(message)")
+        }
+
+        // A request carrying the modern field as well is served: the modern spelling is
+        // what this server answers, so the deprecated one is redundant rather than lost.
+        let both = try decodeRequest("""
+        {"messages":[],"tools":[{"type":"function","function":{"name":"get_weather"}}],
+         "functions":[{"name":"get_weather"}]}
+        """)
+        XCTAssertEqual(both.legacyFunctions?.count, 1, "the deprecated field is still decoded, not dropped")
+        XCTAssertNoThrow(try OpenAIAdapter.refuseDeprecatedFunctionCalling(both))
+        let withChoice = try decodeRequest("""
+        {"messages":[],"tools":[{"type":"function","function":{"name":"f"}}],
+         "tool_choice":"none","function_call":"auto"}
+        """)
+        XCTAssertNoThrow(try OpenAIAdapter.refuseDeprecatedFunctionCalling(withChoice))
+
+        // Mixing a modern `tools` list with a legacy `function_call` and no
+        // `tool_choice` is the case the modern-field rule does not cover, and it is a
+        // refusal for the same reason: the mode the client asked for would be dropped.
+        let mixed = try decodeRequest("""
+        {"messages":[],"tools":[{"type":"function","function":{"name":"f"}}],"function_call":"none"}
+        """)
+        XCTAssertThrowsError(try OpenAIAdapter.refuseDeprecatedFunctionCalling(mixed))
+    }
+
+    // MARK: - Request fields this server cannot honour
+
+    /// The last three OpenAI chat keys this decoder had never carried. `prediction` is a
+    /// latency hint and `service_tier` a routing preference for a fleet, so neither can
+    /// move an answer and both are decoded to be documented as ignored. The third is not
+    /// a hint: the reply would be ungrounded prose where the client asked for a grounded
+    /// one, so it is refused by name.
+    func testTheHintFieldsAreIgnoredAndWebSearchIsRefused() throws {
+        let hints = try decodeRequest("""
+        {"messages":[{"role":"user","content":"hi"}],
+         "prediction":{"type":"content","content":"Paris"},
+         "service_tier":"flex"}
+        """)
+        XCTAssertNil(hints.webSearchOptions)
+        XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedResponseShape(hints))
+
+        let search = try decodeRequest("""
+        {"messages":[{"role":"user","content":"hi"}],
+         "web_search_options":{"search_context_size":"high"}}
+        """)
+        XCTAssertEqual(search.webSearchOptions?.searchContextSize, "high")
+        XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedResponseShape(search)) { error in
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("web_search_options"), "got: \(message)")
+            XCTAssertTrue(message.contains("high"), "the refusal must say what was asked for, got: \(message)")
+        }
+
+        // Presence is the trigger, not a non-default body: an empty object is the default
+        // SEARCH here, unlike `modalities: ["text"]`, which names the protocol's default
+        // and is served.
+        let empty = try decodeRequest(
+            #"{"messages":[{"role":"user","content":"hi"}],"web_search_options":{}}"#
+        )
+        XCTAssertNotNil(empty.webSearchOptions)
+        XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedResponseShape(empty))
+    }
+
+    func testTheFieldsTheServerCannotHonourAreDecodedRatherThanIgnored() throws {
+        // Before `#88` these keys were absent from the decoder, so Swift's
+        // unknown-key tolerance dropped them and the turn was built as if the client
+        // had asked for none of it. Decoding them is what lets the planner refuse
+        // them by name.
+        let request = try decodeRequest("""
+        {"model":"m","messages":[{"role":"user","content":"hi"}],
+         "response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{"type":"object"}}},
+         "n":3,"logprobs":true,"top_logprobs":2,
+         "stream_options":{"include_usage":true}}
+        """)
+        XCTAssertEqual(request.responseFormat?.type, "json_schema")
+        XCTAssertEqual(request.n, 3)
+        XCTAssertEqual(request.logprobs, true)
+        XCTAssertEqual(request.topLogprobs, 2)
+        XCTAssertEqual(request.streamOptions?.includeUsage, true)
+    }
+
+    func testStructuredOutputIsRefusedByNameRatherThanAnsweredInProse() throws {
+        for type in ["json_object", "json_schema"] {
+            let request = try decodeRequest("""
+            {"messages":[],"response_format":{"type":"\(type)"}}
+            """)
+            XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedResponseShape(request)) { error in
+                XCTAssertTrue(
+                    "\(error)".contains("response_format"),
+                    "the refusal must name the field the client sent, got: \(error)"
+                )
+                XCTAssertTrue(
+                    "\(error)".contains(type),
+                    "the refusal must name the mode it cannot honour"
+                )
+            }
+        }
+
+        // OpenAI's default mode is a no-op, and an absent field is every request that
+        // does not ask.
+        for body in [#"{"messages":[]}"#, #"{"messages":[],"response_format":{"type":"text"}}"#] {
+            XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedResponseShape(try decodeRequest(body)))
+        }
+
+        let unknown = try decodeRequest(#"{"messages":[],"response_format":{"type":"yaml"}}"#)
+        XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedResponseShape(unknown)) { error in
+            XCTAssertTrue("\(error)".contains("yaml"))
+        }
+    }
+
+    func testMultipleChoicesAndTokenLogprobsAreRefusedByName() throws {
+        XCTAssertNoThrow(
+            try OpenAIAdapter.refuseUnsupportedResponseShape(try decodeRequest(#"{"messages":[],"n":1}"#)),
+            "n = 1 is the protocol's own default"
+        )
+        for body in [#"{"messages":[],"n":2}"#, #"{"messages":[],"n":0}"#] {
+            XCTAssertThrowsError(
+                try OpenAIAdapter.refuseUnsupportedResponseShape(try decodeRequest(body))
+            ) { error in
+                XCTAssertTrue("\(error)".contains("n ="), "the refusal must name the field, got: \(error)")
+            }
+        }
+
+        XCTAssertNoThrow(
+            try OpenAIAdapter.refuseUnsupportedResponseShape(try decodeRequest(#"{"messages":[],"logprobs":false}"#)),
+            "asking NOT to receive log-probabilities is already the only thing this server does"
+        )
+        for body in [#"{"messages":[],"logprobs":true}"#, #"{"messages":[],"top_logprobs":5}"#] {
+            XCTAssertThrowsError(
+                try OpenAIAdapter.refuseUnsupportedResponseShape(try decodeRequest(body))
+            ) { error in
+                XCTAssertTrue("\(error)".contains("logprobs"), "got: \(error)")
+            }
+        }
+    }
+
+    func testStreamOptionsAreReadBecauseTheirOneMeaningfulFieldIsHonoured() throws {
+        // The usage tail is opt-in by protocol, so this field is decoded and obeyed
+        // rather than refused: the streaming writer emits the chunk only for a client
+        // that asked for it.
+        let absent = try decodeRequest(#"{"messages":[]}"#)
+        XCTAssertNil(absent.streamOptions)
+
+        let declined = try decodeRequest(#"{"messages":[],"stream_options":{"include_usage":false}}"#)
+        XCTAssertEqual(declined.streamOptions?.includeUsage, false)
+
+        let asked = try decodeRequest(#"{"messages":[],"stream_options":{"include_usage":true}}"#)
+        XCTAssertEqual(asked.streamOptions?.includeUsage, true)
+        XCTAssertNoThrow(
+            try OpenAIAdapter.refuseUnsupportedResponseShape(asked),
+            "a field this server can honour must never be refused"
+        )
+    }
+
+    // MARK: - The legacy text-completions route
+
+    func testTheLegacyCompletionsRequestDecodesItsOwnPromptShapes() throws {
+        let single = try decodeCompletions(#"{"prompt":"The capital of France is"}"#)
+        XCTAssertEqual(single.promptText, "The capital of France is")
+        XCTAssertEqual(single.promptCount, 1)
+        XCTAssertFalse(single.promptIsTokenIDs)
+
+        let batch = try decodeCompletions(#"{"prompt":["a","b"]}"#)
+        XCTAssertEqual(batch.promptCount, 2, "a batch is decoded so the planner can refuse it by count rather than silently running the first")
+
+        let ids = try decodeCompletions(#"{"prompt":[1,2,3]}"#)
+        XCTAssertTrue(ids.promptIsTokenIDs)
+        XCTAssertNil(ids.promptText)
+
+        let idBatch = try decodeCompletions(#"{"prompt":[[1,2],[3]]}"#)
+        XCTAssertTrue(idBatch.promptIsTokenIDs)
+
+        let shape = try decodeCompletions("""
+        {"prompt":"x","stop":"END","echo":true,"logprobs":5,"best_of":1,"seed":7,
+         "user":"someone","stream_options":{"include_usage":true}}
+        """)
+        XCTAssertEqual(shape.stop, ["END"], "the protocol allows a bare string stop")
+        XCTAssertEqual(shape.echo, true)
+        XCTAssertTrue(shape.logprobsRequested)
+        XCTAssertEqual(shape.bestOf, 1)
+        XCTAssertEqual(shape.streamOptions?.includeUsage, true)
+
+        // `logprobs` is a Bool on the chat route and an Int here; either spelling is a
+        // request for token log-probabilities.
+        let logprobsAsBool = try decodeCompletions(#"{"prompt":"x","logprobs":true}"#)
+        XCTAssertTrue(logprobsAsBool.logprobsRequested)
+        let logprobsAsZero = try decodeCompletions(#"{"prompt":"x","logprobs":0}"#)
+        XCTAssertFalse(logprobsAsZero.logprobsRequested)
+        let logprobsAbsent = try decodeCompletions(#"{"prompt":"x"}"#)
+        XCTAssertFalse(logprobsAbsent.logprobsRequested)
+
+        XCTAssertThrowsError(
+            try decodeCompletions(#"{"prompt":{"text":"x"}}"#),
+            "a prompt shape the protocol does not define is a decode error, not an empty completion"
+        )
+    }
+
+    func testTheCompletionsFieldsThisServerCannotHonourAreRefusedByName() throws {
+        func refuse(_ body: String, naming needle: String, file: StaticString = #filePath, line: UInt = #line) throws {
+            let request = try decodeCompletions(body)
+            XCTAssertThrowsError(
+                try OpenAIAdapter.refuseUnsupportedCompletionsShape(request),
+                body,
+                file: file,
+                line: line
+            ) { error in
+                XCTAssertTrue(
+                    "\(error)".contains(needle),
+                    "the refusal must name \(needle), got: \(error)",
+                    file: file,
+                    line: line
+                )
+            }
+        }
+
+        try refuse(#"{"prompt":[1,2,3]}"#, naming: "token ids")
+        try refuse(#"{"prompt":["a","b"]}"#, naming: "2 prompts")
+        try refuse(#"{"prompt":""}"#, naming: "empty")
+        try refuse(#"{"prompt":"x","suffix":"y"}"#, naming: "suffix")
+        try refuse(#"{"prompt":"x","n":2}"#, naming: "n = 2")
+        try refuse(#"{"prompt":"x","logprobs":1}"#, naming: "logprobs")
+        try refuse(#"{"prompt":"x","best_of":3}"#, naming: "best_of")
+
+        // Everything this route honours, and the two fields that cannot move an
+        // answer (`seed` is a best-effort hint and `user` is an abuse label), is
+        // accepted. The sampler fields are honoured now, so they are resolved
+        // rather than refused: see `testTheSamplerFieldsAreResolvedRatherThanIgnored`.
+        for body in [
+            #"{"prompt":"x"}"#,
+            #"{"prompt":"x","n":1,"logprobs":0,"best_of":1}"#,
+            #"{"prompt":"x","frequency_penalty":0,"logit_bias":{}}"#,
+            #"{"prompt":"x","echo":true,"presence_penalty":0.2,"temperature":0.4,"stop":["\n"]}"#,
+            #"{"prompt":"x","seed":42,"user":"someone","stream":true,"stream_options":{"include_usage":true}}"#,
+        ] {
+            XCTAssertNoThrow(
+                try OpenAIAdapter.refuseUnsupportedCompletionsShape(try decodeCompletions(body)),
+                body
+            )
+        }
+    }
+
+    /// The reply budget has two spellings in OpenAI's own protocol, and a client that
+    /// sends only the newer one must not be answered with the app's default budget.
+    ///
+    /// `max_completion_tokens` was not in the decoder at all before this, so
+    /// `{"max_completion_tokens": 512}` ran to the app default of up to 8192 tokens.
+    /// A request that carries both spellings with DIFFERENT values is refused rather
+    /// than resolved by preference: whichever one the server picked, the answer would
+    /// be a budget the client did not ask for.
+    func testTheReplyBudgetIsResolvedAcrossItsTwoSpellings() throws {
+        let olderOnly = try decodeRequest(#"{"messages":[],"max_tokens":128}"#)
+        XCTAssertEqual(olderOnly.maxTokens, 128)
+        XCTAssertNil(olderOnly.maxCompletionTokens)
+        XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedResponseShape(olderOnly))
+        let olderBudget = try OpenAIAdapter.replyBudget(
+            maxTokens: olderOnly.maxTokens,
+            maxCompletionTokens: olderOnly.maxCompletionTokens
+        )
+        XCTAssertEqual(olderBudget, 128)
+
+        let newerOnly = try decodeRequest(#"{"messages":[],"max_completion_tokens":512}"#)
+        XCTAssertNil(newerOnly.maxTokens)
+        XCTAssertEqual(newerOnly.maxCompletionTokens, 512)
+        XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedResponseShape(newerOnly))
+        let newerBudget = try OpenAIAdapter.replyBudget(
+            maxTokens: newerOnly.maxTokens,
+            maxCompletionTokens: newerOnly.maxCompletionTokens
+        )
+        XCTAssertEqual(newerBudget, 512, "the newer field alone is the whole budget, not a hint")
+
+        let agreeing = try decodeRequest(#"{"messages":[],"max_tokens":64,"max_completion_tokens":64}"#)
+        XCTAssertNoThrow(
+            try OpenAIAdapter.refuseUnsupportedResponseShape(agreeing),
+            "two spellings that agree are not a conflict"
+        )
+        let agreeingBudget = try OpenAIAdapter.replyBudget(
+            maxTokens: agreeing.maxTokens,
+            maxCompletionTokens: agreeing.maxCompletionTokens
+        )
+        XCTAssertEqual(agreeingBudget, 64)
+
+        let conflicting = try decodeRequest(#"{"messages":[],"max_tokens":64,"max_completion_tokens":512}"#)
+        XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedResponseShape(conflicting)) { error in
+            let text = "\(error)"
+            XCTAssertTrue(text.contains("max_tokens"), "the refusal must name the older field: \(text)")
+            XCTAssertTrue(
+                text.contains("max_completion_tokens"),
+                "the refusal must name the newer field: \(text)"
+            )
+        }
+
+        let absent = try OpenAIAdapter.replyBudget(maxTokens: nil, maxCompletionTokens: nil)
+        XCTAssertNil(absent, "neither field means the app default, which the planner owns")
+    }
+
+    /// The fields both protocols accept and deliberately do not honour now reach the
+    /// request model, so the help guide and the journal can name them instead of
+    /// `Decodable` dropping them silently.
+    func testTheAcceptedAndIgnoredFieldsAreDecodedRatherThanVanishing() throws {
+        let chat = try decodeRequest("""
+        {"messages":[],"parallel_tool_calls":false,"seed":7,"user":"someone"}
+        """)
+        XCTAssertEqual(chat.parallelToolCalls, false)
+        XCTAssertNoThrow(
+            try OpenAIAdapter.refuseUnsupportedResponseShape(chat),
+            "an ignored field is documented, not refused: a 400 would break clients that always send it"
+        )
+    }
+
+    /// OpenAI's `store` is the one field in this protocol whose entire meaning is a
+    /// promise about the server rather than about the answer, and its two values are
+    /// deliberately not symmetric: `false` is honoured per request (that row keeps its
+    /// bodies out of the log), `true` cannot force capture because retention on this
+    /// Mac is the operator's decision. Absent must stay distinguishable from both,
+    /// because a client that never spoke gets the operator's default.
+    func testTheRetentionPromiseIsDecodedOnBothOpenAIRoutes() throws {
+        let refusing = try decodeRequest(#"{"messages":[],"store":false}"#)
+        XCTAssertEqual(refusing.store, false)
+        let allowing = try decodeRequest(#"{"messages":[],"store":true}"#)
+        XCTAssertEqual(allowing.store, true)
+        let silent = try decodeRequest(#"{"messages":[]}"#)
+        XCTAssertNil(silent.store, "absent is not the same request as either value: it leaves retention to the operator")
+
+        let legacy = try decodeCompletions(#"{"prompt":"x","store":false}"#)
+        XCTAssertEqual(legacy.store, false, "both routes take the same retention promise")
+
+        // Retention is a privacy promise, not a shape promise, so it is honoured
+        // rather than refused: no new 400 appears on either path.
+        XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedResponseShape(refusing))
+        XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedCompletionsShape(legacy))
+    }
+
+    /// A row whose bodies were withheld has to explain itself, and the captured
+    /// request summary is where a debugging session looks: `store` must survive
+    /// into it, so "withheld at the client's request" is readable from the row
+    /// alone rather than inferred from the switch's current value.
+    func testTheCapturedRequestSummaryRecordsTheRetentionPromise() throws {
+        func recordedStore(_ json: String) throws -> Bool? {
+            let summary = try XCTUnwrap(ServerRequestLog.openAISummary(try decodeRequest(json)))
+            let object = try JSONSerialization.jsonObject(with: Data(summary.utf8)) as? [String: Any]
+            return object?["store"] as? Bool
+        }
+        XCTAssertEqual(try recordedStore(#"{"messages":[],"store":false}"#), false)
+        XCTAssertEqual(try recordedStore(#"{"messages":[],"store":true}"#), true)
+        XCTAssertNil(
+            try recordedStore(#"{"messages":[]}"#),
+            "a client that sent no promise records none: absent is not store: true"
+        )
+
+        let legacy = try decodeCompletions(#"{"prompt":"x","store":false}"#)
+        let legacySummary = try XCTUnwrap(ServerRequestLog.openAICompletionsSummary(legacy))
+        let legacyObject = try JSONSerialization.jsonObject(with: Data(legacySummary.utf8)) as? [String: Any]
+        XCTAssertEqual(legacyObject?["store"] as? Bool, false)
+    }
+
+    /// OpenAI's two output-modality fields promise a SPOKEN reply, and this server has
+    /// no text-to-speech at all: left out of the decoder they were dropped by unknown
+    /// key tolerance, so a request for audio was answered as prose with no error and no
+    /// `message.audio` for the client's parser to find. They are refused by name
+    /// instead, and the one value the engine DOES produce is served rather than refused
+    /// — a client naming `["text"]`, the protocol's default, must not meet a new 400.
+    func testAudioOutputIsRefusedByNameAndPlainTextModalitiesIsServed() throws {
+        // Silent, and explicit about the default: both are served.
+        XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedResponseShape(try decodeRequest(#"{"messages":[]}"#)))
+        let explicitText = try decodeRequest(#"{"messages":[],"modalities":["text"]}"#)
+        XCTAssertEqual(explicitText.modalities, ["text"])
+        XCTAssertTrue(OpenAIAdapter.unservableModalities(explicitText).isEmpty)
+        XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedResponseShape(explicitText))
+
+        // A spoken reply, in the shape the SDKs actually send.
+        let spoken = try decodeRequest("""
+        {"messages":[],"modalities":["text","audio"],"audio":{"voice":"alloy","format":"mp3","speed":1.1}}
+        """)
+        XCTAssertEqual(spoken.audio?.voice, "alloy")
+        XCTAssertEqual(spoken.audio?.format, "mp3")
+        XCTAssertEqual(OpenAIAdapter.unservableModalities(spoken), ["audio"])
+        XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedResponseShape(spoken)) { error in
+            let text = "\(error)"
+            XCTAssertTrue(text.contains("audio output is not supported"), "got: \(text)")
+            XCTAssertTrue(text.contains("mp3"), "the refusal should name the format the client asked for, got: \(text)")
+            XCTAssertTrue(text.contains("text-to-speech"), "the refusal should say why, got: \(text)")
+        }
+
+        // An `audio` object with no `modalities` is the same request: the settings are
+        // only meaningful for a reply the client has been promised.
+        let audioOnly = try decodeRequest(#"{"messages":[],"audio":{"voice":"nova"}}"#)
+        XCTAssertEqual(OpenAIAdapter.unservableModalities(audioOnly), [])
+        XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedResponseShape(audioOnly)) { error in
+            XCTAssertTrue("\(error)".contains("audio output is not supported"), "got: \(error)")
+        }
+
+        // Any non-text modality, not just audio: the engine has exactly one output, so
+        // the rule is "text or nothing" rather than a list of known audio values.
+        let image = try decodeRequest(#"{"messages":[],"modalities":["text","image"]}"#)
+        XCTAssertEqual(OpenAIAdapter.unservableModalities(image), ["image"])
+        XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedResponseShape(image)) { error in
+            XCTAssertTrue("\(error)".contains("image"), "the refusal must name the modality, got: \(error)")
+        }
+    }
+
+    /// A refused request still gets a row, and that row's only body is the request
+    /// summary — so the fields the refusal was ABOUT have to survive into it, or the
+    /// 400 is unexplainable from the log.
+    func testTheCapturedRequestSummaryRecordsTheRefusedModalityFields() throws {
+        let spoken = try decodeRequest("""
+        {"messages":[],"modalities":["text","audio"],"audio":{"voice":"alloy","format":"mp3"}}
+        """)
+        let summary = try XCTUnwrap(ServerRequestLog.openAISummary(spoken))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(summary.utf8)) as? [String: Any])
+        XCTAssertEqual(object["modalities"] as? [String], ["text", "audio"])
+        let audio = try XCTUnwrap(object["audio"] as? [String: Any])
+        XCTAssertEqual(audio["voice"] as? String, "alloy")
+        XCTAssertEqual(audio["format"] as? String, "mp3")
+    }
+
+    /// The two sampler fields OpenAI defines and this engine can honour are decoded,
+    /// range-checked and resolved into the turn's sampling instead of ignored.
+    ///
+    /// Both routes carry them, and a value either route accepts has to survive the
+    /// decode intact: a silently dropped `logit_bias` answers a request the client
+    /// did not send, which is the class of lie `#88` and `#89` exist to remove.
+    func testTheSamplerFieldsAreResolvedRatherThanIgnored() throws {
+        let chat = try decodeRequest("""
+        {"messages":[],"frequency_penalty":0.5,"logit_bias":{"1000":-100,"1005":5,"7":0},"seed":7,"user":"someone"}
+        """)
+        XCTAssertEqual(chat.frequencyPenalty, 0.5)
+        XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedResponseShape(chat))
+        let chatFrequency = try OpenAIAdapter.frequencyPenalty(chat.frequencyPenalty)
+        XCTAssertEqual(chatFrequency, 0.5, accuracy: 1e-6)
+        let chatBias = try OpenAIAdapter.logitBias(from: chat.logitBias)
+        XCTAssertEqual(chatBias, [1000: -100, 1005: 5], "a zero bias changes nothing and is dropped")
+
+        let legacy = try decodeCompletions(#"{"prompt":"x","frequency_penalty":-1.5,"logit_bias":{"1000":-100}}"#)
+        XCTAssertEqual(legacy.frequencyPenalty, -1.5)
+        XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedCompletionsShape(legacy))
+        let legacyFrequency = try OpenAIAdapter.frequencyPenalty(legacy.frequencyPenalty)
+        XCTAssertEqual(legacyFrequency, -1.5, accuracy: 1e-6)
+        let legacyBias = try OpenAIAdapter.logitBias(from: legacy.logitBias)
+        XCTAssertEqual(legacyBias, [1000: -100])
+
+        // Absent means "no penalty" on both, not an error.
+        let absent = try OpenAIAdapter.frequencyPenalty(nil)
+        XCTAssertEqual(absent, 0)
+        let noBias = try OpenAIAdapter.logitBias(from: nil)
+        XCTAssertTrue(noBias.isEmpty)
+    }
+
+    /// The values neither route can honour are refused BY NAME, before the model
+    /// gate, rather than clamped: a clamped bias answers a distribution the client
+    /// did not ask for.
+    func testTheSamplerFieldsAreRefusedByNameWhereTheyCannotBeHonoured() throws {
+        func refuseChat(_ body: String, naming needle: String, file: StaticString = #filePath, line: UInt = #line) throws {
+            let request = try decodeRequest(body)
+            XCTAssertThrowsError(
+                try OpenAIAdapter.refuseUnsupportedResponseShape(request), body, file: file, line: line
+            ) { error in
+                XCTAssertTrue(
+                    "\(error)".contains(needle), "the refusal must name \(needle), got: \(error)",
+                    file: file, line: line
+                )
+            }
+        }
+
+        try refuseChat(#"{"messages":[],"frequency_penalty":5}"#, naming: "frequency_penalty")
+        try refuseChat(#"{"messages":[],"logit_bias":{"50256":-500}}"#, naming: "logit_bias")
+        try refuseChat(#"{"messages":[],"logit_bias":{"abc":1}}"#, naming: "logit_bias")
+        // A negative key is not a token id either.
+        try refuseChat(#"{"messages":[],"logit_bias":{"-4":1}}"#, naming: "logit_bias")
+
+        // The same two rules on the legacy route, through its own refusal.
+        let legacyFrequency = try decodeCompletions(#"{"prompt":"x","frequency_penalty":2.5}"#)
+        XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedCompletionsShape(legacyFrequency)) { error in
+            XCTAssertTrue("\(error)".contains("frequency_penalty"), "got: \(error)")
+        }
+        let legacyBias = try decodeCompletions(#"{"prompt":"x","logit_bias":{"nope":-1}}"#)
+        XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedCompletionsShape(legacyBias)) { error in
+            XCTAssertTrue("\(error)".contains("logit_bias"), "got: \(error)")
+        }
+
+        // A value that is effectively zero is no penalty rather than a refusal, so a
+        // client that always sends the field is unaffected.
+        let effectivelyZero = try OpenAIAdapter.frequencyPenalty(0.0004)
+        XCTAssertEqual(effectivelyZero, 0)
+    }
+
+    func testTheLegacyRouteReasonsOnlyWhenTheClientAsks() throws {
+        // The opposite default from the chat route on purpose: this protocol has no
+        // field to carry reasoning, so a turn that reasons first spends its budget
+        // there and returns a trace rather than a continuation.
+        let plain = try decodeCompletions(#"{"prompt":"x"}"#)
+        XCTAssertFalse(OpenAIAdapter.completionsThinkingRequested(plain))
+        let asked = try decodeCompletions(#"{"prompt":"x","enable_thinking":true}"#)
+        XCTAssertTrue(OpenAIAdapter.completionsThinkingRequested(asked))
+        let declined = try decodeCompletions(#"{"prompt":"x","enable_thinking":false}"#)
+        XCTAssertFalse(OpenAIAdapter.completionsThinkingRequested(declined))
+    }
+
+    func testTheLegacyPromptIsOneUserTurnWithNoSystemMessage() throws {
+        let request = try decodeCompletions(#"{"prompt":"The capital of France is","model":"m"}"#)
+        let split = OpenAIAdapter.completionsSplit(request)
+        XCTAssertEqual(split.systemPrompt, "", "this protocol has no system field, so the family's own default block is what renders")
+        XCTAssertEqual(split.turns.count, 1)
+        XCTAssertEqual(split.turns[0].role, .user)
+        XCTAssertEqual(split.turns[0].text, "The capital of France is")
+        XCTAssertFalse(split.hasImages, "there is no image field on this protocol")
+    }
+
+    func testTheCompletionsSessionKeyIsThePromptAndTheModel() {
+        let key = OpenAIAdapter.sessionKey(forPrompt: "The capital of France is", model: "m")
+        XCTAssertEqual(
+            OpenAIAdapter.sessionKey(forPrompt: "The capital of France is", model: "m"),
+            key,
+            "a stateless client resends the same prompt, so identity has to be stable"
+        )
+        XCTAssertNotEqual(OpenAIAdapter.sessionKey(forPrompt: "The capital of France is ", model: "m"), key)
+        XCTAssertNotEqual(OpenAIAdapter.sessionKey(forPrompt: "The capital of France is", model: "other"), key)
+        // One prompt and one chat message with the same text are different
+        // conversations, so they must not share a pinned prefix.
+        let chat = OpenAIAdapter.sessionKey(
+            for: [.init(role: "user", contentText: "The capital of France is")],
+            model: "m"
+        )
+        XCTAssertNotEqual(chat, key)
+    }
+
     // MARK: - Tool IDs in history
 
     func testAssistantHistoryKeepsToolCallIds() throws {
@@ -282,7 +962,8 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         ]}
         """
         let request = try decodeRequest(body)
-        let (_, turns) = try OpenAIAdapter.splitMessages(request.messages)
+        let split = try OpenAIAdapter.splitMessages(request.messages)
+        let turns = split.turns
         XCTAssertTrue(turns[1].text.contains("call_abc"), "the call id must reach history so results can be matched to calls")
     }
 
@@ -300,16 +981,103 @@ final class OpenAIAdapterLogicTests: XCTestCase {
 
     // MARK: - Graded thinking levels
 
-    func testReasoningEffortAcceptsOnlySupportedLevels() throws {
+    /// OpenAI documents four graded `reasoning_effort` values and its SDK sends
+    /// `medium` by default, so a resolver that knew only this engine's own two words
+    /// answered a standard request with a 400. The vocabulary is mapped onto the two
+    /// levels instead, and `medium` maps the same way the app already maps a stored
+    /// `"medium"` (`ThinkingEffort.clamped`), so the two cannot disagree.
+    func testReasoningEffortMapsTheProtocolsVocabularyOntoTheEnginesTwoLevels() throws {
         XCTAssertNil(try OpenAIAdapter.thinkingEffort(from: nil, levelCapable: true, thinkingRequested: true))
+        XCTAssertEqual(try OpenAIAdapter.thinkingEffort(from: "minimal", levelCapable: true, thinkingRequested: true), .low)
         XCTAssertEqual(try OpenAIAdapter.thinkingEffort(from: "low", levelCapable: true, thinkingRequested: true), .low)
+        XCTAssertEqual(try OpenAIAdapter.thinkingEffort(from: "medium", levelCapable: true, thinkingRequested: true), .high)
         XCTAssertEqual(try OpenAIAdapter.thinkingEffort(from: " HIGH ", levelCapable: true, thinkingRequested: true), .high)
-        XCTAssertThrowsError(try OpenAIAdapter.thinkingEffort(from: "medium", levelCapable: true, thinkingRequested: true))
+        // Whitespace and case are a hand-written request's business, not a refusal.
+        XCTAssertEqual(try OpenAIAdapter.thinkingEffort(from: " Medium\n", levelCapable: true, thinkingRequested: true), .high)
+        // A word the protocol does not define is still refused, and the message names
+        // the ones that would have worked.
+        XCTAssertThrowsError(try OpenAIAdapter.thinkingEffort(from: "ultra", levelCapable: true, thinkingRequested: true)) { error in
+            let message = String(describing: error)
+            for value in ["minimal", "low", "medium", "high"] {
+                XCTAssertTrue(message.contains(value), "the refusal must name \(value), got: \(message)")
+            }
+        }
         XCTAssertThrowsError(try OpenAIAdapter.thinkingEffort(from: "low", levelCapable: false, thinkingRequested: true))
+        // A stored level string is a different vocabulary: `ThinkingEffort.parse` keeps
+        // matching only the engine's own two, which is what the chat UI writes.
+        XCTAssertNil(ThinkingEffort.parse("medium"))
+        XCTAssertEqual(ThinkingEffort.clamped("medium"), .high)
+    }
+
+    /// `thinking_levels` says a graded level is honoured and nothing about which words
+    /// name one. The advertised list is the resolver's own vocabulary, so a client can
+    /// read it and predict its own rejection instead of discovering it in a 400.
+    func testTheModelsRouteAdvertisesTheReasoningEffortValuesItAccepts() throws {
+        let model = OpenAIModelList.entry(
+            for: loadedInfo(vision: false, thinking: true, levels: true),
+            contextLength: nil,
+            maxPromptTokens: nil,
+            created: 0
+        )
+        let json = try encodedModel(model)
+        let capabilities = try XCTUnwrap(json["capabilities"] as? [String: Any])
+        let advertised = try XCTUnwrap(capabilities["reasoning_effort_values"] as? [String])
+        XCTAssertEqual(advertised, ["minimal", "low", "medium", "high"])
+        // Every announced value must be one the resolver accepts, and dropping any one
+        // of them would silently make the advertisement a promise it does not keep.
+        for value in advertised {
+            XCTAssertEqual(
+                try OpenAIAdapter.thinkingEffort(from: value, levelCapable: true, thinkingRequested: true),
+                OpenAIAdapter.thinkingEffortLevel(forProtocolValue: value)
+            )
+        }
+        XCTAssertNil(OpenAIAdapter.thinkingEffortLevel(forProtocolValue: "ultra"))
+        XCTAssertFalse(advertised.contains("ultra"))
+        // The list is the adapter's own vocabulary, so it cannot announce a word the
+        // resolver refuses. The wire spelling and the no-leak rule are pinned by
+        // `testModelListAdvertisesTheCapabilitiesThePlannerGatesOn`, which encodes a
+        // model once for every capability key.
+        XCTAssertEqual(
+            OpenAIAdapter.reasoningEffortValues,
+            advertised,
+            "what is advertised must be what the resolver reads"
+        )
     }
 
     func testReasoningEffortIsMootWhenThinkingIsOff() throws {
         XCTAssertNil(try OpenAIAdapter.thinkingEffort(from: "high", levelCapable: true, thinkingRequested: false))
         XCTAssertNil(try OpenAIAdapter.thinkingEffort(from: "high", levelCapable: false, thinkingRequested: false))
+    }
+
+    // MARK: - Client labels
+
+    /// OpenAI's `metadata` is the caller's own correlation map, and this protocol has
+    /// no response field to echo it into, so left out of the decoder it went nowhere
+    /// at all, one request at a time, with no error to notice. It is decoded on both
+    /// OpenAI routes, and `nil` stays distinct from an empty object because "sent no
+    /// labels" and "sent nothing" are different claims.
+    func testTheClientsLabelsAreDecodedOnBothOpenAIRoutes() throws {
+        let chat = try decodeRequest("""
+        {"messages":[],"metadata":{"ticket":"ABC-123","team":"infra"}}
+        """)
+        XCTAssertEqual(chat.metadata, ["ticket": "ABC-123", "team": "infra"] as [String: String]?)
+
+        XCTAssertNil(
+            try decodeRequest(#"{"messages":[]}"#).metadata,
+            "a client that sent no labels records none"
+        )
+        XCTAssertEqual(
+            try decodeRequest(#"{"messages":[],"metadata":{}}"#).metadata,
+            [String: String](),
+            "an empty map decodes as empty; the row is what flattens it to nil"
+        )
+        // A map the server cannot read as strings costs the labels, not the answer: the
+        // field was ignored outright before this slice, so a client that puts a number
+        // in it must not start meeting a 400.
+        XCTAssertNil(try decodeRequest(#"{"messages":[],"metadata":{"count":3}}"#).metadata)
+
+        let legacy = try decodeCompletions(#"{"prompt":"x","metadata":{"run":"7"}}"#)
+        XCTAssertEqual(legacy.metadata, ["run": "7"] as [String: String]?)
+        XCTAssertNil(try decodeCompletions(#"{"prompt":"x"}"#).metadata)
     }
 }

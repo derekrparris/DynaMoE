@@ -80,7 +80,8 @@ final class DeepSeekV41SyntheticCheckpointTests: XCTestCase {
                 byteOffset: 0,
                 rows: tensor.shape[0],
                 columns: tensor.shape.count == 2 ? tensor.shape[1] : 1,
-                dtype: tensor.dtype
+                dtype: tensor.dtype,
+                byteLength: 0
             )
             let format = DeepSeekV41DevicePlan.linearFormat(
                 tensor: deviceTensor,
@@ -173,7 +174,9 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
     private let checkpoint = DeepSeekV41SyntheticCheckpoint()
 
     private func makeRuntime(
-        _ checkpoint: DeepSeekV41SyntheticCheckpoint
+        _ checkpoint: DeepSeekV41SyntheticCheckpoint,
+        snapshotDir: URL? = nil,
+        pinDenseWeights: Bool? = nil
     ) throws -> DeepSeekV41Runtime {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw XCTSkip("No Metal device")
@@ -183,12 +186,13 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
             throw XCTSkip("no shard buffer")
         }
         guard let runtime = DeepSeekV41Runtime(
-            snapshotDir: nil,
+            snapshotDir: snapshotDir,
             summary: checkpoint.summary(),
             config: checkpoint.config,
             shardBuffers: [0: buffer],
             contextLength: checkpoint.shape.contextLength,
-            cachePrecision: .fp16
+            cachePrecision: .fp16,
+            pinDenseWeights: pinDenseWeights
         ) else {
             XCTFail(
                 "the synthetic runtime did not build: "
@@ -245,6 +249,42 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         XCTAssertEqual(runtime.weights.problems, [])
     }
 
+    /// The dense pin repoints every tensor it moves, so a pinned runtime has to
+    /// compute exactly what the mapped one does: same bytes, read from a buffer
+    /// the kernels were told about through a rewritten address.
+    ///
+    /// Both arms load the same shard file, so the only difference between them is
+    /// where the dense tensors live. A pin that dropped a tensor, forgot a
+    /// segment's start or misaligned a slot moves the logits by O(1).
+    func testAPinnedRuntimeComputesTheSameLogitsAsTheMappedOne() throws {
+        let checkpoint = DeepSeekV41SyntheticCheckpoint()
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dsv41-pin-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data(checkpoint.blob).write(
+            to: directory.appendingPathComponent("synthetic.safetensors")
+        )
+
+        let pinned = try makeRuntime(checkpoint, snapshotDir: directory, pinDenseWeights: true)
+        let mapped = try makeRuntime(checkpoint, snapshotDir: directory, pinDenseWeights: false)
+        let plan = try XCTUnwrap(pinned.densePin, pinned.describe())
+        XCTAssertNil(mapped.densePin)
+        // A plan that skipped every tensor would pass this test without ever
+        // exercising a rewritten address.
+        XCTAssertGreaterThan(plan.ranges.count, 0)
+        XCTAssertTrue(plan.skipped.isEmpty, "\(plan.skipped)")
+
+        for (position, token) in [5, 6, 7].enumerated() {
+            let pinnedLogits = try pinned.forward().forwardToken(token, position: position)
+            let mappedLogits = try mapped.forward().forwardToken(token, position: position)
+            XCTAssertEqual(
+                worstDelta(pinnedLogits, mappedLogits), 0,
+                "position \(position) differs between the pinned and mapped backbones"
+            )
+        }
+    }
+
     // MARK: Whole model
 
     /// A walk over several positions, both backends.
@@ -270,6 +310,251 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
                 "position \(position) is off by \(delta) against a \(scale) scale"
             )
         }
+    }
+
+    /// The per-stage walk layout is only a measurement if it is the same graph.
+    ///
+    /// `recordsWalkStageTiming` commits every stage of a layer in its own command
+    /// buffer so each reports a device window. That changes no kernel, no binding and
+    /// no submission order, so the answer must be unchanged; the table's windows must
+    /// also cover exactly the buffers the half totals cover, which is what keeps a
+    /// stage's share from being read against a different population. The stage NAMES
+    /// are checked too: a layout that silently dropped a stage would still add up, and
+    /// the missing cost would land on whichever stage the probe printed last.
+    func testThePerStageWalkLayoutIsTheSameWalk() throws {
+        let runtime = try makeRuntime(checkpoint)
+        let device = runtime.forward()
+        let tokens = (0..<6).map { 11 + $0 }
+
+        device.reset()
+        device.resetWalkTiming()
+        device.recordsWalkTiming = true
+        var baseline: [Float] = []
+        for (position, token) in tokens.enumerated() {
+            baseline = try device.forwardToken(token, position: position)
+        }
+        device.recordsWalkTiming = false
+        let baselineTiming = device.walkTiming
+        XCTAssertEqual(baselineTiming.positions, tokens.count)
+        XCTAssertGreaterThan(baselineTiming.frontDeviceNanoseconds, 0)
+        XCTAssertGreaterThan(baselineTiming.mixtureDeviceNanoseconds, 0)
+
+        device.reset()
+        device.resetWalkTiming()
+        device.recordsWalkTiming = true
+        device.recordsWalkStageTiming = true
+        var split: [Float] = []
+        for (position, token) in tokens.enumerated() {
+            split = try device.forwardToken(token, position: position)
+        }
+        device.recordsWalkTiming = false
+        device.recordsWalkStageTiming = false
+        let splitTiming = device.walkTiming
+
+        XCTAssertEqual(split, baseline, "the per-stage layout changed the walk's logits")
+        XCTAssertEqual(device.walkStagePositions, tokens.count)
+        XCTAssertEqual(
+            splitTiming.frontUnwindowedBuffers + splitTiming.mixtureUnwindowedBuffers,
+            0,
+            "a split buffer reported no device window"
+        )
+        let stageTotal = device.walkStageTiming.values.reduce(0, +)
+        XCTAssertEqual(
+            stageTotal,
+            splitTiming.frontDeviceNanoseconds + splitTiming.mixtureDeviceNanoseconds,
+            "the stage windows do not cover the same buffers as the half totals"
+        )
+
+        let frontNames = Set(DeepSeekV41DevicePlan.frontHalf.map(\.rawValue))
+        let backNames = Set(DeepSeekV41DevicePlan.backHalf.map(\.rawValue))
+        let reported = Set(device.walkStageTiming.keys)
+        // Every stage this fixture actually dispatches has to appear. A stage that
+        // dispatches nothing (`.compressPool` runs inside `.indexer`; `.engram` and
+        // `.indexer` are skipped on a layer that has neither) commits an empty buffer
+        // and legitimately reports no window, so the expectation is the pipeline minus
+        // the ones the plan says cannot run here.
+        var expected = frontNames.union(backNames)
+        expected.remove(DeepSeekV41ForwardStages.Stage.compressPool.rawValue)
+        if !checkpoint.plan.contains(where: { $0.engramTable != nil }) {
+            expected.remove(DeepSeekV41ForwardStages.Stage.engram.rawValue)
+        }
+        if !checkpoint.plan.contains(where: { $0.ownsCompressedIndex }) {
+            expected.remove(DeepSeekV41ForwardStages.Stage.indexer.rawValue)
+        }
+        XCTAssertTrue(
+            expected.subtracting(reported).isEmpty,
+            "the table is missing \(expected.subtracting(reported).sorted())"
+        )
+        XCTAssertTrue(
+            reported.subtracting(frontNames).subtracting(backNames).isEmpty,
+            "a buffer was reported under a name that is not a stage: "
+                + "\(reported.subtracting(frontNames).subtracting(backNames).sorted())"
+        )
+        XCTAssertGreaterThan(
+            device.walkStageTable().first?.millisecondsPerPosition ?? 0, 0
+        )
+
+        device.resetWalkTiming()
+        XCTAssertTrue(device.walkStageTiming.isEmpty)
+        XCTAssertEqual(device.walkStagePositions, 0)
+    }
+
+    /// A supplied residual row (how an image span arrives) computes exactly what the
+    /// same row computes on the host.
+    ///
+    /// This is the seam a picture enters the serving path through, and it is the one
+    /// place where the device path deviates from `forwardToken`: the embedding lookup
+    /// is replaced by an upload. A row that landed at the wrong offset, or seeded only
+    /// the first hyper-connection copy, still produces plausible logits, so the host's
+    /// own `forwardEmbedding` is the only thing that can say which is right.
+    func testASuppliedRowComputesTheSameLogitsAsTheHost() throws {
+        let runtime = try makeRuntime(checkpoint)
+        let device = runtime.forward()
+        let host = makeHost(checkpoint)
+        let row = (0..<checkpoint.config.hiddenSize).map { index in
+            Float((index * 7) % 11) / 11 - 0.5
+        }
+
+        let expectedFirst = host.forwardEmbedding(row, token: 9, position: 0)
+        let firstLogits = try device.forwardEmbedding(row, token: 9, position: 0)
+        XCTAssertEqual(firstLogits.count, expectedFirst.count)
+        let firstScale = expectedFirst.map(abs).max() ?? 1
+        XCTAssertLessThan(
+            worstDelta(firstLogits, expectedFirst) / max(firstScale, 1e-6),
+            decodeTolerance,
+            "the first supplied row disagrees with the host"
+        )
+
+        // A second position, one text and one supplied, so the walk after an image
+        // position is compared too: the position ring and the mix carried between
+        // sub-layers are where a seeding bug shows up next.
+        let expectedSecond = host.forwardToken(11, position: 1)
+        let secondLogits = try device.forwardToken(11, position: 1)
+        let secondScale = expectedSecond.map(abs).max() ?? 1
+        XCTAssertLessThan(
+            worstDelta(secondLogits, expectedSecond) / max(secondScale, 1e-6),
+            decodeTolerance,
+            "the text position after a supplied row disagrees with the host"
+        )
+    }
+
+    /// A checkpoint with no tower cannot be asked for pixels, and says which reason
+    /// applies rather than returning an empty span.
+    func testARuntimeWithoutAVisionConfigRefusesAnImage() throws {
+        let runtime = try makeRuntime(checkpoint)
+        XCTAssertNil(runtime.visionForward(), "the synthetic checkpoint publishes no tower")
+        XCTAssertNil(runtime.imageSpanPlan(width: 64, height: 64))
+        XCTAssertThrowsError(
+            try runtime.imageSpan(rgb: [], width: 0, height: 0)
+        ) { error in
+            guard case DeepSeekV41EngineError.visionUnavailable(let detail) = error else {
+                return XCTFail("unexpected error \(error)")
+            }
+            XCTAssertTrue(detail.contains("no vision_config"), detail)
+        }
+    }
+
+    /// A block that carries supplied rows computes what the walk does, position by
+    /// position, including the text positions between them.
+    ///
+    /// This is the batched image prefill. Two ways to get it wrong still produce
+    /// plausible logits: a row uploaded to the block's slot 0 rather than to the
+    /// position's own slot, and the seeding of the hyper-connection copies from the
+    /// wrong slot. Rows at every OTHER position are what makes both visible: a block
+    /// whose rows all landed on slot 0 answers the first position only and leaves the
+    /// text positions beside it reading an image's residual.
+    func testABatchedImageSpanMatchesTheWalk() throws {
+        let runtime = try makeRuntime(checkpoint)
+        let host = makeHost(checkpoint)
+        let width = DeepSeekV41DevicePlan.chunkSlots(
+            config: checkpoint.config,
+            contextLength: checkpoint.shape.contextLength
+        )
+        XCTAssertGreaterThan(width, 1, "a block of one is the walk")
+        let tokens = (0..<width).map { 5 + $0 }
+        let rows = imageRows(at: stride(from: 0, to: width, by: 2).map { $0 }, checkpoint)
+        XCTAssertEqual(rows.count, (width + 1) / 2)
+
+        let chunk = try runtime.forward().prefillChunk(tokens, embeddings: rows)
+
+        let walked = makeHost(checkpoint)
+        var last: [Float] = []
+        for (position, token) in tokens.enumerated() {
+            if let row = rows[position] {
+                last = walked.forwardEmbedding(row, token: token, position: position)
+            } else {
+                last = walked.forwardToken(token, position: position)
+            }
+        }
+        XCTAssertEqual(chunk.last.count, last.count)
+        let scale = max(last.map(abs).max() ?? 1, 1e-6)
+        XCTAssertLessThan(
+            worstDelta(chunk.last, last) / scale,
+            decodeTolerance,
+            "a block with supplied rows disagrees with the host's walk"
+        )
+        // The host the device is compared against is a SECOND executor, so the first
+        // one's own walk is checked too: a bug in the block could otherwise match a
+        // bug in the oracle's chunk form and cancel out.
+        let oracleChunk = host.prefillChunk(tokens, embeddings: rows)
+        XCTAssertLessThan(worstDelta(oracleChunk.last, last), 1e-5)
+    }
+
+    /// A row in a LATER block lands in that block, not in the first one.
+    ///
+    /// `prefillChunk` splits the prompt at `workspace.slots` and hands each block only
+    /// its own rows. A mapping that forgot the block offset would put the second
+    /// block's image rows at its slot 0, which is a different position of a different
+    /// layer pass and still finite, so only a comparison with the walk can say.
+    func testABatchedImageSpanMapsItsRowsIntoTheRightBlocks() throws {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.contextLength = max(shape.contextLength, 16)
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        let width = DeepSeekV41DevicePlan.chunkSlots(
+            config: checkpoint.config,
+            contextLength: checkpoint.shape.contextLength
+        )
+        XCTAssertGreaterThan(width, 1, "the fixture has to allow a block")
+        let tokens = (0..<(width * 2 + 1)).map { 3 + $0 }
+        // Only the second block and the stretch that crosses into it carry rows, so a
+        // per-block slice that dropped its offset answers with the block's first slot.
+        let positions = Array((width - 1)..<tokens.count)
+        let rows = imageRows(at: positions, checkpoint)
+
+        let runtime = try makeRuntime(checkpoint)
+        let chunk = try runtime.forward().prefillChunk(tokens, embeddings: rows)
+
+        let walked = makeHost(checkpoint)
+        var last: [Float] = []
+        for (position, token) in tokens.enumerated() {
+            if let row = rows[position] {
+                last = walked.forwardEmbedding(row, token: token, position: position)
+            } else {
+                last = walked.forwardToken(token, position: position)
+            }
+        }
+        XCTAssertEqual(chunk.last.count, last.count)
+        let scale = max(last.map(abs).max() ?? 1, 1e-6)
+        XCTAssertLessThan(
+            worstDelta(chunk.last, last) / scale,
+            decodeTolerance,
+            "a row from the second block did not land at its own position"
+        )
+    }
+
+    /// Rows that vary by BOTH position and dimension, so a row uploaded to the wrong
+    /// slot cannot agree with the right one by symmetry.
+    private func imageRows(
+        at positions: [Int],
+        _ checkpoint: DeepSeekV41SyntheticCheckpoint
+    ) -> [Int: [Float]] {
+        var rows: [Int: [Float]] = [:]
+        for position in positions {
+            rows[position] = (0..<checkpoint.config.hiddenSize).map { index in
+                Float(((position + 1) * (index + 3)) % 17) / 17 - 0.5
+            }
+        }
+        return rows
     }
 
     /// A block of one is a decode step: the same tokens, the same graph, and the
@@ -300,6 +585,164 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         }
         XCTAssertEqual(chunk.last.count, last.count)
         XCTAssertEqual(worstDelta(chunk.last, last), 0, accuracy: 1e-6)
+    }
+
+    /// A prefilled chunk reports each block it runs, ending on the whole chunk.
+    ///
+    /// This is the granularity the composer can honestly show, because a block is one
+    /// command buffer and nothing inside it is visible to the host. The counts are
+    /// positions of this chunk: strictly increasing, whole blocks until the last.
+    func testAPrefillReportsEveryBlockItRuns() throws {
+        let runtime = try makeRuntime(checkpoint)
+        let width = DeepSeekV41DevicePlan.chunkSlots(
+            config: checkpoint.config,
+            contextLength: checkpoint.shape.contextLength
+        )
+        XCTAssertGreaterThan(width, 1, "a block of one reports like a walk")
+        let tokens = (0..<(width * 2 + 1)).map { 3 + $0 }
+        var reported: [Int] = []
+        _ = try runtime.forward().prefillChunk(tokens, onProgress: { reported.append($0) })
+        XCTAssertEqual(reported, [width, width * 2, tokens.count])
+        XCTAssertEqual(reported.last, tokens.count)
+    }
+
+    /// The width a prompt is prefilled at is the workspace's width, whatever its length.
+    ///
+    /// `#70` shipped a threshold here (the workspace width below 64 positions, four above)
+    /// on the theory that a short prompt's routed experts fit the arena. That sweep ran
+    /// with the arena UNWIRED, a regime the app never runs in; with the slots `mlock`ed the
+    /// fill runs at the disk's ceiling, the two widths land within 0.2-4.5% of each other,
+    /// and the widest one measured ahead in five of six comparisons (`#71`). This pins
+    /// that AND the cadence it produces, because the report count is the block count and
+    /// that is what a composer's progress line reads.
+    func testThePrefillWidthIsTheWorkspaceWidth() throws {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.window = 10
+        shape.contextLength = 128
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        let slots = DeepSeekV41DevicePlan.chunkSlots(
+            config: checkpoint.config, contextLength: shape.contextLength
+        )
+        XCTAssertGreaterThan(slots, 1, "this case needs a workspace wider than one position")
+        for tokens in [1, 3, 4, 5, 63, 64, 128] {
+            XCTAssertEqual(
+                DeepSeekV41DevicePlan.prefillBlockWidth(
+                    config: checkpoint.config, contextLength: shape.contextLength,
+                    promptTokens: tokens
+                ),
+                slots,
+                "a prompt of \(tokens) did not run at the workspace's width"
+            )
+        }
+        // A context shorter than four positions, or a window narrower than one, is
+        // capped by the workspace: the rule may not ask for a block the buffers cannot
+        // hold, which is the one thing that would crash rather than slow down.
+        var narrow = shape
+        narrow.contextLength = 2
+        let narrowCheckpoint = DeepSeekV41SyntheticCheckpoint(shape: narrow)
+        XCTAssertEqual(
+            DeepSeekV41DevicePlan.prefillBlockWidth(
+                config: narrowCheckpoint.config, contextLength: 2, promptTokens: 2
+            ),
+            2,
+            "the rule ran past a workspace that holds two positions"
+        )
+
+        // The cadence is the contract a composer's progress line reads, so it is driven
+        // through a real prefill rather than asserted off the rule alone.
+        func reports(_ tokens: Int) throws -> [Int] {
+            let runtime = try makeRuntime(checkpoint)
+            var reported: [Int] = []
+            _ = try runtime.forward().prefillChunk(
+                (0..<tokens).map { 3 + $0 }, onProgress: { reported.append($0) }
+            )
+            XCTAssertEqual(reported.last, tokens, "the last report is what the turn ran")
+            return reported
+        }
+        func expected(_ tokens: Int) -> [Int] {
+            var out: [Int] = []
+            var offset = 0
+            while offset < tokens {
+                offset = min(offset + slots, tokens)
+                out.append(offset)
+            }
+            return out
+        }
+        for tokens in [3, 9, 64, 128] {
+            XCTAssertEqual(try reports(tokens), expected(tokens), "\(tokens) positions")
+        }
+    }
+
+    /// A capture keeps each position's own logits, not the block's last one.
+    ///
+    /// A verify checks draft `i` against the target's logits at position `i - 1`, so
+    /// it needs the whole run. The head is one grid over the block's slots, which is
+    /// a different dispatch from the walk's one-row projection: the point of this
+    /// case is that the batched form lands every row in its own slot AND computes
+    /// the same numbers.
+    func testACapturedBlockReturnsEveryPositionsLogits() throws {
+        let runtime = try makeRuntime(checkpoint)
+        let boundary = DeepSeekV41DevicePlan.chunkSlots(
+            config: checkpoint.config,
+            contextLength: checkpoint.shape.contextLength
+        )
+        XCTAssertGreaterThan(boundary, 1, "a block of one is the walk")
+        let tokens = (0..<boundary).map { 3 + $0 }
+        let chunk = try runtime.forward().prefillChunk(
+            tokens, capturingLogitsAt: Set(tokens.indices)
+        )
+        XCTAssertEqual(chunk.captured.count, tokens.count)
+
+        let walked = try makeRuntime(checkpoint).forward()
+        for (position, token) in tokens.enumerated() {
+            let expected = try walked.forwardToken(token, position: position)
+            let captured = try XCTUnwrap(chunk.captured[position], "position \(position)")
+            XCTAssertEqual(captured.count, expected.count)
+            let scale = max(expected.map(abs).max() ?? 1, 1e-6)
+            XCTAssertLessThan(
+                worstDelta(captured, expected) / scale,
+                1e-5,
+                "slot \(position) of the batched head is not that position's logits"
+            )
+        }
+        XCTAssertEqual(chunk.last, chunk.captured[tokens.count - 1])
+    }
+
+    /// A chunk wider than one block maps its capture positions into the right block.
+    ///
+    /// `prefillChunk` splits at `workspace.slots`, and a capture is expressed
+    /// relative to the WHOLE chunk. A mapping that forgot the block offset would
+    /// return a later block's slot under an earlier position, or drop the position
+    /// entirely, and a one-block test cannot see it.
+    func testACaptureMapsPositionsAcrossBlockBoundaries() throws {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.contextLength = max(shape.contextLength, 16)
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        let width = DeepSeekV41DevicePlan.chunkSlots(
+            config: checkpoint.config,
+            contextLength: checkpoint.shape.contextLength
+        )
+        XCTAssertGreaterThan(width, 1, "the fixture has to allow a block")
+        let tokens = (0..<(width * 2 + 1)).map { 3 + $0 }
+        XCTAssertGreaterThan(tokens.count, width * 2)
+        XCTAssertLessThanOrEqual(tokens.count, checkpoint.shape.contextLength)
+        let capture: Set<Int> = [0, width - 1, width, tokens.count - 1]
+        let chunk = try makeRuntime(checkpoint).forward().prefillChunk(
+            tokens, capturingLogitsAt: capture
+        )
+        XCTAssertEqual(Set(chunk.captured.keys), capture)
+
+        let walked = try makeRuntime(checkpoint).forward()
+        for (position, token) in tokens.enumerated() {
+            let expected = try walked.forwardToken(token, position: position)
+            guard let captured = chunk.captured[position] else { continue }
+            let scale = max(expected.map(abs).max() ?? 1, 1e-6)
+            XCTAssertLessThan(
+                worstDelta(captured, expected) / scale,
+                1e-5,
+                "position \(position) of a multi-block capture is the wrong slot"
+            )
+        }
     }
 
     /// Every position of a block attends over its OWN gathered rows.
@@ -392,7 +835,10 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         let chunked = runtime.forward()
         let chunkedProbe = try buffer(metal, mult * hidden)
         chunked.parityProbes = DeepSeekV41ParityProbes(afterAttention: chunkedProbe)
-        _ = try chunked.prefillChunk(tokens)
+        // Explicit width: the subject is a block as WIDE as the workspace, which is not
+        // what `prefillBlockWidth` ships a prefill at (`#70` put the shipped width at
+        // four), so leaning on the default would test a quarter of the slot dimension.
+        _ = try chunked.prefillChunk(tokens, blockWidth: blockWidth)
 
         // The same positions, one at a time, capturing after each. Position `target` is
         // the one a shared row list replaces with a successor's rows; the arm the block
@@ -487,6 +933,535 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         XCTAssertLessThan(
             delta, 1e-5 * max(last.map(abs).max() ?? 1, 1),
             "the compressed chunk is off the walk by \(delta)"
+        )
+    }
+
+    /// The indexer's per-position state is bounded by the run, not by the sequence.
+    ///
+    /// A selection and a candidate mask are wanted for the position being computed
+    /// and never again — a query gathers the rows it selected and the cache, not a
+    /// neighbour's list — but both used to be kept for the whole sequence. The mask
+    /// is one `Bool` per compressed row produced SO FAR, so that retention is
+    /// quadratic: at the checkpoint's 262,144-token cap it is tens of gigabytes,
+    /// which a prefill would reach long before its KV budget.
+    ///
+    /// The walk is the case that makes it visible, because a block legitimately
+    /// holds one entry per position of the block while a walk holds exactly one.
+    func testTheIndexerKeepsOnlyTheRunItIsComputing() throws {
+        let compressed = compressedCheckpoint()
+        let runtime = try makeRuntime(compressed)
+        let forward = runtime.forward()
+        let tokens = (0..<(compressed.shape.window * 2)).map { 3 + $0 }
+
+        for (position, token) in tokens.enumerated() {
+            _ = try forward.forwardToken(token, position: position)
+            let counts = forward.retainedIndexPositionCounts
+            XCTAssertEqual(
+                counts.selections, 1,
+                "a walk holds the position it is computing, not position \(position)'s history"
+            )
+            XCTAssertLessThanOrEqual(counts.masks, 1)
+        }
+
+        // And the block path holds its own width, no more.
+        let blockRuntime = try makeRuntime(compressed)
+        let block = blockRuntime.forward()
+        let width = DeepSeekV41DevicePlan.chunkSlots(
+            config: compressed.config,
+            contextLength: compressed.shape.contextLength
+        )
+        XCTAssertGreaterThan(width, 1, "a block of one would not exercise the bound")
+        _ = try block.prefillChunk(tokens)
+        let blockCounts = block.retainedIndexPositionCounts
+        XCTAssertLessThanOrEqual(
+            blockCounts.selections, width,
+            "a block holds one selection per position it is running"
+        )
+        XCTAssertLessThanOrEqual(blockCounts.masks, width)
+    }
+
+    /// `main_x = main_norm(main_proj(main_hidden))`, computed on the device from the
+    /// row the walk captured.
+    ///
+    /// This is the drafter's actual input and the first thing the device path reads
+    /// from the `mtp.*` namespace, which is why it is also the first place a lookup
+    /// that ignored the namespace would go wrong: `mtp.0.main_proj` is not
+    /// `layers.0.main_proj`, and the two have different shapes, so the substitution
+    /// is silent only when the shapes happen to agree.
+    func testTheDeviceProjectsTheDraftersConditioningRow() throws {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.layers = 2
+        // The config requires one target layer per stage, and the fixture's draft
+        // expert counts differ from the backbone's so a stage that routed with the
+        // wrong pair is visible downstream.
+        shape.draftTargetLayers = [1, 0]
+        shape.draftStages = 2
+        shape.contextLength = 16
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        XCTAssertEqual(checkpoint.catalogProblems(), [])
+        XCTAssertEqual(checkpoint.config.numNextNPredictLayers, 2)
+        XCTAssertEqual(checkpoint.config.draftExpertCounts.routed, 3)
+        XCTAssertEqual(checkpoint.config.draftExpertCounts.activated, 2)
+
+        let runtime = try makeRuntime(checkpoint)
+        // The draft namespace resolves to different bytes than the backbone's, which
+        // is what the scope argument is for.
+        let draftNorm = try XCTUnwrap(runtime.weights.tensor(.attnNorm, scope: .draft, layer: 0))
+        let backboneNorm = try XCTUnwrap(runtime.weights.tensor(.attnNorm, layer: 0))
+        XCTAssertNotEqual(draftNorm.byteOffset, backboneNorm.byteOffset)
+        XCTAssertNotEqual(
+            runtime.weights.tensor(.draftMainProj, scope: .draft, layer: 0)?.byteOffset,
+            runtime.weights.tensor(.attnWqA, layer: 0)?.byteOffset
+        )
+
+        let device = runtime.forward()
+        device.capturesDraftInput = true
+        let host = makeHost(checkpoint)
+        let drafter = DeepSeekV41DSparkBlock(forward: host)
+
+        let tokens = [3, 4, 5]
+        for (position, token) in tokens.enumerated() {
+            _ = try device.forwardToken(token, position: position)
+            _ = host.forwardToken(token, position: position)
+            let captured = try XCTUnwrap(host.mainHidden(position: position))
+            let expected = try XCTUnwrap(drafter.mainX([captured]).first)
+            let projected = try XCTUnwrap(
+                try device.draftMainX(
+                    slots: 1, firstSlot: position % shape.window
+                ).first,
+                "the device projected no row"
+            )
+            XCTAssertEqual(projected.count, expected.count)
+            let scale = max(expected.map(abs).max() ?? 1, 1e-6)
+            let delta = worstDelta(projected, expected)
+            XCTAssertLessThan(
+                delta / scale, 5e-4,
+                "position \(position): main_x is off the host by \(delta) "
+                    + "against a \(scale) scale"
+            )
+        }
+    }
+
+    /// The draft rings are seeded from the TARGET's own latents, which is what a draft
+    /// round attends over.
+    ///
+    /// `DSparkAttention`'s seed branch is easy to dismiss as bookkeeping: it writes
+    /// `kv_norm(wkv(main_x))` per prefix position and returns the residual untouched,
+    /// so a seed that stored the wrong rows or the wrong slots stays invisible until
+    /// the first draft reads them. Two rules are load-bearing and both are checked
+    /// here: the row is the target's projection (not the draft stack's), and a prefix
+    /// longer than the window keeps its LAST `window` rows, with slot
+    /// `position % window` holding the row for that position.
+    func testTheDeviceSeedsTheDraftRingsFromTheTargetsLatents() throws {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.layers = 2
+        shape.draftTargetLayers = [1, 0]
+        shape.draftStages = 2
+        shape.window = 4
+        shape.contextLength = 16
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        XCTAssertEqual(checkpoint.catalogProblems(), [])
+
+        let runtime = try makeRuntime(checkpoint)
+        let device = runtime.forward()
+        XCTAssertEqual(
+            try device.seedDraftRings(through: 4), 0,
+            "the seed is idle until the capture is on"
+        )
+        device.capturesDraftInput = true
+
+        // Six positions over a four-row window: the ring wraps during the seed, so the
+        // slot arithmetic is exercised rather than assumed.
+        let tokens = [3, 4, 5, 6, 7, 8]
+        let host = makeHost(checkpoint)
+        var rows: [[Float]] = []
+        for (position, token) in tokens.enumerated() {
+            _ = try device.forwardToken(token, position: position)
+            _ = host.forwardToken(token, position: position)
+            rows.append(try XCTUnwrap(host.mainHidden(position: position)))
+        }
+        let drafter = DeepSeekV41DSparkBlock(forward: host)
+        drafter.seed(drafter.mainX(rows))
+        XCTAssertEqual(drafter.windows.count, 2)
+
+        // Only the window's worth of rows is projected: positions before it are
+        // already gone from the ring, and projecting them would be work nobody reads.
+        XCTAssertEqual(try device.seedDraftRings(through: tokens.count), shape.window)
+        XCTAssertEqual(device.draftSeededPositions, tokens.count)
+        XCTAssertEqual(
+            try device.seedDraftRings(through: tokens.count), 0,
+            "a second seed has nothing left to project"
+        )
+
+        for stage in 0..<drafter.windows.count {
+            let expected = drafter.windows[stage]
+            let ring = device.draftRing(index: stage)
+            XCTAssertEqual(ring.count, expected.count)
+            for slot in expected.indices {
+                let scale = max(expected[slot].map(abs).max() ?? 1, 1e-6)
+                let delta = worstDelta(ring[slot], expected[slot])
+                XCTAssertLessThan(
+                    delta / scale, 5e-4,
+                    "stage \(stage) slot \(slot): the seeded row is off the host by "
+                        + "\(delta) against a \(scale) scale"
+                )
+            }
+        }
+    }
+
+    /// The draft block's attention sub-layer: the ring, the block's own rows, and one
+    /// index list shared by every query.
+    ///
+    /// This is the piece with no precedent in the file. Every other attention here
+    /// reads the CSA2 cache and is causal; this one reads the stage's OWN ring, is not
+    /// causal inside the block (draft position 0 attends over draft position 4), and
+    /// conjugates its output's rope payload back out before the grouped projection.
+    /// The reference is the host block's `Trace.postAttention`, which is the stack the
+    /// same five positions leave behind after `hc_post`.
+    func testTheDraftAttentionMatchesTheHostBlock() throws {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.layers = 2
+        shape.draftTargetLayers = [1, 0]
+        shape.draftStages = 2
+        shape.draftBlockSize = 3
+        shape.draftNoiseTokenID = 5
+        shape.window = 4
+        shape.contextLength = 16
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        XCTAssertEqual(checkpoint.catalogProblems(), [])
+        XCTAssertEqual(checkpoint.config.dsparkNoiseTokenID, 5)
+
+        let runtime = try makeRuntime(checkpoint)
+        let device = runtime.forward()
+        device.capturesDraftInput = true
+
+        let tokens = [3, 4, 5, 6, 7, 8]
+        let host = makeHost(checkpoint)
+        var rows: [[Float]] = []
+        for (position, token) in tokens.enumerated() {
+            _ = try device.forwardToken(token, position: position)
+            _ = host.forwardToken(token, position: position)
+            rows.append(try XCTUnwrap(host.mainHidden(position: position)))
+        }
+        let drafter = DeepSeekV41DSparkBlock(forward: host)
+        let mainX = drafter.mainX(rows)
+        drafter.seed(mainX)
+        _ = try device.seedDraftRings(through: tokens.count)
+
+        // The draft validates the position AFTER the target's newest one, so the ring
+        // row for `startPosition` has to be in place — the seed wrote it.
+        let startPosition = tokens.count - 1
+        let token = tokens[startPosition]
+        _ = drafter.draft(
+            token: token, mainX: mainX[startPosition], startPosition: startPosition
+        )
+        let trace = try XCTUnwrap(drafter.lastTrace)
+        let expected = trace.postAttention
+        XCTAssertEqual(expected.count, shape.draftBlockSize)
+
+        let stack = try device.draftAttentionStack(
+            token: token, startPosition: startPosition
+        )
+        XCTAssertEqual(stack.count, expected.count, "the block's position count")
+        for position in expected.indices {
+            for copy in expected[position].indices {
+                let scale = max(expected[position][copy].map(abs).max() ?? 1, 1e-6)
+                let delta = worstDelta(stack[position][copy], expected[position][copy])
+                XCTAssertLessThan(
+                    delta / scale, 5e-4,
+                    "position \(position) copy \(copy): the draft stack is off the host "
+                        + "by \(delta) against a \(scale) scale"
+                )
+            }
+        }
+    }
+
+    /// The whole draft block: three stages of attention and mixture, chained.
+    ///
+    /// The reference is the host block's `Trace.stageOutputs`, the residual each stage
+    /// leaves behind after BOTH of its sub-layers, so this covers the `hc_ffn_fn`
+    /// coefficients, the FFN's `hc_pre` taken from the ATTENTION sub-layer's mix, the
+    /// router under `draftExpertCounts` (3 routed / 2 active here against the
+    /// backbone's 4 / 2), the routed mixture, the shared expert and the `pre` mix the
+    /// next stage collapses with. The fixture publishes shared experts for the
+    /// backbone too, so `encodeSharedExpert`'s namespaced lookup is exercised on both
+    /// sides.
+    func testTheDraftBlockChainsItsStagesLikeTheHostBlock() throws {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.layers = 2
+        shape.draftTargetLayers = [1, 0]
+        shape.draftStages = 2
+        shape.draftBlockSize = 3
+        shape.draftNoiseTokenID = 5
+        shape.routedExperts = 4
+        shape.activatedExperts = 2
+        shape.draftRoutedExperts = 3
+        shape.draftActivatedExperts = 2
+        shape.sharedExperts = 1
+        shape.window = 4
+        shape.contextLength = 16
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        XCTAssertEqual(checkpoint.catalogProblems(), [])
+        XCTAssertEqual(checkpoint.config.sharedExpertCount, 1)
+        XCTAssertEqual(checkpoint.config.draftExpertCounts.routed, 3)
+        XCTAssertNotEqual(
+            checkpoint.config.draftExpertCounts.routed,
+            checkpoint.config.numRoutedExperts,
+            "the fixture's draft counts must differ or a stage reading the wrong pair passes"
+        )
+
+        let runtime = try makeRuntime(checkpoint)
+        let device = runtime.forward()
+        device.capturesDraftInput = true
+
+        let tokens = [3, 4, 5, 6, 7, 8]
+        let host = makeHost(checkpoint)
+        var rows: [[Float]] = []
+        for (position, token) in tokens.enumerated() {
+            _ = try device.forwardToken(token, position: position)
+            _ = host.forwardToken(token, position: position)
+            rows.append(try XCTUnwrap(host.mainHidden(position: position)))
+        }
+        let drafter = DeepSeekV41DSparkBlock(forward: host)
+        let mainX = drafter.mainX(rows)
+        drafter.seed(mainX)
+        _ = try device.seedDraftRings(through: tokens.count)
+
+        let startPosition = tokens.count - 1
+        let token = tokens[startPosition]
+        _ = drafter.draft(
+            token: token, mainX: mainX[startPosition], startPosition: startPosition
+        )
+        let trace = try XCTUnwrap(drafter.lastTrace)
+        let expected = trace.stageOutputs
+        XCTAssertEqual(expected.count, 2, "one entry per draft stage")
+
+        let stages = try device.draftStageOutputs(
+            token: token, startPosition: startPosition
+        )
+        XCTAssertEqual(stages.count, expected.count)
+        for stage in expected.indices {
+            XCTAssertEqual(stages[stage].count, expected[stage].count)
+            for position in expected[stage].indices {
+                for copy in expected[stage][position].indices {
+                    let reference = expected[stage][position][copy]
+                    let scale = max(reference.map(abs).max() ?? 1, 1e-6)
+                    let delta = worstDelta(stages[stage][position][copy], reference)
+                    XCTAssertLessThan(
+                        delta / scale, 5e-4,
+                        "stage \(stage) position \(position) copy \(copy): the draft "
+                            + "stack is off the host by \(delta) against a \(scale) scale"
+                    )
+                }
+            }
+        }
+    }
+
+    /// The draft head and the chain that consumes it.
+    ///
+    /// `DSparkBlock.forward_head` is two things a port gets wrong separately: the head
+    /// itself (a collapse with the LAST mix, the stage's `norm`, and the backbone's own
+    /// 129,280-row projection — the drafter does not publish a head of its own), and the
+    /// chain on top of it, where the Markov bias is ADDED to the full vocabulary and
+    /// each step conditions on the token IT drew. This compares the logits against the
+    /// host's `Trace` and then the whole chain — tokens and confidences — against
+    /// `DeepSeekV41DSparkBlock.draft`.
+    func testTheDraftHeadAndItsChainMatchTheHostBlock() throws {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.layers = 2
+        shape.draftTargetLayers = [1, 0]
+        shape.draftStages = 2
+        shape.draftBlockSize = 3
+        shape.draftNoiseTokenID = 5
+        shape.draftMarkovRank = 8
+        shape.window = 4
+        shape.contextLength = 16
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        XCTAssertEqual(checkpoint.catalogProblems(), [])
+
+        let runtime = try makeRuntime(checkpoint)
+        let device = runtime.forward()
+        device.capturesDraftInput = true
+
+        let tokens = [3, 4, 5, 6, 7, 8]
+        let host = makeHost(checkpoint)
+        var rows: [[Float]] = []
+        for (position, token) in tokens.enumerated() {
+            _ = try device.forwardToken(token, position: position)
+            _ = host.forwardToken(token, position: position)
+            rows.append(try XCTUnwrap(host.mainHidden(position: position)))
+        }
+        let drafter = DeepSeekV41DSparkBlock(forward: host)
+        let mainX = drafter.mainX(rows)
+        drafter.seed(mainX)
+        _ = try device.seedDraftRings(through: tokens.count)
+
+        let startPosition = tokens.count - 1
+        let token = tokens[startPosition]
+        let hostDraft = drafter.draft(
+            token: token, mainX: mainX[startPosition], startPosition: startPosition
+        )
+        let trace = try XCTUnwrap(drafter.lastTrace)
+        XCTAssertEqual(trace.logits.count, shape.draftBlockSize)
+
+        let logits = try device.draftHeadLogits(
+            token: token, startPosition: startPosition
+        )
+        XCTAssertEqual(logits.count, trace.logits.count)
+        for position in trace.logits.indices {
+            let reference = trace.logits[position]
+            let scale = max(reference.map(abs).max() ?? 1, 1e-6)
+            let delta = worstDelta(logits[position], reference)
+            XCTAssertLessThan(
+                delta / scale, 5e-4,
+                "head position \(position): the draft logits are off the host by "
+                    + "\(delta) against a \(scale) scale"
+            )
+        }
+
+        // The chain, which is the only thing that can catch a bias applied to the wrong
+        // step: a bias from the target's token instead of the draft's own choice shows
+        // up as a token the host does not pick.
+        let chain = DeepSeekV41DSpark.runChain(
+            steps: shape.draftBlockSize,
+            seedToken: token,
+            temperature: 0
+        ) { index, previous in
+            guard let step = try? device.draftStep(index: index, previousToken: previous),
+                  logits.indices.contains(index) else { return nil }
+            return (logits[index], step.bias, step.confidence)
+        }
+        XCTAssertEqual(chain.tokens, hostDraft.tokens, "the drawn tokens")
+        XCTAssertEqual(chain.confidences.count, hostDraft.confidences.count)
+        for (index, expected) in hostDraft.confidences.enumerated() {
+            let scale = max(abs(expected), 1e-6)
+            XCTAssertLessThan(
+                abs(chain.confidences[index] - expected) / scale, 5e-3,
+                "confidence \(index) is off the host by "
+                    + "\(chain.confidences[index] - expected)"
+            )
+        }
+    }
+
+    /// The device captures exactly the row the host forward calls `mainHidden`.
+    ///
+    /// The DSpark drafter conditions on the mean over the hyper-connection copies of
+    /// the BLOCK INPUT at each target layer, concatenated in ascending layer order.
+    /// Every part of that is easy to get subtly wrong — the mean instead of a
+    /// weighted collapse, the block input instead of the layer's output, and the
+    /// config's order instead of the sorted one — and a wrong row does not fail, it
+    /// conditions every draft on a state the target had already moved past. So the
+    /// reference is the host forward, which records the same quantity.
+    func testTheDeviceCapturesTheDraftersConditioningRow() throws {
+        var shape = DeepSeekV41SyntheticShape()
+        shape.layers = 2
+        // Descending on purpose: the concatenation order is the sorted one, so a
+        // capture that followed the config's spelling would write them swapped.
+        shape.draftTargetLayers = [1, 0]
+        shape.contextLength = 16
+        let checkpoint = DeepSeekV41SyntheticCheckpoint(shape: shape)
+        XCTAssertEqual(checkpoint.config.dsparkTargetLayerIDs, [1, 0])
+
+        let runtime = try makeRuntime(checkpoint)
+        let device = runtime.forward()
+        XCTAssertNil(
+            device.capturedDraftInput(atPosition: 0), "capture is off until it is asked for"
+        )
+        device.capturesDraftInput = true
+
+        let host = makeHost(checkpoint)
+        let tokens = [3, 4, 5]
+        var walked: [Float] = []
+        for (position, token) in tokens.enumerated() {
+            walked = try device.forwardToken(token, position: position)
+            _ = host.forwardToken(token, position: position)
+            let captured = try XCTUnwrap(device.capturedDraftInput(atPosition: position))
+            let expected = try XCTUnwrap(host.mainHidden(position: position))
+            XCTAssertEqual(captured.count, expected.count)
+            // Relative, because these are activations rather than weights: the two
+            // backends accumulate the same sums in a different order, and the walk's
+            // own logits agree only to `decodeTolerance` (2e-3). Measured here it is
+            // 1.4e-4 at position 0 and 6e-5 after, so the bar sits between the two:
+            // every way of getting this row WRONG is a definitional error — the
+            // layer's output instead of its input, a weighted collapse instead of the
+            // mean, the config's order instead of the sorted one — and each of those
+            // is O(1), not O(1e-4).
+            let scale = max(expected.map(abs).max() ?? 1, 1e-6)
+            let delta = worstDelta(captured, expected)
+            XCTAssertLessThan(
+                delta / scale, 5e-4,
+                "position \(position): the captured row is off the host by \(delta) "
+                    + "against a \(scale) scale"
+            )
+        }
+        XCTAssertFalse(walked.isEmpty)
+
+        // The block path captures one row per position, and the ring slots are
+        // addressed independently: a capture that wrote every slot to offset 0 would
+        // pass the walk above and leave the block holding its last position only.
+        device.capturesDraftInput = true
+        device.reset()
+        _ = try device.prefillChunk(tokens)
+        let blockedHost = makeHost(checkpoint)
+        for (position, token) in tokens.enumerated() {
+            _ = blockedHost.forwardToken(token, position: position)
+            let captured = try XCTUnwrap(device.capturedDraftInput(atPosition: position))
+            let expected = try XCTUnwrap(blockedHost.mainHidden(position: position))
+            let scale = max(expected.map(abs).max() ?? 1, 1e-6)
+            let delta = worstDelta(captured, expected)
+            XCTAssertLessThan(
+                delta / scale, 5e-4,
+                "block slot \(position): the captured row is off the host by \(delta) "
+                    + "against a \(scale) scale"
+            )
+        }
+    }
+
+    /// A chunk that CONTINUES the cache returns what walking the same positions returns.
+    ///
+    /// `prefillChunk` used to open a sequence and nothing else: it ran its blocks from
+    /// position 0 and refused a cache that already held anything. A speculative verify
+    /// needs the other shape — the drafted run appended to a turn that is already in
+    /// the cache — and the position decides everything that used to be implicit: the
+    /// ring slot, the compressor's group slot, and whether the group completes here.
+    ///
+    /// The continuation starts one position into a group (`compress_ratios` 2) on
+    /// purpose: a chunk that only ever started on a group boundary would fill slot 0
+    /// itself and never read a slot an earlier position left behind.
+    func testAChunkContinuesFromTheCacheLikeTheWalk() throws {
+        let compressed = compressedCheckpoint()
+        let blockWidth = DeepSeekV41DevicePlan.chunkSlots(
+            config: compressed.config,
+            contextLength: compressed.shape.contextLength
+        )
+        XCTAssertGreaterThan(blockWidth, 1, "a block of one is the walk")
+        let tokens = (0..<(compressed.shape.window * 2)).map { 3 + $0 }
+        let promptWidth = blockWidth + 1
+        let prompt = Array(tokens.prefix(promptWidth))
+        let rest = Array(tokens.dropFirst(promptWidth))
+        XCTAssertFalse(rest.isEmpty)
+        XCTAssertEqual(
+            promptWidth % 2, 1,
+            "the continuation has to start mid-group for the compressor slots to matter"
+        )
+
+        let chunked = try makeRuntime(compressed).forward()
+        _ = try chunked.prefillChunk(prompt)
+        XCTAssertEqual(chunked.storedPositions, promptWidth)
+        let continued = try chunked.prefillChunk(rest)
+
+        let walked = try makeRuntime(compressed).forward()
+        _ = try walked.prefillChunk(prompt)
+        var last: [Float] = []
+        for (offset, token) in rest.enumerated() {
+            last = try walked.forwardToken(token, position: promptWidth + offset)
+        }
+
+        XCTAssertEqual(continued.last.count, last.count)
+        let delta = worstDelta(continued.last, last)
+        XCTAssertLessThan(
+            delta, 1e-5 * max(last.map(abs).max() ?? 1, 1),
+            "the continued chunk is off the walk by \(delta)"
         )
     }
 
@@ -1475,5 +2450,97 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         for row in 0..<outDim {
             XCTAssertEqual(pointer[row], expected[row], accuracy: 1e-4, "row \(row)")
         }
+    }
+
+    /// The walk instrument's own contract, because every number in `#47` came out of it.
+    ///
+    /// `recordsWalkTiming` divides a walked position into five buckets and the timeline
+    /// records each committed buffer's commit, wait and device window. Both are off in
+    /// every production path, which means a rename, a reordering or a buffer that stops
+    /// being recorded would be silent: the buckets would still print, they would just
+    /// describe less of the position. This pins the shape on the synthetic checkpoint --
+    /// two buffers per layer, in commit order, every window inside the position, the
+    /// device total below the wall -- and pins the indexer bucket on a shape that
+    /// publishes a compressed index source, where the dense half really does stop twice.
+    func testTheWalkInstrumentCoversEveryBufferOfAPosition() throws {
+        let checkpoint = DeepSeekV41SyntheticCheckpoint()
+        let runtime = try makeRuntime(checkpoint)
+        let executor = runtime.forward()
+        executor.recordsWalkTiming = true
+        executor.recordsWalkTimeline = true
+        executor.walkTimelineLimit = 1
+        executor.reset()
+        runtime.arena.reset()
+        executor.resetWalkTiming()
+
+        var walls: [Double] = []
+        for position in 0..<3 {
+            let started = DispatchTime.now().uptimeNanoseconds
+            _ = try executor.forwardToken(1_000 + position, position: position)
+            walls.append(Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000)
+        }
+
+        XCTAssertEqual(executor.walkTiming.positions, 3, "every walked position is counted")
+        XCTAssertEqual(executor.walkTimelinePositions, 1, "the timeline stops at its limit")
+        XCTAssertEqual(
+            executor.walkTimeline.count, 2 * checkpoint.plan.count,
+            "one front half and one mixture half per layer"
+        )
+        var previousCommit: UInt64 = 0
+        for entry in executor.walkTimeline {
+            XCTAssertGreaterThanOrEqual(
+                entry.commitNanoseconds, previousCommit, "\(entry.stage) is out of order"
+            )
+            previousCommit = entry.commitNanoseconds
+            XCTAssertGreaterThanOrEqual(
+                entry.waitBeginNanoseconds, entry.commitNanoseconds,
+                "\(entry.stage) was waited on before it was committed"
+            )
+            XCTAssertGreaterThanOrEqual(
+                entry.waitEndNanoseconds, entry.waitBeginNanoseconds, entry.stage
+            )
+            if entry.windowEndNanoseconds > entry.windowStartNanoseconds {
+                XCTAssertGreaterThanOrEqual(
+                    entry.windowStartNanoseconds, entry.commitNanoseconds,
+                    "\(entry.stage) started before it was handed to the driver"
+                )
+                XCTAssertGreaterThanOrEqual(
+                    entry.windowEndNanoseconds, entry.windowStartNanoseconds, entry.stage
+                )
+            }
+        }
+        // The buckets have to fit inside the position: a device total above the wall, or
+        // a bucket that is negative, means the accumulators are attributing the same
+        // millisecond twice.
+        let perPosition = executor.walkTiming.millisecondsPerPosition()
+        let device = perPosition.frontDevice + perPosition.mixtureDevice
+        let host = Double(executor.walkTiming.hostNanoseconds)
+            / Double(max(1, executor.walkTiming.positions)) / 1_000_000
+        XCTAssertGreaterThan(device, 0, "a walk has device work")
+        XCTAssertLessThanOrEqual(
+            device, walls[0], "the device windows cannot exceed the position's wall time"
+        )
+        XCTAssertGreaterThan(host, 0)
+        XCTAssertEqual(
+            executor.walkTiming.millisecondsPerPositionIndexerWait(), 0,
+            "the default shape publishes no index source, so there is no second round trip"
+        )
+
+        // A shape that DOES publish one, where the dense half stops at `.indexer` and the
+        // host waits a second time inside the same layer.
+        let compressed = DeepSeekV41SyntheticCheckpoint(shape: .compressedSmall())
+        let compressedRuntime = try makeRuntime(compressed)
+        let compressedExecutor = compressedRuntime.forward()
+        compressedExecutor.recordsWalkTiming = true
+        compressedExecutor.reset()
+        compressedRuntime.arena.reset()
+        compressedExecutor.resetWalkTiming()
+        for position in 0..<3 {
+            _ = try compressedExecutor.forwardToken(1_000 + position, position: position)
+        }
+        XCTAssertGreaterThan(
+            compressedExecutor.walkTiming.millisecondsPerPositionIndexerWait(), 0,
+            "the compressed shape's index-source layer pays the split, so the bucket must see it"
+        )
     }
 }

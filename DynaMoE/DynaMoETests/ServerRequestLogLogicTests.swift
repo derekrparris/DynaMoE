@@ -217,7 +217,7 @@ final class ServerRequestLogLogicTests: XCTestCase {
         XCTAssertFalse(ServerRequestLogRecorder.errorMessage(for: openAIToolChoiceError).contains("dangerous_client_name"))
 
         let anthropicToolChoiceError = try XCTUnwrap(extractError {
-            try AnthropicAdapter.toolUseEnabled(AnthropicMessagesRequest.ToolChoice(type: "tool", name: "exfiltrate"))
+            try AnthropicAdapter.toolUseEnabled(AnthropicMessagesRequest.ToolChoice(type: "tool", name: "exfiltrate", disableParallelToolUse: nil))
         }, "tool_choice rejection is a ServerAPIError")
         XCTAssertTrue(anthropicToolChoiceError.message.contains("exfiltrate"))
         XCTAssertFalse(ServerRequestLogRecorder.errorMessage(for: anthropicToolChoiceError).contains("exfiltrate"))
@@ -362,6 +362,116 @@ final class ServerRequestLogLogicTests: XCTestCase {
 
         XCTAssertEqual(rowWithBodies.requestBody, ServerRequestLog.contentWithheldMarker)
         XCTAssertFalse(ServerRequestLogRecorder.composeLine(rowWithBodies).contains("TOP SECRET"))
+    }
+
+    // MARK: Client-demanded retention refusal
+
+    /// OpenAI's `store: false` is a promise about the server's own behaviour, not
+    /// about the answer, so it is honoured per request: with the Store Request
+    /// Content switch ON, a turn whose client asked not to be retained still writes
+    /// the withheld marker, and the row carries the flag that says who withheld it.
+    /// The last assertion is the control: nobody asked for withholding here, so the
+    /// same composer captures — the test is proving the flag, not the switch.
+    func testAClientRetentionRefusalOutranksTheCaptureSwitch() {
+        UserDefaults.standard.set(true, forKey: ServerRequestLogRecorder.captureBodiesKey)
+        XCTAssertTrue(ServerRequestLogRecorder.captureBodiesEnabled)
+
+        let recorder = ServerRequestLogRecorder.shared
+        let id = "test-\(UUID().uuidString)"
+        let box = recorder.beginBox(requestId: id, method: "POST", path: "/v1/chat/completions")
+        defer { recorder.endBox(requestId: id) }
+        XCTAssertFalse(box.withholdsBodiesForClientRetention, "a fresh box has not been asked to withhold anything")
+        XCTAssertNil(box.snapshot().retentionWithheldByClient, "nothing has claimed a client refusal yet")
+
+        box.withholdBodiesForClientRetention()
+        XCTAssertTrue(box.withholdsBodiesForClientRetention)
+        XCTAssertEqual(
+            box.snapshot().retentionWithheldByClient,
+            true,
+            "the persisted row has to explain its own withheld bodies: the dashboard reads this flag, not the marker alone"
+        )
+
+        // Every body composer obeys the flag, which is what makes the promise hold
+        // for a streaming partial and a terminal outcome, not only for the summary.
+        XCTAssertEqual(
+            ServerRequestLog.capturedRequestBody("a prompt the client asked not to keep", withheldByClient: true),
+            ServerRequestLog.contentWithheldMarker
+        )
+        XCTAssertEqual(
+            ServerRequestLog.capturedResponseBody(thinking: "thinking", response: "answer", withheldByClient: true),
+            ServerRequestLog.contentWithheldMarker
+        )
+        let call = ParsedToolCall(name: "file_read", arguments: [:], rawArguments: "{}", rawText: "{}")
+        XCTAssertEqual(
+            ServerRequestLog.capturedToolCalls(
+                [call],
+                withheldByClient: true,
+                serializeArguments: { _ in "{\"path\":\"/etc/passwd\"}" }
+            )?.first?.arguments,
+            ServerRequestLog.contentWithheldMarker,
+            "tool arguments are content too: a retention refusal covers them"
+        )
+
+        ServerController.recordStreamedPartialOutcome(
+            logBox: box,
+            frame: Self.streamedFrame(thinking: "t", response: "r", tokens: 1),
+            tokenCount: 2
+        )
+        XCTAssertEqual(
+            box.snapshot().responseBody, ServerRequestLog.contentWithheldMarker,
+            "a streamed partial follows the request's retention refusal like the terminal outcome does"
+        )
+
+        XCTAssertEqual(
+            ServerRequestLog.capturedRequestBody("a prompt nobody refused"),
+            "a prompt nobody refused",
+            "capture must still happen when the switch is on and no client refused"
+        )
+    }
+
+    // MARK: Client labels
+
+    /// A client's own labels are metadata rather than content, so they are recorded
+    /// whatever the Store Request Content switch says. That is the whole point of the
+    /// field: the row that withheld everything else still says which request the caller
+    /// meant. The caps are recorded-copy caps (OpenAI's own 16 pairs, 64-character keys,
+    /// 512-character values, applied in bytes), so a client that ignores its own contract
+    /// cannot inflate the database, and the sorted-key order keeps the recorded set
+    /// stable whatever order the wire used.
+    func testTheClientsLabelsAreRecordedWhateverTheCaptureSwitchSays() {
+        UserDefaults.standard.set(false, forKey: ServerRequestLogRecorder.captureBodiesKey)
+        XCTAssertFalse(ServerRequestLogRecorder.captureBodiesEnabled)
+
+        var row = ServerRequestLog()
+        row.requestBody = ServerRequestLog.contentWithheldMarker
+        row.clientMetadata = ServerRequestLog.recordedClientMetadata(["ticket": "ABC-123", "team": "infra"])
+        XCTAssertEqual(row.clientMetadata, ["ticket": "ABC-123", "team": "infra"])
+        XCTAssertFalse(row.hasCapturedContent, "labels are not content: the row is still a metadata-only row")
+
+        XCTAssertNil(ServerRequestLog.recordedClientMetadata(nil), "no labels records nothing")
+        XCTAssertNil(
+            ServerRequestLog.recordedClientMetadata([:]),
+            "an empty map records nothing either, so absent and empty read alike"
+        )
+
+        // Over OpenAI's pair limit the recorded set is the first sixteen keys in sorted
+        // order, so the same request always records the same labels.
+        var many: [String: String] = [:]
+        for index in 0..<20 { many["key\(String(format: "%02d", index))"] = "v\(index)" }
+        let bounded = ServerRequestLog.recordedClientMetadata(many)
+        XCTAssertEqual(bounded?.count, ServerRequestLog.maxClientMetadataPairs)
+        XCTAssertEqual(bounded?["key00"], "v0")
+        XCTAssertEqual(bounded?["key15"], "v15", "sixteen sorted keys, so keys 16 to 19 are the ones dropped")
+        XCTAssertNil(bounded?["key19"])
+
+        // An over-long value is clipped to the budget, never dropped and never refused.
+        let long = String(repeating: "x", count: 2_000)
+        let clipped = ServerRequestLog.recordedClientMetadata(["blob": long])
+        XCTAssertEqual(
+            clipped?["blob"]?.utf8.count,
+            ServerRequestLog.maxClientMetadataValueBytes,
+            "a value past the budget is clipped to it rather than lost"
+        )
     }
 
     // MARK: Console-to-dashboard correlation

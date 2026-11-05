@@ -27,6 +27,7 @@ final class ChatPromptFormatterConversationTests: XCTestCase {
             ("ling", try config("bailing")),
             ("spark", try config("spark")),
             ("gemma4", try config("gemma4")),
+            ("deepseek_v41", try config("deepseek_v41")),
         ]
     }
 
@@ -65,6 +66,79 @@ final class ChatPromptFormatterConversationTests: XCTestCase {
                 }
             }
         }
+    }
+
+    // MARK: - The system body a digest covers
+
+    func testRenderedSystemBodyCarriesTheGradedEffortLevel() throws {
+        // A level change between two otherwise identical turns has to change the
+        // string a recorded turn's digest is compared against, or the server keeps
+        // trusting a raw generation produced under a different system prompt.
+        let v41 = try config("deepseek_v41")
+        let high = ChatPromptFormatter.renderedSystemBody(
+            cleanSystem: system,
+            thinkingEnabled: true,
+            thinkingEffort: .high,
+            modelConfig: v41
+        )
+        let low = ChatPromptFormatter.renderedSystemBody(
+            cleanSystem: system,
+            thinkingEnabled: true,
+            thinkingEffort: .low,
+            modelConfig: v41
+        )
+        XCTAssertTrue(high.hasPrefix(DeepSeekV41PromptDialect.effortInstruction(budget: 100)))
+        XCTAssertTrue(low.hasPrefix(DeepSeekV41PromptDialect.effortInstruction(budget: 25)))
+        XCTAssertTrue(high.hasSuffix(system))
+        XCTAssertNotEqual(high, low)
+
+        // It is the same block the renderer writes, not a parallel spelling.
+        let prompt = ChatPromptFormatter.formatPrompt(
+            prompt: "hello",
+            cleanSystem: system,
+            thinkingEnabled: true,
+            modelSupportsThinking: true,
+            modelConfig: v41,
+            thinkingEffort: .high
+        )
+        XCTAssertTrue(prompt.contains(high))
+
+        // Thinking off emits no level, and a family with no graded level is the
+        // caller's text exactly.
+        XCTAssertEqual(
+            ChatPromptFormatter.renderedSystemBody(
+                cleanSystem: system,
+                thinkingEnabled: false,
+                thinkingEffort: .high,
+                modelConfig: v41
+            ),
+            system
+        )
+        XCTAssertEqual(
+            ChatPromptFormatter.renderedSystemBody(
+                cleanSystem: system,
+                thinkingEnabled: true,
+                thinkingEffort: .high,
+                modelConfig: try config("llama")
+            ),
+            system
+        )
+
+        // Spark's block is unchanged by the extraction: the effort line still
+        // lands inside the rendered body, before the caller's system text.
+        XCTAssertEqual(
+            ChatPromptFormatter.renderedSystemBody(
+                cleanSystem: system,
+                thinkingEnabled: true,
+                thinkingEffort: .low,
+                modelConfig: try config("spark")
+            ),
+            ChatPromptFormatter.sparkSystemBody(
+                cleanSystem: system,
+                thinkingEnabled: true,
+                thinkingEffort: .low
+            )
+        )
     }
 
     // MARK: - Prefix preservation across turns
@@ -479,9 +553,10 @@ final class ChatPromptFormatterConversationTests: XCTestCase {
     }
 
     func testNonSparkFamiliesIgnoreThinkingEffort() throws {
-        // The level is only consumed by the Spark branch. Emitting it for
-        // another family's template would make the menu lie.
-        for (name, family) in try families() where name != "spark" {
+        // The level is consumed by the two graded-effort families: Spark renders
+        // it as a named line, DeepSeek V4.1 as a budget instruction. Emitting it
+        // for another family's template would make the menu lie.
+        for (name, family) in try families() where name != "spark" && name != "deepseek_v41" {
             for thinking in [true, false] {
                 let plain = ChatPromptFormatter.formatPrompt(
                     prompt: "hello",

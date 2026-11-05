@@ -164,6 +164,37 @@ public enum ChatPromptFormatter {
         return base + "\n\n" + cleanSystem
     }
 
+    /// The System block a family renders, i.e. what a digest over "the system
+    /// prompt the model saw" has to cover. Both dialects with a graded effort
+    /// level put it inside that block (Spark appends `thinking_effort`, DeepSeek
+    /// V4.1 prefixes its `Reasoning Effort:` line), so a level change has to
+    /// change this string; otherwise a recorded raw turn stays trusted under a
+    /// system prompt it was never generated with. A family with no graded level
+    /// contributes the caller's text unchanged.
+    public static func renderedSystemBody(
+        cleanSystem: String,
+        thinkingEnabled: Bool,
+        thinkingEffort: ThinkingEffort?,
+        modelConfig: ModelConfig?,
+        promptDialect: DeepSeekV41PromptDialect = DeepSeekV41PromptDialect()
+    ) -> String {
+        if modelConfig?.isSparkModel == true {
+            return sparkSystemBody(
+                cleanSystem: cleanSystem,
+                thinkingEnabled: thinkingEnabled,
+                thinkingEffort: thinkingEffort
+            )
+        }
+        if modelConfig?.isDeepSeekV41Model == true {
+            return promptDialect.systemBody(
+                cleanSystem: cleanSystem,
+                thinkingEnabled: thinkingEnabled,
+                effort: thinkingEffort
+            )
+        }
+        return cleanSystem
+    }
+
     /// Gemma 4's native reasoning channel markers. The model opens the channel
     /// itself after `<|turn>model` when thinking is on, so a completed turn's
     /// echoed reasoning must be re-wrapped in them: the canonical
@@ -242,18 +273,32 @@ public enum ChatPromptFormatter {
     }
 
     /// One role-tagged turn of a conversation, before family templating.
-    public struct ConversationTurn: Sendable, Equatable {
+    nonisolated public struct ConversationTurn: Sendable, Equatable {
         public enum Role: Sendable, Equatable {
             case user
             case assistant
         }
 
+        /// What a turn is, beyond the role it is tagged with. Only DeepSeek V4.1
+        /// distinguishes: the checkpoint has no tool role, so a result is a bare
+        /// `tool▁output` pair after the call turn rather than a turn of its own.
+        /// Every other family keeps rendering `role` + `text` exactly as before,
+        /// which is why a tool result still carries `role == .user`.
+        public enum Kind: Sendable, Equatable {
+            case text
+            /// A tool result, named by the tool that produced it. `text` is the
+            /// payload the model reads.
+            case toolResult(name: String)
+        }
+
         public var role: Role
         public var text: String
+        public var kind: Kind
 
-        public init(role: Role, text: String) {
+        public init(role: Role, text: String, kind: Kind = .text) {
             self.role = role
             self.text = text
+            self.kind = kind
         }
     }
 
@@ -288,6 +333,12 @@ public enum ChatPromptFormatter {
             // dialect re-opens the channel only for a turn that carried
             // reasoning, and always for the turn being generated now.
             let rendered = turns.map { turn -> DeepSeekV41PromptDialect.Turn in
+                if case .toolResult = turn.kind {
+                    // The result's payload, in the family's output pair, after the
+                    // call turn's closer. No role marker: the checkpoint has no
+                    // tool role, and the pair is what the loop appends live.
+                    return .init(isUser: false, text: turn.text, isToolOutput: true)
+                }
                 guard turn.role == .assistant else {
                     return .init(isUser: true, text: turn.text)
                 }

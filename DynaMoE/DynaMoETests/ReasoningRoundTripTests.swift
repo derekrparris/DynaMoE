@@ -61,7 +61,8 @@ final class ReasoningRoundTripTests: XCTestCase {
         ]}
         """
         let request = try JSONDecoder().decode(OpenAIChatRequest.self, from: Data(body.utf8))
-        let (_, turns) = try OpenAIAdapter.splitMessages(request.messages)
+        let split = try OpenAIAdapter.splitMessages(request.messages)
+        let turns = split.turns
         XCTAssertEqual(turns.map(\.role), [.user, .assistant, .user])
         XCTAssertTrue(
             turns[1].text.contains("let me think" + reasoningClose + "\n\nthe answer"),
@@ -81,7 +82,7 @@ final class ReasoningRoundTripTests: XCTestCase {
         ]}
         """
         let request = try JSONDecoder().decode(AnthropicMessagesRequest.self, from: Data(body.utf8))
-        let turns = try AnthropicAdapter.splitMessages(request.messages)
+        let turns = try AnthropicAdapter.splitMessages(request.messages).turns
         XCTAssertEqual(turns.map(\.role), [.user, .assistant, .user])
         XCTAssertEqual(turns[1].text, "let me think" + reasoningClose + "\n\nthe answer")
         XCTAssertEqual(turns[0].text, "hello", "thinking blocks must not leak into the visible text")
@@ -92,7 +93,8 @@ final class ReasoningRoundTripTests: XCTestCase {
         {"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"plain"},{"role":"user","content":"x"}]}
         """
         let request = try JSONDecoder().decode(OpenAIChatRequest.self, from: Data(body.utf8))
-        let (_, turns) = try OpenAIAdapter.splitMessages(request.messages)
+        let split = try OpenAIAdapter.splitMessages(request.messages)
+        let turns = split.turns
         XCTAssertEqual(turns[1].text, "plain")
     }
 
@@ -362,7 +364,8 @@ final class ReasoningRoundTripTests: XCTestCase {
             OpenAIChatRequest.Message(role: "assistant", contentText: inline, name: nil, toolCalls: nil, toolCallId: nil),
             OpenAIChatRequest.Message(role: "user", contentText: "again", name: nil, toolCalls: nil, toolCallId: nil),
         ]
-        let (_, turns) = try OpenAIAdapter.splitMessages(messages)
+        let split = try OpenAIAdapter.splitMessages(messages)
+        let turns = split.turns
         XCTAssertEqual(turns[1].text, "why" + reasoningClose + "\n\nthe answer")
 
         // The recorded generation carries the family's turn closer (which the

@@ -26,14 +26,16 @@ struct OpenAIChatRequest: Decodable {
         /// String form, or the concatenated text parts when the client sends
         /// the multi-part content array. Nil for assistant tool-call turns.
         let contentText: String?
-        /// True when the client sent an image part (`image_url`, `input_image`).
-        /// The local engine has no vision tower, so the server refuses these
-        /// instead of silently stripping them and answering about a picture the
-        /// model never saw.
+        /// True when the client sent an image part (`image_url`, `input_image`,
+        /// `image`). Whether the turn can actually read it is decided at plan
+        /// time from the loaded checkpoint's tower, not here.
         let hasImagePart: Bool
-        /// True when the client sent any non-text content part at all. The local
-        /// engine only understands text, so `file` and `input_audio` parts are
-        /// refused the same way images are, instead of being silently dropped.
+        /// The image parts this message carried, in the order the client sent
+        /// them, already decoded to the bytes the vision tower's decoder reads.
+        let imageParts: [ServerImagePart]
+        /// True when the client sent a content part the engine cannot process at
+        /// all (`file`, `input_audio`, an unknown type). Refused explicitly, so a
+        /// caller is never answered about a document nobody read.
         let hasUnsupportedPart: Bool
         /// Reasoning a client echoed back (the `reasoning_content` extension
         /// this server emits). Clients that keep it let the next turn
@@ -59,21 +61,31 @@ struct OpenAIChatRequest: Decodable {
             self.reasoningContent = try container.decodeIfPresent(String.self, forKey: .reasoningContent)
             if let s = try? container.decode(String.self, forKey: .content) {
                 self.contentText = s
+                self.imageParts = []
                 self.hasImagePart = false
                 self.hasUnsupportedPart = false
             } else if let parts = try? container.decode([ContentPart].self, forKey: .content) {
-                let joined = parts.compactMap(\.text).filter { !$0.isEmpty }.joined(separator: "\n")
-                self.contentText = joined.isEmpty ? nil : joined
-                self.hasImagePart = parts.contains { part in
-                    let type = (part.type ?? "").lowercased()
-                    return type == "image_url" || type == "input_image" || type == "image"
+                // The parts are an ORDERED list and the order is meaning: a picture
+                // between two paragraphs is a different question from both pictures
+                // in front of all the text. The turn renderer can only honour that
+                // if the order survives decoding, so a picture becomes a sentinel
+                // in the text where it sits (`ServerImageParts.interleave`).
+                let pieces = parts.map { part -> ServerImageParts.Piece in
+                    if part.isImage {
+                        return .image(ServerImageParts.fromOpenAIURL(part.imageURL ?? ""))
+                    }
+                    return .text(part.text ?? "")
                 }
+                self.contentText = ServerImageParts.interleave(pieces)
+                self.imageParts = ServerImageParts.images(in: pieces)
+                self.hasImagePart = !self.imageParts.isEmpty
                 self.hasUnsupportedPart = parts.contains { part in
                     let type = (part.type ?? "").lowercased()
-                    return !type.isEmpty && type != "text"
+                    return !type.isEmpty && type != "text" && !part.isImage
                 }
             } else {
                 self.contentText = nil
+                self.imageParts = []
                 self.hasImagePart = false
                 self.hasUnsupportedPart = false
             }
@@ -87,6 +99,7 @@ struct OpenAIChatRequest: Decodable {
             self.name = name
             self.toolCalls = toolCalls
             self.toolCallId = toolCallId
+            self.imageParts = []
             self.hasImagePart = false
             self.hasUnsupportedPart = false
         }
@@ -95,6 +108,42 @@ struct OpenAIChatRequest: Decodable {
     struct ContentPart: Decodable {
         let type: String?
         let text: String?
+        /// The `image_url` value. Chat Completions spells it as an object
+        /// (`{"url": "..."}`) and the Responses API as a bare string, so both
+        /// shapes decode here rather than failing the whole body.
+        let imageURL: String?
+
+        enum CodingKeys: String, CodingKey {
+            case type, text
+            case imageURL = "image_url"
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.type = try container.decodeIfPresent(String.self, forKey: .type)
+            self.text = try container.decodeIfPresent(String.self, forKey: .text)
+            if let bare = try? container.decode(String.self, forKey: .imageURL) {
+                self.imageURL = bare
+            } else if let object = try? container.decode(ImageURLObject.self, forKey: .imageURL) {
+                self.imageURL = object.url
+            } else {
+                self.imageURL = nil
+            }
+        }
+
+        struct ImageURLObject: Decodable {
+            let url: String?
+        }
+
+        /// The content-part types that name a picture: `image_url` is the Chat
+        /// Completions spelling, `input_image` the Responses one, `image` the
+        /// shorthand several clients send.
+        static let imageTypes: Set<String> = ["image_url", "input_image", "image"]
+
+        var isImage: Bool {
+            if Self.imageTypes.contains((type ?? "").lowercased()) { return true }
+            return imageURL != nil
+        }
     }
 
     struct AssistantToolCallIn: Decodable {
@@ -174,13 +223,156 @@ struct OpenAIChatRequest: Decodable {
     let minP: Float?
     let repetitionPenalty: Float?
     let presencePenalty: Float?
+    /// OpenAI's `frequency_penalty`, charged per OCCURRENCE of a recent token
+    /// where `presence_penalty` is charged once per distinct one.
+    let frequencyPenalty: Float?
+    /// OpenAI's `logit_bias` in the wire's own string-keyed form. Converted and
+    /// range-checked by `logitBias(from:)`, which the planner calls before any
+    /// generation work.
+    let logitBias: [String: Float]?
+    /// OpenAI's current reply-budget field. Decoded because leaving it out of the
+    /// decoder answered a request for a 512-token answer with the app default budget
+    /// (up to 8192): `replyBudget(maxTokens:maxCompletionTokens:)` resolves it against
+    /// the deprecated `max_tokens`.
+    let maxCompletionTokens: Int?
+    /// OpenAI's older spelling of the reply budget, still sent by most clients.
     let maxTokens: Int?
+    /// OpenAI's `parallel_tool_calls`: decoded and deliberately not honoured (see the
+    /// decoder note).
+    let parallelToolCalls: Bool?
     let stream: Bool?
     let stop: [String]?
     let tools: [Tool]?
     let toolChoice: ToolChoice?
     let enableThinking: Bool?
     let reasoningEffort: String?
+    /// OpenAI's structured-output request. Only `type` is decoded: this server
+    /// refuses the field outright rather than honouring part of it, so parsing the
+    /// schema would only be a way to accept a promise it cannot keep.
+    let responseFormat: ResponseFormat?
+    /// How many completions the client asked for. OpenAI defaults to 1, which is all
+    /// this engine can produce per request.
+    let n: Int?
+    /// Token log-probabilities. Presence of either field is a request this server
+    /// cannot answer, so they are decoded rather than ignored.
+    let logprobs: Bool?
+    let topLogprobs: Int?
+    /// `stream_options.include_usage` decides whether the trailing usage chunk is
+    /// emitted, which is the one sub-field of it this server can honour.
+    let streamOptions: StreamOptions?
+    /// OpenAI's `store`: whether the request may be retained server-side for
+    /// distillation or evals. Only `false` is actionable here, and it is honoured
+    /// per request — `withholdBodiesForClientRetention()` keeps this turn's prompt
+    /// and answer out of the request log even when the operator's Store Request
+    /// Content switch is on, because "do not retain me" is a promise the client is
+    /// entitled to have kept. `true` cannot force capture: retention on this Mac is
+    /// the operator's own decision, and a client may not overrule it.
+    let store: Bool?
+    /// The output modalities the client asked for: `["text"]` is the protocol's
+    /// default, `["text","audio"]` asks for a spoken reply as well. Decoded so
+    /// `refuseUnsupportedResponseShape` can refuse a non-text one by name — this
+    /// server has no text-to-speech, and a dropped field answered a request for
+    /// audio with text and no `message.audio` for the client's parser to find.
+    let modalities: [String]?
+    /// The settings for that spoken reply (`{voice, format, speed?}`). Decoded for
+    /// the same reason as `modalities`, and its two named fields so the refusal can
+    /// say which voice and format the client asked for.
+    let audio: AudioSettings?
+    /// OpenAI's DEPRECATED function-calling surface: `functions` is a bare list of
+    /// function definitions with no `{"type": "function"}` wrapper, and
+    /// `function_call` is what `tool_choice` was called before `tools` replaced both.
+    ///
+    /// Decoded only so the request can be refused BY NAME. `Decodable`'s unknown-key
+    /// tolerance dropped the pair, which answered a client using this surface with
+    /// prose, no call and no error, on every request. They are refused rather than
+    /// mapped onto `tools`/`tool_choice` because only the request half would work:
+    /// this server returns `tool_calls`, and a client on that surface parses
+    /// `function_call`, so a mapped request would be a working request whose reply was
+    /// silently substituted.
+    let legacyFunctions: [Tool.Function]?
+    let legacyFunctionCall: LegacyFunctionCall?
+    /// The client's own key/value labels for this request (OpenAI allows 16 pairs
+    /// of strings). Decoded because nothing else carries them: this protocol has no
+    /// response field to echo them into, so the request log's row is the only place a
+    /// caller's labels can survive, and left out of the decoder they survived
+    /// nowhere, which made them the last thing in this request a local operator could
+    /// never see. They can never move an answer, so they are recorded rather than
+    /// refused or obeyed.
+    let metadata: [String: String]?
+    /// OpenAI's `web_search_options`, carried only by its search-preview models: the
+    /// backend runs a web search and grounds the answer in the results. Decoded so
+    /// `refuseUnsupportedResponseShape` can refuse it by name, because this server does
+    /// not search the web for a chat turn and dropping the field answered with
+    /// ungrounded prose where the client had asked for a grounded one. It is refused on
+    /// PRESENCE: the field exists only to ask for search, so carrying it at all is a
+    /// request this server cannot serve (an empty object is the default search, not the
+    /// default silence, which is the difference from `modalities: ["text"]`). Only the
+    /// context size is kept, so the refusal can say what scale of search was asked for.
+    let webSearchOptions: WebSearchOptions?
+
+    struct ResponseFormat: Decodable {
+        let type: String?
+    }
+
+    /// `web_search_options`: the user's location and how much search context to pull.
+    /// Only the context size is kept, because those two describe a search this server
+    /// will not run, so there is nothing else the refusal needs to name.
+    struct WebSearchOptions: Decodable {
+        let searchContextSize: String?
+
+        enum CodingKeys: String, CodingKey {
+            case searchContextSize = "search_context_size"
+        }
+    }
+
+    /// `audio`: everything a client needs to describe a spoken reply this server
+    /// cannot produce. Every member is optional because the refusal is keyed on the
+    /// object's presence, not on its contents.
+    struct AudioSettings: Decodable {
+        let voice: String?
+        let format: String?
+        let speed: Float?
+    }
+
+    struct StreamOptions: Decodable {
+        let includeUsage: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case includeUsage = "include_usage"
+        }
+    }
+
+    /// `function_call` as the client sent it: a bare mode string (`"none"`,
+    /// `"auto"`) or `{"name": "..."}`. Only what the refusal needs to say back is
+    /// kept, and decoding never throws, so a shape nobody expected still produces a
+    /// refusal rather than a body error.
+    nonisolated struct LegacyFunctionCall: Decodable {
+        let mode: String?
+        let name: String?
+
+        enum CodingKeys: String, CodingKey { case name }
+
+        init(from decoder: Decoder) throws {
+            if let single = try? decoder.singleValueContainer(),
+               let raw = try? single.decode(String.self) {
+                self.mode = raw.isEmpty ? nil : raw
+                self.name = nil
+                return
+            }
+            var name: String?
+            if let container = try? decoder.container(keyedBy: CodingKeys.self) {
+                name = (try? container.decodeIfPresent(String.self, forKey: .name)) ?? nil
+            }
+            self.name = name
+            self.mode = nil
+        }
+
+        /// What the client asked for, quoted for the refusal message.
+        var described: String {
+            if let name, !name.isEmpty { return "a call to \"\(name)\"" }
+            return "\"\(mode ?? "auto")\""
+        }
+    }
 
     enum CodingKeys: String, CodingKey {
         case model, messages, stream, stop, tools
@@ -190,10 +382,27 @@ struct OpenAIChatRequest: Decodable {
         case minP = "min_p"
         case repetitionPenalty = "repetition_penalty"
         case presencePenalty = "presence_penalty"
+        case frequencyPenalty = "frequency_penalty"
+        case logitBias = "logit_bias"
         case maxTokens = "max_tokens"
+        case maxCompletionTokens = "max_completion_tokens"
+        case parallelToolCalls = "parallel_tool_calls"
         case toolChoice = "tool_choice"
         case enableThinking = "enable_thinking"
         case reasoningEffort = "reasoning_effort"
+        case responseFormat = "response_format"
+        case n, logprobs
+        case topLogprobs = "top_logprobs"
+        case streamOptions = "stream_options"
+        case store
+        case modalities, audio
+        case metadata
+        case seed, user
+        case functions
+        case functionCall = "function_call"
+        case webSearchOptions = "web_search_options"
+        case prediction
+        case serviceTier = "service_tier"
     }
 
     init(from decoder: Decoder) throws {
@@ -206,7 +415,23 @@ struct OpenAIChatRequest: Decodable {
         self.minP = try container.decodeIfPresent(Float.self, forKey: .minP)
         self.repetitionPenalty = try container.decodeIfPresent(Float.self, forKey: .repetitionPenalty)
         self.presencePenalty = try container.decodeIfPresent(Float.self, forKey: .presencePenalty)
+        self.frequencyPenalty = try container.decodeIfPresent(Float.self, forKey: .frequencyPenalty)
+        self.logitBias = try container.decodeIfPresent([String: Float].self, forKey: .logitBias)
+        // `seed` and `user` are decoded only to be documented as ignored, the same
+        // way the legacy route treats them: upstream calls `seed` a best-effort
+        // determinism hint (this engine is already greedy at temperature 0) and
+        // `user` an abuse-monitoring label with no local meaning. Neither can move
+        // an answer, and a 400 for one would break clients that always send it.
+        _ = try container.decodeIfPresent(Int.self, forKey: .seed)
+        _ = try container.decodeIfPresent(String.self, forKey: .user)
         self.maxTokens = try container.decodeIfPresent(Int.self, forKey: .maxTokens)
+        self.maxCompletionTokens = try container.decodeIfPresent(Int.self, forKey: .maxCompletionTokens)
+        // `parallel_tool_calls` is decoded to be documented as ignored rather than to
+        // be obeyed: honouring `false` means emitting at most one call, which is a
+        // grammar constraint the sampler does not have, and refusing it would put a
+        // new 400 on the path clients drive daily. The turn may therefore emit several
+        // calls, which every client recovers from.
+        self.parallelToolCalls = try container.decodeIfPresent(Bool.self, forKey: .parallelToolCalls)
         self.stream = try container.decodeIfPresent(Bool.self, forKey: .stream)
         // OpenAI allows `stop` as a bare string or an array.
         if let single = try? container.decode(String.self, forKey: .stop) {
@@ -221,20 +446,216 @@ struct OpenAIChatRequest: Decodable {
         self.toolChoice = try container.decodeIfPresent(ToolChoice.self, forKey: .toolChoice)
         self.enableThinking = try container.decodeIfPresent(Bool.self, forKey: .enableThinking)
         self.reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
+        // These four are decoded so the planner can refuse them by name. Left out of
+        // the decoder entirely they were ignored by Swift's unknown-key tolerance,
+        // which answered a request for JSON, for two choices or for log-probabilities
+        // exactly as if the client had asked for none of them.
+        self.responseFormat = try container.decodeIfPresent(ResponseFormat.self, forKey: .responseFormat)
+        self.n = try container.decodeIfPresent(Int.self, forKey: .n)
+        self.logprobs = try container.decodeIfPresent(Bool.self, forKey: .logprobs)
+        self.topLogprobs = try container.decodeIfPresent(Int.self, forKey: .topLogprobs)
+        self.streamOptions = try container.decodeIfPresent(StreamOptions.self, forKey: .streamOptions)
+        // Decoded because it is the one field in this protocol whose whole meaning
+        // is a promise about the server's own behaviour rather than about the
+        // answer: dropped, `store: false` was answered exactly as if the client had
+        // asked for the request to be kept.
+        self.store = try container.decodeIfPresent(Bool.self, forKey: .store)
+        // The two output-modality fields join that list for the same reason: a
+        // request asking for a spoken reply was answered as text with no error and
+        // no `message.audio`, so the client waited for a field nothing sent.
+        self.modalities = try container.decodeIfPresent([String].self, forKey: .modalities)
+        self.audio = try container.decodeIfPresent(AudioSettings.self, forKey: .audio)
+        // The client's labels, decoded only so the request log can record them: they
+        // are the caller's own correlation data, which unknown-key tolerance was
+        // dropping into silence one request at a time. Decoded leniently: a map whose
+        // values are not strings yields no labels instead of a 400, because the field
+        // was ignored outright before this and a client that puts a number in it must
+        // not start failing. A malformed map costs the labels for that one request, not
+        // the answer.
+        let labels = try? container.decodeIfPresent([String: String].self, forKey: .metadata)
+        self.metadata = labels ?? nil
+        // The deprecated function-calling surface, decoded strictly so a malformed
+        // definition is a body error rather than another silent drop, and then refused
+        // by name in `refuseDeprecatedFunctionCalling`. See the field notes above for
+        // why the pair is refused instead of mapped onto `tools`/`tool_choice`.
+        self.legacyFunctions = try container.decodeIfPresent([Tool.Function].self, forKey: .functions)
+        self.legacyFunctionCall = try container.decodeIfPresent(LegacyFunctionCall.self, forKey: .functionCall)
+        // The one hint field that changes the answer rather than its speed: see the
+        // field notes above. `prediction` and `service_tier` are the other two OpenAI
+        // chat keys this decoder had never carried, and they are decoded to be
+        // documented as ignored rather than obeyed. `prediction` is a latency hint (a
+        // hosted backend pre-computes part of the expected answer) and `service_tier` is
+        // a routing preference for a fleet (this server has one tier), so neither can
+        // move an answer and a 400 for either would break clients that always send them.
+        // Left out of the decoder, all three were dropped by unknown-key tolerance,
+        // which is the mechanism that made every field in this file a potential silent
+        // substitution.
+        self.webSearchOptions = try container.decodeIfPresent(WebSearchOptions.self, forKey: .webSearchOptions)
+        _ = try container.decodeIfPresent(AnyCodable.self, forKey: .prediction)
+        _ = try container.decodeIfPresent(String.self, forKey: .serviceTier)
     }
 
-    /// True when any message carries an image content part. Refused by the
-    /// server rather than stripped: the loaded weights model has no vision tower,
-    /// and a silently text-only answer about a screenshot is worse than an error.
+    /// True when any message carries an image content part. The turn planner
+    /// accepts these only when the loaded checkpoint publishes a vision tower and
+    /// refuses them by name otherwise, because dropping them would answer a
+    /// question about a picture the model never saw.
     var hasImageContent: Bool {
         messages.contains(where: { $0.hasImagePart })
     }
 
-    /// True when any message carries a content part the text-only engine cannot
-    /// process (an image, a file attachment, or audio). Refused rather than
-    /// stripped, for the same reason as `hasImageContent`.
+    /// True when any message carries a content part the engine cannot process at
+    /// all (a file attachment or audio). Refused rather than stripped, for the
+    /// same reason as `hasImageContent`.
     var hasUnsupportedContent: Bool {
         messages.contains(where: { $0.hasUnsupportedPart })
+    }
+}
+
+/// The legacy OpenAI text-completions request (`POST /v1/completions`).
+///
+/// This protocol is prompt-in/text-out: there is no message list, no role, and no
+/// tool vocabulary, so it is its own type rather than a shim over
+/// `OpenAIChatRequest`. Its `prompt` reaches the same renderer the chat route
+/// uses, which is what makes both halves of the endpoint work: a prompt that
+/// already carries the checkpoint's turn markers passes through byte for byte (a
+/// true continuation), and a plain prompt is rendered as one user turn with the
+/// checkpoint's own begin-of-sentence marker and assistant prefix, because a chat
+/// model answering after its own prefix is the shape it was trained on.
+///
+/// Every field here is decoded, including the ones this server refuses, so a
+/// request for insertion mode or for several choices is answered with a named
+/// error instead of being silently narrowed to "one completion, extras ignored".
+nonisolated struct OpenAICompletionsRequest: Decodable {
+    /// The resolved prompt text, or nil when the client sent token ids (which
+    /// this server refuses by name: it has a tokenizer but no detokenizer, so a
+    /// token-id prompt could be run but never reported back to the client).
+    let promptText: String?
+    /// How many prompts the client sent. The protocol allows a batch; this server
+    /// answers one, so more than one is refused rather than silently truncated.
+    let promptCount: Int
+    let promptIsTokenIDs: Bool
+    let model: String?
+    let suffix: String?
+    let maxTokens: Int?
+    let temperature: Float?
+    let topP: Float?
+    let topK: Int?
+    let minP: Float?
+    let repetitionPenalty: Float?
+    let presencePenalty: Float?
+    let frequencyPenalty: Float?
+    let n: Int?
+    let stream: Bool?
+    /// Upstream spells this as an integer (how many alternatives to return per
+    /// token) rather than the chat route's boolean. Decoded as a flag because
+    /// either spelling means "log-probabilities", and neither is available.
+    let logprobsRequested: Bool
+    let echo: Bool?
+    let stop: [String]?
+    let bestOf: Int?
+    /// OpenAI's `logit_bias` in the wire's own string-keyed form; converted and
+    /// range-checked by `OpenAIAdapter.logitBias(from:)`.
+    let logitBias: [String: Float]?
+    /// This server's own thinking extension, which this route reads in the opposite
+    /// direction from the chat route: see `completionsThinkingRequested`.
+    let enableThinking: Bool?
+    let reasoningEffort: String?
+    let streamOptions: OpenAIChatRequest.StreamOptions?
+    /// OpenAI's `store`, which this route accepts too because both routes take the
+    /// same retention promise: see `OpenAIChatRequest.store`.
+    let store: Bool?
+    /// This route carries `metadata` too, so it takes the client's labels into the
+    /// same row field: see `OpenAIChatRequest.metadata`.
+    let metadata: [String: String]?
+
+    enum CodingKeys: String, CodingKey {
+        case model, prompt, suffix, n, stream, echo, stop, seed, user
+        case maxTokens = "max_tokens"
+        case temperature
+        case topP = "top_p"
+        case topK = "top_k"
+        case minP = "min_p"
+        case repetitionPenalty = "repetition_penalty"
+        case presencePenalty = "presence_penalty"
+        case frequencyPenalty = "frequency_penalty"
+        case logprobs
+        case bestOf = "best_of"
+        case logitBias = "logit_bias"
+        case enableThinking = "enable_thinking"
+        case reasoningEffort = "reasoning_effort"
+        case streamOptions = "stream_options"
+        case store
+        case metadata
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        // `prompt` is a string, an array of strings, an array of token ids, or an
+        // array of token-id arrays. Each shape is tried in turn so the refusal
+        // below can name which one was sent.
+        if let single = try? container.decode(String.self, forKey: .prompt) {
+            self.promptText = single
+            self.promptCount = 1
+            self.promptIsTokenIDs = false
+        } else if let batch = try? container.decode([String].self, forKey: .prompt) {
+            self.promptText = batch.first
+            self.promptCount = batch.count
+            self.promptIsTokenIDs = false
+        } else if (try? container.decode([Int].self, forKey: .prompt)) != nil
+            || (try? container.decode([[Int]].self, forKey: .prompt)) != nil {
+            self.promptText = nil
+            self.promptCount = 1
+            self.promptIsTokenIDs = true
+        } else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .prompt,
+                in: container,
+                debugDescription: "prompt must be a string or an array of strings"
+            )
+        }
+        self.model = try container.decodeIfPresent(String.self, forKey: .model)
+        self.suffix = try container.decodeIfPresent(String.self, forKey: .suffix)
+        self.maxTokens = try container.decodeIfPresent(Int.self, forKey: .maxTokens)
+        self.temperature = try container.decodeIfPresent(Float.self, forKey: .temperature)
+        self.topP = try container.decodeIfPresent(Float.self, forKey: .topP)
+        self.topK = try container.decodeIfPresent(Int.self, forKey: .topK)
+        self.minP = try container.decodeIfPresent(Float.self, forKey: .minP)
+        self.repetitionPenalty = try container.decodeIfPresent(Float.self, forKey: .repetitionPenalty)
+        self.presencePenalty = try container.decodeIfPresent(Float.self, forKey: .presencePenalty)
+        self.frequencyPenalty = try container.decodeIfPresent(Float.self, forKey: .frequencyPenalty)
+        self.n = try container.decodeIfPresent(Int.self, forKey: .n)
+        self.stream = try container.decodeIfPresent(Bool.self, forKey: .stream)
+        // `logprobs` is an Int on this route and a Bool on the chat route; either
+        // one is a request for log-probabilities, which the engine does not emit.
+        if let count = try? container.decode(Int.self, forKey: .logprobs) {
+            self.logprobsRequested = count > 0
+        } else if let flag = try? container.decode(Bool.self, forKey: .logprobs) {
+            self.logprobsRequested = flag
+        } else {
+            self.logprobsRequested = false
+        }
+        self.echo = try container.decodeIfPresent(Bool.self, forKey: .echo)
+        if let single = try? container.decode(String.self, forKey: .stop) {
+            self.stop = [single]
+        } else {
+            self.stop = try container.decodeIfPresent([String].self, forKey: .stop)
+        }
+        self.bestOf = try container.decodeIfPresent(Int.self, forKey: .bestOf)
+        self.logitBias = try container.decodeIfPresent([String: Float].self, forKey: .logitBias)
+        self.enableThinking = try container.decodeIfPresent(Bool.self, forKey: .enableThinking)
+        self.reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
+        self.streamOptions = try container.decodeIfPresent(OpenAIChatRequest.StreamOptions.self, forKey: .streamOptions)
+        self.store = try container.decodeIfPresent(Bool.self, forKey: .store)
+        // Lenient for the same reason as the chat route: a map whose values are not
+        // strings costs the labels, never the answer.
+        let labels = try? container.decodeIfPresent([String: String].self, forKey: .metadata)
+        self.metadata = labels ?? nil
+        // `seed` and `user` are decoded only to be documented as ignored: upstream
+        // calls `seed` a best-effort determinism hint (this server is already greedy
+        // at temperature 0) and `user` an abuse-monitoring label with no local
+        // meaning. Neither can change an answer, so neither is refused.
+        _ = try container.decodeIfPresent(Int.self, forKey: .seed)
+        _ = try container.decodeIfPresent(String.self, forKey: .user)
     }
 }
 
@@ -336,17 +757,206 @@ struct OpenAIChatChunk: Encodable {
     let choices: [Choice]
 }
 
+/// One completed legacy text completion.
+///
+/// The object is `text_completion` and a choice is `text`/`index`/`logprobs`/
+/// `finish_reason`, with no message and no role: this protocol predates both. Its
+/// `logprobs` key is written as an explicit null rather than omitted, because that
+/// is what upstream sends and a strict decoder reads the key as always-present.
+nonisolated struct OpenAICompletionsResponse: ResponseEncodable {
+    struct Choice: Encodable {
+        let text: String
+        let index: Int
+        let finishReason: String
+
+        enum CodingKeys: String, CodingKey {
+            case text, index, logprobs
+            case finishReason = "finish_reason"
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(text, forKey: .text)
+            try container.encode(index, forKey: .index)
+            try container.encodeNil(forKey: .logprobs)
+            try container.encode(finishReason, forKey: .finishReason)
+        }
+    }
+
+    let id: String
+    let object: String = "text_completion"
+    let created: Int
+    let model: String
+    let choices: [Choice]
+    let usage: OpenAIUsage
+
+    enum CodingKeys: String, CodingKey {
+        case id, object, created, model, choices, usage
+    }
+}
+
+/// One streamed legacy text completion delta.
+nonisolated struct OpenAICompletionsChunk: Encodable {
+    struct Choice: Encodable {
+        let text: String
+        let index: Int
+        let finishReason: String?
+
+        enum CodingKeys: String, CodingKey {
+            case text, index, logprobs
+            case finishReason = "finish_reason"
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(text, forKey: .text)
+            try container.encode(index, forKey: .index)
+            try container.encodeNil(forKey: .logprobs)
+            if let finishReason {
+                try container.encode(finishReason, forKey: .finishReason)
+            } else {
+                try container.encodeNil(forKey: .finishReason)
+            }
+        }
+    }
+
+    let id: String
+    let object: String = "text_completion"
+    let created: Int
+    let model: String
+    let choices: [Choice]
+}
+
 struct OpenAIModelList: ResponseEncodable {
+    /// What a client may ask this model to do.
+    ///
+    /// Every field is copied from the fact the turn planner reads, never written
+    /// by hand, so what is advertised cannot drift from what a request is refused
+    /// for: `vision` decides whether an attachment is read or answered with a 400,
+    /// and `thinking`/`thinkingLevels` decide whether a reasoning request is
+    /// honoured or quietly ignored. A client that reads them can predict its own
+    /// rejection instead of discovering it. The object is additive to the OpenAI
+    /// schema on purpose; clients ignore keys they do not know.
+    struct Capabilities: Encodable {
+        var vision: Bool
+        var thinking: Bool
+        /// True when the family renders a graded effort level (High/Low/Off) into
+        /// its system block, rather than a plain on/off switch.
+        var thinkingLevels: Bool
+        /// The `reasoning_effort` values this server accepts, low to high.
+        ///
+        /// `thinkingLevels` says a graded level is honoured and nothing about which
+        /// words name one, which left a client to guess. A client that guessed this
+        /// engine's own two ("low", "high") was served, while one that sent the
+        /// protocol's `medium` met a 400 it could not have predicted from here. The
+        /// list is the adapter's own accepted vocabulary, never a second copy of it,
+        /// and it is nil beside `thinkingLevels: false` for the reason `visionCost`
+        /// is nil beside `vision: false`.
+        var reasoningEffortValues: [String]?
+        /// What one attachment is expected to cost, when this family reads them.
+        ///
+        /// `vision` alone says a picture is accepted and nothing about whether that
+        /// picture is 184 prompt positions and a third of a second or 994 and seven.
+        /// A client picking a request timeout, or deciding whether a near-full
+        /// prompt has room, has to know which. Nil beside `vision: false`, and
+        /// rounded because it is a model of a machine class rather than a promise.
+        var visionCost: VisionCost?
+
+        enum CodingKeys: String, CodingKey {
+            case vision, thinking
+            case thinkingLevels = "thinking_levels"
+            case reasoningEffortValues = "reasoning_effort_values"
+            case visionCost = "vision_cost"
+        }
+
+        struct VisionCost: Encodable {
+            var minPromptPositions: Int
+            var maxPromptPositions: Int
+            var minPatchTokens: Int
+            var maxPatchTokens: Int
+            var minEncodeSeconds: Double
+            var maxEncodeSeconds: Double
+
+            enum CodingKeys: String, CodingKey {
+                case minPromptPositions = "min_prompt_positions"
+                case maxPromptPositions = "max_prompt_positions"
+                case minPatchTokens = "min_patch_tokens"
+                case maxPatchTokens = "max_patch_tokens"
+                case minEncodeSeconds = "min_encode_seconds"
+                case maxEncodeSeconds = "max_encode_seconds"
+            }
+
+            init(_ bounds: DeepSeekV41VisionPricing.Bounds) {
+                minPromptPositions = bounds.minSpanPositions
+                maxPromptPositions = bounds.maxSpanPositions
+                minPatchTokens = bounds.minPatchTokens
+                maxPatchTokens = bounds.maxPatchTokens
+                minEncodeSeconds = VisionCost.rounded(bounds.minSeconds)
+                maxEncodeSeconds = VisionCost.rounded(bounds.maxSeconds)
+            }
+
+            /// Two decimals, so a client sees an estimate rather than a fabricated
+            /// microsecond. The composer's own chip ("about 2.9 s") is the same
+            /// posture.
+            private static func rounded(_ seconds: Double) -> Double {
+                (seconds * 100).rounded() / 100
+            }
+        }
+    }
+
     struct Model: Encodable {
         let id: String
         let object: String = "model"
         let created: Int
         let ownedBy: String = "dynamoe"
+        /// The checkpoint's own architectural ceiling (`max_position_embeddings`),
+        /// not what this machine's KV budget affords. A client asking "how much
+        /// fits" wants the weights' answer; the server's own refusal threshold
+        /// travels separately as `max_prompt_tokens`.
+        let contextLength: Int?
+        /// The prompt length this server refuses outright
+        /// (`dynamoe_server_max_prompt_tokens`). Nil when the server has no cap.
+        let maxPromptTokens: Int?
+        let capabilities: Capabilities?
 
         enum CodingKeys: String, CodingKey {
-            case id, object, created
+            case id, object, created, capabilities
             case ownedBy = "owned_by"
+            case contextLength = "context_length"
+            case maxPromptTokens = "max_prompt_tokens"
         }
+    }
+
+    /// The one entry this server advertises for a loaded checkpoint.
+    ///
+    /// Kept a function of the facts so the mapping is testable without a loaded
+    /// model: a swapped flag here is silent on the wire and would tell a client
+    /// the opposite of what the planner does. The id is the checkpoint's served id
+    /// rather than its display name, because a client resolves it from here and
+    /// then addresses the retrieve route with it as a path segment.
+    static func entry(
+        for info: CompletionEngine.LoadedModelInfo,
+        contextLength: Int?,
+        maxPromptTokens: Int?,
+        created: Int
+    ) -> Model {
+        Model(
+            id: info.servedID,
+            created: created,
+            contextLength: contextLength,
+            maxPromptTokens: maxPromptTokens,
+            capabilities: Capabilities(
+                vision: info.supportsVision,
+                thinking: info.supportsThinking,
+                thinkingLevels: info.supportsThinkingLevels,
+                reasoningEffortValues: info.supportsThinkingLevels
+                    ? OpenAIAdapter.reasoningEffortValues
+                    : nil,
+                visionCost: info.supportsVision
+                    ? info.visionCost.map { Capabilities.VisionCost($0) }
+                    : nil
+            )
+        )
     }
 
     let object: String = "list"
@@ -389,9 +999,367 @@ enum OpenAIAdapter {
         }
     }
 
+    /// Refuses OpenAI's deprecated function-calling surface by name.
+    ///
+    /// `functions` and `function_call` are what `tools` and `tool_choice` were called
+    /// before OpenAI replaced them, and the decoder's unknown-key tolerance dropped
+    /// both: a client on that surface was answered in prose, with no call and no
+    /// error, on every request. Mapping the pair onto the modern fields was the other
+    /// option and is worse than refusing, because only the request half can follow.
+    /// This server returns `tool_calls`, and a client on that surface parses
+    /// `function_call`, so a mapped request would be a working request whose reply was
+    /// silently substituted, which is the failure mode being removed.
+    ///
+    /// A request that carries the modern spelling as well is served: the modern field
+    /// is what this server answers, so nothing is substituted and the deprecated one
+    /// is redundant. The two refusals are therefore keyed on the modern field being
+    /// ABSENT, not on the deprecated field alone.
+    nonisolated static func refuseDeprecatedFunctionCalling(_ request: OpenAIChatRequest) throws {
+        if (request.tools ?? []).isEmpty, let legacy = request.legacyFunctions, !legacy.isEmpty {
+            let named = legacy.prefix(3).map { "\"\($0.name)\"" }.joined(separator: ", ")
+            throw ServerAPIError.badRequest(
+                "functions is not supported: it is OpenAI's deprecated spelling of tools, and a call "
+                    + "this server returned would arrive as tool_calls rather than function_call, so the "
+                    + "reply would look like a turn that dropped its call"
+                    + (named.isEmpty ? "" : " (it declared \(named))")
+                    + ". Send the same definitions as tools, "
+                    + "[{\"type\": \"function\", \"function\": {\"name\", \"description\", \"parameters\"}}], "
+                    + "and read tool_calls in the reply.",
+                logSafeMessage: "functions is the deprecated spelling of tools"
+            )
+        }
+        if case nil = request.toolChoice, let legacyCall = request.legacyFunctionCall {
+            throw ServerAPIError.badRequest(
+                "function_call is not supported: it is OpenAI's deprecated spelling of tool_choice, and "
+                    + "this server reads the modern field, so \(legacyCall.described) would be dropped. "
+                    + "Send tool_choice instead: \"auto\" or \"none\" (a forced call is refused either way).",
+                logSafeMessage: "function_call is the deprecated spelling of tool_choice"
+            )
+        }
+    }
+
+    /// Converts OpenAI's `logit_bias` object into the additive bias the sampler
+    /// applies, refusing by name what it could not honour.
+    ///
+    /// The wire keys token ids as decimal strings and upstream bounds a bias to
+    /// -100...100. A key that is not a token id, or a bias outside that range, is
+    /// refused here rather than clamped: a clamped value answers a request the
+    /// client did not send, which is the silent lie this posture exists to remove.
+    /// An id beyond the LOADED checkpoint's vocabulary is deliberately NOT refused,
+    /// because the vocabulary belongs to the model rather than to the protocol: such
+    /// an id has no candidate logit to bias, so the sampler skips it.
+    nonisolated static func logitBias(from raw: [String: Float]?) throws -> [Int32: Float] {
+        guard let raw, !raw.isEmpty else { return [:] }
+        var resolved: [Int32: Float] = [:]
+        resolved.reserveCapacity(raw.count)
+        for (key, bias) in raw {
+            guard let id = Int32(key.trimmingCharacters(in: .whitespaces)), id >= 0 else {
+                throw ServerAPIError.badRequest(
+                    "logit_bias carries the key \"\(key)\", which is not a token id. Send token ids "
+                        + "as decimal strings, e.g. {\"50256\": -100}.",
+                    logSafeMessage: "logit_bias carries a key that is not a token id"
+                )
+            }
+            guard bias >= -100, bias <= 100 else {
+                throw ServerAPIError.badRequest(
+                    "logit_bias for token \(id) is \(bias): this server honours OpenAI's range of "
+                        + "-100 to 100. Clamp the value or omit the entry."
+                )
+            }
+            // A zero bias changes nothing, and carrying it would only widen the
+            // sampler's touched set.
+            if abs(bias) > 0.0001 { resolved[id] = bias }
+        }
+        return resolved
+    }
+
+    /// OpenAI's `frequency_penalty`, in the range the sampler can honour.
+    ///
+    /// Negative values reward repetition and positive values punish it, exactly as
+    /// upstream; the value rides `TurnSampling` and is charged per OCCURRENCE of a
+    /// recent token, which is what separates it from `presence_penalty`.
+    nonisolated static func frequencyPenalty(_ value: Float?) throws -> Float {
+        guard let value else { return 0 }
+        guard value >= -2.0, value <= 2.0 else {
+            throw ServerAPIError.badRequest(
+                "frequency_penalty is \(value): this server honours OpenAI's range of -2.0 to 2.0. "
+                    + "Clamp the value or omit frequency_penalty."
+            )
+        }
+        return abs(value) > 0.001 ? value : 0
+    }
+
+    /// The reply budget a request asks for, resolved across OpenAI's two spellings.
+    ///
+    /// `max_completion_tokens` is the field OpenAI kept (and the only one its newer
+    /// models accept); `max_tokens` is the deprecated spelling most clients still
+    /// send. Neither was a lie while ONLY `max_tokens` was decoded, but leaving
+    /// `max_completion_tokens` out of the decoder entirely meant a client that sent
+    /// `{"max_completion_tokens": 512}` and no `max_tokens` was answered with the app
+    /// default budget of up to 8192 tokens — the same class of silent substitution
+    /// `#88` removed for `response_format` and `n`.
+    ///
+    /// A request that carries BOTH fields with different values is refused rather
+    /// than resolved by preference: whichever value the server picked, the answer
+    /// would be a budget the client did not ask for, and the two fields being present
+    /// together means the client itself is unsure which one its SDK sends.
+    nonisolated static func replyBudget(
+        maxTokens: Int?,
+        maxCompletionTokens: Int?
+    ) throws -> Int? {
+        switch (maxTokens, maxCompletionTokens) {
+        case let (old?, new?) where old != new:
+            throw ServerAPIError.badRequest(
+                "max_tokens = \(old) and max_completion_tokens = \(new) disagree: send one of them. "
+                    + "This server honours whichever arrives, they are the same budget, and it will "
+                    + "not pick a value the client did not mean."
+            )
+        case let (_, new?):
+            return new
+        case let (old?, _):
+            return old
+        case (nil, nil):
+            return nil
+        }
+    }
+
+    /// Refuse the request fields this server cannot honour, by name.
+    ///
+    /// Swift's `Decodable` ignores the keys it does not know, which is what made
+    /// these fields a silent lie: a client that asked for `response_format:
+    /// json_object` was answered in prose, one that asked for `n: 2` got one choice,
+    /// and one that asked for `logprobs` got a response carrying none — each with a
+    /// 200 and nothing on the wire to tell it apart from the request it meant to
+    /// send. Forced `tool_choice` already established this codebase's rule for the
+    /// class: refuse it explicitly, because a client that planned around an answer it
+    /// did not receive fails somewhere further from the cause than this 400.
+    ///
+    /// `stream_options.include_usage` is deliberately NOT on this list: it asks for
+    /// something this server can do, so the streaming writer honours it instead.
+    ///
+    /// The two sampler fields (`frequency_penalty`, `logit_bias`) are neither
+    /// refused nor ignored: the sampler charges a per-occurrence penalty and biases
+    /// a named token, so they are VALIDATED here and resolved into the turn's
+    /// sampling. Validating rather than refusing keeps a new 400 off the path
+    /// clients already drive daily.
+    nonisolated static func refuseUnsupportedResponseShape(_ request: OpenAIChatRequest) throws {
+        // Output modalities first: they describe what the RESPONSE should be, so a
+        // request that asks for audio is answered before any other field is weighed.
+        // `modalities: ["text"]` is the protocol's default and is served, because a
+        // client naming the default is not asking for anything this server lacks.
+        if let audio = request.audio {
+            throw ServerAPIError.badRequest(
+                "audio output is not supported: this server runs a text model and has no "
+                    + "text-to-speech, so the spoken reply your client would wait for is never produced"
+                    + (audio.format.map { " (it asked for \($0))" } ?? "")
+                    + ". Omit audio and modalities, and synthesise speech on your side if you need it.",
+                logSafeMessage: "audio output requested; this server has no text-to-speech"
+            )
+        }
+        let unservable = unservableModalities(request)
+        if !unservable.isEmpty {
+            throw ServerAPIError.badRequest(
+                "modalities \(unservable.map { "\"\($0)\"" }.joined(separator: ", ")) not supported: "
+                    + "this server produces text only, so the reply would arrive without the output the "
+                    + "request asked for. Send {\"modalities\": [\"text\"]} or omit modalities.",
+                logSafeMessage: "modalities names an output this server cannot produce"
+            )
+        }
+        // Not a response SHAPE, but the same posture and the same pre-gate site: this is
+        // a request for an answer this server cannot produce. `web_search_options` only
+        // exists to ask the backend to search the web and ground the reply in the
+        // results, and this server does not search for a chat turn, so dropping the
+        // field answered with ungrounded prose whose citations the client renders as
+        // absent. Keyed on presence rather than on a non-default body: an empty object is
+        // the default SEARCH, not the default silence, which is the difference from
+        // `modalities: ["text"]`.
+        if let search = request.webSearchOptions {
+            throw ServerAPIError.badRequest(
+                "web_search_options is not supported: it asks the backend to search the web and ground "
+                    + "the answer in the results, and this server does not search for a chat turn"
+                    + (search.searchContextSize.map { " (it asked for \($0) context)" } ?? "")
+                    + ". Ask the model without grounding, or fetch the sources yourself and send them in the "
+                    + "prompt; the in-app agent has its own web_search tool for its own turns.",
+                logSafeMessage: "web_search_options asks the backend to search the web"
+            )
+        }
+        switch request.responseFormat?.type ?? "text" {
+        case "text":
+            break
+        case "json_object":
+            throw ServerAPIError.badRequest(
+                "response_format \"json_object\" is not supported: this server cannot constrain "
+                    + "decoding to JSON, so a turn that expects JSON would receive prose. Ask for the "
+                    + "JSON shape in the prompt and validate it on your side, or omit response_format."
+            )
+        case "json_schema":
+            throw ServerAPIError.badRequest(
+                "response_format \"json_schema\" is not supported: this server cannot enforce a "
+                    + "schema on the model's output. Ask for the JSON shape in the prompt and validate "
+                    + "it on your side, or omit response_format."
+            )
+        case let other:
+            throw ServerAPIError.badRequest(
+                "response_format \"\(other)\" is not a type this server knows.",
+                logSafeMessage: "response_format carries a type this server does not know"
+            )
+        }
+        if let n = request.n, n != 1 {
+            throw ServerAPIError.badRequest(
+                "n = \(n) is not supported: this server generates one completion per request. Send "
+                    + "one request per completion (they queue), or omit n."
+            )
+        }
+        if request.logprobs == true || request.topLogprobs != nil {
+            throw ServerAPIError.badRequest(
+                "logprobs is not supported: this server's responses carry no token log-probabilities, "
+                    + "so a client scoring its own output would silently receive none. Omit logprobs "
+                    + "and top_logprobs."
+            )
+        }
+        // Resolved rather than refused (see the note above), and validated before the
+        // model gate like every other refusal so the ordering a test proves holds.
+        _ = try frequencyPenalty(request.frequencyPenalty)
+        _ = try logitBias(from: request.logitBias)
+        // The reply budget is resolved from either spelling, so two disagreeing
+        // spellings are a 400 here rather than a choice the server made for the client.
+        _ = try replyBudget(
+            maxTokens: request.maxTokens,
+            maxCompletionTokens: request.maxCompletionTokens
+        )
+    }
+
+    /// The requested output modalities this server cannot produce, in the order the
+    /// client named them. `text` is the one modality the engine has, and it is also
+    /// the protocol's DEFAULT (SDKs send `["text"]` explicitly), so naming it is not
+    /// a request for anything and never refuses; every other value is a promise the
+    /// response cannot keep.
+    nonisolated static func unservableModalities(_ request: OpenAIChatRequest) -> [String] {
+        (request.modalities ?? []).filter { $0.lowercased() != "text" }
+    }
+
+    /// The same posture for the legacy text-completions route, over that route's
+    /// own field set.
+    ///
+    /// It is a separate function rather than a widening of the chat refusal
+    /// because the two routes carry different fields and this one is new: nothing
+    /// that works against the chat route today starts failing because of a rule
+    /// added here. The sampler fields (`frequency_penalty`, `logit_bias`) used to be
+    /// named here as unsupported because the chat route still ignored them; now that
+    /// both routes resolve them into the sampler, this route validates them the same
+    /// way instead of refusing them.
+    nonisolated static func refuseUnsupportedCompletionsShape(_ request: OpenAICompletionsRequest) throws {
+        if request.promptIsTokenIDs {
+            throw ServerAPIError.badRequest(
+                "prompt as token ids is not supported: this server tokenizes but does not detokenize, "
+                    + "so it could run an id prompt but never report what it completed. Send prompt as text."
+            )
+        }
+        if request.promptCount != 1 {
+            throw ServerAPIError.badRequest(
+                "prompt carries \(request.promptCount) prompts: this server completes one prompt per "
+                    + "request. Send one request per prompt (they queue)."
+            )
+        }
+        guard let prompt = request.promptText, !prompt.isEmpty else {
+            throw ServerAPIError.badRequest("prompt is empty: send the text to continue.")
+        }
+        if request.suffix != nil {
+            throw ServerAPIError.badRequest(
+                "suffix is not supported: this server cannot do insertion mode, so the text it returned "
+                    + "would not fit the gap the suffix describes. Omit suffix."
+            )
+        }
+        if let n = request.n, n != 1 {
+            throw ServerAPIError.badRequest(
+                "n = \(n) is not supported: this server generates one completion per request. Send "
+                    + "one request per completion (they queue), or omit n."
+            )
+        }
+        if request.logprobsRequested {
+            throw ServerAPIError.badRequest(
+                "logprobs is not supported: this server's responses carry no token log-probabilities, "
+                    + "so a client scoring its own output would silently receive none. Omit logprobs."
+            )
+        }
+        if let bestOf = request.bestOf, bestOf != 1 {
+            throw ServerAPIError.badRequest(
+                "best_of = \(bestOf) is not supported: this server runs one candidate per request, so "
+                    + "best_of would change nothing about the completion it returned. Omit best_of."
+            )
+        }
+        if request.logitBias != nil || request.frequencyPenalty != nil {
+            _ = try frequencyPenalty(request.frequencyPenalty)
+            _ = try logitBias(from: request.logitBias)
+        }
+    }
+
+    /// Whether the legacy route renders the reasoning channel into its prompt.
+    ///
+    /// OFF unless the client asks, which is the opposite of the chat route's default
+    /// and deliberate: `text_completion` has no field to carry reasoning, so a turn
+    /// that reasons first spends its whole budget there and returns a trace instead of
+    /// the continuation the caller asked for (measured on the real checkpoint: eight
+    /// tokens of "The user asks a simple factual question</think>" and no answer). A
+    /// client that wants the reasoning can say so with this server's own
+    /// `enable_thinking`, and then the fold in `completionsText` carries it in `text`.
+    nonisolated static func completionsThinkingRequested(_ request: OpenAICompletionsRequest) -> Bool {
+        request.enableThinking ?? false
+    }
+
+    /// The legacy route's prompt as the one shape the turn planner reads.
+    ///
+    /// There is no system field on this protocol, so the system prompt is empty and
+    /// the checkpoint's own default system block is what the renderer writes — the
+    /// same thing the chat route produces for a request that sent no system
+    /// message. The prompt is a single user turn; the renderer decides from the
+    /// text itself whether it is a plain question or an already-templated
+    /// continuation.
+    nonisolated static func completionsSplit(_ request: OpenAICompletionsRequest) -> ServerPromptSplit {
+        ServerPromptSplit(systemPrompt: "", turns: [.init(role: .user, text: request.promptText ?? "")])
+    }
+
+    /// OpenAI's documented `reasoning_effort` vocabulary, low to high, and the
+    /// engine level each value selects.
+    ///
+    /// The protocol names four graded values and the OpenAI SDK sends `medium` by
+    /// default for reasoning models, so a decoder that knew only this engine's own
+    /// two words refused half the vocabulary: a default-configured client met an HTTP
+    /// 400 saying the supported values were "low and high" for sending the value its
+    /// own protocol documents. The vocabulary is mapped onto the two levels the
+    /// engine exposes instead, `minimal` and `low` onto the short budget and
+    /// `medium` and `high` onto the full one.
+    ///
+    /// `medium` landing on high is the rule the app already applies to its own
+    /// stored level (`ThinkingEffort.clamped`), so a client and the chat UI cannot
+    /// read the same word two ways. This table is the only place the vocabulary
+    /// lives: the mapper below and the `/v1/models` advertisement both read it, so
+    /// what is accepted and what is announced cannot drift apart.
+    nonisolated static let reasoningEffortVocabulary: [(value: String, level: ThinkingEffort)] = [
+        ("minimal", .low),
+        ("low", .low),
+        ("medium", .high),
+        ("high", .high)
+    ]
+
+    /// The values a client may send, for the models route to advertise.
+    nonisolated static var reasoningEffortValues: [String] {
+        reasoningEffortVocabulary.map(\.value)
+    }
+
+    /// The level a client's `reasoning_effort` selects, or nil when the string is
+    /// not one of the protocol's own values. Case and surrounding whitespace are
+    /// ignored, because a hand-written request is not required to be canonical.
+    nonisolated static func thinkingEffortLevel(forProtocolValue raw: String?) -> ThinkingEffort? {
+        guard let raw else { return nil }
+        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return reasoningEffortVocabulary.first { $0.value == normalized }?.level
+    }
+
     /// Maps the client's `reasoning_effort` onto a graded level. Returns nil
-    /// when the field is absent or thinking is explicitly off. A level the
-    /// loaded model cannot honor is rejected rather than silently dropped.
+    /// when the field is absent or thinking is explicitly off. A value outside
+    /// the protocol's vocabulary, or a level the loaded model cannot honor, is
+    /// rejected rather than silently dropped.
     nonisolated static func thinkingEffort(
         from raw: String?,
         levelCapable: Bool,
@@ -405,9 +1373,10 @@ enum OpenAIAdapter {
                 logSafeMessage: "reasoning_effort is not supported by the loaded model"
             )
         }
-        guard let effort = ThinkingEffort.parse(raw) else {
+        guard let effort = thinkingEffortLevel(forProtocolValue: raw) else {
             throw ServerAPIError.badRequest(
-                "Unsupported reasoning_effort value. Supported values are low and high.",
+                "Unsupported reasoning_effort value. Supported values are "
+                    + reasoningEffortValues.joined(separator: ", ") + ".",
                 logSafeMessage: "Unsupported reasoning_effort value"
             )
         }
@@ -479,7 +1448,7 @@ enum OpenAIAdapter {
     /// re-tokenizes the whole conversation every turn, so each turn's prompt
     /// can no longer extend the previous turn's pinned prompt+generation and
     /// multi-turn requests fully re-prefill.
-    static func splitMessages(_ messages: [OpenAIChatRequest.Message]) throws -> (systemPrompt: String, turns: [ChatPromptFormatter.ConversationTurn]) {
+    static func splitMessages(_ messages: [OpenAIChatRequest.Message]) throws -> ServerPromptSplit {
         let systemTexts = messages
             .filter { $0.role == "system" || $0.role == "developer" }
             .compactMap(\.contentText)
@@ -491,11 +1460,20 @@ enum OpenAIAdapter {
             throw ServerAPIError.badRequest("messages must contain at least one non-system message")
         }
 
-        var turns: [ChatPromptFormatter.ConversationTurn] = []
+        var split = ServerPromptSplit(systemPrompt: systemPrompt)
         for message in conversation {
+            // A picture belongs to the turn it was sent with. Only a user turn can
+            // carry one: an image on an assistant or tool message has no position
+            // in the rendered template, so it is refused rather than moved.
+            if message.hasImagePart, message.role != "user" {
+                throw ServerAPIError.unsupportedContent(
+                    "An image part can only be attached to a user message, not to a \"\(message.role)\" message."
+                )
+            }
             switch message.role {
             case "user":
-                turns.append(.init(role: .user, text: message.contentText ?? ""))
+                if message.hasImagePart { split.images[split.turns.count] = message.imageParts }
+                split.turns.append(.init(role: .user, text: message.contentText ?? ""))
             case "assistant":
                 var lines: [String] = []
                 // Reasoning a client echoed back is re-rendered ahead of the
@@ -531,21 +1509,21 @@ enum OpenAIAdapter {
                     lines.append(ChatPromptFormatter.openAIToolCallEchoPrefix + "\n" + rendered)
                 }
                 let body = lines.joined(separator: "\n\n")
-                turns.append(.init(role: .assistant, text: body.isEmpty ? "(no content)" : body))
+                split.turns.append(.init(role: .assistant, text: body.isEmpty ? "(no content)" : body))
             case "tool", "function":
                 let label = message.name ?? message.toolCallId ?? "tool"
                 let args = message.contentText ?? "(no result)"
-                turns.append(.init(role: .user, text: "Function result (\(label)):\n\(args)"))
+                split.turns.append(.init(role: .user, text: "Function result (\(label)):\n\(args)"))
             default:
                 if let content = message.contentText, !content.isEmpty {
-                    turns.append(.init(role: .user, text: "\(message.role.capitalized): \(content)"))
+                    split.turns.append(.init(role: .user, text: "\(message.role.capitalized): \(content)"))
                 }
             }
         }
-        guard !turns.isEmpty else {
+        guard !split.turns.isEmpty else {
             throw ServerAPIError.badRequest("messages must contain at least one non-system message")
         }
-        return (systemPrompt, turns)
+        return split
     }
 
     /// Stable prefix-cache session key. The OpenAI protocol is stateless, so
@@ -558,6 +1536,12 @@ enum OpenAIAdapter {
     /// identically still collide, so reuse is additionally gated on exact
     /// token-prefix equality inside PrefixCacheManager.findCommonPrefix and on
     /// `ServerTurnMemory` re-validating the rendered history.
+    ///
+    /// A picture is part of that identity. Two requests can carry the same TEXT
+    /// and different images, and both render to the same list of image token ids,
+    /// so neither the anchor's text nor token-prefix equality can separate them:
+    /// without the digest folded in here, the second picture's turn would splice
+    /// the first one's recorded generation and reuse its pinned prefix.
     static func sessionKey(for messages: [OpenAIChatRequest.Message], model: String?) -> UUID {
         var lane0: UInt64 = 0xcbf29ce484222325
         var lane1: UInt64 = 0x9e3779b97f4a7c15
@@ -579,8 +1563,46 @@ enum OpenAIAdapter {
                 mixString(call.function.arguments ?? "")
             }
             mixString(anchor.name ?? "")
+            if !anchor.imageParts.isEmpty {
+                mixString("images:" + ServerImageParts.digest(anchor.imageParts))
+            }
         }
 
+        return uuid(fromLanes: (lane0, lane1))
+    }
+
+    /// Stable prefix-cache session key for the legacy text-completions route.
+    ///
+    /// That protocol has no message list, so identity is the prompt itself: two
+    /// requests whose prompts are byte-identical are the same continuation, and any
+    /// difference (including one that is already templated) is a different one. The
+    /// model is mixed in for the reason the chat route mixes it: a model switch must
+    /// not inherit the previous model's pinned prefix. `"completions"` is mixed in
+    /// first so a completion prompt and a chat message with the same text cannot
+    /// collide on one session.
+    nonisolated static func sessionKey(forPrompt prompt: String, model: String?) -> UUID {
+        var lane0: UInt64 = 0xcbf29ce484222325
+        var lane1: UInt64 = 0x9e3779b97f4a7c15
+        func mix(_ byte: UInt8) {
+            lane0 = (lane0 ^ UInt64(byte)) &* 0x100000001b3
+            lane1 = (lane1 ^ UInt64(byte)) &* 0x00000100000001b3
+            lane1 = (lane1 << 7) | (lane1 >> 57)
+        }
+        func mixString(_ s: String) {
+            for byte in s.utf8 { mix(byte) }
+            mix(0x1f)
+        }
+        mixString("completions")
+        mixString(model ?? "")
+        mixString(prompt)
+        return uuid(fromLanes: (lane0, lane1))
+    }
+
+    /// The one place the two lanes become a UUID, so both key derivations agree on
+    /// the bit layout (including the RFC 4122 v4 bits downstream consumers parse).
+    nonisolated private static func uuid(fromLanes lanes: (UInt64, UInt64)) -> UUID {
+        var lane0 = lanes.0
+        var lane1 = lanes.1
         var bytes = [UInt8](repeating: 0, count: 16)
         withUnsafeMutableBytes(of: &lane0) { bytes.replaceSubrange(0..<8, with: $0) }
         withUnsafeMutableBytes(of: &lane1) { bytes.replaceSubrange(8..<16, with: $0) }

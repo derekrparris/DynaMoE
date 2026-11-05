@@ -40,12 +40,38 @@ enum QueuedTurnEvent: @unchecked Sendable {
 
 /// FIFO queue over the engine's single-flight generation slot. Each request
 /// enqueues its whole turn; the work only begins once every earlier turn has
-/// fully drained. Cancellation propagates to the owner task, which cancels
-/// the engine turn handle. Queue-wait timeouts are delivered at their
-/// deadline even when a predecessor is stalled; the timed-out turn leaves
-/// the queue without running work, while turns queued behind it still wait
-/// for their predecessors' drain.
+/// fully drained AND the engine's one generation slot has been CLAIMED — the chat
+/// UI and the agent harness launch turns straight through the engine, so they
+/// occupy that slot without appearing in this FIFO and a request waits for them
+/// the same way it waits for its predecessor. The claim is taken in the same step
+/// that decides the slot is free and is handed to the turn's launch, so the
+/// preparation between the two cannot lose the slot to a chat turn that starts in
+/// between (`Benchmarks/PERF_FINDINGS.md`, "DSV4.1 #84"). Cancellation propagates
+/// to the owner task, which cancels the engine turn handle. Queue-wait timeouts
+/// are delivered at their deadline even when a predecessor is stalled; the
+/// timed-out turn leaves the queue without running work, while turns queued
+/// behind it still wait for their predecessors' drain.
 actor TurnExecutionQueue {
+    /// How the queue asks whether the engine's single-flight generation slot is
+    /// free. A probe rather than a direct read so the wait for an in-app
+    /// generation can be tested without loading a model; production passes the
+    /// default. It exists only to tell the two queue-wait timeouts apart — the
+    /// claim below is what actually decides.
+    private let slotProbe: @Sendable () async -> Bool
+
+    /// How the queue takes the slot. Nil means somebody else holds it, in which
+    /// case the turn keeps waiting rather than failing: the request has already
+    /// invested its queue wait and a claim is bounded work, not a refusal.
+    private let slotReserve: @Sendable () async -> TurnSlotClaim?
+
+    init(
+        slotProbe: @escaping @Sendable () async -> Bool = TurnExecutionQueue.engineSlotIsFree,
+        slotReserve: @escaping @Sendable () async -> TurnSlotClaim? = TurnExecutionQueue.claimEngineSlot
+    ) {
+        self.slotProbe = slotProbe
+        self.slotReserve = slotReserve
+    }
+
     /// Chain element for successor turns: resolves only once every earlier
     /// operation's work has drained. A timed-out operation contributes no
     /// work, so its chain element resolves when its own predecessor drains.
@@ -81,65 +107,148 @@ actor TurnExecutionQueue {
         liveCancelBoxes[id] = nil
     }
 
-    /// Waits for the predecessor to drain, but gives up at `deadline` so a
-    /// stalled or long-running leader cannot hold a timed-out request past
-    /// its deadline. `Task.value` awaits ignore cancellation, so the
-    /// predecessor's completion is observed by a detached watcher and raced
-    /// against the deadline on a short poll cadence; the watcher is
-    /// abandoned on timeout and completes on its own. Returning `true` means
-    /// the slot is genuinely open — the FIFO barrier for real work is
-    /// untouched, since callers run work only after this returns true.
-    nonisolated private static func waitForSlot(_ previous: Task<Void, Never>, deadline: Date) async throws -> Bool {
+    /// Why a turn stopped waiting for the engine's generation slot.
+    private enum SlotWaitOutcome {
+        /// The slot was claimed: run the work with this claim.
+        case opened(TurnSlotClaim)
+        /// An earlier SERVER turn was still draining at the deadline.
+        case timedOutBehindTurns
+        /// The deadline passed with a generation the app started holding the slot.
+        case timedOutBehindInAppTurn
+    }
+
+    /// The engine's single-flight slot as it stands right now.
+    ///
+    /// Read through the engine rather than tracked here, because the chat UI and
+    /// the agent harness call `CompletionEngine.launchTurn` directly and never
+    /// route through this queue — so a slot this queue believes free is not
+    /// necessarily free. A claim another caller holds reads as busy here too.
+    nonisolated private static func engineSlotIsFree() async -> Bool {
+        let active = await CompletionEngine.shared.isActive
+        return !active
+    }
+
+    /// Takes the engine's generation slot, or nil if a turn already holds it.
+    ///
+    /// This is the queue's only way in: the turn is launched with the claim it
+    /// returns, so the slot stays ours across the preparation between here and
+    /// `CompletionEngine.launchTurn`.
+    nonisolated private static func claimEngineSlot() async -> TurnSlotClaim? {
+        await CompletionEngine.shared.reserveTurnSlot()
+    }
+
+    /// Waits for the engine's single-flight generation slot to be free: first for
+    /// every earlier queued turn to drain, then for whoever else holds it.
+    ///
+    /// There is ONE slot, and an in-app generation occupies it without passing
+    /// through this FIFO. Waiting for it rather than failing is what makes a
+    /// request that arrives mid-answer queue instead of returning 503: the client
+    /// asked first, the resource is busy for a bounded time, and the queue already
+    /// has a deadline and a heartbeat. `deadline` bounds both waits, so a stalled
+    /// predecessor or a very long in-app generation cannot hold a request past its
+    /// budget — it is told, with a message that names which of the two it waited
+    /// on. Returning `.opened` means the slot is genuinely free; callers run work
+    /// only then, so the FIFO barrier for real work is untouched.
+    nonisolated private static func waitForSlot(
+        _ previous: Task<Void, Never>,
+        deadline: Date?,
+        slotProbe: @Sendable () async -> Bool,
+        slotReserve: @Sendable () async -> TurnSlotClaim?
+    ) async throws -> SlotWaitOutcome {
         let drained = DrainFlag()
         let watcher = Task.detached(priority: .utility) { [previous, drained] in
             _ = await previous.value
             drained.mark()
         }
         defer { watcher.cancel() }
-        while !drained.isDrained {
+        // `Task.value` awaits ignore cancellation, so an unbounded wait polls the
+        // drained flag rather than awaiting the predecessor directly. With no
+        // deadline (the user asked to wait indefinitely) there is nothing to race,
+        // so await it properly and spend nothing.
+        if let deadline {
+            while !drained.isDrained {
+                try Task.checkCancellation()
+                if Date() >= deadline {
+                    return .timedOutBehindTurns
+                }
+                try? await Task.sleep(nanoseconds: 20_000_000)
+            }
+        } else {
+            await previous.value
+        }
+        // Same deadline, same cadence: only reached while a generation is actually
+        // running, so the idle case costs one MainActor hop. A probe that says free
+        // followed by a claim that fails means somebody else took the slot in
+        // between — that caller now owns it, so this one goes back to waiting
+        // instead of launching into a refusal.
+        while true {
             try Task.checkCancellation()
-            if Date() >= deadline {
-                return false
+            if await slotProbe(), let claim = await slotReserve() {
+                return .opened(claim)
+            }
+            if let deadline, Date() >= deadline {
+                return .timedOutBehindInAppTurn
             }
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
-        return true
     }
 
     /// Enqueues streaming work. Returns the event relay stream plus the task
     /// that owns the work (cancel it to abort a queued/running turn).
     /// `queueWaitTimeout` bounds how long the turn may sit behind earlier
-    /// turns; when it expires the relay emits a launchFailed event instead of
-    /// running the work — promptly, even if an earlier turn is stalled. Nil
-    /// (the default) waits indefinitely. `onSlotOpened` fires exactly once,
-    /// the instant the FIFO slot opens and immediately before the work runs
-    /// (never on the timeout or cancellation paths), mirroring `perform`: the
-    /// streaming writers stamp their box's `queueWaitMs` through the hook —
-    /// at the producer — because the relay can deliver an event late, so an
-    /// SSE writer blocked on an earlier heartbeat would otherwise stamp
-    /// generation time as queue wait.
+    /// turns OR behind a generation the app started (the queue is a FIFO over
+    /// one engine slot, and the chat UI occupies that slot without passing
+    /// through it); when it expires the relay emits a launchFailed event
+    /// instead of running the work — promptly, even if an earlier turn is
+    /// stalled. Nil (the default) waits indefinitely. `onSlotOpened` fires
+    /// exactly once, the instant the FIFO slot opens and immediately before
+    /// the work runs (never on the timeout or cancellation paths), mirroring
+    /// `perform`: the streaming writers stamp their box's `queueWaitMs`
+    /// through the hook — at the producer — because the relay can deliver an
+    /// event late, so an SSE writer blocked on an earlier heartbeat would
+    /// otherwise stamp generation time as queue wait.
+    ///
+    /// The work closure receives the engine-slot claim the queue took on its
+    /// behalf; a turn launched from here must pass it to
+    /// `CompletionEngine.launchTurn(_:claim:)` or the launch will be refused.
     func streamTurn(
-        _ work: @escaping @Sendable (_ emit: @escaping @Sendable (QueuedTurnEvent) -> Void) async -> Void,
+        _ work: @escaping @Sendable (_ claim: TurnSlotClaim, _ emit: @escaping @Sendable (QueuedTurnEvent) -> Void) async -> Void,
         queueWaitTimeout: TimeInterval? = nil,
         onSlotOpened: (@Sendable () -> Void)? = nil
     ) -> (AsyncStream<QueuedTurnEvent>, Task<Void, Never>) {
         let (stream, continuation) = AsyncStream.makeStream(of: QueuedTurnEvent.self, bufferingPolicy: .unbounded)
+        // Read and advance the chain with no suspension in between, exactly as
+        // `perform` does: the gate is built first and waits on `drained`, which the
+        // turn's own task resolves in its `defer`.
         let previous = tail
         enqueuedOperations += 1
         let deadline = queueWaitTimeout.map { Date().addingTimeInterval($0) }
+        let drained = SlotDrain()
+        let gate = Task<Void, Never> { [previous, drained] in
+            await previous.value
+            await drained.wait()
+        }
+        tail = gate
+
         let cancelBox = ServerTurnCancelBox()
         let hookID = registerCancelBox(cancelBox)
         let heartbeat = Task {
             // Queue-wait heartbeat so clients don't idle-timeout while a long
-            // turn ahead of us holds the single-flight slot.
+            // turn ahead of us — or a generation the app is running — holds the
+            // single-flight slot.
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
                 guard !Task.isCancelled else { return }
                 continuation.yield(.ping(comment: nil))
             }
         }
-        let task = Task<Void, Never> { [previous, heartbeat, deadline, onSlotOpened] in
+        let task = Task<Void, Never> { [previous, heartbeat, deadline, onSlotOpened, slotProbe, slotReserve, drained] in
+            var heldClaim: TurnSlotClaim?
             defer {
+                // A claim this turn never redeemed (a timeout, a cancellation, a
+                // work closure that threw first) goes back here; one the launch
+                // already released is a no-op.
+                heldClaim?.release()
                 // The heartbeat also serves the RUNNING turn: cancel it here, not
                 // right after the previous turn drains, so the SSE stream keeps
                 // emitting ping frames while a long prefill runs and clients
@@ -147,17 +256,23 @@ actor TurnExecutionQueue {
                 self.completedOperations += 1
                 self.deregisterCancelBox(hookID)
                 heartbeat.cancel()
+                drained.resolve()
             }
+            let claim: TurnSlotClaim
             do {
-                let slotOpened: Bool
-                if let deadline {
-                    slotOpened = try await Self.waitForSlot(previous, deadline: deadline)
-                } else {
-                    await previous.value
-                    slotOpened = true
-                }
-                guard slotOpened else {
-                    continuation.yield(.launchFailed(ServerAPIError.requestTimeout("Request timed out waiting in the generation queue")))
+                switch try await Self.waitForSlot(
+                    previous, deadline: deadline, slotProbe: slotProbe, slotReserve: slotReserve
+                ) {
+                case .opened(let opened):
+                    claim = opened
+                case .timedOutBehindTurns:
+                    continuation.yield(.launchFailed(ServerAPIError.requestTimeout(
+                        "Request timed out waiting in the generation queue")))
+                    continuation.finish()
+                    return
+                case .timedOutBehindInAppTurn:
+                    continuation.yield(.launchFailed(ServerAPIError.requestTimeout(
+                        "Request timed out waiting for a generation running in the DynaMoE app")))
                     continuation.finish()
                     return
                 }
@@ -166,32 +281,25 @@ actor TurnExecutionQueue {
                 continuation.finish()
                 return
             }
+            heldClaim = claim
             guard !Task.isCancelled else {
                 continuation.finish()
                 return
             }
             onSlotOpened?()
-            await work { continuation.yield($0) }
+            await work(claim) { continuation.yield($0) }
             continuation.finish()
         }
         cancelBox.set { task.cancel() }
-        // Successors wait for this turn's full drain, not merely its task
-        // completion: a turn that timed out without running still holds its
-        // predecessors' drain for the turns queued behind it.
-        let gate = Task<Void, Never> { [previous, task] in
-            await previous.value
-            _ = await task.value
-        }
-        // Keep the chain element alive regardless of this task's outcome.
-        tail = gate
         return (stream, task)
     }
 
     /// Enqueues value-returning work (non-streaming requests and other
     /// engine-facing endpoints). `queueWaitTimeout` bounds how long the work
-    /// may sit behind earlier turns; when it expires the perform throws a
-    /// request-timeout error instead of running the work — promptly, even if
-    /// an earlier turn is stalled. Nil (the default) waits indefinitely.
+    /// may sit behind earlier turns OR behind a generation the app started;
+    /// when it expires the perform throws a request-timeout error instead of
+    /// running the work — promptly, even if an earlier turn is stalled. Nil
+    /// (the default) waits indefinitely.
     /// `onSlotOpened` fires exactly once, the instant the FIFO slot opens and
     /// immediately before the work runs (never on the timeout or
     /// cancellation paths), so callers can split queue wait from generation
@@ -199,41 +307,65 @@ actor TurnExecutionQueue {
     /// Cancelling the caller cancels the queued work: a cancelled request
     /// neither launches after its predecessor drains nor leaves a running
     /// engine turn unreachable by the work's own cancellation hook.
+    ///
+    /// The work closure receives the engine-slot claim the queue took on its
+    /// behalf; a turn launched from here must pass it to
+    /// `CompletionEngine.launchTurn(_:claim:)` or the launch will be refused.
     func perform<T: Sendable>(
-        _ work: @escaping @Sendable () async throws -> T,
+        _ work: @escaping @Sendable (_ claim: TurnSlotClaim) async throws -> T,
         queueWaitTimeout: TimeInterval? = nil,
         onSlotOpened: (@Sendable () -> Void)? = nil
     ) async throws -> T {
+        // The chain is READ AND ADVANCED WITHOUT A SUSPENSION between the two, and
+        // only value construction and a nonisolated lock box sit between them. That
+        // atomicity is the queue: a successor that read a half-advanced `tail` would
+        // chain off the turn BEFORE this one and run alongside it, which the engine
+        // then refuses as a second active turn. Building the gate before the work
+        // task is what makes it possible — the gate waits on `drained`, which the
+        // task resolves in its own `defer`.
         let previous = tail
         enqueuedOperations += 1
         let deadline = queueWaitTimeout.map { Date().addingTimeInterval($0) }
-        let cancelBox = ServerTurnCancelBox()
-        let hookID = registerCancelBox(cancelBox)
-        let task = Task<T, Error> { [previous, deadline] in
-            defer {
-                self.completedOperations += 1
-                self.deregisterCancelBox(hookID)
-            }
-            let slotOpened: Bool
-            if let deadline {
-                slotOpened = try await Self.waitForSlot(previous, deadline: deadline)
-            } else {
-                await previous.value
-                slotOpened = true
-            }
-            guard slotOpened else {
-                throw ServerAPIError.requestTimeout("Request timed out waiting in the generation queue")
-            }
-            try Task.checkCancellation()
-            onSlotOpened?()
-            return try await work()
-        }
-        cancelBox.set { task.cancel() }
-        let gate = Task<Void, Never> { [previous, task] in
+        let drained = SlotDrain()
+        let gate = Task<Void, Never> { [previous, drained] in
             await previous.value
-            _ = try? await task.value
+            await drained.wait()
         }
         tail = gate
+
+        let cancelBox = ServerTurnCancelBox()
+        let hookID = registerCancelBox(cancelBox)
+        let task = Task<T, Error> { [previous, deadline, slotProbe, slotReserve, drained] in
+            var heldClaim: TurnSlotClaim?
+            defer {
+                // A claim this turn never redeemed — a timeout, a cancellation, a
+                // work closure that threw — goes back here; one the launch already
+                // released is a no-op.
+                heldClaim?.release()
+                self.completedOperations += 1
+                self.deregisterCancelBox(hookID)
+                drained.resolve()
+            }
+            let outcome = try await Self.waitForSlot(
+                previous, deadline: deadline, slotProbe: slotProbe, slotReserve: slotReserve
+            )
+            let claim: TurnSlotClaim
+            switch outcome {
+            case .opened(let opened):
+                claim = opened
+            case .timedOutBehindTurns:
+                throw ServerAPIError.requestTimeout("Request timed out waiting in the generation queue")
+            case .timedOutBehindInAppTurn:
+                throw ServerAPIError.requestTimeout(
+                    "Request timed out waiting for a generation running in the DynaMoE app"
+                )
+            }
+            heldClaim = claim
+            try Task.checkCancellation()
+            onSlotOpened?()
+            return try await work(claim)
+        }
+        cancelBox.set { task.cancel() }
         return try await withTaskCancellationHandler {
             try await task.value
         } onCancel: {
@@ -244,7 +376,13 @@ actor TurnExecutionQueue {
 
 /// Lock-guarded one-shot flag so a queue slot wait can poll its
 /// predecessor's drain without a data race.
-private final class DrainFlag: @unchecked Sendable {
+///
+/// `nonisolated` because every one of these boxes is touched from the queue
+/// actor and from a nonisolated static wait: the target builds with
+/// `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, so leaving them unannotated
+/// makes them main-actor types called across an isolation boundary from the
+/// queue's critical path.
+private nonisolated final class DrainFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var drained = false
 
@@ -261,10 +399,52 @@ private final class DrainFlag: @unchecked Sendable {
     }
 }
 
+/// One-shot completion signal for a queued turn.
+///
+/// The FIFO gate has to exist BEFORE the turn's task does — that is what lets the
+/// queue read and advance its chain without a suspension in between — so the gate
+/// waits on this instead of on `Task.value`. Resolving twice is free, and a
+/// resolve that lands before the wait still releases it.
+private nonisolated final class SlotDrain: @unchecked Sendable {
+    private let lock = NSLock()
+    private var resolved = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func resolve() {
+        lock.lock()
+        guard !resolved else {
+            lock.unlock()
+            return
+        }
+        resolved = true
+        let pending = waiters
+        waiters = []
+        lock.unlock()
+        for waiter in pending { waiter.resume() }
+    }
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if resolved {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            waiters.append(continuation)
+            lock.unlock()
+        }
+    }
+}
+
 /// Cancel invoker for a queued turn's shutdown registry entry. The work task
 /// does not exist yet at enqueue time, so the real cancel closure is
 /// installed right after task creation; `invoke` before that is a no-op.
-private final class ServerTurnCancelBox: @unchecked Sendable {
+///
+/// `nonisolated` for the same reason as `DrainFlag`: the queue actor installs
+/// and invokes it, and `cancelLiveWork()` must be able to run it from server
+/// shutdown without crossing an actor.
+private nonisolated final class ServerTurnCancelBox: @unchecked Sendable {
     private let lock = NSLock()
     private var cancel: (() -> Void)?
 
@@ -354,13 +534,20 @@ final class ServerTurnMemory: @unchecked Sendable {
     /// so the recorded history must match before the raw generation is trusted:
     /// a colliding conversation whose history diverges is rejected instead of
     /// having another conversation's private reasoning spliced into its prompt.
+    ///
+    /// `imageDigests` are the per-turn digests of the pictures the request
+    /// carries. They are not decoration: a conversation's images are not all in
+    /// its opening message, and two pictures of the same size render to the same
+    /// run of image token ids, so the TEXT alone cannot tell a replaced picture
+    /// from the original.
     func recordedRawTurn(
         sessionId: UUID,
         modelName: String,
         echoedByClient: String,
         turnCloser: String?,
         conversation: [ChatPromptFormatter.ConversationTurn] = [],
-        systemPrompt: String = ""
+        systemPrompt: String = "",
+        imageDigests: [Int: String] = [:]
     ) -> String? {
         lock.lock()
         let current = record
@@ -371,6 +558,7 @@ final class ServerTurnMemory: @unchecked Sendable {
         guard Self.historyMatches(
             systemPrompt: systemPrompt,
             conversation: conversation,
+            imageDigests: imageDigests,
             turnCount: current.historyTurnCount,
             digest: current.historyDigest
         ) else { return nil }
@@ -387,21 +575,32 @@ final class ServerTurnMemory: @unchecked Sendable {
     nonisolated static func historyMatches(
         systemPrompt: String,
         conversation: [ChatPromptFormatter.ConversationTurn],
+        imageDigests: [Int: String] = [:],
         turnCount: Int,
         digest: UInt64
     ) -> Bool {
         guard turnCount > 0 else { return true }
         guard conversation.count >= turnCount else { return false }
-        return historyDigest(systemPrompt: systemPrompt, turns: conversation[..<turnCount]) == digest
+        return historyDigest(
+            systemPrompt: systemPrompt,
+            turns: conversation[..<turnCount],
+            imageDigests: imageDigests
+        ) == digest
     }
 
     /// FNV-1a digest of the leading conversation turns plus the rendered system
     /// prompt. Cheap, order-sensitive, and stable across the turns of one
     /// conversation, which is all the turn memory needs to tell a follow-up
     /// from an unrelated conversation that merely shares a session key.
+    ///
+    /// `imageDigests` carries each turn's pictures into the same digest. Without
+    /// it a picture swapped on a LATER turn is invisible here: its marker renders
+    /// the same text, and two images of the same dimensions expand to the same run
+    /// of image token ids, so neither the text nor the ids can separate them.
     nonisolated static func historyDigest(
         systemPrompt: String,
-        turns: ArraySlice<ChatPromptFormatter.ConversationTurn>
+        turns: ArraySlice<ChatPromptFormatter.ConversationTurn>,
+        imageDigests: [Int: String] = [:]
     ) -> UInt64 {
         var hash: UInt64 = 0xcbf29ce484222325
         func mix(_ byte: UInt8) { hash = (hash ^ UInt64(byte)) &* 0x100000001b3 }
@@ -410,9 +609,14 @@ final class ServerTurnMemory: @unchecked Sendable {
             mix(0x1f)
         }
         mixString(systemPrompt)
-        for turn in turns {
+        for (offset, turn) in turns.enumerated() {
             mixString(turn.role == .user ? "user" : "assistant")
             mixString(turn.text)
+            // The slice's own offset is the turn's index in the conversation
+            // whenever it is a leading prefix, which is the only way it is used.
+            if let digest = imageDigests[offset] {
+                mixString("images:" + digest)
+            }
         }
         return hash
     }
@@ -559,6 +763,30 @@ final class PromptCountBox: @unchecked Sendable {
 
 // MARK: - Wire-shaped errors
 
+/// Which protocol a request is answered in.
+///
+/// The two protocols share `GET /v1/models`: identical path, different body. A
+/// route therefore cannot decide from its own path, and the request's headers are
+/// the only evidence available, so this type names the decision once and every
+/// caller that has to render a shape consults it — the models routes for their
+/// body and their log row, and the error renderer for its envelope.
+///
+/// `nonisolated` because it is a value the routing decisions compare and render in
+/// contexts that are not the main actor; without it the project's default isolation
+/// makes the comparison itself a main-actor call.
+nonisolated enum ServerWireProtocol: Sendable {
+    case openai
+    case anthropic
+
+    /// The request log's spelling of the same decision.
+    var rowProtocol: ServerRequestLog.Proto {
+        switch self {
+        case .openai: return .openai
+        case .anthropic: return .anthropic
+        }
+    }
+}
+
 /// Server error that renders as the correct JSON envelope for the calling
 /// protocol: the Anthropic `{"type":"error","error":{...}}` shape under
 /// /v1/messages, the OpenAI `{"error":{...}}` shape everywhere else. Conforms
@@ -568,6 +796,7 @@ struct ServerAPIError: Error, HTTPResponseError, LocalizedError, Sendable {
     enum WireType: String, Sendable {
         case invalidRequest = "invalid_request_error"
         case authentication = "authentication_error"
+        case notFound = "not_found_error"
         case requestTimeout = "request_timeout"
         case overloaded = "overloaded_error"
         case api = "api_error"
@@ -621,6 +850,20 @@ struct ServerAPIError: Error, HTTPResponseError, LocalizedError, Sendable {
         ServerAPIError(status: .unauthorized, wireType: .authentication, message: message, logSafeMessage: nil, code: nil)
     }
 
+    /// The named model is not the one this server serves. A models route answers
+    /// 404 rather than an empty list, because a client that asked for a model by
+    /// name and silently received a different one is the failure the route exists
+    /// to prevent.
+    static func modelNotFound(_ model: String) -> ServerAPIError {
+        ServerAPIError(
+            status: .notFound,
+            wireType: .notFound,
+            message: "model \"\(model)\" does not exist",
+            logSafeMessage: "the requested model is not the one this server serves",
+            code: nil
+        )
+    }
+
     static func requestTimeout(_ message: String) -> ServerAPIError {
         ServerAPIError(status: .requestTimeout, wireType: .requestTimeout, message: message, logSafeMessage: nil, code: nil)
     }
@@ -633,9 +876,26 @@ struct ServerAPIError: Error, HTTPResponseError, LocalizedError, Sendable {
         ServerAPIError(status: .internalServerError, wireType: .api, message: message, logSafeMessage: nil, code: nil)
     }
 
+    /// The OpenAI spelling of this error's `type`. The protocols disagree on how a
+    /// missing model is named — Anthropic has `not_found_error`, OpenAI keeps
+    /// `invalid_request_error` and says `model_not_found` in `code` — and the
+    /// status is 404 either way, so the difference belongs in the envelope rather
+    /// than in the error.
+    var openAIWireType: String {
+        wireType == .notFound ? WireType.invalidRequest.rawValue : wireType.rawValue
+    }
+
+    /// The OpenAI spelling of this error's `code`, for the same reason.
+    var openAICode: String? {
+        code ?? (wireType == .notFound ? "model_not_found" : nil)
+    }
+
     func response(from request: Request, context: some RequestContext) throws -> Response {
         var response: Response
-        if request.uri.path.hasPrefix("/v1/messages") {
+        // Decided from the request, not from a route: the models routes are one
+        // path serving two protocols, so a path check here would answer an
+        // Anthropic client's 404 in the OpenAI envelope.
+        if ServerController.wireProtocol(for: request) == .anthropic {
             response = try context.responseEncoder.encode(
                 AnthropicErrorEvent(error: .init(type: wireType.rawValue, message: message)),
                 from: request,
@@ -643,7 +903,7 @@ struct ServerAPIError: Error, HTTPResponseError, LocalizedError, Sendable {
             )
         } else {
             response = try context.responseEncoder.encode(
-                OpenAIErrorEnvelope(error: .init(message: message, type: wireType.rawValue, code: code)),
+                OpenAIErrorEnvelope(error: .init(message: message, type: openAIWireType, code: openAICode)),
                 from: request,
                 context: context
             )
@@ -835,12 +1095,124 @@ final class ServerController: ObservableObject {
             ServerController.healthBody()
         }
 
+        // `GET /v1/models` is both protocols' own route: identical path, different
+        // body. OpenAI answers `object: "list"` with an epoch `created`; Anthropic
+        // answers `type: "model"` with an RFC 3339 `created_at`, a human
+        // `display_name` and pagination cursors. The headers decide which, and the
+        // same decision stamps the log row's protocol, so a dashboard shows which
+        // shape a client was handed.
         router.get("v1/models") { request, context in
+            ServerController.stats.beginRequest()
+            defer { ServerController.stats.endRequest() }
+            let logBox = ServerRequestLogRecorder.shared.box(for: context.id)
             try ServerController.authorizeOrThrow(request)
-            if let info = CompletionEngine.shared.loadedModelInfo {
-                return OpenAIModelList(data: [OpenAIModelList.Model(id: info.displayName, created: Int(Date().timeIntervalSince1970))])
+            let wire = ServerController.wireProtocol(for: request)
+            logBox?.modify { $0.proto = wire.rowProtocol }
+            let now = Date()
+            guard let info = CompletionEngine.shared.loadedModelInfo else {
+                // No loaded checkpoint is an empty list, not an error: a client
+                // polling for a model to appear must not read a 404 as "wrong URL".
+                switch wire {
+                case .openai:
+                    return try context.responseEncoder.encode(
+                        OpenAIModelList(data: []), from: request, context: context
+                    )
+                case .anthropic:
+                    return try context.responseEncoder.encode(
+                        AnthropicModelList(data: [], hasMore: false, firstId: nil, lastId: nil),
+                        from: request,
+                        context: context
+                    )
+                }
             }
-            return OpenAIModelList(data: [])
+            logBox?.modify { $0.model = info.servedID }
+            // What this server refuses is a fact about the server, and what the
+            // weights support is a fact about the checkpoint; `Int.max` (the "no
+            // cap" sentinel) is reported as nil so neither is mistaken for the
+            // other after a client's JSON float conversion.
+            let promptCap = ServerController.resolvedMaxPromptTokens
+            switch wire {
+            case .openai:
+                return try context.responseEncoder.encode(
+                    OpenAIModelList(data: [
+                        OpenAIModelList.entry(
+                            for: info,
+                            contextLength: CompletionEngine.shared.promptModelConfig?
+                                .effectiveMaxPositionEmbeddings,
+                            maxPromptTokens: promptCap == Int.max ? nil : promptCap,
+                            created: Int(now.timeIntervalSince1970)
+                        )
+                    ]),
+                    from: request,
+                    context: context
+                )
+            case .anthropic:
+                return try context.responseEncoder.encode(
+                    AnthropicModelList(
+                        data: [AnthropicAdapter.entry(
+                            id: info.servedID,
+                            displayName: AnthropicAdapter.displayName(
+                                servedId: info.servedID, snapshotPath: info.path
+                            ),
+                            createdAt: now
+                        )],
+                        hasMore: false,
+                        firstId: info.servedID,
+                        lastId: info.servedID
+                    ),
+                    from: request,
+                    context: context
+                )
+            }
+        }
+
+        // Both protocols define a retrieve route beside their list. It answers the
+        // same object the list carries, so a client that resolved an id from the list
+        // reads the same facts here. An id this server does not serve is a 404 in the
+        // protocol's own envelope, because answering the loaded model for a name the
+        // client did not ask for would hide a typo or a stale config.
+        router.get("v1/models/:model_id") { request, context in
+            ServerController.stats.beginRequest()
+            defer { ServerController.stats.endRequest() }
+            let logBox = ServerRequestLogRecorder.shared.box(for: context.id)
+            try ServerController.authorizeOrThrow(request)
+            let wire = ServerController.wireProtocol(for: request)
+            logBox?.modify { $0.proto = wire.rowProtocol }
+            let info = try ServerController.requireLoadedModel()
+            logBox?.modify { $0.model = info.servedID }
+            // The path parameter lives on the request's context, not on the request.
+            let requested = context.parameters.get("model_id")
+            guard let requested, ServerController.serves(modelID: requested, info: info) else {
+                throw ServerAPIError.modelNotFound(requested ?? "")
+            }
+            let promptCap = ServerController.resolvedMaxPromptTokens
+            let now = Date()
+            switch wire {
+            case .openai:
+                return try context.responseEncoder.encode(
+                    OpenAIModelList.entry(
+                        for: info,
+                        contextLength: CompletionEngine.shared.promptModelConfig?
+                            .effectiveMaxPositionEmbeddings,
+                        maxPromptTokens: promptCap == Int.max ? nil : promptCap,
+                        created: Int(now.timeIntervalSince1970)
+                    ),
+                    from: request,
+                    context: context
+                )
+            case .anthropic:
+                return try context.responseEncoder.encode(
+                    AnthropicAdapter.entry(
+                        id: info.servedID,
+                        displayName: AnthropicAdapter.displayName(
+                            servedId: info.servedID, snapshotPath: info.path
+                        ),
+                        createdAt: now
+                    ),
+                    from: request,
+                    context: context
+                )
+            }
         }
 
         router.post("v1/chat/completions") { request, context in
@@ -859,13 +1231,30 @@ final class ServerController: ObservableObject {
                 $0.wasStreaming = apiRequest.stream == true
                 $0.temperature = apiRequest.temperature.map { Double($0) }
                 $0.maxTokens = apiRequest.maxTokens
+            }
+            // `store: false` is a promise about this request's own retention, so it
+            // has to be stamped before any body is composed: every writer below
+            // (the summary here, a streaming partial's text, the terminal outcome)
+            // asks the box rather than re-deriving the rule.
+            if apiRequest.store == false {
+                logBox?.withholdBodiesForClientRetention()
+            }
+            // The client's own labels are stamped here and NOT folded into the summary
+            // below, because the summary is only composed when content capture is on (and
+            // never for a `store: false` request): recording them there would throw away
+            // the one field it is safe to keep when everything else is withheld.
+            logBox?.modify {
+                $0.clientMetadata = ServerRequestLog.recordedClientMetadata(apiRequest.metadata)
+            }
+            let withheld = logBox?.withholdsBodiesForClientRetention == true
+            logBox?.modify {
                 // Building the normalized summary walks and serializes the
-                // whole conversation. Skip that work entirely when body
-                // capture is off and stage the withheld marker directly:
-                // the produced summary would be discarded on the next line.
-                $0.requestBody = ServerRequestLogRecorder.captureBodiesEnabled
-                    ? ServerRequestLog.capturedRequestBody(ServerRequestLog.openAISummary(apiRequest))
-                    : ServerRequestLog.contentWithheldMarker
+                // whole conversation. Skip that work entirely when the bodies are
+                // withheld and stage the withheld marker directly: the produced
+                // summary would be discarded on the next line.
+                $0.requestBody = withheld || !ServerRequestLogRecorder.captureBodiesEnabled
+                    ? ServerRequestLog.contentWithheldMarker
+                    : ServerRequestLog.capturedRequestBody(ServerRequestLog.openAISummary(apiRequest))
             }
             if apiRequest.stream == true {
                 // Streaming keeps the 200 + text/event-stream contract even when
@@ -878,6 +1267,67 @@ final class ServerController: ObservableObject {
                 $0.inputTokens = plan.promptTokenCount
             }
             let result = try await ServerController.nonStreamingResponse(plan: plan, queue: queue, logBox: logBox)
+            return try context.responseEncoder.encode(result, from: request, context: context)
+        }
+
+        // The protocol's legacy text endpoint. It is the same engine and the same
+        // planner as the chat route: the prompt is rendered by the one renderer, so
+        // a plain prompt is answered after the checkpoint's own assistant prefix and
+        // an already-templated one is continued byte for byte. What it does not
+        // share is a shape: no messages in, `text_completion` with `choices[].text`
+        // out. `ServerRequestLog.proto(forPath:)` has always classified this path as
+        // OpenAI, so before this route existed the log vocabulary named a path the
+        // router did not serve.
+        router.post("v1/completions") { request, context in
+            ServerController.stats.beginRequest()
+            defer { ServerController.stats.endRequest() }
+            let logBox = ServerRequestLogRecorder.shared.box(for: context.id)
+            logBox?.modify { $0.requestBytes = Int(request.headers[.contentLength] ?? "") }
+            try ServerController.authorizeOrThrow(request)
+            let apiRequest: OpenAICompletionsRequest
+            do {
+                apiRequest = try await request.decode(as: OpenAICompletionsRequest.self, context: context)
+            } catch {
+                throw ServerAPIError.badRequest("Invalid request body: \(error.localizedDescription)")
+            }
+            logBox?.modify {
+                $0.wasStreaming = apiRequest.stream == true
+                $0.temperature = apiRequest.temperature.map { Double($0) }
+                $0.maxTokens = apiRequest.maxTokens
+            }
+            // Same promise, same place: see the chat route above.
+            if apiRequest.store == false {
+                logBox?.withholdBodiesForClientRetention()
+            }
+            // Same labels, same place too: this route speaks the protocol that carries
+            // `metadata`, so it records it rather than narrowing the request.
+            logBox?.modify {
+                $0.clientMetadata = ServerRequestLog.recordedClientMetadata(apiRequest.metadata)
+            }
+            let withheld = logBox?.withholdsBodiesForClientRetention == true
+            logBox?.modify {
+                // Same gating as the sibling routes: never build the summary just
+                // to discard it when the bodies are withheld.
+                $0.requestBody = withheld || !ServerRequestLogRecorder.captureBodiesEnabled
+                    ? ServerRequestLog.contentWithheldMarker
+                    : ServerRequestLog.capturedRequestBody(ServerRequestLog.openAICompletionsSummary(apiRequest))
+            }
+            if apiRequest.stream == true {
+                // Streaming keeps the 200 + text/event-stream contract even when the
+                // engine cannot accept the turn: errors arrive as SSE frames.
+                return ServerController.completionsStreamingResponse(apiRequest: apiRequest, queue: queue, logBox: logBox)
+            }
+            let plan = try ServerController.buildTurnPlan(apiRequest)
+            logBox?.modify {
+                $0.model = plan.modelName
+                $0.inputTokens = plan.promptTokenCount
+            }
+            let result = try await ServerController.completionsNonStreamingResponse(
+                plan: plan,
+                apiRequest: apiRequest,
+                queue: queue,
+                logBox: logBox
+            )
             return try context.responseEncoder.encode(result, from: request, context: context)
         }
 
@@ -897,6 +1347,10 @@ final class ServerController: ObservableObject {
                 $0.wasStreaming = apiRequest.stream == true
                 $0.temperature = apiRequest.temperature.map { Double($0) }
                 $0.maxTokens = apiRequest.maxTokens
+                // This protocol spells its labels `metadata` too, of which only
+                // `user_id` is defined, so it lands in the same row field the OpenAI
+                // routes use rather than being the one protocol whose labels vanish.
+                $0.clientMetadata = ServerRequestLog.recordedClientMetadata(apiRequest.metadata?.labels)
                 // Same gating as the OpenAI route: never build the summary
                 // just to discard it when body capture is off.
                 $0.requestBody = ServerRequestLogRecorder.captureBodiesEnabled
@@ -917,7 +1371,76 @@ final class ServerController: ObservableObject {
             return try context.responseEncoder.encode(result, from: request, context: context)
         }
 
+        // The protocol's pre-flight. Anthropic clients count a conversation
+        // before sending it, so a client that cannot ask this question either
+        // fails its own pre-flight or guesses.
+        //
+        // The number comes from the messages route's own planner, which is the
+        // point: it is the prompt that route would report as `usage.input_tokens`
+        // for the same body — image spans expanded, a recorded generation spliced
+        // back in, the system block rendered with the same session date. A second
+        // estimator here would answer a number the turn it precedes never matches.
+        // It runs no generation and claims no slot, so it answers while another
+        // turn is generating.
+        router.post("v1/messages/count_tokens") { request, context in
+            ServerController.stats.beginRequest()
+            defer { ServerController.stats.endRequest() }
+            let logBox = ServerRequestLogRecorder.shared.box(for: context.id)
+            logBox?.modify { $0.requestBytes = Int(request.headers[.contentLength] ?? "") }
+            try ServerController.authorizeOrThrow(request)
+            let apiRequest: AnthropicMessagesRequest
+            do {
+                apiRequest = try await request.decode(as: AnthropicMessagesRequest.self, context: context)
+            } catch {
+                throw ServerAPIError.badRequest("Invalid request body: \(error.localizedDescription)")
+            }
+            logBox?.modify {
+                $0.requestBody = ServerRequestLogRecorder.captureBodiesEnabled
+                    ? ServerRequestLog.capturedRequestBody(ServerRequestLog.anthropicSummary(apiRequest))
+                    : ServerRequestLog.contentWithheldMarker
+            }
+            // `max_tokens` is required on the messages route and absent from this
+            // one by protocol; the reply budget never moves the prompt, so the
+            // planner is told not to demand it rather than this route inventing a
+            // plan of its own.
+            let plan = try ServerController.buildTurnPlan(apiRequest, maxTokensRequired: false)
+            logBox?.modify {
+                $0.model = plan.modelName
+                $0.inputTokens = plan.promptTokenCount
+            }
+            let count = AnthropicTokenCount(inputTokens: plan.promptTokenCount)
+            return try context.responseEncoder.encode(count, from: request, context: context)
+        }
+
         return router
+    }
+
+    // MARK: Protocol
+
+    /// Which protocol's wire shape a request is answered in.
+    ///
+    /// Where the two protocols have different paths, the path decides. `GET
+    /// /v1/models` is the case they share — same path, different body — so there the
+    /// request's own headers decide, and they are unambiguous evidence: an Anthropic
+    /// client sends `x-api-key` or `anthropic-version`, and no OpenAI client sends
+    /// either. A client that presents neither gets the OpenAI shape, which is what
+    /// this route has always answered, so nothing that works today changes.
+    ///
+    /// The cost of guessing here is a decode failure inside a client's own SDK, which
+    /// is why the answer is keyed on headers the protocol defines rather than on a
+    /// `User-Agent` string or a query parameter the SDK never sends.
+    nonisolated static func wireProtocol(for request: Request) -> ServerWireProtocol {
+        let path = request.uri.path
+        if path.hasPrefix("/v1/messages") { return .anthropic }
+        if path.hasPrefix("/v1/chat") || path.hasPrefix("/v1/completions") { return .openai }
+        for name in ["anthropic-version", "x-api-key"] {
+            guard let field = HTTPField.Name(name),
+                  let value = request.headers[field],
+                  !value.trimmingCharacters(in: .whitespaces).isEmpty
+            else { continue }
+            return .anthropic
+        }
+        return .openai
     }
 
     // MARK: Auth
@@ -940,6 +1463,10 @@ final class ServerController: ObservableObject {
 
     struct TurnPlan: Sendable {
         var request: CompletionTurnRequest
+        /// Prompt positions the model will actually attend over, i.e. AFTER an
+        /// attachment's span is expanded. One image renders as one token and runs
+        /// several hundred, so this is not the tokenized prompt's length whenever a
+        /// picture is attached.
         var promptTokenCount: Int
         var modelName: String
         var hasTools: Bool
@@ -961,6 +1488,20 @@ final class ServerController: ObservableObject {
             throw ServerAPIError.serviceUnavailable("No model is loaded. Load a model in the DynaMoE app first.")
         }
         return info
+    }
+
+    /// Does this server answer to `modelID`?
+    ///
+    /// The served id is what `/v1/models` advertises and therefore the only name a
+    /// client can have resolved from this server. The snapshot directory's own name
+    /// is accepted too, because it WAS the served id before the id became the
+    /// repository name: a config written against the old server keeps working
+    /// instead of turning a rename into a 404.
+    nonisolated static func serves(
+        modelID: String,
+        info: CompletionEngine.LoadedModelInfo
+    ) -> Bool {
+        modelID == info.servedID || modelID == info.displayName
     }
 
     /// Maps synchronous launch failures onto the protocol-correct error:
@@ -996,6 +1537,11 @@ final class ServerController: ObservableObject {
         var minP: Float?
         var repetitionPenalty: Float?
         var presencePenalty: Float?
+        /// OpenAI's `frequency_penalty`, already range-checked by the adapter.
+        var frequencyPenalty: Float?
+        /// OpenAI's `logit_bias`, already converted from the wire's string keys and
+        /// range-checked by the adapter.
+        var logitBias: [Int32: Float]?
         var maxTokens: Int?
         var stopSequences: [String]
         var thinkingRequested: Bool
@@ -1007,6 +1553,11 @@ final class ServerController: ObservableObject {
         var toolDeclaration: String?
         var maskSchemas: [GrammarToolSchema]
         var sessionId: UUID
+        /// Images attached to specific turns, keyed by that turn's index in
+        /// `conversation`. The planner writes one prompt marker per image at the
+        /// head of its turn and hands the decoded pixels to the engine, because
+        /// only it knows whether the loaded checkpoint publishes a tower.
+        var images: [Int: [ServerImagePart]] = [:]
     }
 
     /// Resolves the level a turn renders. Level-capable models always render a
@@ -1022,9 +1573,151 @@ final class ServerController: ObservableObject {
         return requested ?? .high
     }
 
+    /// The one refusal a checkpoint with no tower gets, on every path.
+    nonisolated private static func noVisionTower(_ info: CompletionEngine.LoadedModelInfo) -> ServerAPIError {
+        ServerAPIError.unsupportedContent(
+            "The loaded model (\(info.servedID)) publishes no vision tower, so image content parts "
+                + "cannot be processed. Send text only, or load a vision-capable checkpoint."
+        )
+    }
+
+    /// A turn's attachments, resolved to what the engine consumes.
+    nonisolated struct ResolvedTurnImages {
+        /// The conversation with one prompt marker written at the head of every
+        /// turn that carried a picture.
+        var turns: [ChatPromptFormatter.ConversationTurn]
+        /// The decoded pixels, in prompt order.
+        var images: [TurnImage]
+    }
+
+    /// Writes one marker per attachment into its turn and decodes the pixels.
+    ///
+    /// This is the server's whole image gate. A checkpoint with no tower is refused
+    /// here, by name, rather than downstream where the engine would refuse an
+    /// expanded prompt whose placeholders have no rows; a URL is refused rather
+    /// than fetched; and the marker is the checkpoint's own image token, so the
+    /// prompt the renderer produces is the same one the in-app composer produces.
+    nonisolated private static func resolveTurnImages(
+        _ inputs: TurnPlanInputs,
+        info: CompletionEngine.LoadedModelInfo
+    ) throws -> ResolvedTurnImages {
+        guard inputs.images.values.contains(where: { !$0.isEmpty }) else {
+            return ResolvedTurnImages(turns: inputs.conversation, images: [])
+        }
+        guard info.supportsVision,
+              let marker = ServerImageParts.visionMarker(
+                  modelPath: info.path,
+                  config: CompletionEngine.shared.promptModelConfig
+              ) else {
+            throw noVisionTower(info)
+        }
+        return try attachImageMarkers(turns: inputs.conversation, images: inputs.images, marker: marker)
+    }
+
+    /// The placement half of the gate, split out so it can be tested without a
+    /// loaded model: which turn a marker lands in, how many markers precede a
+    /// turn's text, and what a part that carries no bytes reports.
+    nonisolated static func attachImageMarkers(
+        turns: [ChatPromptFormatter.ConversationTurn],
+        images: [Int: [ServerImagePart]],
+        marker: String
+    ) throws -> ResolvedTurnImages {
+        var turns = turns
+        var decoded: [TurnImage] = []
+        for index in images.keys.sorted() {
+            let parts = images[index] ?? []
+            guard !parts.isEmpty else { continue }
+            guard index >= 0, index < turns.count else {
+                throw ServerAPIError.badRequest("An image was attached to a conversation turn that does not exist.")
+            }
+            var markerTexts: [String] = []
+            for part in parts {
+                guard let data = part.bytes else {
+                    switch part.payload {
+                    case let .remoteURL(url):
+                        throw ServerAPIError.unsupportedContent(
+                            "This server will not fetch an image from a URL (\(url)). Send the picture "
+                                + "inline as base64 (a `data:image/png;base64,...` URL), which is what the "
+                                + "OpenAI and Anthropic SDKs send."
+                        )
+                    case let .malformed(reason):
+                        throw ServerAPIError.unsupportedContent("An attached image could not be read: \(reason).")
+                    case .inline:
+                        throw ServerAPIError.unsupportedContent("An attached image carried no bytes.")
+                    }
+                }
+                let pixels: DeepSeekV41ImagePixels
+                do {
+                    pixels = try DeepSeekV41ImagePixels.decode(data)
+                } catch {
+                    throw ServerAPIError.unsupportedContent(
+                        "An attached image could not be decoded: \(error.localizedDescription)"
+                    )
+                }
+                markerTexts.append(marker + "\n")
+                decoded.append(
+                    TurnImage(
+                        rgb: pixels.rgb,
+                        width: pixels.width,
+                        height: pixels.height,
+                        sha256: ServerImageParts.digest([part])
+                    )
+                )
+            }
+            turns[index].text = try placingMarkers(
+                markerTexts, in: turns[index].text, turn: index
+            )
+        }
+        return ResolvedTurnImages(turns: turns, images: decoded)
+    }
+
+    /// Puts each picture's marker where the client wrote that picture.
+    ///
+    /// The decoders keep a message's content order as a sentinel in the turn text
+    /// (`ServerImageParts.imagePlaceholder`), so `text → image → text → image`
+    /// stays that and does not become "both pictures, then both paragraphs". The
+    /// alternative is a silent rewrite: the model would answer a question about a
+    /// picture it was shown in a different relation to the words.
+    ///
+    /// A turn with pictures but NO sentinel comes from a caller that assembled the
+    /// split itself (the adapters never do), so the markers go in front — the
+    /// order the in-app composer writes and the one the checkpoint's own prompts
+    /// use. A turn whose sentinel count and picture count disagree is refused
+    /// rather than guessed at, because either choice puts a row set on the wrong
+    /// span.
+    nonisolated static func placingMarkers(
+        _ markerTexts: [String],
+        in text: String,
+        turn: Int
+    ) throws -> String {
+        guard !markerTexts.isEmpty else { return text }
+        let chunks = text.components(separatedBy: ServerImageParts.imagePlaceholder)
+        let slots = chunks.count - 1
+        guard slots > 0 else { return markerTexts.joined() + text }
+        guard slots == markerTexts.count else {
+            throw ServerAPIError.unsupportedContent(
+                "Message \(turn + 1) positions \(slots) image placeholder(s) but carries "
+                    + "\(markerTexts.count) image(s), so the pictures cannot be bound to the "
+                    + "words around them."
+            )
+        }
+        var rebuilt = ""
+        for (offset, chunk) in chunks.enumerated() {
+            if offset > 0 { rebuilt += markerTexts[offset - 1] }
+            rebuilt += chunk
+        }
+        return rebuilt
+    }
+
     nonisolated private static func buildTurnPlan(_ inputs: TurnPlanInputs) throws -> TurnPlan {
         let engine = CompletionEngine.shared
         let info = try requireLoadedModel()
+
+        // Pictures are resolved first: everything below (the history digest, the
+        // recorded-turn splice, the tokenized prompt and the cache the turn runs
+        // on) has to see the expanded turn rather than the picture-less one.
+        let vision = try resolveTurnImages(inputs, info: info)
+        let conversationTurns = vision.turns
 
         // The temporal context this prompt is rendered with. Threaded through the
         // turn request so the completed turn pins the date its prompt actually
@@ -1037,7 +1730,10 @@ final class ServerController: ObservableObject {
             userPrompt: inputs.systemPrompt,
             config: engine.promptModelConfig,
             summary: engine.loadedSummary,
-            modelName: info.displayName,
+            // The family sniff reads this name, so it is fed the checkpoint's name
+            // and not its snapshot's commit hash: the hash matches no family and
+            // left the whole decision to the config and the path.
+            modelName: info.servedID,
             modelPath: info.path,
             // The chat UI threads a per-conversation date for prefix reuse; the
             // server needs the same discipline. A fresh Date() here renders a
@@ -1058,36 +1754,43 @@ final class ServerController: ObservableObject {
             thinkingEnabled: thinkingEnabled,
             levelCapable: info.supportsThinkingLevels
         )
-        // The digest must cover the system text the model actually sees,
-        // including Spark's effort line: changing the level between turns has
-        // to invalidate a recorded raw turn, just as changing the system does.
-        let memorySystem: String
-        if engine.promptModelConfig?.isSparkModel == true {
-            memorySystem = ChatPromptFormatter.sparkSystemBody(
-                cleanSystem: cleanSystem,
-                thinkingEnabled: thinkingEnabled,
-                thinkingEffort: thinkingEffort
-            )
-        } else {
-            memorySystem = cleanSystem
-        }
+        // The digest must cover the system text the model actually sees: changing
+        // the level between turns has to invalidate a recorded raw turn, just as
+        // changing the system does. Both graded-effort families render the level
+        // into the System block, so `renderedSystemBody` is the authority here.
+        let memorySystem = ChatPromptFormatter.renderedSystemBody(
+            cleanSystem: cleanSystem,
+            thinkingEnabled: thinkingEnabled,
+            thinkingEffort: thinkingEffort,
+            modelConfig: engine.promptModelConfig,
+            promptDialect: engine.promptDialect
+        )
         // What a follow-up request has to reproduce before its own raw turn can
         // be trusted: the leading history as the client sent it, plus the system
-        // prompt it was rendered against. Computed before substitution so both
-        // sides of the comparison see the same client-authored turns.
+        // prompt it was rendered against, plus every turn's pictures. Computed
+        // before substitution so both sides of the comparison see the same
+        // client-authored turns.
+        //
+        // The pictures belong in it even though the marker renders as text: a
+        // picture replaced on a later turn keeps the same text and, at the same
+        // dimensions, the same image token ids, so a digest over text alone would
+        // splice the OLD picture's generation into the new request.
+        let imageDigests = ServerImageParts.turnDigests(inputs.images)
         let historyDigest = ServerTurnMemory.historyDigest(
             systemPrompt: memorySystem,
-            turns: inputs.conversation[...]
+            turns: conversationTurns[...],
+            imageDigests: imageDigests
         )
         // Splice in the raw generation recorded for this session (reasoning
         // included) so the rendered prompt reproduces the pinned
         // prompt+generation; a client's echo of the visible answer alone cannot.
         let conversation = Self.substitutingRecordedTurn(
-            inputs.conversation,
+            conversationTurns,
             sessionId: inputs.sessionId,
-            modelName: info.displayName,
+            modelName: info.servedID,
             modelConfig: engine.promptModelConfig,
-            systemPrompt: memorySystem
+            systemPrompt: memorySystem,
+            imageDigests: imageDigests
         )
         // A single plain user turn renders exactly as before (native template
         // with zero wrapper noise). A real history renders with the family's
@@ -1131,9 +1834,36 @@ final class ServerController: ObservableObject {
         guard !promptTokenIds.isEmpty else {
             throw ServerAPIError.badRequest("Prompt tokenization produced 0 tokens.")
         }
+        // An image prompt renders one token per attachment and then runs the whole
+        // span, so the number the budget is checked against and the number the
+        // client is told must be the EXPANDED size. `price` reads no weight: the
+        // resize plan alone says how many positions the spans occupy. It also
+        // re-checks the placeholder/image agreement, so a prompt built with a stray
+        // marker is a 400 here instead of an engine error later.
+        var promptTokenCount = promptTokenIds.count
+        if !vision.images.isEmpty {
+            guard let spec = ModelConfig.visionSpec(modelPath: info.path) else {
+                throw noVisionTower(info)
+            }
+            do {
+                promptTokenCount = try DeepSeekV41TurnImages.price(
+                    tokenIds: promptTokenIds,
+                    images: vision.images.map {
+                        DeepSeekV41ImageInput(
+                            rgb: $0.rgb, width: $0.width, height: $0.height, sha256: $0.sha256
+                        )
+                    },
+                    spec: spec
+                ).promptTokens
+            } catch {
+                throw ServerAPIError.badRequest(
+                    "The attached image could not be placed in the prompt: \(error.localizedDescription)"
+                )
+            }
+        }
         let promptTokenCap = Self.resolvedMaxPromptTokens
-        if promptTokenIds.count > promptTokenCap {
-            throw ServerAPIError.badRequest("Prompt is too long: \(promptTokenIds.count) tokens exceeds the server's \(promptTokenCap)-token limit (dynamoe_server_max_prompt_tokens).")
+        if promptTokenCount > promptTokenCap {
+            throw ServerAPIError.badRequest("Prompt is too long: \(promptTokenCount) tokens exceeds the server's \(promptTokenCap)-token limit (dynamoe_server_max_prompt_tokens).")
         }
 
         let defaults = UserDefaults.standard
@@ -1148,6 +1878,8 @@ final class ServerController: ObservableObject {
             topK: inputs.topK ?? 50,
             repetitionPenalty: inputs.repetitionPenalty ?? 1.1,
             presencePenalty: inputs.presencePenalty ?? 0.0,
+            frequencyPenalty: inputs.frequencyPenalty ?? 0.0,
+            logitBias: inputs.logitBias ?? [:],
             maxTokens: maxTokens
         )
 
@@ -1176,14 +1908,15 @@ final class ServerController: ObservableObject {
             forceSynthesis: false,
             isSplicedContinuation: false,
             stopSequences: stopSequences,
-            asOfDate: renderedAsOfDate
+            asOfDate: renderedAsOfDate,
+            images: vision.images
         )
         return TurnPlan(
             request: turnRequest,
-            promptTokenCount: promptTokenIds.count,
-            modelName: info.displayName,
+            promptTokenCount: promptTokenCount,
+            modelName: info.servedID,
             hasTools: inputs.hasTools,
-            historyTurnCount: inputs.conversation.count,
+            historyTurnCount: conversationTurns.count,
             historyDigest: historyDigest,
             maskSchemas: inputs.maskSchemas
         )
@@ -1209,20 +1942,28 @@ final class ServerController: ObservableObject {
     }
 
     nonisolated private static func buildTurnPlan(_ apiRequest: OpenAIChatRequest) throws -> TurnPlan {
-        // Refuse non-text parts before touching engine state. The loaded weights
-        // model has no vision tower, and silently dropping a picture, file, or
-        // audio part would let the model answer confidently about content it
-        // never received.
+        // Refuse content parts the engine cannot process at all, before touching
+        // engine state. Images are not on this list: whether they can be read is a
+        // property of the loaded checkpoint, which the shared planner checks.
         if apiRequest.hasUnsupportedContent {
             throw ServerAPIError.unsupportedContent(
-                "This server is serving a local weights model, which understands text only, so image, file, and audio content parts cannot be processed. Send text only, or attach images to a vision-capable cloud model in the DynaMoE app."
+                "This server is serving a local weights model, which has no reader for file or audio content parts. Send text and images only."
             )
         }
         // Reject a forced tool choice before touching engine state, so the
         // client gets a clear error instead of a silently unconstrained turn.
         let toolsEnabled = try OpenAIAdapter.toolUseEnabled(apiRequest.toolChoice)
+        // The deprecated spelling of the same vocabulary is refused here for the same
+        // reason and in the same place: left to the decoder's unknown-key tolerance it
+        // was dropped, and the turn ran as though the client had asked for no tools at
+        // all, with a 200.
+        try OpenAIAdapter.refuseDeprecatedFunctionCalling(apiRequest)
+        // Same posture for the fields that ask for an answer this server cannot
+        // produce: structured output, several choices, or token log-probabilities.
+        // Ignoring them answered a different request than the one sent, with a 200.
+        try OpenAIAdapter.refuseUnsupportedResponseShape(apiRequest)
         let info = try requireLoadedModel()
-        let (systemPrompt, turns) = try OpenAIAdapter.splitMessages(apiRequest.messages)
+        let split = try OpenAIAdapter.splitMessages(apiRequest.messages)
         let hasTools = !(apiRequest.tools ?? []).isEmpty && toolsEnabled
         let thinkingRequested = apiRequest.enableThinking ?? true
         let thinkingEffort = try OpenAIAdapter.thinkingEffort(
@@ -1231,15 +1972,22 @@ final class ServerController: ObservableObject {
             thinkingRequested: thinkingRequested
         )
         return try buildTurnPlan(TurnPlanInputs(
-            systemPrompt: systemPrompt,
-            conversation: turns,
+            systemPrompt: split.systemPrompt,
+            conversation: split.turns,
             temperature: apiRequest.temperature,
             topP: apiRequest.topP,
             topK: apiRequest.topK,
             minP: apiRequest.minP,
             repetitionPenalty: apiRequest.repetitionPenalty,
             presencePenalty: apiRequest.presencePenalty,
-            maxTokens: apiRequest.maxTokens,
+            frequencyPenalty: try OpenAIAdapter.frequencyPenalty(apiRequest.frequencyPenalty),
+            logitBias: try OpenAIAdapter.logitBias(from: apiRequest.logitBias),
+            // Either spelling of the reply budget, resolved here exactly as the
+            // refusal above validated it.
+            maxTokens: try OpenAIAdapter.replyBudget(
+                maxTokens: apiRequest.maxTokens,
+                maxCompletionTokens: apiRequest.maxCompletionTokens
+            ),
             stopSequences: apiRequest.stop ?? [],
             thinkingRequested: thinkingRequested,
             thinkingEffort: thinkingEffort,
@@ -1248,27 +1996,81 @@ final class ServerController: ObservableObject {
             maskSchemas: hasTools ? (apiRequest.tools ?? []).filter { ($0.type ?? "function") == "function" }.map {
                 GrammarToolSchema(name: $0.function.name, schemaJSON: $0.function.parametersData)
             } : [],
-            sessionId: OpenAIAdapter.sessionKey(for: apiRequest.messages, model: info.displayName)
+            sessionId: OpenAIAdapter.sessionKey(for: apiRequest.messages, model: info.servedID),
+            images: split.images
         ))
     }
 
-    nonisolated private static func buildTurnPlan(_ apiRequest: AnthropicMessagesRequest) throws -> TurnPlan {
-        guard let maxTokens = apiRequest.maxTokens else {
+    /// The legacy text-completions plan. One prompt, one user turn, no tools: this
+    /// protocol has no message list and no vocabulary for a call, so the planner has
+    /// nothing to resolve beyond the refusal of the fields it cannot honour.
+    ///
+    /// The refusals run before `requireLoadedModel()` for the reason the sibling
+    /// planners' do: a request this server cannot answer at all should say so with a
+    /// 400 rather than a 503 that blames the missing model.
+    nonisolated private static func buildTurnPlan(_ apiRequest: OpenAICompletionsRequest) throws -> TurnPlan {
+        try OpenAIAdapter.refuseUnsupportedCompletionsShape(apiRequest)
+        let info = try requireLoadedModel()
+        let split = OpenAIAdapter.completionsSplit(apiRequest)
+        let thinkingRequested = OpenAIAdapter.completionsThinkingRequested(apiRequest)
+        let thinkingEffort = try OpenAIAdapter.thinkingEffort(
+            from: apiRequest.reasoningEffort,
+            levelCapable: info.supportsThinkingLevels,
+            thinkingRequested: thinkingRequested
+        )
+        return try buildTurnPlan(TurnPlanInputs(
+            systemPrompt: split.systemPrompt,
+            conversation: split.turns,
+            temperature: apiRequest.temperature,
+            topP: apiRequest.topP,
+            topK: apiRequest.topK,
+            minP: apiRequest.minP,
+            repetitionPenalty: apiRequest.repetitionPenalty,
+            presencePenalty: apiRequest.presencePenalty,
+            frequencyPenalty: try OpenAIAdapter.frequencyPenalty(apiRequest.frequencyPenalty),
+            logitBias: try OpenAIAdapter.logitBias(from: apiRequest.logitBias),
+            maxTokens: apiRequest.maxTokens,
+            stopSequences: apiRequest.stop ?? [],
+            thinkingRequested: thinkingRequested,
+            thinkingEffort: thinkingEffort,
+            hasTools: false,
+            toolDeclaration: nil,
+            maskSchemas: [],
+            sessionId: OpenAIAdapter.sessionKey(forPrompt: apiRequest.promptText ?? "", model: info.servedID),
+            images: split.images
+        ))
+    }
+
+    /// - Parameter maxTokensRequired: the messages route requires `max_tokens`
+    ///   and the `count_tokens` body has no such field by protocol. The reply
+    ///   budget never moves the prompt, so the count path takes the smallest legal
+    ///   one instead of refusing or building a plan of its own.
+    nonisolated private static func buildTurnPlan(
+        _ apiRequest: AnthropicMessagesRequest,
+        maxTokensRequired: Bool = true
+    ) throws -> TurnPlan {
+        let declaredMaxTokens = apiRequest.maxTokens ?? (maxTokensRequired ? nil : 1)
+        guard let maxTokens = declaredMaxTokens else {
             throw ServerAPIError.badRequest("max_tokens is a required field")
         }
-        // Same explicit refusal as the OpenAI surface: an image, document, or
-        // audio block would be discarded by the text-only prompt builder,
-        // producing an answer about nothing.
+        // Same explicit refusal as the OpenAI surface for the block kinds the
+        // engine has no reader for. Images are resolved by the shared planner,
+        // which knows whether the loaded checkpoint publishes a tower.
         if apiRequest.hasUnsupportedContent {
             throw ServerAPIError.unsupportedContent(
-                "This server is serving a local weights model, which understands text only, so image, document, and audio content blocks cannot be processed. Send text only, or attach images to a vision-capable cloud model in the DynaMoE app."
+                "This server is serving a local weights model, which has no reader for document or audio content blocks. Send text and images only."
             )
         }
         // Reject a forced tool choice before touching engine state, so the
         // client gets a clear error instead of a silently unconstrained turn.
         let toolsEnabled = try AnthropicAdapter.toolUseEnabled(apiRequest.toolChoice)
+        // Same posture, same place, for the top-level fields that ask for something
+        // this server cannot produce or install: schema-constrained decoding, and a
+        // per-turn set of remote MCP servers. Both were dropped by the decoder, which
+        // answered a different request than the one sent, with a 200.
+        try AnthropicAdapter.refuseUnsupportedRequestFields(apiRequest)
         let info = try requireLoadedModel()
-        let turns = try AnthropicAdapter.splitMessages(apiRequest.messages)
+        let split = try AnthropicAdapter.splitMessages(apiRequest.messages)
         let hasTools = !(apiRequest.tools ?? []).isEmpty && toolsEnabled
         let thinkingRequested = apiRequest.thinking?.type == "enabled"
         let thinkingEffort = try AnthropicAdapter.thinkingEffort(
@@ -1277,7 +2079,7 @@ final class ServerController: ObservableObject {
         )
         return try buildTurnPlan(TurnPlanInputs(
             systemPrompt: apiRequest.systemText ?? "",
-            conversation: turns,
+            conversation: split.turns,
             temperature: apiRequest.temperature,
             topP: apiRequest.topP,
             topK: apiRequest.topK,
@@ -1293,7 +2095,8 @@ final class ServerController: ObservableObject {
             maskSchemas: hasTools ? (apiRequest.tools ?? []).map {
                 GrammarToolSchema(name: $0.name, schemaJSON: $0.inputSchemaData)
             } : [],
-            sessionId: AnthropicAdapter.sessionKey(for: apiRequest.messages, model: info.displayName)
+            sessionId: AnthropicAdapter.sessionKey(for: apiRequest.messages, model: info.servedID),
+            images: split.images
         ))
     }
 
@@ -1336,7 +2139,8 @@ final class ServerController: ObservableObject {
         sessionId: UUID,
         modelName: String,
         modelConfig: ModelConfig?,
-        systemPrompt: String
+        systemPrompt: String,
+        imageDigests: [Int: String] = [:]
     ) -> [ChatPromptFormatter.ConversationTurn] {
         let closer = ChatPromptFormatter.assistantTurnCloseTag(
             modelConfig: modelConfig,
@@ -1349,7 +2153,8 @@ final class ServerController: ObservableObject {
                   echoedByClient: conversation[index].text,
                   turnCloser: closer,
                   conversation: conversation,
-                  systemPrompt: systemPrompt
+                  systemPrompt: systemPrompt,
+                  imageDigests: imageDigests
               ) else { return conversation }
         var turns = conversation
         turns[index].text = recorded
@@ -1360,11 +2165,11 @@ final class ServerController: ObservableObject {
     /// both adapters' non-streaming paths. The slot-open signal stamps the
     /// box's queue wait so it can be split from generation time.
     nonisolated private static func runTurn(plan: TurnPlan, queue: TurnExecutionQueue, logBox: ServerRequestLogBox?) async throws -> TurnResult {
-        try await queue.perform({ () async throws -> TurnResult in
+        try await queue.perform({ claim in
             try await withTurnToolMask(plan.maskSchemas) {
                 let launch: CompletionLaunch
                 do {
-                    launch = try CompletionEngine.shared.launchTurn(plan.request)
+                    launch = try CompletionEngine.shared.launchTurn(plan.request, claim: claim)
                 } catch {
                     throw wireLaunchError(error)
                 }
@@ -1423,18 +2228,69 @@ final class ServerController: ObservableObject {
         )
     }
 
+    // MARK: Legacy text completions
+
+    nonisolated private static func completionsNonStreamingResponse(
+        plan: TurnPlan,
+        apiRequest: OpenAICompletionsRequest,
+        queue: TurnExecutionQueue,
+        logBox: ServerRequestLogBox?
+    ) async throws -> OpenAICompletionsResponse {
+        let result = try await runTurn(plan: plan, queue: queue, logBox: logBox)
+        let text = Self.completionsText(
+            thinking: result.thinkingText,
+            response: result.responseText,
+            echoPrompt: apiRequest.echo == true ? (apiRequest.promptText ?? "") : nil
+        )
+        // This protocol cannot call a tool, so no tool call can be the finish
+        // reason even if the family's dialect would have frozen on one.
+        let finishReason = OpenAIAdapter.finishReasonString(result.finishReason, hasToolCalls: false)
+        Self.recordTurnOutcome(logBox: logBox, result: result, finishReason: finishReason)
+        return OpenAICompletionsResponse(
+            id: "cmpl-\(UUID().uuidString.prefix(24))",
+            created: Int(Date().timeIntervalSince1970),
+            model: plan.modelName,
+            choices: [.init(text: text, index: 0, finishReason: finishReason)],
+            usage: .init(promptTokens: plan.promptTokenCount, completionTokens: result.tokensGenerated)
+        )
+    }
+
+    /// The completion text this protocol returns, and why it is folded.
+    ///
+    /// `text_completion` has no `reasoning_content` field and no content-block
+    /// list, so the reasoning channel is folded into `text` with the canonical
+    /// close tag rather than dropped: a client displaying `choices[0].text` would
+    /// otherwise show an answer whose reasoning silently vanished, and a streaming
+    /// client would see dead air for the whole reasoning phase. The fold is the one
+    /// the chat route's inline-reasoning mode emits, so the two agree there.
+    ///
+    /// `echo` is honoured rather than refused: upstream prepends the prompt to the
+    /// completion so a client can display or score the pair, and the prompt here is
+    /// the client's own text (never the rendered template, which the client never
+    /// sent and could not re-derive).
+    nonisolated static func completionsText(thinking: String, response: String, echoPrompt: String?) -> String {
+        let body = inlineReasoningText(thinking: thinking, response: response)
+        guard let echoPrompt, !echoPrompt.isEmpty else { return body }
+        return echoPrompt + body
+    }
+
     /// Stamp the terminal inference facts (tokens, finish reason, tool calls,
     /// captured response body) onto a completed non-streaming turn's log box.
     /// `finishReason` is optional because the Anthropic adapter maps some
     /// stop reasons to a JSON-absent nil.
     nonisolated private static func recordTurnOutcome(logBox: ServerRequestLogBox?, result: TurnResult, finishReason: String?) {
+        // A request that said `store: false` keeps every content field out of the
+        // row, tool arguments included; the box is the single place that knows.
+        let withheld = logBox?.withholdsBodiesForClientRetention == true
         let toolRecords = ServerRequestLog.capturedToolCalls(
             result.parsedToolCalls,
+            withheldByClient: withheld,
             serializeArguments: Self.toolArgumentsJSON
         )
         let responseBody = ServerRequestLog.capturedResponseBody(
             thinking: result.thinkingText,
-            response: result.responseText
+            response: result.responseText,
+            withheldByClient: withheld
         )
         logBox?.modify { row in
             row.outputTokens = result.tokensGenerated
@@ -1453,7 +2309,8 @@ final class ServerController: ObservableObject {
     nonisolated static func recordStreamedPartialOutcome(logBox: ServerRequestLogBox?, frame: CompletionFrame, tokenCount: Int) {
         let responseBody = ServerRequestLog.capturedResponseBody(
             thinking: frame.thinkingText,
-            response: frame.responseText
+            response: frame.responseText,
+            withheldByClient: logBox?.withholdsBodiesForClientRetention == true
         )
         logBox?.modify { row in
             row.outputTokens = tokenCount
@@ -1535,7 +2392,13 @@ final class ServerController: ObservableObject {
         let id = "chatcmpl-\(UUID().uuidString.prefix(24))"
         let created = Int(Date().timeIntervalSince1970)
         let stopSequences = (apiRequest.stop ?? []).filter { !$0.isEmpty }
-        let model = apiRequest.model ?? CompletionEngine.shared.loadedModelInfo?.displayName ?? "dynamoe"
+        let model = apiRequest.model ?? CompletionEngine.shared.loadedModelInfo?.servedID ?? "dynamoe"
+        // The protocol asks the client to opt into the trailing usage chunk, and it is
+        // the one chunk whose `choices` is empty. Sending it regardless is not a
+        // harmless extra: a client that indexes `choices[0]` on every chunk — a common
+        // shape in OpenAI SDK wrappers — throws on it, and only ever against a server
+        // that volunteers the chunk. So the request decides, as it does upstream.
+        let includeUsage = apiRequest.streamOptions?.includeUsage ?? false
 
         // This request's row is finalized when the stream drains (the HTTP
         // response is already a bare 200 by then), so claim the box: the wire
@@ -1611,7 +2474,7 @@ final class ServerController: ObservableObject {
                 let close = TurnTextSplitter.canonicalReasoningCloseTag
                 try await sse(chunkBuffer(.init(role: nil, content: close + "\n\n", reasoningContent: nil, toolCalls: nil), finishReason: nil))
             }
-            let (relay, task) = await queue.streamTurn({ emit in
+            let (relay, task) = await queue.streamTurn({ claim, emit in
                 do {
                     let plan = try ServerController.buildTurnPlan(apiRequest)
                     promptTokensBox.set(plan.promptTokenCount)
@@ -1624,7 +2487,7 @@ final class ServerController: ObservableObject {
                         row.model = plan.modelName
                     }
                     try await ServerController.withTurnToolMask(plan.maskSchemas) {
-                        let launch = try CompletionEngine.shared.launchTurn(plan.request)
+                        let launch = try CompletionEngine.shared.launchTurn(plan.request, claim: claim)
                         if Task.isCancelled {
                             launch.handle.cancel()
                             return
@@ -1791,9 +2654,10 @@ final class ServerController: ObservableObject {
                     }
                     let finishReason = OpenAIAdapter.finishReasonString(result.finishReason, hasToolCalls: !(toolCalls ?? []).isEmpty)
                     try await sse(chunkBuffer(.init(role: nil, content: nil, reasoningContent: nil, toolCalls: nil), finishReason: finishReason))
-                    // Final usage chunk (OpenAI includes this with stream_options.include_usage).
+                    // Final usage chunk, when the client asked for it with
+                    // `stream_options.include_usage`.
                     let usageTail = OpenAIUsage(promptTokens: promptTokensBox.get(), completionTokens: result.tokensGenerated)
-                    if let data = try? JSONSerialization.data(withJSONObject: [
+                    if includeUsage, let data = try? JSONSerialization.data(withJSONObject: [
                         "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                         "choices": [],
                         "usage": [
@@ -1812,6 +2676,281 @@ final class ServerController: ObservableObject {
             }
             if !finishedCleanly {
                 // Client disconnect or queue cancellation: abort the engine turn.
+                task.cancel()
+                throw CancellationError()
+            }
+            try await writer.finish(nil)
+        }
+
+        var headers = HTTPFields()
+        headers[.contentType] = "text/event-stream"
+        headers[.cacheControl] = "no-store"
+        headers[.connection] = "keep-alive"
+        return Response(status: .ok, headers: headers, body: body)
+    }
+
+    /// The legacy route's stream: `text_completion` frames carrying `choices[].text`
+    /// deltas, terminated by `[DONE]`.
+    ///
+    /// It keeps the chat writer's three disciplines because they are properties of
+    /// this server rather than of that protocol: append-only deltas (a repaired
+    /// snapshot is never re-sent), the suffix that could still grow into a stop
+    /// sequence is withheld until it is safe, and the queue's heartbeats keep a
+    /// waiting client from timing out. Reasoning has no field here, so it is folded
+    /// into `text` exactly as the non-streaming body folds it, which also means the
+    /// stream is never silent through the reasoning phase.
+    nonisolated private static func completionsStreamingResponse(
+        apiRequest: OpenAICompletionsRequest,
+        queue: TurnExecutionQueue,
+        logBox: ServerRequestLogBox?
+    ) -> Response {
+        let encoder = JSONEncoder()
+        let id = "cmpl-\(UUID().uuidString.prefix(24))"
+        let created = Int(Date().timeIntervalSince1970)
+        let stopSequences = (apiRequest.stop ?? []).filter { !$0.isEmpty }
+        let model = apiRequest.model ?? CompletionEngine.shared.loadedModelInfo?.servedID ?? "dynamoe"
+        // Same opt-in rule as the chat route, for the same reason: the usage chunk is
+        // the one chunk whose `choices` is empty, and a client that indexes
+        // `choices[0]` on every chunk throws on it.
+        let includeUsage = apiRequest.streamOptions?.includeUsage ?? false
+        let echoPrompt = apiRequest.echo == true ? (apiRequest.promptText ?? "") : nil
+
+        if let logBox {
+            let claimed = logBox.claim()
+            assert(claimed, "the streaming writer must win its request-log box claim exactly once")
+            logBox.modify { row in
+                row.wasStreaming = true
+            }
+        }
+
+        func chunkBuffer(_ text: String, finishReason: String?) throws -> ByteBuffer {
+            let chunk = OpenAICompletionsChunk(
+                id: id,
+                created: created,
+                model: model,
+                choices: [.init(text: text, index: 0, finishReason: finishReason)]
+            )
+            return ByteBuffer(data: try encoder.encode(chunk))
+        }
+
+        let body = ResponseBody { writer in
+            func sse(_ buffer: ByteBuffer) async throws {
+                var frame = ByteBuffer(string: "data: ")
+                frame.writeImmutableBuffer(buffer)
+                frame.writeString("\n\n")
+                try await writer.write(frame)
+            }
+            func sseRaw(_ text: String) async throws {
+                var frame = ByteBuffer(string: "data: ")
+                frame.writeString(text)
+                frame.writeString("\n\n")
+                try await writer.write(frame)
+            }
+            func ping(_ comment: String?) async throws {
+                try await writer.write(ByteBuffer(string: ":\(comment ?? "ping")\n\n"))
+            }
+            func sseChunk(_ text: String, finishReason: String? = nil) async throws {
+                try await sse(try chunkBuffer(text, finishReason: finishReason))
+            }
+
+            var sentThinking = ""
+            var sentContent = ""
+            var reasoningClosed = false
+            let promptTokensBox = PromptCountBox()
+
+            /// Closes the folded reasoning before any answer text, so the tag never
+            /// straddles the response and the streamed text matches the shape the
+            /// non-streaming body produces.
+            func closeReasoning() async throws {
+                guard !reasoningClosed, !sentThinking.isEmpty else { return }
+                reasoningClosed = true
+                try await sseChunk(TurnTextSplitter.canonicalReasoningCloseTag + "\n\n")
+            }
+
+            if let echoPrompt, !echoPrompt.isEmpty {
+                try await sseChunk(echoPrompt)
+            }
+
+            let (relay, task) = await queue.streamTurn({ claim, emit in
+                do {
+                    let plan = try ServerController.buildTurnPlan(apiRequest)
+                    promptTokensBox.set(plan.promptTokenCount)
+                    logBox?.modify { row in
+                        // The row names the model that actually ran, not the
+                        // client's label: the plan resolves the loaded model behind
+                        // an alias (or a model switch while queued) once the slot
+                        // drains. A turn that never plans carries no model.
+                        row.model = plan.modelName
+                    }
+                    try await ServerController.withTurnToolMask(plan.maskSchemas) {
+                        let launch = try CompletionEngine.shared.launchTurn(plan.request, claim: claim)
+                        if Task.isCancelled {
+                            launch.handle.cancel()
+                            return
+                        }
+                        await withTaskCancellationHandler {
+                            for await event in launch.stream {
+                                if case .finished(let result) = event {
+                                    ServerController.recordCompletedTurn(plan: plan, result: result)
+                                }
+                                emit(.engine(event))
+                            }
+                        } onCancel: {
+                            launch.handle.cancel()
+                        }
+                    }
+                } catch {
+                    emit(.launchFailed(wireLaunchError(error)))
+                }
+            }, queueWaitTimeout: resolvedQueueWaitTimeout, onSlotOpened: { logBox?.noteSlotOpened() })
+            defer { task.cancel() }
+
+            var logTermination: ServerRequestLog.StreamTermination = .clientDisconnected
+            var logErrorMessage: String?
+            var logFirstTokenMs: Double?
+            var logFinish: TurnResult?
+            var logFailure: TurnFailure?
+            var logPartialFrame: CompletionFrame?
+            defer {
+                if let logBox {
+                    logBox.modify { row in
+                        row.httpStatus = 200
+                        row.durationMs = logBox.elapsedMs()
+                        row.firstTokenMs = logFirstTokenMs
+                        row.streamTermination = logTermination
+                        if promptTokensBox.get() > 0 { row.inputTokens = promptTokensBox.get() }
+                        if let message = logErrorMessage { row.errorMessage = message }
+                    }
+                    if let result = logFinish {
+                        recordTurnOutcome(
+                            logBox: logBox,
+                            result: result,
+                            finishReason: OpenAIAdapter.finishReasonString(result.finishReason, hasToolCalls: false)
+                        )
+                    } else if let frame = logPartialFrame {
+                        recordStreamedPartialOutcome(
+                            logBox: logBox,
+                            frame: frame,
+                            tokenCount: logFailure?.tokensGenerated ?? frame.tokensGenerated
+                        )
+                    } else if let failure = logFailure {
+                        recordFailedTurnTokenCount(logBox: logBox, failure: failure)
+                    }
+                    ServerRequestLogRecorder.shared.record(logBox.snapshot())
+                }
+            }
+            var finishedCleanly = false
+            for await event in relay {
+                switch event {
+                case .ping(let comment):
+                    try await ping(comment)
+                case .launchFailed(let apiError):
+                    logTermination = .errorFrame
+                    logErrorMessage = apiError.recordableMessage
+                    let envelope = OpenAIErrorEnvelope(error: .init(
+                        message: apiError.message,
+                        type: apiError.wireType.rawValue,
+                        code: apiError.code
+                    ))
+                    if let data = try? encoder.encode(envelope) {
+                        try await sse(ByteBuffer(data: data))
+                    }
+                    try await sseRaw("[DONE]")
+                    finishedCleanly = true
+                case .engine(.started):
+                    // This protocol has no opening role chunk: the first frame that
+                    // carries text is the first frame.
+                    continue
+                case .engine(.priming):
+                    try await ping("priming weights")
+                case .engine(.prefillProgress(let status, _, _)):
+                    if let status = status {
+                        try await ping("prefill: \(status)")
+                    }
+                case .engine(.frame(let frame)):
+                    if logFirstTokenMs == nil { logFirstTokenMs = logBox?.elapsedMs() }
+                    logPartialFrame = frame
+                    let thinkingDelta = Self.safeStreamDelta(
+                        accumulated: frame.thinkingText,
+                        sent: sentThinking,
+                        stopSequences: stopSequences
+                    )
+                    if !thinkingDelta.isEmpty {
+                        sentThinking += thinkingDelta
+                        try await sseChunk(thinkingDelta)
+                    }
+                    let contentDelta = Self.safeStreamDelta(
+                        accumulated: frame.responseText,
+                        sent: sentContent,
+                        stopSequences: stopSequences
+                    )
+                    if !contentDelta.isEmpty {
+                        try await closeReasoning()
+                        sentContent += contentDelta
+                        try await sseChunk(contentDelta)
+                    }
+                case .engine(.failedTurn(let failure)):
+                    logTermination = .errorFrame
+                    logFailure = failure
+                    logErrorMessage = failure.cancelled ? "Generation cancelled" : failure.message
+                    let envelope = OpenAIErrorEnvelope(error: .init(
+                        message: failure.cancelled ? "Generation cancelled" : failure.message,
+                        type: failure.cancelled ? "cancelled" : "server_error",
+                        code: nil
+                    ))
+                    if let data = try? encoder.encode(envelope) {
+                        try await sse(ByteBuffer(data: data))
+                    }
+                    try await sseRaw("[DONE]")
+                    finishedCleanly = true
+                case .engine(.finished(let result)):
+                    // Capture the final facts before any fallible terminal write, so
+                    // a dropped socket still records the token count and response
+                    // rather than falling back to the last partial frame.
+                    logFinish = result
+                    let tailThinking = Self.safeStreamDelta(
+                        accumulated: result.thinkingText,
+                        sent: sentThinking,
+                        stopSequences: []
+                    )
+                    if !tailThinking.isEmpty {
+                        sentThinking += tailThinking
+                        try await sseChunk(tailThinking)
+                    }
+                    try await closeReasoning()
+                    let tailContent = Self.safeStreamDelta(
+                        accumulated: result.responseText,
+                        sent: sentContent,
+                        stopSequences: []
+                    )
+                    if !tailContent.isEmpty {
+                        try await sseChunk(tailContent)
+                    }
+                    // No tool channel on this protocol, so the terminal frame names
+                    // one of the two reasons a text completion can have.
+                    try await sseChunk("", finishReason: OpenAIAdapter.finishReasonString(result.finishReason, hasToolCalls: false))
+                    let completionTokens = result.tokensGenerated
+                    if includeUsage, let data = try? JSONSerialization.data(withJSONObject: [
+                        "id": id, "object": "text_completion", "created": created, "model": model,
+                        "choices": [],
+                        "usage": [
+                            "prompt_tokens": promptTokensBox.get(),
+                            "completion_tokens": completionTokens,
+                            // The chat route's usage object always carries the sum;
+                            // this one is built by hand because its chunk has an
+                            // empty `choices`, so the two must not disagree.
+                            "total_tokens": promptTokensBox.get() + completionTokens,
+                        ],
+                    ]) {
+                        try await sse(ByteBuffer(data: data))
+                    }
+                    try await sseRaw("[DONE]")
+                    logTermination = .completed
+                    finishedCleanly = true
+                }
+                if finishedCleanly { break }
+            }
+            if !finishedCleanly {
                 task.cancel()
                 throw CancellationError()
             }
@@ -1864,7 +3003,7 @@ final class ServerController: ObservableObject {
     nonisolated private static func anthropicStreamingResponse(apiRequest: AnthropicMessagesRequest, queue: TurnExecutionQueue, logBox: ServerRequestLogBox?) -> Response {
         let encoder = JSONEncoder()
         let id = "msg-\(UUID().uuidString.prefix(24))"
-        let model = apiRequest.model ?? CompletionEngine.shared.loadedModelInfo?.displayName ?? "dynamoe"
+        let model = apiRequest.model ?? CompletionEngine.shared.loadedModelInfo?.servedID ?? "dynamoe"
         let stopSequences = (apiRequest.stopSequences ?? []).filter { !$0.isEmpty }
 
         // Same ownership hand-off as the OpenAI writer: the stream's terminal
@@ -1956,7 +3095,7 @@ final class ServerController: ObservableObject {
                 }
             }
 
-            let (relay, task) = await queue.streamTurn({ emit in
+            let (relay, task) = await queue.streamTurn({ claim, emit in
                 do {
                     let plan = try ServerController.buildTurnPlan(apiRequest)
                     promptTokensBox.set(plan.promptTokenCount)
@@ -1967,7 +3106,7 @@ final class ServerController: ObservableObject {
                         row.model = plan.modelName
                     }
                     try await ServerController.withTurnToolMask(plan.maskSchemas) {
-                        let launch = try CompletionEngine.shared.launchTurn(plan.request)
+                        let launch = try CompletionEngine.shared.launchTurn(plan.request, claim: claim)
                         if Task.isCancelled {
                             launch.handle.cancel()
                             return
@@ -2141,7 +3280,7 @@ final class ServerController: ObservableObject {
 
     nonisolated private static func healthBody() -> ByteBuffer {
         let loaded = CompletionEngine.shared.hasLoadedModel
-        let name = CompletionEngine.shared.loadedModelInfo?.displayName ?? ""
+        let name = CompletionEngine.shared.loadedModelInfo?.servedID ?? ""
         let payload: [String: Any] = [
             "status": "ok",
             "model_loaded": loaded,
