@@ -217,7 +217,7 @@ final class ServerRequestLogLogicTests: XCTestCase {
         XCTAssertFalse(ServerRequestLogRecorder.errorMessage(for: openAIToolChoiceError).contains("dangerous_client_name"))
 
         let anthropicToolChoiceError = try XCTUnwrap(extractError {
-            try AnthropicAdapter.toolUseEnabled(AnthropicMessagesRequest.ToolChoice(type: "tool", name: "exfiltrate"))
+            try AnthropicAdapter.toolUseEnabled(AnthropicMessagesRequest.ToolChoice(type: "tool", name: "exfiltrate", disableParallelToolUse: nil))
         }, "tool_choice rejection is a ServerAPIError")
         XCTAssertTrue(anthropicToolChoiceError.message.contains("exfiltrate"))
         XCTAssertFalse(ServerRequestLogRecorder.errorMessage(for: anthropicToolChoiceError).contains("exfiltrate"))

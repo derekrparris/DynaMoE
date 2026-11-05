@@ -265,6 +265,52 @@ struct AnthropicMessagesRequest: Decodable {
     struct ToolChoice: Decodable {
         let type: String?
         let name: String?
+        /// Anthropic's `disable_parallel_tool_use`, decoded to be documented as
+        /// ignored for the reason OpenAI's `parallel_tool_calls` is: honouring it means
+        /// emitting at most one call, which this engine's sampler cannot express, and
+        /// a 400 would put a new refusal on a path SDKs drive daily. The turn may
+        /// therefore emit several calls, which every client recovers from.
+        let disableParallelToolUse: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case type, name
+            case disableParallelToolUse = "disable_parallel_tool_use"
+        }
+    }
+
+    /// `output_config`: Anthropic's structured-outputs setting. Only the format's
+    /// `type` is kept, because the refusal names it and parsing the schema would only
+    /// be a way to accept a promise this server cannot keep.
+    nonisolated struct OutputConfig: Decodable {
+        let formatType: String?
+
+        enum CodingKeys: String, CodingKey { case format }
+        enum FormatKeys: String, CodingKey { case type }
+
+        init(from decoder: Decoder) throws {
+            var type: String?
+            if let container = try? decoder.container(keyedBy: CodingKeys.self),
+               let format = try? container.nestedContainer(keyedBy: FormatKeys.self, forKey: .format) {
+                type = (try? format.decodeIfPresent(String.self, forKey: .type)) ?? nil
+            }
+            self.formatType = type
+        }
+    }
+
+    /// One entry of `mcp_servers`. Only the name is kept, so the refusal can say which
+    /// servers the client expected the model to have.
+    nonisolated struct MCPServerRef: Decodable {
+        let name: String?
+        let type: String?
+    }
+
+    /// `context_management`. Its edits are kept only to name their kinds in tests and
+    /// docs; nothing in this server performs them.
+    nonisolated struct ContextManagement: Decodable {
+        nonisolated struct Edit: Decodable {
+            let type: String?
+        }
+        let edits: [Edit]?
     }
 
     /// Top-level `system` field: bare string or array of text blocks.
@@ -288,6 +334,21 @@ struct AnthropicMessagesRequest: Decodable {
     /// Decoded for the same reason: a service tier is a routing preference for a
     /// hosted fleet, and this server has exactly one tier.
     let serviceTier: String?
+    /// Anthropic's structured-outputs setting. Decoded so the planner can refuse it by
+    /// name, the way OpenAI's `response_format` is refused: it asks the server to
+    /// constrain decoding to a schema, this engine cannot, and ignoring it answered a
+    /// request for JSON with prose whose shape the client's parser then rejects.
+    let outputConfig: OutputConfig?
+    /// Anthropic's per-turn remote MCP servers. Decoded so the planner can refuse it:
+    /// a request cannot install tools here, because this app's MCP client is driven by
+    /// a local config file with its own per-call approval. Ignoring it ran the turn
+    /// without the tools the client had just named.
+    let mcpServers: [MCPServerRef]?
+    /// Anthropic's server-side context editing. Decoded to be documented as ignored:
+    /// not doing the housekeeping leaves more of the conversation in the prompt rather
+    /// than changing what the model is told, and the KV budget is where a prompt that
+    /// grew too long surfaces (`context_length_exceeded`).
+    let contextManagement: ContextManagement?
 
     enum CodingKeys: String, CodingKey {
         case system, model, messages, stream, tools, thinking, metadata
@@ -298,6 +359,9 @@ struct AnthropicMessagesRequest: Decodable {
         case stopSequences = "stop_sequences"
         case toolChoice = "tool_choice"
         case serviceTier = "service_tier"
+        case outputConfig = "output_config"
+        case mcpServers = "mcp_servers"
+        case contextManagement = "context_management"
     }
 
     init(from decoder: Decoder) throws {
@@ -330,6 +394,12 @@ struct AnthropicMessagesRequest: Decodable {
         // potential silent substitution.
         self.metadata = try container.decodeIfPresent(Metadata.self, forKey: .metadata)
         self.serviceTier = try container.decodeIfPresent(String.self, forKey: .serviceTier)
+        // The two the planner refuses by name, and the one it documents as ignored,
+        // join that list for the same reason: unknown-key tolerance made every field
+        // in this file a potential silent substitution.
+        self.outputConfig = try container.decodeIfPresent(OutputConfig.self, forKey: .outputConfig)
+        self.mcpServers = try container.decodeIfPresent([MCPServerRef].self, forKey: .mcpServers)
+        self.contextManagement = try container.decodeIfPresent(ContextManagement.self, forKey: .contextManagement)
     }
 
     /// The `tool_choice.type` value, for callers (and tests) that only need the
@@ -660,6 +730,47 @@ enum AnthropicAdapter {
             )
         default:
             return true
+        }
+    }
+
+    /// Refuses the Anthropic request fields this server cannot honour, by name.
+    ///
+    /// `output_config` asks for schema-constrained decoding and this engine cannot
+    /// constrain it, so ignoring the field answered a request for JSON with prose whose
+    /// shape the client's parser then rejected. `mcp_servers` asks THIS server to
+    /// connect remote MCP servers for the turn and offer their tools; this app's MCP
+    /// client is driven by a local config file with its own per-call approval, so a
+    /// request cannot install tools, and ignoring the field ran the turn without the
+    /// tools the client had just named.
+    ///
+    /// Both refusals are keyed on presence, and both run before the model gate so a
+    /// test can prove the ordering. `context_management` and
+    /// `tool_choice.disable_parallel_tool_use` are documented as ignored instead, in the
+    /// field notes, because neither changes what the model is told: the first is
+    /// housekeeping whose absence lengthens the prompt (and the KV budget is where that
+    /// surfaces), and the second is a sampling constraint the engine cannot express,
+    /// exactly like OpenAI's `parallel_tool_calls`.
+    nonisolated static func refuseUnsupportedRequestFields(_ request: AnthropicMessagesRequest) throws {
+        if let output = request.outputConfig {
+            throw ServerAPIError.badRequest(
+                "output_config is not supported: it asks this server to constrain decoding to a schema, "
+                    + "and this engine cannot"
+                    + (output.formatType.map { " (it asked for \"\($0)\")" } ?? "")
+                    + ". Ask for the JSON shape in the prompt and validate it on your side, or omit output_config.",
+                logSafeMessage: "output_config asks for schema-constrained decoding"
+            )
+        }
+        if let servers = request.mcpServers, !servers.isEmpty {
+            let named = servers.prefix(3).compactMap(\.name).filter { !$0.isEmpty }
+                .map { "\"\($0)\"" }.joined(separator: ", ")
+            throw ServerAPIError.badRequest(
+                "mcp_servers is not supported: it asks this server to connect remote MCP servers for the "
+                    + "turn, and this app's MCP client is configured locally with its own per-call approval "
+                    + "rather than driven by a request"
+                    + (named.isEmpty ? "" : " (it named \(named))")
+                    + ". Declare the tools you need in tools, or configure the server in the app's MCP settings.",
+                logSafeMessage: "mcp_servers asks this server to connect a remote MCP server"
+            )
         }
     }
 

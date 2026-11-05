@@ -1994,6 +1994,11 @@ final class ServerController: ObservableObject {
         // Reject a forced tool choice before touching engine state, so the
         // client gets a clear error instead of a silently unconstrained turn.
         let toolsEnabled = try AnthropicAdapter.toolUseEnabled(apiRequest.toolChoice)
+        // Same posture, same place, for the top-level fields that ask for something
+        // this server cannot produce or install: schema-constrained decoding, and a
+        // per-turn set of remote MCP servers. Both were dropped by the decoder, which
+        // answered a different request than the one sent, with a 200.
+        try AnthropicAdapter.refuseUnsupportedRequestFields(apiRequest)
         let info = try requireLoadedModel()
         let split = try AnthropicAdapter.splitMessages(apiRequest.messages)
         let hasTools = !(apiRequest.tools ?? []).isEmpty && toolsEnabled

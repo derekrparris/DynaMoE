@@ -525,6 +525,55 @@ final class ServerControllerSmokeTests: XCTestCase {
         )
     }
 
+    /// Anthropic's `output_config` and `mcp_servers` were dropped by the decoder, which
+    /// answered a request for JSON in prose and ran a turn without the tools the client
+    /// had just named. Both are refused by name now, and refused before the model gate:
+    /// the proof is a 400 where the same body without them answers 503.
+    func testTheAnthropicStructuredOutputFieldIsRefusedBeforeTheModelGate() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the pre-gate refusal cannot be isolated from generation")
+        }
+        await ensureServerRunning()
+
+        func post(_ fields: String) async throws -> (status: Int, text: String) {
+            let extra = fields.isEmpty ? "" : ",\(fields)"
+            var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/messages")!)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = Data("""
+            {"model":"any","max_tokens":64\(extra),"messages":[{"role":"user","content":"hello"}]}
+            """.utf8)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            return (
+                try XCTUnwrap((response as? HTTPURLResponse)?.statusCode),
+                String(decoding: data, as: UTF8.self)
+            )
+        }
+
+        let (structuredStatus, structuredText) = try await post(
+            #""output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}"#
+        )
+        XCTAssertEqual(structuredStatus, 400, "output_config must be refused, not ignored: \(structuredText)")
+        XCTAssertTrue(structuredText.contains("output_config"), "got: \(structuredText)")
+
+        let (serversStatus, serversText) = try await post(
+            #""mcp_servers":[{"type":"url","url":"https://example.invalid/mcp","name":"weather"}]"#
+        )
+        XCTAssertEqual(serversStatus, 400, "mcp_servers must be refused, not ignored: \(serversText)")
+        XCTAssertTrue(serversText.contains("mcp_servers"), "got: \(serversText)")
+        XCTAssertTrue(serversText.contains("weather"), "the refusal must name the server: \(serversText)")
+
+        // The fields that are decoded to be documented as ignored reach the model gate,
+        // rather than a new 400: neither changes what the model is told.
+        let (ignoredStatus, ignoredText) = try await post(
+            #""context_management":{"edits":[{"type":"clear_tool_uses_20250919"}]},"tool_choice":{"type":"auto","disable_parallel_tool_use":true}"#
+        )
+        XCTAssertEqual(ignoredStatus, 503, "context_management is housekeeping, not a refusal: \(ignoredText)")
+
+        let (plainStatus, plainText) = try await post("")
+        XCTAssertEqual(plainStatus, 503, "the same body without them is gated on the model: \(plainText)")
+    }
+
     func testMessagesWithoutMaxTokensReturns400() async throws {
         await ensureServerRunning()
 

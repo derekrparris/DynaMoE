@@ -14627,3 +14627,105 @@ rather than the code.
 | `OpenAIAdapterLogicTests` (42 -> 43: both deprecated fields decode, a `function_call` mode string and a named target both read, each field is refused with a message naming its modern replacement and what would be dropped, a request carrying `tools` is served even with `functions` beside it, and mixing `tools` with a bare `function_call` is refused) | **43 cases, 0 failures** |
 | `ServerControllerSmokeTests` (app-hosted, real server on 8787) (28 -> 29: `functions` alone is a 400 naming `tools`, `function_call` alone is a 400 naming `tool_choice`, and both requests spelled with the modern field answer 503) | **29 cases, 0 failures, 1 skipped** |
 | adjacent logic suites: `ServerRequestLogLogicTests` 44, `AnthropicAdapterLogicTests` 29, `ServerQueueLogicTests` 23, `ChatPromptFormatterConversationTests` 20, `ReasoningRoundTripTests` 18, `ServerStreamSafetyTests` 13, `TurnFitLogicTests` 12, `ServerHardeningLogicTests` 6, `ServerToolArgumentTests` 4, `TurnToolMaskTests` 3 | **172 cases, 0 failures** |
+
+## DSV4.1 #98: A REQUEST FOR JSON ON THE ANTHROPIC ENDPOINT WAS ANSWERED IN PROSE, BECAUSE THE SCHEMA FIELD WAS NEVER DECODED
+
+### The question
+
+`#97` closed the last OpenAI chat field that could change an answer. The same audit had never been run on
+the Anthropic side, where the request struct was built field by field as clients asked for features. The
+question was which of that protocol's top-level fields are absent from the decoder, and for each one,
+whether losing it changes the answer or only the bookkeeping.
+
+### What was found
+
+1. **Four fields were absent.** `grep` for `output_config`, `mcp_servers`, `context_management` and
+   `disable_parallel_tool_use` across `AnthropicAdapter.swift` returned zero hits each, so unknown-key
+   tolerance dropped all four. (`container` looked like a fifth and is not: all 65 hits are Swift's own
+   `container(keyedBy:)`.)
+2. **`output_config` changes the answer.** It is Anthropic's structured-outputs setting: it asks the server
+   to constrain decoding to a JSON schema. This engine cannot constrain decoding to a schema, so the field
+   was dropped and a client that asked for JSON got prose, with a 200, and its own parser then failed on
+   the shape it had been promised. This is the same defect class as `#88`'s `response_format`, on the same
+   kind of field, one protocol over.
+3. **`mcp_servers` changes the answer too, for a different reason.** It asks THE SERVER to connect a set of
+   remote MCP servers for that turn and offer their tools. This app does have an MCP client, but it is
+   driven by `~/Library/Application Support/DynaMoE/mcp.json` with per-call human approval and a directory
+   watcher that defers while a tool call is live. A request cannot install tools into that model, so the
+   field was dropped and the turn ran without the tools the client had just named, which is a worse
+   substitution than a missing schema: the model answered from memory about a task it had been told to
+   look up.
+4. **`context_management` does not, in the same sense.** It asks for server-side context editing (clearing
+   old tool results, for instance). Not performing that housekeeping leaves MORE of the conversation in the
+   prompt rather than changing what the model is told, and a prompt that grew too long already surfaces as
+   its own `400` with `code: context_length_exceeded` from the KV budget. So it is a hint whose absence is
+   visible, not a promise being broken.
+5. **`tool_choice.disable_parallel_tool_use` cannot be enforced, and the precedent was already set.**
+   `#88`'s survey decoded OpenAI's `parallel_tool_calls` and documented it as ignored rather than refusing
+   it: honouring `false` means emitting at most one call, which this engine's sampler cannot express, and a
+   400 would put a new refusal on a path every SDK drives daily. Anthropic's spelling of the same switch
+   gets the same treatment, and the reasoning transfers unchanged.
+6. **The refusal has somewhere to live, and the ordering proof comes free.** The Anthropic planner already
+   refuses unsupported content blocks and a forced `tool_choice` before `requireLoadedModel()`, so a new
+   refusal beside them is provable over real HTTP with no checkpoint loaded. `max_tokens` is validated
+   first, which is why the smoke body carries one.
+
+### What was added
+
+- `AnthropicMessagesRequest.outputConfig` (`OutputConfig`, keeping only the format's `type` so the refusal
+  can name it), `mcpServers` (`[MCPServerRef]`, keeping the names the refusal quotes) and
+  `contextManagement` (kept to prove it decodes and is ignored), plus
+  `ToolChoice.disableParallelToolUse`.
+- `AnthropicAdapter.refuseUnsupportedRequestFields(_:)`, called in the Anthropic planner immediately after
+  `toolUseEnabled` and before the model gate. `output_config` and `mcp_servers` are refused by name (the
+  latter naming up to three servers and pointing at `tools` and the app's MCP settings);
+  `context_management` and `disable_parallel_tool_use` are documented as ignored in the field notes.
+- One pure case in `AnthropicAdapterLogicTests` and one app-hosted case in `ServerControllerSmokeTests`
+  (400 for each refused field, 503 for the same body with only the ignored ones), plus the guide's Request
+  Options bullet and two README rows.
+
+### The finding
+
+1. **The field audit is per protocol, and doing one does not audit the other.** `#96` and `#97` spent two
+   slices on four OpenAI keys; the Anthropic struct had four of its own and had never been swept. The two
+   protocols were written by the same hand in the same file family, which is exactly why the assumption
+   that one audit covered both survived as long as it did.
+2. **"Cannot honour it" splits into two different defects, and the split is about what the answer becomes.**
+   A dropped schema promise produces output the client's parser rejects; a dropped server list produces an
+   answer about tools the model never had. Both are wrong, both are silent, and both are refusals. A
+   dropped `context_management` produces a longer prompt and the same answer, which is why it is the one
+   that stays accepted: the failure it can cause is already loud and already has its own status code.
+3. **`disable_parallel_tool_use` needed no new judgement.** The posture for it was decided for
+   `parallel_tool_calls` in `#88` (decode, document, do not obey, do not refuse) and the reasoning is
+   identical: the constraint lives in the sampler, the engine cannot express it, and the cost of being
+   wrong is several calls instead of one. Copying a decided rule beats re-deriving it, and re-deriving it
+   is how a codebase ends up with two answers for one field.
+4. **The memberwise initialiser is the hidden cost of adding a property.** Two test call sites constructed
+   `ToolChoice` positionally and broke, which is the compiler doing its job; the alternative (a defaulted
+   parameter) would have silently pinned the new field to nil in the one place a test wanted to set it.
+
+### What it is not (do not re-propose)
+
+- **Not a `mcp_servers` implementation.** Connecting a remote server from a request would bypass the config
+  file that is this app's authority, the per-call approval that gates every MCP call, and the watcher's
+  deferral while a tool is live.
+- **Not a refusal for `context_management` or `disable_parallel_tool_use`.** See findings 2 and 3.
+- **Not `prediction`, `web_search_options` or `service_tier` on the OpenAI routes.** Still the
+  documentation-only slice.
+- **Not `redacted_thinking`.** A different defect (a block type refused rather than a field dropped) and a
+  separate slice.
+- **Not a `POST /v1/responses` route.** Routed again at 0.0024 against a level-0 bar of about 0.2.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath`, three-part `-only-testing` identifiers and `-parallel-testing-enabled NO`. Bundle
+freshness confirmed with `strings ... | grep -c` over both new case names. Warning instances 1,554 ->
+**1,554**, no new kinds: the three new decoders are `nonisolated` from the start, which is the fix `#95`
+and `#97` each had to discover.
+
+| suite | result |
+|---|---|
+| `AnthropicAdapterLogicTests` (29 -> 30: `output_config` decodes its format type and is refused naming both, `mcp_servers` decodes its names and is refused naming them, a request with neither is served, and `context_management` plus `disable_parallel_tool_use` decode without refusing) | **30 cases, 0 failures** |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787) (29 -> 30: a real `/v1/messages` POST is a 400 for `output_config` and for `mcp_servers`, a 503 for a body carrying only the ignored fields, and a 503 for the plain control) | **30 cases, 0 failures, 1 skipped** |
+| `ServerRequestLogLogicTests`, `OpenAIAdapterLogicTests` | **87 cases, 0 failures** |

@@ -377,7 +377,7 @@ final class AnthropicAdapterLogicTests: XCTestCase {
         """)
         XCTAssertEqual(auto.toolChoiceType, "auto")
         XCTAssertTrue(try AnthropicAdapter.toolUseEnabled(auto.toolChoice))
-        XCTAssertFalse(try AnthropicAdapter.toolUseEnabled(.init(type: "none", name: nil)))
+        XCTAssertFalse(try AnthropicAdapter.toolUseEnabled(.init(type: "none", name: nil, disableParallelToolUse: nil)))
 
         let forced = try decodeRequest("""
         {"max_tokens":10,"tools":[{"name":"get_weather"}],"tool_choice":{"type":"tool","name":"get_weather"},"messages":[{"role":"user","content":"hi"}]}
@@ -480,5 +480,59 @@ final class AnthropicAdapterLogicTests: XCTestCase {
         let unlabelled = try decodeRequest(#"{"model":"any","max_tokens":16,"messages":[]}"#)
         XCTAssertNil(unlabelled.metadata)
         XCTAssertNil(ServerRequestLog.recordedClientMetadata(unlabelled.metadata?.labels))
+    }
+
+    // MARK: - Request fields this server cannot honour
+
+    /// `output_config` asks for schema-constrained decoding and `mcp_servers` asks this
+    /// server to connect remote MCP servers, and neither was in the decoder, so both
+    /// were dropped by unknown-key tolerance: a request for JSON was answered in prose
+    /// the client's parser rejected, and a turn that named servers ran without the tools
+    /// it had just asked for. They are refused by name now, before the model gate, while
+    /// the two fields that cannot change what the model is told are decoded and ignored.
+    func testTheStructuredOutputAndMCPServerFieldsAreRefusedByName() throws {
+        let structured = try decodeRequest("""
+        {"model":"any","max_tokens":16,"messages":[],
+         "output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}}
+        """)
+        XCTAssertEqual(structured.outputConfig?.formatType, "json_schema")
+        XCTAssertThrowsError(try AnthropicAdapter.refuseUnsupportedRequestFields(structured)) { error in
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("output_config"), "got: \(message)")
+            XCTAssertTrue(message.contains("json_schema"), "the refusal must say what was asked for, got: \(message)")
+        }
+
+        let servers = try decodeRequest("""
+        {"model":"any","max_tokens":16,"messages":[],
+         "mcp_servers":[{"type":"url","url":"https://example.invalid/mcp","name":"weather"},
+                        {"type":"url","url":"https://example.invalid/other","name":"calendar"}]}
+        """)
+        XCTAssertEqual(servers.mcpServers?.compactMap(\.name), ["weather", "calendar"])
+        XCTAssertThrowsError(try AnthropicAdapter.refuseUnsupportedRequestFields(servers)) { error in
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("mcp_servers"), "got: \(message)")
+            XCTAssertTrue(message.contains("weather"), "the refusal must name the servers, got: \(message)")
+            XCTAssertTrue(message.contains("tools"), "the refusal must name the replacement, got: \(message)")
+        }
+
+        // Neither field present is the ordinary case, and it must stay served.
+        let plain = try decodeRequest(#"{"model":"any","max_tokens":16,"messages":[]}"#)
+        XCTAssertNil(plain.outputConfig)
+        XCTAssertNil(plain.mcpServers)
+        XCTAssertNoThrow(try AnthropicAdapter.refuseUnsupportedRequestFields(plain))
+
+        // The two that are decoded to be documented as ignored: housekeeping whose
+        // absence lengthens the prompt rather than changing what the model is told, and
+        // a sampling constraint this engine's sampler cannot express (the posture
+        // OpenAI's `parallel_tool_calls` already has).
+        let ignored = try decodeRequest("""
+        {"model":"any","max_tokens":16,"messages":[],
+         "context_management":{"edits":[{"type":"clear_tool_uses_20250919"}]},
+         "tool_choice":{"type":"auto","disable_parallel_tool_use":true}}
+        """)
+        XCTAssertEqual(ignored.contextManagement?.edits?.compactMap(\.type), ["clear_tool_uses_20250919"])
+        XCTAssertEqual(ignored.toolChoice?.disableParallelToolUse, true)
+        XCTAssertNoThrow(try AnthropicAdapter.refuseUnsupportedRequestFields(ignored))
+        XCTAssertTrue(try AnthropicAdapter.toolUseEnabled(ignored.toolChoice))
     }
 }
