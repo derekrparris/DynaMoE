@@ -4941,6 +4941,61 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         }
     }
 
+    /// `max_completion_tokens` is a reply budget, not a hint, and the proof is that the
+    /// turn stops at it.
+    ///
+    /// The prompt is a counting task, so the model would keep emitting long past the
+    /// budget: with the newer spelling ignored (which it was before `#91`, since it was
+    /// not in the decoder at all) this turn would run to the app default of 8192. The
+    /// same request with the older `max_tokens` spelling is the control that the two
+    /// spellings are one budget.
+    func testTheChatRouteHonoursTheNewerReplyBudgetOnThePublishedCheckpoint() async throws {
+        let snapshot = try snapshotDirectory()
+        let engine = try loadPublishedCheckpointIntoTheSharedEngine(snapshot)
+        defer {
+            unloadSharedEngine()
+            withExtendedLifetime(engine) {}
+        }
+        let port = 8802
+
+        func ask(_ budgetFields: String) async throws -> (completion: Int, finish: String) {
+            var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = Data("""
+            {"model":"any","temperature":0,"enable_thinking":false,\(budgetFields),
+             "messages":[{"role":"user","content":"Count from one to fifty in words, comma separated."}]}
+            """.utf8)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let status = try XCTUnwrap((response as? HTTPURLResponse)?.statusCode)
+            let text = String(decoding: data, as: UTF8.self)
+            XCTAssertEqual(status, 200, text)
+            let body = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+            let usage = try XCTUnwrap(body["usage"] as? [String: Any])
+            let completion = try XCTUnwrap(usage["completion_tokens"] as? Int)
+            let choices = try XCTUnwrap(body["choices"] as? [[String: Any]])
+            let finish = (choices.first?["finish_reason"] as? String) ?? ""
+            return (completion, finish)
+        }
+
+        try await withLocalServer(on: port) { _ in
+            let newer = try await ask(#""max_completion_tokens":3"#)
+            XCTAssertEqual(
+                newer.completion, 3,
+                "the newer reply budget must bound the turn; 8192 would mean the field was dropped"
+            )
+            XCTAssertEqual(newer.finish, "length", "a turn stopped by its budget reports length")
+
+            let older = try await ask(#""max_tokens":3"#)
+            XCTAssertEqual(older.completion, 3, "the older spelling is the same budget")
+            XCTAssertEqual(older.finish, "length")
+            print(
+                "🔎 [dsv41 real] reply budget: max_completion_tokens=3 -> \(newer.completion) tokens "
+                    + "(\(newer.finish)), max_tokens=3 -> \(older.completion) tokens (\(older.finish))"
+            )
+        }
+    }
+
     /// The `usage` objects of a stream's frames, one per chunk that carries one.
     private func usageFrames(in raw: String) -> [[String: Any]] {
         var found: [[String: Any]] = []

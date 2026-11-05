@@ -402,6 +402,11 @@ extension ServerRequestLog {
         payload["top_p"] = request.topP
         payload["top_k"] = request.topK
         payload["max_tokens"] = request.maxTokens
+        // The reply budget has two spellings, and the row records both: a row that
+        // showed only `max_tokens` would read as "no budget sent" for a request that
+        // carried the newer field.
+        payload["max_completion_tokens"] = request.maxCompletionTokens
+        payload["parallel_tool_calls"] = request.parallelToolCalls
         payload["stop"] = request.stop
         payload["enable_thinking"] = request.enableThinking
         // The sampler fields that move the DISTRIBUTION belong in the row: a row that

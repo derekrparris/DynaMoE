@@ -222,7 +222,16 @@ struct OpenAIChatRequest: Decodable {
     /// range-checked by `logitBias(from:)`, which the planner calls before any
     /// generation work.
     let logitBias: [String: Float]?
+    /// OpenAI's current reply-budget field. Decoded because leaving it out of the
+    /// decoder answered a request for a 512-token answer with the app default budget
+    /// (up to 8192): `replyBudget(maxTokens:maxCompletionTokens:)` resolves it against
+    /// the deprecated `max_tokens`.
+    let maxCompletionTokens: Int?
+    /// OpenAI's older spelling of the reply budget, still sent by most clients.
     let maxTokens: Int?
+    /// OpenAI's `parallel_tool_calls`: decoded and deliberately not honoured (see the
+    /// decoder note).
+    let parallelToolCalls: Bool?
     let stream: Bool?
     let stop: [String]?
     let tools: [Tool]?
@@ -267,6 +276,8 @@ struct OpenAIChatRequest: Decodable {
         case frequencyPenalty = "frequency_penalty"
         case logitBias = "logit_bias"
         case maxTokens = "max_tokens"
+        case maxCompletionTokens = "max_completion_tokens"
+        case parallelToolCalls = "parallel_tool_calls"
         case toolChoice = "tool_choice"
         case enableThinking = "enable_thinking"
         case reasoningEffort = "reasoning_effort"
@@ -297,6 +308,13 @@ struct OpenAIChatRequest: Decodable {
         _ = try container.decodeIfPresent(Int.self, forKey: .seed)
         _ = try container.decodeIfPresent(String.self, forKey: .user)
         self.maxTokens = try container.decodeIfPresent(Int.self, forKey: .maxTokens)
+        self.maxCompletionTokens = try container.decodeIfPresent(Int.self, forKey: .maxCompletionTokens)
+        // `parallel_tool_calls` is decoded to be documented as ignored rather than to
+        // be obeyed: honouring `false` means emitting at most one call, which is a
+        // grammar constraint the sampler does not have, and refusing it would put a
+        // new 400 on the path clients drive daily. The turn may therefore emit several
+        // calls, which every client recovers from.
+        self.parallelToolCalls = try container.decodeIfPresent(Bool.self, forKey: .parallelToolCalls)
         self.stream = try container.decodeIfPresent(Bool.self, forKey: .stream)
         // OpenAI allows `stop` as a bare string or an array.
         if let single = try? container.decode(String.self, forKey: .stop) {
@@ -848,6 +866,40 @@ enum OpenAIAdapter {
         return abs(value) > 0.001 ? value : 0
     }
 
+    /// The reply budget a request asks for, resolved across OpenAI's two spellings.
+    ///
+    /// `max_completion_tokens` is the field OpenAI kept (and the only one its newer
+    /// models accept); `max_tokens` is the deprecated spelling most clients still
+    /// send. Neither was a lie while ONLY `max_tokens` was decoded, but leaving
+    /// `max_completion_tokens` out of the decoder entirely meant a client that sent
+    /// `{"max_completion_tokens": 512}` and no `max_tokens` was answered with the app
+    /// default budget of up to 8192 tokens — the same class of silent substitution
+    /// `#88` removed for `response_format` and `n`.
+    ///
+    /// A request that carries BOTH fields with different values is refused rather
+    /// than resolved by preference: whichever value the server picked, the answer
+    /// would be a budget the client did not ask for, and the two fields being present
+    /// together means the client itself is unsure which one its SDK sends.
+    nonisolated static func replyBudget(
+        maxTokens: Int?,
+        maxCompletionTokens: Int?
+    ) throws -> Int? {
+        switch (maxTokens, maxCompletionTokens) {
+        case let (old?, new?) where old != new:
+            throw ServerAPIError.badRequest(
+                "max_tokens = \(old) and max_completion_tokens = \(new) disagree: send one of them. "
+                    + "This server honours whichever arrives, they are the same budget, and it will "
+                    + "not pick a value the client did not mean."
+            )
+        case let (_, new?):
+            return new
+        case let (old?, _):
+            return old
+        case (nil, nil):
+            return nil
+        }
+    }
+
     /// Refuse the request fields this server cannot honour, by name.
     ///
     /// Swift's `Decodable` ignores the keys it does not know, which is what made
@@ -906,6 +958,12 @@ enum OpenAIAdapter {
         // model gate like every other refusal so the ordering a test proves holds.
         _ = try frequencyPenalty(request.frequencyPenalty)
         _ = try logitBias(from: request.logitBias)
+        // The reply budget is resolved from either spelling, so two disagreeing
+        // spellings are a 400 here rather than a choice the server made for the client.
+        _ = try replyBudget(
+            maxTokens: request.maxTokens,
+            maxCompletionTokens: request.maxCompletionTokens
+        )
     }
 
     /// The same posture for the legacy text-completions route, over that route's

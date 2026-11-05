@@ -572,6 +572,74 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         }
     }
 
+    /// The reply budget has two spellings in OpenAI's own protocol, and a client that
+    /// sends only the newer one must not be answered with the app's default budget.
+    ///
+    /// `max_completion_tokens` was not in the decoder at all before this, so
+    /// `{"max_completion_tokens": 512}` ran to the app default of up to 8192 tokens.
+    /// A request that carries both spellings with DIFFERENT values is refused rather
+    /// than resolved by preference: whichever one the server picked, the answer would
+    /// be a budget the client did not ask for.
+    func testTheReplyBudgetIsResolvedAcrossItsTwoSpellings() throws {
+        let olderOnly = try decodeRequest(#"{"messages":[],"max_tokens":128}"#)
+        XCTAssertEqual(olderOnly.maxTokens, 128)
+        XCTAssertNil(olderOnly.maxCompletionTokens)
+        XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedResponseShape(olderOnly))
+        let olderBudget = try OpenAIAdapter.replyBudget(
+            maxTokens: olderOnly.maxTokens,
+            maxCompletionTokens: olderOnly.maxCompletionTokens
+        )
+        XCTAssertEqual(olderBudget, 128)
+
+        let newerOnly = try decodeRequest(#"{"messages":[],"max_completion_tokens":512}"#)
+        XCTAssertNil(newerOnly.maxTokens)
+        XCTAssertEqual(newerOnly.maxCompletionTokens, 512)
+        XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedResponseShape(newerOnly))
+        let newerBudget = try OpenAIAdapter.replyBudget(
+            maxTokens: newerOnly.maxTokens,
+            maxCompletionTokens: newerOnly.maxCompletionTokens
+        )
+        XCTAssertEqual(newerBudget, 512, "the newer field alone is the whole budget, not a hint")
+
+        let agreeing = try decodeRequest(#"{"messages":[],"max_tokens":64,"max_completion_tokens":64}"#)
+        XCTAssertNoThrow(
+            try OpenAIAdapter.refuseUnsupportedResponseShape(agreeing),
+            "two spellings that agree are not a conflict"
+        )
+        let agreeingBudget = try OpenAIAdapter.replyBudget(
+            maxTokens: agreeing.maxTokens,
+            maxCompletionTokens: agreeing.maxCompletionTokens
+        )
+        XCTAssertEqual(agreeingBudget, 64)
+
+        let conflicting = try decodeRequest(#"{"messages":[],"max_tokens":64,"max_completion_tokens":512}"#)
+        XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedResponseShape(conflicting)) { error in
+            let text = "\(error)"
+            XCTAssertTrue(text.contains("max_tokens"), "the refusal must name the older field: \(text)")
+            XCTAssertTrue(
+                text.contains("max_completion_tokens"),
+                "the refusal must name the newer field: \(text)"
+            )
+        }
+
+        let absent = try OpenAIAdapter.replyBudget(maxTokens: nil, maxCompletionTokens: nil)
+        XCTAssertNil(absent, "neither field means the app default, which the planner owns")
+    }
+
+    /// The fields both protocols accept and deliberately do not honour now reach the
+    /// request model, so the help guide and the journal can name them instead of
+    /// `Decodable` dropping them silently.
+    func testTheAcceptedAndIgnoredFieldsAreDecodedRatherThanVanishing() throws {
+        let chat = try decodeRequest("""
+        {"messages":[],"parallel_tool_calls":false,"seed":7,"user":"someone"}
+        """)
+        XCTAssertEqual(chat.parallelToolCalls, false)
+        XCTAssertNoThrow(
+            try OpenAIAdapter.refuseUnsupportedResponseShape(chat),
+            "an ignored field is documented, not refused: a 400 would break clients that always send it"
+        )
+    }
+
     /// The two sampler fields OpenAI defines and this engine can honour are decoded,
     /// range-checked and resolved into the turn's sampling instead of ignored.
     ///

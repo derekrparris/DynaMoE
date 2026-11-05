@@ -243,6 +243,33 @@ final class ServerControllerSmokeTests: XCTestCase {
                 "the refusal must name \(named), got: \(message)"
             )
         }
+
+        // A reply budget asked for with BOTH spellings and two different values is a
+        // 400 naming both, before the model gate, rather than a choice the server made
+        // for the client. `max_completion_tokens` alone is a field this server honours,
+        // so it must reach the gate (503) instead.
+        func postBudget(_ fields: String) async throws -> (status: Int, text: String) {
+            var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/chat/completions")!)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = Data("""
+            {"model":"any",\(fields),"messages":[{"role":"user","content":"hello"}]}
+            """.utf8)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            return (
+                try XCTUnwrap((response as? HTTPURLResponse)?.statusCode),
+                String(decoding: data, as: UTF8.self)
+            )
+        }
+
+        let (conflictStatus, conflictText) = try await postBudget(
+            #""max_tokens":64,"max_completion_tokens":512"#
+        )
+        XCTAssertEqual(conflictStatus, 400, "two disagreeing budgets are a bad request: \(conflictText)")
+        XCTAssertTrue(conflictText.contains("max_completion_tokens"), "got: \(conflictText)")
+
+        let (newerStatus, newerText) = try await postBudget(#""max_completion_tokens":512"#)
+        XCTAssertEqual(newerStatus, 503, "the newer reply-budget field is honoured, not refused: \(newerText)")
     }
 
     /// The same refusal on the streaming route keeps that route's own contract: the

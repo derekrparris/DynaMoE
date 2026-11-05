@@ -489,11 +489,18 @@ public final class CompletionEngine: @unchecked Sendable {
                 images: turnImages,
                 spec: dsConfig.vision
             )
-            // The cache is provisioned for the prompt plus the turn's token budget,
-            // capped at what the checkpoint says it can address.
+            // The cache is provisioned for the prompt plus the turn's token budget, PLUS
+            // the one position the last generated token is forwarded at, capped at what
+            // the checkpoint says it can address. The runner's own cap reserves that
+            // position (`limit - prompt - 1`), so provisioning the bare budget made every
+            // budgeted turn answer one token short of what the client asked for: a
+            // `max_tokens` of 3 produced 2 tokens here, and 8 produced 7 in `#89`.
             let contextLength = max(
                 1,
-                min(dsConfig.maxPositionEmbeddings, request.sampling.maxTokens + imagePrice.promptTokens)
+                min(
+                    dsConfig.maxPositionEmbeddings,
+                    request.sampling.maxTokens + imagePrice.promptTokens + 1
+                )
             )
             // Reuse the runtime a previous turn built when it was provisioned for at
             // least this much context. The engine is single-flight (checked at the

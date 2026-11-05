@@ -421,6 +421,27 @@ final class AnthropicAdapterLogicTests: XCTestCase {
 
     // MARK: - Graded thinking levels
 
+    /// The two fields this protocol sends and the engine deliberately does not obey
+    /// now reach the request model, so the help guide and the journal can name them
+    /// instead of `Decodable` dropping them silently.
+    func testTheAcceptedAndIgnoredFieldsAreDecodedRatherThanVanishing() throws {
+        let request = try decodeRequest("""
+        {"max_tokens":32,"messages":[{"role":"user","content":"hi"}],
+         "metadata":{"user_id":"abc"},"service_tier":"auto",
+         "thinking":{"type":"enabled","budget_tokens":1024}}
+        """)
+        XCTAssertEqual(request.metadata?.userId, "abc")
+        XCTAssertEqual(request.serviceTier, "auto")
+        XCTAssertEqual(
+            request.thinking?.budgetTokens, 1024,
+            "the budget selects a graded level and is recorded in the row, so it must survive the decode"
+        )
+        XCTAssertNoThrow(
+            try AnthropicAdapter.thinkingEffort(from: request.thinking, levelCapable: true),
+            "a budget this server can map is never refused"
+        )
+    }
+
     func testThinkingBudgetMapsToGradedLevels() throws {
         let low = AnthropicMessagesRequest.ThinkingConfig(type: "enabled", budgetTokens: 2048)
         let high = AnthropicMessagesRequest.ThinkingConfig(type: "enabled", budgetTokens: 8192)

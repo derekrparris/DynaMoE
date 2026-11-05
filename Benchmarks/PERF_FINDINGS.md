@@ -13891,3 +13891,90 @@ else moved.
 
 `#89`'s "Not `frequency_penalty` for real" and "Not `logit_bias`" paragraphs are SUPERSEDED by this
 entry: both fields are now honoured on both OpenAI routes, and no route refuses them.
+
+## DSV4.1 #91: OPENAI RENAMED THE REPLY BUDGET AND THIS SERVER NEVER HEARD OF THE NEW NAME — AND THE OLD NAME WAS ONE TOKEN SHORT ON THE REAL CHECKPOINT
+
+### The question
+
+Routed with SubQ (`next_slice` = **`reply_budget_alias` 0.9978 @ 0.9974**, against `device_mhc_stages`
+0.0019, `model_id` 0.0001, `vision_cost` 0.00006, `docs_sweep` 0.00006, `ui_status` 0.00005,
+`responses_route` 0.00003, `perf_leftovers` 0.00001; `alias_conflict` = **`refuse_differing` 0.9556 @
+0.9334** against new-wins 0.0426 and old-wins 0.0018; `ignored_fields` = **`decode_and_document` 0.9715
+@ 0.9572**; `budget_tokens` = **`document_only` 0.8919 @ 0.8378**). Decisive on all four.
+
+With the sampler fields closed (`#90`), the last known silent field lies were the reply budget and the
+fields both protocols accept without honouring. `max_completion_tokens` was not in
+`OpenAIChatRequest`'s decoder AT ALL, so `{"max_completion_tokens": 512}` and no `max_tokens` was
+answered with the app default budget of up to 8192 tokens — the exact class of substitution `#88`
+removed for `response_format` and `n`, on the field that bounds how much the client pays for in time.
+
+### What was added
+
+| file | change |
+|---|---|
+| `OpenAIAdapter.replyBudget(maxTokens:maxCompletionTokens:)` | one pure resolver over the two spellings: either alone is the budget, two that agree is the budget, two that disagree is a `400` naming both, neither means "the app default" (nil) |
+| `OpenAIChatRequest` | decodes `max_completion_tokens` and `parallel_tool_calls` (the latter to document it as ignored) |
+| `refuseUnsupportedResponseShape` | validates the resolved budget, so a disagreeing pair is a `400` BEFORE the model gate, like every other refusal |
+| `ServerController.buildTurnPlan` | the chat planner takes its `maxTokens` from the resolver instead of `request.maxTokens` |
+| `AnthropicMessagesRequest` | decodes `metadata` (`user_id`) and `service_tier`, and `ThinkingConfig` now documents what `budget_tokens` really does (a graded LEVEL, not a token cut) |
+| `CompletionEngine` (DeepSeek path) | the runtime is provisioned for `budget + 1` positions, because the runner reserves one — see the finding |
+| `ServerRequestLog.openAISummary` | the row now records both budget spellings and `parallel_tool_calls`, so a row cannot read as "no budget sent" |
+| `HelpAndSettingsGuideView` | the Request Options and Refused Requests bullets name the two spellings, the conflict rule, and the fields that are accepted and ignored |
+
+### The finding: the budget field was a lie twice over, and the second one needed the real checkpoint
+
+The first half is the mapping, and the pure-logic tests pin it. The second half only shows up when a
+turn actually runs: a request for a THREE-token answer returned **two** tokens. Both spellings did, and
+`#89` had already measured the same shape without anyone reading it as a bug (its live run reported
+"7 generated" for an 8-token budget).
+
+`DeepSeekV41TurnRunner` caps a turn at `limit - promptTokens - 1`, a deliberate reserve for the position
+the last generated token is forwarded at, where `limit` is the executor's `positionLimit`. The engine
+provisions that runtime for `prompt + maxTokens` positions, so the cap collapses to `maxTokens - 1`: every
+budgeted DeepSeek turn answered one token short of what the client asked for, on every route, for as long
+as the path has existed. The cache is now provisioned for `prompt + maxTokens + 1`.
+
+Measured on the published checkpoint, same prompt (a counting task, so nothing stops early):
+
+```
+before: max_completion_tokens=3 -> 2 tokens (length)   max_tokens=3 -> 2 tokens (length)
+after : max_completion_tokens=3 -> 3 tokens (length)   max_tokens=3 -> 3 tokens (length)
+```
+
+The two arms agreeing is what makes the alias honest (they are one budget); the count equalling the
+budget is what makes the budget real. Before this, the only way to tell "the newer field is honoured"
+from "the turn stopped early" was the count.
+
+### What it is not (do not re-propose)
+
+- **Not honouring `parallel_tool_calls: false`.** Obeying it means "emit at most one call", which is a
+  decoding constraint the sampler does not have; refusing it would put a new 400 on the path clients
+  drive daily, for a promise every client recovers from (it processes the calls it gets). Decoded and
+  documented instead.
+- **Not a token-level cut for Anthropic `thinking.budget_tokens`.** It was already doing something real
+  and this slice only documented it: `AnthropicAdapter.thinkingEffort` maps it to `.low` below 4096 and
+  `.high` at or above it on a level-capable checkpoint and refuses a non-positive value by name, so the
+  budget picks the prompt's effort line. What it cannot do is bound the reasoning CHANNEL at a token count,
+  because that channel closes when the model emits the family's close tag and the only mid-channel cut
+  available would be forcing that tag, which the grammar mask cannot express today. A turn is bounded by
+  `max_tokens` either way. Refusing the field would fail every SDK that sends one by default.
+- **Not refusing `metadata` or `service_tier`.** An abuse label and a hosted-fleet routing preference:
+  neither can move a local answer, and both are sent by default by real SDKs. The same posture `seed` and
+  `user` got in `#90`.
+- **Not a KV-budget change.** The `+1` position is the reserve the runner already assumed; it is priced
+  into the same fit check as the rest of the conversation.
+- **Not the Responses API.** Still below the standing level-0 completeness bar; see `#89`.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath`. Bundle freshness checked with `strings … | grep -c` over the new live case name
+before running it.
+
+| suite | result |
+|---|---|
+| `OpenAIAdapterLogicTests` (36 cases, two new: the budget resolver's five arms including the disagreeing pair that must name both fields, and the accept-and-ignore fields decoding on both protocols) | **36 cases, 0 failures** (34 before) |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787: two arms added — a disagreeing pair is a 400 naming `max_completion_tokens` where the newer field alone answers 503) | **26 cases, 0 failures, 1 skipped** |
+| `AnthropicAdapterLogicTests` (28 cases, one new: `metadata`, `service_tier` and `budget_tokens` all survive the decode, and the budget still maps to a graded level) | **28 cases, 0 failures** |
+| adjacent suites, none touched by the slice: `ServerRequestLogLogicTests`, `DeepSeekV41ToolDialectTests`, `DeepSeekV41TurnLoopTests`, `KVCacheProvisioningLogicTests`, `TurnFitLogicTests` (153 cases) and `DeepSeekV41ConfigTests`, `DeepSeekV41MemoryPlanTests`, `DeepSeekV41CacheReuseTests`, `DeepSeekV41TurnImagesTests`, `DeepSeekV41ImagePixelsTests`, `DeepSeekV41PromptRenderTests`, `DeepSeekV41PromptMarkerTests` (63 cases) | **216 cases, 0 failures** |
+| `DeepSeekV41PublishedTurnTests.testTheChatRouteHonoursTheNewerReplyBudgetOnThePublishedCheckpoint` (opt-in, private port 8802, two turns on one runtime) | **failed 50.6 s** (2 tokens for a 3 budget, both arms), then **passed 49.7 s** after the provisioning fix: 3 and 3, both `length` |

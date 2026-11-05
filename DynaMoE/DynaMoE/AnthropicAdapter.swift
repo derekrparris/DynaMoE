@@ -221,6 +221,17 @@ struct AnthropicMessagesRequest: Decodable {
         }
     }
 
+    /// The `thinking` block's own configuration.
+    ///
+    /// `budget_tokens` is a graded LEVEL, not a token cut: `AnthropicAdapter.thinkingEffort`
+    /// maps it to `.low` below 4096 and `.high` at or above it on a level-capable
+    /// checkpoint, refuses a non-positive value by name, and the request-log row records
+    /// what was asked. It cannot bound the reasoning channel at a token count, because
+    /// that channel closes when the model emits the family's close tag and the only cut
+    /// available mid-channel would be a forced tag emission the sampler cannot express.
+    /// The turn is bounded by `max_tokens` either way, so a budget can be exceeded only
+    /// INSIDE the total the client also named, and refusing it would fail every SDK that
+    /// sends one by default.
     struct ThinkingConfig: Decodable {
         let type: String?
         let budgetTokens: Int?
@@ -228,6 +239,16 @@ struct AnthropicMessagesRequest: Decodable {
         enum CodingKeys: String, CodingKey {
             case type
             case budgetTokens = "budget_tokens"
+        }
+    }
+
+    /// Anthropic's request metadata, of which only `user_id` has any meaning (an
+    /// abuse-monitoring label, the same idea as OpenAI's `user`).
+    struct Metadata: Decodable {
+        let userId: String?
+
+        enum CodingKeys: String, CodingKey {
+            case userId = "user_id"
         }
     }
 
@@ -249,15 +270,23 @@ struct AnthropicMessagesRequest: Decodable {
     let tools: [Tool]?
     let toolChoice: ToolChoice?
     let thinking: ThinkingConfig?
+    /// Decoded so it is documented as ignored rather than silently dropped: an abuse
+    /// label cannot move a local answer, and a 400 for one would break every SDK that
+    /// sends it by default (the posture `seed` and `user` get on the OpenAI routes).
+    let metadata: Metadata?
+    /// Decoded for the same reason: a service tier is a routing preference for a
+    /// hosted fleet, and this server has exactly one tier.
+    let serviceTier: String?
 
     enum CodingKeys: String, CodingKey {
-        case system, model, messages, stream, tools, thinking
+        case system, model, messages, stream, tools, thinking, metadata
         case maxTokens = "max_tokens"
         case temperature
         case topP = "top_p"
         case topK = "top_k"
         case stopSequences = "stop_sequences"
         case toolChoice = "tool_choice"
+        case serviceTier = "service_tier"
     }
 
     init(from decoder: Decoder) throws {
@@ -284,6 +313,12 @@ struct AnthropicMessagesRequest: Decodable {
         // (silently dropping the name would make it behave like `auto`).
         self.toolChoice = try? container.decode(ToolChoice.self, forKey: .toolChoice)
         self.thinking = try container.decodeIfPresent(ThinkingConfig.self, forKey: .thinking)
+        // Decoded to be documented as ignored, not obeyed: see the field notes above.
+        // Left out of the decoder they were dropped by `Decodable`'s unknown-key
+        // tolerance, which is the mechanism that made every field in this file a
+        // potential silent substitution.
+        self.metadata = try container.decodeIfPresent(Metadata.self, forKey: .metadata)
+        self.serviceTier = try container.decodeIfPresent(String.self, forKey: .serviceTier)
     }
 
     /// The `tool_choice.type` value, for callers (and tests) that only need the

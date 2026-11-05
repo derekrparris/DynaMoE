@@ -1857,7 +1857,12 @@ final class ServerController: ObservableObject {
             presencePenalty: apiRequest.presencePenalty,
             frequencyPenalty: try OpenAIAdapter.frequencyPenalty(apiRequest.frequencyPenalty),
             logitBias: try OpenAIAdapter.logitBias(from: apiRequest.logitBias),
-            maxTokens: apiRequest.maxTokens,
+            // Either spelling of the reply budget, resolved here exactly as the
+            // refusal above validated it.
+            maxTokens: try OpenAIAdapter.replyBudget(
+                maxTokens: apiRequest.maxTokens,
+                maxCompletionTokens: apiRequest.maxCompletionTokens
+            ),
             stopSequences: apiRequest.stop ?? [],
             thinkingRequested: thinkingRequested,
             thinkingEffort: thinkingEffort,
