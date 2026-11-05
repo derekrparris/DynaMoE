@@ -319,6 +319,139 @@ struct OpenAIChatRequest: Decodable {
     }
 }
 
+/// The legacy OpenAI text-completions request (`POST /v1/completions`).
+///
+/// This protocol is prompt-in/text-out: there is no message list, no role, and no
+/// tool vocabulary, so it is its own type rather than a shim over
+/// `OpenAIChatRequest`. Its `prompt` reaches the same renderer the chat route
+/// uses, which is what makes both halves of the endpoint work: a prompt that
+/// already carries the checkpoint's turn markers passes through byte for byte (a
+/// true continuation), and a plain prompt is rendered as one user turn with the
+/// checkpoint's own begin-of-sentence marker and assistant prefix, because a chat
+/// model answering after its own prefix is the shape it was trained on.
+///
+/// Every field here is decoded, including the ones this server refuses, so a
+/// request for insertion mode or for several choices is answered with a named
+/// error instead of being silently narrowed to "one completion, extras ignored".
+nonisolated struct OpenAICompletionsRequest: Decodable {
+    /// The resolved prompt text, or nil when the client sent token ids (which
+    /// this server refuses by name: it has a tokenizer but no detokenizer, so a
+    /// token-id prompt could be run but never reported back to the client).
+    let promptText: String?
+    /// How many prompts the client sent. The protocol allows a batch; this server
+    /// answers one, so more than one is refused rather than silently truncated.
+    let promptCount: Int
+    let promptIsTokenIDs: Bool
+    let model: String?
+    let suffix: String?
+    let maxTokens: Int?
+    let temperature: Float?
+    let topP: Float?
+    let topK: Int?
+    let minP: Float?
+    let repetitionPenalty: Float?
+    let presencePenalty: Float?
+    let frequencyPenalty: Float?
+    let n: Int?
+    let stream: Bool?
+    /// Upstream spells this as an integer (how many alternatives to return per
+    /// token) rather than the chat route's boolean. Decoded as a flag because
+    /// either spelling means "log-probabilities", and neither is available.
+    let logprobsRequested: Bool
+    let echo: Bool?
+    let stop: [String]?
+    let bestOf: Int?
+    let logitBiasCount: Int
+    /// This server's own thinking extension, which this route reads in the opposite
+    /// direction from the chat route: see `completionsThinkingRequested`.
+    let enableThinking: Bool?
+    let reasoningEffort: String?
+    let streamOptions: OpenAIChatRequest.StreamOptions?
+
+    enum CodingKeys: String, CodingKey {
+        case model, prompt, suffix, n, stream, echo, stop, seed, user
+        case maxTokens = "max_tokens"
+        case temperature
+        case topP = "top_p"
+        case topK = "top_k"
+        case minP = "min_p"
+        case repetitionPenalty = "repetition_penalty"
+        case presencePenalty = "presence_penalty"
+        case frequencyPenalty = "frequency_penalty"
+        case logprobs
+        case bestOf = "best_of"
+        case logitBias = "logit_bias"
+        case enableThinking = "enable_thinking"
+        case reasoningEffort = "reasoning_effort"
+        case streamOptions = "stream_options"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        // `prompt` is a string, an array of strings, an array of token ids, or an
+        // array of token-id arrays. Each shape is tried in turn so the refusal
+        // below can name which one was sent.
+        if let single = try? container.decode(String.self, forKey: .prompt) {
+            self.promptText = single
+            self.promptCount = 1
+            self.promptIsTokenIDs = false
+        } else if let batch = try? container.decode([String].self, forKey: .prompt) {
+            self.promptText = batch.first
+            self.promptCount = batch.count
+            self.promptIsTokenIDs = false
+        } else if (try? container.decode([Int].self, forKey: .prompt)) != nil
+            || (try? container.decode([[Int]].self, forKey: .prompt)) != nil {
+            self.promptText = nil
+            self.promptCount = 1
+            self.promptIsTokenIDs = true
+        } else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .prompt,
+                in: container,
+                debugDescription: "prompt must be a string or an array of strings"
+            )
+        }
+        self.model = try container.decodeIfPresent(String.self, forKey: .model)
+        self.suffix = try container.decodeIfPresent(String.self, forKey: .suffix)
+        self.maxTokens = try container.decodeIfPresent(Int.self, forKey: .maxTokens)
+        self.temperature = try container.decodeIfPresent(Float.self, forKey: .temperature)
+        self.topP = try container.decodeIfPresent(Float.self, forKey: .topP)
+        self.topK = try container.decodeIfPresent(Int.self, forKey: .topK)
+        self.minP = try container.decodeIfPresent(Float.self, forKey: .minP)
+        self.repetitionPenalty = try container.decodeIfPresent(Float.self, forKey: .repetitionPenalty)
+        self.presencePenalty = try container.decodeIfPresent(Float.self, forKey: .presencePenalty)
+        self.frequencyPenalty = try container.decodeIfPresent(Float.self, forKey: .frequencyPenalty)
+        self.n = try container.decodeIfPresent(Int.self, forKey: .n)
+        self.stream = try container.decodeIfPresent(Bool.self, forKey: .stream)
+        // `logprobs` is an Int on this route and a Bool on the chat route; either
+        // one is a request for log-probabilities, which the engine does not emit.
+        if let count = try? container.decode(Int.self, forKey: .logprobs) {
+            self.logprobsRequested = count > 0
+        } else if let flag = try? container.decode(Bool.self, forKey: .logprobs) {
+            self.logprobsRequested = flag
+        } else {
+            self.logprobsRequested = false
+        }
+        self.echo = try container.decodeIfPresent(Bool.self, forKey: .echo)
+        if let single = try? container.decode(String.self, forKey: .stop) {
+            self.stop = [single]
+        } else {
+            self.stop = try container.decodeIfPresent([String].self, forKey: .stop)
+        }
+        self.bestOf = try container.decodeIfPresent(Int.self, forKey: .bestOf)
+        self.logitBiasCount = (try container.decodeIfPresent([String: Float].self, forKey: .logitBias))?.count ?? 0
+        self.enableThinking = try container.decodeIfPresent(Bool.self, forKey: .enableThinking)
+        self.reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
+        self.streamOptions = try container.decodeIfPresent(OpenAIChatRequest.StreamOptions.self, forKey: .streamOptions)
+        // `seed` and `user` are decoded only to be documented as ignored: upstream
+        // calls `seed` a best-effort determinism hint (this server is already greedy
+        // at temperature 0) and `user` an abuse-monitoring label with no local
+        // meaning. Neither can change an answer, so neither is refused.
+        _ = try container.decodeIfPresent(Int.self, forKey: .seed)
+        _ = try container.decodeIfPresent(String.self, forKey: .user)
+    }
+}
+
 // MARK: - Response types
 
 struct OpenAIUsage: Encodable {
@@ -412,6 +545,76 @@ struct OpenAIChatChunk: Encodable {
 
     let id: String
     let object: String = "chat.completion.chunk"
+    let created: Int
+    let model: String
+    let choices: [Choice]
+}
+
+/// One completed legacy text completion.
+///
+/// The object is `text_completion` and a choice is `text`/`index`/`logprobs`/
+/// `finish_reason`, with no message and no role: this protocol predates both. Its
+/// `logprobs` key is written as an explicit null rather than omitted, because that
+/// is what upstream sends and a strict decoder reads the key as always-present.
+nonisolated struct OpenAICompletionsResponse: ResponseEncodable {
+    struct Choice: Encodable {
+        let text: String
+        let index: Int
+        let finishReason: String
+
+        enum CodingKeys: String, CodingKey {
+            case text, index, logprobs
+            case finishReason = "finish_reason"
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(text, forKey: .text)
+            try container.encode(index, forKey: .index)
+            try container.encodeNil(forKey: .logprobs)
+            try container.encode(finishReason, forKey: .finishReason)
+        }
+    }
+
+    let id: String
+    let object: String = "text_completion"
+    let created: Int
+    let model: String
+    let choices: [Choice]
+    let usage: OpenAIUsage
+
+    enum CodingKeys: String, CodingKey {
+        case id, object, created, model, choices, usage
+    }
+}
+
+/// One streamed legacy text completion delta.
+nonisolated struct OpenAICompletionsChunk: Encodable {
+    struct Choice: Encodable {
+        let text: String
+        let index: Int
+        let finishReason: String?
+
+        enum CodingKeys: String, CodingKey {
+            case text, index, logprobs
+            case finishReason = "finish_reason"
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(text, forKey: .text)
+            try container.encode(index, forKey: .index)
+            try container.encodeNil(forKey: .logprobs)
+            if let finishReason {
+                try container.encode(finishReason, forKey: .finishReason)
+            } else {
+                try container.encodeNil(forKey: .finishReason)
+            }
+        }
+    }
+
+    let id: String
+    let object: String = "text_completion"
     let created: Int
     let model: String
     let choices: [Choice]
@@ -621,6 +824,96 @@ enum OpenAIAdapter {
                     + "and top_logprobs."
             )
         }
+    }
+
+    /// The same posture for the legacy text-completions route, over that route's
+    /// own field set.
+    ///
+    /// It is a separate function rather than a widening of the chat refusal
+    /// because the two routes carry different fields and this one is new: nothing
+    /// that works against the chat route today starts failing because of a rule
+    /// added here. The sampler fields (`frequency_penalty`, `logit_bias`) are
+    /// named here even though the chat route still ignores them; refusing them on
+    /// the route nobody calls yet cannot break a live client, and the asymmetry is
+    /// recorded rather than hidden.
+    nonisolated static func refuseUnsupportedCompletionsShape(_ request: OpenAICompletionsRequest) throws {
+        if request.promptIsTokenIDs {
+            throw ServerAPIError.badRequest(
+                "prompt as token ids is not supported: this server tokenizes but does not detokenize, "
+                    + "so it could run an id prompt but never report what it completed. Send prompt as text."
+            )
+        }
+        if request.promptCount != 1 {
+            throw ServerAPIError.badRequest(
+                "prompt carries \(request.promptCount) prompts: this server completes one prompt per "
+                    + "request. Send one request per prompt (they queue)."
+            )
+        }
+        guard let prompt = request.promptText, !prompt.isEmpty else {
+            throw ServerAPIError.badRequest("prompt is empty: send the text to continue.")
+        }
+        if request.suffix != nil {
+            throw ServerAPIError.badRequest(
+                "suffix is not supported: this server cannot do insertion mode, so the text it returned "
+                    + "would not fit the gap the suffix describes. Omit suffix."
+            )
+        }
+        if let n = request.n, n != 1 {
+            throw ServerAPIError.badRequest(
+                "n = \(n) is not supported: this server generates one completion per request. Send "
+                    + "one request per completion (they queue), or omit n."
+            )
+        }
+        if request.logprobsRequested {
+            throw ServerAPIError.badRequest(
+                "logprobs is not supported: this server's responses carry no token log-probabilities, "
+                    + "so a client scoring its own output would silently receive none. Omit logprobs."
+            )
+        }
+        if let bestOf = request.bestOf, bestOf != 1 {
+            throw ServerAPIError.badRequest(
+                "best_of = \(bestOf) is not supported: this server runs one candidate per request, so "
+                    + "best_of would change nothing about the completion it returned. Omit best_of."
+            )
+        }
+        if request.logitBiasCount > 0 {
+            throw ServerAPIError.badRequest(
+                "logit_bias is not supported: this server cannot bias token logits per request, so the "
+                    + "completion would be drawn from a distribution the client did not ask for. Omit logit_bias."
+            )
+        }
+        if let frequency = request.frequencyPenalty, abs(frequency) > 0.001 {
+            throw ServerAPIError.badRequest(
+                "frequency_penalty is not supported: this server applies presence_penalty (once per token "
+                    + "seen) but has no occurrence-count penalty, so the completion would be drawn from a "
+                    + "distribution the client did not ask for. Use presence_penalty, or omit frequency_penalty."
+            )
+        }
+    }
+
+    /// Whether the legacy route renders the reasoning channel into its prompt.
+    ///
+    /// OFF unless the client asks, which is the opposite of the chat route's default
+    /// and deliberate: `text_completion` has no field to carry reasoning, so a turn
+    /// that reasons first spends its whole budget there and returns a trace instead of
+    /// the continuation the caller asked for (measured on the real checkpoint: eight
+    /// tokens of "The user asks a simple factual question</think>" and no answer). A
+    /// client that wants the reasoning can say so with this server's own
+    /// `enable_thinking`, and then the fold in `completionsText` carries it in `text`.
+    nonisolated static func completionsThinkingRequested(_ request: OpenAICompletionsRequest) -> Bool {
+        request.enableThinking ?? false
+    }
+
+    /// The legacy route's prompt as the one shape the turn planner reads.
+    ///
+    /// There is no system field on this protocol, so the system prompt is empty and
+    /// the checkpoint's own default system block is what the renderer writes — the
+    /// same thing the chat route produces for a request that sent no system
+    /// message. The prompt is a single user turn; the renderer decides from the
+    /// text itself whether it is a plain question or an already-templated
+    /// continuation.
+    nonisolated static func completionsSplit(_ request: OpenAICompletionsRequest) -> ServerPromptSplit {
+        ServerPromptSplit(systemPrompt: "", turns: [.init(role: .user, text: request.promptText ?? "")])
     }
 
     /// Maps the client's `reasoning_effort` onto a graded level. Returns nil
@@ -833,6 +1126,41 @@ enum OpenAIAdapter {
             }
         }
 
+        return uuid(fromLanes: (lane0, lane1))
+    }
+
+    /// Stable prefix-cache session key for the legacy text-completions route.
+    ///
+    /// That protocol has no message list, so identity is the prompt itself: two
+    /// requests whose prompts are byte-identical are the same continuation, and any
+    /// difference (including one that is already templated) is a different one. The
+    /// model is mixed in for the reason the chat route mixes it: a model switch must
+    /// not inherit the previous model's pinned prefix. `"completions"` is mixed in
+    /// first so a completion prompt and a chat message with the same text cannot
+    /// collide on one session.
+    nonisolated static func sessionKey(forPrompt prompt: String, model: String?) -> UUID {
+        var lane0: UInt64 = 0xcbf29ce484222325
+        var lane1: UInt64 = 0x9e3779b97f4a7c15
+        func mix(_ byte: UInt8) {
+            lane0 = (lane0 ^ UInt64(byte)) &* 0x100000001b3
+            lane1 = (lane1 ^ UInt64(byte)) &* 0x00000100000001b3
+            lane1 = (lane1 << 7) | (lane1 >> 57)
+        }
+        func mixString(_ s: String) {
+            for byte in s.utf8 { mix(byte) }
+            mix(0x1f)
+        }
+        mixString("completions")
+        mixString(model ?? "")
+        mixString(prompt)
+        return uuid(fromLanes: (lane0, lane1))
+    }
+
+    /// The one place the two lanes become a UUID, so both key derivations agree on
+    /// the bit layout (including the RFC 4122 v4 bits downstream consumers parse).
+    nonisolated private static func uuid(fromLanes lanes: (UInt64, UInt64)) -> UUID {
+        var lane0 = lanes.0
+        var lane1 = lanes.1
         var bytes = [UInt8](repeating: 0, count: 16)
         withUnsafeMutableBytes(of: &lane0) { bytes.replaceSubrange(0..<8, with: $0) }
         withUnsafeMutableBytes(of: &lane1) { bytes.replaceSubrange(8..<16, with: $0) }

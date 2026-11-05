@@ -4730,6 +4730,119 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         }
     }
 
+    /// The legacy text-completions route, on the real checkpoint.
+    ///
+    /// Every assertion here is a fact measured outside the mapping it checks: the
+    /// answer completes a fact the prompt states ("The capital of France is"), `echo`
+    /// is honoured by the returned text starting with the prompt the CLIENT sent
+    /// (never the rendered template, which it never sent), the stream carries
+    /// `text_completion` frames rather than `chat.completion.chunk` ones, and both
+    /// requests are logged on the path the request-log vocabulary has always
+    /// classified as OpenAI.
+    func testTheLegacyCompletionsRouteAnswersOnThePublishedCheckpoint() async throws {
+        let snapshot = try snapshotDirectory()
+        let engine = try loadPublishedCheckpointIntoTheSharedEngine(snapshot)
+        defer {
+            unloadSharedEngine()
+            withExtendedLifetime(engine) {}
+        }
+        let port = 8799
+
+        func post(_ body: String) async throws -> (status: Int, text: String) {
+            var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/completions")!)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = Data(body.utf8)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let status = try XCTUnwrap((response as? HTTPURLResponse)?.statusCode)
+            return (status, String(decoding: data, as: UTF8.self))
+        }
+
+        try await withLocalServer(on: port) { store in
+            let plain = try await post("""
+            {"model":"any","prompt":"The capital of France is","max_tokens":8,"echo":true,"temperature":0}
+            """)
+            XCTAssertEqual(plain.status, 200, plain.text)
+            let body = try XCTUnwrap(
+                try JSONSerialization.jsonObject(with: Data(plain.text.utf8)) as? [String: Any]
+            )
+            XCTAssertEqual(body["object"] as? String, "text_completion")
+            let id = try XCTUnwrap(body["id"] as? String)
+            XCTAssertTrue(id.hasPrefix("cmpl-"), "the legacy object has its own id prefix, got: \(id)")
+
+            let choices = try XCTUnwrap(body["choices"] as? [[String: Any]])
+            XCTAssertEqual(choices.count, 1, "one completion per request is the whole contract")
+            let text = try XCTUnwrap(choices[0]["text"] as? String)
+            let promptText = "The capital of France is"
+            XCTAssertTrue(
+                text.hasPrefix(promptText),
+                "echo must return the client's own prompt, got: \(text)"
+            )
+            let completion = String(text.dropFirst(promptText.count))
+            XCTAssertFalse(
+                completion.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                "the model must actually complete the prompt, got: \(text)"
+            )
+            // This protocol has no field to carry reasoning, so the route renders the
+            // reasoning channel CLOSED unless the client asks for it: a turn that
+            // reasons first spends its budget there and answers a trace instead of the
+            // continuation, which is what the first run of this case measured.
+            XCTAssertFalse(
+                completion.contains(TurnTextSplitter.canonicalReasoningCloseTag),
+                "a legacy completion must not default to a reasoning trace, got: \(text)"
+            )
+            XCTAssertTrue(
+                choices[0]["logprobs"] is NSNull,
+                "the key is present and null, which is the shape upstream sends"
+            )
+
+            let usage = try XCTUnwrap(body["usage"] as? [String: Any])
+            let promptTokens = try XCTUnwrap(usage["prompt_tokens"] as? Int)
+            let completionTokens = try XCTUnwrap(usage["completion_tokens"] as? Int)
+            XCTAssertGreaterThan(promptTokens, 0)
+            XCTAssertGreaterThan(completionTokens, 0)
+            XCTAssertEqual(
+                usage["total_tokens"] as? Int,
+                promptTokens + completionTokens,
+                "the total must be the two counts the same object reports"
+            )
+            print("🔎 [dsv41 real] completions: \(Self.jsonText(body))")
+
+            // The same prompt as a stream: this protocol's own object on every frame,
+            // the deltas assembled back into the completion, one usage tail because it
+            // was asked for, and a `[DONE]` terminator.
+            let streamed = try await post("""
+            {"model":"any","prompt":"The capital of France is","max_tokens":8,"stream":true,
+             "stream_options":{"include_usage":true}}
+            """)
+            XCTAssertEqual(streamed.status, 200, streamed.text)
+            XCTAssertTrue(streamed.text.contains("[DONE]"), "the stream must terminate")
+            let frames = parseSSEFrames(streamed.text).frames
+            XCTAssertFalse(frames.isEmpty)
+            var assembled = ""
+            for frame in frames where frame.data != "[DONE]" {
+                guard let data = frame.data.data(using: .utf8),
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+                XCTAssertEqual(
+                    json["object"] as? String, "text_completion",
+                    "a legacy stream must not wear the chat route's chunk object"
+                )
+                guard let choice = (json["choices"] as? [[String: Any]])?.first else { continue }
+                assembled += (choice["text"] as? String) ?? ""
+            }
+            XCTAssertFalse(assembled.isEmpty, "the stream carried no completion text")
+            XCTAssertEqual(usageFrames(in: streamed.text).count, 1, "exactly one usage tail belongs to a stream that asked")
+
+            let rows = await store.fetch(limit: 50).filter { $0.path == "/v1/completions" }
+            XCTAssertEqual(rows.count, 2, "both requests must be logged on their own path")
+            XCTAssertTrue(
+                rows.allSatisfy { $0.proto == .openai },
+                "this path has always been an OpenAI row: \(rows.map { $0.proto })"
+            )
+            XCTAssertTrue(rows.contains { !$0.isError }, "a completed turn is not an error row")
+        }
+    }
+
     /// The `usage` objects of a stream's frames, one per chunk that carries one.
     private func usageFrames(in raw: String) -> [[String: Any]] {
         var found: [[String: Any]] = []

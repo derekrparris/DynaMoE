@@ -273,7 +273,7 @@ public enum ChatPromptFormatter {
     }
 
     /// One role-tagged turn of a conversation, before family templating.
-    public struct ConversationTurn: Sendable, Equatable {
+    nonisolated public struct ConversationTurn: Sendable, Equatable {
         public enum Role: Sendable, Equatable {
             case user
             case assistant

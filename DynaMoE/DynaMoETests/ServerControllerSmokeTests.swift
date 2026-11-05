@@ -269,6 +269,92 @@ final class ServerControllerSmokeTests: XCTestCase {
         XCTAssertTrue(text.contains("response_format"), "the frame must name the field")
     }
 
+    // MARK: - The legacy text-completions route
+
+    /// `POST /v1/completions` exists and is the chat route's sibling, not a 404: with
+    /// no model loaded it answers `503` for the same reason `/v1/chat/completions`
+    /// does. Before this route existed the request log already classified the path as
+    /// OpenAI, so the vocabulary named a path the router did not serve.
+    func testTheCompletionsRouteExistsAndIsGatedOnALoadedModel() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the no-model gate cannot be isolated from generation")
+        }
+        await ensureServerRunning()
+
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data(#"{"model":"any","prompt":"The capital of France is","max_tokens":4}"#.utf8)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        XCTAssertEqual(
+            http.statusCode, 503,
+            "a route that exists answers 503 without a model, not 404"
+        )
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let error = try XCTUnwrap(body["error"] as? [String: Any], "the 503 must wear the OpenAI error envelope")
+        XCTAssertFalse((error["message"] as? String ?? "").isEmpty)
+    }
+
+    /// The legacy route refuses the fields it cannot honour by name, and refuses them
+    /// BEFORE the model gate: the proof is a 400 where the same body shape answers 503.
+    /// The sampler fields are named here even though the chat route still ignores them,
+    /// because this route is new and refusing them cannot break a working client.
+    func testTheCompletionsRouteRefusesUnrunnableFieldsBeforeTheModelGate() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the pre-gate refusal cannot be isolated from generation")
+        }
+        await ensureServerRunning()
+
+        func post(_ field: String, stream: Bool = false) async throws -> (status: Int, text: String) {
+            let streaming = stream ? #","stream":true"# : ""
+            var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/completions")!)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = Data("""
+            {"model":"any","max_tokens":4,\(field)\(streaming),"prompt":"hello"}
+            """.utf8)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            return (try XCTUnwrap((response as? HTTPURLResponse)?.statusCode), String(decoding: data, as: UTF8.self))
+        }
+
+        for field in [
+            #""suffix":"tail""#,
+            #""n":2"#,
+            #""logprobs":1"#,
+            #""best_of":2"#,
+            #""logit_bias":{"50256":-100}"#,
+            #""frequency_penalty":0.5"#,
+        ] {
+            let (status, text) = try await post(field)
+            XCTAssertEqual(status, 400, "\(field) must be refused, not ignored: \(text)")
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+            let error = try XCTUnwrap(body["error"] as? [String: Any])
+            XCTAssertEqual(error["type"] as? String, "invalid_request_error")
+            let message = try XCTUnwrap(error["message"] as? String)
+            let named = field.split(separator: "\"").first.map(String.init) ?? ""
+            XCTAssertTrue(message.contains(named), "the refusal must name \(named), got: \(message)")
+        }
+
+        // A batch of prompts is a body shape rather than a field, so it gets its own
+        // request instead of a field spliced into the loop's fixed body.
+        var batch = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/completions")!)
+        batch.httpMethod = "POST"
+        batch.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        batch.httpBody = Data(#"{"model":"any","max_tokens":4,"prompt":["a","b"]}"#.utf8)
+        let (batchData, batchResponse) = try await URLSession.shared.data(for: batch)
+        XCTAssertEqual((batchResponse as? HTTPURLResponse)?.statusCode, 400, "one prompt per request")
+        XCTAssertTrue(String(decoding: batchData, as: UTF8.self).contains("2 prompts"))
+
+        // The streaming route keeps its own contract: a 200 whose refusal travels as an
+        // SSE error frame, exactly as `#80` pinned for a picture against a model with no
+        // tower.
+        let streamed = try await post(#""suffix":"tail""#, stream: true)
+        XCTAssertEqual(streamed.status, 200, "a streaming refusal wears a 200 by contract")
+        XCTAssertTrue(streamed.text.contains("\"error\""), "got: \(streamed.text)")
+        XCTAssertTrue(streamed.text.contains("suffix"), "the frame must name the field")
+    }
+
     func testStreamingCompletionsWithoutModelEmitsSSEErrorThenDone() async throws {
         guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
             throw XCTSkip("A model is loaded; the SSE error path cannot be exercised")

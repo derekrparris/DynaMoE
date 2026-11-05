@@ -1229,6 +1229,55 @@ final class ServerController: ObservableObject {
             return try context.responseEncoder.encode(result, from: request, context: context)
         }
 
+        // The protocol's legacy text endpoint. It is the same engine and the same
+        // planner as the chat route: the prompt is rendered by the one renderer, so
+        // a plain prompt is answered after the checkpoint's own assistant prefix and
+        // an already-templated one is continued byte for byte. What it does not
+        // share is a shape: no messages in, `text_completion` with `choices[].text`
+        // out. `ServerRequestLog.proto(forPath:)` has always classified this path as
+        // OpenAI, so before this route existed the log vocabulary named a path the
+        // router did not serve.
+        router.post("v1/completions") { request, context in
+            ServerController.stats.beginRequest()
+            defer { ServerController.stats.endRequest() }
+            let logBox = ServerRequestLogRecorder.shared.box(for: context.id)
+            logBox?.modify { $0.requestBytes = Int(request.headers[.contentLength] ?? "") }
+            try ServerController.authorizeOrThrow(request)
+            let apiRequest: OpenAICompletionsRequest
+            do {
+                apiRequest = try await request.decode(as: OpenAICompletionsRequest.self, context: context)
+            } catch {
+                throw ServerAPIError.badRequest("Invalid request body: \(error.localizedDescription)")
+            }
+            logBox?.modify {
+                $0.wasStreaming = apiRequest.stream == true
+                $0.temperature = apiRequest.temperature.map { Double($0) }
+                $0.maxTokens = apiRequest.maxTokens
+                // Same gating as the sibling routes: never build the summary just
+                // to discard it when body capture is off.
+                $0.requestBody = ServerRequestLogRecorder.captureBodiesEnabled
+                    ? ServerRequestLog.capturedRequestBody(ServerRequestLog.openAICompletionsSummary(apiRequest))
+                    : ServerRequestLog.contentWithheldMarker
+            }
+            if apiRequest.stream == true {
+                // Streaming keeps the 200 + text/event-stream contract even when the
+                // engine cannot accept the turn: errors arrive as SSE frames.
+                return ServerController.completionsStreamingResponse(apiRequest: apiRequest, queue: queue, logBox: logBox)
+            }
+            let plan = try ServerController.buildTurnPlan(apiRequest)
+            logBox?.modify {
+                $0.model = plan.modelName
+                $0.inputTokens = plan.promptTokenCount
+            }
+            let result = try await ServerController.completionsNonStreamingResponse(
+                plan: plan,
+                apiRequest: apiRequest,
+                queue: queue,
+                logBox: logBox
+            )
+            return try context.responseEncoder.encode(result, from: request, context: context)
+        }
+
         router.post("v1/messages") { request, context in
             ServerController.stats.beginRequest()
             defer { ServerController.stats.endRequest() }
@@ -1813,6 +1862,44 @@ final class ServerController: ObservableObject {
         ))
     }
 
+    /// The legacy text-completions plan. One prompt, one user turn, no tools: this
+    /// protocol has no message list and no vocabulary for a call, so the planner has
+    /// nothing to resolve beyond the refusal of the fields it cannot honour.
+    ///
+    /// The refusals run before `requireLoadedModel()` for the reason the sibling
+    /// planners' do: a request this server cannot answer at all should say so with a
+    /// 400 rather than a 503 that blames the missing model.
+    nonisolated private static func buildTurnPlan(_ apiRequest: OpenAICompletionsRequest) throws -> TurnPlan {
+        try OpenAIAdapter.refuseUnsupportedCompletionsShape(apiRequest)
+        let info = try requireLoadedModel()
+        let split = OpenAIAdapter.completionsSplit(apiRequest)
+        let thinkingRequested = OpenAIAdapter.completionsThinkingRequested(apiRequest)
+        let thinkingEffort = try OpenAIAdapter.thinkingEffort(
+            from: apiRequest.reasoningEffort,
+            levelCapable: info.supportsThinkingLevels,
+            thinkingRequested: thinkingRequested
+        )
+        return try buildTurnPlan(TurnPlanInputs(
+            systemPrompt: split.systemPrompt,
+            conversation: split.turns,
+            temperature: apiRequest.temperature,
+            topP: apiRequest.topP,
+            topK: apiRequest.topK,
+            minP: apiRequest.minP,
+            repetitionPenalty: apiRequest.repetitionPenalty,
+            presencePenalty: apiRequest.presencePenalty,
+            maxTokens: apiRequest.maxTokens,
+            stopSequences: apiRequest.stop ?? [],
+            thinkingRequested: thinkingRequested,
+            thinkingEffort: thinkingEffort,
+            hasTools: false,
+            toolDeclaration: nil,
+            maskSchemas: [],
+            sessionId: OpenAIAdapter.sessionKey(forPrompt: apiRequest.promptText ?? "", model: info.displayName),
+            images: split.images
+        ))
+    }
+
     /// - Parameter maxTokensRequired: the messages route requires `max_tokens`
     ///   and the `count_tokens` body has no such field by protocol. The reply
     ///   budget never moves the prompt, so the count path takes the smallest legal
@@ -1991,6 +2078,52 @@ final class ServerController: ObservableObject {
             choices: [.init(index: 0, message: message, finishReason: finishReason)],
             usage: .init(promptTokens: plan.promptTokenCount, completionTokens: result.tokensGenerated)
         )
+    }
+
+    // MARK: Legacy text completions
+
+    nonisolated private static func completionsNonStreamingResponse(
+        plan: TurnPlan,
+        apiRequest: OpenAICompletionsRequest,
+        queue: TurnExecutionQueue,
+        logBox: ServerRequestLogBox?
+    ) async throws -> OpenAICompletionsResponse {
+        let result = try await runTurn(plan: plan, queue: queue, logBox: logBox)
+        let text = Self.completionsText(
+            thinking: result.thinkingText,
+            response: result.responseText,
+            echoPrompt: apiRequest.echo == true ? (apiRequest.promptText ?? "") : nil
+        )
+        // This protocol cannot call a tool, so no tool call can be the finish
+        // reason even if the family's dialect would have frozen on one.
+        let finishReason = OpenAIAdapter.finishReasonString(result.finishReason, hasToolCalls: false)
+        Self.recordTurnOutcome(logBox: logBox, result: result, finishReason: finishReason)
+        return OpenAICompletionsResponse(
+            id: "cmpl-\(UUID().uuidString.prefix(24))",
+            created: Int(Date().timeIntervalSince1970),
+            model: plan.modelName,
+            choices: [.init(text: text, index: 0, finishReason: finishReason)],
+            usage: .init(promptTokens: plan.promptTokenCount, completionTokens: result.tokensGenerated)
+        )
+    }
+
+    /// The completion text this protocol returns, and why it is folded.
+    ///
+    /// `text_completion` has no `reasoning_content` field and no content-block
+    /// list, so the reasoning channel is folded into `text` with the canonical
+    /// close tag rather than dropped: a client displaying `choices[0].text` would
+    /// otherwise show an answer whose reasoning silently vanished, and a streaming
+    /// client would see dead air for the whole reasoning phase. The fold is the one
+    /// the chat route's inline-reasoning mode emits, so the two agree there.
+    ///
+    /// `echo` is honoured rather than refused: upstream prepends the prompt to the
+    /// completion so a client can display or score the pair, and the prompt here is
+    /// the client's own text (never the rendered template, which the client never
+    /// sent and could not re-derive).
+    nonisolated static func completionsText(thinking: String, response: String, echoPrompt: String?) -> String {
+        let body = inlineReasoningText(thinking: thinking, response: response)
+        guard let echoPrompt, !echoPrompt.isEmpty else { return body }
+        return echoPrompt + body
     }
 
     /// Stamp the terminal inference facts (tokens, finish reason, tool calls,
@@ -2389,6 +2522,281 @@ final class ServerController: ObservableObject {
             }
             if !finishedCleanly {
                 // Client disconnect or queue cancellation: abort the engine turn.
+                task.cancel()
+                throw CancellationError()
+            }
+            try await writer.finish(nil)
+        }
+
+        var headers = HTTPFields()
+        headers[.contentType] = "text/event-stream"
+        headers[.cacheControl] = "no-store"
+        headers[.connection] = "keep-alive"
+        return Response(status: .ok, headers: headers, body: body)
+    }
+
+    /// The legacy route's stream: `text_completion` frames carrying `choices[].text`
+    /// deltas, terminated by `[DONE]`.
+    ///
+    /// It keeps the chat writer's three disciplines because they are properties of
+    /// this server rather than of that protocol: append-only deltas (a repaired
+    /// snapshot is never re-sent), the suffix that could still grow into a stop
+    /// sequence is withheld until it is safe, and the queue's heartbeats keep a
+    /// waiting client from timing out. Reasoning has no field here, so it is folded
+    /// into `text` exactly as the non-streaming body folds it, which also means the
+    /// stream is never silent through the reasoning phase.
+    nonisolated private static func completionsStreamingResponse(
+        apiRequest: OpenAICompletionsRequest,
+        queue: TurnExecutionQueue,
+        logBox: ServerRequestLogBox?
+    ) -> Response {
+        let encoder = JSONEncoder()
+        let id = "cmpl-\(UUID().uuidString.prefix(24))"
+        let created = Int(Date().timeIntervalSince1970)
+        let stopSequences = (apiRequest.stop ?? []).filter { !$0.isEmpty }
+        let model = apiRequest.model ?? CompletionEngine.shared.loadedModelInfo?.displayName ?? "dynamoe"
+        // Same opt-in rule as the chat route, for the same reason: the usage chunk is
+        // the one chunk whose `choices` is empty, and a client that indexes
+        // `choices[0]` on every chunk throws on it.
+        let includeUsage = apiRequest.streamOptions?.includeUsage ?? false
+        let echoPrompt = apiRequest.echo == true ? (apiRequest.promptText ?? "") : nil
+
+        if let logBox {
+            let claimed = logBox.claim()
+            assert(claimed, "the streaming writer must win its request-log box claim exactly once")
+            logBox.modify { row in
+                row.wasStreaming = true
+            }
+        }
+
+        func chunkBuffer(_ text: String, finishReason: String?) throws -> ByteBuffer {
+            let chunk = OpenAICompletionsChunk(
+                id: id,
+                created: created,
+                model: model,
+                choices: [.init(text: text, index: 0, finishReason: finishReason)]
+            )
+            return ByteBuffer(data: try encoder.encode(chunk))
+        }
+
+        let body = ResponseBody { writer in
+            func sse(_ buffer: ByteBuffer) async throws {
+                var frame = ByteBuffer(string: "data: ")
+                frame.writeImmutableBuffer(buffer)
+                frame.writeString("\n\n")
+                try await writer.write(frame)
+            }
+            func sseRaw(_ text: String) async throws {
+                var frame = ByteBuffer(string: "data: ")
+                frame.writeString(text)
+                frame.writeString("\n\n")
+                try await writer.write(frame)
+            }
+            func ping(_ comment: String?) async throws {
+                try await writer.write(ByteBuffer(string: ":\(comment ?? "ping")\n\n"))
+            }
+            func sseChunk(_ text: String, finishReason: String? = nil) async throws {
+                try await sse(try chunkBuffer(text, finishReason: finishReason))
+            }
+
+            var sentThinking = ""
+            var sentContent = ""
+            var reasoningClosed = false
+            let promptTokensBox = PromptCountBox()
+
+            /// Closes the folded reasoning before any answer text, so the tag never
+            /// straddles the response and the streamed text matches the shape the
+            /// non-streaming body produces.
+            func closeReasoning() async throws {
+                guard !reasoningClosed, !sentThinking.isEmpty else { return }
+                reasoningClosed = true
+                try await sseChunk(TurnTextSplitter.canonicalReasoningCloseTag + "\n\n")
+            }
+
+            if let echoPrompt, !echoPrompt.isEmpty {
+                try await sseChunk(echoPrompt)
+            }
+
+            let (relay, task) = await queue.streamTurn({ claim, emit in
+                do {
+                    let plan = try ServerController.buildTurnPlan(apiRequest)
+                    promptTokensBox.set(plan.promptTokenCount)
+                    logBox?.modify { row in
+                        // The row names the model that actually ran, not the
+                        // client's label: the plan resolves the loaded model behind
+                        // an alias (or a model switch while queued) once the slot
+                        // drains. A turn that never plans carries no model.
+                        row.model = plan.modelName
+                    }
+                    try await ServerController.withTurnToolMask(plan.maskSchemas) {
+                        let launch = try CompletionEngine.shared.launchTurn(plan.request, claim: claim)
+                        if Task.isCancelled {
+                            launch.handle.cancel()
+                            return
+                        }
+                        await withTaskCancellationHandler {
+                            for await event in launch.stream {
+                                if case .finished(let result) = event {
+                                    ServerController.recordCompletedTurn(plan: plan, result: result)
+                                }
+                                emit(.engine(event))
+                            }
+                        } onCancel: {
+                            launch.handle.cancel()
+                        }
+                    }
+                } catch {
+                    emit(.launchFailed(wireLaunchError(error)))
+                }
+            }, queueWaitTimeout: resolvedQueueWaitTimeout, onSlotOpened: { logBox?.noteSlotOpened() })
+            defer { task.cancel() }
+
+            var logTermination: ServerRequestLog.StreamTermination = .clientDisconnected
+            var logErrorMessage: String?
+            var logFirstTokenMs: Double?
+            var logFinish: TurnResult?
+            var logFailure: TurnFailure?
+            var logPartialFrame: CompletionFrame?
+            defer {
+                if let logBox {
+                    logBox.modify { row in
+                        row.httpStatus = 200
+                        row.durationMs = logBox.elapsedMs()
+                        row.firstTokenMs = logFirstTokenMs
+                        row.streamTermination = logTermination
+                        if promptTokensBox.get() > 0 { row.inputTokens = promptTokensBox.get() }
+                        if let message = logErrorMessage { row.errorMessage = message }
+                    }
+                    if let result = logFinish {
+                        recordTurnOutcome(
+                            logBox: logBox,
+                            result: result,
+                            finishReason: OpenAIAdapter.finishReasonString(result.finishReason, hasToolCalls: false)
+                        )
+                    } else if let frame = logPartialFrame {
+                        recordStreamedPartialOutcome(
+                            logBox: logBox,
+                            frame: frame,
+                            tokenCount: logFailure?.tokensGenerated ?? frame.tokensGenerated
+                        )
+                    } else if let failure = logFailure {
+                        recordFailedTurnTokenCount(logBox: logBox, failure: failure)
+                    }
+                    ServerRequestLogRecorder.shared.record(logBox.snapshot())
+                }
+            }
+            var finishedCleanly = false
+            for await event in relay {
+                switch event {
+                case .ping(let comment):
+                    try await ping(comment)
+                case .launchFailed(let apiError):
+                    logTermination = .errorFrame
+                    logErrorMessage = apiError.recordableMessage
+                    let envelope = OpenAIErrorEnvelope(error: .init(
+                        message: apiError.message,
+                        type: apiError.wireType.rawValue,
+                        code: apiError.code
+                    ))
+                    if let data = try? encoder.encode(envelope) {
+                        try await sse(ByteBuffer(data: data))
+                    }
+                    try await sseRaw("[DONE]")
+                    finishedCleanly = true
+                case .engine(.started):
+                    // This protocol has no opening role chunk: the first frame that
+                    // carries text is the first frame.
+                    continue
+                case .engine(.priming):
+                    try await ping("priming weights")
+                case .engine(.prefillProgress(let status, _, _)):
+                    if let status = status {
+                        try await ping("prefill: \(status)")
+                    }
+                case .engine(.frame(let frame)):
+                    if logFirstTokenMs == nil { logFirstTokenMs = logBox?.elapsedMs() }
+                    logPartialFrame = frame
+                    let thinkingDelta = Self.safeStreamDelta(
+                        accumulated: frame.thinkingText,
+                        sent: sentThinking,
+                        stopSequences: stopSequences
+                    )
+                    if !thinkingDelta.isEmpty {
+                        sentThinking += thinkingDelta
+                        try await sseChunk(thinkingDelta)
+                    }
+                    let contentDelta = Self.safeStreamDelta(
+                        accumulated: frame.responseText,
+                        sent: sentContent,
+                        stopSequences: stopSequences
+                    )
+                    if !contentDelta.isEmpty {
+                        try await closeReasoning()
+                        sentContent += contentDelta
+                        try await sseChunk(contentDelta)
+                    }
+                case .engine(.failedTurn(let failure)):
+                    logTermination = .errorFrame
+                    logFailure = failure
+                    logErrorMessage = failure.cancelled ? "Generation cancelled" : failure.message
+                    let envelope = OpenAIErrorEnvelope(error: .init(
+                        message: failure.cancelled ? "Generation cancelled" : failure.message,
+                        type: failure.cancelled ? "cancelled" : "server_error",
+                        code: nil
+                    ))
+                    if let data = try? encoder.encode(envelope) {
+                        try await sse(ByteBuffer(data: data))
+                    }
+                    try await sseRaw("[DONE]")
+                    finishedCleanly = true
+                case .engine(.finished(let result)):
+                    // Capture the final facts before any fallible terminal write, so
+                    // a dropped socket still records the token count and response
+                    // rather than falling back to the last partial frame.
+                    logFinish = result
+                    let tailThinking = Self.safeStreamDelta(
+                        accumulated: result.thinkingText,
+                        sent: sentThinking,
+                        stopSequences: []
+                    )
+                    if !tailThinking.isEmpty {
+                        sentThinking += tailThinking
+                        try await sseChunk(tailThinking)
+                    }
+                    try await closeReasoning()
+                    let tailContent = Self.safeStreamDelta(
+                        accumulated: result.responseText,
+                        sent: sentContent,
+                        stopSequences: []
+                    )
+                    if !tailContent.isEmpty {
+                        try await sseChunk(tailContent)
+                    }
+                    // No tool channel on this protocol, so the terminal frame names
+                    // one of the two reasons a text completion can have.
+                    try await sseChunk("", finishReason: OpenAIAdapter.finishReasonString(result.finishReason, hasToolCalls: false))
+                    let completionTokens = result.tokensGenerated
+                    if includeUsage, let data = try? JSONSerialization.data(withJSONObject: [
+                        "id": id, "object": "text_completion", "created": created, "model": model,
+                        "choices": [],
+                        "usage": [
+                            "prompt_tokens": promptTokensBox.get(),
+                            "completion_tokens": completionTokens,
+                            // The chat route's usage object always carries the sum;
+                            // this one is built by hand because its chunk has an
+                            // empty `choices`, so the two must not disagree.
+                            "total_tokens": promptTokensBox.get() + completionTokens,
+                        ],
+                    ]) {
+                        try await sse(ByteBuffer(data: data))
+                    }
+                    try await sseRaw("[DONE]")
+                    logTermination = .completed
+                    finishedCleanly = true
+                }
+                if finishedCleanly { break }
+            }
+            if !finishedCleanly {
                 task.cancel()
                 throw CancellationError()
             }

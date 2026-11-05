@@ -20,6 +20,11 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         return try decoder.decode(OpenAIChatRequest.self, from: Data(json.utf8))
     }
 
+    private func decodeCompletions(_ json: String) throws -> OpenAICompletionsRequest {
+        let decoder = JSONDecoder()
+        return try decoder.decode(OpenAICompletionsRequest.self, from: Data(json.utf8))
+    }
+
     // MARK: - Request decoding
 
     func testDecodesMinimalRequestWithStringContent() throws {
@@ -478,6 +483,134 @@ final class OpenAIAdapterLogicTests: XCTestCase {
             try OpenAIAdapter.refuseUnsupportedResponseShape(asked),
             "a field this server can honour must never be refused"
         )
+    }
+
+    // MARK: - The legacy text-completions route
+
+    func testTheLegacyCompletionsRequestDecodesItsOwnPromptShapes() throws {
+        let single = try decodeCompletions(#"{"prompt":"The capital of France is"}"#)
+        XCTAssertEqual(single.promptText, "The capital of France is")
+        XCTAssertEqual(single.promptCount, 1)
+        XCTAssertFalse(single.promptIsTokenIDs)
+
+        let batch = try decodeCompletions(#"{"prompt":["a","b"]}"#)
+        XCTAssertEqual(batch.promptCount, 2, "a batch is decoded so the planner can refuse it by count rather than silently running the first")
+
+        let ids = try decodeCompletions(#"{"prompt":[1,2,3]}"#)
+        XCTAssertTrue(ids.promptIsTokenIDs)
+        XCTAssertNil(ids.promptText)
+
+        let idBatch = try decodeCompletions(#"{"prompt":[[1,2],[3]]}"#)
+        XCTAssertTrue(idBatch.promptIsTokenIDs)
+
+        let shape = try decodeCompletions("""
+        {"prompt":"x","stop":"END","echo":true,"logprobs":5,"best_of":1,"seed":7,
+         "user":"someone","stream_options":{"include_usage":true}}
+        """)
+        XCTAssertEqual(shape.stop, ["END"], "the protocol allows a bare string stop")
+        XCTAssertEqual(shape.echo, true)
+        XCTAssertTrue(shape.logprobsRequested)
+        XCTAssertEqual(shape.bestOf, 1)
+        XCTAssertEqual(shape.streamOptions?.includeUsage, true)
+
+        // `logprobs` is a Bool on the chat route and an Int here; either spelling is a
+        // request for token log-probabilities.
+        let logprobsAsBool = try decodeCompletions(#"{"prompt":"x","logprobs":true}"#)
+        XCTAssertTrue(logprobsAsBool.logprobsRequested)
+        let logprobsAsZero = try decodeCompletions(#"{"prompt":"x","logprobs":0}"#)
+        XCTAssertFalse(logprobsAsZero.logprobsRequested)
+        let logprobsAbsent = try decodeCompletions(#"{"prompt":"x"}"#)
+        XCTAssertFalse(logprobsAbsent.logprobsRequested)
+
+        XCTAssertThrowsError(
+            try decodeCompletions(#"{"prompt":{"text":"x"}}"#),
+            "a prompt shape the protocol does not define is a decode error, not an empty completion"
+        )
+    }
+
+    func testTheCompletionsFieldsThisServerCannotHonourAreRefusedByName() throws {
+        func refuse(_ body: String, naming needle: String, file: StaticString = #filePath, line: UInt = #line) throws {
+            let request = try decodeCompletions(body)
+            XCTAssertThrowsError(
+                try OpenAIAdapter.refuseUnsupportedCompletionsShape(request),
+                body,
+                file: file,
+                line: line
+            ) { error in
+                XCTAssertTrue(
+                    "\(error)".contains(needle),
+                    "the refusal must name \(needle), got: \(error)",
+                    file: file,
+                    line: line
+                )
+            }
+        }
+
+        try refuse(#"{"prompt":[1,2,3]}"#, naming: "token ids")
+        try refuse(#"{"prompt":["a","b"]}"#, naming: "2 prompts")
+        try refuse(#"{"prompt":""}"#, naming: "empty")
+        try refuse(#"{"prompt":"x","suffix":"y"}"#, naming: "suffix")
+        try refuse(#"{"prompt":"x","n":2}"#, naming: "n = 2")
+        try refuse(#"{"prompt":"x","logprobs":1}"#, naming: "logprobs")
+        try refuse(#"{"prompt":"x","best_of":3}"#, naming: "best_of")
+        try refuse(#"{"prompt":"x","logit_bias":{"50256":-100}}"#, naming: "logit_bias")
+        try refuse(#"{"prompt":"x","frequency_penalty":0.5}"#, naming: "frequency_penalty")
+
+        // Everything this route honours, and the two fields that cannot move an
+        // answer (`seed` is a best-effort hint and `user` is an abuse label), is
+        // accepted.
+        for body in [
+            #"{"prompt":"x"}"#,
+            #"{"prompt":"x","n":1,"logprobs":0,"best_of":1}"#,
+            #"{"prompt":"x","frequency_penalty":0,"logit_bias":{}}"#,
+            #"{"prompt":"x","echo":true,"presence_penalty":0.2,"temperature":0.4,"stop":["\n"]}"#,
+            #"{"prompt":"x","seed":42,"user":"someone","stream":true,"stream_options":{"include_usage":true}}"#,
+        ] {
+            XCTAssertNoThrow(
+                try OpenAIAdapter.refuseUnsupportedCompletionsShape(try decodeCompletions(body)),
+                body
+            )
+        }
+    }
+
+    func testTheLegacyRouteReasonsOnlyWhenTheClientAsks() throws {
+        // The opposite default from the chat route on purpose: this protocol has no
+        // field to carry reasoning, so a turn that reasons first spends its budget
+        // there and returns a trace rather than a continuation.
+        let plain = try decodeCompletions(#"{"prompt":"x"}"#)
+        XCTAssertFalse(OpenAIAdapter.completionsThinkingRequested(plain))
+        let asked = try decodeCompletions(#"{"prompt":"x","enable_thinking":true}"#)
+        XCTAssertTrue(OpenAIAdapter.completionsThinkingRequested(asked))
+        let declined = try decodeCompletions(#"{"prompt":"x","enable_thinking":false}"#)
+        XCTAssertFalse(OpenAIAdapter.completionsThinkingRequested(declined))
+    }
+
+    func testTheLegacyPromptIsOneUserTurnWithNoSystemMessage() throws {
+        let request = try decodeCompletions(#"{"prompt":"The capital of France is","model":"m"}"#)
+        let split = OpenAIAdapter.completionsSplit(request)
+        XCTAssertEqual(split.systemPrompt, "", "this protocol has no system field, so the family's own default block is what renders")
+        XCTAssertEqual(split.turns.count, 1)
+        XCTAssertEqual(split.turns[0].role, .user)
+        XCTAssertEqual(split.turns[0].text, "The capital of France is")
+        XCTAssertFalse(split.hasImages, "there is no image field on this protocol")
+    }
+
+    func testTheCompletionsSessionKeyIsThePromptAndTheModel() {
+        let key = OpenAIAdapter.sessionKey(forPrompt: "The capital of France is", model: "m")
+        XCTAssertEqual(
+            OpenAIAdapter.sessionKey(forPrompt: "The capital of France is", model: "m"),
+            key,
+            "a stateless client resends the same prompt, so identity has to be stable"
+        )
+        XCTAssertNotEqual(OpenAIAdapter.sessionKey(forPrompt: "The capital of France is ", model: "m"), key)
+        XCTAssertNotEqual(OpenAIAdapter.sessionKey(forPrompt: "The capital of France is", model: "other"), key)
+        // One prompt and one chat message with the same text are different
+        // conversations, so they must not share a pinned prefix.
+        let chat = OpenAIAdapter.sessionKey(
+            for: [.init(role: "user", contentText: "The capital of France is")],
+            model: "m"
+        )
+        XCTAssertNotEqual(chat, key)
     }
 
     // MARK: - Tool IDs in history

@@ -13642,3 +13642,139 @@ The smoke cases are deliberately split that way: the 400-vs-503 contrast can onl
 model loaded (that is what makes the ordering visible), while the streaming refusal needs no model at
 all because the plan is built inside the stream's own body closure — which is also why a streamed
 refusal wears a 200 and has done since `#80`.
+
+## DSV4.1 #89: THE LEGACY TEXT ROUTE EXISTED IN THE LOG VOCABULARY AND NOWHERE ELSE
+
+### The question
+
+`#87` and `#88` closed the two holes in the server's front door that a real client would hit first:
+a route that answered in the wrong protocol's shape, and four request fields that were answered as if
+they had not been sent. What neither touched is a path the server ALREADY claimed:
+`ServerRequestLog.proto(forPath:)` has classified anything under `/v1/completions` as an OpenAI row
+since long before this branch, and the router served no such path. A client that called it got a 404
+that the app then logged as an OpenAI request.
+
+Routing put this in the mid-band rather than picking it: `next_slice` = **`legacy_completions_route`
+0.497 @ 0.425** against the symmetric Anthropic field audit at 0.447, `openai_responses_route` 0.036,
+`model_id` 0.012, `docs_sweep` 0.005, `device_mhc_stages` 0.002 and `image_cost_ceiling` 0.002 — and
+`docs_worth_a_slice` **0.227**, i.e. the Help-guide repair that has now scored low three times is
+still not a slice of its own. A mid-band answer is decided by reasoning, and two questions settled it:
+`legacy_is_justified` **0.988** (yes: it is part of the OpenAI surface real clients still call, and
+this server already names its path in its own log vocabulary) and `protocol_completeness_bar`
+**level 0 at 0.874** ("every route an in-scope client actually calls exists and answers in that
+client's own shape"), which is why the Responses API is NOT this slice.
+
+The Anthropic audit lost on evidence rather than on probability: `AnthropicMessagesRequest` already
+decodes the whole Messages surface — `system`, `model`, `messages`, `max_tokens`, `temperature`,
+`top_p`, `top_k`, `stop_sequences`, `stream`, `tools`, `tool_choice`, `thinking` — and refuses an
+unknown content block by name (`document`, `audio`). The only fields it ignores are `metadata` and
+`service_tier`, which are an abuse-monitoring label and a cloud routing tier; neither can change an
+answer on a local single-flight engine, so the audit would have produced a paragraph and no code.
+
+Design routing was decisive: `sampler_field_posture` = **`refuse_new_route_only` 0.933 @ 0.910**
+over mirroring the chat route's tolerance (0.061), refusing on both OpenAI routes (0.002) and
+implementing `frequency_penalty` for real (0.004); `prompt_should_be_templated` **0.994** yes;
+`route_is_complete_enough` **0.9995** yes for a one-prompt, one-choice, no-logprob subset.
+
+### What was added
+
+| | where | what it is |
+|---|---|---|
+| `OpenAICompletionsRequest` | `OpenAIAdapter.swift` | this protocol's own request: four `prompt` shapes (string, `[String]`, `[Int]`, `[[Int]]`), `suffix`, `stop` as bare string or array, `echo`, `logprobs` as Int OR Bool, `n`, `best_of`, `logit_bias`, `presence_penalty`, `frequency_penalty`, `seed`, `user`, and this server's `enable_thinking`/`reasoning_effort`/`stream_options` |
+| `OpenAIAdapter.refuseUnsupportedCompletionsShape(_:)` | same | refuses token-id prompts, a prompt batch, an empty prompt, `suffix`, `n != 1`, any `logprobs`, `best_of != 1`, a non-empty `logit_bias` and a non-zero `frequency_penalty`, each naming the field |
+| `OpenAIAdapter.completionsSplit(_:)` / `completionsThinkingRequested(_:)` / `sessionKey(forPrompt:model:)` | same | one user turn with no system prompt, the reasoning default, and a prompt-anchored session key through a shared `uuid(fromLanes:)` with the chat route's |
+| `OpenAICompletionsResponse` / `OpenAICompletionsChunk` | same | `text_completion` with `choices[].text`, an explicit `"logprobs": null`, and an `[DONE]`-terminated stream |
+| `buildTurnPlan(_: OpenAICompletionsRequest)` + `completionsNonStreamingResponse` / `completionsStreamingResponse` / `completionsText` | `ServerController.swift` | the route, its plan, and both writers, all sharing `runTurn`, the queue, the log box, the stop-sequence hold-back and the 200-on-SSE-refusal contract |
+| `ServerRequestLog.openAICompletionsSummary(_:)` | `ServerRequestLog.swift` | the captured-body summary (the prompt IS the body on this route) |
+| `POST /v1/completions` | `ServerController.swift` | registered beside the chat route, with the same stats/log/auth prologue |
+
+### The finding: the route's own default had to be the opposite of the chat route's
+
+The first version of the planner defaulted `thinkingRequested` to `true`, copying the chat route, and
+the live case on the published checkpoint measured what that means for a protocol with no reasoning
+field (`/tmp/test89_live.log`):
+
+```
+"text":"The capital of France isThe user asks a simple factual question</think>"
+```
+
+Eight tokens of budget, all of them reasoning, and **no answer** — the model had not finished thinking
+when the budget ran out, so `choices[0].text` was a trace with an unterminated thought. That is not a
+mapping bug; it is this route having nowhere to put reasoning and therefore no reason to spend budget
+on it. The default is now OFF (a client opts in with this server's own `enable_thinking`, and then
+`completionsText` folds the reasoning into `text` with the canonical close tag rather than dropping
+it), and the same case returns (`/tmp/test89_live2.log`):
+
+```
+"text":"The capital of France isThe capital of France is **Paris"
+```
+
+Three things follow, and all of them are worth keeping:
+
+- **The prompt changes with the default.** The reasoning channel being closed shortens the rendered
+  prompt: **189 → 164 prompt positions** for the same request body. A pinned prefix from a
+  thinking-on request cannot be reused by a thinking-off one, which is already the rule the chat route
+  obeys by rendering the level into the system block.
+- **The model restates the question, so `echo` doubles it.** V4.1 with thinking off answers
+  `The capital of France is **Paris` — the prompt itself is the first thing in its own continuation.
+  An in-app chat turn for the same prompt does the same, so this is the checkpoint's behaviour and not
+  the mapping's; `echo: true` therefore returns the prompt twice, which is what upstream's `echo`
+  means (prompt + completion) and what the case pins.
+- **A legacy stream must not wear the chat route's object.** Every frame is `text_completion`, and the
+  usage tail is opt-in exactly as `#88` made it: the chunk with an empty `choices` array is the one a
+  client that indexes `choices[0]` throws on.
+
+### What it is not (do not re-propose)
+
+- **Not the Responses API.** `POST /v1/responses` is a different and much larger wire surface (items,
+  typed input and output objects, a named streaming event protocol). The completeness bar that decided
+  this slice is level 0 — the routes in-scope clients actually call — and neither Crush nor Claude Code
+  calls it.
+- **Not detokenization.** A token-id prompt is refused by name rather than run, because this server
+  tokenizes but does not detokenize: it could complete an id list and then be unable to say what it
+  completed. Building the reverse map is a real piece of work with no caller here.
+- **Not `frequency_penalty` for real.** The sampler applies `presence_penalty` once per DISTINCT token
+  in the last 256 (`InferenceEngine.sampleNextToken`) and has no occurrence count; honouring the field
+  means threading a count through `TurnSampling`, `CompletionTurnRequest` and three call sites in the
+  hot decode loop. It is refused on this route, which is new, and left ignored on the chat route,
+  which the user's own coding agent drives daily — an asymmetry recorded here rather than hidden,
+  because a new 400 on a live path is a behaviour change and this slice has no measurement that
+  justifies it.
+- **Not `logit_bias`, `best_of` or insertion (`suffix`).** Each asks the engine for something it does
+  not do (per-request logit bias, several candidates, gap filling); each is refused by name here.
+- **Not a change to `seed` or `user`.** Upstream calls `seed` a best-effort determinism hint (this
+  route is greedy at temperature 0, which is already deterministic) and `user` an abuse-monitoring
+  label with no local meaning. Decoding them and documenting them as ignored is the honest half; a
+  400 would break clients that always send them and buy nothing.
+- **Not a perf result.** Nothing here touches the engine, the kernels or the generation path. The two
+  numbers this slice reports (164 prompt positions, 7 generated tokens in an 8-token budget) are the
+  turn's own accounting on the real checkpoint, ~400 ms/token of decode, unchanged.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_89` (status 0, four times), then
+`test-without-building` with the same `-derivedDataPath` throughout. Bundle freshness checked with
+`strings … | grep -c` over the seven new case names (**7**, then **1** for the case added after the
+first live run) before running.
+
+The warning set moved by **+17 instances and 0 kinds**: **1,829 → 1,846**, `diff` of the distinct
+`warning:` texts against `#87`'s baseline shows nothing added and two kinds removed
+(`ChatPromptFormatter.ConversationTurn.Role`'s `Equatable` conformance and its `text` property, which
+went away because `ConversationTurn` is now declared `nonisolated` — it is a pure `Sendable` value
+type and the OpenAI planner reaches it from a `nonisolated` context). The 17 added instances are all
+pre-existing kinds duplicated in `ServerController.swift` by one more route prologue and one more
+streaming body (`beginRequest`, `endRequest`, `cancel`, `PromptCountBox.get`,
+`finishReasonString`). The new wire types are declared `nonisolated` on purpose, which is what keeps
+`OpenAICompletionsRequest`/`Response`/`Chunk` off the conformance diagnostics list.
+
+| suite | result |
+|---|---|
+| `OpenAIAdapterLogicTests` (31 cases, five new: the four prompt shapes decode and an undefined one is a decode error, nine refusals each naming their field while five acceptable bodies pass, one user turn with no system prompt, the prompt-anchored session key, and the reasoning default being OFF) | **31 cases, 0 failures** (27 before) |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787, two new: the route answers **503** with no model loaded instead of 404, and six refused fields plus a prompt batch all answer **400** naming theirs where the same shape answers 503, with the streaming arm answering 200 + an SSE error frame) | **26 cases, 0 failures, 1 skipped** (24 before) |
+| `AnthropicAdapterLogicTests`, `ServerQueueLogicTests`, `ServerStreamSafetyTests`, `ServerToolArgumentTests`, `ServerHardeningLogicTests`, `TurnToolMaskTests`, `ChatPromptFormatterConversationTests`, `ReasoningRoundTripTests`, `PrefixAsOfDateTests`, `EngineTurnSlotTests`, `DeepSeekV41ChatPromptFormatterTests` | **170 cases, 0 failures, 1 skipped** across both runs, none touched by this slice (`DeepSeekV41ChatPromptFormatterTests` runs because `ConversationTurn` changed isolation) |
+| `DeepSeekV41PublishedTurnTests.testTheLegacyCompletionsRouteAnswersOnThePublishedCheckpoint` (opt-in, `/tmp/dynamoe_dsv41_real_turn`, private port 8799, two requests on one runtime) | **passed, 53.8 s then 48.3 s**, `text_completion` object, `cmpl-` id, `echo` prefix, `"logprobs":null`, 189/7 then 164/7 tokens, one usage tail, two `.openai` log rows on `/v1/completions` |
+
+The live case is deliberately two requests rather than one: the non-streaming arm pins the object,
+the echo contract and the accounting, and the streaming arm pins that a legacy stream carries
+`text_completion` frames (never `chat.completion.chunk`) and exactly one usage tail because it asked
+for one.

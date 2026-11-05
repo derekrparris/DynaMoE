@@ -440,6 +440,25 @@ extension ServerRequestLog {
         return serializeSummary(payload)
     }
 
+    /// The legacy text-completions request as a normalized summary. It has no
+    /// messages, so the prompt itself is the body a debugging session needs; the
+    /// fields beside it are the ones that change the answer or the wire shape.
+    nonisolated static func openAICompletionsSummary(_ request: OpenAICompletionsRequest) -> String? {
+        var payload: [String: Any] = [:]
+        payload["model"] = request.model
+        payload["prompt"] = request.promptText
+        payload["prompt_count"] = request.promptCount
+        payload["stream"] = request.stream
+        payload["temperature"] = request.temperature
+        payload["top_p"] = request.topP
+        payload["top_k"] = request.topK
+        payload["max_tokens"] = request.maxTokens
+        payload["stop"] = request.stop
+        payload["echo"] = request.echo
+        payload["enable_thinking"] = request.enableThinking
+        return serializeSummary(payload)
+    }
+
     nonisolated static func anthropicSummary(_ request: AnthropicMessagesRequest) -> String? {
         var payload: [String: Any] = [:]
         payload["model"] = request.model
