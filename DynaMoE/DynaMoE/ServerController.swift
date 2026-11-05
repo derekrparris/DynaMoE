@@ -1215,6 +1215,13 @@ final class ServerController: ObservableObject {
             if apiRequest.store == false {
                 logBox?.withholdBodiesForClientRetention()
             }
+            // The client's own labels are stamped here and NOT folded into the summary
+            // below, because the summary is only composed when content capture is on (and
+            // never for a `store: false` request): recording them there would throw away
+            // the one field it is safe to keep when everything else is withheld.
+            logBox?.modify {
+                $0.clientMetadata = ServerRequestLog.recordedClientMetadata(apiRequest.metadata)
+            }
             let withheld = logBox?.withholdsBodiesForClientRetention == true
             logBox?.modify {
                 // Building the normalized summary walks and serializes the
@@ -1268,6 +1275,11 @@ final class ServerController: ObservableObject {
             if apiRequest.store == false {
                 logBox?.withholdBodiesForClientRetention()
             }
+            // Same labels, same place too: this route speaks the protocol that carries
+            // `metadata`, so it records it rather than narrowing the request.
+            logBox?.modify {
+                $0.clientMetadata = ServerRequestLog.recordedClientMetadata(apiRequest.metadata)
+            }
             let withheld = logBox?.withholdsBodiesForClientRetention == true
             logBox?.modify {
                 // Same gating as the sibling routes: never build the summary just
@@ -1311,6 +1323,10 @@ final class ServerController: ObservableObject {
                 $0.wasStreaming = apiRequest.stream == true
                 $0.temperature = apiRequest.temperature.map { Double($0) }
                 $0.maxTokens = apiRequest.maxTokens
+                // This protocol spells its labels `metadata` too, of which only
+                // `user_id` is defined, so it lands in the same row field the OpenAI
+                // routes use rather than being the one protocol whose labels vanish.
+                $0.clientMetadata = ServerRequestLog.recordedClientMetadata(apiRequest.metadata?.labels)
                 // Same gating as the OpenAI route: never build the summary
                 // just to discard it when body capture is off.
                 $0.requestBody = ServerRequestLogRecorder.captureBodiesEnabled

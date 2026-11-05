@@ -104,6 +104,14 @@ nonisolated struct ServerRequestLog: Identifiable, Codable, Sendable, Equatable,
     /// retention promise, so "never asked" stays distinguishable from "asked to be
     /// kept", which is `false`.
     var retentionWithheldByClient: Bool?
+    /// The client's own labels for this request (OpenAI's `metadata` on both routes,
+    /// Anthropic's `metadata.user_id`). Recorded whatever the Store Request Content
+    /// switch says, because these are metadata rather than content: the caller's own
+    /// correlation data, never conversation text, so a reader working out which request
+    /// a client was asking about keeps them in the row that withheld everything else.
+    /// Nil on payloads persisted before the field (they decode, like `source`) and on
+    /// any request that sent none, which is most.
+    var clientMetadata: [String: String]?
     /// Reason encoding cancelled-by-queue-timeout and similar launch-failure
     /// frames is included in `errorMessage`.
 
@@ -140,6 +148,34 @@ nonisolated struct ServerRequestLog: Identifiable, Codable, Sendable, Equatable,
 
     static func clippedArguments(_ text: String) -> String {
         clippedToUTF8Bytes(text, limit: maxToolArgumentCaptureLength)
+    }
+
+    /// The bounds OpenAI publishes for `metadata` (16 pairs, 64-character keys,
+    /// 512-character values), applied in BYTES so the recorded copy can never inflate
+    /// the database however far a client strays from its own contract. This is a
+    /// RECORDING bound, not a behavioural one: nothing about the answer changes and no
+    /// request is refused, the way `clippedBody` bounds an over-long conversation
+    /// instead of rejecting it.
+    static let maxClientMetadataPairs = 16
+    static let maxClientMetadataKeyBytes = 64
+    static let maxClientMetadataValueBytes = 512
+
+    /// The row's copy of the client's labels, or nil when there are none. Pairs are
+    /// taken in sorted key order so the recorded set is stable whatever order the wire
+    /// used, and an empty map records nothing rather than an empty dictionary: "sent
+    /// no labels" and "sent an empty object" mean the same thing to a reader.
+    static func recordedClientMetadata(_ labels: [String: String]?) -> [String: String]? {
+        guard let labels, !labels.isEmpty else { return nil }
+        var recorded: [String: String] = [:]
+        for key in labels.keys.sorted().prefix(maxClientMetadataPairs) {
+            let clippedKey = clippedToUTF8Bytes(key, limit: maxClientMetadataKeyBytes)
+            guard !clippedKey.isEmpty else { continue }
+            recorded[clippedKey] = clippedToUTF8Bytes(
+                labels[key] ?? "",
+                limit: maxClientMetadataValueBytes
+            )
+        }
+        return recorded.isEmpty ? nil : recorded
     }
 
     /// Byte-budgeted clip: the capture caps are advertised in bytes, and

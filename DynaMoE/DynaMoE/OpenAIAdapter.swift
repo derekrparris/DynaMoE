@@ -270,6 +270,14 @@ struct OpenAIChatRequest: Decodable {
     /// the same reason as `modalities`, and its two named fields so the refusal can
     /// say which voice and format the client asked for.
     let audio: AudioSettings?
+    /// The client's own key/value labels for this request (OpenAI allows 16 pairs
+    /// of strings). Decoded because nothing else carries them: this protocol has no
+    /// response field to echo them into, so the request log's row is the only place a
+    /// caller's labels can survive, and left out of the decoder they survived
+    /// nowhere, which made them the last thing in this request a local operator could
+    /// never see. They can never move an answer, so they are recorded rather than
+    /// refused or obeyed.
+    let metadata: [String: String]?
 
     struct ResponseFormat: Decodable {
         let type: String?
@@ -314,6 +322,7 @@ struct OpenAIChatRequest: Decodable {
         case streamOptions = "stream_options"
         case store
         case modalities, audio
+        case metadata
         case seed, user
     }
 
@@ -377,6 +386,15 @@ struct OpenAIChatRequest: Decodable {
         // no `message.audio`, so the client waited for a field nothing sent.
         self.modalities = try container.decodeIfPresent([String].self, forKey: .modalities)
         self.audio = try container.decodeIfPresent(AudioSettings.self, forKey: .audio)
+        // The client's labels, decoded only so the request log can record them: they
+        // are the caller's own correlation data, which unknown-key tolerance was
+        // dropping into silence one request at a time. Decoded leniently: a map whose
+        // values are not strings yields no labels instead of a 400, because the field
+        // was ignored outright before this and a client that puts a number in it must
+        // not start failing. A malformed map costs the labels for that one request, not
+        // the answer.
+        let labels = try? container.decodeIfPresent([String: String].self, forKey: .metadata)
+        self.metadata = labels ?? nil
     }
 
     /// True when any message carries an image content part. The turn planner
@@ -448,6 +466,9 @@ nonisolated struct OpenAICompletionsRequest: Decodable {
     /// OpenAI's `store`, which this route accepts too because both routes take the
     /// same retention promise: see `OpenAIChatRequest.store`.
     let store: Bool?
+    /// This route carries `metadata` too, so it takes the client's labels into the
+    /// same row field: see `OpenAIChatRequest.metadata`.
+    let metadata: [String: String]?
 
     enum CodingKeys: String, CodingKey {
         case model, prompt, suffix, n, stream, echo, stop, seed, user
@@ -466,6 +487,7 @@ nonisolated struct OpenAICompletionsRequest: Decodable {
         case reasoningEffort = "reasoning_effort"
         case streamOptions = "stream_options"
         case store
+        case metadata
     }
 
     init(from decoder: Decoder) throws {
@@ -526,6 +548,10 @@ nonisolated struct OpenAICompletionsRequest: Decodable {
         self.reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
         self.streamOptions = try container.decodeIfPresent(OpenAIChatRequest.StreamOptions.self, forKey: .streamOptions)
         self.store = try container.decodeIfPresent(Bool.self, forKey: .store)
+        // Lenient for the same reason as the chat route: a map whose values are not
+        // strings costs the labels, never the answer.
+        let labels = try? container.decodeIfPresent([String: String].self, forKey: .metadata)
+        self.metadata = labels ?? nil
         // `seed` and `user` are decoded only to be documented as ignored: upstream
         // calls `seed` a best-effort determinism hint (this server is already greedy
         // at temperature 0) and `user` an abuse-monitoring label with no local

@@ -898,4 +898,36 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         XCTAssertNil(try OpenAIAdapter.thinkingEffort(from: "high", levelCapable: true, thinkingRequested: false))
         XCTAssertNil(try OpenAIAdapter.thinkingEffort(from: "high", levelCapable: false, thinkingRequested: false))
     }
+
+    // MARK: - Client labels
+
+    /// OpenAI's `metadata` is the caller's own correlation map, and this protocol has
+    /// no response field to echo it into, so left out of the decoder it went nowhere
+    /// at all, one request at a time, with no error to notice. It is decoded on both
+    /// OpenAI routes, and `nil` stays distinct from an empty object because "sent no
+    /// labels" and "sent nothing" are different claims.
+    func testTheClientsLabelsAreDecodedOnBothOpenAIRoutes() throws {
+        let chat = try decodeRequest("""
+        {"messages":[],"metadata":{"ticket":"ABC-123","team":"infra"}}
+        """)
+        XCTAssertEqual(chat.metadata, ["ticket": "ABC-123", "team": "infra"] as [String: String]?)
+
+        XCTAssertNil(
+            try decodeRequest(#"{"messages":[]}"#).metadata,
+            "a client that sent no labels records none"
+        )
+        XCTAssertEqual(
+            try decodeRequest(#"{"messages":[],"metadata":{}}"#).metadata,
+            [String: String](),
+            "an empty map decodes as empty; the row is what flattens it to nil"
+        )
+        // A map the server cannot read as strings costs the labels, not the answer: the
+        // field was ignored outright before this slice, so a client that puts a number
+        // in it must not start meeting a 400.
+        XCTAssertNil(try decodeRequest(#"{"messages":[],"metadata":{"count":3}}"#).metadata)
+
+        let legacy = try decodeCompletions(#"{"prompt":"x","metadata":{"run":"7"}}"#)
+        XCTAssertEqual(legacy.metadata, ["run": "7"] as [String: String]?)
+        XCTAssertNil(try decodeCompletions(#"{"prompt":"x"}"#).metadata)
+    }
 }

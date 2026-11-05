@@ -243,12 +243,22 @@ struct AnthropicMessagesRequest: Decodable {
     }
 
     /// Anthropic's request metadata, of which only `user_id` has any meaning (an
-    /// abuse-monitoring label, the same idea as OpenAI's `user`).
-    struct Metadata: Decodable {
+    /// abuse-monitoring label, the same idea as OpenAI's `user`). Recorded on the
+    /// request log's row under the protocol's own spelling, so a caller's label
+    /// survives even when the bodies do not: see `ServerRequestLog.clientMetadata`.
+    nonisolated struct Metadata: Decodable {
         let userId: String?
 
         enum CodingKeys: String, CodingKey {
             case userId = "user_id"
+        }
+
+        /// The recorded labels: the protocol's own key for the one value it carries.
+        /// Kept here rather than at the route so the spelling cannot drift from the
+        /// decoder's.
+        var labels: [String: String] {
+            guard let userId, !userId.isEmpty else { return [:] }
+            return ["user_id": userId]
         }
     }
 
@@ -270,9 +280,10 @@ struct AnthropicMessagesRequest: Decodable {
     let tools: [Tool]?
     let toolChoice: ToolChoice?
     let thinking: ThinkingConfig?
-    /// Decoded so it is documented as ignored rather than silently dropped: an abuse
-    /// label cannot move a local answer, and a 400 for one would break every SDK that
-    /// sends it by default (the posture `seed` and `user` get on the OpenAI routes).
+    /// Recorded on the request log's row and never obeyed: an abuse label cannot move
+    /// a local answer, and a 400 for one would break every SDK that sends it by
+    /// default (the posture `seed` and `user` get on the OpenAI routes). Dropping it
+    /// entirely was the one thing it could not afford to do: see `Metadata.labels`.
     let metadata: Metadata?
     /// Decoded for the same reason: a service tier is a routing preference for a
     /// hosted fleet, and this server has exactly one tier.

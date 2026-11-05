@@ -463,4 +463,22 @@ final class AnthropicAdapterLogicTests: XCTestCase {
             try AnthropicAdapter.thinkingEffort(from: .init(type: "enabled", budgetTokens: 0), levelCapable: true)
         )
     }
+
+    // MARK: - Client labels
+
+    /// This protocol's `metadata` carries exactly one value, and it used to be decoded
+    /// and thrown away. It now lands in the request log's row under the protocol's own
+    /// spelling, so the one label an Anthropic client can send survives where the bodies
+    /// do not, in the same field the OpenAI routes use.
+    func testTheAnthropicMetadataLabelIsRecordedUnderItsOwnSpelling() throws {
+        let labelled = try decodeRequest("""
+        {"model":"any","max_tokens":16,"metadata":{"user_id":"enduser-42"},"messages":[]}
+        """)
+        XCTAssertEqual(labelled.metadata?.userId, "enduser-42")
+        XCTAssertEqual(labelled.metadata?.labels, ["user_id": "enduser-42"])
+
+        let unlabelled = try decodeRequest(#"{"model":"any","max_tokens":16,"messages":[]}"#)
+        XCTAssertNil(unlabelled.metadata)
+        XCTAssertNil(ServerRequestLog.recordedClientMetadata(unlabelled.metadata?.labels))
+    }
 }

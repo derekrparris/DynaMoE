@@ -2279,6 +2279,15 @@ struct SettingsSheetView: View {
                     if log.retentionWithheldByClient == true {
                         serverRequestLogDetailLine("Content", "withheld at the client's request (store: false)")
                     }
+                    // The client's labels survive the switch, so they are shown even
+                    // when both bodies read "withheld": this is the one line that still
+                    // says which request the caller was asking about.
+                    if let labels = log.clientMetadata, !labels.isEmpty {
+                        serverRequestLogDetailLine(
+                            "Client Labels",
+                            labels.keys.sorted().map { "\($0)=\(labels[$0] ?? "")" }.joined(separator: ", ")
+                        )
+                    }
                 }
 
                 serverRequestLogBodySection("Request", log.requestBody)

@@ -920,6 +920,69 @@ final class ServerControllerSmokeTests: XCTestCase {
         )
     }
 
+    /// The client's own labels are the one thing a fully withheld row can still say, so
+    /// they survive the Store Request Content switch rather than riding on it: a request
+    /// carrying `metadata` records it with the switch OFF (where its body reads
+    /// "withheld") and with the switch ON, and the third arm is the control that proves
+    /// the field rather than the switch is what puts them there. The pair limit is a
+    /// recording bound, applied on the way in, so a client over OpenAI's own limit still
+    /// gets its answer.
+    func testAClientsLabelsSurviveAWithheldRow() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the 503 path cannot be exercised")
+        }
+        await ensureServerRunning()
+        let captureBodiesKey = await MainActor.run { ServerRequestLogRecorder.captureBodiesKey }
+        let defaults = UserDefaults.standard
+
+        func row(maxTokens: Int) async throws -> ServerRequestLog {
+            let logged = try await waitForLoggedRow {
+                $0.path == "/v1/chat/completions" && $0.maxTokens == maxTokens
+            }
+            return try XCTUnwrap(logged)
+        }
+
+        defaults.set(false, forKey: captureBodiesKey)
+        let withheldStatus = try await postChat([
+            "model": "any",
+            "max_tokens": 44,
+            "metadata": ["ticket": "ABC-123", "team": "infra"],
+            "messages": [["role": "user", "content": "which request was this"]]
+        ])
+        XCTAssertEqual(withheldStatus, 503)
+        let withheld = try await row(maxTokens: 44)
+        XCTAssertEqual(withheld.requestBody, ServerRequestLog.contentWithheldMarker, "the switch is off, so the bodies are withheld")
+        XCTAssertEqual(
+            withheld.clientMetadata, ["ticket": "ABC-123", "team": "infra"],
+            "the labels are metadata rather than content, so a withheld row still says which request the caller meant"
+        )
+
+        // Control: the same switch state, no labels sent, nothing recorded.
+        let controlStatus = try await postChat([
+            "model": "any",
+            "max_tokens": 55,
+            "messages": [["role": "user", "content": "no labels sent"]]
+        ])
+        XCTAssertEqual(controlStatus, 503)
+        let control = try await row(maxTokens: 55)
+        XCTAssertNil(control.clientMetadata, "no labels sent records none")
+
+        // Over the pair limit the answer is unaffected and the recorded copy is bounded.
+        defaults.set(true, forKey: captureBodiesKey)
+        var many: [String: String] = [:]
+        for index in 0..<20 { many["key\(String(format: "%02d", index))"] = "v\(index)" }
+        let manyStatus = try await postChat([
+            "model": "any",
+            "max_tokens": 66,
+            "metadata": many,
+            "messages": [["role": "user", "content": "too many labels"]]
+        ])
+        XCTAssertEqual(manyStatus, 503, "an over-long metadata map is recorded in part, never refused")
+        let bounded = try await row(maxTokens: 66)
+        XCTAssertEqual(bounded.clientMetadata?.count, ServerRequestLog.maxClientMetadataPairs)
+        XCTAssertNil(bounded.clientMetadata?["key19"], "the sorted-key cut is what drops the last four")
+    }
+
     // MARK: - Lifecycle transitions
 
     func testToggleBackOnDuringShutdownLeavesTheServerRunning() async throws {

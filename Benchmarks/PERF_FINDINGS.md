@@ -14179,8 +14179,8 @@ over all four new case names before running. Warning instances 1,841 -> **1,554*
 | suite | result |
 |---|---|
 | `ServerRequestLogLogicTests` (+1: the refusal outranks the switch, every composer obeys it, a streamed partial obeys it, and the control arm still captures) | **43 cases, 0 failures** |
-| `OpenAIAdapterLogicTests` (+2: `store` decodes on both routes with absent distinct from either value, and the captured summary records it) | **28 cases, 0 failures** |
-| `AnthropicAdapterLogicTests` | **38 cases, 0 failures** |
+| `OpenAIAdapterLogicTests` (+2: `store` decodes on both routes with absent distinct from either value, and the captured summary records it) | **38 cases, 0 failures** |
+| `AnthropicAdapterLogicTests` | **28 cases, 0 failures** |
 | `ServerControllerSmokeTests` (app-hosted, real server on 8787) (+1: three arms over real HTTP — `store: false` with the switch on gives a withheld row flagged as the client's, no `store` gives a captured body with no `store` key, and `store: true` with the switch off is still withheld) | **27 cases, 0 failures, 1 skipped** |
 | adjacent logic suites: `ServerStreamSafetyTests`, `ServerToolArgumentTests`, `ServerHardeningLogicTests`, `ServerQueueLogicTests`, `TurnFitLogicTests`, `KVCacheProvisioningLogicTests`, `ChatPromptFormatterConversationTests`, `ReasoningRoundTripTests`, `PrefixAsOfDateTests`, `TurnToolMaskTests`, `DeepSeekV41PromptRenderTests`, `DeepSeekV41ChatPromptFormatterTests` | **146 cases, 0 failures** |
 
@@ -14266,3 +14266,113 @@ before running. Warning instances 1,554 -> **1,554** (unchanged), no new warning
 One assertion had to be loosened and the reason is worth keeping: `"\(error)"` renders a `ServerAPIError`
 through its reflection, so an embedded `"image"` arrives escaped as `\"image\"`. Assert on the substring the
 message actually contains, not on a quoted literal.
+## DSV4.1 #95: A CLIENT'S OWN LABELS WERE THE ONE THING IN THE REQUEST THE LOG COULD NEVER SHOW
+
+### The question
+
+Routed with SubQ in one call (`next_slice` = **`metadata_echo` 0.9822 @ 0.9786**, against
+`doc_hint_fields` 0.0110, `embeddings_route` 0.0061, `responses_route` 0.0003, `docs_sweep` 0.0002,
+`perf_leftovers` 0.0002; `is_a_defect` = **0.9994**; `embeddings_is_tractable` = **0.0016**, which is the
+answer that matters for the ranked second candidate: `/v1/embeddings` needs a product decision about WHICH
+vector to return before it is a commit, since the app's own 512-d `NaturalLanguage` index is not the loaded
+model's embedding matrix).
+
+`#93`'s field audit left four OpenAI chat keys undecoded, re-confirmed here by `grep` per key across
+`OpenAIAdapter.swift`, `ServerController.swift`, `CompletionTypes.swift` and `ServerRequestLog.swift`:
+`metadata`, `prediction`, `web_search_options`, `service_tier`. Three of them cannot move anything a local
+server owes a client. `metadata` is the exception, and not because it changes an answer: it is the caller's
+own identity for the request, and Swift's unknown-key tolerance was dropping it one request at a time with
+no error to notice.
+
+### What was found
+
+`OpenAIAdapter` had no `metadata` case at all. `AnthropicAdapter` DID decode its own `metadata`, and then
+threw it away: the property carried a comment saying it was "decoded so it is documented as ignored", which
+is a worse state than not decoding it, because the one label an Anthropic client can send looked handled.
+
+Meanwhile the row was already able to say everything else. `ServerRequestLog` carries model, tokens,
+timings, the retention refusal (`#93`), the tool names, and, when the operator turned content capture on,
+the prompt and the answer. What it could not carry was the client's own correlation data, which is
+precisely the information a reader needs when the bodies read "withheld": in the default configuration,
+every row in the log said what was asked of the engine and nothing about which request a caller meant.
+
+The distinction the fix turns on is the one the log's own vocabulary already draws.
+`contentWithheldMarker` says "[content withheld — metadata only]", so this file reserves "metadata" for
+exactly the class of field a withheld row is still allowed to hold. A client's labels belong in that class
+and nowhere else: they are strings the CALLER wrote about the REQUEST, not text the model saw or produced.
+
+### What was added
+
+| file | change |
+|---|---|
+| `OpenAIAdapter` | `OpenAIChatRequest.metadata` and `OpenAICompletionsRequest.metadata` (`[String: String]?`) on both OpenAI routes, decoded leniently |
+| `AnthropicAdapter` | `Metadata` is now `nonisolated` and exposes `labels`, the protocol's own `user_id` key mapped into the same row vocabulary; the "decoded and ignored" comment is gone because it is no longer true |
+| `ServerRequestLog` | `clientMetadata: [String: String]?` on the row (nil on payloads persisted before the field, the way `source` and `retentionWithheldByClient` decode, so legacy rows still open) |
+| `ServerRequestLog.recordedClientMetadata` | the recorded copy: at most 16 pairs, keys clipped to 64 bytes, values to 512, taken in sorted key order, and nil for an empty map |
+| `ServerController` | all three routes stamp the labels on the box next to the retention stamp, and deliberately NOT inside the request summary |
+| `SettingsSheetView` | the log detail sheet prints `Client Labels` as `key=value, key=value`, which is the line that still identifies the request when both bodies read "withheld" |
+| `HelpAndSettingsGuideView` | Request Options and Privacy & Body Capture both state the rule, and the stale "the Anthropic metadata field is accepted and ignored" clause is corrected |
+
+### The finding
+
+1. **The labels cannot ride on the capture switch, or the fix would be worthless.** Every other
+   client-supplied string in a row arrives through `openAISummary`, which is only composed when the
+   Store Request Content switch is on (and never for a `store: false` request). Folding the labels into
+   that summary would have hidden them in the default configuration, which is the state that was already
+   broken. They are stamped on the row instead, so the row that withheld the prompt still names the
+   request, and `hasCapturedContent` stays false beside them because labels are not content.
+2. **A malformed map costs the labels, not the answer.** Both OpenAI routes decode the map with `try?`
+   rather than `try`: `metadata` was ignored outright before this slice, so a client that puts a number
+   in it must not start meeting a 400. OpenAI's own contract requires strings, but enforcing it here would
+   have been a new refusal on a field nobody could previously fail, which is the trade `#88`-`#94` were
+   built to avoid making in the wrong direction.
+3. **The caps are recording caps, applied in bytes.** 16 pairs / 64-character keys / 512-character values
+   are OpenAI's published limits, and honouring them on the way INTO the row (rather than on the way out of
+   the request) is what stops a client that ignores its own contract from inflating a SQLite payload
+   there is no body-size limit to protect. Clipping is the convention `clippedBody` already sets for an
+   over-long conversation; nothing is refused and nothing can change the answer.
+4. **Sorted key order, so the recorded set is stable.** Over the pair limit the row keeps the first
+   sixteen keys in sorted order, which means the same request always records the same labels whatever
+   order the JSON arrived in. A set chosen by dictionary iteration order would differ between two
+   identical requests, and would then be indistinguishable from the server having lost one.
+5. **The labels stay out of the unified log.** `composeLine` prints a metadata-only `.public` line into
+   Console.app; a client's labels are free-form text a caller wrote, so they go to the row and never to
+   the system log. That is the same line `#93` drew for message content, applied one level out.
+6. **Anthropic's `Metadata` had to become `nonisolated`.** Its `labels` accessor is read from the route's
+   `logBox.modify` closure, which is nonisolated, and the project's default actor isolation made the
+   property main-actor state: one new warning instance appeared on the first build and the keyword
+   retired it. The `ServerRequestLog` struct had already needed the same treatment in `#93`.
+
+### What it is not (do not re-propose)
+
+- **Not an echo in the response.** This protocol exposes `metadata` only on the stored object, which a
+  local server does not have. The row is the honest home.
+- **Not a 400 on a malformed map.** See finding 2.
+- **Not `prediction`, `web_search_options` or `service_tier`.** Still open, still candidates, still
+  unable to move an answer; the guide now says so in one line instead of three stale ones.
+- **Not `user`.** OpenAI's `user` is a single abuse-monitoring identifier with its own doc note, not a
+  map, so folding it into `clientMetadata` would invent a vocabulary. It stays decoded and ignored; the
+  field exists now if that changes.
+- **Not a `/v1/embeddings` route.** Routed at 0.0061, with `embeddings_is_tractable` at 0.0016: which
+  vector to return is a decision, not an implementation detail.
+- **Not scrubbing labels from existing rows.** Same contract as the switch: nothing rewrites history.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath` and `-parallel-testing-enabled NO`. Bundle freshness checked with `strings ... | grep -c`
+over all four new case names before running. Warning instances 1,554 -> **1,554**, no new warning KINDS
+(the first build was 1,555 with one new kind, `main actor-isolated property 'labels' ...`, which finding 6
+retired).
+
+| suite | result |
+|---|---|
+| `OpenAIAdapterLogicTests` (+1: `metadata` decodes on both OpenAI routes, absent stays distinct from an empty map, and a non-string map costs the labels) | **41 cases, 0 failures** |
+| `AnthropicAdapterLogicTests` (+1: `metadata.user_id` decodes and maps to the row's vocabulary; a request with no metadata records nothing) | **29 cases, 0 failures** |
+| `ServerRequestLogLogicTests` (+1: labels are recorded with the capture switch OFF and the row still reports no captured content, an empty map records nothing, twenty pairs record sixteen in sorted order, an over-long value is clipped to the budget) | **44 cases, 0 failures** |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787) (+1: three arms over real HTTP distinguished by `max_tokens` 44/55/66 — with the switch off a labelled request's row carries the labels beside the withheld marker, an unlabelled request records none, and a twenty-pair map records sixteen without refusing the turn) | **28 cases, 0 failures, 1 skipped** |
+| adjacent logic suites: `ServerStreamSafetyTests`, `ServerToolArgumentTests`, `ServerHardeningLogicTests`, `ServerQueueLogicTests`, `TurnFitLogicTests`, `KVCacheProvisioningLogicTests`, `ChatPromptFormatterConversationTests`, `ReasoningRoundTripTests`, `PrefixAsOfDateTests`, `TurnToolMaskTests` | **124 cases, 0 failures** |
+
+One compile trap repeated from `#93` and worth carrying: `try XCTUnwrap(try await f())` is an `'async' call
+in an autoclosure that does not support concurrency`. Bind the awaited value to a local first. The smoke
+case's polling helper needed exactly that in two places.

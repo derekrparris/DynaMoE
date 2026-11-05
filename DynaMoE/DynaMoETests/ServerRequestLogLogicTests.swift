@@ -429,6 +429,51 @@ final class ServerRequestLogLogicTests: XCTestCase {
         )
     }
 
+    // MARK: Client labels
+
+    /// A client's own labels are metadata rather than content, so they are recorded
+    /// whatever the Store Request Content switch says. That is the whole point of the
+    /// field: the row that withheld everything else still says which request the caller
+    /// meant. The caps are recorded-copy caps (OpenAI's own 16 pairs, 64-character keys,
+    /// 512-character values, applied in bytes), so a client that ignores its own contract
+    /// cannot inflate the database, and the sorted-key order keeps the recorded set
+    /// stable whatever order the wire used.
+    func testTheClientsLabelsAreRecordedWhateverTheCaptureSwitchSays() {
+        UserDefaults.standard.set(false, forKey: ServerRequestLogRecorder.captureBodiesKey)
+        XCTAssertFalse(ServerRequestLogRecorder.captureBodiesEnabled)
+
+        var row = ServerRequestLog()
+        row.requestBody = ServerRequestLog.contentWithheldMarker
+        row.clientMetadata = ServerRequestLog.recordedClientMetadata(["ticket": "ABC-123", "team": "infra"])
+        XCTAssertEqual(row.clientMetadata, ["ticket": "ABC-123", "team": "infra"])
+        XCTAssertFalse(row.hasCapturedContent, "labels are not content: the row is still a metadata-only row")
+
+        XCTAssertNil(ServerRequestLog.recordedClientMetadata(nil), "no labels records nothing")
+        XCTAssertNil(
+            ServerRequestLog.recordedClientMetadata([:]),
+            "an empty map records nothing either, so absent and empty read alike"
+        )
+
+        // Over OpenAI's pair limit the recorded set is the first sixteen keys in sorted
+        // order, so the same request always records the same labels.
+        var many: [String: String] = [:]
+        for index in 0..<20 { many["key\(String(format: "%02d", index))"] = "v\(index)" }
+        let bounded = ServerRequestLog.recordedClientMetadata(many)
+        XCTAssertEqual(bounded?.count, ServerRequestLog.maxClientMetadataPairs)
+        XCTAssertEqual(bounded?["key00"], "v0")
+        XCTAssertEqual(bounded?["key15"], "v15", "sixteen sorted keys, so keys 16 to 19 are the ones dropped")
+        XCTAssertNil(bounded?["key19"])
+
+        // An over-long value is clipped to the budget, never dropped and never refused.
+        let long = String(repeating: "x", count: 2_000)
+        let clipped = ServerRequestLog.recordedClientMetadata(["blob": long])
+        XCTAssertEqual(
+            clipped?["blob"]?.utf8.count,
+            ServerRequestLog.maxClientMetadataValueBytes,
+            "a value past the budget is clipped to it rather than lost"
+        )
+    }
+
     // MARK: Console-to-dashboard correlation
 
     func testComposedLineLeadsWithRowShortId() throws {
