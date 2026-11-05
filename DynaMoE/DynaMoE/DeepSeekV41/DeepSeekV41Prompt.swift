@@ -392,8 +392,18 @@ nonisolated public struct DeepSeekV41PromptDialect: Sendable, Equatable {
             + "(range 1-100, the higher the value, the more thorough the reasoning)\n\n"
     }
 
-    /// Parses an effort budget out of arbitrary client text so the API adapters
-    /// can accept `reasoning_effort: 60` as well as `"high"`.
+    /// Parses an effort budget out of arbitrary text: a number in this checkpoint's
+    /// range, or one of the words the menu and the API adapters already use.
+    ///
+    /// This is deliberately NOT what the API adapters call, and the reason is a type
+    /// rather than an oversight. `ThinkingEffort` carries two levels, so a client's
+    /// `reasoning_effort` is resolved onto low or high by
+    /// `OpenAIAdapter.thinkingEffortLevel` and a NUMBER never reaches this function
+    /// (`#96`). The words above are the same vocabulary that mapping uses, which is why
+    /// `minimal` is 25 here and `.low` there: keeping the two in step is the point of
+    /// saying it twice. A caller that does hold a budget (a stored profile, or a numeric
+    /// surface if the enum ever grows one) gets the number back, or nil outside the range
+    /// the checkpoint publishes.
     public static func effortBudget(from raw: String?) -> Int? {
         guard let raw else { return nil }
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()

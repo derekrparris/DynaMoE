@@ -14896,3 +14896,54 @@ instances 1,554 -> **1,554**, no new kinds.
 |---|---|
 | `OpenAIAdapterLogicTests` (43 -> 44: `prediction` and `service_tier` decode without refusing, `web_search_options` decodes its context size and is refused naming both, and an empty object is refused because presence is the trigger) | **44 cases, 0 failures** |
 | `ServerControllerSmokeTests` (app-hosted, real server on 8787) (30 cases, unchanged count: the pre-gate field loop gained `web_search_options` as an eighth entry and still asserts a 400 naming the field) | **30 cases, 0 failures, 1 skipped** |
+
+## DSV4.1 #101: A DOC COMMENT CLAIMED THE API ADAPTERS ACCEPTED A NUMERIC EFFORT, AND NOTHING CALLED THE PARSER
+
+### The question
+
+`#96` mapped OpenAI's `reasoning_effort` onto the engine's two levels and left one loose end on the record:
+`DeepSeekV41PromptDialect.effortBudget(from:)` parses `minimal`/`low`/`medium`/`mid`/`max`/`maximum` and any
+numeric budget, is covered by tests, and is called by nothing in production, while its doc comment said it
+existed "so the API adapters can accept `reasoning_effort: 60` as well as `"high"`". A false comment about a
+capability is the kind of thing this branch has been treating as a defect in its own right.
+
+### What was found
+
+1. **The claim was false, and the reason is a type.** `ThinkingEffort` is a two-case enum, so a client's
+   `reasoning_effort` is resolved by `OpenAIAdapter.thinkingEffortLevel` onto `.low` or `.high` before any
+   budget could be consulted. A numeric budget can only become one of two levels, which loses the number the
+   client sent, so wiring the parser would have been a worse answer than refusing an unrecognised value.
+2. **The vocabulary is genuinely duplicated, and the duplication is the point.** `effortBudget` maps
+   `minimal` to 25 (the bottom of the 1-100 range this checkpoint publishes) and `thinkingEffortLevel` maps
+   it to `.low`, which renders 25. Two functions, one rule, deliberately: the adapter's mapper must not
+   depend on a DeepSeek-specific type, and the dialect's parser must not depend on the OpenAI wire.
+3. **Nothing else was wrong with it.** The parser is correct against the range, is tested, and would be the
+   right thing to call from a surface that actually carries a number.
+
+### What was added
+
+- The doc comment now says what the function is for, that the adapters deliberately do not call it, why the
+  reason is a type rather than an oversight, and where the duplicated vocabulary came from. No code changed.
+
+### The finding
+
+**A comment that describes a capability nobody wired is a lie the compiler cannot catch, and it survives
+because it is plausible.** The function was written, tested and reviewed; the only thing missing was the call
+site, which no test can assert the presence of. The two ways out are to delete the function or to describe
+it truthfully, and deleting a correct, tested parser to satisfy a comment would be the wrong trade. The
+general rule this leaves: when a helper is written "so that X can Y", either wire X or write the doc in the
+past tense about what exists.
+
+### What it is not (do not re-propose)
+
+- **Not a numeric `reasoning_effort` on the wire.** `#96` settled that: a third `ThinkingEffort` case would
+  touch the toolbar menu, session storage, every family's template and the server turn-memory digest, and the
+  interoperability failure was the 400, which is closed.
+- **Not a deletion of `effortBudget`.** It is correct, tested, and is what a future numeric surface would
+  call.
+
+### Verification
+
+Comment-only change: `xcodebuild build-for-testing` into `/tmp/dd_dsv41_status` stays green and the warning
+count is unchanged, and `DeepSeekV41PromptEffortTests` (which pins `effortBudget`'s behaviour, including the
+range refusals) is part of the suite already run in this session.
