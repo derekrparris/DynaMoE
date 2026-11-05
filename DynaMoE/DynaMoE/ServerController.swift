@@ -1101,7 +1101,7 @@ final class ServerController: ObservableObject {
                     )
                 }
             }
-            logBox?.modify { $0.model = info.displayName }
+            logBox?.modify { $0.model = info.servedID }
             // What this server refuses is a fact about the server, and what the
             // weights support is a fact about the checkpoint; `Int.max` (the "no
             // cap" sentinel) is reported as nil so neither is mistaken for the
@@ -1126,15 +1126,15 @@ final class ServerController: ObservableObject {
                 return try context.responseEncoder.encode(
                     AnthropicModelList(
                         data: [AnthropicAdapter.entry(
-                            id: info.displayName,
+                            id: info.servedID,
                             displayName: AnthropicAdapter.displayName(
-                                servedId: info.displayName, snapshotPath: info.path
+                                servedId: info.servedID, snapshotPath: info.path
                             ),
                             createdAt: now
                         )],
                         hasMore: false,
-                        firstId: info.displayName,
-                        lastId: info.displayName
+                        firstId: info.servedID,
+                        lastId: info.servedID
                     ),
                     from: request,
                     context: context
@@ -1155,10 +1155,10 @@ final class ServerController: ObservableObject {
             let wire = ServerController.wireProtocol(for: request)
             logBox?.modify { $0.proto = wire.rowProtocol }
             let info = try ServerController.requireLoadedModel()
-            logBox?.modify { $0.model = info.displayName }
+            logBox?.modify { $0.model = info.servedID }
             // The path parameter lives on the request's context, not on the request.
             let requested = context.parameters.get("model_id")
-            guard let requested, requested == info.displayName else {
+            guard let requested, ServerController.serves(modelID: requested, info: info) else {
                 throw ServerAPIError.modelNotFound(requested ?? "")
             }
             let promptCap = ServerController.resolvedMaxPromptTokens
@@ -1179,9 +1179,9 @@ final class ServerController: ObservableObject {
             case .anthropic:
                 return try context.responseEncoder.encode(
                     AnthropicAdapter.entry(
-                        id: info.displayName,
+                        id: info.servedID,
                         displayName: AnthropicAdapter.displayName(
-                            servedId: info.displayName, snapshotPath: info.path
+                            servedId: info.servedID, snapshotPath: info.path
                         ),
                         createdAt: now
                     ),
@@ -1433,6 +1433,20 @@ final class ServerController: ObservableObject {
         return info
     }
 
+    /// Does this server answer to `modelID`?
+    ///
+    /// The served id is what `/v1/models` advertises and therefore the only name a
+    /// client can have resolved from this server. The snapshot directory's own name
+    /// is accepted too, because it WAS the served id before the id became the
+    /// repository name: a config written against the old server keeps working
+    /// instead of turning a rename into a 404.
+    nonisolated static func serves(
+        modelID: String,
+        info: CompletionEngine.LoadedModelInfo
+    ) -> Bool {
+        modelID == info.servedID || modelID == info.displayName
+    }
+
     /// Maps synchronous launch failures onto the protocol-correct error:
     /// request-shape problems (prompt too long for this machine's KV budget)
     /// are 4xx, engine state problems are 503.
@@ -1505,7 +1519,7 @@ final class ServerController: ObservableObject {
     /// The one refusal a checkpoint with no tower gets, on every path.
     nonisolated private static func noVisionTower(_ info: CompletionEngine.LoadedModelInfo) -> ServerAPIError {
         ServerAPIError.unsupportedContent(
-            "The loaded model (\(info.displayName)) publishes no vision tower, so image content parts "
+            "The loaded model (\(info.servedID)) publishes no vision tower, so image content parts "
                 + "cannot be processed. Send text only, or load a vision-capable checkpoint."
         )
     }
@@ -1622,7 +1636,10 @@ final class ServerController: ObservableObject {
             userPrompt: inputs.systemPrompt,
             config: engine.promptModelConfig,
             summary: engine.loadedSummary,
-            modelName: info.displayName,
+            // The family sniff reads this name, so it is fed the checkpoint's name
+            // and not its snapshot's commit hash: the hash matches no family and
+            // left the whole decision to the config and the path.
+            modelName: info.servedID,
             modelPath: info.path,
             // The chat UI threads a per-conversation date for prefix reuse; the
             // server needs the same discipline. A fresh Date() here renders a
@@ -1668,7 +1685,7 @@ final class ServerController: ObservableObject {
         let conversation = Self.substitutingRecordedTurn(
             conversationTurns,
             sessionId: inputs.sessionId,
-            modelName: info.displayName,
+            modelName: info.servedID,
             modelConfig: engine.promptModelConfig,
             systemPrompt: memorySystem
         )
@@ -1794,7 +1811,7 @@ final class ServerController: ObservableObject {
         return TurnPlan(
             request: turnRequest,
             promptTokenCount: promptTokenCount,
-            modelName: info.displayName,
+            modelName: info.servedID,
             hasTools: inputs.hasTools,
             historyTurnCount: conversationTurns.count,
             historyDigest: historyDigest,
@@ -1871,7 +1888,7 @@ final class ServerController: ObservableObject {
             maskSchemas: hasTools ? (apiRequest.tools ?? []).filter { ($0.type ?? "function") == "function" }.map {
                 GrammarToolSchema(name: $0.function.name, schemaJSON: $0.function.parametersData)
             } : [],
-            sessionId: OpenAIAdapter.sessionKey(for: apiRequest.messages, model: info.displayName),
+            sessionId: OpenAIAdapter.sessionKey(for: apiRequest.messages, model: info.servedID),
             images: split.images
         ))
     }
@@ -1911,7 +1928,7 @@ final class ServerController: ObservableObject {
             hasTools: false,
             toolDeclaration: nil,
             maskSchemas: [],
-            sessionId: OpenAIAdapter.sessionKey(forPrompt: apiRequest.promptText ?? "", model: info.displayName),
+            sessionId: OpenAIAdapter.sessionKey(forPrompt: apiRequest.promptText ?? "", model: info.servedID),
             images: split.images
         ))
     }
@@ -1965,7 +1982,7 @@ final class ServerController: ObservableObject {
             maskSchemas: hasTools ? (apiRequest.tools ?? []).map {
                 GrammarToolSchema(name: $0.name, schemaJSON: $0.inputSchemaData)
             } : [],
-            sessionId: AnthropicAdapter.sessionKey(for: apiRequest.messages, model: info.displayName),
+            sessionId: AnthropicAdapter.sessionKey(for: apiRequest.messages, model: info.servedID),
             images: split.images
         ))
     }
@@ -2254,7 +2271,7 @@ final class ServerController: ObservableObject {
         let id = "chatcmpl-\(UUID().uuidString.prefix(24))"
         let created = Int(Date().timeIntervalSince1970)
         let stopSequences = (apiRequest.stop ?? []).filter { !$0.isEmpty }
-        let model = apiRequest.model ?? CompletionEngine.shared.loadedModelInfo?.displayName ?? "dynamoe"
+        let model = apiRequest.model ?? CompletionEngine.shared.loadedModelInfo?.servedID ?? "dynamoe"
         // The protocol asks the client to opt into the trailing usage chunk, and it is
         // the one chunk whose `choices` is empty. Sending it regardless is not a
         // harmless extra: a client that indexes `choices[0]` on every chunk — a common
@@ -2570,7 +2587,7 @@ final class ServerController: ObservableObject {
         let id = "cmpl-\(UUID().uuidString.prefix(24))"
         let created = Int(Date().timeIntervalSince1970)
         let stopSequences = (apiRequest.stop ?? []).filter { !$0.isEmpty }
-        let model = apiRequest.model ?? CompletionEngine.shared.loadedModelInfo?.displayName ?? "dynamoe"
+        let model = apiRequest.model ?? CompletionEngine.shared.loadedModelInfo?.servedID ?? "dynamoe"
         // Same opt-in rule as the chat route, for the same reason: the usage chunk is
         // the one chunk whose `choices` is empty, and a client that indexes
         // `choices[0]` on every chunk throws on it.
@@ -2865,7 +2882,7 @@ final class ServerController: ObservableObject {
     nonisolated private static func anthropicStreamingResponse(apiRequest: AnthropicMessagesRequest, queue: TurnExecutionQueue, logBox: ServerRequestLogBox?) -> Response {
         let encoder = JSONEncoder()
         let id = "msg-\(UUID().uuidString.prefix(24))"
-        let model = apiRequest.model ?? CompletionEngine.shared.loadedModelInfo?.displayName ?? "dynamoe"
+        let model = apiRequest.model ?? CompletionEngine.shared.loadedModelInfo?.servedID ?? "dynamoe"
         let stopSequences = (apiRequest.stopSequences ?? []).filter { !$0.isEmpty }
 
         // Same ownership hand-off as the OpenAI writer: the stream's terminal
@@ -3142,7 +3159,7 @@ final class ServerController: ObservableObject {
 
     nonisolated private static func healthBody() -> ByteBuffer {
         let loaded = CompletionEngine.shared.hasLoadedModel
-        let name = CompletionEngine.shared.loadedModelInfo?.displayName ?? ""
+        let name = CompletionEngine.shared.loadedModelInfo?.servedID ?? ""
         let payload: [String: Any] = [
             "status": "ok",
             "model_loaded": loaded,

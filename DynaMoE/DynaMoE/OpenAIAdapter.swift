@@ -752,7 +752,9 @@ struct OpenAIModelList: ResponseEncodable {
     ///
     /// Kept a function of the facts so the mapping is testable without a loaded
     /// model: a swapped flag here is silent on the wire and would tell a client
-    /// the opposite of what the planner does.
+    /// the opposite of what the planner does. The id is the checkpoint's served id
+    /// rather than its display name, because a client resolves it from here and
+    /// then addresses the retrieve route with it as a path segment.
     static func entry(
         for info: CompletionEngine.LoadedModelInfo,
         contextLength: Int?,
@@ -760,7 +762,7 @@ struct OpenAIModelList: ResponseEncodable {
         created: Int
     ) -> Model {
         Model(
-            id: info.displayName,
+            id: info.servedID,
             created: created,
             contextLength: contextLength,
             maxPromptTokens: maxPromptTokens,

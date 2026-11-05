@@ -13978,3 +13978,117 @@ before running it.
 | `AnthropicAdapterLogicTests` (28 cases, one new: `metadata`, `service_tier` and `budget_tokens` all survive the decode, and the budget still maps to a graded level) | **28 cases, 0 failures** |
 | adjacent suites, none touched by the slice: `ServerRequestLogLogicTests`, `DeepSeekV41ToolDialectTests`, `DeepSeekV41TurnLoopTests`, `KVCacheProvisioningLogicTests`, `TurnFitLogicTests` (153 cases) and `DeepSeekV41ConfigTests`, `DeepSeekV41MemoryPlanTests`, `DeepSeekV41CacheReuseTests`, `DeepSeekV41TurnImagesTests`, `DeepSeekV41ImagePixelsTests`, `DeepSeekV41PromptRenderTests`, `DeepSeekV41PromptMarkerTests` (63 cases) | **216 cases, 0 failures** |
 | `DeepSeekV41PublishedTurnTests.testTheChatRouteHonoursTheNewerReplyBudgetOnThePublishedCheckpoint` (opt-in, private port 8802, two turns on one runtime) | **failed 50.6 s** (2 tokens for a 3 budget, both arms), then **passed 49.7 s** after the provisioning fix: 3 and 3, both `length` |
+
+## DSV4.1 #92: BOTH PROTOCOLS SERVED A COMMIT HASH AS THE MODEL ID, AND THE NAME THAT WOULD HAVE WORKED WAS ONE FIELD AWAY
+
+### The question
+
+Routed with SubQ (`next_slice` = **`model_id` 0.9933 @ 0.9920**, against `docs_sweep` 0.0051,
+`responses_route` 0.0011, `vision_cost` 0.0002, `ui_status` 0.0002, `perf_leftovers` 0.0001;
+`id_is_a_defect` = 0.9995; `id_shape` = **`slug` 0.9258 @ 0.8886**; `id_migration` = `accept_both_ids`
+0.5570 @ 0.3355, i.e. MID-BAND at low confidence, so it was decided by hand).
+
+Two candidates the hand-off ranked highly were verified against the code BEFORE routing and were already
+done: the four `dsv41_hc_*` kernels are dispatched by `DeepSeekV41MetalForward` (`hcProject`/`hcProjectX4`,
+`hcSplit`/`hcSplitRegs`, `hcPre`, `hcPost`, `hcSinkhorn`, `hcIdentityMix`), and
+`DeepSeekV41VisionCostModel.measured` was already refit to the device encode. `AGENTS.md`'s claim that the
+mHC stages are unwired is stale prose, not a gap — the same stale-prose problem `#87`-`#91` kept hitting,
+and worth remembering before trusting any hand-off candidate list.
+
+### What was found
+
+`LoadedModelInfo.displayName` is `URL(fileURLWithPath: path).lastPathComponent`, and `path` is what
+`ContentView` set from `model.snapshotPath`. For a hub checkpoint that is the commit hash, so every route
+advertised the hash as the model id:
+
+| surface | served before `#92` | serves now |
+|---|---|---|
+| OpenAI `GET /v1/models` `data[].id` | `1bae0e1088993b9b82de08f59de5be5a34e42170` | `DeepSeek-V4.1-Flash-1017` |
+| OpenAI `GET /v1/models/:model_id` match | the hash | the slug, and the hash as an alias |
+| Anthropic `data[].id`, `first_id`, `last_id` | the hash | the slug |
+| Anthropic `display_name` | `deepseek-ai/DeepSeek-V4.1-Flash-1017` | unchanged (it was already right) |
+| response `model` when the request omits one | the hash | the slug |
+| `GET /health` `model` | the hash | the slug |
+| request-log row `model` | the hash | the slug |
+| session-key hash input | the hash | the slug |
+
+The name a client could use was therefore already being read out of the same path, for one field, in
+`AnthropicAdapter.displayName(servedId:snapshotPath:)`, whose own doc comment argued the id "cannot change
+without invalidating recorded turns and pinned prefixes". That was the defensive half of the truth: the id
+cannot change CASUALLY, but a hub snapshot hash changes whenever the same model is re-resolved, so the hash
+was the one identity guaranteed to move, and the repository name is the one guaranteed not to. The display
+name is not a substitute either: `LocalModelManager.formatDisplayName` replaces dashes and underscores with
+SPACES, so the DeepSeek checkpoint's display name is `DeepSeek V4.1 Flash 1017` and needs percent-encoding
+to survive `GET /v1/models/:model_id`.
+
+### What was added
+
+| file | change |
+|---|---|
+| `ModelServingID` (new) | `nonisolated` pure logic: `repository(from:)` (`author/name`), `shortName(from:)` (the author-less part), `slug(_:)` (`[A-Za-z0-9._-]`, runs collapse, no leading/trailing separator, and `.`/`..` cannot survive), and `servedID(from:fallback:)` |
+| `LoadedModelInfo.servedID` | the id, DERIVED from `path` rather than stored so a copy cannot drift from what the routes answer; `nonisolated` because a computed property otherwise inherits the default main-actor isolation and warned at every nonisolated read |
+| `OpenAIAdapter.entry(for:)` | `id:` is the served id |
+| `AnthropicAdapter.displayName(servedId:snapshotPath:)` | now `ModelServingID.repository(...) ?? servedId`, so one parser of the `models--author--name` shape replaced two |
+| `ServerController` | both lists, both retrieves, both protocols' `first_id`/`last_id`, the three response writers' `model` fallback, `/health`, the request-log `model`, all three session-key inputs, `TurnPlan.modelName`, and the family-name hint `buildEffectiveSystemPrompt` sniffs all take the served id; `serves(modelID:info:)` is the retrieve route's one match rule |
+| `SettingsSheetView` | the dashboard's model row is the id clients see |
+| `HelpAndSettingsGuideView` | the Endpoints bullet says which name the id is and that the old one still answers |
+
+### The finding
+
+Three things came out of it that the mapping alone would not have said.
+
+1. **The id has to be one path segment, and the two natural sources are both unusable.** The repository id
+   `deepseek-ai/DeepSeek-V4.1-Flash-1017` carries a slash and the display name carries spaces, so the slug
+   is the author-less repository name and the display name keeps the author. Both facts are pinned
+   (`ModelServingIDTests`, and the Anthropic case asserts the two fields differ).
+2. **A rename of the id is a rename of the session identity.** The session key is
+   FNV-1a over the opening user message AND the model, and turn memory additionally digests the rendered
+   system prompt; feeding it the served id therefore invalidates recorded turns and pinned prefixes exactly
+   once, on the first request after the upgrade. That is the honest cost of the identity being the id, and
+   the alternative (hashing a string the routes no longer serve) is a stale name in a key that outlives
+   every snapshot.
+3. **The alias is what makes the rename safe.** `ServerController.serves(modelID:info:)` answers the
+   snapshot directory's own name as well as the slug, so a config written against the old server — which is
+   every config that ever talked to this one — keeps resolving instead of meeting a 404 on a rename it never
+   made. Planned and measured on the real checkpoint:
+
+```
+🔎 [dsv41 real] model id: advertised=DeepSeek-V4.1-Flash-1017
+   snapshot=1bae0e1088993b9b82de08f59de5be5a34e42170
+   anthropic display_name=deepseek-ai/DeepSeek-V4.1-Flash-1017
+```
+
+The advertised id was then retrieved with no percent-encoding at all, in both protocols, and the snapshot
+name was retrieved too and answered the same object.
+
+### What it is not (do not re-propose)
+
+- **Not validation of a request's own `model` field.** A client sending `"model": "gpt-4"` (or `"any"`, as
+  the live cases here do) is still served. OpenAI answers a name it does not serve with
+  `model_not_found`, but every local-server client sends an arbitrary string by habit, so refusing it would
+  break the drop-in path to enforce a rule the server cannot benefit from: exactly one checkpoint is loaded.
+  The alias is about the retrieve ROUTE, not about the request body.
+- **Not a human display name as the id.** Spaces are not a path segment, and `formatDisplayName` is the
+  chat UI's label, not an identifier.
+- **Not a stored field.** `servedID` is computed from `path`; storing it would add a second source of truth
+  next to the path the routes already read.
+- **Not keeping the old string in the session key.** `pin_key_input` scored 0.0097 in the routing, and it
+  would leave the identity split: one name in the key, another on the wire.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath`. Bundle freshness checked with `strings … | grep -c` over every new case name before
+running. Warning instances 1,846 -> **1,841**, no new warning KINDS (the only kind-level change is the
+`displayName` nonisolated-autoclosure kind at `ServerControllerSmokeTests` being retired by the same
+assertion reading `servedID`; `servedID` itself is `nonisolated`, so it adds none).
+
+| suite | result |
+|---|---|
+| `ModelServingIDTests` (7 cases: the id is the repository name and not the hash, it is a path segment, the repository spelling keeps the author, an off-hub checkpoint uses its own directory name, `.`/`..`/separators can never be an id, runs collapse, and the `models--` shape parses both ways) | **7 cases, 0 failures** |
+| `ServedModelAliasTests` (3 cases: the retrieve rule answers the advertised id and the one it replaced and nothing else, the list entry carries the served id, and the Anthropic id and display name stay different spellings) | **3 cases, 0 failures** |
+| `OpenAIAdapterLogicTests` + `AnthropicAdapterLogicTests` (the load fixture is now a hub path, so the id assertion passes for the right reason) | **64 cases, 0 failures** |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787) | **26 cases, 0 failures, 1 skipped** (the retrieve route needs a loaded model) |
+| prompt rendering, because the family-name hint now gets the checkpoint's name instead of its hash: `ChatPromptFormatterConversationTests`, `DeepSeekV41PromptRenderTests`, `ReasoningRoundTripTests`, `DeepSeekV41ChatPromptFormatterTests`, `ModelConfigThinkingLevelTests` | **67 cases, 0 failures** |
+| adjacent logic suites: `ServerRequestLogLogicTests`, `TurnFitLogicTests`, `KVCacheProvisioningLogicTests`, `PrefixAsOfDateTests`, `ServerHardeningLogicTests`, `TurnToolMaskTests` | **137 cases, 0 failures** |
+| `DeepSeekV41PublishedTurnTests.testThePublishedCheckpointAdvertisesAUsableModelId` (opt-in, private port 8803, the real 475.25 GB checkpoint loaded into the shared engine: list, retrieve, Anthropic retrieve, and the legacy alias) | **passed 1.68 s** after one fix: the retrieve answers the model OBJECT, not a page |

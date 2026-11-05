@@ -880,25 +880,17 @@ enum AnthropicAdapter {
 
     /// The human-readable name for the served checkpoint.
     ///
-    /// The served id is the snapshot directory's own name (a commit hash) and
-    /// cannot change without invalidating recorded turns and pinned prefixes, but
-    /// `display_name` is not used for keying anything: it exists so a human reads a
-    /// model name rather than a hash. The repository directory carries that name, so
+    /// The `id` beside it is the repository's short name (`ModelServingID`), which
+    /// is stable across a re-resolve; `display_name` is the same repository spelled
+    /// the way a human writes it, author included, because this protocol has a
+    /// field for exactly that while the id has to survive as a path segment. The
+    /// repository directory carries both, so
     /// `.../hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/<hash>`
-    /// advertises `deepseek-ai/DeepSeek-V4.1-Flash-1017`. A checkpoint that is not a
-    /// hub snapshot has no repository name to recover, so its own directory name is
-    /// the display name rather than nothing.
+    /// advertises `deepseek-ai/DeepSeek-V4.1-Flash-1017`. A checkpoint that is not
+    /// a hub snapshot has no repository name to recover, so its own directory name
+    /// is the display name rather than nothing.
     nonisolated static func displayName(servedId: String, snapshotPath: String?) -> String {
-        guard let snapshotPath, !snapshotPath.isEmpty else { return servedId }
-        let components = URL(fileURLWithPath: snapshotPath).pathComponents
-        guard let repository = components.last(where: { $0.hasPrefix("models--") }) else {
-            let directory = URL(fileURLWithPath: snapshotPath).lastPathComponent
-            return directory.isEmpty ? servedId : directory
-        }
-        let stripped = String(repository.dropFirst("models--".count))
-        let parts = stripped.components(separatedBy: "--")
-        guard let author = parts.first, parts.count > 1 else { return stripped }
-        return author + "/" + parts.dropFirst().joined(separator: "--")
+        ModelServingID.repository(from: snapshotPath) ?? servedId
     }
 
     /// Stable prefix-cache session key, mirroring the OpenAI adapter scheme:

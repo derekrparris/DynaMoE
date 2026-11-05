@@ -304,6 +304,23 @@ public final class CompletionEngine: @unchecked Sendable {
         /// the block rather than advertising a zero cost it cannot honour.
         public var visionCost: DeepSeekV41VisionPricing.Bounds?
         public var weightsSizeGB: Double
+
+        /// The id both protocols serve for this checkpoint, and the identity a
+        /// session key hashes.
+        ///
+        /// Derived rather than stored, because it is a fact about the path and a
+        /// stored copy could drift from what the routes answer. `displayName` is
+        /// the snapshot directory's own name, which for a hub checkpoint is a
+        /// commit hash: unique, human-unreadable, not a path segment, and
+        /// different every time the same model is re-resolved. The repository name
+        /// the path already carries is none of those, so it is what the id is made
+        /// of (`ModelServingID`).
+        /// `nonisolated` because a stored property of a `Sendable` struct is, and
+        /// the routes read this from their own nonisolated contexts; a computed one
+        /// otherwise inherits the default main-actor isolation and warns at each.
+        nonisolated public var servedID: String {
+            ModelServingID.servedID(from: path, fallback: displayName)
+        }
     }
 
     public var loadedModelInfo: LoadedModelInfo? {

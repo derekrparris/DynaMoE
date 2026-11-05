@@ -2459,7 +2459,7 @@ struct SettingsSheetView: View {
     private func refreshServerDashboard() {
         let engine = CompletionEngine.shared
         serverDashboardEngineActive = engine.isActive
-        serverDashboardModelName = engine.loadedModelInfo?.displayName
+        serverDashboardModelName = engine.loadedModelInfo?.servedID
         let stats = ServerController.stats.snapshot()
         serverDashboardActiveRequests = stats.activeRequests
         serverDashboardTotalRequests = stats.totalRequests

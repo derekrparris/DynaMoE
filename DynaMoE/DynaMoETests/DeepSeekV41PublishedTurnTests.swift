@@ -4996,6 +4996,79 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         }
     }
 
+    /// The id this server advertises is one a client can address, on the checkpoint
+    /// that made the difference visible.
+    ///
+    /// Both routes served the snapshot directory's own name until `#92`, i.e. the
+    /// commit hash `1bae0e10…`, while Anthropic's `display_name` already recovered
+    /// `deepseek-ai/DeepSeek-V4.1-Flash-1017` from the same path. A hash is not a
+    /// path segment a client stores and it changes whenever the snapshot is
+    /// re-resolved, so the id is now the repository's short name. The assertions
+    /// below are all facts about the real checkpoint's path, not about the mapping:
+    /// the id it produces, that it needs no percent-encoding, that it differs from
+    /// the snapshot name, and that the snapshot name is still answered.
+    func testThePublishedCheckpointAdvertisesAUsableModelId() async throws {
+        let snapshot = try snapshotDirectory()
+        let engine = try loadPublishedCheckpointIntoTheSharedEngine(snapshot)
+        defer {
+            unloadSharedEngine()
+            withExtendedLifetime(engine) {}
+        }
+        let port = 8803
+
+        let info = try await MainActor.run { () -> CompletionEngine.LoadedModelInfo in
+            try XCTUnwrap(CompletionEngine.shared.loadedModelInfo)
+        }
+
+        func models(_ path: String, anthropic: Bool = false) async throws -> (status: Int, body: [String: Any]) {
+            var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)\(path)")!)
+            if anthropic { request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version") }
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let status = try XCTUnwrap((response as? HTTPURLResponse)?.statusCode)
+            let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+            return (status, body)
+        }
+
+        try await withLocalServer(on: port) { _ in
+            let listed = try await models("/v1/models")
+            XCTAssertEqual(listed.status, 200)
+            let entries = try XCTUnwrap(listed.body["data"] as? [[String: Any]])
+            let advertised = try XCTUnwrap(entries.first?["id"] as? String)
+
+            let snapshotName = snapshot.lastPathComponent
+            XCTAssertEqual(advertised, "DeepSeek-V4.1-Flash-1017", "the id is the repository's own name")
+            XCTAssertEqual(advertised, info.servedID)
+            XCTAssertNotEqual(advertised, snapshotName, "the served id is not the snapshot's commit hash")
+            XCTAssertFalse(advertised.contains(" "))
+            XCTAssertFalse(advertised.contains("/"))
+
+            // Not percent-encoded anywhere: this is the URL a client that read the id
+            // from the list would build.
+            let retrieved = try await models("/v1/models/\(advertised)")
+            XCTAssertEqual(retrieved.status, 200, "a client must be able to address the id it was given")
+            XCTAssertEqual(retrieved.body["id"] as? String, advertised)
+
+            // The retrieve route answers the model OBJECT, not a page, so these are
+            // top-level fields.
+            let anthropic = try await models("/v1/models/\(advertised)", anthropic: true)
+            XCTAssertEqual(anthropic.status, 200)
+            XCTAssertEqual(anthropic.body["type"] as? String, "model")
+            XCTAssertEqual(anthropic.body["id"] as? String, advertised)
+            let displayName = try XCTUnwrap(anthropic.body["display_name"] as? String)
+            XCTAssertEqual(displayName, "deepseek-ai/DeepSeek-V4.1-Flash-1017")
+
+            // The name this server answered to before the id changed.
+            let legacy = try await models("/v1/models/\(snapshotName)")
+            XCTAssertEqual(legacy.status, 200, "a client holding the old id keeps working")
+            XCTAssertEqual(legacy.body["id"] as? String, advertised)
+
+            print(
+                "🔎 [dsv41 real] model id: advertised=\(advertised) "
+                    + "snapshot=\(snapshotName) anthropic display_name=\(displayName)"
+            )
+        }
+    }
+
     /// The `usage` objects of a stream's frames, one per chunk that carries one.
     private func usageFrames(in raw: String) -> [[String: Any]] {
         var found: [[String: Any]] = []

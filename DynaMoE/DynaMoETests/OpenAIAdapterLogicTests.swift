@@ -189,8 +189,8 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         visionCost: DeepSeekV41VisionPricing.Bounds? = nil
     ) -> CompletionEngine.LoadedModelInfo {
         CompletionEngine.LoadedModelInfo(
-            displayName: "DeepSeek-V4.1-Flash-1017",
-            path: "/nonexistent/snapshot",
+            displayName: "1bae0e1089",
+            path: "/nonexistent/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1089",
             supportsThinking: thinking,
             supportsThinkingLevels: levels,
             supportsVision: vision,

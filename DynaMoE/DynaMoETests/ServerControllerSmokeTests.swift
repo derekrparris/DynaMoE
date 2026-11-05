@@ -98,7 +98,7 @@ final class ServerControllerSmokeTests: XCTestCase {
         XCTAssertTrue(body["data"] is [Any])
         if let info = await MainActor.run(body: { CompletionEngine.shared.loadedModelInfo }) {
             let entries = try XCTUnwrap(body["data"] as? [[String: Any]])
-            XCTAssertEqual(entries.first?["id"] as? String, info.displayName)
+            XCTAssertEqual(entries.first?["id"] as? String, info.servedID)
         }
     }
 
@@ -126,12 +126,16 @@ final class ServerControllerSmokeTests: XCTestCase {
                 let entries = try XCTUnwrap(anthropic.body["data"] as? [[String: Any]])
                 let first = try XCTUnwrap(entries.first)
                 XCTAssertEqual(first["type"] as? String, "model")
-                XCTAssertEqual(first["id"] as? String, info.displayName)
-                XCTAssertEqual(anthropic.body["first_id"] as? String, info.displayName)
-                XCTAssertEqual(anthropic.body["last_id"] as? String, info.displayName)
+                XCTAssertEqual(first["id"] as? String, info.servedID)
+                XCTAssertEqual(anthropic.body["first_id"] as? String, info.servedID)
+                XCTAssertEqual(anthropic.body["last_id"] as? String, info.servedID)
                 let createdAt = try XCTUnwrap(first["created_at"] as? String)
                 XCTAssertTrue(createdAt.hasSuffix("Z"), "the protocol's date is RFC 3339, not an epoch second")
-                XCTAssertNotNil(first["display_name"] as? String)
+                // The id is a path segment and the display name is the human
+                // spelling; the two must not collapse into each other again.
+                let displayName = try XCTUnwrap(first["display_name"] as? String)
+                XCTAssertFalse(displayName.isEmpty)
+                XCTAssertFalse(info.servedID.contains(" "), "an id with a space is not a path segment")
             }
         }
 
@@ -148,17 +152,27 @@ final class ServerControllerSmokeTests: XCTestCase {
             throw XCTSkip("No model is loaded; there is no served id to retrieve")
         }
 
-        let openai = try await getModels("/v1/models/\(info.displayName)", headers: [:])
+        let openai = try await getModels("/v1/models/\(info.servedID)", headers: [:])
         XCTAssertEqual(openai.status, 200)
         XCTAssertEqual(openai.body["object"] as? String, "model")
-        XCTAssertEqual(openai.body["id"] as? String, info.displayName)
+        XCTAssertEqual(openai.body["id"] as? String, info.servedID)
 
         let anthropic = try await getModels(
-            "/v1/models/\(info.displayName)", headers: ["anthropic-version": "2023-06-01"]
+            "/v1/models/\(info.servedID)", headers: ["anthropic-version": "2023-06-01"]
         )
         XCTAssertEqual(anthropic.status, 200)
         XCTAssertEqual(anthropic.body["type"] as? String, "model")
         XCTAssertNil(anthropic.body["has_more"], "a retrieve answers the object, not a page")
+
+        // The snapshot directory's own name was the served id before it became the
+        // checkpoint's repository name. A client configured against the old server
+        // keeps working rather than meeting a 404 on a rename it never made.
+        let legacy = try await getModels("/v1/models/\(info.displayName)", headers: [:])
+        XCTAssertEqual(legacy.status, 200)
+        XCTAssertEqual(
+            legacy.body["id"] as? String, info.servedID,
+            "the alias answers the served object, not the name it was asked by"
+        )
 
         // An id this server does not serve is a 404 in the caller's own envelope:
         // OpenAI keeps `invalid_request_error` and names the condition in `code`,
