@@ -314,7 +314,7 @@ The server drives the same headless turn engine as the chat UI, so a client gets
 | Endpoint | Protocol | Notes |
 | --- | --- | --- |
 | `POST /v1/chat/completions` | OpenAI Chat Completions | Streaming (SSE) + non-streaming; `reasoning_content` deltas for thinking models, `tool_calls` in responses, `tools` / `tool_choice` (`auto`, `none`), `reasoning_effort` (`minimal`, `low`, `medium`, `high`, mapped onto the engine's two levels) for level-capable models, sampler extras (`top_k`, `min_p`, `repetition_penalty`, `presence_penalty`) |
-| `POST /v1/messages` | Anthropic Messages | Streaming + non-streaming; `thinking` blocks (`budget_tokens` maps to low/high for level-capable models), `tool_use` / `tool_result` turns, `max_tokens` required, `stop_reason` reports `stop_sequence` and `tool_use`; `output_config` and `mcp_servers` are refused by name, `context_management` and `disable_parallel_tool_use` are accepted and ignored |
+| `POST /v1/messages` | Anthropic Messages | Streaming + non-streaming; `thinking` blocks (`budget_tokens` maps to low/high for level-capable models), `tool_use` / `tool_result` turns, `max_tokens` required, `stop_reason` reports `stop_sequence` and `tool_use`; `output_config` and `mcp_servers` are refused by name, `context_management` and `disable_parallel_tool_use` are accepted and ignored, an echoed `redacted_thinking` block is accepted and renders as nothing |
 | `GET /v1/models` | OpenAI model list | Lists the model loaded in the app |
 | `GET /health` | Liveness/readiness | `status`, `model_loaded`, `model`, `engine_active` |
 

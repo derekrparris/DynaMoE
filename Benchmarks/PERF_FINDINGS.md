@@ -14729,3 +14729,81 @@ and `#97` each had to discover.
 | `AnthropicAdapterLogicTests` (29 -> 30: `output_config` decodes its format type and is refused naming both, `mcp_servers` decodes its names and is refused naming them, a request with neither is served, and `context_management` plus `disable_parallel_tool_use` decode without refusing) | **30 cases, 0 failures** |
 | `ServerControllerSmokeTests` (app-hosted, real server on 8787) (29 -> 30: a real `/v1/messages` POST is a 400 for `output_config` and for `mcp_servers`, a 503 for a body carrying only the ignored fields, and a 503 for the plain control) | **30 cases, 0 failures, 1 skipped** |
 | `ServerRequestLogLogicTests`, `OpenAIAdapterLogicTests` | **87 cases, 0 failures** |
+
+## DSV4.1 #99: ONE ECHOED REDACTED_THINKING BLOCK COST THE USER THE WHOLE CONVERSATION
+
+### The question
+
+`#98` swept the Anthropic request for fields the decoder dropped. The same protocol can put blocks in a
+MESSAGE, and that list was an allowlist written when the only blocks were text, thinking, tool_use,
+tool_result and image. The question was what happens to a block type that is not on it but is not garbage.
+
+### What was found
+
+1. **The allowlist refused the whole turn.** `ContentBlockIn.isUnsupported` was
+   `!["", "text", "thinking", "tool_use", "tool_result", "image"].contains(type)`, and one unsupported block
+   anywhere in the request raised `unsupportedContent` for the entire turn with a message about documents
+   and audio.
+2. **`redacted_thinking` is neither.** Anthropic returns it when part of a reasoning trace is withheld, and
+   the protocol requires a client to pass such a block back verbatim to the model that issued it. Its
+   payload is opaque bytes in a `data` field with no readable text. So the second turn of a conversation
+   that contained one was refused outright, over bytes this engine would not have read even if it had
+   accepted them.
+3. **This server never emits one**, which is why nothing had caught it: the refusal is only reachable from a
+   transcript produced elsewhere, or from a client that synthesises the block. That made it a real defect
+   with a narrow blast radius, and it is the reason the fix is a list entry rather than a new code path.
+4. **Accepting it renders nothing, which is the same turn.** The block contributes no `text`, no `thinking`,
+   no `tool_use` and no image, so every rendering path already skips it. The only thing the refusal bought
+   was a 400.
+5. **`rejectUnsupportedPrefill` is unaffected.** A trailing assistant turn made only of redacted thinking
+   has no `contentText` and no `reasoningText`, so it is not a response prefill and is treated as an
+   ordinary generation request, which is the behaviour a client resuming after a redaction needs.
+
+### What was added
+
+- `ContentBlockIn.handledTypes`, a named `nonisolated static let` set that now carries
+  `redacted_thinking`, with `isUnsupported` reading it. Naming the set is the point: the decision is a list,
+  it is documented as one, and the next block type has an obvious place to be argued about.
+- One pure case in `AnthropicAdapterLogicTests`: a conversation whose assistant turn holds thinking,
+  redacted thinking and text renders the readable parts and none of the opaque bytes; a `document` is still
+  refused; and a trailing redacted-only assistant turn is not a prefill.
+- The guide's Request Options bullet and the README's Anthropic row.
+
+### The finding
+
+1. **An allowlist of block types is a list of decisions, and it was written as a literal.** The set lived
+   inline in a boolean expression, so there was no name to search for and no place a comment could explain
+   why each member is on it. Extracting it cost nothing and is what made the `redacted_thinking` question
+   askable at all.
+2. **"The engine cannot read it" and "the engine must refuse it" are different claims.** A document block
+   changes the answer if dropped, because the model would answer about a file nobody read, so refusing is
+   correct. An opaque reasoning blob changes nothing if dropped, because there is nothing in it to read, so
+   refusing is pure cost. The distinguishing question is whether the block carries information this engine
+   could otherwise have used, not whether this engine understands the block.
+3. **A protocol that requires an echo is a protocol that requires acceptance.** The block is addressed to
+   the issuer, and a local server is not the issuer. Rejecting it was enforcing a rule about comprehension
+   on a field whose whole purpose is to be carried, not understood. The same reasoning would apply to any
+   future opaque-thought type Anthropic adds.
+4. **The narrow reachability is why this was worth a commit rather than a footnote.** Nothing in this app
+   produces the block, so no local test run would ever have hit the refusal; the users who do hit it hit it
+   on turn two of a conversation they cannot continue, which is the worst place for a 400 to appear.
+
+### What it is not (do not re-propose)
+
+- **Not a rendering of the block.** Its payload is encrypted bytes; there is nothing to render.
+- **Not a relaxation of the allowlist.** Every other unknown type is still refused by name, and the test
+  pins that with a `document` block.
+- **Not an Anthropic-side `ReasoningRoundTrip` change.** `reasoningText` still comes only from readable
+  `thinking` blocks, so an accepted redacted block cannot become prompt text.
+- **Not the OpenAI surface.** It has no block types to allowlist.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath`, three-part `-only-testing` identifiers and `-parallel-testing-enabled NO`. Warning
+instances 1,554 -> **1,554**, no new kinds (the new set is `nonisolated` from the start).
+
+| suite | result |
+|---|---|
+| `AnthropicAdapterLogicTests` (30 -> 31: an echoed `redacted_thinking` block no longer refuses the turn, the readable thinking and text around it still render, none of the opaque bytes reach the prompt, a `document` block is still refused, and a redacted-only trailing assistant turn is not a response prefill) | **31 cases, 0 failures** |
+| adjacent logic suites: `ChatPromptFormatterConversationTests` 20, `ReasoningRoundTripTests` 18, `ServerStreamSafetyTests` 13, `ServerHardeningLogicTests` 6 | **57 cases, 0 failures** |

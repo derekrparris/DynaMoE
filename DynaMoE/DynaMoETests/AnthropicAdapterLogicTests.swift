@@ -535,4 +535,51 @@ final class AnthropicAdapterLogicTests: XCTestCase {
         XCTAssertNoThrow(try AnthropicAdapter.refuseUnsupportedRequestFields(ignored))
         XCTAssertTrue(try AnthropicAdapter.toolUseEnabled(ignored.toolChoice))
     }
+
+    // MARK: - Echoed redacted thinking
+
+    /// Anthropic returns a `redacted_thinking` block when part of a reasoning trace is
+    /// withheld, and the protocol requires a client to pass it back verbatim. It was on
+    /// the unsupported list, so one echoed block refused the WHOLE turn: a conversation
+    /// could not continue over bytes the engine cannot read anyway. It is accepted and
+    /// rendered as nothing, which is the same turn this server would run without it, and
+    /// every other unreadable type is still refused by name.
+    func testAnEchoedRedactedThinkingBlockIsAcceptedAndRenderedAsNothing() throws {
+        let request = try decodeRequest("""
+        {"model":"any","max_tokens":16,"messages":[
+          {"role":"user","content":"The capital of France?"},
+          {"role":"assistant","content":[
+            {"type":"thinking","thinking":"weighing it","signature":"sig"},
+            {"type":"redacted_thinking","data":"ENCRYPTED-BYTES"},
+            {"type":"text","text":"Paris"}]},
+          {"role":"user","content":"and Italy?"}]}
+        """)
+        XCTAssertFalse(
+            request.hasUnsupportedContent,
+            "an echoed redacted_thinking block must not refuse the turn"
+        )
+        let split = try AnthropicAdapter.splitMessages(request.messages)
+        let rendered = split.turns.map(\.text).joined(separator: "\n")
+        XCTAssertTrue(rendered.contains("weighing it"), "the readable thinking block still renders")
+        XCTAssertFalse(rendered.contains("ENCRYPTED-BYTES"), "the opaque block contributes nothing")
+        XCTAssertTrue(rendered.contains("Paris"))
+        XCTAssertTrue(rendered.contains("and Italy?"))
+
+        // The type list is an allowlist, not a relaxation: a block the engine genuinely
+        // cannot read is still refused, so a document does not vanish either.
+        let document = try decodeRequest("""
+        {"model":"any","max_tokens":16,"messages":[{"role":"user","content":[
+          {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"AA=="}}]}]}
+        """)
+        XCTAssertTrue(document.hasUnsupportedContent)
+
+        // The block alone is not a response prefill: it carries no text of its own, so a
+        // trailing assistant turn of redacted thinking is an ordinary generation request.
+        let onlyRedacted = try decodeRequest("""
+        {"model":"any","max_tokens":16,"messages":[
+          {"role":"user","content":"hi"},
+          {"role":"assistant","content":[{"type":"redacted_thinking","data":"ENCRYPTED"}]}]}
+        """)
+        XCTAssertNoThrow(try AnthropicAdapter.rejectUnsupportedPrefill(onlyRedacted.messages))
+    }
 }

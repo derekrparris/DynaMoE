@@ -103,12 +103,25 @@ struct AnthropicMessagesRequest: Decodable {
         /// by name (an `image` block has its own payload).
         let isUnsupported: Bool
 
+        /// The block types this protocol may put in a message that this engine can
+        /// handle. `redacted_thinking` is on the list precisely because it carries
+        /// nothing to handle: Anthropic returns it when part of a reasoning trace is
+        /// withheld, and the protocol requires a client to pass it back verbatim to the
+        /// model that issued it. Its payload is opaque bytes with no readable text, so
+        /// accepting it and rendering nothing from it is the same turn this server would
+        /// run without the block at all, while refusing it costs the user the whole
+        /// conversation over a block that adds nothing locally. EVERY other type is
+        /// still refused by name, which is what keeps a `document` from vanishing.
+        nonisolated static let handledTypes: Set<String> = [
+            "", "text", "thinking", "tool_use", "tool_result", "image", "redacted_thinking"
+        ]
+
         var isImage: Bool { image != nil }
 
         init(from decoder: Decoder) throws {
             let container = try decoder.container(keyedBy: CodingKeys.self)
             let type = try container.decodeIfPresent(String.self, forKey: .type) ?? ""
-            self.isUnsupported = !["", "text", "thinking", "tool_use", "tool_result", "image"].contains(type)
+            self.isUnsupported = !Self.handledTypes.contains(type)
             self.text = type == "text" ? try container.decodeIfPresent(String.self, forKey: .text) : nil
             self.thinking = type == "thinking" ? try container.decodeIfPresent(String.self, forKey: .thinking) : nil
             self.toolUse = type == "tool_use" ? try ToolUseIn(from: decoder) : nil
