@@ -688,6 +688,19 @@ final class ServerControllerSmokeTests: XCTestCase {
         return (status, body)
     }
 
+    /// Issues a chat-completions POST with the given body and returns the status.
+    /// With no model loaded every arm answers 503, which is exactly enough to reach
+    /// the row the request logging writes.
+    private func postChat(_ body: [String: Any]) async throws -> Int {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        _ = data
+        return try XCTUnwrap((response as? HTTPURLResponse)?.statusCode)
+    }
+
     /// The logging pipeline appends on a background queue, so assertions poll
     /// briefly instead of sleeping a fixed interval.
     private func waitForLoggedRow(matching predicate: @escaping (ServerRequestLog) -> Bool) async throws -> ServerRequestLog? {
@@ -823,6 +836,80 @@ final class ServerControllerSmokeTests: XCTestCase {
         XCTAssertNil(row.model, "the plan never resolved, so the row has no model")
         XCTAssertEqual(row.requestBody, ServerRequestLog.contentWithheldMarker, "body capture is off; the row must say withheld, not silence")
         XCTAssertNil(row.streamTermination)
+    }
+
+    /// `store: false` is a promise the client is entitled to have kept, and it is
+    /// honoured per request: with body capture ON, that request's row still carries
+    /// the withheld marker and the flag that says the client asked for it. The other
+    /// two arms are the control and the asymmetry — a client that says nothing or
+    /// allows retention gets captured bodies, and `store: true` cannot force capture
+    /// once the operator's switch is off, because retention here is the operator's
+    /// decision. Each arm carries its own `max_tokens` so the rows cannot be
+    /// confused: content is exactly what the withheld arms do not have to match on.
+    func testAClientRetentionRefusalWithholdsItsRowAndATrueCannotForceCapture() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the 503 path cannot be exercised")
+        }
+        await ensureServerRunning()
+        // `captureBodiesKey` is main-actor state, so it is read once here rather than
+        // from this nonisolated context at each use. `tearDown` restores the
+        // developer's saved value; this case needs the switch ON for its first two
+        // arms and OFF for the third.
+        let captureBodiesKey = await MainActor.run { ServerRequestLogRecorder.captureBodiesKey }
+        let defaults = UserDefaults.standard
+        defaults.set(true, forKey: captureBodiesKey)
+
+        func row(maxTokens: Int) async throws -> ServerRequestLog {
+            let logged = try await waitForLoggedRow {
+                $0.path == "/v1/chat/completions" && $0.maxTokens == maxTokens
+            }
+            return try XCTUnwrap(logged)
+        }
+
+        let refusedStatus = try await postChat([
+            "model": "any",
+            "store": false,
+            "max_tokens": 11,
+            "messages": [["role": "user", "content": "a prompt the client asked not to keep"]]
+        ])
+        XCTAssertEqual(refusedStatus, 503)
+        let refused = try await row(maxTokens: 11)
+        XCTAssertEqual(refused.retentionWithheldByClient, true, "the row must say who withheld it, so this never reads as the switch failing")
+        XCTAssertEqual(refused.requestBody, ServerRequestLog.contentWithheldMarker)
+        XCTAssertFalse(refused.hasCapturedContent, "no content field may survive a store: false")
+
+        let capturedStatus = try await postChat([
+            "model": "any",
+            "max_tokens": 22,
+            "messages": [["role": "user", "content": "kept because the client allowed it"]]
+        ])
+        XCTAssertEqual(capturedStatus, 503)
+        let captured = try await row(maxTokens: 22)
+        XCTAssertNil(captured.retentionWithheldByClient, "no retention promise was sent, and nil is not the same claim as store: true")
+        let capturedBody = try XCTUnwrap(captured.requestBody)
+        XCTAssertTrue(
+            capturedBody.contains("kept because the client allowed it"),
+            "the control arm proves capture is on, so the refused arm was proving the flag"
+        )
+        XCTAssertFalse(
+            capturedBody.contains("\"store\""),
+            "a request that sent no retention promise records none, which is what keeps absent distinguishable from store: true"
+        )
+
+        defaults.set(false, forKey: captureBodiesKey)
+        let allowingStatus = try await postChat([
+            "model": "any",
+            "store": true,
+            "max_tokens": 33,
+            "messages": [["role": "user", "content": "the client allowed retention but the switch is off"]]
+        ])
+        XCTAssertEqual(allowingStatus, 503)
+        let stillWithheld = try await row(maxTokens: 33)
+        XCTAssertNil(stillWithheld.retentionWithheldByClient, "the operator withheld this one, not the client, so no client refusal is recorded")
+        XCTAssertEqual(
+            stillWithheld.requestBody, ServerRequestLog.contentWithheldMarker,
+            "store: true cannot force capture: the operator's switch is the stronger authority on their own Mac"
+        )
     }
 
     // MARK: - Lifecycle transitions

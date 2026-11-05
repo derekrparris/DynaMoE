@@ -1207,13 +1207,23 @@ final class ServerController: ObservableObject {
                 $0.wasStreaming = apiRequest.stream == true
                 $0.temperature = apiRequest.temperature.map { Double($0) }
                 $0.maxTokens = apiRequest.maxTokens
+            }
+            // `store: false` is a promise about this request's own retention, so it
+            // has to be stamped before any body is composed: every writer below
+            // (the summary here, a streaming partial's text, the terminal outcome)
+            // asks the box rather than re-deriving the rule.
+            if apiRequest.store == false {
+                logBox?.withholdBodiesForClientRetention()
+            }
+            let withheld = logBox?.withholdsBodiesForClientRetention == true
+            logBox?.modify {
                 // Building the normalized summary walks and serializes the
-                // whole conversation. Skip that work entirely when body
-                // capture is off and stage the withheld marker directly:
-                // the produced summary would be discarded on the next line.
-                $0.requestBody = ServerRequestLogRecorder.captureBodiesEnabled
-                    ? ServerRequestLog.capturedRequestBody(ServerRequestLog.openAISummary(apiRequest))
-                    : ServerRequestLog.contentWithheldMarker
+                // whole conversation. Skip that work entirely when the bodies are
+                // withheld and stage the withheld marker directly: the produced
+                // summary would be discarded on the next line.
+                $0.requestBody = withheld || !ServerRequestLogRecorder.captureBodiesEnabled
+                    ? ServerRequestLog.contentWithheldMarker
+                    : ServerRequestLog.capturedRequestBody(ServerRequestLog.openAISummary(apiRequest))
             }
             if apiRequest.stream == true {
                 // Streaming keeps the 200 + text/event-stream contract even when
@@ -1253,11 +1263,18 @@ final class ServerController: ObservableObject {
                 $0.wasStreaming = apiRequest.stream == true
                 $0.temperature = apiRequest.temperature.map { Double($0) }
                 $0.maxTokens = apiRequest.maxTokens
+            }
+            // Same promise, same place: see the chat route above.
+            if apiRequest.store == false {
+                logBox?.withholdBodiesForClientRetention()
+            }
+            let withheld = logBox?.withholdsBodiesForClientRetention == true
+            logBox?.modify {
                 // Same gating as the sibling routes: never build the summary just
-                // to discard it when body capture is off.
-                $0.requestBody = ServerRequestLogRecorder.captureBodiesEnabled
-                    ? ServerRequestLog.capturedRequestBody(ServerRequestLog.openAICompletionsSummary(apiRequest))
-                    : ServerRequestLog.contentWithheldMarker
+                // to discard it when the bodies are withheld.
+                $0.requestBody = withheld || !ServerRequestLogRecorder.captureBodiesEnabled
+                    ? ServerRequestLog.contentWithheldMarker
+                    : ServerRequestLog.capturedRequestBody(ServerRequestLog.openAICompletionsSummary(apiRequest))
             }
             if apiRequest.stream == true {
                 // Streaming keeps the 200 + text/event-stream contract even when the
@@ -2164,13 +2181,18 @@ final class ServerController: ObservableObject {
     /// `finishReason` is optional because the Anthropic adapter maps some
     /// stop reasons to a JSON-absent nil.
     nonisolated private static func recordTurnOutcome(logBox: ServerRequestLogBox?, result: TurnResult, finishReason: String?) {
+        // A request that said `store: false` keeps every content field out of the
+        // row, tool arguments included; the box is the single place that knows.
+        let withheld = logBox?.withholdsBodiesForClientRetention == true
         let toolRecords = ServerRequestLog.capturedToolCalls(
             result.parsedToolCalls,
+            withheldByClient: withheld,
             serializeArguments: Self.toolArgumentsJSON
         )
         let responseBody = ServerRequestLog.capturedResponseBody(
             thinking: result.thinkingText,
-            response: result.responseText
+            response: result.responseText,
+            withheldByClient: withheld
         )
         logBox?.modify { row in
             row.outputTokens = result.tokensGenerated
@@ -2189,7 +2211,8 @@ final class ServerController: ObservableObject {
     nonisolated static func recordStreamedPartialOutcome(logBox: ServerRequestLogBox?, frame: CompletionFrame, tokenCount: Int) {
         let responseBody = ServerRequestLog.capturedResponseBody(
             thinking: frame.thinkingText,
-            response: frame.responseText
+            response: frame.responseText,
+            withheldByClient: logBox?.withholdsBodiesForClientRetention == true
         )
         logBox?.modify { row in
             row.outputTokens = tokenCount

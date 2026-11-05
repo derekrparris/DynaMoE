@@ -24,7 +24,12 @@ import Foundation
 
 /// One recorded API-server request, persisted as a JSON payload by
 /// `ServerRequestLogStore` and rendered by the Server settings dashboard.
-struct ServerRequestLog: Identifiable, Codable, Sendable, Equatable, Hashable {
+///
+/// `nonisolated` because this is a plain Sendable value: the project's default
+/// actor isolation would otherwise make every field main-actor state, which the
+/// recorder and the dashboard both read from off the main actor (and which every
+/// test that inspects a captured row would have to hop for).
+nonisolated struct ServerRequestLog: Identifiable, Codable, Sendable, Equatable, Hashable {
     enum Proto: String, Codable, Sendable {
         case openai
         case anthropic
@@ -90,6 +95,15 @@ struct ServerRequestLog: Identifiable, Codable, Sendable, Equatable, Hashable {
     var requestBytes: Int?
     var requestBody: String?
     var responseBody: String?
+    /// True when the client that sent this request demanded it not be retained
+    /// (OpenAI's `store: false`). Such a row carries the withheld marker even
+    /// though the Store Request Content switch was on, and this flag is what
+    /// stops that from reading as the switch silently failing: the dashboard can
+    /// say who withheld the content. Nil on rows persisted before the field
+    /// existed (they decode, like `source` does) and on every request that sent no
+    /// retention promise, so "never asked" stays distinguishable from "asked to be
+    /// kept", which is `false`.
+    var retentionWithheldByClient: Bool?
     /// Reason encoding cancelled-by-queue-timeout and similar launch-failure
     /// frames is included in `errorMessage`.
 
@@ -369,6 +383,23 @@ final class ServerRequestLogBox: @unchecked Sendable {
         return builder
     }
 
+    /// Records that this request's client demanded it not be retained (OpenAI's
+    /// `store: false`) and stamps that fact on the row, so every body field
+    /// written afterwards — the route's request summary, a streaming partial's
+    /// text, the terminal outcome — is withheld instead of captured, whatever the
+    /// Store Request Content switch says. Called once, straight after the body
+    /// decodes, because the request summary is composed immediately after it.
+    nonisolated func withholdBodiesForClientRetention() {
+        modify { $0.retentionWithheldByClient = true }
+    }
+
+    /// True when this request must have no body captured at all, regardless of the
+    /// operator's switch. Read by every writer that composes a body, so the rule
+    /// lives in one place instead of being re-derived at each call site.
+    nonisolated var withholdsBodiesForClientRetention: Bool {
+        snapshot().retentionWithheldByClient == true
+    }
+
     /// Stamps wire status, duration, and (for failures) the recordable error
     /// message, returning the finalized row for `record`.
     nonisolated func composeFinal(status: Int, error: (any Error)?) -> ServerRequestLog {
@@ -409,6 +440,11 @@ extension ServerRequestLog {
         payload["parallel_tool_calls"] = request.parallelToolCalls
         payload["stop"] = request.stop
         payload["enable_thinking"] = request.enableThinking
+        // The retention promise belongs in the row it explains: a reader who sees
+        // withheld bodies beside a switch that is on needs to know the client asked
+        // for it, and a reader who sees captured bodies needs to know the client
+        // never forbade them.
+        payload["store"] = request.store
         // The sampler fields that move the DISTRIBUTION belong in the row: a row that
         // omitted them could not explain why two requests with one prompt differ.
         payload["presence_penalty"] = request.presencePenalty
@@ -470,6 +506,9 @@ extension ServerRequestLog {
         // row could explain why one prompt answered differently than the last.
         payload["frequency_penalty"] = request.frequencyPenalty
         payload["logit_bias"] = request.logitBias
+        // Same reason as the chat summary: the row that withheld its bodies has to
+        // say the client asked for that.
+        payload["store"] = request.store
         return serializeSummary(payload)
     }
 
@@ -521,22 +560,29 @@ extension ServerRequestLog {
 /// Body composition shared by both entry paths, so a row means the same thing
 /// whichever one wrote it. Every helper consults the Store Request Content
 /// toggle at call time and falls back to the withheld marker rather than nil,
-/// keeping "capture is off" distinguishable from "nothing to capture".
+/// keeping "capture is off" distinguishable from "nothing to capture", and takes
+/// `withheldByClient` for the one case where the switch is irrelevant: a client
+/// that sent `store: false` asked for this request not to be retained, and that
+/// promise outranks the operator's own setting for that one row.
 extension ServerRequestLog {
     /// The prompt side of a row: the normalized client request for server
     /// rows, the rendered prompt for in-app turns. Nil only when the caller
     /// has no prompt to offer (a request that never decoded).
-    nonisolated static func capturedRequestBody(_ text: String?) -> String? {
+    nonisolated static func capturedRequestBody(_ text: String?, withheldByClient: Bool = false) -> String? {
         guard let text else { return nil }
-        guard ServerRequestLogRecorder.captureBodiesEnabled else { return contentWithheldMarker }
+        guard !withheldByClient, ServerRequestLogRecorder.captureBodiesEnabled else { return contentWithheldMarker }
         return clippedBody(text)
     }
 
     /// The answer side of a row: reasoning plus answer. Nil when the turn
     /// produced no text at all (a failure before the first token), so an
     /// empty box never masquerades as a captured body.
-    nonisolated static func capturedResponseBody(thinking: String, response: String) -> String? {
-        guard ServerRequestLogRecorder.captureBodiesEnabled else { return contentWithheldMarker }
+    nonisolated static func capturedResponseBody(
+        thinking: String,
+        response: String,
+        withheldByClient: Bool = false
+    ) -> String? {
+        guard !withheldByClient, ServerRequestLogRecorder.captureBodiesEnabled else { return contentWithheldMarker }
         let combined: String
         if thinking.isEmpty {
             combined = response
@@ -552,10 +598,11 @@ extension ServerRequestLog {
     /// recorded; arguments are content and follow the toggle.
     nonisolated static func capturedToolCalls(
         _ calls: [ParsedToolCall],
+        withheldByClient: Bool = false,
         serializeArguments: (ParsedToolCall) -> String
     ) -> [ToolCallRecord]? {
         guard !calls.isEmpty else { return nil }
-        let capture = ServerRequestLogRecorder.captureBodiesEnabled
+        let capture = !withheldByClient && ServerRequestLogRecorder.captureBodiesEnabled
         return calls.map { call in
             ToolCallRecord(
                 name: call.name,

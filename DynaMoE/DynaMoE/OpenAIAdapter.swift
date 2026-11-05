@@ -252,6 +252,14 @@ struct OpenAIChatRequest: Decodable {
     /// `stream_options.include_usage` decides whether the trailing usage chunk is
     /// emitted, which is the one sub-field of it this server can honour.
     let streamOptions: StreamOptions?
+    /// OpenAI's `store`: whether the request may be retained server-side for
+    /// distillation or evals. Only `false` is actionable here, and it is honoured
+    /// per request — `withholdBodiesForClientRetention()` keeps this turn's prompt
+    /// and answer out of the request log even when the operator's Store Request
+    /// Content switch is on, because "do not retain me" is a promise the client is
+    /// entitled to have kept. `true` cannot force capture: retention on this Mac is
+    /// the operator's own decision, and a client may not overrule it.
+    let store: Bool?
 
     struct ResponseFormat: Decodable {
         let type: String?
@@ -285,6 +293,7 @@ struct OpenAIChatRequest: Decodable {
         case n, logprobs
         case topLogprobs = "top_logprobs"
         case streamOptions = "stream_options"
+        case store
         case seed, user
     }
 
@@ -338,6 +347,11 @@ struct OpenAIChatRequest: Decodable {
         self.logprobs = try container.decodeIfPresent(Bool.self, forKey: .logprobs)
         self.topLogprobs = try container.decodeIfPresent(Int.self, forKey: .topLogprobs)
         self.streamOptions = try container.decodeIfPresent(StreamOptions.self, forKey: .streamOptions)
+        // Decoded because it is the one field in this protocol whose whole meaning
+        // is a promise about the server's own behaviour rather than about the
+        // answer: dropped, `store: false` was answered exactly as if the client had
+        // asked for the request to be kept.
+        self.store = try container.decodeIfPresent(Bool.self, forKey: .store)
     }
 
     /// True when any message carries an image content part. The turn planner
@@ -406,6 +420,9 @@ nonisolated struct OpenAICompletionsRequest: Decodable {
     let enableThinking: Bool?
     let reasoningEffort: String?
     let streamOptions: OpenAIChatRequest.StreamOptions?
+    /// OpenAI's `store`, which this route accepts too because both routes take the
+    /// same retention promise: see `OpenAIChatRequest.store`.
+    let store: Bool?
 
     enum CodingKeys: String, CodingKey {
         case model, prompt, suffix, n, stream, echo, stop, seed, user
@@ -423,6 +440,7 @@ nonisolated struct OpenAICompletionsRequest: Decodable {
         case enableThinking = "enable_thinking"
         case reasoningEffort = "reasoning_effort"
         case streamOptions = "stream_options"
+        case store
     }
 
     init(from decoder: Decoder) throws {
@@ -482,6 +500,7 @@ nonisolated struct OpenAICompletionsRequest: Decodable {
         self.enableThinking = try container.decodeIfPresent(Bool.self, forKey: .enableThinking)
         self.reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
         self.streamOptions = try container.decodeIfPresent(OpenAIChatRequest.StreamOptions.self, forKey: .streamOptions)
+        self.store = try container.decodeIfPresent(Bool.self, forKey: .store)
         // `seed` and `user` are decoded only to be documented as ignored: upstream
         // calls `seed` a best-effort determinism hint (this server is already greedy
         // at temperature 0) and `user` an abuse-monitoring label with no local

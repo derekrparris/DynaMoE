@@ -640,6 +640,52 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         )
     }
 
+    /// OpenAI's `store` is the one field in this protocol whose entire meaning is a
+    /// promise about the server rather than about the answer, and its two values are
+    /// deliberately not symmetric: `false` is honoured per request (that row keeps its
+    /// bodies out of the log), `true` cannot force capture because retention on this
+    /// Mac is the operator's decision. Absent must stay distinguishable from both,
+    /// because a client that never spoke gets the operator's default.
+    func testTheRetentionPromiseIsDecodedOnBothOpenAIRoutes() throws {
+        let refusing = try decodeRequest(#"{"messages":[],"store":false}"#)
+        XCTAssertEqual(refusing.store, false)
+        let allowing = try decodeRequest(#"{"messages":[],"store":true}"#)
+        XCTAssertEqual(allowing.store, true)
+        let silent = try decodeRequest(#"{"messages":[]}"#)
+        XCTAssertNil(silent.store, "absent is not the same request as either value: it leaves retention to the operator")
+
+        let legacy = try decodeCompletions(#"{"prompt":"x","store":false}"#)
+        XCTAssertEqual(legacy.store, false, "both routes take the same retention promise")
+
+        // Retention is a privacy promise, not a shape promise, so it is honoured
+        // rather than refused: no new 400 appears on either path.
+        XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedResponseShape(refusing))
+        XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedCompletionsShape(legacy))
+    }
+
+    /// A row whose bodies were withheld has to explain itself, and the captured
+    /// request summary is where a debugging session looks: `store` must survive
+    /// into it, so "withheld at the client's request" is readable from the row
+    /// alone rather than inferred from the switch's current value.
+    func testTheCapturedRequestSummaryRecordsTheRetentionPromise() throws {
+        func recordedStore(_ json: String) throws -> Bool? {
+            let summary = try XCTUnwrap(ServerRequestLog.openAISummary(try decodeRequest(json)))
+            let object = try JSONSerialization.jsonObject(with: Data(summary.utf8)) as? [String: Any]
+            return object?["store"] as? Bool
+        }
+        XCTAssertEqual(try recordedStore(#"{"messages":[],"store":false}"#), false)
+        XCTAssertEqual(try recordedStore(#"{"messages":[],"store":true}"#), true)
+        XCTAssertNil(
+            try recordedStore(#"{"messages":[]}"#),
+            "a client that sent no promise records none: absent is not store: true"
+        )
+
+        let legacy = try decodeCompletions(#"{"prompt":"x","store":false}"#)
+        let legacySummary = try XCTUnwrap(ServerRequestLog.openAICompletionsSummary(legacy))
+        let legacyObject = try JSONSerialization.jsonObject(with: Data(legacySummary.utf8)) as? [String: Any]
+        XCTAssertEqual(legacyObject?["store"] as? Bool, false)
+    }
+
     /// The two sampler fields OpenAI defines and this engine can honour are decoded,
     /// range-checked and resolved into the turn's sampling instead of ignored.
     ///

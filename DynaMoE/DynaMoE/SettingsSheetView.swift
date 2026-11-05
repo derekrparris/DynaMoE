@@ -2273,6 +2273,12 @@ struct SettingsSheetView: View {
                     if let tools = log.toolCalls, !tools.isEmpty {
                         serverRequestLogDetailLine("Tool Calls", tools.map(\.name).joined(separator: ", "))
                     }
+                    // Says WHY a row has no bodies when the Store Request Content
+                    // switch was on: the client asked for that (`store: false`), so a
+                    // reader never files it as the switch having failed.
+                    if log.retentionWithheldByClient == true {
+                        serverRequestLogDetailLine("Content", "withheld at the client's request (store: false)")
+                    }
                 }
 
                 serverRequestLogBodySection("Request", log.requestBody)

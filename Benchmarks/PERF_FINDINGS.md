@@ -14092,3 +14092,99 @@ assertion reading `servedID`; `servedID` itself is `nonisolated`, so it adds non
 | prompt rendering, because the family-name hint now gets the checkpoint's name instead of its hash: `ChatPromptFormatterConversationTests`, `DeepSeekV41PromptRenderTests`, `ReasoningRoundTripTests`, `DeepSeekV41ChatPromptFormatterTests`, `ModelConfigThinkingLevelTests` | **67 cases, 0 failures** |
 | adjacent logic suites: `ServerRequestLogLogicTests`, `TurnFitLogicTests`, `KVCacheProvisioningLogicTests`, `PrefixAsOfDateTests`, `ServerHardeningLogicTests`, `TurnToolMaskTests` | **137 cases, 0 failures** |
 | `DeepSeekV41PublishedTurnTests.testThePublishedCheckpointAdvertisesAUsableModelId` (opt-in, private port 8803, the real 475.25 GB checkpoint loaded into the shared engine: list, retrieve, Anthropic retrieve, and the legacy alias) | **passed 1.68 s** after one fix: the retrieve answers the model OBJECT, not a page |
+
+## DSV4.1 #93: A CLIENT THAT SAID "DO NOT RETAIN THIS" WAS RETAINED, BECAUSE THE ONE FIELD WHOSE WHOLE MEANING IS A PROMISE WAS DROPPED BY THE DECODER
+
+### The question
+
+Routed with SubQ in one call (`next_slice` = **`privacy_store` 0.9130 @ 0.9006**, against
+`audio_modalities` 0.0432, `embeddings_route` 0.0302, `doc_hint_fields` 0.0080, `responses_route`
+0.0034, `docs_sweep` 0.0008, `perf_leftovers` 0.0009, `ui_status` 0.0004; `store_is_a_defect` =
+**0.9764**).
+
+The candidate set was built by auditing the OpenAI chat decoder against every key the protocol defines,
+which is the check `#88`/`#90`/`#91` established: `store`, `metadata`, `modalities`, `audio`,
+`prediction`, `web_search_options` and `service_tier` are all absent from `OpenAIChatRequest`, so Swift's
+unknown-key tolerance silently drops all seven. Six of them cannot change anything a local server owes a
+client (`store: true` is the only one that would, and it is the operator's decision — see below).
+`store: false` is the exception, and it was the only candidate whose whole meaning is a promise about the
+SERVER rather than about the answer.
+
+### What was found
+
+`ServerRequestLogRecorder.captureBodiesEnabled` is the operator's "Store Request Content" switch, and when
+it is on the recorder persists the normalized client request — every message's full text, via
+`ServerRequestLog.openAISummary` — and the turn's reasoning plus answer, for 30 days in
+`~/Library/Application Support/DynaMoE/logs/server-requests.sqlite`. `store` was not decoded at all, so a
+request carrying `"store": false` was retained exactly as if it had asked to be kept. The one field in the
+protocol whose entire purpose is "do not retain me" was the one field answered as if it had not been sent —
+the same class of lie `#88`-`#92` exist to remove, except the thing silently dropped is a privacy promise
+rather than a sampler setting.
+
+The asymmetry the fix turns on: retention on this Mac is the OPERATOR's decision, so a client may not
+overrule it in the other direction. `store: true` is therefore decoded, honoured as "no opinion" and
+recorded, but cannot force capture when the switch is off.
+
+### What was added
+
+| file | change |
+|---|---|
+| `OpenAIAdapter` | `OpenAIChatRequest.store` and `OpenAICompletionsRequest.store` (`Bool?`) — both routes take the same promise, and absent stays distinguishable from either value |
+| `ServerRequestLog` | `retentionWithheldByClient: Bool?` on the row (`nil` on payloads persisted before the field, the way `source` decodes, so the log's own legacy rows still open) |
+| `ServerRequestLogBox` | `withholdBodiesForClientRetention()` and `withholdsBodiesForClientRetention` — the per-request refusal lives on the box, so the rule has one home instead of being re-derived at every writer |
+| `capturedRequestBody` / `capturedResponseBody` / `capturedToolCalls` | a `withheldByClient:` parameter (default false) that withholds regardless of the switch; tool ARGUMENTS follow it too, because arguments are content |
+| `ServerController` | both OpenAI routes stamp the refusal straight after the body decodes (before the summary is composed) and skip building the summary when it would be discarded; `recordTurnOutcome` and `recordStreamedPartialOutcome` read the flag off the box |
+| `openAISummary` / `openAICompletionsSummary` | record `store`, so a row with withheld bodies beside a switch that is on reads as the client's request rather than as the switch failing |
+| `SettingsSheetView` | the log detail sheet prints `Content: withheld at the client's request (store: false)` |
+| `HelpAndSettingsGuideView` | the Privacy & Body Capture bullet states the rule and both directions of it |
+
+### The finding
+
+1. **The promise has to be stamped before the first body is composed, not when the turn ends.** Every
+   body field is written by a different owner — the route writes the request summary immediately after
+   decoding, a streaming writer writes a partial's text when a stream dies mid-tail, and the terminal
+   outcome writes reasoning plus answer — and all of them run on the same box. The flag therefore lives on
+   `ServerRequestLogBox` and the writers ASK it, which is why the fix is one call at the route and one
+   parameter at each of three composers rather than three parallel rules that could disagree.
+2. **`store: true` is decoded and NOT obeyed, on purpose.** A local server's retention policy belongs to
+   the person whose disk the rows land on. A client can refuse; a client cannot consent on the operator's
+   behalf. `testAClientRetentionRefusalWithholdsItsRowAndATrueCannotForceCapture` pins that third arm.
+3. **The row has to explain itself.** The withheld marker already says "metadata only"; it cannot say WHO
+   withheld. `retentionWithheldByClient` is what lets the dashboard distinguish "the operator turned the
+   switch off" from "this one client asked, and it was honoured" — the same principle (`withheld` must
+   never read as silence) that made the marker a placeholder instead of `nil` in the first place.
+4. **`ServerRequestLog` is now a `nonisolated` struct.** Its fields are `Date`/`UUID`/`String`/`Int`/
+   `Bool`/arrays of a Sendable record; the project's `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` made them
+   main-actor state for no reason, which is why the recorder, the store and every test that inspects a
+   captured row either hopped or warned. One keyword retired **287 warning instances** and no behaviour.
+
+### What it is not (do not re-propose)
+
+- **Not `store: true` forcing capture.** See finding 2.
+- **Not refusing `store` with a 400.** Retention is a promise the server can keep, so it is kept; a 400
+  would put a new error on a field clients send by default in the newer SDKs.
+- **Not `metadata` echo, `prediction`, `web_search_options`, `service_tier` or `modalities` in this slice.**
+  None can move an answer; `metadata` has no response field in this protocol to echo into (OpenAI exposes
+  it only on the stored object), and `modalities`/`audio` are a real gap of their own (a request asking for
+  spoken output is answered as text today), so they stay named candidates rather than being bundled here.
+- **Not scrubbing rows that already exist.** The switch's own contract is the same: turning retention off
+  never rewrites history.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath` and `-parallel-testing-enabled NO`. Bundle freshness checked with `strings … | grep -c`
+over all four new case names before running. Warning instances 1,841 -> **1,554**, no new warning KINDS.
+
+| suite | result |
+|---|---|
+| `ServerRequestLogLogicTests` (+1: the refusal outranks the switch, every composer obeys it, a streamed partial obeys it, and the control arm still captures) | **43 cases, 0 failures** |
+| `OpenAIAdapterLogicTests` (+2: `store` decodes on both routes with absent distinct from either value, and the captured summary records it) | **28 cases, 0 failures** |
+| `AnthropicAdapterLogicTests` | **38 cases, 0 failures** |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787) (+1: three arms over real HTTP — `store: false` with the switch on gives a withheld row flagged as the client's, no `store` gives a captured body with no `store` key, and `store: true` with the switch off is still withheld) | **27 cases, 0 failures, 1 skipped** |
+| adjacent logic suites: `ServerStreamSafetyTests`, `ServerToolArgumentTests`, `ServerHardeningLogicTests`, `ServerQueueLogicTests`, `TurnFitLogicTests`, `KVCacheProvisioningLogicTests`, `ChatPromptFormatterConversationTests`, `ReasoningRoundTripTests`, `PrefixAsOfDateTests`, `TurnToolMaskTests`, `DeepSeekV41PromptRenderTests`, `DeepSeekV41ChatPromptFormatterTests` | **146 cases, 0 failures** |
+
+The legacy-row case is worth calling out: `testLegacyRowsDecodeWithNoSource` failed on the first run
+because a stored payload written before this slice has no `retentionWithheldByClient` key, and a
+non-optional field with a default value does NOT make a synthesized `Codable` key optional. The field is
+`Bool?` for that reason, exactly as `source` is.
