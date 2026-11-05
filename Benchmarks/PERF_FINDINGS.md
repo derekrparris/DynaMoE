@@ -13241,3 +13241,124 @@ tensors over 48 segments, server on 127.0.0.1:8791, two requests `200` — the p
 prompt tokens, a span of 184 positions over 1,521 patch tokens from 0.32 s of tower, and the
 model describing the picture. Same numbers to the tenth of a second as `#84`'s run, which is what
 a four-line change to who holds a lock should look like.
+
+## DSV4.1 #86: THE ANTHROPIC FRONT DOOR CAN NOW ANSWER WHAT A REQUEST WILL COST, AND ITS NUMBER IS THE TURN'S OWN
+
+### The question
+
+`#77` to `#82` spent six slices making the local server a front door a real client could walk
+through: a picture on both protocols, both transports, the models list advertising the capability
+and then its cost. What that left is not a bug but a hole in the protocol surface. The Anthropic
+API defines two POST routes, and this server had one of them.
+
+`POST /v1/messages/count_tokens` is the pre-flight. A client that manages its own context — Claude
+Code is the one that matters — counts a conversation before sending it, and without the route
+that pre-flight is a 404. So the branch's own theme, "complete full DeepSeek support" as a drop-in
+local server, had exactly one cheap unbuilt piece left, and the price of it is a request with no
+generation in it.
+
+Routing agreed decisively: `next_slice` = `anthropic_count_tokens` **0.995 @ 0.994**, with
+`device_mhc_stages` 0.004, `model_id` 0.001, `openai_responses` 0.0003, `docs_sweep` 0.0003,
+`perf_leftovers` 0.0001 and `image_cost_ceiling` 0.0001. The scope question —
+`count_tokens_scope` "the route alone" against "both protocols" and "route plus docs only" —
+answered **0.947 @ 0.921** for the route alone.
+
+One correction matters more than the routing. The first request put `vision_device_encode` on top
+of the state at 0.94, because that was the largest unbuilt thing this journal used to name — and it
+was **stale**: `#43` built the whole device encode (0.32 s smallest image, 6.90 s largest, 8.81x to
+6.02x), `#44` and `#45` then measured its attention dead as a SIMT *and* a matrix-unit question,
+and `#46` found the encode was 2% of a picture's real cost. The candidate list is only as good as
+the journal it is read from, and the journal says the tower is done.
+
+### What was added
+
+One route, one response type, one parameter.
+
+- **`POST /v1/messages/count_tokens`** (`ServerController.buildRouter`), registered beside
+  `/v1/messages`. It authorizes, decodes the body as `AnthropicMessagesRequest`, prints the same
+  request summary into the same log row, and answers `{"input_tokens": N}`.
+- **`AnthropicTokenCount`** (`AnthropicAdapter.swift`) is the whole body. The protocol answers one
+  field, and a type that could carry more would invite one.
+- **`buildTurnPlan(_:maxTokensRequired:)`** on the Anthropic surface: the messages route requires
+  `max_tokens` and the `count_tokens` body has no such field by protocol. The count path passes
+  `false` and the planner takes the smallest legal budget instead of refusing.
+
+The reason the route is nine lines of behaviour rather than an estimator is the whole point of the
+slice: **it calls the messages route's own planner.** `buildTurnPlan` is where a request becomes a
+prompt — the system block rendered with the session's own date, the recorded turn spliced back in
+when a follow-up reproduces the history, the tokenizer run once, and an attachment's placeholder
+expanded into the span the resize plan predicts. A second estimator here, even a careful one, would
+answer a number the turn it precedes never matches, and that mismatch is the only way this endpoint
+can be wrong.
+
+The reply budget is safe to substitute because it never moves the prompt: `maxTokens` reaches
+`TurnSampling` and nothing else in the planner.
+
+### The finding: the number is a property of the plan, not of the route
+
+Measured on the published checkpoint, one body through both routes (`testTheTokenCountRoutePredictsWhatItsTurnCosts`,
+33.2 s, `/tmp/test86_live.log`):
+
+```
+[server.request] POST /v1/messages/count_tokens → 200 56ms  model=1bae0e10…  in=166
+[server.request] POST /v1/messages/count_tokens → 200 52ms  model=1bae0e10…  in=166
+🔎 [dsv41 real] count_tokens: 166 predicted, 166 reported, 23 generated
+```
+
+166 predicted, 166 reported, and two identical pre-flights agreeing in between. Three separate
+claims are in that line and each one is a thing that could have been wrong:
+
+- **the count is the turn's own `usage.input_tokens`**, not an estimate near it. Both routes render
+  the same prompt because they run the same function, so the equality is structural;
+- **the count is stable**, so the session date the system block carries is minted once per session
+  and not per request (`PrefixCacheManager.asOfDate`). A per-request date would have moved it;
+- **the body it accepts is the protocol's**, i.e. without `max_tokens`, which is the one field the
+  messages route insists on and this one must not.
+
+A pre-flight is also cheap in the way a pre-flight has to be: **56 ms and 52 ms**, against 33 s for
+the turn it predicted. It runs no generation and claims no engine slot, so it answers while a turn
+generates — a client compacting mid-turn is not blocked by the turn it is measuring.
+
+### What it is not (do not re-propose)
+
+- **Not a second estimator.** Any implementation that counts without the planner will drift from
+  the turn, and drift is the entire failure mode. The shared call is the feature.
+- **Not an OpenAI route.** The OpenAI protocol has no pre-flight; a client there sends and reads
+  `usage`, or reads the models list `#82` taught to advertise a picture's cost range. Adding a
+  `/v1/chat/completions/count` would be an invention, not a compatibility fix.
+- **Not a change to `/v1/messages`.** `maxTokensRequired` defaults to `true`, so the generation
+  route's refusal of a body without `max_tokens` is unchanged and still pinned
+  (`testMessagesWithoutMaxTokensReturns400`).
+- **Not a `/health`-style silent route.** `/health` writes no row because polling would flood the
+  store; a pre-flight is a client request that happens once per turn, and its row is what lets a
+  developer read the predicted count beside the turn that followed it. It inherits the Anthropic
+  row key automatically, because `ServerRequestLog.proto(forPath:)` matches `/v1/messages*`.
+- **Not a token budget change.** The prompt cap, the KV `turnFit` check and the 503-when-busy
+  contract all live in the turn path, which this route does not enter.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_86` (status 0, error grep with a leading space so
+source echo lines do not read as errors), then `test-without-building` with the same
+`-derivedDataPath` throughout. Bundle freshness checked with `strings … | grep -c <case>` (4 for the
+four new cases) before running anything.
+
+The build's warning set grew by **25 instances of categories that already fill these files**
+(1,773 → 1,798 diagnostics, `diff` of the `file:line: warning` sets taken against `#85`'s build).
+Every one is the project-wide `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` pattern that the two
+existing route handlers already carry dozens of times — `beginRequest()`/`endRequest()` from a
+nonisolated context, `loadedModelInfo` from a nonisolated context, and the main-actor-isolated
+`Encodable` conformance of a wire type (`AnthropicTokenCount` joins `AnthropicMessageResponse`,
+`OpenAIChatResponse`, `OpenAIErrorEnvelope` in that list). No new kind of diagnostic, so the shape
+of the codebase is unchanged.
+
+| suite | result |
+|---|---|
+| `AnthropicAdapterLogicTests` (25 cases: `#86`'s two are a `count_tokens` body decoding with no `max_tokens`, and the response encoding to exactly one field) | **25 cases, 0 failures** |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787; `#86`'s three are the 503 model gate with a body that carries no `max_tokens`, the Anthropic-shaped 400 on a malformed body, and the credential both ways — 401 anonymous, past-the-gate with `x-api-key`) | **20 cases, 0 failures** (17 before) |
+| `ServerQueueLogicTests`, `OpenAIAdapterLogicTests`, `ServerStreamSafetyTests`, `ServerToolArgumentTests`, `ServerHardeningLogicTests`, `TurnToolMaskTests`, `ChatPromptFormatterConversationTests`, `ReasoningRoundTripTests`, `PrefixAsOfDateTests`, `EngineTurnSlotTests` | 129 cases, 0 failures |
+| `DeepSeekV41PublishedTurnTests.testTheTokenCountRoutePredictsWhatItsTurnCosts` (opt-in, `/tmp/dynamoe_dsv41_real_turn`, private port 8793) | **passed, 33.2 s**, 166/166, rows carry the count |
+
+The three smoke cases are chosen so the route's state machine is pinned without a model: a planner
+that still demanded `max_tokens` would answer 400 where the first case requires 503, and a
+credential path that did not accept `x-api-key` would answer 401 where the third requires 503.

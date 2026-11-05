@@ -316,6 +316,19 @@ struct AnthropicUsage: Encodable {
     }
 }
 
+/// The whole body of `POST /v1/messages/count_tokens`: the protocol's pre-flight
+/// answers one field and nothing else. The number is the prompt the messages
+/// route would report as `usage.input_tokens` for the same body, i.e. AFTER an
+/// attachment's span is expanded, because the span is what the model attends over
+/// and what the budget is checked against.
+struct AnthropicTokenCount: ResponseEncodable {
+    let inputTokens: Int
+
+    enum CodingKeys: String, CodingKey {
+        case inputTokens = "input_tokens"
+    }
+}
+
 /// A single assistant content block in the non-streaming response.
 enum AnthropicContentBlock: Encodable {
     case text(String)

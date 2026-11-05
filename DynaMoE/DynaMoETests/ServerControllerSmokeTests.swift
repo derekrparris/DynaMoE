@@ -208,6 +208,104 @@ final class ServerControllerSmokeTests: XCTestCase {
         XCTAssertFalse((error["message"] as? String ?? "").isEmpty)
     }
 
+    // MARK: - Token counting
+
+    /// Anthropic's pre-flight, on the real server. The body carries no
+    /// `max_tokens` — the protocol's count_tokens body has no such field — so a
+    /// 503 from the model gate is also the proof that the route does not demand
+    /// one: a planner that still required it would answer 400 first.
+    func testCountTokensWithoutModelReturns503ErrorEnvelope() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the 503 path cannot be exercised")
+        }
+        await ensureServerRunning()
+
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/messages/count_tokens")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data("""
+        {"model":"any","messages":[{"role":"user","content":"hello"}]}
+        """.utf8)
+        let statsBefore = ServerController.stats.snapshot()
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        XCTAssertEqual(http.statusCode, 503, "with no model there is no prompt to render")
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(body["type"] as? String, "error", "the pre-flight answers the Anthropic envelope")
+        XCTAssertFalse(((body["error"] as? [String: Any])?["message"] as? String ?? "").isEmpty)
+        XCTAssertEqual(
+            ServerController.stats.snapshot().totalRequests,
+            statsBefore.totalRequests + 1,
+            "the pre-flight must be counted in the server stats like any other request"
+        )
+
+        let loggedRow = try await waitForLoggedRow { $0.path == "/v1/messages/count_tokens" }
+        let logged = try XCTUnwrap(loggedRow)
+        XCTAssertEqual(logged.method, "POST")
+        XCTAssertEqual(
+            logged.proto, .anthropic,
+            "the pre-flight shares the messages route's protocol, so a dashboard reads it as Anthropic"
+        )
+        XCTAssertEqual(logged.httpStatus, 503)
+        XCTAssertTrue(logged.isError)
+    }
+
+    func testCountTokensErrorResponsesAreAnthropicShaped() async throws {
+        await ensureServerRunning()
+
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/messages/count_tokens")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data(#"{"messages":"not an array"}"#.utf8)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        XCTAssertEqual(http.statusCode, 400, "an unparseable body must be rejected before the model gate")
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(body["type"] as? String, "error")
+        let error = try XCTUnwrap(body["error"] as? [String: Any])
+        XCTAssertEqual(error["type"] as? String, "invalid_request_error")
+        XCTAssertFalse((error["message"] as? String ?? "").isEmpty)
+    }
+
+    /// The pre-flight is a client request like any other, so it carries the same
+    /// credential either a bearer token or Anthropic's `x-api-key`.
+    func testCountTokensRequiresTheAPIKey() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the past-the-gate path cannot be exercised")
+        }
+        let defaults = UserDefaults.standard
+        let savedKey = defaults.object(forKey: ServerController.apiKeyKey)
+        defer {
+            if let savedKey {
+                defaults.set(savedKey, forKey: ServerController.apiKeyKey)
+            } else {
+                defaults.removeObject(forKey: ServerController.apiKeyKey)
+            }
+        }
+        defaults.set("secret-test-key", forKey: ServerController.apiKeyKey)
+        await ensureServerRunning()
+
+        var anonymous = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/messages/count_tokens")!)
+        anonymous.httpMethod = "POST"
+        anonymous.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        anonymous.httpBody = Data("""
+        {"model":"any","messages":[{"role":"user","content":"hello"}]}
+        """.utf8)
+        let (_, anonymousResponse) = try await URLSession.shared.data(for: anonymous)
+        XCTAssertEqual(
+            try XCTUnwrap(anonymousResponse as? HTTPURLResponse).statusCode, 401,
+            "a request with no credential must be refused"
+        )
+
+        var keyed = anonymous
+        keyed.setValue("secret-test-key", forHTTPHeaderField: "x-api-key")
+        let (_, keyedResponse) = try await URLSession.shared.data(for: keyed)
+        XCTAssertEqual(
+            try XCTUnwrap(keyedResponse as? HTTPURLResponse).statusCode, 503,
+            "x-api-key must be accepted, leaving the model gate as the only refusal"
+        )
+    }
+
     func testCompletionsErrorResponsesAreOpenAIShaped() async throws {
         await ensureServerRunning()
 

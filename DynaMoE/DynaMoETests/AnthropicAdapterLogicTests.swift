@@ -287,6 +287,30 @@ final class AnthropicAdapterLogicTests: XCTestCase {
         XCTAssertEqual(jsonDelta["partial_json"] as? String, #"{"a":1}"#)
     }
 
+    // MARK: - Token counting
+
+    func testACountTokensBodyCarriesNoMaxTokensAndStillDecodes() throws {
+        // The protocol's count_tokens body is the messages body minus the reply
+        // budget. One decodable type serves both, which is why the route needs no
+        // wire type of its own; a body with no `max_tokens` must still arrive.
+        let request = try decodeRequest("""
+        {"model":"m","messages":[{"role":"user","content":"hi"}],
+         "system":"be terse","thinking":{"type":"enabled","budget_tokens":2048}}
+        """)
+        XCTAssertNil(request.maxTokens)
+        XCTAssertEqual(request.messages.count, 1)
+        XCTAssertEqual(request.messages[0].contentText, "hi")
+        XCTAssertEqual(request.systemText, "be terse")
+        XCTAssertEqual(request.thinking?.type, "enabled")
+    }
+
+    func testTokenCountResponseIsExactlyOneField() throws {
+        let data = try JSONEncoder().encode(AnthropicTokenCount(inputTokens: 14))
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(json.count, 1, "Anthropic's pre-flight answers `input_tokens` and nothing else")
+        XCTAssertEqual(json["input_tokens"] as? Int, 14)
+    }
+
     // MARK: - Tool choice
 
     func testToolChoiceNameIsPreservedAndForcedChoiceIsRejected() throws {

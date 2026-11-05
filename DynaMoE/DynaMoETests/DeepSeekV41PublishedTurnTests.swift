@@ -3849,6 +3849,66 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         }
     }
 
+    /// The protocol's pre-flight, against the turn it precedes.
+    ///
+    /// `POST /v1/messages/count_tokens` is what a client such as Claude Code calls
+    /// before sending a request, to decide whether to compact. Its only useful
+    /// property is that the number it answers is the number the turn will report, so
+    /// that is what this case checks: one body through both routes, one prompt behind
+    /// them. The planner is shared on purpose — the count route calls the messages
+    /// route's own `buildTurnPlan` rather than estimating a second time — and the two
+    /// ways it could still drift are the ones this catches: the count path is told
+    /// not to demand `max_tokens`, and a client's `max_tokens` must not move the
+    /// prompt.
+    ///
+    /// No `thinking` block is sent, so the prompt is the family's thinking-off shape
+    /// and the turn answers immediately rather than spending its budget in the
+    /// reasoning channel.
+    func testTheTokenCountRoutePredictsWhatItsTurnCosts() async throws {
+        let snapshot = try snapshotDirectory()
+        let engine = try loadPublishedCheckpointIntoTheSharedEngine(snapshot)
+        defer {
+            unloadSharedEngine()
+            withExtendedLifetime(engine) {}
+        }
+
+        // A different private port from `#78`'s and `#79`'s, so no case can inherit
+        // another's listening socket if a stop ever leaves one behind.
+        let port = 8793
+        let text = "Name one file in this repository."
+        try await withLocalServer(on: port) { store in
+            let counted = try await postTokenCount(port: port, text: text)
+            XCTAssertGreaterThan(counted, 0, "a rendered prompt is never zero tokens")
+            let recounted = try await postTokenCount(port: port, text: text)
+            XCTAssertEqual(
+                recounted, counted,
+                "the same body counted twice must answer the same number"
+            )
+
+            let turn = try await postMessages(port: port, text: text, imageBase64: nil)
+            print(
+                "🔎 [dsv41 real] count_tokens: \(counted) predicted, "
+                    + "\(turn.inputTokens) reported, \(turn.outputTokens) generated"
+            )
+            XCTAssertEqual(
+                counted, turn.inputTokens,
+                "the pre-flight must answer the number the turn it precedes reports"
+            )
+
+            // The row is the dashboard's half of the same claim: a pre-flight that
+            // answered a number nobody persisted would leave the turn it predicted
+            // unaccounted for beside it.
+            let rows = await store.fetch(limit: 20)
+            let preflights = rows.filter { $0.path == "/v1/messages/count_tokens" }
+            XCTAssertEqual(preflights.count, 2, "both pre-flights must be logged")
+            XCTAssertTrue(
+                preflights.allSatisfy { $0.inputTokens == counted && $0.httpStatus == 200 },
+                "each pre-flight's row must carry the number it answered: "
+                    + "\(preflights.map { "\(String(describing: $0.inputTokens)) \($0.httpStatus)" })"
+            )
+        }
+    }
+
     /// What one non-streaming `/v1/messages` turn reported back.
     private struct AnthropicTurn {
         var content: String
@@ -3856,6 +3916,40 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         var inputTokens: Int
         var outputTokens: Int
         var stopReason: String?
+    }
+
+    /// Posts one Anthropic pre-flight to the local server and returns the count it
+    /// answers.
+    ///
+    /// The body is the messages body minus `max_tokens`, which is what the protocol
+    /// specifies: a body that carried one would not prove the route accepts its own
+    /// shape. The content block array is spelled the same way `postMessages` spells
+    /// it, so a difference between the two answers is the route and not the decoder.
+    private func postTokenCount(port: Int, text: String) async throws -> Int {
+        let body = """
+        {"model":"any","messages":[
+            {"role":"user","content":[{"type":"text","text":"\(text)"}]}
+        ]}
+        """
+        var request = URLRequest(
+            url: URL(string: "http://127.0.0.1:\(port)/v1/messages/count_tokens")!
+        )
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data(body.utf8)
+        request.timeoutInterval = 900
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any],
+            "the pre-flight's reply was not a JSON object: "
+                + String(decoding: data, as: UTF8.self)
+        )
+        guard http.statusCode == 200 else {
+            XCTFail("\(http.statusCode) from the local pre-flight: \(json)")
+            return -1
+        }
+        return try XCTUnwrap(json["input_tokens"] as? Int, "the reply must carry input_tokens")
     }
 
     /// Posts one Anthropic message to the local server, text or text+image.

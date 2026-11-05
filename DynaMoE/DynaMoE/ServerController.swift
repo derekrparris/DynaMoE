@@ -1110,6 +1110,47 @@ final class ServerController: ObservableObject {
             return try context.responseEncoder.encode(result, from: request, context: context)
         }
 
+        // The protocol's pre-flight. Anthropic clients count a conversation
+        // before sending it, so a client that cannot ask this question either
+        // fails its own pre-flight or guesses.
+        //
+        // The number comes from the messages route's own planner, which is the
+        // point: it is the prompt that route would report as `usage.input_tokens`
+        // for the same body — image spans expanded, a recorded generation spliced
+        // back in, the system block rendered with the same session date. A second
+        // estimator here would answer a number the turn it precedes never matches.
+        // It runs no generation and claims no slot, so it answers while another
+        // turn is generating.
+        router.post("v1/messages/count_tokens") { request, context in
+            ServerController.stats.beginRequest()
+            defer { ServerController.stats.endRequest() }
+            let logBox = ServerRequestLogRecorder.shared.box(for: context.id)
+            logBox?.modify { $0.requestBytes = Int(request.headers[.contentLength] ?? "") }
+            try ServerController.authorizeOrThrow(request)
+            let apiRequest: AnthropicMessagesRequest
+            do {
+                apiRequest = try await request.decode(as: AnthropicMessagesRequest.self, context: context)
+            } catch {
+                throw ServerAPIError.badRequest("Invalid request body: \(error.localizedDescription)")
+            }
+            logBox?.modify {
+                $0.requestBody = ServerRequestLogRecorder.captureBodiesEnabled
+                    ? ServerRequestLog.capturedRequestBody(ServerRequestLog.anthropicSummary(apiRequest))
+                    : ServerRequestLog.contentWithheldMarker
+            }
+            // `max_tokens` is required on the messages route and absent from this
+            // one by protocol; the reply budget never moves the prompt, so the
+            // planner is told not to demand it rather than this route inventing a
+            // plan of its own.
+            let plan = try ServerController.buildTurnPlan(apiRequest, maxTokensRequired: false)
+            logBox?.modify {
+                $0.model = plan.modelName
+                $0.inputTokens = plan.promptTokenCount
+            }
+            let count = AnthropicTokenCount(inputTokens: plan.promptTokenCount)
+            return try context.responseEncoder.encode(count, from: request, context: context)
+        }
+
         return router
     }
 
@@ -1585,8 +1626,16 @@ final class ServerController: ObservableObject {
         ))
     }
 
-    nonisolated private static func buildTurnPlan(_ apiRequest: AnthropicMessagesRequest) throws -> TurnPlan {
-        guard let maxTokens = apiRequest.maxTokens else {
+    /// - Parameter maxTokensRequired: the messages route requires `max_tokens`
+    ///   and the `count_tokens` body has no such field by protocol. The reply
+    ///   budget never moves the prompt, so the count path takes the smallest legal
+    ///   one instead of refusing or building a plan of its own.
+    nonisolated private static func buildTurnPlan(
+        _ apiRequest: AnthropicMessagesRequest,
+        maxTokensRequired: Bool = true
+    ) throws -> TurnPlan {
+        let declaredMaxTokens = apiRequest.maxTokens ?? (maxTokensRequired ? nil : 1)
+        guard let maxTokens = declaredMaxTokens else {
             throw ServerAPIError.badRequest("max_tokens is a required field")
         }
         // Same explicit refusal as the OpenAI surface for the block kinds the
