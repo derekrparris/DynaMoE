@@ -14510,3 +14510,120 @@ encode was removed rather than the warning tolerated).
 | `ServerHardeningLogicTests` | **6 cases, 0 failures** |
 | `ServerToolArgumentTests` | **4 cases, 0 failures** |
 | `TurnToolMaskTests` | **3 cases, 0 failures** |
+
+## DSV4.1 #97: A CLIENT ON OPENAI'S DEPRECATED FUNCTION-CALLING SURFACE WAS ANSWERED IN PROSE, WITH NO CALL AND NO ERROR
+
+### The question
+
+`#96` closed because a decoded wire value had been validated against the engine's vocabulary instead of the
+protocol's. The next question was what else the request carries that the planner never sees. The audit that
+settled `#96` had listed five undecoded OpenAI chat keys, and three of them (`prediction`,
+`web_search_options`, `service_tier`) cannot move an answer. The other two are `functions` and
+`function_call`, and those are not hints: they are the tool vocabulary, spelled the way OpenAI spelled it
+before `tools` and `tool_choice` replaced them.
+
+### What was found
+
+1. **The pair was absent from the decoder entirely.** `grep` for `function_call` and the `functions` key
+   across `OpenAIAdapter.swift` and `ServerController.swift` returned zero hits, so `Decodable`'s
+   unknown-key tolerance dropped both. A client on that surface got a 200, prose, no `tool_calls` and no
+   `function_call`, and nothing anywhere said why. That is the exact failure mode `#88` was written to end,
+   on the one surface where the field list looked complete because the modern spelling sat beside it.
+2. **The rest of the tool path was already whole.** `tools` reaches the prompt as a declaration block,
+   installs its schemas into the grammar mask for the turn (so a masked sample cannot rewrite a client's
+   tool name), returns `tool_calls` or `tool_use` blocks, and accepts a `tool` / `tool_result` turn back.
+   The deprecated spelling shares every one of those steps except the two names, which is why the mapping
+   option looked cheap.
+3. **The mapping option is only half available.** `functions` and `function_call` are the request half of
+   the old surface. The response half is the assistant message's `function_call` object, and this server
+   emits `tool_calls`. A client on the old surface parses the old field, so a mapped request would produce
+   a working request whose reply silently had no call in it, which is a different substitution wearing the
+   clothes of a fix.
+4. **The refusal is provable end to end, unlike `#96`'s mapping.** `buildTurnPlan` refuses before
+   `requireLoadedModel()`, so the smoke suite can post a real request on 8787 with no model loaded and get
+   a 400 where the modern spelling of the same body gets a 503. That ordering proof is the one `#88`
+   established for `response_format` and it applies here unchanged.
+5. **`tool_choice` already had this posture.** `toolUseEnabled` refuses `"required"` and a named-function
+   object with a message naming `"auto"` and `"none"`. The legacy pair is the same vocabulary one
+   generation older, so refusing it in the same place and with the same shape is consistency rather than a
+   new rule.
+6. **The Anthropic side has no equivalent hole.** Its content blocks are type-dispatched and an unknown type
+   refuses the turn rather than vanishing, which is why nothing changed there.
+
+### What was added
+
+- `OpenAIChatRequest.legacyFunctions` (`[Tool.Function]?`, reusing the existing function decoder) and
+  `legacyFunctionCall` (`LegacyFunctionCall?`, a `nonisolated` decoder that accepts a bare mode string or
+  `{"name": ...}` and never throws, so an unexpected shape still reaches the refusal instead of failing the
+  body).
+- `OpenAIAdapter.refuseDeprecatedFunctionCalling(_:)`, called from the chat `buildTurnPlan` immediately
+  after `toolUseEnabled` and before `refuseUnsupportedResponseShape`, so both refusals sit ahead of the
+  model gate. The `functions` message names the declared functions (up to three), the `tools` shape to send
+  instead, and the fact that the reply will carry `tool_calls`. The `function_call` message says what it
+  asked for (`"auto"`, `"none"`, or "a call to X") and names `tool_choice`.
+- Both refusals are keyed on the MODERN field being absent, not on the deprecated field alone, so a request
+  that carries `tools` (or `tool_choice`) is served: the modern field is what this server answers, so
+  nothing is substituted and the deprecated one is merely redundant.
+- One pure case in `OpenAIAdapterLogicTests` and one app-hosted case in `ServerControllerSmokeTests` (a
+  400 for each deprecated field, and a 503 for the same request spelled with the modern one), plus the
+  guide's Request Options bullet and two README rows.
+
+### The finding
+
+1. **The absent-field audit has to be repeated per route, and it is not done at five keys.** `#96` listed
+   the undecoded chat keys and ranked them by whether they can move an answer. Two of them can, and they
+   were the two that mattered; the three that could not were ranked correctly and are still open. The
+   lesson is not "audit more", it is that a field which changes the answer and a field which cannot are
+   different slices, and closing the cheap one first is what makes the expensive one visible.
+2. **"Mapping is free" was false, and the reason is the response.** Every other deprecated field this
+   branch has met was request-only, so honouring the modern equivalent cost one dictionary lookup. The
+   function-calling surface has a response shape of its own, and a server that maps the request without
+   emitting it answers a different question than the client asked. Checking where the value lands in the
+   RESPONSE is what separates "map it" from "refuse it", and it is the step the reflex skips.
+3. **Refusing in the shared planner is what makes the claim testable.** Putting the refusal beside
+   `toolUseEnabled` rather than in the route means one code path serves streaming and non-streaming, and
+   sitting before `requireLoadedModel()` means the smoke suite proves the ordering with no checkpoint on
+   the machine. A behaviour that can only be observed with a 475 GB download present is a behaviour that
+   will regress.
+4. **Keying on the modern field's absence is the whole subtlety.** A blanket refusal of `functions` would
+   break every client that sends both spellings for compatibility, which is common, and would be a new
+   400 on a request that works today. The rule is that a request is refused only when the deprecated field
+   is the ONLY vocabulary it carries, because that is the only case where something is actually lost.
+5. **Mixing has to be decided, not left implicit.** A request with `tools` and a legacy `function_call` but
+   no `tool_choice` is refused, and that is deliberate: the mode the client asked for (`"none"`, say)
+   would otherwise be dropped while the tools were offered anyway. The test states it, because it is the
+   one arm of the rule a reader would not predict.
+
+### What it is not (do not re-propose)
+
+- **Not a mapping of `functions` onto `tools`.** See findings 2 and 4. The response half does not exist on
+  this server, and the reply is the half a client parses.
+- **Not an outbound `function_call` echo.** Emitting both shapes would be a second response dialect to
+  keep in step with streaming, the grammar mask and the tool-result loop, for a surface OpenAI retired.
+- **Not a change to `tool_choice`'s own decoding.** An unrecognised string still falls through to `.auto`,
+  which is leniency for an out-of-spec value rather than a documented one being lost, and `"required"` and
+  the named form were already refused.
+- **Not `prediction`, `web_search_options` or `service_tier`.** Still undecoded, still unable to move an
+  answer, still the documentation-only slice.
+- **Not an Anthropic change.** Its block types are dispatched, and an unknown one refuses the turn.
+- **Not the same treatment for the legacy text-completions route.** That protocol has no function
+  vocabulary at all, so there is nothing to drop.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath`, three-part `-only-testing` identifiers and `-parallel-testing-enabled NO`. Bundle
+freshness confirmed with `strings ... | grep -c` over both new case names. Warning instances 1,554 ->
+**1,554**, kinds identical. The first build was 1,556 with two new kinds, both from reading a main-actor
+type out of a `nonisolated` function: `LegacyFunctionCall` became `nonisolated struct` (the fix
+`AnthropicAdapter.Metadata` needed in `#95`) and `request.toolChoice == nil` became `if case nil =
+request.toolChoice` (the `nil` comparison was resolving to the `Equatable` conformance). One test failure
+was mine and worth recording: the "both spellings" arm asserted `XCTAssertNoThrow` while carrying a
+`function_call` with no `tool_choice`, which the mixed rule refuses, so the test disagreed with the rule
+rather than the code.
+
+| suite | result |
+|---|---|
+| `OpenAIAdapterLogicTests` (42 -> 43: both deprecated fields decode, a `function_call` mode string and a named target both read, each field is refused with a message naming its modern replacement and what would be dropped, a request carrying `tools` is served even with `functions` beside it, and mixing `tools` with a bare `function_call` is refused) | **43 cases, 0 failures** |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787) (28 -> 29: `functions` alone is a 400 naming `tools`, `function_call` alone is a 400 naming `tool_choice`, and both requests spelled with the modern field answer 503) | **29 cases, 0 failures, 1 skipped** |
+| adjacent logic suites: `ServerRequestLogLogicTests` 44, `AnthropicAdapterLogicTests` 29, `ServerQueueLogicTests` 23, `ChatPromptFormatterConversationTests` 20, `ReasoningRoundTripTests` 18, `ServerStreamSafetyTests` 13, `TurnFitLogicTests` 12, `ServerHardeningLogicTests` 6, `ServerToolArgumentTests` 4, `TurnToolMaskTests` 3 | **172 cases, 0 failures** |

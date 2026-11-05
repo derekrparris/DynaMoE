@@ -294,6 +294,56 @@ final class ServerControllerSmokeTests: XCTestCase {
         XCTAssertEqual(textOnlyStatus, 503, "text is the modality this server has: \(textOnlyBody)")
     }
 
+    /// OpenAI's deprecated `functions` / `function_call` pair was absent from the
+    /// decoder, so a client on that surface was answered in prose with no call and no
+    /// error. It is refused by name, and refused before the model gate: the proof is a
+    /// 400 where the same request spelled with `tools` answers 503. Mapping the pair
+    /// was the alternative and is worse, because the reply would carry `tool_calls`
+    /// while a legacy client parses `function_call`.
+    func testTheDeprecatedFunctionCallingSurfaceIsRefusedBeforeTheModelGate() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the pre-gate refusal cannot be isolated from generation")
+        }
+        await ensureServerRunning()
+
+        func post(_ fields: String) async throws -> (status: Int, text: String) {
+            var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/chat/completions")!)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = Data("""
+            {"model":"any",\(fields),"messages":[{"role":"user","content":"hello"}]}
+            """.utf8)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            return (
+                try XCTUnwrap((response as? HTTPURLResponse)?.statusCode),
+                String(decoding: data, as: UTF8.self)
+            )
+        }
+
+        let (legacyStatus, legacyText) = try await post(#""functions":[{"name":"get_weather"}]"#)
+        XCTAssertEqual(legacyStatus, 400, "functions must be refused, not ignored: \(legacyText)")
+        XCTAssertTrue(legacyText.contains("functions"), "got: \(legacyText)")
+        XCTAssertTrue(legacyText.contains("tools"), "the refusal must name the modern field: \(legacyText)")
+        XCTAssertTrue(legacyText.contains("invalid_request_error"), "got: \(legacyText)")
+
+        let (callStatus, callText) = try await post(#""function_call":"auto""#)
+        XCTAssertEqual(callStatus, 400, "function_call must be refused, not ignored: \(callText)")
+        XCTAssertTrue(callText.contains("function_call"), "got: \(callText)")
+        XCTAssertTrue(callText.contains("tool_choice"), "the refusal must name the modern field: \(callText)")
+
+        // The modern spelling is served, so a client sending both reaches the model gate
+        // rather than a new 400: the deprecated field is then redundant, not lost.
+        let (modernStatus, modernText) = try await post(
+            #""tools":[{"type":"function","function":{"name":"get_weather"}}],"functions":[{"name":"get_weather"}]"#
+        )
+        XCTAssertEqual(modernStatus, 503, "tools is the vocabulary this server serves: \(modernText)")
+
+        let (choiceStatus, choiceText) = try await post(
+            #""tools":[{"type":"function","function":{"name":"get_weather"}}],"tool_choice":"auto","function_call":"none""#
+        )
+        XCTAssertEqual(choiceStatus, 503, "tool_choice is the vocabulary this server serves: \(choiceText)")
+    }
+
     /// The same refusal on the streaming route keeps that route's own contract: the
     /// response is a 200 and the refusal travels as an SSE error frame, exactly as
     /// `#80` pinned for a picture against a model with no tower.

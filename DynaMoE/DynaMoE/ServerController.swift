@@ -1883,6 +1883,11 @@ final class ServerController: ObservableObject {
         // Reject a forced tool choice before touching engine state, so the
         // client gets a clear error instead of a silently unconstrained turn.
         let toolsEnabled = try OpenAIAdapter.toolUseEnabled(apiRequest.toolChoice)
+        // The deprecated spelling of the same vocabulary is refused here for the same
+        // reason and in the same place: left to the decoder's unknown-key tolerance it
+        // was dropped, and the turn ran as though the client had asked for no tools at
+        // all, with a 200.
+        try OpenAIAdapter.refuseDeprecatedFunctionCalling(apiRequest)
         // Same posture for the fields that ask for an answer this server cannot
         // produce: structured output, several choices, or token log-probabilities.
         // Ignoring them answered a different request than the one sent, with a 200.

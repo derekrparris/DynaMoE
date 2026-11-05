@@ -270,6 +270,19 @@ struct OpenAIChatRequest: Decodable {
     /// the same reason as `modalities`, and its two named fields so the refusal can
     /// say which voice and format the client asked for.
     let audio: AudioSettings?
+    /// OpenAI's DEPRECATED function-calling surface: `functions` is a bare list of
+    /// function definitions with no `{"type": "function"}` wrapper, and
+    /// `function_call` is what `tool_choice` was called before `tools` replaced both.
+    ///
+    /// Decoded only so the request can be refused BY NAME. `Decodable`'s unknown-key
+    /// tolerance dropped the pair, which answered a client using this surface with
+    /// prose, no call and no error, on every request. They are refused rather than
+    /// mapped onto `tools`/`tool_choice` because only the request half would work:
+    /// this server returns `tool_calls`, and a client on that surface parses
+    /// `function_call`, so a mapped request would be a working request whose reply was
+    /// silently substituted.
+    let legacyFunctions: [Tool.Function]?
+    let legacyFunctionCall: LegacyFunctionCall?
     /// The client's own key/value labels for this request (OpenAI allows 16 pairs
     /// of strings). Decoded because nothing else carries them: this protocol has no
     /// response field to echo them into, so the request log's row is the only place a
@@ -300,6 +313,38 @@ struct OpenAIChatRequest: Decodable {
         }
     }
 
+    /// `function_call` as the client sent it: a bare mode string (`"none"`,
+    /// `"auto"`) or `{"name": "..."}`. Only what the refusal needs to say back is
+    /// kept, and decoding never throws, so a shape nobody expected still produces a
+    /// refusal rather than a body error.
+    nonisolated struct LegacyFunctionCall: Decodable {
+        let mode: String?
+        let name: String?
+
+        enum CodingKeys: String, CodingKey { case name }
+
+        init(from decoder: Decoder) throws {
+            if let single = try? decoder.singleValueContainer(),
+               let raw = try? single.decode(String.self) {
+                self.mode = raw.isEmpty ? nil : raw
+                self.name = nil
+                return
+            }
+            var name: String?
+            if let container = try? decoder.container(keyedBy: CodingKeys.self) {
+                name = (try? container.decodeIfPresent(String.self, forKey: .name)) ?? nil
+            }
+            self.name = name
+            self.mode = nil
+        }
+
+        /// What the client asked for, quoted for the refusal message.
+        var described: String {
+            if let name, !name.isEmpty { return "a call to \"\(name)\"" }
+            return "\"\(mode ?? "auto")\""
+        }
+    }
+
     enum CodingKeys: String, CodingKey {
         case model, messages, stream, stop, tools
         case temperature
@@ -324,6 +369,8 @@ struct OpenAIChatRequest: Decodable {
         case modalities, audio
         case metadata
         case seed, user
+        case functions
+        case functionCall = "function_call"
     }
 
     init(from decoder: Decoder) throws {
@@ -395,6 +442,12 @@ struct OpenAIChatRequest: Decodable {
         // the answer.
         let labels = try? container.decodeIfPresent([String: String].self, forKey: .metadata)
         self.metadata = labels ?? nil
+        // The deprecated function-calling surface, decoded strictly so a malformed
+        // definition is a body error rather than another silent drop, and then refused
+        // by name in `refuseDeprecatedFunctionCalling`. See the field notes above for
+        // why the pair is refused instead of mapped onto `tools`/`tool_choice`.
+        self.legacyFunctions = try container.decodeIfPresent([Tool.Function].self, forKey: .functions)
+        self.legacyFunctionCall = try container.decodeIfPresent(LegacyFunctionCall.self, forKey: .functionCall)
     }
 
     /// True when any message carries an image content part. The turn planner
@@ -897,6 +950,45 @@ enum OpenAIAdapter {
             throw ServerAPIError.badRequest(
                 "tool_choice for a specific function (\"\(name)\") is not supported: this server cannot force a tool call. Use \"auto\" or \"none\".",
                 logSafeMessage: "tool_choice for a specific function is not supported: this server cannot force a tool call. Use \"auto\" or \"none\"."
+            )
+        }
+    }
+
+    /// Refuses OpenAI's deprecated function-calling surface by name.
+    ///
+    /// `functions` and `function_call` are what `tools` and `tool_choice` were called
+    /// before OpenAI replaced them, and the decoder's unknown-key tolerance dropped
+    /// both: a client on that surface was answered in prose, with no call and no
+    /// error, on every request. Mapping the pair onto the modern fields was the other
+    /// option and is worse than refusing, because only the request half can follow.
+    /// This server returns `tool_calls`, and a client on that surface parses
+    /// `function_call`, so a mapped request would be a working request whose reply was
+    /// silently substituted, which is the failure mode being removed.
+    ///
+    /// A request that carries the modern spelling as well is served: the modern field
+    /// is what this server answers, so nothing is substituted and the deprecated one
+    /// is redundant. The two refusals are therefore keyed on the modern field being
+    /// ABSENT, not on the deprecated field alone.
+    nonisolated static func refuseDeprecatedFunctionCalling(_ request: OpenAIChatRequest) throws {
+        if (request.tools ?? []).isEmpty, let legacy = request.legacyFunctions, !legacy.isEmpty {
+            let named = legacy.prefix(3).map { "\"\($0.name)\"" }.joined(separator: ", ")
+            throw ServerAPIError.badRequest(
+                "functions is not supported: it is OpenAI's deprecated spelling of tools, and a call "
+                    + "this server returned would arrive as tool_calls rather than function_call, so the "
+                    + "reply would look like a turn that dropped its call"
+                    + (named.isEmpty ? "" : " (it declared \(named))")
+                    + ". Send the same definitions as tools, "
+                    + "[{\"type\": \"function\", \"function\": {\"name\", \"description\", \"parameters\"}}], "
+                    + "and read tool_calls in the reply.",
+                logSafeMessage: "functions is the deprecated spelling of tools"
+            )
+        }
+        if case nil = request.toolChoice, let legacyCall = request.legacyFunctionCall {
+            throw ServerAPIError.badRequest(
+                "function_call is not supported: it is OpenAI's deprecated spelling of tool_choice, and "
+                    + "this server reads the modern field, so \(legacyCall.described) would be dropped. "
+                    + "Send tool_choice instead: \"auto\" or \"none\" (a forced call is refused either way).",
+                logSafeMessage: "function_call is the deprecated spelling of tool_choice"
             )
         }
     }

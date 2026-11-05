@@ -397,6 +397,61 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         XCTAssertTrue(try OpenAIAdapter.toolUseEnabled(auto.toolChoice))
     }
 
+    /// OpenAI's pre-2023 spelling of the same vocabulary, `functions` plus
+    /// `function_call`, was absent from the decoder entirely, so a client on that
+    /// surface was answered in prose with no call and no error. It is decoded now and
+    /// refused by name, because only the request half could be mapped: the reply would
+    /// carry `tool_calls` while a legacy client parses `function_call`.
+    func testTheDeprecatedFunctionCallingSurfaceIsDecodedAndRefusedByName() throws {
+        let legacy = try decodeRequest("""
+        {"messages":[],"functions":[{"name":"get_weather","description":"d","parameters":{"type":"object"}}]}
+        """)
+        XCTAssertEqual(legacy.legacyFunctions?.map(\.name), ["get_weather"])
+        XCTAssertNil(legacy.legacyFunctionCall)
+        XCTAssertThrowsError(try OpenAIAdapter.refuseDeprecatedFunctionCalling(legacy)) { error in
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("functions"), "got: \(message)")
+            XCTAssertTrue(message.contains("tools"), "the refusal must name its replacement, got: \(message)")
+            XCTAssertTrue(message.contains("tool_calls"), "got: \(message)")
+            XCTAssertTrue(message.contains("get_weather"), "got: \(message)")
+        }
+
+        // `function_call` is the old `tool_choice`: a mode string or a named target.
+        let autoCall = try decodeRequest(#"{"messages":[],"tools":[{"type":"function","function":{"name":"f"}}],"function_call":"auto"}"#)
+        XCTAssertEqual(autoCall.legacyFunctionCall?.mode, "auto")
+        XCTAssertNil(autoCall.legacyFunctionCall?.name)
+        let namedCall = try decodeRequest(#"{"messages":[],"tools":[{"type":"function","function":{"name":"f"}}],"function_call":{"name":"find_files"}}"#)
+        XCTAssertEqual(namedCall.legacyFunctionCall?.name, "find_files")
+        XCTAssertThrowsError(try OpenAIAdapter.refuseDeprecatedFunctionCalling(namedCall)) { error in
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("function_call"), "got: \(message)")
+            XCTAssertTrue(message.contains("tool_choice"), "the refusal must name its replacement, got: \(message)")
+            XCTAssertTrue(message.contains("find_files"), "the refusal must say what would be dropped, got: \(message)")
+        }
+
+        // A request carrying the modern field as well is served: the modern spelling is
+        // what this server answers, so the deprecated one is redundant rather than lost.
+        let both = try decodeRequest("""
+        {"messages":[],"tools":[{"type":"function","function":{"name":"get_weather"}}],
+         "functions":[{"name":"get_weather"}]}
+        """)
+        XCTAssertEqual(both.legacyFunctions?.count, 1, "the deprecated field is still decoded, not dropped")
+        XCTAssertNoThrow(try OpenAIAdapter.refuseDeprecatedFunctionCalling(both))
+        let withChoice = try decodeRequest("""
+        {"messages":[],"tools":[{"type":"function","function":{"name":"f"}}],
+         "tool_choice":"none","function_call":"auto"}
+        """)
+        XCTAssertNoThrow(try OpenAIAdapter.refuseDeprecatedFunctionCalling(withChoice))
+
+        // Mixing a modern `tools` list with a legacy `function_call` and no
+        // `tool_choice` is the case the modern-field rule does not cover, and it is a
+        // refusal for the same reason: the mode the client asked for would be dropped.
+        let mixed = try decodeRequest("""
+        {"messages":[],"tools":[{"type":"function","function":{"name":"f"}}],"function_call":"none"}
+        """)
+        XCTAssertThrowsError(try OpenAIAdapter.refuseDeprecatedFunctionCalling(mixed))
+    }
+
     // MARK: - Request fields this server cannot honour
 
     func testTheFieldsTheServerCannotHonourAreDecodedRatherThanIgnored() throws {
