@@ -411,4 +411,49 @@ final class DeepSeekV41VisionWeightDecodeTests: XCTestCase {
         XCTAssertEqual(DeepSeekV41VisionWeights.bytesPerValue("F32"), 4)
         XCTAssertNil(DeepSeekV41VisionWeights.bytesPerValue("I8"))
     }
+
+    /// FP16 and BF16 are both two bytes and are NOT the same encoding. `0x3C00`
+    /// is 1.0 as an IEEE half and 0.0078125 as the high half of a float, so a
+    /// decoder that widens an accepted FP16 tensor with a shift corrupts every
+    /// projection it reads, silently and in the direction of "the model answers
+    /// something plausible about the wrong picture".
+    func testFP16IsDecodedAsFP16() {
+        // 1.0, -2.0, 0.5, 0.0 in IEEE half bit patterns.
+        let halves: [UInt16] = [0x3C00, 0xC000, 0x3800, 0x0000]
+        XCTAssertEqual(decode(halves, dtype: "F16"), [1, -2, 0.5, 0])
+        XCTAssertEqual(decode(halves, dtype: "FLOAT16"), [1, -2, 0.5, 0])
+        // The same bytes read as bf16 are a different number, and that is the
+        // whole point: the two readings must not be interchangeable.
+        XCTAssertEqual(decode([0x3C00], dtype: "BF16")[0], Float(bitPattern: 0x3C000000))
+        XCTAssertNotEqual(decode([0x3C00], dtype: "BF16")[0], 1)
+    }
+
+    /// Values with no exact bf16 representation are where the two decoders
+    /// diverge hardest: 1/3 rounds to a different float, and the smallest
+    /// subnormal half is 2^-24 where the shift reading gives 3.6e-41.
+    func testFP16CarriesMantissaAndSubnormalsThatBF16WouldDrop() {
+        let third = Float16(1.0 / 3.0)
+        XCTAssertEqual(decode([third.bitPattern], dtype: "F16")[0], Float(third))
+        XCTAssertNotEqual(
+            decode([third.bitPattern], dtype: "F16")[0],
+            decode([third.bitPattern], dtype: "BF16")[0]
+        )
+        XCTAssertEqual(decode([0x0001], dtype: "F16")[0], Float(bitPattern: 0x33800000))
+        // Negative zero and both infinities survive the conversion.
+        XCTAssertEqual(decode([0x8000], dtype: "F16")[0].bitPattern, Float(-0.0).bitPattern)
+        XCTAssertEqual(decode([0x7C00], dtype: "F16")[0], Float.infinity)
+        XCTAssertEqual(decode([0xFC00], dtype: "F16")[0], -Float.infinity)
+    }
+
+    func testTheStorageFormatClassifiesEverySpellingTheTowerPublishes() {
+        XCTAssertEqual(DeepSeekV41VisionWeights.storageFormat("BF16"), .bf16)
+        XCTAssertEqual(DeepSeekV41VisionWeights.storageFormat("F16"), .fp16)
+        XCTAssertEqual(DeepSeekV41VisionWeights.storageFormat("FLOAT16"), .fp16)
+        XCTAssertEqual(DeepSeekV41VisionWeights.storageFormat("F32"), .fp32)
+        XCTAssertNil(DeepSeekV41VisionWeights.storageFormat("I8"))
+        // A bf16 spelling must not be captured by the "16" half's rules: the
+        // order of the two tests is what keeps `BF16` out of the FP16 branch.
+        XCTAssertEqual(DeepSeekV41VisionWeights.bytesPerValue("F16"), 2)
+        XCTAssertEqual(DeepSeekV41VisionWeights.bytesPerValue("BF16"), 2)
+    }
 }

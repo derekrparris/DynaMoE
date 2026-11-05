@@ -1073,10 +1073,18 @@ public struct ModelConfig: Codable {
     nonisolated public static func supportsVision(modelPath: String?) -> Bool {
         guard let path = modelPath, !path.isEmpty else { return false }
         let key = path as NSString
-        if let cached = visionCache.object(forKey: key) {
-            return cached.boolValue
-        }
         let directory = URL(fileURLWithPath: path)
+        // A stat per call is what makes a NEGATIVE answer revocable: the
+        // modification stamp moves when files land in the snapshot directory, and a
+        // download that finishes while the app is open has to turn the attachment
+        // button on without a restart. A positive is not re-decided — a tower's
+        // shards do not appear twice, and if they are removed the load fails by
+        // name instead of the composer quietly closing.
+        let stamp = snapshotStamp(directory)
+        if let cached = visionCache.object(forKey: key) as? VisionSupportBox,
+           cached.supported || (cached.stamp != nil && cached.stamp == stamp) {
+            return cached.supported
+        }
         var supported = false
         if DeepSeekV41Availability.isRuntimeAvailable, isDeepSeekV41Directory(directory),
            let config = try? DeepSeekV41Config.decode(
@@ -1088,11 +1096,43 @@ public struct ModelConfig: Codable {
             // backbone; here it must keep the composer closed instead.
             supported = DeepSeekV41VisionWeights.directoryHasTower(directory)
         }
-        visionCache.setObject(NSNumber(value: supported), forKey: key)
+        visionCache.setObject(
+            VisionSupportBox(supported: supported, stamp: supported ? nil : stamp),
+            forKey: key
+        )
         return supported
     }
 
-    nonisolated(unsafe) private static let visionCache = NSCache<NSString, NSNumber>()
+    /// Drops every memoized `supportsVision` answer, so the next call re-reads the
+    /// snapshot. Used by tests and by anything that knows a snapshot changed.
+    nonisolated public static func invalidateVisionCache() {
+        visionCache.removeAllObjects()
+    }
+
+    /// A cheap fingerprint of a snapshot's current contents: the directory's own
+    /// modification date, which is what a finished download moves. Nil when the
+    /// directory cannot be stat'ed, and a nil stamp is never used to hold a negative
+    /// (nothing would ever invalidate it).
+    nonisolated private static func snapshotStamp(_ directory: URL) -> TimeInterval? {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: directory.path)
+        guard let date = attributes?[.modificationDate] as? Date else { return nil }
+        return date.timeIntervalSince1970
+    }
+
+    /// A memoized answer plus, for a negative, the stamp it was decided at.
+    private final class VisionSupportBox: NSObject {
+        let supported: Bool
+        /// Nil for a positive. For a negative this is the snapshot's stamp at the
+        /// moment of the decision, so a later stamp makes the answer stale.
+        let stamp: TimeInterval?
+
+        init(supported: Bool, stamp: TimeInterval?) {
+            self.supported = supported
+            self.stamp = stamp
+        }
+    }
+
+    nonisolated(unsafe) private static let visionCache = NSCache<NSString, NSObject>()
 
     /// The checkpoint's own vision plan, decoded once per path.
     ///

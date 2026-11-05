@@ -65,11 +65,19 @@ struct OpenAIChatRequest: Decodable {
                 self.hasImagePart = false
                 self.hasUnsupportedPart = false
             } else if let parts = try? container.decode([ContentPart].self, forKey: .content) {
-                let joined = parts.compactMap(\.text).filter { !$0.isEmpty }.joined(separator: "\n")
-                self.contentText = joined.isEmpty ? nil : joined
-                self.imageParts = parts.filter(\.isImage).map { part in
-                    ServerImageParts.fromOpenAIURL(part.imageURL ?? "")
+                // The parts are an ORDERED list and the order is meaning: a picture
+                // between two paragraphs is a different question from both pictures
+                // in front of all the text. The turn renderer can only honour that
+                // if the order survives decoding, so a picture becomes a sentinel
+                // in the text where it sits (`ServerImageParts.interleave`).
+                let pieces = parts.map { part -> ServerImageParts.Piece in
+                    if part.isImage {
+                        return .image(ServerImageParts.fromOpenAIURL(part.imageURL ?? ""))
+                    }
+                    return .text(part.text ?? "")
                 }
+                self.contentText = ServerImageParts.interleave(pieces)
+                self.imageParts = ServerImageParts.images(in: pieces)
                 self.hasImagePart = !self.imageParts.isEmpty
                 self.hasUnsupportedPart = parts.contains { part in
                     let type = (part.type ?? "").lowercased()

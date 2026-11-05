@@ -189,6 +189,198 @@ final class DeepSeekV41TurnImagesTests: XCTestCase {
         XCTAssertEqual(bound.tokenIds, tokenIds)
         XCTAssertTrue(bound.rows.isEmpty)
     }
+
+    // MARK: Carried spans (a continuation reusing an expanded prompt)
+
+    /// The tower stand-in the carried-span cases share: `fit` decides the grid, so
+    /// the row count is checkable against the span length.
+    private func fittedSpan(_ input: DeepSeekV41ImageInput, rowWidth: Int = 3)
+        -> DeepSeekV41ImagePrompt.ImageSpan {
+        let fitted = DeepSeekV41VisionLayout.fit(
+            width: input.width, height: input.height, spec: spec
+        )
+        let tag = Float(input.width)
+        let rows = (0..<fitted.tokens).map { _ in
+            [tag] + [Float](repeating: 0, count: max(0, rowWidth - 1))
+        }
+        return DeepSeekV41ImagePrompt.ImageSpan(
+            rows: rows, columns: fitted.columns, gridRows: fitted.rows
+        )
+    }
+
+    /// A continuation splices the previous turn's EXPANDED ids forward, so the
+    /// prompt holds one image token per span position. Pricing that from a marker
+    /// count reads a single picture as hundreds of placeholders and refuses every
+    /// image-bearing tool continuation, which is exactly what happened before the
+    /// layout travelled with the ids.
+    func testAContinuationPricesItsCarriedSpansWithoutCountingMarkers() throws {
+        let marker = UInt32(spec.imageTokenID)
+        let plain: [UInt32] = [1, 2, marker, 3, 4]
+        let expanded = try DeepSeekV41TurnImages.bind(
+            tokenIds: plain,
+            images: [image(56)],
+            spec: spec,
+            rowWidth: 3,
+            encode: { self.fittedSpan($0) }
+        )
+        let span = try XCTUnwrap(expanded.spans.first)
+        // The marker count no longer says one per picture...
+        XCTAssertGreaterThan(expanded.tokenIds.filter { $0 == marker }.count, 1)
+        // ...and re-pricing it as a fresh expansion is a hard refusal.
+        XCTAssertThrowsError(
+            try DeepSeekV41TurnImages.price(
+                tokenIds: expanded.tokenIds, images: [image(56)], spec: spec
+            )
+        )
+        // The recorded layout prices it exactly, with no tower and no growth.
+        let priced = try DeepSeekV41TurnImages.priceCarried(
+            tokenIds: expanded.tokenIds, ranges: [span], spec: spec
+        )
+        XCTAssertEqual(priced, expanded.tokenIds.count)
+    }
+
+    /// The point of carrying the layout: the same rows come back to the same
+    /// positions, so a continuation's prompt is byte-identical to the turn it
+    /// extends and its pinned prefix still matches.
+    func testAContinuationRebindsItsSpansAtTheRecordedPositions() throws {
+        let marker = UInt32(spec.imageTokenID)
+        let plain: [UInt32] = [11, marker, 12]
+        let first = try DeepSeekV41TurnImages.bind(
+            tokenIds: plain,
+            images: [image(56)],
+            spec: spec,
+            rowWidth: 3,
+            encode: { self.fittedSpan($0) }
+        )
+        let range = try XCTUnwrap(first.spans.first)
+        // A continuation appends the assistant turn's ids and the tool result, so
+        // the span's positions are unchanged but the prompt is longer.
+        let continued = first.tokenIds + [21, 22, 23]
+        let placed = try DeepSeekV41TurnImages.place(
+            tokenIds: continued,
+            spans: [self.fittedSpan(image(56))],
+            at: [range],
+            spec: spec,
+            rowWidth: 3
+        )
+        XCTAssertEqual(placed.tokenIds, continued, "the ids are not rewritten")
+        XCTAssertEqual(placed.rows, first.rows)
+        XCTAssertEqual(placed.rows.keys.sorted().first, range.lowerBound)
+        XCTAssertEqual(placed.rows.count, range.count)
+        XCTAssertTrue(continued.contains(marker))
+    }
+
+    /// Two pictures keep their own rows: a `place` that ignored the ranges would
+    /// put the second picture's encode on the first one's span.
+    func testTwoCarriedSpansDoNotShareRows() throws {
+        let marker = UInt32(spec.imageTokenID)
+        let plain: [UInt32] = [1, marker, 2, marker, 3]
+        let first = try DeepSeekV41TurnImages.bind(
+            tokenIds: plain,
+            images: [image(56), image(112)],
+            spec: spec,
+            rowWidth: 3,
+            encode: { self.fittedSpan($0) }
+        )
+        let placed = try DeepSeekV41TurnImages.place(
+            tokenIds: first.tokenIds,
+            spans: [self.fittedSpan(image(56)), self.fittedSpan(image(112))],
+            at: first.spans,
+            spec: spec,
+            rowWidth: 3
+        )
+        XCTAssertEqual(placed.rows, first.rows)
+        let left = try XCTUnwrap(placed.rows[first.spans[0].lowerBound])
+        let right = try XCTUnwrap(placed.rows[first.spans[1].lowerBound])
+        XCTAssertEqual(left[0], 56)
+        XCTAssertEqual(right[0], 112)
+        XCTAssertTrue(first.tokenIds.contains(marker))
+    }
+
+    /// Every way the recorded layout can stop describing the ids is refused by
+    /// name, because each one would otherwise land rows on the wrong span.
+    func testACarriedLayoutThatDoesNotDescribeThePromptIsRefused() throws {
+        let marker = UInt32(spec.imageTokenID)
+        let span = fittedSpan(image(56))
+        let tokenIds = [UInt32](repeating: marker, count: span.tokenCount)
+
+        func refusal(_ ranges: [Range<Int>], tokens: [UInt32] = tokenIds) -> DeepSeekV41TurnImageError? {
+            do {
+                _ = try DeepSeekV41TurnImages.priceCarried(
+                    tokenIds: tokens, ranges: ranges, spec: spec
+                )
+                return nil
+            } catch let error as DeepSeekV41TurnImageError {
+                return error
+            } catch {
+                return nil
+            }
+        }
+
+        // In bounds and claimed by exactly one span: accepted.
+        XCTAssertNil(refusal([0..<span.tokenCount]))
+        // Past the end of the prompt.
+        XCTAssertNotNil(refusal([0..<(span.tokenCount + 5)]))
+        // Empty.
+        XCTAssertNotNil(refusal([0..<0]))
+        // Overlapping spans.
+        XCTAssertNotNil(refusal([0..<span.tokenCount, (span.tokenCount - 1)..<span.tokenCount]))
+        // A span that sits on ordinary tokens.
+        XCTAssertNotNil(refusal([0..<span.tokenCount], tokens: [UInt32](repeating: 7, count: span.tokenCount)))
+        // A prompt carrying an image token no span claims.
+        XCTAssertNotNil(refusal([0..<(span.tokenCount - 1)]))
+        // A span whose GRID disagrees with the recorded length: an encode from a
+        // different fit would shift every row after it.
+        let narrow = DeepSeekV41ImagePrompt.ImageSpan(
+            rows: Array(
+                repeating: [1, 0, 0],
+                count: DeepSeekV41VisionLayout.imageTokenCount(columns: 1, rows: 1)
+            ),
+            columns: 1,
+            gridRows: 1
+        )
+        XCTAssertNotEqual(narrow.tokenCount, span.tokenCount, "the fixture must actually disagree")
+        XCTAssertThrowsError(
+            try DeepSeekV41TurnImages.place(
+                tokenIds: tokenIds,
+                spans: [narrow],
+                at: [0..<span.tokenCount],
+                spec: spec,
+                rowWidth: 3
+            )
+        )
+        // And a continuation whose picture count and span count disagree.
+        XCTAssertThrowsError(
+            try DeepSeekV41TurnImages.place(
+                tokenIds: tokenIds,
+                spans: [],
+                at: [0..<span.tokenCount],
+                spec: spec,
+                rowWidth: 3
+            )
+        )
+    }
+
+    /// A prompt with spans but no tower is the same refusal the fresh path makes.
+    func testCarriedSpansAreRefusedWithoutATower() {
+        let tokenIds: [UInt32] = [1, 2, 3]
+        XCTAssertThrowsError(
+            try DeepSeekV41TurnImages.priceCarried(
+                tokenIds: tokenIds, ranges: [0..<1], spec: nil
+            )
+        ) { error in
+            XCTAssertEqual(error as? DeepSeekV41TurnImageError, .noTower(images: 1))
+        }
+        XCTAssertThrowsError(
+            try DeepSeekV41TurnImages.place(
+                tokenIds: tokenIds,
+                spans: [DeepSeekV41ImagePrompt.ImageSpan(rows: [[1, 0, 0]], columns: 1, gridRows: 1)],
+                at: [0..<1],
+                spec: nil,
+                rowWidth: 3
+            )
+        )
+    }
 }
 
 final class DeepSeekV41VisionCostTests: XCTestCase {
@@ -491,6 +683,10 @@ final class DeepSeekV41VisionDirectoryTests: XCTestCase {
     /// The composer's attachment button is driven by this check, so it must key off
     /// the snapshot rather than the config: a checkpoint that advertises a tower
     /// but never downloaded it must keep the composer closed.
+    ///
+    /// The index is written for the whole REPOSITORY, so it lists tensors whose
+    /// shards a partial download has not produced yet. A check that only read the
+    /// index advertised a tower that the first encode then failed to open.
     func testASnapshotIsOnlyVisionCapableWhenItsShardsHaveTheTower() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("dsv41-vision-dir-\(UUID().uuidString)")
@@ -525,6 +721,94 @@ final class DeepSeekV41VisionDirectoryTests: XCTestCase {
         complete["weight_map"] = map
         try JSONSerialization.data(withJSONObject: complete).write(to: index)
 
+        XCTAssertFalse(
+            DeepSeekV41VisionWeights.directoryHasTower(root),
+            "every name is in the index and neither shard exists on disk, which is what a "
+                + "download still running looks like"
+        )
+
+        // Half the download lands: the block shard is there, the marker shard is not.
+        try Data().write(to: root.appendingPathComponent("model-00001-of-00002.safetensors"))
+        XCTAssertFalse(
+            DeepSeekV41VisionWeights.directoryHasTower(root),
+            "the marker embeddings' shard is still missing"
+        )
+
+        try Data().write(to: root.appendingPathComponent("model-00002-of-00002.safetensors"))
         XCTAssertTrue(DeepSeekV41VisionWeights.directoryHasTower(root))
+    }
+
+    /// The negative is not cached forever: a download that finishes while the app
+    /// is open has to turn the attachment button on without a restart, so the
+    /// memoized answer carries the snapshot's stamp and is re-decided once it moves.
+    func testAFinishedDownloadTurnsTheVisionFlagOn() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dsv41-vision-cache-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer {
+            ModelConfig.invalidateVisionCache()
+            try? FileManager.default.removeItem(at: root)
+        }
+        ModelConfig.invalidateVisionCache()
+
+        // A decodable text checkpoint that ADVERTISES a tower it has not shipped:
+        // exactly the half-downloaded case the composer must not open for. The
+        // config is the one the golden fixtures already keep, plus a `vision_config`.
+        let base = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: Data(DeepSeekV41DSparkBlockGoldenTests.configJSON.utf8)
+            ) as? [String: Any]
+        )
+        var config = base
+        config["vision_config"] = [
+            "num_hidden_layers": 2,
+            "hidden_size": 8,
+            "num_attention_heads": 2,
+            "intermediate_size": 16,
+            "patch_size": 14,
+            "downsample_ratio": 3,
+            "image_token_id": 129_264
+        ]
+        try JSONSerialization.data(withJSONObject: config)
+            .write(to: root.appendingPathComponent("config.json"))
+
+        XCTAssertFalse(
+            ModelConfig.supportsVision(modelPath: root.path),
+            "a config that promises a tower the snapshot has not shipped is not vision"
+        )
+        // The stamp of the decision is the directory's own modification date.
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-600)],
+            ofItemAtPath: root.path
+        )
+        XCTAssertFalse(
+            ModelConfig.supportsVision(modelPath: root.path),
+            "nothing has changed yet, so the cached negative still answers"
+        )
+
+        let weightMap: [String: Any] = [
+            "weight_map": [
+                "vision.blocks.0.attn.wqkv.weight": "model-00001-of-00001.safetensors",
+                "vision.blocks.0.mlp.w2.weight": "model-00001-of-00001.safetensors",
+                "aligner.w2.weight": "model-00001-of-00001.safetensors",
+                "image_start": "model-00001-of-00001.safetensors",
+                "image_end": "model-00001-of-00001.safetensors",
+                "image_newline": "model-00001-of-00001.safetensors"
+            ]
+        ]
+        try JSONSerialization.data(withJSONObject: weightMap)
+            .write(to: root.appendingPathComponent("model.safetensors.index.json"))
+        try Data().write(to: root.appendingPathComponent("model-00001-of-00001.safetensors"))
+        // Move the stamp so the two decisions are distinguishable regardless of
+        // filesystem timestamp resolution: the shards have landed.
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(60)],
+            ofItemAtPath: root.path
+        )
+
+        XCTAssertTrue(
+            ModelConfig.supportsVision(modelPath: root.path),
+            "the shards have landed, so the cached negative is stale"
+        )
     }
 }

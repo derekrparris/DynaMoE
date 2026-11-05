@@ -130,6 +130,17 @@ internal struct CompletionTurnRequest: Sendable {
     /// per image and the engine binds the tower's rows to them; a family without
     /// a tower refuses the turn rather than dropping pixels.
     var images: [TurnImage]
+    /// Spans the prompt ALREADY carries, when it was spliced from a previous
+    /// turn's expanded ids rather than tokenized from text.
+    ///
+    /// An image is one placeholder in the rendered text and a run of image tokens
+    /// in the prompt, so a continuation that reuses the previous turn's ids reuses
+    /// the EXPANSION too. Re-deriving it would count every span position as a new
+    /// placeholder and refuse the turn; ignoring it would let the rows land
+    /// somewhere else. So the expansion travels as data: where each span sits, how
+    /// long it is, and which picture it came from. Empty means "not expanded yet",
+    /// which is every turn tokenized from a prompt string.
+    var imageSpans: [TurnImageSpan]
 
     init(
         promptTokenIds: [UInt32],
@@ -144,7 +155,8 @@ internal struct CompletionTurnRequest: Sendable {
         isSplicedContinuation: Bool = false,
         stopSequences: [String] = [],
         asOfDate: Date? = nil,
-        images: [TurnImage] = []
+        images: [TurnImage] = [],
+        imageSpans: [TurnImageSpan] = []
     ) {
         self.promptTokenIds = promptTokenIds
         self.formattedPrompt = formattedPrompt
@@ -159,7 +171,29 @@ internal struct CompletionTurnRequest: Sendable {
         self.stopSequences = stopSequences
         self.asOfDate = asOfDate
         self.images = images
+        self.imageSpans = imageSpans
     }
+}
+
+/// Where one attachment's expanded span sits in a prompt that already carries it.
+///
+/// Once expanded, an image is indistinguishable from text in the token stream: the
+/// checkpoint writes the same `image_token_id` at every position of the span, with
+/// the start / image / newline / end distinction kept in a parallel type array the
+/// prompt does not carry. So the ids alone cannot say how many pictures produced
+/// them or where one ends and the next begins — `sha256` is what stops a
+/// continuation landing a different picture's rows on an existing span, and
+/// `range` is what puts them back where they were.
+internal struct TurnImageSpan: Sendable, Equatable {
+    /// Content digest of the picture this span came from. Empty only for a caller
+    /// that never had one, which the engine reads as "identity unknown".
+    var sha256: String
+    var width: Int
+    var height: Int
+    /// The span's positions in the turn's prompt ids, in prompt order.
+    var range: Range<Int>
+
+    var tokenCount: Int { range.count }
 }
 
 /// One attached image, decoded to row-major 8-bit RGB.
@@ -354,6 +388,14 @@ internal struct TurnResult: @unchecked Sendable {
     /// The configured stop sequence that ended the turn (when `finishReason`
     /// is `.stoppedBySequence`); protocol adapters surface it to clients.
     var matchedStopSequence: String?
+    /// Where this turn's attachments sit inside `promptTokenIds`, which is the
+    /// EXPANDED prompt. Empty for a text-only turn.
+    ///
+    /// The ids alone cannot express this: an expanded span is a run of identical
+    /// image tokens, so a consumer that splices them forward into the next turn
+    /// has to be told where they came from or the rows would have to be
+    /// re-derived from a marker count that no longer means one per picture.
+    var imageSpans: [TurnImageSpan]
 
     init(
         finishReason: TurnFinishReason,
@@ -383,7 +425,8 @@ internal struct TurnResult: @unchecked Sendable {
         actionableCallIndices: [Int],
         gestureSkipNotices: [Int: String],
         brokenFragments: [String],
-        matchedStopSequence: String? = nil
+        matchedStopSequence: String? = nil,
+        imageSpans: [TurnImageSpan] = []
     ) {
         self.finishReason = finishReason
         self.formattedPrompt = formattedPrompt
@@ -413,6 +456,7 @@ internal struct TurnResult: @unchecked Sendable {
         self.gestureSkipNotices = gestureSkipNotices
         self.brokenFragments = brokenFragments
         self.matchedStopSequence = matchedStopSequence
+        self.imageSpans = imageSpans
     }
 }
 

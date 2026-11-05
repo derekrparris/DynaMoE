@@ -388,12 +388,16 @@ public final class CompletionEngine: @unchecked Sendable {
     /// so a caller that is merely preparing looks busy to everyone else: that is
     /// the point — see `EngineTurnSlot.swift`.
     ///
-    /// Two callers reserve: the API server's queue, so a chat turn cannot take the
-    /// slot the queue is preparing for, and `ContentView.startAutoregressiveGeneration`,
+    /// Three callers reserve: the API server's queue, so a chat turn cannot take the
+    /// slot the queue is preparing for; `ContentView.startAutoregressiveGeneration`,
     /// so a server turn cannot take the slot while a chat prompt is being rendered
-    /// and tokenized. Whichever reserves first keeps the slot; the other goes on
-    /// waiting or is told why.
-    func reserveTurnSlot() -> TurnSlotClaim? {
+    /// and tokenized; and the model-load task, so a turn cannot start while the
+    /// shard buffers and the DeepSeek runtime are being replaced. Whichever reserves
+    /// first keeps the slot; the other goes on waiting or is told why.
+    ///
+    /// `nonisolated` because the load task is detached and the claim is a lock box:
+    /// the only state it touches is `stateLock` and the ledger, both guarded.
+    nonisolated func reserveTurnSlot() -> TurnSlotClaim? {
         stateLock.lock()
         defer { stateLock.unlock() }
         guard currentGenerationTask == nil else { return nil }
@@ -411,6 +415,13 @@ public final class CompletionEngine: @unchecked Sendable {
     /// queue, and the in-app send path — because preparation is where the slot used
     /// to be lost. A claim handed in here that is no longer held is refused rather
     /// than honoured: see `EngineTurnSlot.swift`.
+    ///
+    /// A MODEL SWAP holds the same claim for the length of the load, which is the
+    /// other half of the same invariant: `configure` replaces the shard buffers and
+    /// retires the DeepSeek runtime, so a turn that started in between would be
+    /// running on mappings that no longer exist. Because the ledger does not know
+    /// who holds a claim, the refusal names both possibilities instead of blaming a
+    /// turn that is not there.
     func launchTurn(
         _ request: CompletionTurnRequest,
         claim: TurnSlotClaim? = nil
@@ -419,7 +430,8 @@ public final class CompletionEngine: @unchecked Sendable {
         guard let held = claim ?? turnSlotLedger.tryClaim() else {
             stateLock.unlock()
             throw CompletionLaunchError.engineNotReady(
-                "❌ The local API server is starting a generation; one turn may run at a time. Try again in a moment."
+                "❌ Another caller is holding the generation slot — a turn being prepared, or "
+                    + "a model load. One turn may run at a time; try again in a moment."
             )
         }
         defer { held.release() }
@@ -501,11 +513,26 @@ public final class CompletionEngine: @unchecked Sendable {
                     rgb: $0.rgb, width: $0.width, height: $0.height, sha256: $0.sha256
                 )
             }
-            let imagePrice = try DeepSeekV41TurnImages.price(
-                tokenIds: request.promptTokenIds,
-                images: turnImages,
-                spec: dsConfig.vision
-            )
+            // A continuation splices the previous turn's ids forward verbatim, so it
+            // arrives already expanded. There is no marker count to price that with —
+            // an expanded span is a RUN of image tokens, so counting them reads one
+            // picture as hundreds of placeholders — and the recorded layout is what
+            // the length and the row placement come from instead.
+            let carriedSpans = request.imageSpans
+            let pricedPromptTokens: Int
+            if carriedSpans.isEmpty {
+                pricedPromptTokens = try DeepSeekV41TurnImages.price(
+                    tokenIds: request.promptTokenIds,
+                    images: turnImages,
+                    spec: dsConfig.vision
+                ).promptTokens
+            } else {
+                pricedPromptTokens = try DeepSeekV41TurnImages.priceCarried(
+                    tokenIds: request.promptTokenIds,
+                    ranges: carriedSpans.map(\.range),
+                    spec: dsConfig.vision
+                )
+            }
             // The cache is provisioned for the prompt plus the turn's token budget, PLUS
             // the one position the last generated token is forwarded at, capped at what
             // the checkpoint says it can address. The runner's own cap reserves that
@@ -516,7 +543,7 @@ public final class CompletionEngine: @unchecked Sendable {
                 1,
                 min(
                     dsConfig.maxPositionEmbeddings,
-                    request.sampling.maxTokens + imagePrice.promptTokens + 1
+                    request.sampling.maxTokens + pricedPromptTokens + 1
                 )
             )
             // Reuse the runtime a previous turn built when it was provisioned for at
@@ -605,13 +632,93 @@ public final class CompletionEngine: @unchecked Sendable {
                     freshSpans[key] = span
                     return span
                 }
-                let bound = try DeepSeekV41TurnImages.bind(
-                    tokenIds: request.promptTokenIds,
-                    images: turnImages,
-                    spec: dsConfig.vision,
-                    rowWidth: dsConfig.hiddenSize,
-                    encode: encodeImage
-                )
+                // An attachment this engine already encoded can be reused by digest
+                // alone, which is what lets a continuation rebind its spans without
+                // being handed the pixels again.
+                func encodedSpan(for span: TurnImageSpan) throws -> DeepSeekV41ImagePrompt.ImageSpan {
+                    let key = "\(snapshotDir.path)|\(span.sha256)"
+                    if let hit = cachedSpans[key] ?? freshSpans[key] { return hit }
+                    throw CompletionLaunchError.engineNotReady(
+                        "⚠️ This turn continues a prompt that already carries an image, but "
+                            + "that image's rows are no longer encoded and its pixels were "
+                            + "not sent again, so they cannot be rebuilt."
+                    )
+                }
+                // Everything downstream — the prefix pin, the provisioned length,
+                // the sampler's context — has to see the EXPANDED ids: a placeholder
+                // is one token and the rows live at the span's positions.
+                let expandedPromptIds: [UInt32]
+                let boundRows: [Int: [Float]]
+                // The layout a continuation has to hand back so the NEXT turn can put
+                // the same rows at the same positions: the prompt's ids alone cannot
+                // say it, because an expanded span is a run of one repeated token.
+                let imageSpans: [TurnImageSpan]
+                if carriedSpans.isEmpty {
+                    let bound = try DeepSeekV41TurnImages.bind(
+                        tokenIds: request.promptTokenIds,
+                        images: turnImages,
+                        spec: dsConfig.vision,
+                        rowWidth: dsConfig.hiddenSize,
+                        encode: encodeImage
+                    )
+                    guard bound.tokenIds.count == pricedPromptTokens else {
+                        throw CompletionLaunchError.engineNotReady(
+                            "⚠️ Image expansion produced \(bound.tokenIds.count) prompt tokens, "
+                                + "but the resize plan priced \(pricedPromptTokens)."
+                        )
+                    }
+                    expandedPromptIds = bound.tokenIds
+                    boundRows = bound.rows
+                    imageSpans = zip(turnImages, bound.spans).map { image, range in
+                        TurnImageSpan(
+                            sha256: image.sha256,
+                            width: image.width,
+                            height: image.height,
+                            range: range
+                        )
+                    }
+                } else {
+                    // The prompt already holds its spans, so nothing is expanded and
+                    // nothing is re-tokenized: the recorded layout decides where the
+                    // rows go, and the same picture has to be the one that went there.
+                    if !turnImages.isEmpty {
+                        guard turnImages.count == carriedSpans.count else {
+                            throw CompletionLaunchError.engineNotReady(
+                                "⚠️ This continuation carries \(carriedSpans.count) image span(s) "
+                                    + "but \(turnImages.count) image(s) were attached."
+                            )
+                        }
+                        for (index, span) in carriedSpans.enumerated()
+                        where !span.sha256.isEmpty && !turnImages[index].sha256.isEmpty
+                            && span.sha256 != turnImages[index].sha256 {
+                            throw CompletionLaunchError.engineNotReady(
+                                "⚠️ Image \(index + 1) of this continuation is not the picture its "
+                                    + "prompt was built with, so its rows cannot be reused."
+                            )
+                        }
+                    }
+                    var spans: [DeepSeekV41ImagePrompt.ImageSpan] = []
+                    spans.reserveCapacity(carriedSpans.count)
+                    for (index, carried) in carriedSpans.enumerated() {
+                        if !turnImages.isEmpty {
+                            spans.append(try encodeImage(turnImages[index]))
+                        } else {
+                            spans.append(try encodedSpan(for: carried))
+                        }
+                    }
+                    let placed = try DeepSeekV41TurnImages.place(
+                        tokenIds: request.promptTokenIds,
+                        spans: spans,
+                        at: carriedSpans.map(\.range),
+                        spec: dsConfig.vision,
+                        rowWidth: dsConfig.hiddenSize
+                    )
+                    expandedPromptIds = placed.tokenIds
+                    boundRows = placed.rows
+                    // The layout passes straight through: nothing about it changed,
+                    // and the validation above is what makes trusting it safe.
+                    imageSpans = carriedSpans
+                }
                 if !freshSpans.isEmpty {
                     stateLock.lock()
                     for (key, span) in freshSpans { cachedImageSpans[key] = span }
@@ -623,16 +730,6 @@ public final class CompletionEngine: @unchecked Sendable {
                     }
                     stateLock.unlock()
                 }
-                guard bound.tokenIds.count == imagePrice.promptTokens else {
-                    throw CompletionLaunchError.engineNotReady(
-                        "⚠️ Image expansion produced \(bound.tokenIds.count) prompt tokens, "
-                            + "but the resize plan priced \(imagePrice.promptTokens)."
-                    )
-                }
-                // Everything downstream — the prefix pin, the provisioned length, the
-                // sampler's context — has to see the EXPANDED ids: the placeholders are
-                // one token each and the rows live at the span's positions.
-                let expandedPromptIds = bound.tokenIds
 
                 // Same ordering as the generic loop: KV reset (in the turn loop) ->
                 // grammar token -> turn id. A superseded turn still holds its old
@@ -749,7 +846,7 @@ public final class CompletionEngine: @unchecked Sendable {
                             forward: forward,
                             promptTokenIds: dsPromptIds,
                             prefixTokens: reusablePrefix,
-                            imageEmbeddings: bound.rows,
+                            imageEmbeddings: boundRows,
                             settings: settings,
                             sample: { logits, generated in
                                 var scratch = logits
@@ -949,7 +1046,8 @@ public final class CompletionEngine: @unchecked Sendable {
                             actionableCallIndices: dsActionable,
                             gestureSkipNotices: dsGestureNotices,
                             brokenFragments: dsBroken,
-                            matchedStopSequence: output.matchedStopSequence
+                            matchedStopSequence: output.matchedStopSequence,
+                            imageSpans: imageSpans
                         )))
                     } catch {
                         emit(.prefillProgress(status: nil, speed: nil, rssGB: nil))
@@ -11016,13 +11114,32 @@ if layer.attnGateProjTensor != nil,
     }
 
     /// Suspends until no turn is active (model switch/load safety).
+    ///
+    /// "Active" is `isActive`, not just the registered task. A turn is UNREGISTERED
+    /// for the whole of its preparation — `launchTurn` builds the DeepSeek runtime,
+    /// prices the attachments and runs the vision tower before it ever mints the
+    /// task, and a caller that watched `currentGenerationTask` alone saw a free
+    /// engine in the middle of exactly that window and then replaced the shard
+    /// buffers and retired the runtime the turn was using.
+    ///
+    /// The slot claim is what covers it: `launchTurn` redeems the caller's claim or
+    /// takes its own as its first statement and gives it back only after the task
+    /// is registered, so an outstanding claim IS a turn in preparation. A claim has
+    /// no completion to await, so that half of the wait polls — the load path this
+    /// guards is a multi-second operation on the main actor and the poll yields,
+    /// which is what lets the preparation it is waiting for finish.
     public func awaitIdle() async {
         while true {
             stateLock.lock()
             let pending = currentGenerationTask
+            let preparing = turnSlotLedger.isClaimed
             stateLock.unlock()
-            guard let task = pending else { break }
-            _ = await task.value
+            if let task = pending {
+                _ = await task.value
+                continue
+            }
+            guard preparing else { break }
+            try? await Task.sleep(nanoseconds: 5_000_000)
         }
     }
 

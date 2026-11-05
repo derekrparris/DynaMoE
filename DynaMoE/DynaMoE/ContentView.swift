@@ -5989,7 +5989,7 @@ struct ContentView: View {
     /// matching the image placeholders the caller wrote into `customPrompt`. Only a
     /// family with a vision tower consumes them; the engine refuses a turn whose
     /// placeholder count disagrees with this list rather than dropping pixels.
-    private func startAutoregressiveGeneration(customPrompt: String? = nil, promptTokens: [UInt32]? = nil, images: [TurnImage] = [], sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false) {
+    private func startAutoregressiveGeneration(customPrompt: String? = nil, promptTokens: [UInt32]? = nil, images: [TurnImage] = [], carriedImageSpans: [TurnImageSpan] = [], sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false) {
         guard let summary = summary,
               let tokenizer = tokenizer else {
             let err = "❌ Metal or Tokenizer not ready for text generation. Please load model and tokenizer in Settings."
@@ -6136,7 +6136,13 @@ struct ContentView: View {
             forceSynthesis: forceSynthesis,
             isSplicedContinuation: (promptTokens?.isEmpty == false),
             asOfDate: generationDate,
-            images: images
+            images: images,
+            // Only a spliced continuation reuses ids that already carry an expanded
+            // span. A prompt that had to be RE-ENCODED (the tool section changed, a
+            // synthesis directive was appended) starts from one marker per image
+            // again, so a span carried from the old layout would describe positions
+            // the new prompt does not have.
+            imageSpans: (promptTokens?.isEmpty == false) ? carriedImageSpans : []
         )
 
         let launch: CompletionLaunch
@@ -6419,6 +6425,12 @@ struct ContentView: View {
             let finalResp = result.responseText
             let formattedPrompt = result.formattedPrompt
             let promptTokenIds = result.promptTokenIds
+            // `promptTokenIds` is the EXPANDED prompt: a picture is a run of image
+            // tokens, not one marker. Every continuation below splices those ids
+            // forward, so this layout has to travel with them — re-deriving it from
+            // a marker count reads one picture as hundreds of placeholders and
+            // refuses the turn.
+            let promptImageSpans = result.imageSpans
             let generatedTokenIds = result.generatedTokenIds
             let finalElapsedMs = result.elapsedMs
             let finalTokPerSec = result.tokensPerSecond
@@ -6591,6 +6603,8 @@ struct ContentView: View {
                     self.startAutoregressiveGeneration(
                         customPrompt: synthesisPrompt,
                         promptTokens: synthesisToolsChanged ? nil : splicedTokens,
+                        images: images,
+                        carriedImageSpans: promptImageSpans,
                         sessionId: sessionId,
                         messageId: synthesisMsgId,
                         agentStep: agentStep + 1,
@@ -6623,6 +6637,8 @@ struct ContentView: View {
                     self.startAutoregressiveGeneration(
                         customPrompt: formattedPrompt,
                         promptTokens: promptTokenIds,
+                        images: images,
+                        carriedImageSpans: promptImageSpans,
                         sessionId: sessionId,
                         messageId: messageId,
                         agentStep: agentStep,
@@ -6955,6 +6971,8 @@ struct ContentView: View {
                             self.startAutoregressiveGeneration(
                                 customPrompt: nextPrompt,
                                 promptTokens: toolsSectionChanged ? nil : splicedTokens,
+                                images: images,
+                                carriedImageSpans: promptImageSpans,
                                 sessionId: sessionId,
                                 messageId: nextAssistantMsgId,
                                 agentStep: agentStep + 1
@@ -7012,6 +7030,8 @@ struct ContentView: View {
                                 self.startAutoregressiveGeneration(
                                     customPrompt: synthesisPrompt,
                                     promptTokens: synthesisToolsChanged ? nil : splicedTokens,
+                                    images: images,
+                                    carriedImageSpans: promptImageSpans,
                                     sessionId: sessionId,
                                     messageId: synthesisMsgId,
                                     agentStep: agentStep + 1,
@@ -7071,6 +7091,8 @@ struct ContentView: View {
                                     self.startAutoregressiveGeneration(
                                         customPrompt: relayPrompt,
                                         promptTokens: splicedTokens,
+                                        images: images,
+                                        carriedImageSpans: promptImageSpans,
                                         sessionId: sessionId,
                                         messageId: relayMsgId,
                                         agentStep: agentStep + 1,
@@ -7152,6 +7174,8 @@ struct ContentView: View {
                         self.startAutoregressiveGeneration(
                             customPrompt: nextPrompt,
                             promptTokens: splicedTokens,
+                            images: images,
+                            carriedImageSpans: promptImageSpans,
                             sessionId: sessionId,
                             messageId: nextAssistantMsgId,
                             agentStep: agentStep + 1
@@ -7209,6 +7233,8 @@ struct ContentView: View {
                         self.startAutoregressiveGeneration(
                             customPrompt: nextPrompt,
                             promptTokens: splicedTokens,
+                            images: images,
+                            carriedImageSpans: promptImageSpans,
                             sessionId: sessionId,
                             messageId: nextAssistantMsgId,
                             agentStep: agentStep + 1
@@ -7356,6 +7382,16 @@ struct ContentView: View {
             // waits the generation out before loading; direct callers reach this
             // task without it, so stop and await any generation here too.
             await self.awaitGenerationTeardown()
+            // ...and then HOLD the generation slot for the rest of the load. Waiting
+            // a turn out only covers the turn that was running: `configure` below
+            // replaces the shard buffers and retires the DeepSeek runtime, so a turn
+            // that started in between would be computing on mappings that no longer
+            // exist. The slot is the one thing both callers check, so the load takes
+            // it and gives it back once the new engine is installed. Nil means
+            // another caller got there first, which is no worse than the behaviour
+            // before the claim existed.
+            let swapClaim = CompletionEngine.shared.reserveTurnSlot()
+            defer { swapClaim?.release() }
             // The wait can be long: a newer load may have superseded this one, in
             // which case it must not touch the shared state the newer one owns.
             let superseded = await MainActor.run { self.modelLoadToken != token }

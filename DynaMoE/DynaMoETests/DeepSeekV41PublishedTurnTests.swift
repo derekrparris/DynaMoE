@@ -3452,9 +3452,16 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             turns: split.turns, images: split.images, marker: markers.imagePlaceholder
         )
         XCTAssertEqual(resolved.images.count, 1)
+        // The client wrote the question FIRST and the picture second, and that is
+        // the order the turn keeps: the marker is not moved to the head of a turn
+        // whose content put it after the words (slice #7's content-order fix).
         XCTAssertTrue(
-            resolved.turns[2].text.hasPrefix(markers.imagePlaceholder),
-            "the marker must head the turn that carried the picture"
+            resolved.turns[2].text.contains(markers.imagePlaceholder),
+            "the marker must land in the turn that carried the picture"
+        )
+        XCTAssertTrue(
+            resolved.turns[2].text.hasPrefix("what is in this picture?"),
+            "and it stays after the text the client wrote before it"
         )
         XCTAssertFalse(
             resolved.turns[0].text.contains(markers.imagePlaceholder),

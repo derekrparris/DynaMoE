@@ -1696,7 +1696,10 @@ final class DeepSeekV41DSparkBlockGoldenTests: XCTestCase {
 
     // MARK: Inputs
 
-    private static let configJSON = """
+    /// Also the shape `ModelConfig.supportsVision` needs a decodable checkpoint
+    /// for, so the vision-capability cases reuse it rather than keeping a second
+    /// copy of a config that would drift.
+    static let configJSON = """
         {
           "architectures": [
             "DeepseekV41ForCausalLM"

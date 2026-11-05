@@ -534,13 +534,20 @@ final class ServerTurnMemory: @unchecked Sendable {
     /// so the recorded history must match before the raw generation is trusted:
     /// a colliding conversation whose history diverges is rejected instead of
     /// having another conversation's private reasoning spliced into its prompt.
+    ///
+    /// `imageDigests` are the per-turn digests of the pictures the request
+    /// carries. They are not decoration: a conversation's images are not all in
+    /// its opening message, and two pictures of the same size render to the same
+    /// run of image token ids, so the TEXT alone cannot tell a replaced picture
+    /// from the original.
     func recordedRawTurn(
         sessionId: UUID,
         modelName: String,
         echoedByClient: String,
         turnCloser: String?,
         conversation: [ChatPromptFormatter.ConversationTurn] = [],
-        systemPrompt: String = ""
+        systemPrompt: String = "",
+        imageDigests: [Int: String] = [:]
     ) -> String? {
         lock.lock()
         let current = record
@@ -551,6 +558,7 @@ final class ServerTurnMemory: @unchecked Sendable {
         guard Self.historyMatches(
             systemPrompt: systemPrompt,
             conversation: conversation,
+            imageDigests: imageDigests,
             turnCount: current.historyTurnCount,
             digest: current.historyDigest
         ) else { return nil }
@@ -567,21 +575,32 @@ final class ServerTurnMemory: @unchecked Sendable {
     nonisolated static func historyMatches(
         systemPrompt: String,
         conversation: [ChatPromptFormatter.ConversationTurn],
+        imageDigests: [Int: String] = [:],
         turnCount: Int,
         digest: UInt64
     ) -> Bool {
         guard turnCount > 0 else { return true }
         guard conversation.count >= turnCount else { return false }
-        return historyDigest(systemPrompt: systemPrompt, turns: conversation[..<turnCount]) == digest
+        return historyDigest(
+            systemPrompt: systemPrompt,
+            turns: conversation[..<turnCount],
+            imageDigests: imageDigests
+        ) == digest
     }
 
     /// FNV-1a digest of the leading conversation turns plus the rendered system
     /// prompt. Cheap, order-sensitive, and stable across the turns of one
     /// conversation, which is all the turn memory needs to tell a follow-up
     /// from an unrelated conversation that merely shares a session key.
+    ///
+    /// `imageDigests` carries each turn's pictures into the same digest. Without
+    /// it a picture swapped on a LATER turn is invisible here: its marker renders
+    /// the same text, and two images of the same dimensions expand to the same run
+    /// of image token ids, so neither the text nor the ids can separate them.
     nonisolated static func historyDigest(
         systemPrompt: String,
-        turns: ArraySlice<ChatPromptFormatter.ConversationTurn>
+        turns: ArraySlice<ChatPromptFormatter.ConversationTurn>,
+        imageDigests: [Int: String] = [:]
     ) -> UInt64 {
         var hash: UInt64 = 0xcbf29ce484222325
         func mix(_ byte: UInt8) { hash = (hash ^ UInt64(byte)) &* 0x100000001b3 }
@@ -590,9 +609,14 @@ final class ServerTurnMemory: @unchecked Sendable {
             mix(0x1f)
         }
         mixString(systemPrompt)
-        for turn in turns {
+        for (offset, turn) in turns.enumerated() {
             mixString(turn.role == .user ? "user" : "assistant")
             mixString(turn.text)
+            // The slice's own offset is the turn's index in the conversation
+            // whenever it is a leading prefix, which is the only way it is used.
+            if let digest = imageDigests[offset] {
+                mixString("images:" + digest)
+            }
         }
         return hash
     }
@@ -1606,7 +1630,7 @@ final class ServerController: ObservableObject {
             guard index >= 0, index < turns.count else {
                 throw ServerAPIError.badRequest("An image was attached to a conversation turn that does not exist.")
             }
-            var fragment = ""
+            var markerTexts: [String] = []
             for part in parts {
                 guard let data = part.bytes else {
                     switch part.payload {
@@ -1630,10 +1654,7 @@ final class ServerController: ObservableObject {
                         "An attached image could not be decoded: \(error.localizedDescription)"
                     )
                 }
-                // The picture goes FIRST inside its turn: that is where the
-                // checkpoint's own prompts place an image relative to the question
-                // about it, and what the in-app composer writes.
-                fragment += marker + "\n"
+                markerTexts.append(marker + "\n")
                 decoded.append(
                     TurnImage(
                         rgb: pixels.rgb,
@@ -1643,9 +1664,49 @@ final class ServerController: ObservableObject {
                     )
                 )
             }
-            turns[index].text = fragment + turns[index].text
+            turns[index].text = try placingMarkers(
+                markerTexts, in: turns[index].text, turn: index
+            )
         }
         return ResolvedTurnImages(turns: turns, images: decoded)
+    }
+
+    /// Puts each picture's marker where the client wrote that picture.
+    ///
+    /// The decoders keep a message's content order as a sentinel in the turn text
+    /// (`ServerImageParts.imagePlaceholder`), so `text → image → text → image`
+    /// stays that and does not become "both pictures, then both paragraphs". The
+    /// alternative is a silent rewrite: the model would answer a question about a
+    /// picture it was shown in a different relation to the words.
+    ///
+    /// A turn with pictures but NO sentinel comes from a caller that assembled the
+    /// split itself (the adapters never do), so the markers go in front — the
+    /// order the in-app composer writes and the one the checkpoint's own prompts
+    /// use. A turn whose sentinel count and picture count disagree is refused
+    /// rather than guessed at, because either choice puts a row set on the wrong
+    /// span.
+    nonisolated static func placingMarkers(
+        _ markerTexts: [String],
+        in text: String,
+        turn: Int
+    ) throws -> String {
+        guard !markerTexts.isEmpty else { return text }
+        let chunks = text.components(separatedBy: ServerImageParts.imagePlaceholder)
+        let slots = chunks.count - 1
+        guard slots > 0 else { return markerTexts.joined() + text }
+        guard slots == markerTexts.count else {
+            throw ServerAPIError.unsupportedContent(
+                "Message \(turn + 1) positions \(slots) image placeholder(s) but carries "
+                    + "\(markerTexts.count) image(s), so the pictures cannot be bound to the "
+                    + "words around them."
+            )
+        }
+        var rebuilt = ""
+        for (offset, chunk) in chunks.enumerated() {
+            if offset > 0 { rebuilt += markerTexts[offset - 1] }
+            rebuilt += chunk
+        }
+        return rebuilt
     }
 
     nonisolated private static func buildTurnPlan(_ inputs: TurnPlanInputs) throws -> TurnPlan {
@@ -1706,11 +1767,19 @@ final class ServerController: ObservableObject {
         )
         // What a follow-up request has to reproduce before its own raw turn can
         // be trusted: the leading history as the client sent it, plus the system
-        // prompt it was rendered against. Computed before substitution so both
-        // sides of the comparison see the same client-authored turns.
+        // prompt it was rendered against, plus every turn's pictures. Computed
+        // before substitution so both sides of the comparison see the same
+        // client-authored turns.
+        //
+        // The pictures belong in it even though the marker renders as text: a
+        // picture replaced on a later turn keeps the same text and, at the same
+        // dimensions, the same image token ids, so a digest over text alone would
+        // splice the OLD picture's generation into the new request.
+        let imageDigests = ServerImageParts.turnDigests(inputs.images)
         let historyDigest = ServerTurnMemory.historyDigest(
             systemPrompt: memorySystem,
-            turns: conversationTurns[...]
+            turns: conversationTurns[...],
+            imageDigests: imageDigests
         )
         // Splice in the raw generation recorded for this session (reasoning
         // included) so the rendered prompt reproduces the pinned
@@ -1720,7 +1789,8 @@ final class ServerController: ObservableObject {
             sessionId: inputs.sessionId,
             modelName: info.servedID,
             modelConfig: engine.promptModelConfig,
-            systemPrompt: memorySystem
+            systemPrompt: memorySystem,
+            imageDigests: imageDigests
         )
         // A single plain user turn renders exactly as before (native template
         // with zero wrapper noise). A real history renders with the family's
@@ -2069,7 +2139,8 @@ final class ServerController: ObservableObject {
         sessionId: UUID,
         modelName: String,
         modelConfig: ModelConfig?,
-        systemPrompt: String
+        systemPrompt: String,
+        imageDigests: [Int: String] = [:]
     ) -> [ChatPromptFormatter.ConversationTurn] {
         let closer = ChatPromptFormatter.assistantTurnCloseTag(
             modelConfig: modelConfig,
@@ -2082,7 +2153,8 @@ final class ServerController: ObservableObject {
                   echoedByClient: conversation[index].text,
                   turnCloser: closer,
                   conversation: conversation,
-                  systemPrompt: systemPrompt
+                  systemPrompt: systemPrompt,
+                  imageDigests: imageDigests
               ) else { return conversation }
         var turns = conversation
         turns[index].text = recorded

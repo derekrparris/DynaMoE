@@ -55,6 +55,60 @@ nonisolated struct ServerImagePart: Sendable, Equatable {
 
 nonisolated enum ServerImageParts {
 
+    /// Where a picture belongs inside a turn's text, before the loaded
+    /// checkpoint's own image marker is known.
+    ///
+    /// Both protocols describe content as an ORDERED list of parts, and the turn
+    /// renderer needs that order: a picture between two paragraphs asks a different
+    /// question from the same two pictures placed after all of it. Collecting the
+    /// pictures beside the joined text loses the association, and nothing is left
+    /// afterwards to restore it from. So the decoders keep the order as a sentinel
+    /// in the turn text and `ServerController` replaces each one with the
+    /// checkpoint's marker. U+FFFC is the Unicode object replacement character,
+    /// which is what local runners conventionally use for exactly this. It never
+    /// reaches the model.
+    static let imagePlaceholder = "\u{FFFC}"
+
+    /// One element of a message's content, in the order the client wrote it.
+    nonisolated enum Piece: Sendable {
+        case text(String)
+        case image(ServerImagePart)
+    }
+
+    /// Assembles a message's pieces into one turn string, with the placeholder
+    /// exactly where each picture sits.
+    ///
+    /// Consecutive text pieces keep the newline join the adapters always used;
+    /// a picture ends the run, because the marker substitution supplies its own
+    /// trailing newline. Nil when the content carries no text and no picture.
+    static func interleave(_ pieces: [Piece]) -> String? {
+        var out = ""
+        var separatorPending = false
+        for piece in pieces {
+            switch piece {
+            case .image:
+                out += imagePlaceholder
+                // The substitution writes the marker AND its newline, so a text
+                // piece that follows starts on the next line already.
+                separatorPending = false
+            case let .text(text):
+                guard !text.isEmpty else { continue }
+                if separatorPending { out += "\n" }
+                out += text
+                separatorPending = true
+            }
+        }
+        return out.isEmpty ? nil : out
+    }
+
+    /// The images a message carries, in the order the client wrote them.
+    static func images(in pieces: [Piece]) -> [ServerImagePart] {
+        pieces.compactMap { piece in
+            if case let .image(part) = piece { return part }
+            return nil
+        }
+    }
+
     /// Decodes an OpenAI `image_url` value.
     ///
     /// Three shapes reach here: a `data:` URL carrying base64 (what every SDK
@@ -132,6 +186,23 @@ nonisolated enum ServerImageParts {
             hasher.update(data: Data([0x1e]))
         }
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// One digest per turn that carries pictures, over that turn's images in the
+    /// order the client sent them.
+    ///
+    /// A conversation's pictures are not all in its opening message: a follow-up
+    /// can replace the image on turn four while every turn's TEXT stays identical,
+    /// and two pictures of the same size render to the same run of image token ids.
+    /// Identity therefore has to cover every turn the prompt was rendered from, not
+    /// just the anchor — otherwise the second picture's turn splices the first
+    /// picture's recorded generation.
+    static func turnDigests(_ images: [Int: [ServerImagePart]]) -> [Int: String] {
+        var digests: [Int: String] = [:]
+        for (turn, parts) in images where !parts.isEmpty {
+            digests[turn] = digest(parts)
+        }
+        return digests
     }
 
     /// The marker a turn's prompt must carry for this model, or nil when the

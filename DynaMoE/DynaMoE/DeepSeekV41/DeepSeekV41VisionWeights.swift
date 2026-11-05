@@ -87,6 +87,13 @@ nonisolated public final class DeepSeekV41VisionWeights: DeepSeekV41WeightSource
     /// The sample names cover the three families the tower reads — a block, the
     /// aligner, and the marker embeddings, which live in a DIFFERENT shard from the
     /// blocks and are the part a partial download loses first.
+    ///
+    /// A NAME IN THE INDEX IS NOT A TENSOR ON DISK. `model.safetensors.index.json`
+    /// is written for the whole repository, so a snapshot whose download is still
+    /// running — or was interrupted — lists every vision tensor while the shard
+    /// file that holds it is absent, and a check that only looked at the index
+    /// advertised a tower that the first encode would fail to open. Each required
+    /// name therefore resolves to its shard, and the shard has to exist.
     public static func directoryHasTower(_ snapshotDir: URL) -> Bool {
         let required = [
             "vision.blocks.0.attn.wqkv.weight",
@@ -98,7 +105,13 @@ nonisolated public final class DeepSeekV41VisionWeights: DeepSeekV41WeightSource
         ]
         let weightMap = DeepSeekV41EngramTableLocator.indexWeightMap(in: snapshotDir)
         if !weightMap.isEmpty {
-            return required.allSatisfy { !(weightMap[$0] ?? "").isEmpty }
+            let present = Set(DeepSeekV41EngramTableLocator.shardFiles(in: snapshotDir))
+            return required.allSatisfy { name in
+                let shard = weightMap[name] ?? ""
+                // An empty entry is a tensor the index does not list; a non-empty
+                // one still has to name a file this snapshot actually holds.
+                return !shard.isEmpty && present.contains(shard)
+            }
         }
         let shards = DeepSeekV41EngramTableLocator.shardFiles(in: snapshotDir)
         guard !shards.isEmpty else { return false }
@@ -307,23 +320,51 @@ nonisolated public final class DeepSeekV41VisionWeights: DeepSeekV41WeightSource
         "\(role.rawValue)|\(layer.map(String.init) ?? "-")"
     }
 
-    /// Byte width of one value, or nil for a format the decoder does not read.
-    /// The tower is published BF16; FP32 is accepted because a converted
-    /// checkpoint is byte-identical in meaning and costs one branch.
-    static func bytesPerValue(_ dtype: String) -> Int? {
+    /// The storage formats the tower's decoder reads.
+    ///
+    /// BF16 and FP16 are both two bytes wide and both are called "16" by some
+    /// spelling, but they are DIFFERENT layouts: a bfloat16 is the high half of
+    /// a float, while an IEEE half has a five-bit exponent and a ten-bit
+    /// mantissa. Widening one as the other is silent corruption of every value,
+    /// so the format is classified before the width is read and a two-byte
+    /// tensor is never widened without knowing which one it is.
+    enum StorageFormat {
+        case bf16
+        case fp16
+        case fp32
+    }
+
+    static func storageFormat(_ dtype: String) -> StorageFormat? {
         let upper = dtype.uppercased()
-        if upper.contains("BF16") || upper.contains("FLOAT16") || upper == "F16" {
-            return 2
+        if upper.contains("BF16") || upper.contains("BFLOAT16") {
+            return .bf16
+        }
+        if upper.contains("FLOAT16") || upper.contains("HALF") || upper == "F16" {
+            return .fp16
         }
         if upper.contains("F32") || upper.contains("FLOAT32") {
-            return 4
+            return .fp32
         }
         return nil
     }
 
-    /// BF16 and FP32 to host floats. Both are read as integer bits and reproduced
-    /// exactly: a bfloat16 is the high half of the float it came from, so widening
-    /// it is a shift and never a conversion.
+    /// Byte width of one value, or nil for a format the decoder does not read.
+    /// The tower is published BF16; FP16 and FP32 are accepted because a
+    /// converted checkpoint is byte-identical in meaning and costs one branch.
+    static func bytesPerValue(_ dtype: String) -> Int? {
+        switch storageFormat(dtype) {
+        case .bf16, .fp16: return 2
+        case .fp32: return 4
+        case nil: return nil
+        }
+    }
+
+    /// BF16, FP16 and FP32 to host floats, each read as integer bits.
+    ///
+    /// A bfloat16 is the high half of the float it came from, so widening it is a
+    /// shift and never a conversion. An FP16 is a genuinely different encoding
+    /// (`0x3C00` is 1.0, where the same bits read as bf16 are 0.0078), so it goes
+    /// through `Float16`'s own conversion.
     ///
     /// The widening runs over typed destinations rather than one byte-addressable
     /// load per value, because the published tower is 485 million values and the
@@ -333,6 +374,7 @@ nonisolated public final class DeepSeekV41VisionWeights: DeepSeekV41WeightSource
         dtype: String,
         count: Int
     ) -> [Float] {
+        let format = storageFormat(dtype) ?? .bf16
         let width = bytesPerValue(dtype) ?? 2
         var values = [Float](repeating: 0, count: count)
         guard count > 0, bytes.count >= count * width, let base = bytes.baseAddress else {
@@ -341,12 +383,18 @@ nonisolated public final class DeepSeekV41VisionWeights: DeepSeekV41WeightSource
         values.withUnsafeMutableBufferPointer { destination in
             guard let floats = destination.baseAddress else { return }
             floats.withMemoryRebound(to: UInt32.self, capacity: count) { bits in
-                if width == 2 {
+                switch format {
+                case .bf16:
                     for index in 0..<count {
                         let half = base.loadUnaligned(fromByteOffset: index * 2, as: UInt16.self)
                         bits[index] = UInt32(half) << 16
                     }
-                } else {
+                case .fp16:
+                    for index in 0..<count {
+                        let half = base.loadUnaligned(fromByteOffset: index * 2, as: UInt16.self)
+                        bits[index] = Float(Float16(bitPattern: half)).bitPattern
+                    }
+                case .fp32:
                     for index in 0..<count {
                         bits[index] = base.loadUnaligned(fromByteOffset: index * 4, as: UInt32.self)
                     }

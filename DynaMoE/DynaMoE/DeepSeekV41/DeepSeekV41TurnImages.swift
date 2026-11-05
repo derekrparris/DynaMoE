@@ -20,6 +20,11 @@ nonisolated public enum DeepSeekV41TurnImageError: LocalizedError, Equatable {
     case malformedImage(index: Int)
     case placeholderCountMismatch(images: Int, placeholders: Int)
     case bindingFailed(unusedImages: Int, unfilledPlaceholders: Int)
+    /// A prompt that already carries its spans, whose recorded layout does not
+    /// describe the ids it holds. Named rather than tolerated: the alternative is
+    /// rows landing on one picture's span from another's encode.
+    case carriedSpanMismatch(reason: String)
+    case carriedSpanCountMismatch(spans: Int, images: Int)
 
     public var errorDescription: String? {
         switch self {
@@ -34,6 +39,10 @@ nonisolated public enum DeepSeekV41TurnImageError: LocalizedError, Equatable {
         case .bindingFailed(let unusedImages, let unfilledPlaceholders):
             return "The image rows could not be bound: \(unusedImages) image(s) unused, "
                 + "\(unfilledPlaceholders) placeholder(s) unfilled."
+        case .carriedSpanMismatch(let reason):
+            return "This continuation's image layout does not match its prompt: \(reason)."
+        case .carriedSpanCountMismatch(let spans, let images):
+            return "This continuation records \(spans) image span(s) for \(images) attached image(s)."
         }
     }
 }
@@ -114,15 +123,17 @@ nonisolated public enum DeepSeekV41TurnImages {
     ///
     /// `encode` is the tower call itself (`DeepSeekV41Runtime.imageSpan`), passed in
     /// so the binding can be tested without 970 MB of weights. The result is what
-    /// the turn loop wants: the expanded ids and a position -> residual row map.
+    /// the turn loop wants: the expanded ids, a position -> residual row map, and
+    /// the range each image occupies — the last of which is what a continuation
+    /// hands back so the NEXT turn can put the same rows at the same positions.
     public static func bind(
         tokenIds: [UInt32],
         images: [DeepSeekV41ImageInput],
         spec: DeepSeekV41VisionSpec?,
         rowWidth: Int,
         encode: (DeepSeekV41ImageInput) throws -> DeepSeekV41ImagePrompt.ImageSpan
-    ) throws -> (tokenIds: [UInt32], rows: [Int: [Float]]) {
-        guard !images.isEmpty else { return (tokenIds, [:]) }
+    ) throws -> (tokenIds: [UInt32], rows: [Int: [Float]], spans: [Range<Int>]) {
+        guard !images.isEmpty else { return (tokenIds, [:], []) }
         guard let spec else { throw DeepSeekV41TurnImageError.noTower(images: images.count) }
         var spans: [DeepSeekV41ImagePrompt.ImageSpan] = []
         spans.reserveCapacity(images.count)
@@ -145,6 +156,137 @@ nonisolated public enum DeepSeekV41TurnImages {
                 unfilledPlaceholders: plan.report.unfilledPlaceholderCount
             )
         }
-        return (plan.tokenIds, plan.rows)
+        return (plan.tokenIds, plan.rows, plan.spans)
+    }
+
+    /// Checks a prompt whose spans a previous turn already expanded, without
+    /// reading a weight.
+    ///
+    /// A continuation reuses the previous turn's prompt ids verbatim — that is what
+    /// keeps the pinned prefix byte-identical — so it carries the expanded spans
+    /// with them. Nothing about those ids says how many pictures produced them, so
+    /// the checks that `price` makes from a marker count have to be made from the
+    /// recorded layout instead: every span in bounds and on the checkpoint's image
+    /// token, and the layout accounting for EVERY image token the prompt holds. A
+    /// prompt with an image token the layout does not claim is the one failure that
+    /// reads as "the model answered about something else", so it is refused here,
+    /// before a runtime is built.
+    ///
+    /// Returns the prompt length, which is what the cache is provisioned for.
+    public static func priceCarried(
+        tokenIds: [UInt32],
+        ranges: [Range<Int>],
+        spec: DeepSeekV41VisionSpec?
+    ) throws -> Int {
+        guard !ranges.isEmpty else { return tokenIds.count }
+        guard let spec else {
+            throw DeepSeekV41TurnImageError.noTower(images: ranges.count)
+        }
+        _ = try validateCarried(tokenIds: tokenIds, ranges: ranges, spec: spec)
+        return tokenIds.count
+    }
+
+    /// Puts already-encoded spans back at the positions a previous turn recorded.
+    ///
+    /// The ids are not rewritten: they already hold the span, and replacing them
+    /// with the same tokens is only a way to lose the rest of the prompt.
+    public static func place(
+        tokenIds: [UInt32],
+        spans: [DeepSeekV41ImagePrompt.ImageSpan],
+        at ranges: [Range<Int>],
+        spec: DeepSeekV41VisionSpec?,
+        rowWidth: Int
+    ) throws -> (tokenIds: [UInt32], rows: [Int: [Float]]) {
+        guard !ranges.isEmpty else { return (tokenIds, [:]) }
+        guard let spec else {
+            throw DeepSeekV41TurnImageError.noTower(images: ranges.count)
+        }
+        guard spans.count == ranges.count else {
+            throw DeepSeekV41TurnImageError.carriedSpanCountMismatch(
+                spans: ranges.count, images: spans.count
+            )
+        }
+        let counts = try validateCarried(tokenIds: tokenIds, ranges: ranges, spec: spec)
+        var rows: [Int: [Float]] = [:]
+        for (index, span) in spans.enumerated() {
+            guard span.rows.count == span.tokenCount else {
+                throw DeepSeekV41ImagePromptError.spanLengthMismatch(
+                    image: index, expected: span.tokenCount, actual: span.rows.count
+                )
+            }
+            // The recorded length and the encoded one have to agree: a stale span
+            // (an encode from a different grid) would shift every row after it.
+            guard span.tokenCount == counts[index] else {
+                throw DeepSeekV41TurnImageError.carriedSpanMismatch(
+                    reason: "image \(index + 1) encodes \(span.tokenCount) positions but the prompt's "
+                        + "span is \(counts[index]) long"
+                )
+            }
+            for (position, row) in span.rows.enumerated() {
+                guard row.count == rowWidth else {
+                    throw DeepSeekV41ImagePromptError.rowWidthMismatch(
+                        image: index, position: position, expected: rowWidth, actual: row.count
+                    )
+                }
+            }
+            let start = ranges[index].lowerBound
+            for (offset, row) in span.rows.enumerated() {
+                rows[start + offset] = row
+            }
+        }
+        return (tokenIds, rows)
+    }
+
+    /// The shared half of the two carried-prompt entry points: every span is in
+    /// bounds and holds the image token, and the prompt carries no image token the
+    /// layout does not claim.
+    private static func validateCarried(
+        tokenIds: [UInt32],
+        ranges: [Range<Int>],
+        spec: DeepSeekV41VisionSpec
+    ) throws -> [Int] {
+        let marker = UInt32(clamping: spec.imageTokenID)
+        var counts: [Int] = []
+        counts.reserveCapacity(ranges.count)
+        var claimed = 0
+        var previousUpper = 0
+        for (index, range) in ranges.enumerated() {
+            guard !range.isEmpty else {
+                throw DeepSeekV41TurnImageError.carriedSpanMismatch(
+                    reason: "image \(index + 1) has an empty span"
+                )
+            }
+            guard range.lowerBound >= 0, range.upperBound <= tokenIds.count else {
+                throw DeepSeekV41TurnImageError.carriedSpanMismatch(
+                    reason: "image \(index + 1) claims positions \(range.lowerBound)..<"
+                        + "\(range.upperBound) of a \(tokenIds.count)-token prompt"
+                )
+            }
+            guard range.lowerBound >= previousUpper else {
+                throw DeepSeekV41TurnImageError.carriedSpanMismatch(
+                    reason: "image \(index + 1) starts at \(range.lowerBound), before the previous "
+                        + "span ended at \(previousUpper)"
+                )
+            }
+            previousUpper = range.upperBound
+            // A span must sit on the checkpoint's own image token; anything else
+            // means the recorded range describes a different prompt.
+            if let stray = range.first(where: { tokenIds[$0] != marker }) {
+                throw DeepSeekV41TurnImageError.carriedSpanMismatch(
+                    reason: "image \(index + 1)'s span holds token \(tokenIds[stray]) at position "
+                        + "\(stray), which is not the checkpoint's image token \(marker)"
+                )
+            }
+            counts.append(range.count)
+            claimed += range.count
+        }
+        let present = tokenIds.reduce(into: 0) { count, id in if id == marker { count += 1 } }
+        guard present == claimed else {
+            throw DeepSeekV41TurnImageError.carriedSpanMismatch(
+                reason: "the prompt carries \(present) image token(s) but its recorded spans claim "
+                    + "\(claimed)"
+            )
+        }
+        return counts
     }
 }

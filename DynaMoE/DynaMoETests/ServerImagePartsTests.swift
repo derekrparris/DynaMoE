@@ -186,6 +186,56 @@ final class ServerImagePartsTests: XCTestCase {
 
     // MARK: - The tower gate
 
+    /// The anchor key cannot see a picture on a LATER turn, so the history digest
+    /// has to. Two pictures of the same size render to the same run of image token
+    /// ids and the marker renders as the same text, so without the per-turn digest
+    /// a request that replaced turn 2's image would keep every identity and splice
+    /// the old picture's generation into the new conversation.
+    func testTheHistoryDigestCoversEveryTurnsPictures() throws {
+        let a = ServerImagePart(payload: .inline(try png(red: 10), mediaType: "image/png"))
+        let b = ServerImagePart(payload: .inline(try png(red: 240), mediaType: "image/png"))
+        let turns = [
+            ChatPromptFormatter.ConversationTurn(role: .user, text: "first"),
+            ChatPromptFormatter.ConversationTurn(role: .assistant, text: "answer"),
+            ChatPromptFormatter.ConversationTurn(role: .user, text: "second"),
+        ]
+        let withA = ServerImageParts.turnDigests([2: [a]])
+        let withB = ServerImageParts.turnDigests([2: [b]])
+        XCTAssertEqual(withA[2], ServerImageParts.digest([a]))
+        XCTAssertNil(withA[0], "a turn with no picture contributes no digest")
+
+        let digestA = ServerTurnMemory.historyDigest(
+            systemPrompt: "sys", turns: turns[...], imageDigests: withA
+        )
+        let digestB = ServerTurnMemory.historyDigest(
+            systemPrompt: "sys", turns: turns[...], imageDigests: withB
+        )
+        let digestNone = ServerTurnMemory.historyDigest(systemPrompt: "sys", turns: turns[...])
+        XCTAssertNotEqual(digestA, digestB, "a replaced picture is a different history")
+        XCTAssertNotEqual(digestA, digestNone, "a pictured turn is not a text-only one")
+        // Stable across a repeat, which is what makes it usable as a record.
+        XCTAssertEqual(
+            digestA,
+            ServerTurnMemory.historyDigest(
+                systemPrompt: "sys", turns: turns[...], imageDigests: withA
+            )
+        )
+        XCTAssertTrue(ServerTurnMemory.historyMatches(
+            systemPrompt: "sys",
+            conversation: turns,
+            imageDigests: withA,
+            turnCount: 3,
+            digest: digestA
+        ))
+        XCTAssertFalse(ServerTurnMemory.historyMatches(
+            systemPrompt: "sys",
+            conversation: turns,
+            imageDigests: withB,
+            turnCount: 3,
+            digest: digestA
+        ))
+    }
+
     func testNoLoadedPathMeansNoMarker() {
         XCTAssertNil(ServerImageParts.visionMarker(modelPath: nil, config: nil))
         XCTAssertNil(ServerImageParts.visionMarker(modelPath: "", config: nil))
@@ -216,8 +266,13 @@ final class ServerImagePartsTests: XCTestCase {
         XCTAssertEqual(split.images.count, 1)
         XCTAssertEqual(split.images[2]?.count, 2, "both pictures belong to the third turn")
         XCTAssertEqual(split.orderedImages.count, 2)
-        XCTAssertFalse(split.turns[0].text.contains("image"))
-        XCTAssertEqual(split.turns[2].text, "and this one")
+        XCTAssertFalse(split.turns[0].text.contains(ServerImageParts.imagePlaceholder))
+        // Both pictures followed the text in the client's content, so both sentinels
+        // follow it here; `attachImageMarkers` turns each into the model's marker.
+        XCTAssertEqual(
+            split.turns[2].text,
+            "and this one" + String(repeating: ServerImageParts.imagePlaceholder, count: 2)
+        )
     }
 
     func testAnImageOnAnAssistantTurnIsRefused() throws {
@@ -247,7 +302,9 @@ final class ServerImagePartsTests: XCTestCase {
         ]}
         """)
         XCTAssertEqual(split.images[0]?.count, 1)
-        XCTAssertEqual(split.turns[0].text, "", "an image-only turn carries no placeholder text")
+        // An image-only turn's text IS its placeholder: the planner replaces it with
+        // the checkpoint's marker, so an empty string would drop the picture.
+        XCTAssertEqual(split.turns[0].text, ServerImageParts.imagePlaceholder)
     }
 
     func testAnImageInsideAnAnthropicToolResultIsRefused() throws {
@@ -283,7 +340,108 @@ final class ServerImagePartsTests: XCTestCase {
         let split = try AnthropicAdapter.splitMessages(request.messages)
         XCTAssertEqual(split.images.count, 1)
         XCTAssertEqual(split.images[2]?.count, 1)
-        XCTAssertEqual(split.turns[2].text, "what is this")
+        // The image block came FIRST in the client's content, so its sentinel does
+        // too. (`attachImageMarkers` turns it into the checkpoint's marker.)
+        XCTAssertEqual(
+            split.turns[2].text,
+            ServerImageParts.imagePlaceholder + "what is this"
+        )
+    }
+
+    /// Content blocks are ordered and the order is meaning. Collecting every
+    /// picture beside the joined text silently rewrites
+    /// `text → image → text → image` into "both pictures, then both paragraphs",
+    /// which is a different question about a different relation between them.
+    func testAnInterleavedImageAndTextKeepsItsOrder() throws {
+        let base64 = try png().base64EncodedString()
+        let marker = DeepSeekV41VisionMarkers.familyDefault.imagePlaceholder
+
+        // OpenAI: text, image, text, image, text.
+        let openAIBody = """
+        {"messages":[{"role":"user","content":[
+          {"type":"text","text":"before"},
+          {"type":"image_url","image_url":{"url":"data:image/png;base64,\(base64)"}},
+          {"type":"text","text":"between"},
+          {"type":"image_url","image_url":{"url":"data:image/png;base64,\(base64)"}},
+          {"type":"text","text":"after"}
+        ]}]}
+        """
+        let openAI = try JSONDecoder().decode(
+            OpenAIChatRequest.self, from: Data(openAIBody.utf8)
+        )
+        let openAISplit = try OpenAIAdapter.splitMessages(openAI.messages)
+        XCTAssertEqual(openAISplit.images[0]?.count, 2)
+        let openAIPlaced = try ServerController.attachImageMarkers(
+            turns: openAISplit.turns, images: openAISplit.images, marker: marker
+        )
+        XCTAssertEqual(
+            openAIPlaced.turns[0].text,
+            "before" + marker + "\nbetween" + marker + "\nafter"
+        )
+
+        // Anthropic: the same order, spelled with blocks.
+        let anthropicBody = """
+        {"max_tokens":10,"model":"m","messages":[{"role":"user","content":[
+          {"type":"text","text":"before"},
+          {"type":"image","source":{"type":"base64","media_type":"image/png","data":"\(base64)"}},
+          {"type":"text","text":"between"},
+          {"type":"image","source":{"type":"base64","media_type":"image/png","data":"\(base64)"}},
+          {"type":"text","text":"after"}
+        ]}]}
+        """
+        let anthropic = try JSONDecoder().decode(
+            AnthropicMessagesRequest.self, from: Data(anthropicBody.utf8)
+        )
+        let anthropicSplit = try AnthropicAdapter.splitMessages(anthropic.messages)
+        let anthropicPlaced = try ServerController.attachImageMarkers(
+            turns: anthropicSplit.turns, images: anthropicSplit.images, marker: marker
+        )
+        XCTAssertEqual(anthropicPlaced.turns[0].text, openAIPlaced.turns[0].text)
+        XCTAssertEqual(anthropicPlaced.images.count, 2)
+    }
+
+    /// An image written after the text stays after the text.
+    func testAnImageWrittenAfterTheTextStaysAfterIt() throws {
+        let base64 = try png().base64EncodedString()
+        let marker = DeepSeekV41VisionMarkers.familyDefault.imagePlaceholder
+        let body = """
+        {"messages":[{"role":"user","content":[
+          {"type":"text","text":"describe this then"},
+          {"type":"image_url","image_url":{"url":"data:image/png;base64,\(base64)"}}
+        ]}]}
+        """
+        let request = try JSONDecoder().decode(
+            OpenAIChatRequest.self, from: Data(body.utf8)
+        )
+        let split = try OpenAIAdapter.splitMessages(request.messages)
+        let placed = try ServerController.attachImageMarkers(
+            turns: split.turns, images: split.images, marker: marker
+        )
+        XCTAssertEqual(placed.turns[0].text, "describe this then" + marker + "\n")
+    }
+
+    /// A message that positions fewer sentinels than it carries pictures cannot be
+    /// bound faithfully, so it is refused rather than guessed at: either choice
+    /// puts a row set on the wrong span.
+    func testAMismatchedPlaceholderCountIsRefused() throws {
+        let payload = try png()
+        let turns = [
+            ChatPromptFormatter.ConversationTurn(
+                role: .user, text: "one place " + ServerImageParts.imagePlaceholder + " only"
+            )
+        ]
+        XCTAssertThrowsError(try ServerController.attachImageMarkers(
+            turns: turns,
+            images: [0: [
+                ServerImagePart(payload: .inline(payload, mediaType: "image/png")),
+                ServerImagePart(payload: .inline(payload, mediaType: "image/png")),
+            ]],
+            marker: DeepSeekV41VisionMarkers.familyDefault.imagePlaceholder
+        )) { error in
+            XCTAssertTrue(
+                (error as? ServerAPIError)?.message.contains("cannot be bound") == true
+            )
+        }
     }
 
     func testTheMarkerLandsAtTheHeadOfItsOwnTurnOnly() throws {

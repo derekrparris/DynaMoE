@@ -936,6 +936,50 @@ final class DeepSeekV41DeviceGraphParityTests: XCTestCase {
         )
     }
 
+    /// The indexer's per-position state is bounded by the run, not by the sequence.
+    ///
+    /// A selection and a candidate mask are wanted for the position being computed
+    /// and never again — a query gathers the rows it selected and the cache, not a
+    /// neighbour's list — but both used to be kept for the whole sequence. The mask
+    /// is one `Bool` per compressed row produced SO FAR, so that retention is
+    /// quadratic: at the checkpoint's 262,144-token cap it is tens of gigabytes,
+    /// which a prefill would reach long before its KV budget.
+    ///
+    /// The walk is the case that makes it visible, because a block legitimately
+    /// holds one entry per position of the block while a walk holds exactly one.
+    func testTheIndexerKeepsOnlyTheRunItIsComputing() throws {
+        let compressed = compressedCheckpoint()
+        let runtime = try makeRuntime(compressed)
+        let forward = runtime.forward()
+        let tokens = (0..<(compressed.shape.window * 2)).map { 3 + $0 }
+
+        for (position, token) in tokens.enumerated() {
+            _ = try forward.forwardToken(token, position: position)
+            let counts = forward.retainedIndexPositionCounts
+            XCTAssertEqual(
+                counts.selections, 1,
+                "a walk holds the position it is computing, not position \(position)'s history"
+            )
+            XCTAssertLessThanOrEqual(counts.masks, 1)
+        }
+
+        // And the block path holds its own width, no more.
+        let blockRuntime = try makeRuntime(compressed)
+        let block = blockRuntime.forward()
+        let width = DeepSeekV41DevicePlan.chunkSlots(
+            config: compressed.config,
+            contextLength: compressed.shape.contextLength
+        )
+        XCTAssertGreaterThan(width, 1, "a block of one would not exercise the bound")
+        _ = try block.prefillChunk(tokens)
+        let blockCounts = block.retainedIndexPositionCounts
+        XCTAssertLessThanOrEqual(
+            blockCounts.selections, width,
+            "a block holds one selection per position it is running"
+        )
+        XCTAssertLessThanOrEqual(blockCounts.masks, width)
+    }
+
     /// `main_x = main_norm(main_proj(main_hidden))`, computed on the device from the
     /// row the walk captured.
     ///

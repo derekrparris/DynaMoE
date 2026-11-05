@@ -461,8 +461,16 @@ final class ServerImagePartRefusalTests: XCTestCase {
         ]}]}
         """)
         XCTAssertTrue(request.hasImageContent)
-        XCTAssertTrue(request.hasUnsupportedContent)
-        XCTAssertEqual(request.messages.first?.contentText, "what is this")
+        // An image is a part this server CAN process (the loaded checkpoint may
+        // still refuse it for having no tower, but the request is well formed), so
+        // it is not "unsupported content" -- that flag is for files and audio.
+        XCTAssertFalse(request.hasUnsupportedContent)
+        // The picture keeps its place in the text as a sentinel, which is what lets
+        // `text -> image` stay that order rather than being reordered downstream.
+        XCTAssertEqual(
+            request.messages.first?.contentText,
+            "what is this" + ServerImageParts.imagePlaceholder
+        )
     }
 
     func testOpenAIFileAndAudioPartsAreFlagged() throws {

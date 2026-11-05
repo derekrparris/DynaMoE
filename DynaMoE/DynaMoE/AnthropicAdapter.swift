@@ -70,13 +70,20 @@ struct AnthropicMessagesRequest: Decodable {
             if let s = try? container.decode(String.self, forKey: .content) {
                 text = s.isEmpty ? nil : s
             } else if let blocks = try? container.decode([ContentBlockIn].self, forKey: .content) {
-                let joined = blocks.compactMap(\.text).filter { !$0.isEmpty }.joined(separator: "\n")
-                text = joined.isEmpty ? nil : joined
+                // Blocks are ordered and the order is meaning, so a picture keeps
+                // its place in the text as a sentinel rather than being collected
+                // beside it (`ServerImageParts.interleave`). Reasoning and tool
+                // blocks render separately and are not part of that order.
+                let pieces = blocks.map { block -> ServerImageParts.Piece in
+                    if let image = block.image { return .image(image) }
+                    return .text(block.text ?? "")
+                }
+                text = ServerImageParts.interleave(pieces)
                 let thoughts = blocks.compactMap(\.thinking).filter { !$0.isEmpty }.joined(separator: "\n")
                 reasoning = thoughts.isEmpty ? nil : thoughts
                 toolUses = blocks.compactMap(\.toolUse)
                 toolResults = blocks.compactMap(\.toolResult)
-                images = blocks.compactMap(\.image)
+                images = ServerImageParts.images(in: pieces)
                 hasUnsupported = blocks.contains(where: \.isUnsupported)
                     || toolResults.contains(where: \.hasUnsupportedBlock)
             }

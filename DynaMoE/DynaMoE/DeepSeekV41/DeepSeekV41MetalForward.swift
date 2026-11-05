@@ -1971,9 +1971,16 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// The compressed rows the indexer selected, per position. Value-dependent, so
     /// it is read back from the device after the score kernel and reused by every
     /// layer between two index sources.
+    ///
+    /// Holds the CURRENT run's positions only (`pruneIndexState`): an entry is
+    /// wanted for the position being computed and never afterwards, and a whole
+    /// sequence's worth is quadratic in the sequence length.
     private var indexSelectionsByPosition: [Int: [Int]] = [:]
     /// The block mask the candidate-source layer published, per position, for the
-    /// layers after it to score inside.
+    /// layers after it to score inside. Bounded to the current run for the same
+    /// reason as the selections, and it matters more: this one is one flag per
+    /// compressed row produced so far, so its retention grew with the square of the
+    /// sequence length.
     private var indexMasksByPosition: [Int: [Bool]] = [:]
     /// Which block of the compressor scratch each owner fills. Divided from the
     /// plan at load, because the block a layer writes is a property of the layer
@@ -2032,6 +2039,19 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
     /// Nil in every production path.
     public var indexerInputRequest: DeepSeekV41IndexerInputRequest?
     public private(set) var indexerInputDump: DeepSeekV41IndexerInputDump?
+
+    /// How many positions' indexer state the executor is holding, as
+    /// `(selections, candidate masks)`.
+    ///
+    /// Both maps are private, and what matters about them is not their contents but
+    /// their SIZE: the retention must be the run's width (one entry per position
+    /// being computed, so at most `chunkSlots`) rather than the sequence length.
+    /// Each candidate mask is one `Bool` per compressed row produced so far, so an
+    /// unbounded map is quadratic in the sequence and reached tens of gigabytes at
+    /// the checkpoint's 262,144-token cap. This is the assertion surface for that.
+    public var retainedIndexPositionCounts: (selections: Int, masks: Int) {
+        (indexSelectionsByPosition.count, indexMasksByPosition.count)
+    }
 
     /// Where a block's per-layer time goes, accumulated while `recordsBlockTiming`
     /// is on. Off in every production path.
@@ -6237,6 +6257,32 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         }
     }
 
+    /// Drops the per-position indexer state a run no longer needs.
+    ///
+    /// The selection is value-dependent device output, so it has to be read back
+    /// and kept in host memory — but only for the positions being computed RIGHT
+    /// NOW. A run's positions all need their entry at once (the block path writes
+    /// every position's mask and rows before any attention reads them) and nothing
+    /// outside the run is ever looked up again: a query gathers the rows it
+    /// selected and the cache, not a neighbour's list. Keeping the whole sequence
+    /// instead retains one entry per position whose candidate mask is one `Bool`
+    /// per compressed row produced so far, i.e. a `[Bool]` that grows with its own
+    /// position: at the checkpoint's 262,144-token cap that is tens of gigabytes of
+    /// masks for a prefill that never reaches its KV budget.
+    ///
+    /// Called from the one place that stores a selection, so the retained window
+    /// and the written window cannot drift.
+    private func pruneIndexState(keepingPositions start: Int, count: Int) {
+        guard !indexSelectionsByPosition.isEmpty || !indexMasksByPosition.isEmpty else { return }
+        let window = start..<(start + count)
+        if !indexSelectionsByPosition.isEmpty {
+            indexSelectionsByPosition = indexSelectionsByPosition.filter { window.contains($0.key) }
+        }
+        if !indexMasksByPosition.isEmpty {
+            indexMasksByPosition = indexMasksByPosition.filter { window.contains($0.key) }
+        }
+    }
+
     /// Resolves the rows the indexer selected, from the scores just read back.
     ///
     /// The scores are the only value-dependent state the port keeps per position:
@@ -6253,6 +6299,7 @@ nonisolated public final class DeepSeekV41MetalForward: DeepSeekV41PositionForwa
         guard layer.ownsCompressedIndex, config.indexNHeads > 0, layer.compressedKVSource >= 0 else {
             return
         }
+        pruneIndexState(keepingPositions: startPosition, count: count)
         let ownerRows = min(
             workspace.indexerRows,
             cache.layout.indexerRowsByOwner[layer.compressedKVSource] ?? workspace.indexerRows
