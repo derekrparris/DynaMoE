@@ -27,6 +27,32 @@ import Metal
 
 // MARK: - Thinking / Response Boundary Splitting (whitespace tolerant)
 
+/// Writes a decode step's logits (and the context that produced them) under
+/// `/tmp/dynamoe_logits`, for comparing an engine step against an independent
+/// reference. Diagnostic only: `dynamoe_dump_logits` gates every call.
+func dumpDecodeLogits(
+    _ logits: UnsafeMutablePointer<Float>,
+    vocabSize: Int,
+    step: Int,
+    chosen: UInt32,
+    context: [UInt32]
+) {
+    let directory = URL(fileURLWithPath: "/tmp/dynamoe_logits")
+    try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    let name = String(format: "step_%03d", step)
+    let vector = Data(bytes: logits, count: vocabSize * MemoryLayout<Float>.stride)
+    try? vector.write(to: directory.appendingPathComponent(name + ".f32"))
+    let meta: [String: Any] = [
+        "step": step,
+        "chosen": Int(chosen),
+        "vocabSize": vocabSize,
+        "context": context.map { Int($0) }
+    ]
+    if let json = try? JSONSerialization.data(withJSONObject: meta) {
+        try? json.write(to: directory.appendingPathComponent(name + ".json"))
+    }
+}
+
 nonisolated public enum TurnTextSplitter {
     /// Reasoning open/close marker tags used across model families (Qwen, DeepSeek, Ornith, etc.).
     private static let openTags = ["<think>", "<thought>", "<|thought|>", "<|channel>"]
@@ -1958,7 +1984,14 @@ public final class CompletionEngine: @unchecked Sendable {
               let routerIndicesBuffer = device.makeBuffer(length: 16 * MemoryLayout<UInt32>.stride, options: .storageModeShared),
               let routerWeightsBuffer = device.makeBuffer(length: 16 * MemoryLayout<Float>.stride, options: .storageModeShared),
               let sharedScoreBuffer = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared),
-              let interBuffer = device.makeBuffer(length: max(Int(maxInterDim), 512) * max(1, Int(modelConfig?.effectiveNumExpertsPerTok ?? (numExperts >= 512 ? 10 : 8))) * MemoryLayout<Float>.stride, options: .storageModeShared),
+              // One intermediate vector per active expert on an MoE layer, and
+              // `effectiveNumExpertsPerTok` answers 0 for a DENSE checkpoint, so
+              // this used to land on exactly `maxInterDim` floats with no slack at
+              // all. The additive 512 keeps a fused write inside the buffer.
+              let interBuffer = device.makeBuffer(length: max(
+                  max(Int(maxInterDim), 512) * max(1, Int(modelConfig?.effectiveNumExpertsPerTok ?? (numExperts >= 512 ? 10 : 8))),
+                  max(Int(maxInterDim), 512) + 512
+              ) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let fusedSlotListBuffer = device.makeBuffer(length: 16 * MemoryLayout<UInt32>.stride, options: .storageModeShared),
               let fusedSlotWeightsBuffer = device.makeBuffer(length: 16 * MemoryLayout<Float>.stride, options: .storageModeShared),
               // Flash-decoding partials (256 = split-K chunk cap), sized from the
@@ -1993,14 +2026,20 @@ public final class CompletionEngine: @unchecked Sendable {
         let budgetMode: MemoryBudgetMode = isFullRAM ? .unrestricted : memory.budgetMode
 
         let isAgentSession = request.agentToolsEnabled
+        // The row ceiling is the CHECKPOINT's architectural one, not a flat
+        // constant: a model declaring 524,288 positions should be refused a long
+        // prompt by the KV budget, not by a policy number.
+        let policyMaxRows = KVCacheProvisioning.policyMaxRows(config: modelConfig)
         let sessionFloor = KVCacheProvisioning.sessionFloor(
             isAgentSession: isAgentSession,
-            configured: UserDefaults.standard.object(forKey: KVCacheProvisioning.agentSessionFloorKey) as? Int
+            configured: UserDefaults.standard.object(forKey: KVCacheProvisioning.agentSessionFloorKey) as? Int,
+            policyMaxRows: policyMaxRows
         )
         var neededSeqLen = KVCacheProvisioning.neededSeqLen(
             sessionFloor: sessionFloor,
             promptTokens: promptTokenIds.count,
-            requestedMaxTokens: maxTokens
+            requestedMaxTokens: maxTokens,
+            policyMaxRows: policyMaxRows
         )
         var kvPrec = memory.kvPrecision
         // Resolve the effective KV precision BEFORE the fit check: the gate has
@@ -2093,7 +2132,8 @@ public final class CompletionEngine: @unchecked Sendable {
             budgetMode: budgetMode,
             modelFootprintGB: summary.sizeGb,
             physicalGB: fitPhysicalGB,
-            residentFootprintGB: streamedFootprintGB
+            residentFootprintGB: streamedFootprintGB,
+            policyMaxRows: policyMaxRows
         )
         // Both KV gates report the same numbers, and never claim the prompt is
         // longer than the cache when the bind is the budget or the reserve.
@@ -2122,7 +2162,8 @@ public final class CompletionEngine: @unchecked Sendable {
                 neededSeqLen = KVCacheProvisioning.neededSeqLen(
                     sessionFloor: sessionFloor,
                     promptTokens: promptTokenIds.count,
-                    requestedMaxTokens: capped
+                    requestedMaxTokens: capped,
+                    policyMaxRows: policyMaxRows
                 )
             }
         case .ok:
@@ -8639,6 +8680,7 @@ if layer.attnGateProjTensor != nil,
                 jetSpecEnabled: jetSpecEnabled,
                 hasLinearRecurrence: hasLinearRecurrence,
                 isSparkModel: modelConfig?.isSparkModel == true,
+                hasRoutedExperts: numExperts > 0,
                 kvPrecision: KVCacheManager.shared.activePrecision
             )
             let effectiveInterDim = modelConfig?.intermediateSize ?? Int(cachedLayers.first?.intermediateDim ?? 14336)
@@ -10615,8 +10657,10 @@ if layer.attnGateProjTensor != nil,
 
                         for (idx, pTok) in prefillTokens.enumerated() {
                             if Task.isCancelled { prefillSuccess = false; break }
-                            let stepOk = autoreleasepool {
-                                runTokenForward(tokenId: pTok, step: UInt32(startPos + idx), computeLogits: false)
+                            let stepOk = runOnLargeStack {
+                                autoreleasepool {
+                                    runTokenForward(tokenId: pTok, step: UInt32(startPos + idx), computeLogits: false)
+                                }
                             }
                             if !stepOk {
                                 if Task.isCancelled {
@@ -10642,22 +10686,29 @@ if layer.attnGateProjTensor != nil,
                             }
                         }
                         ok = prefillSuccess
-                    } else if modelConfig?.isGemma4Model == true {
-                        // Chunked batched prefill: each call's batch must fit the
-                        // sliding ring's slack (window + chunk) so a store never
-                        // overwrites a row a later row in the same pass still
-                        // reads, and the transient per-call buffers stay bounded
-                        // instead of scaling with the whole delta prompt.
+                    } else {
+                        // Batched prefill, capped per call. Two reasons, and the
+                        // second one is not Gemma's: the per-call transient
+                        // buffers (attention/MLP scratch) scale with the CHUNK's
+                        // token count rather than with the cache, and Gemma's
+                        // sliding ring only has `window + chunk` slack so a store
+                        // must never overwrite a row a later row in the same pass
+                        // still reads. A prompt shorter than the cap runs exactly
+                        // one chunk, i.e. the single call this used to make.
+                        let chunkCap = prefillChunkCap(for: modelConfig)
                         var chunkedOk = true
                         var chunkStart = 0
                         var chunkIndex = 0
-                        let totalPrefillChunks = max(1, (prefillTokens.count + gemmaPrefillChunkCap - 1) / gemmaPrefillChunkCap)
+                        let totalPrefillChunks = max(1, (prefillTokens.count + chunkCap - 1) / chunkCap)
                         while chunkStart < prefillTokens.count {
                             if Task.isCancelled { chunkedOk = false; break }
-                            let chunkEnd = min(chunkStart + gemmaPrefillChunkCap, prefillTokens.count)
+                            let chunkEnd = min(chunkStart + chunkCap, prefillTokens.count)
                             let chunk = Array(prefillTokens[chunkStart..<chunkEnd])
-                        if !runLayerWisePrefill(promptTokens: chunk, startPos: UInt32(startPos) + UInt32(chunkStart), chunkIndex: chunkIndex, chunkCount: totalPrefillChunks, prefillProgress: { s, sp, rs in emit(.prefillProgress(status: s, speed: sp, rssGB: rs)) }) {
-                                print("❌ [PREFILL] Gemma chunked prefill failed at tokens \(chunkStart)..<\(chunkEnd) — see prior diagnostics for the failing layer/buffer.")
+                            let chunkOk = runOnLargeStack {
+                                runLayerWisePrefill(promptTokens: chunk, startPos: UInt32(startPos) + UInt32(chunkStart), chunkIndex: chunkIndex, chunkCount: totalPrefillChunks, prefillProgress: { s, sp, rs in emit(.prefillProgress(status: s, speed: sp, rssGB: rs)) })
+                            }
+                            if !chunkOk {
+                                print("❌ [PREFILL] Chunked prefill failed at tokens \(chunkStart)..<\(chunkEnd) — see prior diagnostics for the failing layer/buffer.")
                                 chunkedOk = false
                                 break
                             }
@@ -10665,8 +10716,6 @@ if layer.attnGateProjTensor != nil,
                             chunkIndex += 1
                         }
                         ok = chunkedOk
-                    } else {
-                    ok = runLayerWisePrefill(promptTokens: prefillTokens, startPos: UInt32(startPos), prefillProgress: { s, sp, rs in emit(.prefillProgress(status: s, speed: sp, rssGB: rs)) })
                     }
                     if !ok {
                         PrefillTransientPool.shared.drain()
@@ -10709,8 +10758,10 @@ if layer.attnGateProjTensor != nil,
                     jetSpecTotalDraftProposed += 1
                     jetSpecMeanTau = Double(jetSpecTotalDraftAccepted) / Double(max(jetSpecTotalDraftProposed, 1))
                 } else {
-                    let ok = autoreleasepool {
-                        runTokenForward(tokenId: currentTokenId, step: currentStep, computeLogits: true, wait: true)
+                    let ok = runOnLargeStack {
+                        autoreleasepool {
+                            runTokenForward(tokenId: currentTokenId, step: currentStep, computeLogits: true, wait: true)
+                        }
                     }
                     if !ok {
                         let fwdCancelled = Task.isCancelled
@@ -10763,6 +10814,18 @@ if layer.attnGateProjTensor != nil,
                         let tokText = (try? tokenizer.decode(ids: [nextToken])) ?? ""
                         print("[Autoregressive] Step \(tokensGenerated): nextToken=\(nextToken) ('\(tokText)') logits[nextToken]=\(logitsPtr[Int(nextToken)])")
                     }
+                    // `dynamoe_dump_logits` writes every decode step's full logit
+                    // vector, so a divergence from an independent reference can be
+                    // located by position instead of argued about. Off in production.
+                    if UserDefaults.standard.bool(forKey: "dynamoe_dump_logits") {
+                        dumpDecodeLogits(
+                            logitsPtr,
+                            vocabSize: Int(vocabSize),
+                            step: Int(currentStep),
+                            chosen: nextToken,
+                            context: contextTokens
+                        )
+                    }
                     acceptedBatch = [nextToken]
                 }
 
@@ -10774,7 +10837,13 @@ if layer.attnGateProjTensor != nil,
                     let isLingEos = (modelConfig?.isLingModel == true) && (nextToken == 156895 || nextToken == 156892)
                     let isSparkEos = (modelConfig?.isSparkModel == true) && (nextToken == 1 || nextToken == 2 || nextToken == 7)
                     let isGemma4Eos = (modelConfig?.isGemma4Model == true) && (nextToken == 1 || nextToken == 106 || nextToken == 50)
-                    if nextToken == eosTokenId || nextToken == 248044 || nextToken == 248046 || nextToken == 166101 || nextToken == 166102 || isLingEos || isSparkEos || isGemma4Eos {
+                    // Nanbeige 4.3's `<|im_end|>` (166101) is the checkpoint's own
+                    // `eos_token_id` and `<|endoftext|>` (166102) its extra special
+                    // token. Both ids live INSIDE a 166,912-row vocabulary, so they
+                    // are gated on the family instead of matching on every model.
+                    let isNanbeigeEos = (modelConfig?.isNanbeige43Model == true) && (nextToken == 166101 || nextToken == 166102)
+                    let declaredEos = modelConfig?.effectiveEosTokenIds ?? [Int(eosTokenId)]
+                    if nextToken == eosTokenId || declaredEos.contains(Int(nextToken)) || nextToken == 248044 || nextToken == 248046 || isLingEos || isSparkEos || isGemma4Eos || isNanbeigeEos {
                         shouldBreak = true
                         breakReasonText = "eos-token(\(nextToken))"
                         break
@@ -10988,8 +11057,10 @@ if layer.attnGateProjTensor != nil,
                 var backfillFailed = false
                 while backfillPos < totalContextTokens {
                     if Task.isCancelled { break }
-                    let ok = autoreleasepool {
-                        runTokenForward(tokenId: contextTokens[backfillPos], step: UInt32(backfillPos), computeLogits: false, wait: true)
+                    let ok = runOnLargeStack {
+                        autoreleasepool {
+                            runTokenForward(tokenId: contextTokens[backfillPos], step: UInt32(backfillPos), computeLogits: false, wait: true)
+                        }
                     }
                     if !ok {
                         backfillFailed = true

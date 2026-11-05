@@ -268,7 +268,10 @@ public class LocalModelManager: ObservableObject {
         return nil
     }
 
-    private func inspectModelDirectory(dirUrl: URL, customRepoId: String?) -> DiscoveredModel? {
+    /// Internal rather than private so `Nanbeige43DiscoveryTests` can exercise
+    /// the real scan (arch label, thinking flag, precision label) instead of a
+    /// re-implementation of its rules.
+    func inspectModelDirectory(dirUrl: URL, customRepoId: String?) -> DiscoveredModel? {
         let fileManager = FileManager.default
         let dirPath = dirUrl.path
 
@@ -342,12 +345,24 @@ public class LocalModelManager: ObservableObject {
             }
 
             let isGemma4 = archLower.contains("gemma4") || (rawModelType?.localizedCaseInsensitiveContains("gemma4") ?? false) || textType.localizedCaseInsensitiveContains("gemma4")
+            // Nanbeige 4.3 is `llama`-typed, so `architectures[0]` is
+            // "LlamaForCausalLM" and matches no name branch: the family can only
+            // be named from the checkpoint's own shape.
+            let isNanbeige43 = ModelConfig.isNanbeige43Shape(
+                modelType: rawModelType,
+                architectures: archs,
+                vocabSize: json["vocab_size"] as? Int,
+                hiddenSize: json["hidden_size"] as? Int,
+                layerCount: json["num_hidden_layers"] as? Int
+            )
             if textType.localizedCaseInsensitiveContains("deepseek_v41") || archLower.contains("deepseekv41") || (rawModelType?.localizedCaseInsensitiveContains("deepseek_v41") ?? false) {
                 architectureName = DeepSeekV41Availability.isRuntimeAvailable
                     ? "DeepSeek V4.1 Flash (CED / CSA2 MoE)"
                     : "DeepSeek V4.1 Flash (CED / CSA2 MoE, runtime not available)"
             } else if isGemma4 {
                 architectureName = isMoE ? "Gemma 4 Hybrid Attention MoE" : "Gemma 4 Hybrid Attention"
+            } else if isNanbeige43 {
+                architectureName = isMoE ? "Dense/MoE Transformer" : "Nanbeige Transformer (33B Dense)"
             } else if archString.localizedCaseInsensitiveContains("qwen3_5") || archString.localizedCaseInsensitiveContains("ornith") || (rawModelType?.localizedCaseInsensitiveContains("qwen3_5") ?? false) || (rawModelType?.localizedCaseInsensitiveContains("ornith") ?? false) {
                 architectureName = isMoE ? "Hybrid SSM-MoE" : "Hybrid SSM-Dense"
             } else if archString.localizedCaseInsensitiveContains("nanbeige") {
@@ -372,7 +387,7 @@ public class LocalModelManager: ObservableObject {
                 let mode = quant["mode"] as? String ?? "Affine"
                 quantization = "MLX \(bits)-Bit (\(mode.capitalized))"
             } else if let dtype = json["torch_dtype"] as? String {
-                quantization = dtype
+                quantization = Self.dtypeLabel(dtype)
             }
 
             // DeepSeek V4.1 ships one FP8 recipe for the dense weights and a
@@ -384,6 +399,13 @@ public class LocalModelManager: ObservableObject {
                let quant = quantization, quant.contains("FP8") {
                 quantization = "FP8 + MXFP4 experts"
             }
+        }
+
+        // A dense repack replaces the precision the row would otherwise report
+        // from `torch_dtype`, which describes the checkpoint on disk and not what
+        // the engine actually reads.
+        if let repacked = DenseRepacker.quantizedFormat(dir: dirUrl) {
+            quantization = repacked.displayName
         }
 
         let tokPath = dirUrl.appendingPathComponent("tokenizer.json").path
@@ -400,36 +422,15 @@ public class LocalModelManager: ObservableObject {
 
         let formattedSize = ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
 
-        // Check if model supports thinking / reasoning (pre-computed on background scanning thread)
-        var supportsThinking = false
-        let nameLower = displayName.lowercased()
-        let repoLower = repoId.lowercased()
-        let typeLower = (rawModelType ?? "").lowercased()
-        let archLower = architectureName.lowercased()
-        let pathLower = dirPath.lowercased()
-
-        if nameLower.contains("nanbeige") || repoLower.contains("nanbeige") || typeLower.contains("nanbeige") || archLower.contains("nanbeige") || pathLower.contains("nanbeige") ||
-           nameLower.contains("ornith") || repoLower.contains("ornith") || typeLower.contains("ornith") || archLower.contains("ornith") || pathLower.contains("ornith") ||
-           nameLower.contains("qwen") || repoLower.contains("qwen") || typeLower.contains("qwen") || archLower.contains("qwen") || pathLower.contains("qwen") ||
-           nameLower.contains("deepseek") || repoLower.contains("deepseek") || typeLower.contains("deepseek") || archLower.contains("deepseek") || pathLower.contains("deepseek") ||
-           nameLower.contains("r1") || repoLower.contains("r1") || nameLower.contains("reason") || repoLower.contains("reason") ||
-           nameLower.contains("qwq") || repoLower.contains("qwq") || typeLower.contains("qwq") ||
-           nameLower.contains("glm") || repoLower.contains("glm") || typeLower.contains("glm") ||
-           nameLower.contains("nemotron") || repoLower.contains("nemotron") || typeLower.contains("nemotron") ||
-           nameLower.contains("think") || repoLower.contains("think") {
-            supportsThinking = true
-        } else {
-            // Check only lightweight config templates (never huge tokenizer.json)
-            for fName in ["tokenizer_config.json", "chat_template.jinja"] {
-                let fUrl = dirUrl.appendingPathComponent(fName)
-                if fileManager.fileExists(atPath: fUrl.path), let content = try? String(contentsOf: fUrl, encoding: .utf8) {
-                    if content.contains("<think>") || content.contains("enable_thinking") || content.contains("<|thought|>") || content.contains("reasoning_content") {
-                        supportsThinking = true
-                        break
-                    }
-                }
-            }
-        }
+        // Check if model supports thinking / reasoning (pre-computed on background scanning thread).
+        // One detector, shared with the engine's prompt assembly: the local
+        // name list this used to carry could not see a renamed copy, and could
+        // disagree with the toggle the turn actually renders.
+        let supportsThinking = ModelConfig.supportsThinking(
+            config: ModelConfig.load(from: dirUrl),
+            modelName: repoId,
+            modelPath: dirPath
+        )
 
         // Graded thinking levels (Spark X2.6 `reasoning_effort`): sniff the
         // model's own chat template, on this background scanning thread.
@@ -459,6 +460,19 @@ public class LocalModelManager: ObservableObject {
             supportsThinkingLevels: supportsThinkingLevels,
             supportsVision: supportsVision
         )
+    }
+
+    /// A `torch_dtype` rendered the way the rest of the UI spells precisions
+    /// ("BF16"), instead of echoing the checkpoint's raw "bfloat16".
+    nonisolated static func dtypeLabel(_ raw: String) -> String {
+        switch raw.lowercased() {
+        case "bfloat16": return "BF16"
+        case "float16", "half": return "FP16"
+        case "float32", "float": return "FP32"
+        case "float8_e4m3fn", "float8_e4m3fnuz": return "FP8 (E4M3)"
+        case "float8_e5m2", "float8_e5m2fnuz": return "FP8 (E5M2)"
+        default: return raw.uppercased()
+        }
     }
 
     private func formatDisplayName(repoId: String) -> String {

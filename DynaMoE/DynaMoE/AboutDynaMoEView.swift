@@ -378,7 +378,7 @@ struct AboutDynaMoEView: View {
                                 .font(.system(size: 11))
                                 .foregroundColor(.secondary)
 
-                            Text("• Supported model weights, architectures, and tokenizers (including DeepSeek-R1, Qwen 2.5/3.5, Ornith 1.5, Nanbeige 2, and others) are the property of their respective creators and research labs, and are subject to their original model licenses and acceptable use policies.")
+                            Text("• Supported model weights, architectures, and tokenizers (including DeepSeek-R1, Qwen 2.5/3.5, Ornith 1.5, Nanbeige 2/4.3, and others) are the property of their respective creators and research labs, and are subject to their original model licenses and acceptable use policies.")
                                 .font(.system(size: 11))
                                 .foregroundColor(.secondary)
 

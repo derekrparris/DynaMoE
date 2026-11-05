@@ -2866,10 +2866,9 @@ struct ContentView: View {
                        !cleanMsg.contains(DeepSeekV41ToolDialect.dsmlTag),
                        !cleanMsg.contains("<tool_call") {
                         for call in calls {
-                            body += "\n" + DeepSeekV41ToolDialect.callBlock(
-                                name: call.name,
-                                arguments: call.arguments
-                            )
+                            body += "\n" + (modelConfig?.isNanbeige43Model == true
+                                ? ChatPromptFormatter.nanbeigeToolCallBlock(name: call.name, arguments: call.arguments)
+                                : DeepSeekV41ToolDialect.callBlock(name: call.name, arguments: call.arguments))
                         }
                     }
                     turns.append(.init(role: .assistant, text: body))

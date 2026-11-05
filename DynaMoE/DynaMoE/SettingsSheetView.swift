@@ -645,6 +645,28 @@ struct SettingsSheetView: View {
                                                 Label("FlashMoE Repack", systemImage: "bolt.badge.automatic.fill")
                                             }
                                         }
+
+                                        // A dense checkpoint has no routed experts
+                                        // to repack around, and its per-token cost
+                                        // is the whole weight set, so quantizing is
+                                        // the only lever. Gated on the model row's
+                                        // own label, which `LocalModelManager`
+                                        // derives from the repack manifest.
+                                        if !model.isMoE,
+                                           !isFlashMoEPacked,
+                                           (model.quantization ?? "").contains("dense repack") == false {
+                                            Divider()
+                                            Button {
+                                                repackDenseModel(model, quantization: .q8)
+                                            } label: {
+                                                Label("Quantize to Q8", systemImage: "arrow.down.circle")
+                                            }
+                                            Button {
+                                                repackDenseModel(model, quantization: .q4)
+                                            } label: {
+                                                Label("Quantize to Q4", systemImage: "arrow.down.circle.fill")
+                                            }
+                                        }
                                     } label: {
                                         Image(systemName: "ellipsis.circle")
                                             .font(.system(size: 15))
@@ -2885,6 +2907,41 @@ struct SettingsSheetView: View {
         .padding(12)
         .background(Color.purple.opacity(0.05))
         .cornerRadius(10)
+    }
+
+    /// Dense counterpart of `repackModel`: no expert axis, so the whole weight set
+    /// becomes one contiguous quantized blob (`dense_weights.bin` + `.json`) next
+    /// to the snapshot, and the engine prefers it on the next load.
+    private func repackDenseModel(_ model: DiscoveredModel, quantization: DenseRepacker.Quantization) {
+        repackingModelId = model.id
+        repackProgress = 0.0
+        repackStatus = "Preparing the dense repack…"
+        repackError = nil
+
+        Task.detached(priority: .userInitiated) {
+            do {
+                let dir = URL(fileURLWithPath: model.snapshotPath)
+                try DenseRepacker.shared.repackSafetensors(
+                    sourceDir: dir,
+                    outputDir: dir,
+                    quantization: quantization
+                ) { prog, msg in
+                    Task { @MainActor in
+                        self.repackProgress = prog
+                        self.repackStatus = msg
+                    }
+                }
+                Task { @MainActor in
+                    self.repackingModelId = nil
+                    self.localModelManager.scanLocalModels()
+                }
+            } catch {
+                Task { @MainActor in
+                    self.repackingModelId = nil
+                    self.repackError = error.localizedDescription
+                }
+            }
+        }
     }
 
     private func repackModel(_ model: DiscoveredModel) {

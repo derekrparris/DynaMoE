@@ -4295,18 +4295,21 @@ final class DynaMoETests: XCTestCase {
     }
 
     // Pure-logic coverage of the JetSpec eligibility gate (no model required).
-    // The FP8 exclusion is the only guard keeping the F16/FP32-only tree
-    // store/verify kernels away from the 1-byte-per-element FP8 cache.
+    // Two guards matter: the FP8 exclusion keeps the F16/FP32-only tree
+    // store/verify kernels away from the 1-byte-per-element FP8 cache, and the
+    // routed-expert requirement keeps the tree off a dense checkpoint, where its
+    // expert-budget topology describes nothing (see `isJetSpecEligible`).
     func testJetSpecEligibilityExcludesFP8KVCache() {
-        // Non-recurrent, non-Spark, user-enabled: eligible under FP16 and FP32.
-        XCTAssertTrue(isJetSpecEligible(jetSpecEnabled: true, hasLinearRecurrence: false, isSparkModel: false, kvPrecision: .fp16))
-        XCTAssertTrue(isJetSpecEligible(jetSpecEnabled: true, hasLinearRecurrence: false, isSparkModel: false, kvPrecision: .fp32))
+        // Non-recurrent, non-Spark, MoE, user-enabled: eligible under FP16 and FP32.
+        XCTAssertTrue(isJetSpecEligible(jetSpecEnabled: true, hasLinearRecurrence: false, isSparkModel: false, hasRoutedExperts: true, kvPrecision: .fp16))
+        XCTAssertTrue(isJetSpecEligible(jetSpecEnabled: true, hasLinearRecurrence: false, isSparkModel: false, hasRoutedExperts: true, kvPrecision: .fp32))
         // FP8 must bypass even for an otherwise-eligible model.
-        XCTAssertFalse(isJetSpecEligible(jetSpecEnabled: true, hasLinearRecurrence: false, isSparkModel: false, kvPrecision: .fp8))
-        // Recurrence, Spark, and the user toggle still bypass regardless of precision.
-        XCTAssertFalse(isJetSpecEligible(jetSpecEnabled: true, hasLinearRecurrence: true, isSparkModel: false, kvPrecision: .fp16))
-        XCTAssertFalse(isJetSpecEligible(jetSpecEnabled: true, hasLinearRecurrence: false, isSparkModel: true, kvPrecision: .fp32))
-        XCTAssertFalse(isJetSpecEligible(jetSpecEnabled: false, hasLinearRecurrence: false, isSparkModel: false, kvPrecision: .fp16))
+        XCTAssertFalse(isJetSpecEligible(jetSpecEnabled: true, hasLinearRecurrence: false, isSparkModel: false, hasRoutedExperts: true, kvPrecision: .fp8))
+        // Recurrence, Spark, dense, and the user toggle still bypass regardless of precision.
+        XCTAssertFalse(isJetSpecEligible(jetSpecEnabled: true, hasLinearRecurrence: true, isSparkModel: false, hasRoutedExperts: true, kvPrecision: .fp16))
+        XCTAssertFalse(isJetSpecEligible(jetSpecEnabled: true, hasLinearRecurrence: false, isSparkModel: true, hasRoutedExperts: true, kvPrecision: .fp32))
+        XCTAssertFalse(isJetSpecEligible(jetSpecEnabled: false, hasLinearRecurrence: false, isSparkModel: false, hasRoutedExperts: true, kvPrecision: .fp16))
+        XCTAssertFalse(isJetSpecEligible(jetSpecEnabled: true, hasLinearRecurrence: false, isSparkModel: false, hasRoutedExperts: false, kvPrecision: .fp16))
     }
 
     func testKVCacheFP8ScalePrefixSurvivesSpliceRealloc() throws {
@@ -4684,7 +4687,7 @@ final class DynaMoETests: XCTestCase {
         // Even when user has JetSpec enabled, recurrent Gated DeltaNet models MUST bypass speculative tree execution
         // because multi-node tree drafting disrupts continuous causal convolution and O(1) state updates.
         let userJetSpecEnabled = true
-        let effectiveJetSpec = isJetSpecEligible(jetSpecEnabled: userJetSpecEnabled, hasLinearRecurrence: hasLinearRecurrence, isSparkModel: false, kvPrecision: .fp16)
+        let effectiveJetSpec = isJetSpecEligible(jetSpecEnabled: userJetSpecEnabled, hasLinearRecurrence: hasLinearRecurrence, isSparkModel: false, hasRoutedExperts: true, kvPrecision: .fp16)
         XCTAssertFalse(effectiveJetSpec, "effectiveJetSpec must be false for Ornith 1.5 9B to ensure 100% coherent execution")
 
         // 3. Verify high-performance Top-K / Top-P sampling with User's Exact Coding Settings:

@@ -597,6 +597,134 @@ fn try_load_flash_moe(search_path: &Path) -> Option<(Vec<ShardHandle>, Vec<Tenso
     None
 }
 
+/// The dense (non-MoE) repack manifest: one entry per logical tensor, each a
+/// byte range in `dense_weights.bin`. A quantized tensor is three entries (the
+/// packed weight, its per-group scales and its per-group biases), named
+/// `<name>`, `<name>.scale` and `<name>.bias`, because the Swift side resolves a
+/// projection's companions by name substring and its quantized path requires
+/// BOTH (a Q8 weight without a bias sibling silently takes the FP8 branch).
+#[derive(Deserialize, Debug)]
+struct DenseRepackJson {
+    #[serde(default)]
+    pub quantization: String,
+    #[serde(default)]
+    pub group_size: u32,
+    #[serde(default)]
+    pub tensors: Vec<DenseRepackTensorEntry>,
+}
+
+#[derive(Deserialize, Debug)]
+struct DenseRepackTensorEntry {
+    pub name: String,
+    pub dtype: String,
+    pub shape: Vec<u64>,
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// Loads a dense repack (`dense_weights.json` + `dense_weights.bin`) beside the
+/// snapshot, if one is present.
+///
+/// Failure is always a fallback to the safetensors index rather than an error: a
+/// truncated or half-written repack must never be traded for a model that
+/// "loads" and then reads offsets the file does not have. Between choosing the
+/// two, the checks are completeness (every entry inside the file), the format
+/// (group size 64, which is baked into the kernels, and a known quantization)
+/// and at least one tensor.
+fn try_load_dense_repack(search_path: &Path) -> Option<(Vec<ShardHandle>, Vec<TensorMetadata>)> {
+    let base_dir = if search_path.is_file() {
+        search_path.parent().unwrap_or(Path::new(""))
+    } else {
+        search_path
+    };
+
+    let mut candidate_dirs = vec![base_dir.to_path_buf()];
+    let snapshots_dir = base_dir.join("snapshots");
+    if snapshots_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    candidate_dirs.push(entry.path());
+                }
+            }
+        }
+    }
+
+    for dir in candidate_dirs {
+        let manifest_path = dir.join("dense_weights.json");
+        let weights_path = dir.join("dense_weights.bin");
+        if !manifest_path.is_file() || !weights_path.is_file() {
+            continue;
+        }
+        let manifest = std::fs::read_to_string(&manifest_path).ok()?;
+        let manifest: DenseRepackJson = serde_json::from_str(&manifest).ok()?;
+        if manifest.tensors.is_empty() {
+            return None;
+        }
+        // The kernels hardcode group size 64; a manifest that says otherwise
+        // describes a layout this engine would read wrong.
+        if manifest.group_size != 0 && manifest.group_size != 64 {
+            eprintln!(
+                "⚠️ [DenseRepack] refusing {}: group_size {} is not 64",
+                manifest_path.display(),
+                manifest.group_size
+            );
+            return None;
+        }
+        if !manifest.quantization.is_empty()
+            && !matches!(manifest.quantization.as_str(), "bf16" | "q8" | "q4")
+        {
+            eprintln!(
+                "⚠️ [DenseRepack] refusing {}: unknown quantization {:?}",
+                manifest_path.display(),
+                manifest.quantization
+            );
+            return None;
+        }
+
+        let file = File::open(&weights_path).ok()?;
+        let file_len = file.metadata().ok()?.len();
+        for entry in &manifest.tensors {
+            if entry.offset + entry.size > file_len {
+                eprintln!(
+                    "⚠️ [DenseRepack] refusing {}: {} runs to {} past the {} byte blob",
+                    manifest_path.display(),
+                    entry.name,
+                    entry.offset + entry.size,
+                    file_len
+                );
+                return None;
+            }
+        }
+        let mmap = unsafe { MmapOptions::new().map(&file) }.ok()?;
+
+        let mut tensor_list = Vec::with_capacity(manifest.tensors.len());
+        for entry in manifest.tensors {
+            let (category, layer_index, expert_id) = parse_layer_and_expert(&entry.name);
+            tensor_list.push(TensorMetadata {
+                name: entry.name,
+                shape_display: format!("{:?}", entry.shape),
+                dtype: entry.dtype,
+                size_mb: entry.size as f64 / (1024.0 * 1024.0),
+                shard_index: 0,
+                offset_start: entry.offset,
+                offset_end: entry.offset + entry.size,
+                category,
+                layer_index,
+                expert_id,
+            });
+        }
+        tensor_list.sort_by(|a, b| a.name.cmp(&b.name));
+        let shards = vec![ShardHandle {
+            filename: "dense_weights.bin".to_string(),
+            mmap,
+        }];
+        return Some((shards, tensor_list));
+    }
+
+    None
+}
+
 #[derive(uniffi::Object)]
 pub struct DynaMoeEngine {
     shards: Vec<ShardHandle>,
@@ -612,6 +740,16 @@ impl DynaMoeEngine {
 
         // 0. Try FlashMoE Q4 Model Format
         if let Some((shards, tensors)) = try_load_flash_moe(&path).or_else(|| try_load_flash_moe(&resolved_target)) {
+            return Ok(Arc::new(Self {
+                shards,
+                custom_tensors: Some(tensors),
+            }));
+        }
+
+        // 0b. Try the DENSE repack (`dense_weights.bin` + `.json`). Same idea for
+        // a model with no routed experts, whose weights would otherwise be read
+        // at BF16 for every token.
+        if let Some((shards, tensors)) = try_load_dense_repack(&path).or_else(|| try_load_dense_repack(&resolved_target)) {
             return Ok(Arc::new(Self {
                 shards,
                 custom_tensors: Some(tensors),
@@ -2346,6 +2484,51 @@ mod tests {
         assert!(ids.contains(&130976), "<|Bot|> token id present");
         assert!(ids.contains(&130973), "<|User|> token id present");
         assert!(ids.contains(&130972), "<|System|> token id present");
+    }
+
+    /// Nanbeige 4.3: the chat template's own markers are single added tokens, and
+    /// the prompt it builds carries exactly ONE begin-of-sequence marker.
+    ///
+    /// The checkpoint declares `add_bos_token: true` with `bos_token` =
+    /// `<|im_start|>`, so the risk is a duplicated BOS: the template's leading
+    /// `<|im_start|>` is itself token 166100, and `encode` passes
+    /// `add_special_tokens: false`, which makes the tokenizer's own post-processor
+    /// inert. Asserting `ids[0]` pins BOTH halves — a post-processor that fired
+    /// would put `<s>` (id 1) in front of it.
+    #[test]
+    fn test_nanbeige43_tokenizer_special_tokens() {
+        let snap = "/Users/derekparris/.cache/huggingface/hub/models--Nanbeige--Nanbeige4.3-33B/snapshots/df919e1e2cf077a22204c78b6c826bf3db18bc08";
+        let tok_path = format!("{}/tokenizer.json", snap);
+        if !PathBuf::from(&tok_path).exists() {
+            println!("Nanbeige 4.3 tokenizer snapshot not present; skipping");
+            return;
+        }
+        let tok = DynaMoeTokenizer::new(tok_path).unwrap();
+
+        // Every literal below is checked against the checkpoint's own decode, so a
+        // tag mangled in this source fails here instead of asserting against itself.
+        let tag_ok = format!("<{}>", "think");
+        assert_eq!(tok.decode(vec![166103]).unwrap(), tag_ok, "166103 is the reasoning opener");
+        assert_eq!(tok.decode(vec![166104]).unwrap(), format!("</{}>", "think"));
+        assert_eq!(tok.decode(vec![166105]).unwrap(), "<tool_call>");
+        assert_eq!(tok.decode(vec![166106]).unwrap(), "</tool_call>");
+
+        let prompt = format!(
+            "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n{tag_ok}\n"
+        );
+        let ids = tok.encode(prompt).unwrap();
+        assert_eq!(ids[0], 166100, "the template's own <|im_start|> is the BOS, not a second marker");
+        assert_eq!(ids[ids.len() - 2], 166103, "the reasoning channel opens on one added token (then its newline)");
+        assert!(ids.contains(&166101), "<|im_end|> is one id inside the prompt");
+        assert!(!ids.contains(&1), "no duplicated <s> BOS");
+
+        // The tool-result turn is a USER turn wrapped in <tool_response>.
+        let call = format!(
+            "<|im_start|>assistant\n{tag_ok}\n<|im_end|>\n<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n"
+        );
+        let call_ids = tok.encode(call).unwrap();
+        assert!(call_ids.contains(&166101));
+        assert_eq!(call_ids[0], 166100);
     }
 
     /// The compressed map is what the whole Engram hash is built on, so its two

@@ -195,6 +195,44 @@ public struct GenerationProfileSettings: Codable, Equatable, Hashable {
             }
         }
 
+        // Nanbeige 4.3 is a dense 33B tuned for agentic tool use. Its card quotes
+        // temperature 1.0 / top_p 0.95 for agentic work and 0.6 / 0.95 for plain
+        // reasoning, and NO repetition penalty (unlike the R1-style families).
+        if nameLower.contains("nanbeige") {
+            switch type {
+            case .coder:
+                return GenerationProfileSettings(
+                    temperature: 1.00,
+                    topP: 0.95,
+                    minP: 0.00,
+                    topK: 20,
+                    repetitionPenalty: 1.00,
+                    presencePenalty: 0.00,
+                    maxNewTokens: 65536,
+                    systemPrompt: "You are a helpful, respectful, and honest AI assistant.",
+                    jetSpecEnabled: false,
+                    jetSpecMaxDepth: 3,
+                    jetSpecBranchingFactor: 2,
+                    jetSpecMaxExpertCap: 8
+                )
+            case .assistant:
+                return GenerationProfileSettings(
+                    temperature: 0.60,
+                    topP: 0.95,
+                    minP: 0.00,
+                    topK: 20,
+                    repetitionPenalty: 1.00,
+                    presencePenalty: 0.00,
+                    maxNewTokens: 262144,
+                    systemPrompt: "You are a helpful, respectful, and honest AI assistant.",
+                    jetSpecEnabled: false,
+                    jetSpecMaxDepth: 3,
+                    jetSpecBranchingFactor: 2,
+                    jetSpecMaxExpertCap: 8
+                )
+            }
+        }
+
         // Generic fallback defaults
         switch type {
         case .coder:
@@ -327,6 +365,12 @@ public final class ModelProfileManager: ObservableObject {
                     return settings
                 }
             }
+        } else if keyLower.contains("nanbeige") || idLower.contains("nanbeige") {
+            for (candidateKey, profiles) in profilesByModel where candidateKey.lowercased().contains("nanbeige") {
+                if let settings = profiles[type.rawValue] {
+                    return settings
+                }
+            }
         }
 
         // 5. Fallback to model-specific default
@@ -399,7 +443,16 @@ public final class ModelProfileManager: ObservableObject {
             "qwen"
         ]
 
-        let seedFlagKey = "dynamoe_seeded_official_profiles_v3"
+        let nanbeigeCoder = GenerationProfileSettings.defaultFor(type: .coder, modelName: "nanbeige")
+        let nanbeigeAssistant = GenerationProfileSettings.defaultFor(type: .assistant, modelName: "nanbeige")
+
+        let nanbeigeKeys = [
+            "nanbeige/nanbeige4.3-33b",
+            "nanbeige4.3-33b",
+            "nanbeige"
+        ]
+
+        let seedFlagKey = "dynamoe_seeded_official_profiles_v4"
         let alreadySeeded = UserDefaults.standard.bool(forKey: seedFlagKey)
 
         var changed = false
@@ -414,6 +467,12 @@ public final class ModelProfileManager: ObservableObject {
                 profilesByModel[key] = [
                     ModelProfileType.coder.rawValue: qwenCoder,
                     ModelProfileType.assistant.rawValue: qwenAssistant
+                ]
+            }
+            for key in nanbeigeKeys {
+                profilesByModel[key] = [
+                    ModelProfileType.coder.rawValue: nanbeigeCoder,
+                    ModelProfileType.assistant.rawValue: nanbeigeAssistant
                 ]
             }
             UserDefaults.standard.set(true, forKey: seedFlagKey)
@@ -433,6 +492,15 @@ public final class ModelProfileManager: ObservableObject {
                     profilesByModel[key] = [
                         ModelProfileType.coder.rawValue: qwenCoder,
                         ModelProfileType.assistant.rawValue: qwenAssistant
+                    ]
+                    changed = true
+                }
+            }
+            for key in nanbeigeKeys {
+                if profilesByModel[key] == nil {
+                    profilesByModel[key] = [
+                        ModelProfileType.coder.rawValue: nanbeigeCoder,
+                        ModelProfileType.assistant.rawValue: nanbeigeAssistant
                     ]
                     changed = true
                 }

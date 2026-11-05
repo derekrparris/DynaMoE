@@ -471,6 +471,14 @@ public struct ModelConfig: Codable {
         if let topArray = eosTokenId?.array, !topArray.isEmpty {
             return topArray
         }
+        // A single declared EOS is a stop id in its own right. Without this the
+        // fallback below answers the DEFAULT family's pair, so a checkpoint whose
+        // `eos_token_id` is one number (Nanbeige 4.3: 166101) never had its stop
+        // token injected as a candidate and could only stop when it happened to
+        // rank inside top-K.
+        if let declared = (textConfig?.eosTokenId?.single ?? eosTokenId?.single) {
+            return [declared]
+        }
         return [248044, 248046]
     }
 
@@ -621,6 +629,87 @@ public struct ModelConfig: Codable {
             || textType.contains("deepseek_v41")
             || archs.contains(where: { $0.contains("deepseekv41") })
     }
+
+    /// Nanbeige 4.3 (33B dense). The checkpoint declares
+    /// `architectures: ["LlamaForCausalLM"]` and `model_type: "llama"`, so the
+    /// name says nothing about the family and identity has to come from the
+    /// checkpoint's own shape. No forward-pass branch depends on this flag: a
+    /// plain Llama already runs on the generic dense path. What it selects is
+    /// the family's chat-template deltas (`<tool_response>` tool turns), its EOS
+    /// pair, and the display / profile / documentation entries.
+    public var isNanbeige43Model: Bool {
+        Self.isNanbeige43Shape(
+            modelType: modelType,
+            architectures: architectures,
+            vocabSize: effectiveVocabSize,
+            hiddenSize: effectiveHiddenSize,
+            layerCount: effectiveNumHiddenLayers
+        )
+    }
+
+    /// The structural fingerprint, shared by the decoded config, the file-only
+    /// probe and the directory scanner so all three agree on what counts as
+    /// Nanbeige 4.3. Requires Llama typing (this family ships no marker of its
+    /// own) AND one of the checkpoint's two discriminators: the 166,912-row
+    /// vocabulary, or the 7168-wide / 52-layer stack.
+    nonisolated public static func isNanbeige43Shape(
+        modelType: String?,
+        architectures: [String]?,
+        vocabSize: Int?,
+        hiddenSize: Int?,
+        layerCount: Int?
+    ) -> Bool {
+        let rawType = (modelType ?? "").lowercased()
+        let archs = architectures?.map { $0.lowercased() } ?? []
+        guard rawType.contains("llama") || archs.contains(where: { $0.contains("llamaforcausallm") }) else {
+            return false
+        }
+        if vocabSize == 166912 { return true }
+        return hiddenSize == 7168 && layerCount == 52
+    }
+
+    /// File-only probe for call sites that run before a `ModelConfig` exists
+    /// (`LocalModelManager` scanning, `supportsThinking`). Reads the snapshot's
+    /// own `config.json`, so a renamed copy of the checkpoint is still
+    /// recognized; the path also matches Nanbeige's repository and snapshot
+    /// names, which is what a partially written snapshot has to fall back on.
+    nonisolated public static func isNanbeige43Directory(_ directory: URL) -> Bool {
+        let path = directory.path.lowercased().replacingOccurrences(of: " ", with: "")
+        if path.contains("nanbeige4.3") || path.contains("nanbeige43") {
+            return true
+        }
+        let configUrl = directory.appendingPathComponent("config.json")
+        guard let data = try? Data(contentsOf: configUrl),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        return isNanbeige43Shape(
+            modelType: json["model_type"] as? String,
+            architectures: json["architectures"] as? [String],
+            vocabSize: json["vocab_size"] as? Int,
+            hiddenSize: json["hidden_size"] as? Int,
+            layerCount: json["num_hidden_layers"] as? Int
+        )
+    }
+
+    /// `isNanbeige43Directory` with the config read memoized, for callers on a
+    /// per-turn path (prompt assembly). An empty or missing path is a cheap no.
+    nonisolated public static func isNanbeige43Snapshot(_ modelPath: String?) -> Bool {
+        guard let modelPath, !modelPath.isEmpty else { return false }
+        let path = modelPath as NSString
+        if let cached = nanbeige43Cache.object(forKey: path) {
+            return cached.boolValue
+        }
+        let directory = URL(fileURLWithPath: modelPath)
+        let isNanbeige43 = FileManager.default.fileExists(atPath: directory.path)
+            && isNanbeige43Directory(directory)
+        nanbeige43Cache.setObject(NSNumber(value: isNanbeige43), forKey: path)
+        return isNanbeige43
+    }
+
+    /// Scan-time detection runs off the main actor, so the shared cache must be
+    /// safe across threads; `NSCache` is.
+    nonisolated(unsafe) private static let nanbeige43Cache = NSCache<NSString, NSNumber>()
 
     /// Global-attention layers reuse the key projection as the value projection
     /// (`attention_k_eq_v`), and use `global_head_dim` with a reduced KV head count.
@@ -876,6 +965,16 @@ public struct ModelConfig: Codable {
         let typeStr = (config?.modelType ?? "").lowercased()
         let archStr = config?.architectures?.joined(separator: " ").lowercased() ?? ""
 
+        // Nanbeige 4.3 ships no mandatory persona: its template's default system
+        // line is only the fallback for a conversation that carries no system
+        // message at all, and this app always sends one. Checked FIRST and
+        // returned from, so the legacy Nanbeige-2 arms below (which carry a
+        // Chinese persona and a 22-layer topology probe) can never claim it.
+        if config?.isNanbeige43Model == true { return "" }
+        if config == nil, Self.isNanbeige43Snapshot(modelPath) {
+            return ""
+        }
+
         let isNanbeige = nameLower.contains("nanbeige") ||
                          pathLower.contains("nanbeige") ||
                          typeStr.contains("nanbeige") ||
@@ -980,6 +1079,11 @@ public struct ModelConfig: Codable {
         let pathLower = (modelPath ?? "").lowercased()
         let typeStr = (config?.modelType ?? "").lowercased()
         let archStr = config?.architectures?.joined(separator: " ").lowercased() ?? ""
+
+        // Structural first: this family is `llama`-typed, so a renamed copy has
+        // no name to match and only the checkpoint's own shape to go on.
+        if config?.isNanbeige43Model == true { return true }
+        if config == nil, Self.isNanbeige43Snapshot(modelPath) { return true }
 
         if nameLower.contains("nanbeige") || typeStr.contains("nanbeige") || archStr.contains("nanbeige") || pathLower.contains("nanbeige") {
             return true
