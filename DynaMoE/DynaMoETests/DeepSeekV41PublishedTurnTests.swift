@@ -4547,6 +4547,151 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         }
     }
 
+    /// One path, two protocols.
+    ///
+    /// Both protocols define `GET /v1/models` and `GET /v1/models/{id}` at the SAME
+    /// path, and their bodies do not agree: OpenAI is `object: "list"` with an epoch
+    /// `created`, Anthropic is `type: "model"` with an RFC 3339 `created_at`, a human
+    /// `display_name` and pagination cursors. The request's headers are therefore the
+    /// only evidence a route has, and a guess costs a decode failure inside a client's
+    /// own SDK. This walks both shapes on the real checkpoint and checks the display
+    /// name against the repository directory the snapshot lives in rather than against
+    /// a second copy of the mapping.
+    func testTheModelsRouteAnswersEachClientInItsOwnShape() async throws {
+        let snapshot = try snapshotDirectory()
+        let modelConfig = try XCTUnwrap(ModelConfig.load(from: snapshot))
+        let engine = try loadPublishedCheckpointIntoTheSharedEngine(snapshot)
+        defer {
+            unloadSharedEngine()
+            withExtendedLifetime(engine) {}
+        }
+        let servedId = snapshot.lastPathComponent
+        let repository = String(
+            snapshot.deletingLastPathComponent().deletingLastPathComponent().lastPathComponent
+                .dropFirst("models--".count)
+        ).replacingOccurrences(of: "--", with: "/")
+        let port = 8796
+
+        try await withLocalServer(on: port) { store in
+            let openAIList = try await fetchJSON(port: port, path: "/v1/models")
+            print("🔎 [dsv41 real] /v1/models (openai): \(Self.jsonText(openAIList.body))")
+            XCTAssertEqual(openAIList.status, 200)
+            XCTAssertEqual(openAIList.body["object"] as? String, "list")
+            let openAIModels = try XCTUnwrap(openAIList.body["data"] as? [[String: Any]])
+            XCTAssertEqual(try XCTUnwrap(openAIModels.first)["id"] as? String, servedId)
+            XCTAssertNotNil(openAIModels.first?["created"] as? Int)
+
+            for header in ["anthropic-version", "x-api-key"] {
+                let headers = [header: header == "x-api-key" ? "unused-key" : "2023-06-01"]
+                let list = try await fetchJSON(port: port, path: "/v1/models", headers: headers)
+                print("🔎 [dsv41 real] /v1/models (\(header)): \(Self.jsonText(list.body))")
+                XCTAssertEqual(list.status, 200)
+                XCTAssertNil(list.body["object"], "an Anthropic body is not an OpenAI list")
+                XCTAssertEqual(list.body["has_more"] as? Bool, false)
+                XCTAssertEqual(list.body["first_id"] as? String, servedId)
+                XCTAssertEqual(list.body["last_id"] as? String, servedId)
+                let models = try XCTUnwrap(list.body["data"] as? [[String: Any]])
+                let model = try XCTUnwrap(models.first)
+                XCTAssertEqual(model["type"] as? String, "model")
+                XCTAssertEqual(model["id"] as? String, servedId)
+                XCTAssertEqual(
+                    model["display_name"] as? String, repository,
+                    "the protocol asks for a human name, and the repository directory is where one exists"
+                )
+                let createdAt = try XCTUnwrap(model["created_at"] as? String)
+                XCTAssertNotNil(
+                    ISO8601DateFormatter().date(from: createdAt),
+                    "a client parses `created_at` as RFC 3339, so it must be one"
+                )
+                XCTAssertNil(model["object"], "OpenAI keys must never appear in an Anthropic model")
+            }
+
+            // The retrieve route answers the same object the list carries.
+            let openAIRetrieve = try await fetchJSON(port: port, path: "/v1/models/\(servedId)")
+            XCTAssertEqual(openAIRetrieve.status, 200)
+            XCTAssertEqual(openAIRetrieve.body["object"] as? String, "model")
+            XCTAssertEqual(openAIRetrieve.body["id"] as? String, servedId)
+            XCTAssertEqual(
+                openAIRetrieve.body["context_length"] as? Int,
+                modelConfig.effectiveMaxPositionEmbeddings,
+                "the retrieve carries the same facts the list does"
+            )
+
+            let anthropicRetrieve = try await fetchJSON(
+                port: port,
+                path: "/v1/models/\(servedId)",
+                headers: ["anthropic-version": "2023-06-01"]
+            )
+            print("🔎 [dsv41 real] /v1/models/\(servedId) (anthropic): \(Self.jsonText(anthropicRetrieve.body))")
+            XCTAssertEqual(anthropicRetrieve.status, 200)
+            XCTAssertEqual(anthropicRetrieve.body["type"] as? String, "model")
+            XCTAssertEqual(anthropicRetrieve.body["display_name"] as? String, repository)
+            XCTAssertNil(
+                anthropicRetrieve.body["has_more"],
+                "a retrieve answers the object, not a page of them"
+            )
+
+            // A name this server does not serve is a 404 in the caller's own
+            // envelope: the protocols spell the same condition differently.
+            let missingOpenAI = try await fetchJSON(port: port, path: "/v1/models/not-served")
+            XCTAssertEqual(missingOpenAI.status, 404)
+            let openAIError = try XCTUnwrap(missingOpenAI.body["error"] as? [String: Any])
+            XCTAssertEqual(openAIError["type"] as? String, "invalid_request_error")
+            XCTAssertEqual(openAIError["code"] as? String, "model_not_found")
+
+            let missingAnthropic = try await fetchJSON(
+                port: port,
+                path: "/v1/models/not-served",
+                headers: ["anthropic-version": "2023-06-01"]
+            )
+            XCTAssertEqual(missingAnthropic.status, 404)
+            XCTAssertEqual(missingAnthropic.body["type"] as? String, "error")
+            XCTAssertEqual(
+                (missingAnthropic.body["error"] as? [String: Any])?["type"] as? String,
+                "not_found_error"
+            )
+
+            let modelsRows = await store.fetch(limit: 50).filter { $0.path.hasPrefix("/v1/models") }
+            XCTAssertTrue(
+                modelsRows.contains { $0.proto == .openai && !$0.isError },
+                "the header-less calls must be logged as OpenAI rows"
+            )
+            XCTAssertTrue(
+                modelsRows.contains { $0.proto == .anthropic && !$0.isError },
+                "the headed calls must be logged as Anthropic rows"
+            )
+            XCTAssertTrue(
+                modelsRows.contains { $0.proto == .anthropic && $0.isError },
+                "an Anthropic client's 404 must be logged as an Anthropic error row"
+            )
+        }
+    }
+
+    /// One decoded body as readable JSON, so a run's log carries the wire shape rather
+    /// than Swift's own description of a dictionary.
+    private static func jsonText(_ body: [String: Any]) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys]) else {
+            return "<unencodable body>"
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// One models-route GET, returning the status and the decoded object.
+    private func fetchJSON(
+        port: Int,
+        path: String,
+        headers: [String: String] = [:]
+    ) async throws -> (status: Int, body: [String: Any]) {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)\(path)")!)
+        for (field, value) in headers {
+            request.setValue(value, forHTTPHeaderField: field)
+        }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = try XCTUnwrap((response as? HTTPURLResponse)?.statusCode)
+        let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        return (status, body)
+    }
+
     /// The smallest thing ImageIO will decode.
     ///
     /// The checkpoint's own `min_pixels` floor (544x544) turns this 2x2 into its

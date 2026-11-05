@@ -739,6 +739,30 @@ final class PromptCountBox: @unchecked Sendable {
 
 // MARK: - Wire-shaped errors
 
+/// Which protocol a request is answered in.
+///
+/// The two protocols share `GET /v1/models`: identical path, different body. A
+/// route therefore cannot decide from its own path, and the request's headers are
+/// the only evidence available, so this type names the decision once and every
+/// caller that has to render a shape consults it — the models routes for their
+/// body and their log row, and the error renderer for its envelope.
+///
+/// `nonisolated` because it is a value the routing decisions compare and render in
+/// contexts that are not the main actor; without it the project's default isolation
+/// makes the comparison itself a main-actor call.
+nonisolated enum ServerWireProtocol: Sendable {
+    case openai
+    case anthropic
+
+    /// The request log's spelling of the same decision.
+    var rowProtocol: ServerRequestLog.Proto {
+        switch self {
+        case .openai: return .openai
+        case .anthropic: return .anthropic
+        }
+    }
+}
+
 /// Server error that renders as the correct JSON envelope for the calling
 /// protocol: the Anthropic `{"type":"error","error":{...}}` shape under
 /// /v1/messages, the OpenAI `{"error":{...}}` shape everywhere else. Conforms
@@ -748,6 +772,7 @@ struct ServerAPIError: Error, HTTPResponseError, LocalizedError, Sendable {
     enum WireType: String, Sendable {
         case invalidRequest = "invalid_request_error"
         case authentication = "authentication_error"
+        case notFound = "not_found_error"
         case requestTimeout = "request_timeout"
         case overloaded = "overloaded_error"
         case api = "api_error"
@@ -801,6 +826,20 @@ struct ServerAPIError: Error, HTTPResponseError, LocalizedError, Sendable {
         ServerAPIError(status: .unauthorized, wireType: .authentication, message: message, logSafeMessage: nil, code: nil)
     }
 
+    /// The named model is not the one this server serves. A models route answers
+    /// 404 rather than an empty list, because a client that asked for a model by
+    /// name and silently received a different one is the failure the route exists
+    /// to prevent.
+    static func modelNotFound(_ model: String) -> ServerAPIError {
+        ServerAPIError(
+            status: .notFound,
+            wireType: .notFound,
+            message: "model \"\(model)\" does not exist",
+            logSafeMessage: "the requested model is not the one this server serves",
+            code: nil
+        )
+    }
+
     static func requestTimeout(_ message: String) -> ServerAPIError {
         ServerAPIError(status: .requestTimeout, wireType: .requestTimeout, message: message, logSafeMessage: nil, code: nil)
     }
@@ -813,9 +852,26 @@ struct ServerAPIError: Error, HTTPResponseError, LocalizedError, Sendable {
         ServerAPIError(status: .internalServerError, wireType: .api, message: message, logSafeMessage: nil, code: nil)
     }
 
+    /// The OpenAI spelling of this error's `type`. The protocols disagree on how a
+    /// missing model is named — Anthropic has `not_found_error`, OpenAI keeps
+    /// `invalid_request_error` and says `model_not_found` in `code` — and the
+    /// status is 404 either way, so the difference belongs in the envelope rather
+    /// than in the error.
+    var openAIWireType: String {
+        wireType == .notFound ? WireType.invalidRequest.rawValue : wireType.rawValue
+    }
+
+    /// The OpenAI spelling of this error's `code`, for the same reason.
+    var openAICode: String? {
+        code ?? (wireType == .notFound ? "model_not_found" : nil)
+    }
+
     func response(from request: Request, context: some RequestContext) throws -> Response {
         var response: Response
-        if request.uri.path.hasPrefix("/v1/messages") {
+        // Decided from the request, not from a route: the models routes are one
+        // path serving two protocols, so a path check here would answer an
+        // Anthropic client's 404 in the OpenAI envelope.
+        if ServerController.wireProtocol(for: request) == .anthropic {
             response = try context.responseEncoder.encode(
                 AnthropicErrorEvent(error: .init(type: wireType.rawValue, message: message)),
                 from: request,
@@ -823,7 +879,7 @@ struct ServerAPIError: Error, HTTPResponseError, LocalizedError, Sendable {
             )
         } else {
             response = try context.responseEncoder.encode(
-                OpenAIErrorEnvelope(error: .init(message: message, type: wireType.rawValue, code: code)),
+                OpenAIErrorEnvelope(error: .init(message: message, type: openAIWireType, code: openAICode)),
                 from: request,
                 context: context
             )
@@ -1015,25 +1071,124 @@ final class ServerController: ObservableObject {
             ServerController.healthBody()
         }
 
-        router.get("v1/models") { request, _ in
+        // `GET /v1/models` is both protocols' own route: identical path, different
+        // body. OpenAI answers `object: "list"` with an epoch `created`; Anthropic
+        // answers `type: "model"` with an RFC 3339 `created_at`, a human
+        // `display_name` and pagination cursors. The headers decide which, and the
+        // same decision stamps the log row's protocol, so a dashboard shows which
+        // shape a client was handed.
+        router.get("v1/models") { request, context in
+            ServerController.stats.beginRequest()
+            defer { ServerController.stats.endRequest() }
+            let logBox = ServerRequestLogRecorder.shared.box(for: context.id)
             try ServerController.authorizeOrThrow(request)
+            let wire = ServerController.wireProtocol(for: request)
+            logBox?.modify { $0.proto = wire.rowProtocol }
+            let now = Date()
             guard let info = CompletionEngine.shared.loadedModelInfo else {
-                return OpenAIModelList(data: [])
+                // No loaded checkpoint is an empty list, not an error: a client
+                // polling for a model to appear must not read a 404 as "wrong URL".
+                switch wire {
+                case .openai:
+                    return try context.responseEncoder.encode(
+                        OpenAIModelList(data: []), from: request, context: context
+                    )
+                case .anthropic:
+                    return try context.responseEncoder.encode(
+                        AnthropicModelList(data: [], hasMore: false, firstId: nil, lastId: nil),
+                        from: request,
+                        context: context
+                    )
+                }
             }
+            logBox?.modify { $0.model = info.displayName }
             // What this server refuses is a fact about the server, and what the
             // weights support is a fact about the checkpoint; `Int.max` (the "no
             // cap" sentinel) is reported as nil so neither is mistaken for the
             // other after a client's JSON float conversion.
             let promptCap = ServerController.resolvedMaxPromptTokens
-            return OpenAIModelList(data: [
-                OpenAIModelList.entry(
-                    for: info,
-                    contextLength: CompletionEngine.shared.promptModelConfig?
-                        .effectiveMaxPositionEmbeddings,
-                    maxPromptTokens: promptCap == Int.max ? nil : promptCap,
-                    created: Int(Date().timeIntervalSince1970)
+            switch wire {
+            case .openai:
+                return try context.responseEncoder.encode(
+                    OpenAIModelList(data: [
+                        OpenAIModelList.entry(
+                            for: info,
+                            contextLength: CompletionEngine.shared.promptModelConfig?
+                                .effectiveMaxPositionEmbeddings,
+                            maxPromptTokens: promptCap == Int.max ? nil : promptCap,
+                            created: Int(now.timeIntervalSince1970)
+                        )
+                    ]),
+                    from: request,
+                    context: context
                 )
-            ])
+            case .anthropic:
+                return try context.responseEncoder.encode(
+                    AnthropicModelList(
+                        data: [AnthropicAdapter.entry(
+                            id: info.displayName,
+                            displayName: AnthropicAdapter.displayName(
+                                servedId: info.displayName, snapshotPath: info.path
+                            ),
+                            createdAt: now
+                        )],
+                        hasMore: false,
+                        firstId: info.displayName,
+                        lastId: info.displayName
+                    ),
+                    from: request,
+                    context: context
+                )
+            }
+        }
+
+        // Both protocols define a retrieve route beside their list. It answers the
+        // same object the list carries, so a client that resolved an id from the list
+        // reads the same facts here. An id this server does not serve is a 404 in the
+        // protocol's own envelope, because answering the loaded model for a name the
+        // client did not ask for would hide a typo or a stale config.
+        router.get("v1/models/:model_id") { request, context in
+            ServerController.stats.beginRequest()
+            defer { ServerController.stats.endRequest() }
+            let logBox = ServerRequestLogRecorder.shared.box(for: context.id)
+            try ServerController.authorizeOrThrow(request)
+            let wire = ServerController.wireProtocol(for: request)
+            logBox?.modify { $0.proto = wire.rowProtocol }
+            let info = try ServerController.requireLoadedModel()
+            logBox?.modify { $0.model = info.displayName }
+            // The path parameter lives on the request's context, not on the request.
+            let requested = context.parameters.get("model_id")
+            guard let requested, requested == info.displayName else {
+                throw ServerAPIError.modelNotFound(requested ?? "")
+            }
+            let promptCap = ServerController.resolvedMaxPromptTokens
+            let now = Date()
+            switch wire {
+            case .openai:
+                return try context.responseEncoder.encode(
+                    OpenAIModelList.entry(
+                        for: info,
+                        contextLength: CompletionEngine.shared.promptModelConfig?
+                            .effectiveMaxPositionEmbeddings,
+                        maxPromptTokens: promptCap == Int.max ? nil : promptCap,
+                        created: Int(now.timeIntervalSince1970)
+                    ),
+                    from: request,
+                    context: context
+                )
+            case .anthropic:
+                return try context.responseEncoder.encode(
+                    AnthropicAdapter.entry(
+                        id: info.displayName,
+                        displayName: AnthropicAdapter.displayName(
+                            servedId: info.displayName, snapshotPath: info.path
+                        ),
+                        createdAt: now
+                    ),
+                    from: request,
+                    context: context
+                )
+            }
         }
 
         router.post("v1/chat/completions") { request, context in
@@ -1152,6 +1307,34 @@ final class ServerController: ObservableObject {
         }
 
         return router
+    }
+
+    // MARK: Protocol
+
+    /// Which protocol's wire shape a request is answered in.
+    ///
+    /// Where the two protocols have different paths, the path decides. `GET
+    /// /v1/models` is the case they share — same path, different body — so there the
+    /// request's own headers decide, and they are unambiguous evidence: an Anthropic
+    /// client sends `x-api-key` or `anthropic-version`, and no OpenAI client sends
+    /// either. A client that presents neither gets the OpenAI shape, which is what
+    /// this route has always answered, so nothing that works today changes.
+    ///
+    /// The cost of guessing here is a decode failure inside a client's own SDK, which
+    /// is why the answer is keyed on headers the protocol defines rather than on a
+    /// `User-Agent` string or a query parameter the SDK never sends.
+    nonisolated static func wireProtocol(for request: Request) -> ServerWireProtocol {
+        let path = request.uri.path
+        if path.hasPrefix("/v1/messages") { return .anthropic }
+        if path.hasPrefix("/v1/chat") || path.hasPrefix("/v1/completions") { return .openai }
+        for name in ["anthropic-version", "x-api-key"] {
+            guard let field = HTTPField.Name(name),
+                  let value = request.headers[field],
+                  !value.trimmingCharacters(in: .whitespaces).isEmpty
+            else { continue }
+            return .anthropic
+        }
+        return .openai
     }
 
     // MARK: Auth

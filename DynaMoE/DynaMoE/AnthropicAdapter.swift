@@ -329,6 +329,48 @@ struct AnthropicTokenCount: ResponseEncodable {
     }
 }
 
+/// One model in this protocol's own models list.
+///
+/// Anthropic's model object is not OpenAI's. It is `type`/`id`/`display_name`/
+/// `created_at`, where `id` is the string every response's `model` field carries
+/// and `display_name` is the human form a UI shows, and `created_at` is an RFC
+/// 3339 timestamp rather than an epoch second, so a client formats it instead of
+/// converting it. Both SDKs' model types decode these four fields and ignore the
+/// rest, so nothing beyond them is invented here.
+struct AnthropicModel: ResponseEncodable {
+    let id: String
+    let displayName: String
+    let createdAt: String
+    let type: String = "model"
+
+    enum CodingKeys: String, CodingKey {
+        case id, type
+        case displayName = "display_name"
+        case createdAt = "created_at"
+    }
+}
+
+/// The body of `GET /v1/models` under this protocol.
+///
+/// One entry, because this app serves one loaded checkpoint, so the pagination
+/// cursors describe a page that is always the whole list: `has_more` is false and
+/// both cursors name the only model. They are carried rather than omitted because
+/// the protocol's list type requires them, and a client that pages on a missing
+/// cursor sees a decode failure rather than the end of the list.
+struct AnthropicModelList: ResponseEncodable {
+    let data: [AnthropicModel]
+    let hasMore: Bool
+    let firstId: String?
+    let lastId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case data
+        case hasMore = "has_more"
+        case firstId = "first_id"
+        case lastId = "last_id"
+    }
+}
+
 /// A single assistant content block in the non-streaming response.
 enum AnthropicContentBlock: Encodable {
     case text(String)
@@ -775,6 +817,53 @@ enum AnthropicAdapter {
             throw ServerAPIError.badRequest("messages must contain at least one message")
         }
         return split
+    }
+
+    /// The one model entry this server advertises for a loaded checkpoint.
+    ///
+    /// Kept a function of the facts, mirroring `OpenAIModelList.entry`, so the
+    /// mapping is testable with no loaded model and so the id a client sees here
+    /// is the same string every response's `model` field carries.
+    nonisolated static func entry(
+        id: String,
+        displayName: String,
+        createdAt: Date
+    ) -> AnthropicModel {
+        AnthropicModel(id: id, displayName: displayName, createdAt: createdAtString(createdAt))
+    }
+
+    /// RFC 3339 as this protocol spells it: second precision, `Z` rather than an
+    /// offset. A client parses this into its own date type, so minutes or a
+    /// numeric offset would both decode and both be a different value than the
+    /// one sent.
+    nonisolated static func createdAtString(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        return formatter.string(from: date)
+    }
+
+    /// The human-readable name for the served checkpoint.
+    ///
+    /// The served id is the snapshot directory's own name (a commit hash) and
+    /// cannot change without invalidating recorded turns and pinned prefixes, but
+    /// `display_name` is not used for keying anything: it exists so a human reads a
+    /// model name rather than a hash. The repository directory carries that name, so
+    /// `.../hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/<hash>`
+    /// advertises `deepseek-ai/DeepSeek-V4.1-Flash-1017`. A checkpoint that is not a
+    /// hub snapshot has no repository name to recover, so its own directory name is
+    /// the display name rather than nothing.
+    nonisolated static func displayName(servedId: String, snapshotPath: String?) -> String {
+        guard let snapshotPath, !snapshotPath.isEmpty else { return servedId }
+        let components = URL(fileURLWithPath: snapshotPath).pathComponents
+        guard let repository = components.last(where: { $0.hasPrefix("models--") }) else {
+            let directory = URL(fileURLWithPath: snapshotPath).lastPathComponent
+            return directory.isEmpty ? servedId : directory
+        }
+        let stripped = String(repository.dropFirst("models--".count))
+        let parts = stripped.components(separatedBy: "--")
+        guard let author = parts.first, parts.count > 1 else { return stripped }
+        return author + "/" + parts.dropFirst().joined(separator: "--")
     }
 
     /// Stable prefix-cache session key, mirroring the OpenAI adapter scheme:

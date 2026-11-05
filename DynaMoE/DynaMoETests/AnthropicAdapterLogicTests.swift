@@ -311,6 +311,64 @@ final class AnthropicAdapterLogicTests: XCTestCase {
         XCTAssertEqual(json["input_tokens"] as? Int, 14)
     }
 
+    // MARK: - Models list
+
+    func testTheModelsListCarriesTheProtocolsOwnShape() throws {
+        // The two protocols share the path and not the body. Anthropic's model
+        // object is `type`/`id`/`display_name`/`created_at` and its list carries
+        // pagination cursors; OpenAI's is `object`/`created` under an
+        // `object: "list"` wrapper. A client's SDK decodes one and fails the other,
+        // so the keys are the contract.
+        let model = AnthropicAdapter.entry(
+            id: "1bae0e10",
+            displayName: "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            createdAt: Date(timeIntervalSince1970: 1_793_830_186)
+        )
+        let entry = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(model)) as? [String: Any])
+        XCTAssertEqual(Set(entry.keys), ["type", "id", "display_name", "created_at"])
+        XCTAssertEqual(entry["type"] as? String, "model")
+        XCTAssertEqual(entry["id"] as? String, "1bae0e10")
+        XCTAssertEqual(entry["display_name"] as? String, "deepseek-ai/DeepSeek-V4.1-Flash-1017")
+        XCTAssertEqual(
+            entry["created_at"] as? String, "2026-11-04T22:09:46Z",
+            "RFC 3339 with second precision and a Z offset is what the protocol's list type parses"
+        )
+
+        let list = AnthropicModelList(
+            data: [model], hasMore: false, firstId: model.id, lastId: model.id
+        )
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(list)) as? [String: Any])
+        XCTAssertEqual(Set(body.keys), ["data", "has_more", "first_id", "last_id"])
+        XCTAssertEqual(body["has_more"] as? Bool, false)
+        XCTAssertEqual(body["first_id"] as? String, "1bae0e10")
+        XCTAssertEqual(body["last_id"] as? String, "1bae0e10")
+        XCTAssertEqual((body["data"] as? [Any])?.count, 1)
+        XCTAssertNil(body["object"], "an OpenAI list key must never appear in an Anthropic body")
+    }
+
+    func testTheModelDisplayNameIsTheRepositoryRatherThanTheSnapshotHash() {
+        // The served id is the snapshot directory's own name and is load-bearing
+        // (recorded turns and pinned prefixes are keyed on it), so the human name is
+        // recovered from the repository directory beside it instead.
+        XCTAssertEqual(
+            AnthropicAdapter.displayName(
+                servedId: "1bae0e1088993b9b82de08f59de5be5a34e42170",
+                snapshotPath: "/Users/x/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/1bae0e1088993b9b82de08f59de5be5a34e42170"
+            ),
+            "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+        )
+        XCTAssertEqual(
+            AnthropicAdapter.displayName(servedId: "hash", snapshotPath: "/Models/my-own-checkpoint"),
+            "my-own-checkpoint",
+            "a checkpoint that is not a hub snapshot has no repository name to recover"
+        )
+        XCTAssertEqual(
+            AnthropicAdapter.displayName(servedId: "hash", snapshotPath: nil),
+            "hash",
+            "with no path at all the served id is the only name there is"
+        )
+    }
+
     // MARK: - Tool choice
 
     func testToolChoiceNameIsPreservedAndForcedChoiceIsRejected() throws {

@@ -13362,3 +13362,167 @@ of the codebase is unchanged.
 The three smoke cases are chosen so the route's state machine is pinned without a model: a planner
 that still demanded `max_tokens` would answer 400 where the first case requires 503, and a
 credential path that did not accept `x-api-key` would answer 401 where the third requires 503.
+
+## DSV4.1 #87: THE MODELS ROUTE NOW SPEAKS BOTH PROTOCOLS, AND THE REQUEST'S OWN HEADERS ARE WHAT PAYS FOR IT
+
+### The question
+
+`#81` closed by writing the hole down itself: "**Not an Anthropic-shaped models route.** `GET
+/v1/models` answers in the OpenAI shape on both protocols, as it always has." `#86` then closed the
+Anthropic protocol's second and last POST route.
+
+Between them those two slices leave one asymmetry that is not cosmetic. The Anthropic API defines
+`GET /v1/models` and `GET /v1/models/{model_id}`, and an SDK client calls them by name
+(`client.models.list()`, `client.models.retrieve(id)`) against a typed model. This server answered
+the first in OpenAI's shape — `object: "list"` around entries of `object`/`created`/`owned_by` — and
+the second not at all. So a client's model listing either failed its own decode or produced a model
+whose fields it does not read, and a client that resolved an id from that list had nowhere to take
+it. That is the same class of gap `#86` fixed on the POST side: the capability is real, the route
+is missing, and the failure lands inside a client that did nothing wrong.
+
+Routing agreed decisively: `next_slice` = **`anthropic_models_route` 0.996 @ 0.995** against the
+OpenAI-retrieve-only route 0.0014, `device_mhc_stages` 0.0012, `model_id` 0.0008, `docs_sweep`
+0.0006 and `perf_leftovers` 0.0004. Every remaining perf item is under ~1.2% of a prefill position
+against a 5-30% process-to-process spread and several "obvious" ones were shipped then reverted
+(rows-per-threadgroup 2.42x worse, band collapse 29% slower, `F_NOCACHE` 2.2x loss, a shared record
+row 17% worse, matrix-unit attention 0.31-0.56x, a two-to-five-wide speculative verify losing to a
+walk), so the branch could not go back for one.
+
+The design question — how one path decides which body to answer — was asked separately and answered
+`request_headers` **0.997 @ 0.996** over a distinct path or query parameter (0.003), an
+always-Anthropic body (0.0002) and one body carrying both shapes (0.0003).
+
+### What was added
+
+Two routes, two wire types, one decision.
+
+- **`GET /v1/models`** answers Anthropic's shape for an Anthropic client:
+  `{data:[{type,id,display_name,created_at}], has_more, first_id, last_id}`. `created_at` is RFC
+  3339 (`2026-11-05T11:21:54Z`) because a client PARSES it rather than converting it, and the
+  pagination cursors are present rather than omitted because the protocol's list type requires them
+  — a missing cursor is a decode failure, not an end-of-list.
+- **`GET /v1/models/:model_id`** is the retrieve route both protocols define. It answers the same
+  object the list carries, in the caller's shape. An id this server does not serve is a **404 in the
+  caller's own envelope**, not a silent substitution of the loaded model: that substitution is
+  exactly what hides a typo or a stale config in a client.
+- **`ServerWireProtocol`** (`ServerController.swift`) names the decision once. `wireProtocol(for:)`
+  prefers the path where the paths differ (`/v1/messages*` → Anthropic, `/v1/chat*` and
+  `/v1/completions*` → OpenAI) and falls back to the request's headers on the shared path.
+  `anthropic-version` and `x-api-key` are unambiguous evidence: no OpenAI client sends either, and an
+  Anthropic client sends at least one (the version on every request, the key header whether or not
+  this server requires a key). A client presenting neither gets the OpenAI shape, which is what this
+  route has always answered, so nothing that works today changes.
+- **`AnthropicModel` / `AnthropicModelList`** (`AnthropicAdapter.swift`) are the two bodies, and
+  `AnthropicAdapter.entry`/`createdAtString`/`displayName` are the mapping as free functions of the
+  facts, mirroring `OpenAIModelList.entry`, so all of it is testable with no loaded model.
+- **`ServerAPIError` gained `notFound`** plus `openAIWireType`/`openAICode`. The protocols disagree
+  on how a missing model is named — Anthropic has `not_found_error`, OpenAI keeps
+  `invalid_request_error` and says `model_not_found` in `code` — and the status is 404 either way, so
+  the difference lives in the envelope rather than in the error. Its renderer now asks
+  `wireProtocol(for:)` instead of testing the path, because on the shared path a path check would
+  answer an Anthropic client's 404 in the OpenAI envelope.
+- The route **stamps the log row's protocol** from the same decision, so one path is still two
+  readable protocols in the dashboard, and `rowProtocol` keeps the two spellings in step. It also
+  joins every other client route in `stats.beginRequest()`/`endRequest()`, which the models route
+  never did: a models call is a request, and `#86`'s pre-flight case already asserts that a route
+  with no generation in it is still counted.
+
+### The finding: `display_name` is where a human name belongs, and it is not the id
+
+The served id is the snapshot directory's own name — `1bae0e1088993b9b82de08f59de5be5a34e42170` —
+and `#81` recorded why it must not change casually: every response's `model` field carries it and
+the turn-memory digest and prefix session keys are built from it, so renaming it invalidates
+recorded turns across an update. Anthropic's model object asks for exactly the field that problem
+needs and does not have: **`display_name`**, which nothing keys on.
+
+So the name is recovered from the REPOSITORY directory, which the snapshot path already carries:
+
+```
+hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots/<hash>
+  → display_name: "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+```
+
+That makes `#87` the cheap half of the `model_id` candidate the routing scored 0.0008, with none of
+its migration risk: a human name reaches a client, and not one byte of keying moves. A checkpoint
+that is not a hub snapshot has no repository name to recover, so its own directory name is the
+display name rather than nothing.
+
+The two shapes, on the published checkpoint
+(`testTheModelsRouteAnswersEachClientInItsOwnShape`, 1.666 s, `/tmp/test87_live2.log`):
+
+```
+/v1/models (openai):
+  {"data":[{"capabilities":{...,"vision_cost":{...}},"context_length":1048576,"created":1793877714,
+   "id":"1bae0e1088993b9b82de08f59de5be5a34e42170","max_prompt_tokens":262144,"object":"model",
+   "owned_by":"dynamoe"}],"object":"list"}
+/v1/models (anthropic-version):
+  {"data":[{"created_at":"2026-11-05T11:21:54Z","display_name":"deepseek-ai\/DeepSeek-V4.1-Flash-1017",
+   "id":"1bae0e1088993b9b82de08f59de5be5a34e42170","type":"model"}],"first_id":"1bae0e10…",
+   "has_more":false,"last_id":"1bae0e10…"}
+/v1/models/1bae0e10… (anthropic):
+  {"created_at":"2026-11-05T11:21:54Z","display_name":"deepseek-ai\/DeepSeek-V4.1-Flash-1017",
+   "id":"1bae0e1088993b9b82de08f59de5be5a34e42170","type":"model"}
+```
+
+Both Anthropic headers produce byte-identical bodies, which is the point: `anthropic-version` and
+`x-api-key` are the same evidence and the SDKs send them together.
+
+The case costs **1.666 s** end to end — the app-order load of the 475 GB / 96,085-tensor checkpoint,
+the server start, and eight requests — which is `#81`'s 1.716 s to within noise. A models route is
+therefore still free to cover in the suite, and everything expensive about this branch is the turns.
+
+### What it is not (do not re-propose)
+
+- **Not a capability block on the Anthropic object.** Anthropic's model object is the four documented
+  fields, and inventing a `capabilities` sub-object for it would be this server's own dialect. The
+  capability facts `#81`/`#82` advertise stay on the OpenAI shape — which any client can read by
+  asking the SAME path without the Anthropic headers. That is a property of the discriminator, not a
+  gap: the two bodies are one path and two conventions, and a client chooses.
+- **Not an id change.** Still the snapshot hash. `display_name` is additive and unkeyed, which is
+  precisely why it was safe inside this slice.
+- **Not a taxonomy of `anthropic-version` values.** The header is used as evidence of the client's
+  protocol, not parsed, because every value it can carry belongs to the same shape.
+- **Not a models-route 404 for "no model loaded".** The list stays `{"data":[]}` — `#81`'s choice,
+  and a client polling for a model to appear must not read an empty answer as a wrong URL. The
+  retrieve route is where a missing model is a refusal, and there a loaded-nothing server answers
+  **503** rather than 404, because "no model is loaded" and "that id is not served" are different
+  facts and a 404 would claim the wrong one.
+- **Not a `GET /v1/models` limit/cursor implementation.** One entry is the whole list, so
+  `limit`/`after_id`/`before_id` are accepted and ignored rather than honoured against a list that
+  cannot be paged; the cursors this route reports are the model's own id, which is true for the page
+  it actually returns.
+- **Not a perf result.** Nothing here touches the engine, the arena, or the generation path; the
+  slice is protocol surface only.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_87` (status 0; the error grep needs a leading
+space, because source echo lines like `error: .init(message:…)` otherwise read as errors), then
+`test-without-building` with the same `-derivedDataPath` throughout. Bundle freshness checked with
+`strings … | grep -c` over the three new names (**3**) before any run — the first smoke run reported
+one failure purely because the bundle predated the test edits, which is the trap this check exists
+for.
+
+The build's warning set grew from **1,798 to 1,829 instances**, all of categories that already fill
+these files: `beginRequest()`/`endRequest()` and `ServerRequestLogRecorder.shared` from a
+nonisolated context, the main-actor-isolated `Encodable` conformance of a wire type
+(`AnthropicModel`/`AnthropicModelList` join `AnthropicMessageResponse`/`OpenAIModelList`), and
+main-actor-isolated properties read from test autoclosures. One of them was new and was fixed rather
+than recorded: comparing `ServerWireProtocol` in a nonisolated function was a main-actor conformance
+use, so the type is declared `nonisolated` (34 → 31 added instances). No new KIND of diagnostic.
+
+| suite | result |
+|---|---|
+| `AnthropicAdapterLogicTests` (27 cases; the two new ones are the Anthropic body's exact key set, `created_at` in RFC 3339 and the display name recovered from the repository directory) | **27 cases, 0 failures** (25 before) |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787; two new — the shape follows the headers on both Anthropic header spellings and the row records which, and the retrieve route in both shapes with the two 404 envelopes) | **22 cases, 0 failures, 1 skipped** (20 before; the retrieve case skips without a loaded model) |
+| `ServerQueueLogicTests`, `OpenAIAdapterLogicTests`, `ServerStreamSafetyTests`, `ServerToolArgumentTests`, `ServerHardeningLogicTests`, `TurnToolMaskTests`, `ChatPromptFormatterConversationTests`, `ReasoningRoundTripTests`, `PrefixAsOfDateTests`, `EngineTurnSlotTests` | 129 cases, 0 failures |
+| `DeepSeekV41PublishedTurnTests.testTheModelsRouteAnswersEachClientInItsOwnShape` (opt-in, `/tmp/dynamoe_dsv41_real_turn`, private port 8796) | **passed, 1.666 s**, both shapes, both headers, retrieve, and both 404 envelopes |
+
+One existing assertion moved with the change rather than being worked around: `#82`'s
+`testRequestLogModelsEndpointRowHasWireFields` asserted the models row's `proto` was `.other`. It is
+now `.openai` for a header-less call and `.anthropic` for a headed one, which is what makes one path
+two readable protocols in the dashboard, and the assertion was updated to say so.
+
+The new smoke cases are chosen so the decision is pinned without a model: the shape is asserted on
+the key SET (`object` present vs `has_more` present, and never both), because a body that decodes as
+a dictionary proves nothing about which SDK will read it.

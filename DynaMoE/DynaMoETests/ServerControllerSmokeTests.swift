@@ -102,6 +102,83 @@ final class ServerControllerSmokeTests: XCTestCase {
         }
     }
 
+    // MARK: - Shared models path, two protocols
+
+    /// `GET /v1/models` is one path and two bodies, so the request's headers are the
+    /// only evidence the route has. A client that sends neither Anthropic header must
+    /// still get the shape this route has always answered.
+    func testTheModelsListAnswersInTheShapeTheClientsHeadersAskFor() async throws {
+        await ensureServerRunning()
+
+        let plain = try await getModels("/v1/models", headers: [:])
+        XCTAssertEqual(plain.status, 200)
+        XCTAssertEqual(plain.body["object"] as? String, "list")
+        XCTAssertNil(plain.body["has_more"], "an OpenAI body must not carry Anthropic pagination")
+
+        // Either Anthropic header is enough: the SDKs send the version on every
+        // request and the key header whether or not this server requires a key.
+        for headers in [["anthropic-version": "2023-06-01"], ["x-api-key": "unused-key"]] {
+            let anthropic = try await getModels("/v1/models", headers: headers)
+            XCTAssertEqual(anthropic.status, 200)
+            XCTAssertNil(anthropic.body["object"], "an Anthropic body is not an OpenAI list")
+            XCTAssertEqual(anthropic.body["has_more"] as? Bool, false)
+            if let info = await MainActor.run(body: { CompletionEngine.shared.loadedModelInfo }) {
+                let entries = try XCTUnwrap(anthropic.body["data"] as? [[String: Any]])
+                let first = try XCTUnwrap(entries.first)
+                XCTAssertEqual(first["type"] as? String, "model")
+                XCTAssertEqual(first["id"] as? String, info.displayName)
+                XCTAssertEqual(anthropic.body["first_id"] as? String, info.displayName)
+                XCTAssertEqual(anthropic.body["last_id"] as? String, info.displayName)
+                let createdAt = try XCTUnwrap(first["created_at"] as? String)
+                XCTAssertTrue(createdAt.hasSuffix("Z"), "the protocol's date is RFC 3339, not an epoch second")
+                XCTAssertNotNil(first["display_name"] as? String)
+            }
+        }
+
+        // Both shapes are recorded, and the row says which protocol answered, so one
+        // path is still two readable protocols in the dashboard.
+        let rows = await logStore.fetch(limit: 50).filter { $0.path == "/v1/models" }
+        XCTAssertTrue(rows.contains { $0.proto == .openai }, "the plain request is an OpenAI models call")
+        XCTAssertTrue(rows.contains { $0.proto == .anthropic }, "the headed requests are Anthropic models calls")
+    }
+
+    func testTheModelsRetrieveRouteAnswersBothShapesAndRefusesAnUnknownId() async throws {
+        await ensureServerRunning()
+        guard let info = await MainActor.run(body: { CompletionEngine.shared.loadedModelInfo }) else {
+            throw XCTSkip("No model is loaded; there is no served id to retrieve")
+        }
+
+        let openai = try await getModels("/v1/models/\(info.displayName)", headers: [:])
+        XCTAssertEqual(openai.status, 200)
+        XCTAssertEqual(openai.body["object"] as? String, "model")
+        XCTAssertEqual(openai.body["id"] as? String, info.displayName)
+
+        let anthropic = try await getModels(
+            "/v1/models/\(info.displayName)", headers: ["anthropic-version": "2023-06-01"]
+        )
+        XCTAssertEqual(anthropic.status, 200)
+        XCTAssertEqual(anthropic.body["type"] as? String, "model")
+        XCTAssertNil(anthropic.body["has_more"], "a retrieve answers the object, not a page")
+
+        // An id this server does not serve is a 404 in the caller's own envelope:
+        // OpenAI keeps `invalid_request_error` and names the condition in `code`,
+        // Anthropic has a `not_found_error`.
+        let missing = try await getModels("/v1/models/not-a-served-model", headers: [:])
+        XCTAssertEqual(missing.status, 404)
+        let openAIError = try XCTUnwrap(missing.body["error"] as? [String: Any])
+        XCTAssertEqual(openAIError["type"] as? String, "invalid_request_error")
+        XCTAssertEqual(openAIError["code"] as? String, "model_not_found")
+
+        let missingAnthropic = try await getModels(
+            "/v1/models/not-a-served-model", headers: ["anthropic-version": "2023-06-01"]
+        )
+        XCTAssertEqual(missingAnthropic.status, 404)
+        XCTAssertEqual(missingAnthropic.body["type"] as? String, "error")
+        XCTAssertEqual(
+            (missingAnthropic.body["error"] as? [String: Any])?["type"] as? String, "not_found_error"
+        )
+    }
+
     func testCompletionsWithoutModelReturns503ErrorEnvelope() async throws {
         guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
             throw XCTSkip("A model is loaded; the 503 path cannot be exercised")
@@ -393,6 +470,22 @@ final class ServerControllerSmokeTests: XCTestCase {
 
     // MARK: - Request logging
 
+    /// Issues a models-route GET with the given headers and returns the status and
+    /// the decoded body, which is all the shape assertions need.
+    private func getModels(
+        _ path: String,
+        headers: [String: String]
+    ) async throws -> (status: Int, body: [String: Any]) {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:8787\(path)")!)
+        for (field, value) in headers {
+            request.setValue(value, forHTTPHeaderField: field)
+        }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = try XCTUnwrap((response as? HTTPURLResponse)?.statusCode)
+        let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        return (status, body)
+    }
+
     /// The logging pipeline appends on a background queue, so assertions poll
     /// briefly instead of sleeping a fixed interval.
     private func waitForLoggedRow(matching predicate: @escaping (ServerRequestLog) -> Bool) async throws -> ServerRequestLog? {
@@ -430,7 +523,7 @@ final class ServerControllerSmokeTests: XCTestCase {
         let row = try XCTUnwrap(logged)
         XCTAssertEqual(row.httpStatus, 200)
         XCTAssertEqual(row.method, "GET")
-        XCTAssertEqual(row.proto, .other)
+        XCTAssertEqual(row.proto, .openai, "a header-less models call is the OpenAI shape, and the row says so")
         XCTAssertFalse(row.isError)
         XCTAssertNil(row.requestBody, "GET rows carry no captured body")
         let after = await logStore.count()
