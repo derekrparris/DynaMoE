@@ -222,6 +222,32 @@ struct OpenAIChatRequest: Decodable {
     let toolChoice: ToolChoice?
     let enableThinking: Bool?
     let reasoningEffort: String?
+    /// OpenAI's structured-output request. Only `type` is decoded: this server
+    /// refuses the field outright rather than honouring part of it, so parsing the
+    /// schema would only be a way to accept a promise it cannot keep.
+    let responseFormat: ResponseFormat?
+    /// How many completions the client asked for. OpenAI defaults to 1, which is all
+    /// this engine can produce per request.
+    let n: Int?
+    /// Token log-probabilities. Presence of either field is a request this server
+    /// cannot answer, so they are decoded rather than ignored.
+    let logprobs: Bool?
+    let topLogprobs: Int?
+    /// `stream_options.include_usage` decides whether the trailing usage chunk is
+    /// emitted, which is the one sub-field of it this server can honour.
+    let streamOptions: StreamOptions?
+
+    struct ResponseFormat: Decodable {
+        let type: String?
+    }
+
+    struct StreamOptions: Decodable {
+        let includeUsage: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case includeUsage = "include_usage"
+        }
+    }
 
     enum CodingKeys: String, CodingKey {
         case model, messages, stream, stop, tools
@@ -235,6 +261,10 @@ struct OpenAIChatRequest: Decodable {
         case toolChoice = "tool_choice"
         case enableThinking = "enable_thinking"
         case reasoningEffort = "reasoning_effort"
+        case responseFormat = "response_format"
+        case n, logprobs
+        case topLogprobs = "top_logprobs"
+        case streamOptions = "stream_options"
     }
 
     init(from decoder: Decoder) throws {
@@ -262,6 +292,15 @@ struct OpenAIChatRequest: Decodable {
         self.toolChoice = try container.decodeIfPresent(ToolChoice.self, forKey: .toolChoice)
         self.enableThinking = try container.decodeIfPresent(Bool.self, forKey: .enableThinking)
         self.reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
+        // These four are decoded so the planner can refuse them by name. Left out of
+        // the decoder entirely they were ignored by Swift's unknown-key tolerance,
+        // which answered a request for JSON, for two choices or for log-probabilities
+        // exactly as if the client had asked for none of them.
+        self.responseFormat = try container.decodeIfPresent(ResponseFormat.self, forKey: .responseFormat)
+        self.n = try container.decodeIfPresent(Int.self, forKey: .n)
+        self.logprobs = try container.decodeIfPresent(Bool.self, forKey: .logprobs)
+        self.topLogprobs = try container.decodeIfPresent(Int.self, forKey: .topLogprobs)
+        self.streamOptions = try container.decodeIfPresent(StreamOptions.self, forKey: .streamOptions)
     }
 
     /// True when any message carries an image content part. The turn planner
@@ -530,6 +569,56 @@ enum OpenAIAdapter {
             throw ServerAPIError.badRequest(
                 "tool_choice for a specific function (\"\(name)\") is not supported: this server cannot force a tool call. Use \"auto\" or \"none\".",
                 logSafeMessage: "tool_choice for a specific function is not supported: this server cannot force a tool call. Use \"auto\" or \"none\"."
+            )
+        }
+    }
+
+    /// Refuse the request fields this server cannot honour, by name.
+    ///
+    /// Swift's `Decodable` ignores the keys it does not know, which is what made
+    /// these fields a silent lie: a client that asked for `response_format:
+    /// json_object` was answered in prose, one that asked for `n: 2` got one choice,
+    /// and one that asked for `logprobs` got a response carrying none — each with a
+    /// 200 and nothing on the wire to tell it apart from the request it meant to
+    /// send. Forced `tool_choice` already established this codebase's rule for the
+    /// class: refuse it explicitly, because a client that planned around an answer it
+    /// did not receive fails somewhere further from the cause than this 400.
+    ///
+    /// `stream_options.include_usage` is deliberately NOT on this list: it asks for
+    /// something this server can do, so the streaming writer honours it instead.
+    nonisolated static func refuseUnsupportedResponseShape(_ request: OpenAIChatRequest) throws {
+        switch request.responseFormat?.type ?? "text" {
+        case "text":
+            break
+        case "json_object":
+            throw ServerAPIError.badRequest(
+                "response_format \"json_object\" is not supported: this server cannot constrain "
+                    + "decoding to JSON, so a turn that expects JSON would receive prose. Ask for the "
+                    + "JSON shape in the prompt and validate it on your side, or omit response_format."
+            )
+        case "json_schema":
+            throw ServerAPIError.badRequest(
+                "response_format \"json_schema\" is not supported: this server cannot enforce a "
+                    + "schema on the model's output. Ask for the JSON shape in the prompt and validate "
+                    + "it on your side, or omit response_format."
+            )
+        case let other:
+            throw ServerAPIError.badRequest(
+                "response_format \"\(other)\" is not a type this server knows.",
+                logSafeMessage: "response_format carries a type this server does not know"
+            )
+        }
+        if let n = request.n, n != 1 {
+            throw ServerAPIError.badRequest(
+                "n = \(n) is not supported: this server generates one completion per request. Send "
+                    + "one request per completion (they queue), or omit n."
+            )
+        }
+        if request.logprobs == true || request.topLogprobs != nil {
+            throw ServerAPIError.badRequest(
+                "logprobs is not supported: this server's responses carry no token log-probabilities, "
+                    + "so a client scoring its own output would silently receive none. Omit logprobs "
+                    + "and top_logprobs."
             )
         }
     }

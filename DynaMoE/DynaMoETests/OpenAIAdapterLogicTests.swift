@@ -387,6 +387,99 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         XCTAssertTrue(try OpenAIAdapter.toolUseEnabled(auto.toolChoice))
     }
 
+    // MARK: - Request fields this server cannot honour
+
+    func testTheFieldsTheServerCannotHonourAreDecodedRatherThanIgnored() throws {
+        // Before `#88` these keys were absent from the decoder, so Swift's
+        // unknown-key tolerance dropped them and the turn was built as if the client
+        // had asked for none of it. Decoding them is what lets the planner refuse
+        // them by name.
+        let request = try decodeRequest("""
+        {"model":"m","messages":[{"role":"user","content":"hi"}],
+         "response_format":{"type":"json_schema","json_schema":{"name":"x","schema":{"type":"object"}}},
+         "n":3,"logprobs":true,"top_logprobs":2,
+         "stream_options":{"include_usage":true}}
+        """)
+        XCTAssertEqual(request.responseFormat?.type, "json_schema")
+        XCTAssertEqual(request.n, 3)
+        XCTAssertEqual(request.logprobs, true)
+        XCTAssertEqual(request.topLogprobs, 2)
+        XCTAssertEqual(request.streamOptions?.includeUsage, true)
+    }
+
+    func testStructuredOutputIsRefusedByNameRatherThanAnsweredInProse() throws {
+        for type in ["json_object", "json_schema"] {
+            let request = try decodeRequest("""
+            {"messages":[],"response_format":{"type":"\(type)"}}
+            """)
+            XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedResponseShape(request)) { error in
+                XCTAssertTrue(
+                    "\(error)".contains("response_format"),
+                    "the refusal must name the field the client sent, got: \(error)"
+                )
+                XCTAssertTrue(
+                    "\(error)".contains(type),
+                    "the refusal must name the mode it cannot honour"
+                )
+            }
+        }
+
+        // OpenAI's default mode is a no-op, and an absent field is every request that
+        // does not ask.
+        for body in [#"{"messages":[]}"#, #"{"messages":[],"response_format":{"type":"text"}}"#] {
+            XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedResponseShape(try decodeRequest(body)))
+        }
+
+        let unknown = try decodeRequest(#"{"messages":[],"response_format":{"type":"yaml"}}"#)
+        XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedResponseShape(unknown)) { error in
+            XCTAssertTrue("\(error)".contains("yaml"))
+        }
+    }
+
+    func testMultipleChoicesAndTokenLogprobsAreRefusedByName() throws {
+        XCTAssertNoThrow(
+            try OpenAIAdapter.refuseUnsupportedResponseShape(try decodeRequest(#"{"messages":[],"n":1}"#)),
+            "n = 1 is the protocol's own default"
+        )
+        for body in [#"{"messages":[],"n":2}"#, #"{"messages":[],"n":0}"#] {
+            XCTAssertThrowsError(
+                try OpenAIAdapter.refuseUnsupportedResponseShape(try decodeRequest(body))
+            ) { error in
+                XCTAssertTrue("\(error)".contains("n ="), "the refusal must name the field, got: \(error)")
+            }
+        }
+
+        XCTAssertNoThrow(
+            try OpenAIAdapter.refuseUnsupportedResponseShape(try decodeRequest(#"{"messages":[],"logprobs":false}"#)),
+            "asking NOT to receive log-probabilities is already the only thing this server does"
+        )
+        for body in [#"{"messages":[],"logprobs":true}"#, #"{"messages":[],"top_logprobs":5}"#] {
+            XCTAssertThrowsError(
+                try OpenAIAdapter.refuseUnsupportedResponseShape(try decodeRequest(body))
+            ) { error in
+                XCTAssertTrue("\(error)".contains("logprobs"), "got: \(error)")
+            }
+        }
+    }
+
+    func testStreamOptionsAreReadBecauseTheirOneMeaningfulFieldIsHonoured() throws {
+        // The usage tail is opt-in by protocol, so this field is decoded and obeyed
+        // rather than refused: the streaming writer emits the chunk only for a client
+        // that asked for it.
+        let absent = try decodeRequest(#"{"messages":[]}"#)
+        XCTAssertNil(absent.streamOptions)
+
+        let declined = try decodeRequest(#"{"messages":[],"stream_options":{"include_usage":false}}"#)
+        XCTAssertEqual(declined.streamOptions?.includeUsage, false)
+
+        let asked = try decodeRequest(#"{"messages":[],"stream_options":{"include_usage":true}}"#)
+        XCTAssertEqual(asked.streamOptions?.includeUsage, true)
+        XCTAssertNoThrow(
+            try OpenAIAdapter.refuseUnsupportedResponseShape(asked),
+            "a field this server can honour must never be refused"
+        )
+    }
+
     // MARK: - Tool IDs in history
 
     func testAssistantHistoryKeepsToolCallIds() throws {

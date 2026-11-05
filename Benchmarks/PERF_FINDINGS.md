@@ -13526,3 +13526,119 @@ two readable protocols in the dashboard, and the assertion was updated to say so
 The new smoke cases are chosen so the decision is pinned without a model: the shape is asserted on
 the key SET (`object` present vs `has_more` present, and never both), because a body that decodes as
 a dictionary proves nothing about which SDK will read it.
+
+## DSV4.1 #88: FOUR REQUEST FIELDS WERE ANSWERED AS IF THEY HAD NOT BEEN SENT
+
+### The question
+
+`#87` closed the last missing ROUTE on either protocol. This slice is about a different hole in the
+same front door: a route can exist, answer 200, and still reply to a request nobody sent.
+
+`OpenAIChatRequest` decoded fifteen fields and none of `response_format`, `n`, `logprobs`,
+`top_logprobs` or `stream_options`. Swift's `Decodable` ignores keys it does not know, which is
+usually the right default and was, here, a silent lie: a client that asked for `response_format:
+{"type": "json_object"}` was answered in prose, one that asked for `n: 2` received one choice, and
+one that asked for `logprobs` received a body with no log-probabilities in it — each with a **200**
+and nothing on the wire to tell it apart from the request it meant to send. Every one of those
+clients then fails somewhere further from the cause than a rejection would have put it: a
+`json.loads` on prose, an index into a missing second choice, a loop over an empty `content`
+array.
+
+Routing agreed decisively on both the slice and its shape: `next_slice` =
+**`structured_output_handling` 0.993 @ 0.991** against the legacy `/v1/completions` route 0.006,
+`model_id` 0.0003, `docs_sweep` 0.0006, `image_cost_ceiling` 0.0001 and `perf_leftovers` 0.0001;
+`response_format_answer` = **`reject_both` 0.993 @ 0.990** over rejecting `json_schema` alone
+(0.006), building real JSON constraint machinery (0.0005) and keeping the fields ignored (0.0004);
+`scope_breadth` = **`all_silent_fields` 0.987 @ 0.980** over `response_format` alone (0.012) and a
+documentation-only pass (0.0009).
+
+### What was added
+
+Five fields decoded, and one rule applied to four of them.
+
+- **`OpenAIChatRequest`** now decodes `response_format` (its `type` only), `n`, `logprobs`,
+  `top_logprobs` and `stream_options` (its `include_usage` only). Decoding them is what makes them
+  refusable; while they were unknown keys nothing downstream could see them at all.
+- **`OpenAIAdapter.refuseUnsupportedResponseShape(_:)`** refuses `json_object`, `json_schema`, any
+  other `response_format` type, `n != 1`, `logprobs: true` and any `top_logprobs`, each with a
+  message that names the field it received and says what this server can do instead. It accepts
+  `response_format: {"type": "text"}` (the protocol's own default), `logprobs: false` (which asks for
+  exactly what this server already does) and `n: 1`.
+- **`buildTurnPlan(_ apiRequest: OpenAIChatRequest)`** calls it beside `toolUseEnabled`, i.e. before
+  the model gate and before any engine state is touched. That ordering is visible from outside: the
+  same bodies answer **400** where the identical request without those fields answers 503.
+- **The streaming writer honours `stream_options.include_usage`** instead of volunteering the chunk.
+  It is the one field in the set that asks for something this server can do, so it is obeyed rather
+  than refused.
+
+### The finding: the usage chunk was the one field whose silence could crash a client
+
+`stream_options.include_usage` looked harmless to ignore — the server sent usage anyway, which is
+more information, not less. It is not harmless. The usage chunk is the ONLY chunk in the stream with
+an **empty `choices` array**, and a good deal of client code does `chunk.choices[0]` on every chunk.
+Against OpenAI that never fires, because the chunk only exists when the caller asked for it; against
+this server it fired for every streaming request, i.e. only against a local server, which is the
+worst place for a client's own bug to surface.
+
+So the field is obeyed, and the two arms are measured on the published checkpoint
+(`testTheStreamedUsageTailIsOptIn`, 53.3 s, `/tmp/test88_live.log`):
+
+```
+🔎 [dsv41 real] streamed usage tail: 187 prompt / 5 generated, unrequested stream carried 0 usage frame(s)
+```
+
+Three separate claims in one line: a stream that never asked carries **zero** chunks with an empty
+`choices` array; a stream that asked carries **exactly one**; and the numbers in it are the turn's own
+(**187** prompt positions for this prompt, **5** generated in a 6-token budget), with
+`total_tokens == prompt + completion` in the same chunk.
+
+The prompt count is the expanded one, which is what `#80` pinned for a picture and what the
+non-streaming route reports for the same body — the cases that read it (`streamChat`) now ask for it
+the way a client does (`, "stream_options": {"include_usage": true}`), and re-running `#80`'s
+`testAStreamedAPIRequestWithAnImageAnswersOverTheLocalServer` unchanged otherwise still passes
+(**123.3 s**) with the expanded-length assertion intact.
+
+### What it is not (do not re-propose)
+
+- **Not JSON-constrained generation.** `GrammarConstrainedSampler` is a tool-call tag state machine
+  with a token trie of tool names; it has no JSON grammar and no schema-to-token-mask compiler.
+  Honouring `json_schema` means building one, which is inference machinery, not protocol surface.
+  Refusing the field is the honest half and it costs a switch statement.
+- **Not a silent `n`-dropping.** Returning one choice when two were asked for is the failure this
+  slice exists to remove; the engine is single-flight per request, so a second choice is a second
+  request and the queue is already the mechanism for that.
+- **Not a log-probability implementation.** The sampler could expose them, but a response field that
+  only sometimes appears must not appear empty; give a client the 400 and let it decide.
+- **Not an Anthropic-side change.** Anthropic's request has no `n`, no `logprobs` and no
+  `response_format`, and its `top_k` was already wired into the turn plan. There is no equivalent
+  hole on that surface.
+- **Not a change to any accepted request.** Every field the adapters already decoded behaves exactly
+  as before, and the four new refusals are all for modes this server never honoured — the only
+  requests that change behaviour are the ones that were being answered wrongly.
+- **Not a rejection of `stream_options`.** Only its one meaningful sub-field is read; unknown
+  sub-fields are ignored as before, because they ask for nothing this server could either honour or
+  contradict.
+- **Not a perf result.** Nothing here touches the engine or the generation path.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_88` (status 0), then `test-without-building` with
+the same `-derivedDataPath` throughout. Bundle freshness checked with `strings … | grep -c` over the
+seven new case names (**7**) before running.
+
+The warning set did not move at all: **1,829 → 1,829**, `diff` of the `file:line: warning` sets
+against `#87`'s build shows zero added instances. The new refusal lives inside the existing
+`nonisolated` adapter surface, which is why it costs no new actor diagnostics.
+
+| suite | result |
+|---|---|
+| `OpenAIAdapterLogicTests` (27 cases; four new — the fields decode rather than vanishing, `json_object`/`json_schema`/an unknown type are refused by name while `text` and absent are accepted, `n`/`logprobs`/`top_logprobs` are refused while `n: 1` and `logprobs: false` are not, and `stream_options` is read and never refused) | **27 cases, 0 failures** (23 before) |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787; two new — five refusal bodies all answer 400 naming their field where the same shape answers 503, and the streaming route answers the same refusal as a 200 SSE error frame) | **24 cases, 0 failures, 1 skipped** (22 before) |
+| `AnthropicAdapterLogicTests`, `ServerQueueLogicTests`, `ServerStreamSafetyTests`, `ServerToolArgumentTests`, `ServerHardeningLogicTests`, `TurnToolMaskTests`, `ChatPromptFormatterConversationTests`, `ReasoningRoundTripTests`, `PrefixAsOfDateTests`, `EngineTurnSlotTests` | **133 cases, 0 failures**, none of them touched by this slice |
+| `DeepSeekV41PublishedTurnTests.testTheStreamedUsageTailIsOptIn` (opt-in, `/tmp/dynamoe_dsv41_real_turn`, private port 8798) | **passed, 53.3 s**, 0 unrequested usage frames, 1 requested, 187/5 |
+| `DeepSeekV41PublishedTurnTests.testAStreamedAPIRequestWithAnImageAnswersOverTheLocalServer` (`#80`'s case, unchanged except that its body now asks for usage) | **passed, 123.3 s**, expanded-length assertion intact |
+
+The smoke cases are deliberately split that way: the 400-vs-503 contrast can only be shown with NO
+model loaded (that is what makes the ordering visible), while the streaming refusal needs no model at
+all because the plan is built inside the stream's own body closure — which is also why a streamed
+refusal wears a 200 and has done since `#80`.

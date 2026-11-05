@@ -4106,8 +4106,13 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         // Twice the non-streaming budget: reasoning is streamed into its own
         // `reasoning_content` field on this route, so the visible answer needs
         // tokens that `#78` spent on the pre-amble it printed instead.
+        //
+        // `stream_options.include_usage` is asked for because the usage tail is
+        // opt-in by protocol (`#88`): a stream that does not ask for it carries no
+        // chunk with an empty `choices` array, and these cases read the expanded
+        // prompt length out of that chunk.
         let body = """
-        {"model":"any","max_tokens":48,"stream":true,"messages":[
+        {"model":"any","max_tokens":48,"stream":true,"stream_options":{"include_usage":true},"messages":[
             {"role":"user","content":[\(parts.joined(separator: ","))]}
         ]}
         """
@@ -4665,6 +4670,77 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
                 "an Anthropic client's 404 must be logged as an Anthropic error row"
             )
         }
+    }
+
+    /// The streamed usage tail is opt-in by protocol, and this server now obeys the
+    /// request instead of volunteering it.
+    ///
+    /// The chunk carries an EMPTY `choices` array, so a client that indexes
+    /// `choices[0]` on every chunk — a common shape in OpenAI SDK wrappers — throws on
+    /// it, and only ever against a server that sends it unrequested. Two streams of
+    /// the same tiny prompt on the real checkpoint: one that does not ask must carry
+    /// no such chunk, one that asks must carry exactly one, and the prompt length in
+    /// it must be the expanded one the non-streaming route reports.
+    func testTheStreamedUsageTailIsOptIn() async throws {
+        let snapshot = try snapshotDirectory()
+        let engine = try loadPublishedCheckpointIntoTheSharedEngine(snapshot)
+        defer {
+            unloadSharedEngine()
+            withExtendedLifetime(engine) {}
+        }
+        let port = 8798
+
+        func stream(askingForUsage: Bool) async throws -> String {
+            let options = askingForUsage ? #","stream_options":{"include_usage":true}"# : ""
+            return try await postStreaming(
+                port: port,
+                path: "/v1/chat/completions",
+                body: """
+                {"model":"any","max_tokens":6,"stream":true\(options),
+                 "messages":[{"role":"user","content":"Say hello."}]}
+                """
+            )
+        }
+
+        try await withLocalServer(on: port) { _ in
+            let plain = try await stream(askingForUsage: false)
+            let asked = try await stream(askingForUsage: true)
+
+            XCTAssertTrue(plain.contains("[DONE]"), "the unrequested stream must still terminate cleanly")
+            XCTAssertTrue(asked.contains("[DONE]"), "the requested stream must terminate cleanly")
+
+            let plainUsage = usageFrames(in: plain)
+            let askedUsage = usageFrames(in: asked)
+            XCTAssertEqual(
+                plainUsage.count, 0,
+                "a stream that never asked for usage must carry no chunk with an empty choices array"
+            )
+            XCTAssertEqual(askedUsage.count, 1, "exactly one usage tail belongs to a stream that asked")
+            let usage = try XCTUnwrap(askedUsage.first)
+            let prompt = try XCTUnwrap(usage["prompt_tokens"] as? Int)
+            let completion = try XCTUnwrap(usage["completion_tokens"] as? Int)
+            XCTAssertGreaterThan(prompt, 0, "the tail reports the prompt, not a placeholder")
+            XCTAssertGreaterThan(completion, 0, "the tail reports what was generated")
+            XCTAssertEqual(
+                usage["total_tokens"] as? Int, prompt + completion,
+                "the total must be the two counts the same chunk reports"
+            )
+            print("🔎 [dsv41 real] streamed usage tail: \(prompt) prompt / \(completion) generated, "
+                + "unrequested stream carried \(plainUsage.count) usage frame(s)")
+        }
+    }
+
+    /// The `usage` objects of a stream's frames, one per chunk that carries one.
+    private func usageFrames(in raw: String) -> [[String: Any]] {
+        var found: [[String: Any]] = []
+        for frame in parseSSEFrames(raw).frames {
+            guard frame.data != "[DONE]", let data = frame.data.data(using: .utf8),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let usage = json["usage"] as? [String: Any]
+            else { continue }
+            found.append(usage)
+        }
+        return found
     }
 
     /// One decoded body as readable JSON, so a run's log carries the wire shape rather

@@ -205,6 +205,70 @@ final class ServerControllerSmokeTests: XCTestCase {
         )
     }
 
+    // MARK: - Request fields this server cannot honour
+
+    /// A request asking for JSON, for two choices or for log-probabilities is
+    /// refused BY NAME, and refused before the model gate: the proof is a 400 where
+    /// the same body shape answers 503. Before `#88` these keys were dropped by the
+    /// decoder and the turn ran as if they had not been sent.
+    func testUnsupportedResponseShapeFieldsAreRefusedBeforeTheModelGate() async throws {
+        guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
+            throw XCTSkip("A model is loaded; the pre-gate refusal cannot be isolated from generation")
+        }
+        await ensureServerRunning()
+
+        for field in [
+            #""response_format":{"type":"json_object"}"#,
+            #""response_format":{"type":"json_schema","json_schema":{"name":"x"}}"#,
+            #""n":2"#,
+            #""logprobs":true"#,
+            #""top_logprobs":3"#,
+        ] {
+            var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/chat/completions")!)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = Data("""
+            {"model":"any",\(field),"messages":[{"role":"user","content":"hello"}]}
+            """.utf8)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let http = try XCTUnwrap(response as? HTTPURLResponse)
+            XCTAssertEqual(http.statusCode, 400, "\(field) must be refused, not ignored")
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let error = try XCTUnwrap(body["error"] as? [String: Any])
+            XCTAssertEqual(error["type"] as? String, "invalid_request_error")
+            let message = try XCTUnwrap(error["message"] as? String)
+            let named = field.split(separator: "\"").first.map(String.init) ?? ""
+            XCTAssertTrue(
+                message.contains(named),
+                "the refusal must name \(named), got: \(message)"
+            )
+        }
+    }
+
+    /// The same refusal on the streaming route keeps that route's own contract: the
+    /// response is a 200 and the refusal travels as an SSE error frame, exactly as
+    /// `#80` pinned for a picture against a model with no tower.
+    func testUnsupportedResponseShapeIsAnSSEErrorOnTheStreamingRoute() async throws {
+        await ensureServerRunning()
+
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:8787/v1/chat/completions")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data("""
+        {"model":"any","stream":true,"response_format":{"type":"json_schema","json_schema":{"name":"x"}},
+         "messages":[{"role":"user","content":"hello"}]}
+        """.utf8)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let http = try XCTUnwrap(response as? HTTPURLResponse)
+        XCTAssertEqual(http.statusCode, 200, "a streaming refusal wears a 200 by contract")
+        let text = String(decoding: data, as: UTF8.self)
+        XCTAssertTrue(
+            text.contains("\"error\""),
+            "the refusal must arrive as an SSE error frame, got: \(text)"
+        )
+        XCTAssertTrue(text.contains("response_format"), "the frame must name the field")
+    }
+
     func testStreamingCompletionsWithoutModelEmitsSSEErrorThenDone() async throws {
         guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
             throw XCTSkip("A model is loaded; the SSE error path cannot be exercised")

@@ -1777,6 +1777,10 @@ final class ServerController: ObservableObject {
         // Reject a forced tool choice before touching engine state, so the
         // client gets a clear error instead of a silently unconstrained turn.
         let toolsEnabled = try OpenAIAdapter.toolUseEnabled(apiRequest.toolChoice)
+        // Same posture for the fields that ask for an answer this server cannot
+        // produce: structured output, several choices, or token log-probabilities.
+        // Ignoring them answered a different request than the one sent, with a 200.
+        try OpenAIAdapter.refuseUnsupportedResponseShape(apiRequest)
         let info = try requireLoadedModel()
         let split = try OpenAIAdapter.splitMessages(apiRequest.messages)
         let hasTools = !(apiRequest.tools ?? []).isEmpty && toolsEnabled
@@ -2102,6 +2106,12 @@ final class ServerController: ObservableObject {
         let created = Int(Date().timeIntervalSince1970)
         let stopSequences = (apiRequest.stop ?? []).filter { !$0.isEmpty }
         let model = apiRequest.model ?? CompletionEngine.shared.loadedModelInfo?.displayName ?? "dynamoe"
+        // The protocol asks the client to opt into the trailing usage chunk, and it is
+        // the one chunk whose `choices` is empty. Sending it regardless is not a
+        // harmless extra: a client that indexes `choices[0]` on every chunk — a common
+        // shape in OpenAI SDK wrappers — throws on it, and only ever against a server
+        // that volunteers the chunk. So the request decides, as it does upstream.
+        let includeUsage = apiRequest.streamOptions?.includeUsage ?? false
 
         // This request's row is finalized when the stream drains (the HTTP
         // response is already a bare 200 by then), so claim the box: the wire
@@ -2357,9 +2367,10 @@ final class ServerController: ObservableObject {
                     }
                     let finishReason = OpenAIAdapter.finishReasonString(result.finishReason, hasToolCalls: !(toolCalls ?? []).isEmpty)
                     try await sse(chunkBuffer(.init(role: nil, content: nil, reasoningContent: nil, toolCalls: nil), finishReason: finishReason))
-                    // Final usage chunk (OpenAI includes this with stream_options.include_usage).
+                    // Final usage chunk, when the client asked for it with
+                    // `stream_options.include_usage`.
                     let usageTail = OpenAIUsage(promptTokens: promptTokensBox.get(), completionTokens: result.tokensGenerated)
-                    if let data = try? JSONSerialization.data(withJSONObject: [
+                    if includeUsage, let data = try? JSONSerialization.data(withJSONObject: [
                         "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
                         "choices": [],
                         "usage": [
