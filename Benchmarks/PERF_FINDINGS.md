@@ -14376,3 +14376,137 @@ retired).
 One compile trap repeated from `#93` and worth carrying: `try XCTUnwrap(try await f())` is an `'async' call
 in an autoclosure that does not support concurrency`. Bind the awaited value to a local first. The smoke
 case's polling helper needed exactly that in two places.
+
+## DSV4.1 #96: A CLIENT SENDING THE PROTOCOL'S OWN `medium` WAS REFUSED, BECAUSE THE DECODER KNEW ONLY THIS ENGINE'S TWO WORDS
+
+### The question
+
+How many of the `reasoning_effort` values OpenAI documents does this server accept, and what happens to a
+client that sends one of the others? The field is the one request knob that decides whether the model
+reasons at all, so unlike `prediction` or `service_tier` it cannot be quietly ignored, and `#88`-`#95` had
+spent eight slices making the server refuse by name rather than silently answer a different question. The
+suspicion was that the refusal had been pointed at the wrong side.
+
+### What was found
+
+1. **The engine has two levels and the protocol has four.** `ThinkingEffort` (`ChatModels.swift`) is a
+   two-case enum, `low` and `high`, because that is what a level-capable checkpoint's template exposes
+   (Spark X2.6's High/Low/Off menu, and the DeepSeek-V4.1 `Reasoning Effort:` line). `ThinkingEffort.parse`
+   matches exactly those two raw values and nothing else.
+2. **The decoder asked the engine, not the protocol.** `OpenAIAdapter.thinkingEffort` called
+   `ThinkingEffort.parse(raw)` and threw on nil, so `"medium"` and `"minimal"` were both HTTP 400. The
+   message said "Supported values are low and high", which is true of the engine and false of the wire:
+   `low` and `high` are not OpenAI's vocabulary at all, they are this engine's.
+3. **OpenAI documents `minimal`, `low`, `medium` and `high`, and its SDK sends `medium` by default for
+   reasoning models.** A client that followed its own protocol therefore failed against this server on
+   every request, with a 400 that read as the client's mistake. That is the shape `#88` was written to
+   end, arriving through a different door: not a field dropped by `Decodable`'s unknown-key tolerance, but
+   a known field validated against the wrong vocabulary.
+4. **The app already had a rule for the word `medium`.** `ThinkingEffort.clamped` maps a stored or
+   hand-edited `"medium"` to `.high`, and `DynaMoETests` pins that (`object["thinkingEffort"] = "medium"`
+   decodes to `.high`). So the mapping the server needed was not a new decision, it was the decision the
+   chat UI had been making since graded levels shipped.
+5. **`/v1/models` advertised the capability and not the vocabulary.** `#81` added
+   `capabilities: {vision, thinking, thinking_levels}` with the explicit intent that "a client that reads
+   them can predict its own rejection instead of discovering it". `thinking_levels: true` says a graded
+   level is honoured and nothing about which words name one, so a client could read the models route,
+   correctly learn that levels work, and still have no way to know `medium` would be refused.
+6. **The checkpoint's own 1-100 budget is a separate, unreachable surface.**
+   `DeepSeekV41PromptDialect.effortBudget(from:)` parses `minimal`/`low`/`medium`/`mid`/`max`/`maximum` and
+   any numeric budget, and its doc comment says it exists "so the API adapters can accept
+   `reasoning_effort: 60` as well as `"high"`". Nothing in production calls it. That claim is false and
+   stays false after this slice, for the reason in finding 5 of the next section.
+
+### What was added
+
+- `OpenAIAdapter.reasoningEffortVocabulary`: one table of `(value, level)` pairs, `minimal` and `low` to
+  `.low`, `medium` and `high` to `.high`, and `reasoningEffortValues` derived from it. This is the only
+  place the vocabulary lives.
+- `OpenAIAdapter.thinkingEffortLevel(forProtocolValue:)`, which trims and lowercases and then reads that
+  table, returning nil for a word the protocol does not define. `thinkingEffort` now maps through it
+  instead of parsing, and builds its refusal message from the same table, so the 400 now names
+  `minimal, low, medium, high`.
+- `OpenAIModelList.Capabilities.reasoningEffortValues` (wire key `reasoning_effort_values`), copied from
+  the adapter's own list and nil beside `thinking_levels: false`.
+- Two pure cases in `OpenAIAdapterLogicTests` (one replacing
+  `testReasoningEffortAcceptsOnlySupportedLevels`, whose `medium` assertion was the bug written down as a
+  test), the models-route capability cases extended, and the guide's Request Options bullet plus two
+  README rows updated.
+
+### The finding
+
+1. **A vocabulary mismatch is not a capability gap, and the reflex to refuse hid the difference.** The
+   engine genuinely has two levels, so nothing here was unfixable, but the existing code treated "the
+   engine cannot represent this value" as "this request is unanswerable". `#88`'s rule is to refuse what
+   the server cannot honour rather than answer a different question; it does not license refusing what it
+   can honour under another name. A documented value a default-configured client sends is the clearest
+   case: the server was not declining to guess, it was declining to read its own protocol.
+2. **`medium` to high is not a new decision, it is the app's existing one.** `ThinkingEffort.clamped`
+   already resolves a stored `"medium"` to `.high`, and the client path now agrees with it, so the chat UI
+   and an API caller cannot read one word two ways. `minimal` to `.low` is the same argument on the other
+   end: the DeepSeek dialect's own `effortBudget` puts `minimal` at the bottom of its range (25), which is
+   the short budget `.low` renders. Both halves of the mapping were already written down elsewhere in this
+   codebase; nothing was invented.
+3. **One table, three readers.** The mapper, the refusal message and the models-route advertisement all
+   read `reasoningEffortVocabulary`, so the list a client can read is by construction the list it can
+   send. A hand-written array on the wire is the failure mode `#81` called out ("copied from the fact the
+   turn planner reads, never written by hand"), and the test asserts the two are equal rather than
+   comparing each against a third literal.
+4. **The advertisement is nil beside `thinking_levels: false`, for the cost block's reason.** A family with
+   only an on/off switch refuses every graded value with a different message ("not supported by the loaded
+   model"), so announcing a vocabulary it cannot honour would be the same mistake as advertising
+   `vision_cost` for a checkpoint that published a resize plan and not the tower.
+5. **The 1-100 budget is still unreachable, and that is a wider slice.** Widening `ThinkingEffort` to carry
+   a numeric budget would touch the toolbar's High/Low/Off menu, `@AppStorage`/session persistence, every
+   family's template rendering, and the server turn-memory digest that invalidates a recorded turn on a
+   level change. The interoperability failure was the 400, so the 400 is what this slice fixed; a third
+   level is a product change, not a decode fix.
+6. **The thinking-off path is untouched.** `thinkingEffort` returns nil for an absent field or
+   `enable_thinking: false` before it looks at the vocabulary, so a client that disabled thinking and left
+   a stale `reasoning_effort` behind still gets its turn rather than a new 400. The mapping is only
+   consulted when a level would actually be rendered.
+
+### What it is not (do not re-propose)
+
+- **Not a third `ThinkingEffort` case, and not a numeric level on the wire.** See finding 5.
+- **Not `reasoning_effort: "60"`.** The DeepSeek dialect can parse it and no adapter asks, which is
+  recorded above as a false doc comment rather than wired here: the OpenAI protocol types the field as a
+  string enum, and a client that sends a number currently fails at decode with a body error, which is a
+  separate question from the vocabulary.
+- **Not a change to `ThinkingEffort.parse`.** It stays matching only the engine's two words, because it is
+  also what reads `@AppStorage` and session JSON; the coercion belongs to the protocol adapter.
+- **Not a new 400 on the thinking-off path** (finding 6), and not a stricter check before
+  `requireLoadedModel()`. A no-model request with `reasoning_effort: "medium"` answers 503 exactly as
+  before, which is why there is no smoke case for this slice: the mapping is unreachable over real HTTP
+  without a loaded checkpoint, and the smoke harness asserts the no-model path.
+- **Not `prediction`, `web_search_options`, `service_tier`, `functions` or `function_call`.** Still
+  undecoded, still candidates (the last two are the only ones in that list that can move an answer).
+- **Not an Anthropic change.** That protocol already grades through `thinking.budget_tokens`, which is
+  numeric and was already mapped (`<4096` low, else high).
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status`, then `test-without-building` with the same
+`-derivedDataPath`, three-part `-only-testing` identifiers and `-parallel-testing-enabled NO`. Bundle
+freshness confirmed with `strings ... | grep -c` over both new case names before running. Warning
+instances 1,554 -> **1,554**, kinds 506 -> 506 (a first pass added one
+`main actor-isolated conformance of 'OpenAIModelList.Model' to 'Encodable'` instance from an extra
+`JSONEncoder().encode` in the new test, which the existing capability case already performs; the duplicate
+encode was removed rather than the warning tolerated).
+
+| suite | result |
+|---|---|
+| `OpenAIAdapterLogicTests` (41 -> 42: `reasoning_effort` maps all four documented values, case and whitespace ignored, an undefined word still refused with a message that names the four, and `ThinkingEffort.parse` still matching only the engine's two while `clamped("medium")` is `.high`; the models route advertises exactly the resolver's vocabulary, nil beside `thinking_levels: false`, and the Swift property name does not leak) | **42 cases, 0 failures** |
+| `AnthropicAdapterLogicTests` | **29 cases, 0 failures** |
+| `DeepSeekV41PromptEffortTests`, `DeepSeekV41ChatPromptFormatterTests` | **17 cases, 0 failures** |
+| `ChatPromptFormatterConversationTests` | **20 cases, 0 failures** |
+| `KVCacheProvisioningLogicTests` | **16 cases, 0 failures** |
+| `ServerQueueLogicTests` | **23 cases, 0 failures** |
+| `ReasoningRoundTripTests` | **18 cases, 0 failures** |
+| `ServerStreamSafetyTests` | **13 cases, 0 failures** |
+| `TurnFitLogicTests` | **12 cases, 0 failures** |
+| `PrefixAsOfDateTests` | **9 cases, 0 failures** |
+| `ModelConfigThinkingLevelTests` | **7 cases, 0 failures** |
+| `ServerHardeningLogicTests` | **6 cases, 0 failures** |
+| `ServerToolArgumentTests` | **4 cases, 0 failures** |
+| `TurnToolMaskTests` | **3 cases, 0 failures** |

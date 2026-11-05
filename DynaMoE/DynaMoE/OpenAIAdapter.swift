@@ -745,6 +745,16 @@ struct OpenAIModelList: ResponseEncodable {
         /// True when the family renders a graded effort level (High/Low/Off) into
         /// its system block, rather than a plain on/off switch.
         var thinkingLevels: Bool
+        /// The `reasoning_effort` values this server accepts, low to high.
+        ///
+        /// `thinkingLevels` says a graded level is honoured and nothing about which
+        /// words name one, which left a client to guess. A client that guessed this
+        /// engine's own two ("low", "high") was served, while one that sent the
+        /// protocol's `medium` met a 400 it could not have predicted from here. The
+        /// list is the adapter's own accepted vocabulary, never a second copy of it,
+        /// and it is nil beside `thinkingLevels: false` for the reason `visionCost`
+        /// is nil beside `vision: false`.
+        var reasoningEffortValues: [String]?
         /// What one attachment is expected to cost, when this family reads them.
         ///
         /// `vision` alone says a picture is accepted and nothing about whether that
@@ -757,6 +767,7 @@ struct OpenAIModelList: ResponseEncodable {
         enum CodingKeys: String, CodingKey {
             case vision, thinking
             case thinkingLevels = "thinking_levels"
+            case reasoningEffortValues = "reasoning_effort_values"
             case visionCost = "vision_cost"
         }
 
@@ -840,6 +851,9 @@ struct OpenAIModelList: ResponseEncodable {
                 vision: info.supportsVision,
                 thinking: info.supportsThinking,
                 thinkingLevels: info.supportsThinkingLevels,
+                reasoningEffortValues: info.supportsThinkingLevels
+                    ? OpenAIAdapter.reasoningEffortValues
+                    : nil,
                 visionCost: info.supportsVision
                     ? info.visionCost.map { Capabilities.VisionCost($0) }
                     : nil
@@ -1150,9 +1164,47 @@ enum OpenAIAdapter {
         ServerPromptSplit(systemPrompt: "", turns: [.init(role: .user, text: request.promptText ?? "")])
     }
 
+    /// OpenAI's documented `reasoning_effort` vocabulary, low to high, and the
+    /// engine level each value selects.
+    ///
+    /// The protocol names four graded values and the OpenAI SDK sends `medium` by
+    /// default for reasoning models, so a decoder that knew only this engine's own
+    /// two words refused half the vocabulary: a default-configured client met an HTTP
+    /// 400 saying the supported values were "low and high" for sending the value its
+    /// own protocol documents. The vocabulary is mapped onto the two levels the
+    /// engine exposes instead, `minimal` and `low` onto the short budget and
+    /// `medium` and `high` onto the full one.
+    ///
+    /// `medium` landing on high is the rule the app already applies to its own
+    /// stored level (`ThinkingEffort.clamped`), so a client and the chat UI cannot
+    /// read the same word two ways. This table is the only place the vocabulary
+    /// lives: the mapper below and the `/v1/models` advertisement both read it, so
+    /// what is accepted and what is announced cannot drift apart.
+    nonisolated static let reasoningEffortVocabulary: [(value: String, level: ThinkingEffort)] = [
+        ("minimal", .low),
+        ("low", .low),
+        ("medium", .high),
+        ("high", .high)
+    ]
+
+    /// The values a client may send, for the models route to advertise.
+    nonisolated static var reasoningEffortValues: [String] {
+        reasoningEffortVocabulary.map(\.value)
+    }
+
+    /// The level a client's `reasoning_effort` selects, or nil when the string is
+    /// not one of the protocol's own values. Case and surrounding whitespace are
+    /// ignored, because a hand-written request is not required to be canonical.
+    nonisolated static func thinkingEffortLevel(forProtocolValue raw: String?) -> ThinkingEffort? {
+        guard let raw else { return nil }
+        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return reasoningEffortVocabulary.first { $0.value == normalized }?.level
+    }
+
     /// Maps the client's `reasoning_effort` onto a graded level. Returns nil
-    /// when the field is absent or thinking is explicitly off. A level the
-    /// loaded model cannot honor is rejected rather than silently dropped.
+    /// when the field is absent or thinking is explicitly off. A value outside
+    /// the protocol's vocabulary, or a level the loaded model cannot honor, is
+    /// rejected rather than silently dropped.
     nonisolated static func thinkingEffort(
         from raw: String?,
         levelCapable: Bool,
@@ -1166,9 +1218,10 @@ enum OpenAIAdapter {
                 logSafeMessage: "reasoning_effort is not supported by the loaded model"
             )
         }
-        guard let effort = ThinkingEffort.parse(raw) else {
+        guard let effort = thinkingEffortLevel(forProtocolValue: raw) else {
             throw ServerAPIError.badRequest(
-                "Unsupported reasoning_effort value. Supported values are low and high.",
+                "Unsupported reasoning_effort value. Supported values are "
+                    + reasoningEffortValues.joined(separator: ", ") + ".",
                 logSafeMessage: "Unsupported reasoning_effort value"
             )
         }

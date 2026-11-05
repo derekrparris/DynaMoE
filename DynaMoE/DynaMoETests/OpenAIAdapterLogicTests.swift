@@ -244,7 +244,7 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         XCTAssertEqual(cost["max_encode_seconds"] as? Double, 7.84)
         // The wire must not leak Swift property names, at either level.
         let encoded = String(decoding: try JSONEncoder().encode(model), as: UTF8.self)
-        for leaked in ["thinkingLevels", "visionCost", "minPromptPositions",
+        for leaked in ["thinkingLevels", "visionCost", "reasoningEffortValues", "minPromptPositions",
                        "maxPatchTokens", "minEncodeSeconds", "minSpanPositions"] {
             XCTAssertFalse(encoded.contains(leaked), "\(leaked) leaked into the payload")
         }
@@ -252,7 +252,8 @@ final class OpenAIAdapterLogicTests: XCTestCase {
 
     /// The flags must be copied, not hardcoded: a tower-less family must advertise
     /// `vision: false` or a client sends a picture that is refused with a 400, and
-    /// a family with a plain on/off switch must not claim graded levels.
+    /// a family with a plain on/off switch must not claim graded levels, nor the
+    /// `reasoning_effort` vocabulary that only a graded level can honour.
     ///
     /// The cost block follows the same rule, and it is the case that matters here:
     /// a checkpoint can publish a `vision_config` and a resize plan and still not
@@ -272,6 +273,10 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         XCTAssertEqual(capabilities["thinking"] as? Bool, true)
         XCTAssertEqual(capabilities["thinking_levels"] as? Bool, false)
         XCTAssertNil(capabilities["vision_cost"], "no tower, no cost to advertise")
+        XCTAssertNil(
+            capabilities["reasoning_effort_values"],
+            "no graded levels, so no vocabulary to advertise"
+        )
         // A model with no architectural ceiling and a server with no cap both
         // report nothing rather than a sentinel a client would read as a number.
         XCTAssertNil(json["context_length"])
@@ -886,12 +891,67 @@ final class OpenAIAdapterLogicTests: XCTestCase {
 
     // MARK: - Graded thinking levels
 
-    func testReasoningEffortAcceptsOnlySupportedLevels() throws {
+    /// OpenAI documents four graded `reasoning_effort` values and its SDK sends
+    /// `medium` by default, so a resolver that knew only this engine's own two words
+    /// answered a standard request with a 400. The vocabulary is mapped onto the two
+    /// levels instead, and `medium` maps the same way the app already maps a stored
+    /// `"medium"` (`ThinkingEffort.clamped`), so the two cannot disagree.
+    func testReasoningEffortMapsTheProtocolsVocabularyOntoTheEnginesTwoLevels() throws {
         XCTAssertNil(try OpenAIAdapter.thinkingEffort(from: nil, levelCapable: true, thinkingRequested: true))
+        XCTAssertEqual(try OpenAIAdapter.thinkingEffort(from: "minimal", levelCapable: true, thinkingRequested: true), .low)
         XCTAssertEqual(try OpenAIAdapter.thinkingEffort(from: "low", levelCapable: true, thinkingRequested: true), .low)
+        XCTAssertEqual(try OpenAIAdapter.thinkingEffort(from: "medium", levelCapable: true, thinkingRequested: true), .high)
         XCTAssertEqual(try OpenAIAdapter.thinkingEffort(from: " HIGH ", levelCapable: true, thinkingRequested: true), .high)
-        XCTAssertThrowsError(try OpenAIAdapter.thinkingEffort(from: "medium", levelCapable: true, thinkingRequested: true))
+        // Whitespace and case are a hand-written request's business, not a refusal.
+        XCTAssertEqual(try OpenAIAdapter.thinkingEffort(from: " Medium\n", levelCapable: true, thinkingRequested: true), .high)
+        // A word the protocol does not define is still refused, and the message names
+        // the ones that would have worked.
+        XCTAssertThrowsError(try OpenAIAdapter.thinkingEffort(from: "ultra", levelCapable: true, thinkingRequested: true)) { error in
+            let message = String(describing: error)
+            for value in ["minimal", "low", "medium", "high"] {
+                XCTAssertTrue(message.contains(value), "the refusal must name \(value), got: \(message)")
+            }
+        }
         XCTAssertThrowsError(try OpenAIAdapter.thinkingEffort(from: "low", levelCapable: false, thinkingRequested: true))
+        // A stored level string is a different vocabulary: `ThinkingEffort.parse` keeps
+        // matching only the engine's own two, which is what the chat UI writes.
+        XCTAssertNil(ThinkingEffort.parse("medium"))
+        XCTAssertEqual(ThinkingEffort.clamped("medium"), .high)
+    }
+
+    /// `thinking_levels` says a graded level is honoured and nothing about which words
+    /// name one. The advertised list is the resolver's own vocabulary, so a client can
+    /// read it and predict its own rejection instead of discovering it in a 400.
+    func testTheModelsRouteAdvertisesTheReasoningEffortValuesItAccepts() throws {
+        let model = OpenAIModelList.entry(
+            for: loadedInfo(vision: false, thinking: true, levels: true),
+            contextLength: nil,
+            maxPromptTokens: nil,
+            created: 0
+        )
+        let json = try encodedModel(model)
+        let capabilities = try XCTUnwrap(json["capabilities"] as? [String: Any])
+        let advertised = try XCTUnwrap(capabilities["reasoning_effort_values"] as? [String])
+        XCTAssertEqual(advertised, ["minimal", "low", "medium", "high"])
+        // Every announced value must be one the resolver accepts, and dropping any one
+        // of them would silently make the advertisement a promise it does not keep.
+        for value in advertised {
+            XCTAssertEqual(
+                try OpenAIAdapter.thinkingEffort(from: value, levelCapable: true, thinkingRequested: true),
+                OpenAIAdapter.thinkingEffortLevel(forProtocolValue: value)
+            )
+        }
+        XCTAssertNil(OpenAIAdapter.thinkingEffortLevel(forProtocolValue: "ultra"))
+        XCTAssertFalse(advertised.contains("ultra"))
+        // The list is the adapter's own vocabulary, so it cannot announce a word the
+        // resolver refuses. The wire spelling and the no-leak rule are pinned by
+        // `testModelListAdvertisesTheCapabilitiesThePlannerGatesOn`, which encodes a
+        // model once for every capability key.
+        XCTAssertEqual(
+            OpenAIAdapter.reasoningEffortValues,
+            advertised,
+            "what is advertised must be what the resolver reads"
+        )
     }
 
     func testReasoningEffortIsMootWhenThinkingIsOff() throws {
