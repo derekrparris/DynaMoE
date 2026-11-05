@@ -320,6 +320,55 @@ final class DeepSeekV41TurnLoopTests: XCTestCase {
         XCTAssertEqual(progress.map(\.1), [5, 5, 5])
     }
 
+    /// Every shape of prefill ends on a report that covers the WHOLE prompt.
+    ///
+    /// The engine retires the composer's prefill pill on exactly that report
+    /// (`done >= total`), because this family reasons for hundreds of tokens after
+    /// ingestion and the heading is keyed off a nil status. A shape that stopped one
+    /// block short would leave a reasoning turn reading as "Ingesting Prompt..." for
+    /// its whole length, and nothing else would notice.
+    func testTheLastPrefillReportCoversTheWholePromptInEveryShape() throws {
+        // One chunk call: a single report, already complete.
+        let singleChunk = ScriptedForward(positionLimit: 64, scripted: [7])
+        var singleProgress: [(Int, Int)] = []
+        _ = try run(
+            forward: singleChunk,
+            prompt: [10, 11, 12],
+            settings: settings(maxTokens: 1),
+            prefill: { singleProgress.append(($0, $1)) }
+        )
+        XCTAssertEqual(singleProgress.last?.0, 3)
+        XCTAssertEqual(singleProgress.last?.1, 3)
+
+        // The same chunk in blocks of two: 2 then 3, never a short tail.
+        let blocked = ScriptedForward(positionLimit: 64, scripted: [7])
+        blocked.chunkBlockSize = 2
+        var blockedProgress: [(Int, Int)] = []
+        _ = try run(
+            forward: blocked,
+            prompt: [10, 11, 12],
+            settings: settings(maxTokens: 1),
+            prefill: { blockedProgress.append(($0, $1)) }
+        )
+        XCTAssertEqual(blockedProgress.map(\.0), [2, 3])
+        XCTAssertEqual(blockedProgress.last?.1, 3)
+
+        // A resumed turn walks the delta, and the walk's last report is the delta's
+        // length rather than the prompt's.
+        let walked = ScriptedForward(positionLimit: 64, scripted: [7], resident: [10])
+        var walkProgress: [(Int, Int)] = []
+        _ = try run(
+            forward: walked,
+            prompt: [10, 11, 12],
+            prefixTokens: 1,
+            settings: settings(maxTokens: 1),
+            prefill: { walkProgress.append(($0, $1)) }
+        )
+        XCTAssertTrue(walked.chunkedPrompts.isEmpty)
+        XCTAssertEqual(walkProgress.map(\.0), [1, 2])
+        XCTAssertEqual(walkProgress.last?.0, walkProgress.last?.1)
+    }
+
     func testAStopSequenceEndsTheTurnAndIsReported() throws {
         let forward = ScriptedForward(positionLimit: 64, scripted: [5])
         let output = try run(

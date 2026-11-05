@@ -782,6 +782,17 @@ public final class CompletionEngine: @unchecked Sendable {
                                     speed: rate,
                                     rssGB: WorkingSetManager.shared.effectiveResidentMemoryGB
                                 ))
+                                // Retire the prefill pill the moment prefill ends, not
+                                // at the turn's tail. This family reasons for hundreds
+                                // of tokens after ingestion, and the composer keys its
+                                // "Ingesting Prompt..." / "Thinking..." heading off a
+                                // nil status, so leaving the clear to the post-`run`
+                                // emit below left the whole reasoning pass reading as
+                                // prefill. The generic path clears between prefill and
+                                // decode for exactly this reason.
+                                if isFinal {
+                                    emit(.prefillProgress(status: nil, speed: nil, rssGB: nil))
+                                }
                             },
                             onText: { text, tokens, elapsed in
                                 let now = CFAbsoluteTimeGetCurrent()

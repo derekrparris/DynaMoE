@@ -6295,6 +6295,11 @@ struct ContentView: View {
                                 // placeholder creation, so a long response would
                                 // look stale to retention as soon as it finishes.
                                 self.sessions[sIdx].messages[mIdx].timestamp = Date()
+                                // No frame can exist before prefill produced a token,
+                                // so the pill retires here even if the backend's own
+                                // clear never arrived — the same belt the Apple
+                                // Foundation path wears on its first visible text.
+                                self.sessions[sIdx].messages[mIdx].prefillStatus = nil
                                 self.sessions[sIdx].messages[mIdx].isThinking = frame.isActivelyThinking
                                 self.sessions[sIdx].messages[mIdx].tokenCount = frame.tokensGenerated
                                 self.sessions[sIdx].messages[mIdx].tokensPerSec = frame.tokensPerSecond
