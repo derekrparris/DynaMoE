@@ -740,6 +740,8 @@ public final class CompletionEngine: @unchecked Sendable {
                                         topK: dsSampling.topK,
                                         repetitionPenalty: dsSampling.repetitionPenalty,
                                         presencePenalty: dsSampling.presencePenalty,
+                                        frequencyPenalty: dsSampling.frequencyPenalty,
+                                        logitBias: dsSampling.logitBias,
                                         eosTokenIds: dsEosIDs
                                     )
                                 }
@@ -1860,6 +1862,8 @@ public final class CompletionEngine: @unchecked Sendable {
         let topKVal = sampling.topK
         let repPen = sampling.repetitionPenalty
         let presPen = sampling.presencePenalty
+        let freqPen = sampling.frequencyPenalty
+        let bias = sampling.logitBias
         var maxTokens = sampling.maxTokens
         let buffers = shardBuffers
         let effMode = memory.executionMode.resolveEffectiveMode(modelFootprintGB: summary.sizeGb)
@@ -10619,6 +10623,8 @@ if layer.attnGateProjTensor != nil,
                         topK: topKVal,
                         repetitionPenalty: repPen,
                         presencePenalty: presPen,
+                        frequencyPenalty: freqPen,
+                        logitBias: bias,
                         eosTokenIds: modelConfig?.effectiveEosTokenIds.map { UInt32($0) } ?? [eosTokenId],
                         grammarMask: isGrammarActive && !UserDefaults.standard.bool(forKey: "dynamoe_disable_grammar") ? { maskLogits, maskVocab in
                             GrammarConstrainedSampler.shared.updateStateAndApplyLogitMask(

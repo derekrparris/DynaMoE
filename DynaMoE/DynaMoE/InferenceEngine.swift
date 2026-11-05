@@ -1426,15 +1426,37 @@ extension InferenceEngine {
         topK: Int,
         repetitionPenalty: Float,
         presencePenalty: Float = 0.0,
+        frequencyPenalty: Float = 0.0,
+        logitBias: [Int32: Float] = [:],
         eosTokenIds: [UInt32] = [],
         grammarMask: ((UnsafeMutablePointer<Float>, Int) -> Void)? = nil
     ) -> UInt32 {
-        // 1. Direct repetition and presence penalties to recent context tokens (no Set lookup across 166k items)
+        // 1. Direct repetition, presence and frequency penalties to recent context
+        // tokens (no Set lookup across 166k items), plus any per-token bias.
+        //
+        // Presence is charged ONCE per distinct recent token; frequency is charged
+        // per OCCURRENCE (`logits -= penalty * count`), which is the one difference
+        // between the two OpenAI knobs. `logitBias` is additive on a named token id
+        // whether or not the context holds it, which is how a client bans a token.
         let recent = contextTokens.suffix(256)
+        let frequencyActive = abs(frequencyPenalty) > 0.001
+        let biasActive = !logitBias.isEmpty
         var origVals: [(Int, Float)] = []
-        if repetitionPenalty > 1.001 || abs(presencePenalty) > 0.001 {
+        if repetitionPenalty > 1.001 || abs(presencePenalty) > 0.001 || frequencyActive || biasActive {
             var seen = Set<Int>()
-            origVals.reserveCapacity(recent.count)
+            var counts: [Int: Int] = [:]
+            if frequencyActive {
+                // Counted in its own pass, because the penalty is a function of the
+                // FINAL count: charging on the first occurrence would read the count
+                // as 1 for every token and make frequency behave like presence.
+                counts.reserveCapacity(recent.count)
+                for tok in recent {
+                    let v = Int(tok)
+                    guard v < vocabSize else { continue }
+                    counts[v, default: 0] += 1
+                }
+            }
+            origVals.reserveCapacity(recent.count + logitBias.count)
             for tok in recent {
                 let v = Int(tok)
                 guard v < vocabSize else { continue }
@@ -1448,7 +1470,23 @@ extension InferenceEngine {
                     if abs(presencePenalty) > 0.001 {
                         modified -= presencePenalty
                     }
+                    if frequencyActive {
+                        modified -= frequencyPenalty * Float(counts[v] ?? 1)
+                    }
                     logits[v] = modified
+                }
+            }
+            if biasActive {
+                for (id, bias) in logitBias {
+                    let v = Int(id)
+                    // An id the model cannot emit has no candidate to bias, so it is
+                    // skipped rather than refused: the vocabulary belongs to the
+                    // loaded checkpoint, not to the request's protocol.
+                    guard v >= 0, v < vocabSize else { continue }
+                    if seen.insert(v).inserted {
+                        origVals.append((v, logits[v]))
+                    }
+                    logits[v] += bias
                 }
             }
         }

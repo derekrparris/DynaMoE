@@ -4843,6 +4843,104 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         }
     }
 
+    /// `logit_bias` reaches the sampler on the real checkpoint, and the proof is the
+    /// answer rather than the mapping.
+    ///
+    /// At temperature 0 this engine is greedy, so two identical chat requests return
+    /// identical text: that is the control. The third request bans the id of a token
+    /// the control actually produced (`-100` on it), and the only way its answer can
+    /// differ is that the sampler read the bias. `frequency_penalty` rides the same
+    /// `TurnSampling` path, so this pins the plumbing both fields share; the
+    /// occurrence arithmetic itself is pinned without weights in
+    /// `CompletionEngineLogicTests`.
+    func testTheChatRouteHonoursLogitBiasOnThePublishedCheckpoint() async throws {
+        let snapshot = try snapshotDirectory()
+        let engine = try loadPublishedCheckpointIntoTheSharedEngine(snapshot)
+        defer {
+            unloadSharedEngine()
+            withExtendedLifetime(engine) {}
+        }
+        // The tokenizer is main-actor isolated like the rest of the app's own types,
+        // so it is opened and driven on the main actor rather than from here.
+        let tokenizer: DynaMoeTokenizer? = await MainActor.run {
+            try? DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        }
+        guard tokenizer != nil else {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let port = 8801
+
+        func ask(bias: [Int: Float]?) async throws -> String {
+            var body: [String: Any] = [
+                "model": "any",
+                "max_tokens": 8,
+                "temperature": 0,
+                "enable_thinking": false,
+                "messages": [["role": "user", "content": "The capital of France is"]],
+            ]
+            if let bias {
+                body["logit_bias"] = Dictionary(
+                    uniqueKeysWithValues: bias.map { (String($0.key), NSNumber(value: $0.value)) }
+                )
+            }
+            var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let status = try XCTUnwrap((response as? HTTPURLResponse)?.statusCode)
+            let text = String(decoding: data, as: UTF8.self)
+            XCTAssertEqual(status, 200, text)
+            let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+            let choices = try XCTUnwrap(json["choices"] as? [[String: Any]])
+            let message = try XCTUnwrap(choices.first?["message"] as? [String: Any])
+            return (message["content"] as? String) ?? ""
+        }
+
+        try await withLocalServer(on: port) { _ in
+            let control = try await ask(bias: nil)
+            XCTAssertFalse(
+                control.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                "the control turn produced nothing to bias"
+            )
+            let repeatControl = try await ask(bias: nil)
+            XCTAssertEqual(
+                repeatControl, control,
+                "temperature 0 is greedy, so a repeated request must be identical: without that, a difference proves nothing"
+            )
+
+            // Ban a token the control actually emitted, taken from the checkpoint's own
+            // tokenizer rather than guessed.
+            let banTarget: (id: UInt32, text: String)? = await MainActor.run {
+                guard let tokenizer, let ids = try? tokenizer.encode(text: control) else { return nil }
+                for id in ids {
+                    guard let piece = try? tokenizer.decode(ids: [id]),
+                          piece.contains(where: { $0.isLetter }) else { continue }
+                    return (id, piece)
+                }
+                return nil
+            }
+            guard let banTarget else {
+                throw XCTSkip("the control answer carried no letter-bearing token to ban")
+            }
+            let banned = banTarget.id
+            let bannedText = banTarget.text
+
+            let biased = try await ask(bias: [Int(banned): -100])
+            print(
+                "🔎 [dsv41 real] logit_bias: control=\(control.debugDescription) "
+                    + "banned id \(banned)=\(bannedText.debugDescription) "
+                    + "biased=\(biased.debugDescription)"
+            )
+            XCTAssertNotEqual(
+                biased, control,
+                "a -100 bias on token \(banned) (\(bannedText)) must change a greedy answer"
+            )
+        }
+    }
+
     /// The `usage` objects of a stream's frames, one per chunk that carries one.
     private func usageFrames(in raw: String) -> [[String: Any]] {
         var found: [[String: Any]] = []

@@ -1466,6 +1466,11 @@ final class ServerController: ObservableObject {
         var minP: Float?
         var repetitionPenalty: Float?
         var presencePenalty: Float?
+        /// OpenAI's `frequency_penalty`, already range-checked by the adapter.
+        var frequencyPenalty: Float?
+        /// OpenAI's `logit_bias`, already converted from the wire's string keys and
+        /// range-checked by the adapter.
+        var logitBias: [Int32: Float]?
         var maxTokens: Int?
         var stopSequences: [String]
         var thinkingRequested: Bool
@@ -1753,6 +1758,8 @@ final class ServerController: ObservableObject {
             topK: inputs.topK ?? 50,
             repetitionPenalty: inputs.repetitionPenalty ?? 1.1,
             presencePenalty: inputs.presencePenalty ?? 0.0,
+            frequencyPenalty: inputs.frequencyPenalty ?? 0.0,
+            logitBias: inputs.logitBias ?? [:],
             maxTokens: maxTokens
         )
 
@@ -1848,6 +1855,8 @@ final class ServerController: ObservableObject {
             minP: apiRequest.minP,
             repetitionPenalty: apiRequest.repetitionPenalty,
             presencePenalty: apiRequest.presencePenalty,
+            frequencyPenalty: try OpenAIAdapter.frequencyPenalty(apiRequest.frequencyPenalty),
+            logitBias: try OpenAIAdapter.logitBias(from: apiRequest.logitBias),
             maxTokens: apiRequest.maxTokens,
             stopSequences: apiRequest.stop ?? [],
             thinkingRequested: thinkingRequested,
@@ -1888,6 +1897,8 @@ final class ServerController: ObservableObject {
             minP: apiRequest.minP,
             repetitionPenalty: apiRequest.repetitionPenalty,
             presencePenalty: apiRequest.presencePenalty,
+            frequencyPenalty: try OpenAIAdapter.frequencyPenalty(apiRequest.frequencyPenalty),
+            logitBias: try OpenAIAdapter.logitBias(from: apiRequest.logitBias),
             maxTokens: apiRequest.maxTokens,
             stopSequences: apiRequest.stop ?? [],
             thinkingRequested: thinkingRequested,

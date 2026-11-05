@@ -13778,3 +13778,116 @@ The live case is deliberately two requests rather than one: the non-streaming ar
 the echo contract and the accounting, and the streaming arm pins that a legacy stream carries
 `text_completion` frames (never `chat.completion.chunk`) and exactly one usage tail because it asked
 for one.
+
+## DSV4.1 #90: TWO OPENAI SAMPLER FIELDS WERE ANSWERED AS IF THEY HAD NOT BEEN SENT — AND THE ENGINE ALREADY HAD THE HALF THAT WAS MISSING
+
+### The question
+
+Routed with SubQ (`next_slice` = **`sampler_fields` 0.9992 @ 0.9991**, against `responses_route` 0.0002,
+`ui_status` 0.0002, `mhc_device` 0.0002, `model_id` 0.00006, `docs_sweep` 0.00006, `perf_leftovers`
+0.00003; `sampler_posture` = **`implement` 0.9817 @ 0.9726** against refuse-by-name 0.0176 and
+document-only 0.0006; `logit_bias_scope` **0.9206** yes, same slice; `seed_user_posture` =
+**`decode_and_document` 0.9993 @ 0.9989**). Decisive on all four, so no reasoning override was needed.
+
+`#88` and `#89` established the posture: a field the server cannot honour is refused by name rather than
+silently ignored. That left one hole on the route clients actually drive: `OpenAIChatRequest` did not
+decode `frequency_penalty`, `logit_bias`, `seed` or `user` at all, so Swift's unknown-key tolerance
+answered a request that asked for a repetition penalty exactly as if it had not asked — while
+`/v1/completions` refused two of those fields at the same time. `#89`'s journal entry recorded the
+asymmetry and named the reason ("a new 400 on a path the user's own coding agent drives daily is a
+behaviour change with no measurement behind it"). This slice closes it from the other side, which turns
+out to be the cheap side: the engine could already do most of the work.
+
+### What was added
+
+| file | change |
+|---|---|
+| `InferenceEngine.sampleNextToken` | two parameters with no-penalty defaults: `frequencyPenalty` (charged per OCCURRENCE, counted in its own pass because the penalty is a function of the FINAL count) and `logitBias: [Int32: Float]` (additive on a named id whether or not the context holds it), both folded into the same touched-and-restored set the presence penalty already used |
+| `CompletionTypes.TurnSampling` | `frequencyPenalty` and `logitBias` fields with defaults, so every existing construction site is unchanged |
+| `OpenAIAdapter` | `frequency_penalty`/`logit_bias`/`seed`/`user` decoded on the chat route; `logitBias(from:)` converts the wire's string keys and refuses a non-id key or a bias outside -100…100; `frequencyPenalty(_:)` refuses outside -2.0…2.0 and folds a value that is effectively zero to none |
+| `ServerController` | `TurnPlanInputs` carries both, the two OpenAI planners resolve them BEFORE the model gate (the same ordering every refusal keeps), and both routes feed `TurnSampling` |
+| `ServerRequestLog` | both request summaries now carry `frequency_penalty`, `logit_bias` (and the chat route's `presence_penalty`): a row that omitted them could not explain why two requests with one prompt differ |
+| `OpenAIAdapter.refuseUnsupportedCompletionsShape` | the two refusals are gone; the legacy route validates the same two fields instead of naming them unsupported |
+| `HelpAndSettingsGuideView` | the Request Options bullet says what the fields now do and what `seed`/`user` do not; the Refused Requests bullet lists only the ranges that are still refused |
+
+### The finding: the sampler was missing a loop, not a feature
+
+`presence_penalty` already walked the last 256 context tokens once per DISTINCT token. That loop is the
+whole of what `frequency_penalty` needs and the whole of what `logit_bias` needs; the two fields are one
+counted pass and one additive pass over the same touched set the presence penalty was already
+restoring, which is why this is +44 lines in the sampler's file and not the "thread a count through
+three hot-loop call sites" the earlier entry predicted. Two things had to be right, and both are pinned:
+
+- **The count must be taken before the penalty is applied.** The first version counted inside the
+  distinct-token branch and charged on the first occurrence, which reads the count as 1 for every token
+  and makes `frequency_penalty` behave exactly like `presence_penalty` — the unit test caught it
+  immediately (`[1000, 1000, 1000]` with a 0.2 penalty still preferred the penalised token), and the
+  fix is a separate counting pass. A wrong count here is invisible in any single-token context.
+- **The restore must not be applied twice.** A biased id that is ALSO in context records its original
+  once (the `seen` set is shared), so the defer puts back the pre-penalty value rather than the
+  pre-bias one. The composition case is a test of its own.
+
+The clip is on the wire, not on the arithmetic: a bias outside OpenAI's range and a key that is not a
+token id are 400s naming the field, because a clamped bias answers a distribution the client did not
+ask for. An id beyond the LOADED checkpoint's vocabulary is deliberately NOT refused — the vocabulary
+belongs to the model rather than to the protocol, such an id has no candidate logit to bias, and the
+sampler skips it.
+
+### The live number, on the published checkpoint
+
+`testTheChatRouteHonoursLogitBiasOnThePublishedCheckpoint` (opt-in, private port 8801) is three short
+turns on the real checkpoint:
+
+```
+control          "The capital of France is **Paris"      (identical on the repeat)
+banned id 671    = "The"   (the leading token of that answer, taken from the checkpoint's tokenizer)
+biased turn      "Paris."
+```
+
+66.1 s for the three turns including load. The repeat is the control that makes the third turn mean
+something: temperature 0 is greedy here, so a differing answer can only come from the bias reaching the
+sampler. `frequency_penalty` rides the identical `TurnSampling` path, so this pins the plumbing both
+fields share; the occurrence arithmetic is pinned without weights.
+
+### What it is not (do not re-propose)
+
+- **Not a new 400 on the chat route.** The posture `#88`/`#89` built is "refuse what you cannot honour";
+  the corollary this slice adds is "honour what you can". Refusing `frequency_penalty` on
+  `/v1/chat/completions` would have been a behaviour change on the daily-driver path for a capability
+  the engine has.
+- **Not `seed`/`user` semantics.** Both are decoded and discarded, documented: `seed` is a best-effort
+  determinism hint (this engine is already greedy at temperature 0) and `user` is an abuse label with no
+  local meaning. Neither can move an answer.
+- **Not `logit_bias` vocabulary validation.** See above: an out-of-vocabulary id is skipped. Validating
+  it would need the tokenizer's vocab at DECODE time, i.e. a model load inside request decoding.
+- **Not a perf result.** The added work is one count pass over at most 256 tokens when
+  `frequency_penalty` is non-zero and one dictionary walk when `logit_bias` is present. Both are
+  skipped entirely when absent, so the decode loop this repo spends its measurements on is unchanged
+  for every request that does not send them.
+- **Not the Responses API.** Still excluded by the level-0 completeness bar; see `#89`.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_status` (status 0 throughout, six times), then
+`test-without-building` with the same `-derivedDataPath`. Bundle freshness checked with
+`strings … | grep -c testTheChatRouteHonoursLogitBiasOnThePublishedCheckpoint` → **1** before the live
+run.
+
+| suite | result |
+|---|---|
+| `OpenAIAdapterLogicTests` (34 cases, two new: both fields decoded and resolved on both routes with a zero bias dropped, and the four refusals by name — out-of-range frequency, out-of-range bias, a non-numeric key, a negative key — plus the effectively-zero no-op) | **34 cases, 0 failures** (31 before) |
+| `CompletionEngineLogicTests` (18 cases, five new on a synthetic 2,000-wide logits vector: frequency charged per occurrence where presence is charged once, a negative frequency penalty rewarding repetition, bias suppressing and promoting ids outside the context, bias composing with the penalties on one id with an exact restore, and an out-of-vocabulary id changing nothing) | **18 cases, 0 failures** (13 before) |
+| `ServerControllerSmokeTests` (app-hosted, real server on 8787: the field loop shrank to the four refusals, and two arms were added — the sampler fields reach the MODEL gate as 503, and an out-of-range bias is still a 400 naming the field) | **26 cases, 0 failures, 1 skipped** |
+| `ServerRequestLogLogicTests`, `AnthropicAdapterLogicTests` | **69 cases, 0 failures** across the two, unaffected but sharing the summary path |
+| `DeepSeekV41PublishedTurnTests.testTheChatRouteHonoursLogitBiasOnThePublishedCheckpoint` (opt-in) | **passed, 66.1 s**, control == repeat, banned id 671 (`"The"`), biased answer `"Paris."` |
+
+The live test opens and drives the checkpoint's tokenizer on the main actor: the first version called it
+from the test's own `async` context and added four main-actor-isolation instances, all of which are gone
+from the touched line range in the final build. A full recompile (`touch` over both source trees, then
+`build-for-testing` into the same derived-data path) leaves the warning set at exactly **1,846
+instances, the pre-slice number**: two kinds are renamed rather than added (`sampleNextToken`'s and
+`TurnSampling.init`'s main-actor-isolation texts, which now spell the new parameter list) and nothing
+else moved.
+
+`#89`'s "Not `frequency_penalty` for real" and "Not `logit_bias`" paragraphs are SUPERSEDED by this
+entry: both fields are now honoured on both OpenAI routes, and no route refuses them.

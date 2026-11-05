@@ -215,6 +215,13 @@ struct OpenAIChatRequest: Decodable {
     let minP: Float?
     let repetitionPenalty: Float?
     let presencePenalty: Float?
+    /// OpenAI's `frequency_penalty`, charged per OCCURRENCE of a recent token
+    /// where `presence_penalty` is charged once per distinct one.
+    let frequencyPenalty: Float?
+    /// OpenAI's `logit_bias` in the wire's own string-keyed form. Converted and
+    /// range-checked by `logitBias(from:)`, which the planner calls before any
+    /// generation work.
+    let logitBias: [String: Float]?
     let maxTokens: Int?
     let stream: Bool?
     let stop: [String]?
@@ -257,6 +264,8 @@ struct OpenAIChatRequest: Decodable {
         case minP = "min_p"
         case repetitionPenalty = "repetition_penalty"
         case presencePenalty = "presence_penalty"
+        case frequencyPenalty = "frequency_penalty"
+        case logitBias = "logit_bias"
         case maxTokens = "max_tokens"
         case toolChoice = "tool_choice"
         case enableThinking = "enable_thinking"
@@ -265,6 +274,7 @@ struct OpenAIChatRequest: Decodable {
         case n, logprobs
         case topLogprobs = "top_logprobs"
         case streamOptions = "stream_options"
+        case seed, user
     }
 
     init(from decoder: Decoder) throws {
@@ -277,6 +287,15 @@ struct OpenAIChatRequest: Decodable {
         self.minP = try container.decodeIfPresent(Float.self, forKey: .minP)
         self.repetitionPenalty = try container.decodeIfPresent(Float.self, forKey: .repetitionPenalty)
         self.presencePenalty = try container.decodeIfPresent(Float.self, forKey: .presencePenalty)
+        self.frequencyPenalty = try container.decodeIfPresent(Float.self, forKey: .frequencyPenalty)
+        self.logitBias = try container.decodeIfPresent([String: Float].self, forKey: .logitBias)
+        // `seed` and `user` are decoded only to be documented as ignored, the same
+        // way the legacy route treats them: upstream calls `seed` a best-effort
+        // determinism hint (this engine is already greedy at temperature 0) and
+        // `user` an abuse-monitoring label with no local meaning. Neither can move
+        // an answer, and a 400 for one would break clients that always send it.
+        _ = try container.decodeIfPresent(Int.self, forKey: .seed)
+        _ = try container.decodeIfPresent(String.self, forKey: .user)
         self.maxTokens = try container.decodeIfPresent(Int.self, forKey: .maxTokens)
         self.stream = try container.decodeIfPresent(Bool.self, forKey: .stream)
         // OpenAI allows `stop` as a bare string or an array.
@@ -361,7 +380,9 @@ nonisolated struct OpenAICompletionsRequest: Decodable {
     let echo: Bool?
     let stop: [String]?
     let bestOf: Int?
-    let logitBiasCount: Int
+    /// OpenAI's `logit_bias` in the wire's own string-keyed form; converted and
+    /// range-checked by `OpenAIAdapter.logitBias(from:)`.
+    let logitBias: [String: Float]?
     /// This server's own thinking extension, which this route reads in the opposite
     /// direction from the chat route: see `completionsThinkingRequested`.
     let enableThinking: Bool?
@@ -439,7 +460,7 @@ nonisolated struct OpenAICompletionsRequest: Decodable {
             self.stop = try container.decodeIfPresent([String].self, forKey: .stop)
         }
         self.bestOf = try container.decodeIfPresent(Int.self, forKey: .bestOf)
-        self.logitBiasCount = (try container.decodeIfPresent([String: Float].self, forKey: .logitBias))?.count ?? 0
+        self.logitBias = try container.decodeIfPresent([String: Float].self, forKey: .logitBias)
         self.enableThinking = try container.decodeIfPresent(Bool.self, forKey: .enableThinking)
         self.reasoningEffort = try container.decodeIfPresent(String.self, forKey: .reasoningEffort)
         self.streamOptions = try container.decodeIfPresent(OpenAIChatRequest.StreamOptions.self, forKey: .streamOptions)
@@ -776,6 +797,57 @@ enum OpenAIAdapter {
         }
     }
 
+    /// Converts OpenAI's `logit_bias` object into the additive bias the sampler
+    /// applies, refusing by name what it could not honour.
+    ///
+    /// The wire keys token ids as decimal strings and upstream bounds a bias to
+    /// -100...100. A key that is not a token id, or a bias outside that range, is
+    /// refused here rather than clamped: a clamped value answers a request the
+    /// client did not send, which is the silent lie this posture exists to remove.
+    /// An id beyond the LOADED checkpoint's vocabulary is deliberately NOT refused,
+    /// because the vocabulary belongs to the model rather than to the protocol: such
+    /// an id has no candidate logit to bias, so the sampler skips it.
+    nonisolated static func logitBias(from raw: [String: Float]?) throws -> [Int32: Float] {
+        guard let raw, !raw.isEmpty else { return [:] }
+        var resolved: [Int32: Float] = [:]
+        resolved.reserveCapacity(raw.count)
+        for (key, bias) in raw {
+            guard let id = Int32(key.trimmingCharacters(in: .whitespaces)), id >= 0 else {
+                throw ServerAPIError.badRequest(
+                    "logit_bias carries the key \"\(key)\", which is not a token id. Send token ids "
+                        + "as decimal strings, e.g. {\"50256\": -100}.",
+                    logSafeMessage: "logit_bias carries a key that is not a token id"
+                )
+            }
+            guard bias >= -100, bias <= 100 else {
+                throw ServerAPIError.badRequest(
+                    "logit_bias for token \(id) is \(bias): this server honours OpenAI's range of "
+                        + "-100 to 100. Clamp the value or omit the entry."
+                )
+            }
+            // A zero bias changes nothing, and carrying it would only widen the
+            // sampler's touched set.
+            if abs(bias) > 0.0001 { resolved[id] = bias }
+        }
+        return resolved
+    }
+
+    /// OpenAI's `frequency_penalty`, in the range the sampler can honour.
+    ///
+    /// Negative values reward repetition and positive values punish it, exactly as
+    /// upstream; the value rides `TurnSampling` and is charged per OCCURRENCE of a
+    /// recent token, which is what separates it from `presence_penalty`.
+    nonisolated static func frequencyPenalty(_ value: Float?) throws -> Float {
+        guard let value else { return 0 }
+        guard value >= -2.0, value <= 2.0 else {
+            throw ServerAPIError.badRequest(
+                "frequency_penalty is \(value): this server honours OpenAI's range of -2.0 to 2.0. "
+                    + "Clamp the value or omit frequency_penalty."
+            )
+        }
+        return abs(value) > 0.001 ? value : 0
+    }
+
     /// Refuse the request fields this server cannot honour, by name.
     ///
     /// Swift's `Decodable` ignores the keys it does not know, which is what made
@@ -789,6 +861,12 @@ enum OpenAIAdapter {
     ///
     /// `stream_options.include_usage` is deliberately NOT on this list: it asks for
     /// something this server can do, so the streaming writer honours it instead.
+    ///
+    /// The two sampler fields (`frequency_penalty`, `logit_bias`) are neither
+    /// refused nor ignored: the sampler charges a per-occurrence penalty and biases
+    /// a named token, so they are VALIDATED here and resolved into the turn's
+    /// sampling. Validating rather than refusing keeps a new 400 off the path
+    /// clients already drive daily.
     nonisolated static func refuseUnsupportedResponseShape(_ request: OpenAIChatRequest) throws {
         switch request.responseFormat?.type ?? "text" {
         case "text":
@@ -824,6 +902,10 @@ enum OpenAIAdapter {
                     + "and top_logprobs."
             )
         }
+        // Resolved rather than refused (see the note above), and validated before the
+        // model gate like every other refusal so the ordering a test proves holds.
+        _ = try frequencyPenalty(request.frequencyPenalty)
+        _ = try logitBias(from: request.logitBias)
     }
 
     /// The same posture for the legacy text-completions route, over that route's
@@ -832,10 +914,10 @@ enum OpenAIAdapter {
     /// It is a separate function rather than a widening of the chat refusal
     /// because the two routes carry different fields and this one is new: nothing
     /// that works against the chat route today starts failing because of a rule
-    /// added here. The sampler fields (`frequency_penalty`, `logit_bias`) are
-    /// named here even though the chat route still ignores them; refusing them on
-    /// the route nobody calls yet cannot break a live client, and the asymmetry is
-    /// recorded rather than hidden.
+    /// added here. The sampler fields (`frequency_penalty`, `logit_bias`) used to be
+    /// named here as unsupported because the chat route still ignored them; now that
+    /// both routes resolve them into the sampler, this route validates them the same
+    /// way instead of refusing them.
     nonisolated static func refuseUnsupportedCompletionsShape(_ request: OpenAICompletionsRequest) throws {
         if request.promptIsTokenIDs {
             throw ServerAPIError.badRequest(
@@ -876,18 +958,9 @@ enum OpenAIAdapter {
                     + "best_of would change nothing about the completion it returned. Omit best_of."
             )
         }
-        if request.logitBiasCount > 0 {
-            throw ServerAPIError.badRequest(
-                "logit_bias is not supported: this server cannot bias token logits per request, so the "
-                    + "completion would be drawn from a distribution the client did not ask for. Omit logit_bias."
-            )
-        }
-        if let frequency = request.frequencyPenalty, abs(frequency) > 0.001 {
-            throw ServerAPIError.badRequest(
-                "frequency_penalty is not supported: this server applies presence_penalty (once per token "
-                    + "seen) but has no occurrence-count penalty, so the completion would be drawn from a "
-                    + "distribution the client did not ask for. Use presence_penalty, or omit frequency_penalty."
-            )
+        if request.logitBias != nil || request.frequencyPenalty != nil {
+            _ = try frequencyPenalty(request.frequencyPenalty)
+            _ = try logitBias(from: request.logitBias)
         }
     }
 

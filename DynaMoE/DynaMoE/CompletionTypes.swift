@@ -20,6 +20,12 @@ internal struct TurnSampling: Sendable {
     var topK: Int
     var repetitionPenalty: Float
     var presencePenalty: Float
+    /// OpenAI's `frequency_penalty`: charged per OCCURRENCE of a recent token,
+    /// where `presencePenalty` is charged once per distinct one.
+    var frequencyPenalty: Float
+    /// OpenAI's `logit_bias`: additive on a named token id, applied whether or not
+    /// the context holds it. Negative values suppress, positive values promote.
+    var logitBias: [Int32: Float]
     var maxTokens: Int
 
     init(
@@ -29,6 +35,8 @@ internal struct TurnSampling: Sendable {
         topK: Int,
         repetitionPenalty: Float,
         presencePenalty: Float = 0.0,
+        frequencyPenalty: Float = 0.0,
+        logitBias: [Int32: Float] = [:],
         maxTokens: Int
     ) {
         self.temperature = temperature
@@ -37,6 +45,8 @@ internal struct TurnSampling: Sendable {
         self.topK = topK
         self.repetitionPenalty = repetitionPenalty
         self.presencePenalty = presencePenalty
+        self.frequencyPenalty = frequencyPenalty
+        self.logitBias = logitBias
         self.maxTokens = maxTokens
     }
 }

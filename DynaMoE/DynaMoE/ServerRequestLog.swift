@@ -404,6 +404,11 @@ extension ServerRequestLog {
         payload["max_tokens"] = request.maxTokens
         payload["stop"] = request.stop
         payload["enable_thinking"] = request.enableThinking
+        // The sampler fields that move the DISTRIBUTION belong in the row: a row that
+        // omitted them could not explain why two requests with one prompt differ.
+        payload["presence_penalty"] = request.presencePenalty
+        payload["frequency_penalty"] = request.frequencyPenalty
+        payload["logit_bias"] = request.logitBias
         payload["messages"] = request.messages.map { message in
             var entry: [String: Any] = ["role": message.role]
             if let content = message.contentText { entry["content"] = content }
@@ -456,6 +461,10 @@ extension ServerRequestLog {
         payload["stop"] = request.stop
         payload["echo"] = request.echo
         payload["enable_thinking"] = request.enableThinking
+        // Both fields move the distribution, so the row carries them: without them no
+        // row could explain why one prompt answered differently than the last.
+        payload["frequency_penalty"] = request.frequencyPenalty
+        payload["logit_bias"] = request.logitBias
         return serializeSummary(payload)
     }
 

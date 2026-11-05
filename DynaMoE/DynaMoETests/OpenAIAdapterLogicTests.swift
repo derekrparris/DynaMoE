@@ -553,12 +553,11 @@ final class OpenAIAdapterLogicTests: XCTestCase {
         try refuse(#"{"prompt":"x","n":2}"#, naming: "n = 2")
         try refuse(#"{"prompt":"x","logprobs":1}"#, naming: "logprobs")
         try refuse(#"{"prompt":"x","best_of":3}"#, naming: "best_of")
-        try refuse(#"{"prompt":"x","logit_bias":{"50256":-100}}"#, naming: "logit_bias")
-        try refuse(#"{"prompt":"x","frequency_penalty":0.5}"#, naming: "frequency_penalty")
 
         // Everything this route honours, and the two fields that cannot move an
         // answer (`seed` is a best-effort hint and `user` is an abuse label), is
-        // accepted.
+        // accepted. The sampler fields are honoured now, so they are resolved
+        // rather than refused: see `testTheSamplerFieldsAreResolvedRatherThanIgnored`.
         for body in [
             #"{"prompt":"x"}"#,
             #"{"prompt":"x","n":1,"logprobs":0,"best_of":1}"#,
@@ -571,6 +570,76 @@ final class OpenAIAdapterLogicTests: XCTestCase {
                 body
             )
         }
+    }
+
+    /// The two sampler fields OpenAI defines and this engine can honour are decoded,
+    /// range-checked and resolved into the turn's sampling instead of ignored.
+    ///
+    /// Both routes carry them, and a value either route accepts has to survive the
+    /// decode intact: a silently dropped `logit_bias` answers a request the client
+    /// did not send, which is the class of lie `#88` and `#89` exist to remove.
+    func testTheSamplerFieldsAreResolvedRatherThanIgnored() throws {
+        let chat = try decodeRequest("""
+        {"messages":[],"frequency_penalty":0.5,"logit_bias":{"1000":-100,"1005":5,"7":0},"seed":7,"user":"someone"}
+        """)
+        XCTAssertEqual(chat.frequencyPenalty, 0.5)
+        XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedResponseShape(chat))
+        let chatFrequency = try OpenAIAdapter.frequencyPenalty(chat.frequencyPenalty)
+        XCTAssertEqual(chatFrequency, 0.5, accuracy: 1e-6)
+        let chatBias = try OpenAIAdapter.logitBias(from: chat.logitBias)
+        XCTAssertEqual(chatBias, [1000: -100, 1005: 5], "a zero bias changes nothing and is dropped")
+
+        let legacy = try decodeCompletions(#"{"prompt":"x","frequency_penalty":-1.5,"logit_bias":{"1000":-100}}"#)
+        XCTAssertEqual(legacy.frequencyPenalty, -1.5)
+        XCTAssertNoThrow(try OpenAIAdapter.refuseUnsupportedCompletionsShape(legacy))
+        let legacyFrequency = try OpenAIAdapter.frequencyPenalty(legacy.frequencyPenalty)
+        XCTAssertEqual(legacyFrequency, -1.5, accuracy: 1e-6)
+        let legacyBias = try OpenAIAdapter.logitBias(from: legacy.logitBias)
+        XCTAssertEqual(legacyBias, [1000: -100])
+
+        // Absent means "no penalty" on both, not an error.
+        let absent = try OpenAIAdapter.frequencyPenalty(nil)
+        XCTAssertEqual(absent, 0)
+        let noBias = try OpenAIAdapter.logitBias(from: nil)
+        XCTAssertTrue(noBias.isEmpty)
+    }
+
+    /// The values neither route can honour are refused BY NAME, before the model
+    /// gate, rather than clamped: a clamped bias answers a distribution the client
+    /// did not ask for.
+    func testTheSamplerFieldsAreRefusedByNameWhereTheyCannotBeHonoured() throws {
+        func refuseChat(_ body: String, naming needle: String, file: StaticString = #filePath, line: UInt = #line) throws {
+            let request = try decodeRequest(body)
+            XCTAssertThrowsError(
+                try OpenAIAdapter.refuseUnsupportedResponseShape(request), body, file: file, line: line
+            ) { error in
+                XCTAssertTrue(
+                    "\(error)".contains(needle), "the refusal must name \(needle), got: \(error)",
+                    file: file, line: line
+                )
+            }
+        }
+
+        try refuseChat(#"{"messages":[],"frequency_penalty":5}"#, naming: "frequency_penalty")
+        try refuseChat(#"{"messages":[],"logit_bias":{"50256":-500}}"#, naming: "logit_bias")
+        try refuseChat(#"{"messages":[],"logit_bias":{"abc":1}}"#, naming: "logit_bias")
+        // A negative key is not a token id either.
+        try refuseChat(#"{"messages":[],"logit_bias":{"-4":1}}"#, naming: "logit_bias")
+
+        // The same two rules on the legacy route, through its own refusal.
+        let legacyFrequency = try decodeCompletions(#"{"prompt":"x","frequency_penalty":2.5}"#)
+        XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedCompletionsShape(legacyFrequency)) { error in
+            XCTAssertTrue("\(error)".contains("frequency_penalty"), "got: \(error)")
+        }
+        let legacyBias = try decodeCompletions(#"{"prompt":"x","logit_bias":{"nope":-1}}"#)
+        XCTAssertThrowsError(try OpenAIAdapter.refuseUnsupportedCompletionsShape(legacyBias)) { error in
+            XCTAssertTrue("\(error)".contains("logit_bias"), "got: \(error)")
+        }
+
+        // A value that is effectively zero is no penalty rather than a refusal, so a
+        // client that always sends the field is unaffected.
+        let effectivelyZero = try OpenAIAdapter.frequencyPenalty(0.0004)
+        XCTAssertEqual(effectivelyZero, 0)
     }
 
     func testTheLegacyRouteReasonsOnlyWhenTheClientAsks() throws {

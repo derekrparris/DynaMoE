@@ -298,8 +298,8 @@ final class ServerControllerSmokeTests: XCTestCase {
 
     /// The legacy route refuses the fields it cannot honour by name, and refuses them
     /// BEFORE the model gate: the proof is a 400 where the same body shape answers 503.
-    /// The sampler fields are named here even though the chat route still ignores them,
-    /// because this route is new and refusing them cannot break a working client.
+    /// The sampler fields are no longer on this list: both routes resolve them into the
+    /// sampler, so they are asserted to reach the gate instead.
     func testTheCompletionsRouteRefusesUnrunnableFieldsBeforeTheModelGate() async throws {
         guard await MainActor.run(body: { !CompletionEngine.shared.hasLoadedModel }) else {
             throw XCTSkip("A model is loaded; the pre-gate refusal cannot be isolated from generation")
@@ -323,8 +323,6 @@ final class ServerControllerSmokeTests: XCTestCase {
             #""n":2"#,
             #""logprobs":1"#,
             #""best_of":2"#,
-            #""logit_bias":{"50256":-100}"#,
-            #""frequency_penalty":0.5"#,
         ] {
             let (status, text) = try await post(field)
             XCTAssertEqual(status, 400, "\(field) must be refused, not ignored: \(text)")
@@ -335,6 +333,19 @@ final class ServerControllerSmokeTests: XCTestCase {
             let named = field.split(separator: "\"").first.map(String.init) ?? ""
             XCTAssertTrue(message.contains(named), "the refusal must name \(named), got: \(message)")
         }
+
+        // The sampler fields are honoured, so they must reach the MODEL gate (503)
+        // rather than the refusal (400): a value this server can apply is not a bad
+        // request, and the opposite answer would break a client that always sends it.
+        let (samplerStatus, samplerText) = try await post(
+            #""frequency_penalty":0.5,"logit_bias":{"50256":-100}"#
+        )
+        XCTAssertEqual(samplerStatus, 503, "a field the sampler honours is not a 400: \(samplerText)")
+
+        // A value outside the range OpenAI defines is still refused by name.
+        let (rangeStatus, rangeText) = try await post(#""logit_bias":{"50256":-500}"#)
+        XCTAssertEqual(rangeStatus, 400, "an out-of-range bias is a bad request: \(rangeText)")
+        XCTAssertTrue(rangeText.contains("logit_bias"), "the refusal must name logit_bias, got: \(rangeText)")
 
         // A batch of prompts is a body shape rather than a field, so it gets its own
         // request instead of a field spliced into the loop's fixed body.
