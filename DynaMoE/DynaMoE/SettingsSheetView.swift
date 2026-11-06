@@ -2921,6 +2921,14 @@ struct SettingsSheetView: View {
         Task.detached(priority: .userInitiated) {
             do {
                 let dir = URL(fileURLWithPath: model.snapshotPath)
+                // An MoE checkpoint has no dense weight set to quantize (its
+                // per-token cost is the routed experts, which is FlashMoE's job),
+                // and a checkpoint without a vocabulary cannot be served at all.
+                // Re-repacking an ALREADY quantized directory is allowed: that is
+                // how Q8 becomes Q4, and the write is atomic now.
+                guard DenseRepacker.canRepack(dir: dir) || DenseRepacker.isRepacked(dir: dir) else {
+                    throw DenseRepackerError.notARepackableCheckpoint
+                }
                 try DenseRepacker.shared.repackSafetensors(
                     sourceDir: dir,
                     outputDir: dir,

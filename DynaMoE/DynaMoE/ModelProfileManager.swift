@@ -452,7 +452,11 @@ public final class ModelProfileManager: ObservableObject {
             "nanbeige"
         ]
 
-        let seedFlagKey = "dynamoe_seeded_official_profiles_v4"
+        // Deliberately NOT bumped for Nanbeige. The `else` branch below adds a
+        // profile for any key that has none, so a new family needs no flag change;
+        // bumping it would make `alreadySeeded` false for every existing user and
+        // overwrite customised ornith and qwen generation settings.
+        let seedFlagKey = "dynamoe_seeded_official_profiles_v3"
         let alreadySeeded = UserDefaults.standard.bool(forKey: seedFlagKey)
 
         var changed = false

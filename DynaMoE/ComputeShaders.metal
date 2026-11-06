@@ -4956,7 +4956,7 @@ kernel void q8_gemv(
     uint32_t numChunks16 = inDim / 16;
     for (uint32_t c = laneId; c < numChunks16; c += 32) {
         uint32_t colStart = c * 16;
-        uint32_t g = colStart / groupSize;
+        uint32_t g = min(colStart / groupSize, numGroups > 0 ? numGroups - 1 : 0);
         float scale = read_bf16_unaligned(sRow + g * 2);
         float bias  = read_bf16_unaligned(bRow + g * 2);
 
@@ -4988,9 +4988,12 @@ kernel void q8_gemv(
         threadSum += scale * groupSum + bias * groupXSum;
     }
     // Columns past the last whole 16-byte chunk (none for the widths this path
-    // serves) keep the scalar tail so a short row cannot overrun the buffer.
+    // serves) keep the scalar tail so a short row cannot overrun the buffer. The
+    // group index is CLAMPED, here and in the chunk loop above: a row whose width
+    // is not a multiple of `groupSize` would otherwise index the row's scale
+    // companion past its end and read the next row's scales.
     for (uint32_t col = numChunks16 * 16 + laneId; col < inDim; col += 32) {
-        uint32_t g = col / groupSize;
+        uint32_t g = min(col / groupSize, numGroups > 0 ? numGroups - 1 : 0);
         float scale = read_bf16_unaligned(sRow + g * 2);
         float bias  = read_bf16_unaligned(bRow + g * 2);
         float x = inPtr[col];
@@ -5075,7 +5078,7 @@ kernel void q8_swiglu_gate_up(
     uint32_t numChunks16 = hiddenDim / 16;
     for (uint32_t c = laneId; c < numChunks16; c += 32) {
         uint32_t colStart = c * 16;
-        uint32_t g = colStart / groupSize;
+        uint32_t g = min(colStart / groupSize, numGroups > 0 ? numGroups - 1 : 0);
         float gScale = read_bf16_unaligned(gSRow + g * 2);
         float gBias  = read_bf16_unaligned(gBRow + g * 2);
         float uScale = read_bf16_unaligned(uSRow + g * 2);
@@ -5124,7 +5127,7 @@ kernel void q8_swiglu_gate_up(
         up_sum   += uScale * uGroupSum + uBias * groupXSum;
     }
     for (uint32_t col = numChunks16 * 16 + laneId; col < hiddenDim; col += 32) {
-        uint32_t g = col / groupSize;
+        uint32_t g = min(col / groupSize, numGroups > 0 ? numGroups - 1 : 0);
         float gScale = read_bf16_unaligned(gSRow + g * 2);
         float gBias  = read_bf16_unaligned(gBRow + g * 2);
         float uScale = read_bf16_unaligned(uSRow + g * 2);
@@ -5321,7 +5324,7 @@ kernel void q8_down_proj_accumulate(
     uint32_t numChunks16 = intermediateDim / 16;
     for (uint32_t c = laneId; c < numChunks16; c += 32) {
         uint32_t colStart = c * 16;
-        uint32_t g = colStart / groupSize;
+        uint32_t g = min(colStart / groupSize, numGroups > 0 ? numGroups - 1 : 0);
         float dScale = read_bf16_unaligned(dSRow + g * 2);
         float dBias  = read_bf16_unaligned(dBRow + g * 2);
 
@@ -5354,7 +5357,7 @@ kernel void q8_down_proj_accumulate(
         down_sum += dScale * dGroupSum + dBias * groupXSum;
     }
     for (uint32_t col = numChunks16 * 16 + laneId; col < intermediateDim; col += 32) {
-        uint32_t g = col / groupSize;
+        uint32_t g = min(col / groupSize, numGroups > 0 ? numGroups - 1 : 0);
         float dScale = read_bf16_unaligned(dSRow + g * 2);
         float dBias  = read_bf16_unaligned(dBRow + g * 2);
         float x = intermediateVector[col];

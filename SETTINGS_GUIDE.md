@@ -152,7 +152,7 @@ A dense model has no routed experts to repack around, and a token reads the *who
 - `dense_weights.bin` holds every tensor back to back; `dense_weights.json` records each one's dtype, shape and byte range.
 - Weights are quantized to MLX-style affine 4-bit or 8-bit with a group size of 64: every group of 64 values keeps a scale and an offset, which is what the engine's GEMV kernels read. Perplexity loss is the usual 4-bit/8-bit trade; the quantization is lossy, and a repack is not reversible — delete the two files to go back to the full-precision checkpoint.
 - The token embedding and output head stay at full precision: the embedding is read one row at a time and the head is what the sampler reads.
-- Nanbeige 4.3's 66 GB becomes about **34 GB at Q8** and **22 GB at Q4**. A Q4 repack of that checkpoint still answers its published turn token for token.
+- Nanbeige 4.3's 66 GB becomes about **34 GB at Q8** and **22 GB at Q4**. A Q4 repack of that checkpoint still answers its published turn, with the same opening tokens as the full-precision run.
 - The repack is a one-time, minutes-long job (it reads every shard and writes the blob). An interrupted run leaves an incomplete manifest, which the engine detects and ignores: it falls back to the original safetensors, so a half-written repack can never load as a broken model.
 
 #### Model-Specific Profiles ("Coder" & "Assistant")
@@ -327,7 +327,7 @@ Controls the floating-point representation of the autoregressive key-value cache
 - **FP16**: Half precision. 50% memory reduction compared to FP32 with zero noticeable degradation in generation quality. Default for most configurations.
 - **FP8 (E4M3 / E5M2)**: 8-bit quantized KV cache with per-head dynamic scale factors. Reduces KV cache memory by 75%, enabling 32k+ token contexts on 16GB Macs without memory pressure.
 
-**Long context needs FP8 KV.** The row ceiling is now derived from the checkpoint's own `max_position_embeddings` (capped at 262,144 rows) instead of a flat 32,768, so a long-context model can be driven past 32k when the machine affords it — and the KV budget, not that ceiling, is what decides. The bytes are what bind. A 52-layer dense model with 8 KV heads of 128 costs 4 KB per logical token at FP16 (52 slots x 1024 stride x 2 tensors x 2 bytes), so a 66 GB checkpoint on a 128 GB Mac leaves roughly 27 GB of KV budget in Unrestricted mode: about 130k rows at FP16, versus about 270k at FP8. Past roughly 100k rows, switch the KV cache to FP8 E4M3; below that FP16 is the better trade.
+**Long context needs FP8 KV.** The row ceiling is now derived from the checkpoint's own `max_position_embeddings` (capped at 262,144 rows) instead of a flat 32,768, so a long-context model can be driven past 32k when the machine affords it — and the KV budget, not that ceiling, is what decides. The bytes are what bind. A 52-layer dense model with 8 KV heads of 128 costs 4 KB per layer per logical token at FP16 (1024 stride x 2 tensors x 2 bytes), i.e. about 208 KB per token across the 52 layers (52 slots x 1024 stride x 2 tensors x 2 bytes). So a 66 GB checkpoint on a 128 GB Mac leaves roughly 27 GB of KV budget in Unrestricted mode: about 130k rows at FP16, versus about 270k at FP8 (the FP8 cache also carries one scaling byte per 32 values, about 1.6% on top). Past roughly 100k rows, switch the KV cache to FP8 E4M3; below that FP16 is the better trade.
 
 ### Speculative MoE Lookahead Prefetching
 When running sparse MoE models in SSD streaming mode:

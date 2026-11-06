@@ -20,7 +20,7 @@
 //      xcodebuild test-without-building -project DynaMoE.xcodeproj -scheme DynaMoE \
 //          -destination 'platform=macOS,arch=arm64' -parallel-testing-enabled NO \
 //          -derivedDataPath <dd> \
-//          -only-testing:DynaMoETests/Nanbeige43PublishedTurnTests/Nanbeige43PublishedTurnTests/testAPublishedNanbeige43PromptCompletesATurn
+//          -only-testing:DynaMoETests/Nanbeige43PublishedTurnTests/testAPublishedNanbeige43PromptCompletesATurn
 //
 //  The assertions are the executable facts (the checkpoint is complete, the
 //  model path resolves to this family, the turn produced tokens and terminated).
@@ -276,6 +276,16 @@ final class Nanbeige43PublishedTurnTests: XCTestCase {
         print("📦 [nb43 repack] text: \(text)")
         XCTAssertGreaterThan(ids.count, 0, "the repacked checkpoint produced no tokens")
         if userText == Self.referencePrompt {
+            // The same oracle the unquantized case uses. Q4 is lossy, but the docs
+            // claim a repacked checkpoint still answers its published turn with the
+            // same opening tokens, and this is the assertion that makes that claim
+            // testable instead of prose.
+            XCTAssertGreaterThanOrEqual(ids.count, 4)
+            XCTAssertEqual(
+                Array(ids.prefix(4)),
+                [764, 5463, 290, 7914],
+                "the Q4 repack must reproduce the published checkpoint's greedy continuation"
+            )
             XCTAssertTrue(
                 text.contains("Paris"),
                 "Q4 is lossy, but the answer must survive it: \(text)"

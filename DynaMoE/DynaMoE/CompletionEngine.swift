@@ -27,9 +27,16 @@ import Metal
 
 // MARK: - Thinking / Response Boundary Splitting (whitespace tolerant)
 
-/// Writes a decode step's logits (and the context that produced them) under
-/// `/tmp/dynamoe_logits`, for comparing an engine step against an independent
+/// Writes a decode step's logits (and the tail of the context that produced them)
+/// under `/tmp/dynamoe_logits`, for comparing an engine step against an independent
 /// reference. Diagnostic only: `dynamoe_dump_logits` gates every call.
+///
+/// Bounded on purpose. A decode step's logit vector is `vocabSize` floats and the
+/// context grows with the conversation, so an unbounded dump writes a
+/// conversation's token ids to /tmp for as long as a turn runs. Only the context
+/// TAIL is recorded (with the true length beside it, which is what a reference
+/// replay needs), and files from a previous session are dropped rather than
+/// accumulated.
 func dumpDecodeLogits(
     _ logits: UnsafeMutablePointer<Float>,
     vocabSize: Int,
@@ -37,8 +44,23 @@ func dumpDecodeLogits(
     chosen: UInt32,
     context: [UInt32]
 ) {
+    let contextTailLimit = 64
+    let staleAfter: TimeInterval = 3600
     let directory = URL(fileURLWithPath: "/tmp/dynamoe_logits")
     try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    if let existing = try? FileManager.default.contentsOfDirectory(
+        at: directory,
+        includingPropertiesForKeys: [.contentModificationDateKey],
+        options: []
+    ) {
+        let cutoff = Date().addingTimeInterval(-staleAfter)
+        for url in existing {
+            let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            if let modified, modified < cutoff {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+    }
     let name = String(format: "step_%03d", step)
     let vector = Data(bytes: logits, count: vocabSize * MemoryLayout<Float>.stride)
     try? vector.write(to: directory.appendingPathComponent(name + ".f32"))
@@ -46,7 +68,8 @@ func dumpDecodeLogits(
         "step": step,
         "chosen": Int(chosen),
         "vocabSize": vocabSize,
-        "context": context.map { Int($0) }
+        "contextLength": context.count,
+        "contextTail": context.suffix(contextTailLimit).map { Int($0) }
     ]
     if let json = try? JSONSerialization.data(withJSONObject: meta) {
         try? json.write(to: directory.appendingPathComponent(name + ".json"))
@@ -251,6 +274,13 @@ public final class CompletionEngine: @unchecked Sendable {
     private var currentGenerationTask: Task<Void, Never>?
     private var currentGenerationId: UInt64 = 0
     private var generationCounter: UInt64 = 0
+    /// Cooperative Stop for the work that runs on `runOnLargeStack`'s dedicated
+    /// thread. That thread is a plain `Thread`, not an executor-managed one, so
+    /// `Task.isCancelled` always reads false there and the layer loops would lose
+    /// every cancellation point: Stop would not interrupt a chunk, and because the
+    /// interrupt path awaits the outgoing task, a replacement send would sit behind
+    /// the whole chunk. Set by `cancelActiveTurn`, cleared when a turn is minted.
+    private var activeTurnCancelled = false
 
     /// Ownership of the single-flight slot while a turn is being PREPARED, i.e.
     /// after a caller has been told the slot is free and before `launchTurn` mints
@@ -766,6 +796,7 @@ public final class CompletionEngine: @unchecked Sendable {
                 generationCounter &+= 1
                 let myGenerationId = generationCounter
                 currentGenerationId = myGenerationId
+                activeTurnCancelled = false
                 stateLock.unlock()
 
                 // The pin proposes how much of this prompt a previous turn may have
@@ -2084,6 +2115,13 @@ public final class CompletionEngine: @unchecked Sendable {
         let bias = sampling.logitBias
         var maxTokens = sampling.maxTokens
         let buffers = shardBuffers
+        // Which packed tensors have dequantization companions, resolved once per
+        // turn. A dense repack writes `<name>.scale` / `<name>.bias` as their own
+        // manifest rows, and several projection call sites pass no companions
+        // (MLA, KDA, the SSM `in_proj` trio) because a plain safetensors checkpoint
+        // has none. Without this fallback those sites would be handed a packed
+        // weight with nothing to dequantize it and skip the dispatch in silence.
+        let denseCompanions = DenseRepacker.companionIndex(summary.tensors)
         let effMode = memory.executionMode.resolveEffectiveMode(modelFootprintGB: summary.sizeGb)
         let isFullRAM = (effMode == .residentRAM || memory.budgetMode == .unrestricted)
         let budgetMode: MemoryBudgetMode = isFullRAM ? .unrestricted : memory.budgetMode
@@ -2425,6 +2463,7 @@ public final class CompletionEngine: @unchecked Sendable {
         generationCounter &+= 1
         let myGenerationId = generationCounter
         currentGenerationId = myGenerationId
+        activeTurnCancelled = false
         stateLock.unlock()
 
         let prep = TurnPrepInfo(
@@ -2498,7 +2537,7 @@ public final class CompletionEngine: @unchecked Sendable {
                 let hasScale = (scale != nil)
                 let hasBias = (bias != nil)
                 let isMXFP8 = hasScale && (scale!.dtype.contains("U8") || scale!.dtype.contains("UINT8") || (!hasBias && (w.dtype.contains("U32") || w.dtype.contains("U8") || w.dtype.contains("FP8")) && (scale!.offsetEnd - scale!.offsetStart) >= UInt64((inDim / 32) * outDim)))
-                let isQuantizedAffine = (hasBias || w.dtype.contains("Q4")) && !isMXFP8
+                let isQuantizedAffine = (hasBias || DenseRepacker.isPackedWeightDtype(w.dtype)) && !isMXFP8
                 let isFP8 = !isMXFP8 && !isQuantizedAffine && !w.dtype.contains("BF16") && !w.dtype.contains("F16") && !w.dtype.contains("FLOAT")
 
                 if isMXFP8, let sRaw = (scale != nil) ? buffers[scale!.shardIndex] : nil {
@@ -2527,11 +2566,21 @@ public final class CompletionEngine: @unchecked Sendable {
                         enc.dispatchThreads(MTLSize(width: Int(outDim), height: batchSize, depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, mxfp8Pipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                     }
                 } else if isQuantizedAffine {
-                    let sRaw = (scale != nil) ? buffers[scale!.shardIndex] : nil
-                    let bRaw = (bias != nil) ? buffers[bias!.shardIndex] : nil
-                    guard let sBuffer = sRaw, let bBuffer = bRaw else { return }
-                    var sOff = scale!.offsetStart
-                    var bOff = bias!.offsetStart
+                    // A call site may pass no companions even though the tensor IS
+                    // packed (MLA, KDA and the SSM `in_proj` trio do exactly that).
+                    // Resolve them by name rather than reading the packed bytes
+                    // through the E4M3 branch or skipping the dispatch.
+                    let scaleMeta = scale ?? (weightOffsetAdd == 0 ? denseCompanions[w.name]?.scale : nil)
+                    let biasMeta = bias ?? (weightOffsetAdd == 0 ? denseCompanions[w.name]?.bias : nil)
+                    let sRaw = scaleMeta.flatMap { buffers[$0.shardIndex] }
+                    let bRaw = biasMeta.flatMap { buffers[$0.shardIndex] }
+                    guard let sBuffer = sRaw, let bBuffer = bRaw,
+                          let sMeta = scaleMeta, let bMeta = biasMeta else {
+                        print("❌ [DENSE] \(w.name) is packed \(w.dtype) but has no scale/bias companion. Skipping the dispatch.")
+                        return
+                    }
+                    var sOff = sMeta.offsetStart
+                    var bOff = bMeta.offsetStart
 
                     let is8Bit = (w.offsetEnd - w.offsetStart) >= UInt64(outDim) * UInt64(inDim)
                     if is8Bit, let q8Pipe = q8GemvPipeline {
@@ -3121,7 +3170,7 @@ public final class CompletionEngine: @unchecked Sendable {
 
                 for loopIdx in 0..<totalLoops {
                     for l in 0..<actualLayers {
-                        if Task.isCancelled { return false }
+                        if engineSelf.forwardWorkShouldStop(myGenerationId) { return false }
                         let layer = cachedLayers[l]
 
                         // Asynchronous Layer Lookahead Backbone Prefetching
@@ -3927,6 +3976,13 @@ if layer.attnGateProjTensor != nil,
                                         layerEnc1.setBytes(&splitNKv, length: MemoryLayout<UInt32>.stride, index: 8)
                                         layerEnc1.setBytes(&splitHD, length: MemoryLayout<UInt32>.stride, index: 9)
                                         layerEnc1.setBytes(&splitChunk, length: MemoryLayout<UInt32>.stride, index: 10)
+                                        // The partials are addressed two different ways and
+                                        // the two MUST agree: the chunk kernel writes
+                                        // `qHeadIdx * gridDim.y + chunkIdx`, while the
+                                        // combine reads `qHeadIdx * numChunks + c` from the
+                                        // constant it is handed. Both are `splitChunks`, one
+                                        // as this dispatch's grid height and one as
+                                        // `splitChunkCount` below. Change one, change both.
                                         layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: Int(splitChunks), depth: 1), threadsPerThreadgroup: MTLSize(width: StandardGqaSplitK.lanes, height: 1, depth: 1))
                                         layerEnc1.memoryBarrier(scope: .buffers)
 
@@ -6402,7 +6458,7 @@ if layer.attnGateProjTensor != nil,
 
                 for loopIdx in 0..<totalLoops {
                     for l in 0..<actualLayers {
-                        if Task.isCancelled { return false }
+                        if engineSelf.forwardWorkShouldStop(myGenerationId) { return false }
                         let layer = cachedLayers[l]
                         let intermediateDim = layer.intermediateDim
 
@@ -7337,12 +7393,16 @@ if layer.attnGateProjTensor != nil,
                                             layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: sliceRows, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), headGatePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                                         } else if isStandardGqa,
                                                   UsesTiledPrefillAttention.isEnabled,
+                                                  !layer.isSlidingAttention,
                                                   headDim == StandardGqaSplitK.headDim,
                                                   let tiledPipe = gqaStandardPrefillTiledF16Pipeline {
                                             // SIMD-tiled standard-GQA attention: a 32-lane
                                             // threadgroup per (head, row) instead of one thread,
                                             // so a row's dot product and accumulator are split
                                             // across lanes. See `UsesTiledPrefillAttention`.
+                                            // A SLIDING layer is excluded because this kernel
+                                            // takes no window parameter, so it cannot mask one;
+                                            // it keeps the non-tiled kernel it used before.
                                             layerEnc1.setComputePipelineState(tiledPipe)
                                             layerEnc1.setBuffer(qGateBuffer_all, offset: qOff, index: 0)
                                             layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
@@ -7436,12 +7496,14 @@ if layer.attnGateProjTensor != nil,
                                                 layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: sliceRows, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), headGatePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                                             } else if isStandardGqa,
                                                       UsesTiledPrefillAttention.isEnabled,
+                                                      !layer.isSlidingAttention,
                                                       headDim == StandardGqaSplitK.headDim,
                                                       let tiledPipe = gqaStandardPrefillTiledFP8Pipeline {
                                                 // SIMD-tiled standard-GQA attention over an FP8 KV
                                                 // cache: a 32-lane threadgroup per (head, row), the
                                                 // head's dot product split across lanes. See
-                                                // `UsesTiledPrefillAttention`.
+                                                // `UsesTiledPrefillAttention`; sliding layers are
+                                                // excluded here for the same reason as the F16 form.
                                                 layerEnc1.setComputePipelineState(tiledPipe)
                                                 layerEnc1.setBuffer(qGateBuffer_all, offset: qOff, index: 0)
                                                 layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
@@ -9122,7 +9184,7 @@ if layer.attnGateProjTensor != nil,
                 // 3. Forward Pass through Backbone Layers
                 for loopIdx in 0..<totalLoops {
                     for l in 0..<actualLayers {
-                        if Task.isCancelled { return false }
+                        if engineSelf.forwardWorkShouldStop(myGenerationId) { return false }
                         let layer = cachedLayers[l]
                         // ================= Gemma 4 hybrid-attention MoE decoder layer =================
                         // Verifies all N tree nodes in one pass. Gemma differs from the generic tree
@@ -11006,7 +11068,15 @@ if layer.attnGateProjTensor != nil,
                                 runLayerWisePrefill(promptTokens: chunk, startPos: UInt32(startPos) + UInt32(chunkStart), chunkIndex: chunkIndex, chunkCount: totalPrefillChunks, prefillProgress: { s, sp, rs in emit(.prefillProgress(status: s, speed: sp, rssGB: rs)) })
                             }
                             if !chunkOk {
-                                print("❌ [PREFILL] Chunked prefill failed at tokens \(chunkStart)..<\(chunkEnd) — see prior diagnostics for the failing layer/buffer.")
+                                // The chunk returns false for a cancelled turn as well as for
+                                // a real forward-pass failure, and since the layer loops now
+                                // run on the large-stack thread they can see Stop. Name which
+                                // one it was so a user stop does not read as a broken model.
+                                if Task.isCancelled {
+                                    print("🛑 [PREFILL] Chunk \(chunkIndex + 1)/\(totalPrefillChunks) stopped by user at tokens \(chunkStart)..<\(chunkEnd).")
+                                } else {
+                                    print("❌ [PREFILL] Chunked prefill failed at tokens \(chunkStart)..<\(chunkEnd). See prior diagnostics for the failing layer/buffer.")
+                                }
                                 chunkedOk = false
                                 break
                             }
@@ -11479,6 +11549,7 @@ if layer.attnGateProjTensor != nil,
     public func cancelActiveTurn() {
         stateLock.lock()
         currentGenerationTask?.cancel()
+        activeTurnCancelled = true
         stateLock.unlock()
     }
 
@@ -11529,6 +11600,21 @@ if layer.attnGateProjTensor != nil,
         stateLock.lock()
         defer { stateLock.unlock() }
         return id == currentGenerationId && currentGenerationTask != nil
+    }
+
+    /// True when turn `id` must stop at its next layer boundary.
+    ///
+    /// This is what the layer loops inside `runTokenForward`,
+    /// `runLayerWisePrefill` and `runJetSpecTreeForward` ask instead of
+    /// `Task.isCancelled`: those bodies run on `runOnLargeStack`'s plain `Thread`,
+    /// which carries no task context, so `Task.isCancelled` is always false there
+    /// and Stop could not interrupt a single chunk. It folds the explicit Stop flag
+    /// together with supersession (a newer turn minted a different id), which is
+    /// exactly what the scratch checks saw when they ran on the task itself.
+    fileprivate func forwardWorkShouldStop(_ id: UInt64) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return activeTurnCancelled || id != currentGenerationId
     }
 
     /// Installs the loaded model snapshot; called from model load/switch.

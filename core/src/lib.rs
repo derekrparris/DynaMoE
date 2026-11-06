@@ -650,16 +650,43 @@ fn try_load_dense_repack(search_path: &Path) -> Option<(Vec<ShardHandle>, Vec<Te
         }
     }
 
-    for dir in candidate_dirs {
+    'dir: for dir in candidate_dirs {
         let manifest_path = dir.join("dense_weights.json");
         let weights_path = dir.join("dense_weights.bin");
         if !manifest_path.is_file() || !weights_path.is_file() {
             continue;
         }
-        let manifest = std::fs::read_to_string(&manifest_path).ok()?;
-        let manifest: DenseRepackJson = serde_json::from_str(&manifest).ok()?;
+        // Every per-directory failure continues rather than returning: a broken
+        // manifest in one candidate must not stop a valid repack in the next, which
+        // is the whole reason this function walks more than one directory.
+        let manifest = match std::fs::read_to_string(&manifest_path) {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!(
+                    "⚠️ [DenseRepack] skipping {}: cannot read the manifest ({})",
+                    manifest_path.display(),
+                    error
+                );
+                continue;
+            }
+        };
+        let manifest: DenseRepackJson = match serde_json::from_str(&manifest) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                eprintln!(
+                    "⚠️ [DenseRepack] skipping {}: the manifest does not parse ({})",
+                    manifest_path.display(),
+                    error
+                );
+                continue;
+            }
+        };
         if manifest.tensors.is_empty() {
-            return None;
+            eprintln!(
+                "⚠️ [DenseRepack] skipping {}: the manifest lists no tensors",
+                manifest_path.display()
+            );
+            continue;
         }
         // The kernels hardcode group size 64; a manifest that says otherwise
         // describes a layout this engine would read wrong.
@@ -669,7 +696,7 @@ fn try_load_dense_repack(search_path: &Path) -> Option<(Vec<ShardHandle>, Vec<Te
                 manifest_path.display(),
                 manifest.group_size
             );
-            return None;
+            continue;
         }
         if !manifest.quantization.is_empty()
             && !matches!(manifest.quantization.as_str(), "bf16" | "q8" | "q4")
@@ -679,21 +706,76 @@ fn try_load_dense_repack(search_path: &Path) -> Option<(Vec<ShardHandle>, Vec<Te
                 manifest_path.display(),
                 manifest.quantization
             );
-            return None;
+            continue;
+        }
+        // A packed tensor is unusable without BOTH companions: the Swift quantized
+        // path needs the scale and the bias, and a weight that reaches it without
+        // them is either read as E4M3 (wrong bytes) or skipped (stale output). The
+        // repacker always writes the trio, so an entry missing one came from a
+        // truncated or hand-edited manifest.
+        if matches!(manifest.quantization.as_str(), "q4" | "q8") {
+            let names: std::collections::HashSet<&str> =
+                manifest.tensors.iter().map(|entry| entry.name.as_str()).collect();
+            if let Some(orphan) = manifest.tensors.iter().find(|entry| {
+                matches!(entry.dtype.as_str(), "Q4" | "Q8")
+                    && (!names.contains(format!("{}.scale", entry.name).as_str())
+                        || !names.contains(format!("{}.bias", entry.name).as_str()))
+            }) {
+                eprintln!(
+                    "⚠️ [DenseRepack] refusing {}: {} is packed {} with no scale/bias companion",
+                    manifest_path.display(),
+                    orphan.name,
+                    orphan.dtype
+                );
+                continue;
+            }
         }
 
-        let file = File::open(&weights_path).ok()?;
-        let file_len = file.metadata().ok()?.len();
-        for entry in &manifest.tensors {
-            if entry.offset + entry.size > file_len {
+        let file = match File::open(&weights_path) {
+            Ok(handle) => handle,
+            Err(error) => {
                 eprintln!(
-                    "⚠️ [DenseRepack] refusing {}: {} runs to {} past the {} byte blob",
-                    manifest_path.display(),
-                    entry.name,
-                    entry.offset + entry.size,
-                    file_len
+                    "⚠️ [DenseRepack] skipping {}: cannot open the blob ({})",
+                    weights_path.display(),
+                    error
                 );
-                return None;
+                continue;
+            }
+        };
+        let file_len = match file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                eprintln!(
+                    "⚠️ [DenseRepack] skipping {}: cannot stat the blob ({})",
+                    weights_path.display(),
+                    error
+                );
+                continue;
+            }
+        };
+        for entry in &manifest.tensors {
+            // Checked, because `offset + size` wraps in a release build and a
+            // wrapped range would pass the completeness test.
+            match entry.offset.checked_add(entry.size) {
+                Some(end) if end <= file_len => {}
+                Some(end) => {
+                    eprintln!(
+                        "⚠️ [DenseRepack] refusing {}: {} runs to {} past the {} byte blob",
+                        manifest_path.display(),
+                        entry.name,
+                        end,
+                        file_len
+                    );
+                    continue 'dir;
+                }
+                None => {
+                    eprintln!(
+                        "⚠️ [DenseRepack] refusing {}: {} has an overflowing byte range",
+                        manifest_path.display(),
+                        entry.name
+                    );
+                    continue 'dir;
+                }
             }
         }
         let mmap = unsafe { MmapOptions::new().map(&file) }.ok()?;

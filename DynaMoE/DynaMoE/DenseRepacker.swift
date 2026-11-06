@@ -58,6 +58,7 @@ public struct DenseRepackManifest: Codable, Sendable {
 
 public enum DenseRepackerError: LocalizedError {
     case nothingToQuantize
+    case notARepackableCheckpoint
     case writeFailed(String)
     case unsupportedTensor(String)
 
@@ -65,6 +66,8 @@ public enum DenseRepackerError: LocalizedError {
         switch self {
         case .nothingToQuantize:
             return "No 2-D BF16 tensors wide enough to quantize were found (inDim must be a multiple of 64)."
+        case .notARepackableCheckpoint:
+            return "This checkpoint cannot take a dense repack: it has routed experts (use FlashMoE Repack instead) or no usable vocabulary."
         case .writeFailed(let detail):
             return "Dense repack write failed: \(detail)"
         case .unsupportedTensor(let name):
@@ -96,7 +99,13 @@ public final class DenseRepacker {
     }
 
     /// The quantization a repacked directory already carries, from the manifest.
+    ///
+    /// Deliberately requires the manifest to be COMPLETE (`isRepacked`): an
+    /// interrupted repack leaves a manifest describing bytes that are not there,
+    /// and answering "Q4 (dense repack)" for it both mislabels the model row and
+    /// hides the Quantize action that is the only way to repair it.
     public static func quantizedFormat(dir: URL) -> Quantization? {
+        guard isRepacked(dir: dir) else { return nil }
         let manifestUrl = dir.appendingPathComponent("dense_weights.json")
         guard let data = try? Data(contentsOf: manifestUrl),
               let manifest = try? JSONDecoder().decode(DenseRepackManifest.self, from: data),
@@ -119,7 +128,63 @@ public final class DenseRepacker {
               let blobBytes = attributes[.size] as? UInt64 else {
             return false
         }
-        return manifest.tensors.allSatisfy { $0.offset + $0.size <= blobBytes }
+        return manifest.tensors.allSatisfy { entry in
+            // Checked: a hand-edited or corrupt manifest can carry an `offset` and
+            // `size` whose sum overflows, and an unchecked `+` traps.
+            let (end, overflowed) = entry.offset.addingReportingOverflow(entry.size)
+            return !overflowed && end <= blobBytes
+        }
+    }
+
+    /// Moves a dense repack aside when this GPU cannot map it, so the loader falls
+    /// back to the checkpoint's own safetensors shards.
+    ///
+    /// A repack is ONE contiguous blob. `segmentShardsForMetal` splits a blob that
+    /// is merely large, but a single packed tensor still has to fit one
+    /// `MTLBuffer`, and a blob that cannot be mapped leaves its weights
+    /// unreachable: the load succeeds, then the first dispatch that touches one of
+    /// them throws "weight tensor not found", which names neither the repack nor
+    /// the GPU limit. The manifest names every span, so this needs no mapping to
+    /// answer. The files are RENAMED rather than deleted, so re-running the
+    /// quantize replaces them and nothing the user paid for is destroyed.
+    @discardableResult
+    public static func setAsideRepackIfUnusable(dir: URL, maxBufferLength: UInt64) -> Bool {
+        guard maxBufferLength > 0 else { return false }
+        let fileManager = FileManager.default
+        let manifestUrl = dir.appendingPathComponent("dense_weights.json")
+        let blobUrl = dir.appendingPathComponent("dense_weights.bin")
+        guard let data = try? Data(contentsOf: manifestUrl),
+              let manifest = try? JSONDecoder().decode(DenseRepackManifest.self, from: data),
+              !manifest.tensors.isEmpty,
+              let attributes = try? fileManager.attributesOfItem(atPath: blobUrl.path),
+              let blobBytes = attributes[.size] as? UInt64 else {
+            return false
+        }
+        // 16 KB is the largest Apple Silicon page, so this can only overestimate a
+        // span, which is the safe direction for a refusal.
+        let page: UInt64 = 16 * 1024
+        func alignedSpan(_ entry: DenseRepackManifest.TensorEntry) -> UInt64 {
+            let (rawEnd, overflowed) = entry.offset.addingReportingOverflow(entry.size)
+            guard !overflowed, rawEnd <= blobBytes else { return UInt64.max }
+            let start = entry.offset & ~(page - 1)
+            let clipped = min((rawEnd + page - 1) & ~(page - 1), blobBytes)
+            return clipped > start ? clipped - start : 0
+        }
+        guard manifest.tensors.contains(where: { alignedSpan($0) > maxBufferLength }) else {
+            return false
+        }
+        let parkedBlob = dir.appendingPathComponent("dense_weights.bin.unusable")
+        let parkedManifest = dir.appendingPathComponent("dense_weights.json.unusable")
+        try? fileManager.removeItem(at: parkedBlob)
+        try? fileManager.removeItem(at: parkedManifest)
+        do {
+            try fileManager.moveItem(at: blobUrl, to: parkedBlob)
+            try fileManager.moveItem(at: manifestUrl, to: parkedManifest)
+        } catch {
+            print("⚠️ [Dense] could not set the unusable repack aside: \(error)")
+            return false
+        }
+        return true
     }
 
     /// Whether this directory holds a dense BF16 checkpoint that would benefit.
@@ -173,10 +238,23 @@ public final class DenseRepacker {
         }
 
         let blobUrl = outputDir.appendingPathComponent("dense_weights.bin")
-        guard let blob = fopen(blobUrl.path, "wb") else {
+        // Written beside the target and renamed only once it is whole. Truncating
+        // `dense_weights.bin` in place meant an interrupted re-repack (Q4 over an
+        // existing Q8, say) left the OLD, longer manifest validating against the
+        // NEW, shorter partial blob, i.e. offsets that point into nothing. The
+        // manifest is committed last, and atomically, for the same reason.
+        let stagingBlobUrl = outputDir.appendingPathComponent("dense_weights.bin.tmp")
+        try? fileManager.removeItem(at: stagingBlobUrl)
+        guard let blob = fopen(stagingBlobUrl.path, "wb") else {
             throw DenseRepackerError.writeFailed("cannot open dense_weights.bin for writing")
         }
-        defer { fclose(blob) }
+        var blobHandleOpen = true
+        defer {
+            if blobHandleOpen {
+                fclose(blob)
+                try? fileManager.removeItem(at: stagingBlobUrl)
+            }
+        }
 
         var entries: [DenseRepackManifest.TensorEntry] = []
         var offset: UInt64 = 0
@@ -282,6 +360,20 @@ public final class DenseRepacker {
             )
         }
 
+        // Flush and fsync BEFORE the rename: a rename that is durable while the
+        // bytes behind it are not would publish a blob the next boot reads short.
+        guard fflush(blob) == 0, fsync(fileno(blob)) == 0 else {
+            throw DenseRepackerError.writeFailed("cannot flush dense_weights.bin to disk")
+        }
+        guard fclose(blob) == 0 else {
+            throw DenseRepackerError.writeFailed("cannot close dense_weights.bin")
+        }
+        blobHandleOpen = false
+        guard rename(stagingBlobUrl.path, blobUrl.path) == 0 else {
+            try? fileManager.removeItem(at: stagingBlobUrl)
+            throw DenseRepackerError.writeFailed("cannot move dense_weights.bin into place")
+        }
+
         let manifest = DenseRepackManifest(
             quantization: quantization.rawValue,
             groupSize: UInt64(Self.groupSize),
@@ -289,7 +381,12 @@ public final class DenseRepacker {
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(manifest).write(to: outputDir.appendingPathComponent("dense_weights.json"))
+        // `.atomic` is the manifest half of the same rule: a half-written manifest
+        // is the file every offset is validated against.
+        try encoder.encode(manifest).write(
+            to: outputDir.appendingPathComponent("dense_weights.json"),
+            options: .atomic
+        )
         progress(1.0, "Dense repack complete — \(entries.count) manifest rows, \(quantizedCount) tensors quantized.")
     }
 
@@ -401,6 +498,44 @@ public final class DenseRepacker {
 
     static func bf16ToFloat(_ bits: UInt16) -> Float {
         Float(bitPattern: UInt32(bits) << 16)
+    }
+
+    /// The dtypes a dense repack writes for a PACKED weight, as opposed to a
+    /// tensor it copied verbatim.
+    public static func isPackedWeightDtype(_ dtype: String) -> Bool {
+        dtype.contains("Q4") || dtype.contains("Q8")
+    }
+
+    /// Scale/bias companions of a dense repack, keyed by the tensor they annotate.
+    ///
+    /// A packed tensor's companions are SEPARATE manifest rows (`<name>.scale`,
+    /// `<name>.bias`), but several of the engine's projection call sites pass
+    /// `scale: nil, bias: nil` — the MLA and KDA projections and the SSM `in_proj`
+    /// trio — because a plain safetensors checkpoint has no companions to pass.
+    /// Those sites would otherwise be handed a packed weight with nothing to
+    /// dequantize it and silently skip the dispatch, so the companions are resolved
+    /// by name once per turn instead of depending on every call site remembering.
+    public struct Companions: Sendable {
+        public let scale: TensorMetadata?
+        public let bias: TensorMetadata?
+    }
+
+    public static func companionIndex(_ tensors: [TensorMetadata]) -> [String: Companions] {
+        var scales: [String: TensorMetadata] = [:]
+        var biases: [String: TensorMetadata] = [:]
+        for tensor in tensors {
+            if tensor.name.hasSuffix(".scale") {
+                scales[String(tensor.name.dropLast(".scale".count))] = tensor
+            } else if tensor.name.hasSuffix(".bias") {
+                biases[String(tensor.name.dropLast(".bias".count))] = tensor
+            }
+        }
+        var index: [String: Companions] = [:]
+        index.reserveCapacity(scales.count + biases.count)
+        for key in Set(scales.keys).union(biases.keys) {
+            index[key] = Companions(scale: scales[key], bias: biases[key])
+        }
+        return index
     }
 
     /// Round-to-nearest-even, which is what `MLX` and numpy both do; the encoder

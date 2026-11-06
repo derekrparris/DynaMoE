@@ -173,6 +173,11 @@ enum StandardGqaSplitK {
 ///     defaults write DRP.DynaMoE dynamoe_prefill_tiled_attention -bool NO
 ///
 /// Absent means ON (so an unset machine gets the measured-faster path).
+///
+/// What it does not cover is excluded at the dispatch site, not here: a head whose
+/// width is not `StandardGqaSplitK.headDim`, and a SLIDING layer, which needs a
+/// window this kernel has no parameter for and therefore keeps the non-tiled
+/// kernel it used before.
 enum UsesTiledPrefillAttention {
     static var isEnabled: Bool {
         let defaults = UserDefaults.standard

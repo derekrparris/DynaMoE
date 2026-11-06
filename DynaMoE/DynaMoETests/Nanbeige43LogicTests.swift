@@ -349,6 +349,26 @@ final class Nanbeige43PromptTests: XCTestCase {
         XCTAssertTrue(prompt.contains("<|im_start|>user\nthanks<|im_end|>\n"))
     }
 
+    /// The wrapper's spelling, with the reference template's codepoints written
+    /// out. A rendered file view strips the angle brackets from an unrecognized
+    /// tag, so a literal copied from one can look right and be the wrong string;
+    /// these scalars cannot. `<tool_response>` and `</tool_response>` here are the
+    /// template's own tags, not this app's invention.
+    func testTheToolResponseWrapperIsTheTemplatesOwnSpelling() {
+        let rendered = ChatPromptFormatter.nanbeigeToolResponse(text: "X")
+        XCTAssertEqual(
+            rendered.unicodeScalars.map(\.value),
+            [
+                0x3c, 0x74, 0x6f, 0x6f, 0x6c, 0x5f, 0x72, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x3e,
+                0x0a,
+                0x58,
+                0x0a,
+                0x3c, 0x2f, 0x74, 0x6f, 0x6f, 0x6c, 0x5f, 0x72, 0x65, 0x73, 0x70, 0x6f, 0x6e, 0x73, 0x65, 0x3e,
+                0x0a,
+            ]
+        )
+    }
+
     /// The live continuation and the rebuilt history must agree, or a post-tool
     /// turn can never extend the previous turn's pinned prefix.
     func testTheLiveToolContinuationMatchesTheHistoryRender() throws {
