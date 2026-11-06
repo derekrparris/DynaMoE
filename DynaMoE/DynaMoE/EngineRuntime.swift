@@ -114,6 +114,73 @@ func prefillChunkCap(for config: ModelConfig?) -> Int {
     return config?.isGemma4Model == true ? gemmaPrefillChunkCap : densePrefillChunkCap
 }
 
+/// Geometry of the split-K (flash-decoding) standard-GQA decode path.
+///
+/// `gqa_attention_decode_standard_*` runs a layer's entire attention in ONE
+/// threadgroup — one thread per head, each walking every stored KV row serially —
+/// so a decode step at a few thousand positions is millions of dependent
+/// iterations on a single GPU core. The split-K twins give every (head, KV
+/// chunk) its own thread and merge the partials afterwards. That is only worth
+/// a second dispatch once the walk is long; below `minimumContext` the plain
+/// kernel keeps one dispatch and a short, latency-tolerable walk.
+enum StandardGqaSplitK {
+    /// KV rows per chunk. Matches the fused-Q+Gate split-K path, which is the
+    /// only split-K shape in this codebase that has been measured.
+    static let chunkRows: UInt32 = 64
+
+    /// Ceiling on chunks per head, which is also the capacity the partial
+    /// buffers are allocated with (`attnPartialM/L/Acc` are `numQHeads * 256`).
+    static let maximumChunks: UInt32 = 256
+
+    /// Context below which the unsplit kernel is used.
+    static let minimumContext: UInt32 = 128
+
+    /// Stored KV rows for a decode step, decoding the bit-31 delta marker the
+    /// streaming KV kernels carry (`0x80000000 | prefix`).
+    static func curLen(_ seqLen: UInt32) -> UInt32 {
+        if seqLen == 0 { return 1 }
+        if (seqLen & 0x80000000) != 0 { return (seqLen & 0x7FFFFFFF) + 1 }
+        return seqLen
+    }
+
+    /// Chunks a `curLen`-row walk is split into.
+    static func chunkCount(_ curLen: UInt32) -> UInt32 {
+        max(1, min(maximumChunks, (curLen + chunkRows - 1) / chunkRows))
+    }
+
+    /// Lanes per (head, chunk) threadgroup. Each lane owns four CONTIGUOUS head
+    /// dimensions, which is what keeps the query and the online-softmax
+    /// accumulator in registers instead of in the thread-local memory a
+    /// runtime-indexed `float4 acc[64]` gets demoted to.
+    static let lanes = 32
+
+    /// Head width the register-resident kernels require (`lanes * 4`). A head of
+    /// any other width keeps the per-thread kernel: a lane would no longer own
+    /// exactly one contiguous `float4`.
+    static let headDim = 32 * 4
+}
+
+/// Debug seam for the SIMD-tiled standard-GQA PREFILL attention
+/// (`dynamoe_prefill_tiled_attention`).
+///
+/// The tiled kernel gives a (head, row) pair a 32-lane threadgroup so the
+/// head's dot product and accumulator are split across lanes instead of living
+/// in one lane's serial chain — the rewrite FIX #6a asked for after the
+/// rows-chunked attempt measured 0.2-0.3x. It is ON by default because it
+/// measured faster than the per-thread kernel on the published Nanbeige
+/// checkpoint; the key is the opt-OUT for an A/B or a regression:
+///
+///     defaults write DRP.DynaMoE dynamoe_prefill_tiled_attention -bool NO
+///
+/// Absent means ON (so an unset machine gets the measured-faster path).
+enum UsesTiledPrefillAttention {
+    static var isEnabled: Bool {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: "dynamoe_prefill_tiled_attention") != nil else { return true }
+        return defaults.bool(forKey: "dynamoe_prefill_tiled_attention")
+    }
+}
+
 /// Reusable transient buffers for the batched prefill (`runLayerWisePrefill`).
 /// The chunked Gemma prefill re-enters that function once per 512-token chunk;
 /// re-allocating the ~3 GB of double-buffered expert staging (plus the per-chunk

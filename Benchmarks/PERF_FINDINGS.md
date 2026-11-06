@@ -15009,3 +15009,129 @@ Documentation only, so the check is that nothing moved: `git status` is clean af
 file changed, and the suites run earlier in this session (`OpenAIAdapterLogicTests` 44,
 `AnthropicAdapterLogicTests` 31, `ServerRequestLogLogicTests` 44, `ServerControllerSmokeTests` 30) already
 cover the refusal set these two non-goals sit beside.
+
+## NANBEIGE 4.3 #1: THE Q4/Q8 DENSE PATH WAS DECODE-ONLY, AND STANDARD-GQA ATTENTION RAN A WHOLE LAYER ON ONE GPU CORE
+
+**Regime.** `Nanbeige/Nanbeige4.3-33B` (52 layers, hidden 7168, 56/8 heads of 128, intermediate 22016,
+vocab 166,912), repacked to MLX affine **Q8 (34.86 GB)** by `DenseRepacker`, FP8 KV cache, 128 GB M5 Max.
+Every number below is a live turn on that machine through the app's own path (`CompletionEngine` ->
+`runTokenForward` / `runLayerWisePrefill`), not a bench fixture: the starting point was **12 tok/s prefill
+and 1.1 tok/s decode** on a 3,081-token prompt + 94 generated tokens (352.7 s total, of which ~84 s was
+decode and ~269 s prefill).
+
+### Finding 1: standard GQA decode attention is one threadgroup per LAYER
+
+`gqa_attention_decode_standard_f16/fp8` dispatches `(numQHeads, 1)` threads — 56 for this model — and each
+thread walks the whole stored KV serially (`for tau in 0..<currentSeqLen`), doing a 128-dim dot, two
+`exp()`s and a full 128-float accumulator rescale per key. That is 3,081 x 56 x 52 = **8.97M head-key
+iterations per token on a single GPU core**. The flash-decoding split-K kernels (`..._fused_*_chunked` +
+`_combine`) already existed but were reachable only from the *gated* branch; a plain Llama-shaped model
+takes the `isStandardGqa` branch, which has no chunked variant. The arithmetic lands on the measurement:
+890 ms/token at ~139 cycles per head-key iteration.
+
+**Fix.** `gqa_attention_decode_standard_{f16,fp8}_chunked` + `gqa_attention_decode_standard_chunked_combine`
+(the gate-free twin of the fused pair, same partial layout, same per-position FP8 scales), wired ahead of
+the unsplit branch for both precisions and engaged once the walk exceeds 128 rows. A layer's attention is
+now `56 x chunks` threads. **Measured: 1.1 -> 4.7 tok/s.** At 3k positions the whole attention is now
+~1 ms/token, so it is closed at this context length.
+
+### Finding 2: Q4/Q8 prefill had no weight-stationary form, and the dense MLP was dispatched per token
+
+`bf16_gemv_batched` / `fp8_gemv_batched` exist precisely so a prefill reads a weight row `ceil(P/16)` times
+instead of `P` times (FIX #9 / #9b). The quantized-affine family never got twins, and the dense MLP did not
+even use `dispatchLinear` — it fell through to `for p in 0..<P { dispatchExpertMlp(...) }`, i.e. **2 x P
+launches per layer** with every weight row re-read once per prompt token. For this checkpoint the MLP is
+473 MB of the 590 MB per layer, so 80% of the model was prefilling at decode's per-token cost. That is
+consistent with the observed 87 ms/token (34.9 GB/token) and it is why prefill sat at 12 tok/s.
+
+**Fix.** `q8_gemv_batched` (wired into `dispatchLinear`'s Q8 branch for `batch > 1`),
+`q8_swiglu_gate_up_batched` and `q8_down_proj_accumulate_batched` (a new dense-prefill branch that covers
+the whole chunk with one threadgroup per (output row, 16-token block)). Each 8-column chunk lies inside one
+affine group because 8 divides the group size (64), so the per-group scale/bias pair is unchanged and the
+result differs only by float32 reordering. **Measured: prefill "much faster"** (the reporter's phrase; the
+exact tok/s was not captured — re-measure before quoting a number).
+
+### Finding 3: the Q8 GEMV family spent one memory request per 4 bytes
+
+`q8_gemv`, `q8_swiglu_gate_up` and `q8_down_proj_accumulate` gave a lane **4 weight bytes at a 64-byte
+stride**. Every lane therefore landed alone in its own 32-byte sector, so one warp instruction asked the
+memory system for 32 sectors to cover 128 bytes — 4 bytes per request, an eighth of what a sector can
+deliver. This is invisible at prefill, where the batched twins read contiguous chunks, which is why it
+survived until decode was the only thing left.
+
+**Fix.** All three read 16 contiguous bytes per lane per iteration (`uchar4` quads). Two lanes now share a
+sector and a warp covers 512 bytes in 16 requests — 32 bytes per request, the maximum. Accumulation order
+inside a group is unchanged; only which lane owns which group moved. Tail columns past the last whole chunk
+keep a scalar loop, and `16 | groupSize` is required (64 for every checkpoint this path serves).
+**Measured: 4.7 -> 11.7 tok/s averaged.**
+
+### Finding 4: the standard-GQA prefill attention, SIMD-tiled
+
+`gqa_attention_prefill_standard_{f16,fp8}` give a (head, row) pair a 32-lane threadgroup: the lanes split
+`headDim`, the score is one `simd_sum`, and each lane updates the online-softmax accumulator for its own
+dimensions only (no barrier, since a lane reads what it wrote). This is the rewrite FIX #6a asked for after
+the rows-chunked attempt measured 0.2-0.3x. **Measured: faster than the per-thread kernel** on this
+checkpoint, so it ships ON with `dynamoe_prefill_tiled_attention` as the opt-out.
+
+### Where decode now stands (what is closed)
+
+11.7 tok/s is **85.5 ms/token for 34.86 GB of weights, i.e. ~408 GB/s**, which is at the practical ceiling
+the DSV4.1 work measured on this machine (332-397 GB/s for coalesced GEMV forms, against a ~546 GB/s part).
+Do not re-propose decode-side kernel work for this checkpoint: vectorized Q8 loads, batched Q8 prefill and
+split-K decode attention are all shipped, and the remaining time is bytes. The only lever left is fewer of
+them — **Q4 packs the same model into 22.07 GB, a straight ~1.5x** — and note that the batched/vectorized
+twins above were written for the Q8 layout only, so the Q4 family is untested against this work.
+
+### Verification
+
+The Swift side type-checks clean (`swiftc -typecheck` over the app target with the SPM module maps; the
+only diagnostics are pre-existing SwiftUI-macro-plugin errors in `AboutDynaMoEView.swift` from the CLI
+context, which the Xcode build does not see). The Metal side was NOT compiled in the agent's shell — this
+machine's `xcode-select` points at CommandLineTools, so `metal` is unavailable and the shaders are reviewed
+rather than built; the app compiles them through Xcode. Output quality on the published checkpoint was
+confirmed by the reporter across both changes; the numeric contract to re-check on any further touch of
+these kernels is `Tools/nb43_goldens.py`'s greedy continuation
+(`764, 5463, 290, 7914, 322, 1472, 50432, 35906`) plus the app's own Metal validation run.
+
+## NANBEIGE 4.3 #2: THE SPLIT-K DECODE ATTENTION KEPT ITS ACCUMULATOR IN LOCAL MEMORY, SO DECODE STILL SCALED WITH CONTEXT
+
+**The observation that reopened it.** After "NANBEIGE 4.3 #1" the same session reported decode at **11.7 tok/s
+on a short context but 3.0 tok/s at a 3,000-token prompt, 3.0 at 6,600, and 1.4 at 21,000** — while prefill
+stayed flat (26 -> 24 -> 22 tok/s). A cost that grows with stored positions and only in decode is attention,
+and #1 was supposed to have removed exactly that by splitting the walk across chunks. It had not: the split
+was real but each thread was still doing something absurdly expensive per key.
+
+**The cause.** The chunked kernels declared `float4 acc[64]` and indexed it with a runtime bound
+(`for (d = 0; d < headDimVec; d++)`). MSL puts a **dynamically indexed array in the thread address space
+into thread-local memory**, i.e. spilled to device memory, so every key iteration re-read and re-wrote
+`128 floats = 512 B` of accumulator plus the query. At 128 keys per chunk that is 128 KB of local traffic
+per thread, and with 5,824 (6.6k context) to 14,336 (21k context) threads resident the working set is
+megabytes -- far past L1 -- so it is served from L2/DRAM. The result is a per-key cost that dwarfs the
+actual dot product and is linear in the walk, which is the shape of the reported curve. The same construct
+was in the prefill tiled kernels from #1 (`threadgroup float accTile[256]`, also runtime-indexed).
+
+**The fix.** Both attention families now give a lane **four contiguous head dimensions** and keep the query
+and the accumulator in registers:
+
+- `gqa_attention_decode_standard_{f16,fp8}_chunked` are 32-lane threadgroups per (head, chunk). Per key a
+  lane issues one `half4`/`char4` load (the whole 128-wide row across the warp, so the access is one
+  contiguous run), one 4-wide dot, one `simd_sum` for the score, and four FMAs for the value update.
+  `gqa_attention_decode_standard_chunked_combine` is one 32-lane threadgroup per head and merges the
+  partials the same way, one 16-byte load per chunk per lane.
+- `gqa_attention_prefill_standard_{f16,fp8}` are the same shape (registers instead of threadgroup arrays).
+
+`headDim == 128` is now required for both (`StandardGqaSplitK.headDim`, four dimensions per lane); any other
+head width keeps the per-thread kernel, which is correct if slower. The dispatch shape changed with it:
+the partial pass is `dispatchThreadgroups((numQHeads, numChunks), (32, 1, 1))` and the combine is
+`dispatchThreadgroups((numQHeads, 1), (32, 1, 1))`.
+
+**Expected, and not yet measured.** At 21,000 positions the per-layer attention becomes
+`56 heads x 256 chunks` threadgroups of 32 lanes walking 83 keys each -- a few microseconds per layer, a few
+milliseconds per token, against the ~629 ms the local-memory version was spending above the 85 ms weight
+baseline. **Re-measure before quoting a number**; the curve to reproduce is 3,000 / 6,600 / 21,000 positions
+landing back near the short-context rate (weights only) plus a few ms.
+
+**Do not re-propose.** Dynamic per-thread arrays for an online-softmax accumulator (this is the second time
+the layout cost more than the arithmetic); "just parallelize it more" as an answer to a per-key cost (the
+local-memory traffic scales with threads, not down with them); or assuming the `simd_sum` per key is the
+bottleneck -- it is ~40 cycles against the ~1 KB of local traffic it replaced.

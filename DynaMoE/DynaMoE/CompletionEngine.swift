@@ -1303,6 +1303,14 @@ public final class CompletionEngine: @unchecked Sendable {
         let gqaHeadGateFP8Pipeline: MTLComputePipelineState?
         let gqaHeadGateFP8ChunkedPipeline: MTLComputePipelineState?
         let gqaFusedFP8ChunkedPipeline: MTLComputePipelineState?
+        let gqaStandardF16ChunkedPipeline: MTLComputePipelineState?
+        let gqaStandardFP8ChunkedPipeline: MTLComputePipelineState?
+        let gqaStandardChunkedCombinePipeline: MTLComputePipelineState?
+        let gqaStandardPrefillTiledF16Pipeline: MTLComputePipelineState?
+        let gqaStandardPrefillTiledFP8Pipeline: MTLComputePipelineState?
+        let q8GemvBatchedPipeline: MTLComputePipelineState?
+        let q8GateUpBatchedPipeline: MTLComputePipelineState?
+        let q8DownBatchedPipeline: MTLComputePipelineState?
         let bf16GeluGateUpPipeline: MTLComputePipelineState?
         let bf16GeluGateUpSimdPipeline: MTLComputePipelineState?
         let bf16GeluGateUpBatchedPipeline: MTLComputePipelineState?
@@ -1503,6 +1511,29 @@ public final class CompletionEngine: @unchecked Sendable {
                 q8GemvPipeline = try device.makeComputePipelineState(function: q8GemvFunc)
             } else { q8GemvPipeline = nil }
 
+            // Weight-stationary Q8 prefill forms: a threadgroup covers a 16-token
+            // block of one output row, so a prompt re-reads the quantized weights
+            // ceil(P/16) times instead of P times. Without these the Q4/Q8 path
+            // is decode-only and a long prompt costs the same per token as a
+            // decode step.
+            if let q8GemvBatchedFunc = defaultLibrary.makeFunction(name: "q8_gemv_batched") {
+                q8GemvBatchedPipeline = try device.makeComputePipelineState(function: q8GemvBatchedFunc)
+            } else { q8GemvBatchedPipeline = nil }
+
+            if let q8GateUpBatchedFunc = defaultLibrary.makeFunction(name: "q8_swiglu_gate_up_batched") {
+                q8GateUpBatchedPipeline = try device.makeComputePipelineState(function: q8GateUpBatchedFunc)
+            } else { q8GateUpBatchedPipeline = nil }
+
+            if let q8DownBatchedFunc = defaultLibrary.makeFunction(name: "q8_down_proj_accumulate_batched") {
+                q8DownBatchedPipeline = try device.makeComputePipelineState(function: q8DownBatchedFunc)
+            } else { q8DownBatchedPipeline = nil }
+
+            if q8GemvBatchedPipeline != nil, q8GateUpBatchedPipeline != nil, q8DownBatchedPipeline != nil {
+                print("⚡ [GEMV] q8_gemv_batched + q8 MLP batched pipelines ready — Q4/Q8 prefill uses weight-stationary reads")
+            } else {
+                print("⚠️ [GEMV] Q8 batched prefill kernels unavailable — Q4/Q8 prefill re-reads every weight once per prompt token")
+            }
+
             if let fp8GateUpFunc = defaultLibrary.makeFunction(name: "fp8_swiglu_gate_up") {
                 fp8GateUpPipeline = try device.makeComputePipelineState(function: fp8GateUpFunc)
             } else { fp8GateUpPipeline = nil }
@@ -1666,6 +1697,38 @@ public final class CompletionEngine: @unchecked Sendable {
             if let gqaStdFP8Func = defaultLibrary.makeFunction(name: "gqa_attention_decode_standard_fp8") {
                 gqaStandardFP8Pipeline = try device.makeComputePipelineState(function: gqaStdFP8Func)
             } else { gqaStandardFP8Pipeline = nil }
+
+            // Split-K (flash-decoding) twins of the standard-GQA decode kernel.
+            // The plain kernels are one threadgroup per layer (one thread per
+            // head, a serial walk of the whole KV), which at a few thousand
+            // positions is most of a decoded token. These give every (head, KV
+            // chunk) its own thread and merge the partials afterwards.
+            if let stdF16ChunkedFunc = defaultLibrary.makeFunction(name: "gqa_attention_decode_standard_f16_chunked") {
+                gqaStandardF16ChunkedPipeline = try device.makeComputePipelineState(function: stdF16ChunkedFunc)
+            } else { gqaStandardF16ChunkedPipeline = nil }
+
+            if let stdFP8ChunkedFunc = defaultLibrary.makeFunction(name: "gqa_attention_decode_standard_fp8_chunked") {
+                gqaStandardFP8ChunkedPipeline = try device.makeComputePipelineState(function: stdFP8ChunkedFunc)
+            } else { gqaStandardFP8ChunkedPipeline = nil }
+
+            if let stdChunkedCombineFunc = defaultLibrary.makeFunction(name: "gqa_attention_decode_standard_chunked_combine") {
+                gqaStandardChunkedCombinePipeline = try device.makeComputePipelineState(function: stdChunkedCombineFunc)
+            } else { gqaStandardChunkedCombinePipeline = nil }
+
+            if let tiledF16Func = defaultLibrary.makeFunction(name: "gqa_attention_prefill_standard_f16") {
+                gqaStandardPrefillTiledF16Pipeline = try device.makeComputePipelineState(function: tiledF16Func)
+            } else { gqaStandardPrefillTiledF16Pipeline = nil }
+
+            if let tiledFP8Func = defaultLibrary.makeFunction(name: "gqa_attention_prefill_standard_fp8") {
+                gqaStandardPrefillTiledFP8Pipeline = try device.makeComputePipelineState(function: tiledFP8Func)
+            } else { gqaStandardPrefillTiledFP8Pipeline = nil }
+
+            if gqaStandardChunkedCombinePipeline != nil,
+               gqaStandardF16ChunkedPipeline != nil || gqaStandardFP8ChunkedPipeline != nil {
+                print("⚡ [GQA] standard-GQA split-K decode ready — long-context decode attends in parallel chunks")
+            } else {
+                print("⚠️ [GQA] standard-GQA split-K decode unavailable — decode attention stays one thread per head")
+            }
 
             if let convFunc = defaultLibrary.makeFunction(name: "causal_conv1d_silu") {
                 causalConv1dPipeline = try device.makeComputePipelineState(function: convFunc)
@@ -2472,19 +2535,45 @@ public final class CompletionEngine: @unchecked Sendable {
 
                     let is8Bit = (w.offsetEnd - w.offsetStart) >= UInt64(outDim) * UInt64(inDim)
                     if is8Bit, let q8Pipe = q8GemvPipeline {
-                        enc.setComputePipelineState(q8Pipe)
-                        enc.setBuffer(wRaw, offset: 0, index: 0)
-                        enc.setBuffer(sBuffer, offset: 0, index: 1)
-                        enc.setBuffer(bBuffer, offset: 0, index: 2)
-                        enc.setBuffer(inBuf, offset: inOffset, index: 3)
-                        enc.setBuffer(outBuf, offset: outOffset, index: 4)
-                        enc.setBytes(&wOff, length: MemoryLayout<UInt64>.stride, index: 5)
-                        enc.setBytes(&sOff, length: MemoryLayout<UInt64>.stride, index: 6)
-                        enc.setBytes(&bOff, length: MemoryLayout<UInt64>.stride, index: 7)
-                        enc.setBytes(&inD, length: MemoryLayout<UInt32>.stride, index: 8)
-                        enc.setBytes(&outD, length: MemoryLayout<UInt32>.stride, index: 9)
-                        enc.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 10)
-                        enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: batchSize, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                        if batchSize > 1,
+                           let q8Batched = q8GemvBatchedPipeline,
+                           grp > 0, inD % 8 == 0, grp % 8 == 0, inD % grp == 0 {
+                            // Weight-stationary prefill form: one threadgroup covers a
+                            // 16-token block of one output row, so this dispatch reads the
+                            // row ceil(batch/16) times instead of `batch` times. Every
+                            // 8-column chunk sits inside a single affine group (8 divides
+                            // groupSize), so the per-group scale/bias pair is unchanged
+                            // and the result differs only by float32 reordering.
+                            var batchVal = UInt32(batchSize)
+                            enc.setComputePipelineState(q8Batched)
+                            enc.setBuffer(wRaw, offset: 0, index: 0)
+                            enc.setBuffer(sBuffer, offset: 0, index: 1)
+                            enc.setBuffer(bBuffer, offset: 0, index: 2)
+                            enc.setBuffer(inBuf, offset: inOffset, index: 3)
+                            enc.setBuffer(outBuf, offset: outOffset, index: 4)
+                            enc.setBytes(&wOff, length: MemoryLayout<UInt64>.stride, index: 5)
+                            enc.setBytes(&sOff, length: MemoryLayout<UInt64>.stride, index: 6)
+                            enc.setBytes(&bOff, length: MemoryLayout<UInt64>.stride, index: 7)
+                            enc.setBytes(&inD, length: MemoryLayout<UInt32>.stride, index: 8)
+                            enc.setBytes(&outD, length: MemoryLayout<UInt32>.stride, index: 9)
+                            enc.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 10)
+                            enc.setBytes(&batchVal, length: MemoryLayout<UInt32>.stride, index: 11)
+                            enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: (batchSize + 15) / 16, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                        } else {
+                            enc.setComputePipelineState(q8Pipe)
+                            enc.setBuffer(wRaw, offset: 0, index: 0)
+                            enc.setBuffer(sBuffer, offset: 0, index: 1)
+                            enc.setBuffer(bBuffer, offset: 0, index: 2)
+                            enc.setBuffer(inBuf, offset: inOffset, index: 3)
+                            enc.setBuffer(outBuf, offset: outOffset, index: 4)
+                            enc.setBytes(&wOff, length: MemoryLayout<UInt64>.stride, index: 5)
+                            enc.setBytes(&sOff, length: MemoryLayout<UInt64>.stride, index: 6)
+                            enc.setBytes(&bOff, length: MemoryLayout<UInt64>.stride, index: 7)
+                            enc.setBytes(&inD, length: MemoryLayout<UInt32>.stride, index: 8)
+                            enc.setBytes(&outD, length: MemoryLayout<UInt32>.stride, index: 9)
+                            enc.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 10)
+                            enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: batchSize, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                        }
                     } else if let q4Pipe = q4GemvPipeline {
                         enc.setComputePipelineState(q4Pipe)
                         enc.setBuffer(wRaw, offset: 0, index: 0)
@@ -3805,6 +3894,51 @@ if layer.attnGateProjTensor != nil,
                                         layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 8)
                                         layerEnc1.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 9)
                                         layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), headGatePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    } else if isStandardGqa,
+                                              headDim == StandardGqaSplitK.headDim,
+                                              let stdSplitPipe = gqaStandardF16ChunkedPipeline,
+                                              let stdSplitCombine = gqaStandardChunkedCombinePipeline,
+                                              StandardGqaSplitK.curLen(seqLen) > StandardGqaSplitK.minimumContext {
+                                        // Flash-decoding split-K for standard GQA (Llama-family,
+                                        // no q-gate). The plain kernel gives this layer ONE
+                                        // threadgroup — one thread per head, each walking the
+                                        // whole KV serially — so a 3k-token context costs
+                                        // millions of dependent iterations on a single GPU
+                                        // core. Here every (head, KV chunk) is its own thread
+                                        // and a combine pass merges the partials.
+                                        let splitCurLen = StandardGqaSplitK.curLen(seqLen)
+                                        let splitChunks: UInt32 = StandardGqaSplitK.chunkCount(splitCurLen)
+                                        let splitChunkSize: UInt32 = (splitCurLen + splitChunks - 1) / splitChunks
+                                        var splitSeqLen = seqLen
+                                        var splitNQ = nQ
+                                        var splitNKv = nKv
+                                        var splitHD = hD
+                                        var splitChunk = splitChunkSize
+                                        var splitChunkCount = splitChunks
+                                        layerEnc1.setComputePipelineState(stdSplitPipe)
+                                        layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                        layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                        layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                        layerEnc1.setBuffer(attnPartialMBuffer, offset: 0, index: 3)
+                                        layerEnc1.setBuffer(attnPartialLBuffer, offset: 0, index: 4)
+                                        layerEnc1.setBuffer(attnPartialAccBuffer, offset: 0, index: 5)
+                                        layerEnc1.setBytes(&splitSeqLen, length: MemoryLayout<UInt32>.stride, index: 6)
+                                        layerEnc1.setBytes(&splitNQ, length: MemoryLayout<UInt32>.stride, index: 7)
+                                        layerEnc1.setBytes(&splitNKv, length: MemoryLayout<UInt32>.stride, index: 8)
+                                        layerEnc1.setBytes(&splitHD, length: MemoryLayout<UInt32>.stride, index: 9)
+                                        layerEnc1.setBytes(&splitChunk, length: MemoryLayout<UInt32>.stride, index: 10)
+                                        layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: Int(splitChunks), depth: 1), threadsPerThreadgroup: MTLSize(width: StandardGqaSplitK.lanes, height: 1, depth: 1))
+                                        layerEnc1.memoryBarrier(scope: .buffers)
+
+                                        layerEnc1.setComputePipelineState(stdSplitCombine)
+                                        layerEnc1.setBuffer(attnPartialMBuffer, offset: 0, index: 0)
+                                        layerEnc1.setBuffer(attnPartialLBuffer, offset: 0, index: 1)
+                                        layerEnc1.setBuffer(attnPartialAccBuffer, offset: 0, index: 2)
+                                        layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 3)
+                                        layerEnc1.setBytes(&splitChunkCount, length: MemoryLayout<UInt32>.stride, index: 4)
+                                        layerEnc1.setBytes(&splitNQ, length: MemoryLayout<UInt32>.stride, index: 5)
+                                        layerEnc1.setBytes(&splitHD, length: MemoryLayout<UInt32>.stride, index: 6)
+                                        layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: StandardGqaSplitK.lanes, height: 1, depth: 1))
                                     } else if isStandardGqa, let gqaStdPipe = gqaStandardF16Pipeline ?? gqaStandardPipeline {
                                         layerEnc1.setComputePipelineState(gqaStdPipe)
                                         layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
@@ -3970,6 +4104,51 @@ if layer.attnGateProjTensor != nil,
                                             layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 10)
                                             layerEnc1.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 11)
                                             layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), headGatePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                        } else if isStandardGqa,
+                                                  headDim == StandardGqaSplitK.headDim,
+                                                  let stdSplitPipe = gqaStandardFP8ChunkedPipeline,
+                                                  let stdSplitCombine = gqaStandardChunkedCombinePipeline,
+                                                  StandardGqaSplitK.curLen(seqLen) > StandardGqaSplitK.minimumContext {
+                                            // Split-K standard GQA over an FP8 KV cache: same
+                                            // arithmetic as `gqa_attention_decode_standard_fp8`
+                                            // (per-position K/V scales unchanged), but every
+                                            // (head, KV chunk) gets its own thread instead of the
+                                            // whole layer sharing 56 of them.
+                                            let splitCurLen = StandardGqaSplitK.curLen(seqLen)
+                                            let splitChunks: UInt32 = StandardGqaSplitK.chunkCount(splitCurLen)
+                                            let splitChunkSize: UInt32 = (splitCurLen + splitChunks - 1) / splitChunks
+                                            var splitSeqLen = seqLen
+                                            var splitNQ = nQ
+                                            var splitNKv = nKv
+                                            var splitHD = hD
+                                            var splitChunk = splitChunkSize
+                                            var splitChunkCount = splitChunks
+                                            layerEnc1.setComputePipelineState(stdSplitPipe)
+                                            layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                            layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                            layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                            layerEnc1.setBuffer(kScale, offset: scaleByteOffset, index: 3)
+                                            layerEnc1.setBuffer(vScale, offset: scaleByteOffset, index: 4)
+                                            layerEnc1.setBuffer(attnPartialMBuffer, offset: 0, index: 5)
+                                            layerEnc1.setBuffer(attnPartialLBuffer, offset: 0, index: 6)
+                                            layerEnc1.setBuffer(attnPartialAccBuffer, offset: 0, index: 7)
+                                            layerEnc1.setBytes(&splitSeqLen, length: MemoryLayout<UInt32>.stride, index: 8)
+                                            layerEnc1.setBytes(&splitNQ, length: MemoryLayout<UInt32>.stride, index: 9)
+                                            layerEnc1.setBytes(&splitNKv, length: MemoryLayout<UInt32>.stride, index: 10)
+                                            layerEnc1.setBytes(&splitHD, length: MemoryLayout<UInt32>.stride, index: 11)
+                                            layerEnc1.setBytes(&splitChunk, length: MemoryLayout<UInt32>.stride, index: 12)
+                                            layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: Int(splitChunks), depth: 1), threadsPerThreadgroup: MTLSize(width: StandardGqaSplitK.lanes, height: 1, depth: 1))
+                                            layerEnc1.memoryBarrier(scope: .buffers)
+
+                                            layerEnc1.setComputePipelineState(stdSplitCombine)
+                                            layerEnc1.setBuffer(attnPartialMBuffer, offset: 0, index: 0)
+                                            layerEnc1.setBuffer(attnPartialLBuffer, offset: 0, index: 1)
+                                            layerEnc1.setBuffer(attnPartialAccBuffer, offset: 0, index: 2)
+                                            layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 3)
+                                            layerEnc1.setBytes(&splitChunkCount, length: MemoryLayout<UInt32>.stride, index: 4)
+                                            layerEnc1.setBytes(&splitNQ, length: MemoryLayout<UInt32>.stride, index: 5)
+                                            layerEnc1.setBytes(&splitHD, length: MemoryLayout<UInt32>.stride, index: 6)
+                                            layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: StandardGqaSplitK.lanes, height: 1, depth: 1))
                                         } else if isStandardGqa, let gqaStdPipe = gqaStandardFP8Pipeline {
                                             layerEnc1.setComputePipelineState(gqaStdPipe)
                                             layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
@@ -5921,6 +6100,12 @@ if layer.attnGateProjTensor != nil,
                 dispatchLinear(enc: finalEnc, weight: lmHeadTensor, scale: lmHeadScale, bias: lmHeadBias, inBuf: xFinalBuffer, outBuf: logitsBuffer, inDim: hiddenDim, outDim: vocabSize)
 
                 finalEnc.endEncoding()
+                // Everything above runs on the generation thread: per-layer
+                // bookkeeping plus ~800 encoder calls for a 52-layer model.
+                // Everything below is the GPU. A token bound by the first reads
+                // exactly like a token bound by the second once they are summed
+                // into `Other`, which is why the DIAG line splits them.
+                let tEncodeDone = CFAbsoluteTimeGetCurrent()
                 activeCmd.commit()
                 if wait {
                     activeCmd.waitUntilCompleted()
@@ -5931,10 +6116,13 @@ if layer.attnGateProjTensor != nil,
                 }
 
                 if computeLogits {
-                    let tTokenElapsed = (CFAbsoluteTimeGetCurrent() - tTokenStart) * 1000.0
+                    let tTokenEnd = CFAbsoluteTimeGetCurrent()
+                    let tTokenElapsed = (tTokenEnd - tTokenStart) * 1000.0
+                    let diagEncodeMs = (tEncodeDone - tTokenStart) * 1000.0
+                    let diagGpuMs = (tTokenEnd - tEncodeDone) * 1000.0
                     diagOtherMs = tTokenElapsed - diagRouterGpuMs - diagIoMs - diagMoeGpuMs
                     let hitStr = diagPrefetchTotal > 0 ? " | Prefetch \(diagPrefetchHits)/\(diagPrefetchTotal) (\(String(format: "%.0f", Double(diagPrefetchHits) / Double(max(diagPrefetchTotal, 1)) * 100.0))%)" : ""
-                    print("[DIAG] Token \(step) total=\(String(format: "%.1f", tTokenElapsed))ms | RouterGPU=\(String(format: "%.1f", diagRouterGpuMs))ms | IO=\(String(format: "%.1f", diagIoMs))ms | MoEGPU=\(String(format: "%.1f", diagMoeGpuMs))ms | Other=\(String(format: "%.1f", diagOtherMs))ms\(hitStr)")
+                    print("[DIAG] Token \(step) total=\(String(format: "%.1f", tTokenElapsed))ms | enc=\(String(format: "%.1f", diagEncodeMs))ms | gpu=\(String(format: "%.1f", diagGpuMs))ms | RouterGPU=\(String(format: "%.1f", diagRouterGpuMs))ms | IO=\(String(format: "%.1f", diagIoMs))ms | MoEGPU=\(String(format: "%.1f", diagMoeGpuMs))ms | Other=\(String(format: "%.1f", diagOtherMs))ms\(hitStr)")
                 }
 
                 return true
@@ -7147,6 +7335,24 @@ if layer.attnGateProjTensor != nil,
                                             layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 8)
                                             layerEnc1.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 9)
                                             layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: sliceRows, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), headGatePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                        } else if isStandardGqa,
+                                                  UsesTiledPrefillAttention.isEnabled,
+                                                  headDim == StandardGqaSplitK.headDim,
+                                                  let tiledPipe = gqaStandardPrefillTiledF16Pipeline {
+                                            // SIMD-tiled standard-GQA attention: a 32-lane
+                                            // threadgroup per (head, row) instead of one thread,
+                                            // so a row's dot product and accumulator are split
+                                            // across lanes. See `UsesTiledPrefillAttention`.
+                                            layerEnc1.setComputePipelineState(tiledPipe)
+                                            layerEnc1.setBuffer(qGateBuffer_all, offset: qOff, index: 0)
+                                            layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                            layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                            layerEnc1.setBuffer(attnCtxBuffer_all, offset: ctxOff, index: 3)
+                                            layerEnc1.setBytes(&sliceSeq, length: MemoryLayout<UInt32>.stride, index: 4)
+                                            layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 5)
+                                            layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 6)
+                                            layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 7)
+                                            layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: sliceRows, depth: 1), threadsPerThreadgroup: MTLSize(width: StandardGqaSplitK.lanes, height: 1, depth: 1))
                                         } else if isStandardGqa, let gqaStdPipe = gqaStandardF16Pipeline ?? gqaStandardPipeline {
                                             layerEnc1.setComputePipelineState(gqaStdPipe)
                                             layerEnc1.setBuffer(qGateBuffer_all, offset: qOff, index: 0)
@@ -7228,6 +7434,26 @@ if layer.attnGateProjTensor != nil,
                                                 layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 10)
                                                 layerEnc1.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 11)
                                                 layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: sliceRows, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), headGatePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                            } else if isStandardGqa,
+                                                      UsesTiledPrefillAttention.isEnabled,
+                                                      headDim == StandardGqaSplitK.headDim,
+                                                      let tiledPipe = gqaStandardPrefillTiledFP8Pipeline {
+                                                // SIMD-tiled standard-GQA attention over an FP8 KV
+                                                // cache: a 32-lane threadgroup per (head, row), the
+                                                // head's dot product split across lanes. See
+                                                // `UsesTiledPrefillAttention`.
+                                                layerEnc1.setComputePipelineState(tiledPipe)
+                                                layerEnc1.setBuffer(qGateBuffer_all, offset: qOff, index: 0)
+                                                layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                                layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                                layerEnc1.setBuffer(kScale, offset: scaleByteOffset, index: 3)
+                                                layerEnc1.setBuffer(vScale, offset: scaleByteOffset, index: 4)
+                                                layerEnc1.setBuffer(attnCtxBuffer_all, offset: ctxOff, index: 5)
+                                                layerEnc1.setBytes(&sliceSeq, length: MemoryLayout<UInt32>.stride, index: 6)
+                                                layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 7)
+                                                layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 8)
+                                                layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 9)
+                                                layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: sliceRows, depth: 1), threadsPerThreadgroup: MTLSize(width: StandardGqaSplitK.lanes, height: 1, depth: 1))
                                             } else if isStandardGqa, let gqaStdPipe = gqaStandardFP8Pipeline {
                                                 layerEnc1.setComputePipelineState(gqaStdPipe)
                                                 layerEnc1.setBuffer(qGateBuffer_all, offset: qOff, index: 0)
@@ -7647,6 +7873,78 @@ if layer.attnGateProjTensor != nil,
                                     layerEnc1.setBuffer(denseActiveTokensBuffer, offset: 0, index: 7)
                                     layerEnc1.setBuffer(denseActiveWeightsBuffer, offset: 0, index: 8)
                                     layerEnc1.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                    layerEnc1.memoryBarrier(scope: .buffers)
+                                } else if isQuantizedAffine,
+                                          let gateSQ = gateS, let upSQ = upS, let downSQ = downS,
+                                          let gateBQ = layer.denseGateBias,
+                                          let upBQ = layer.denseUpBias,
+                                          let downBQ = layer.denseDownBias,
+                                          let gateSQRaw = buffers[gateSQ.shardIndex],
+                                          let upSQRaw = buffers[upSQ.shardIndex],
+                                          let downSQRaw = buffers[downSQ.shardIndex],
+                                          let gateBQRaw = buffers[gateBQ.shardIndex],
+                                          let upBQRaw = buffers[upBQ.shardIndex],
+                                          let downBQRaw = buffers[downBQ.shardIndex],
+                                          let gateUpBatched = q8GateUpBatchedPipeline,
+                                          let downBatched = q8DownBatchedPipeline,
+                                          (gateW.offsetEnd - gateW.offsetStart) >= UInt64(intermediateDim) * UInt64(hiddenDim),
+                                          (upW.offsetEnd - upW.offsetStart) >= UInt64(intermediateDim) * UInt64(hiddenDim),
+                                          (downW.offsetEnd - downW.offsetStart) >= UInt64(hiddenDim) * UInt64(intermediateDim),
+                                          hiddenDim % 64 == 0, intermediateDim % 64 == 0 {
+                                    // 8-bit affine (Q8) dense MLP across the whole chunk. The
+                                    // per-token fallback below issues 2 x P launches per layer
+                                    // and re-reads every weight row once per prompt token, which
+                                    // for a 33B dense model is the prefill floor. One
+                                    // threadgroup per (output row, 16-token block) reuses the
+                                    // row it loaded for all 16 tokens of the block.
+                                    var gSQOff = gateSQ.offsetStart
+                                    var uSQOff = upSQ.offsetStart
+                                    var dSQOff = downSQ.offsetStart
+                                    var gBQOff = gateBQ.offsetStart
+                                    var uBQOff = upBQ.offsetStart
+                                    var dBQOff = downBQ.offsetStart
+                                    var q8Group: UInt32 = 64
+                                    var q8Batch = UInt32(P)
+                                    var q8Pk: Float = 1.0
+                                    let q8Blocks = (P + 15) / 16
+
+                                    layerEnc1.setComputePipelineState(gateUpBatched)
+                                    layerEnc1.setBuffer(gRaw, offset: 0, index: 0)
+                                    layerEnc1.setBuffer(gateSQRaw, offset: 0, index: 1)
+                                    layerEnc1.setBuffer(gateBQRaw, offset: 0, index: 2)
+                                    layerEnc1.setBuffer(uRaw, offset: 0, index: 3)
+                                    layerEnc1.setBuffer(upSQRaw, offset: 0, index: 4)
+                                    layerEnc1.setBuffer(upBQRaw, offset: 0, index: 5)
+                                    layerEnc1.setBuffer(xNorm2Buffer_all, offset: 0, index: 6)
+                                    layerEnc1.setBuffer(interBuffer_all, offset: 0, index: 7)
+                                    layerEnc1.setBytes(&gWOff, length: 8, index: 8)
+                                    layerEnc1.setBytes(&gSQOff, length: 8, index: 9)
+                                    layerEnc1.setBytes(&gBQOff, length: 8, index: 10)
+                                    layerEnc1.setBytes(&uWOff, length: 8, index: 11)
+                                    layerEnc1.setBytes(&uSQOff, length: 8, index: 12)
+                                    layerEnc1.setBytes(&uBQOff, length: 8, index: 13)
+                                    layerEnc1.setBytes(&hDimVal, length: 4, index: 14)
+                                    layerEnc1.setBytes(&interDimVal, length: 4, index: 15)
+                                    layerEnc1.setBytes(&q8Group, length: 4, index: 16)
+                                    layerEnc1.setBytes(&q8Batch, length: 4, index: 17)
+                                    layerEnc1.dispatchThreadgroups(MTLSize(width: Int(intermediateDim), height: q8Blocks, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                    layerEnc1.memoryBarrier(scope: .buffers)
+
+                                    layerEnc1.setComputePipelineState(downBatched)
+                                    layerEnc1.setBuffer(dRaw, offset: 0, index: 0)
+                                    layerEnc1.setBuffer(downSQRaw, offset: 0, index: 1)
+                                    layerEnc1.setBuffer(downBQRaw, offset: 0, index: 2)
+                                    layerEnc1.setBuffer(interBuffer_all, offset: 0, index: 3)
+                                    layerEnc1.setBuffer(hMlpBuffer_all, offset: 0, index: 4)
+                                    layerEnc1.setBytes(&dWOff, length: 8, index: 5)
+                                    layerEnc1.setBytes(&dSQOff, length: 8, index: 6)
+                                    layerEnc1.setBytes(&dBQOff, length: 8, index: 7)
+                                    layerEnc1.setBytes(&interDimVal, length: 4, index: 8)
+                                    layerEnc1.setBytes(&hDimVal, length: 4, index: 9)
+                                    layerEnc1.setBytes(&q8Group, length: 4, index: 10)
+                                    layerEnc1.setBytes(&q8Pk, length: 4, index: 11)
+                                    layerEnc1.setBytes(&q8Batch, length: 4, index: 12)
+                                    layerEnc1.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: q8Blocks, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                                     layerEnc1.memoryBarrier(scope: .buffers)
                                 } else {
                                     for p in 0..<P {
