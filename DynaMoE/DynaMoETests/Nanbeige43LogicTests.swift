@@ -369,33 +369,69 @@ final class Nanbeige43PromptTests: XCTestCase {
         )
     }
 
-    /// The live continuation and the rebuilt history must agree, or a post-tool
-    /// turn can never extend the previous turn's pinned prefix.
+    /// The live continuation and the rebuilt history must agree BYTE FOR BYTE,
+    /// or a post-tool turn can never extend the previous turn's pinned prefix.
+    ///
+    /// They are assembled differently, which is exactly why this is worth pinning:
+    /// the live path (`ContentView`'s agent loop) asks the harness for a turn that
+    /// closes the call and re-opens the assistant, while the history path renders
+    /// each assistant turn itself and must therefore NOT get that second marker.
+    /// Asking for it in both put `<|im_start|>assistant\n` in the rebuilt prompt
+    /// twice, and the pin died on every turn after a tool call.
     func testTheLiveToolContinuationMatchesTheHistoryRender() throws {
         let payload = "file_a.txt\nfile_b.txt"
-        let live = ChatPromptFormatter.nanbeigeToolResponse(text: payload)
-        let history = try render(
-            turns: [.init(role: .user, text: payload, kind: .toolResult(name: "shell_run"))],
-            thinking: false
-        )
-        XCTAssertTrue(history.contains("<|im_start|>user\n" + live + "<|im_end|>\n"))
+        let open = ChatPromptFormatter.openReasoningSuffix
 
-        // The harness's own ChatML continuation wraps the payload the same way,
-        // so the two paths cannot drift.
-        let harnessTurn = AgentHarness.shared.formatToolResponseTurn(responses: [payload])
-        XCTAssertTrue(harnessTurn.contains(live))
+        for thinking in [true, false] {
+            // Live: the prompt ends at the turn this helper closes.
+            let live = AgentHarness.shared.formatToolResponseTurn(
+                responses: [payload],
+                includeThinkSuffix: thinking
+            )
+            // History: the same turn WITHOUT the assistant half, which the
+            // history loop then supplies exactly once.
+            let historyHalf = AgentHarness.shared.formatToolResponseTurn(
+                responses: [payload],
+                includeThinkSuffix: false,
+                includeAssistantPrefix: false
+            )
+            let rebuilt = historyHalf + "<|im_start|>assistant\n" + (thinking ? open : "")
+            XCTAssertEqual(
+                rebuilt.unicodeScalars.map(\.value),
+                live.unicodeScalars.map(\.value),
+                "thinking=\(thinking): history and live must be one render"
+            )
+
+            // One assistant marker, and it is the LAST thing in the prompt.
+            let markers = live.components(separatedBy: "<|im_start|>assistant\n").count - 1
+            XCTAssertEqual(markers, 1, "a duplicated role marker loses the prefix")
+            if thinking {
+                XCTAssertTrue(live.hasSuffix("<|im_start|>assistant\n" + open))
+            } else {
+                XCTAssertTrue(live.hasSuffix("<|im_start|>assistant\n"))
+            }
+            XCTAssertTrue(live.contains("<|im_start|>user\n" + ChatPromptFormatter.nanbeigeToolResponse(text: payload)))
+        }
     }
 
-    /// A rebuilt call uses the family's own XML markup, not DSML.
-    func testARebuiltToolCallUsesTheQwenCoderXMLShape() {
-        let block = ChatPromptFormatter.nanbeigeToolCallBlock(
-            name: "file_read",
-            arguments: ["path": "/tmp/a.txt"]
-        )
-        XCTAssertEqual(
-            block,
-            "<tool_call>\n<function=file_read>\n<parameter=path>\n/tmp/a.txt\n</parameter>\n</function>\n</tool_call>"
-        )
+    /// A rebuilt call uses the family's own XML markup, not DSML, and the claim
+    /// is CHECKED rather than asserted as a constant: the block has to come back
+    /// out of the app's own streaming parser as the call it was built from. That
+    /// parser is what runs against the model's live output, so a rebuild that
+    /// matches a hand-written string but not the parser would be a dialect drift
+    /// nothing else could see.
+    func testARebuiltToolCallParsesBackInTheQwenCoderDialect() {
+        let arguments = ["path": "/tmp/a.txt", "mode": "whole"]
+        let block = ChatPromptFormatter.nanbeigeToolCallBlock(name: "file_read", arguments: arguments)
+        let parsed = StreamingToolParser.shared.parseStreamingToolCalls(from: block, format: .qwenXML)
+        XCTAssertEqual(parsed.brokenFragments, [])
+        XCTAssertEqual(parsed.calls.count, 1)
+        XCTAssertEqual(parsed.calls.first?.name, "file_read")
+        XCTAssertEqual(parsed.calls.first?.arguments as? [String: String], arguments)
+        // And the dialect normalizer leaves it as the canonical block, so every
+        // downstream consumer (grammar mask, HITL prompt, history render) sees one
+        // shape.
+        XCTAssertTrue(StreamingToolParser.shared.shouldFreezeGeneration(accumulatedText: block, deltaText: block))
     }
 
     /// A historical turn that carried reasoning keeps its block open even after
@@ -512,7 +548,7 @@ final class Nanbeige43DiscoveryTests: XCTestCase {
             LocalModelManager.shared.inspectModelDirectory(dirUrl: dir, customRepoId: "Nanbeige/Nanbeige4.3-33B"),
             "a directory with config + weights must be discovered"
         )
-        XCTAssertEqual(model.architectureName, "Nanbeige Transformer (33B Dense)")
+        XCTAssertEqual(model.architectureName, "Nanbeige Transformer (Dense)")
         XCTAssertTrue(model.supportsThinking)
         XCTAssertFalse(model.supportsThinkingLevels)
         XCTAssertFalse(model.isMoE)

@@ -117,9 +117,17 @@ final class EngineTurnSlotTests: XCTestCase {
 
         XCTAssertThrowsError(try engine.launchTurn(makeRequest())) { error in
             let text = message(error)
+            // The ledger does not know WHO holds the slot (a queued server turn, a
+            // chat turn still preparing, or a model load all claim the same way),
+            // so the honest refusal says that rather than naming the API server
+            // and being wrong the rest of the time.
             XCTAssertTrue(
-                text.contains("API server"),
-                "the refusal must name the caller holding the slot, not claim a generation is running: \(text)"
+                text.contains("holding the generation slot"),
+                "the refusal must say the slot is held: \(text)"
+            )
+            XCTAssertTrue(
+                text.contains("turn being prepared") && text.contains("model load"),
+                "the refusal must name what can be holding it: \(text)"
             )
         }
     }

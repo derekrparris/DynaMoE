@@ -3641,7 +3641,21 @@ public final class AgentHarness {
         return prompt
     }
 
-    public func formatToolResponseTurn(responses: [String], includeThinkSuffix: Bool = false) -> String {
+    /// The ChatML tool-response turn: one `<|im_start|>user` turn wrapping each
+    /// result in `<tool_response>`, then the next assistant turn.
+    ///
+    /// `includeAssistantPrefix` exists because this turn OWNS the assistant
+    /// marker it opens. A live continuation is spliced onto the end of the prompt
+    /// and needs it; a rebuilt HISTORY renders its assistant turns itself and
+    /// would otherwise emit `<|im_start|>assistant\n` twice, which re-renders the
+    /// conversation differently from the pinned prompt and loses the prefix on
+    /// every post-tool turn. `includeThinkSuffix` only means anything when the
+    /// prefix is included.
+    public func formatToolResponseTurn(
+        responses: [String],
+        includeThinkSuffix: Bool = false,
+        includeAssistantPrefix: Bool = true
+    ) -> String {
         var turn = "<|im_start|>user\n"
         for r in responses {
             if let data = r.data(using: .utf8),
@@ -3656,9 +3670,15 @@ public final class AgentHarness {
             }
             turn += "<tool_response>\n\(Self.renderToolResultForModel(r))\n</tool_response>\n"
         }
-        turn += "<|im_end|>\n<|im_start|>assistant\n"
+        turn += "<|im_end|>\n"
+        guard includeAssistantPrefix else { return turn }
+        turn += "<|im_start|>assistant\n"
         if includeThinkSuffix {
-            turn += "<think>\n"
+            // The ChatML reasoning opener, taken from the formatter instead of retyped:
+            // this literal used to be the bare word "thinking" with no angle brackets,
+            // so a live continuation opened a channel the rebuilt history never opened
+            // and the pinned prefix was lost on every turn after a tool call.
+            turn += ChatPromptFormatter.openReasoningSuffix
         }
         return turn
     }

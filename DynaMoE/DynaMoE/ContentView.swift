@@ -2862,13 +2862,15 @@ struct ContentView: View {
                     // its record, in the dialect the model actually emits. The raw
                     // call survives in `content` for every turn this app produced,
                     // so this only fires for a turn that came from somewhere else.
+                    // Only the V4.1 dialect reaches this branch (`if isDeepSeekV41`
+                    // above), so the call is always DSML: a Nanbeige test here
+                    // could never be true, and the Nanbeige history rebuild lives
+                    // in the ChatML branch with the other ChatML families.
                     if let calls = msg.toolCalls, !calls.isEmpty,
                        !cleanMsg.contains(DeepSeekV41ToolDialect.dsmlTag),
                        !cleanMsg.contains("<tool_call") {
                         for call in calls {
-                            body += "\n" + (modelConfig?.isNanbeige43Model == true
-                                ? ChatPromptFormatter.nanbeigeToolCallBlock(name: call.name, arguments: call.arguments)
-                                : DeepSeekV41ToolDialect.callBlock(name: call.name, arguments: call.arguments))
+                            body += "\n" + DeepSeekV41ToolDialect.callBlock(name: call.name, arguments: call.arguments)
                         }
                     }
                     turns.append(.init(role: .assistant, text: body))
@@ -3143,7 +3145,17 @@ struct ContentView: View {
                     // it (mirrors the Spark/Ling branches); otherwise the raw call is
                     // already in `cleanMsg` and rebuilding would print it twice.
                     if let calls = msg.toolCalls, !calls.isEmpty, !cleanMsg.contains("tool_call>") {
+                        let isNanbeige = (modelConfig?.isNanbeige43Model == true)
                         for call in calls {
+                            if isNanbeige {
+                                // The family's own formatter owns the tag literals
+                                // (AGENTS.md: never retype tag-bearing strings).
+                                assistantBody += "\n" + ChatPromptFormatter.nanbeigeToolCallBlock(
+                                    name: call.name,
+                                    arguments: call.arguments
+                                ) + "\n"
+                                continue
+                            }
                             assistantBody += "<tool_call>\n<function=\(call.name)>\n"
                             for (k, v) in call.arguments {
                                 assistantBody += "<parameter=\(k)>\n\(v)\n</parameter>\n"
@@ -3161,7 +3173,17 @@ struct ContentView: View {
                             }
                         }
                         if !outputs.isEmpty {
-                            promptString += AgentHarness.shared.formatToolResponseTurn(responses: outputs, includeThinkSuffix: false)
+                            // No assistant prefix from this turn: the loop opens
+                            // one per assistant message above, and asking for a
+                            // second here put `<|im_start|>assistant\n` in the
+                            // rebuilt prompt twice, so a post-tool turn could
+                            // never extend the prefix the live continuation had
+                            // pinned.
+                            promptString += AgentHarness.shared.formatToolResponseTurn(
+                                responses: outputs,
+                                includeThinkSuffix: false,
+                                includeAssistantPrefix: false
+                            )
                         }
                     }
                 }

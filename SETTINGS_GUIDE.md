@@ -267,7 +267,7 @@ At the top of the Generation section, an active profile banner indicates which p
 
 ### System Prompts & Conjunction Merging
 DynaMoE features an intelligent **System Prompt Conjunction Engine**:
-- Many frontier models require specific system instructions embedded in their tokenizer chat templates (e.g. Ornith, DeepSeek-R1, Nanbeige).
+- A few families require a specific system instruction (Ornith, DeepSeek-R1). Nanbeige 4.3 does not: its template has a Chinese default line, but that line is only the fallback for a conversation with no system message, and DynaMoE always sends one, so the persona is deliberately not injected.
 - In DynaMoE, your custom system prompt entered in Settings is never overwritten; instead, it is merged *in conjunction* with the model's mandatory instruct requirements.
 - Example merged prompt:
   ```text
@@ -327,7 +327,7 @@ Controls the floating-point representation of the autoregressive key-value cache
 - **FP16**: Half precision. 50% memory reduction compared to FP32 with zero noticeable degradation in generation quality. Default for most configurations.
 - **FP8 (E4M3 / E5M2)**: 8-bit quantized KV cache with per-head dynamic scale factors. Reduces KV cache memory by 75%, enabling 32k+ token contexts on 16GB Macs without memory pressure.
 
-**Long context needs FP8 KV.** The row ceiling is now derived from the checkpoint's own `max_position_embeddings` (capped at 262,144 rows) instead of a flat 32,768, so a long-context model can be driven past 32k when the machine affords it — and the KV budget, not that ceiling, is what decides. The bytes are what bind. A 52-layer dense model with 8 KV heads of 128 costs 4 KB per layer per logical token at FP16 (1024 stride x 2 tensors x 2 bytes), i.e. about 208 KB per token across the 52 layers (52 slots x 1024 stride x 2 tensors x 2 bytes). So a 66 GB checkpoint on a 128 GB Mac leaves roughly 27 GB of KV budget in Unrestricted mode: about 130k rows at FP16, versus about 270k at FP8 (the FP8 cache also carries one scaling byte per 32 values, about 1.6% on top). Past roughly 100k rows, switch the KV cache to FP8 E4M3; below that FP16 is the better trade.
+**Long context needs FP8 KV.** The row ceiling is now derived from the checkpoint's own `max_position_embeddings` (capped at 262,144 rows) instead of a flat 32,768, so a long-context model can be driven past 32k when the machine affords it — and the KV budget, not that ceiling, is what decides. The bytes are what bind. A 52-layer dense model with 8 KV heads of 128 costs 4 KB per layer per logical token at FP16 (1024 stride x 2 tensors x 2 bytes), i.e. about 208 KB per token across the 52 layers (52 slots x 1024 stride x 2 tensors x 2 bytes). So a 66 GB checkpoint on a 128 GB Mac leaves roughly 27 GB of KV budget in Unrestricted mode: about 130k rows at FP16, versus about 260k at FP8 (the FP8 cache also carries one scaling byte per 32 values, about 1.6% on top). That FP8 figure sits within a few percent of the 262,144-row policy ceiling, so at FP8 the KV budget stops being the binding constraint before the ceiling does. Past roughly 100k rows, switch the KV cache to FP8 E4M3; below that FP16 is the better trade.
 
 ### Speculative MoE Lookahead Prefetching
 When running sparse MoE models in SSD streaming mode:

@@ -609,6 +609,16 @@ struct DenseRepackJson {
     pub quantization: String,
     #[serde(default)]
     pub group_size: u32,
+    /// Length of the blob these offsets were written against.
+    ///
+    /// Bounds alone cannot say the manifest and the blob are the SAME pair: a Q4
+    /// blob and a Q8 blob of the same tensors both contain every one of each
+    /// other's offsets, so a stale manifest over a freshly written blob would
+    /// load at the wrong stride while still reporting its own quantization.
+    /// Absent in manifests written before the field existed, which are then
+    /// validated exactly as they were.
+    #[serde(default)]
+    pub blob_size: Option<u64>,
     #[serde(default)]
     pub tensors: Vec<DenseRepackTensorEntry>,
 }
@@ -620,6 +630,14 @@ struct DenseRepackTensorEntry {
     pub shape: Vec<u64>,
     pub offset: u64,
     pub size: u64,
+}
+
+/// Whether a manifest `dtype` is an AFFINE-PACKED weight (as opposed to a tensor
+/// the repack copied verbatim). Mirrors `DenseRepacker.isPackedWeightDtype` on
+/// the Swift side: the two decide "is this a repack" between them, so they must
+/// agree on which rows are packed.
+fn is_packed_weight_dtype(dtype: &str) -> bool {
+    dtype.contains("Q4") || dtype.contains("Q8")
 }
 
 /// Loads a dense repack (`dense_weights.json` + `dense_weights.bin`) beside the
@@ -713,11 +731,15 @@ fn try_load_dense_repack(search_path: &Path) -> Option<(Vec<ShardHandle>, Vec<Te
         // them is either read as E4M3 (wrong bytes) or skipped (stale output). The
         // repacker always writes the trio, so an entry missing one came from a
         // truncated or hand-edited manifest.
-        if matches!(manifest.quantization.as_str(), "q4" | "q8") {
+        //
+        // Keyed on the ENTRY's dtype rather than on the manifest's `quantization`
+        // value, so a manifest whose label disagrees with its rows is still held
+        // to the rule (the label is what the Swift side reads for the model row).
+        {
             let names: std::collections::HashSet<&str> =
                 manifest.tensors.iter().map(|entry| entry.name.as_str()).collect();
             if let Some(orphan) = manifest.tensors.iter().find(|entry| {
-                matches!(entry.dtype.as_str(), "Q4" | "Q8")
+                is_packed_weight_dtype(&entry.dtype)
                     && (!names.contains(format!("{}.scale", entry.name).as_str())
                         || !names.contains(format!("{}.bias", entry.name).as_str()))
             }) {
@@ -727,7 +749,7 @@ fn try_load_dense_repack(search_path: &Path) -> Option<(Vec<ShardHandle>, Vec<Te
                     orphan.name,
                     orphan.dtype
                 );
-                continue;
+                continue 'dir;
             }
         }
 
@@ -753,6 +775,20 @@ fn try_load_dense_repack(search_path: &Path) -> Option<(Vec<ShardHandle>, Vec<Te
                 continue;
             }
         };
+        // The manifest records the blob it was written against, so a mismatch is
+        // a manifest describing a DIFFERENT blob: refuse rather than read every
+        // offset at a stride it was not computed for.
+        if let Some(recorded) = manifest.blob_size {
+            if recorded != file_len {
+                eprintln!(
+                    "⚠️ [DenseRepack] refusing {}: it describes a {} byte blob but {} bytes are on disk",
+                    manifest_path.display(),
+                    recorded,
+                    file_len
+                );
+                continue 'dir;
+            }
+        }
         for entry in &manifest.tensors {
             // Checked, because `offset + size` wraps in a release build and a
             // wrapped range would pass the completeness test.
@@ -777,8 +813,53 @@ fn try_load_dense_repack(search_path: &Path) -> Option<(Vec<ShardHandle>, Vec<Te
                     continue 'dir;
                 }
             }
+            // A packed tensor is read with VECTOR loads whose natural alignment
+            // is 4 bytes for the packed row and 16 for the input, and a row
+            // begins at `offset + row * inDim`. The repacker aligns every entry
+            // to 16 bytes and only packs a row width that divides into the
+            // kernels' 16-byte chunks, so a manifest that violates either was
+            // not written by this engine's repacker (or was hand-edited) and
+            // would read garbage rather than the checkpoint's bytes.
+            if is_packed_weight_dtype(&entry.dtype) {
+                if entry.offset % 16 != 0 {
+                    eprintln!(
+                        "⚠️ [DenseRepack] refusing {}: {} starts at {}, which is not 16-byte aligned",
+                        manifest_path.display(),
+                        entry.name,
+                        entry.offset
+                    );
+                    continue 'dir;
+                }
+                match entry.shape.as_slice() {
+                    [_, width] if *width > 0 && *width % 16 == 0 => {}
+                    _ => {
+                        eprintln!(
+                            "⚠️ [DenseRepack] refusing {}: {} has shape {:?}, whose row width the kernels cannot read as 16-byte chunks",
+                            manifest_path.display(),
+                            entry.name,
+                            entry.shape
+                        );
+                        continue 'dir;
+                    }
+                }
+            }
         }
-        let mmap = unsafe { MmapOptions::new().map(&file) }.ok()?;
+        // `continue` rather than `?`: a blob this process cannot map says nothing
+        // about the next candidate directory, and returning here would abandon the
+        // whole search for the sake of one unusable repack. The caller falls back
+        // to the safetensors index, which is the honest answer for a blob that
+        // cannot be mapped.
+        let mmap = match unsafe { MmapOptions::new().map(&file) } {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                eprintln!(
+                    "⚠️ [DenseRepack] skipping {}: cannot map the blob ({})",
+                    weights_path.display(),
+                    error
+                );
+                continue;
+            }
+        };
 
         let mut tensor_list = Vec::with_capacity(manifest.tensors.len());
         for entry in manifest.tensors {
@@ -790,7 +871,10 @@ fn try_load_dense_repack(search_path: &Path) -> Option<(Vec<ShardHandle>, Vec<Te
                 size_mb: entry.size as f64 / (1024.0 * 1024.0),
                 shard_index: 0,
                 offset_start: entry.offset,
-                offset_end: entry.offset + entry.size,
+                // Saturating rather than `+`: the range was already proved to fit
+                // in the file above, so this can only be the same value, but a
+                // release build traps on overflow and a manifest is project input.
+                offset_end: entry.offset.saturating_add(entry.size),
                 category,
                 layer_index,
                 expert_id,
@@ -2579,8 +2663,13 @@ mod tests {
     /// would put `<s>` (id 1) in front of it.
     #[test]
     fn test_nanbeige43_tokenizer_special_tokens() {
-        let snap = "/Users/derekparris/.cache/huggingface/hub/models--Nanbeige--Nanbeige4.3-33B/snapshots/df919e1e2cf077a22204c78b6c826bf3db18bc08";
-        let tok_path = format!("{}/tokenizer.json", snap);
+        // Located from `$HOME` rather than a hardcoded checkout: the snapshot
+        // hash is not stable across machines, and a path baked into the source
+        // makes this test pass only for whoever wrote it.
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/derekparris".to_string());
+        let snap = PathBuf::from(home)
+            .join(".cache/huggingface/hub/models--Nanbeige--Nanbeige4.3-33B/snapshots/df919e1e2cf077a22204c78b6c826bf3db18bc08");
+        let tok_path = format!("{}/tokenizer.json", snap.display());
         if !PathBuf::from(&tok_path).exists() {
             println!("Nanbeige 4.3 tokenizer snapshot not present; skipping");
             return;
@@ -2594,6 +2683,15 @@ mod tests {
         assert_eq!(tok.decode(vec![166104]).unwrap(), format!("</{}>", "think"));
         assert_eq!(tok.decode(vec![166105]).unwrap(), "<tool_call>");
         assert_eq!(tok.decode(vec![166106]).unwrap(), "</tool_call>");
+        // 166102 is the checkpoint's text end-of-sequence, and `ModelConfig`
+        // excludes it from the 4.3 EOS set because it is an alias of the turn
+        // closer the template actually ends on. Asserted, because until now only a
+        // comment said so.
+        assert_eq!(
+            tok.decode(vec![166102]).unwrap(),
+            format!("<|{}|>", "endoftext"),
+            "166102 is the checkpoint's text EOS"
+        );
 
         let prompt = format!(
             "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n{tag_ok}\n"

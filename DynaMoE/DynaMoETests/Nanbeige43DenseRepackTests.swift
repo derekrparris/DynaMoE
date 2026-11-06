@@ -231,8 +231,10 @@ final class Nanbeige43DenseRepackTests: XCTestCase {
             groupSize: 64,
             tensors: [
                 .init(name: "model.layers.0.mlp.gate_proj.weight", dtype: "Q4", shape: [22016, 7168], offset: 0, size: 1000),
-                .init(name: "model.layers.0.mlp.gate_proj.weight.scale", dtype: "BF16", shape: [22016, 112], offset: 1000, size: 200),
-            ]
+                .init(name: "model.layers.0.mlp.gate_proj.weight.scale", dtype: "BF16", shape: [22016, 112], offset: 1008, size: 200),
+                .init(name: "model.layers.0.mlp.gate_proj.weight.bias", dtype: "BF16", shape: [22016, 112], offset: 1216, size: 200),
+            ],
+            blobSize: 1416
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -244,14 +246,117 @@ final class Nanbeige43DenseRepackTests: XCTestCase {
         XCTAssertTrue(raw.contains("\"quantization\""))
 
         XCTAssertFalse(DenseRepacker.isRepacked(dir: directory), "a manifest with no blob is not a repack")
-        try Data(count: 1200).write(to: directory.appendingPathComponent("dense_weights.bin"))
+        try Data(count: 1416).write(to: directory.appendingPathComponent("dense_weights.bin"))
         XCTAssertTrue(DenseRepacker.isRepacked(dir: directory))
         XCTAssertEqual(DenseRepacker.quantizedFormat(dir: directory), .q4)
         XCTAssertEqual(DenseRepacker.Quantization.q4.displayName, "Q4 (dense repack)")
+
+        // The blob the manifest was written against is recorded, so a blob of a
+        // DIFFERENT length is refused even when every offset still lands inside
+        // it. That is the Q4-over-Q8 case: a Q8 blob contains every Q4 offset, so
+        // bounds alone would have loaded it at the wrong stride while still
+        // reporting "Q4".
+        try Data(count: 2048).write(to: directory.appendingPathComponent("dense_weights.bin"))
+        XCTAssertFalse(
+            DenseRepacker.isRepacked(dir: directory),
+            "a blob of another length is not the blob this manifest describes"
+        )
 
         // A truncated blob describes bytes that were never written, which is the
         // shape an interrupted run leaves behind.
         try Data(count: 900).write(to: directory.appendingPathComponent("dense_weights.bin"))
         XCTAssertFalse(DenseRepacker.isRepacked(dir: directory))
+    }
+
+    /// The packed kernels read a weight row as `uchar4` and the input as `float4`,
+    /// and Apple GPUs require a vector load to be naturally aligned. A row starts
+    /// at `offset + row * inDim`, so the manifest is accepted only when every
+    /// packed entry starts on a 16-byte boundary and its row width is a multiple
+    /// of 16. Nothing else in the app can see this: a misaligned row reads
+    /// garbage rather than failing.
+    func testAPackedEntryMustBeReadableAsAlignedSixteenByteChunks() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dense-repack-align-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let blobBytes: UInt64 = 4096
+        try Data(count: Int(blobBytes)).write(to: directory.appendingPathComponent("dense_weights.bin"))
+
+        func write(_ manifest: DenseRepackManifest) throws {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            try encoder.encode(manifest).write(to: directory.appendingPathComponent("dense_weights.json"))
+        }
+        func entry(_ name: String, offset: UInt64, width: Int, dtype: String = "Q8") -> DenseRepackManifest.TensorEntry {
+            .init(name: name, dtype: dtype, shape: [16, width], offset: offset, size: 256)
+        }
+
+        // A two-byte offset is what a verbatim-copied tensor of odd length used to
+        // leave behind, and it is exactly the misalignment that read garbage.
+        try write(DenseRepackManifest(
+            quantization: "q8",
+            groupSize: 64,
+            tensors: [
+                entry("a.weight", offset: 2, width: 64),
+                entry("a.weight.scale", offset: 512, width: 1, dtype: "BF16"),
+                entry("a.weight.bias", offset: 768, width: 1, dtype: "BF16"),
+            ],
+            blobSize: blobBytes
+        ))
+        XCTAssertFalse(DenseRepacker.isRepacked(dir: directory), "a packed row at byte 2 is not 4-byte aligned")
+
+        // Aligned, but a row of 72 bytes cannot be read in 16-byte chunks.
+        try write(DenseRepackManifest(
+            quantization: "q8",
+            groupSize: 64,
+            tensors: [
+                entry("a.weight", offset: 0, width: 72),
+                entry("a.weight.scale", offset: 512, width: 1, dtype: "BF16"),
+                entry("a.weight.bias", offset: 768, width: 1, dtype: "BF16"),
+            ],
+            blobSize: blobBytes
+        ))
+        XCTAssertFalse(DenseRepacker.isRepacked(dir: directory), "a 72-wide row cannot be read as 16-byte chunks")
+
+        // And a packed weight with no bias companion is refused: the quantized
+        // path needs both, and a missing one silently skipped the dispatch.
+        try write(DenseRepackManifest(
+            quantization: "q8",
+            groupSize: 64,
+            tensors: [
+                entry("a.weight", offset: 0, width: 64),
+                entry("a.weight.scale", offset: 512, width: 1, dtype: "BF16"),
+            ],
+            blobSize: blobBytes
+        ))
+        XCTAssertFalse(DenseRepacker.isRepacked(dir: directory), "a packed weight needs both companions")
+
+        // The whole trio, aligned, on a 16-divisible row width: a repack.
+        try write(DenseRepackManifest(
+            quantization: "q8",
+            groupSize: 64,
+            tensors: [
+                entry("a.weight", offset: 0, width: 64),
+                entry("a.weight.scale", offset: 256, width: 1, dtype: "BF16"),
+                entry("a.weight.bias", offset: 512, width: 1, dtype: "BF16"),
+            ],
+            blobSize: blobBytes
+        ))
+        XCTAssertTrue(DenseRepacker.isRepacked(dir: directory))
+        XCTAssertEqual(DenseRepacker.quantizedFormat(dir: directory), .q8)
+    }
+
+    /// Everything the repacker writes starts on, and stays on, a 16-byte boundary:
+    /// the header records a blob length the entries live inside, and the offsets
+    /// are what the kernels' vector loads depend on.
+    func testEveryEntryTheRepackerWritesIsSixteenByteAligned() {
+        XCTAssertEqual(DenseRepacker.tensorAlignment, 16)
+        // The row width rule `isQuantizable` enforces is what makes `offset +
+        // row * inDim` aligned for every row once the offset is.
+        XCTAssertTrue(DenseRepacker.isQuantizable(tensor("model.layers.0.self_attn.q_proj.weight", shape: [7168, 7168])))
+        XCTAssertFalse(DenseRepacker.isQuantizable(tensor("model.layers.0.self_attn.q_proj.weight", shape: [7168, 7168 + 16 - 8])))
+        // Companions of an already packed tensor are never re-quantized.
+        XCTAssertFalse(DenseRepacker.isQuantizable(tensor("model.layers.0.mlp.gate_proj.weight.scale", shape: [22016, 112])))
+        XCTAssertFalse(DenseRepacker.isQuantizable(tensor("model.layers.0.mlp.gate_proj.weight.bias", shape: [22016, 112])))
     }
 }

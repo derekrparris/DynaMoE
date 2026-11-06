@@ -932,22 +932,33 @@ enum AnthropicAdapter {
             }
             switch message.role {
             case "user":
-                var parts: [String] = []
-                if let text = message.contentText, !text.isEmpty {
-                    parts.append(text)
+                let results = message.toolResults ?? []
+                let text = message.contentText ?? ""
+                if !text.isEmpty || results.isEmpty {
+                    // An image-only turn still has content: the planner writes the
+                    // marker, so the placeholder text would be read as the question.
+                    let placeholderText = text.isEmpty
+                        ? (message.imageBlocks.isEmpty ? "(no content)" : "")
+                        : text
+                    split.turns.append(.init(role: .user, text: placeholderText))
+                    if !message.imageBlocks.isEmpty {
+                        split.images[split.turns.count - 1] = message.imageBlocks
+                    }
                 }
-                for result in message.toolResults ?? [] {
+                // A TOOL RESULT is its own turn, tagged as one, so the family's own
+                // template renders it: Nanbeige wraps a result in
+                // `<tool_response>` inside a user turn, DeepSeek V4.1 uses its own
+                // output pair. Flattening them into the turn's text (what this did)
+                // made the same conversation render differently from the in-app
+                // path and from `/v1/chat/completions`.
+                for result in results {
                     let label = result.toolUseId ?? "tool"
-                    parts.append("Tool result (\(label)):\n\(result.content ?? "(no result)")")
+                    split.turns.append(.init(
+                        role: .user,
+                        text: "Tool result (\(label)):\n\(result.content ?? "(no result)")",
+                        kind: .toolResult(name: label)
+                    ))
                 }
-                let body = parts.joined(separator: "\n\n")
-                if !message.imageBlocks.isEmpty { split.images[split.turns.count] = message.imageBlocks }
-                // An image-only turn still has content: the planner writes the
-                // marker, so the placeholder text would be read as the question.
-                let placeholderText = body.isEmpty
-                    ? (message.imageBlocks.isEmpty ? "(no content)" : "")
-                    : body
-                split.turns.append(.init(role: .user, text: placeholderText))
             case "assistant":
                 var parts: [String] = []
                 // Reasoning a client echoed back is re-rendered ahead of the

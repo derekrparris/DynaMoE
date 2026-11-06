@@ -894,8 +894,13 @@ enum KVCacheProvisioning {
     /// policy only lets the budget answer instead of the constant. Never lowers
     /// the ceiling below `maxProvisionedRows`, so a model declaring a small
     /// window keeps the range every existing turn already had.
+    ///
+    /// Reads the DECLARED window, not `effectiveMaxPositionEmbeddings`: that
+    /// getter substitutes 262,144 for a config that says nothing, so a fallback
+    /// written against it was unreachable and a checkpoint declaring no window
+    /// was treated as if it had claimed 262k positions.
     static func policyMaxRows(config: ModelConfig?) -> Int {
-        guard let declared = config?.effectiveMaxPositionEmbeddings, declared > 0 else {
+        guard let declared = config?.declaredMaxPositionEmbeddings else {
             return maxProvisionedRows
         }
         return max(maxProvisionedRows, min(declared, absoluteMaxProvisionedRows))

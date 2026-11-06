@@ -451,6 +451,20 @@ public struct ModelConfig: Codable {
         return textConfig?.maxPositionEmbeddings ?? maxPositionEmbeddings ?? 262144
     }
 
+    /// The `max_position_embeddings` the checkpoint actually DECLARES, or nil.
+    ///
+    /// `effectiveMaxPositionEmbeddings` above substitutes 262,144 when the file
+    /// says nothing, which is the right answer for a display or an advertised
+    /// capability and the wrong one for a KV CACHE POLICY: a window nobody
+    /// declared must not be read as a 262k-token claim, or the policy silently
+    /// provisions against a number the checkpoint never made. Kept separate so
+    /// the two questions cannot be confused again.
+    public var declaredMaxPositionEmbeddings: Int? {
+        let declared = textConfig?.maxPositionEmbeddings ?? maxPositionEmbeddings
+        guard let declared, declared > 0 else { return nil }
+        return declared
+    }
+
     public var effectiveRopeTheta: Float {
         if let t = textConfig?.ropeParameters?.ropeTheta { return t }
         if let t = ropeParameters?.ropeTheta { return t }
@@ -674,7 +688,16 @@ public struct ModelConfig: Codable {
     /// recognized; the path also matches Nanbeige's repository and snapshot
     /// names, which is what a partially written snapshot has to fall back on.
     nonisolated public static func isNanbeige43Directory(_ directory: URL) -> Bool {
-        let path = directory.path.lowercased().replacingOccurrences(of: " ", with: "")
+        // Letters and digits only, so `Nanbeige4.3`, `Nanbeige-4.3` and
+        // `Nanbeige 4.3` all normalize to the same key. The earlier form stripped
+        // only spaces, which made the arm miss every dashed spelling and match a
+        // hub REPOSITORY directory (`models--Nanbeige--Nanbeige4.3-33B`) only by
+        // accident of its own separators.
+        //
+        // This arm is a convenience for a local directory whose config.json has
+        // been stripped or replaced; the shape check below is what actually
+        // decides a checkpoint, which is what keeps a renamed copy recognised.
+        let path = directory.path.lowercased().filter { $0.isLetter || $0.isNumber }
         if path.contains("nanbeige4.3") || path.contains("nanbeige43") {
             return true
         }
@@ -696,20 +719,30 @@ public struct ModelConfig: Codable {
     /// per-turn path (prompt assembly). An empty or missing path is a cheap no.
     nonisolated public static func isNanbeige43Snapshot(_ modelPath: String?) -> Bool {
         guard let modelPath, !modelPath.isEmpty else { return false }
-        let path = modelPath as NSString
-        if let cached = nanbeige43Cache.object(forKey: path) {
-            return cached.boolValue
-        }
+        let key = modelPath as NSString
         let directory = URL(fileURLWithPath: modelPath)
+        // The SAME rule as `supportsVision`: a yes is kept (the checkpoint's own
+        // shape does not change under it), a no is re-decided when the
+        // directory's modification stamp moves. Caching a bare no, as this did,
+        // meant a download that finished while the app was open was never
+        // recognised, which is the exact failure mode `supportsVision` guards against.
+        let stamp = snapshotStamp(directory)
+        if let cached = nanbeige43Cache.object(forKey: key) as? StampedSupportBox,
+           cached.supported || (cached.stamp != nil && cached.stamp == stamp) {
+            return cached.supported
+        }
         let isNanbeige43 = FileManager.default.fileExists(atPath: directory.path)
             && isNanbeige43Directory(directory)
-        nanbeige43Cache.setObject(NSNumber(value: isNanbeige43), forKey: path)
+        nanbeige43Cache.setObject(
+            StampedSupportBox(supported: isNanbeige43, stamp: isNanbeige43 ? nil : stamp),
+            forKey: key
+        )
         return isNanbeige43
     }
 
     /// Scan-time detection runs off the main actor, so the shared cache must be
     /// safe across threads; `NSCache` is.
-    nonisolated(unsafe) private static let nanbeige43Cache = NSCache<NSString, NSNumber>()
+    nonisolated(unsafe) private static let nanbeige43Cache = NSCache<NSString, NSObject>()
 
     /// Global-attention layers reuse the key projection as the value projection
     /// (`attention_k_eq_v`), and use `global_head_dim` with a reduced KV head count.
@@ -1185,7 +1218,7 @@ public struct ModelConfig: Codable {
         // shards do not appear twice, and if they are removed the load fails by
         // name instead of the composer quietly closing.
         let stamp = snapshotStamp(directory)
-        if let cached = visionCache.object(forKey: key) as? VisionSupportBox,
+        if let cached = visionCache.object(forKey: key) as? StampedSupportBox,
            cached.supported || (cached.stamp != nil && cached.stamp == stamp) {
             return cached.supported
         }
@@ -1201,7 +1234,7 @@ public struct ModelConfig: Codable {
             supported = DeepSeekV41VisionWeights.directoryHasTower(directory)
         }
         visionCache.setObject(
-            VisionSupportBox(supported: supported, stamp: supported ? nil : stamp),
+            StampedSupportBox(supported: supported, stamp: supported ? nil : stamp),
             forKey: key
         )
         return supported
@@ -1223,8 +1256,12 @@ public struct ModelConfig: Codable {
         return date.timeIntervalSince1970
     }
 
-    /// A memoized answer plus, for a negative, the stamp it was decided at.
-    private final class VisionSupportBox: NSObject {
+    /// A memoized yes/no answer plus, for a NO, the stamp it was decided at.
+    ///
+    /// Shared by `supportsVision` and `isNanbeige43Snapshot` because both answer a
+    /// question a half-finished download changes: a positive never needs
+    /// revisiting, a negative does.
+    private final class StampedSupportBox: NSObject {
         let supported: Bool
         /// Nil for a positive. For a negative this is the snapshot's stamp at the
         /// moment of the decision, so a later stamp makes the answer stale.

@@ -652,19 +652,34 @@ struct SettingsSheetView: View {
                                         // the only lever. Gated on the model row's
                                         // own label, which `LocalModelManager`
                                         // derives from the repack manifest.
-                                        if !model.isMoE,
-                                           !isFlashMoEPacked,
-                                           (model.quantization ?? "").contains("dense repack") == false {
-                                            Divider()
-                                            Button {
-                                                repackDenseModel(model, quantization: .q8)
-                                            } label: {
-                                                Label("Quantize to Q8", systemImage: "arrow.down.circle")
-                                            }
-                                            Button {
-                                                repackDenseModel(model, quantization: .q4)
-                                            } label: {
-                                                Label("Quantize to Q4", systemImage: "arrow.down.circle.fill")
+                                        //
+                                        // A directory that is ALREADY dense-repacked
+                                        // still offers the OTHER format: Q8 -> Q4 is a
+                                        // re-quantize from the checkpoint's own shards
+                                        // (`repackDenseModel` parks the outgoing blob
+                                        // first). Hiding both items, as this did, was
+                                        // also what kept a stale manifest's label from
+                                        // ever being repaired.
+                                        if !model.isMoE, !isFlashMoEPacked {
+                                            let denseLabel = model.quantization ?? ""
+                                            let isDenseQ8 = denseLabel == DenseRepacker.Quantization.q8.displayName
+                                            let isDenseQ4 = denseLabel == DenseRepacker.Quantization.q4.displayName
+                                            if !isDenseQ8 || !isDenseQ4 {
+                                                Divider()
+                                                if !isDenseQ8 {
+                                                    Button {
+                                                        repackDenseModel(model, quantization: .q8)
+                                                    } label: {
+                                                        Label("Quantize to Q8", systemImage: "arrow.down.circle")
+                                                    }
+                                                }
+                                                if !isDenseQ4 {
+                                                    Button {
+                                                        repackDenseModel(model, quantization: .q4)
+                                                    } label: {
+                                                        Label("Quantize to Q4", systemImage: "arrow.down.circle.fill")
+                                                    }
+                                                }
                                             }
                                         }
                                     } label: {
@@ -2608,7 +2623,11 @@ struct SettingsSheetView: View {
     }
 
     private func resetProfileDraft(model: DiscoveredModel, type: ModelProfileType) {
-        let defaults = GenerationProfileSettings.defaultFor(type: type, modelName: model.displayName)
+        let defaults = GenerationProfileSettings.defaultFor(
+            type: type,
+            modelName: model.displayName,
+            modelPath: model.snapshotPath
+        )
         editingDraft = defaults
         profileManager.saveProfile(for: model.id, type: type, settings: defaults)
         profileFeedbackText = "Reset to Defaults!"
@@ -2929,6 +2948,11 @@ struct SettingsSheetView: View {
                 guard DenseRepacker.canRepack(dir: dir) || DenseRepacker.isRepacked(dir: dir) else {
                     throw DenseRepackerError.notARepackableCheckpoint
                 }
+                // A re-quantize has to read the checkpoint's OWN shards, but the
+                // engine prefers a dense repack, so the outgoing blob is parked
+                // first (kept as `.unusable`, not deleted). Without this the
+                // repack below would be handed the packed rows it is replacing.
+                DenseRepacker.setAsideRepackForRequantize(dir: dir)
                 try DenseRepacker.shared.repackSafetensors(
                     sourceDir: dir,
                     outputDir: dir,

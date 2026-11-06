@@ -362,7 +362,11 @@ public class LocalModelManager: ObservableObject {
             } else if isGemma4 {
                 architectureName = isMoE ? "Gemma 4 Hybrid Attention MoE" : "Gemma 4 Hybrid Attention"
             } else if isNanbeige43 {
-                architectureName = isMoE ? "Dense/MoE Transformer" : "Nanbeige Transformer (33B Dense)"
+                // No hardcoded parameter count: identity here is shape-based (a
+                // 166,912-row vocabulary, or 7,168 hidden over 52 layers), so a
+                // "33B" label would lie about any checkpoint that matched the shape
+                // without being this one.
+                architectureName = isMoE ? "Dense/MoE Transformer" : "Nanbeige Transformer (Dense)"
             } else if archString.localizedCaseInsensitiveContains("qwen3_5") || archString.localizedCaseInsensitiveContains("ornith") || (rawModelType?.localizedCaseInsensitiveContains("qwen3_5") ?? false) || (rawModelType?.localizedCaseInsensitiveContains("ornith") ?? false) {
                 architectureName = isMoE ? "Hybrid SSM-MoE" : "Hybrid SSM-Dense"
             } else if archString.localizedCaseInsensitiveContains("nanbeige") {

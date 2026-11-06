@@ -7401,8 +7401,11 @@ if layer.attnGateProjTensor != nil,
                                             // so a row's dot product and accumulator are split
                                             // across lanes. See `UsesTiledPrefillAttention`.
                                             // A SLIDING layer is excluded because this kernel
-                                            // takes no window parameter, so it cannot mask one;
-                                            // it keeps the non-tiled kernel it used before.
+                                            // takes no window parameter. Its non-tiled fallback
+                                            // below (`gqa_attention_decode_standard_*`) takes no
+                                            // window either, so the exclusion keeps those layers
+                                            // on the arithmetic they already had; it does not
+                                            // preserve a mask the fallback would have applied.
                                             layerEnc1.setComputePipelineState(tiledPipe)
                                             layerEnc1.setBuffer(qGateBuffer_all, offset: qOff, index: 0)
                                             layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
@@ -7503,7 +7506,8 @@ if layer.attnGateProjTensor != nil,
                                                 // cache: a 32-lane threadgroup per (head, row), the
                                                 // head's dot product split across lanes. See
                                                 // `UsesTiledPrefillAttention`; sliding layers are
-                                                // excluded here for the same reason as the F16 form.
+                                                // excluded here for the same reason as the F16 form
+                                                // (neither kernel applies a window).
                                                 layerEnc1.setComputePipelineState(tiledPipe)
                                                 layerEnc1.setBuffer(qGateBuffer_all, offset: qOff, index: 0)
                                                 layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)

@@ -391,7 +391,7 @@ struct HelpAndSettingsGuideView: View {
             }
 
             infoBox(title: "System Prompt Conjunction Merging", icon: "link") {
-                Text("DynaMoE automatically merges your custom system prompt in Settings with mandatory instruct personas required by models (e.g. Nanbeige, Ornith, DeepSeek-R1) into a single cohesive instruction block during inference.")
+                Text("DynaMoE automatically merges your custom system prompt in Settings with the instruct persona a family requires (e.g. Ornith, DeepSeek-R1) into a single cohesive instruction block during inference. Families that need none, such as Nanbeige 4.3, get your prompt unchanged.")
                     .font(.system(size: 12))
             }
         }

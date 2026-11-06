@@ -46,13 +46,39 @@ public struct DenseRepackManifest: Codable, Sendable {
     }
 
     public let quantization: String
-    public let groupSize: UInt64
+    /// Optional, and absent reads as "unstated", because the Rust loader
+    /// (`try_load_dense_repack`) treats an absent `group_size` the same way and
+    /// the two sides decide "is this a repack" between them: a rule only one of
+    /// them applies is a directory the app half-believes.
+    public let groupSize: UInt64?
     public let tensors: [TensorEntry]
+    /// Length of the blob these offsets were written against.
+    ///
+    /// Bounds alone cannot say the manifest and the blob are the SAME pair: a
+    /// Q4 blob and a Q8 blob of the same tensors both contain every Q4 offset,
+    /// so a stale manifest over a freshly written blob loads at the wrong
+    /// stride and reports the wrong quantization. Optional because manifests
+    /// written before this field existed are still readable, and their offsets
+    /// are validated exactly as before.
+    public let blobSize: UInt64?
 
     enum CodingKeys: String, CodingKey {
         case quantization
         case groupSize = "group_size"
+        case blobSize = "blob_size"
         case tensors
+    }
+
+    public init(
+        quantization: String,
+        groupSize: UInt64?,
+        tensors: [TensorEntry],
+        blobSize: UInt64? = nil
+    ) {
+        self.quantization = quantization
+        self.groupSize = groupSize
+        self.tensors = tensors
+        self.blobSize = blobSize
     }
 }
 
@@ -61,6 +87,8 @@ public enum DenseRepackerError: LocalizedError {
     case notARepackableCheckpoint
     case writeFailed(String)
     case unsupportedTensor(String)
+    case alreadyQuantized(String)
+    case unreachableTensor(String)
 
     public var errorDescription: String? {
         switch self {
@@ -72,6 +100,10 @@ public enum DenseRepackerError: LocalizedError {
             return "Dense repack write failed: \(detail)"
         case .unsupportedTensor(let name):
             return "Dense repack: \(name) is not BF16, so this checkpoint is already quantized."
+        case .alreadyQuantized(let detail):
+            return "This checkpoint is already quantized, so packing it again would quantize quantized bytes. \(detail)"
+        case .unreachableTensor(let name):
+            return "Dense repack: \(name) lives in a shard the engine could not map, so it cannot be copied. Nothing was written."
         }
     }
 }
@@ -81,10 +113,28 @@ public final class DenseRepacker {
 
     /// The one group size the Metal kernels implement.
     public static let groupSize = 64
+
+    /// Every tensor starts on a 16-byte boundary in the blob.
+    ///
+    /// The packed-weight kernels read their rows as `uchar4` (4-byte) vector
+    /// loads and the input as `float4` (16-byte) ones, and Apple GPUs require a
+    /// vector load to be naturally aligned: a row that begins mid-word reads
+    /// garbage rather than the checkpoint's bytes. A row's start is
+    /// `offset + row * inDim`, and `isQuantizable` already requires
+    /// `inDim % groupSize == 0`, so aligning each entry's `offset` is what makes
+    /// every row aligned (see `ComputeShaders.metal`'s note at the top of
+    /// `q8_gemv`). Aligning to 16 rather than 4 covers the `float4` reads too.
+    public static let tensorAlignment: UInt64 = 16
+
     /// Names never quantized: the token embedding is read a row at a time, and the
     /// output head keeps full precision so the logits the sampler reads are the
-    /// checkpoint's own.
-    static let excludedNameFragments = ["embed_tokens", "lm_head", "visual.", "mtp.", "ple.", "ngram_embedding"]
+    /// checkpoint's own. `.scale`/`.bias` are the companions of an ALREADY packed
+    /// tensor: a 64-wide companion row would pass `isQuantizable`, and quantizing
+    /// it would leave the packed weight with scales of scales.
+    static let excludedNameFragments = [
+        "embed_tokens", "lm_head", "visual.", "mtp.", "ple.", "ngram_embedding",
+        ".scale", ".bias", ".scales",
+    ]
 
     private init() {}
 
@@ -106,34 +156,145 @@ public final class DenseRepacker {
     /// hides the Quantize action that is the only way to repair it.
     public static func quantizedFormat(dir: URL) -> Quantization? {
         guard isRepacked(dir: dir) else { return nil }
-        let manifestUrl = dir.appendingPathComponent("dense_weights.json")
-        guard let data = try? Data(contentsOf: manifestUrl),
-              let manifest = try? JSONDecoder().decode(DenseRepackManifest.self, from: data),
+        guard let manifest = manifest(in: dir),
               let quant = Quantization(rawValue: manifest.quantization) else {
             return nil
         }
         return quant
     }
 
-    /// Whether a repack is present AND reads as complete: every entry must lie
-    /// inside the blob, because an interrupted run leaves a manifest describing
-    /// bytes that were never written.
+    /// Why a manifest does not describe the blob beside it, or nil when it does.
+    ///
+    /// The SAME rule exists in the Rust loader (`try_load_dense_repack`,
+    /// core/src/lib.rs) and the two must not drift: Swift uses it to decide
+    /// whether the model row may say "Q8 (dense repack)" (which also hides the
+    /// Quantize action that repairs the directory), and Rust uses it to decide
+    /// whether the blob may be loaded at all. A disagreement means one half of
+    /// the app believes a repack the other half refuses.
+    ///
+    /// Every check is here rather than at the call sites so the answers cannot
+    /// differ:
+    ///
+    /// - the blob exists and its length matches the manifest's `blob_size`
+    ///   (a Q4 blob and a Q8 blob of the same tensors contain every one of each
+    ///   other's offsets, so bounds alone cannot tell a stale manifest from a
+    ///   fresh one);
+    /// - every entry lies inside the blob, without wrapping;
+    /// - every PACKED entry starts on `tensorAlignment`, because the kernels
+    ///   read its rows as vector loads, and its row width divides into the
+    ///   kernels' 16-byte chunks;
+    /// - every packed weight has BOTH companions, because the quantized path
+    ///   needs the scale and the bias.
+    static func manifestProblem(
+        _ manifest: DenseRepackManifest,
+        blobBytes: UInt64
+    ) -> String? {
+        guard !manifest.tensors.isEmpty else { return "the manifest lists no tensors" }
+        // The kernels hardcode 64, and an absent value reads as "unstated" (the
+        // Rust loader accepts `group_size` 0 the same way).
+        if let declared = manifest.groupSize, declared != 0, declared != UInt64(groupSize) {
+            return "group_size \(declared) is not \(groupSize)"
+        }
+        if !manifest.quantization.isEmpty,
+           Quantization(rawValue: manifest.quantization) == nil,
+           manifest.quantization != "bf16" {
+            return "unknown quantization \(manifest.quantization)"
+        }
+        if let recorded = manifest.blobSize, recorded != blobBytes {
+            return "it describes a \(recorded) byte blob but \(blobBytes) bytes are on disk"
+        }
+        let names = Set(manifest.tensors.map(\.name))
+        for entry in manifest.tensors {
+            let (end, overflowed) = entry.offset.addingReportingOverflow(entry.size)
+            guard !overflowed else { return "\(entry.name) has an overflowing byte range" }
+            guard end <= blobBytes else { return "\(entry.name) runs past the end of the blob" }
+            guard isPackedWeightDtype(entry.dtype) else { continue }
+            guard entry.offset % tensorAlignment == 0 else {
+                return "\(entry.name) starts at \(entry.offset), which is not \(tensorAlignment)-byte aligned"
+            }
+            guard entry.shape.count == 2, entry.shape[1] > 0, entry.shape[1] % 16 == 0 else {
+                return "\(entry.name) has a row width the kernels cannot read as 16-byte chunks"
+            }
+            guard names.contains(entry.name + ".scale"), names.contains(entry.name + ".bias") else {
+                return "\(entry.name) is packed \(entry.dtype) with no scale/bias companion"
+            }
+        }
+        return nil
+    }
+
+    /// Whether a repack is present AND reads as complete. See
+    /// `manifestProblem(_:blobBytes:)` for what "complete" means and why it is
+    /// shared with the Rust loader.
     public static func isRepacked(dir: URL) -> Bool {
-        let manifestUrl = dir.appendingPathComponent("dense_weights.json")
+        guard let manifest = manifest(in: dir) else { return false }
         let blobUrl = dir.appendingPathComponent("dense_weights.bin")
-        guard let data = try? Data(contentsOf: manifestUrl),
-              let manifest = try? JSONDecoder().decode(DenseRepackManifest.self, from: data),
-              !manifest.tensors.isEmpty,
-              let attributes = try? FileManager.default.attributesOfItem(atPath: blobUrl.path),
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: blobUrl.path),
               let blobBytes = attributes[.size] as? UInt64 else {
             return false
         }
-        return manifest.tensors.allSatisfy { entry in
-            // Checked: a hand-edited or corrupt manifest can carry an `offset` and
-            // `size` whose sum overflows, and an unchecked `+` traps.
-            let (end, overflowed) = entry.offset.addingReportingOverflow(entry.size)
-            return !overflowed && end <= blobBytes
+        return manifestProblem(manifest, blobBytes: blobBytes) == nil
+    }
+
+    /// The decoded manifest, or nil when the file is absent or unreadable.
+    static func manifest(in dir: URL) -> DenseRepackManifest? {
+        let manifestUrl = dir.appendingPathComponent("dense_weights.json")
+        guard let data = try? Data(contentsOf: manifestUrl),
+              let manifest = try? JSONDecoder().decode(DenseRepackManifest.self, from: data) else {
+            return nil
         }
+        return manifest
+    }
+
+    /// The file names a parked repack keeps, so parking is reversible by hand and
+    /// a re-quantize can find what it replaced.
+    static let parkedBlobName = "dense_weights.bin.unusable"
+    static let parkedManifestName = "dense_weights.json.unusable"
+
+    /// Renames the repack out of the way without deleting it.
+    ///
+    /// Used both by the GPU-limit path below and by a RE-QUANTIZE, which needs the
+    /// checkpoint's own safetensors back: the engine prefers the repack, so while
+    /// the files are named `dense_weights.*` a new repack would be handed the
+    /// packed rows it is trying to replace.
+    @discardableResult
+    private static func parkRepackFiles(dir: URL, fileManager: FileManager = .default) -> Bool {
+        let blobUrl = dir.appendingPathComponent("dense_weights.bin")
+        let manifestUrl = dir.appendingPathComponent("dense_weights.json")
+        let parkedBlob = dir.appendingPathComponent(parkedBlobName)
+        let parkedManifest = dir.appendingPathComponent(parkedManifestName)
+        // Each file separately: an interrupted repack can leave a manifest with no
+        // blob (or the reverse), and parking must clear what is there rather than
+        // abandon the pair because one half is missing.
+        var parkedAny = false
+        try? fileManager.removeItem(at: parkedBlob)
+        try? fileManager.removeItem(at: parkedManifest)
+        if fileManager.fileExists(atPath: blobUrl.path) {
+            do {
+                try fileManager.moveItem(at: blobUrl, to: parkedBlob)
+                parkedAny = true
+            } catch {
+                print("⚠️ [Dense] could not set the repack blob aside: \(error)")
+                return false
+            }
+        }
+        if fileManager.fileExists(atPath: manifestUrl.path) {
+            do {
+                try fileManager.moveItem(at: manifestUrl, to: parkedManifest)
+                parkedAny = true
+            } catch {
+                print("⚠️ [Dense] could not set the repack manifest aside: \(error)")
+                return false
+            }
+        }
+        return parkedAny
+    }
+
+    /// Moves a dense repack aside so a new one can be written from the
+    /// checkpoint's own shards (the Q8 → Q4 path). Answers false when there is
+    /// nothing to park.
+    @discardableResult
+    public static func setAsideRepackForRequantize(dir: URL) -> Bool {
+        parkRepackFiles(dir: dir)
     }
 
     /// Moves a dense repack aside when this GPU cannot map it, so the loader falls
@@ -145,23 +306,21 @@ public final class DenseRepacker {
     /// unreachable: the load succeeds, then the first dispatch that touches one of
     /// them throws "weight tensor not found", which names neither the repack nor
     /// the GPU limit. The manifest names every span, so this needs no mapping to
-    /// answer. The files are RENAMED rather than deleted, so re-running the
-    /// quantize replaces them and nothing the user paid for is destroyed.
+    /// answer.
     @discardableResult
     public static func setAsideRepackIfUnusable(dir: URL, maxBufferLength: UInt64) -> Bool {
         guard maxBufferLength > 0 else { return false }
         let fileManager = FileManager.default
-        let manifestUrl = dir.appendingPathComponent("dense_weights.json")
         let blobUrl = dir.appendingPathComponent("dense_weights.bin")
-        guard let data = try? Data(contentsOf: manifestUrl),
-              let manifest = try? JSONDecoder().decode(DenseRepackManifest.self, from: data),
-              !manifest.tensors.isEmpty,
+        guard let manifest = manifest(in: dir),
               let attributes = try? fileManager.attributesOfItem(atPath: blobUrl.path),
               let blobBytes = attributes[.size] as? UInt64 else {
             return false
         }
         // 16 KB is the largest Apple Silicon page, so this can only overestimate a
-        // span, which is the safe direction for a refusal.
+        // span, which is the safe direction for a refusal. A range that does not
+        // fit the blob is refused as unusable too: at least one span of a manifest
+        // the reader would reject cannot be mapped.
         let page: UInt64 = 16 * 1024
         func alignedSpan(_ entry: DenseRepackManifest.TensorEntry) -> UInt64 {
             let (rawEnd, overflowed) = entry.offset.addingReportingOverflow(entry.size)
@@ -173,18 +332,7 @@ public final class DenseRepacker {
         guard manifest.tensors.contains(where: { alignedSpan($0) > maxBufferLength }) else {
             return false
         }
-        let parkedBlob = dir.appendingPathComponent("dense_weights.bin.unusable")
-        let parkedManifest = dir.appendingPathComponent("dense_weights.json.unusable")
-        try? fileManager.removeItem(at: parkedBlob)
-        try? fileManager.removeItem(at: parkedManifest)
-        do {
-            try fileManager.moveItem(at: blobUrl, to: parkedBlob)
-            try fileManager.moveItem(at: manifestUrl, to: parkedManifest)
-        } catch {
-            print("⚠️ [Dense] could not set the unusable repack aside: \(error)")
-            return false
-        }
-        return true
+        return parkRepackFiles(dir: dir, fileManager: fileManager)
     }
 
     /// Whether this directory holds a dense BF16 checkpoint that would benefit.
@@ -209,9 +357,14 @@ public final class DenseRepacker {
         if !fileManager.fileExists(atPath: outputDir.path) {
             try fileManager.createDirectory(at: outputDir, withIntermediateDirectories: true)
         }
+        // `tokenizer_config.json` is what carries the CHAT TEMPLATE the family's
+        // prompt renderer is verified against, so a repack into a different
+        // directory would otherwise be a checkpoint that lost the thing that says
+        // how a turn is shaped.
         let auxFiles = [
-            "config.json", "tokenizer.json", "tokenizer.model", "generation_config.json",
-            "added_tokens.json", "special_tokens_map.json", "vocab.bin", "tokenizer.bin"
+            "config.json", "tokenizer_config.json", "tokenizer.json", "tokenizer.model",
+            "generation_config.json", "added_tokens.json", "special_tokens_map.json",
+            "vocab.bin", "tokenizer.bin"
         ]
         for aux in auxFiles {
             let source = sourceDir.appendingPathComponent(aux)
@@ -229,6 +382,19 @@ public final class DenseRepacker {
         progress(0.02, "Reading the checkpoint index…")
         let engine = try DynaMoeEngine(filePath: sourceDir.path)
         let summary = try engine.getSummary()
+
+        // The engine PREFERS a dense repack over the safetensors shards, so
+        // re-running the quantize on a directory that already holds one hands
+        // this function the repack's own Q4/Q8 rows. Copying those verbatim
+        // while the manifest is labelled with the REQUESTED format publishes a
+        // blob the kernels would read at the wrong stride, and quantizing them
+        // again would quantize quantized bytes. Refuse instead: the repair is to
+        // move the repack aside, which re-enables the Quantize action.
+        if let packed = summary.tensors.first(where: { Self.isPackedWeightDtype($0.dtype) }) {
+            throw DenseRepackerError.alreadyQuantized(
+                "\(packed.name) is already \(packed.dtype), so re-packing would quantize quantized bytes. Move dense_weights.bin and dense_weights.json aside to re-quantize from the checkpoint's own shards."
+            )
+        }
 
         var shardPointers: [UInt32: UnsafeRawPointer] = [:]
         for shard in summary.shards {
@@ -270,9 +436,18 @@ public final class DenseRepacker {
         var quantizedSoFar: UInt64 = 0
 
         for tensor in tensors {
-            guard let base = shardPointers[tensor.shardIndex] else { continue }
+            // A tensor the engine could not map cannot be copied. Dropping it from
+            // the manifest used to publish a model with a missing projection,
+            // which loads and silently contributes only its residual, so the
+            // whole repack fails instead and names the tensor.
+            guard let base = shardPointers[tensor.shardIndex] else {
+                throw DenseRepackerError.unreachableTensor(tensor.name)
+            }
             let source = base.advanced(by: Int(tensor.offsetStart))
             let shape = ExpertRepacker.parseShapeDisplay(tensor.shapeDisplay)
+            // Every entry starts on `tensorAlignment`, which is what keeps the
+            // packed kernels' vector loads naturally aligned (see that constant).
+            try padToAlignment(&offset, handle: blob)
 
             guard Self.isQuantizable(tensor), shape.count == 2 else {
                 // Copied verbatim: norms, the embedding, the head, and anything
@@ -377,7 +552,8 @@ public final class DenseRepacker {
         let manifest = DenseRepackManifest(
             quantization: quantization.rawValue,
             groupSize: UInt64(Self.groupSize),
-            tensors: entries
+            tensors: entries,
+            blobSize: offset
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -559,6 +735,17 @@ public final class DenseRepacker {
         guard written == bytes.count else {
             throw DenseRepackerError.writeFailed("short write for \(name)")
         }
+    }
+
+    /// Writes zero bytes up to the next `tensorAlignment` boundary and advances
+    /// `offset` by them, so every manifest offset is also the entry's byte
+    /// position in the file.
+    private func padToAlignment(_ offset: inout UInt64, handle: UnsafeMutablePointer<FILE>) throws {
+        let remainder = offset % Self.tensorAlignment
+        guard remainder != 0 else { return }
+        let padding = Int(Self.tensorAlignment - remainder)
+        try write([UInt8](repeating: 0, count: padding), to: handle, name: "alignment padding")
+        offset += UInt64(padding)
     }
 
     private func bf16Bytes(_ values: [UInt16]) -> [UInt8] {

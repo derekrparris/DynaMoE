@@ -110,10 +110,21 @@ public struct GenerationProfileSettings: Codable, Equatable, Hashable {
         self.jetSpecMaxExpertCap = jetSpecMaxExpertCap
     }
 
-    public static func defaultFor(type: ModelProfileType, modelName: String? = nil) -> GenerationProfileSettings {
+    /// `modelPath` is asked about only where the NAME cannot answer, which is
+    /// Nanbeige 4.3: its identity is structural (`ModelConfig.isNanbeige43Shape`),
+    /// so a renamed copy would otherwise fall through to the generic profile.
+    /// Every other family here is matched by name because its name is the only
+    /// discriminator that exists.
+    public static func defaultFor(
+        type: ModelProfileType,
+        modelName: String? = nil,
+        modelPath: String? = nil
+    ) -> GenerationProfileSettings {
         let nameLower = (modelName ?? "").lowercased()
         let isQwen = nameLower.contains("qwen")
         let isOrnith = nameLower.contains("ornith")
+        let isNanbeige = nameLower.contains("nanbeige")
+            || (modelPath.map { ModelConfig.isNanbeige43Snapshot($0) } ?? false)
 
         if isQwen {
             switch type {
@@ -198,7 +209,7 @@ public struct GenerationProfileSettings: Codable, Equatable, Hashable {
         // Nanbeige 4.3 is a dense 33B tuned for agentic tool use. Its card quotes
         // temperature 1.0 / top_p 0.95 for agentic work and 0.6 / 0.95 for plain
         // reasoning, and NO repetition penalty (unlike the R1-style families).
-        if nameLower.contains("nanbeige") {
+        if isNanbeige {
             switch type {
             case .coder:
                 return GenerationProfileSettings(

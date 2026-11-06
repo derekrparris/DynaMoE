@@ -4953,7 +4953,20 @@ kernel void q8_gemv(
     // lanes in a sector and cover 512 bytes with 16 requests (32 bytes per
     // request), and each chunk still lies inside one affine group because 16
     // divides groupSize for every checkpoint this path serves (64).
-    uint32_t numChunks16 = inDim / 16;
+    //
+    // The chunk loop is GATED on that division rather than assuming it: a group
+    // size that does not divide 16 would let one chunk straddle two groups and
+    // apply one group's scale to the other's values, so such a call runs the
+    // scalar tail instead (correct, and only slower).
+    //
+    // ALIGNMENT: `wRow + colStart` is read as `uchar4`, which Apple GPUs require
+    // to be 4-byte aligned, and `inPtr + colStart` as `float4` (16-byte). A row
+    // starts at `weightOffset + row * inDim`, so the producer must keep every
+    // tensor's offset 16-byte aligned and `inDim` a multiple of 16. The dense
+    // repack does both (`DenseRepacker.tensorAlignment`) and both loaders refuse
+    // a manifest that does not (`dense_weights.json`'s `blob_size` and alignment
+    // checks); a misaligned row reads garbage rather than the checkpoint's bytes.
+    uint32_t numChunks16 = (groupSize % 16 == 0) ? (inDim / 16) : 0;
     for (uint32_t c = laneId; c < numChunks16; c += 32) {
         uint32_t colStart = c * 16;
         uint32_t g = min(colStart / groupSize, numGroups > 0 ? numGroups - 1 : 0);
@@ -5075,7 +5088,7 @@ kernel void q8_swiglu_gate_up(
     // 16 contiguous bytes per lane per projection per iteration — see the note in
     // `q8_gemv`: a 4-byte lane stride spends one memory request per 4 bytes,
     // while a 16-byte chunk keeps two lanes in one sector and fills it.
-    uint32_t numChunks16 = hiddenDim / 16;
+    uint32_t numChunks16 = (groupSize % 16 == 0) ? (hiddenDim / 16) : 0;
     for (uint32_t c = laneId; c < numChunks16; c += 32) {
         uint32_t colStart = c * 16;
         uint32_t g = min(colStart / groupSize, numGroups > 0 ? numGroups - 1 : 0);
@@ -5321,7 +5334,7 @@ kernel void q8_down_proj_accumulate(
     float down_sum = 0.0f;
 
     // 16 contiguous weight bytes per lane per iteration — see `q8_gemv`.
-    uint32_t numChunks16 = intermediateDim / 16;
+    uint32_t numChunks16 = (groupSize % 16 == 0) ? (intermediateDim / 16) : 0;
     for (uint32_t c = laneId; c < numChunks16; c += 32) {
         uint32_t colStart = c * 16;
         uint32_t g = min(colStart / groupSize, numGroups > 0 ? numGroups - 1 : 0);
@@ -13367,7 +13380,11 @@ kernel void q8_gemv_batched(
     uint32_t numChunks = inDim / 8;
     for (uint32_t c = laneId; c < numChunks; c += 32) {
         uint32_t baseCol = c * 8;
-        uint32_t g = (groupSize > 0) ? (baseCol / groupSize) : 0;
+        // Clamped like `q8_gemv`'s chunk loop: a row whose width is not a
+        // multiple of `groupSize` would otherwise index past the row's scale
+        // companion and weight the next row's scales into this one.
+        uint32_t g = min((groupSize > 0) ? (baseCol / groupSize) : 0,
+                         (groupSize > 0 && inDim >= groupSize) ? (inDim / groupSize - 1) : 0);
         float scale = read_bf16_unaligned(sRow + g * 2);
         float bias = read_bf16_unaligned(bRow + g * 2);
 
@@ -13443,7 +13460,11 @@ kernel void q8_swiglu_gate_up_batched(
     uint32_t numChunks = hiddenDim / 8;
     for (uint32_t c = laneId; c < numChunks; c += 32) {
         uint32_t baseCol = c * 8;
-        uint32_t g = (groupSize > 0) ? (baseCol / groupSize) : 0;
+        // Clamped like `q8_gemv`'s chunk loop: a row whose width is not a
+        // multiple of `groupSize` would otherwise index past the row's scale
+        // companion and weight the next row's scales into this one.
+        uint32_t g = min((groupSize > 0) ? (baseCol / groupSize) : 0,
+                         (groupSize > 0 && hiddenDim >= groupSize) ? (hiddenDim / groupSize - 1) : 0);
         float gScale = read_bf16_unaligned(gSRow + g * 2);
         float gBias = read_bf16_unaligned(gBRow + g * 2);
         float uScale = read_bf16_unaligned(uSRow + g * 2);
@@ -13516,7 +13537,11 @@ kernel void q8_down_proj_accumulate_batched(
     uint32_t numChunks = intermediateDim / 8;
     for (uint32_t c = laneId; c < numChunks; c += 32) {
         uint32_t baseCol = c * 8;
-        uint32_t g = (groupSize > 0) ? (baseCol / groupSize) : 0;
+        // Clamped like `q8_gemv`'s chunk loop: a row whose width is not a
+        // multiple of `groupSize` would otherwise index past the row's scale
+        // companion and weight the next row's scales into this one.
+        uint32_t g = min((groupSize > 0) ? (baseCol / groupSize) : 0,
+                         (groupSize > 0 && intermediateDim >= groupSize) ? (intermediateDim / groupSize - 1) : 0);
         float scale = read_bf16_unaligned(dSRow + g * 2);
         float bias = read_bf16_unaligned(dBRow + g * 2);
 
