@@ -110,10 +110,21 @@ public struct GenerationProfileSettings: Codable, Equatable, Hashable {
         self.jetSpecMaxExpertCap = jetSpecMaxExpertCap
     }
 
-    public static func defaultFor(type: ModelProfileType, modelName: String? = nil) -> GenerationProfileSettings {
+    /// `modelPath` is asked about only where the NAME cannot answer, which is
+    /// Nanbeige 4.3: its identity is structural (`ModelConfig.isNanbeige43Shape`),
+    /// so a renamed copy would otherwise fall through to the generic profile.
+    /// Every other family here is matched by name because its name is the only
+    /// discriminator that exists.
+    public static func defaultFor(
+        type: ModelProfileType,
+        modelName: String? = nil,
+        modelPath: String? = nil
+    ) -> GenerationProfileSettings {
         let nameLower = (modelName ?? "").lowercased()
         let isQwen = nameLower.contains("qwen")
         let isOrnith = nameLower.contains("ornith")
+        let isNanbeige = nameLower.contains("nanbeige")
+            || (modelPath.map { ModelConfig.isNanbeige43Snapshot($0) } ?? false)
 
         if isQwen {
             switch type {
@@ -186,6 +197,44 @@ public struct GenerationProfileSettings: Codable, Equatable, Hashable {
                     repetitionPenalty: 1.00,
                     presencePenalty: 1.50,
                     maxNewTokens: 4096,
+                    systemPrompt: "You are a helpful, respectful, and honest AI assistant.",
+                    jetSpecEnabled: false,
+                    jetSpecMaxDepth: 3,
+                    jetSpecBranchingFactor: 2,
+                    jetSpecMaxExpertCap: 8
+                )
+            }
+        }
+
+        // Nanbeige 4.3 is a dense 33B tuned for agentic tool use. Its card quotes
+        // temperature 1.0 / top_p 0.95 for agentic work and 0.6 / 0.95 for plain
+        // reasoning, and NO repetition penalty (unlike the R1-style families).
+        if isNanbeige {
+            switch type {
+            case .coder:
+                return GenerationProfileSettings(
+                    temperature: 1.00,
+                    topP: 0.95,
+                    minP: 0.00,
+                    topK: 20,
+                    repetitionPenalty: 1.00,
+                    presencePenalty: 0.00,
+                    maxNewTokens: 65536,
+                    systemPrompt: "You are a helpful, respectful, and honest AI assistant.",
+                    jetSpecEnabled: false,
+                    jetSpecMaxDepth: 3,
+                    jetSpecBranchingFactor: 2,
+                    jetSpecMaxExpertCap: 8
+                )
+            case .assistant:
+                return GenerationProfileSettings(
+                    temperature: 0.60,
+                    topP: 0.95,
+                    minP: 0.00,
+                    topK: 20,
+                    repetitionPenalty: 1.00,
+                    presencePenalty: 0.00,
+                    maxNewTokens: 262144,
                     systemPrompt: "You are a helpful, respectful, and honest AI assistant.",
                     jetSpecEnabled: false,
                     jetSpecMaxDepth: 3,
@@ -327,6 +376,12 @@ public final class ModelProfileManager: ObservableObject {
                     return settings
                 }
             }
+        } else if keyLower.contains("nanbeige") || idLower.contains("nanbeige") {
+            for (candidateKey, profiles) in profilesByModel where candidateKey.lowercased().contains("nanbeige") {
+                if let settings = profiles[type.rawValue] {
+                    return settings
+                }
+            }
         }
 
         // 5. Fallback to model-specific default
@@ -399,6 +454,19 @@ public final class ModelProfileManager: ObservableObject {
             "qwen"
         ]
 
+        let nanbeigeCoder = GenerationProfileSettings.defaultFor(type: .coder, modelName: "nanbeige")
+        let nanbeigeAssistant = GenerationProfileSettings.defaultFor(type: .assistant, modelName: "nanbeige")
+
+        let nanbeigeKeys = [
+            "nanbeige/nanbeige4.3-33b",
+            "nanbeige4.3-33b",
+            "nanbeige"
+        ]
+
+        // Deliberately NOT bumped for Nanbeige. The `else` branch below adds a
+        // profile for any key that has none, so a new family needs no flag change;
+        // bumping it would make `alreadySeeded` false for every existing user and
+        // overwrite customised ornith and qwen generation settings.
         let seedFlagKey = "dynamoe_seeded_official_profiles_v3"
         let alreadySeeded = UserDefaults.standard.bool(forKey: seedFlagKey)
 
@@ -414,6 +482,12 @@ public final class ModelProfileManager: ObservableObject {
                 profilesByModel[key] = [
                     ModelProfileType.coder.rawValue: qwenCoder,
                     ModelProfileType.assistant.rawValue: qwenAssistant
+                ]
+            }
+            for key in nanbeigeKeys {
+                profilesByModel[key] = [
+                    ModelProfileType.coder.rawValue: nanbeigeCoder,
+                    ModelProfileType.assistant.rawValue: nanbeigeAssistant
                 ]
             }
             UserDefaults.standard.set(true, forKey: seedFlagKey)
@@ -433,6 +507,15 @@ public final class ModelProfileManager: ObservableObject {
                     profilesByModel[key] = [
                         ModelProfileType.coder.rawValue: qwenCoder,
                         ModelProfileType.assistant.rawValue: qwenAssistant
+                    ]
+                    changed = true
+                }
+            }
+            for key in nanbeigeKeys {
+                if profilesByModel[key] == nil {
+                    profilesByModel[key] = [
+                        ModelProfileType.coder.rawValue: nanbeigeCoder,
+                        ModelProfileType.assistant.rawValue: nanbeigeAssistant
                     ]
                     changed = true
                 }

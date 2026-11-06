@@ -28,6 +28,12 @@ final class ChatPromptFormatterConversationTests: XCTestCase {
             ("spark", try config("spark")),
             ("gemma4", try config("gemma4")),
             ("deepseek_v41", try config("deepseek_v41")),
+            // Nanbeige 4.3 is `llama`-typed, so the family is selected by its
+            // shape (the 166,912-row vocabulary here) rather than by model_type.
+            ("nanbeige43", try JSONDecoder().decode(
+                ModelConfig.self,
+                from: Data("{\"model_type\":\"llama\",\"vocab_size\":166912}".utf8)
+            )),
         ]
     }
 

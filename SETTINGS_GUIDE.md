@@ -13,6 +13,7 @@ A comprehensive, practical guide to configuring, tuning, and operating DynaMoE o
    - [Apple Foundation Model (On-Device System Model)](#apple-foundation-model-on-device-system-model)
    - [Conversation Compaction (`/compact`)](#conversation-compaction-compact)
    - [MoE Contiguous Binary Repackaging (Flash-MoE)](#moe-contiguous-binary-repackaging-flash-moe)
+   - [Dense Weight Quantization (Q4 / Q8)](#dense-weight-quantization-q4--q8)
    - [Model-Specific Profiles ("Coder" & "Assistant")](#model-specific-profiles-coder--assistant)
 4. [Generation & Sampling Hyperparameters](#4-generation--sampling-hyperparameters)
    - [Active Profile Banner & Fast Switching](#active-profile-banner--fast-switching)
@@ -145,6 +146,15 @@ Sparse MoE models with hundreds of experts (e.g., Qwen 3.8 Flash Next with 512 r
 > [!TIP]
 > Repackaging is recommended for large MoE models that will run in **SSD Streaming** mode. For models that fit entirely into physical RAM (like Ornith 1.5 9B), repackaging is not required.
 
+### Dense Weight Quantization (Q4 / Q8)
+A dense model has no routed experts to repack around, and a token reads the *whole* weight set, so decode throughput tracks the bytes on disk rather than which expert the router picked. The Models tab therefore offers **Quantize to Q8** and **Quantize to Q4** for a dense checkpoint (a model with no `num_experts`), which rewrites its weights into one contiguous quantized blob next to the snapshot:
+
+- `dense_weights.bin` holds every tensor back to back; `dense_weights.json` records each one's dtype, shape and byte range.
+- Weights are quantized to MLX-style affine 4-bit or 8-bit with a group size of 64: every group of 64 values keeps a scale and an offset, which is what the engine's GEMV kernels read. Perplexity loss is the usual 4-bit/8-bit trade; the quantization is lossy, and a repack is not reversible — delete the two files to go back to the full-precision checkpoint.
+- The token embedding and output head stay at full precision: the embedding is read one row at a time and the head is what the sampler reads.
+- Nanbeige 4.3's 66 GB becomes about **34 GB at Q8** and **22 GB at Q4**. A Q4 repack of that checkpoint still answers its published turn, with the same opening tokens as the full-precision run.
+- The repack is a one-time, minutes-long job (it reads every shard and writes the blob). An interrupted run leaves an incomplete manifest, which the engine detects and ignores: it falls back to the original safetensors, so a half-written repack can never load as a broken model.
+
 #### Model-Specific Profiles ("Coder" & "Assistant")
 Different workloads demand opposite sampling behaviors. Coding requires precision, structural consistency, and low entropy, while assistant conversations require natural flow, topic freshness, and conversational variety.
 
@@ -250,14 +260,14 @@ At the top of the Generation section, an active profile banner indicates which p
 - **Recommended Values**: $0.00$ for coding; $0.10\text{–}0.40$ for open conversation.
 
 #### 7. Max Tokens
-- **What it does**: Hard ceiling on the maximum number of new tokens generated per turn (32 to 32,768, the KV cache provision ceiling). The KV cache budget can lower the effective ceiling further for a long prompt.
+- **What it does**: Hard ceiling on the maximum number of new tokens generated per turn (32 to the KV cache provision ceiling, 32,768 here; a turn may provision up to the checkpoint's own `max_position_embeddings`, capped at 262,144 rows). The KV cache budget can lower the effective ceiling further for a long prompt.
 - **Recommended Values**: $8192$ for Coder; $4096$ for Assistant.
 
 ---
 
 ### System Prompts & Conjunction Merging
 DynaMoE features an intelligent **System Prompt Conjunction Engine**:
-- Many frontier models require specific system instructions embedded in their tokenizer chat templates (e.g. Ornith, DeepSeek-R1, Nanbeige).
+- A few families require a specific system instruction (Ornith, DeepSeek-R1). Nanbeige 4.3 does not: its template has a Chinese default line, but that line is only the fallback for a conversation with no system message, and DynaMoE always sends one, so the persona is deliberately not injected.
 - In DynaMoE, your custom system prompt entered in Settings is never overwritten; instead, it is merged *in conjunction* with the model's mandatory instruct requirements.
 - Example merged prompt:
   ```text
@@ -316,6 +326,8 @@ Controls the floating-point representation of the autoregressive key-value cache
 - **FP32**: Full 32-bit precision. Highest numerical fidelity, largest memory footprint.
 - **FP16**: Half precision. 50% memory reduction compared to FP32 with zero noticeable degradation in generation quality. Default for most configurations.
 - **FP8 (E4M3 / E5M2)**: 8-bit quantized KV cache with per-head dynamic scale factors. Reduces KV cache memory by 75%, enabling 32k+ token contexts on 16GB Macs without memory pressure.
+
+**Long context needs FP8 KV.** The row ceiling is now derived from the checkpoint's own `max_position_embeddings` (capped at 262,144 rows) instead of a flat 32,768, so a long-context model can be driven past 32k when the machine affords it — and the KV budget, not that ceiling, is what decides. The bytes are what bind. A 52-layer dense model with 8 KV heads of 128 costs 4 KB per layer per logical token at FP16 (1024 stride x 2 tensors x 2 bytes), i.e. about 208 KB per token across the 52 layers (52 slots x 1024 stride x 2 tensors x 2 bytes). So a 66 GB checkpoint on a 128 GB Mac leaves roughly 27 GB of KV budget in Unrestricted mode: about 130k rows at FP16, versus about 260k at FP8 (the FP8 cache also carries one scaling byte per 32 values, about 1.6% on top). That FP8 figure sits within a few percent of the 262,144-row policy ceiling, so at FP8 the KV budget stops being the binding constraint before the ceiling does. Past roughly 100k rows, switch the KV cache to FP8 E4M3; below that FP16 is the better trade.
 
 ### Speculative MoE Lookahead Prefetching
 When running sparse MoE models in SSD streaming mode:
@@ -504,7 +516,7 @@ The **Local Inference Server** section turns DynaMoE into a local API server: th
 - **Queue deadline**: `dynamoe_server_queue_timeout` (default 120 seconds) rejects requests that wait too long with `408` (or an SSE error). `0` waits indefinitely.
 - **Prompt ceiling**: `dynamoe_server_max_prompt_tokens` (default 262,144 tokens) rejects oversized prompts with `400` before prefill. `0` disables the check.
 - **KV capacity**: before prefill, the turn is priced against the KV cache this machine can actually provision (RAM minus the model footprint minus a 2.5 GB working reserve, at the configured KV precision and the model's real sliding-window layout). A prompt that cannot fit is rejected with `400` and `"code": "context_length_exceeded"`; the message names the budget, the affordable rows and the reserve involved. The memory budget always wins, so a tools-enabled turn's session reserve is capped to what the machine affords rather than refusing prompts it could serve.
-- **Agent session reserve**: `dynamoe_agent_session_floor` (default 8,192 rows) is the KV headroom a tools-enabled turn keeps for its multi-step loop, in-app and for API clients alike; plain chat turns reserve 2,048. Lower it on a memory-constrained Mac with `defaults write DRP.DynaMoE dynamoe_agent_session_floor -int 4096`. `0` restores the default, and values above the 32,768-row provision ceiling are clamped to it.
+- **Agent session reserve**: `dynamoe_agent_session_floor` (default 8,192 rows) is the KV headroom a tools-enabled turn keeps for its multi-step loop, in-app and for API clients alike; plain chat turns reserve 2,048. Lower it on a memory-constrained Mac with `defaults write DRP.DynaMoE dynamoe_agent_session_floor -int 4096`. `0` restores the default, and values above the turn's row ceiling are clamped to it.
 - **Multi-turn prefix reuse**: A client resends the whole conversation every turn, so the server records the last completed turn (reasoning included) and replays it whenever the echoed history matches, letting a follow-up extend the pinned prompt instead of re-prefilling it. Reuse is refused whenever the history, rendered system prompt or echoed answer no longer match.
 
 ### Client Setup

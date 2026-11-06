@@ -645,6 +645,43 @@ struct SettingsSheetView: View {
                                                 Label("FlashMoE Repack", systemImage: "bolt.badge.automatic.fill")
                                             }
                                         }
+
+                                        // A dense checkpoint has no routed experts
+                                        // to repack around, and its per-token cost
+                                        // is the whole weight set, so quantizing is
+                                        // the only lever. Gated on the model row's
+                                        // own label, which `LocalModelManager`
+                                        // derives from the repack manifest.
+                                        //
+                                        // A directory that is ALREADY dense-repacked
+                                        // still offers the OTHER format: Q8 -> Q4 is a
+                                        // re-quantize from the checkpoint's own shards
+                                        // (`repackDenseModel` parks the outgoing blob
+                                        // first). Hiding both items, as this did, was
+                                        // also what kept a stale manifest's label from
+                                        // ever being repaired.
+                                        if !model.isMoE, !isFlashMoEPacked {
+                                            let denseLabel = model.quantization ?? ""
+                                            let isDenseQ8 = denseLabel == DenseRepacker.Quantization.q8.displayName
+                                            let isDenseQ4 = denseLabel == DenseRepacker.Quantization.q4.displayName
+                                            if !isDenseQ8 || !isDenseQ4 {
+                                                Divider()
+                                                if !isDenseQ8 {
+                                                    Button {
+                                                        repackDenseModel(model, quantization: .q8)
+                                                    } label: {
+                                                        Label("Quantize to Q8", systemImage: "arrow.down.circle")
+                                                    }
+                                                }
+                                                if !isDenseQ4 {
+                                                    Button {
+                                                        repackDenseModel(model, quantization: .q4)
+                                                    } label: {
+                                                        Label("Quantize to Q4", systemImage: "arrow.down.circle.fill")
+                                                    }
+                                                }
+                                            }
+                                        }
                                     } label: {
                                         Image(systemName: "ellipsis.circle")
                                             .font(.system(size: 15))
@@ -2586,7 +2623,11 @@ struct SettingsSheetView: View {
     }
 
     private func resetProfileDraft(model: DiscoveredModel, type: ModelProfileType) {
-        let defaults = GenerationProfileSettings.defaultFor(type: type, modelName: model.displayName)
+        let defaults = GenerationProfileSettings.defaultFor(
+            type: type,
+            modelName: model.displayName,
+            modelPath: model.snapshotPath
+        )
         editingDraft = defaults
         profileManager.saveProfile(for: model.id, type: type, settings: defaults)
         profileFeedbackText = "Reset to Defaults!"
@@ -2885,6 +2926,54 @@ struct SettingsSheetView: View {
         .padding(12)
         .background(Color.purple.opacity(0.05))
         .cornerRadius(10)
+    }
+
+    /// Dense counterpart of `repackModel`: no expert axis, so the whole weight set
+    /// becomes one contiguous quantized blob (`dense_weights.bin` + `.json`) next
+    /// to the snapshot, and the engine prefers it on the next load.
+    private func repackDenseModel(_ model: DiscoveredModel, quantization: DenseRepacker.Quantization) {
+        repackingModelId = model.id
+        repackProgress = 0.0
+        repackStatus = "Preparing the dense repack…"
+        repackError = nil
+
+        Task.detached(priority: .userInitiated) {
+            do {
+                let dir = URL(fileURLWithPath: model.snapshotPath)
+                // An MoE checkpoint has no dense weight set to quantize (its
+                // per-token cost is the routed experts, which is FlashMoE's job),
+                // and a checkpoint without a vocabulary cannot be served at all.
+                // Re-repacking an ALREADY quantized directory is allowed: that is
+                // how Q8 becomes Q4, and the write is atomic now.
+                guard DenseRepacker.canRepack(dir: dir) || DenseRepacker.isRepacked(dir: dir) else {
+                    throw DenseRepackerError.notARepackableCheckpoint
+                }
+                // A re-quantize has to read the checkpoint's OWN shards, but the
+                // engine prefers a dense repack, so the outgoing blob is parked
+                // first (kept as `.unusable`, not deleted). Without this the
+                // repack below would be handed the packed rows it is replacing.
+                DenseRepacker.setAsideRepackForRequantize(dir: dir)
+                try DenseRepacker.shared.repackSafetensors(
+                    sourceDir: dir,
+                    outputDir: dir,
+                    quantization: quantization
+                ) { prog, msg in
+                    Task { @MainActor in
+                        self.repackProgress = prog
+                        self.repackStatus = msg
+                    }
+                }
+                Task { @MainActor in
+                    self.repackingModelId = nil
+                    self.localModelManager.scanLocalModels()
+                }
+            } catch {
+                Task { @MainActor in
+                    self.repackingModelId = nil
+                    self.repackError = error.localizedDescription
+                }
+            }
+        }
     }
 
     private func repackModel(_ model: DiscoveredModel) {

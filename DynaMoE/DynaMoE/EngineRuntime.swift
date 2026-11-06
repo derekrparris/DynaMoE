@@ -34,8 +34,58 @@ enum KVCachePrecision: String, CaseIterable, Identifiable {
 /// and covered by DynaMoETests). FP8 KV is excluded: the tree store/verify kernels are
 /// F16/FP32-only, and the FP32 fallback would write 4-byte elements into a
 /// 1-byte-per-element cache.
-nonisolated func isJetSpecEligible(jetSpecEnabled: Bool, hasLinearRecurrence: Bool, isSparkModel: Bool, kvPrecision: KVCachePrecision) -> Bool {
-    jetSpecEnabled && !hasLinearRecurrence && !isSparkModel && kvPrecision != .fp8
+/// A dense checkpoint has ONE expert, which is not a routing decision: JetSpec's
+/// tree is sized, masked and pruned by the routed-expert budget per layer, so on
+/// a dense model every draft node is verified against a topology that does not
+/// exist. Measured on the published Nanbeige 4.3 checkpoint (52 dense layers),
+/// greedy decode with the tree on produced `[764, 1148, 13, 13, 0, 152402, …]`
+/// ("We j eb \0 …"), where the plain walk produces
+/// `[764, 5463, 290, 7914, 322, 1472, 50432, 35906]` ("The capital of France is
+/// **Paris**.") — the exact continuation an independent float32 numpy forward of
+/// the same checkpoint gives. So eligibility requires routed experts.
+nonisolated func isJetSpecEligible(
+    jetSpecEnabled: Bool,
+    hasLinearRecurrence: Bool,
+    isSparkModel: Bool,
+    hasRoutedExperts: Bool,
+    kvPrecision: KVCachePrecision
+) -> Bool {
+    jetSpecEnabled && !hasLinearRecurrence && !isSparkModel && hasRoutedExperts && kvPrecision != .fp8
+}
+
+/// Box for `runOnLargeStack`'s result: a local type cannot carry the enclosing
+/// generic parameter, so it is declared once here.
+final class LargeStackResult<T>: @unchecked Sendable {
+    var value: T?
+}
+
+/// Runs `body` on a dedicated thread with a large, explicit stack.
+///
+/// `runLayerWisePrefill` and `runTokenForward` keep almost every local in a stack
+/// slot in an unoptimized build: their frames measure 0x81460 (~517 KB) and
+/// 0x940FC0 (~610 KB) on the published Nanbeige 4.3 checkpoint, which is past the
+/// 512 KB a Swift-concurrency worker thread is given. Entering either from
+/// `Task.detached` therefore trips the stack guard
+/// (`___chkstk_darwin`, SIGBUS `KERN_PROTECTION_FAILURE`) before the function's
+/// first statement runs — the whole turn dies in prefill, with no diagnostic that
+/// names the stack. The frame sizes are a property of the function bodies in
+/// `-Onone`, so a release build fits and this only ever bit Debug and the test
+/// bundle; nothing about either body can be shrunk enough to rely on that.
+///
+/// The thread is synchronous and per call: a turn makes one call per prefill
+/// chunk and one per decoded token, so thread creation is noise beside a layer
+/// pass, and no state is shared between calls.
+func runOnLargeStack<T>(stackBytes: Int = 32 << 20, _ body: @escaping () -> T) -> T {
+    let box = LargeStackResult<T>()
+    let finished = DispatchSemaphore(value: 0)
+    let thread = Thread {
+        box.value = body()
+        finished.signal()
+    }
+    thread.stackSize = stackBytes
+    thread.start()
+    finished.wait()
+    return box.value!
 }
 
 /// Batched-prefill chunk cap for Gemma 4: tokens per `runLayerWisePrefill` call.
@@ -44,6 +94,97 @@ nonisolated func isJetSpecEligible(jetSpecEnabled: Bool, hasLinearRecurrence: Bo
 /// per-call prefill buffers (~250 KB/token) that previously scaled with the
 /// entire delta prompt.
 let gemmaPrefillChunkCap = 512
+
+/// Batched-prefill chunk cap for every OTHER family. The per-call transient
+/// buffers in `runLayerWisePrefill` scale with the CHUNK's token count, not
+/// with the cache, so ingesting a long dense prompt in one call allocates them
+/// for the whole prompt: ~344 KB/token at 7168 wide / 22016 intermediate, i.e.
+/// ~11 GB at 32k positions and tens of GB past that. A prompt shorter than the
+/// cap is a single chunk, which is exactly the one call the unchunked path made.
+let densePrefillChunkCap = 1024
+
+/// Tokens per `runLayerWisePrefill` call for the model being prefilled.
+///
+/// `dynamoe_prefill_chunk_cap` is a debug seam (1 forces the per-token walk
+/// through the batched entry point, which is how a batched-prefill defect is
+/// separated from a decode one).
+func prefillChunkCap(for config: ModelConfig?) -> Int {
+    let override = UserDefaults.standard.integer(forKey: "dynamoe_prefill_chunk_cap")
+    if override > 0 { return override }
+    return config?.isGemma4Model == true ? gemmaPrefillChunkCap : densePrefillChunkCap
+}
+
+/// Geometry of the split-K (flash-decoding) standard-GQA decode path.
+///
+/// `gqa_attention_decode_standard_*` runs a layer's entire attention in ONE
+/// threadgroup — one thread per head, each walking every stored KV row serially —
+/// so a decode step at a few thousand positions is millions of dependent
+/// iterations on a single GPU core. The split-K twins give every (head, KV
+/// chunk) its own thread and merge the partials afterwards. That is only worth
+/// a second dispatch once the walk is long; below `minimumContext` the plain
+/// kernel keeps one dispatch and a short, latency-tolerable walk.
+enum StandardGqaSplitK {
+    /// KV rows per chunk. Matches the fused-Q+Gate split-K path, which is the
+    /// only split-K shape in this codebase that has been measured.
+    static let chunkRows: UInt32 = 64
+
+    /// Ceiling on chunks per head, which is also the capacity the partial
+    /// buffers are allocated with (`attnPartialM/L/Acc` are `numQHeads * 256`).
+    static let maximumChunks: UInt32 = 256
+
+    /// Context below which the unsplit kernel is used.
+    static let minimumContext: UInt32 = 128
+
+    /// Stored KV rows for a decode step, decoding the bit-31 delta marker the
+    /// streaming KV kernels carry (`0x80000000 | prefix`).
+    static func curLen(_ seqLen: UInt32) -> UInt32 {
+        if seqLen == 0 { return 1 }
+        if (seqLen & 0x80000000) != 0 { return (seqLen & 0x7FFFFFFF) + 1 }
+        return seqLen
+    }
+
+    /// Chunks a `curLen`-row walk is split into.
+    static func chunkCount(_ curLen: UInt32) -> UInt32 {
+        max(1, min(maximumChunks, (curLen + chunkRows - 1) / chunkRows))
+    }
+
+    /// Lanes per (head, chunk) threadgroup. Each lane owns four CONTIGUOUS head
+    /// dimensions, which is what keeps the query and the online-softmax
+    /// accumulator in registers instead of in the thread-local memory a
+    /// runtime-indexed `float4 acc[64]` gets demoted to.
+    static let lanes = 32
+
+    /// Head width the register-resident kernels require (`lanes * 4`). A head of
+    /// any other width keeps the per-thread kernel: a lane would no longer own
+    /// exactly one contiguous `float4`.
+    static let headDim = 32 * 4
+}
+
+/// Debug seam for the SIMD-tiled standard-GQA PREFILL attention
+/// (`dynamoe_prefill_tiled_attention`).
+///
+/// The tiled kernel gives a (head, row) pair a 32-lane threadgroup so the
+/// head's dot product and accumulator are split across lanes instead of living
+/// in one lane's serial chain — the rewrite FIX #6a asked for after the
+/// rows-chunked attempt measured 0.2-0.3x. It is ON by default because it
+/// measured faster than the per-thread kernel on the published Nanbeige
+/// checkpoint; the key is the opt-OUT for an A/B or a regression:
+///
+///     defaults write DRP.DynaMoE dynamoe_prefill_tiled_attention -bool NO
+///
+/// Absent means ON (so an unset machine gets the measured-faster path).
+///
+/// What it does not cover is excluded at the dispatch site, not here: a head whose
+/// width is not `StandardGqaSplitK.headDim`, and a SLIDING layer, which needs a
+/// window this kernel has no parameter for and therefore keeps the non-tiled
+/// kernel it used before.
+enum UsesTiledPrefillAttention {
+    static var isEnabled: Bool {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: "dynamoe_prefill_tiled_attention") != nil else { return true }
+        return defaults.bool(forKey: "dynamoe_prefill_tiled_attention")
+    }
+}
 
 /// Reusable transient buffers for the batched prefill (`runLayerWisePrefill`).
 /// The chunked Gemma prefill re-enters that function once per 512-token chunk;
@@ -740,13 +881,38 @@ enum KVCacheProvisioning {
     /// cannot become a way to provision past the sequence cap.
     static let maxProvisionedRows = 32768
 
+    /// The absolute ceiling `policyMaxRows` will ever return. A checkpoint that
+    /// advertises more positions than this still has to fit its KV cache in RAM,
+    /// so 262,144 (2^18) is the outermost the policy goes.
+    static let absoluteMaxProvisionedRows = 262144
+
+    /// The row ceiling a turn may ASK for, derived from the checkpoint's own
+    /// `max_position_embeddings`. `maxProvisionedRows` is a flat constant, which
+    /// meant a 524,288-position checkpoint was refused a 40k-token prompt by a
+    /// policy number rather than by the machine. The budget is still the
+    /// authority (`affordableSeqLen` clamps, `turnFit` refuses), so raising the
+    /// policy only lets the budget answer instead of the constant. Never lowers
+    /// the ceiling below `maxProvisionedRows`, so a model declaring a small
+    /// window keeps the range every existing turn already had.
+    ///
+    /// Reads the DECLARED window, not `effectiveMaxPositionEmbeddings`: that
+    /// getter substitutes 262,144 for a config that says nothing, so a fallback
+    /// written against it was unreachable and a checkpoint declaring no window
+    /// was treated as if it had claimed 262k positions.
+    static func policyMaxRows(config: ModelConfig?) -> Int {
+        guard let declared = config?.declaredMaxPositionEmbeddings else {
+            return maxProvisionedRows
+        }
+        return max(maxProvisionedRows, min(declared, absoluteMaxProvisionedRows))
+    }
+
     /// The reserve this turn asks for. `configured` is the persisted
     /// `dynamoe_agent_session_floor` value (nil when unset) and only applies to
-    /// agent sessions; it is clamped to `maxProvisionedRows`, so the key can
-    /// only move the reserve inside the range the provision cap allows.
-    static func sessionFloor(isAgentSession: Bool, configured: Int?) -> Int {
+    /// agent sessions; it is clamped to the row ceiling, so the key can only
+    /// move the reserve inside the range the provision cap allows.
+    static func sessionFloor(isAgentSession: Bool, configured: Int?, policyMaxRows: Int = maxProvisionedRows) -> Int {
         guard isAgentSession else { return defaultChatSessionFloorRows }
-        if let configured, configured > 0 { return min(configured, maxProvisionedRows) }
+        if let configured, configured > 0 { return min(configured, policyMaxRows) }
         return defaultAgentSessionFloorRows
     }
 
@@ -757,8 +923,13 @@ enum KVCacheProvisioning {
         max(1, min(sessionFloor, max(0, affordableRows)))
     }
 
-    static func neededSeqLen(sessionFloor: Int, promptTokens: Int, requestedMaxTokens: Int) -> Int {
-        max(sessionFloor, min(maxProvisionedRows, promptTokens + max(1, requestedMaxTokens) + turnHeadroomRows))
+    static func neededSeqLen(
+        sessionFloor: Int,
+        promptTokens: Int,
+        requestedMaxTokens: Int,
+        policyMaxRows: Int = maxProvisionedRows
+    ) -> Int {
+        max(sessionFloor, min(policyMaxRows, promptTokens + max(1, requestedMaxTokens) + turnHeadroomRows))
     }
 
     /// Short label for a KV precision in capacity messages.
@@ -863,12 +1034,14 @@ enum KVCacheProvisioning {
         budgetMode: MemoryBudgetMode,
         modelFootprintGB: Double,
         physicalGB: Double,
-        residentFootprintGB: Double? = nil
+        residentFootprintGB: Double? = nil,
+        policyMaxRows: Int = maxProvisionedRows
     ) -> TurnFit {
         let requested = neededSeqLen(
             sessionFloor: sessionFloor,
             promptTokens: promptTokens,
-            requestedMaxTokens: requestedMaxTokens
+            requestedMaxTokens: requestedMaxTokens,
+            policyMaxRows: policyMaxRows
         )
         let kvGeometry = geometry(
             config: config,

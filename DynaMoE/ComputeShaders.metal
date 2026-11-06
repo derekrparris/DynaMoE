@@ -4918,6 +4918,8 @@ kernel void lookup_embeddings_q4(
 
 /// MSL Kernel: Q8 (8-bit affine quantized) Matrix-Vector Multiplication (y = W * x) (128-bit Vectorized)
 /// Supports 2D batched grid (outDim, batchSize, 1) with threadgroup (32, 1, 1)
+/// Requires 16 | groupSize (64 for every checkpoint this path serves), so a
+/// 16-column chunk never straddles two affine groups.
 kernel void q8_gemv(
     device const uchar* rawWeightBuffer [[buffer(0)]],
     device const uchar* rawScaleBuffer [[buffer(1)]],
@@ -4944,36 +4946,71 @@ kernel void q8_gemv(
     device const float* inPtr = inputVector + ((uint64_t)tokenIdx * inDim);
 
     float threadSum = 0.0f;
-    for (uint32_t g = laneId; g < numGroups; g += 32) {
+    // 16 contiguous weight bytes per lane per iteration. The previous shape gave
+    // a lane 4 bytes at a 64-byte stride, so every lane sat in its own 32-byte
+    // sector and one warp instruction asked the memory system for 32 sectors to
+    // cover 128 bytes (4 bytes per request). Contiguous 16-byte chunks put two
+    // lanes in a sector and cover 512 bytes with 16 requests (32 bytes per
+    // request), and each chunk still lies inside one affine group because 16
+    // divides groupSize for every checkpoint this path serves (64).
+    //
+    // The chunk loop is GATED on that division rather than assuming it: a group
+    // size that does not divide 16 would let one chunk straddle two groups and
+    // apply one group's scale to the other's values, so such a call runs the
+    // scalar tail instead (correct, and only slower).
+    //
+    // ALIGNMENT: `wRow + colStart` is read as `uchar4`, which Apple GPUs require
+    // to be 4-byte aligned, and `inPtr + colStart` as `float4` (16-byte). A row
+    // starts at `weightOffset + row * inDim`, so the producer must keep every
+    // tensor's offset 16-byte aligned and `inDim` a multiple of 16. The dense
+    // repack does both (`DenseRepacker.tensorAlignment`) and both loaders refuse
+    // a manifest that does not (`dense_weights.json`'s `blob_size` and alignment
+    // checks); a misaligned row reads garbage rather than the checkpoint's bytes.
+    uint32_t numChunks16 = (groupSize % 16 == 0) ? (inDim / 16) : 0;
+    for (uint32_t c = laneId; c < numChunks16; c += 32) {
+        uint32_t colStart = c * 16;
+        uint32_t g = min(colStart / groupSize, numGroups > 0 ? numGroups - 1 : 0);
         float scale = read_bf16_unaligned(sRow + g * 2);
         float bias  = read_bf16_unaligned(bRow + g * 2);
-        uint32_t colStart = g * groupSize;
-        float groupSum = 0.0f;
-        float groupXSum = 0.0f;
 
-        uint32_t numVec4 = groupSize / 4;
+        uchar4 w0 = *(device const uchar4*)(wRow + colStart);
+        uchar4 w1 = *(device const uchar4*)(wRow + colStart + 4);
+        uchar4 w2 = *(device const uchar4*)(wRow + colStart + 8);
+        uchar4 w3 = *(device const uchar4*)(wRow + colStart + 12);
         device const float4* inVec4 = (device const float4*)(inPtr + colStart);
+        float4 x0 = inVec4[0];
+        float4 x1 = inVec4[1];
+        float4 x2 = inVec4[2];
+        float4 x3 = inVec4[3];
 
-        for (uint32_t c = 0; c < numVec4; c++) {
-            uint32_t baseCol = colStart + (c * 4);
-            float4 x4 = inVec4[c];
-            float4 wf = float4(
-                float(wRow[baseCol + 0]),
-                float(wRow[baseCol + 1]),
-                float(wRow[baseCol + 2]),
-                float(wRow[baseCol + 3])
-            );
-            groupSum += dot(wf, x4);
-            groupXSum += (x4.x + x4.y + x4.z + x4.w);
-        }
-        for (uint32_t c = numVec4 * 4; c < groupSize; c++) {
-            uint32_t col = colStart + c;
-            float x = inPtr[col];
-            float w8 = float(wRow[col]);
-            groupSum += w8 * x;
-            groupXSum += x;
-        }
+        float4 f0 = float4(float(w0.x), float(w0.y), float(w0.z), float(w0.w));
+        float4 f1 = float4(float(w1.x), float(w1.y), float(w1.z), float(w1.w));
+        float4 f2 = float4(float(w2.x), float(w2.y), float(w2.z), float(w2.w));
+        float4 f3 = float4(float(w3.x), float(w3.y), float(w3.z), float(w3.w));
+
+        float groupSum = dot(f0, x0);
+        groupSum += dot(f1, x1);
+        groupSum += dot(f2, x2);
+        groupSum += dot(f3, x3);
+
+        float groupXSum = (x0.x + x0.y + x0.z + x0.w)
+                        + (x1.x + x1.y + x1.z + x1.w)
+                        + (x2.x + x2.y + x2.z + x2.w)
+                        + (x3.x + x3.y + x3.z + x3.w);
+
         threadSum += scale * groupSum + bias * groupXSum;
+    }
+    // Columns past the last whole 16-byte chunk (none for the widths this path
+    // serves) keep the scalar tail so a short row cannot overrun the buffer. The
+    // group index is CLAMPED, here and in the chunk loop above: a row whose width
+    // is not a multiple of `groupSize` would otherwise index the row's scale
+    // companion past its end and read the next row's scales.
+    for (uint32_t col = numChunks16 * 16 + laneId; col < inDim; col += 32) {
+        uint32_t g = min(col / groupSize, numGroups > 0 ? numGroups - 1 : 0);
+        float scale = read_bf16_unaligned(sRow + g * 2);
+        float bias  = read_bf16_unaligned(bRow + g * 2);
+        float x = inPtr[col];
+        threadSum += scale * (float(wRow[col]) * x) + bias * x;
     }
 
     float totalSum = simd_sum(threadSum);
@@ -5048,53 +5085,69 @@ kernel void q8_swiglu_gate_up(
     float gate_sum = 0.0f;
     float up_sum   = 0.0f;
 
-    for (uint32_t g = laneId; g < numGroups; g += 32) {
+    // 16 contiguous bytes per lane per projection per iteration — see the note in
+    // `q8_gemv`: a 4-byte lane stride spends one memory request per 4 bytes,
+    // while a 16-byte chunk keeps two lanes in one sector and fills it.
+    uint32_t numChunks16 = (groupSize % 16 == 0) ? (hiddenDim / 16) : 0;
+    for (uint32_t c = laneId; c < numChunks16; c += 32) {
+        uint32_t colStart = c * 16;
+        uint32_t g = min(colStart / groupSize, numGroups > 0 ? numGroups - 1 : 0);
         float gScale = read_bf16_unaligned(gSRow + g * 2);
         float gBias  = read_bf16_unaligned(gBRow + g * 2);
         float uScale = read_bf16_unaligned(uSRow + g * 2);
         float uBias  = read_bf16_unaligned(uBRow + g * 2);
 
-        uint32_t colStart = g * groupSize;
-        float gGroupSum = 0.0f;
-        float uGroupSum = 0.0f;
-        float groupXSum = 0.0f;
+        uchar4 gw0 = *(device const uchar4*)(gWRow + colStart);
+        uchar4 gw1 = *(device const uchar4*)(gWRow + colStart + 4);
+        uchar4 gw2 = *(device const uchar4*)(gWRow + colStart + 8);
+        uchar4 gw3 = *(device const uchar4*)(gWRow + colStart + 12);
+        uchar4 uw0 = *(device const uchar4*)(uWRow + colStart);
+        uchar4 uw1 = *(device const uchar4*)(uWRow + colStart + 4);
+        uchar4 uw2 = *(device const uchar4*)(uWRow + colStart + 8);
+        uchar4 uw3 = *(device const uchar4*)(uWRow + colStart + 12);
 
         device const float4* inVec4 = (device const float4*)(inputVector + colStart);
-        uint32_t numVec4 = groupSize / 4;
+        float4 x0 = inVec4[0];
+        float4 x1 = inVec4[1];
+        float4 x2 = inVec4[2];
+        float4 x3 = inVec4[3];
 
-        for (uint32_t c = 0; c < numVec4; c++) {
-            uint32_t baseCol = colStart + (c * 4);
-            float4 x4 = inVec4[c];
-            float4 gwf = float4(
-                float(gWRow[baseCol + 0]),
-                float(gWRow[baseCol + 1]),
-                float(gWRow[baseCol + 2]),
-                float(gWRow[baseCol + 3])
-            );
-            float4 uwf = float4(
-                float(uWRow[baseCol + 0]),
-                float(uWRow[baseCol + 1]),
-                float(uWRow[baseCol + 2]),
-                float(uWRow[baseCol + 3])
-            );
+        float4 g0 = float4(float(gw0.x), float(gw0.y), float(gw0.z), float(gw0.w));
+        float4 g1 = float4(float(gw1.x), float(gw1.y), float(gw1.z), float(gw1.w));
+        float4 g2 = float4(float(gw2.x), float(gw2.y), float(gw2.z), float(gw2.w));
+        float4 g3 = float4(float(gw3.x), float(gw3.y), float(gw3.z), float(gw3.w));
+        float4 u0 = float4(float(uw0.x), float(uw0.y), float(uw0.z), float(uw0.w));
+        float4 u1 = float4(float(uw1.x), float(uw1.y), float(uw1.z), float(uw1.w));
+        float4 u2 = float4(float(uw2.x), float(uw2.y), float(uw2.z), float(uw2.w));
+        float4 u3 = float4(float(uw3.x), float(uw3.y), float(uw3.z), float(uw3.w));
 
-            gGroupSum += dot(gwf, x4);
-            uGroupSum += dot(uwf, x4);
-            groupXSum += (x4.x + x4.y + x4.z + x4.w);
-        }
-        for (uint32_t c = numVec4 * 4; c < groupSize; c++) {
-            uint32_t col = colStart + c;
-            float x = inputVector[col];
-            float gw8 = float(gWRow[col]);
-            float uw8 = float(uWRow[col]);
+        float gGroupSum = dot(g0, x0);
+        gGroupSum += dot(g1, x1);
+        gGroupSum += dot(g2, x2);
+        gGroupSum += dot(g3, x3);
 
-            gGroupSum += gw8 * x;
-            uGroupSum += uw8 * x;
-            groupXSum += x;
-        }
+        float uGroupSum = dot(u0, x0);
+        uGroupSum += dot(u1, x1);
+        uGroupSum += dot(u2, x2);
+        uGroupSum += dot(u3, x3);
+
+        float groupXSum = (x0.x + x0.y + x0.z + x0.w)
+                        + (x1.x + x1.y + x1.z + x1.w)
+                        + (x2.x + x2.y + x2.z + x2.w)
+                        + (x3.x + x3.y + x3.z + x3.w);
 
         gate_sum += gScale * gGroupSum + gBias * groupXSum;
         up_sum   += uScale * uGroupSum + uBias * groupXSum;
+    }
+    for (uint32_t col = numChunks16 * 16 + laneId; col < hiddenDim; col += 32) {
+        uint32_t g = min(col / groupSize, numGroups > 0 ? numGroups - 1 : 0);
+        float gScale = read_bf16_unaligned(gSRow + g * 2);
+        float gBias  = read_bf16_unaligned(gBRow + g * 2);
+        float uScale = read_bf16_unaligned(uSRow + g * 2);
+        float uBias  = read_bf16_unaligned(uBRow + g * 2);
+        float x = inputVector[col];
+        gate_sum += gScale * (float(gWRow[col]) * x) + gBias * x;
+        up_sum   += uScale * (float(uWRow[col]) * x) + uBias * x;
     }
 
     gate_sum = simd_sum(gate_sum);
@@ -5280,40 +5333,48 @@ kernel void q8_down_proj_accumulate(
 
     float down_sum = 0.0f;
 
-    for (uint32_t g = laneId; g < numGroups; g += 32) {
+    // 16 contiguous weight bytes per lane per iteration — see `q8_gemv`.
+    uint32_t numChunks16 = (groupSize % 16 == 0) ? (intermediateDim / 16) : 0;
+    for (uint32_t c = laneId; c < numChunks16; c += 32) {
+        uint32_t colStart = c * 16;
+        uint32_t g = min(colStart / groupSize, numGroups > 0 ? numGroups - 1 : 0);
         float dScale = read_bf16_unaligned(dSRow + g * 2);
         float dBias  = read_bf16_unaligned(dBRow + g * 2);
 
-        uint32_t colStart = g * groupSize;
-        float dGroupSum = 0.0f;
-        float groupXSum = 0.0f;
+        uchar4 w0 = *(device const uchar4*)(dWRow + colStart);
+        uchar4 w1 = *(device const uchar4*)(dWRow + colStart + 4);
+        uchar4 w2 = *(device const uchar4*)(dWRow + colStart + 8);
+        uchar4 w3 = *(device const uchar4*)(dWRow + colStart + 12);
 
         device const float4* inVec4 = (device const float4*)(intermediateVector + colStart);
-        uint32_t numVec4 = groupSize / 4;
+        float4 x0 = inVec4[0];
+        float4 x1 = inVec4[1];
+        float4 x2 = inVec4[2];
+        float4 x3 = inVec4[3];
 
-        for (uint32_t c = 0; c < numVec4; c++) {
-            uint32_t baseCol = colStart + (c * 4);
-            float4 x4 = inVec4[c];
-            float4 dwf = float4(
-                float(dWRow[baseCol + 0]),
-                float(dWRow[baseCol + 1]),
-                float(dWRow[baseCol + 2]),
-                float(dWRow[baseCol + 3])
-            );
+        float4 f0 = float4(float(w0.x), float(w0.y), float(w0.z), float(w0.w));
+        float4 f1 = float4(float(w1.x), float(w1.y), float(w1.z), float(w1.w));
+        float4 f2 = float4(float(w2.x), float(w2.y), float(w2.z), float(w2.w));
+        float4 f3 = float4(float(w3.x), float(w3.y), float(w3.z), float(w3.w));
 
-            dGroupSum += dot(dwf, x4);
-            groupXSum += (x4.x + x4.y + x4.z + x4.w);
-        }
-        for (uint32_t c = numVec4 * 4; c < groupSize; c++) {
-            uint32_t col = colStart + c;
-            float x = intermediateVector[col];
-            float dw8 = float(dWRow[col]);
+        float dGroupSum = dot(f0, x0);
+        dGroupSum += dot(f1, x1);
+        dGroupSum += dot(f2, x2);
+        dGroupSum += dot(f3, x3);
 
-            dGroupSum += dw8 * x;
-            groupXSum += x;
-        }
+        float groupXSum = (x0.x + x0.y + x0.z + x0.w)
+                        + (x1.x + x1.y + x1.z + x1.w)
+                        + (x2.x + x2.y + x2.z + x2.w)
+                        + (x3.x + x3.y + x3.z + x3.w);
 
         down_sum += dScale * dGroupSum + dBias * groupXSum;
+    }
+    for (uint32_t col = numChunks16 * 16 + laneId; col < intermediateDim; col += 32) {
+        uint32_t g = min(col / groupSize, numGroups > 0 ? numGroups - 1 : 0);
+        float dScale = read_bf16_unaligned(dSRow + g * 2);
+        float dBias  = read_bf16_unaligned(dBRow + g * 2);
+        float x = intermediateVector[col];
+        down_sum += dScale * (float(dWRow[col]) * x) + dBias * x;
     }
 
     down_sum = simd_sum(down_sum);
@@ -13077,4 +13138,569 @@ kernel void dsv41_vision_unshuffle_f32(
         value = patches[((uint64_t)sourceRow * patchColumns + sourceColumn) * width + channel];
     }
     cells[(uint64_t)cellIndex * cellVolume + element] = value;
+}
+
+// ============================================================================
+// MARK: - Standard GQA decode: flash-decoding split-K
+//
+// `gqa_attention_decode_standard_f16` / `_fp8` run the WHOLE layer's attention
+// in ONE threadgroup (grid `(numQHeads, 1)`, i.e. 56 threads for Nanbeige) and
+// each thread walks the entire KV serially — at 3k positions that is ~9M
+// head-key iterations per token on a single GPU core. These chunked twins keep
+// the arithmetic identical (same online-softmax rule, same FP8 per-position
+// scales) but give every (head, KV chunk) its own thread, so the grid is
+// `(numQHeads, numChunks)` and a following combine pass merges the partials.
+// Partials use the same layout as the fused-Q+Gate chunked path, so they share
+// `attnPartialM/L/Acc`: M/L are `numQHeads * numChunks` floats, Acc is
+// `numQHeads * numChunks * headDim` floats, indexed `head * numChunks + chunk`.
+// ============================================================================
+
+/// Standard GQA decode, FP16 KV, split-K across KV chunks. Partial pass.
+///
+/// One 32-lane threadgroup per (head, chunk). Lane `l` owns four CONTIGUOUS
+/// hidden dimensions (`4l .. 4l+3`), so its query and online-softmax
+/// accumulator live in registers (`float4`) and each key costs one 8-byte load
+/// per lane (the whole `headDim` row across the warp), one dot, one `simd_sum`
+/// and two FMAs.
+///
+/// The previous shape kept `float4 acc[64]` indexed by a runtime loop variable,
+/// which MSL places in thread-local memory: every key re-read and re-wrote 1 KB
+/// of spilled registers, so the cost was linear in the walk and dominated a long
+/// context (the reason decode fell to ~1.4 tok/s at 21k positions while a short
+/// one ran at 11.7). `headDim == 128` is required — exactly four dimensions per
+/// lane — and the host keeps the unsplit kernel otherwise.
+kernel void gqa_attention_decode_standard_f16_chunked(
+    device const float* qVector [[buffer(0)]],     // [numQHeads * headDim]
+    device const half* kCacheBuffer [[buffer(1)]],
+    device const half* vCacheBuffer [[buffer(2)]],
+    device float* partialM [[buffer(3)]],
+    device float* partialL [[buffer(4)]],
+    device float* partialAcc [[buffer(5)]],
+    constant uint32_t& seqLen [[buffer(6)]],
+    constant uint32_t& numQHeads [[buffer(7)]],
+    constant uint32_t& numKvHeads [[buffer(8)]],
+    constant uint32_t& headDim [[buffer(9)]],
+    constant uint32_t& chunkSize [[buffer(10)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint2 gridDim [[threadgroups_per_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint qHeadIdx = tgPos.x;
+    uint chunkIdx = tgPos.y;
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+    uint32_t dimBase = laneId * 4;
+
+    float4 q4 = *(device const float4*)(qVector + (qHeadIdx * headDim) + dimBase);
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    uint32_t currentSeqLen = (seqLen == 0) ? 1 : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + 1) : seqLen);
+    uint32_t chunkStart = chunkIdx * chunkSize;
+    uint32_t chunkEnd = min(chunkStart + chunkSize, currentSeqLen);
+
+    float4 acc4 = float4(0.0f);
+    float m = -1e20f;
+    float l = 0.0f;
+
+    for (uint32_t tau = chunkStart; tau < chunkEnd; tau++) {
+        uint32_t base = (tau * kvStride) + kvHeadBase + dimBase;
+        float4 k4 = float4(*(device const half4*)(kCacheBuffer + base));
+        float score = simd_sum(dot(q4, k4)) * invSqrtHeadDim;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+        l = (l * alpha) + beta;
+
+        float4 v4 = float4(*(device const half4*)(vCacheBuffer + base));
+        acc4 = (acc4 * alpha) + (beta * v4);
+    }
+
+    uint32_t partIdx = (qHeadIdx * gridDim.y) + chunkIdx;
+    if (laneId == 0) {
+        partialM[partIdx] = m;
+        partialL[partIdx] = l;
+    }
+    *(device float4*)(partialAcc + ((uint64_t)partIdx * headDim) + dimBase) = acc4;
+}
+
+/// Standard GQA decode, FP8 KV, split-K across KV chunks. Partial pass.
+/// Register-resident accumulator over four contiguous dims per lane, exactly as
+/// the FP16 twin; the per-position K/V scales are unchanged.
+kernel void gqa_attention_decode_standard_fp8_chunked(
+    device const float* qVector [[buffer(0)]],     // [numQHeads * headDim]
+    device const char* kCacheBuffer [[buffer(1)]],
+    device const char* vCacheBuffer [[buffer(2)]],
+    device const half* kScaleBuffer [[buffer(3)]],
+    device const half* vScaleBuffer [[buffer(4)]],
+    device float* partialM [[buffer(5)]],
+    device float* partialL [[buffer(6)]],
+    device float* partialAcc [[buffer(7)]],
+    constant uint32_t& seqLen [[buffer(8)]],
+    constant uint32_t& numQHeads [[buffer(9)]],
+    constant uint32_t& numKvHeads [[buffer(10)]],
+    constant uint32_t& headDim [[buffer(11)]],
+    constant uint32_t& chunkSize [[buffer(12)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint2 gridDim [[threadgroups_per_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint qHeadIdx = tgPos.x;
+    uint chunkIdx = tgPos.y;
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+    uint32_t dimBase = laneId * 4;
+
+    float4 q4 = *(device const float4*)(qVector + (qHeadIdx * headDim) + dimBase);
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    uint32_t currentSeqLen = (seqLen == 0) ? 1 : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + 1) : seqLen);
+    uint32_t chunkStart = chunkIdx * chunkSize;
+    uint32_t chunkEnd = min(chunkStart + chunkSize, currentSeqLen);
+
+    float4 acc4 = float4(0.0f);
+    float m = -1e20f;
+    float l = 0.0f;
+
+    for (uint32_t tau = chunkStart; tau < chunkEnd; tau++) {
+        uint32_t scaleIdx = (tau * numKvHeads) + kvHeadIdx;
+        float kScale = float(kScaleBuffer[scaleIdx]);
+        float vScale = float(vScaleBuffer[scaleIdx]);
+
+        uint32_t base = (tau * kvStride) + kvHeadBase + dimBase;
+        char4 kc = *(device const char4*)(kCacheBuffer + base);
+        float4 k4 = float4(float(kc.x), float(kc.y), float(kc.z), float(kc.w));
+        float score = simd_sum(dot(q4, k4) * kScale) * invSqrtHeadDim;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+        l = (l * alpha) + beta;
+
+        char4 vc = *(device const char4*)(vCacheBuffer + base);
+        float4 v4 = float4(float(vc.x), float(vc.y), float(vc.z), float(vc.w));
+        acc4 = (acc4 * alpha) + ((beta * vScale) * v4);
+    }
+
+    uint32_t partIdx = (qHeadIdx * gridDim.y) + chunkIdx;
+    if (laneId == 0) {
+        partialM[partIdx] = m;
+        partialL[partIdx] = l;
+    }
+    *(device float4*)(partialAcc + ((uint64_t)partIdx * headDim) + dimBase) = acc4;
+}
+
+/// Combine pass for the standard-GQA split-K decode. One 32-lane threadgroup per
+/// head, lane `l` owning the same four contiguous dims as the partial pass, so
+/// the merge (running max, weighted sum, normalize) is all registers and one
+/// 16-byte load per chunk per lane.
+kernel void gqa_attention_decode_standard_chunked_combine(
+    device const float* partialM [[buffer(0)]],
+    device const float* partialL [[buffer(1)]],
+    device const float* partialAcc [[buffer(2)]],
+    device float* attnOutBuffer [[buffer(3)]],
+    constant uint32_t& numChunks [[buffer(4)]],
+    constant uint32_t& numQHeads [[buffer(5)]],
+    constant uint32_t& headDim [[buffer(6)]],
+    uint headPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint qHeadIdx = headPos;
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t dimBase = laneId * 4;
+
+    float M = -1e20f;
+    for (uint32_t c = 0; c < numChunks; c++) {
+        float m = partialM[(qHeadIdx * numChunks) + c];
+        if (m > M) M = m;
+    }
+
+    float4 acc4 = float4(0.0f);
+    float L = 0.0f;
+    for (uint32_t c = 0; c < numChunks; c++) {
+        uint32_t partIdx = (qHeadIdx * numChunks) + c;
+        float l_c = partialL[partIdx];
+        float w = (l_c > 0.0f) ? exp(partialM[partIdx] - M) : 0.0f;
+        L += l_c * w;
+        float4 p4 = *(device const float4*)(partialAcc + ((uint64_t)partIdx * headDim) + dimBase);
+        acc4 += p4 * w;
+    }
+
+    float invL = (L > 0.0f) ? (1.0f / L) : 0.0f;
+    *(device float4*)(attnOutBuffer + (qHeadIdx * headDim) + dimBase) = acc4 * invL;
+}
+
+/// Weight-stationary batched Q8 affine GEMV (out = W * x). Grid:
+/// (outDim, ceil(batch / 16)) threadgroups of 32 lanes.
+kernel void q8_gemv_batched(
+    device const uchar* rawWeightBuffer [[buffer(0)]],
+    device const uchar* rawScaleBuffer [[buffer(1)]],
+    device const uchar* rawBiasBuffer [[buffer(2)]],
+    device const float* inputBatched [[buffer(3)]],
+    device float* outputBatched [[buffer(4)]],
+    constant uint64_t& weightOffset [[buffer(5)]],
+    constant uint64_t& scaleOffset [[buffer(6)]],
+    constant uint64_t& biasOffset [[buffer(7)]],
+    constant uint32_t& inDim [[buffer(8)]],
+    constant uint32_t& outDim [[buffer(9)]],
+    constant uint32_t& groupSize [[buffer(10)]],
+    constant uint32_t& batch [[buffer(11)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint row = tgPos.x;
+    uint t0 = tgPos.y * 16;
+    if (row >= outDim || t0 >= batch) return;
+
+    uint32_t numGroups = (groupSize > 0) ? (inDim / groupSize) : 0;
+    device const uchar* wRow = rawWeightBuffer + weightOffset + ((uint64_t)row * inDim);
+    device const uchar* sRow = rawScaleBuffer + scaleOffset + ((uint64_t)row * numGroups * 2);
+    device const uchar* bRow = rawBiasBuffer + biasOffset + ((uint64_t)row * numGroups * 2);
+
+    float acc[16];
+    for (uint t = 0; t < 16; t++) {
+        acc[t] = 0.0f;
+    }
+
+    uint32_t numChunks = inDim / 8;
+    for (uint32_t c = laneId; c < numChunks; c += 32) {
+        uint32_t baseCol = c * 8;
+        // Clamped like `q8_gemv`'s chunk loop: a row whose width is not a
+        // multiple of `groupSize` would otherwise index past the row's scale
+        // companion and weight the next row's scales into this one.
+        uint32_t g = min((groupSize > 0) ? (baseCol / groupSize) : 0,
+                         (groupSize > 0 && inDim >= groupSize) ? (inDim / groupSize - 1) : 0);
+        float scale = read_bf16_unaligned(sRow + g * 2);
+        float bias = read_bf16_unaligned(bRow + g * 2);
+
+        uchar4 w0 = *(device const uchar4*)(wRow + baseCol);
+        uchar4 w1 = *(device const uchar4*)(wRow + baseCol + 4);
+        float4 wA = float4(float(w0.x), float(w0.y), float(w0.z), float(w0.w));
+        float4 wB = float4(float(w1.x), float(w1.y), float(w1.z), float(w1.w));
+
+        for (uint t = 0; t < 16; t++) {
+            device const float4* in4 = (device const float4*)(inputBatched + ((uint64_t)min(t0 + t, batch - 1) * inDim));
+            float4 in_lo = in4[c * 2 + 0];
+            float4 in_hi = in4[c * 2 + 1];
+            float xsum = (in_lo.x + in_lo.y + in_lo.z + in_lo.w) + (in_hi.x + in_hi.y + in_hi.z + in_hi.w);
+            acc[t] += scale * (dot(wA, in_lo) + dot(wB, in_hi)) + bias * xsum;
+        }
+    }
+
+    for (uint t = 0; t < 16; t++) {
+        float total = simd_sum(acc[t]);
+        if (laneId == 0 && t0 + t < batch) {
+            outputBatched[(uint64_t)(t0 + t) * outDim + row] = total;
+        }
+    }
+}
+
+/// Weight-stationary batched Q8 affine SwiGLU gate+up. Grid:
+/// (intermediateDim, ceil(batch / 16)) threadgroups of 32 lanes. Writes
+/// `silu(gate) * up` for every token of the block, so the caller clears nothing
+/// here. Same 8-bit layout as `q8_swiglu_gate_up` (values, then the per-group
+/// scale and bias companions).
+kernel void q8_swiglu_gate_up_batched(
+    device const uchar* rawGateWeight [[buffer(0)]],
+    device const uchar* rawGateScales [[buffer(1)]],
+    device const uchar* rawGateBiases [[buffer(2)]],
+    device const uchar* rawUpWeight [[buffer(3)]],
+    device const uchar* rawUpScales [[buffer(4)]],
+    device const uchar* rawUpBiases [[buffer(5)]],
+    device const float* inputBatched [[buffer(6)]],
+    device float* intermediateOutput [[buffer(7)]],
+    constant uint64_t& gateWeightOffset [[buffer(8)]],
+    constant uint64_t& gateScaleOffset [[buffer(9)]],
+    constant uint64_t& gateBiasOffset [[buffer(10)]],
+    constant uint64_t& upWeightOffset [[buffer(11)]],
+    constant uint64_t& upScaleOffset [[buffer(12)]],
+    constant uint64_t& upBiasOffset [[buffer(13)]],
+    constant uint32_t& hiddenDim [[buffer(14)]],
+    constant uint32_t& intermediateDim [[buffer(15)]],
+    constant uint32_t& groupSize [[buffer(16)]],
+    constant uint32_t& batch [[buffer(17)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint r = tgPos.x;
+    uint t0 = tgPos.y * 16;
+    if (r >= intermediateDim || t0 >= batch) return;
+
+    uint32_t numGroups = (groupSize > 0) ? (hiddenDim / groupSize) : 0;
+    device const uchar* gWRow = rawGateWeight + gateWeightOffset + ((uint64_t)r * hiddenDim);
+    device const uchar* gSRow = rawGateScales + gateScaleOffset + ((uint64_t)r * numGroups * 2);
+    device const uchar* gBRow = rawGateBiases + gateBiasOffset + ((uint64_t)r * numGroups * 2);
+
+    device const uchar* uWRow = rawUpWeight + upWeightOffset + ((uint64_t)r * hiddenDim);
+    device const uchar* uSRow = rawUpScales + upScaleOffset + ((uint64_t)r * numGroups * 2);
+    device const uchar* uBRow = rawUpBiases + upBiasOffset + ((uint64_t)r * numGroups * 2);
+
+    float gAcc[16];
+    float uAcc[16];
+    for (uint t = 0; t < 16; t++) {
+        gAcc[t] = 0.0f;
+        uAcc[t] = 0.0f;
+    }
+
+    uint32_t numChunks = hiddenDim / 8;
+    for (uint32_t c = laneId; c < numChunks; c += 32) {
+        uint32_t baseCol = c * 8;
+        // Clamped like `q8_gemv`'s chunk loop: a row whose width is not a
+        // multiple of `groupSize` would otherwise index past the row's scale
+        // companion and weight the next row's scales into this one.
+        uint32_t g = min((groupSize > 0) ? (baseCol / groupSize) : 0,
+                         (groupSize > 0 && hiddenDim >= groupSize) ? (hiddenDim / groupSize - 1) : 0);
+        float gScale = read_bf16_unaligned(gSRow + g * 2);
+        float gBias = read_bf16_unaligned(gBRow + g * 2);
+        float uScale = read_bf16_unaligned(uSRow + g * 2);
+        float uBias = read_bf16_unaligned(uBRow + g * 2);
+
+        uchar4 gw0 = *(device const uchar4*)(gWRow + baseCol);
+        uchar4 gw1 = *(device const uchar4*)(gWRow + baseCol + 4);
+        uchar4 uw0 = *(device const uchar4*)(uWRow + baseCol);
+        uchar4 uw1 = *(device const uchar4*)(uWRow + baseCol + 4);
+        float4 gA = float4(float(gw0.x), float(gw0.y), float(gw0.z), float(gw0.w));
+        float4 gB = float4(float(gw1.x), float(gw1.y), float(gw1.z), float(gw1.w));
+        float4 uA = float4(float(uw0.x), float(uw0.y), float(uw0.z), float(uw0.w));
+        float4 uB = float4(float(uw1.x), float(uw1.y), float(uw1.z), float(uw1.w));
+
+        for (uint t = 0; t < 16; t++) {
+            device const float4* in4 = (device const float4*)(inputBatched + ((uint64_t)min(t0 + t, batch - 1) * hiddenDim));
+            float4 in_lo = in4[c * 2 + 0];
+            float4 in_hi = in4[c * 2 + 1];
+            float xsum = (in_lo.x + in_lo.y + in_lo.z + in_lo.w) + (in_hi.x + in_hi.y + in_hi.z + in_hi.w);
+            gAcc[t] += gScale * (dot(gA, in_lo) + dot(gB, in_hi)) + gBias * xsum;
+            uAcc[t] += uScale * (dot(uA, in_lo) + dot(uB, in_hi)) + uBias * xsum;
+        }
+    }
+
+    for (uint t = 0; t < 16; t++) {
+        float gv = simd_sum(gAcc[t]);
+        float uv = simd_sum(uAcc[t]);
+        if (laneId == 0 && t0 + t < batch) {
+            float silu_gate = gv / (1.0f + exp(-gv));
+            intermediateOutput[(uint64_t)(t0 + t) * intermediateDim + r] = silu_gate * uv;
+        }
+    }
+}
+
+/// Weight-stationary batched Q8 affine down projection, accumulating
+/// `routingWeight * (W * x)` into the caller's buffer (which it must clear
+/// first, exactly as the per-token form requires). Grid:
+/// (hiddenDim, ceil(batch / 16)) threadgroups of 32 lanes.
+kernel void q8_down_proj_accumulate_batched(
+    device const uchar* rawDownWeight [[buffer(0)]],
+    device const uchar* rawDownScales [[buffer(1)]],
+    device const uchar* rawDownBiases [[buffer(2)]],
+    device const float* intermediateBatched [[buffer(3)]],
+    device float* outputAccumulator [[buffer(4)]],
+    constant uint64_t& downWeightOffset [[buffer(5)]],
+    constant uint64_t& downScaleOffset [[buffer(6)]],
+    constant uint64_t& downBiasOffset [[buffer(7)]],
+    constant uint32_t& intermediateDim [[buffer(8)]],
+    constant uint32_t& hiddenDim [[buffer(9)]],
+    constant uint32_t& groupSize [[buffer(10)]],
+    constant float& routingWeight [[buffer(11)]],
+    constant uint32_t& batch [[buffer(12)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint d = tgPos.x;
+    uint t0 = tgPos.y * 16;
+    if (d >= hiddenDim || t0 >= batch) return;
+
+    uint32_t numGroups = (groupSize > 0) ? (intermediateDim / groupSize) : 0;
+    device const uchar* dWRow = rawDownWeight + downWeightOffset + ((uint64_t)d * intermediateDim);
+    device const uchar* dSRow = rawDownScales + downScaleOffset + ((uint64_t)d * numGroups * 2);
+    device const uchar* dBRow = rawDownBiases + downBiasOffset + ((uint64_t)d * numGroups * 2);
+
+    float acc[16];
+    for (uint t = 0; t < 16; t++) {
+        acc[t] = 0.0f;
+    }
+
+    uint32_t numChunks = intermediateDim / 8;
+    for (uint32_t c = laneId; c < numChunks; c += 32) {
+        uint32_t baseCol = c * 8;
+        // Clamped like `q8_gemv`'s chunk loop: a row whose width is not a
+        // multiple of `groupSize` would otherwise index past the row's scale
+        // companion and weight the next row's scales into this one.
+        uint32_t g = min((groupSize > 0) ? (baseCol / groupSize) : 0,
+                         (groupSize > 0 && intermediateDim >= groupSize) ? (intermediateDim / groupSize - 1) : 0);
+        float scale = read_bf16_unaligned(dSRow + g * 2);
+        float bias = read_bf16_unaligned(dBRow + g * 2);
+
+        uchar4 w0 = *(device const uchar4*)(dWRow + baseCol);
+        uchar4 w1 = *(device const uchar4*)(dWRow + baseCol + 4);
+        float4 wA = float4(float(w0.x), float(w0.y), float(w0.z), float(w0.w));
+        float4 wB = float4(float(w1.x), float(w1.y), float(w1.z), float(w1.w));
+
+        for (uint t = 0; t < 16; t++) {
+            device const float4* in4 = (device const float4*)(intermediateBatched + ((uint64_t)min(t0 + t, batch - 1) * intermediateDim));
+            float4 in_lo = in4[c * 2 + 0];
+            float4 in_hi = in4[c * 2 + 1];
+            float xsum = (in_lo.x + in_lo.y + in_lo.z + in_lo.w) + (in_hi.x + in_hi.y + in_hi.z + in_hi.w);
+            acc[t] += scale * (dot(wA, in_lo) + dot(wB, in_hi)) + bias * xsum;
+        }
+    }
+
+    for (uint t = 0; t < 16; t++) {
+        float total = simd_sum(acc[t]);
+        if (laneId == 0 && t0 + t < batch) {
+            outputAccumulator[(uint64_t)(t0 + t) * hiddenDim + d] += routingWeight * total;
+        }
+    }
+}
+
+// MARK: - Standard GQA prefill attention, SIMD-lane tiled
+//
+// `gqa_attention_decode_standard_*` used for prefill gives a (head, row) pair a
+// single THREAD that walks the row's whole causal range, so the head's 128-wide
+// dot product is one lane's serial FMA chain. These give the pair a 32-lane
+// threadgroup instead: lane `l` owns four contiguous dimensions (`4l .. 4l+3`),
+// so its query and online-softmax accumulator stay in registers, each key is one
+// 8-byte load per lane (the whole row across the warp) plus one `simd_sum`, and
+// no threadgroup memory or barrier is involved.
+//
+// FIX #6a measured a ROWS-chunked prefill attention 0.2-0.3x the old kernel and
+// that form stays reverted; this is the SIMD-tiling rewrite that note asked for.
+// `headDim == 128` is required (four dimensions per lane); the host falls back to
+// the per-thread kernel otherwise.
+// ============================================================================
+
+/// Standard GQA prefill attention, FP16 KV, SIMD-tiled. Grid:
+/// (numQHeads, rows) threadgroups of 32 lanes.
+kernel void gqa_attention_prefill_standard_f16(
+    device const float* qVector [[buffer(0)]],     // [rows * numQHeads * headDim]
+    device const half* kCacheBuffer [[buffer(1)]],
+    device const half* vCacheBuffer [[buffer(2)]],
+    device float* attnOutBuffer [[buffer(3)]],     // [rows * numQHeads * headDim]
+    constant uint32_t& seqLen [[buffer(4)]],
+    constant uint32_t& numQHeads [[buffer(5)]],
+    constant uint32_t& numKvHeads [[buffer(6)]],
+    constant uint32_t& headDim [[buffer(7)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint qHeadIdx = tgPos.x;
+    uint rowIdx = tgPos.y;
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+    uint32_t dimBase = laneId * 4;
+    uint64_t qBase = ((uint64_t)rowIdx * numQHeads + qHeadIdx) * (uint64_t)headDim;
+
+    float4 q4 = *(device const float4*)(qVector + qBase + dimBase);
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    uint32_t currentSeqLen = (seqLen == 0)
+        ? (rowIdx + 1)
+        : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + rowIdx + 1) : seqLen);
+
+    float4 acc4 = float4(0.0f);
+    float m = -1e20f;
+    float l = 0.0f;
+
+    for (uint32_t tau = 0; tau < currentSeqLen; tau++) {
+        uint32_t base = (tau * kvStride) + kvHeadBase + dimBase;
+        float4 k4 = float4(*(device const half4*)(kCacheBuffer + base));
+        float score = simd_sum(dot(q4, k4)) * invSqrtHeadDim;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+        l = (l * alpha) + beta;
+
+        float4 v4 = float4(*(device const half4*)(vCacheBuffer + base));
+        acc4 = (acc4 * alpha) + (beta * v4);
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    *(device float4*)(attnOutBuffer + qBase + dimBase) = acc4 * invL;
+}
+
+/// Standard GQA prefill attention, FP8 KV, SIMD-tiled. Grid:
+/// (numQHeads, rows) threadgroups of 32 lanes.
+kernel void gqa_attention_prefill_standard_fp8(
+    device const float* qVector [[buffer(0)]],     // [rows * numQHeads * headDim]
+    device const char* kCacheBuffer [[buffer(1)]],
+    device const char* vCacheBuffer [[buffer(2)]],
+    device const half* kScaleBuffer [[buffer(3)]],
+    device const half* vScaleBuffer [[buffer(4)]],
+    device float* attnOutBuffer [[buffer(5)]],     // [rows * numQHeads * headDim]
+    constant uint32_t& seqLen [[buffer(6)]],
+    constant uint32_t& numQHeads [[buffer(7)]],
+    constant uint32_t& numKvHeads [[buffer(8)]],
+    constant uint32_t& headDim [[buffer(9)]],
+    uint2 tgPos [[threadgroup_position_in_grid]],
+    uint laneId [[thread_index_in_simdgroup]]
+) {
+    uint qHeadIdx = tgPos.x;
+    uint rowIdx = tgPos.y;
+    if (qHeadIdx >= numQHeads) return;
+
+    uint32_t headsPerKv = numQHeads / numKvHeads;
+    uint32_t kvHeadIdx = qHeadIdx / headsPerKv;
+    uint32_t kvStride = numKvHeads * headDim;
+    uint32_t kvHeadBase = kvHeadIdx * headDim;
+    uint32_t dimBase = laneId * 4;
+    uint64_t qBase = ((uint64_t)rowIdx * numQHeads + qHeadIdx) * (uint64_t)headDim;
+
+    float4 q4 = *(device const float4*)(qVector + qBase + dimBase);
+    float invSqrtHeadDim = rsqrt((float)headDim);
+
+    uint32_t currentSeqLen = (seqLen == 0)
+        ? (rowIdx + 1)
+        : ((seqLen & 0x80000000) ? ((seqLen & 0x7FFFFFFF) + rowIdx + 1) : seqLen);
+
+    float4 acc4 = float4(0.0f);
+    float m = -1e20f;
+    float l = 0.0f;
+
+    for (uint32_t tau = 0; tau < currentSeqLen; tau++) {
+        uint32_t scaleIdx = (tau * numKvHeads) + kvHeadIdx;
+        float kScale = float(kScaleBuffer[scaleIdx]);
+        float vScale = float(vScaleBuffer[scaleIdx]);
+
+        uint32_t base = (tau * kvStride) + kvHeadBase + dimBase;
+        char4 kc = *(device const char4*)(kCacheBuffer + base);
+        float4 k4 = float4(float(kc.x), float(kc.y), float(kc.z), float(kc.w));
+        float score = simd_sum(dot(q4, k4) * kScale) * invSqrtHeadDim;
+
+        float m_prev = m;
+        if (score > m) {
+            m = score;
+        }
+        float alpha = exp(m_prev - m);
+        float beta = exp(score - m);
+        l = (l * alpha) + beta;
+
+        char4 vc = *(device const char4*)(vCacheBuffer + base);
+        float4 v4 = float4(float(vc.x), float(vc.y), float(vc.z), float(vc.w));
+        acc4 = (acc4 * alpha) + ((beta * vScale) * v4);
+    }
+
+    float invL = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    *(device float4*)(attnOutBuffer + qBase + dimBase) = acc4 * invL;
 }

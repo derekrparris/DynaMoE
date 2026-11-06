@@ -164,6 +164,31 @@ public enum ChatPromptFormatter {
         return base + "\n\n" + cleanSystem
     }
 
+    /// Nanbeige 4.3's tool-result block. The checkpoint's template has no tool
+    /// role: a result rides a USER turn as `<tool_response>…</tool_response>`,
+    /// one block per executed call, the turn closed once. The trailing newline
+    /// matches what `AgentHarness.formatToolResponseTurn` emits live, so a
+    /// rebuilt history and the live continuation stay byte-compatible (which is
+    /// what lets a post-tool turn extend the previous turn's pinned prefix).
+    public static func nanbeigeToolResponse(text: String) -> String {
+        "<tool_response>\n" + text + "\n</tool_response>\n"
+    }
+
+    /// Nanbeige 4.3's own tool-call markup, used only to REBUILD a call whose
+    /// raw text is no longer in the stored turn (the raw call survives in every
+    /// turn this app produced). The family documents the `qwen3_coder` parser,
+    /// which is this XML form: the arguments are `<parameter=name>` children of
+    /// one `<function=name>` inside a `<tool_call>` container, each value on its
+    /// own lines.
+    public static func nanbeigeToolCallBlock(name: String, arguments: [String: String]) -> String {
+        var block = "<tool_call>\n<function=" + name + ">\n"
+        for key in arguments.keys.sorted() {
+            block += "<parameter=" + key + ">\n" + (arguments[key] ?? "") + "\n</parameter>\n"
+        }
+        block += "</function>\n</tool_call>"
+        return block
+    }
+
     /// The System block a family renders, i.e. what a digest over "the system
     /// prompt the model saw" has to cover. Both dialects with a graded effort
     /// level put it inside that block (Spark appends `thinking_effort`, DeepSeek
@@ -431,13 +456,27 @@ public enum ChatPromptFormatter {
         let emptyPrefix = "<|im_start|>assistant\n" + emptySuffix
         let openPrefix = "<|im_start|>assistant\n" + Self.openReasoningSuffix
         let assistantPrefix = thinkingEnabled ? openPrefix : emptyPrefix
+        // Nanbeige 4.3 keeps a tool result in a USER turn wrapped in
+        // `<tool_response>` (its template has no tool role at all); every other
+        // ChatML family renders the payload as the turn's own text.
+        //
+        // The rest of this family's template needs no branch: its `<|im_start|>`
+        // framing, its `Thinking` channel and its already-closed empty block are
+        // byte-identical to the defaults above, and `preserve_thinking` is
+        // deliberately left ON (always replay) so a recorded turn re-renders the
+        // way it was generated.
+        let wrapsToolResults = modelConfig?.isNanbeige43Model == true
         var p = ""
         if !cleanSystem.isEmpty {
             p += "<|im_start|>system\n" + cleanSystem + "<|im_end|>\n"
         }
         for turn in turns {
             if turn.role == .user {
-                p += "<|im_start|>user\n" + turn.text + "<|im_end|>\n"
+                if wrapsToolResults, case .toolResult = turn.kind {
+                    p += "<|im_start|>user\n" + Self.nanbeigeToolResponse(text: turn.text) + "<|im_end|>\n"
+                } else {
+                    p += "<|im_start|>user\n" + turn.text + "<|im_end|>\n"
+                }
             } else {
                 let opens = Self.opensReasoningForHistory(
                     thinkingEnabled: thinkingEnabled,

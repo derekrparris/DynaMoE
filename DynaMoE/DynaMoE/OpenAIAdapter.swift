@@ -1513,7 +1513,15 @@ enum OpenAIAdapter {
             case "tool", "function":
                 let label = message.name ?? message.toolCallId ?? "tool"
                 let args = message.contentText ?? "(no result)"
-                split.turns.append(.init(role: .user, text: "Function result (\(label)):\n\(args)"))
+                // A TOOL RESULT, not an ordinary user turn: the family decides how
+                // one is rendered (Nanbeige wraps it in `<tool_response>` inside a
+                // user turn, DeepSeek V4.1 uses its own output pair), and only the
+                // turn's KIND can say so, because `role` is `.user` for both.
+                split.turns.append(.init(
+                    role: .user,
+                    text: "Function result (\(label)):\n\(args)",
+                    kind: .toolResult(name: label)
+                ))
             default:
                 if let content = message.contentText, !content.isEmpty {
                     split.turns.append(.init(role: .user, text: "\(message.role.capitalized): \(content)"))

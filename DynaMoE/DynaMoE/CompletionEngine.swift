@@ -27,6 +27,55 @@ import Metal
 
 // MARK: - Thinking / Response Boundary Splitting (whitespace tolerant)
 
+/// Writes a decode step's logits (and the tail of the context that produced them)
+/// under `/tmp/dynamoe_logits`, for comparing an engine step against an independent
+/// reference. Diagnostic only: `dynamoe_dump_logits` gates every call.
+///
+/// Bounded on purpose. A decode step's logit vector is `vocabSize` floats and the
+/// context grows with the conversation, so an unbounded dump writes a
+/// conversation's token ids to /tmp for as long as a turn runs. Only the context
+/// TAIL is recorded (with the true length beside it, which is what a reference
+/// replay needs), and files from a previous session are dropped rather than
+/// accumulated.
+func dumpDecodeLogits(
+    _ logits: UnsafeMutablePointer<Float>,
+    vocabSize: Int,
+    step: Int,
+    chosen: UInt32,
+    context: [UInt32]
+) {
+    let contextTailLimit = 64
+    let staleAfter: TimeInterval = 3600
+    let directory = URL(fileURLWithPath: "/tmp/dynamoe_logits")
+    try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    if let existing = try? FileManager.default.contentsOfDirectory(
+        at: directory,
+        includingPropertiesForKeys: [.contentModificationDateKey],
+        options: []
+    ) {
+        let cutoff = Date().addingTimeInterval(-staleAfter)
+        for url in existing {
+            let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            if let modified, modified < cutoff {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+    }
+    let name = String(format: "step_%03d", step)
+    let vector = Data(bytes: logits, count: vocabSize * MemoryLayout<Float>.stride)
+    try? vector.write(to: directory.appendingPathComponent(name + ".f32"))
+    let meta: [String: Any] = [
+        "step": step,
+        "chosen": Int(chosen),
+        "vocabSize": vocabSize,
+        "contextLength": context.count,
+        "contextTail": context.suffix(contextTailLimit).map { Int($0) }
+    ]
+    if let json = try? JSONSerialization.data(withJSONObject: meta) {
+        try? json.write(to: directory.appendingPathComponent(name + ".json"))
+    }
+}
+
 nonisolated public enum TurnTextSplitter {
     /// Reasoning open/close marker tags used across model families (Qwen, DeepSeek, Ornith, etc.).
     private static let openTags = ["<think>", "<thought>", "<|thought|>", "<|channel>"]
@@ -225,6 +274,13 @@ public final class CompletionEngine: @unchecked Sendable {
     private var currentGenerationTask: Task<Void, Never>?
     private var currentGenerationId: UInt64 = 0
     private var generationCounter: UInt64 = 0
+    /// Cooperative Stop for the work that runs on `runOnLargeStack`'s dedicated
+    /// thread. That thread is a plain `Thread`, not an executor-managed one, so
+    /// `Task.isCancelled` always reads false there and the layer loops would lose
+    /// every cancellation point: Stop would not interrupt a chunk, and because the
+    /// interrupt path awaits the outgoing task, a replacement send would sit behind
+    /// the whole chunk. Set by `cancelActiveTurn`, cleared when a turn is minted.
+    private var activeTurnCancelled = false
 
     /// Ownership of the single-flight slot while a turn is being PREPARED, i.e.
     /// after a caller has been told the slot is free and before `launchTurn` mints
@@ -740,6 +796,7 @@ public final class CompletionEngine: @unchecked Sendable {
                 generationCounter &+= 1
                 let myGenerationId = generationCounter
                 currentGenerationId = myGenerationId
+                activeTurnCancelled = false
                 stateLock.unlock()
 
                 // The pin proposes how much of this prompt a previous turn may have
@@ -1277,6 +1334,14 @@ public final class CompletionEngine: @unchecked Sendable {
         let gqaHeadGateFP8Pipeline: MTLComputePipelineState?
         let gqaHeadGateFP8ChunkedPipeline: MTLComputePipelineState?
         let gqaFusedFP8ChunkedPipeline: MTLComputePipelineState?
+        let gqaStandardF16ChunkedPipeline: MTLComputePipelineState?
+        let gqaStandardFP8ChunkedPipeline: MTLComputePipelineState?
+        let gqaStandardChunkedCombinePipeline: MTLComputePipelineState?
+        let gqaStandardPrefillTiledF16Pipeline: MTLComputePipelineState?
+        let gqaStandardPrefillTiledFP8Pipeline: MTLComputePipelineState?
+        let q8GemvBatchedPipeline: MTLComputePipelineState?
+        let q8GateUpBatchedPipeline: MTLComputePipelineState?
+        let q8DownBatchedPipeline: MTLComputePipelineState?
         let bf16GeluGateUpPipeline: MTLComputePipelineState?
         let bf16GeluGateUpSimdPipeline: MTLComputePipelineState?
         let bf16GeluGateUpBatchedPipeline: MTLComputePipelineState?
@@ -1477,6 +1542,29 @@ public final class CompletionEngine: @unchecked Sendable {
                 q8GemvPipeline = try device.makeComputePipelineState(function: q8GemvFunc)
             } else { q8GemvPipeline = nil }
 
+            // Weight-stationary Q8 prefill forms: a threadgroup covers a 16-token
+            // block of one output row, so a prompt re-reads the quantized weights
+            // ceil(P/16) times instead of P times. Without these the Q4/Q8 path
+            // is decode-only and a long prompt costs the same per token as a
+            // decode step.
+            if let q8GemvBatchedFunc = defaultLibrary.makeFunction(name: "q8_gemv_batched") {
+                q8GemvBatchedPipeline = try device.makeComputePipelineState(function: q8GemvBatchedFunc)
+            } else { q8GemvBatchedPipeline = nil }
+
+            if let q8GateUpBatchedFunc = defaultLibrary.makeFunction(name: "q8_swiglu_gate_up_batched") {
+                q8GateUpBatchedPipeline = try device.makeComputePipelineState(function: q8GateUpBatchedFunc)
+            } else { q8GateUpBatchedPipeline = nil }
+
+            if let q8DownBatchedFunc = defaultLibrary.makeFunction(name: "q8_down_proj_accumulate_batched") {
+                q8DownBatchedPipeline = try device.makeComputePipelineState(function: q8DownBatchedFunc)
+            } else { q8DownBatchedPipeline = nil }
+
+            if q8GemvBatchedPipeline != nil, q8GateUpBatchedPipeline != nil, q8DownBatchedPipeline != nil {
+                print("⚡ [GEMV] q8_gemv_batched + q8 MLP batched pipelines ready — Q4/Q8 prefill uses weight-stationary reads")
+            } else {
+                print("⚠️ [GEMV] Q8 batched prefill kernels unavailable — Q4/Q8 prefill re-reads every weight once per prompt token")
+            }
+
             if let fp8GateUpFunc = defaultLibrary.makeFunction(name: "fp8_swiglu_gate_up") {
                 fp8GateUpPipeline = try device.makeComputePipelineState(function: fp8GateUpFunc)
             } else { fp8GateUpPipeline = nil }
@@ -1640,6 +1728,38 @@ public final class CompletionEngine: @unchecked Sendable {
             if let gqaStdFP8Func = defaultLibrary.makeFunction(name: "gqa_attention_decode_standard_fp8") {
                 gqaStandardFP8Pipeline = try device.makeComputePipelineState(function: gqaStdFP8Func)
             } else { gqaStandardFP8Pipeline = nil }
+
+            // Split-K (flash-decoding) twins of the standard-GQA decode kernel.
+            // The plain kernels are one threadgroup per layer (one thread per
+            // head, a serial walk of the whole KV), which at a few thousand
+            // positions is most of a decoded token. These give every (head, KV
+            // chunk) its own thread and merge the partials afterwards.
+            if let stdF16ChunkedFunc = defaultLibrary.makeFunction(name: "gqa_attention_decode_standard_f16_chunked") {
+                gqaStandardF16ChunkedPipeline = try device.makeComputePipelineState(function: stdF16ChunkedFunc)
+            } else { gqaStandardF16ChunkedPipeline = nil }
+
+            if let stdFP8ChunkedFunc = defaultLibrary.makeFunction(name: "gqa_attention_decode_standard_fp8_chunked") {
+                gqaStandardFP8ChunkedPipeline = try device.makeComputePipelineState(function: stdFP8ChunkedFunc)
+            } else { gqaStandardFP8ChunkedPipeline = nil }
+
+            if let stdChunkedCombineFunc = defaultLibrary.makeFunction(name: "gqa_attention_decode_standard_chunked_combine") {
+                gqaStandardChunkedCombinePipeline = try device.makeComputePipelineState(function: stdChunkedCombineFunc)
+            } else { gqaStandardChunkedCombinePipeline = nil }
+
+            if let tiledF16Func = defaultLibrary.makeFunction(name: "gqa_attention_prefill_standard_f16") {
+                gqaStandardPrefillTiledF16Pipeline = try device.makeComputePipelineState(function: tiledF16Func)
+            } else { gqaStandardPrefillTiledF16Pipeline = nil }
+
+            if let tiledFP8Func = defaultLibrary.makeFunction(name: "gqa_attention_prefill_standard_fp8") {
+                gqaStandardPrefillTiledFP8Pipeline = try device.makeComputePipelineState(function: tiledFP8Func)
+            } else { gqaStandardPrefillTiledFP8Pipeline = nil }
+
+            if gqaStandardChunkedCombinePipeline != nil,
+               gqaStandardF16ChunkedPipeline != nil || gqaStandardFP8ChunkedPipeline != nil {
+                print("⚡ [GQA] standard-GQA split-K decode ready — long-context decode attends in parallel chunks")
+            } else {
+                print("⚠️ [GQA] standard-GQA split-K decode unavailable — decode attention stays one thread per head")
+            }
 
             if let convFunc = defaultLibrary.makeFunction(name: "causal_conv1d_silu") {
                 causalConv1dPipeline = try device.makeComputePipelineState(function: convFunc)
@@ -1958,7 +2078,14 @@ public final class CompletionEngine: @unchecked Sendable {
               let routerIndicesBuffer = device.makeBuffer(length: 16 * MemoryLayout<UInt32>.stride, options: .storageModeShared),
               let routerWeightsBuffer = device.makeBuffer(length: 16 * MemoryLayout<Float>.stride, options: .storageModeShared),
               let sharedScoreBuffer = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared),
-              let interBuffer = device.makeBuffer(length: max(Int(maxInterDim), 512) * max(1, Int(modelConfig?.effectiveNumExpertsPerTok ?? (numExperts >= 512 ? 10 : 8))) * MemoryLayout<Float>.stride, options: .storageModeShared),
+              // One intermediate vector per active expert on an MoE layer, and
+              // `effectiveNumExpertsPerTok` answers 0 for a DENSE checkpoint, so
+              // this used to land on exactly `maxInterDim` floats with no slack at
+              // all. The additive 512 keeps a fused write inside the buffer.
+              let interBuffer = device.makeBuffer(length: max(
+                  max(Int(maxInterDim), 512) * max(1, Int(modelConfig?.effectiveNumExpertsPerTok ?? (numExperts >= 512 ? 10 : 8))),
+                  max(Int(maxInterDim), 512) + 512
+              ) * MemoryLayout<Float>.stride, options: .storageModeShared),
               let fusedSlotListBuffer = device.makeBuffer(length: 16 * MemoryLayout<UInt32>.stride, options: .storageModeShared),
               let fusedSlotWeightsBuffer = device.makeBuffer(length: 16 * MemoryLayout<Float>.stride, options: .storageModeShared),
               // Flash-decoding partials (256 = split-K chunk cap), sized from the
@@ -1988,19 +2115,32 @@ public final class CompletionEngine: @unchecked Sendable {
         let bias = sampling.logitBias
         var maxTokens = sampling.maxTokens
         let buffers = shardBuffers
+        // Which packed tensors have dequantization companions, resolved once per
+        // turn. A dense repack writes `<name>.scale` / `<name>.bias` as their own
+        // manifest rows, and several projection call sites pass no companions
+        // (MLA, KDA, the SSM `in_proj` trio) because a plain safetensors checkpoint
+        // has none. Without this fallback those sites would be handed a packed
+        // weight with nothing to dequantize it and skip the dispatch in silence.
+        let denseCompanions = DenseRepacker.companionIndex(summary.tensors)
         let effMode = memory.executionMode.resolveEffectiveMode(modelFootprintGB: summary.sizeGb)
         let isFullRAM = (effMode == .residentRAM || memory.budgetMode == .unrestricted)
         let budgetMode: MemoryBudgetMode = isFullRAM ? .unrestricted : memory.budgetMode
 
         let isAgentSession = request.agentToolsEnabled
+        // The row ceiling is the CHECKPOINT's architectural one, not a flat
+        // constant: a model declaring 524,288 positions should be refused a long
+        // prompt by the KV budget, not by a policy number.
+        let policyMaxRows = KVCacheProvisioning.policyMaxRows(config: modelConfig)
         let sessionFloor = KVCacheProvisioning.sessionFloor(
             isAgentSession: isAgentSession,
-            configured: UserDefaults.standard.object(forKey: KVCacheProvisioning.agentSessionFloorKey) as? Int
+            configured: UserDefaults.standard.object(forKey: KVCacheProvisioning.agentSessionFloorKey) as? Int,
+            policyMaxRows: policyMaxRows
         )
         var neededSeqLen = KVCacheProvisioning.neededSeqLen(
             sessionFloor: sessionFloor,
             promptTokens: promptTokenIds.count,
-            requestedMaxTokens: maxTokens
+            requestedMaxTokens: maxTokens,
+            policyMaxRows: policyMaxRows
         )
         var kvPrec = memory.kvPrecision
         // Resolve the effective KV precision BEFORE the fit check: the gate has
@@ -2093,7 +2233,8 @@ public final class CompletionEngine: @unchecked Sendable {
             budgetMode: budgetMode,
             modelFootprintGB: summary.sizeGb,
             physicalGB: fitPhysicalGB,
-            residentFootprintGB: streamedFootprintGB
+            residentFootprintGB: streamedFootprintGB,
+            policyMaxRows: policyMaxRows
         )
         // Both KV gates report the same numbers, and never claim the prompt is
         // longer than the cache when the bind is the budget or the reserve.
@@ -2122,7 +2263,8 @@ public final class CompletionEngine: @unchecked Sendable {
                 neededSeqLen = KVCacheProvisioning.neededSeqLen(
                     sessionFloor: sessionFloor,
                     promptTokens: promptTokenIds.count,
-                    requestedMaxTokens: capped
+                    requestedMaxTokens: capped,
+                    policyMaxRows: policyMaxRows
                 )
             }
         case .ok:
@@ -2321,6 +2463,7 @@ public final class CompletionEngine: @unchecked Sendable {
         generationCounter &+= 1
         let myGenerationId = generationCounter
         currentGenerationId = myGenerationId
+        activeTurnCancelled = false
         stateLock.unlock()
 
         let prep = TurnPrepInfo(
@@ -2394,7 +2537,7 @@ public final class CompletionEngine: @unchecked Sendable {
                 let hasScale = (scale != nil)
                 let hasBias = (bias != nil)
                 let isMXFP8 = hasScale && (scale!.dtype.contains("U8") || scale!.dtype.contains("UINT8") || (!hasBias && (w.dtype.contains("U32") || w.dtype.contains("U8") || w.dtype.contains("FP8")) && (scale!.offsetEnd - scale!.offsetStart) >= UInt64((inDim / 32) * outDim)))
-                let isQuantizedAffine = (hasBias || w.dtype.contains("Q4")) && !isMXFP8
+                let isQuantizedAffine = (hasBias || DenseRepacker.isPackedWeightDtype(w.dtype)) && !isMXFP8
                 let isFP8 = !isMXFP8 && !isQuantizedAffine && !w.dtype.contains("BF16") && !w.dtype.contains("F16") && !w.dtype.contains("FLOAT")
 
                 if isMXFP8, let sRaw = (scale != nil) ? buffers[scale!.shardIndex] : nil {
@@ -2423,27 +2566,63 @@ public final class CompletionEngine: @unchecked Sendable {
                         enc.dispatchThreads(MTLSize(width: Int(outDim), height: batchSize, depth: 1), threadsPerThreadgroup: MTLSize(width: min(256, mxfp8Pipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
                     }
                 } else if isQuantizedAffine {
-                    let sRaw = (scale != nil) ? buffers[scale!.shardIndex] : nil
-                    let bRaw = (bias != nil) ? buffers[bias!.shardIndex] : nil
-                    guard let sBuffer = sRaw, let bBuffer = bRaw else { return }
-                    var sOff = scale!.offsetStart
-                    var bOff = bias!.offsetStart
+                    // A call site may pass no companions even though the tensor IS
+                    // packed (MLA, KDA and the SSM `in_proj` trio do exactly that).
+                    // Resolve them by name rather than reading the packed bytes
+                    // through the E4M3 branch or skipping the dispatch.
+                    let scaleMeta = scale ?? (weightOffsetAdd == 0 ? denseCompanions[w.name]?.scale : nil)
+                    let biasMeta = bias ?? (weightOffsetAdd == 0 ? denseCompanions[w.name]?.bias : nil)
+                    let sRaw = scaleMeta.flatMap { buffers[$0.shardIndex] }
+                    let bRaw = biasMeta.flatMap { buffers[$0.shardIndex] }
+                    guard let sBuffer = sRaw, let bBuffer = bRaw,
+                          let sMeta = scaleMeta, let bMeta = biasMeta else {
+                        print("❌ [DENSE] \(w.name) is packed \(w.dtype) but has no scale/bias companion. Skipping the dispatch.")
+                        return
+                    }
+                    var sOff = sMeta.offsetStart
+                    var bOff = bMeta.offsetStart
 
                     let is8Bit = (w.offsetEnd - w.offsetStart) >= UInt64(outDim) * UInt64(inDim)
                     if is8Bit, let q8Pipe = q8GemvPipeline {
-                        enc.setComputePipelineState(q8Pipe)
-                        enc.setBuffer(wRaw, offset: 0, index: 0)
-                        enc.setBuffer(sBuffer, offset: 0, index: 1)
-                        enc.setBuffer(bBuffer, offset: 0, index: 2)
-                        enc.setBuffer(inBuf, offset: inOffset, index: 3)
-                        enc.setBuffer(outBuf, offset: outOffset, index: 4)
-                        enc.setBytes(&wOff, length: MemoryLayout<UInt64>.stride, index: 5)
-                        enc.setBytes(&sOff, length: MemoryLayout<UInt64>.stride, index: 6)
-                        enc.setBytes(&bOff, length: MemoryLayout<UInt64>.stride, index: 7)
-                        enc.setBytes(&inD, length: MemoryLayout<UInt32>.stride, index: 8)
-                        enc.setBytes(&outD, length: MemoryLayout<UInt32>.stride, index: 9)
-                        enc.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 10)
-                        enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: batchSize, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                        if batchSize > 1,
+                           let q8Batched = q8GemvBatchedPipeline,
+                           grp > 0, inD % 8 == 0, grp % 8 == 0, inD % grp == 0 {
+                            // Weight-stationary prefill form: one threadgroup covers a
+                            // 16-token block of one output row, so this dispatch reads the
+                            // row ceil(batch/16) times instead of `batch` times. Every
+                            // 8-column chunk sits inside a single affine group (8 divides
+                            // groupSize), so the per-group scale/bias pair is unchanged
+                            // and the result differs only by float32 reordering.
+                            var batchVal = UInt32(batchSize)
+                            enc.setComputePipelineState(q8Batched)
+                            enc.setBuffer(wRaw, offset: 0, index: 0)
+                            enc.setBuffer(sBuffer, offset: 0, index: 1)
+                            enc.setBuffer(bBuffer, offset: 0, index: 2)
+                            enc.setBuffer(inBuf, offset: inOffset, index: 3)
+                            enc.setBuffer(outBuf, offset: outOffset, index: 4)
+                            enc.setBytes(&wOff, length: MemoryLayout<UInt64>.stride, index: 5)
+                            enc.setBytes(&sOff, length: MemoryLayout<UInt64>.stride, index: 6)
+                            enc.setBytes(&bOff, length: MemoryLayout<UInt64>.stride, index: 7)
+                            enc.setBytes(&inD, length: MemoryLayout<UInt32>.stride, index: 8)
+                            enc.setBytes(&outD, length: MemoryLayout<UInt32>.stride, index: 9)
+                            enc.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 10)
+                            enc.setBytes(&batchVal, length: MemoryLayout<UInt32>.stride, index: 11)
+                            enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: (batchSize + 15) / 16, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                        } else {
+                            enc.setComputePipelineState(q8Pipe)
+                            enc.setBuffer(wRaw, offset: 0, index: 0)
+                            enc.setBuffer(sBuffer, offset: 0, index: 1)
+                            enc.setBuffer(bBuffer, offset: 0, index: 2)
+                            enc.setBuffer(inBuf, offset: inOffset, index: 3)
+                            enc.setBuffer(outBuf, offset: outOffset, index: 4)
+                            enc.setBytes(&wOff, length: MemoryLayout<UInt64>.stride, index: 5)
+                            enc.setBytes(&sOff, length: MemoryLayout<UInt64>.stride, index: 6)
+                            enc.setBytes(&bOff, length: MemoryLayout<UInt64>.stride, index: 7)
+                            enc.setBytes(&inD, length: MemoryLayout<UInt32>.stride, index: 8)
+                            enc.setBytes(&outD, length: MemoryLayout<UInt32>.stride, index: 9)
+                            enc.setBytes(&grp, length: MemoryLayout<UInt32>.stride, index: 10)
+                            enc.dispatchThreadgroups(MTLSize(width: Int(outDim), height: batchSize, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                        }
                     } else if let q4Pipe = q4GemvPipeline {
                         enc.setComputePipelineState(q4Pipe)
                         enc.setBuffer(wRaw, offset: 0, index: 0)
@@ -2991,7 +3170,7 @@ public final class CompletionEngine: @unchecked Sendable {
 
                 for loopIdx in 0..<totalLoops {
                     for l in 0..<actualLayers {
-                        if Task.isCancelled { return false }
+                        if engineSelf.forwardWorkShouldStop(myGenerationId) { return false }
                         let layer = cachedLayers[l]
 
                         // Asynchronous Layer Lookahead Backbone Prefetching
@@ -3764,6 +3943,58 @@ if layer.attnGateProjTensor != nil,
                                         layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 8)
                                         layerEnc1.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 9)
                                         layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), headGatePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                    } else if isStandardGqa,
+                                              headDim == StandardGqaSplitK.headDim,
+                                              let stdSplitPipe = gqaStandardF16ChunkedPipeline,
+                                              let stdSplitCombine = gqaStandardChunkedCombinePipeline,
+                                              StandardGqaSplitK.curLen(seqLen) > StandardGqaSplitK.minimumContext {
+                                        // Flash-decoding split-K for standard GQA (Llama-family,
+                                        // no q-gate). The plain kernel gives this layer ONE
+                                        // threadgroup — one thread per head, each walking the
+                                        // whole KV serially — so a 3k-token context costs
+                                        // millions of dependent iterations on a single GPU
+                                        // core. Here every (head, KV chunk) is its own thread
+                                        // and a combine pass merges the partials.
+                                        let splitCurLen = StandardGqaSplitK.curLen(seqLen)
+                                        let splitChunks: UInt32 = StandardGqaSplitK.chunkCount(splitCurLen)
+                                        let splitChunkSize: UInt32 = (splitCurLen + splitChunks - 1) / splitChunks
+                                        var splitSeqLen = seqLen
+                                        var splitNQ = nQ
+                                        var splitNKv = nKv
+                                        var splitHD = hD
+                                        var splitChunk = splitChunkSize
+                                        var splitChunkCount = splitChunks
+                                        layerEnc1.setComputePipelineState(stdSplitPipe)
+                                        layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                        layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                        layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                        layerEnc1.setBuffer(attnPartialMBuffer, offset: 0, index: 3)
+                                        layerEnc1.setBuffer(attnPartialLBuffer, offset: 0, index: 4)
+                                        layerEnc1.setBuffer(attnPartialAccBuffer, offset: 0, index: 5)
+                                        layerEnc1.setBytes(&splitSeqLen, length: MemoryLayout<UInt32>.stride, index: 6)
+                                        layerEnc1.setBytes(&splitNQ, length: MemoryLayout<UInt32>.stride, index: 7)
+                                        layerEnc1.setBytes(&splitNKv, length: MemoryLayout<UInt32>.stride, index: 8)
+                                        layerEnc1.setBytes(&splitHD, length: MemoryLayout<UInt32>.stride, index: 9)
+                                        layerEnc1.setBytes(&splitChunk, length: MemoryLayout<UInt32>.stride, index: 10)
+                                        // The partials are addressed two different ways and
+                                        // the two MUST agree: the chunk kernel writes
+                                        // `qHeadIdx * gridDim.y + chunkIdx`, while the
+                                        // combine reads `qHeadIdx * numChunks + c` from the
+                                        // constant it is handed. Both are `splitChunks`, one
+                                        // as this dispatch's grid height and one as
+                                        // `splitChunkCount` below. Change one, change both.
+                                        layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: Int(splitChunks), depth: 1), threadsPerThreadgroup: MTLSize(width: StandardGqaSplitK.lanes, height: 1, depth: 1))
+                                        layerEnc1.memoryBarrier(scope: .buffers)
+
+                                        layerEnc1.setComputePipelineState(stdSplitCombine)
+                                        layerEnc1.setBuffer(attnPartialMBuffer, offset: 0, index: 0)
+                                        layerEnc1.setBuffer(attnPartialLBuffer, offset: 0, index: 1)
+                                        layerEnc1.setBuffer(attnPartialAccBuffer, offset: 0, index: 2)
+                                        layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 3)
+                                        layerEnc1.setBytes(&splitChunkCount, length: MemoryLayout<UInt32>.stride, index: 4)
+                                        layerEnc1.setBytes(&splitNQ, length: MemoryLayout<UInt32>.stride, index: 5)
+                                        layerEnc1.setBytes(&splitHD, length: MemoryLayout<UInt32>.stride, index: 6)
+                                        layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: StandardGqaSplitK.lanes, height: 1, depth: 1))
                                     } else if isStandardGqa, let gqaStdPipe = gqaStandardF16Pipeline ?? gqaStandardPipeline {
                                         layerEnc1.setComputePipelineState(gqaStdPipe)
                                         layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
@@ -3929,6 +4160,51 @@ if layer.attnGateProjTensor != nil,
                                             layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 10)
                                             layerEnc1.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 11)
                                             layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), headGatePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                        } else if isStandardGqa,
+                                                  headDim == StandardGqaSplitK.headDim,
+                                                  let stdSplitPipe = gqaStandardFP8ChunkedPipeline,
+                                                  let stdSplitCombine = gqaStandardChunkedCombinePipeline,
+                                                  StandardGqaSplitK.curLen(seqLen) > StandardGqaSplitK.minimumContext {
+                                            // Split-K standard GQA over an FP8 KV cache: same
+                                            // arithmetic as `gqa_attention_decode_standard_fp8`
+                                            // (per-position K/V scales unchanged), but every
+                                            // (head, KV chunk) gets its own thread instead of the
+                                            // whole layer sharing 56 of them.
+                                            let splitCurLen = StandardGqaSplitK.curLen(seqLen)
+                                            let splitChunks: UInt32 = StandardGqaSplitK.chunkCount(splitCurLen)
+                                            let splitChunkSize: UInt32 = (splitCurLen + splitChunks - 1) / splitChunks
+                                            var splitSeqLen = seqLen
+                                            var splitNQ = nQ
+                                            var splitNKv = nKv
+                                            var splitHD = hD
+                                            var splitChunk = splitChunkSize
+                                            var splitChunkCount = splitChunks
+                                            layerEnc1.setComputePipelineState(stdSplitPipe)
+                                            layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
+                                            layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                            layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                            layerEnc1.setBuffer(kScale, offset: scaleByteOffset, index: 3)
+                                            layerEnc1.setBuffer(vScale, offset: scaleByteOffset, index: 4)
+                                            layerEnc1.setBuffer(attnPartialMBuffer, offset: 0, index: 5)
+                                            layerEnc1.setBuffer(attnPartialLBuffer, offset: 0, index: 6)
+                                            layerEnc1.setBuffer(attnPartialAccBuffer, offset: 0, index: 7)
+                                            layerEnc1.setBytes(&splitSeqLen, length: MemoryLayout<UInt32>.stride, index: 8)
+                                            layerEnc1.setBytes(&splitNQ, length: MemoryLayout<UInt32>.stride, index: 9)
+                                            layerEnc1.setBytes(&splitNKv, length: MemoryLayout<UInt32>.stride, index: 10)
+                                            layerEnc1.setBytes(&splitHD, length: MemoryLayout<UInt32>.stride, index: 11)
+                                            layerEnc1.setBytes(&splitChunk, length: MemoryLayout<UInt32>.stride, index: 12)
+                                            layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: Int(splitChunks), depth: 1), threadsPerThreadgroup: MTLSize(width: StandardGqaSplitK.lanes, height: 1, depth: 1))
+                                            layerEnc1.memoryBarrier(scope: .buffers)
+
+                                            layerEnc1.setComputePipelineState(stdSplitCombine)
+                                            layerEnc1.setBuffer(attnPartialMBuffer, offset: 0, index: 0)
+                                            layerEnc1.setBuffer(attnPartialLBuffer, offset: 0, index: 1)
+                                            layerEnc1.setBuffer(attnPartialAccBuffer, offset: 0, index: 2)
+                                            layerEnc1.setBuffer(attnCtxBuffer, offset: 0, index: 3)
+                                            layerEnc1.setBytes(&splitChunkCount, length: MemoryLayout<UInt32>.stride, index: 4)
+                                            layerEnc1.setBytes(&splitNQ, length: MemoryLayout<UInt32>.stride, index: 5)
+                                            layerEnc1.setBytes(&splitHD, length: MemoryLayout<UInt32>.stride, index: 6)
+                                            layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: StandardGqaSplitK.lanes, height: 1, depth: 1))
                                         } else if isStandardGqa, let gqaStdPipe = gqaStandardFP8Pipeline {
                                             layerEnc1.setComputePipelineState(gqaStdPipe)
                                             layerEnc1.setBuffer(qGateBuffer, offset: 0, index: 0)
@@ -5880,6 +6156,12 @@ if layer.attnGateProjTensor != nil,
                 dispatchLinear(enc: finalEnc, weight: lmHeadTensor, scale: lmHeadScale, bias: lmHeadBias, inBuf: xFinalBuffer, outBuf: logitsBuffer, inDim: hiddenDim, outDim: vocabSize)
 
                 finalEnc.endEncoding()
+                // Everything above runs on the generation thread: per-layer
+                // bookkeeping plus ~800 encoder calls for a 52-layer model.
+                // Everything below is the GPU. A token bound by the first reads
+                // exactly like a token bound by the second once they are summed
+                // into `Other`, which is why the DIAG line splits them.
+                let tEncodeDone = CFAbsoluteTimeGetCurrent()
                 activeCmd.commit()
                 if wait {
                     activeCmd.waitUntilCompleted()
@@ -5890,10 +6172,13 @@ if layer.attnGateProjTensor != nil,
                 }
 
                 if computeLogits {
-                    let tTokenElapsed = (CFAbsoluteTimeGetCurrent() - tTokenStart) * 1000.0
+                    let tTokenEnd = CFAbsoluteTimeGetCurrent()
+                    let tTokenElapsed = (tTokenEnd - tTokenStart) * 1000.0
+                    let diagEncodeMs = (tEncodeDone - tTokenStart) * 1000.0
+                    let diagGpuMs = (tTokenEnd - tEncodeDone) * 1000.0
                     diagOtherMs = tTokenElapsed - diagRouterGpuMs - diagIoMs - diagMoeGpuMs
                     let hitStr = diagPrefetchTotal > 0 ? " | Prefetch \(diagPrefetchHits)/\(diagPrefetchTotal) (\(String(format: "%.0f", Double(diagPrefetchHits) / Double(max(diagPrefetchTotal, 1)) * 100.0))%)" : ""
-                    print("[DIAG] Token \(step) total=\(String(format: "%.1f", tTokenElapsed))ms | RouterGPU=\(String(format: "%.1f", diagRouterGpuMs))ms | IO=\(String(format: "%.1f", diagIoMs))ms | MoEGPU=\(String(format: "%.1f", diagMoeGpuMs))ms | Other=\(String(format: "%.1f", diagOtherMs))ms\(hitStr)")
+                    print("[DIAG] Token \(step) total=\(String(format: "%.1f", tTokenElapsed))ms | enc=\(String(format: "%.1f", diagEncodeMs))ms | gpu=\(String(format: "%.1f", diagGpuMs))ms | RouterGPU=\(String(format: "%.1f", diagRouterGpuMs))ms | IO=\(String(format: "%.1f", diagIoMs))ms | MoEGPU=\(String(format: "%.1f", diagMoeGpuMs))ms | Other=\(String(format: "%.1f", diagOtherMs))ms\(hitStr)")
                 }
 
                 return true
@@ -6173,7 +6458,7 @@ if layer.attnGateProjTensor != nil,
 
                 for loopIdx in 0..<totalLoops {
                     for l in 0..<actualLayers {
-                        if Task.isCancelled { return false }
+                        if engineSelf.forwardWorkShouldStop(myGenerationId) { return false }
                         let layer = cachedLayers[l]
                         let intermediateDim = layer.intermediateDim
 
@@ -7106,6 +7391,31 @@ if layer.attnGateProjTensor != nil,
                                             layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 8)
                                             layerEnc1.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 9)
                                             layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: sliceRows, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), headGatePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                        } else if isStandardGqa,
+                                                  UsesTiledPrefillAttention.isEnabled,
+                                                  !layer.isSlidingAttention,
+                                                  headDim == StandardGqaSplitK.headDim,
+                                                  let tiledPipe = gqaStandardPrefillTiledF16Pipeline {
+                                            // SIMD-tiled standard-GQA attention: a 32-lane
+                                            // threadgroup per (head, row) instead of one thread,
+                                            // so a row's dot product and accumulator are split
+                                            // across lanes. See `UsesTiledPrefillAttention`.
+                                            // A SLIDING layer is excluded because this kernel
+                                            // takes no window parameter. Its non-tiled fallback
+                                            // below (`gqa_attention_decode_standard_*`) takes no
+                                            // window either, so the exclusion keeps those layers
+                                            // on the arithmetic they already had; it does not
+                                            // preserve a mask the fallback would have applied.
+                                            layerEnc1.setComputePipelineState(tiledPipe)
+                                            layerEnc1.setBuffer(qGateBuffer_all, offset: qOff, index: 0)
+                                            layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                            layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                            layerEnc1.setBuffer(attnCtxBuffer_all, offset: ctxOff, index: 3)
+                                            layerEnc1.setBytes(&sliceSeq, length: MemoryLayout<UInt32>.stride, index: 4)
+                                            layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 5)
+                                            layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 6)
+                                            layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 7)
+                                            layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: sliceRows, depth: 1), threadsPerThreadgroup: MTLSize(width: StandardGqaSplitK.lanes, height: 1, depth: 1))
                                         } else if isStandardGqa, let gqaStdPipe = gqaStandardF16Pipeline ?? gqaStandardPipeline {
                                             layerEnc1.setComputePipelineState(gqaStdPipe)
                                             layerEnc1.setBuffer(qGateBuffer_all, offset: qOff, index: 0)
@@ -7187,6 +7497,29 @@ if layer.attnGateProjTensor != nil,
                                                 layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 10)
                                                 layerEnc1.setBytes(&windowSize, length: MemoryLayout<UInt32>.stride, index: 11)
                                                 layerEnc1.dispatchThreads(MTLSize(width: Int(numHeads), height: sliceRows, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numHeads), headGatePipe.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+                                            } else if isStandardGqa,
+                                                      UsesTiledPrefillAttention.isEnabled,
+                                                      !layer.isSlidingAttention,
+                                                      headDim == StandardGqaSplitK.headDim,
+                                                      let tiledPipe = gqaStandardPrefillTiledFP8Pipeline {
+                                                // SIMD-tiled standard-GQA attention over an FP8 KV
+                                                // cache: a 32-lane threadgroup per (head, row), the
+                                                // head's dot product split across lanes. See
+                                                // `UsesTiledPrefillAttention`; sliding layers are
+                                                // excluded here for the same reason as the F16 form
+                                                // (neither kernel applies a window).
+                                                layerEnc1.setComputePipelineState(tiledPipe)
+                                                layerEnc1.setBuffer(qGateBuffer_all, offset: qOff, index: 0)
+                                                layerEnc1.setBuffer(kCache, offset: layerByteOffset, index: 1)
+                                                layerEnc1.setBuffer(vCache, offset: layerByteOffset, index: 2)
+                                                layerEnc1.setBuffer(kScale, offset: scaleByteOffset, index: 3)
+                                                layerEnc1.setBuffer(vScale, offset: scaleByteOffset, index: 4)
+                                                layerEnc1.setBuffer(attnCtxBuffer_all, offset: ctxOff, index: 5)
+                                                layerEnc1.setBytes(&sliceSeq, length: MemoryLayout<UInt32>.stride, index: 6)
+                                                layerEnc1.setBytes(&nQ, length: MemoryLayout<UInt32>.stride, index: 7)
+                                                layerEnc1.setBytes(&nKv, length: MemoryLayout<UInt32>.stride, index: 8)
+                                                layerEnc1.setBytes(&hD, length: MemoryLayout<UInt32>.stride, index: 9)
+                                                layerEnc1.dispatchThreadgroups(MTLSize(width: Int(numHeads), height: sliceRows, depth: 1), threadsPerThreadgroup: MTLSize(width: StandardGqaSplitK.lanes, height: 1, depth: 1))
                                             } else if isStandardGqa, let gqaStdPipe = gqaStandardFP8Pipeline {
                                                 layerEnc1.setComputePipelineState(gqaStdPipe)
                                                 layerEnc1.setBuffer(qGateBuffer_all, offset: qOff, index: 0)
@@ -7606,6 +7939,78 @@ if layer.attnGateProjTensor != nil,
                                     layerEnc1.setBuffer(denseActiveTokensBuffer, offset: 0, index: 7)
                                     layerEnc1.setBuffer(denseActiveWeightsBuffer, offset: 0, index: 8)
                                     layerEnc1.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: P, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                    layerEnc1.memoryBarrier(scope: .buffers)
+                                } else if isQuantizedAffine,
+                                          let gateSQ = gateS, let upSQ = upS, let downSQ = downS,
+                                          let gateBQ = layer.denseGateBias,
+                                          let upBQ = layer.denseUpBias,
+                                          let downBQ = layer.denseDownBias,
+                                          let gateSQRaw = buffers[gateSQ.shardIndex],
+                                          let upSQRaw = buffers[upSQ.shardIndex],
+                                          let downSQRaw = buffers[downSQ.shardIndex],
+                                          let gateBQRaw = buffers[gateBQ.shardIndex],
+                                          let upBQRaw = buffers[upBQ.shardIndex],
+                                          let downBQRaw = buffers[downBQ.shardIndex],
+                                          let gateUpBatched = q8GateUpBatchedPipeline,
+                                          let downBatched = q8DownBatchedPipeline,
+                                          (gateW.offsetEnd - gateW.offsetStart) >= UInt64(intermediateDim) * UInt64(hiddenDim),
+                                          (upW.offsetEnd - upW.offsetStart) >= UInt64(intermediateDim) * UInt64(hiddenDim),
+                                          (downW.offsetEnd - downW.offsetStart) >= UInt64(hiddenDim) * UInt64(intermediateDim),
+                                          hiddenDim % 64 == 0, intermediateDim % 64 == 0 {
+                                    // 8-bit affine (Q8) dense MLP across the whole chunk. The
+                                    // per-token fallback below issues 2 x P launches per layer
+                                    // and re-reads every weight row once per prompt token, which
+                                    // for a 33B dense model is the prefill floor. One
+                                    // threadgroup per (output row, 16-token block) reuses the
+                                    // row it loaded for all 16 tokens of the block.
+                                    var gSQOff = gateSQ.offsetStart
+                                    var uSQOff = upSQ.offsetStart
+                                    var dSQOff = downSQ.offsetStart
+                                    var gBQOff = gateBQ.offsetStart
+                                    var uBQOff = upBQ.offsetStart
+                                    var dBQOff = downBQ.offsetStart
+                                    var q8Group: UInt32 = 64
+                                    var q8Batch = UInt32(P)
+                                    var q8Pk: Float = 1.0
+                                    let q8Blocks = (P + 15) / 16
+
+                                    layerEnc1.setComputePipelineState(gateUpBatched)
+                                    layerEnc1.setBuffer(gRaw, offset: 0, index: 0)
+                                    layerEnc1.setBuffer(gateSQRaw, offset: 0, index: 1)
+                                    layerEnc1.setBuffer(gateBQRaw, offset: 0, index: 2)
+                                    layerEnc1.setBuffer(uRaw, offset: 0, index: 3)
+                                    layerEnc1.setBuffer(upSQRaw, offset: 0, index: 4)
+                                    layerEnc1.setBuffer(upBQRaw, offset: 0, index: 5)
+                                    layerEnc1.setBuffer(xNorm2Buffer_all, offset: 0, index: 6)
+                                    layerEnc1.setBuffer(interBuffer_all, offset: 0, index: 7)
+                                    layerEnc1.setBytes(&gWOff, length: 8, index: 8)
+                                    layerEnc1.setBytes(&gSQOff, length: 8, index: 9)
+                                    layerEnc1.setBytes(&gBQOff, length: 8, index: 10)
+                                    layerEnc1.setBytes(&uWOff, length: 8, index: 11)
+                                    layerEnc1.setBytes(&uSQOff, length: 8, index: 12)
+                                    layerEnc1.setBytes(&uBQOff, length: 8, index: 13)
+                                    layerEnc1.setBytes(&hDimVal, length: 4, index: 14)
+                                    layerEnc1.setBytes(&interDimVal, length: 4, index: 15)
+                                    layerEnc1.setBytes(&q8Group, length: 4, index: 16)
+                                    layerEnc1.setBytes(&q8Batch, length: 4, index: 17)
+                                    layerEnc1.dispatchThreadgroups(MTLSize(width: Int(intermediateDim), height: q8Blocks, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+                                    layerEnc1.memoryBarrier(scope: .buffers)
+
+                                    layerEnc1.setComputePipelineState(downBatched)
+                                    layerEnc1.setBuffer(dRaw, offset: 0, index: 0)
+                                    layerEnc1.setBuffer(downSQRaw, offset: 0, index: 1)
+                                    layerEnc1.setBuffer(downBQRaw, offset: 0, index: 2)
+                                    layerEnc1.setBuffer(interBuffer_all, offset: 0, index: 3)
+                                    layerEnc1.setBuffer(hMlpBuffer_all, offset: 0, index: 4)
+                                    layerEnc1.setBytes(&dWOff, length: 8, index: 5)
+                                    layerEnc1.setBytes(&dSQOff, length: 8, index: 6)
+                                    layerEnc1.setBytes(&dBQOff, length: 8, index: 7)
+                                    layerEnc1.setBytes(&interDimVal, length: 4, index: 8)
+                                    layerEnc1.setBytes(&hDimVal, length: 4, index: 9)
+                                    layerEnc1.setBytes(&q8Group, length: 4, index: 10)
+                                    layerEnc1.setBytes(&q8Pk, length: 4, index: 11)
+                                    layerEnc1.setBytes(&q8Batch, length: 4, index: 12)
+                                    layerEnc1.dispatchThreadgroups(MTLSize(width: Int(hiddenDim), height: q8Blocks, depth: 1), threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
                                     layerEnc1.memoryBarrier(scope: .buffers)
                                 } else {
                                     for p in 0..<P {
@@ -8639,6 +9044,7 @@ if layer.attnGateProjTensor != nil,
                 jetSpecEnabled: jetSpecEnabled,
                 hasLinearRecurrence: hasLinearRecurrence,
                 isSparkModel: modelConfig?.isSparkModel == true,
+                hasRoutedExperts: numExperts > 0,
                 kvPrecision: KVCacheManager.shared.activePrecision
             )
             let effectiveInterDim = modelConfig?.intermediateSize ?? Int(cachedLayers.first?.intermediateDim ?? 14336)
@@ -8782,7 +9188,7 @@ if layer.attnGateProjTensor != nil,
                 // 3. Forward Pass through Backbone Layers
                 for loopIdx in 0..<totalLoops {
                     for l in 0..<actualLayers {
-                        if Task.isCancelled { return false }
+                        if engineSelf.forwardWorkShouldStop(myGenerationId) { return false }
                         let layer = cachedLayers[l]
                         // ================= Gemma 4 hybrid-attention MoE decoder layer =================
                         // Verifies all N tree nodes in one pass. Gemma differs from the generic tree
@@ -10615,8 +11021,10 @@ if layer.attnGateProjTensor != nil,
 
                         for (idx, pTok) in prefillTokens.enumerated() {
                             if Task.isCancelled { prefillSuccess = false; break }
-                            let stepOk = autoreleasepool {
-                                runTokenForward(tokenId: pTok, step: UInt32(startPos + idx), computeLogits: false)
+                            let stepOk = runOnLargeStack {
+                                autoreleasepool {
+                                    runTokenForward(tokenId: pTok, step: UInt32(startPos + idx), computeLogits: false)
+                                }
                             }
                             if !stepOk {
                                 if Task.isCancelled {
@@ -10642,22 +11050,37 @@ if layer.attnGateProjTensor != nil,
                             }
                         }
                         ok = prefillSuccess
-                    } else if modelConfig?.isGemma4Model == true {
-                        // Chunked batched prefill: each call's batch must fit the
-                        // sliding ring's slack (window + chunk) so a store never
-                        // overwrites a row a later row in the same pass still
-                        // reads, and the transient per-call buffers stay bounded
-                        // instead of scaling with the whole delta prompt.
+                    } else {
+                        // Batched prefill, capped per call. Two reasons, and the
+                        // second one is not Gemma's: the per-call transient
+                        // buffers (attention/MLP scratch) scale with the CHUNK's
+                        // token count rather than with the cache, and Gemma's
+                        // sliding ring only has `window + chunk` slack so a store
+                        // must never overwrite a row a later row in the same pass
+                        // still reads. A prompt shorter than the cap runs exactly
+                        // one chunk, i.e. the single call this used to make.
+                        let chunkCap = prefillChunkCap(for: modelConfig)
                         var chunkedOk = true
                         var chunkStart = 0
                         var chunkIndex = 0
-                        let totalPrefillChunks = max(1, (prefillTokens.count + gemmaPrefillChunkCap - 1) / gemmaPrefillChunkCap)
+                        let totalPrefillChunks = max(1, (prefillTokens.count + chunkCap - 1) / chunkCap)
                         while chunkStart < prefillTokens.count {
                             if Task.isCancelled { chunkedOk = false; break }
-                            let chunkEnd = min(chunkStart + gemmaPrefillChunkCap, prefillTokens.count)
+                            let chunkEnd = min(chunkStart + chunkCap, prefillTokens.count)
                             let chunk = Array(prefillTokens[chunkStart..<chunkEnd])
-                        if !runLayerWisePrefill(promptTokens: chunk, startPos: UInt32(startPos) + UInt32(chunkStart), chunkIndex: chunkIndex, chunkCount: totalPrefillChunks, prefillProgress: { s, sp, rs in emit(.prefillProgress(status: s, speed: sp, rssGB: rs)) }) {
-                                print("❌ [PREFILL] Gemma chunked prefill failed at tokens \(chunkStart)..<\(chunkEnd) — see prior diagnostics for the failing layer/buffer.")
+                            let chunkOk = runOnLargeStack {
+                                runLayerWisePrefill(promptTokens: chunk, startPos: UInt32(startPos) + UInt32(chunkStart), chunkIndex: chunkIndex, chunkCount: totalPrefillChunks, prefillProgress: { s, sp, rs in emit(.prefillProgress(status: s, speed: sp, rssGB: rs)) })
+                            }
+                            if !chunkOk {
+                                // The chunk returns false for a cancelled turn as well as for
+                                // a real forward-pass failure, and since the layer loops now
+                                // run on the large-stack thread they can see Stop. Name which
+                                // one it was so a user stop does not read as a broken model.
+                                if Task.isCancelled {
+                                    print("🛑 [PREFILL] Chunk \(chunkIndex + 1)/\(totalPrefillChunks) stopped by user at tokens \(chunkStart)..<\(chunkEnd).")
+                                } else {
+                                    print("❌ [PREFILL] Chunked prefill failed at tokens \(chunkStart)..<\(chunkEnd). See prior diagnostics for the failing layer/buffer.")
+                                }
                                 chunkedOk = false
                                 break
                             }
@@ -10665,8 +11088,6 @@ if layer.attnGateProjTensor != nil,
                             chunkIndex += 1
                         }
                         ok = chunkedOk
-                    } else {
-                    ok = runLayerWisePrefill(promptTokens: prefillTokens, startPos: UInt32(startPos), prefillProgress: { s, sp, rs in emit(.prefillProgress(status: s, speed: sp, rssGB: rs)) })
                     }
                     if !ok {
                         PrefillTransientPool.shared.drain()
@@ -10709,8 +11130,10 @@ if layer.attnGateProjTensor != nil,
                     jetSpecTotalDraftProposed += 1
                     jetSpecMeanTau = Double(jetSpecTotalDraftAccepted) / Double(max(jetSpecTotalDraftProposed, 1))
                 } else {
-                    let ok = autoreleasepool {
-                        runTokenForward(tokenId: currentTokenId, step: currentStep, computeLogits: true, wait: true)
+                    let ok = runOnLargeStack {
+                        autoreleasepool {
+                            runTokenForward(tokenId: currentTokenId, step: currentStep, computeLogits: true, wait: true)
+                        }
                     }
                     if !ok {
                         let fwdCancelled = Task.isCancelled
@@ -10763,6 +11186,18 @@ if layer.attnGateProjTensor != nil,
                         let tokText = (try? tokenizer.decode(ids: [nextToken])) ?? ""
                         print("[Autoregressive] Step \(tokensGenerated): nextToken=\(nextToken) ('\(tokText)') logits[nextToken]=\(logitsPtr[Int(nextToken)])")
                     }
+                    // `dynamoe_dump_logits` writes every decode step's full logit
+                    // vector, so a divergence from an independent reference can be
+                    // located by position instead of argued about. Off in production.
+                    if UserDefaults.standard.bool(forKey: "dynamoe_dump_logits") {
+                        dumpDecodeLogits(
+                            logitsPtr,
+                            vocabSize: Int(vocabSize),
+                            step: Int(currentStep),
+                            chosen: nextToken,
+                            context: contextTokens
+                        )
+                    }
                     acceptedBatch = [nextToken]
                 }
 
@@ -10774,7 +11209,13 @@ if layer.attnGateProjTensor != nil,
                     let isLingEos = (modelConfig?.isLingModel == true) && (nextToken == 156895 || nextToken == 156892)
                     let isSparkEos = (modelConfig?.isSparkModel == true) && (nextToken == 1 || nextToken == 2 || nextToken == 7)
                     let isGemma4Eos = (modelConfig?.isGemma4Model == true) && (nextToken == 1 || nextToken == 106 || nextToken == 50)
-                    if nextToken == eosTokenId || nextToken == 248044 || nextToken == 248046 || nextToken == 166101 || nextToken == 166102 || isLingEos || isSparkEos || isGemma4Eos {
+                    // Nanbeige 4.3's `<|im_end|>` (166101) is the checkpoint's own
+                    // `eos_token_id` and `<|endoftext|>` (166102) its extra special
+                    // token. Both ids live INSIDE a 166,912-row vocabulary, so they
+                    // are gated on the family instead of matching on every model.
+                    let isNanbeigeEos = (modelConfig?.isNanbeige43Model == true) && (nextToken == 166101 || nextToken == 166102)
+                    let declaredEos = modelConfig?.effectiveEosTokenIds ?? [Int(eosTokenId)]
+                    if nextToken == eosTokenId || declaredEos.contains(Int(nextToken)) || nextToken == 248044 || nextToken == 248046 || isLingEos || isSparkEos || isGemma4Eos || isNanbeigeEos {
                         shouldBreak = true
                         breakReasonText = "eos-token(\(nextToken))"
                         break
@@ -10988,8 +11429,10 @@ if layer.attnGateProjTensor != nil,
                 var backfillFailed = false
                 while backfillPos < totalContextTokens {
                     if Task.isCancelled { break }
-                    let ok = autoreleasepool {
-                        runTokenForward(tokenId: contextTokens[backfillPos], step: UInt32(backfillPos), computeLogits: false, wait: true)
+                    let ok = runOnLargeStack {
+                        autoreleasepool {
+                            runTokenForward(tokenId: contextTokens[backfillPos], step: UInt32(backfillPos), computeLogits: false, wait: true)
+                        }
                     }
                     if !ok {
                         backfillFailed = true
@@ -11110,6 +11553,7 @@ if layer.attnGateProjTensor != nil,
     public func cancelActiveTurn() {
         stateLock.lock()
         currentGenerationTask?.cancel()
+        activeTurnCancelled = true
         stateLock.unlock()
     }
 
@@ -11160,6 +11604,21 @@ if layer.attnGateProjTensor != nil,
         stateLock.lock()
         defer { stateLock.unlock() }
         return id == currentGenerationId && currentGenerationTask != nil
+    }
+
+    /// True when turn `id` must stop at its next layer boundary.
+    ///
+    /// This is what the layer loops inside `runTokenForward`,
+    /// `runLayerWisePrefill` and `runJetSpecTreeForward` ask instead of
+    /// `Task.isCancelled`: those bodies run on `runOnLargeStack`'s plain `Thread`,
+    /// which carries no task context, so `Task.isCancelled` is always false there
+    /// and Stop could not interrupt a single chunk. It folds the explicit Stop flag
+    /// together with supersession (a newer turn minted a different id), which is
+    /// exactly what the scratch checks saw when they ran on the task itself.
+    fileprivate func forwardWorkShouldStop(_ id: UInt64) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return activeTurnCancelled || id != currentGenerationId
     }
 
     /// Installs the loaded model snapshot; called from model load/switch.

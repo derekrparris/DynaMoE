@@ -2862,14 +2862,15 @@ struct ContentView: View {
                     // its record, in the dialect the model actually emits. The raw
                     // call survives in `content` for every turn this app produced,
                     // so this only fires for a turn that came from somewhere else.
+                    // Only the V4.1 dialect reaches this branch (`if isDeepSeekV41`
+                    // above), so the call is always DSML: a Nanbeige test here
+                    // could never be true, and the Nanbeige history rebuild lives
+                    // in the ChatML branch with the other ChatML families.
                     if let calls = msg.toolCalls, !calls.isEmpty,
                        !cleanMsg.contains(DeepSeekV41ToolDialect.dsmlTag),
                        !cleanMsg.contains("<tool_call") {
                         for call in calls {
-                            body += "\n" + DeepSeekV41ToolDialect.callBlock(
-                                name: call.name,
-                                arguments: call.arguments
-                            )
+                            body += "\n" + DeepSeekV41ToolDialect.callBlock(name: call.name, arguments: call.arguments)
                         }
                     }
                     turns.append(.init(role: .assistant, text: body))
@@ -3144,7 +3145,17 @@ struct ContentView: View {
                     // it (mirrors the Spark/Ling branches); otherwise the raw call is
                     // already in `cleanMsg` and rebuilding would print it twice.
                     if let calls = msg.toolCalls, !calls.isEmpty, !cleanMsg.contains("tool_call>") {
+                        let isNanbeige = (modelConfig?.isNanbeige43Model == true)
                         for call in calls {
+                            if isNanbeige {
+                                // The family's own formatter owns the tag literals
+                                // (AGENTS.md: never retype tag-bearing strings).
+                                assistantBody += "\n" + ChatPromptFormatter.nanbeigeToolCallBlock(
+                                    name: call.name,
+                                    arguments: call.arguments
+                                ) + "\n"
+                                continue
+                            }
                             assistantBody += "<tool_call>\n<function=\(call.name)>\n"
                             for (k, v) in call.arguments {
                                 assistantBody += "<parameter=\(k)>\n\(v)\n</parameter>\n"
@@ -3162,7 +3173,17 @@ struct ContentView: View {
                             }
                         }
                         if !outputs.isEmpty {
-                            promptString += AgentHarness.shared.formatToolResponseTurn(responses: outputs, includeThinkSuffix: false)
+                            // No assistant prefix from this turn: the loop opens
+                            // one per assistant message above, and asking for a
+                            // second here put `<|im_start|>assistant\n` in the
+                            // rebuilt prompt twice, so a post-tool turn could
+                            // never extend the prefix the live continuation had
+                            // pinned.
+                            promptString += AgentHarness.shared.formatToolResponseTurn(
+                                responses: outputs,
+                                includeThinkSuffix: false,
+                                includeAssistantPrefix: false
+                            )
                         }
                     }
                 }
@@ -7401,9 +7422,6 @@ struct ContentView: View {
             // would otherwise pread the old model's packed expert files.
             ExpertIOThreadPool.shared.closeAllLayerFDs()
             do {
-                let loadedEngine = try DynaMoeEngine(filePath: filePath)
-                var loadedSummary = try loadedEngine.getSummary()
-                
                 guard let device = MTLCreateSystemDefaultDevice() else {
                     await MainActor.run {
                         guard self.modelLoadToken == token else { return }
@@ -7418,6 +7436,20 @@ struct ContentView: View {
                 var isDir: ObjCBool = false
                 FileManager.default.fileExists(atPath: filePath, isDirectory: &isDir)
                 let dirUrl = isDir.boolValue ? fileUrl : fileUrl.deletingLastPathComponent()
+
+                // A dense repack is one contiguous blob, and its weights are only
+                // reachable if they can be mapped as MTLBuffers on THIS GPU. The
+                // device has to be known before the engine is built for that check
+                // to mean anything: the engine prefers the repack, and discovering
+                // the limit afterwards leaves a model that "loads" and then throws
+                // "weight tensor not found" the first time a packed projection runs.
+                if DenseRepacker.setAsideRepackIfUnusable(dir: dirUrl, maxBufferLength: UInt64(device.maxBufferLength)) {
+                    print("⚠️ [Dense] the quantized blob cannot be mapped on this GPU. Falling back to the checkpoint's safetensors shards.")
+                }
+
+                let loadedEngine = try DynaMoeEngine(filePath: filePath)
+                var loadedSummary = try loadedEngine.getSummary()
+
                 let cfg = ModelConfig.load(from: dirUrl)
                 let arch = cfg?.resolveArchitectureType(summary: loadedSummary) ?? (loadedSummary.maxExpertId > 0 ? .hybridSsmMoe : .denseTransformer)
 
@@ -7456,8 +7488,26 @@ struct ContentView: View {
                         buffers[shard.index] = buffer
                         mappedGB += Double(length) / (1024.0 * 1024.0 * 1024.0)
                     } else {
-                        print("⚠️ [Metal Warning] Failed to map shard #\(shard.index) (\(shard.filename), \(String(format: "%.2f", Double(length) / 1073741824.0)) GB) as a zero-copy buffer — tensors in this segment will be unavailable.")
+                        print("⚠️ [Metal Warning] Failed to map shard #\(shard.index) (\(shard.filename), \(String(format: "%.2f", Double(length) / 1073741824.0)) GB) as a zero-copy buffer. Tensors in this segment will be unavailable.")
                     }
+                }
+
+                // A segment with no buffer leaves its tensors unreadable, and that
+                // only surfaces later as "weight tensor not found" inside whatever
+                // dispatch touches one first, with no mention of the segment. Say
+                // so here, where the shard is still known. Shards with no address
+                // are not attempted (the loop skips them the same way) so they are
+                // not counted.
+                let mappable = loadedSummary.shards.filter { $0.length > 0 && $0.baseAddress != 0 }
+                if buffers.count < mappable.count {
+                    let missing = mappable.filter { buffers[$0.index] == nil }.map { $0.filename }
+                    throw NSError(
+                        domain: "DynaMoE.ModelLoad",
+                        code: 2,
+                        userInfo: [NSLocalizedDescriptionKey:
+                            "\(missing.count) weight segment(s) could not be mapped on this GPU (\(missing.prefix(3).joined(separator: ", "))). "
+                                + "A zero-copy buffer is limited to \(String(format: "%.1f", Double(device.maxBufferLength) / 1073741824.0)) GB per segment."]
+                    )
                 }
 
                 // Hoisted so the guarded install below can exclude the pinned backbone

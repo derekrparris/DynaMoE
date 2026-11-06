@@ -597,6 +597,300 @@ fn try_load_flash_moe(search_path: &Path) -> Option<(Vec<ShardHandle>, Vec<Tenso
     None
 }
 
+/// The dense (non-MoE) repack manifest: one entry per logical tensor, each a
+/// byte range in `dense_weights.bin`. A quantized tensor is three entries (the
+/// packed weight, its per-group scales and its per-group biases), named
+/// `<name>`, `<name>.scale` and `<name>.bias`, because the Swift side resolves a
+/// projection's companions by name substring and its quantized path requires
+/// BOTH (a Q8 weight without a bias sibling silently takes the FP8 branch).
+#[derive(Deserialize, Debug)]
+struct DenseRepackJson {
+    #[serde(default)]
+    pub quantization: String,
+    #[serde(default)]
+    pub group_size: u32,
+    /// Length of the blob these offsets were written against.
+    ///
+    /// Bounds alone cannot say the manifest and the blob are the SAME pair: a Q4
+    /// blob and a Q8 blob of the same tensors both contain every one of each
+    /// other's offsets, so a stale manifest over a freshly written blob would
+    /// load at the wrong stride while still reporting its own quantization.
+    /// Absent in manifests written before the field existed, which are then
+    /// validated exactly as they were.
+    #[serde(default)]
+    pub blob_size: Option<u64>,
+    #[serde(default)]
+    pub tensors: Vec<DenseRepackTensorEntry>,
+}
+
+#[derive(Deserialize, Debug)]
+struct DenseRepackTensorEntry {
+    pub name: String,
+    pub dtype: String,
+    pub shape: Vec<u64>,
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// Whether a manifest `dtype` is an AFFINE-PACKED weight (as opposed to a tensor
+/// the repack copied verbatim). Mirrors `DenseRepacker.isPackedWeightDtype` on
+/// the Swift side: the two decide "is this a repack" between them, so they must
+/// agree on which rows are packed.
+fn is_packed_weight_dtype(dtype: &str) -> bool {
+    dtype.contains("Q4") || dtype.contains("Q8")
+}
+
+/// Loads a dense repack (`dense_weights.json` + `dense_weights.bin`) beside the
+/// snapshot, if one is present.
+///
+/// Failure is always a fallback to the safetensors index rather than an error: a
+/// truncated or half-written repack must never be traded for a model that
+/// "loads" and then reads offsets the file does not have. Between choosing the
+/// two, the checks are completeness (every entry inside the file), the format
+/// (group size 64, which is baked into the kernels, and a known quantization)
+/// and at least one tensor.
+fn try_load_dense_repack(search_path: &Path) -> Option<(Vec<ShardHandle>, Vec<TensorMetadata>)> {
+    let base_dir = if search_path.is_file() {
+        search_path.parent().unwrap_or(Path::new(""))
+    } else {
+        search_path
+    };
+
+    let mut candidate_dirs = vec![base_dir.to_path_buf()];
+    let snapshots_dir = base_dir.join("snapshots");
+    if snapshots_dir.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(&snapshots_dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    candidate_dirs.push(entry.path());
+                }
+            }
+        }
+    }
+
+    'dir: for dir in candidate_dirs {
+        let manifest_path = dir.join("dense_weights.json");
+        let weights_path = dir.join("dense_weights.bin");
+        if !manifest_path.is_file() || !weights_path.is_file() {
+            continue;
+        }
+        // Every per-directory failure continues rather than returning: a broken
+        // manifest in one candidate must not stop a valid repack in the next, which
+        // is the whole reason this function walks more than one directory.
+        let manifest = match std::fs::read_to_string(&manifest_path) {
+            Ok(text) => text,
+            Err(error) => {
+                eprintln!(
+                    "⚠️ [DenseRepack] skipping {}: cannot read the manifest ({})",
+                    manifest_path.display(),
+                    error
+                );
+                continue;
+            }
+        };
+        let manifest: DenseRepackJson = match serde_json::from_str(&manifest) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                eprintln!(
+                    "⚠️ [DenseRepack] skipping {}: the manifest does not parse ({})",
+                    manifest_path.display(),
+                    error
+                );
+                continue;
+            }
+        };
+        if manifest.tensors.is_empty() {
+            eprintln!(
+                "⚠️ [DenseRepack] skipping {}: the manifest lists no tensors",
+                manifest_path.display()
+            );
+            continue;
+        }
+        // The kernels hardcode group size 64; a manifest that says otherwise
+        // describes a layout this engine would read wrong.
+        if manifest.group_size != 0 && manifest.group_size != 64 {
+            eprintln!(
+                "⚠️ [DenseRepack] refusing {}: group_size {} is not 64",
+                manifest_path.display(),
+                manifest.group_size
+            );
+            continue;
+        }
+        if !manifest.quantization.is_empty()
+            && !matches!(manifest.quantization.as_str(), "bf16" | "q8" | "q4")
+        {
+            eprintln!(
+                "⚠️ [DenseRepack] refusing {}: unknown quantization {:?}",
+                manifest_path.display(),
+                manifest.quantization
+            );
+            continue;
+        }
+        // A packed tensor is unusable without BOTH companions: the Swift quantized
+        // path needs the scale and the bias, and a weight that reaches it without
+        // them is either read as E4M3 (wrong bytes) or skipped (stale output). The
+        // repacker always writes the trio, so an entry missing one came from a
+        // truncated or hand-edited manifest.
+        //
+        // Keyed on the ENTRY's dtype rather than on the manifest's `quantization`
+        // value, so a manifest whose label disagrees with its rows is still held
+        // to the rule (the label is what the Swift side reads for the model row).
+        {
+            let names: std::collections::HashSet<&str> =
+                manifest.tensors.iter().map(|entry| entry.name.as_str()).collect();
+            if let Some(orphan) = manifest.tensors.iter().find(|entry| {
+                is_packed_weight_dtype(&entry.dtype)
+                    && (!names.contains(format!("{}.scale", entry.name).as_str())
+                        || !names.contains(format!("{}.bias", entry.name).as_str()))
+            }) {
+                eprintln!(
+                    "⚠️ [DenseRepack] refusing {}: {} is packed {} with no scale/bias companion",
+                    manifest_path.display(),
+                    orphan.name,
+                    orphan.dtype
+                );
+                continue 'dir;
+            }
+        }
+
+        let file = match File::open(&weights_path) {
+            Ok(handle) => handle,
+            Err(error) => {
+                eprintln!(
+                    "⚠️ [DenseRepack] skipping {}: cannot open the blob ({})",
+                    weights_path.display(),
+                    error
+                );
+                continue;
+            }
+        };
+        let file_len = match file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                eprintln!(
+                    "⚠️ [DenseRepack] skipping {}: cannot stat the blob ({})",
+                    weights_path.display(),
+                    error
+                );
+                continue;
+            }
+        };
+        // The manifest records the blob it was written against, so a mismatch is
+        // a manifest describing a DIFFERENT blob: refuse rather than read every
+        // offset at a stride it was not computed for.
+        if let Some(recorded) = manifest.blob_size {
+            if recorded != file_len {
+                eprintln!(
+                    "⚠️ [DenseRepack] refusing {}: it describes a {} byte blob but {} bytes are on disk",
+                    manifest_path.display(),
+                    recorded,
+                    file_len
+                );
+                continue 'dir;
+            }
+        }
+        for entry in &manifest.tensors {
+            // Checked, because `offset + size` wraps in a release build and a
+            // wrapped range would pass the completeness test.
+            match entry.offset.checked_add(entry.size) {
+                Some(end) if end <= file_len => {}
+                Some(end) => {
+                    eprintln!(
+                        "⚠️ [DenseRepack] refusing {}: {} runs to {} past the {} byte blob",
+                        manifest_path.display(),
+                        entry.name,
+                        end,
+                        file_len
+                    );
+                    continue 'dir;
+                }
+                None => {
+                    eprintln!(
+                        "⚠️ [DenseRepack] refusing {}: {} has an overflowing byte range",
+                        manifest_path.display(),
+                        entry.name
+                    );
+                    continue 'dir;
+                }
+            }
+            // A packed tensor is read with VECTOR loads whose natural alignment
+            // is 4 bytes for the packed row and 16 for the input, and a row
+            // begins at `offset + row * inDim`. The repacker aligns every entry
+            // to 16 bytes and only packs a row width that divides into the
+            // kernels' 16-byte chunks, so a manifest that violates either was
+            // not written by this engine's repacker (or was hand-edited) and
+            // would read garbage rather than the checkpoint's bytes.
+            if is_packed_weight_dtype(&entry.dtype) {
+                if entry.offset % 16 != 0 {
+                    eprintln!(
+                        "⚠️ [DenseRepack] refusing {}: {} starts at {}, which is not 16-byte aligned",
+                        manifest_path.display(),
+                        entry.name,
+                        entry.offset
+                    );
+                    continue 'dir;
+                }
+                match entry.shape.as_slice() {
+                    [_, width] if *width > 0 && *width % 16 == 0 => {}
+                    _ => {
+                        eprintln!(
+                            "⚠️ [DenseRepack] refusing {}: {} has shape {:?}, whose row width the kernels cannot read as 16-byte chunks",
+                            manifest_path.display(),
+                            entry.name,
+                            entry.shape
+                        );
+                        continue 'dir;
+                    }
+                }
+            }
+        }
+        // `continue` rather than `?`: a blob this process cannot map says nothing
+        // about the next candidate directory, and returning here would abandon the
+        // whole search for the sake of one unusable repack. The caller falls back
+        // to the safetensors index, which is the honest answer for a blob that
+        // cannot be mapped.
+        let mmap = match unsafe { MmapOptions::new().map(&file) } {
+            Ok(mapped) => mapped,
+            Err(error) => {
+                eprintln!(
+                    "⚠️ [DenseRepack] skipping {}: cannot map the blob ({})",
+                    weights_path.display(),
+                    error
+                );
+                continue;
+            }
+        };
+
+        let mut tensor_list = Vec::with_capacity(manifest.tensors.len());
+        for entry in manifest.tensors {
+            let (category, layer_index, expert_id) = parse_layer_and_expert(&entry.name);
+            tensor_list.push(TensorMetadata {
+                name: entry.name,
+                shape_display: format!("{:?}", entry.shape),
+                dtype: entry.dtype,
+                size_mb: entry.size as f64 / (1024.0 * 1024.0),
+                shard_index: 0,
+                offset_start: entry.offset,
+                // Saturating rather than `+`: the range was already proved to fit
+                // in the file above, so this can only be the same value, but a
+                // release build traps on overflow and a manifest is project input.
+                offset_end: entry.offset.saturating_add(entry.size),
+                category,
+                layer_index,
+                expert_id,
+            });
+        }
+        tensor_list.sort_by(|a, b| a.name.cmp(&b.name));
+        let shards = vec![ShardHandle {
+            filename: "dense_weights.bin".to_string(),
+            mmap,
+        }];
+        return Some((shards, tensor_list));
+    }
+
+    None
+}
+
 #[derive(uniffi::Object)]
 pub struct DynaMoeEngine {
     shards: Vec<ShardHandle>,
@@ -612,6 +906,16 @@ impl DynaMoeEngine {
 
         // 0. Try FlashMoE Q4 Model Format
         if let Some((shards, tensors)) = try_load_flash_moe(&path).or_else(|| try_load_flash_moe(&resolved_target)) {
+            return Ok(Arc::new(Self {
+                shards,
+                custom_tensors: Some(tensors),
+            }));
+        }
+
+        // 0b. Try the DENSE repack (`dense_weights.bin` + `.json`). Same idea for
+        // a model with no routed experts, whose weights would otherwise be read
+        // at BF16 for every token.
+        if let Some((shards, tensors)) = try_load_dense_repack(&path).or_else(|| try_load_dense_repack(&resolved_target)) {
             return Ok(Arc::new(Self {
                 shards,
                 custom_tensors: Some(tensors),
@@ -2346,6 +2650,65 @@ mod tests {
         assert!(ids.contains(&130976), "<|Bot|> token id present");
         assert!(ids.contains(&130973), "<|User|> token id present");
         assert!(ids.contains(&130972), "<|System|> token id present");
+    }
+
+    /// Nanbeige 4.3: the chat template's own markers are single added tokens, and
+    /// the prompt it builds carries exactly ONE begin-of-sequence marker.
+    ///
+    /// The checkpoint declares `add_bos_token: true` with `bos_token` =
+    /// `<|im_start|>`, so the risk is a duplicated BOS: the template's leading
+    /// `<|im_start|>` is itself token 166100, and `encode` passes
+    /// `add_special_tokens: false`, which makes the tokenizer's own post-processor
+    /// inert. Asserting `ids[0]` pins BOTH halves — a post-processor that fired
+    /// would put `<s>` (id 1) in front of it.
+    #[test]
+    fn test_nanbeige43_tokenizer_special_tokens() {
+        // Located from `$HOME` rather than a hardcoded checkout: the snapshot
+        // hash is not stable across machines, and a path baked into the source
+        // makes this test pass only for whoever wrote it.
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/derekparris".to_string());
+        let snap = PathBuf::from(home)
+            .join(".cache/huggingface/hub/models--Nanbeige--Nanbeige4.3-33B/snapshots/df919e1e2cf077a22204c78b6c826bf3db18bc08");
+        let tok_path = format!("{}/tokenizer.json", snap.display());
+        if !PathBuf::from(&tok_path).exists() {
+            println!("Nanbeige 4.3 tokenizer snapshot not present; skipping");
+            return;
+        }
+        let tok = DynaMoeTokenizer::new(tok_path).unwrap();
+
+        // Every literal below is checked against the checkpoint's own decode, so a
+        // tag mangled in this source fails here instead of asserting against itself.
+        let tag_ok = format!("<{}>", "think");
+        assert_eq!(tok.decode(vec![166103]).unwrap(), tag_ok, "166103 is the reasoning opener");
+        assert_eq!(tok.decode(vec![166104]).unwrap(), format!("</{}>", "think"));
+        assert_eq!(tok.decode(vec![166105]).unwrap(), "<tool_call>");
+        assert_eq!(tok.decode(vec![166106]).unwrap(), "</tool_call>");
+        // 166102 is the checkpoint's text end-of-sequence, and `ModelConfig`
+        // excludes it from the 4.3 EOS set because it is an alias of the turn
+        // closer the template actually ends on. Asserted, because until now only a
+        // comment said so.
+        assert_eq!(
+            tok.decode(vec![166102]).unwrap(),
+            format!("<|{}|>", "endoftext"),
+            "166102 is the checkpoint's text EOS"
+        );
+
+        let prompt = format!(
+            "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n{tag_ok}\n"
+        );
+        let ids = tok.encode(prompt).unwrap();
+        assert_eq!(ids[0], 166100, "the template's own <|im_start|> is the BOS, not a second marker");
+        assert_eq!(ids[ids.len() - 2], 166103, "the reasoning channel opens on one added token (then its newline)");
+        assert!(ids.contains(&166101), "<|im_end|> is one id inside the prompt");
+        assert!(!ids.contains(&1), "no duplicated <s> BOS");
+
+        // The tool-result turn is a USER turn wrapped in <tool_response>.
+        let call = format!(
+            "<|im_start|>assistant\n{tag_ok}\n<|im_end|>\n<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n"
+        );
+        let call_ids = tok.encode(call).unwrap();
+        assert!(call_ids.contains(&166101));
+        assert_eq!(call_ids[0], 166100);
     }
 
     /// The compressed map is what the whole Engram hash is built on, so its two

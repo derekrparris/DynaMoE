@@ -287,6 +287,83 @@ final class RepackedManifestShapeTests: XCTestCase {
     /// What a layer will actually run: every singleton tensor it resolved (by name, dtype
     /// and byte size) plus, for routed experts, the key set and per-component sizes. The
     /// packed loader synthesizes expert names under a different prefix, so expert maps are
+    // MARK: - A dense repack resolves both its width and its quantization
+
+    /// The dense repack names its companion rows `<name>.scale` / `<name>.bias`,
+    /// and the engine resolves a projection's companions by NAME SUBSTRING while
+    /// excluding the weight itself with `!contains("scale")` / `!contains("bias")`.
+    /// Get either wrong and the layer builds with a Q4 weight and no bias — which
+    /// `dispatchLinear` silently treats as FP8. This pins the whole naming contract
+    /// through the real builder, at the published geometry.
+    func testADenseRepackResolvesItsWidthAndItsQuantization() throws {
+        let config = try JSONDecoder().decode(
+            ModelConfig.self,
+            from: Data((
+                "{\"model_type\":\"llama\",\"hidden_size\":7168,\"num_hidden_layers\":1,"
+                + "\"num_attention_heads\":56,\"num_key_value_heads\":8,\"head_dim\":128,"
+                + "\"intermediate_size\":22016,\"vocab_size\":166912}"
+            ).utf8)
+        )
+
+        func entry(_ name: String, _ shape: String, _ dtype: String, _ bytes: UInt64) -> TensorMetadata {
+            TensorMetadata(
+                name: name, shapeDisplay: shape, dtype: dtype, sizeMb: Double(bytes) / 1_048_576,
+                shardIndex: 0, offsetStart: 0, offsetEnd: bytes,
+                category: "Other", layerIndex: 0, expertId: nil
+            )
+        }
+
+        var tensors: [TensorMetadata] = [
+            entry("model.layers.0.input_layernorm.weight", "[7168]", "BF16", 14_336),
+            entry("model.layers.0.post_attention_layernorm.weight", "[7168]", "BF16", 14_336),
+            entry("model.layers.0.self_attn.q_proj.weight", "[7168, 7168]", "Q4", 25_690_112),
+            entry("model.layers.0.self_attn.q_proj.weight.scale", "[7168, 112]", "BF16", 1_605_632),
+            entry("model.layers.0.self_attn.q_proj.weight.bias", "[7168, 112]", "BF16", 1_605_632),
+            entry("model.layers.0.self_attn.k_proj.weight", "[1024, 7168]", "Q8", 7_340_032),
+            entry("model.layers.0.self_attn.k_proj.weight.scale", "[1024, 112]", "BF16", 229_376),
+            entry("model.layers.0.self_attn.k_proj.weight.bias", "[1024, 112]", "BF16", 229_376),
+            entry("model.layers.0.self_attn.v_proj.weight", "[1024, 7168]", "Q8", 7_340_032),
+            entry("model.layers.0.self_attn.v_proj.weight.scale", "[1024, 112]", "BF16", 229_376),
+            entry("model.layers.0.self_attn.v_proj.weight.bias", "[1024, 112]", "BF16", 229_376),
+            entry("model.layers.0.self_attn.o_proj.weight", "[7168, 7168]", "Q4", 25_690_112),
+            entry("model.layers.0.self_attn.o_proj.weight.scale", "[7168, 112]", "BF16", 1_605_632),
+            entry("model.layers.0.self_attn.o_proj.weight.bias", "[7168, 112]", "BF16", 1_605_632),
+        ]
+        for projection in ["gate_proj", "up_proj"] {
+            tensors.append(entry("model.layers.0.mlp.\(projection).weight", "[22016, 7168]", "Q4", 78_905_344))
+            tensors.append(entry("model.layers.0.mlp.\(projection).weight.scale", "[22016, 112]", "BF16", 4_931_584))
+            tensors.append(entry("model.layers.0.mlp.\(projection).weight.bias", "[22016, 112]", "BF16", 4_931_584))
+        }
+        tensors.append(entry("model.layers.0.mlp.down_proj.weight", "[7168, 22016]", "Q4", 78_905_344))
+        tensors.append(entry("model.layers.0.mlp.down_proj.weight.scale", "[7168, 344]", "BF16", 4_931_584))
+        tensors.append(entry("model.layers.0.mlp.down_proj.weight.bias", "[7168, 344]", "BF16", 4_931_584))
+
+        let layers = InferenceEngine.shared.buildCachedLayers(
+            summary: Self.summary(tensors: tensors, layerCount: 1, maxExpertId: 0),
+            config: config
+        )
+        let layer = try XCTUnwrap(layers.first)
+        XCTAssertEqual(layer.mlpType, .denseMlp)
+        XCTAssertEqual(layer.attentionType, .fullAttention)
+        XCTAssertEqual(layer.intermediateDim, 22016, "the dense width comes from the repacked gate_proj shape")
+
+        // The weight itself must not be a companion, and every companion must exist:
+        // a missing bias makes the affine path unreachable.
+        XCTAssertEqual(layer.denseGateWeight?.dtype, "Q4")
+        XCTAssertNotNil(layer.denseGateScale)
+        XCTAssertNotNil(layer.denseGateBias)
+        XCTAssertNotNil(layer.denseUpScale)
+        XCTAssertNotNil(layer.denseUpBias)
+        XCTAssertNotNil(layer.denseDownScale)
+        XCTAssertNotNil(layer.denseDownBias)
+        XCTAssertEqual(layer.qProjTensor?.dtype, "Q4")
+        XCTAssertEqual(layer.kProjTensor?.dtype, "Q8")
+        XCTAssertNotNil(layer.kScaleTensor)
+        XCTAssertNotNil(layer.kBiasTensor)
+        XCTAssertNotNil(layer.qScaleTensor)
+        XCTAssertNotNil(layer.qBiasTensor)
+    }
+
     /// compared by what the decoder dispatches on rather than by name.
     static func signature(_ layer: EngineCachedLayer) -> [String: String] {
         var parts: [String: String] = [:]
