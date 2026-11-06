@@ -41,7 +41,7 @@ On macOS 26 or later with Apple Intelligence enabled, Apple's built-in **on-devi
 
 **The following models have been tested and should run well in DynaMoE:**
 
-* **deepseek-ai/DeepSeek-V4.1-Flash-1017** Deepseek is here and it's spactacular!
+* **deepseek-ai/DeepSeek-V4.1-Flash-1017** Deepseek is here and it's spectacular!
 * **Nanbeige/Nanbeige4.3-33B**
 * **google/gemma-4-26B-A4B**
 * **ornith-ai/Ornith-1.5-35B-A3B**
