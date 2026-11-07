@@ -1955,6 +1955,16 @@ final class MCPConfigStoreTests: XCTestCase {
 
 final class MCPSecretStoreTests: XCTestCase {
 
+    /// A throwaway service per test: the app's real `DRP.DynaMoE.mcp` store is
+    /// left alone, so a green run never depends on (or disturbs) a developer's
+    /// own credentials.
+    private var store = MCPSecretStore(service: "DRP.DynaMoE.tests.mcp")
+
+    override func setUp() {
+        super.setUp()
+        store = MCPSecretStore(service: "DRP.DynaMoE.tests.mcp.\(UUID().uuidString)")
+    }
+
     func testAccountNameIsDeterministic() {
         XCTAssertEqual(
             MCPSecretStore.account(serverKey: "linear", field: "Authorization"),
@@ -1964,30 +1974,35 @@ final class MCPSecretStoreTests: XCTestCase {
 
     func testSetGetDeleteRoundTrip() throws {
         let account = "dynamoe.mcp.tests.\(UUID().uuidString)"
-        defer { MCPSecretStore.delete(account: account) }
+        defer { store.delete(account: account) }
 
         let secret = "sk-test-\(UUID().uuidString)"
         do {
-            try MCPSecretStore.set(secret, account: account)
+            try store.set(secret, account: account)
         } catch {
             throw XCTSkip("Keychain is not reachable from this test host: \(error.localizedDescription)")
         }
-        XCTAssertEqual(MCPSecretStore.get(account: account), secret)
-        XCTAssertTrue(MCPSecretStore.exists(account: account))
+        XCTAssertEqual(store.get(account: account), secret)
+        XCTAssertEqual(store.read(account: account), .found(secret))
+        XCTAssertTrue(store.exists(account: account))
 
-        MCPSecretStore.delete(account: account)
-        XCTAssertNil(MCPSecretStore.get(account: account))
+        store.delete(account: account)
+        XCTAssertNil(store.get(account: account))
+        XCTAssertEqual(store.read(account: account), .missing)
     }
 
     func testRefusesEmptySecret() {
-        XCTAssertThrowsError(try MCPSecretStore.set("", account: "dynamoe.mcp.tests.empty"))
+        XCTAssertThrowsError(try store.set("", account: "dynamoe.mcp.tests.empty"))
     }
 
     func testRejectedSaveRestoresThePreviousCredential() throws {
+        // `SecretCommit` writes through the app's shared store, so this case uses
+        // it too; the account name is test-scoped and removed on the way out.
+        let live = MCPSecretStore.shared
         let account = "dynamoe.mcp.tests.rollback-\(UUID().uuidString)"
-        defer { MCPSecretStore.delete(account: account) }
+        defer { live.delete(account: account) }
         do {
-            try MCPSecretStore.set("original", account: account)
+            try live.set("original", account: account)
         } catch {
             throw XCTSkip("Keychain is not reachable from this test host: \(error.localizedDescription)")
         }
@@ -1997,19 +2012,20 @@ final class MCPSecretStoreTests: XCTestCase {
             MCPAddServerSheet.PendingSecret(name: "Authorization", account: account, value: "replacement")
         ])
         XCTAssertNil(failure)
-        XCTAssertEqual(MCPSecretStore.get(account: account), "replacement")
+        XCTAssertEqual(live.get(account: account), "replacement")
 
         commit.rollback()
         XCTAssertEqual(
-            MCPSecretStore.get(account: account),
+            live.get(account: account),
             "original",
             "a config that is rejected after the credential was staged must not keep the new value"
         )
     }
 
     func testRollbackRemovesACredentialThatDidNotExistBefore() throws {
+        let live = MCPSecretStore.shared
         let account = "dynamoe.mcp.tests.fresh-\(UUID().uuidString)"
-        defer { MCPSecretStore.delete(account: account) }
+        defer { live.delete(account: account) }
 
         var commit = MCPAddServerSheet.SecretCommit()
         if let failure = commit.apply([
@@ -2017,10 +2033,10 @@ final class MCPSecretStoreTests: XCTestCase {
         ]) {
             throw XCTSkip("Keychain is not reachable from this test host: \(failure)")
         }
-        XCTAssertEqual(MCPSecretStore.get(account: account), "fresh")
+        XCTAssertEqual(live.get(account: account), "fresh")
 
         commit.rollback()
-        XCTAssertNil(MCPSecretStore.get(account: account))
+        XCTAssertNil(live.get(account: account))
     }
 }
 

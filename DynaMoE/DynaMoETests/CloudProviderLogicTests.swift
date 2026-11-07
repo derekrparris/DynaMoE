@@ -1056,10 +1056,17 @@ final class CloudSecretStoreTests: XCTestCase {
             throw XCTSkip("Keychain is not reachable from this test host: \(error.localizedDescription)")
         }
         XCTAssertEqual(store.get(providerId: "synthetic"), secret)
+        XCTAssertEqual(store.read(providerId: "synthetic"), .found(secret))
         XCTAssertTrue(store.exists(providerId: "synthetic"))
+        XCTAssertTrue(store.hasCurrentCredential(providerId: "synthetic"))
 
         store.delete(providerId: "synthetic")
         XCTAssertNil(store.get(providerId: "synthetic"))
+        XCTAssertEqual(
+            store.read(providerId: "synthetic"),
+            .missing,
+            "a deleted key must read as missing rather than as a refusal, so the reply is 'add one'"
+        )
     }
 
     func testRefusesEmptySecret() {

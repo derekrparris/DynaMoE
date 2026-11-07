@@ -234,6 +234,11 @@ public nonisolated enum CloudTurnEvent: Equatable, Sendable {
 
 public nonisolated enum CloudTurnFailure: Equatable, Sendable, LocalizedError {
     case missingAPIKey(providerName: String)
+    /// The key is stored but this build could not read it (dismissed dialog,
+    /// locked keychain). Distinct from `missingAPIKey` because the fix differs.
+    case credentialAccessDenied(providerName: String)
+    /// The key still lives in the older keychain and has not been imported.
+    case credentialNeedsImport(providerName: String)
     case unsupportedFlavor(flavor: String)
     case httpStatus(code: Int, summary: String)
     case transport(String)
@@ -243,6 +248,10 @@ public nonisolated enum CloudTurnFailure: Equatable, Sendable, LocalizedError {
         switch self {
         case .missingAPIKey(let providerName):
             return "No API key is stored for \(providerName). Add one in Settings ▸ Cloud Providers."
+        case .credentialAccessDenied(let providerName):
+            return "DynaMoE could not read the stored \(providerName) API key. Approve the Keychain dialog (Always Allow) and send again, or re-enter the key in Settings ▸ Cloud Providers."
+        case .credentialNeedsImport(let providerName):
+            return "The \(providerName) API key is still in the older keychain. Open Settings ▸ Cloud Providers and choose Import stored credentials."
         case .unsupportedFlavor(let flavor):
             return "The \(flavor) API flavor is not implemented yet."
         case .httpStatus(let code, let summary):

@@ -166,7 +166,8 @@ flowchart TD
 * **Model Context Protocol Client**: Connects to MCP servers declared in `~/Library/Application Support/DynaMoE/mcp.json`, over **stdio** (local child processes) or **Streamable HTTP** (remote endpoints). Each server's tools become first-class agent tools, so adding a capability needs no new Swift code.
 * **Config File as the Source of Truth**: The JSON file can be hand-edited, version-controlled, or pasted from another client. Settings renders it as a form *and* a raw JSON editor, a directory watcher picks up external edits without a restart, and both the `command`/`args`/`env` and `url`/`headers` shapes are understood.
 * **Lazy Tool Exposure**: Discovered tools register as `mcp__<server>__<tool>` in the tool catalog but are **not** loaded into the prompt. The model finds them with `tools_discover` (category `mcp`) and loads them on demand, so an MCP integration costs zero prefill tokens until it is used.
-* **Credentials Stay Out of the File**: Secret environment values and headers live in the login Keychain; `mcp.json` holds only a `${keychain:...}` reference. `${env:NAME}` and `${workspace}` expansion happens at connect time and is never written back to disk.
+* **Credentials Stay Out of the File**: Secret environment values and headers live in the Keychain; `mcp.json` holds only a `${keychain:...}` reference. `${env:NAME}` and `${workspace}` expansion happens at connect time and is never written back to disk.
+* **No keychain prompts at launch**: a credential is read only when something actually needs it, and "is one stored?" is answered from item attributes, which macOS returns without a dialog. Shipped builds keep their credentials in the data protection keychain, where access is granted by the app's code-signing identity, so a new version never asks for permission again. Credentials written by an older version are copied across once from **Settings ▸ Import stored credentials**.
 * **Gated by Default**: Every MCP tool call asks for human approval unless Turbo Mode is on, because a remote server can do anything and its own `readOnlyHint` annotation is a claim rather than a guarantee.
 
 ---
@@ -304,6 +305,8 @@ If a build fails with `error: cannot execute tool 'metal' due to missing Metal T
 
 The Xcode targets always link `core/target/debug/libdynamoe_core.a`; the Release build phase copies the release archive over that path so both configurations work through the same reference. Don't remove that copy step.
 
+**Release builds need a Developer ID provisioning profile.** The Release configuration is manually signed with the `Developer ID Application` identity and carries `keychain-access-groups` (`DynaMoE/DynaMoE-Release.entitlements`), which is what lets shipped builds read their credentials from the data protection keychain without ever asking for permission. That entitlement is restricted: it only resolves against an embedded profile that grants `RMY84Y8G7M.*`. Create a **Developer ID** profile for App ID `DRP.DynaMoE` in the developer portal, install it, and the Release configuration picks it up as `DynaMoE Developer ID` (change the `PROVISIONING_PROFILE_SPECIFIER` build setting if you name it differently). Without it, Release fails at build time with `No profile for team ... matching 'DynaMoE Developer ID' found`, which is deliberate: an app that carries the entitlement with no profile is killed by launchd at startup. Debug builds are unaffected and keep using the legacy login keychain.
+
 ---
 
 ## 🌐 Local Inference Server (OpenAI- & Anthropic-compatible APIs)
@@ -403,7 +406,7 @@ The Thinking toggle is hidden for cloud models: the OpenAI-compatible surface ha
 ### Setup
 
 1. Open **Settings (⌘,) → Cloud Providers**.
-2. Paste a Synthetic API key and press **Save**. The key is stored in the login Keychain (`DRP.DynaMoE.cloud`), never in UserDefaults or on disk.
+2. Paste a Synthetic API key and press **Save**. The key is stored in the Keychain (`DRP.DynaMoE.cloud`), never in UserDefaults or on disk. If an earlier version stored it, **Import stored credentials** copies it forward with one system prompt; after that macOS never asks again, including after an update.
 3. Press **Test & Sync Models**. DynaMoE calls `GET /openai/v1/models`, which validates the key and registers the provider's live chat models in one pass — no model ids to type. A bad key fails with `401` before spending a completion.
 4. Pick a model from the composer's **Cloud Models** section. The same action re-runs whenever the provider adds or retires models.
 

@@ -241,10 +241,12 @@ struct CloudProvidersSettingsView: View {
     /// one pass: GET /models both proves the credential and returns every
     /// model the provider serves, so there is nothing for the user to type.
     private func testAndSync(_ provider: CloudProvider) {
-        guard let client = CloudChatClient.makeStored(provider: provider) else {
-            testStates[provider.id] = .failure(
-                CloudTurnFailure.missingAPIKey(providerName: provider.displayName).localizedDescription
-            )
+        let client: CloudChatClient
+        switch CloudChatClient.makeStoredResult(provider: provider) {
+        case .success(let ready):
+            client = ready
+        case .failure(let failure):
+            testStates[provider.id] = .failure(failure.localizedDescription)
             return
         }
         testStates[provider.id] = .testing
