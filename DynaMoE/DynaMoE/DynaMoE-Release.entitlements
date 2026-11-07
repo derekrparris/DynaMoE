@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Release-only entitlements for DynaMoE.
+
+    keychain-access-groups moves the app onto the data protection keychain
+    (SecretStoreSupport.swift), which authorizes items by this group instead of a
+    per-item ACL. That is what stops macOS from asking for keychain access again
+    whenever a new version is installed.
+
+    Two properties of this entitlement are easy to get wrong:
+
+    1. It is a restricted entitlement. It only works alongside an embedded
+       Developer ID provisioning profile that grants RMY84Y8G7M.*, which is why
+       the Release configuration is MANUALLY signed with the "Developer ID
+       Application" identity and PROVISIONING_PROFILE_SPECIFIER = "DynaMoE
+       Developer ID". Xcode refuses automatic signing with a Developer ID
+       identity, and an app that carries this entitlement without a matching
+       profile is killed by launchd at startup. A missing profile therefore has
+       to fail the BUILD, not the launch: install the profile (or let
+       `xcodebuild ... -allowProvisioningUpdates` fetch it) before building
+       Release. Debug is unaffected.
+
+    2. $(AppIdentifierPrefix) is expanded by Xcode. codesign expands nothing, so
+       any hand-written signing step must use the literal group instead:
+       RMY84Y8G7M.DRP.DynaMoE.
+
+    The Debug configuration deliberately has no keychain group
+    (DynaMoE-Debug.entitlements): the entitlement forces profile resolution at
+    build time and would otherwise break the fast local loop, and an unentitled
+    build already falls back to the legacy keychain.
+-->
+<plist version="1.0">
+<dict>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)DRP.DynaMoE</string>
+	</array>
+</dict>
+</plist>

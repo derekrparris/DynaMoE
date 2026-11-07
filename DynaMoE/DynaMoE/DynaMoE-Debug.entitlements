@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    Debug-only entitlements for DynaMoE: intentionally empty.
+
+    The Release build adds keychain-access-groups (DynaMoE-Release.entitlements)
+    so it can use the data protection keychain. That entitlement is restricted:
+    Xcode has to resolve a Developer ID provisioning profile for the build, and
+    a build that carries it without a matching profile is killed at launch. Local
+    development should not pay either cost, so Debug keeps no keychain group and
+    SecretStoreSupport falls back to the legacy login keychain exactly as every
+    earlier version did.
+
+    To exercise the data protection path from a local build, sign it with the
+    Release entitlements and the embedded profile instead of changing this file.
+-->
+<plist version="1.0">
+<dict/>
+</plist>

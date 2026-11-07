@@ -112,6 +112,17 @@ if [ -n "$APP_PATH" ]; then
         echo "warning: '$APP_PATH' does not appear to be signed with Developer ID." >&2
         echo "         Updates installed from it may be blocked by Gatekeeper." >&2
     fi
+    # keychain-access-groups is a restricted entitlement: the app needs an
+    # embedded Developer ID profile that grants it, or launchd kills it at
+    # startup. Shipping the entitlement without the profile ships a dead app.
+    if ! codesign -d --entitlements :- "$APP_PATH" 2>&1 | grep -q "keychain-access-groups"; then
+        echo "warning: '$APP_PATH' has no keychain-access-groups entitlement." >&2
+        echo "         Users will be asked to authorize keychain access again on every update." >&2
+    elif [ ! -f "$APP_PATH/Contents/embedded.provisionprofile" ]; then
+        echo "error: '$APP_PATH' claims keychain-access-groups but carries no embedded.provisionprofile." >&2
+        echo "       That pairing refuses to launch; sign with the 'DynaMoE Developer ID' profile." >&2
+        exit 1
+    fi
     if ! spctl --assess --type execute "$APP_PATH" >/dev/null 2>&1; then
         echo "warning: '$APP_PATH' does not pass Gatekeeper (notarize + staple it first)." >&2
     fi
@@ -121,6 +132,7 @@ else
         -scheme DynaMoE -configuration Release \
         -derivedDataPath "$OUT_DIR/DerivedData" \
         ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+        -allowProvisioningUpdates \
         build
     APP_PATH="$OUT_DIR/DerivedData/Build/Products/Release/DynaMoE.app"
 fi

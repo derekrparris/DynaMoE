@@ -21,6 +21,9 @@
 #   8. appcast.xml is well-formed
 #   9. gh-pages exists (and, unless --offline, the feed URL is reachable)
 #  10. With --app: signature, Gatekeeper and staple checks on the export
+#  11. Keychain sharing: the Release entitlements grant keychain-access-groups,
+#      and (with --app) the app carries the entitlement and an embedded
+#      Developer ID profile that grants the same group
 #
 # Note: gate 4 can raise a Keychain authorization dialog on first use. Approve
 # it — a dismissed dialog makes generate_keys succeed while printing nothing,
@@ -257,6 +260,55 @@ else
                 fail "app's SUPublicEDKey ($APP_PUBKEY) does not match the source Info.plist"
             fi
         fi
+    fi
+fi
+
+# ------------------------------------------------- 11. keychain sharing
+head_ "11. Keychain sharing (stops the access prompts)"
+RELEASE_ENTITLEMENTS="$ROOT/DynaMoE/DynaMoE/DynaMoE-Release.entitlements"
+KEYCHAIN_GROUP="RMY84Y8G7M.DRP.DynaMoE"
+if [ ! -f "$RELEASE_ENTITLEMENTS" ]; then
+    fail "missing DynaMoE/DynaMoE-Release.entitlements: the app would fall back to the legacy keychain and ask for access on every update"
+elif grep -q 'keychain-access-groups' "$RELEASE_ENTITLEMENTS"; then
+    ok "Release entitlements grant keychain-access-groups"
+else
+    fail "DynaMoE-Release.entitlements has no keychain-access-groups"
+fi
+if grep -Eq 'CODE_SIGN_ENTITLEMENTS = "?DynaMoE/DynaMoE-Release\.entitlements"?' "$PBXPROJ"; then
+    ok "Release configuration signs with those entitlements"
+else
+    fail "project.pbxproj Release config does not set CODE_SIGN_ENTITLEMENTS to the Release entitlements"
+fi
+if grep -q 'CODE_SIGN_IDENTITY = "Developer ID Application"' "$PBXPROJ"; then
+    ok "Release configuration signs with the Developer ID identity"
+else
+    warn "Release configuration does not name the Developer ID identity, so Xcode cannot provision a profile granting the keychain group"
+fi
+if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
+    skip "no --app given (cannot inspect the built entitlement or profile)"
+else
+    APP_ENTITLEMENTS="$(codesign -d --entitlements :- "$APP_PATH" 2>&1 || true)"
+    case "$APP_ENTITLEMENTS" in
+        *"$KEYCHAIN_GROUP"*) ok "app carries keychain-access-groups = $KEYCHAIN_GROUP" ;;
+        *keychain-access-groups*)
+            fail "app keychain-access-groups is not $KEYCHAIN_GROUP: codesign expands no build variables, so a hand-signed build must use the literal group" ;;
+        *) fail "app has no keychain-access-groups entitlement (it would keep prompting for keychain access)" ;;
+    esac
+    PROFILE="$APP_PATH/Contents/embedded.provisionprofile"
+    if [ ! -f "$PROFILE" ]; then
+        fail "no Contents/embedded.provisionprofile: keychain-access-groups is a restricted entitlement, and without a profile granting it the app is killed at launch"
+    elif ! security cms -D -i "$PROFILE" >/dev/null 2>&1; then
+        fail "embedded.provisionprofile is not a readable CMS profile"
+    else
+        PROFILE_TEXT="$(security cms -D -i "$PROFILE" 2>/dev/null || true)"
+        case "$PROFILE_TEXT" in
+            *"$KEYCHAIN_GROUP"*) ok "profile grants $KEYCHAIN_GROUP" ;;
+            *) fail "profile does not grant $KEYCHAIN_GROUP: the app would launch and then fail every keychain write" ;;
+        esac
+        case "$PROFILE_TEXT" in
+            *"<string>RMY84Y8G7M</string>"*) ok "profile team matches the signing team" ;;
+            *) warn "profile TeamIdentifier is not RMY84Y8G7M" ;;
+        esac
     fi
 fi
 

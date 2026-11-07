@@ -59,6 +59,12 @@ build/
 # build on fresh clones and after any `git clean -xfd` / orphan-branch reset.
 !DynaMoE/DynaMoE-Bridging-Header.h
 
+# The Developer ID provisioning profile that grants keychain-access-groups is
+# installed per machine and embedded at build time, never committed. The
+# entitlements files are tracked on purpose: they are the source of truth for
+# which keychain the app reads.
+*.provisionprofile
+
 # ==========================================
 # Local AI Models & Weights (CRITICAL)
 # ==========================================

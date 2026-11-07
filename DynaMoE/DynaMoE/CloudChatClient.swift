@@ -469,8 +469,32 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
         provider: CloudProvider,
         flavor: CloudApiFlavor = .openAI
     ) -> CloudChatClient? {
-        guard let key = CloudSecretStore.shared.get(providerId: provider.id) else { return nil }
-        return CloudChatClient(provider: provider, flavor: flavor, apiKey: key)
+        try? makeStoredResult(provider: provider, flavor: flavor).get()
+    }
+
+    /// The same lookup with the reason kept. A missing key, a refusal to read
+    /// one, and a key that is still in the older keychain are three different
+    /// things for the person reading the message.
+    public static func makeStoredResult(
+        provider: CloudProvider,
+        flavor: CloudApiFlavor = .openAI
+    ) -> Result<CloudChatClient, CloudTurnFailure> {
+        let store = CloudSecretStore.shared
+        switch store.read(providerId: provider.id) {
+        case .found(let key) where !key.isEmpty:
+            return .success(CloudChatClient(provider: provider, flavor: flavor, apiKey: key))
+        case .found, .missing:
+            // Attribute-only, so this cannot prompt: it only answers whether the
+            // credential is waiting in the keychain this build does not read.
+            if store.exists(providerId: provider.id) {
+                return .failure(.credentialNeedsImport(providerName: provider.displayName))
+            }
+            return .failure(.missingAPIKey(providerName: provider.displayName))
+        case .accessDenied:
+            return .failure(.credentialAccessDenied(providerName: provider.displayName))
+        case .unavailable:
+            return .failure(.credentialAccessDenied(providerName: provider.displayName))
+        }
     }
 
     public func streamTurn(
