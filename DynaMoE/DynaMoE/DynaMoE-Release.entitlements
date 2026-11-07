@@ -17,9 +17,13 @@
        Developer ID". Xcode refuses automatic signing with a Developer ID
        identity, and an app that carries this entitlement without a matching
        profile is killed by launchd at startup. A missing profile therefore has
-       to fail the BUILD, not the launch: install the profile (or let
-       `xcodebuild ... -allowProvisioningUpdates` fetch it) before building
-       Release. Debug is unaffected.
+       to fail the BUILD, not the launch, so install it first:
+       `Tools/install_profile.py <file.provisionprofile>` validates the profile
+       against the certificate this Mac actually holds, copies it into both
+       provisioning directories and removes older profiles with the same name.
+       That is the only supported path: manual signing with a profile specifier
+       means `xcodebuild -allowProvisioningUpdates` cannot resolve a profile by
+       name for you. Debug is unaffected.
 
     2. $(AppIdentifierPrefix) is expanded by Xcode. codesign expands nothing, so
        any hand-written signing step must use the literal group instead:

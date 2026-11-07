@@ -14,6 +14,37 @@ import XCTest
 import Security
 @testable import DynaMoE
 
+// MARK: - Test support
+
+/// Statuses that mean "this test host has no usable keychain", as distinct from
+/// "the keychain rejected this write". Only the first kind may skip a case:
+/// making every write failure a skip is how a broken write path reports green.
+let keychainUnreachableStatuses: Set<OSStatus> = [
+    errSecMissingEntitlement,
+    errSecInteractionNotAllowed,
+    errSecNotAvailable,
+    errSecUserCanceled,
+]
+
+func keychainStatus(of error: Error) -> OSStatus? {
+    if let failure = error as? SecretStoreFailure, case .status(let status) = failure {
+        return status
+    }
+    if let failure = error as? CloudKeychainError, case .status(let status) = failure {
+        return status
+    }
+    return nil
+}
+
+/// Skips when the host has no keychain, and rethrows anything else so a genuine
+/// write failure fails the test instead of hiding behind a skip.
+func skipIfKeychainUnreachable(_ error: Error) throws {
+    guard let status = keychainStatus(of: error),
+          keychainUnreachableStatuses.contains(status)
+    else { throw error }
+    throw XCTSkip("Keychain is not reachable from this test host: \(KeychainSecretStore.describe(status))")
+}
+
 // MARK: - Query builders
 
 final class KeychainQueryLogicTests: XCTestCase {
@@ -115,6 +146,8 @@ final class SecretStoreBackendResolverTests: XCTestCase {
         resolver.overrideForTesting(nil)
         resolver.entitlementGroupsProvider = nil
         resolver.capabilityProbe = nil
+        resolver.probeAttempts = 2
+        resolver.probeRetryDelayMicroseconds = 25_000
         super.tearDown()
     }
 
@@ -122,6 +155,18 @@ final class SecretStoreBackendResolverTests: XCTestCase {
         resolver.overrideForTesting(nil)
         resolver.entitlementGroupsProvider = { groups }
         resolver.capabilityProbe = { _ in probe }
+        return resolver.backend()
+    }
+
+    /// A scripted probe that never makes a test wait for the retry delay.
+    private func resolve(
+        groups: [String] = ["RMY84Y8G7M.DRP.DynaMoE"],
+        probe: @escaping () -> OSStatus
+    ) -> KeychainBackend {
+        resolver.overrideForTesting(nil)
+        resolver.entitlementGroupsProvider = { groups }
+        resolver.capabilityProbe = { _ in probe() }
+        resolver.probeRetryDelayMicroseconds = 0
         return resolver.backend()
     }
 
@@ -169,6 +214,53 @@ final class SecretStoreBackendResolverTests: XCTestCase {
         _ = resolver.backend()
         XCTAssertEqual(probeCount, 1, "the capability probe must not run per keychain call")
     }
+
+    /// A keychain that is still coming up at launch answers with an interaction
+    /// status; the answer it gives a moment later is the real one.
+    func testATransientProbeFailureIsRetriedBeforeFallingBack() {
+        var statuses = [errSecInteractionNotAllowed, errSecSuccess]
+        let resolved = resolve {
+            statuses.isEmpty ? errSecInteractionNotAllowed : statuses.removeFirst()
+        }
+        XCTAssertEqual(
+            resolved,
+            .dataProtection(accessGroup: "RMY84Y8G7M.DRP.DynaMoE"),
+            "a status that could clear is not a reason to spend the session on the legacy keychain"
+        )
+        XCTAssertTrue(statuses.isEmpty)
+    }
+
+    /// The defect this pins: a transient launch failure used to pin the whole
+    /// process to the legacy store, so secrets saved that session landed where
+    /// the next launch could not read them and looked like they needed importing.
+    func testAnInconclusiveProbeIsNotRememberedForTheProcess() {
+        resolver.overrideForTesting(nil)
+        resolver.entitlementGroupsProvider = { ["RMY84Y8G7M.DRP.DynaMoE"] }
+        resolver.probeRetryDelayMicroseconds = 0
+        var probeCount = 0
+        resolver.capabilityProbe = { _ in
+            probeCount += 1
+            return errSecInteractionNotAllowed
+        }
+        XCTAssertEqual(resolver.backend(), .legacy)
+        XCTAssertEqual(probeCount, 2, "one resolution asks twice before calling the answer inconclusive")
+        XCTAssertEqual(resolver.backend(), .legacy)
+        XCTAssertEqual(probeCount, 4, "an inconclusive answer is asked again rather than cached")
+    }
+
+    func testAMissingEntitlementIsDefinitiveAndCached() {
+        resolver.overrideForTesting(nil)
+        resolver.entitlementGroupsProvider = { ["RMY84Y8G7M.DRP.DynaMoE"] }
+        resolver.probeRetryDelayMicroseconds = 0
+        var probeCount = 0
+        resolver.capabilityProbe = { _ in
+            probeCount += 1
+            return errSecMissingEntitlement
+        }
+        XCTAssertEqual(resolver.backend(), .legacy)
+        XCTAssertEqual(resolver.backend(), .legacy)
+        XCTAssertEqual(probeCount, 1, "the signature will not change, so asking again cannot help")
+    }
 }
 
 // MARK: - Migration planning
@@ -178,7 +270,26 @@ final class KeychainMigrationPlanningTests: XCTestCase {
     func testACredentialAlreadyInTheCurrentKeychainIsLeftAlone() {
         XCTAssertEqual(
             KeychainMigration.decision(current: .found("new"), legacy: .found("old")),
-            .alreadyPresent
+            .alreadyPresent,
+            "differing values are a real conflict, not a leftover to delete"
+        )
+    }
+
+    /// An import that wrote the new copy but was interrupted before the reap (or
+    /// whose delete failed) leaves both keychains holding the same value. Nothing
+    /// else would ever remove the legacy copy, which is the one thing this change
+    /// exists to get rid of.
+    func testMatchingCopiesAreALeftoverToReapRatherThanAConflict() {
+        XCTAssertEqual(
+            KeychainMigration.decision(current: .found("same"), legacy: .found("same")),
+            .duplicate
+        )
+    }
+
+    func testAnEmptyCurrentValueLetsTheStoredValueWin() {
+        XCTAssertEqual(
+            KeychainMigration.decision(current: .found(""), legacy: .found("old")),
+            .migrate("old")
         )
     }
 
@@ -217,6 +328,7 @@ final class KeychainMigrationPlanningTests: XCTestCase {
     func testOutcomeSuccessCoversEverythingThatLeftTheCredentialUsable() {
         XCTAssertTrue(KeychainImportOutcome.imported(account: "a").succeeded)
         XCTAssertTrue(KeychainImportOutcome.tombstoneRemoved(account: "a").succeeded)
+        XCTAssertTrue(KeychainImportOutcome.duplicateRemoved(account: "a").succeeded)
         XCTAssertTrue(KeychainImportOutcome.alreadyPresent(account: "a").succeeded)
         XCTAssertFalse(KeychainImportOutcome.needsAuthorization(account: "a", errSecUserCanceled).succeeded)
         XCTAssertFalse(KeychainImportOutcome.failed(account: "a", errSecDecode).succeeded)
@@ -224,6 +336,10 @@ final class KeychainMigrationPlanningTests: XCTestCase {
             KeychainImportOutcome.needsAuthorization(account: "a", errSecUserCanceled)
                 .message.contains("Always Allow"),
             "a refused read has to tell the user what to click"
+        )
+        XCTAssertTrue(
+            KeychainImportOutcome.duplicateRemoved(account: "a").message.contains("already had it"),
+            "removing a leftover copy has to say the credential was never at risk"
         )
     }
 
@@ -240,17 +356,39 @@ final class KeychainMigrationPlanningTests: XCTestCase {
         )
     }
 
-    func testNothingIsPendingWhenTheCurrentKeychainIsTheLegacyOne() {
-        let resolver = SecretStoreBackendResolver.shared
-        resolver.overrideForTesting(.legacy)
-        defer {
-            resolver.overrideForTesting(nil)
-            resolver.entitlementGroupsProvider = nil
-            resolver.capabilityProbe = nil
-        }
+    /// Replaces a vacuous version of this test, which overrode the resolver to
+    /// `.legacy` and then asserted emptiness: in a Debug build the resolver
+    /// answers `.legacy` anyway, so the short-circuit being asserted was the
+    /// only reason it passed. The rule is a pure function of the inventory now.
+    func testNothingIsPendingForABuildWithoutTheEntitlement() {
+        let inventory = KeychainMigrationInventory(
+            usesDataProtection: false,
+            legacyAccounts: ["dynamoe.cloud.synthetic.apikey"]
+        )
         XCTAssertTrue(
-            KeychainMigration.pending(services: ["DRP.DynaMoE.tests.import"]).isEmpty,
+            KeychainMigration.pendingCredentials(
+                service: CloudSecretStore.defaultService,
+                inventory: inventory
+            ).isEmpty,
             "an unentitled build reads the legacy keychain directly, so there is nothing to import"
+        )
+    }
+
+    func testEveryLegacyAccountIsOfferedIncludingOneTheCurrentKeychainHolds() {
+        let inventory = KeychainMigrationInventory(
+            usesDataProtection: true,
+            legacyAccounts: ["dynamoe.cloud.b.apikey", "dynamoe.cloud.a.apikey"]
+        )
+        XCTAssertEqual(
+            KeychainMigration.pendingCredentials(
+                service: CloudSecretStore.defaultService,
+                inventory: inventory
+            ).map(\.id),
+            [
+                "DRP.DynaMoE.cloud|dynamoe.cloud.b.apikey",
+                "DRP.DynaMoE.cloud|dynamoe.cloud.a.apikey"
+            ],
+            "every legacy copy is listed: one whose value matches is a leftover the import has to remove"
         )
     }
 }
@@ -278,7 +416,7 @@ final class KeychainSecretStoreTests: XCTestCase {
         do {
             try store.set("sk-test", account: "acct", label: "l", description: "d")
         } catch {
-            throw XCTSkip("Keychain is not reachable from this test host: \(error.localizedDescription)")
+            try skipIfKeychainUnreachable(error)
         }
 
         XCTAssertEqual(store.read(account: "acct"), .found("sk-test"))
@@ -326,7 +464,7 @@ final class MCPSecretStoreFacadeTests: XCTestCase {
         do {
             try store.set("token", account: "dynamoe.mcp.tests.roundtrip")
         } catch {
-            throw XCTSkip("Keychain is not reachable from this test host: \(error.localizedDescription)")
+            try skipIfKeychainUnreachable(error)
         }
         XCTAssertEqual(store.read(account: "dynamoe.mcp.tests.roundtrip").value, "token")
 
@@ -396,6 +534,74 @@ final class MCPKeychainTokenOutcomeTests: XCTestCase {
         XCTAssertEqual(
             MCPTokenExpander.keychainTokenOutcome(read: .found(""), existsInLegacyKeychain: false),
             .unset
+        )
+    }
+}
+
+// MARK: - MCP credential issues
+
+/// The two user-visible payoff paths of the keychain split: a server that could
+/// not read its credential says why, and the three reasons stay distinct
+/// because the fix differs for each.
+final class MCPCredentialIssueTests: XCTestCase {
+
+    func testAnUnimportedCredentialNamesTheImportRatherThanAMissingKey() {
+        let issues = MCPConfigResolver.credentialIssues(
+            key: "linear",
+            unresolved: [],
+            denied: [],
+            needsImport: ["${keychain:dynamoe.mcp.linear.Authorization}"]
+        )
+        XCTAssertEqual(issues.count, 1)
+        XCTAssertEqual(issues.first?.severity, .error)
+        XCTAssertEqual(issues.first?.serverKey, "linear")
+        let message = issues.first?.message ?? ""
+        XCTAssertTrue(message.contains("not imported yet"))
+        XCTAssertTrue(message.contains("Import stored credentials"))
+        XCTAssertFalse(
+            message.contains("Unresolved credential"),
+            "'add a key' is the wrong advice for a credential that exists somewhere"
+        )
+    }
+
+    func testARefusedCredentialNamesAuthorizationAndDeduplicatesItsTokens() {
+        let issues = MCPConfigResolver.credentialIssues(
+            key: "linear",
+            unresolved: [],
+            denied: ["${keychain:b}", "${keychain:a}", "${keychain:a}"],
+            needsImport: []
+        )
+        XCTAssertEqual(issues.count, 1)
+        let message = issues.first?.message ?? ""
+        XCTAssertTrue(message.contains("Always Allow"))
+        XCTAssertTrue(message.contains("${keychain:a}, ${keychain:b}"), "tokens are deduplicated and sorted")
+    }
+
+    func testAMissingCredentialAsksForAKey() {
+        let issues = MCPConfigResolver.credentialIssues(
+            key: "linear",
+            unresolved: ["${env:LINEAR_TOKEN}"],
+            denied: [],
+            needsImport: []
+        )
+        XCTAssertEqual(issues.count, 1)
+        XCTAssertTrue(issues.first?.message.contains("Unresolved credential token(s)") == true)
+    }
+
+    func testEveryOutcomeIsReportedSeparatelyOnTheSameServer() {
+        let issues = MCPConfigResolver.credentialIssues(
+            key: "linear",
+            unresolved: ["${env:LINEAR_TOKEN}"],
+            denied: ["${keychain:a}"],
+            needsImport: ["${keychain:b}"]
+        )
+        XCTAssertEqual(issues.count, 3)
+        XCTAssertTrue(issues.allSatisfy { $0.severity == .error && $0.serverKey == "linear" })
+    }
+
+    func testNoOutcomeMeansNoIssue() {
+        XCTAssertTrue(
+            MCPConfigResolver.credentialIssues(key: "linear", unresolved: [], denied: [], needsImport: []).isEmpty
         )
     }
 }

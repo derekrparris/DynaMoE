@@ -218,6 +218,15 @@ public nonisolated enum SecretStoreFailure: LocalizedError, Equatable {
 
 /// Chooses the backend once per process: entitlement first, capability probe
 /// second, legacy as the answer whenever either is inconclusive.
+///
+/// "Inconclusive" is not the same as "refused", and the difference matters.
+/// `errSecMissingEntitlement`/`errSecParam` say the signature will never be
+/// granted the group, so the legacy keychain is the answer for the life of the
+/// process. Any other probe failure is a property of this instant (a keychain
+/// still coming up at launch, an interaction that could not be shown yet), so
+/// it is retried immediately, and a retry that also fails leaves the answer
+/// uncached: the next caller asks again rather than the process spending its
+/// whole life writing secrets to a keychain the next launch will not read.
 public nonisolated final class SecretStoreBackendResolver: @unchecked Sendable {
     public static let shared = SecretStoreBackendResolver()
 
@@ -229,9 +238,17 @@ public nonisolated final class SecretStoreBackendResolver: @unchecked Sendable {
     /// the write. Nil means "use the real keychain".
     var capabilityProbe: ((KeychainBackend) -> OSStatus)?
 
+    /// How many times one resolution asks the probe before calling the answer
+    /// inconclusive. Two is enough for a keychain that was still coming up.
+    var probeAttempts: Int = 2
+
+    /// Delay between those attempts, in microseconds. Zero disables the wait,
+    /// which is what tests want.
+    var probeRetryDelayMicroseconds: UInt32 = 25_000
+
     private let lock = NSLock()
     private var cached: KeychainBackend?
-    private var didLog = false
+    private var lastLogged: KeychainBackend?
 
     private init() {}
 
@@ -249,50 +266,79 @@ public nonisolated final class SecretStoreBackendResolver: @unchecked Sendable {
             lock.unlock()
             return cached
         }
-        cached = resolved
-        let announce = !didLog
-        didLog = true
+        if resolved.definitive {
+            cached = resolved.backend
+        }
+        let announce = lastLogged != resolved.backend
+        if announce { lastLogged = resolved.backend }
         lock.unlock()
 
         if announce {
-            switch resolved {
+            switch resolved.backend {
             case .dataProtection(let group):
                 DiagLog.info("keychain", "backend=dataProtection group=\(group)")
             case .legacy:
-                DiagLog.info("keychain", "backend=legacy (no keychain-access-groups capability in this build)")
+                if resolved.definitive {
+                    DiagLog.info("keychain", "backend=legacy (no keychain-access-groups capability in this build)")
+                } else {
+                    DiagLog.info("keychain", "backend=legacy (provisional: the data protection keychain did not answer, will ask again)")
+                }
             }
         }
-        return resolved
+        return resolved.backend
     }
 
     /// Test seam so a decision can be exercised without a signed build.
     func overrideForTesting(_ backend: KeychainBackend?) {
         lock.lock()
         cached = backend
+        lastLogged = backend
         lock.unlock()
     }
 
-    private func resolve() -> KeychainBackend {
+    private struct Resolution {
+        let backend: KeychainBackend
+        /// True when the answer is a property of this build rather than of this
+        /// instant, i.e. worth remembering for the life of the process.
+        let definitive: Bool
+    }
+
+    private func resolve() -> Resolution {
         let groups = entitlementGroupsProvider?() ?? Self.signatureAccessGroups()
-        guard !groups.isEmpty else { return .legacy }
+        // No entitlement at all: nothing to probe, and nothing can grant it
+        // later, so this is the legacy answer for good.
+        guard !groups.isEmpty else { return Resolution(backend: .legacy, definitive: true) }
 
         let bundleId = Bundle.main.bundleIdentifier ?? "DRP.DynaMoE"
         let group = groups.first(where: { $0.hasSuffix(".\(bundleId)") || $0 == bundleId }) ?? groups.first
-        guard let group, !group.isEmpty else { return .legacy }
+        guard let group, !group.isEmpty else { return Resolution(backend: .legacy, definitive: true) }
 
         let candidate = KeychainBackend.dataProtection(accessGroup: group)
-        let status = capabilityProbe?(candidate) ?? Self.probeWrite(candidate)
-
-        switch status {
-        case errSecSuccess, errSecDuplicateItem:
-            return candidate
-        default:
-            if SecretAccessClassifier.indicatesMissingEntitlement(status) {
-                return .legacy
+        var lastStatus = errSecSuccess
+        let attempts = max(1, probeAttempts)
+        for attempt in 1...attempts {
+            let status = capabilityProbe?(candidate) ?? Self.probeWrite(candidate)
+            lastStatus = status
+            switch status {
+            case errSecSuccess, errSecDuplicateItem:
+                return Resolution(backend: candidate, definitive: true)
+            default:
+                if SecretAccessClassifier.indicatesMissingEntitlement(status) {
+                    // The signature does not grant the group. Retrying cannot
+                    // change that, and a transient status must not be mistaken
+                    // for it.
+                    return Resolution(backend: .legacy, definitive: true)
+                }
+                if attempt < attempts, probeRetryDelayMicroseconds > 0 {
+                    Thread.sleep(forTimeInterval: TimeInterval(probeRetryDelayMicroseconds) / 1_000_000)
+                }
             }
-            DiagLog.warning("keychain", "data protection probe failed (\(status)); using legacy keychain")
-            return .legacy
         }
+        DiagLog.warning(
+            "keychain",
+            "data protection keychain did not answer (\(lastStatus)); using the legacy keychain until it does"
+        )
+        return Resolution(backend: .legacy, definitive: false)
     }
 
     /// A read is not enough to prove the capability: an unentitled app is

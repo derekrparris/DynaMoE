@@ -480,20 +480,42 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
         flavor: CloudApiFlavor = .openAI
     ) -> Result<CloudChatClient, CloudTurnFailure> {
         let store = CloudSecretStore.shared
-        switch store.read(providerId: provider.id) {
-        case .found(let key) where !key.isEmpty:
+        switch storedKeyResult(
+            providerName: provider.displayName,
+            read: store.read(providerId: provider.id),
+            // Evaluated only when the read established nothing: the existence
+            // check is attributes-only (so it cannot prompt) but it is still a
+            // keychain round trip per token, and a readable key settles it.
+            existsInEitherKeychain: { store.exists(providerId: provider.id) }
+        ) {
+        case .success(let key):
             return .success(CloudChatClient(provider: provider, flavor: flavor, apiKey: key))
-        case .found, .missing:
-            // Attribute-only, so this cannot prompt: it only answers whether the
-            // credential is waiting in the keychain this build does not read.
-            if store.exists(providerId: provider.id) {
-                return .failure(.credentialNeedsImport(providerName: provider.displayName))
-            }
-            return .failure(.missingAPIKey(providerName: provider.displayName))
-        case .accessDenied:
-            return .failure(.credentialAccessDenied(providerName: provider.displayName))
-        case .unavailable:
-            return .failure(.credentialAccessDenied(providerName: provider.displayName))
+        case .failure(let failure):
+            return .failure(failure)
+        }
+    }
+
+    /// The lookup rule as a pure function of the two keychain answers, so each
+    /// outcome can be exercised without a keychain.
+    static func storedKeyResult(
+        providerName: String,
+        read: SecretAccessResult,
+        existsInEitherKeychain: () -> Bool
+    ) -> Result<String, CloudTurnFailure> {
+        switch read {
+        case .found(let key) where !key.isEmpty:
+            return .success(key)
+        case .found:
+            // An empty stored item is not a credential. Asking `exists` here
+            // would find that same empty item and report "still in the older
+            // keychain, import it" about a key that could never work.
+            return .failure(.missingAPIKey(providerName: providerName))
+        case .missing:
+            return existsInEitherKeychain()
+                ? .failure(.credentialNeedsImport(providerName: providerName))
+                : .failure(.missingAPIKey(providerName: providerName))
+        case .accessDenied, .unavailable:
+            return .failure(.credentialAccessDenied(providerName: providerName))
         }
     }
 

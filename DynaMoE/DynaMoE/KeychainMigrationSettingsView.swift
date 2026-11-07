@@ -34,17 +34,22 @@ struct KeychainMigrationSettingsSection: View {
                         icon: "key.viewfinder",
                         iconTint: .orange
                     ) {
-                        HStack(spacing: 8) {
-                            if isImporting {
-                                ProgressView()
-                                    .controlSize(.small)
+                        // Nothing left to import: the card stays to report what
+                        // the import did, but a disabled "Import 0" button would
+                        // be an invitation to press it.
+                        if !pending.isEmpty {
+                            HStack(spacing: 8) {
+                                if isImporting {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                }
+                                Button(isImporting ? "Importing…" : "Import \(pending.count)") {
+                                    runImport()
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                                .disabled(isImporting)
                             }
-                            Button(isImporting ? "Importing…" : "Import \(pending.count)") {
-                                runImport()
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-                            .disabled(isImporting || pending.isEmpty)
                         }
                     }
 

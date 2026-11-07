@@ -128,11 +128,20 @@ if [ -n "$APP_PATH" ]; then
     fi
 else
     echo "==> Building Release app (dev build; use --app for distribution)..."
+    # Release is manually signed against PROVISIONING_PROFILE_SPECIFIER, so
+    # -allowProvisioningUpdates cannot resolve a profile by name; the profile has
+    # to be installed beforehand (Tools/install_profile.py). Say so here instead
+    # of failing later with "No profile for team ... found".
+    if ! ls "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"/*.provisionprofile \
+            "$HOME/Library/MobileDevice/Provisioning Profiles"/*.provisionprofile >/dev/null 2>&1; then
+        echo "warning: no provisioning profile is installed; Release needs a Developer ID" >&2
+        echo "         profile granting keychain-access-groups. Install it with" >&2
+        echo "         Tools/install_profile.py <file.provisionprofile>." >&2
+    fi
     xcodebuild -project "$APP_DIR/DynaMoE.xcodeproj" \
         -scheme DynaMoE -configuration Release \
         -derivedDataPath "$OUT_DIR/DerivedData" \
         ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
-        -allowProvisioningUpdates \
         build
     APP_PATH="$OUT_DIR/DerivedData/Build/Products/Release/DynaMoE.app"
 fi

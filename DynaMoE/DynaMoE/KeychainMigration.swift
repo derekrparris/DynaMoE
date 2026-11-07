@@ -20,7 +20,7 @@
 import Foundation
 import Security
 
-// MARK: - Inventory
+// MARK: - Credentials
 
 /// One credential still sitting in the legacy keychain.
 public nonisolated struct PendingCredential: Sendable, Hashable, Identifiable {
@@ -64,6 +64,21 @@ public nonisolated struct PendingCredential: Sendable, Hashable, Identifiable {
     }
 }
 
+// MARK: - Inventory
+
+/// What one service's keychains hold, so the planning rule is a pure function
+/// of account names. Deliberately not "legacy minus current": see
+/// `KeychainMigration.pending(services:)`.
+public nonisolated struct KeychainMigrationInventory: Sendable, Equatable {
+    public let usesDataProtection: Bool
+    public let legacyAccounts: [String]
+
+    public init(usesDataProtection: Bool, legacyAccounts: [String]) {
+        self.usesDataProtection = usesDataProtection
+        self.legacyAccounts = legacyAccounts
+    }
+}
+
 // MARK: - Decision
 
 /// What an import should do with one credential, decided from two reads so the
@@ -73,8 +88,11 @@ public nonisolated enum KeychainMigrationDecision: Sendable, Equatable {
     case migrate(String)
     /// The legacy item exists but holds nothing; reap it and copy nothing.
     case tombstone
-    /// The current keychain already has this account; leave the legacy copy for
-    /// a conflict to be resolved by hand.
+    /// Both keychains hold this account and the copies agree, so the legacy one
+    /// is a leftover: reap it and copy nothing.
+    case duplicate
+    /// The current keychain has this account with a different value; leave the
+    /// legacy copy for a conflict to be resolved by hand.
     case alreadyPresent
     /// The legacy read was refused, which is what a dismissed dialog returns.
     case needsAuthorization(OSStatus)
@@ -86,6 +104,7 @@ public nonisolated enum KeychainMigrationDecision: Sendable, Equatable {
 public nonisolated enum KeychainImportOutcome: Sendable, Equatable {
     case imported(account: String)
     case tombstoneRemoved(account: String)
+    case duplicateRemoved(account: String)
     case alreadyPresent(account: String)
     case needsAuthorization(account: String, OSStatus)
     case failed(account: String, OSStatus)
@@ -93,7 +112,8 @@ public nonisolated enum KeychainImportOutcome: Sendable, Equatable {
     public var account: String {
         switch self {
         case .imported(let account), .tombstoneRemoved(let account),
-             .alreadyPresent(let account), .failed(let account, _):
+             .duplicateRemoved(let account), .alreadyPresent(let account),
+             .failed(let account, _):
             return account
         case .needsAuthorization(let account, _):
             return account
@@ -102,7 +122,7 @@ public nonisolated enum KeychainImportOutcome: Sendable, Equatable {
 
     public var succeeded: Bool {
         switch self {
-        case .imported, .tombstoneRemoved, .alreadyPresent: return true
+        case .imported, .tombstoneRemoved, .duplicateRemoved, .alreadyPresent: return true
         case .needsAuthorization, .failed: return false
         }
     }
@@ -113,8 +133,10 @@ public nonisolated enum KeychainImportOutcome: Sendable, Equatable {
             return "Imported."
         case .tombstoneRemoved:
             return "Removed an empty entry."
+        case .duplicateRemoved:
+            return "Removed the older copy; the current keychain already had it."
         case .alreadyPresent:
-            return "Already in the current keychain; left the older copy alone."
+            return "Both keychains hold this credential with different values; left the older copy alone."
         case .needsAuthorization(_, let status):
             return "Not authorized (\(KeychainSecretStore.describe(status))). Click Always Allow when macOS asks, then import again."
         case .failed(_, let status):
@@ -130,38 +152,59 @@ public nonisolated enum KeychainMigration {
         [MCPSecretStore.defaultService, CloudSecretStore.defaultService]
     }
 
-    /// Credentials that exist only in the legacy keychain. Attribute-only
-    /// queries on both keychains, so this never prompts and is safe to call from
-    /// Settings' appearance path.
+    /// Credentials still sitting in the legacy keychain. Attribute-only queries,
+    /// so this never prompts and is safe to call from Settings' appearance path.
+    ///
+    /// An account that the current keychain already holds is listed too, because
+    /// the legacy copy is exactly what has to go: an import that was interrupted
+    /// after the write but before the reap leaves both, and nothing else would
+    /// ever remove the older one. What to do with it is decided by the values in
+    /// `adopt`, which is where a real conflict is told apart from a leftover.
     public static func pending(services: [String] = services) -> [PendingCredential] {
         var found: [PendingCredential] = []
         for service in services {
             let store = KeychainSecretStore(service: service)
-            guard store.backend.usesDataProtection else { continue }
-            let current = Set(store.accounts(includingLegacy: false))
-            for account in store.legacyAccounts() where !current.contains(account) {
-                found.append(PendingCredential(service: service, account: account))
-            }
+            let inventory = KeychainMigrationInventory(
+                usesDataProtection: store.backend.usesDataProtection,
+                legacyAccounts: store.legacyAccounts()
+            )
+            found.append(contentsOf: pendingCredentials(service: service, inventory: inventory))
         }
         return found.sorted { lhs, rhs in
             lhs.service == rhs.service ? lhs.account < rhs.account : lhs.service < rhs.service
         }
     }
 
+    /// The planning rule as a pure function of account names, so the "a build
+    /// without the entitlement has nothing to import" contract is testable
+    /// without a keychain.
+    public static func pendingCredentials(
+        service: String,
+        inventory: KeychainMigrationInventory
+    ) -> [PendingCredential] {
+        // An unentitled build reads the legacy keychain directly; there is no
+        // second keychain to copy anything into.
+        guard inventory.usesDataProtection else { return [] }
+        return inventory.legacyAccounts.map { PendingCredential(service: service, account: $0) }
+    }
+
     public static func decision(
         current: SecretAccessResult,
         legacy: SecretAccessResult
     ) -> KeychainMigrationDecision {
-        if case .found = current { return .alreadyPresent }
         switch legacy {
-        case .found(let secret):
-            return secret.isEmpty ? .tombstone : .migrate(secret)
         case .accessDenied(let status):
             return .needsAuthorization(status)
         case .unavailable(let status):
             return .failed(status)
         case .missing:
             return .failed(errSecItemNotFound)
+        case .found(let older):
+            if older.isEmpty { return .tombstone }
+            // An empty current value is not a credential: treat it as absent so
+            // the real value wins rather than being reported as a conflict.
+            guard let existing = current.value, !existing.isEmpty else { return .migrate(older) }
+            return existing == older ? .duplicate : .alreadyPresent
         }
     }
 
@@ -173,6 +216,13 @@ public nonisolated enum KeychainMigration {
         let legacy = store.readLegacy(account: credential.account)
 
         switch decision(current: current, legacy: legacy) {
+        case .duplicate:
+            // The copies agree, so this credential is already usable from the
+            // current keychain and the legacy one is a leftover. Removing it is
+            // the whole point of the import.
+            store.deleteLegacy(account: credential.account)
+            return .duplicateRemoved(account: credential.account)
+
         case .alreadyPresent:
             return .alreadyPresent(account: credential.account)
 

@@ -613,19 +613,29 @@ public nonisolated enum MCPTokenExpander {
         case denied
     }
 
+    /// The rule with the legacy answer asked lazily: it is only needed when the
+    /// read established nothing, so a stored credential costs one keychain call
+    /// instead of two on every connect.
+    public static func keychainTokenOutcome(
+        read: SecretAccessResult,
+        legacyCopyExists: () -> Bool
+    ) -> KeychainTokenOutcome {
+        switch read {
+        case .found(let secret):
+            guard secret.isEmpty else { return .value(secret) }
+            return legacyCopyExists() ? .needsImport : .unset
+        case .missing:
+            return legacyCopyExists() ? .needsImport : .unset
+        case .accessDenied, .unavailable:
+            return .denied
+        }
+    }
+
     public static func keychainTokenOutcome(
         read: SecretAccessResult,
         existsInLegacyKeychain: Bool
     ) -> KeychainTokenOutcome {
-        switch read {
-        case .found(let secret):
-            if !secret.isEmpty { return .value(secret) }
-            return existsInLegacyKeychain ? .needsImport : .unset
-        case .missing:
-            return existsInLegacyKeychain ? .needsImport : .unset
-        case .accessDenied, .unavailable:
-            return .denied
-        }
+        keychainTokenOutcome(read: read, legacyCopyExists: { existsInLegacyKeychain })
     }
 
     public static func keychainToken(account: String) -> String {
@@ -696,7 +706,7 @@ public nonisolated enum MCPTokenExpander {
                 let store = MCPSecretStore.shared
                 switch keychainTokenOutcome(
                     read: store.read(account: account),
-                    existsInLegacyKeychain: store.existsInLegacyKeychain(account: account)
+                    legacyCopyExists: { store.existsInLegacyKeychain(account: account) }
                 ) {
                 case .value(let secret):
                     output += secret

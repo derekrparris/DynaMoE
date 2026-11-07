@@ -300,15 +300,32 @@ else
     elif ! security cms -D -i "$PROFILE" >/dev/null 2>&1; then
         fail "embedded.provisionprofile is not a readable CMS profile"
     else
-        PROFILE_TEXT="$(security cms -D -i "$PROFILE" 2>/dev/null || true)"
-        case "$PROFILE_TEXT" in
-            *"$KEYCHAIN_GROUP"*) ok "profile grants $KEYCHAIN_GROUP" ;;
-            *) fail "profile does not grant $KEYCHAIN_GROUP: the app would launch and then fail every keychain write" ;;
-        esac
-        case "$PROFILE_TEXT" in
-            *"<string>RMY84Y8G7M</string>"*) ok "profile team matches the signing team" ;;
-            *) warn "profile TeamIdentifier is not RMY84Y8G7M" ;;
-        esac
+        KEYCHAIN_TEAM="${KEYCHAIN_GROUP%%.*}"
+        PROFILE_PLIST="$(mktemp -t dynamoe-profile)"
+        PROFILE_GROUPS="$(mktemp -t dynamoe-profile-groups)"
+        PROFILE_TEAMS="$(mktemp -t dynamoe-profile-teams)"
+        security cms -D -i "$PROFILE" >"$PROFILE_PLIST" 2>/dev/null || true
+        # Read the entitlement itself rather than searching the profile's text:
+        # com.apple.application-identifier is "<team>.<bundle>", so the group
+        # name also appears in a profile whose access-group array does not cover
+        # this app, and a substring search would pass it for the wrong reason.
+        plutil -extract 'Entitlements.keychain-access-groups' xml1 \
+            -o "$PROFILE_GROUPS" "$PROFILE_PLIST" 2>/dev/null || : >"$PROFILE_GROUPS"
+        plutil -extract 'TeamIdentifier' xml1 \
+            -o "$PROFILE_TEAMS" "$PROFILE_PLIST" 2>/dev/null || : >"$PROFILE_TEAMS"
+        if grep -Fq "<string>$KEYCHAIN_GROUP</string>" "$PROFILE_GROUPS"; then
+            ok "profile grants keychain-access-groups = $KEYCHAIN_GROUP"
+        elif grep -Fq "<string>$KEYCHAIN_TEAM.*</string>" "$PROFILE_GROUPS"; then
+            ok "profile grants keychain-access-groups = $KEYCHAIN_TEAM.* (the team wildcard covers $KEYCHAIN_GROUP)"
+        else
+            fail "profile's keychain-access-groups does not cover $KEYCHAIN_GROUP: the app would launch and then fail every keychain write"
+        fi
+        if grep -Fq "<string>$KEYCHAIN_TEAM</string>" "$PROFILE_TEAMS"; then
+            ok "profile team matches the signing team"
+        else
+            warn "profile TeamIdentifier is not $KEYCHAIN_TEAM"
+        fi
+        rm -f "$PROFILE_PLIST" "$PROFILE_GROUPS" "$PROFILE_TEAMS"
     fi
 fi
 
