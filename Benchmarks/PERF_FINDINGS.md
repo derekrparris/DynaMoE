@@ -15010,6 +15010,106 @@ file changed, and the suites run earlier in this session (`OpenAIAdapterLogicTes
 `AnthropicAdapterLogicTests` 31, `ServerRequestLogLogicTests` 44, `ServerControllerSmokeTests` 30) already
 cover the refusal set these two non-goals sit beside.
 
+## DSV4.1 #104: EVERY TURN RETIRED THE KV CACHE, SO A CONVERSATION RE-PREFILLED ITSELF FROM POSITION 0
+
+### The question
+
+`CompletionEngine.launchTurn` keeps one `DeepSeekV41Runtime` between turns, and that runtime is where
+the whole reuse story lives: its KV cache holds the previous turn's sequence, `DeepSeekV41TurnRunner`
+skips whatever of the new prompt that sequence covers, the expert arena holds ~65 GB of slots, its
+`mlock` keeps them out of the compressor, and the dense backbone is pinned in it. Nothing had ever asked
+what happens to that object on the SECOND turn of a growing conversation, because `#69`'s turn harness
+builds its own runtime and every real-checkpoint case in the suite drives `DeepSeekV41TurnRunner`
+directly.
+
+### What was found
+
+1. **The cache was provisioned for exactly the turn that asked for it.** `contextLength` was
+   `maxTokens + prompt + 1`, and reuse was gated on `cached.contextLength >= contextLength`. A cache
+   built for turn 1's 30 rows is smaller than turn 2's 48, so turn 2 retired the runtime, and with it
+   the resident sequence, the arena and its wiring. Every step of an agent loop paid: a fresh runtime
+   (dense pin + arena + Engram tables), a cold arena (240 cold expert reads, ~4.5 GB), and a full
+   prefill of the whole transcript from position 0 — 5.8 s of prefill for the app's own 31-token
+   default prompt, on a prompt that was already resident a moment earlier.
+2. **The fix had to be growth, not exactness.** Provisioning the *next* turn's length would have chased
+   the conversation one turn behind and rebuilt on every step anyway. A floor on the first allocation
+   plus geometric growth makes a session pay a handful of rebuilds instead.
+3. **The floor is cheap because the indexer keys dominate, not the latents.** 131,072 rows at this
+   checkpoint's FP16 default is **~777 MB**: 336 MB of compressed latents (4 owners from
+   `kv_source_layer_ids` `[2,8,14,20]`), **436 MB of indexer keys** (8 index owners, ratio-1 at 512 B
+   per key) and 5 MB of rings. That is ~43 of 3,760 arena slots (~1.1%), and `wireBudgetBytes` still
+   grants on 128 GB (65.8 + 11 + 0.8 + 16 ≪ 128). `chunkSlots` is untouched: its ceiling is 8, so a
+   31-token prompt never grows a bigger block workspace.
+4. **A measurement, not a policy test.** The unit tests pin `DeepSeekV41ContextProvisioning`; they
+   cannot see the object that gets retired.
+
+### What was measured
+
+`DeepSeekV41PublishedTurnTests.testASecondChatTurnKeepsTheCacheTheFirstOneProvisioned`
+(`/tmp/dynamoe_dsv41_real_turn`), two turns on one session through `CompletionEngine.launchTurn` on the
+published checkpoint, greedy, `maxTokens` 16. Both facts come from `CompletionLaunch.prep`, resolved
+BEFORE the engine task starts, so neither is a timing inference:
+
+| | prompt ids | reused | provisioned rows | wall, run 1 / run 2 |
+|---|---|---|---|---|
+| turn 1 (also builds the runtime) | 13 | 0 | 131,072 | **10.70 s** / 7.34 s |
+| turn 2 (continuation) | 31 | **24** (13 + 11 generated) | **131,072** | **1.79 s** / 1.58 s |
+
+4.6-6.0x on the second turn across two processes (the spread is the machine, not the mechanism — the
+two runs agree on every structural fact), and `🧠 [DSV41] no runtime yet — new KV cache, full prefill of
+13 positions` printed once for each run: the `context grew …` line never appeared on turn 2, which is
+the log signature of a rebuild. The turn also reports `2634/3719` experts resident at a 57.9% hit rate,
+i.e. the arena the first turn filled is the one the second turn read. Under the old rule turn 2 would
+have needed 48 rows against a cached 30 and rebuilt. The whole case, load included, is **11.8-15.5 s**.
+
+### What was added
+
+- `DeepSeekV41ContextProvisioning.contextLength(needed:cached:cap:)` (`EngineRuntime.swift`): the floor
+  on a fresh allocation (`initialFloorRows` 131,072), `cached * 2` on growth, and the checkpoint's own
+  ceiling winning at every branch. Overflow is guarded (`cached > Int.max / 2`).
+- `launchTurn` names a rebuild in the log (`context grew X -> Y`, or that a different checkpoint's
+  runtime was cached), so the cost is visible rather than inferred, and reports the **priced** prompt
+  length — on an image turn the placeholder count and the position count are not the same number.
+- The test above, plus `KVCacheProvisioningLogicTests` coverage of the policy itself (floor, growth,
+  ceiling, the nil-cache path, overflow).
+- A corrected doc comment on `cachedDeepSeekRuntime`: it claimed the turn loop resets the cache at the
+  start of every turn, which stopped being true when prefix reuse landed — a resumed turn must not
+  reset, and that is precisely why the runtime is worth keeping.
+
+### The finding
+
+**A cache the engine keeps between turns is a promise about the NEXT turn, so provisioning it for the
+current one is self-defeating.** The mechanism was already there (`#69` reused the runtime, recorded the
+pin, resumed the prefix) and one line of arithmetic defeated all of it, silently: every symptom looked
+like "DeepSeek is slow", and no test could see it because each one built its own runtime. The rule this
+leaves: when a policy decides whether a resource is retained, the resource's own claim about what it can
+serve is the thing to grow, not the demand that triggered it.
+
+### What it is not (do not re-propose)
+
+- **Not a bigger floor.** 131,072 rows already keeps a normal conversation on one allocation, and every
+  extra row is arena capacity (~1.1% for this one). Growth is what absorbs a long session, and past the
+  checkpoint's own ceiling the KV budget still decides — the floor is a first guess, not a promise.
+- **Not per-turn exact provisioning with a retained pin.** The pin is keyed on token ids and lives
+  outside the runtime, so a naive "keep the pin, rebuild the cache" would resume a prefix the new cache
+  never held; `reusablePrefix` would clamp it to 0 and the prefill would be paid anyway, minus the arena.
+- **Not a reset between turns for isolation.** A resumed turn must not reset (the half-filled compressor
+  group is this sequence's own), and `resume` already validates that the history it keeps is the
+  prompt's.
+- **Not `mlock`-ing the cache.** The arena's wiring policy (`#57`) is all-or-nothing by measurement; the
+  cache is 777 MB against 65.8 GB and was never the term that mattered.
+
+### Verification
+
+`xcodebuild build-for-testing` into `/tmp/dd_dsv41_104`, then `test-without-building` with the same
+`-derivedDataPath`, three-part `-only-testing` identifiers and `-parallel-testing-enabled NO`:
+
+| suite | result |
+|---|---|
+| `DynaMoETests` (`testToolCallOpenerDetectionForWorkingIndicator`, `testEveryToolCallMarkerIsBothAnOpenerAndTruncated`, `testGemmaDisplayCleanupGatedByDialect`) | **3 cases, 0 failures** |
+| `KVCacheProvisioningLogicTests` (16 cases) | **16 cases, 0 failures** |
+| `DeepSeekV41PublishedTurnTests/testASecondChatTurnKeepsTheCacheTheFirstOneProvisioned` (opt-in, published checkpoint) | **1 case, 0 failures, 15.5 s** |
+
 ## NANBEIGE 4.3 #1: THE Q4/Q8 DENSE PATH WAS DECODE-ONLY, AND STANDARD-GQA ATTENTION RAN A WHOLE LAYER ON ONE GPU CORE
 
 **Regime.** `Nanbeige/Nanbeige4.3-33B` (52 layers, hidden 7168, 56/8 heads of 128, intermediate 22016,

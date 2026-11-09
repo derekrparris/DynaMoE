@@ -1873,22 +1873,69 @@ struct ChatMessageView: View {
         return Self.isToolOnlyStreamingContent(message.content, isGemmaDialect: isGemmaDialect)
     }
 
+    /// One marker a model opens a tool call with.
+    struct ToolCallMarker {
+        let text: String
+        /// Gemma permits no suffix after a call, and its marker is a documented
+        /// vocabulary token an answer may quote, so only its own dialect may read it
+        /// as an opener. Every other marker is call machinery under any dialect.
+        let onlyInGemmaDialect: Bool
+    }
+
+    /// Every shape a call can open with, in ONE place. Two consumers read it — the
+    /// display truncation (`cleanedMarkdown`) and the streaming-pill predicate
+    /// (`firstToolCallOpenerRange`) — and both ask the same question, "from here on the
+    /// text is call machinery rather than answer". Keeping two lists let a new dialect
+    /// be recognised by one and not the other, which is exactly what the DeepSeek-V4.1
+    /// DSML spelling did: its call streamed as an empty bubble (markup stripped) with
+    /// no working pill, because nothing said the turn was mid-call. Adding a marker
+    /// here is all a new dialect needs.
+    static let toolCallMarkers: [ToolCallMarker] = [
+        ToolCallMarker(text: StreamingToolParser.qwenToolCallOpen, onlyInGemmaDialect: false),
+        ToolCallMarker(text: StreamingToolParser.qwenFunctionOpen, onlyInGemmaDialect: false),
+        ToolCallMarker(text: StreamingToolParser.llamaTagOpen, onlyInGemmaDialect: false),
+        // DeepSeek-V4.1 writes neither of those shapes: its agent prompt teaches the
+        // DSML container (`#27`), one vocabulary tag token wrapping `invoke` elements,
+        // so the tag itself is the opener. `callNameOpen` is that family's other
+        // spelling, a bare `<tool_call_name>` tag around a JSON argument object.
+        ToolCallMarker(
+            text: "<" + DeepSeekV41ToolDialect.dsmlTag,
+            onlyInGemmaDialect: false
+        ),
+        ToolCallMarker(text: DeepSeekV41ToolDialect.callNameOpen, onlyInGemmaDialect: false),
+        ToolCallMarker(text: StreamingToolParser.gemmaToolCallOpen, onlyInGemmaDialect: true),
+    ]
+
+    /// The markers that count as openers under the active dialect.
+    private static func activeToolCallMarkers(isGemmaDialect: Bool) -> [String] {
+        toolCallMarkers
+            .filter { isGemmaDialect || !$0.onlyInGemmaDialect }
+            .map(\.text)
+    }
+
+    /// The earliest of `markers` in `raw`, or nil when `raw` carries none.
+    private static func earliestMarker(
+        of markers: [String],
+        in raw: String
+    ) -> Range<String.Index>? {
+        var earliest: Range<String.Index>?
+        for marker in markers {
+            guard let found = raw.range(of: marker) else { continue }
+            if earliest == nil || found.lowerBound < earliest!.lowerBound {
+                earliest = found
+            }
+        }
+        return earliest
+    }
+
     /// The range of the earliest tool-call opener of the active dialect, or nil when
     /// the text carries none. The Gemma marker is only an opener under the Gemma
     /// dialect, so a non-Gemma answer that documents `<|tool_call>` keeps its text.
-    static func firstToolCallOpenerRange(in raw: String, isGemmaDialect: Bool) -> Range<String.Index>? {
-        var openers = [
-            StreamingToolParser.qwenToolCallOpen,
-            StreamingToolParser.qwenFunctionOpen,
-            StreamingToolParser.llamaTagOpen,
-        ]
-        if isGemmaDialect { openers.append(StreamingToolParser.gemmaToolCallOpen) }
-        var earliest: Range<String.Index>? = nil
-        for opener in openers {
-            guard let r = raw.range(of: opener) else { continue }
-            if earliest == nil || r.lowerBound < earliest!.lowerBound { earliest = r }
-        }
-        return earliest
+    static func firstToolCallOpenerRange(
+        in raw: String,
+        isGemmaDialect: Bool
+    ) -> Range<String.Index>? {
+        earliestMarker(of: activeToolCallMarkers(isGemmaDialect: isGemmaDialect), in: raw)
     }
 
     /// True when `raw` holds a tool-call opener with no visible text before it, i.e.
@@ -1924,33 +1971,27 @@ struct ChatMessageView: View {
         return isStreamingToolCall
     }
 
-    /// Strips tool-call markup from assistant text for display. The Gemma truncation is
-    /// gated on the active dialect: Gemma permits no suffix after a tool call, but a
-    /// non-Gemma answer that merely documents `<|tool_call>` must keep the rest of its text.
+    /// Strips tool-call markup from assistant text for display, truncating at the
+    /// earliest marker that survived the block strip. The marker table is shared with
+    /// the working-pill predicate, so a dialect cannot be readable in one and invisible
+    /// in the other; only the Gemma marker is dialect-gated, because Gemma permits no
+    /// suffix after a call while a non-Gemma answer that merely documents
+    /// `<|tool_call>` must keep the rest of its text.
     static func cleanedMarkdown(_ content: String, isGemmaDialect: Bool) -> String {
         var clean = content
-        // Truncate at the Gemma opener before regex stripping so the remainder of the
-        // call (which may contain a quoted terminator) is never shown as an answer.
-        if isGemmaDialect, let gemmaStart = clean.range(of: "<|tool_call>") {
-            clean = String(clean[..<gemmaStart.lowerBound])
-        }
+        // Complete blocks go first, so a closed call is removed without discarding an
+        // answer that resumes after it. What is left of a block the regexes cannot
+        // match (a dialect's own spelling, or a call still streaming) is caught by the
+        // truncation below, which is also why a payload carrying a quoted terminator
+        // can never be shown as an answer.
         clean = clean
             .replacingOccurrences(of: "<tool_call>[\\s\\S]*?</tool_call>", with: "", options: .regularExpression)
             .replacingOccurrences(of: "<tool_response>[\\s\\S]*?</tool_response>", with: "", options: .regularExpression)
             // DeepSeek-V4.1's own call tags (`#27`): the call is executed from the raw
             // text, so the bubble must not show it as prose.
             .replacingOccurrences(of: "<tool_call_name>[\\s\\S]*?</tool_call_arguments>", with: "", options: .regularExpression)
-        if let toolCallRange = clean.range(of: "<tool_call>") {
-            clean = String(clean[..<toolCallRange.lowerBound])
-        }
-        if let deepSeekCall = clean.range(of: "<tool_call_name>") {
-            clean = String(clean[..<deepSeekCall.lowerBound])
-        }
-        // DSML (`#27`) is that same family's other call shape, and the one its agent
-        // prompt actually produces. The call container is the last thing in a tool
-        // turn, so everything from the first DSML tag on is machinery, not answer.
-        if let dsmlCall = clean.range(of: "<" + DeepSeekV41ToolDialect.dsmlTag) {
-            clean = String(clean[..<dsmlCall.lowerBound])
+        if let opener = firstToolCallOpenerRange(in: clean, isGemmaDialect: isGemmaDialect) {
+            clean = String(clean[..<opener.lowerBound])
         }
         return clean.trimmingCharacters(in: .whitespacesAndNewlines)
     }

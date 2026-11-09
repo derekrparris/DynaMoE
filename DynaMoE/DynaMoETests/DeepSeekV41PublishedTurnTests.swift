@@ -5276,6 +5276,154 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         }
     }
 
+    // MARK: - The KV cache across turns
+
+    /// Does a growing conversation keep the cache the first turn provisioned?
+    ///
+    /// `#69`'s turn harness builds its own `DeepSeekV41Runtime`, so nothing in this
+    /// file has ever seen the decision `CompletionEngine.launchTurn` makes about an
+    /// EXISTING one. A turn provisioned its cache for exactly its own prompt plus the
+    /// token budget and reused it only when that length still covered the next
+    /// prompt, so every step of a growing conversation outgrew it and retired the
+    /// runtime — and with it the resident sequence the prefix pin reads, the ~65 GB
+    /// expert arena, its `mlock` and the dense pin. The cost is the whole difference
+    /// between a resumed turn (0.14-0.18 s to its first token) and a full re-prefill
+    /// (5.8 s), paid again against a cold arena, on every step.
+    ///
+    /// Two turns, one session, one loaded checkpoint, through the app's own launch
+    /// path. Both facts asserted here come from `CompletionLaunch.prep`, which
+    /// `launchTurn` resolves BEFORE the engine task starts, so neither is a timing
+    /// inference: the second turn must report the SAME provisioned length (no
+    /// rebuild) and must skip the first turn's prompt plus its generation.
+    @MainActor
+    func testASecondChatTurnKeepsTheCacheTheFirstOneProvisioned() async throws {
+        let snapshot = try snapshotDirectory()
+        let tokenizer: DynaMoeTokenizer
+        do {
+            tokenizer = try DynaMoeTokenizer(
+                tokenizerPath: snapshot.appendingPathComponent("tokenizer.json").path
+            )
+        } catch {
+            throw XCTSkip("the checkpoint's tokenizer could not be opened")
+        }
+        let modelConfig = try JSONDecoder().decode(
+            ModelConfig.self,
+            from: Data(contentsOf: snapshot.appendingPathComponent("config.json"))
+        )
+        let dialect = DeepSeekV41PromptDialect.resolve(snapshotDir: snapshot)
+        let engine = try loadPublishedCheckpointIntoTheSharedEngine(snapshot)
+        defer {
+            unloadSharedEngine()
+            withExtendedLifetime(engine) {}
+        }
+        // A pin left by another case would make the first turn look resident.
+        PrefixCacheManager.shared.invalidate()
+
+        let sessionId = UUID()
+        let sampling = TurnSampling(
+            temperature: 0, topP: 1, minP: 0, topK: 50, repetitionPenalty: 1, maxTokens: 16
+        )
+        let memory = TurnMemorySettings.persisted()
+        let system = "You are a careful assistant."
+
+        func run(
+            _ ids: [UInt32], _ prompt: String
+        ) async throws -> (prep: TurnPrepInfo, result: TurnResult, seconds: Double) {
+            let request = CompletionTurnRequest(
+                promptTokenIds: ids,
+                formattedPrompt: prompt,
+                sessionId: sessionId,
+                sampling: sampling,
+                memory: memory,
+                agentToolsEnabled: false,
+                thinkingEnabled: false,
+                asOfDate: nil
+            )
+            let started = CFAbsoluteTimeGetCurrent()
+            let launch = try CompletionEngine.shared.launchTurn(request)
+            var finished: TurnResult?
+            for await event in launch.stream {
+                switch event {
+                case let .finished(result): finished = result
+                case let .failedTurn(failure): XCTFail("the turn failed: \(failure.message)")
+                default: break
+                }
+            }
+            let result = try XCTUnwrap(finished, "the turn produced no result")
+            return (launch.prep, result, CFAbsoluteTimeGetCurrent() - started)
+        }
+
+        let firstPrompt = ChatPromptFormatter.formatConversation(
+            turns: [.init(role: .user, text: "hello there")],
+            cleanSystem: system,
+            thinkingEnabled: false,
+            modelSupportsThinking: true,
+            modelConfig: modelConfig,
+            thinkingEffort: nil,
+            promptDialect: dialect
+        )
+        let firstIds = try tokenizer.encode(text: firstPrompt)
+        let first = try await run(firstIds, firstPrompt)
+        // Hoisted out of the assertions: an `@autoclosure` message is nonisolated, and
+        // reading an implicitly main-actor value inside one is the project's existing
+        // Swift 6 warning rather than anything this case is about.
+        let firstReused = first.prep.prefixTokensReused
+        let firstProvisioned = first.prep.provisionedSequenceLength
+        let firstPromptTokens = first.prep.promptTokenCount
+        let floor = DeepSeekV41ContextProvisioning.initialFloorRows
+        let pinned = PrefixCacheManager.shared.currentPinnedCount
+        let firstGenerated = first.result.generatedTokenIds.count
+        XCTAssertEqual(firstReused, 0, "the first turn has no resident prefix to skip")
+        XCTAssertEqual(
+            firstProvisioned, floor,
+            "the first allocation must buy the floor rather than this turn's own length"
+        )
+        XCTAssertEqual(
+            firstPromptTokens, firstIds.count,
+            "the prep facts must describe the prompt the turn actually ran"
+        )
+        XCTAssertEqual(
+            pinned, firstIds.count + firstGenerated,
+            "the first turn must pin its prompt plus the tokens it generated"
+        )
+
+        // The continuation the chat UI builds: the recorded turn replayed between two
+        // user turns. Splicing the ids says the same thing re-rendering the history
+        // does, without pinning a second copy of the template.
+        var secondIds = first.result.promptTokenIds + first.result.generatedTokenIds
+        let resident = secondIds.count
+        let tail = try tokenizer.encode(text: "\n\nWhat is two plus two?")
+        secondIds += tail
+        let secondPrompt = firstPrompt + first.result.rawDecodedText + "\n\nWhat is two plus two?"
+        let second = try await run(secondIds, secondPrompt)
+        let secondProvisioned = second.prep.provisionedSequenceLength
+        let secondReused = second.prep.prefixTokensReused
+        let secondPromptTokens = second.prep.promptTokenCount
+
+        XCTAssertEqual(
+            secondProvisioned, firstProvisioned,
+            "the second turn must reuse the cache the first provisioned, not rebuild it: a "
+                + "rebuild retires the resident sequence and the expert arena with it"
+        )
+        XCTAssertEqual(
+            secondReused, resident,
+            "the second turn must skip exactly the prompt plus generation the first left "
+                + "behind; 0 means the runtime (or its sequence) was retired and the whole "
+                + "transcript was re-prefilled from position 0"
+        )
+        print(
+            "🔎 [dsv41 real] two turns on one runtime: "
+                + "\(firstPromptTokens) + \(firstGenerated) ids "
+                + "in \(String(format: "%.2f", first.seconds)) s, then "
+                + "\(secondPromptTokens) ids reusing \(secondReused) "
+                + "in \(String(format: "%.2f", second.seconds)) s — provisioned "
+                + "\(secondProvisioned) rows on both, "
+                + "\(second.result.residentExpertCount)/\(second.result.totalExpertCount) experts "
+                + "resident, hit rate "
+                + String(format: "%.1f", second.result.cacheHitRatePercent) + "%"
+        )
+    }
+
     // MARK: - An image in a real turn
 
     /// The tower at the checkpoint's own weights, and its rows inside a real turn.

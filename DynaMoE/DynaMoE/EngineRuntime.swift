@@ -1113,6 +1113,45 @@ enum KVCacheProvisioning {
     }
 }
 
+/// Context length a DeepSeek V4.1 runtime is provisioned for.
+///
+/// The runtime is where prefix reuse lives: its KV cache holds the previous
+/// turn's sequence and `DeepSeekV41TurnRunner` skips whatever of the new prompt
+/// that sequence already covers. A runtime is only reused when it was
+/// provisioned for at least the turn's own length, so provisioning exactly
+/// `prompt + maxTokens` retired the runtime, and with it the cache, on every
+/// turn of a growing conversation -- which is every step of an agent loop, so
+/// a long code review re-prefilled its whole transcript from position 0 per
+/// step, cold arena included.
+///
+/// Growth is therefore geometric. A length the cache already covers is reused
+/// untouched; one it does not is provisioned at twice what it held, and at
+/// least what this turn needs, so a session pays a handful of rebuilds rather
+/// than one per turn. The first allocation also buys the floor, because one
+/// rebuild costs an entire re-prefill of everything the cache was keeping.
+enum DeepSeekV41ContextProvisioning {
+    /// Rows a fresh runtime is provisioned beyond the turn that first needs it.
+    /// 128k positions of this checkpoint's cache price at well under a gigabyte
+    /// (`DeepSeekV41Config.cacheBytesPerToken`), against tens of gigabytes of
+    /// expert arena, so the floor is cheap and it is what keeps a normal
+    /// conversation on one allocation.
+    static let initialFloorRows = 131_072
+
+    /// Provisioned length for a turn that needs `needed` rows, given what the
+    /// cached runtime holds (`nil` when there is no reusable runtime) and the
+    /// checkpoint's own ceiling.
+    static func contextLength(needed: Int, cached: Int?, cap: Int) -> Int {
+        let ceiling = max(1, cap)
+        let required = max(1, min(ceiling, needed))
+        guard let cached, cached > 0 else {
+            return min(ceiling, max(required, initialFloorRows))
+        }
+        guard cached < required else { return cached }
+        let doubled = cached > Int.max / 2 ? Int.max : cached * 2
+        return min(ceiling, max(required, doubled))
+    }
+}
+
 struct ExpertSlice {
     let shardIndex: UInt32
     let offset: UInt64
