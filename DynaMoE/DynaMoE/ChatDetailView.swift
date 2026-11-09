@@ -1881,6 +1881,14 @@ struct ChatMessageView: View {
             StreamingToolParser.qwenToolCallOpen,
             StreamingToolParser.qwenFunctionOpen,
             StreamingToolParser.llamaTagOpen,
+            // DeepSeek-V4.1 writes neither of those shapes: its agent prompt teaches
+            // the DSML container (`#27`), one vocabulary tag token wrapping `invoke`
+            // elements, so the tag itself is the opener and the same prefix
+            // `cleanedMarkdown` truncates on. Without it a DSML call streamed with an
+            // empty bubble (markup stripped) and no working pill, because nothing
+            // declared the turn was mid-call.
+            "<" + DeepSeekV41ToolDialect.dsmlTag,
+            DeepSeekV41ToolDialect.callNameOpen,
         ]
         if isGemmaDialect { openers.append(StreamingToolParser.gemmaToolCallOpen) }
         var earliest: Range<String.Index>? = nil

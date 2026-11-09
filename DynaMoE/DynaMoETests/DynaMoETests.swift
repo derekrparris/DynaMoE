@@ -6152,6 +6152,26 @@ final class DynaMoETests: XCTestCase {
         XCTAssertTrue(ChatMessageView.isToolOnlyStreamingContent("<|python_tag|>{\"name\"", isGemmaDialect: false))
         XCTAssertTrue(ChatMessageView.isToolOnlyStreamingContent("<|tool_call>call:shell_run{", isGemmaDialect: true))
 
+        // DeepSeek-V4.1's own DSML spelling is a third call shape, and the one its
+        // agent prompt actually produces: the vocabulary tag wraps a `calls` container
+        // of `invoke` elements. It must drive the pill too, both mid-container and
+        // after the first invoke has opened, and in its JSON-argument spelling.
+        let dsmlCall = "<" + DeepSeekV41ToolDialect.dsmlTag
+            + " calls>\n<" + DeepSeekV41ToolDialect.dsmlTag + " invoke name=\"file_write"
+        XCTAssertTrue(ChatMessageView.isToolOnlyStreamingContent(dsmlCall, isGemmaDialect: false))
+        XCTAssertTrue(ChatMessageView.isToolOnlyStreamingContent(
+            "<" + DeepSeekV41ToolDialect.dsmlTag, isGemmaDialect: false
+        ))
+        XCTAssertTrue(ChatMessageView.isToolOnlyStreamingContent(
+            DeepSeekV41ToolDialect.callNameOpen + "file_write", isGemmaDialect: false
+        ))
+        XCTAssertEqual(ChatMessageView.responseDisplayContent(dsmlCall, isGemmaDialect: false), "")
+        // Prose before the call stays prose: the pill is for a turn with nothing
+        // readable in it, not for every turn that ends in a call.
+        XCTAssertFalse(ChatMessageView.isToolOnlyStreamingContent(
+            "I'll write the file now. " + dsmlCall, isGemmaDialect: false
+        ))
+
         // Visible prose before the opener means it is not a tool-only stream.
         XCTAssertFalse(ChatMessageView.isToolOnlyStreamingContent("Let me check. <function=shell_run>", isGemmaDialect: false))
         XCTAssertFalse(ChatMessageView.isToolOnlyStreamingContent("Just a normal answer.", isGemmaDialect: false))
