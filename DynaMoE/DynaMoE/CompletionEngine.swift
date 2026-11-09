@@ -301,10 +301,13 @@ public final class CompletionEngine: @unchecked Sendable {
     /// Building it is load work, not turn work: it indexes 96k tensors, opens the
     /// two Engram tables and the 48 expert shards, and allocates the caches and the
     /// expert arena. Rebuilding it per turn also threw away the whole arena, so every
-    /// turn began with 240 cold expert reads (~4.5 GB from disk). The turn loop
-    /// resets the cache at the start of each turn, which is all the isolation a turn
-    /// needs. Keyed by snapshot path and the context it was provisioned for, because
-    /// a longer turn needs a larger cache.
+    /// turn began with 240 cold expert reads (~4.5 GB from disk), and threw away the
+    /// resident sequence the prefix pin reads, so every turn re-prefilled its whole
+    /// transcript from position 0. The turn loop resets the cache only when it cannot
+    /// resume a prefix, which is the isolation a turn actually needs. Keyed by
+    /// snapshot path and the context it was provisioned for, because a longer turn
+    /// needs a larger cache and `DeepSeekV41ContextProvisioning` decides how much
+    /// larger.
     private var cachedDeepSeekRuntime: (path: String, contextLength: Int, runtime: DeepSeekV41Runtime)?
 
     /// Encoded image spans, keyed by `snapshot path | image sha256`.
@@ -642,7 +645,7 @@ public final class CompletionEngine: @unchecked Sendable {
                 }
                 print(
                     "🧠 [DSV41] \(reason) — new KV cache, full prefill of "
-                        + "\(request.promptTokenIds.count) tokens"
+                        + "\(pricedPromptTokens) positions"
                 )
             }
 
