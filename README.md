@@ -7,7 +7,10 @@ DynaMoE is a high-performance native macOS application, a local inference engine
 Engineered specifically for Apple Silicon's Unified Memory Architecture (UMA), DynaMoE runs massive Mixture-of-Experts (MoE) and cutting-edge hybrid attention architectures that exceed physical system RAM by dynamically memory-mapping and streaming weights directly from high-speed NVMe storage to the GPU. It also runs dense language models.
 
 ---
-## Make sure to check the latest release to see what's new with DynaMoE! I'm not great at keeping this readme up to date on all the latest and greatest changes! :)
+**Make sure to check the latest release to see what's new with DynaMoE!**  
+I'm not great at keeping this readme up to date on all the latest and greatest changes! :)
+
+---
 
 ## Inspiration & Acknowledgements
 
