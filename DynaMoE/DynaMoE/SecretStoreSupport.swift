@@ -98,8 +98,18 @@ public nonisolated enum SecretAccessClassifier {
 
     /// `errSecMissingEntitlement` is the documented answer for an app that asks
     /// the data protection keychain for a group its signature does not grant.
+    ///
+    /// `errSecParam` is deliberately NOT included: it is what a malformed query
+    /// returns, so it says nothing about the signature. Treating it as proof of
+    /// a missing capability would cache a query-construction bug for the life of
+    /// the process as "this build cannot use the keychain".
     public static func indicatesMissingEntitlement(_ status: OSStatus) -> Bool {
-        status == errSecMissingEntitlement || status == errSecParam
+        status == errSecMissingEntitlement
+    }
+
+    /// A status that points at the QUERY rather than at the build's signature.
+    public static func indicatesMalformedQuery(_ status: OSStatus) -> Bool {
+        status == errSecParam
     }
 }
 
@@ -220,13 +230,14 @@ public nonisolated enum SecretStoreFailure: LocalizedError, Equatable {
 /// second, legacy as the answer whenever either is inconclusive.
 ///
 /// "Inconclusive" is not the same as "refused", and the difference matters.
-/// `errSecMissingEntitlement`/`errSecParam` say the signature will never be
-/// granted the group, so the legacy keychain is the answer for the life of the
-/// process. Any other probe failure is a property of this instant (a keychain
-/// still coming up at launch, an interaction that could not be shown yet), so
-/// it is retried immediately, and a retry that also fails leaves the answer
-/// uncached: the next caller asks again rather than the process spending its
-/// whole life writing secrets to a keychain the next launch will not read.
+/// `errSecMissingEntitlement` says the signature will never be granted the
+/// group, so the legacy keychain is the answer for the life of the process.
+/// Every other probe failure is a property of this instant (a keychain still
+/// coming up at launch, an interaction that could not be shown yet, or a query
+/// this code built wrongly) so it is retried immediately, and a retry that also
+/// fails leaves the answer uncached: the next caller asks again rather than the
+/// process spending its whole life writing secrets to a keychain the next
+/// launch will not read.
 public nonisolated final class SecretStoreBackendResolver: @unchecked Sendable {
     public static let shared = SecretStoreBackendResolver()
 
@@ -329,6 +340,16 @@ public nonisolated final class SecretStoreBackendResolver: @unchecked Sendable {
                     // for it.
                     return Resolution(backend: .legacy, definitive: true)
                 }
+                if SecretAccessClassifier.indicatesMalformedQuery(status) {
+                    // errSecParam is returned for a malformed query, not for an
+                    // unentitled build. Name the status instead of reporting an
+                    // entitlement fact, and leave the answer provisional so the
+                    // next caller asks again rather than inheriting it.
+                    DiagLog.warning(
+                        "keychain",
+                        "data protection keychain probe answered errSecParam (\(status)), which points at the query, not the entitlement; not caching this answer"
+                    )
+                }
                 if attempt < attempts, probeRetryDelayMicroseconds > 0 {
                     Thread.sleep(forTimeInterval: TimeInterval(probeRetryDelayMicroseconds) / 1_000_000)
                 }
@@ -373,6 +394,56 @@ public nonisolated final class SecretStoreBackendResolver: @unchecked Sendable {
     }
 }
 
+// MARK: - Item access
+
+/// One keychain lookup's outcome: the status, plus whatever the query was
+/// allowed to return. Deliberately not `Sendable`: the value is a Core
+/// Foundation object that the caller consumes immediately.
+public nonisolated struct KeychainItemLookup {
+    public let status: OSStatus
+    public let value: CFTypeRef?
+
+    public init(status: OSStatus, value: CFTypeRef? = nil) {
+        self.status = status
+        self.value = value
+    }
+}
+
+/// The four keychain primitives this app issues, behind a protocol.
+///
+/// The default implementation is the real `SecItem*` family; the seam exists
+/// because the data protection keychain can only be WRITTEN from a build that
+/// carries `keychain-access-groups`, and the test host is an unentitled Debug
+/// app. Without it, every test would have to skip the backend that ships.
+public nonisolated protocol KeychainItemAccess: Sendable {
+    func copyMatching(_ query: [String: Any]) -> KeychainItemLookup
+    func add(_ attributes: [String: Any]) -> OSStatus
+    func update(query: [String: Any], attributes: [String: Any]) -> OSStatus
+    func delete(_ query: [String: Any]) -> OSStatus
+}
+
+public nonisolated struct SystemKeychainItemAccess: KeychainItemAccess {
+    public init() {}
+
+    public func copyMatching(_ query: [String: Any]) -> KeychainItemLookup {
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        return KeychainItemLookup(status: status, value: item)
+    }
+
+    public func add(_ attributes: [String: Any]) -> OSStatus {
+        SecItemAdd(attributes as CFDictionary, nil)
+    }
+
+    public func update(query: [String: Any], attributes: [String: Any]) -> OSStatus {
+        SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+    }
+
+    public func delete(_ query: [String: Any]) -> OSStatus {
+        SecItemDelete(query as CFDictionary)
+    }
+}
+
 // MARK: - Store
 
 /// A keychain-backed secret store scoped to one service string. The MCP and
@@ -380,13 +451,25 @@ public nonisolated final class SecretStoreBackendResolver: @unchecked Sendable {
 /// the same way.
 public nonisolated struct KeychainSecretStore: Sendable {
     public let service: String
+    private let items: any KeychainItemAccess
+    /// Test seam: pins this store to one backend instead of asking the
+    /// process-wide resolver. Nil in production.
+    private let pinnedBackend: KeychainBackend?
 
     public init(service: String) {
         self.service = service
+        self.items = SystemKeychainItemAccess()
+        self.pinnedBackend = nil
+    }
+
+    init(service: String, items: any KeychainItemAccess, backend: KeychainBackend?) {
+        self.service = service
+        self.items = items
+        self.pinnedBackend = backend
     }
 
     public var backend: KeychainBackend {
-        SecretStoreBackendResolver.shared.backend()
+        pinnedBackend ?? SecretStoreBackendResolver.shared.backend()
     }
 
     @discardableResult
@@ -400,20 +483,20 @@ public nonisolated struct KeychainSecretStore: Sendable {
         guard let data = secret.data(using: .utf8) else { throw SecretStoreFailure.invalidValue }
 
         let backend = self.backend
-        let updateStatus = SecItemUpdate(
-            SecretStoreQuery.scoped([
+        let updateStatus = items.update(
+            query: SecretStoreQuery.scoped([
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: service,
                 kSecAttrAccount as String: account,
-            ], backend: backend) as CFDictionary,
-            [kSecValueData as String: data] as CFDictionary
+            ], backend: backend),
+            attributes: [kSecValueData as String: data]
         )
         if updateStatus == errSecSuccess { return account }
         guard updateStatus == errSecItemNotFound else {
             throw SecretStoreFailure.status(updateStatus)
         }
 
-        let addStatus = SecItemAdd(
+        let addStatus = items.add(
             SecretStoreQuery.add(
                 service: service,
                 account: account,
@@ -421,8 +504,7 @@ public nonisolated struct KeychainSecretStore: Sendable {
                 label: label,
                 description: description,
                 backend: backend
-            ) as CFDictionary,
-            nil
+            )
         )
         guard addStatus == errSecSuccess else {
             throw SecretStoreFailure.status(addStatus)
@@ -443,15 +525,13 @@ public nonisolated struct KeychainSecretStore: Sendable {
     }
 
     public func read(account: String, backend: KeychainBackend) -> SecretAccessResult {
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(
-            SecretStoreQuery.read(service: service, account: account, backend: backend) as CFDictionary,
-            &item
+        let lookup = items.copyMatching(
+            SecretStoreQuery.read(service: service, account: account, backend: backend)
         )
-        guard status == errSecSuccess else {
-            return SecretAccessClassifier.failure(status)
+        guard lookup.status == errSecSuccess else {
+            return SecretAccessClassifier.failure(lookup.status)
         }
-        guard let data = item as? Data, let secret = String(data: data, encoding: .utf8) else {
+        guard let data = lookup.value as? Data, let secret = String(data: data, encoding: .utf8) else {
             return .unavailable(errSecDecode)
         }
         return .found(secret)
@@ -467,10 +547,9 @@ public nonisolated struct KeychainSecretStore: Sendable {
     }
 
     public func exists(account: String, backend: KeychainBackend) -> Bool {
-        SecItemCopyMatching(
-            SecretStoreQuery.existence(service: service, account: account, backend: backend) as CFDictionary,
-            nil
-        ) == errSecSuccess
+        items.copyMatching(
+            SecretStoreQuery.existence(service: service, account: account, backend: backend)
+        ).status == errSecSuccess
     }
 
     /// Removes the credential from both keychains, so a deleted integration
@@ -483,7 +562,7 @@ public nonisolated struct KeychainSecretStore: Sendable {
     }
 
     public func delete(account: String, backend: KeychainBackend) {
-        SecItemDelete(SecretStoreQuery.delete(service: service, account: account, backend: backend) as CFDictionary)
+        _ = items.delete(SecretStoreQuery.delete(service: service, account: account, backend: backend))
     }
 
     /// Removes only the legacy copy, which is what a finished import reaps.
@@ -505,21 +584,19 @@ public nonisolated struct KeychainSecretStore: Sendable {
     }
 
     private func accountNames(backend: KeychainBackend) -> [String] {
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(
-            SecretStoreQuery.listing(service: service, backend: backend) as CFDictionary,
-            &result
+        let lookup = items.copyMatching(
+            SecretStoreQuery.listing(service: service, backend: backend)
         )
-        guard status == errSecSuccess else { return [] }
-        let items: [[String: Any]]
-        if let list = result as? [[String: Any]] {
-            items = list
-        } else if let single = result as? [String: Any] {
-            items = [single]
+        guard lookup.status == errSecSuccess else { return [] }
+        let records: [[String: Any]]
+        if let list = lookup.value as? [[String: Any]] {
+            records = list
+        } else if let single = lookup.value as? [String: Any] {
+            records = [single]
         } else {
             return []
         }
-        return items.compactMap { $0[kSecAttrAccount as String] as? String }
+        return records.compactMap { $0[kSecAttrAccount as String] as? String }
     }
 
     public static func describe(_ status: OSStatus) -> String {

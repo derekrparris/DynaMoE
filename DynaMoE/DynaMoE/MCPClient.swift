@@ -1159,7 +1159,7 @@ public nonisolated enum MCPConfigResolver {
             issues.append(MCPConfigIssue(
                 severity: .error,
                 serverKey: key,
-                message: "Credential token(s) not imported yet: \(Set(needsImport).sorted().joined(separator: ", ")). Open Settings \u{25B8} Import stored credentials to copy them from the older Keychain."
+                message: "Credential token(s) not imported yet: \(Set(needsImport).sorted().joined(separator: ", ")). Open Settings \u{25B8} Agent & Tools \u{25B8} Stored Credentials and press Import to copy them from the older Keychain."
             ))
         }
         if !denied.isEmpty {

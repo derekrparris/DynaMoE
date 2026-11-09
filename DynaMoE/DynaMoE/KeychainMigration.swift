@@ -106,6 +106,9 @@ public nonisolated enum KeychainImportOutcome: Sendable, Equatable {
     case tombstoneRemoved(account: String)
     case duplicateRemoved(account: String)
     case alreadyPresent(account: String)
+    /// This build reads the legacy keychain directly, so the credential is
+    /// already where it is read from and there is no second copy to make.
+    case noSecondKeychain(account: String)
     case needsAuthorization(account: String, OSStatus)
     case failed(account: String, OSStatus)
 
@@ -113,6 +116,7 @@ public nonisolated enum KeychainImportOutcome: Sendable, Equatable {
         switch self {
         case .imported(let account), .tombstoneRemoved(let account),
              .duplicateRemoved(let account), .alreadyPresent(let account),
+             .noSecondKeychain(let account),
              .failed(let account, _):
             return account
         case .needsAuthorization(let account, _):
@@ -122,7 +126,8 @@ public nonisolated enum KeychainImportOutcome: Sendable, Equatable {
 
     public var succeeded: Bool {
         switch self {
-        case .imported, .tombstoneRemoved, .duplicateRemoved, .alreadyPresent: return true
+        case .imported, .tombstoneRemoved, .duplicateRemoved, .alreadyPresent,
+             .noSecondKeychain: return true
         case .needsAuthorization, .failed: return false
         }
     }
@@ -137,6 +142,8 @@ public nonisolated enum KeychainImportOutcome: Sendable, Equatable {
             return "Removed the older copy; the current keychain already had it."
         case .alreadyPresent:
             return "Both keychains hold this credential with different values; left the older copy alone."
+        case .noSecondKeychain:
+            return "This build reads the login keychain directly, so there is nothing to import."
         case .needsAuthorization(_, let status):
             return "Not authorized (\(KeychainSecretStore.describe(status))). Click Always Allow when macOS asks, then import again."
         case .failed(_, let status):
@@ -208,10 +215,26 @@ public nonisolated enum KeychainMigration {
         }
     }
 
-    /// Copies one credential forward. `nil` means the legacy read prompted and
-    /// the user dismissed it, which the caller reports rather than retries.
+    /// Copies one credential forward, reporting rather than retrying anything
+    /// the user refused. Only reachable from the explicit import.
     public static func adopt(_ credential: PendingCredential) -> KeychainImportOutcome {
-        let store = KeychainSecretStore(service: credential.service)
+        adopt(credential, items: SystemKeychainItemAccess())
+    }
+
+    /// The same import over an injected item layer, which is how the data
+    /// protection branch is exercised on a host that cannot be signed for it.
+    static func adopt(
+        _ credential: PendingCredential,
+        items: any KeychainItemAccess
+    ) -> KeychainImportOutcome {
+        let store = KeychainSecretStore(service: credential.service, items: items, backend: nil)
+        // On a legacy backend `read` and `readLegacy` address the SAME item, so
+        // `decision` would answer `.duplicate` and the reap below would delete
+        // the only copy of the credential. There is no second keychain to copy
+        // into here, so this is a no-op rather than a migration.
+        guard store.backend.usesDataProtection else {
+            return .noSecondKeychain(account: credential.account)
+        }
         let current = store.read(account: credential.account)
         let legacy = store.readLegacy(account: credential.account)
 

@@ -167,7 +167,7 @@ flowchart TD
 * **Config File as the Source of Truth**: The JSON file can be hand-edited, version-controlled, or pasted from another client. Settings renders it as a form *and* a raw JSON editor, a directory watcher picks up external edits without a restart, and both the `command`/`args`/`env` and `url`/`headers` shapes are understood.
 * **Lazy Tool Exposure**: Discovered tools register as `mcp__<server>__<tool>` in the tool catalog but are **not** loaded into the prompt. The model finds them with `tools_discover` (category `mcp`) and loads them on demand, so an MCP integration costs zero prefill tokens until it is used.
 * **Credentials Stay Out of the File**: Secret environment values and headers live in the Keychain; `mcp.json` holds only a `${keychain:...}` reference. `${env:NAME}` and `${workspace}` expansion happens at connect time and is never written back to disk.
-* **No keychain prompts at launch**: a credential is read only when something actually needs it, and "is one stored?" is answered from item attributes, which macOS returns without a dialog. Shipped builds keep their credentials in the data protection keychain, where access is granted by the app's code-signing identity, so a new version never asks for permission again. Credentials written by an older version are copied across once from **Settings ▸ Import stored credentials**.
+* **No keychain prompts at launch**: a credential is read only when something actually needs it, and "is one stored?" is answered from item attributes, which macOS returns without a dialog. Shipped builds keep their credentials in the data protection keychain, where access is granted by the app's code-signing identity, so a new version never asks for permission again. Credentials written by an older version are copied across once from the **Stored Credentials** card, which appears in Settings on both **Cloud Providers** and **Agent & Tools** while something is still waiting to be imported.
 * **Gated by Default**: Every MCP tool call asks for human approval unless Turbo Mode is on, because a remote server can do anything and its own `readOnlyHint` annotation is a claim rather than a guarantee.
 
 ---
@@ -406,7 +406,7 @@ The Thinking toggle is hidden for cloud models: the OpenAI-compatible surface ha
 ### Setup
 
 1. Open **Settings (⌘,) → Cloud Providers**.
-2. Paste a Synthetic API key and press **Save**. The key is stored in the Keychain (`DRP.DynaMoE.cloud`), never in UserDefaults or on disk. If an earlier version stored it, **Import stored credentials** copies it forward with one system prompt; after that macOS never asks again, including after an update.
+2. Paste a Synthetic API key and press **Save**. The key is stored in the Keychain (`DRP.DynaMoE.cloud`), never in UserDefaults or on disk. If an earlier version stored it, the **Stored Credentials** card just below copies it forward with one system prompt (choose **Always Allow**); after that macOS never asks again, including after an update.
 3. Press **Test & Sync Models**. DynaMoE calls `GET /openai/v1/models`, which validates the key and registers the provider's live chat models in one pass — no model ids to type. A bad key fails with `401` before spending a completion.
 4. Pick a model from the composer's **Cloud Models** section. The same action re-runs whenever the provider adds or retires models.
 

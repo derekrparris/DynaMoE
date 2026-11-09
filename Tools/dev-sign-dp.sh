@@ -21,8 +21,12 @@
 
 set -eu
 
+case "${1:-}" in
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+
 if [ $# -lt 1 ]; then
-    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
 fi
 
@@ -31,8 +35,10 @@ shift
 PROFILE=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --profile) PROFILE="${2:-}"; shift 2 ;;
-        -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --profile)
+            [ $# -ge 2 ] || { echo "error: --profile needs a file.provisionprofile" >&2; exit 1; }
+            PROFILE="$2"; shift 2 ;;
+        -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "error: unknown argument '$1'" >&2; exit 1 ;;
     esac
 done
@@ -76,6 +82,21 @@ profile_grants_group() {
     return 1
 }
 
+# The profile's ExpirationDate as an epoch second, or empty when it carries no
+# date or cannot be read.
+profile_expiration_epoch() {
+    _plist="$(mktemp -t dynamoe-profile-expiry)"
+    _epoch=""
+    if security cms -D -i "$1" >"$_plist" 2>/dev/null; then
+        _raw="$(plutil -extract ExpirationDate raw -o - "$_plist" 2>/dev/null || true)"
+        if [ -n "$_raw" ]; then
+            _epoch="$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$_raw" "+%s" 2>/dev/null || true)"
+        fi
+    fi
+    rm -f "$_plist"
+    printf '%s\n' "$_epoch"
+}
+
 if [ -z "$PROFILE" ]; then
     for DIR in "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" \
                "$HOME/Library/MobileDevice/Provisioning Profiles"; do
@@ -99,6 +120,16 @@ fi
     echo "       Tools/install_profile.py, or pass it with --profile <file.provisionprofile>." >&2
     exit 1
 }
+
+# An expired profile signs and installs cleanly, and then launchd kills the app
+# at startup, which reads as "the re-sign broke it".
+PROFILE_EXPIRY="$(profile_expiration_epoch "$PROFILE")"
+if [ -n "$PROFILE_EXPIRY" ] && [ "$PROFILE_EXPIRY" -le "$(date -u '+%s')" ]; then
+    echo "error: $PROFILE expired on $(date -u -r "$PROFILE_EXPIRY" '+%Y-%m-%d')." >&2
+    echo "       Regenerate it against the installed certificate; an expired profile" >&2
+    echo "       gets the app killed at launch." >&2
+    exit 1
+fi
 
 echo "==> identity: $IDENTITY"
 echo "==> profile:  $PROFILE"
@@ -130,7 +161,17 @@ find "$APP/Contents" -depth \
 while IFS= read -r NESTED; do
     [ -n "$NESTED" ] || continue
     echo "    $NESTED"
-    if ! codesign --force --timestamp --options runtime --sign "$IDENTITY" "$NESTED"; then
+    # Preserve what the nested bundle already carries. Signing without
+    # --entitlements replaces the signature outright, which would strip the
+    # entitlements of the very XPC services and helper apps listed above.
+    #
+    # `requirements` is deliberately NOT in this list: a preserved designated
+    # requirement still names the OLD signature's cdhash (an ad-hoc Debug build
+    # names an ad-hoc one), so the re-signed bundle fails
+    # `codesign --verify --strict` with "nested code is modified or invalid".
+    if ! codesign --force --timestamp --options runtime \
+            --preserve-metadata=entitlements,flags,runtime \
+            --sign "$IDENTITY" "$NESTED"; then
         echo "error: could not sign nested code at $NESTED" >&2
         exit 1
     fi
@@ -141,6 +182,6 @@ codesign --force --timestamp --options runtime \
 
 echo "==> verifying"
 codesign --verify --strict --verbose=2 "$APP"
-codesign -d --entitlements :- "$APP" 2>&1 | grep -q "$KEYCHAIN_GROUP" \
+codesign -d --entitlements :- "$APP" 2>&1 | grep -Fq "$KEYCHAIN_GROUP" \
     || { echo "error: $KEYCHAIN_GROUP missing from the signed app" >&2; exit 1; }
 echo "ready: launch $APP and check Console.app for keychain backend=dataProtection"

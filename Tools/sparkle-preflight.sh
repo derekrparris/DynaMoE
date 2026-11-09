@@ -23,7 +23,7 @@
 #  10. With --app: signature, Gatekeeper and staple checks on the export
 #  11. Keychain sharing: the Release entitlements grant keychain-access-groups,
 #      and (with --app) the app carries the entitlement and an embedded
-#      Developer ID profile that grants the same group
+#      Developer ID profile that grants the same group and has not expired
 #
 # Note: gate 4 can raise a Keychain authorization dialog on first use. Approve
 # it — a dismissed dialog makes generate_keys succeed while printing nothing,
@@ -51,11 +51,14 @@ ONLINE=1
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --app)     APP_PATH="${2:-}"; shift 2 ;;
-        --version) WANT_VERSION="${2:-}"; shift 2 ;;
-        --profile) NOTARY_PROFILE="${2:-}"; shift 2 ;;
+        --app)     [ $# -ge 2 ] || { echo "error: --app needs a path" >&2; exit 1; }
+                   APP_PATH="$2"; shift 2 ;;
+        --version) [ $# -ge 2 ] || { echo "error: --version needs a value" >&2; exit 1; }
+                   WANT_VERSION="$2"; shift 2 ;;
+        --profile) [ $# -ge 2 ] || { echo "error: --profile needs a name" >&2; exit 1; }
+                   NOTARY_PROFILE="$2"; shift 2 ;;
         --offline) ONLINE=0; shift ;;
-        -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "error: unknown argument '$1'" >&2; exit 1 ;;
     esac
 done
@@ -267,12 +270,25 @@ fi
 head_ "11. Keychain sharing (stops the access prompts)"
 RELEASE_ENTITLEMENTS="$ROOT/DynaMoE/DynaMoE/DynaMoE-Release.entitlements"
 KEYCHAIN_GROUP="RMY84Y8G7M.DRP.DynaMoE"
+# The source entitlements keep the build variable; codesign expands nothing, so
+# anything that inspects a SIGNED app has to look for the literal group.
+KEYCHAIN_GROUP_SOURCE='$(AppIdentifierPrefix)DRP.DynaMoE'
 if [ ! -f "$RELEASE_ENTITLEMENTS" ]; then
     fail "missing DynaMoE/DynaMoE-Release.entitlements: the app would fall back to the legacy keychain and ask for access on every update"
-elif grep -q 'keychain-access-groups' "$RELEASE_ENTITLEMENTS"; then
-    ok "Release entitlements grant keychain-access-groups"
 else
-    fail "DynaMoE-Release.entitlements has no keychain-access-groups"
+    # Read the ENTITLEMENT, not the file's text: the plist's own comment names
+    # keychain-access-groups, so a grep would pass after the key was deleted --
+    # and it would pass for any group value, including a typo.
+    ENTITLED_GROUP="$(mktemp -t dynamoe-release-groups)"
+    plutil -extract 'keychain-access-groups' xml1 \
+        -o "$ENTITLED_GROUP" "$RELEASE_ENTITLEMENTS" 2>/dev/null || : >"$ENTITLED_GROUP"
+    if grep -Fq "<string>$KEYCHAIN_GROUP</string>" "$ENTITLED_GROUP" \
+        || grep -Fq "<string>$KEYCHAIN_GROUP_SOURCE</string>" "$ENTITLED_GROUP"; then
+        ok "Release entitlements grant keychain-access-groups = $KEYCHAIN_GROUP_SOURCE (\"$KEYCHAIN_GROUP\" signed)"
+    else
+        fail "DynaMoE-Release.entitlements does not grant $KEYCHAIN_GROUP: the app would fall back to the legacy keychain and prompt on every update"
+    fi
+    rm -f "$ENTITLED_GROUP"
 fi
 if grep -Eq 'CODE_SIGN_ENTITLEMENTS = "?DynaMoE/DynaMoE-Release\.entitlements"?' "$PBXPROJ"; then
     ok "Release configuration signs with those entitlements"
@@ -324,6 +340,24 @@ else
             ok "profile team matches the signing team"
         else
             warn "profile TeamIdentifier is not $KEYCHAIN_TEAM"
+        fi
+        # An expired profile validates, signs, notarizes and installs; launchd
+        # then kills the app on first launch. Nothing else in this chain notices.
+        PROFILE_EXPIRY="$(plutil -extract ExpirationDate raw -o - "$PROFILE_PLIST" 2>/dev/null || true)"
+        if [ -z "$PROFILE_EXPIRY" ]; then
+            warn "embedded profile carries no ExpirationDate; cannot tell how long it lasts"
+        else
+            PROFILE_EXPIRY_EPOCH="$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$PROFILE_EXPIRY" '+%s' 2>/dev/null || true)"
+            NOW_EPOCH="$(date -u '+%s')"
+            if [ -z "$PROFILE_EXPIRY_EPOCH" ]; then
+                warn "could not parse embedded profile ExpirationDate '$PROFILE_EXPIRY'"
+            elif [ "$PROFILE_EXPIRY_EPOCH" -le "$NOW_EPOCH" ]; then
+                fail "embedded profile EXPIRED on $(date -u -r "$PROFILE_EXPIRY_EPOCH" '+%Y-%m-%d') — the app would be killed at launch"
+            elif [ "$PROFILE_EXPIRY_EPOCH" -le "$((NOW_EPOCH + 2592000))" ]; then
+                warn "embedded profile expires on $(date -u -r "$PROFILE_EXPIRY_EPOCH" '+%Y-%m-%d')"
+            else
+                ok "embedded profile valid until $(date -u -r "$PROFILE_EXPIRY_EPOCH" '+%Y-%m-%d')"
+            fi
         fi
         rm -f "$PROFILE_PLIST" "$PROFILE_GROUPS" "$PROFILE_TEAMS"
     fi
