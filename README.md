@@ -9,8 +9,6 @@ Engineered specifically for Apple Silicon's Unified Memory Architecture (UMA), D
 ---
 ## Make sure to check the latest release to see what's new with DynaMoE! I'm not great at keeping this readme up to date on all the latest and greatest changes! :)
 
----
-
 ## Inspiration & Acknowledgements
 
 This project was undertaken purely for the joy of exploration by someone who is not a software engineer. Just someone who is enjoying learning with the help of AI.
