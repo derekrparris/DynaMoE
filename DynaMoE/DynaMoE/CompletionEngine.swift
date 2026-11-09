@@ -595,7 +595,7 @@ public final class CompletionEngine: @unchecked Sendable {
             // position (`limit - prompt - 1`), so provisioning the bare budget made every
             // budgeted turn answer one token short of what the client asked for: a
             // `max_tokens` of 3 produced 2 tokens here, and 8 produced 7 in `#89`.
-            let contextLength = max(
+            let neededContextLength = max(
                 1,
                 min(
                     dsConfig.maxPositionEmbeddings,
@@ -603,18 +603,48 @@ public final class CompletionEngine: @unchecked Sendable {
                 )
             )
             // Reuse the runtime a previous turn built when it was provisioned for at
-            // least this much context. The engine is single-flight (checked at the
-            // top), so no other turn can be holding it.
+            // least this much context, and grow the provisioning geometrically when it
+            // was not: a cache provisioned for exactly one turn's length is retired by
+            // the next turn of a growing conversation, and that retires the resident
+            // sequence the prefix reuse depends on. The engine is single-flight
+            // (checked at the top), so no other turn can be holding it.
             var reused = false
             var built: DeepSeekV41Runtime?
+            var contextLength = neededContextLength
             stateLock.lock()
-            if let cached = cachedDeepSeekRuntime,
-               cached.path == snapshotDir.path,
-               cached.contextLength >= contextLength {
-                built = cached.runtime
-                reused = true
+            let cachedRuntime = cachedDeepSeekRuntime
+            if let cached = cachedRuntime, cached.path == snapshotDir.path {
+                contextLength = DeepSeekV41ContextProvisioning.contextLength(
+                    needed: neededContextLength,
+                    cached: cached.contextLength,
+                    cap: dsConfig.maxPositionEmbeddings
+                )
+                if cached.contextLength >= contextLength {
+                    built = cached.runtime
+                    reused = true
+                }
+            } else {
+                contextLength = DeepSeekV41ContextProvisioning.contextLength(
+                    needed: neededContextLength,
+                    cached: nil,
+                    cap: dsConfig.maxPositionEmbeddings
+                )
             }
             stateLock.unlock()
+            if !reused {
+                let reason: String
+                if let cached = cachedRuntime {
+                    reason = cached.path == snapshotDir.path
+                        ? "context grew \(cached.contextLength) -> \(contextLength)"
+                        : "a different checkpoint's runtime was cached"
+                } else {
+                    reason = "no runtime yet"
+                }
+                print(
+                    "🧠 [DSV41] \(reason) — new KV cache, full prefill of "
+                        + "\(request.promptTokenIds.count) tokens"
+                )
+            }
 
             let runtime: DeepSeekV41Runtime? = built ?? DeepSeekV41Runtime(
                 snapshotDir: snapshotDir,

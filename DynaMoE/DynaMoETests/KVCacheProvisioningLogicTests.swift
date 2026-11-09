@@ -337,3 +337,100 @@ final class KVCacheProvisioningLogicTests: XCTestCase {
         XCTAssertEqual(looped.elementBytes, 1)
     }
 }
+
+/// The DeepSeek V4.1 runtime is reused only when it was provisioned for at least
+/// the turn's own length, so the provisioned length decides whether prefix reuse
+/// survives a conversation that grows. These pin the policy, not the runtime.
+final class DeepSeekV41ContextProvisioningTests: XCTestCase {
+
+    private let cap = 1_048_576
+
+    func testTheFirstRuntimeBuysMoreThanTheFirstTurn() {
+        let provisioned = DeepSeekV41ContextProvisioning.contextLength(
+            needed: 6_000, cached: nil, cap: cap
+        )
+        XCTAssertGreaterThanOrEqual(provisioned, DeepSeekV41ContextProvisioning.initialFloorRows)
+        XCTAssertLessThanOrEqual(provisioned, cap)
+    }
+
+    func testATurnInsideTheProvisionedLengthKeepsTheCacheItAlreadyHas() {
+        let first = DeepSeekV41ContextProvisioning.contextLength(needed: 6_000, cached: nil, cap: cap)
+        // Growth that stays inside the headroom must ask for the SAME length, so the
+        // runtime is reused and its resident sequence stays addressable.
+        for needed in stride(from: 6_000, through: first, by: 7_919) {
+            XCTAssertEqual(
+                DeepSeekV41ContextProvisioning.contextLength(
+                    needed: needed, cached: first, cap: cap
+                ),
+                first,
+                "needed \(needed) is inside a cache provisioned for \(first)"
+            )
+        }
+    }
+
+    func testGrowthPastTheProvisionedLengthDoublesInsteadOfMatchingTheTurn() {
+        let doubled = DeepSeekV41ContextProvisioning.contextLength(
+            needed: 200_000, cached: 131_072, cap: cap
+        )
+        XCTAssertEqual(doubled, 262_144, "a cache at its limit grows by doubling, not to 200k")
+        XCTAssertNotEqual(doubled, 200_000, "matching the turn exactly is what retired the cache")
+    }
+
+    func testASingleLargeTurnJumpsStraightToWhatItNeeds() {
+        // Doubling from a small cache would take several rebuilds to arrive; one turn
+        // that needs more than twice the cache gets its own length in one step.
+        let provisioned = DeepSeekV41ContextProvisioning.contextLength(
+            needed: 400_000, cached: 65_536, cap: cap
+        )
+        XCTAssertEqual(provisioned, 400_000)
+    }
+
+    func testTheCheckpointCeilingAlwaysWins() {
+        XCTAssertEqual(
+            DeepSeekV41ContextProvisioning.contextLength(
+                needed: 900_000, cached: 600_000, cap: 700_000
+            ),
+            700_000
+        )
+        XCTAssertEqual(
+            DeepSeekV41ContextProvisioning.contextLength(needed: 900_000, cached: nil, cap: 700_000),
+            700_000,
+            "the floor may not provision past the ceiling either"
+        )
+        XCTAssertEqual(
+            DeepSeekV41ContextProvisioning.contextLength(needed: 40, cached: nil, cap: 16),
+            16
+        )
+    }
+
+    func testAZeroNeededLengthStillProvisionsOneRow() {
+        XCTAssertEqual(
+            DeepSeekV41ContextProvisioning.contextLength(needed: 0, cached: nil, cap: 1_000_000),
+            DeepSeekV41ContextProvisioning.initialFloorRows
+        )
+    }
+
+    /// The defect this policy exists for: an agent loop whose prompt grows every
+    /// step used to rebuild the runtime (and drop the resident prefix) on EVERY
+    /// step. Growth must cost a logarithmic number of rebuilds instead.
+    func testAGrowingAgentLoopRebuildsLogarithmicallyNotEveryStep() {
+        var cached: Int?
+        var rebuilds = 0
+        var prompt = 4_000
+        let steps = 40
+        for _ in 0..<steps {
+            let needed = prompt + 8_192 + 1
+            let provisioned = DeepSeekV41ContextProvisioning.contextLength(
+                needed: needed, cached: cached, cap: cap
+            )
+            if cached == nil || provisioned > cached! { rebuilds += 1 }
+            cached = provisioned
+            prompt += 15_000  // one model-sized tool result per step
+        }
+        XCTAssertLessThanOrEqual(
+            rebuilds, 5,
+            "\(steps) growing steps must not cost a rebuild each (got \(rebuilds))"
+        )
+        XCTAssertGreaterThanOrEqual(cached ?? 0, prompt, "every step had to fit")
+    }
+}
