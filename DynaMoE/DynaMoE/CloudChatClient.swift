@@ -469,8 +469,54 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
         provider: CloudProvider,
         flavor: CloudApiFlavor = .openAI
     ) -> CloudChatClient? {
-        guard let key = CloudSecretStore.shared.get(providerId: provider.id) else { return nil }
-        return CloudChatClient(provider: provider, flavor: flavor, apiKey: key)
+        try? makeStoredResult(provider: provider, flavor: flavor).get()
+    }
+
+    /// The same lookup with the reason kept. A missing key, a refusal to read
+    /// one, and a key that is still in the older keychain are three different
+    /// things for the person reading the message.
+    public static func makeStoredResult(
+        provider: CloudProvider,
+        flavor: CloudApiFlavor = .openAI
+    ) -> Result<CloudChatClient, CloudTurnFailure> {
+        let store = CloudSecretStore.shared
+        switch storedKeyResult(
+            providerName: provider.displayName,
+            read: store.read(providerId: provider.id),
+            // Evaluated only when the read established nothing: the existence
+            // check is attributes-only (so it cannot prompt) but it is still a
+            // keychain round trip per token, and a readable key settles it.
+            existsInEitherKeychain: { store.exists(providerId: provider.id) }
+        ) {
+        case .success(let key):
+            return .success(CloudChatClient(provider: provider, flavor: flavor, apiKey: key))
+        case .failure(let failure):
+            return .failure(failure)
+        }
+    }
+
+    /// The lookup rule as a pure function of the two keychain answers, so each
+    /// outcome can be exercised without a keychain.
+    static func storedKeyResult(
+        providerName: String,
+        read: SecretAccessResult,
+        existsInEitherKeychain: () -> Bool
+    ) -> Result<String, CloudTurnFailure> {
+        switch read {
+        case .found(let key) where !key.isEmpty:
+            return .success(key)
+        case .found:
+            // An empty stored item is not a credential. Asking `exists` here
+            // would find that same empty item and report "still in the older
+            // keychain, import it" about a key that could never work.
+            return .failure(.missingAPIKey(providerName: providerName))
+        case .missing:
+            return existsInEitherKeychain()
+                ? .failure(.credentialNeedsImport(providerName: providerName))
+                : .failure(.missingAPIKey(providerName: providerName))
+        case .accessDenied, .unavailable:
+            return .failure(.credentialAccessDenied(providerName: providerName))
+        }
     }
 
     public func streamTurn(

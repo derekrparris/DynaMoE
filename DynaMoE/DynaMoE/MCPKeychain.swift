@@ -3,17 +3,19 @@
 //  DynaMoE
 //
 //  Phase 7: Model Context Protocol client.
-//  Minimal Keychain-backed secret store for MCP credentials.
+//  Keychain-backed secret store for MCP credentials.
 //
 //  mcp.json never holds a secret. Secret fields carry a
-//  "${keychain:<account>}" token instead, and the value lives in the login
-//  Keychain keyed by that account. That keeps an API key out of a file the
-//  user may put in a dotfiles repo or paste into an issue.
+//  "${keychain:<account>}" token instead, and the value lives in the keychain
+//  keyed by that account. That keeps an API key out of a file the user may put
+//  in a dotfiles repo or paste into an issue.
 //
-//  The legacy file-based keychain is used deliberately (no
-//  kSecUseDataProtectionKeychain): the data-protection keychain requires an
-//  application-identifier entitlement, and ad-hoc-signed local builds of this
-//  app (the recovery path in AGENTS.md) do not have one.
+//  Which keychain, and why it matters for repeated authorization, is documented
+//  in SecretStoreSupport.swift. In short: the data protection keychain is used
+//  whenever this build is signed with a keychain-access-groups entitlement, and
+//  the legacy login keychain otherwise. Reads here never fall back to the
+//  legacy item on their own, because that read is the one call that can show an
+//  ACL dialog; KeychainMigration performs it on the user's request instead.
 //
 
 import Foundation
@@ -34,11 +36,33 @@ public nonisolated enum MCPKeychainError: LocalizedError {
             return "Keychain error \(status): \(MCPSecretStore.describe(status))"
         }
     }
+
+    init(_ failure: SecretStoreFailure) {
+        switch failure {
+        case .emptySecret: self = .emptySecret
+        case .invalidValue: self = .invalidValue
+        case .status(let status): self = .status(status)
+        }
+    }
 }
 
-public nonisolated enum MCPSecretStore {
+public nonisolated struct MCPSecretStore: Sendable {
     /// Namespaces every item this app creates.
-    public static let service = "DRP.DynaMoE.mcp"
+    public static let defaultService = "DRP.DynaMoE.mcp"
+
+    /// The process-wide store. Tests construct their own instance with a
+    /// throwaway service name instead of writing into the real one.
+    public static let shared = MCPSecretStore()
+
+    public let service: String
+
+    public init(service: String = MCPSecretStore.defaultService) {
+        self.service = service
+    }
+
+    private var core: KeychainSecretStore {
+        KeychainSecretStore(service: service)
+    }
 
     /// Deterministic per-server, per-field account name, so the JSON token and
     /// the Keychain item cannot drift. `serverKey` is already constrained to
@@ -52,98 +76,97 @@ public nonisolated enum MCPSecretStore {
     }
 
     @discardableResult
-    public static func set(_ secret: String, account: String) throws -> String {
-        guard !secret.isEmpty else { throw MCPKeychainError.emptySecret }
-        guard let data = secret.data(using: .utf8) else { throw MCPKeychainError.invalidValue }
-
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-
-        let updateStatus = SecItemUpdate(
-            query as CFDictionary,
-            [kSecValueData as String: data] as CFDictionary
-        )
-        if updateStatus == errSecSuccess { return account }
-        guard updateStatus == errSecItemNotFound else {
-            throw MCPKeychainError.status(updateStatus)
+    public func set(_ secret: String, account: String) throws -> String {
+        do {
+            return try core.set(
+                secret,
+                account: account,
+                label: "DynaMoE MCP secret",
+                description: "MCP server credential"
+            )
+        } catch let failure as SecretStoreFailure {
+            throw MCPKeychainError(failure)
         }
-
-        var attributes = query
-        attributes[kSecValueData as String] = data
-        attributes[kSecAttrLabel as String] = "DynaMoE MCP secret"
-        attributes[kSecAttrDescription as String] = "MCP server credential"
-        let addStatus = SecItemAdd(attributes as CFDictionary, nil)
-        guard addStatus == errSecSuccess else {
-            throw MCPKeychainError.status(addStatus)
-        }
-        return account
     }
 
-    /// Returns nil for "not found" *and* for "could not read right now"
-    /// (locked keychain, denied access): an MCP server must fail closed with a
-    /// clear unresolved-token error rather than connect with a blank value.
-    public static func get(account: String) -> String? {
-        var query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess,
-              let data = item as? Data,
-              let secret = String(data: data, encoding: .utf8) else { return nil }
-        return secret
+    /// Answers "could this credential be read, and if not, why". A missing item
+    /// and a refused read are different states: a server should fail with an
+    /// actionable message either way, but only one of them is fixed by adding a
+    /// key.
+    public func read(account: String) -> SecretAccessResult {
+        core.read(account: account)
     }
 
-    public static func exists(account: String) -> Bool {
-        get(account: account) != nil
+    public func readLegacy(account: String) -> SecretAccessResult {
+        core.readLegacy(account: account)
     }
 
-    public static func delete(account: String) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        SecItemDelete(query as CFDictionary)
+    /// Returns nil for "not found", "could not read right now" and "denied":
+    /// an MCP server must fail closed with a clear unresolved-token error
+    /// rather than connect with a blank value. Callers that need the
+    /// distinction use `read(account:)`.
+    public func get(account: String) -> String? {
+        core.read(account: account).value
     }
 
-    /// Removes every secret belonging to one server. Called when a server is
-    /// deleted from the config so a removed integration leaves no credential
-    /// behind.
-    public static func deleteAll(serverKey: String) {
+    /// True when a credential is stored, whether in the current keychain or
+    /// still in the legacy one. Attributes only, so never prompts.
+    public func exists(account: String) -> Bool {
+        core.exists(account: account)
+    }
+
+    /// True when the credential is only in the keychain an earlier version
+    /// wrote, i.e. a token needs importing before it can be expanded. Attribute
+    /// query only, so this is safe on the connect path.
+    public func existsInLegacyKeychain(account: String) -> Bool {
+        core.exists(account: account, backend: .legacy)
+    }
+
+    public func delete(account: String) {
+        core.delete(account: account)
+    }
+
+    /// Removes every secret belonging to one server, from both keychains. Called
+    /// when a server is deleted from the config so a removed integration leaves
+    /// no credential behind, including one that was never imported.
+    public func deleteAll(serverKey: String) {
         let prefix = "dynamoe.mcp.\(serverKey)."
-        var query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecReturnAttributes as String: true,
-            kSecMatchLimit as String: kSecMatchLimitAll,
-        ]
-        query[kSecReturnAttributes as String] = true
-
-        var result: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
-              let items = result as? [[String: Any]] else { return }
-
-        for item in items {
-            guard let account = item[kSecAttrAccount as String] as? String,
-                  account.hasPrefix(prefix) else { continue }
-            delete(account: account)
+        for account in core.accounts(includingLegacy: true) where account.hasPrefix(prefix) {
+            core.delete(account: account)
         }
     }
 
     public static func describe(_ status: OSStatus) -> String {
-        if let message = SecCopyErrorMessageString(status, nil) as String? {
-            return message
-        }
-        return "unknown status"
+        KeychainSecretStore.describe(status)
+    }
+}
+
+// MARK: - Static facade
+
+/// The app reads and writes through the shared store. Kept as statics so the
+/// call sites stay one-liners; tests build an instance with their own service.
+public extension MCPSecretStore {
+    static func set(_ secret: String, account: String) throws -> String {
+        try shared.set(secret, account: account)
+    }
+
+    static func read(account: String) -> SecretAccessResult {
+        shared.read(account: account)
+    }
+
+    static func get(account: String) -> String? {
+        shared.get(account: account)
+    }
+
+    static func exists(account: String) -> Bool {
+        shared.exists(account: account)
+    }
+
+    static func delete(account: String) {
+        shared.delete(account: account)
+    }
+
+    static func deleteAll(serverKey: String) {
+        shared.deleteAll(serverKey: serverKey)
     }
 }

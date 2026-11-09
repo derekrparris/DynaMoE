@@ -2,14 +2,13 @@
 //  CloudKeychain.swift
 //  DynaMoE
 //
-//  Minimal Keychain-backed secret store for connected cloud providers.
+//  Keychain-backed secret store for connected cloud providers.
 //
 //  Modeled on MCPKeychain.swift: a provider's API key lives only in the
-//  login Keychain, so neither UserDefaults nor any file the user may sync
-//  or paste ever holds a credential. The legacy file-based keychain is used
-//  deliberately (no kSecUseDataProtectionKeychain): the data-protection
-//  keychain requires an application-identifier entitlement, and
-//  ad-hoc-signed local builds of this app do not have one.
+//  keychain, so neither UserDefaults nor any file the user may sync or paste
+//  ever holds a credential. Backend selection (data protection keychain when
+//  this build is entitled, legacy login keychain otherwise) and the reasoning
+//  behind it live in SecretStoreSupport.swift.
 //
 
 import Foundation
@@ -30,6 +29,14 @@ public nonisolated enum CloudKeychainError: LocalizedError {
             return "Keychain error \(status): \(CloudSecretStore.describe(status))"
         }
     }
+
+    init(_ failure: SecretStoreFailure) {
+        switch failure {
+        case .emptySecret: self = .emptySecret
+        case .invalidValue: self = .invalidValue
+        case .status(let status): self = .status(status)
+        }
+    }
 }
 
 public nonisolated struct CloudSecretStore: Sendable {
@@ -44,6 +51,10 @@ public nonisolated struct CloudSecretStore: Sendable {
         self.service = service
     }
 
+    private var core: KeychainSecretStore {
+        KeychainSecretStore(service: service)
+    }
+
     /// Deterministic per-provider account name: one API key per provider
     /// ("dynamoe.cloud.synthetic.apikey").
     public static func account(providerId: String) -> String {
@@ -52,73 +63,54 @@ public nonisolated struct CloudSecretStore: Sendable {
 
     @discardableResult
     public func set(_ secret: String, providerId: String) throws -> String {
-        guard !secret.isEmpty else { throw CloudKeychainError.emptySecret }
-        guard let data = secret.data(using: .utf8) else { throw CloudKeychainError.invalidValue }
-
         let account = Self.account(providerId: providerId)
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-
-        let updateStatus = SecItemUpdate(
-            query as CFDictionary,
-            [kSecValueData as String: data] as CFDictionary
-        )
-        if updateStatus == errSecSuccess { return account }
-        guard updateStatus == errSecItemNotFound else {
-            throw CloudKeychainError.status(updateStatus)
+        do {
+            return try core.set(
+                secret,
+                account: account,
+                label: "DynaMoE cloud provider API key",
+                description: "Cloud inference provider credential"
+            )
+        } catch let failure as SecretStoreFailure {
+            throw CloudKeychainError(failure)
         }
+    }
 
-        var attributes = query
-        attributes[kSecValueData as String] = data
-        attributes[kSecAttrLabel as String] = "DynaMoE cloud provider API key"
-        attributes[kSecAttrDescription as String] = "Cloud inference provider credential"
-        let addStatus = SecItemAdd(attributes as CFDictionary, nil)
-        guard addStatus == errSecSuccess else {
-            throw CloudKeychainError.status(addStatus)
-        }
-        return account
+    /// A missing key and a refused read are different states: the first means
+    /// "add one", the second means a dialog was dismissed. Callers that only
+    /// need a value use `get(providerId:)`.
+    public func read(providerId: String) -> SecretAccessResult {
+        core.read(account: Self.account(providerId: providerId))
+    }
+
+    public func readLegacy(providerId: String) -> SecretAccessResult {
+        core.readLegacy(account: Self.account(providerId: providerId))
     }
 
     /// Returns nil for "not found" *and* for "could not read right now"
     /// (locked keychain, denied access): a turn must fail with a clear
     /// missing-key error rather than send a blank bearer token upstream.
     public func get(providerId: String) -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: Self.account(providerId: providerId),
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        guard status == errSecSuccess,
-              let data = item as? Data,
-              let secret = String(data: data, encoding: .utf8) else { return nil }
-        return secret
+        core.read(account: Self.account(providerId: providerId)).value
     }
 
+    /// True when a key is stored, in either keychain. Attributes only, so this
+    /// is safe on the launch path where it is asked once per provider.
     public func exists(providerId: String) -> Bool {
-        get(providerId: providerId) != nil
+        core.exists(account: Self.account(providerId: providerId))
+    }
+
+    /// True only when the keychain this build actually reads holds the key, i.e.
+    /// a turn can run without an import step first.
+    public func hasCurrentCredential(providerId: String) -> Bool {
+        core.exists(account: Self.account(providerId: providerId), backend: core.backend)
     }
 
     public func delete(providerId: String) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: Self.account(providerId: providerId),
-        ]
-        SecItemDelete(query as CFDictionary)
+        core.delete(account: Self.account(providerId: providerId))
     }
 
     public static func describe(_ status: OSStatus) -> String {
-        if let message = SecCopyErrorMessageString(status, nil) as String? {
-            return message
-        }
-        return "unknown status"
+        KeychainSecretStore.describe(status)
     }
 }

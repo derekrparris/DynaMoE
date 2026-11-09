@@ -1053,17 +1053,93 @@ final class CloudSecretStoreTests: XCTestCase {
         do {
             try store.set(secret, providerId: "synthetic")
         } catch {
-            throw XCTSkip("Keychain is not reachable from this test host: \(error.localizedDescription)")
+            try skipIfKeychainUnreachable(error)
         }
         XCTAssertEqual(store.get(providerId: "synthetic"), secret)
+        XCTAssertEqual(store.read(providerId: "synthetic"), .found(secret))
         XCTAssertTrue(store.exists(providerId: "synthetic"))
+        XCTAssertTrue(store.hasCurrentCredential(providerId: "synthetic"))
 
         store.delete(providerId: "synthetic")
         XCTAssertNil(store.get(providerId: "synthetic"))
+        XCTAssertEqual(
+            store.read(providerId: "synthetic"),
+            .missing,
+            "a deleted key must read as missing rather than as a refusal, so the reply is 'add one'"
+        )
     }
 
     func testRefusesEmptySecret() {
         XCTAssertThrowsError(try store.set("", providerId: "synthetic"))
+    }
+}
+
+// MARK: - Stored key outcome
+
+/// The reasons a cloud turn cannot start, which the chat surface turns into
+/// different messages. `makeStoredResult` is this rule plus a keychain read, so
+/// every branch is exercised here without a keychain.
+final class CloudStoredKeyLogicTests: XCTestCase {
+
+    private func result(
+        _ read: SecretAccessResult,
+        legacyCopy: Bool = false
+    ) -> Result<String, CloudTurnFailure> {
+        CloudChatClient.storedKeyResult(
+            providerName: "Synthetic",
+            read: read,
+            existsInEitherKeychain: { legacyCopy }
+        )
+    }
+
+    func testAStoredKeyIsUsedAndTheOlderKeychainIsNeverAsked() {
+        var asked = false
+        let result = CloudChatClient.storedKeyResult(
+            providerName: "Synthetic",
+            read: .found("sk-1"),
+            existsInEitherKeychain: {
+                asked = true
+                return true
+            }
+        )
+        XCTAssertEqual(try? result.get(), "sk-1")
+        XCTAssertFalse(asked, "a readable key settles it; the existence check is a second keychain call")
+    }
+
+    func testAKeyOnlyInTheOlderKeychainAsksForAnImport() {
+        XCTAssertEqual(
+            result(.missing, legacyCopy: true),
+            .failure(.credentialNeedsImport(providerName: "Synthetic"))
+        )
+    }
+
+    func testNoKeyAnywhereAsksForOne() {
+        XCTAssertEqual(
+            result(.missing),
+            .failure(.missingAPIKey(providerName: "Synthetic"))
+        )
+    }
+
+    /// The defect this pins: `.found` with an empty value joined the
+    /// needs-import branch, and the existence check found that same empty item,
+    /// so a key that could never work was reported as one waiting to be imported.
+    func testAnEmptyStoredItemIsNotAnImportRequest() {
+        XCTAssertEqual(
+            result(.found(""), legacyCopy: true),
+            .failure(.missingAPIKey(providerName: "Synthetic"))
+        )
+    }
+
+    func testARefusedReadIsReportedAsDeniedRatherThanMissing() {
+        XCTAssertEqual(
+            result(.accessDenied(errSecUserCanceled)),
+            .failure(.credentialAccessDenied(providerName: "Synthetic"))
+        )
+        XCTAssertEqual(
+            result(.unavailable(errSecMissingEntitlement)),
+            .failure(.credentialAccessDenied(providerName: "Synthetic")),
+            "an unentitled build holding a key is not a missing key"
+        )
     }
 }
 

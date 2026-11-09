@@ -441,7 +441,8 @@ The file at `~/Library/Application Support/DynaMoE/mcp.json` is the single sourc
 - **Transport is inferred**: a `command` means **stdio** (DynaMoE launches the program as a child process and speaks JSON-RPC over its stdin/stdout); a `url` means **Streamable HTTP**. Declare exactly one of the two.
 - **`enabled`** defaults to `true` when omitted, so a config pasted from another client works as-is.
 - **Server names** may contain letters, digits, `-` and `_`. They may not contain `__` or end with `_`, because tool names are built as `mcp__<server>__<tool>`: a name ending in `_` would run into that separator and share tool names with the name without it.
-- **Secrets**: any env value or header may be a `${keychain:...}` token instead of plaintext. The Settings form has a per-field **Keychain** checkbox that stores the value in the login Keychain and writes only the token to disk.
+- **Secrets**: any env value or header may be a `${keychain:...}` token instead of plaintext. The Settings form has a per-field **Keychain** checkbox that stores the value in the Keychain and writes only the token to disk.
+- **Keychain access**: shipped builds keep these items in the data protection keychain, where access is granted by the app's code-signing identity rather than by a per-item prompt, so an update never asks again. "Is a credential stored?" is answered from item attributes, which macOS returns without a dialog, so nothing here asks for access at launch. If a token still lives in the keychain an older version wrote, the **Stored Credentials** card (Agent & Tools, and Cloud Providers) copies it forward with one system prompt per credential.
 - **Other tokens**: `${env:NAME}` reads an environment variable; `${workspace}` is the agent working directory. Tokens are expanded when a server connects and are never written back, so changing the workspace reconnects every server that uses `${workspace}` instead of leaving it scoped to the previous project.
 
 #### Tool Discovery & Loading
@@ -546,7 +547,8 @@ The **Cloud Providers** section connects remote inference providers, with **Synt
 ```
 
 ### API Key & Connection Test
-- **API Key**: Paste a key from the provider's dashboard and press **Save**. It is written only to the login Keychain (service `DRP.DynaMoE.cloud`, account `dynamoe.cloud.<provider>.apikey`) — never to UserDefaults, logs, or a config file. The field never pre-fills an existing key; the placeholder says "Stored" and typing a new value replaces it. **Remove** deletes the Keychain item.
+- **API Key**: Paste a key from the provider's dashboard and press **Save**. It is written only to the Keychain (service `DRP.DynaMoE.cloud`, account `dynamoe.cloud.<provider>.apikey`) — never to UserDefaults, logs, or a config file. The field never pre-fills an existing key; the placeholder says "Stored" and typing a new value replaces it. **Remove** deletes the item from both the current and the older keychain.
+- **Stored Credentials**: shows up only when a credential is still in the keychain an older version wrote; press **Import** in that card. Importing copies each one across (read back and verified) and then removes the older copy, so a new version stops asking for keychain access. macOS asks once per credential during the import; choose **Always Allow**.
 - **Test & Sync Models**: Calls the provider's `GET /models` endpoint with the stored key. A good key validates the credential **and** registers the provider's current chat models, then rescans so the composer's **Cloud Models** section updates immediately. Embeddings, rerankers, speech, moderation, and image generators in the same catalog are skipped (falling back to the unfiltered list only if the filter would register nothing). A bad key returns `401`, a rate-limited endpoint `429`, and an unreachable endpoint a network error — all shown inline. The test spends no completion tokens.
 - **Documentation**: Opens the provider's API reference.
 

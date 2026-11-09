@@ -1144,6 +1144,41 @@ public nonisolated struct MCPResolvedServer: Sendable {
 }
 
 public nonisolated enum MCPConfigResolver {
+    /// The three token outcomes that stop a server from connecting, as issues.
+    /// Kept apart from `resolve` so the wording a user actually reads can be
+    /// exercised without a config file or a keychain: "import it", "authorize
+    /// it" and "add it" are three different fixes.
+    public static func credentialIssues(
+        key: String,
+        unresolved: [String],
+        denied: [String],
+        needsImport: [String]
+    ) -> [MCPConfigIssue] {
+        var issues: [MCPConfigIssue] = []
+        if !needsImport.isEmpty {
+            issues.append(MCPConfigIssue(
+                severity: .error,
+                serverKey: key,
+                message: "Credential token(s) not imported yet: \(Set(needsImport).sorted().joined(separator: ", ")). Open Settings \u{25B8} Agent & Tools \u{25B8} Stored Credentials and press Import to copy them from the older Keychain."
+            ))
+        }
+        if !denied.isEmpty {
+            issues.append(MCPConfigIssue(
+                severity: .error,
+                serverKey: key,
+                message: "Stored credential token(s) could not be read: \(Set(denied).sorted().joined(separator: ", ")). Authorize DynaMoE (Always Allow) when macOS asks, then restart the server."
+            ))
+        }
+        if !unresolved.isEmpty {
+            issues.append(MCPConfigIssue(
+                severity: .error,
+                serverKey: key,
+                message: "Unresolved credential token(s): \(Set(unresolved).sorted().joined(separator: ", "))"
+            ))
+        }
+        return issues
+    }
+
     /// Expands tokens and builds transport inputs. Returns validation errors
     /// as values so the caller can surface them without throwing.
     public static func resolve(
@@ -1155,20 +1190,30 @@ public nonisolated enum MCPConfigResolver {
         guard !MCPConfigValidator.hasErrors(issues) else { return (nil, issues) }
 
         var unresolved: [String] = []
+        var denied: [String] = []
+        var needsImport: [String] = []
 
         let expandedArgs = MCPTokenExpander.expand(config.args ?? [], workspacePath: workspacePath)
         unresolved.append(contentsOf: expandedArgs.unresolved)
+        denied.append(contentsOf: expandedArgs.denied)
+        needsImport.append(contentsOf: expandedArgs.needsImport)
 
         let expandedEnv = MCPTokenExpander.expand(config.env ?? [:], workspacePath: workspacePath)
         unresolved.append(contentsOf: expandedEnv.unresolved)
+        denied.append(contentsOf: expandedEnv.denied)
+        needsImport.append(contentsOf: expandedEnv.needsImport)
 
         let expandedHeaders = MCPTokenExpander.expand(config.headers ?? [:], workspacePath: workspacePath)
         unresolved.append(contentsOf: expandedHeaders.unresolved)
+        denied.append(contentsOf: expandedHeaders.denied)
+        needsImport.append(contentsOf: expandedHeaders.needsImport)
 
         let expandedCWD: String? = {
             guard let raw = config.cwd, !raw.isEmpty else { return nil }
             let resolution = MCPTokenExpander.expand(raw, workspacePath: workspacePath)
             unresolved.append(contentsOf: resolution.unresolved)
+            denied.append(contentsOf: resolution.denied)
+            needsImport.append(contentsOf: resolution.needsImport)
             return resolution.value
         }()
 
@@ -1176,6 +1221,8 @@ public nonisolated enum MCPConfigResolver {
             guard let raw = config.url, !raw.isEmpty else { return nil }
             let resolution = MCPTokenExpander.expand(raw, workspacePath: workspacePath)
             unresolved.append(contentsOf: resolution.unresolved)
+            denied.append(contentsOf: resolution.denied)
+            needsImport.append(contentsOf: resolution.needsImport)
             return URL(string: resolution.value)
         }()
 
@@ -1183,15 +1230,18 @@ public nonisolated enum MCPConfigResolver {
         if let raw = config.command, !raw.isEmpty {
             let resolution = MCPTokenExpander.expand(raw, workspacePath: workspacePath)
             unresolved.append(contentsOf: resolution.unresolved)
+            denied.append(contentsOf: resolution.denied)
+            needsImport.append(contentsOf: resolution.needsImport)
             expandedCommand = resolution.value
         }
 
-        if !unresolved.isEmpty {
-            issues.append(MCPConfigIssue(
-                severity: .error,
-                serverKey: key,
-                message: "Unresolved credential token(s): \(Set(unresolved).sorted().joined(separator: ", "))"
-            ))
+        issues.append(contentsOf: credentialIssues(
+            key: key,
+            unresolved: unresolved,
+            denied: denied,
+            needsImport: needsImport
+        ))
+        if !unresolved.isEmpty || !denied.isEmpty || !needsImport.isEmpty {
             return (nil, issues)
         }
 

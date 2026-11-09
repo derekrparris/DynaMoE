@@ -21,6 +21,9 @@
 #   8. appcast.xml is well-formed
 #   9. gh-pages exists (and, unless --offline, the feed URL is reachable)
 #  10. With --app: signature, Gatekeeper and staple checks on the export
+#  11. Keychain sharing: the Release entitlements grant keychain-access-groups,
+#      and (with --app) the app carries the entitlement and an embedded
+#      Developer ID profile that grants the same group and has not expired
 #
 # Note: gate 4 can raise a Keychain authorization dialog on first use. Approve
 # it — a dismissed dialog makes generate_keys succeed while printing nothing,
@@ -48,11 +51,14 @@ ONLINE=1
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --app)     APP_PATH="${2:-}"; shift 2 ;;
-        --version) WANT_VERSION="${2:-}"; shift 2 ;;
-        --profile) NOTARY_PROFILE="${2:-}"; shift 2 ;;
+        --app)     [ $# -ge 2 ] || { echo "error: --app needs a path" >&2; exit 1; }
+                   APP_PATH="$2"; shift 2 ;;
+        --version) [ $# -ge 2 ] || { echo "error: --version needs a value" >&2; exit 1; }
+                   WANT_VERSION="$2"; shift 2 ;;
+        --profile) [ $# -ge 2 ] || { echo "error: --profile needs a name" >&2; exit 1; }
+                   NOTARY_PROFILE="$2"; shift 2 ;;
         --offline) ONLINE=0; shift ;;
-        -h|--help) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "error: unknown argument '$1'" >&2; exit 1 ;;
     esac
 done
@@ -257,6 +263,103 @@ else
                 fail "app's SUPublicEDKey ($APP_PUBKEY) does not match the source Info.plist"
             fi
         fi
+    fi
+fi
+
+# ------------------------------------------------- 11. keychain sharing
+head_ "11. Keychain sharing (stops the access prompts)"
+RELEASE_ENTITLEMENTS="$ROOT/DynaMoE/DynaMoE/DynaMoE-Release.entitlements"
+KEYCHAIN_GROUP="RMY84Y8G7M.DRP.DynaMoE"
+# The source entitlements keep the build variable; codesign expands nothing, so
+# anything that inspects a SIGNED app has to look for the literal group.
+KEYCHAIN_GROUP_SOURCE='$(AppIdentifierPrefix)DRP.DynaMoE'
+if [ ! -f "$RELEASE_ENTITLEMENTS" ]; then
+    fail "missing DynaMoE/DynaMoE-Release.entitlements: the app would fall back to the legacy keychain and ask for access on every update"
+else
+    # Read the ENTITLEMENT, not the file's text: the plist's own comment names
+    # keychain-access-groups, so a grep would pass after the key was deleted --
+    # and it would pass for any group value, including a typo.
+    ENTITLED_GROUP="$(mktemp -t dynamoe-release-groups)"
+    plutil -extract 'keychain-access-groups' xml1 \
+        -o "$ENTITLED_GROUP" "$RELEASE_ENTITLEMENTS" 2>/dev/null || : >"$ENTITLED_GROUP"
+    if grep -Fq "<string>$KEYCHAIN_GROUP</string>" "$ENTITLED_GROUP" \
+        || grep -Fq "<string>$KEYCHAIN_GROUP_SOURCE</string>" "$ENTITLED_GROUP"; then
+        ok "Release entitlements grant keychain-access-groups = $KEYCHAIN_GROUP_SOURCE (\"$KEYCHAIN_GROUP\" signed)"
+    else
+        fail "DynaMoE-Release.entitlements does not grant $KEYCHAIN_GROUP: the app would fall back to the legacy keychain and prompt on every update"
+    fi
+    rm -f "$ENTITLED_GROUP"
+fi
+if grep -Eq 'CODE_SIGN_ENTITLEMENTS = "?DynaMoE/DynaMoE-Release\.entitlements"?' "$PBXPROJ"; then
+    ok "Release configuration signs with those entitlements"
+else
+    fail "project.pbxproj Release config does not set CODE_SIGN_ENTITLEMENTS to the Release entitlements"
+fi
+if grep -q 'CODE_SIGN_IDENTITY = "Developer ID Application"' "$PBXPROJ"; then
+    ok "Release configuration signs with the Developer ID identity"
+else
+    warn "Release configuration does not name the Developer ID identity, so Xcode cannot provision a profile granting the keychain group"
+fi
+if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
+    skip "no --app given (cannot inspect the built entitlement or profile)"
+else
+    APP_ENTITLEMENTS="$(codesign -d --entitlements :- "$APP_PATH" 2>&1 || true)"
+    case "$APP_ENTITLEMENTS" in
+        *"$KEYCHAIN_GROUP"*) ok "app carries keychain-access-groups = $KEYCHAIN_GROUP" ;;
+        *keychain-access-groups*)
+            fail "app keychain-access-groups is not $KEYCHAIN_GROUP: codesign expands no build variables, so a hand-signed build must use the literal group" ;;
+        *) fail "app has no keychain-access-groups entitlement (it would keep prompting for keychain access)" ;;
+    esac
+    PROFILE="$APP_PATH/Contents/embedded.provisionprofile"
+    if [ ! -f "$PROFILE" ]; then
+        fail "no Contents/embedded.provisionprofile: keychain-access-groups is a restricted entitlement, and without a profile granting it the app is killed at launch"
+    elif ! security cms -D -i "$PROFILE" >/dev/null 2>&1; then
+        fail "embedded.provisionprofile is not a readable CMS profile"
+    else
+        KEYCHAIN_TEAM="${KEYCHAIN_GROUP%%.*}"
+        PROFILE_PLIST="$(mktemp -t dynamoe-profile)"
+        PROFILE_GROUPS="$(mktemp -t dynamoe-profile-groups)"
+        PROFILE_TEAMS="$(mktemp -t dynamoe-profile-teams)"
+        security cms -D -i "$PROFILE" >"$PROFILE_PLIST" 2>/dev/null || true
+        # Read the entitlement itself rather than searching the profile's text:
+        # com.apple.application-identifier is "<team>.<bundle>", so the group
+        # name also appears in a profile whose access-group array does not cover
+        # this app, and a substring search would pass it for the wrong reason.
+        plutil -extract 'Entitlements.keychain-access-groups' xml1 \
+            -o "$PROFILE_GROUPS" "$PROFILE_PLIST" 2>/dev/null || : >"$PROFILE_GROUPS"
+        plutil -extract 'TeamIdentifier' xml1 \
+            -o "$PROFILE_TEAMS" "$PROFILE_PLIST" 2>/dev/null || : >"$PROFILE_TEAMS"
+        if grep -Fq "<string>$KEYCHAIN_GROUP</string>" "$PROFILE_GROUPS"; then
+            ok "profile grants keychain-access-groups = $KEYCHAIN_GROUP"
+        elif grep -Fq "<string>$KEYCHAIN_TEAM.*</string>" "$PROFILE_GROUPS"; then
+            ok "profile grants keychain-access-groups = $KEYCHAIN_TEAM.* (the team wildcard covers $KEYCHAIN_GROUP)"
+        else
+            fail "profile's keychain-access-groups does not cover $KEYCHAIN_GROUP: the app would launch and then fail every keychain write"
+        fi
+        if grep -Fq "<string>$KEYCHAIN_TEAM</string>" "$PROFILE_TEAMS"; then
+            ok "profile team matches the signing team"
+        else
+            warn "profile TeamIdentifier is not $KEYCHAIN_TEAM"
+        fi
+        # An expired profile validates, signs, notarizes and installs; launchd
+        # then kills the app on first launch. Nothing else in this chain notices.
+        PROFILE_EXPIRY="$(plutil -extract ExpirationDate raw -o - "$PROFILE_PLIST" 2>/dev/null || true)"
+        if [ -z "$PROFILE_EXPIRY" ]; then
+            warn "embedded profile carries no ExpirationDate; cannot tell how long it lasts"
+        else
+            PROFILE_EXPIRY_EPOCH="$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$PROFILE_EXPIRY" '+%s' 2>/dev/null || true)"
+            NOW_EPOCH="$(date -u '+%s')"
+            if [ -z "$PROFILE_EXPIRY_EPOCH" ]; then
+                warn "could not parse embedded profile ExpirationDate '$PROFILE_EXPIRY'"
+            elif [ "$PROFILE_EXPIRY_EPOCH" -le "$NOW_EPOCH" ]; then
+                fail "embedded profile EXPIRED on $(date -u -r "$PROFILE_EXPIRY_EPOCH" '+%Y-%m-%d') — the app would be killed at launch"
+            elif [ "$PROFILE_EXPIRY_EPOCH" -le "$((NOW_EPOCH + 2592000))" ]; then
+                warn "embedded profile expires on $(date -u -r "$PROFILE_EXPIRY_EPOCH" '+%Y-%m-%d')"
+            else
+                ok "embedded profile valid until $(date -u -r "$PROFILE_EXPIRY_EPOCH" '+%Y-%m-%d')"
+            fi
+        fi
+        rm -f "$PROFILE_PLIST" "$PROFILE_GROUPS" "$PROFILE_TEAMS"
     fi
 fi
 

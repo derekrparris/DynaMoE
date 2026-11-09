@@ -1150,9 +1150,13 @@ struct ContentView: View {
         }
         let preferredProfile = ModelProfileManager.shared.getActiveProfile(for: model.id)
         applyProfile(preferredProfile, for: model.id)
-        if CloudSecretStore.shared.exists(providerId: resolved.provider.id) {
+        if CloudSecretStore.shared.hasCurrentCredential(providerId: resolved.provider.id) {
             metalStatus = "☁️ \(resolved.provider.displayName) ready — \(model.displayName)."
             generationStatusText = "☁️ \(resolved.provider.displayName) active."
+        } else if CloudSecretStore.shared.exists(providerId: resolved.provider.id) {
+            let message = "⚠️ \(resolved.provider.displayName): the API key is still in the older keychain. Import it in Settings ▸ Cloud Providers."
+            metalStatus = message
+            generationStatusText = message
         } else {
             let message = "⚠️ \(resolved.provider.displayName): no API key stored — add one in Settings ▸ Cloud Providers."
             metalStatus = message
@@ -5203,8 +5207,12 @@ struct ContentView: View {
         isAgentTurn: Bool = false
     ) -> Bool {
         let displayName = modelDisplayName.isEmpty ? providerModelId : modelDisplayName
-        guard let client = CloudChatClient.makeStored(provider: provider) else {
-            let err = "⚠️ \(provider.displayName): no API key stored — add one in Settings ▸ Cloud Providers."
+        let client: CloudChatClient
+        switch CloudChatClient.makeStoredResult(provider: provider) {
+        case .success(let ready):
+            client = ready
+        case .failure(let failure):
+            let err = "⚠️ \(failure.localizedDescription)"
             if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }),
                let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) {
                 sessions[sIdx].messages[mIdx].content = err

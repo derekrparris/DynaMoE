@@ -582,6 +582,60 @@ public nonisolated enum MCPTokenExpander {
     public struct Resolution: Sendable, Equatable {
         public let value: String
         public let unresolved: [String]
+        /// Tokens whose secret exists but could not be read (dismissed or
+        /// locked keychain). Kept apart from `unresolved` so the failure can say
+        /// "authorize this" instead of "no such credential".
+        public let denied: [String]
+        /// Tokens whose credential is only in the keychain an earlier version
+        /// wrote. Distinct from both other lists: the fix is an import, not a
+        /// new key and not a dialog.
+        public let needsImport: [String]
+
+        public init(
+            value: String,
+            unresolved: [String],
+            denied: [String] = [],
+            needsImport: [String] = []
+        ) {
+            self.value = value
+            self.unresolved = unresolved
+            self.denied = denied
+            self.needsImport = needsImport
+        }
+    }
+
+    /// What one keychain token resolved to, separated from the grouping so the
+    /// rule can be exercised without a keychain.
+    public enum KeychainTokenOutcome: Sendable, Equatable {
+        case value(String)
+        case unset
+        case needsImport
+        case denied
+    }
+
+    /// The rule with the legacy answer asked lazily: it is only needed when the
+    /// read established nothing, so a stored credential costs one keychain call
+    /// instead of two on every connect.
+    public static func keychainTokenOutcome(
+        read: SecretAccessResult,
+        legacyCopyExists: () -> Bool
+    ) -> KeychainTokenOutcome {
+        switch read {
+        case .found(let secret):
+            guard secret.isEmpty else { return .value(secret) }
+            return legacyCopyExists() ? .needsImport : .unset
+        case .missing:
+            return legacyCopyExists() ? .needsImport : .unset
+        case .accessDenied, .unavailable:
+            return .denied
+        }
+    }
+
+    public static func keychainTokenOutcome(
+        read: SecretAccessResult,
+        existsInLegacyKeychain: Bool
+    ) -> KeychainTokenOutcome {
+        keychainTokenOutcome(read: read, legacyCopyExists: { existsInLegacyKeychain })
     }
 
     public static func keychainToken(account: String) -> String {
@@ -621,6 +675,8 @@ public nonisolated enum MCPTokenExpander {
 
         var output = ""
         var unresolved: [String] = []
+        var denied: [String] = []
+        var needsImport: [String] = []
         var index = raw.startIndex
 
         while index < raw.endIndex {
@@ -647,10 +703,19 @@ public nonisolated enum MCPTokenExpander {
                 }
             } else if body.hasPrefix("keychain:") {
                 let account = String(body.dropFirst("keychain:".count))
-                if let secret = MCPSecretStore.get(account: account), !secret.isEmpty {
+                let store = MCPSecretStore.shared
+                switch keychainTokenOutcome(
+                    read: store.read(account: account),
+                    legacyCopyExists: { store.existsInLegacyKeychain(account: account) }
+                ) {
+                case .value(let secret):
                     output += secret
-                } else {
+                case .unset:
                     unresolved.append(token)
+                case .needsImport:
+                    needsImport.append(token)
+                case .denied:
+                    denied.append(token)
                 }
             } else {
                 unresolved.append(token)
@@ -659,34 +724,42 @@ public nonisolated enum MCPTokenExpander {
             index = close.upperBound
         }
 
-        return Resolution(value: output, unresolved: unresolved)
+        return Resolution(value: output, unresolved: unresolved, denied: denied, needsImport: needsImport)
     }
 
     public static func expand(
         _ values: [String: String],
         workspacePath: String?
-    ) -> (values: [String: String], unresolved: [String]) {
+    ) -> (values: [String: String], unresolved: [String], denied: [String], needsImport: [String]) {
         var expanded: [String: String] = [:]
         var unresolved: [String] = []
+        var denied: [String] = []
+        var needsImport: [String] = []
         for (key, raw) in values {
             let resolution = expand(raw, workspacePath: workspacePath)
             expanded[key] = resolution.value
             unresolved.append(contentsOf: resolution.unresolved)
+            denied.append(contentsOf: resolution.denied)
+            needsImport.append(contentsOf: resolution.needsImport)
         }
-        return (expanded, unresolved)
+        return (expanded, unresolved, denied, needsImport)
     }
 
     public static func expand(
         _ values: [String],
         workspacePath: String?
-    ) -> (values: [String], unresolved: [String]) {
+    ) -> (values: [String], unresolved: [String], denied: [String], needsImport: [String]) {
         var expanded: [String] = []
         var unresolved: [String] = []
+        var denied: [String] = []
+        var needsImport: [String] = []
         for raw in values {
             let resolution = expand(raw, workspacePath: workspacePath)
             expanded.append(resolution.value)
             unresolved.append(contentsOf: resolution.unresolved)
+            denied.append(contentsOf: resolution.denied)
+            needsImport.append(contentsOf: resolution.needsImport)
         }
-        return (expanded, unresolved)
+        return (expanded, unresolved, denied, needsImport)
     }
 }

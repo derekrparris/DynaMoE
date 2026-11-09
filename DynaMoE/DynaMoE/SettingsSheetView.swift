@@ -89,9 +89,9 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .memory:
             return ["memory", "ram", "budget", "kv cache", "precision", "fp8", "fp16", "prefetch", "ssd", "paging", "diagnostics", "cache", "lookahead depth", "execution mode", "working set budget"]
         case .agent:
-            return ["agent", "tools", "turbo", "grammar", "workspace", "directory", "search", "brave", "chrome", "index", "rag", "subagent", "git", "lint", "dogfood", "benchmark", "max multi-step agent iterations", "max tool output", "working directory", "mcp", "model context protocol", "keychain", "mcp.json", "stdio", "streamable http", "external tools"]
+            return ["agent", "tools", "turbo", "grammar", "workspace", "directory", "search", "brave", "chrome", "index", "rag", "subagent", "git", "lint", "dogfood", "benchmark", "max multi-step agent iterations", "max tool output", "working directory", "mcp", "model context protocol", "keychain", "mcp.json", "stdio", "streamable http", "external tools", "import", "stored credentials", "authorize", "login keychain"]
         case .cloud:
-            return ["cloud", "provider", "synthetic", "synthetic.new", "remote", "api key", "connected provider", "deepseek", "cloud models", "keychain"]
+            return ["cloud", "provider", "synthetic", "synthetic.new", "remote", "api key", "connected provider", "deepseek", "cloud models", "keychain", "import", "stored credentials", "authorize", "login keychain"]
         case .server:
             return ["server", "api", "openai", "endpoint", "port", "api key", "completions", "local server", "crush", "http", "chat completions", "inference", "v1"]
         case .advanced:
@@ -335,7 +335,10 @@ struct SettingsSheetView: View {
     /// Keychain reads and connection-test state) so this tab stays a one-line
     /// embedding, mirroring how the MCP settings section is hosted.
     private var cloudSettingsSection: some View {
-        CloudProvidersSettingsView()
+        VStack(alignment: .leading, spacing: 22) {
+            CloudProvidersSettingsView()
+            KeychainMigrationSettingsSection()
+        }
     }
 
     // MARK: - Tab 0: General
@@ -1575,6 +1578,9 @@ struct SettingsSheetView: View {
 
             // Model Context Protocol servers (external tool integrations)
             MCPSettingsSection()
+
+            // Credentials an earlier version left in the login keychain
+            KeychainMigrationSettingsSection()
 
             // Deep Developer Tooling (Native Git & SourceKit-LSP) Card
             SettingsCard(header: "Developer Tooling", spacing: 10) {
