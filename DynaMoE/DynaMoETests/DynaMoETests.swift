@@ -6199,6 +6199,41 @@ final class DynaMoETests: XCTestCase {
             .contains("Gemma emits"))
     }
 
+    func testEveryToolCallMarkerIsBothAnOpenerAndTruncated() throws {
+        // The pill predicate and the display truncation read the same table, so a
+        // marker listed there must be recognised by BOTH. Pinning it per marker is
+        // what makes adding a dialect to one path and forgetting the other impossible:
+        // that is how a DSML call streamed as an empty bubble with no working pill.
+        XCTAssertFalse(ChatMessageView.toolCallMarkers.isEmpty)
+        for marker in ChatMessageView.toolCallMarkers {
+            let prose = "Answer so far. " + marker.text + "payload"
+            let range = ChatMessageView.firstToolCallOpenerRange(in: prose, isGemmaDialect: false)
+            let cleaned = ChatMessageView.cleanedMarkdown(prose, isGemmaDialect: false)
+            if marker.onlyInGemmaDialect {
+                // Documented markers stay prose outside their own dialect, in both
+                // paths at once — including the trailing whitespace trim.
+                XCTAssertNil(range, marker.text)
+                XCTAssertEqual(cleaned, prose, marker.text)
+            } else {
+                XCTAssertEqual(
+                    range.map { String(prose[..<$0.lowerBound]) },
+                    "Answer so far. ",
+                    marker.text
+                )
+                XCTAssertEqual(cleaned, "Answer so far.", marker.text)
+            }
+        }
+        // A marker opening the text leaves nothing readable, which is the pill's
+        // trigger, and the marker still counts under the Gemma dialect where the
+        // Gemma entry is admitted.
+        for marker in ChatMessageView.toolCallMarkers {
+            XCTAssertTrue(
+                ChatMessageView.isToolOnlyStreamingContent(marker.text, isGemmaDialect: true),
+                marker.text
+            )
+        }
+    }
+
     func testGemma4RebuildPreservesRawArguments() throws {
         // Persisted-history replay keeps the model's own argument text so native types
         // (bare numbers, booleans) are not restringified.
