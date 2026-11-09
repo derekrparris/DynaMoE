@@ -151,18 +151,35 @@ head_ "7. Version not already served"
 if [ ! -f "$PBXPROJ" ]; then
     skip "no project file to read"
 else
-    # App target values come first in the file; the test target also sets them,
-    # so report if the values are not uniform.
-    MV_ALL="$(grep -o 'MARKETING_VERSION = [^;]*;' "$PBXPROJ" | sed 's/.*= //; s/;//' | sort -u)"
-    CPV_ALL="$(grep -o 'CURRENT_PROJECT_VERSION = [^;]*;' "$PBXPROJ" | sed 's/.*= //; s/;//' | sort -u)"
+    # Only the APP target's configurations count. The test targets set their own
+    # (1 / 1.0), so grepping the whole project reads those back instead and an
+    # app target sitting on an already-served version looks unserved, which is
+    # exactly the mistake this gate exists to catch. Report only disagreement
+    # between the app target's own configurations (Debug vs Release).
+    app_target_versions() {
+        awk -v key="$1" '
+            BEGIN { RS = "isa = XCBuildConfiguration;" }
+            NR > 1 && /PRODUCT_BUNDLE_IDENTIFIER = DRP\.DynaMoE;/ {
+                if (match($0, key " = [^;]*;"))
+                    print substr($0, RSTART + length(key) + 3, RLENGTH - length(key) - 4)
+            }
+        ' "$PBXPROJ"
+    }
+
+    MV_ALL="$(app_target_versions MARKETING_VERSION | sort -u)"
+    CPV_ALL="$(app_target_versions CURRENT_PROJECT_VERSION | sort -u)"
     MARKETING_VERSION="$(printf '%s\n' "$MV_ALL" | head -1)"
     BUNDLE_VERSION="$(printf '%s\n' "$CPV_ALL" | head -1)"
-    ok "MARKETING_VERSION=$MARKETING_VERSION  CURRENT_PROJECT_VERSION=$BUNDLE_VERSION"
+    if [ -z "$BUNDLE_VERSION" ]; then
+        fail "could not read the app target's version (no CURRENT_PROJECT_VERSION under PRODUCT_BUNDLE_IDENTIFIER = DRP.DynaMoE)"
+    else
+        ok "MARKETING_VERSION=$MARKETING_VERSION  CURRENT_PROJECT_VERSION=$BUNDLE_VERSION"
+    fi
     if [ "$(printf '%s\n' "$MV_ALL" | wc -l | tr -d ' ')" -gt 1 ]; then
-        warn "multiple MARKETING_VERSION values in the project: $(printf '%s' "$MV_ALL" | tr '\n' ' ')"
+        warn "app target's configurations disagree on MARKETING_VERSION: $(printf '%s' "$MV_ALL" | tr '\n' ' ')"
     fi
     if [ "$(printf '%s\n' "$CPV_ALL" | wc -l | tr -d ' ')" -gt 1 ]; then
-        warn "multiple CURRENT_PROJECT_VERSION values in the project: $(printf '%s' "$CPV_ALL" | tr '\n' ' ')"
+        warn "app target's configurations disagree on CURRENT_PROJECT_VERSION: $(printf '%s' "$CPV_ALL" | tr '\n' ' ')"
     fi
 
     case "$BUNDLE_VERSION" in

@@ -7,6 +7,9 @@ DynaMoE is a high-performance native macOS application, a local inference engine
 Engineered specifically for Apple Silicon's Unified Memory Architecture (UMA), DynaMoE runs massive Mixture-of-Experts (MoE) and cutting-edge hybrid attention architectures that exceed physical system RAM by dynamically memory-mapping and streaming weights directly from high-speed NVMe storage to the GPU. It also runs dense language models.
 
 ---
+## Make sure to check the latest release to see what's new with DynaMoE! I'm not great at keeping this readme up to date on all the latest and greatest changes! :)
+
+---
 
 ## Inspiration & Acknowledgements
 
@@ -272,7 +275,7 @@ DynaMoE/
 If you're interested in building and running the app in your own development environment:
 
 ### Prerequisites
-* macOS 15.6+ (macOS 26 or later to use the on-device Apple system model and `/compact` conversation compaction)
+* macOS 26+ (Apple Intelligence enabled for the on-device Apple system model and `/compact` conversation compaction)
 * Apple Silicon Mac (M1/M2/M3/M4/M5/M6, 16 GB+ Unified Memory recommended)
 * Xcode 26 or later with Command Line Tools (the project builds in Swift 5 language mode with default `MainActor` actor isolation)
 * Rust toolchain (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
