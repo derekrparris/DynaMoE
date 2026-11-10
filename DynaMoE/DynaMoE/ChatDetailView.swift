@@ -50,10 +50,20 @@ struct ChatDetailView: View {
     /// (Spark X2.6's `reasoning_effort`). When false, the plain On/Off menu shows.
     var supportsThinkingLevels: Bool = false
     /// Whether the active model can be sent images. Cloud models opt in per model
-    /// in Settings; local weights report false because the engine has no vision
-    /// tower, and the composer refuses an attachment rather than sending pixels
-    /// that would be silently dropped.
+    /// in Settings; local weights report true only for a checkpoint that ships a
+    /// vision tower, and the composer refuses an attachment for every other
+    /// family rather than sending pixels that would be silently dropped.
     var supportsVision: Bool = false
+    /// What the chat window is momentarily saying: a refused send, a turn
+    /// outcome, a model that failed to load. The window hands it down so it is
+    /// drawn in the same layer as the composer's notices, above the composer
+    /// rather than on top of it.
+    var windowNotice: StatusNotice? = nil
+    /// The chat store cannot read or save. That is a standing condition rather
+    /// than an event, so it is not a notice: it stays until the store recovers,
+    /// and it is drawn at the top of the transcript rather than over the whole
+    /// column, whose header controls must stay reachable for the whole session.
+    var isHistoryUnavailable: Bool = false
     /// What the active model's vision tower will cost for a staged image, phrased
     /// for the chip ("about 5 s"). `nil` when the backend prices nothing, which
     /// keeps every non-local and non-vision model's chip exactly as it was.
@@ -117,12 +127,22 @@ struct ChatDetailView: View {
     /// `ImageAttachmentRef`s only when a send is accepted, so a draft the user
     /// abandons leaves nothing on disk.
     @State private var pendingImages: [PreparedImage] = []
-    /// Why the last attachment attempt failed, shown under the chips.
-    @State private var attachmentError: String? = nil
-    /// True while an attachment is being decoded/downscaled, so the composer can
-    /// say so instead of appearing to ignore the drop.
-    @State private var isPreparingAttachment = false
+    /// What the composer is momentarily saying — a refused attachment, a decode
+    /// in flight. It is drawn above the composer rather than added to its rows,
+    /// because the composer's height is what sizes the transcript above it.
+    @State private var composerNotice: StatusNotice? = nil
+    /// Mints notice identities, so a repeat of the same text still restarts the
+    /// dismissal timer.
+    @State private var noticeSerial: UInt64 = 0
+    /// The in-flight auto-dismissal, cancelled whenever the notice changes.
+    @State private var noticeDismissTask: Task<Void, Never>? = nil
     @State private var isAttachmentDropTargeted = false
+    /// How much of the transcript the floating layer is covering. The layer is an
+    /// overlay so it cannot resize anything, which also means the last message
+    /// could sit under it forever; the scroll content reserves this much instead.
+    @State private var floatingLayerHeight: CGFloat = 0
+    /// The same reservation at the top, for the standing history warning.
+    @State private var historyWarningHeight: CGFloat = 0
 
     /// Distance-from-bottom bookkeeping for the pin/detach logic.
     private struct ScrollSnapshot: Equatable {
@@ -482,6 +502,14 @@ struct ChatDetailView: View {
                     .frame(maxWidth: max(600, 800 * zoomManager.zoomScale))
                     .padding(.horizontal, 24)
                     .frame(maxWidth: .infinity)
+                    // The floating layer covers the bottom of this view, so the
+                    // content reserves its height: an opaque queue card must never
+                    // hold the newest message's last lines out of reach.
+                    .padding(.bottom, floatingLayerHeight)
+                    // The standing history warning covers the top the same way,
+                    // and a conversation scrolled back to its first message must
+                    // still be reachable under it.
+                    .padding(.top, historyWarningHeight)
                 }
                 .onChange(of: session?.id) { _ in
                     isPinnedToBottom = true
@@ -527,173 +555,29 @@ struct ChatDetailView: View {
                         isPinnedToBottom = pinned
                     }
                 }
+                // Everything the chat column says without moving anything: the
+                // queued-prompt card and the composer's notices. Overlay content
+                // cannot change this view's size, and sitting inside the
+                // transcript's own bounds means nothing overflows or is clipped.
+                .overlay(alignment: .bottom) {
+                    chatFloatingLayer
+                }
+                // The standing history warning sits under the header rather than
+                // over it: it lasts as long as the store is broken, so covering
+                // Stop, the token counts or Tasks would hide them all session.
+                .overlay(alignment: .top) {
+                    if isHistoryUnavailable {
+                        historyWarning
+                            .transition(.opacity)
+                    }
+                }
+                .animation(.easeInOut(duration: 0.2), value: isHistoryUnavailable)
             }
 
             // Floating Bottom Composer (Antigravity Centered Constrained Width)
             VStack(spacing: 0) {
-                // Queued Prompts Card (Antigravity-Style)
-                if let queued = session?.queuedPrompts, !queued.isEmpty {
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack(spacing: 6) {
-                            Image(systemName: "tray.full.fill")
-                                .font(.system(size: max(9, 11 * zoomManager.zoomScale), weight: .semibold))
-                                .foregroundColor(.purple)
-                            Text("QUEUED")
-                                .font(.system(size: max(9, 10.5 * zoomManager.zoomScale), weight: .bold))
-                                .foregroundColor(.purple)
-                            Text("(\(queued.count))")
-                                .font(.system(size: max(9, 10.5 * zoomManager.zoomScale), weight: .semibold, design: .monospaced))
-                                .foregroundColor(.secondary)
-
-                            Spacer()
-
-                            Text(isGenerating ? "Will run automatically next turn" : "Waiting to send")
-                                .font(.system(size: max(8.5, 10 * zoomManager.zoomScale), weight: .medium))
-                                .foregroundColor(.secondary)
-                        }
-                        .padding(.horizontal, 4)
-
-                        ForEach(queued) { item in
-                            HStack(spacing: 8) {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(item.text)
-                                        .font(.system(size: max(10, 12 * zoomManager.zoomScale)))
-                                        .foregroundColor(.primary)
-                                        .lineLimit(2)
-                                        .truncationMode(.tail)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                    if let count = item.attachments?.count, count > 0 {
-                                        Label(
-                                            "\(count) image\(count == 1 ? "" : "s")",
-                                            systemImage: "photo"
-                                        )
-                                        .font(.system(size: max(8.5, 9.5 * zoomManager.zoomScale), weight: .medium))
-                                        .foregroundColor(.secondary)
-                                    }
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-
-                                HStack(spacing: 6) {
-                                    Button(action: {
-                                        let textToSend = item.text
-                                        // The row stays visible while the send
-                                        // waits out a generation teardown, so a
-                                        // second activation must be ignored until
-                                        // this one finishes or the prompt would
-                                        // be sent twice.
-                                        guard !sendingQueuedIds.contains(item.id) else { return }
-                                        sendingQueuedIds.insert(item.id)
-                                        let queuedRefs = item.attachments ?? []
-                                        if let immediate = onSendImmediate {
-                                            // Only drop the queued prompt once the
-                                            // send actually lands, so a rejected
-                                            // send (no model, still loading) does
-                                            // not lose it.
-                                            Task {
-                                                let queuedImages = await Task.detached(priority: .userInitiated) {
-                                                    ImageAttachmentStore.shared.preparedImages(for: queuedRefs)
-                                                }.value
-                                                if await immediate(textToSend, queuedImages) {
-                                                    onRemoveQueuedPrompt?(item.id)
-                                                }
-                                                sendingQueuedIds.remove(item.id)
-                                            }
-                                        } else {
-                                            Task {
-                                                let queuedImages = await Task.detached(priority: .userInitiated) {
-                                                    ImageAttachmentStore.shared.preparedImages(for: queuedRefs)
-                                                }.value
-                                                if onSendMessage(textToSend, queuedImages) {
-                                                    onRemoveQueuedPrompt?(item.id)
-                                                }
-                                                sendingQueuedIds.remove(item.id)
-                                            }
-                                        }
-                                    }) {
-                                        HStack(spacing: 3) {
-                                            Image(systemName: "bolt.fill")
-                                                .font(.system(size: max(8.5, 9.5 * zoomManager.zoomScale)))
-                                            Text("Send Now")
-                                                .font(.system(size: max(9, 11 * zoomManager.zoomScale), weight: .medium))
-                                        }
-                                        .padding(.horizontal, 7)
-                                        .padding(.vertical, 3.5)
-                                        .background(Color.orange.opacity(0.15))
-                                        .foregroundColor(.orange)
-                                        .cornerRadius(6)
-                                    }
-                                    .buttonStyle(.plain)
-                                    .disabled(sendingQueuedIds.contains(item.id))
-                                    .help("Send this message now (interrupts current turn)")
-
-                                    Button(action: {
-                                        promptText = item.text
-                                        attachmentError = nil
-                                        // Read the bytes before dropping the queue
-                                        // entry: removal now deletes the assets, so
-                                        // pulling the prompt back must copy first.
-                                        let queuedRefs = item.attachments ?? []
-                                        Task {
-                                            let images = await Task.detached(priority: .userInitiated) {
-                                                ImageAttachmentStore.shared.preparedImages(for: queuedRefs)
-                                            }.value
-                                            pendingImages = images
-                                            onRemoveQueuedPrompt?(item.id)
-                                        }
-                                    }) {
-                                        Image(systemName: "pencil")
-                                            .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
-                                            .foregroundColor(.secondary)
-                                            .frame(width: max(18, 22 * zoomManager.zoomScale), height: max(18, 22 * zoomManager.zoomScale))
-                                            .background(Color.secondary.opacity(0.08))
-                                            .clipShape(Circle())
-                                    }
-                                    .buttonStyle(.plain)
-                                    .disabled(sendingQueuedIds.contains(item.id))
-                                    .help("Edit prompt in composer")
-
-                                    Button(action: {
-                                        onRemoveQueuedPrompt?(item.id)
-                                    }) {
-                                        Image(systemName: "xmark")
-                                            .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .bold))
-                                            .foregroundColor(.secondary)
-                                            .frame(width: max(18, 22 * zoomManager.zoomScale), height: max(18, 22 * zoomManager.zoomScale))
-                                            .background(Color.secondary.opacity(0.08))
-                                            .clipShape(Circle())
-                                    }
-                                    .buttonStyle(.plain)
-                                    .disabled(sendingQueuedIds.contains(item.id))
-                                    .help("Remove from queue")
-                                }
-                            }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 7)
-                            .background(Color.primary.opacity(0.04))
-                            .cornerRadius(10)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 10)
-                                    .stroke(Color.primary.opacity(0.06), lineWidth: 1)
-                            )
-                        }
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 8)
-                    .background(Color(NSColor.controlBackgroundColor))
-                    .cornerRadius(14)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 14)
-                            .stroke(Color.purple.opacity(0.2), lineWidth: 1)
-                    )
-                    .shadow(color: Color.black.opacity(0.04), radius: 6, x: 0, y: 2)
-                    .frame(maxWidth: max(600, 800 * zoomManager.zoomScale))
-                    .padding(.horizontal, 24)
-                    .padding(.bottom, 8)
-                    .transition(.asymmetric(insertion: .opacity.combined(with: .move(edge: .bottom)), removal: .opacity.combined(with: .scale(scale: 0.95))))
-                }
-
                 VStack(alignment: .leading, spacing: 6) {
-                    if !pendingImages.isEmpty || attachmentError != nil || isPreparingAttachment {
+                    if !pendingImages.isEmpty {
                         attachmentChipsRow()
                     }
                     // Multi-line Expanding Input
@@ -728,12 +612,20 @@ struct ChatDetailView: View {
                     HStack(spacing: 8) {
                         // Attachment menu
                         Menu {
+                            // Disabled for a model without a tower: the refusal
+                            // is the fallback for a drop, not something to walk
+                            // the user into from a menu. A disabled row cannot be
+                            // activated, so the reason rides on it as a tooltip.
                             Button(action: presentAttachmentPicker) {
                                 Label("Attach Image…", systemImage: "photo.badge.plus")
                             }
+                            .disabled(!supportsVision)
+                            .help(attachImageHelp)
                             Button(action: { _ = handlePasteboardImage() }) {
                                 Label("Attach from Clipboard", systemImage: "doc.on.clipboard")
                             }
+                            .disabled(!supportsVision)
+                            .help(attachImageHelp)
                             if !pendingImages.isEmpty {
                                 Divider()
                                 Button(role: .destructive, action: clearAttachments) {
@@ -751,7 +643,7 @@ struct ChatDetailView: View {
                         .menuStyle(.borderlessButton)
                         .menuIndicator(.hidden)
                         .fixedSize()
-                        .help(supportsVision ? "Attach images (or paste / drop them)" : "The selected model cannot see images")
+                        .help(attachImageHelp)
 
                         // Antigravity-Style Model Selector Menu
                         Menu {
@@ -1185,6 +1077,28 @@ struct ChatDetailView: View {
         .onChange(of: tokenizer != nil) { _ in
             updateTokenCount(for: promptText)
         }
+        // A refusal is about the model that was selected when it was raised, so a
+        // switch has to retract it. Staging survives a switch, so a model that
+        // cannot see what is already staged has to say so.
+        .onChange(of: supportsVision) { canSeeImages in
+            if canSeeImages {
+                // The refusal is retracted; a decode that is still running is not
+                // a refusal, and clearing it would drop "Preparing image…" while
+                // the image it names is still being prepared.
+                if composerNotice?.kind != .progress { clearNotice() }
+            } else if !pendingImages.isEmpty {
+                showNotice(
+                    ImageAttachmentMessages.cannotSeeImagesSend(modelName: modelName),
+                    kind: .warning
+                )
+            }
+        }
+        .onPreferenceChange(FloatingLayerHeight.self) { height in
+            floatingLayerHeight = height
+        }
+        .onPreferenceChange(HistoryWarningHeight.self) { height in
+            historyWarningHeight = height
+        }
     }
 
     /// Submits the current draft through the async immediate-send path
@@ -1220,58 +1134,327 @@ struct ChatDetailView: View {
         }
     }
 
+    // MARK: - Floating Chat Layer
+
+    /// Height the floating layer covers at the bottom of the transcript, reported
+    /// up so the scroll content can reserve exactly that much.
+    private struct FloatingLayerHeight: PreferenceKey {
+        static let defaultValue: CGFloat = 0
+        static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+            value = max(value, nextValue())
+        }
+    }
+
+    /// Everything the chat column says without moving anything. The queued-prompt
+    /// card and the notices are drawn over the bottom of the transcript instead of
+    /// inset into the composer's rows: the composer's height is what sizes the
+    /// transcript above it, so a queue entry or a refused drop must never reach it.
+    /// Overlay content cannot change its host's size, and because this sits inside
+    /// the transcript's own bounds nothing overflows or is clipped.
+    @ViewBuilder
+    private var chatFloatingLayer: some View {
+        VStack(spacing: 6) {
+            if let queued = session?.queuedPrompts, !queued.isEmpty {
+                queuedPromptsCard(queued)
+                    .transition(.opacity)
+            }
+            ForEach(layerNotices) { notice in
+                // Closest to the composer is what the notice is about. None of
+                // them takes a click: the transcript under it is live.
+                StatusNoticeBubble(notice: notice, zoomScale: zoomManager.zoomScale)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: max(600, 800 * zoomManager.zoomScale))
+        .padding(.horizontal, 24)
+        .padding(.bottom, 10)
+        .background(
+            GeometryReader { proxy in
+                Color.clear.preference(key: FloatingLayerHeight.self, value: proxy.size.height)
+            }
+        )
+        .animation(.easeInOut(duration: 0.15), value: session?.queuedPrompts.count ?? 0)
+        .animation(.easeInOut(duration: 0.15), value: layerNotices)
+    }
+
+    /// The notices this layer shows, in the order they stack. The window and the
+    /// composer can hold the same sentence at once, and a fact repeated on two
+    /// pills reads as two problems, so `stacked` keeps one copy.
+    private var layerNotices: [StatusNotice] {
+        StatusNoticePolicy.stacked(window: windowNotice, composer: composerNotice)
+    }
+
+    /// Height the standing history warning covers at the top of the transcript,
+    /// reported up so the scroll content can reserve exactly that much.
+    private struct HistoryWarningHeight: PreferenceKey {
+        static let defaultValue: CGFloat = 0
+        static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+            value = max(value, nextValue())
+        }
+    }
+
+    /// Shown when the store reports persistence as unavailable. The specific
+    /// cause varies (unopenable folder, a failed read or write, encoding failure,
+    /// failed cleanup), and a listing failure means existing conversations may not
+    /// have loaded, so the wording covers both reading and saving rather than
+    /// blaming the folder or promising the failure only affects future saves.
+    ///
+    /// It floats over the transcript rather than insetting it: a banner that
+    /// pushes the conversation down moves the very thing it is warning about. The
+    /// solid background is what keeps it readable over the messages beneath it.
+    @ViewBuilder
+    private var historyWarning: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundColor(.orange)
+                .font(.system(size: 13))
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Chat history is unavailable")
+                    .font(.system(size: 12, weight: .semibold))
+                Text("DynaMoE couldn't read or save chat history. Existing conversations may not appear, and recent ones may not persist between launches.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(NSColor.controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.orange.opacity(0.45), lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(0.14), radius: 10, x: 0, y: 4)
+        .padding(.horizontal, 12)
+        .padding(.top, 6)
+        .allowsHitTesting(false)
+        .background(
+            GeometryReader { proxy in
+                Color.clear.preference(key: HistoryWarningHeight.self, value: proxy.size.height)
+            }
+        )
+    }
+
+    /// The queued-prompt rows. Capped and internally scrollable because the card
+    /// floats: a long queue must not swallow the conversation it queues into.
+    private func queuedPromptsCard(_ queued: [QueuedPrompt]) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "tray.full.fill")
+                    .font(.system(size: max(9, 11 * zoomManager.zoomScale), weight: .semibold))
+                    .foregroundColor(.purple)
+                Text("QUEUED")
+                    .font(.system(size: max(9, 10.5 * zoomManager.zoomScale), weight: .bold))
+                    .foregroundColor(.purple)
+                Text("(\(queued.count))")
+                    .font(.system(size: max(9, 10.5 * zoomManager.zoomScale), weight: .semibold, design: .monospaced))
+                    .foregroundColor(.secondary)
+
+                Spacer()
+
+                Text(isGenerating ? "Will run automatically next turn" : "Waiting to send")
+                    .font(.system(size: max(8.5, 10 * zoomManager.zoomScale), weight: .medium))
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 4)
+
+            ScrollView(.vertical, showsIndicators: true) {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(queued) { item in
+                        HStack(spacing: 8) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(item.text)
+                                    .font(.system(size: max(10, 12 * zoomManager.zoomScale)))
+                                    .foregroundColor(.primary)
+                                    .lineLimit(2)
+                                    .truncationMode(.tail)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                if let count = item.attachments?.count, count > 0 {
+                                    Label(
+                                        "\(count) image\(count == 1 ? "" : "s")",
+                                        systemImage: "photo"
+                                    )
+                                    .font(.system(size: max(8.5, 9.5 * zoomManager.zoomScale), weight: .medium))
+                                    .foregroundColor(.secondary)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                            HStack(spacing: 6) {
+                                Button(action: {
+                                    let textToSend = item.text
+                                    // The row stays visible while the send waits
+                                    // out a generation teardown, so a second
+                                    // activation must be ignored until this one
+                                    // finishes or the prompt would be sent twice.
+                                    guard !sendingQueuedIds.contains(item.id) else { return }
+                                    sendingQueuedIds.insert(item.id)
+                                    let queuedRefs = item.attachments ?? []
+                                    if let immediate = onSendImmediate {
+                                        // Only drop the queued prompt once the
+                                        // send actually lands, so a rejected
+                                        // send (no model, still loading) does
+                                        // not lose it.
+                                        Task {
+                                            let queuedImages = await Task.detached(priority: .userInitiated) {
+                                                ImageAttachmentStore.shared.preparedImages(for: queuedRefs)
+                                            }.value
+                                            if await immediate(textToSend, queuedImages) {
+                                                onRemoveQueuedPrompt?(item.id)
+                                            }
+                                            sendingQueuedIds.remove(item.id)
+                                        }
+                                    } else {
+                                        Task {
+                                            let queuedImages = await Task.detached(priority: .userInitiated) {
+                                                ImageAttachmentStore.shared.preparedImages(for: queuedRefs)
+                                            }.value
+                                            if onSendMessage(textToSend, queuedImages) {
+                                                onRemoveQueuedPrompt?(item.id)
+                                            }
+                                            sendingQueuedIds.remove(item.id)
+                                        }
+                                    }
+                                }) {
+                                    HStack(spacing: 3) {
+                                        Image(systemName: "bolt.fill")
+                                            .font(.system(size: max(8.5, 9.5 * zoomManager.zoomScale)))
+                                        Text("Send Now")
+                                            .font(.system(size: max(9, 11 * zoomManager.zoomScale), weight: .medium))
+                                    }
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 3.5)
+                                    .background(Color.orange.opacity(0.15))
+                                    .foregroundColor(.orange)
+                                    .cornerRadius(6)
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(sendingQueuedIds.contains(item.id))
+                                .help("Send this message now (interrupts current turn)")
+
+                                Button(action: {
+                                    promptText = item.text
+                                    clearNotice()
+                                    // Read the bytes before dropping the queue
+                                    // entry: removal now deletes the assets, so
+                                    // pulling the prompt back must copy first.
+                                    let queuedRefs = item.attachments ?? []
+                                    Task {
+                                        let images = await Task.detached(priority: .userInitiated) {
+                                            ImageAttachmentStore.shared.preparedImages(for: queuedRefs)
+                                        }.value
+                                        pendingImages = images
+                                        onRemoveQueuedPrompt?(item.id)
+                                    }
+                                }) {
+                                    Image(systemName: "pencil")
+                                        .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
+                                        .foregroundColor(.secondary)
+                                        .frame(width: max(18, 22 * zoomManager.zoomScale), height: max(18, 22 * zoomManager.zoomScale))
+                                        .background(Color.secondary.opacity(0.08))
+                                        .clipShape(Circle())
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(sendingQueuedIds.contains(item.id))
+                                .help("Edit prompt in composer")
+
+                                Button(action: {
+                                    onRemoveQueuedPrompt?(item.id)
+                                }) {
+                                    Image(systemName: "xmark")
+                                        .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .bold))
+                                        .foregroundColor(.secondary)
+                                        .frame(width: max(18, 22 * zoomManager.zoomScale), height: max(18, 22 * zoomManager.zoomScale))
+                                        .background(Color.secondary.opacity(0.08))
+                                        .clipShape(Circle())
+                                }
+                                .buttonStyle(.plain)
+                                .disabled(sendingQueuedIds.contains(item.id))
+                                .help("Remove from queue")
+                            }
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(Color.primary.opacity(0.04))
+                        .cornerRadius(10)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
+                        )
+                    }
+                }
+            }
+            .frame(maxHeight: max(120, 200 * zoomManager.zoomScale))
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color(NSColor.controlBackgroundColor))
+        .cornerRadius(14)
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(Color.purple.opacity(0.2), lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(0.08), radius: 12, x: 0, y: 4)
+    }
+
     // MARK: - Image Attachments
 
     /// Stages an image in the composer. Only a send persists it, so an abandoned
     /// draft leaves nothing on disk.
     private func stageAttachment(_ image: PreparedImage) {
         guard supportsVision else {
-            attachmentError = "This model cannot see images. Switch to a vision-capable model to attach one."
+            showNotice(ImageAttachmentMessages.cannotSeeImagesAttach(modelName: modelName), kind: .warning)
             return
         }
         guard pendingImages.count < ImageAttachmentPreparer.maxImagesPerMessage else {
-            attachmentError = ImageAttachmentError.tooManyImages(
-                limit: ImageAttachmentPreparer.maxImagesPerMessage
-            ).errorDescription
+            showNotice(
+                ImageAttachmentError.tooManyImages(
+                    limit: ImageAttachmentPreparer.maxImagesPerMessage
+                ).errorDescription ?? "Too many images.",
+                kind: .warning
+            )
             return
         }
         // The same picture dropped twice is one attachment, not two billed ones.
         guard !pendingImages.contains(where: { $0.sha256 == image.sha256 }) else { return }
         pendingImages.append(image)
-        attachmentError = nil
+        clearNotice()
     }
 
     private func attachFile(at url: URL) async {
         guard supportsVision else {
-            attachmentError = "This model cannot see images. Switch to a vision-capable model to attach one."
+            showNotice(ImageAttachmentMessages.cannotSeeImagesAttach(modelName: modelName), kind: .warning)
             return
         }
-        isPreparingAttachment = true
-        defer { isPreparingAttachment = false }
+        showNotice(StatusNoticePolicy.preparingText, kind: .progress)
+        defer { clearProgressNotice() }
         do {
             let prepared = try await Task.detached(priority: .userInitiated) {
                 try ImageAttachmentPreparer.prepare(fileURL: url)
             }.value
             stageAttachment(prepared)
         } catch {
-            attachmentError = error.localizedDescription
+            showNotice(error.localizedDescription, kind: .warning)
         }
     }
 
     private func attachImageData(_ data: Data, fileName: String) async {
         guard supportsVision else {
-            attachmentError = "This model cannot see images. Switch to a vision-capable model to attach one."
+            showNotice(ImageAttachmentMessages.cannotSeeImagesAttach(modelName: modelName), kind: .warning)
             return
         }
-        isPreparingAttachment = true
-        defer { isPreparingAttachment = false }
+        showNotice(StatusNoticePolicy.preparingText, kind: .progress)
+        defer { clearProgressNotice() }
         do {
             let prepared = try await Task.detached(priority: .userInitiated) {
                 try ImageAttachmentPreparer.prepare(data: data, fileName: fileName)
             }.value
             stageAttachment(prepared)
         } catch {
-            attachmentError = error.localizedDescription
+            showNotice(error.localizedDescription, kind: .warning)
         }
     }
 
@@ -1293,7 +1476,7 @@ struct ChatDetailView: View {
 
     private func handleAttachmentDrop(_ providers: [NSItemProvider]) -> Bool {
         guard supportsVision else {
-            attachmentError = "This model cannot see images. Switch to a vision-capable model to attach one."
+            showNotice(ImageAttachmentMessages.cannotSeeImagesAttach(modelName: modelName), kind: .warning)
             return true
         }
         var claimed = false
@@ -1356,7 +1539,69 @@ struct ChatDetailView: View {
 
     private func clearAttachments() {
         pendingImages.removeAll()
-        attachmentError = nil
+        clearNotice()
+    }
+
+    // MARK: - Composer Notices
+
+    /// Shows a transient composer message. It is drawn above the composer, never
+    /// added to its rows, so it cannot resize the transcript. A warning clears
+    /// itself; progress stays until the work it describes finishes.
+    private func showNotice(_ text: String, kind: StatusNotice.Kind) {
+        assert(
+            !StatusNoticePolicy.statesContradictorySeverity(text: text, kind: kind),
+            "\(text) leads with a glyph of another severity: drop the explicit kind, or the glyph"
+        )
+        noticeDismissTask?.cancel()
+        noticeDismissTask = nil
+        // A repeat of what is already on screen keeps its identity, so it does
+        // not re-run the fade, but it does restart the dismissal timer.
+        let isRepeat = StatusNoticePolicy.isRepeat(
+            text: text, kind: kind, source: .composer, current: composerNotice
+        )
+        let identity: StatusNotice.Identity
+        if isRepeat, let current = composerNotice {
+            identity = current.id
+        } else {
+            noticeSerial &+= 1
+            identity = StatusNotice.Identity(source: .composer, serial: noticeSerial)
+        }
+        composerNotice = StatusNotice(id: identity, kind: kind, text: text)
+        // The old row was reachable by tabbing; an overlay is not, so announce it
+        // — once per identity, because a repeat is the same sentence continued.
+        if !isRepeat {
+            AccessibilityNotification.Announcement(text).post()
+        }
+        guard kind.autoDismisses else { return }
+        noticeDismissTask = Task {
+            try? await Task.sleep(nanoseconds: StatusNoticePolicy.autoDismissNanoseconds)
+            guard !Task.isCancelled, composerNotice?.id == identity else { return }
+            withAnimation(.easeOut(duration: 0.15)) {
+                composerNotice = nil
+            }
+            noticeDismissTask = nil
+        }
+    }
+
+    private func clearNotice() {
+        noticeDismissTask?.cancel()
+        noticeDismissTask = nil
+        composerNotice = nil
+    }
+
+    /// Clears the notice only if it is the in-flight "preparing" one, so finishing
+    /// an attachment cannot wipe a refusal that landed while it decoded.
+    private func clearProgressNotice() {
+        guard composerNotice?.kind == .progress else { return }
+        clearNotice()
+    }
+
+    /// The attach menu's tooltip. A disabled row cannot be activated, so this is
+    /// the only place the reason is discoverable before a drop or a paste fails.
+    private var attachImageHelp: String {
+        supportsVision
+            ? "Attach an image (or paste / drop one)"
+            : ImageAttachmentMessages.cannotSeeImagesAttach(modelName: modelName)
     }
 
     private func attachmentDetailLine(_ image: PreparedImage) -> String {
@@ -1376,6 +1621,27 @@ struct ChatDetailView: View {
                         let image = pendingImages[index]
                         HStack(spacing: 6) {
                             AttachmentChipThumbnail(image: image)
+                                // A staged image the current model cannot see is
+                                // marked on the chip itself: durable state at a
+                                // constant size, where an extra row would resize
+                                // the composer and jump the transcript.
+                                .overlay(alignment: .topTrailing) {
+                                    if !supportsVision {
+                                        Image(systemName: "exclamationmark.triangle.fill")
+                                            .font(.system(size: max(8, 9.5 * zoomManager.zoomScale)))
+                                            .foregroundColor(.orange)
+                                            .padding(1)
+                                            .background(Color(NSColor.controlBackgroundColor))
+                                            .clipShape(Circle())
+                                            .offset(x: 4, y: -4)
+                                            // The refusal copy has one owner: a
+                                            // second hand-written sentence here
+                                            // could explain the same model
+                                            // differently from the notice a drop
+                                            // or a send raises.
+                                            .help(ImageAttachmentMessages.cannotSeeImagesSend(modelName: modelName))
+                                    }
+                                }
                             VStack(alignment: .leading, spacing: 1) {
                                 Text(image.fileName)
                                     .font(.system(size: max(9, 10.5 * zoomManager.zoomScale), weight: .semibold))
@@ -1408,23 +1674,6 @@ struct ChatDetailView: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-
-            if !supportsVision {
-                Label("This model cannot see images.", systemImage: "exclamationmark.triangle.fill")
-                    .font(.system(size: max(9, 10.5 * zoomManager.zoomScale), weight: .medium))
-                    .foregroundColor(.orange)
-            }
-            if isPreparingAttachment {
-                Text("Preparing image…")
-                    .font(.system(size: max(9, 10.5 * zoomManager.zoomScale)))
-                    .foregroundColor(.secondary)
-            }
-            if let attachmentError {
-                Text(attachmentError)
-                    .font(.system(size: max(9, 10.5 * zoomManager.zoomScale), weight: .medium))
-                    .foregroundColor(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
         }
     }
 

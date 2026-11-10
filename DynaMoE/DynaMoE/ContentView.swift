@@ -55,23 +55,6 @@ struct ExpertRoutingBadgeView: View {
         .cornerRadius(8)
     }
 }
-
-struct LayerTelemetry: Identifiable {
-    var id: Int { layerIndex }
-    let layerIndex: Int
-    let durationMs: Double
-    let topExperts: [Int]
-    let l2Norm: Float
-}
-
-struct TokenPrediction: Identifiable {
-    var id: Int { rank }
-    let rank: Int
-    let tokenId: UInt32
-    let tokenString: String
-    let logit: Float
-    let probability: Float
-}
 #if canImport(Darwin)
 import Darwin
 
@@ -206,10 +189,7 @@ struct ContentView: View {
     @State private var engine: DynaMoeEngine? = nil
     @State private var tokenizer: DynaMoeTokenizer? = nil
     @State private var summary: ModelSummary? = nil
-    @State private var errorMessage: String? = nil
     @State private var metalStatus: String = "GPU Status: Waiting for weights..."
-    @State private var searchText: String = ""
-    @State private var selectedCategory: String = "All"
     
     // Multi-Shard Metal Buffers
     @State private var shardBuffers: [UInt32: MTLBuffer] = [:]
@@ -222,44 +202,6 @@ struct ContentView: View {
     @State private var promptInput: String = "Hello DynaMoE, routing tokens to experts..."
     @State private var tokenIDsOutput: String = "Load a tokenizer.json file to tokenize text"
     
-    @State private var selectedTensorID: String? = nil
-    @State private var gpuComputeOutput: String? = nil
-
-    // Active Token Embedding & MoE Routing State
-    @State private var activeH0Buffer: MTLBuffer? = nil
-    @State private var activeTokenCount: Int = 0
-    @State private var activeHiddenDim: Int = 2048
-    
-    @State private var selectedLayerForRouting: Int = 0
-    @State private var routedExperts: [(id: Int, weight: Float)] = []
-    @State private var sharedExpertWeight: Float? = nil
-    @State private var routerStatusText: String? = nil
-
-    // MoE Layer MLP Output State
-    @State private var activeHmlpBuffer: MTLBuffer? = nil
-    @State private var layerMlpStatusText: String? = nil
-    @State private var layerMlpSampleOutput: String? = nil
-    @State private var isExecutingMlp: Bool = false
-
-    // Full Transformer Layer Execution State (h_l -> h_l+1)
-    @State private var activeH1Buffer: MTLBuffer? = nil
-    @State private var fullLayerStatusText: String? = nil
-    @State private var fullLayerSampleOutput: String? = nil
-    @State private var isExecutingFullLayer: Bool = false
-
-    // Multi-Layer Backbone Execution State (h_0 -> h_N)
-    @State private var targetLayerCount: Int = 40
-    @State private var activeHFinalBuffer: MTLBuffer? = nil
-    @State private var multiLayerStatusText: String? = nil
-    @State private var multiLayerTelemetry: [LayerTelemetry] = []
-    @State private var isExecutingMultiLayer: Bool = false
-
-    // Final RMSNorm & LM Head Vocabulary Projection State
-    @State private var activeLogitsBuffer: MTLBuffer? = nil
-    @State private var topTokenPredictions: [TokenPrediction] = []
-    @State private var lmHeadStatusText: String? = nil
-    @State private var isExecutingLMHead: Bool = false
-
     // Autoregressive Text Generation State
     @State private var temperature: Float = 0.0
     @State private var topP: Float = 0.9
@@ -310,7 +252,18 @@ struct ContentView: View {
     @State private var generationSpeedTokPerSec: Double = 0.0
     @State private var generationTotalTokens: Int = 0
     @State private var generationElapsedMs: Double = 0.0
-    @State private var generationStatusText: String? = nil
+    /// One transient status line for the whole window: refusals, failures and
+    /// turn outcomes. It is drawn as an overlay like the zoom HUD, never as a
+    /// row, so a message can never resize the layout it is reporting on.
+    @State private var statusNotice: StatusNotice? = nil
+    /// The conversation a window notice is about, or nil when it is about the app
+    /// itself. Compaction and on-device generation describe work inside one chat,
+    /// so their pills are withheld while another chat is on screen.
+    @State private var statusNoticeSessionId: UUID? = nil
+    /// Mints notice identities, so a repeat of the same text still restarts the
+    /// dismissal timer.
+    @State private var statusSerial: UInt64 = 0
+    @State private var statusDismissTask: Task<Void, Never>? = nil
     @State private var generationTask: Task<Void, Never>? = nil
     /// Monotonic id for the live generation. A cancelled task that has already
     /// been superseded (interrupt + replacement, or a scheduled continuation)
@@ -743,12 +696,6 @@ struct ContentView: View {
         )
     }
 
-    let categoryFilters = ["All", "Self-Attention", "MoE Router", "Routed Expert", "Shared Expert", "Embedding", "LM Head"]
-
-    var selectedTensor: TensorMetadata? {
-        summary?.tensors.first(where: { $0.name == selectedTensorID })
-    }
-
     private func applyProfile(_ profile: ModelProfileType, for modelIdentifier: String? = nil) {
         let modelKey = modelIdentifier ?? activeModelDisplayName ?? localModelManager.defaultModelId
         let settings = ModelProfileManager.shared.getProfile(for: modelKey, type: profile)
@@ -884,7 +831,7 @@ struct ContentView: View {
             modelId: session.selectedModelId,
             modelPath: targetPath
         ) {
-            generationStatusText = "⚠️ This conversation's cloud model could not be resolved. Reselect the model in the model picker."
+            showStatus("⚠️ This conversation's cloud model could not be resolved. Reselect the model in the model picker.")
             return false
         }
         if installedModelPath == targetPath {
@@ -1025,10 +972,10 @@ struct ContentView: View {
         let availability = AppleFoundationModelService.checkAvailability()
         if availability.isReady {
             metalStatus = "✅ Apple Foundation Model ready (on-device)."
-            generationStatusText = "🍎 Apple Foundation Model active."
+            showStatus("🍎 Apple Foundation Model active.")
         } else {
             metalStatus = "⚠️ Apple Foundation Model: \(availability.statusText)"
-            generationStatusText = metalStatus
+            showStatus(metalStatus)
         }
         // Warm the on-device model so the first turn does not pay spin-up latency.
         AppleFoundationModelService.prewarm()
@@ -1125,7 +1072,7 @@ struct ContentView: View {
             // that claims a cloud model: say why nothing happened.
             let message = "⚠️ Could not resolve \(model.displayName) to a cloud provider — reselect the model in the model picker."
             metalStatus = message
-            generationStatusText = message
+            showStatus(message, kind: .warning)
             return
         }
         PrefixCacheManager.shared.invalidate()
@@ -1152,15 +1099,15 @@ struct ContentView: View {
         applyProfile(preferredProfile, for: model.id)
         if CloudSecretStore.shared.hasCurrentCredential(providerId: resolved.provider.id) {
             metalStatus = "☁️ \(resolved.provider.displayName) ready — \(model.displayName)."
-            generationStatusText = "☁️ \(resolved.provider.displayName) active."
+            showStatus("☁️ \(resolved.provider.displayName) active.")
         } else if CloudSecretStore.shared.exists(providerId: resolved.provider.id) {
             let message = "⚠️ \(resolved.provider.displayName): the API key is still in the older keychain. Import it in Settings ▸ Cloud Providers."
             metalStatus = message
-            generationStatusText = message
+            showStatus(message, kind: .warning)
         } else {
             let message = "⚠️ \(resolved.provider.displayName): no API key stored — add one in Settings ▸ Cloud Providers."
             metalStatus = message
-            generationStatusText = message
+            showStatus(message, kind: .warning)
         }
     }
 
@@ -1379,31 +1326,104 @@ struct ContentView: View {
         ChatSessionStore.shared.saveAll(sessions, cleanOrphans: hasLoadedPersistedSessions)
     }
 
-    /// Shown when the store reports persistence as unavailable. The specific
-    /// cause varies (unopenable folder, a failed read or write, encoding failure,
-    /// failed cleanup), and a listing failure means existing conversations may not
-    /// have loaded, so the wording covers both reading and saving rather than
-    /// blaming the folder or promising the failure only affects future saves.
-    @ViewBuilder
-    private var chatPersistenceWarningBanner: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundColor(.orange)
-                .font(.system(size: 13))
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Chat history is unavailable")
-                    .font(.system(size: 12, weight: .semibold))
-                Text("DynaMoE couldn't read or save chat history. Existing conversations may not appear, and recent ones may not persist between launches.")
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
-            }
-            Spacer(minLength: 0)
+    // MARK: - Transient Status
+
+    /// Says something without moving anything. Refusals (a queued prompt that
+    /// cannot be sent, a model that cannot see a staged image), failures, and
+    /// turn outcomes all arrive here; before this they were written to state that
+    /// nothing rendered, so a refused send looked like a dead button.
+    ///
+    /// Severity comes from the message's own leading glyph, so a writer cannot
+    /// disagree with the tint, and every notice clears itself unless it describes
+    /// unfinished work: a status line that outlives its event is worse than none.
+    ///
+    /// Returns the identity the notice was given, so work that reports progress
+    /// in place can take down exactly its own pill when it finishes. A notice
+    /// that replaced it keeps its own identity and is left alone.
+    @discardableResult
+    private func showStatus(
+        _ text: String,
+        kind: StatusNotice.Kind? = nil,
+        sessionId: UUID? = nil
+    ) -> StatusNotice.Identity {
+        let resolved = kind ?? StatusNoticePolicy.kind(for: text)
+        assert(
+            !StatusNoticePolicy.statesContradictorySeverity(text: text, kind: resolved),
+            "\(text) leads with a glyph of another severity: drop the explicit kind, or the glyph"
+        )
+        statusDismissTask?.cancel()
+        statusDismissTask = nil
+        // A repeat of what is already on screen keeps its identity, so it does
+        // not re-run the fade, but it does restart the dismissal timer.
+        let isRepeat = StatusNoticePolicy.isRepeat(
+            text: text, kind: resolved, source: .window, current: statusNotice
+        )
+        let identity: StatusNotice.Identity
+        if isRepeat, let current = statusNotice {
+            identity = current.id
+        } else {
+            statusSerial &+= 1
+            identity = StatusNotice.Identity(source: .window, serial: statusSerial)
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.orange.opacity(0.14))
-        .overlay(alignment: .bottom) { Divider() }
+        statusNotice = StatusNotice(id: identity, kind: resolved, text: text)
+        // Every notice states its scope: a work pill belongs to one conversation
+        // and must not float over another, while the rest are about the app.
+        statusNoticeSessionId = sessionId
+        // An overlay is not reachable by tabbing, so announce it instead — once
+        // per identity, because a repeat is the same sentence continued.
+        if !isRepeat {
+            AccessibilityNotification.Announcement(text).post()
+        }
+        guard resolved.autoDismisses else { return identity }
+        statusDismissTask = Task {
+            try? await Task.sleep(nanoseconds: StatusNoticePolicy.autoDismissNanoseconds)
+            guard !Task.isCancelled, statusNotice?.id == identity else { return }
+            withAnimation(.easeOut(duration: 0.15)) {
+                statusNotice = nil
+            }
+            statusDismissTask = nil
+        }
+        return identity
+    }
+
+    private func clearStatus() {
+        statusDismissTask?.cancel()
+        statusDismissTask = nil
+        statusNotice = nil
+        statusNoticeSessionId = nil
+    }
+
+    /// Clears the notice only if it is still the one `id` names. Progress work can
+    /// finish after another message has taken the pill — a late finisher must not
+    /// retract somebody else's notice.
+    private func clearStatus(ifIdentity id: StatusNotice.Identity) {
+        guard statusNotice?.id == id else { return }
+        clearStatus()
+    }
+
+    /// The window notice the visible chat column may draw. A pill about one
+    /// conversation is withheld while another is on screen — the transcript's own
+    /// progress row is keyed to the session for the same reason — while a notice
+    /// about the app stays visible everywhere.
+    private var visibleStatusNotice: StatusNotice? {
+        guard let statusNotice else { return nil }
+        guard let statusNoticeSessionId else { return statusNotice }
+        return statusNoticeSessionId == (selectedSessionId ?? sessions.first?.id) ? statusNotice : nil
+    }
+
+    /// A load failure is the one status line whose cause is long and whose effect
+    /// outlives the six seconds the notice lives: "missing shard" or an allocation
+    /// refusal is several lines in a three-line pill, and a chat that cannot send
+    /// is a permanent state. The transcript row is the durable copy, the same way
+    /// a provider's image downgrade is recorded there, so the reason stays
+    /// readable after the pill has gone.
+    private func recordLoadFailureInTranscript(_ reason: String) {
+        let text = "❌ Engine load failed: \(reason)"
+        guard let sid = selectedSessionId ?? sessions.first?.id,
+              let idx = sessions.firstIndex(where: { $0.id == sid }) else { return }
+        // Retrying the same load fails the same way; the row is a record, not a log.
+        guard sessions[idx].messages.last?.content != text else { return }
+        sessions[idx].messages.append(ChatMessage(role: .system, content: text))
     }
 
     var body: some View {
@@ -1486,6 +1506,8 @@ struct ContentView: View {
                     thinkingEffort: levelCapable ? thinkingEffortForActiveSession : nil,
                     supportsThinkingLevels: levelCapable,
                     supportsVision: activeModelSupportsVision,
+                    windowNotice: visibleStatusNotice,
+                    isHistoryUnavailable: !sessionStore.isPersistenceAvailable,
                     visionCostLabel: { image in
                         guard let estimate = ModelConfig.visionCostEstimate(
                             modelPath: activeLoadedModelPath,
@@ -1559,11 +1581,6 @@ struct ContentView: View {
                         sessions[idx].titleOrigin = .user
                     }
                 )
-                .safeAreaInset(edge: .top, spacing: 0) {
-                    if !sessionStore.isPersistenceAvailable {
-                        chatPersistenceWarningBanner
-                    }
-                }
             }
             .toolbar(removing: .title)
             .toolbar {
@@ -1607,6 +1624,11 @@ struct ContentView: View {
                 .allowsHitTesting(false)
                 .animation(.easeInOut(duration: 0.2), value: zoomManager.hudText)
             }
+
+            // The window's status notice is not drawn here: it is handed to the
+            // chat column, which owns the composer it belongs above. Anchored to
+            // the window it landed on the composer's own controls, and the
+            // composer already reports refusals — two surfaces for one fact.
         }
         .onChange(of: isSettingsPresented) { isPresented in
             if isPresented {
@@ -1770,7 +1792,6 @@ struct ContentView: View {
             presencePenalty: $presencePenalty,
             maxNewTokens: $maxNewTokens,
             systemPrompt: $systemPrompt,
-            targetLayerCount: $targetLayerCount,
             activeProfile: $activeProfile,
             memoryExecutionMode: memoryExecutionModeBinding,
             memoryBudgetMode: memoryBudgetModeBinding,
@@ -1786,22 +1807,11 @@ struct ContentView: View {
             pagingStatusMessage: pagingStatusMessage,
             onFlushCache: { flushExpertCache() },
             onPreFaultAll: { preFaultAllWeights() },
-            searchText: $searchText,
-            selectedCategory: $selectedCategory,
-            categoryFilters: categoryFilters,
-            selectedTensorID: $selectedTensorID,
-            selectedTensor: selectedTensor,
-            onExecuteMoERouter: { l in executeMoERouter(layerIndex: l) },
-            onExecuteFullLayer: { l in executeFullLayerForward(layerIndex: l) },
-            onExecuteMultiLayer: { n in executeMultiLayerForward(numLayers: n) },
-            isExecutingMlp: isExecutingMlp,
-            isExecutingFullLayer: isExecutingFullLayer,
-            isExecutingMultiLayer: isExecutingMultiLayer
         )
     }
 
     private func openSettingsWindow() {
-        SettingsWindowManager.shared.show(title: "Settings & Diagnostics") {
+        SettingsWindowManager.shared.show(title: "Settings") {
             buildSettingsSheetView()
         }
     }
@@ -1824,14 +1834,14 @@ struct ContentView: View {
         guard preparedImages.count <= ImageAttachmentPreparer.maxImagesPerMessage else {
             let err = ImageAttachmentError.tooManyImages(limit: ImageAttachmentPreparer.maxImagesPerMessage)
                 .errorDescription ?? "Too many images."
-            generationStatusText = err
-            gpuComputeOutput = err
+            showStatus(err, kind: .warning)
             return false
         }
         if !preparedImages.isEmpty, !supportsVision(for: sessions[sessionIdx]) {
-            let err = "⚠️ \(modelDisplayName(for: sessions[sessionIdx]) ?? "This model") cannot see images. Switch to a vision-capable model, or remove the attachment."
-            generationStatusText = err
-            gpuComputeOutput = err
+            let err = "⚠️ " + ImageAttachmentMessages.cannotSeeImagesSend(
+                modelName: modelDisplayName(for: sessions[sessionIdx])
+            )
+            showStatus(err, kind: .warning)
             return false
         }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1843,16 +1853,14 @@ struct ContentView: View {
             // images would be persisted and then silently dropped when the command
             // returns. Refuse before writing and leave the draft intact.
             let err = Self.slashCommandWithImagesMessage
-            generationStatusText = err
-            gpuComputeOutput = err
+            showStatus(err, kind: .warning)
             return false
         }
         let refs = preparedImages.compactMap { ImageAttachmentStore.shared.write($0, sessionId: currentSessionId) }
         guard refs.count == preparedImages.count else {
             ImageAttachmentStore.shared.remove(refs)
             let err = "⚠️ Could not save the attached image(s) — the prompt was kept in the composer."
-            generationStatusText = err
-            gpuComputeOutput = err
+            showStatus(err, kind: .warning)
             return false
         }
         sessions[sessionIdx].queuedPrompts.append(QueuedPrompt(
@@ -1899,8 +1907,7 @@ struct ContentView: View {
         // the command action has no message to carry them, so running it first
         // would start the action and then leave the images behind.
         if !preparedImages.isEmpty, ChatCommand.parse(trimmed) != nil {
-            generationStatusText = Self.slashCommandWithImagesMessage
-            gpuComputeOutput = Self.slashCommandWithImagesMessage
+            showStatus(Self.slashCommandWithImagesMessage)
             return false
         }
         // Slash commands are app actions with their own backend, so they dispatch
@@ -2169,13 +2176,11 @@ struct ContentView: View {
         if isGeneratingText {
             let note = "⚠️ Stop the running turn before compacting — /compact rewrites the conversation while it works."
             sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
-            generationStatusText = note
             return true
         }
         if generationTeardownTask != nil {
             let note = "⚠️ The previous turn is still winding down — run /compact again in a moment."
             sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
-            generationStatusText = note
             return true
         }
         // Blank slate: every message is eligible, notices and prior compact
@@ -2187,14 +2192,12 @@ struct ContentView: View {
         guard !evicted.isEmpty else {
             let note = "ℹ️ Nothing to compact — this conversation is still empty."
             sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
-            generationStatusText = note
             return true
         }
         let availability = AppleFoundationModelService.checkAvailability()
         guard case .ready = availability else {
             let note = "⚠️ Cannot compact — Apple Foundation Model unavailable (\(availability.statusText))."
             sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
-            generationStatusText = note
             return true
         }
         // Read before any async work: both digests describe pre-pass state,
@@ -2231,7 +2234,6 @@ struct ContentView: View {
         guard chunkBudget > 0 else {
             let note = "⚠️ Cannot compact — the existing summary plus your /compact focus already fill the on-device model's window. Shorten the focus and try again."
             sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
-            generationStatusText = note
             return true
         }
         let transcriptChunks = AppleFoundationModelService.buildCompactionTranscriptChunks(
@@ -2242,7 +2244,6 @@ struct ContentView: View {
         guard !transcriptChunks.isEmpty else {
             let note = "ℹ️ Nothing to compact — no user or assistant content to summarize yet."
             sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
-            generationStatusText = note
             return true
         }
         let evictedCount = evicted.count
@@ -2268,13 +2269,21 @@ struct ContentView: View {
         // would return silently after the store destroyed the original. Same
         // pin the other long-running session operations hold.
         retainRetentionProtection(sessionId)
-        generationStatusText = "🗂 Compacting \(evictedCount) messages via Apple Foundation Model…"
+        // Progress, not an outcome: a multi-pass compaction runs for minutes and
+        // a pill that cleared itself after six seconds would leave the window
+        // silent for the rest of it. The task's own defer retracts it.
+        let compactionStatusId = showStatus(
+            StatusNoticePolicy.compactionText(messageCount: evictedCount),
+            kind: .progress,
+            sessionId: sessionId
+        )
         Task { @MainActor in
             defer {
                 self.isCompactingConversation = false
                 self.compactingSessionId = nil
                 self.compactingProgressMessageId = nil
                 self.releaseRetentionProtection(sessionId)
+                self.clearStatus(ifIdentity: compactionStatusId)
             }
             func postToProgress(_ text: String) {
                 guard let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
@@ -2389,9 +2398,9 @@ struct ContentView: View {
                 // summaries into stale slots. One full re-prefill is the cost
                 // of compaction; it is paid here, deliberately.
                 PrefixCacheManager.shared.invalidate(sessionId: sessionId)
-                self.generationStatusText = "🗂 Compacted \(evictedCount) messages — details live in the rolling summary."
+                self.showStatus("🗂 Compacted \(evictedCount) messages — details live in the rolling summary.")
             } catch {
-                self.generationStatusText = "⚠️ Compaction failed: \(error.localizedDescription)"
+                self.showStatus("⚠️ Compaction failed: \(error.localizedDescription)")
                 postToProgress("⚠️ Compaction failed: \(error.localizedDescription) — the conversation was left unchanged.")
             }
         }
@@ -2411,7 +2420,6 @@ struct ContentView: View {
         if isCompactingConversation {
             let note = "⚠️ A compaction is already running — try /compact again once it finishes."
             sessions[cmdSessionIdx].messages.append(ChatMessage(role: .system, content: note))
-            generationStatusText = note
             return true
         }
         return handleChatCommand(command, sessionIndex: cmdSessionIdx, sessionId: cmdSessionId)
@@ -2435,8 +2443,7 @@ struct ContentView: View {
         guard preparedImages.count <= ImageAttachmentPreparer.maxImagesPerMessage else {
             let err = ImageAttachmentError.tooManyImages(limit: ImageAttachmentPreparer.maxImagesPerMessage)
                 .errorDescription ?? "Too many images."
-            generationStatusText = err
-            gpuComputeOutput = err
+            showStatus(err, kind: .warning)
             return false
         }
         guard let targetId = explicitSessionId ?? selectedSessionId ?? sessions.first?.id,
@@ -2447,22 +2454,21 @@ struct ContentView: View {
         // and the picture disappears without a message.
         if ChatCommand.parse(text) != nil {
             let err = Self.slashCommandWithImagesMessage
-            generationStatusText = err
-            gpuComputeOutput = err
+            showStatus(err, kind: .warning)
             return false
         }
         guard supportsVision(for: sessions[targetIdx]) else {
-            let err = "⚠️ \(modelDisplayName(for: sessions[targetIdx]) ?? "This model") cannot see images. Switch to a vision-capable model, or remove the attachment."
-            generationStatusText = err
-            gpuComputeOutput = err
+            let err = "⚠️ " + ImageAttachmentMessages.cannotSeeImagesSend(
+                modelName: modelDisplayName(for: sessions[targetIdx])
+            )
+            showStatus(err, kind: .warning)
             return false
         }
         let refs = preparedImages.compactMap { ImageAttachmentStore.shared.write($0, sessionId: targetId) }
         guard refs.count == preparedImages.count else {
             ImageAttachmentStore.shared.remove(refs)
             let err = "⚠️ Could not save the attached image(s) — the draft was kept so nothing is lost."
-            generationStatusText = err
-            gpuComputeOutput = err
+            showStatus(err, kind: .warning)
             return false
         }
         let accepted = handleSendMessage(text, attachmentRefs: refs, sessionId: explicitSessionId)
@@ -2523,9 +2529,10 @@ struct ContentView: View {
         // silently receives a turn whose picture vanished answers about nothing;
         // returning false keeps the composer's draft and chips intact.
         if !attachmentRefs.isEmpty, !supportsVision(for: sessions[sessionIdx]) {
-            let err = "⚠️ \(modelDisplayName(for: sessions[sessionIdx]) ?? "This model") cannot see images. Switch to a vision-capable model, or remove the attachment."
-            generationStatusText = err
-            gpuComputeOutput = err
+            let err = "⚠️ " + ImageAttachmentMessages.cannotSeeImagesSend(
+                modelName: modelDisplayName(for: sessions[sessionIdx])
+            )
+            showStatus(err, kind: .warning)
             return false
         }
         // A cloud selection that no longer resolves must refuse here, exactly
@@ -2534,14 +2541,13 @@ struct ContentView: View {
         // model, which is both surprising and a privacy problem.
         if unresolvedCloudSelection(for: sessions[sessionIdx]) {
             let err = "⚠️ This conversation's cloud model could not be resolved. Reselect the model in the model picker."
-            generationStatusText = err
-            gpuComputeOutput = err
+            showStatus(err, kind: .warning)
             return false
         }
         // A running compaction rewrites this session's messages when its
         // summaries land; an interleaved send would be part of the rewrite.
         if isCompactingConversation {
-            generationStatusText = "⚠️ Conversation is being compacted — try again in a moment."
+            showStatus("⚠️ Conversation is being compacted — try again in a moment.")
             return false
         }
         // Backstop for the send button's isModelLoaded gate: sending before the
@@ -2557,8 +2563,7 @@ struct ContentView: View {
         let weightsEngineReady = tokenizer != nil && summary != nil
         guard AppleFoundationModelService.sendGateAllowsSend(hasEngine: weightsEngineReady, sessionUsesSystemModel: sendSessionUsesAFM || sendSessionUsesCloud) else {
             let err = "⚠️ No model loaded — select a model in Settings (bottom left) before sending."
-            generationStatusText = err
-            gpuComputeOutput = err
+            showStatus(err, kind: .warning)
             return false
         }
         
@@ -2622,7 +2627,7 @@ struct ContentView: View {
             ) else {
                 sessions[sessionIdx].messages.removeLast(2)
                 let err = "⚠️ This message is too long for the on-device model's context window. Shorten it and try again."
-                generationStatusText = err
+                showStatus(err, kind: .warning)
                 return false
             }
             // History travels in the session instructions as context; only the
@@ -2707,9 +2712,11 @@ struct ContentView: View {
             let cloudSupportsTools = cloudSpec?.supportsTools ?? true
             let cloudAgentMode = agentToolsRequested && cloudSupportsTools
             if agentToolsRequested && !cloudSupportsTools {
-                // Park the notice in the transcript: `generationStatusText` is
-                // immediately overwritten by the cloud path's own status line,
-                // so a status-only notice never became visible.
+                // Park the notice in the transcript rather than the status
+                // line: "this model cannot call tools" is a property of the
+                // model that applies to every turn, so it belongs in the
+                // conversation where it can be read back, not in a pill that
+                // fades after six seconds.
                 let notice = "⚠️ \(sessionModelName ?? cloud.providerModelId) is registered without tool support. Sending this turn as plain chat."
                 let alreadyNoted = sessions[sessionIdx].messages.contains {
                     $0.role == .system && $0.content == notice
@@ -3237,1580 +3244,6 @@ struct ContentView: View {
             tokenIDsOutput = "❌ Encoding Error: \(error.localizedDescription)"
         }
     }
-    
-    // MARK: - Execute Token Embedding Lookup (h_0)
-    private func executeEmbeddingLookup(tokenIds: [UInt32]) {
-        guard let summary = summary,
-              let device = MTLCreateSystemDefaultDevice(),
-              let commandQueue = device.makeCommandQueue(),
-              let defaultLibrary = device.makeDefaultLibrary() else {
-            gpuComputeOutput = "❌ Error setting up Metal embedding pipeline."
-            return
-        }
-
-        do {
-            guard let embedWeight = summary.tensors.first(where: {
-                !$0.name.contains("visual") && !$0.name.contains("mtp") &&
-                ($0.name.contains("embed_tokens") || $0.name.hasSuffix("embed.weight") || $0.name.contains("wte") || $0.name.contains("word_embeddings") || $0.category == "Embedding") &&
-                $0.name.contains("weight") && !$0.name.contains("scale")
-            }) else {
-                gpuComputeOutput = "❌ Couldn't locate embedding weight tensor."
-                return
-            }
-
-            guard let rawBaseBuffer = shardBuffers[embedWeight.shardIndex] else {
-                gpuComputeOutput = "❌ Shard #\(embedWeight.shardIndex) buffer not loaded."
-                return
-            }
-
-            var weightOffset = embedWeight.offsetStart
-            var hiddenDim: UInt32 = 2048 // Qwen 35B hidden dimension
-            let tokenCount = tokenIds.count
-            let totalVectorElements = tokenCount * Int(hiddenDim)
-            
-            guard let tokenBuffer = device.makeBuffer(bytes: tokenIds, length: tokenCount * MemoryLayout<UInt32>.stride, options: .storageModeShared),
-                  let h0OutputBuffer = device.makeBuffer(length: totalVectorElements * MemoryLayout<Float>.stride, options: .storageModeShared),
-                  let commandBuffer = commandQueue.makeCommandBuffer(),
-                  let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
-
-            let isBF16 = embedWeight.dtype.contains("BF16") || embedWeight.dtype.contains("BFLOAT16")
-            
-            if isBF16 {
-                guard let kernelFunction = defaultLibrary.makeFunction(name: "lookup_embeddings_bf16") else { return }
-                let pipelineState = try device.makeComputePipelineState(function: kernelFunction)
-                
-                computeEncoder.setComputePipelineState(pipelineState)
-                computeEncoder.setBuffer(rawBaseBuffer, offset: 0, index: 0)
-                computeEncoder.setBuffer(tokenBuffer, offset: 0, index: 1)
-                computeEncoder.setBuffer(h0OutputBuffer, offset: 0, index: 2)
-                computeEncoder.setBytes(&weightOffset, length: MemoryLayout<UInt64>.stride, index: 3)
-                computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 4)
-            } else {
-                let embedScale = summary.tensors.first(where: {
-                    $0.name.contains(embedWeight.name.replacingOccurrences(of: ".weight", with: "")) &&
-                    ($0.name.contains("scale") || $0.name.contains("scales"))
-                })
-                let embedScaleRaw = (embedScale != nil) ? shardBuffers[embedScale!.shardIndex] : rawBaseBuffer
-                var scaleOffset = embedScale?.offsetStart ?? 0
-                
-                if let kernelFunction = defaultLibrary.makeFunction(name: "lookup_embeddings_fp8") {
-                    let pipelineState = try device.makeComputePipelineState(function: kernelFunction)
-                    computeEncoder.setComputePipelineState(pipelineState)
-                    computeEncoder.setBuffer(rawBaseBuffer, offset: 0, index: 0)
-                    computeEncoder.setBuffer(tokenBuffer, offset: 0, index: 1)
-                    computeEncoder.setBuffer(h0OutputBuffer, offset: 0, index: 2)
-                    computeEncoder.setBuffer(embedScaleRaw, offset: 0, index: 3)
-                    computeEncoder.setBytes(&weightOffset, length: MemoryLayout<UInt64>.stride, index: 4)
-                    computeEncoder.setBytes(&scaleOffset, length: MemoryLayout<UInt64>.stride, index: 5)
-                    computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 6)
-                }
-            }
-            
-            let gridSize = MTLSize(width: totalVectorElements, height: 1, depth: 1)
-            let threadgroupSize = MTLSize(width: min(totalVectorElements, 256), height: 1, depth: 1)
-            computeEncoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
-            
-            computeEncoder.endEncoding()
-            commandBuffer.commit()
-            commandBuffer.waitUntilCompleted()
-            
-            let rawFloatPtr = h0OutputBuffer.contents().bindMemory(to: Float.self, capacity: totalVectorElements)
-            var h0Sample: [String] = []
-            for i in 0..<min(8, totalVectorElements) {
-                h0Sample.append(String(format: "%.6f", rawFloatPtr[i]))
-            }
-            
-            self.activeH0Buffer = h0OutputBuffer
-            self.activeTokenCount = tokenCount
-            self.activeHiddenDim = Int(hiddenDim)
-            
-            gpuComputeOutput = "🚀 Generated h_0 Vector (\(embedWeight.dtype)) [\(tokenCount) x \(hiddenDim)] from Shard #\(embedWeight.shardIndex)! First 8 dims of Token #0: [\(h0Sample.joined(separator: ", "))]"
-            
-        } catch {
-            gpuComputeOutput = "❌ Embedding Lookup Error: \(error.localizedDescription)"
-        }
-    }
-
-    // MARK: - Execute MoE Top-K Router
-    private func executeMoERouter(layerIndex: Int, topK: Int = 8) {
-        guard let summary = summary,
-              let h0Buffer = activeH0Buffer,
-              let device = MTLCreateSystemDefaultDevice(),
-              let commandQueue = device.makeCommandQueue(),
-              let defaultLibrary = device.makeDefaultLibrary() else {
-            gpuComputeOutput = "❌ Missing active h_0 buffer or Metal device. Please click 'Generate Hidden State h_0' first."
-            return
-        }
-
-        do {
-            // Locate the router gate weight tensor for the target layer
-            guard let gateWeight = summary.tensors.first(where: {
-                $0.layerIndex == UInt32(layerIndex) &&
-                ($0.category == "MoE Router" || $0.name.hasSuffix("mlp.gate.weight") || $0.name.contains("mlp.gate")) &&
-                !$0.name.contains("shared") &&
-                !$0.name.contains("scale")
-            }) else {
-                gpuComputeOutput = "❌ Could not find mlp.gate.weight for Layer #\(layerIndex)."
-                return
-            }
-
-            guard let rawGateBuffer = shardBuffers[gateWeight.shardIndex] else {
-                gpuComputeOutput = "❌ Shard #\(gateWeight.shardIndex) containing Layer #\(layerIndex) gate is not loaded."
-                return
-            }
-
-            let numExpertsVal: UInt32 = summary.maxExpertId > 0 ? summary.maxExpertId : 256
-            var topKVal: UInt32 = UInt32(topK)
-            var hiddenDimVal: UInt32 = UInt32(activeHiddenDim)
-            var gateOffset: UInt64 = gateWeight.offsetStart
-            var numExperts: UInt32 = numExpertsVal
-
-            guard let outIndicesBuffer = device.makeBuffer(length: topK * MemoryLayout<UInt32>.stride, options: .storageModeShared),
-                  let outWeightsBuffer = device.makeBuffer(length: topK * MemoryLayout<Float>.stride, options: .storageModeShared),
-                  let commandBuffer = commandQueue.makeCommandBuffer(),
-                  let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
-
-            guard let kernelFunction = defaultLibrary.makeFunction(name: "moe_router_topk_bf16") else {
-                gpuComputeOutput = "❌ Failed to load moe_router_topk_bf16 kernel."
-                return
-            }
-            let pipelineState = try device.makeComputePipelineState(function: kernelFunction)
-
-            computeEncoder.setComputePipelineState(pipelineState)
-            computeEncoder.setBuffer(rawGateBuffer, offset: 0, index: 0)
-            computeEncoder.setBuffer(h0Buffer, offset: 0, index: 1)
-            computeEncoder.setBuffer(outIndicesBuffer, offset: 0, index: 2)
-            computeEncoder.setBuffer(outWeightsBuffer, offset: 0, index: 3)
-            computeEncoder.setBytes(&gateOffset, length: MemoryLayout<UInt64>.stride, index: 4)
-            computeEncoder.setBytes(&hiddenDimVal, length: MemoryLayout<UInt32>.stride, index: 5)
-            computeEncoder.setBytes(&numExperts, length: MemoryLayout<UInt32>.stride, index: 6)
-            computeEncoder.setBytes(&topKVal, length: MemoryLayout<UInt32>.stride, index: 7)
-
-            let threadsPerThreadgroup = MTLSize(width: Int(numExpertsVal), height: 1, depth: 1)
-            let threadgroups = MTLSize(width: 1, height: 1, depth: 1)
-            computeEncoder.dispatchThreadgroups(threadgroups, threadsPerThreadgroup: threadsPerThreadgroup)
-
-            // Also check for shared expert gate
-            var sharedOutBuffer: MTLBuffer? = nil
-            if let sharedGateWeight = summary.tensors.first(where: {
-                $0.layerIndex == UInt32(layerIndex) && $0.name.contains("shared_expert_gate") && !$0.name.contains("scale")
-            }), let sharedRawBuffer = shardBuffers[sharedGateWeight.shardIndex],
-               let sharedKernel = defaultLibrary.makeFunction(name: "moe_shared_gate_bf16") {
-                
-                let sharedPipelineState = try device.makeComputePipelineState(function: sharedKernel)
-                var sharedOffset: UInt64 = sharedGateWeight.offsetStart
-                sharedOutBuffer = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared)
-                
-                if let sharedOutBuffer = sharedOutBuffer {
-                    computeEncoder.setComputePipelineState(sharedPipelineState)
-                    computeEncoder.setBuffer(sharedRawBuffer, offset: 0, index: 0)
-                    computeEncoder.setBuffer(h0Buffer, offset: 0, index: 1)
-                    computeEncoder.setBuffer(sharedOutBuffer, offset: 0, index: 2)
-                    computeEncoder.setBytes(&sharedOffset, length: MemoryLayout<UInt64>.stride, index: 3)
-                    computeEncoder.setBytes(&hiddenDimVal, length: MemoryLayout<UInt32>.stride, index: 4)
-                    
-                    computeEncoder.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
-                }
-            }
-
-            let startTime = CFAbsoluteTimeGetCurrent()
-            computeEncoder.endEncoding()
-            commandBuffer.commit()
-            commandBuffer.waitUntilCompleted()
-            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
-
-            let indicesPtr = outIndicesBuffer.contents().bindMemory(to: UInt32.self, capacity: topK)
-            let weightsPtr = outWeightsBuffer.contents().bindMemory(to: Float.self, capacity: topK)
-
-            var extractedExperts: [(id: Int, weight: Float)] = []
-            var sumProb: Float = 0.0
-            for i in 0..<topK {
-                let expertId = Int(indicesPtr[i])
-                let w = weightsPtr[i]
-                extractedExperts.append((id: expertId, weight: w))
-                sumProb += w
-            }
-            self.routedExperts = extractedExperts
-
-            if let sharedOutBuffer = sharedOutBuffer {
-                let sharedPtr = sharedOutBuffer.contents().bindMemory(to: Float.self, capacity: 1)
-                self.sharedExpertWeight = sharedPtr[0]
-            } else {
-                self.sharedExpertWeight = nil
-            }
-
-            let topExpertSummary = extractedExperts.map { "#\($0.id) (\(String(format: "%.1f%%", $0.weight * 100)))" }.joined(separator: ", ")
-            let status = "⚡ Layer #\(layerIndex) Gated on GPU in \(String(format: "%.3f", elapsedMs)) ms! Top-\(topK): [\(topExpertSummary)] (Sum: \(String(format: "%.4f", sumProb)))"
-            self.routerStatusText = status
-            self.gpuComputeOutput = status
-
-        } catch {
-            gpuComputeOutput = "❌ MoE Router Error: \(error.localizedDescription)"
-        }
-    }
-
-    // MARK: - Execute MoE Layer MLP (SwiGLU across Top-K + Shared Experts)
-    private func executeMoELayerMLP(layerIndex: Int, topK: Int = 8) {
-        guard let summary = summary,
-              let h0Buffer = activeH0Buffer,
-              let device = MTLCreateSystemDefaultDevice(),
-              let commandQueue = device.makeCommandQueue(),
-              let defaultLibrary = device.makeDefaultLibrary() else {
-            gpuComputeOutput = "❌ Missing active h_0 buffer or Metal device. Generate h_0 first."
-            return
-        }
-
-        self.isExecutingMlp = true
-        defer { self.isExecutingMlp = false }
-
-        do {
-            // 1. Ensure Routing has been performed for this layer
-            if routedExperts.isEmpty {
-                executeMoERouter(layerIndex: layerIndex, topK: topK)
-            }
-            guard !routedExperts.isEmpty else {
-                gpuComputeOutput = "❌ MoE routing failed for Layer #\(layerIndex)."
-                return
-            }
-
-            var hiddenDim: UInt32 = UInt32(activeHiddenDim)
-            var intermediateDim: UInt32 = 512 // Default intermediate size for Qwen/Ornith 35B
-            
-            // Check if any expert tensor reveals intermediate dimension
-            if let sampleGate = summary.tensors.first(where: {
-                $0.layerIndex == UInt32(layerIndex) && $0.name.contains("gate_proj") && !$0.name.contains("scale")
-            }) {
-                let dims = sampleGate.shapeDisplay
-                    .trimmingCharacters(in: CharacterSet(charactersIn: "[]() "))
-                    .components(separatedBy: ",")
-                    .compactMap { UInt32($0.trimmingCharacters(in: .whitespaces)) }
-                if dims.count >= 2 {
-                    intermediateDim = dims[0]
-                    hiddenDim = dims[1]
-                }
-            }
-
-            // 2. Allocate output accumulator h_mlp and intermediate buffer
-            guard let hMlpBuffer = device.makeBuffer(length: Int(hiddenDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                  let interBuffer = device.makeBuffer(length: Int(intermediateDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                  let commandBuffer = commandQueue.makeCommandBuffer(),
-                  let computeEncoder = commandBuffer.makeComputeCommandEncoder() else {
-                gpuComputeOutput = "❌ Failed to allocate GPU command encoder/buffers."
-                return
-            }
-
-            // 3. Clear h_mlp accumulator vector to 0.0
-            if let clearKernel = defaultLibrary.makeFunction(name: "clear_vector_f32") {
-                let clearPipeline = try device.makeComputePipelineState(function: clearKernel)
-                computeEncoder.setComputePipelineState(clearPipeline)
-                computeEncoder.setBuffer(hMlpBuffer, offset: 0, index: 0)
-                let gridSize = MTLSize(width: Int(hiddenDim), height: 1, depth: 1)
-                let threadgroupSize = MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-                computeEncoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
-            }
-
-            // Helper to lookup tensor by query
-            let findTensor = { (sub1: String, sub2: String, isScale: Bool) -> TensorMetadata? in
-                return summary.tensors.first(where: { t in
-                    t.layerIndex == UInt32(layerIndex) &&
-                    t.name.contains(sub1) &&
-                    t.name.contains(sub2) &&
-                    (isScale ? (t.name.contains("scale") || t.name.contains("scales")) : (!t.name.contains("scale") && !t.name.contains("scales")))
-                })
-            }
-
-            // Load pipeline states for FP8 and BF16 SwiGLU & Down Projections
-            guard let fp8GateUpKernel = defaultLibrary.makeFunction(name: "fp8_swiglu_gate_up"),
-                  let fp8DownKernel = defaultLibrary.makeFunction(name: "fp8_down_proj_accumulate"),
-                  let bf16GateUpKernel = defaultLibrary.makeFunction(name: "bf16_swiglu_gate_up"),
-                  let bf16DownKernel = defaultLibrary.makeFunction(name: "bf16_down_proj_accumulate") else {
-                gpuComputeOutput = "❌ Failed to locate SwiGLU / DownProj Metal kernels."
-                return
-            }
-
-            let fp8GateUpPipeline = try device.makeComputePipelineState(function: fp8GateUpKernel)
-            let fp8DownPipeline = try device.makeComputePipelineState(function: fp8DownKernel)
-            let bf16GateUpPipeline = try device.makeComputePipelineState(function: bf16GateUpKernel)
-            let bf16DownPipeline = try device.makeComputePipelineState(function: bf16DownKernel)
-
-            var executedExpertCount = 0
-
-            // 4. Dispatch each of the Top-K Routed Experts
-            for expert in routedExperts {
-                let expId = expert.id
-                var p_k = expert.weight
-                if p_k <= 0.00001 { continue }
-
-                let expTag = "experts.\(expId)"
-                guard let gateWeight = findTensor(expTag, "gate_proj", false),
-                      let upWeight   = findTensor(expTag, "up_proj", false),
-                      let downWeight = findTensor(expTag, "down_proj", false),
-                      let gateRaw    = shardBuffers[gateWeight.shardIndex],
-                      let upRaw      = shardBuffers[upWeight.shardIndex],
-                      let downRaw    = shardBuffers[downWeight.shardIndex] else {
-                    continue
-                }
-
-                let isFP8 = !gateWeight.dtype.contains("BF16") && !gateWeight.dtype.contains("FLOAT")
-
-                if isFP8 {
-                    let gateScale = findTensor(expTag, "gate_proj", true)
-                    let upScale   = findTensor(expTag, "up_proj", true)
-                    let downScale = findTensor(expTag, "down_proj", true)
-
-                    guard let gateSRaw = (gateScale != nil) ? shardBuffers[gateScale!.shardIndex] : nil,
-                          let upSRaw = (upScale != nil) ? shardBuffers[upScale!.shardIndex] : nil,
-                          let downSRaw = (downScale != nil) ? shardBuffers[downScale!.shardIndex] : nil else {
-                        continue
-                    }
-
-                    var gateWeightOffset = gateWeight.offsetStart
-                    var gateScaleOffset  = gateScale!.offsetStart
-                    var upWeightOffset   = upWeight.offsetStart
-                    var upScaleOffset    = upScale!.offsetStart
-                    var downWeightOffset = downWeight.offsetStart
-                    var downScaleOffset  = downScale!.offsetStart
-
-                    // Dispatch SwiGLU (Gate & Up Proj)
-                    computeEncoder.setComputePipelineState(fp8GateUpPipeline)
-                    computeEncoder.setBuffer(gateRaw, offset: 0, index: 0)
-                    computeEncoder.setBuffer(upRaw, offset: 0, index: 1)
-                    computeEncoder.setBuffer(h0Buffer, offset: 0, index: 2)
-                    computeEncoder.setBuffer(interBuffer, offset: 0, index: 3)
-                    computeEncoder.setBuffer(gateSRaw, offset: 0, index: 4)
-                    computeEncoder.setBuffer(upSRaw, offset: 0, index: 5)
-                    computeEncoder.setBytes(&gateWeightOffset, length: MemoryLayout<UInt64>.stride, index: 6)
-                    computeEncoder.setBytes(&gateScaleOffset, length: MemoryLayout<UInt64>.stride, index: 7)
-                    computeEncoder.setBytes(&upWeightOffset, length: MemoryLayout<UInt64>.stride, index: 8)
-                    computeEncoder.setBytes(&upScaleOffset, length: MemoryLayout<UInt64>.stride, index: 9)
-                    computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 10)
-                    computeEncoder.setBytes(&intermediateDim, length: MemoryLayout<UInt32>.stride, index: 11)
-
-                    let interGrid = MTLSize(width: Int(intermediateDim), height: 1, depth: 1)
-                    let interTg = MTLSize(width: min(Int(intermediateDim), fp8GateUpPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-                    computeEncoder.dispatchThreads(interGrid, threadsPerThreadgroup: interTg)
-
-                    // Dispatch Down Proj with Weighted Accumulation
-                    computeEncoder.setComputePipelineState(fp8DownPipeline)
-                    computeEncoder.setBuffer(downRaw, offset: 0, index: 0)
-                    computeEncoder.setBuffer(interBuffer, offset: 0, index: 1)
-                    computeEncoder.setBuffer(hMlpBuffer, offset: 0, index: 2)
-                    computeEncoder.setBuffer(downSRaw, offset: 0, index: 3)
-                    computeEncoder.setBytes(&downWeightOffset, length: MemoryLayout<UInt64>.stride, index: 4)
-                    computeEncoder.setBytes(&downScaleOffset, length: MemoryLayout<UInt64>.stride, index: 5)
-                    computeEncoder.setBytes(&intermediateDim, length: MemoryLayout<UInt32>.stride, index: 6)
-                    computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 7)
-                    computeEncoder.setBytes(&p_k, length: MemoryLayout<Float>.stride, index: 8)
-
-                    let hiddenGrid = MTLSize(width: Int(hiddenDim), height: 1, depth: 1)
-                    let hiddenTg = MTLSize(width: min(Int(hiddenDim), fp8DownPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-                    computeEncoder.dispatchThreads(hiddenGrid, threadsPerThreadgroup: hiddenTg)
-
-                } else {
-                    var gateWeightOffset = gateWeight.offsetStart
-                    var upWeightOffset   = upWeight.offsetStart
-                    var downWeightOffset = downWeight.offsetStart
-
-                    // Dispatch BF16 SwiGLU
-                    computeEncoder.setComputePipelineState(bf16GateUpPipeline)
-                    computeEncoder.setBuffer(gateRaw, offset: 0, index: 0)
-                    computeEncoder.setBuffer(upRaw, offset: 0, index: 1)
-                    computeEncoder.setBuffer(h0Buffer, offset: 0, index: 2)
-                    computeEncoder.setBuffer(interBuffer, offset: 0, index: 3)
-                    computeEncoder.setBytes(&gateWeightOffset, length: MemoryLayout<UInt64>.stride, index: 4)
-                    computeEncoder.setBytes(&upWeightOffset, length: MemoryLayout<UInt64>.stride, index: 5)
-                    computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 6)
-                    computeEncoder.setBytes(&intermediateDim, length: MemoryLayout<UInt32>.stride, index: 7)
-
-                    let interGrid = MTLSize(width: Int(intermediateDim), height: 1, depth: 1)
-                    let interTg = MTLSize(width: min(Int(intermediateDim), bf16GateUpPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-                    computeEncoder.dispatchThreads(interGrid, threadsPerThreadgroup: interTg)
-
-                    // Dispatch BF16 Down Proj
-                    computeEncoder.setComputePipelineState(bf16DownPipeline)
-                    computeEncoder.setBuffer(downRaw, offset: 0, index: 0)
-                    computeEncoder.setBuffer(interBuffer, offset: 0, index: 1)
-                    computeEncoder.setBuffer(hMlpBuffer, offset: 0, index: 2)
-                    computeEncoder.setBytes(&downWeightOffset, length: MemoryLayout<UInt64>.stride, index: 3)
-                    computeEncoder.setBytes(&intermediateDim, length: MemoryLayout<UInt32>.stride, index: 4)
-                    computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 5)
-                    computeEncoder.setBytes(&p_k, length: MemoryLayout<Float>.stride, index: 6)
-
-                    let hiddenGrid = MTLSize(width: Int(hiddenDim), height: 1, depth: 1)
-                    let hiddenTg = MTLSize(width: min(Int(hiddenDim), bf16DownPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-                    computeEncoder.dispatchThreads(hiddenGrid, threadsPerThreadgroup: hiddenTg)
-                }
-
-                executedExpertCount += 1
-            }
-
-            // 5. Dispatch Shared Expert if present
-            var sharedDispatched = false
-            if var sharedWeight = sharedExpertWeight, sharedWeight > 0.0001 {
-                let sharedTag = "shared_expert"
-                if let gateWeight = findTensor(sharedTag, "gate_proj", false),
-                   let upWeight   = findTensor(sharedTag, "up_proj", false),
-                   let downWeight = findTensor(sharedTag, "down_proj", false),
-                   let gateRaw    = shardBuffers[gateWeight.shardIndex],
-                   let upRaw      = shardBuffers[upWeight.shardIndex],
-                   let downRaw    = shardBuffers[downWeight.shardIndex] {
-
-                    let isFP8 = !gateWeight.dtype.contains("BF16") && !gateWeight.dtype.contains("FLOAT")
-
-                    if isFP8 {
-                        let gateScale = findTensor(sharedTag, "gate_proj", true)
-                        let upScale   = findTensor(sharedTag, "up_proj", true)
-                        let downScale = findTensor(sharedTag, "down_proj", true)
-
-                        if let gateSRaw = (gateScale != nil) ? shardBuffers[gateScale!.shardIndex] : nil,
-                           let upSRaw = (upScale != nil) ? shardBuffers[upScale!.shardIndex] : nil,
-                           let downSRaw = (downScale != nil) ? shardBuffers[downScale!.shardIndex] : nil {
-
-                            var gateWeightOffset = gateWeight.offsetStart
-                            var gateScaleOffset  = gateScale!.offsetStart
-                            var upWeightOffset   = upWeight.offsetStart
-                            var upScaleOffset    = upScale!.offsetStart
-                            var downWeightOffset = downWeight.offsetStart
-                            var downScaleOffset  = downScale!.offsetStart
-
-                            computeEncoder.setComputePipelineState(fp8GateUpPipeline)
-                            computeEncoder.setBuffer(gateRaw, offset: 0, index: 0)
-                            computeEncoder.setBuffer(upRaw, offset: 0, index: 1)
-                            computeEncoder.setBuffer(h0Buffer, offset: 0, index: 2)
-                            computeEncoder.setBuffer(interBuffer, offset: 0, index: 3)
-                            computeEncoder.setBuffer(gateSRaw, offset: 0, index: 4)
-                            computeEncoder.setBuffer(upSRaw, offset: 0, index: 5)
-                            computeEncoder.setBytes(&gateWeightOffset, length: MemoryLayout<UInt64>.stride, index: 6)
-                            computeEncoder.setBytes(&gateScaleOffset, length: MemoryLayout<UInt64>.stride, index: 7)
-                            computeEncoder.setBytes(&upWeightOffset, length: MemoryLayout<UInt64>.stride, index: 8)
-                            computeEncoder.setBytes(&upScaleOffset, length: MemoryLayout<UInt64>.stride, index: 9)
-                            computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 10)
-                            computeEncoder.setBytes(&intermediateDim, length: MemoryLayout<UInt32>.stride, index: 11)
-
-                            let interGrid = MTLSize(width: Int(intermediateDim), height: 1, depth: 1)
-                            let interTg = MTLSize(width: min(Int(intermediateDim), fp8GateUpPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-                            computeEncoder.dispatchThreads(interGrid, threadsPerThreadgroup: interTg)
-
-                            computeEncoder.setComputePipelineState(fp8DownPipeline)
-                            computeEncoder.setBuffer(downRaw, offset: 0, index: 0)
-                            computeEncoder.setBuffer(interBuffer, offset: 0, index: 1)
-                            computeEncoder.setBuffer(hMlpBuffer, offset: 0, index: 2)
-                            computeEncoder.setBuffer(downSRaw, offset: 0, index: 3)
-                            computeEncoder.setBytes(&downWeightOffset, length: MemoryLayout<UInt64>.stride, index: 4)
-                            computeEncoder.setBytes(&downScaleOffset, length: MemoryLayout<UInt64>.stride, index: 5)
-                            computeEncoder.setBytes(&intermediateDim, length: MemoryLayout<UInt32>.stride, index: 6)
-                            computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 7)
-                            computeEncoder.setBytes(&sharedWeight, length: MemoryLayout<Float>.stride, index: 8)
-
-                            let hiddenGrid = MTLSize(width: Int(hiddenDim), height: 1, depth: 1)
-                            let hiddenTg = MTLSize(width: min(Int(hiddenDim), fp8DownPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-                            computeEncoder.dispatchThreads(hiddenGrid, threadsPerThreadgroup: hiddenTg)
-                        }
-                    } else {
-                        var gateWeightOffset = gateWeight.offsetStart
-                        var upWeightOffset   = upWeight.offsetStart
-                        var downWeightOffset = downWeight.offsetStart
-
-                        computeEncoder.setComputePipelineState(bf16GateUpPipeline)
-                        computeEncoder.setBuffer(gateRaw, offset: 0, index: 0)
-                        computeEncoder.setBuffer(upRaw, offset: 0, index: 1)
-                        computeEncoder.setBuffer(h0Buffer, offset: 0, index: 2)
-                        computeEncoder.setBuffer(interBuffer, offset: 0, index: 3)
-                        computeEncoder.setBytes(&gateWeightOffset, length: MemoryLayout<UInt64>.stride, index: 4)
-                        computeEncoder.setBytes(&upWeightOffset, length: MemoryLayout<UInt64>.stride, index: 5)
-                        computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 6)
-                        computeEncoder.setBytes(&intermediateDim, length: MemoryLayout<UInt32>.stride, index: 7)
-
-                        let interGrid = MTLSize(width: Int(intermediateDim), height: 1, depth: 1)
-                        let interTg = MTLSize(width: min(Int(intermediateDim), bf16GateUpPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-                        computeEncoder.dispatchThreads(interGrid, threadsPerThreadgroup: interTg)
-
-                        computeEncoder.setComputePipelineState(bf16DownPipeline)
-                        computeEncoder.setBuffer(downRaw, offset: 0, index: 0)
-                        computeEncoder.setBuffer(interBuffer, offset: 0, index: 1)
-                        computeEncoder.setBuffer(hMlpBuffer, offset: 0, index: 2)
-                        computeEncoder.setBytes(&downWeightOffset, length: MemoryLayout<UInt64>.stride, index: 3)
-                        computeEncoder.setBytes(&intermediateDim, length: MemoryLayout<UInt32>.stride, index: 4)
-                        computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 5)
-                        computeEncoder.setBytes(&sharedWeight, length: MemoryLayout<Float>.stride, index: 6)
-
-                        let hiddenGrid = MTLSize(width: Int(hiddenDim), height: 1, depth: 1)
-                        let hiddenTg = MTLSize(width: min(Int(hiddenDim), bf16DownPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-                        computeEncoder.dispatchThreads(hiddenGrid, threadsPerThreadgroup: hiddenTg)
-                    }
-                    sharedDispatched = true
-                }
-            }
-
-            // 6. Commit and Measure Execution Time
-            let startTime = CFAbsoluteTimeGetCurrent()
-            computeEncoder.endEncoding()
-            commandBuffer.commit()
-            commandBuffer.waitUntilCompleted()
-            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
-
-            // 7. Calculate L2 Norm & Sample Output
-            let outPtr = hMlpBuffer.contents().bindMemory(to: Float.self, capacity: Int(hiddenDim))
-            var sumSquares: Float = 0.0
-            var sampleValues: [String] = []
-            for i in 0..<Int(hiddenDim) {
-                let v = outPtr[i]
-                sumSquares += v * v
-                if i < 8 {
-                    sampleValues.append(String(format: "%.5f", v))
-                }
-            }
-            let l2Norm = sqrt(sumSquares)
-
-            self.activeHmlpBuffer = hMlpBuffer
-            let sharedDesc = sharedDispatched ? "+ 1 Shared Expert" : ""
-            let status = "⚡ Layer #\(layerIndex) MoE MLP Computed in \(String(format: "%.3f", elapsedMs)) ms! (\(executedExpertCount) Routed Experts \(sharedDesc)) | L2 Norm: \(String(format: "%.4f", l2Norm))"
-            self.layerMlpStatusText = status
-            self.layerMlpSampleOutput = "First 8 dims of h_mlp: [\(sampleValues.joined(separator: ", "))]"
-            self.gpuComputeOutput = "\(status)\n\(self.layerMlpSampleOutput!)"
-
-        } catch {
-            gpuComputeOutput = "❌ MoE MLP Execution Error: \(error.localizedDescription)"
-        }
-    }
-
-    // MARK: - Execute Full Layer Forward Pass (h_l -> h_l+1)
-    private func executeFullLayerForward(layerIndex: Int) {
-        guard let summary = summary,
-              let h0Buffer = activeH0Buffer,
-              let device = MTLCreateSystemDefaultDevice(),
-              let commandQueue = device.makeCommandQueue(),
-              let defaultLibrary = device.makeDefaultLibrary() else {
-            gpuComputeOutput = "❌ Missing active h_0 buffer or Metal device. Generate h_0 first."
-            return
-        }
-
-        self.isExecutingFullLayer = true
-        defer { self.isExecutingFullLayer = false }
-
-        do {
-            // Ensure routing is calculated
-            if routedExperts.isEmpty {
-                executeMoERouter(layerIndex: layerIndex, topK: 8)
-            }
-
-            var hiddenDim: UInt32 = UInt32(activeHiddenDim)
-            var eps: Float = 1e-6
-
-            let findTensorInLayer = { (query: String) -> TensorMetadata? in
-                return summary.tensors.first(where: { t in
-                    t.layerIndex == UInt32(layerIndex) && t.name.contains(query)
-                })
-            }
-
-            guard let rmsKernel = defaultLibrary.makeFunction(name: "rmsnorm_bf16"),
-                  let addKernel = defaultLibrary.makeFunction(name: "vector_add_f32"),
-                  let clearKernel = defaultLibrary.makeFunction(name: "clear_vector_f32"),
-                  let fp8GateUpKernel = defaultLibrary.makeFunction(name: "fp8_swiglu_gate_up"),
-                  let fp8DownKernel = defaultLibrary.makeFunction(name: "fp8_down_proj_accumulate"),
-                  let bf16GateUpKernel = defaultLibrary.makeFunction(name: "bf16_swiglu_gate_up"),
-                  let bf16DownKernel = defaultLibrary.makeFunction(name: "bf16_down_proj_accumulate") else {
-                gpuComputeOutput = "❌ Failed to load required Metal compute functions for full layer forward."
-                return
-            }
-
-            let rmsPipeline = try device.makeComputePipelineState(function: rmsKernel)
-            let addPipeline = try device.makeComputePipelineState(function: addKernel)
-            let clearPipeline = try device.makeComputePipelineState(function: clearKernel)
-            let fp8GateUpPipeline = try device.makeComputePipelineState(function: fp8GateUpKernel)
-            let fp8DownPipeline = try device.makeComputePipelineState(function: fp8DownKernel)
-            let bf16GateUpPipeline = try device.makeComputePipelineState(function: bf16GateUpKernel)
-            let bf16DownPipeline = try device.makeComputePipelineState(function: bf16DownKernel)
-
-            guard let commandBuffer = commandQueue.makeCommandBuffer(),
-                  let computeEncoder = commandBuffer.makeComputeCommandEncoder() else {
-                gpuComputeOutput = "❌ Failed to allocate GPU command encoder."
-                return
-            }
-
-            let byteLength = Int(hiddenDim) * MemoryLayout<Float>.stride
-            guard let xNorm1Buffer = device.makeBuffer(length: byteLength, options: .storageModeShared),
-                  let attnOutBuffer = device.makeBuffer(length: byteLength, options: .storageModeShared),
-                  let hMidBuffer   = device.makeBuffer(length: byteLength, options: .storageModeShared),
-                  let xNorm2Buffer = device.makeBuffer(length: byteLength, options: .storageModeShared),
-                  let hMlpBuffer   = device.makeBuffer(length: byteLength, options: .storageModeShared),
-                  let hNextBuffer  = device.makeBuffer(length: byteLength, options: .storageModeShared) else {
-                gpuComputeOutput = "❌ Failed to allocate GPU layer buffers."
-                return
-            }
-
-            // -------------------------------------------------------------
-            // Step 1: Pre-Attention RMSNorm (h_l -> xNorm1)
-            // -------------------------------------------------------------
-            if let norm1Tensor = findTensorInLayer("input_layernorm"),
-               let norm1Raw = shardBuffers[norm1Tensor.shardIndex] {
-                var gammaOffset = norm1Tensor.offsetStart
-                computeEncoder.setComputePipelineState(rmsPipeline)
-                computeEncoder.setBuffer(h0Buffer, offset: 0, index: 0)
-                computeEncoder.setBuffer(norm1Raw, offset: 0, index: 1)
-                computeEncoder.setBuffer(xNorm1Buffer, offset: 0, index: 2)
-                computeEncoder.setBytes(&gammaOffset, length: MemoryLayout<UInt64>.stride, index: 3)
-                computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 4)
-                computeEncoder.setBytes(&eps, length: MemoryLayout<Float>.stride, index: 5)
-                computeEncoder.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
-                computeEncoder.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
-            }
-
-            // -------------------------------------------------------------
-            // Step 2: Attention Computation (xNorm1 -> attnOut)
-            // -------------------------------------------------------------
-            computeEncoder.setComputePipelineState(clearPipeline)
-            computeEncoder.setBuffer(attnOutBuffer, offset: 0, index: 0)
-            computeEncoder.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
-
-            if let oProjTensor = findTensorInLayer("o_proj") ?? findTensorInLayer("out_proj"),
-               let oProjRaw = shardBuffers[oProjTensor.shardIndex] {
-                let isFP8 = !oProjTensor.dtype.contains("BF16") && !oProjTensor.dtype.contains("FLOAT")
-                var oProjOffset = oProjTensor.offsetStart
-                var inAttnDim = hiddenDim
-
-                if isFP8, let gemvKernel = defaultLibrary.makeFunction(name: "fp8_gemv") {
-                    let gemvPipeline = try device.makeComputePipelineState(function: gemvKernel)
-                    let oScaleTensor = summary.tensors.first(where: { t in
-                        t.layerIndex == UInt32(layerIndex) && (t.name.contains("o_proj") || t.name.contains("out_proj")) && (t.name.contains("scale") || t.name.contains("scales"))
-                    })
-                    let oScaleRaw = (oScaleTensor != nil) ? shardBuffers[oScaleTensor!.shardIndex] : oProjRaw
-                    var oScaleOffset = oScaleTensor?.offsetStart ?? 0
-
-                    computeEncoder.setComputePipelineState(gemvPipeline)
-                    computeEncoder.setBuffer(oProjRaw, offset: 0, index: 0)
-                    computeEncoder.setBuffer(xNorm1Buffer, offset: 0, index: 1)
-                    computeEncoder.setBuffer(attnOutBuffer, offset: 0, index: 2)
-                    computeEncoder.setBuffer(oScaleRaw, offset: 0, index: 3)
-                    computeEncoder.setBytes(&oProjOffset, length: MemoryLayout<UInt64>.stride, index: 4)
-                    computeEncoder.setBytes(&oScaleOffset, length: MemoryLayout<UInt64>.stride, index: 5)
-                    computeEncoder.setBytes(&inAttnDim, length: MemoryLayout<UInt32>.stride, index: 6)
-                    computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 7)
-                    computeEncoder.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), gemvPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
-                } else if let bf16GemvKernel = defaultLibrary.makeFunction(name: "bf16_gemv") {
-                    let bf16GemvPipeline = try device.makeComputePipelineState(function: bf16GemvKernel)
-                    computeEncoder.setComputePipelineState(bf16GemvPipeline)
-                    computeEncoder.setBuffer(oProjRaw, offset: 0, index: 0)
-                    computeEncoder.setBuffer(xNorm1Buffer, offset: 0, index: 1)
-                    computeEncoder.setBuffer(attnOutBuffer, offset: 0, index: 2)
-                    computeEncoder.setBytes(&oProjOffset, length: MemoryLayout<UInt64>.stride, index: 3)
-                    computeEncoder.setBytes(&inAttnDim, length: MemoryLayout<UInt32>.stride, index: 4)
-                    computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 5)
-                    var inRowStride = UInt32(inAttnDim)
-                    var outRowStride = UInt32(hiddenDim)
-                    computeEncoder.setBytes(&inRowStride, length: MemoryLayout<UInt32>.stride, index: 6)
-                    computeEncoder.setBytes(&outRowStride, length: MemoryLayout<UInt32>.stride, index: 7)
-                    computeEncoder.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), bf16GemvPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
-                }
-            }
-
-            // -------------------------------------------------------------
-            // Step 3: Residual Connection 1 (h_mid = h_l + attnOut)
-            // -------------------------------------------------------------
-            computeEncoder.setComputePipelineState(addPipeline)
-            computeEncoder.setBuffer(h0Buffer, offset: 0, index: 0)
-            computeEncoder.setBuffer(attnOutBuffer, offset: 0, index: 1)
-            computeEncoder.setBuffer(hMidBuffer, offset: 0, index: 2)
-            computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 3)
-            computeEncoder.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), addPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
-
-            // -------------------------------------------------------------
-            // Step 4: Post-Attention RMSNorm (h_mid -> xNorm2)
-            // -------------------------------------------------------------
-            if let norm2Tensor = findTensorInLayer("post_attention_layernorm"),
-               let norm2Raw = shardBuffers[norm2Tensor.shardIndex] {
-                var gammaOffset = norm2Tensor.offsetStart
-                computeEncoder.setComputePipelineState(rmsPipeline)
-                computeEncoder.setBuffer(hMidBuffer, offset: 0, index: 0)
-                computeEncoder.setBuffer(norm2Raw, offset: 0, index: 1)
-                computeEncoder.setBuffer(xNorm2Buffer, offset: 0, index: 2)
-                computeEncoder.setBytes(&gammaOffset, length: MemoryLayout<UInt64>.stride, index: 3)
-                computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 4)
-                computeEncoder.setBytes(&eps, length: MemoryLayout<Float>.stride, index: 5)
-                computeEncoder.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
-                computeEncoder.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
-            }
-
-            // -------------------------------------------------------------
-            // Step 5: MoE Router & SwiGLU Feed-Forward Compute (xNorm2 -> hMlp)
-            // -------------------------------------------------------------
-            computeEncoder.setComputePipelineState(clearPipeline)
-            computeEncoder.setBuffer(hMlpBuffer, offset: 0, index: 0)
-            computeEncoder.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
-
-            var intermediateDim: UInt32 = 512
-            if let sampleGate = summary.tensors.first(where: {
-                $0.layerIndex == UInt32(layerIndex) && $0.name.contains("gate_proj") && !$0.name.contains("scale")
-            }) {
-                let dims = sampleGate.shapeDisplay
-                    .trimmingCharacters(in: CharacterSet(charactersIn: "[]() "))
-                    .components(separatedBy: ",")
-                    .compactMap { UInt32($0.trimmingCharacters(in: .whitespaces)) }
-                if dims.count >= 2 {
-                    intermediateDim = dims[0]
-                }
-            }
-
-            guard let interBuffer = device.makeBuffer(length: Int(intermediateDim) * MemoryLayout<Float>.stride, options: .storageModeShared) else {
-                return
-            }
-
-            let findTensor = { (sub1: String, sub2: String, isScale: Bool) -> TensorMetadata? in
-                return summary.tensors.first(where: { t in
-                    t.layerIndex == UInt32(layerIndex) &&
-                    t.name.contains(sub1) &&
-                    t.name.contains(sub2) &&
-                    (isScale ? (t.name.contains("scale") || t.name.contains("scales")) : (!t.name.contains("scale") && !t.name.contains("scales")))
-                })
-            }
-
-            for expert in routedExperts {
-                let expId = expert.id
-                var p_k = expert.weight
-                if p_k <= 0.00001 { continue }
-
-                let expTag = "experts.\(expId)"
-                guard let gateWeight = findTensor(expTag, "gate_proj", false),
-                      let upWeight   = findTensor(expTag, "up_proj", false),
-                      let downWeight = findTensor(expTag, "down_proj", false),
-                      let gateRaw    = shardBuffers[gateWeight.shardIndex],
-                      let upRaw      = shardBuffers[upWeight.shardIndex],
-                      let downRaw    = shardBuffers[downWeight.shardIndex] else {
-                    continue
-                }
-
-                let isFP8 = !gateWeight.dtype.contains("BF16") && !gateWeight.dtype.contains("FLOAT")
-
-                if isFP8 {
-                    let gateScale = findTensor(expTag, "gate_proj", true)
-                    let upScale   = findTensor(expTag, "up_proj", true)
-                    let downScale = findTensor(expTag, "down_proj", true)
-
-                    guard let gateSRaw = (gateScale != nil) ? shardBuffers[gateScale!.shardIndex] : nil,
-                          let upSRaw = (upScale != nil) ? shardBuffers[upScale!.shardIndex] : nil,
-                          let downSRaw = (downScale != nil) ? shardBuffers[downScale!.shardIndex] : nil else {
-                        continue
-                    }
-
-                    var gateWeightOffset = gateWeight.offsetStart
-                    var gateScaleOffset  = gateScale!.offsetStart
-                    var upWeightOffset   = upWeight.offsetStart
-                    var upScaleOffset    = upScale!.offsetStart
-                    var downWeightOffset = downWeight.offsetStart
-                    var downScaleOffset  = downScale!.offsetStart
-
-                    computeEncoder.setComputePipelineState(fp8GateUpPipeline)
-                    computeEncoder.setBuffer(gateRaw, offset: 0, index: 0)
-                    computeEncoder.setBuffer(upRaw, offset: 0, index: 1)
-                    computeEncoder.setBuffer(xNorm2Buffer, offset: 0, index: 2)
-                    computeEncoder.setBuffer(interBuffer, offset: 0, index: 3)
-                    computeEncoder.setBuffer(gateSRaw, offset: 0, index: 4)
-                    computeEncoder.setBuffer(upSRaw, offset: 0, index: 5)
-                    computeEncoder.setBytes(&gateWeightOffset, length: MemoryLayout<UInt64>.stride, index: 6)
-                    computeEncoder.setBytes(&gateScaleOffset, length: MemoryLayout<UInt64>.stride, index: 7)
-                    computeEncoder.setBytes(&upWeightOffset, length: MemoryLayout<UInt64>.stride, index: 8)
-                    computeEncoder.setBytes(&upScaleOffset, length: MemoryLayout<UInt64>.stride, index: 9)
-                    computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 10)
-                    computeEncoder.setBytes(&intermediateDim, length: MemoryLayout<UInt32>.stride, index: 11)
-
-                    let interGrid = MTLSize(width: Int(intermediateDim), height: 1, depth: 1)
-                    let interTg = MTLSize(width: min(Int(intermediateDim), fp8GateUpPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-                    computeEncoder.dispatchThreads(interGrid, threadsPerThreadgroup: interTg)
-
-                    computeEncoder.setComputePipelineState(fp8DownPipeline)
-                    computeEncoder.setBuffer(downRaw, offset: 0, index: 0)
-                    computeEncoder.setBuffer(interBuffer, offset: 0, index: 1)
-                    computeEncoder.setBuffer(hMlpBuffer, offset: 0, index: 2)
-                    computeEncoder.setBuffer(downSRaw, offset: 0, index: 3)
-                    computeEncoder.setBytes(&downWeightOffset, length: MemoryLayout<UInt64>.stride, index: 4)
-                    computeEncoder.setBytes(&downScaleOffset, length: MemoryLayout<UInt64>.stride, index: 5)
-                    computeEncoder.setBytes(&intermediateDim, length: MemoryLayout<UInt32>.stride, index: 6)
-                    computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 7)
-                    computeEncoder.setBytes(&p_k, length: MemoryLayout<Float>.stride, index: 8)
-
-                    let hiddenGrid = MTLSize(width: Int(hiddenDim), height: 1, depth: 1)
-                    let hiddenTg = MTLSize(width: min(Int(hiddenDim), fp8DownPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-                    computeEncoder.dispatchThreads(hiddenGrid, threadsPerThreadgroup: hiddenTg)
-                } else {
-                    var gateWeightOffset = gateWeight.offsetStart
-                    var upWeightOffset   = upWeight.offsetStart
-                    var downWeightOffset = downWeight.offsetStart
-
-                    computeEncoder.setComputePipelineState(bf16GateUpPipeline)
-                    computeEncoder.setBuffer(gateRaw, offset: 0, index: 0)
-                    computeEncoder.setBuffer(upRaw, offset: 0, index: 1)
-                    computeEncoder.setBuffer(xNorm2Buffer, offset: 0, index: 2)
-                    computeEncoder.setBuffer(interBuffer, offset: 0, index: 3)
-                    computeEncoder.setBytes(&gateWeightOffset, length: MemoryLayout<UInt64>.stride, index: 4)
-                    computeEncoder.setBytes(&upWeightOffset, length: MemoryLayout<UInt64>.stride, index: 5)
-                    computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 6)
-                    computeEncoder.setBytes(&intermediateDim, length: MemoryLayout<UInt32>.stride, index: 7)
-
-                    let interGrid = MTLSize(width: Int(intermediateDim), height: 1, depth: 1)
-                    let interTg = MTLSize(width: min(Int(intermediateDim), bf16GateUpPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-                    computeEncoder.dispatchThreads(interGrid, threadsPerThreadgroup: interTg)
-
-                    computeEncoder.setComputePipelineState(bf16DownPipeline)
-                    computeEncoder.setBuffer(downRaw, offset: 0, index: 0)
-                    computeEncoder.setBuffer(interBuffer, offset: 0, index: 1)
-                    computeEncoder.setBuffer(hMlpBuffer, offset: 0, index: 2)
-                    computeEncoder.setBytes(&downWeightOffset, length: MemoryLayout<UInt64>.stride, index: 3)
-                    computeEncoder.setBytes(&intermediateDim, length: MemoryLayout<UInt32>.stride, index: 4)
-                    computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 5)
-                    computeEncoder.setBytes(&p_k, length: MemoryLayout<Float>.stride, index: 6)
-
-                    let hiddenGrid = MTLSize(width: Int(hiddenDim), height: 1, depth: 1)
-                    let hiddenTg = MTLSize(width: min(Int(hiddenDim), bf16DownPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-                    computeEncoder.dispatchThreads(hiddenGrid, threadsPerThreadgroup: hiddenTg)
-                }
-            }
-
-            if var sharedWeight = sharedExpertWeight, sharedWeight > 0.0001 {
-                let sharedTag = "shared_expert"
-                if let gateWeight = findTensor(sharedTag, "gate_proj", false),
-                   let upWeight   = findTensor(sharedTag, "up_proj", false),
-                   let downWeight = findTensor(sharedTag, "down_proj", false),
-                   let gateRaw    = shardBuffers[gateWeight.shardIndex],
-                   let upRaw      = shardBuffers[upWeight.shardIndex],
-                   let downRaw    = shardBuffers[downWeight.shardIndex] {
-
-                    let isFP8 = !gateWeight.dtype.contains("BF16") && !gateWeight.dtype.contains("FLOAT")
-                    if isFP8 {
-                        let gateScale = findTensor(sharedTag, "gate_proj", true)
-                        let upScale   = findTensor(sharedTag, "up_proj", true)
-                        let downScale = findTensor(sharedTag, "down_proj", true)
-
-                        if let gateSRaw = (gateScale != nil) ? shardBuffers[gateScale!.shardIndex] : nil,
-                           let upSRaw = (upScale != nil) ? shardBuffers[upScale!.shardIndex] : nil,
-                           let downSRaw = (downScale != nil) ? shardBuffers[downScale!.shardIndex] : nil {
-
-                            var gateWeightOffset = gateWeight.offsetStart
-                            var gateScaleOffset  = gateScale!.offsetStart
-                            var upWeightOffset   = upWeight.offsetStart
-                            var upScaleOffset    = upScale!.offsetStart
-                            var downWeightOffset = downWeight.offsetStart
-                            var downScaleOffset  = downScale!.offsetStart
-
-                            computeEncoder.setComputePipelineState(fp8GateUpPipeline)
-                            computeEncoder.setBuffer(gateRaw, offset: 0, index: 0)
-                            computeEncoder.setBuffer(upRaw, offset: 0, index: 1)
-                            computeEncoder.setBuffer(xNorm2Buffer, offset: 0, index: 2)
-                            computeEncoder.setBuffer(interBuffer, offset: 0, index: 3)
-                            computeEncoder.setBuffer(gateSRaw, offset: 0, index: 4)
-                            computeEncoder.setBuffer(upSRaw, offset: 0, index: 5)
-                            computeEncoder.setBytes(&gateWeightOffset, length: MemoryLayout<UInt64>.stride, index: 6)
-                            computeEncoder.setBytes(&gateScaleOffset, length: MemoryLayout<UInt64>.stride, index: 7)
-                            computeEncoder.setBytes(&upWeightOffset, length: MemoryLayout<UInt64>.stride, index: 8)
-                            computeEncoder.setBytes(&upScaleOffset, length: MemoryLayout<UInt64>.stride, index: 9)
-                            computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 10)
-                            computeEncoder.setBytes(&intermediateDim, length: MemoryLayout<UInt32>.stride, index: 11)
-
-                            let interGrid = MTLSize(width: Int(intermediateDim), height: 1, depth: 1)
-                            let interTg = MTLSize(width: min(Int(intermediateDim), fp8GateUpPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-                            computeEncoder.dispatchThreads(interGrid, threadsPerThreadgroup: interTg)
-
-                            computeEncoder.setComputePipelineState(fp8DownPipeline)
-                            computeEncoder.setBuffer(downRaw, offset: 0, index: 0)
-                            computeEncoder.setBuffer(interBuffer, offset: 0, index: 1)
-                            computeEncoder.setBuffer(hMlpBuffer, offset: 0, index: 2)
-                            computeEncoder.setBuffer(downSRaw, offset: 0, index: 3)
-                            computeEncoder.setBytes(&downWeightOffset, length: MemoryLayout<UInt64>.stride, index: 4)
-                            computeEncoder.setBytes(&downScaleOffset, length: MemoryLayout<UInt64>.stride, index: 5)
-                            computeEncoder.setBytes(&intermediateDim, length: MemoryLayout<UInt32>.stride, index: 6)
-                            computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 7)
-                            computeEncoder.setBytes(&sharedWeight, length: MemoryLayout<Float>.stride, index: 8)
-
-                            let hiddenGrid = MTLSize(width: Int(hiddenDim), height: 1, depth: 1)
-                            let hiddenTg = MTLSize(width: min(Int(hiddenDim), fp8DownPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-                            computeEncoder.dispatchThreads(hiddenGrid, threadsPerThreadgroup: hiddenTg)
-                        }
-                    }
-                }
-            }
-
-            // -------------------------------------------------------------
-            // Step 6: Residual Connection 2 (h_next = h_mid + hMlp)
-            // -------------------------------------------------------------
-            computeEncoder.setComputePipelineState(addPipeline)
-            computeEncoder.setBuffer(hMidBuffer, offset: 0, index: 0)
-            computeEncoder.setBuffer(hMlpBuffer, offset: 0, index: 1)
-            computeEncoder.setBuffer(hNextBuffer, offset: 0, index: 2)
-            computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 3)
-            computeEncoder.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), addPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
-
-            // -------------------------------------------------------------
-            // Step 7: Commit & Measure Full Block Latency
-            // -------------------------------------------------------------
-            let startTime = CFAbsoluteTimeGetCurrent()
-            computeEncoder.endEncoding()
-            commandBuffer.commit()
-            commandBuffer.waitUntilCompleted()
-            let elapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
-
-            let outPtr = hNextBuffer.contents().bindMemory(to: Float.self, capacity: Int(hiddenDim))
-            var sumSquares: Float = 0.0
-            var sampleValues: [String] = []
-            for i in 0..<Int(hiddenDim) {
-                let v = outPtr[i]
-                sumSquares += v * v
-                if i < 8 {
-                    sampleValues.append(String(format: "%.5f", v))
-                }
-            }
-            let l2Norm = sqrt(sumSquares)
-
-            self.activeH1Buffer = hNextBuffer
-            let status = "⚡ Layer #\(layerIndex) Full Block (RMSNorm + Attn + Res + MoE + Res) Executed in \(String(format: "%.3f", elapsedMs)) ms! | Output h_\(layerIndex + 1) L2 Norm: \(String(format: "%.4f", l2Norm))"
-            self.fullLayerStatusText = status
-            self.fullLayerSampleOutput = "First 8 dims of h_\(layerIndex + 1): [\(sampleValues.joined(separator: ", "))]"
-            self.gpuComputeOutput = "\(status)\n\(self.fullLayerSampleOutput!)"
-
-        } catch {
-            gpuComputeOutput = "❌ Full Layer Forward Error: \(error.localizedDescription)"
-        }
-    }
-
-    // MARK: - Execute Sequential Multi-Layer Forward Pass (h_0 -> h_N)
-    private func executeMultiLayerForward(numLayers: Int) {
-        guard let summary = summary,
-              let h0Buffer = activeH0Buffer,
-              let device = MTLCreateSystemDefaultDevice(),
-              let commandQueue = device.makeCommandQueue(),
-              let defaultLibrary = device.makeDefaultLibrary() else {
-            gpuComputeOutput = "❌ Missing active h_0 buffer or Metal device. Generate h_0 first."
-            return
-        }
-
-        self.isExecutingMultiLayer = true
-        defer { self.isExecutingMultiLayer = false }
-
-        do {
-            var hiddenDim: UInt32 = UInt32(activeHiddenDim)
-            var eps: Float = 1e-6
-
-            guard let rmsKernel = defaultLibrary.makeFunction(name: "rmsnorm_bf16"),
-                  let addKernel = defaultLibrary.makeFunction(name: "vector_add_f32"),
-                  let clearKernel = defaultLibrary.makeFunction(name: "clear_vector_f32"),
-                  let fp8GateUpKernel = defaultLibrary.makeFunction(name: "fp8_swiglu_gate_up"),
-                  let fp8DownKernel = defaultLibrary.makeFunction(name: "fp8_down_proj_accumulate"),
-                  let routerKernel = defaultLibrary.makeFunction(name: "moe_router_topk_bf16"),
-                  let sharedGateKernel = defaultLibrary.makeFunction(name: "moe_shared_gate_bf16") else {
-                gpuComputeOutput = "❌ Failed to load required Metal compute functions for multi-layer forward."
-                return
-            }
-
-            let rmsPipeline = try device.makeComputePipelineState(function: rmsKernel)
-            let addPipeline = try device.makeComputePipelineState(function: addKernel)
-            let clearPipeline = try device.makeComputePipelineState(function: clearKernel)
-            let fp8GateUpPipeline = try device.makeComputePipelineState(function: fp8GateUpKernel)
-            let fp8DownPipeline = try device.makeComputePipelineState(function: fp8DownKernel)
-            let routerPipeline = try device.makeComputePipelineState(function: routerKernel)
-            let sharedGatePipeline = try device.makeComputePipelineState(function: sharedGateKernel)
-
-            let byteLength = Int(hiddenDim) * MemoryLayout<Float>.stride
-            guard let hCurrBuffer  = device.makeBuffer(length: byteLength, options: .storageModeShared),
-                  let hNextBuffer  = device.makeBuffer(length: byteLength, options: .storageModeShared),
-                  let xNorm1Buffer = device.makeBuffer(length: byteLength, options: .storageModeShared),
-                  let attnOutBuffer = device.makeBuffer(length: byteLength, options: .storageModeShared),
-                  let hMidBuffer   = device.makeBuffer(length: byteLength, options: .storageModeShared),
-                  let xNorm2Buffer = device.makeBuffer(length: byteLength, options: .storageModeShared),
-                  let hMlpBuffer   = device.makeBuffer(length: byteLength, options: .storageModeShared),
-                  let routerScoresBuffer = device.makeBuffer(length: 256 * MemoryLayout<Float>.stride, options: .storageModeShared),
-                  let sharedScoreBuffer = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared) else {
-                gpuComputeOutput = "❌ Failed to allocate GPU multi-layer buffers."
-                return
-            }
-
-            // Copy initial h0 into hCurrBuffer
-            memcpy(hCurrBuffer.contents(), h0Buffer.contents(), byteLength)
-
-            var telemetryList: [LayerTelemetry] = []
-            let totalStartTime = CFAbsoluteTimeGetCurrent()
-            let actualLayers = min(numLayers, Int(summary.layerCount))
-
-            for l in 0..<actualLayers {
-                let layerStartTime = CFAbsoluteTimeGetCurrent()
-
-                let findTensorInLayer = { (query: String) -> TensorMetadata? in
-                    return summary.tensors.first(where: { t in
-                        t.layerIndex == UInt32(l) && t.name.contains(query)
-                    })
-                }
-
-                guard let commandBuffer = commandQueue.makeCommandBuffer(),
-                      let computeEncoder = commandBuffer.makeComputeCommandEncoder() else {
-                    continue
-                }
-
-                // ---------------------------------------------------------
-                // Step 0: Dynamic Routing for Layer l
-                // ---------------------------------------------------------
-                var activeExperts: [(id: Int, weight: Float)] = []
-
-                if let routerTensor = summary.tensors.first(where: {
-                    $0.layerIndex == UInt32(l) && $0.name.contains("mlp.gate.weight")
-                }), let routerRaw = shardBuffers[routerTensor.shardIndex] {
-                    var routerOffset = routerTensor.offsetStart
-                    var numExperts: UInt32 = summary.maxExpertId > 0 ? summary.maxExpertId : 256
-
-                    computeEncoder.setComputePipelineState(routerPipeline)
-                    computeEncoder.setBuffer(routerRaw, offset: 0, index: 0)
-                    computeEncoder.setBuffer(hCurrBuffer, offset: 0, index: 1)
-                    computeEncoder.setBuffer(routerScoresBuffer, offset: 0, index: 2)
-                    computeEncoder.setBytes(&routerOffset, length: MemoryLayout<UInt64>.stride, index: 3)
-                    computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 4)
-                    computeEncoder.setBytes(&numExperts, length: MemoryLayout<UInt32>.stride, index: 5)
-                    computeEncoder.dispatchThreads(MTLSize(width: Int(numExperts), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(numExperts), routerPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
-                }
-
-                if let sharedGateTensor = summary.tensors.first(where: {
-                    $0.layerIndex == UInt32(l) && $0.name.contains("shared_expert_gate.weight")
-                }), let sharedGateRaw = shardBuffers[sharedGateTensor.shardIndex] {
-                    var gateOffset = sharedGateTensor.offsetStart
-                    computeEncoder.setComputePipelineState(sharedGatePipeline)
-                    computeEncoder.setBuffer(sharedGateRaw, offset: 0, index: 0)
-                    computeEncoder.setBuffer(hCurrBuffer, offset: 0, index: 1)
-                    computeEncoder.setBuffer(sharedScoreBuffer, offset: 0, index: 2)
-                    computeEncoder.setBytes(&gateOffset, length: MemoryLayout<UInt64>.stride, index: 3)
-                    computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 4)
-                    computeEncoder.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
-                }
-
-                // ---------------------------------------------------------
-                // Step 1: Pre-Attention RMSNorm (hCurr -> xNorm1)
-                // ---------------------------------------------------------
-                if let norm1Tensor = findTensorInLayer("input_layernorm"),
-                   let norm1Raw = shardBuffers[norm1Tensor.shardIndex] {
-                    var gammaOffset = norm1Tensor.offsetStart
-                    computeEncoder.setComputePipelineState(rmsPipeline)
-                    computeEncoder.setBuffer(hCurrBuffer, offset: 0, index: 0)
-                    computeEncoder.setBuffer(norm1Raw, offset: 0, index: 1)
-                    computeEncoder.setBuffer(xNorm1Buffer, offset: 0, index: 2)
-                    computeEncoder.setBytes(&gammaOffset, length: MemoryLayout<UInt64>.stride, index: 3)
-                    computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 4)
-                    computeEncoder.setBytes(&eps, length: MemoryLayout<Float>.stride, index: 5)
-                    computeEncoder.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
-                    computeEncoder.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
-                }
-
-                // ---------------------------------------------------------
-                // Step 2: Attention Computation (xNorm1 -> attnOut)
-                // ---------------------------------------------------------
-                computeEncoder.setComputePipelineState(clearPipeline)
-                computeEncoder.setBuffer(attnOutBuffer, offset: 0, index: 0)
-                computeEncoder.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
-
-                if let oProjTensor = findTensorInLayer("o_proj") ?? findTensorInLayer("out_proj"),
-                   let oProjRaw = shardBuffers[oProjTensor.shardIndex] {
-                    let isFP8 = !oProjTensor.dtype.contains("BF16") && !oProjTensor.dtype.contains("FLOAT")
-                    var oProjOffset = oProjTensor.offsetStart
-                    var inAttnDim = hiddenDim
-
-                    if isFP8, let gemvKernel = defaultLibrary.makeFunction(name: "fp8_gemv") {
-                        let gemvPipeline = try device.makeComputePipelineState(function: gemvKernel)
-                        let oScaleTensor = summary.tensors.first(where: { t in
-                            t.layerIndex == UInt32(l) && (t.name.contains("o_proj") || t.name.contains("out_proj")) && (t.name.contains("scale") || t.name.contains("scales"))
-                        })
-                        let oScaleRaw = (oScaleTensor != nil) ? shardBuffers[oScaleTensor!.shardIndex] : oProjRaw
-                        var oScaleOffset = oScaleTensor?.offsetStart ?? 0
-
-                        computeEncoder.setComputePipelineState(gemvPipeline)
-                        computeEncoder.setBuffer(oProjRaw, offset: 0, index: 0)
-                        computeEncoder.setBuffer(xNorm1Buffer, offset: 0, index: 1)
-                        computeEncoder.setBuffer(attnOutBuffer, offset: 0, index: 2)
-                        computeEncoder.setBuffer(oScaleRaw, offset: 0, index: 3)
-                        computeEncoder.setBytes(&oProjOffset, length: MemoryLayout<UInt64>.stride, index: 4)
-                        computeEncoder.setBytes(&oScaleOffset, length: MemoryLayout<UInt64>.stride, index: 5)
-                        computeEncoder.setBytes(&inAttnDim, length: MemoryLayout<UInt32>.stride, index: 6)
-                        computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 7)
-                        computeEncoder.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), gemvPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
-                    } else if let bf16GemvKernel = defaultLibrary.makeFunction(name: "bf16_gemv") {
-                        let bf16GemvPipeline = try device.makeComputePipelineState(function: bf16GemvKernel)
-                        computeEncoder.setComputePipelineState(bf16GemvPipeline)
-                        computeEncoder.setBuffer(oProjRaw, offset: 0, index: 0)
-                        computeEncoder.setBuffer(xNorm1Buffer, offset: 0, index: 1)
-                        computeEncoder.setBuffer(attnOutBuffer, offset: 0, index: 2)
-                        computeEncoder.setBytes(&oProjOffset, length: MemoryLayout<UInt64>.stride, index: 3)
-                        computeEncoder.setBytes(&inAttnDim, length: MemoryLayout<UInt32>.stride, index: 4)
-                        computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 5)
-                        var inRowStride = UInt32(inAttnDim)
-                        var outRowStride = UInt32(hiddenDim)
-                        computeEncoder.setBytes(&inRowStride, length: MemoryLayout<UInt32>.stride, index: 6)
-                        computeEncoder.setBytes(&outRowStride, length: MemoryLayout<UInt32>.stride, index: 7)
-                        computeEncoder.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), bf16GemvPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
-                    }
-                }
-
-                // ---------------------------------------------------------
-                // Step 3: Residual Connection 1 (hMid = hCurr + attnOut)
-                // ---------------------------------------------------------
-                computeEncoder.setComputePipelineState(addPipeline)
-                computeEncoder.setBuffer(hCurrBuffer, offset: 0, index: 0)
-                computeEncoder.setBuffer(attnOutBuffer, offset: 0, index: 1)
-                computeEncoder.setBuffer(hMidBuffer, offset: 0, index: 2)
-                computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 3)
-                computeEncoder.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), addPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
-
-                // ---------------------------------------------------------
-                // Step 4: Post-Attention RMSNorm (hMid -> xNorm2)
-                // ---------------------------------------------------------
-                if let norm2Tensor = findTensorInLayer("post_attention_layernorm"),
-                   let norm2Raw = shardBuffers[norm2Tensor.shardIndex] {
-                    var gammaOffset = norm2Tensor.offsetStart
-                    computeEncoder.setComputePipelineState(rmsPipeline)
-                    computeEncoder.setBuffer(hMidBuffer, offset: 0, index: 0)
-                    computeEncoder.setBuffer(norm2Raw, offset: 0, index: 1)
-                    computeEncoder.setBuffer(xNorm2Buffer, offset: 0, index: 2)
-                    computeEncoder.setBytes(&gammaOffset, length: MemoryLayout<UInt64>.stride, index: 3)
-                    computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 4)
-                    computeEncoder.setBytes(&eps, length: MemoryLayout<Float>.stride, index: 5)
-                    computeEncoder.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
-                    computeEncoder.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(1024, Int(hiddenDim)), height: 1, depth: 1))
-                }
-
-                // ---------------------------------------------------------
-                // Step 5: MoE Router & SwiGLU Feed-Forward Compute (xNorm2 -> hMlp)
-                // ---------------------------------------------------------
-                computeEncoder.setComputePipelineState(clearPipeline)
-                computeEncoder.setBuffer(hMlpBuffer, offset: 0, index: 0)
-                computeEncoder.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), clearPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
-
-                var intermediateDim: UInt32 = 512
-                if let sampleGate = summary.tensors.first(where: {
-                    $0.layerIndex == UInt32(l) && $0.name.contains("gate_proj") && !$0.name.contains("scale")
-                }) {
-                    let dims = sampleGate.shapeDisplay
-                        .trimmingCharacters(in: CharacterSet(charactersIn: "[]() "))
-                        .components(separatedBy: ",")
-                        .compactMap { UInt32($0.trimmingCharacters(in: .whitespaces)) }
-                    if dims.count >= 2 {
-                        intermediateDim = dims[0]
-                    }
-                }
-
-                guard let interBuffer = device.makeBuffer(length: Int(intermediateDim) * MemoryLayout<Float>.stride, options: .storageModeShared) else {
-                    continue
-                }
-
-                let findTensor = { (sub1: String, sub2: String, isScale: Bool) -> TensorMetadata? in
-                    return summary.tensors.first(where: { t in
-                        t.layerIndex == UInt32(l) &&
-                        t.name.contains(sub1) &&
-                        t.name.contains(sub2) &&
-                        (isScale ? (t.name.contains("scale") || t.name.contains("scales")) : (!t.name.contains("scale") && !t.name.contains("scales")))
-                    })
-                }
-
-                let rawScores = routerScoresBuffer.contents().bindMemory(to: Float.self, capacity: 256)
-                var scorePairs: [(id: Int, score: Float)] = []
-                for idx in 0..<256 {
-                    scorePairs.append((id: idx, score: rawScores[idx]))
-                }
-                scorePairs.sort(by: { $0.score > $1.score })
-                let top8 = Array(scorePairs.prefix(8))
-                var expSum: Float = 0.0
-                for item in top8 {
-                    expSum += Darwin.exp(item.score)
-                }
-                if expSum > 0.0 {
-                    activeExperts = top8.map { (id: $0.id, weight: Darwin.exp($0.score) / expSum) }
-                } else {
-                    activeExperts = (0..<8).map { (id: $0, weight: 1.0 / 8.0) }
-                }
-
-                // Demand Paging & Working Set LRU Eviction for Active Experts
-                let activeIds = activeExperts.map { $0.id }
-                WorkingSetManager.shared.touchAndEvict(layer: l, activeExpertIds: activeIds, mode: memoryBudgetMode, shardBuffers: shardBuffers)
-
-                // Async Lookahead Speculative Prefetching for layer l + 1
-                if l + 1 < actualLayers {
-                    let predicted = WorkingSetManager.shared.predictNextLayerExperts(currentLayer: l, currentActiveExperts: activeIds, topN: 8)
-                    let prefetchIds = predicted.isEmpty ? [0, 1, 2, 3, 4, 5, 6, 7] : predicted
-                    WorkingSetManager.shared.prefetchLayerExperts(layer: l + 1, expertIds: prefetchIds, shardBuffers: shardBuffers)
-                }
-
-                for expert in activeExperts {
-                    let expId = expert.id
-                    var p_k = expert.weight
-                    if p_k <= 0.00001 { continue }
-
-                    let expTag = "experts.\(expId)"
-                    guard let gateWeight = findTensor(expTag, "gate_proj", false),
-                          let upWeight   = findTensor(expTag, "up_proj", false),
-                          let downWeight = findTensor(expTag, "down_proj", false),
-                          let gateRaw    = shardBuffers[gateWeight.shardIndex],
-                          let upRaw      = shardBuffers[upWeight.shardIndex],
-                          let downRaw    = shardBuffers[downWeight.shardIndex] else {
-                        continue
-                    }
-
-                    let isFP8 = !gateWeight.dtype.contains("BF16") && !gateWeight.dtype.contains("FLOAT")
-
-                    if isFP8 {
-                        let gateScale = findTensor(expTag, "gate_proj", true)
-                        let upScale   = findTensor(expTag, "up_proj", true)
-                        let downScale = findTensor(expTag, "down_proj", true)
-
-                        guard let gateSRaw = (gateScale != nil) ? shardBuffers[gateScale!.shardIndex] : nil,
-                              let upSRaw = (upScale != nil) ? shardBuffers[upScale!.shardIndex] : nil,
-                              let downSRaw = (downScale != nil) ? shardBuffers[downScale!.shardIndex] : nil else {
-                            continue
-                        }
-
-                        var gateWeightOffset = gateWeight.offsetStart
-                        var gateScaleOffset  = gateScale!.offsetStart
-                        var upWeightOffset   = upWeight.offsetStart
-                        var upScaleOffset    = upScale!.offsetStart
-                        var downWeightOffset = downWeight.offsetStart
-                        var downScaleOffset  = downScale!.offsetStart
-
-                        computeEncoder.setComputePipelineState(fp8GateUpPipeline)
-                        computeEncoder.setBuffer(gateRaw, offset: 0, index: 0)
-                        computeEncoder.setBuffer(upRaw, offset: 0, index: 1)
-                        computeEncoder.setBuffer(xNorm2Buffer, offset: 0, index: 2)
-                        computeEncoder.setBuffer(interBuffer, offset: 0, index: 3)
-                        computeEncoder.setBuffer(gateSRaw, offset: 0, index: 4)
-                        computeEncoder.setBuffer(upSRaw, offset: 0, index: 5)
-                        computeEncoder.setBytes(&gateWeightOffset, length: MemoryLayout<UInt64>.stride, index: 6)
-                        computeEncoder.setBytes(&gateScaleOffset, length: MemoryLayout<UInt64>.stride, index: 7)
-                        computeEncoder.setBytes(&upWeightOffset, length: MemoryLayout<UInt64>.stride, index: 8)
-                        computeEncoder.setBytes(&upScaleOffset, length: MemoryLayout<UInt64>.stride, index: 9)
-                        computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 10)
-                        computeEncoder.setBytes(&intermediateDim, length: MemoryLayout<UInt32>.stride, index: 11)
-
-                        let interGrid = MTLSize(width: Int(intermediateDim), height: 1, depth: 1)
-                        let interTg = MTLSize(width: min(Int(intermediateDim), fp8GateUpPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-                        computeEncoder.dispatchThreads(interGrid, threadsPerThreadgroup: interTg)
-
-                        computeEncoder.setComputePipelineState(fp8DownPipeline)
-                        computeEncoder.setBuffer(downRaw, offset: 0, index: 0)
-                        computeEncoder.setBuffer(interBuffer, offset: 0, index: 1)
-                        computeEncoder.setBuffer(hMlpBuffer, offset: 0, index: 2)
-                        computeEncoder.setBuffer(downSRaw, offset: 0, index: 3)
-                        computeEncoder.setBytes(&downWeightOffset, length: MemoryLayout<UInt64>.stride, index: 4)
-                        computeEncoder.setBytes(&downScaleOffset, length: MemoryLayout<UInt64>.stride, index: 5)
-                        computeEncoder.setBytes(&intermediateDim, length: MemoryLayout<UInt32>.stride, index: 6)
-                        computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 7)
-                        computeEncoder.setBytes(&p_k, length: MemoryLayout<Float>.stride, index: 8)
-
-                        let hiddenGrid = MTLSize(width: Int(hiddenDim), height: 1, depth: 1)
-                        let hiddenTg = MTLSize(width: min(Int(hiddenDim), fp8DownPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-                        computeEncoder.dispatchThreads(hiddenGrid, threadsPerThreadgroup: hiddenTg)
-                    }
-                }
-
-                // Shared expert
-                let sharedTag = "shared_expert"
-                if let gateWeight = findTensor(sharedTag, "gate_proj", false),
-                   let upWeight   = findTensor(sharedTag, "up_proj", false),
-                   let downWeight = findTensor(sharedTag, "down_proj", false),
-                   let gateRaw    = shardBuffers[gateWeight.shardIndex],
-                   let upRaw      = shardBuffers[upWeight.shardIndex],
-                   let downRaw    = shardBuffers[downWeight.shardIndex] {
-
-                    let isFP8 = !gateWeight.dtype.contains("BF16") && !gateWeight.dtype.contains("FLOAT")
-                    if isFP8 {
-                        let gateScale = findTensor(sharedTag, "gate_proj", true)
-                        let upScale   = findTensor(sharedTag, "up_proj", true)
-                        let downScale = findTensor(sharedTag, "down_proj", true)
-
-                        if let gateSRaw = (gateScale != nil) ? shardBuffers[gateScale!.shardIndex] : nil,
-                           let upSRaw = (upScale != nil) ? shardBuffers[upScale!.shardIndex] : nil,
-                           let downSRaw = (downScale != nil) ? shardBuffers[downScale!.shardIndex] : nil {
-
-                            var gateWeightOffset = gateWeight.offsetStart
-                            var gateScaleOffset  = gateScale!.offsetStart
-                            var upWeightOffset   = upWeight.offsetStart
-                            var upScaleOffset    = upScale!.offsetStart
-                            var downWeightOffset = downWeight.offsetStart
-                            var downScaleOffset  = downScale!.offsetStart
-                            var sharedW: Float = 0.5
-
-                            computeEncoder.setComputePipelineState(fp8GateUpPipeline)
-                            computeEncoder.setBuffer(gateRaw, offset: 0, index: 0)
-                            computeEncoder.setBuffer(upRaw, offset: 0, index: 1)
-                            computeEncoder.setBuffer(xNorm2Buffer, offset: 0, index: 2)
-                            computeEncoder.setBuffer(interBuffer, offset: 0, index: 3)
-                            computeEncoder.setBuffer(gateSRaw, offset: 0, index: 4)
-                            computeEncoder.setBuffer(upSRaw, offset: 0, index: 5)
-                            computeEncoder.setBytes(&gateWeightOffset, length: MemoryLayout<UInt64>.stride, index: 6)
-                            computeEncoder.setBytes(&gateScaleOffset, length: MemoryLayout<UInt64>.stride, index: 7)
-                            computeEncoder.setBytes(&upWeightOffset, length: MemoryLayout<UInt64>.stride, index: 8)
-                            computeEncoder.setBytes(&upScaleOffset, length: MemoryLayout<UInt64>.stride, index: 9)
-                            computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 10)
-                            computeEncoder.setBytes(&intermediateDim, length: MemoryLayout<UInt32>.stride, index: 11)
-
-                            let interGrid = MTLSize(width: Int(intermediateDim), height: 1, depth: 1)
-                            let interTg = MTLSize(width: min(Int(intermediateDim), fp8GateUpPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-                            computeEncoder.dispatchThreads(interGrid, threadsPerThreadgroup: interTg)
-
-                            computeEncoder.setComputePipelineState(fp8DownPipeline)
-                            computeEncoder.setBuffer(downRaw, offset: 0, index: 0)
-                            computeEncoder.setBuffer(interBuffer, offset: 0, index: 1)
-                            computeEncoder.setBuffer(hMlpBuffer, offset: 0, index: 2)
-                            computeEncoder.setBuffer(downSRaw, offset: 0, index: 3)
-                            computeEncoder.setBytes(&downWeightOffset, length: MemoryLayout<UInt64>.stride, index: 4)
-                            computeEncoder.setBytes(&downScaleOffset, length: MemoryLayout<UInt64>.stride, index: 5)
-                            computeEncoder.setBytes(&intermediateDim, length: MemoryLayout<UInt32>.stride, index: 6)
-                            computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 7)
-                            computeEncoder.setBytes(&sharedW, length: MemoryLayout<Float>.stride, index: 8)
-
-                            let hiddenGrid = MTLSize(width: Int(hiddenDim), height: 1, depth: 1)
-                            let hiddenTg = MTLSize(width: min(Int(hiddenDim), fp8DownPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
-                            computeEncoder.dispatchThreads(hiddenGrid, threadsPerThreadgroup: hiddenTg)
-                        }
-                    }
-                }
-
-                // ---------------------------------------------------------
-                // Step 6: Residual Connection 2 (hNext = hMid + hMlp)
-                // ---------------------------------------------------------
-                computeEncoder.setComputePipelineState(addPipeline)
-                computeEncoder.setBuffer(hMidBuffer, offset: 0, index: 0)
-                computeEncoder.setBuffer(hMlpBuffer, offset: 0, index: 1)
-                computeEncoder.setBuffer(hNextBuffer, offset: 0, index: 2)
-                computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 3)
-                computeEncoder.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(Int(hiddenDim), addPipeline.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
-
-                // End encoding and commit layer
-                computeEncoder.endEncoding()
-                commandBuffer.commit()
-                commandBuffer.waitUntilCompleted()
-
-                let layerElapsedMs = (CFAbsoluteTimeGetCurrent() - layerStartTime) * 1000.0
-
-                // Read L2 norm
-                let outPtr = hNextBuffer.contents().bindMemory(to: Float.self, capacity: Int(hiddenDim))
-                var sumSquares: Float = 0.0
-                for i in 0..<Int(hiddenDim) {
-                    let v = outPtr[i]
-                    sumSquares += v * v
-                }
-                let l2Norm = sqrt(sumSquares)
-
-                telemetryList.append(LayerTelemetry(
-                    layerIndex: l,
-                    durationMs: layerElapsedMs,
-                    topExperts: activeExperts.map { $0.id },
-                    l2Norm: l2Norm
-                ))
-
-                // Ping-pong copy for next layer
-                memcpy(hCurrBuffer.contents(), hNextBuffer.contents(), byteLength)
-            }
-
-            let totalElapsedMs = (CFAbsoluteTimeGetCurrent() - totalStartTime) * 1000.0
-            let avgMsPerLayer = totalElapsedMs / Double(max(1, actualLayers))
-            let layersPerSec = 1000.0 / max(0.001, avgMsPerLayer)
-
-            // Final L2 norm
-            let finalPtr = hCurrBuffer.contents().bindMemory(to: Float.self, capacity: Int(hiddenDim))
-            var finalSumSq: Float = 0.0
-            var finalSamples: [String] = []
-            for i in 0..<Int(hiddenDim) {
-                let v = finalPtr[i]
-                finalSumSq += v * v
-                if i < 8 {
-                    finalSamples.append(String(format: "%.5f", v))
-                }
-            }
-            let finalL2Norm = sqrt(finalSumSq)
-
-            self.activeHFinalBuffer = hCurrBuffer
-            self.multiLayerTelemetry = telemetryList
-
-            let status = "🚀 Full \(actualLayers)-Layer Backbone Executed in \(String(format: "%.2f", totalElapsedMs)) ms! (Avg \(String(format: "%.3f", avgMsPerLayer)) ms/layer | \(String(format: "%.0f", layersPerSec)) layers/sec) | Final h_\(actualLayers) L2 Norm: \(String(format: "%.4f", finalL2Norm))"
-            self.multiLayerStatusText = status
-            self.gpuComputeOutput = "\(status)\nFirst 8 dims of h_\(actualLayers): [\(finalSamples.joined(separator: ", "))]"
-            updatePagingStats()
-
-        } catch {
-            gpuComputeOutput = "❌ Multi-Layer Forward Error: \(error.localizedDescription)"
-        }
-    }
-
-    private func executeLMHeadProjection() {
-        guard let summary = summary,
-              let device = MTLCreateSystemDefaultDevice(),
-              let commandQueue = device.makeCommandQueue(),
-              let defaultLibrary = device.makeDefaultLibrary(),
-              let rmsnormFunction = defaultLibrary.makeFunction(name: "rmsnorm_bf16"),
-              let gemvFunction = defaultLibrary.makeFunction(name: "bf16_gemv") else {
-            gpuComputeOutput = "❌ Error setting up Metal pipeline or missing shaders."
-            return
-        }
-
-        let inputBuffer: MTLBuffer
-        let sourceDescription: String
-        if let hFinal = activeHFinalBuffer {
-            inputBuffer = hFinal
-            sourceDescription = "h_40 (Backbone Output)"
-        } else if let h1 = activeH1Buffer {
-            inputBuffer = h1
-            sourceDescription = "h_1 (Single Block Output)"
-        } else if let h0 = activeH0Buffer {
-            inputBuffer = h0
-            sourceDescription = "h_0 (Initial Embedding)"
-        } else {
-            gpuComputeOutput = "⚠️ Please run 'Embed & Route' or 'Execute All 40 Layers' first to generate hidden activations."
-            return
-        }
-
-        // Find Final RMSNorm Tensor
-        guard let normTensor = summary.tensors.first(where: {
-            $0.name == "model.language_model.norm.weight" ||
-            $0.name == "language_model.norm.weight" ||
-            $0.name == "model.norm.weight" ||
-            ($0.name.hasSuffix(".norm.weight") && !$0.name.contains("layers."))
-        }), let normShardBuffer = shardBuffers[normTensor.shardIndex] else {
-            gpuComputeOutput = "❌ Final RMSNorm weight (model.language_model.norm.weight) not found."
-            return
-        }
-
-        // Find LM Head Weight Tensor
-        guard let lmHeadTensor = summary.tensors.first(where: {
-            $0.name == "lm_head.weight" ||
-            $0.name == "language_model.lm_head.weight" ||
-            $0.name == "model.lm_head.weight" ||
-            $0.name == "lm_head"
-        }) ?? summary.tensors.first(where: {
-            $0.name.hasSuffix("embed_tokens.weight") || $0.name == "embed_tokens" || $0.name.contains("word_embeddings") || $0.category == "Embedding"
-        }), let lmHeadShardBuffer = shardBuffers[lmHeadTensor.shardIndex] else {
-            gpuComputeOutput = "❌ LM Head weight not found."
-            return
-        }
-
-        isExecutingLMHead = true
-        topTokenPredictions = []
-        lmHeadStatusText = "Projecting 248,320 vocabulary logits..."
-
-        do {
-            let rmsnormPipeline = try device.makeComputePipelineState(function: rmsnormFunction)
-            let gemvPipeline = try device.makeComputePipelineState(function: gemvFunction)
-
-            var hiddenDim = UInt32(activeHiddenDim)
-            var eps: Float = 1e-6
-            var normOffset = normTensor.offsetStart
-
-            // Parse or set vocab size
-            var vocabSize: UInt32 = 248320
-            let cleanShape = lmHeadTensor.shapeDisplay.replacingOccurrences(of: "[", with: "").replacingOccurrences(of: "]", with: "").replacingOccurrences(of: " ", with: "")
-            let shapeParts = cleanShape.split(separator: ",")
-            if let first = shapeParts.first, let parsed = UInt32(first), parsed > 0 {
-                vocabSize = parsed
-            }
-
-            var lmHeadOffset = lmHeadTensor.offsetStart
-
-            // Allocate buffers
-            guard let xFinalBuffer = device.makeBuffer(length: Int(hiddenDim) * MemoryLayout<Float>.stride, options: .storageModeShared),
-                  let logitsBuffer = device.makeBuffer(length: Int(vocabSize) * MemoryLayout<Float>.stride, options: .storageModeShared) else {
-                gpuComputeOutput = "❌ Failed to allocate xFinal or Logits buffers."
-                isExecutingLMHead = false
-                return
-            }
-
-            let startTime = CFAbsoluteTimeGetCurrent()
-
-            guard let commandBuffer = commandQueue.makeCommandBuffer(),
-                  let computeEncoder = commandBuffer.makeComputeCommandEncoder() else {
-                isExecutingLMHead = false
-                return
-            }
-
-            // 1. Dispatch Final RMSNorm (input -> xFinal)
-            computeEncoder.setComputePipelineState(rmsnormPipeline)
-            computeEncoder.setBuffer(inputBuffer, offset: 0, index: 0)
-            computeEncoder.setBuffer(normShardBuffer, offset: 0, index: 1)
-            computeEncoder.setBuffer(xFinalBuffer, offset: 0, index: 2)
-            computeEncoder.setBytes(&normOffset, length: MemoryLayout<UInt64>.stride, index: 3)
-            computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 4)
-            computeEncoder.setBytes(&eps, length: MemoryLayout<Float>.stride, index: 5)
-
-            let normTgSize = min(1024, rmsnormPipeline.maxTotalThreadsPerThreadgroup)
-            computeEncoder.setThreadgroupMemoryLength(1024 * MemoryLayout<Float>.stride, index: 0)
-            computeEncoder.dispatchThreads(MTLSize(width: Int(hiddenDim), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: normTgSize, height: 1, depth: 1))
-
-            // 2. Dispatch LM Head GEMV (xFinal -> logits)
-            computeEncoder.setComputePipelineState(gemvPipeline)
-            computeEncoder.setBuffer(lmHeadShardBuffer, offset: 0, index: 0)
-            computeEncoder.setBuffer(xFinalBuffer, offset: 0, index: 1)
-            computeEncoder.setBuffer(logitsBuffer, offset: 0, index: 2)
-            computeEncoder.setBytes(&lmHeadOffset, length: MemoryLayout<UInt64>.stride, index: 3)
-            computeEncoder.setBytes(&hiddenDim, length: MemoryLayout<UInt32>.stride, index: 4)
-            computeEncoder.setBytes(&vocabSize, length: MemoryLayout<UInt32>.stride, index: 5)
-
-            let gemvTgSize = min(256, gemvPipeline.maxTotalThreadsPerThreadgroup)
-            computeEncoder.dispatchThreads(MTLSize(width: Int(vocabSize), height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: gemvTgSize, height: 1, depth: 1))
-
-            computeEncoder.endEncoding()
-            commandBuffer.commit()
-            commandBuffer.waitUntilCompleted()
-
-            let gpuElapsedMs = (CFAbsoluteTimeGetCurrent() - startTime) * 1000.0
-
-            // 3. Extract Top-10 Vocabulary Candidates
-            let logitsPtr = logitsBuffer.contents().bindMemory(to: Float.self, capacity: Int(vocabSize))
-            var topCandidates: [(id: Int, logit: Float)] = []
-            
-            for v in 0..<Int(vocabSize) {
-                let val = logitsPtr[v]
-                if topCandidates.count < 10 {
-                    topCandidates.append((id: v, logit: val))
-                    if topCandidates.count == 10 {
-                        topCandidates.sort(by: { $0.logit > $1.logit })
-                    }
-                } else if val > topCandidates.last!.logit {
-                    topCandidates[9] = (id: v, logit: val)
-                    topCandidates.sort(by: { $0.logit > $1.logit })
-                }
-            }
-
-            // Softmax over top candidates
-            let maxLogit = topCandidates.first?.logit ?? 0.0
-            var expSum: Float = 0.0
-            for c in topCandidates {
-                expSum += Darwin.exp(c.logit - maxLogit)
-            }
-
-            var predictions: [TokenPrediction] = []
-            for (idx, item) in topCandidates.enumerated() {
-                let prob = expSum > 0.0 ? (Darwin.exp(item.logit - maxLogit) / expSum) : (1.0 / Float(topCandidates.count))
-                var tokenStr = "<Token \(item.id)>"
-                if let tok = self.tokenizer {
-                    do {
-                        let decoded = try tok.decode(ids: [UInt32(item.id)])
-                        if !decoded.isEmpty {
-                            tokenStr = decoded
-                        }
-                    } catch {}
-                }
-                predictions.append(TokenPrediction(
-                    rank: idx + 1,
-                    tokenId: UInt32(item.id),
-                    tokenString: tokenStr,
-                    logit: item.logit,
-                    probability: prob
-                ))
-            }
-
-            self.topTokenPredictions = predictions
-            self.activeLogitsBuffer = logitsBuffer
-            self.isExecutingLMHead = false
-
-            let top1 = predictions.first
-            let top1Str = top1?.tokenString.replacingOccurrences(of: "\n", with: "\\n") ?? "N/A"
-            let top1Pct = String(format: "%.1f%%", (top1?.probability ?? 0) * 100.0)
-
-            let status = "✨ LM Head Projected \(vocabSize) Vocab Logits in \(String(format: "%.2f", gpuElapsedMs)) ms from \(sourceDescription)! Top Candidate: \"\(top1Str)\" (\(top1Pct) prob)"
-            self.lmHeadStatusText = status
-            self.gpuComputeOutput = status
-
-        } catch {
-            isExecutingLMHead = false
-            gpuComputeOutput = "❌ LM Head Pipeline Error: \(error.localizedDescription)"
-        }
-    }
 
     // MARK: - Autoregressive Generation & Sampling Engine
 
@@ -4878,7 +3311,7 @@ struct ContentView: View {
         generationTask?.cancel()
         generationTask = nil
         ActionApprovalManager.shared.cancelAll()
-        generationStatusText = "⏹ Generation stopped by user."
+        showStatus("⏹ Generation stopped by user.")
     }
 
     /// True when the given generation still owns the shared generation state.
@@ -4918,8 +3351,7 @@ struct ContentView: View {
                 sessions[sIdx].messages[mIdx].content = err
                 sessions[sIdx].messages[mIdx].isThinking = false
             }
-            gpuComputeOutput = err
-            generationStatusText = err
+            showStatus(err, kind: .warning)
             return true
         }
 
@@ -4934,7 +3366,15 @@ struct ContentView: View {
         generationTotalTokens = 0
         generationElapsedMs = 0.0
         generationSpeedTokPerSec = 0.0
-        generationStatusText = "🍎 Apple Foundation Model — generating…"
+        // Progress, not an outcome: the on-device model spools up its session and
+        // ingests the prompt before any content flows, which is longer than the
+        // six seconds an informational pill lives, so the window would go silent
+        // while the work it named was still running.
+        let afmStatusId = showStatus(
+            StatusNoticePolicy.appleFoundationModelGeneratingText,
+            kind: .progress,
+            sessionId: sessionId
+        )
         if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }),
            let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) {
             // Same plumbing the weights path uses during prefill: keeps the
@@ -4988,6 +3428,11 @@ struct ContentView: View {
         )
 
         generationTask = Task(priority: .userInitiated) {
+            // The progress pill lives exactly as long as this task. The success
+            // path replaces it with the outcome status, which has its own
+            // identity, so retracting here cannot take that down — it only stops
+            // a stopped or failed turn leaving a spinner behind.
+            defer { self.clearStatus(ifIdentity: afmStatusId) }
             var latestPartial = ""
             var sawFirstPartial = false
             var firstPartialAt = 0.0
@@ -5035,7 +3480,6 @@ struct ContentView: View {
                     self.generationTotalTokens = approxTokens
                     self.generationElapsedMs = elapsed * 1000.0
                     self.generationSpeedTokPerSec = tokPerSec
-                    self.generationStatusText = "🍎 Streaming: ~\(approxTokens) tokens | \(String(format: "%.1f", tokPerSec)) tok/s"
                     if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
                        let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) {
                         if self.sessions[sIdx].messages[mIdx].prefillStatus != nil {
@@ -5082,8 +3526,7 @@ struct ContentView: View {
                 let errText = "⚠️ Apple Foundation Model error: \(error.localizedDescription)"
                 self.isGeneratingText = false
                 self.generationTask = nil
-                self.generationStatusText = errText
-                self.gpuComputeOutput = errText
+                self.showStatus(errText, kind: .warning)
                 if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
                    let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) {
                     let partialPrefix = latestPartial.isEmpty ? "" : latestPartial + "\n\n"
@@ -5142,7 +3585,7 @@ struct ContentView: View {
             self.generationTotalTokens = approxTokens
             self.generationElapsedMs = finalElapsed * 1000.0
             self.generationSpeedTokPerSec = finalTokPerSec
-            self.generationStatusText = "🍎 Generated ~\(approxTokens) tokens in \(String(format: "%.2f", finalElapsed * 1000.0)) ms (\(String(format: "%.1f", finalTokPerSec)) tok/s)"
+            self.showStatus("🍎 Generated ~\(approxTokens) tokens in \(String(format: "%.2f", finalElapsed * 1000.0)) ms (\(String(format: "%.1f", finalTokPerSec)) tok/s)")
 
             if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
                let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) {
@@ -5218,8 +3661,7 @@ struct ContentView: View {
                 sessions[sIdx].messages[mIdx].content = err
                 sessions[sIdx].messages[mIdx].isThinking = false
             }
-            gpuComputeOutput = err
-            generationStatusText = err
+            showStatus(err, kind: .warning)
             return true
         }
 
@@ -5243,7 +3685,7 @@ struct ContentView: View {
         generationTotalTokens = 0
         generationElapsedMs = 0.0
         generationSpeedTokPerSec = 0.0
-        generationStatusText = "☁️ \(provider.displayName) — generating…"
+        showStatus("☁️ \(provider.displayName) — generating…")
         if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }),
            let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) {
             sessions[sIdx].messages[mIdx].prefillStatus = "☁️ \(provider.displayName) — contacting the model…"
@@ -5419,9 +3861,6 @@ struct ContentView: View {
                     self.generationTotalTokens = generatedSoFar
                     self.generationElapsedMs = elapsed * 1000.0
                     self.generationSpeedTokPerSec = tokPerSec
-                    self.generationStatusText = activelyThinking
-                        ? "☁️ \(provider.displayName) — reasoning: ~\(generatedSoFar) tokens | \(String(format: "%.1f", tokPerSec)) tok/s"
-                        : "☁️ \(provider.displayName) — streaming: ~\(generatedSoFar) tokens | \(String(format: "%.1f", tokPerSec)) tok/s"
                     if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
                        let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == stepMessageId }) {
                         self.sessions[sIdx].messages[mIdx].prefillStatus = nil
@@ -5507,7 +3946,7 @@ struct ContentView: View {
                         providerModelId: providerModelId,
                         supported: false
                     )
-                    self.generationStatusText = "⚠️ \(provider.displayName) rejected the image for this model — marked it text-only and retrying without it."
+                    self.showStatus("⚠️ \(provider.displayName) rejected the image for this model — marked it text-only and retrying without it.")
                     // The status line is overwritten by the next streamed partial,
                     // so record the downgrade in the transcript too. Otherwise the
                     // model silently stops accepting images with no later clue why.
@@ -5541,8 +3980,7 @@ struct ContentView: View {
                     }
                     self.isGeneratingText = false
                     self.generationTask = nil
-                    self.generationStatusText = errText
-                    self.gpuComputeOutput = errText
+                    self.showStatus(errText, kind: .warning)
                     if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
                        let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == stepMessageId }) {
                         let partialPrefix = latestText.isEmpty ? "" : latestText + "\n\n"
@@ -5607,7 +4045,7 @@ struct ContentView: View {
                     offeredToolCount: tools.count,
                     callCount: stepToolCalls.count
                 ) {
-                    self.generationStatusText = "⚙️ Executing \(stepToolCalls.count) tool call(s)..."
+                    self.showStatus("⚙️ Executing \(stepToolCalls.count) tool call(s)...")
                     let outcome = await self.executeCloudToolCalls(
                         calls: stepToolCalls,
                         sessionId: sessionId,
@@ -5627,7 +4065,7 @@ struct ContentView: View {
                         if self.ownsGeneration(myGenerationId) {
                             self.isGeneratingText = false
                             self.generationTask = nil
-                            self.generationStatusText = "⏹ Tool execution stopped by user."
+                            self.showStatus("⏹ Tool execution stopped by user.")
                         }
                         return
                     }
@@ -5662,9 +4100,9 @@ struct ContentView: View {
                         continue
                     }
                     if failureLoop {
-                        self.generationStatusText = "🛡️ Tool loop guard hit — ending the agent run."
+                        self.showStatus("🛡️ Tool loop guard hit — ending the agent run.")
                     } else if ranComplete {
-                        self.generationStatusText = "✅ Task complete — \(provider.displayName)."
+                        self.showStatus("✅ Task complete — \(provider.displayName).")
                     }
                 }
 
@@ -5696,9 +4134,12 @@ struct ContentView: View {
                     }
                     currentMessageId = nextMessageId
                     step += 1
-                    self.generationStatusText = failureLoop
-                        ? "🛡️ Tool loop guard hit; forcing final answer..."
-                        : "🛡️ Step budget exhausted; forcing final answer..."
+                    self.showStatus(
+                        failureLoop
+                            ? "🛡️ Tool loop guard hit; forcing final answer..."
+                            : "🛡️ Step budget exhausted; forcing final answer...",
+                        kind: .warning
+                    )
                     continue
                 }
 
@@ -5732,7 +4173,7 @@ struct ContentView: View {
                     }
                     currentMessageId = nextMessageId
                     step += 1
-                    self.generationStatusText = "📨 Subagent report ready — relaying results to user..."
+                    self.showStatus("📨 Subagent report ready — relaying results to user...")
                     continue
                 }
 
@@ -5763,8 +4204,10 @@ struct ContentView: View {
                 self.generationTotalTokens = generatedTokens
                 self.generationElapsedMs = finalElapsed * 1000.0
                 self.generationSpeedTokPerSec = finalTokPerSec
-                self.generationStatusText = "☁️ \(provider.displayName) — generated ~\(generatedTokens) tokens in \(String(format: "%.2f", finalElapsed * 1000.0)) ms (\(String(format: "%.1f", finalTokPerSec)) tok/s)"
-                    + (truncatedAtLimit ? " — truncated at the Max Output Tokens limit." : "")
+                self.showStatus(
+                    "☁️ \(provider.displayName) — generated ~\(generatedTokens) tokens in \(String(format: "%.2f", finalElapsed * 1000.0)) ms (\(String(format: "%.1f", finalTokPerSec)) tok/s)"
+                        + (truncatedAtLimit ? " — truncated at the Max Output Tokens limit." : "")
+                )
                 self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)
                 return
             }
@@ -5854,7 +4297,7 @@ struct ContentView: View {
             let record = records[index]
             guard let parsedCall = parsed[index] else { continue }
 
-            generationStatusText = "⚙️ Executing [\(index + 1)/\(calls.count)]: \(call.name)..."
+            showStatus("⚙️ Executing [\(index + 1)/\(calls.count)]: \(call.name)...")
 
             // A call whose required arguments are all empty is a broken
             // scaffold: reject it without executing and without a HITL prompt.
@@ -5877,7 +4320,7 @@ struct ContentView: View {
             let isTurbo = UserDefaults.standard.bool(forKey: "dynamoe_agent_turbo_mode")
             if AgentHarness.isStateChanging(toolName: call.name), !isTurbo {
                 updateRecord(record.id) { rec in rec.status = .awaitingApproval }
-                generationStatusText = "🛡️ Action requires confirmation: \(call.name)"
+                showStatus("🛡️ Action requires confirmation: \(call.name)")
                 let approved = await ActionApprovalManager.shared.waitForApproval(id: record.id)
                 if !approved {
                     let rejectJSON = AgentHarness.toolErrorJSON(tool: call.name, error: "Action rejected by user.")
@@ -6030,8 +4473,7 @@ struct ContentView: View {
                 sessions[sIdx].messages[mIdx].content = err
                 sessions[sIdx].messages[mIdx].isThinking = false
             }
-            gpuComputeOutput = err
-            generationStatusText = err
+            showStatus(err, kind: .warning)
             return
         }
 
@@ -6045,8 +4487,7 @@ struct ContentView: View {
             let err = "⚠️ Please enter a prompt to generate text."
             isGeneratingText = false
             generationTask = nil
-            gpuComputeOutput = err
-            generationStatusText = err
+            showStatus(err, kind: .warning)
             return
         }
 
@@ -6121,8 +4562,7 @@ struct ContentView: View {
             let err = "❌ Tokenizer failed to encode prompt: \(error.localizedDescription)"
             isGeneratingText = false
             generationTask = nil
-            gpuComputeOutput = err
-            generationStatusText = err
+            showStatus(err, kind: .warning)
             return
         }
 
@@ -6130,8 +4570,7 @@ struct ContentView: View {
             let err = "⚠️ Prompt tokenization produced 0 tokens."
             isGeneratingText = false
             generationTask = nil
-            gpuComputeOutput = err
-            generationStatusText = err
+            showStatus(err, kind: .warning)
             return
         }
 
@@ -6187,8 +4626,7 @@ struct ContentView: View {
                 sessions[sIdx].messages[mIdx].content = err
                 sessions[sIdx].messages[mIdx].isThinking = false
             }
-            gpuComputeOutput = err
-            generationStatusText = err
+            showStatus(err, kind: .warning)
             return
         }
 
@@ -6232,7 +4670,7 @@ struct ContentView: View {
         generationTotalTokens = 0
         generationSpeedTokPerSec = 0.0
         generationElapsedMs = 0.0
-        generationStatusText = thinkingEnabled ? "🧠 Reasoning..." : "⚡ Initializing Autoregressive Generation..."
+        showStatus(thinkingEnabled ? "🧠 Reasoning..." : "⚡ Initializing Autoregressive Generation...")
 
         var priorThinking: String? = nil
         var priorContent: String? = nil
@@ -6260,12 +4698,16 @@ struct ContentView: View {
                     break
                 case .priming:
                     await MainActor.run {
-                        self.generationStatusText = "⚡ Priming resident weights into RAM..."
+                        self.showStatus("⚡ Priming resident weights into RAM...")
                     }
                 case let .prefillProgress(status, speed, rssGB):
                     await MainActor.run {
                         if let speedValue = speed { self.generationSpeedTokPerSec = speedValue }
-                        if let statusText = status { self.generationStatusText = "📥 " + statusText }
+                        // Ingesting a prompt reports at ~10 Hz, and the status it
+                        // carries is already on the transcript row and in the
+                        // header pill. Repeating it here re-minted the notice's
+                        // identity every tick, so the pill re-faded and VoiceOver
+                        // read the same sentence out ten times a second.
                         if let rssValue = rssGB { self.currentRssGB = rssValue }
                         if let sId = sessionId, let mId = messageId,
                            let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
@@ -6290,7 +4732,6 @@ struct ContentView: View {
                         self.jetSpecTotalDraftAccepted = frame.jetSpecDraftAccepted
                         self.jetSpecTotalDraftProposed = frame.jetSpecDraftProposed
                         let jetSpecBadge = frame.jetSpecActive ? " | 🚀 JetSpec τ=\(String(format: "%.1f", frame.jetSpecMeanTau))" : ""
-                        self.generationStatusText = frame.isActivelyThinking ? "🧠 Reasoning: \(frame.tokensGenerated) tokens | \(String(format: "%.1f", frame.tokensPerSecond)) tok/s\(jetSpecBadge)" : "⚡ Streaming: \(frame.tokensGenerated) tokens | \(String(format: "%.1f", frame.tokensPerSecond)) tok/s\(jetSpecBadge)"
                         self.currentRssGB = frame.residentMemoryGB
                         self.residentExpertCount = frame.residentExpertCount
                         self.totalExpertCount = frame.totalExpertCount
@@ -6379,7 +4820,7 @@ struct ContentView: View {
                             guard self.ownsGeneration(myGenerationId) else { return }
                             self.isGeneratingText = false
                             self.generationTask = nil
-                            self.generationStatusText = failure.message
+                            self.showStatus(failure.message)
                             if let sId = sessionId, let mId = messageId,
                                let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
                                let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
@@ -6391,7 +4832,7 @@ struct ContentView: View {
                         await MainActor.run {
                             self.isGeneratingText = false
                             self.generationTask = nil
-                            self.generationStatusText = failure.message
+                            self.showStatus(failure.message)
                             if let sId = sessionId, let mId = messageId,
                                let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
                                let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
@@ -6407,7 +4848,7 @@ struct ContentView: View {
                             guard self.ownsGeneration(myGenerationId) else { return }
                             self.isGeneratingText = false
                             self.generationTask = nil
-                            self.generationStatusText = failure.message
+                            self.showStatus(failure.message)
                             if let sId = sessionId, let mId = messageId,
                                let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
                                let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
@@ -6540,11 +4981,11 @@ struct ContentView: View {
                 self.generationSpeedTokPerSec = finalTokPerSec
                 let finalJetSpecBadge = effectiveJetSpec && result.jetSpecDraftProposed > 0 ? " (JetSpec τ=\(String(format: "%.1f", result.jetSpecMeanTau)), \(result.jetSpecDraftAccepted) draft tokens accepted)" : ""
                 if !willContinueAgent {
-                    self.generationStatusText = "✨ Generated \(tokensGenerated) tokens in \(String(format: "%.2f", finalElapsedMs)) ms (\(String(format: "%.1f", finalTokPerSec)) tok/s)\(finalJetSpecBadge)"
+                    self.showStatus("✨ Generated \(tokensGenerated) tokens in \(String(format: "%.2f", finalElapsedMs)) ms (\(String(format: "%.1f", finalTokPerSec)) tok/s)\(finalJetSpecBadge)")
                 } else if !actionableCalls.isEmpty {
-                    self.generationStatusText = "⚙️ Executing \(actionableCalls.count) tool call(s)..."
+                    self.showStatus("⚙️ Executing \(actionableCalls.count) tool call(s)...")
                 } else {
-                    self.generationStatusText = "🔄 Continuing agent multi-turn action..."
+                    self.showStatus("🔄 Continuing agent multi-turn action...")
                 }
                 self.currentRssGB = finalRss
                 self.residentExpertCount = finalResCount
@@ -6628,7 +5069,7 @@ struct ContentView: View {
                         )
                         self.sessions[sIdx].messages.append(synthMsg)
                     }
-                    self.generationStatusText = "🛡️ Tool loop guard hit — forcing final answer..."
+                    self.showStatus("🛡️ Tool loop guard hit — forcing final answer...")
                     self.startAutoregressiveGeneration(
                         customPrompt: synthesisPrompt,
                         promptTokens: synthesisToolsChanged ? nil : splicedTokens,
@@ -6719,7 +5160,7 @@ struct ContentView: View {
                             currentCalls.append(contentsOf: orderedRecords)
                             self.sessions[sIdx].messages[mIdx].toolCalls = currentCalls
                             if !actionableCalls.isEmpty {
-                                self.generationStatusText = "⚙️ Executing \(actionableCalls.count) tool call(s)..."
+                                self.showStatus("⚙️ Executing \(actionableCalls.count) tool call(s)...")
                             }
                         }
                     }
@@ -6745,7 +5186,7 @@ struct ContentView: View {
                                 guard self.ownsGeneration(myGenerationId) else { return }
                                 self.isGeneratingText = false
                                 self.generationTask = nil
-                                self.generationStatusText = "⏹ Tool execution stopped by user."
+                                self.showStatus("⏹ Tool execution stopped by user.")
                                 if let sId = sessionId, let mId = messageId,
                                    let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
                                    let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }),
@@ -6764,7 +5205,7 @@ struct ContentView: View {
 
                         let recordId = initialRecords[idx].id
                         await MainActor.run {
-                            self.generationStatusText = "⚙️ Executing [\(idx + 1)/\(actionableCalls.count)]: \(call.name)..."
+                            self.showStatus("⚙️ Executing [\(idx + 1)/\(actionableCalls.count)]: \(call.name)...")
                         }
 
                         // Degenerate-call guard: reject tool calls whose required arguments
@@ -6818,7 +5259,7 @@ struct ContentView: View {
                                    let callIdx = currentCalls.firstIndex(where: { $0.id == recordId }) {
                                     currentCalls[callIdx].status = .awaitingApproval
                                     self.sessions[sIdx].messages[mIdx].toolCalls = currentCalls
-                                    self.generationStatusText = "🛡️ Action requires confirmation: \(call.name)"
+                                    self.showStatus("🛡️ Action requires confirmation: \(call.name)")
                                 }
                             }
 
@@ -6892,7 +5333,7 @@ struct ContentView: View {
                             guard self.ownsGeneration(myGenerationId) else { return }
                             self.isGeneratingText = false
                             self.generationTask = nil
-                            self.generationStatusText = "⏹ Generation stopped by user."
+                            self.showStatus("⏹ Generation stopped by user.")
                         }
                         return
                     }
@@ -7055,7 +5496,7 @@ struct ContentView: View {
                                     )
                                     self.sessions[sIdx].messages.append(synthMsg)
                                 }
-                                self.generationStatusText = "🛡️ Tool loop guard hit — forcing final answer..."
+                                self.showStatus("🛡️ Tool loop guard hit — forcing final answer...")
                                 self.startAutoregressiveGeneration(
                                     customPrompt: synthesisPrompt,
                                     promptTokens: synthesisToolsChanged ? nil : splicedTokens,
@@ -7116,7 +5557,7 @@ struct ContentView: View {
                                         )
                                         self.sessions[sIdx].messages.append(relayMsg)
                                     }
-                                    self.generationStatusText = "📨 Subagent report ready — relaying results to user..."
+                                    self.showStatus("📨 Subagent report ready — relaying results to user...")
                                     self.startAutoregressiveGeneration(
                                         customPrompt: relayPrompt,
                                         promptTokens: splicedTokens,
@@ -7135,7 +5576,7 @@ struct ContentView: View {
                         await MainActor.run {
                             self.isGeneratingText = false
                             self.generationTask = nil
-                            self.generationStatusText = anyCompleted ? "✨ Agent completed task." : "✨ Agent completed maximum allowed steps (\(self.maxAgentSteps))."
+                            self.showStatus(anyCompleted ? "✨ Agent completed task." : "✨ Agent completed maximum allowed steps (\(self.maxAgentSteps)).")
                             self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)
                         }
                         return
@@ -7157,7 +5598,7 @@ struct ContentView: View {
                             guard self.ownsGeneration(myGenerationId) else { return }
                             self.isGeneratingText = false
                             self.generationTask = nil
-                            self.generationStatusText = "⏹ Generation stopped by user."
+                            self.showStatus("⏹ Generation stopped by user.")
                         }
                         return
                     }
@@ -7199,7 +5640,7 @@ struct ContentView: View {
                             )
                             self.sessions[sIdx].messages.append(nextMsg)
                         }
-                        self.generationStatusText = "⚠️ Tool call was cut off — asking the model to re-emit it..."
+                        self.showStatus("⚠️ Tool call was cut off — asking the model to re-emit it...")
                         self.startAutoregressiveGeneration(
                             customPrompt: nextPrompt,
                             promptTokens: splicedTokens,
@@ -7217,7 +5658,7 @@ struct ContentView: View {
                             guard self.ownsGeneration(myGenerationId) else { return }
                             self.isGeneratingText = false
                             self.generationTask = nil
-                            self.generationStatusText = "⏹ Generation stopped by user."
+                            self.showStatus("⏹ Generation stopped by user.")
                         }
                         return
                     }
@@ -7639,9 +6080,8 @@ struct ContentView: View {
                         // vocab-size-keyed token caches, which do not encode identity.
                         GrammarConstrainedSampler.shared.invalidateTokenizerCaches()
                     }
-                    self.errorMessage = nil
-                    self.selectedTensorID = nil
-                    self.gpuComputeOutput = nil
+                    // A previous load's failure notice is no longer true.
+                    self.clearStatus()
                     self.activeLoadedModelPath = filePath
                     // Publish the installed model to the headless engine (chat UI
                     // and API server share this one runtime snapshot).
@@ -7669,7 +6109,12 @@ struct ContentView: View {
                     // Only the current load may report its failure; a stale one
                     // must not clobber the engine a newer load installed.
                     guard self.modelLoadToken == token else { return }
-                    self.errorMessage = "Core Engine Error: \(error.localizedDescription)"
+                    // The reason belongs where the user can read it: the
+                    // sidebar keeps only "Engine Load Error", which is a
+                    // symptom without a cause.
+                    let reason = error.localizedDescription
+                    self.showStatus("❌ Engine load failed: \(reason)")
+                    self.recordLoadFailureInTranscript(reason)
                     self.summary = nil
                     self.engine = nil
                     self.shardBuffers.removeAll()
@@ -7693,72 +6138,6 @@ struct ContentView: View {
         }
         modelLoadTask = loadTask
         return loadTask
-    }
-
-    private func executeGpuShader(on tensor: TensorMetadata) {
-        guard let summary = summary,
-              let device = MTLCreateSystemDefaultDevice(),
-              let commandQueue = device.makeCommandQueue(),
-              let defaultLibrary = device.makeDefaultLibrary(),
-              let rawBaseBuffer = shardBuffers[tensor.shardIndex] else {
-            gpuComputeOutput = "❌ Error setting up Metal pipeline or missing shard buffer."
-            return
-        }
-
-        do {
-            let isBF16 = tensor.dtype.contains("BF16") || tensor.dtype.contains("FLOAT")
-            let sampleCount = 8
-            let outputByteLength = sampleCount * MemoryLayout<Float>.stride
-            guard let outputBuffer = device.makeBuffer(length: outputByteLength, options: .storageModeShared),
-                  let commandBuffer = commandQueue.makeCommandBuffer(),
-                  let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
-
-            let baseName = tensor.name.replacingOccurrences(of: ".weight", with: "").replacingOccurrences(of: ".scales", with: "").replacingOccurrences(of: ".weight_scale", with: "")
-
-            if isBF16 {
-                guard let kernelFunction = defaultLibrary.makeFunction(name: "dequantize_bf16_preview") else { return }
-                let pipelineState = try device.makeComputePipelineState(function: kernelFunction)
-                var weightOffset = tensor.offsetStart
-                computeEncoder.setComputePipelineState(pipelineState)
-                computeEncoder.setBuffer(rawBaseBuffer, offset: 0, index: 0)
-                computeEncoder.setBuffer(outputBuffer, offset: 0, index: 1)
-                computeEncoder.setBytes(&weightOffset, length: MemoryLayout<UInt64>.stride, index: 2)
-                computeEncoder.dispatchThreads(MTLSize(width: sampleCount, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: sampleCount, height: 1, depth: 1))
-            } else {
-                let weightTensor = summary.tensors.first(where: { $0.name == "\(baseName).weight" }) ?? tensor
-                let scaleTensor = summary.tensors.first(where: { $0.name == "\(baseName).weight_scale" || $0.name == "\(baseName).scales" || $0.name == "\(baseName).scale" })
-                let scaleShardRaw = (scaleTensor != nil) ? shardBuffers[scaleTensor!.shardIndex] : rawBaseBuffer
-
-                var weightOffset = weightTensor.offsetStart
-                var scaleOffset = scaleTensor?.offsetStart ?? 0
-
-                if let kernelFunction = defaultLibrary.makeFunction(name: "dequantize_fp8_row_scaled") {
-                    let pipelineState = try device.makeComputePipelineState(function: kernelFunction)
-                    computeEncoder.setComputePipelineState(pipelineState)
-                    computeEncoder.setBuffer(rawBaseBuffer, offset: 0, index: 0)
-                    computeEncoder.setBuffer(outputBuffer, offset: 0, index: 1)
-                    computeEncoder.setBuffer(scaleShardRaw, offset: 0, index: 2)
-                    computeEncoder.setBytes(&weightOffset, length: MemoryLayout<UInt64>.stride, index: 3)
-                    computeEncoder.setBytes(&scaleOffset, length: MemoryLayout<UInt64>.stride, index: 4)
-                    computeEncoder.dispatchThreads(MTLSize(width: sampleCount, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: sampleCount, height: 1, depth: 1))
-                }
-            }
-
-            computeEncoder.endEncoding()
-            commandBuffer.commit()
-            commandBuffer.waitUntilCompleted()
-
-            let rawFloatPtr = outputBuffer.contents().bindMemory(to: Float.self, capacity: sampleCount)
-            var sampleValues: [String] = []
-            for i in 0..<sampleCount {
-                sampleValues.append(String(format: "%.6f", rawFloatPtr[i]))
-            }
-
-            gpuComputeOutput = "⚡ Dequantized! First 8 values for '\(tensor.name)' (Shard #\(tensor.shardIndex)): [\(sampleValues.joined(separator: ", "))]"
-
-        } catch {
-            gpuComputeOutput = "❌ Pipeline Error: \(error.localizedDescription)"
-        }
     }
 
     #if os(macOS)

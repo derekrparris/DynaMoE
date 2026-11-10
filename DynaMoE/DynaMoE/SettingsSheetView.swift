@@ -24,7 +24,6 @@ enum SettingsTab: String, CaseIterable, Identifiable {
     case agent = "Agent & Tools"
     case cloud = "Cloud Providers"
     case server = "Server"
-    case advanced = "Advanced Diagnostics"
 
     var id: String { rawValue }
 
@@ -37,7 +36,6 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .agent: return "wrench.and.screwdriver.fill"
         case .cloud: return "cloud.fill"
         case .server: return "server.rack"
-        case .advanced: return "waveform.path.ecg"
         }
     }
 
@@ -58,8 +56,6 @@ enum SettingsTab: String, CaseIterable, Identifiable {
             return "Connect remote inference providers such as Synthetic: store API keys in the Keychain, verify the connection, and register cloud chat models."
         case .server:
             return "Serve the loaded model over a local OpenAI- and Anthropic-compatible API for clients like Crush; configure access and watch live activity."
-        case .advanced:
-            return "Inspect sharded SafeTensors metadata and run direct Metal kernel execution harnesses."
         }
     }
 
@@ -73,7 +69,6 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .agent: return .orange
         case .cloud: return .cyan
         case .server: return .blue
-        case .advanced: return .pink
         }
     }
 
@@ -94,8 +89,6 @@ enum SettingsTab: String, CaseIterable, Identifiable {
             return ["cloud", "provider", "synthetic", "synthetic.new", "remote", "api key", "connected provider", "deepseek", "cloud models", "keychain", "import", "stored credentials", "authorize", "login keychain"]
         case .server:
             return ["server", "api", "openai", "endpoint", "port", "api key", "completions", "local server", "crush", "http", "chat completions", "inference", "v1"]
-        case .advanced:
-            return ["diagnostics", "tensor", "inspector", "router", "metal", "kernel", "layer", "shard", "inspect"]
         }
     }
 }
@@ -184,7 +177,6 @@ struct SettingsSheetView: View {
     @Binding var presencePenalty: Float
     @Binding var maxNewTokens: Int
     @Binding var systemPrompt: String
-    @Binding var targetLayerCount: Int
     @Binding var activeProfile: ModelProfileType
 
     // Memory & Working Set bindings
@@ -202,38 +194,6 @@ struct SettingsSheetView: View {
     var pagingStatusMessage: String?
     var onFlushCache: () -> Void
     var onPreFaultAll: () -> Void
-
-    // Advanced Diagnostics bindings & callbacks
-    @Binding var searchText: String
-    @Binding var selectedCategory: String
-    var categoryFilters: [String]
-
-    private var filteredTensors: [TensorMetadata] {
-        guard let tensors = summary?.tensors else { return [] }
-        if searchText.isEmpty && selectedCategory == "All" {
-            return Array(tensors.prefix(100))
-        }
-        var matches: [TensorMetadata] = []
-        for tensor in tensors {
-            let matchesSearch = searchText.isEmpty || tensor.name.localizedCaseInsensitiveContains(searchText)
-            let matchesCategory = (selectedCategory == "All") || tensor.category.contains(selectedCategory)
-            if matchesSearch && matchesCategory {
-                matches.append(tensor)
-                if matches.count >= 100 {
-                    break
-                }
-            }
-        }
-        return matches
-    }
-    @Binding var selectedTensorID: String?
-    var selectedTensor: TensorMetadata?
-    var onExecuteMoERouter: (Int) -> Void
-    var onExecuteFullLayer: (Int) -> Void
-    var onExecuteMultiLayer: (Int) -> Void
-    var isExecutingMlp: Bool
-    var isExecutingFullLayer: Bool
-    var isExecutingMultiLayer: Bool
 
     var body: some View {
         NavigationSplitView(columnVisibility: .constant(.all)) {
@@ -317,8 +277,6 @@ struct SettingsSheetView: View {
                     cloudSettingsSection
                 case .server:
                     serverSettingsSection
-                case .advanced:
-                    advancedDiagnosticsSection
                 }
             }
             .padding(.horizontal, 28)
@@ -2525,89 +2483,6 @@ struct SettingsSheetView: View {
         Task { serverDashboardQueueDepth = await controller.pendingQueueDepth() }
         // The request-log rows refresh through the store's change signal
         // (see serverRequestLogCard), not this timer-driven stats pass.
-    }
-
-    // MARK: - Tab 6: Advanced Diagnostics & Inspector
-    private var advancedDiagnosticsSection: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            SettingsCard(spacing: 12) {
-                // Search & Filter
-                HStack(spacing: 8) {
-                    TextField("Search tensors by name...", text: $searchText)
-                        .textFieldStyle(.roundedBorder)
-
-                    Picker("Category", selection: $selectedCategory) {
-                        ForEach(categoryFilters, id: \.self) { cat in
-                            Text(cat).tag(cat)
-                        }
-                    }
-                    .frame(width: 160)
-                }
-
-                // Quick Diagnostics Execution Buttons
-                HStack(spacing: 8) {
-                    Button(action: { onExecuteMoERouter(0) }) {
-                        Label("Test Layer 0 Router", systemImage: "point.3.connected.trianglepath.dotted")
-                    }
-                    .buttonStyle(.bordered)
-
-                    Button(action: { onExecuteFullLayer(0) }) {
-                        Label(isExecutingFullLayer ? "Running..." : "Test Block L0", systemImage: "arrow.triangle.merge")
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(isExecutingFullLayer)
-
-                    Button(action: { onExecuteMultiLayer(targetLayerCount) }) {
-                        Label(isExecutingMultiLayer ? "Running..." : "Test Backbone (40L)", systemImage: "square.stack.3d.forward.dottedline.fill")
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(isExecutingMultiLayer)
-                }
-
-                Divider()
-
-                // Tensors Table
-                Text("Tensors (\(filteredTensors.count) matching)")
-                    .font(.caption)
-                    .fontWeight(.semibold)
-                    .foregroundColor(.secondary)
-
-                ScrollView {
-                    LazyVStack(spacing: 4) {
-                        ForEach(filteredTensors.prefix(100)) { tensor in
-                            HStack {
-                                Text(tensor.name)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .lineLimit(1)
-                                Spacer()
-                                Text("Shard #\(tensor.shardIndex)")
-                                    .font(.system(size: 10))
-                                    .foregroundColor(.secondary)
-                                Text(tensor.dtype)
-                                    .font(.system(size: 10, design: .monospaced))
-                                    .foregroundColor(.purple)
-                                Text(tensor.category)
-                                    .font(.system(size: 10))
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(Color.secondary.opacity(0.1))
-                                    .cornerRadius(4)
-                            }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(tensor.name == selectedTensorID ? Color.purple.opacity(0.12) : Color.clear)
-                            .cornerRadius(6)
-                            .onTapGesture {
-                                selectedTensorID = tensor.name
-                            }
-                        }
-                    }
-                }
-                .frame(height: 220)
-                .background(Color.settingsPaneBackground)
-                .cornerRadius(8)
-            }
-        }
     }
 
     // MARK: - Model Profile Management Helpers & Views

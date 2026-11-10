@@ -77,6 +77,32 @@ nonisolated enum ImageAttachmentError: LocalizedError, Equatable {
     }
 }
 
+/// Refusal copy for a model with no vision tower. One owner, because the same
+/// fact is reported from the composer (a drop, a paste, a pick) and from the
+/// turn path (a send or a queue of an already-staged image), and three drifting
+/// copies of it is how a user ends up with two different explanations for one
+/// model.
+nonisolated enum ImageAttachmentMessages {
+    /// The composer path: the caller is trying to attach, so switching models is
+    /// the fix and there is nothing to remove yet.
+    static func cannotSeeImagesAttach(modelName: String?) -> String {
+        "\(modelPhrase(modelName)) cannot see images. Switch to a vision-capable model to attach one."
+    }
+
+    /// The send/queue path: an attachment is already staged, so removing it is an
+    /// equally valid fix.
+    static func cannotSeeImagesSend(modelName: String?) -> String {
+        "\(modelPhrase(modelName)) cannot see images. Switch to a vision-capable model, or remove the attachment."
+    }
+
+    /// Names the model when one is known, because "this model" is unhelpful in a
+    /// conversation that has been switching between them.
+    private static func modelPhrase(_ modelName: String?) -> String {
+        let trimmed = modelName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "This model" : trimmed
+    }
+}
+
 nonisolated enum ImageAttachmentPreparer {
     /// 4096 is the "low detail" tile of most vision APIs; 1024 keeps text legible
     /// while staying inside one tile's worth of tokens.

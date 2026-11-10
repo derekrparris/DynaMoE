@@ -22,7 +22,7 @@ final class SettingsWindowManager: NSObject, NSWindowDelegate {
         super.init()
     }
 
-    func show<Content: View>(title: String = "Settings & Diagnostics", content: @escaping () -> Content) {
+    func show<Content: View>(title: String = "Settings", content: @escaping () -> Content) {
         let view = content()
 
         if let existingWindow = window {

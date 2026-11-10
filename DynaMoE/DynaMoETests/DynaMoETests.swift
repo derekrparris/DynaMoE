@@ -4914,9 +4914,9 @@ final class DynaMoETests: XCTestCase {
     }
 
     func testHelpTopicsAndSettingsGuideCoverage() throws {
-        // 1. Verify all 12 HelpTopic enum cases are present
+        // 1. Verify all 11 HelpTopic enum cases are present
         let topics = HelpTopic.allCases
-        XCTAssertEqual(topics.count, 12, "HelpTopic must have exactly 12 documented sections")
+        XCTAssertEqual(topics.count, 11, "HelpTopic must have exactly 11 documented sections")
 
         // 2. Verify all topics have valid non-empty titles and SF Symbols
         for topic in topics {
@@ -4935,11 +4935,10 @@ final class DynaMoETests: XCTestCase {
         XCTAssertTrue(topicRawValues.contains("KV Cache Precision"))
         XCTAssertTrue(topicRawValues.contains("JetSpec Acceleration"))
         XCTAssertTrue(topicRawValues.contains("Agent & Tool Execution"))
-        XCTAssertTrue(topicRawValues.contains("Advanced Diagnostics"))
         XCTAssertTrue(topicRawValues.contains("Hardware Profiles (16GB - 128GB)"))
         XCTAssertTrue(topicRawValues.contains("Troubleshooting & FAQs"))
 
-        print("  ✅ [TEST] Help topics and settings guide coverage verified with 12 distinct sections.")
+        print("  ✅ [TEST] Help topics and settings guide coverage verified with 11 distinct sections.")
     }
 
     func testGDNSiLUGatingKernel() throws {

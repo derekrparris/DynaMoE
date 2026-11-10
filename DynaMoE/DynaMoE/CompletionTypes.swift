@@ -323,10 +323,6 @@ internal struct TurnFailure: Sendable {
     var message: String
     var cancelled: Bool
     var tokensGenerated: Int
-    /// The consumer should treat message as generation status text AND
-    /// gpuComputeOutput-style error text (chat behavior); server consumers
-    /// may ignore and emit their own error payload.
-    var isTechnicalError: Bool
     /// Clear streaming placeholder flags (prefill status, isThinking) on the
     /// live message owned by the consumer.
     var clearStreamingPlaceholders: Bool
@@ -336,14 +332,12 @@ internal struct TurnFailure: Sendable {
         message: String,
         cancelled: Bool,
         tokensGenerated: Int = 0,
-        isTechnicalError: Bool = true,
         clearStreamingPlaceholders: Bool = true
     ) {
         self.kind = kind
         self.message = message
         self.cancelled = cancelled
         self.tokensGenerated = tokensGenerated
-        self.isTechnicalError = isTechnicalError
         self.clearStreamingPlaceholders = clearStreamingPlaceholders
     }
 }

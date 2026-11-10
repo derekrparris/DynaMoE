@@ -18,7 +18,6 @@ enum HelpTopic: String, CaseIterable, Identifiable {
     case jetSpec = "JetSpec Acceleration"
     case agent = "Agent & Tool Execution"
     case server = "Local Inference Server"
-    case diagnostics = "Advanced Diagnostics"
     case hardware = "Hardware Profiles (16GB - 128GB)"
     case faq = "Troubleshooting & FAQs"
 
@@ -35,7 +34,6 @@ enum HelpTopic: String, CaseIterable, Identifiable {
         case .jetSpec: return "bolt.fill"
         case .agent: return "wrench.and.screwdriver.fill"
         case .server: return "server.rack"
-        case .diagnostics: return "waveform.path.ecg"
         case .hardware: return "laptopcomputer"
         case .faq: return "questionmark.circle.fill"
         }
@@ -177,8 +175,6 @@ struct HelpAndSettingsGuideView: View {
             agentSection
         case .server:
             serverSection
-        case .diagnostics:
-            diagnosticsSection
         case .hardware:
             hardwareSection
         case .faq:
@@ -200,7 +196,7 @@ struct HelpAndSettingsGuideView: View {
 
             infoBox(title: "Keyboard Shortcuts", icon: "command") {
                 VStack(alignment: .leading, spacing: 6) {
-                    shortcutRow("⌘,", "Open Settings & Diagnostics")
+                    shortcutRow("⌘,", "Open Settings")
                     shortcutRow("⌘?", "Open this Help & Settings Guide")
                     shortcutRow("⌘0", "Actual Size (Reset Zoom)")
                     shortcutRow("⌘=", "Zoom In")
@@ -539,27 +535,8 @@ struct HelpAndSettingsGuideView: View {
         }
     }
 
-    // MARK: - 10. Advanced Diagnostics
-    private var diagnosticsSection: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            headerBadge("Advanced Diagnostics Section", color: .red)
 
-            Text("Metal Shaders & Tensor Inspector")
-                .font(.title2).bold()
-
-            Text("The Advanced Diagnostics panel allows developers and researchers to inspect SafeTensors shards and execute Metal compute kernels in isolation.")
-                .font(.body)
-
-            VStack(alignment: .leading, spacing: 8) {
-                bulletPoint("Tensor Inspector", "Search through hundreds of tensors by name and filter by category (Self-Attention, MoE Router, Routed Expert, Shared Expert, Embedding, LM Head) to inspect shard index, data types, and categories.")
-                bulletPoint("Test Layer 0 Router", "Runs the Top-K gating shader to verify softmax routing probability distribution and expert index selection.")
-                bulletPoint("Test Block L0", "Computes a complete forward pass through one transformer layer to measure execution time.")
-                bulletPoint("Test Backbone (Multi-Layer)", "Chains N consecutive layers through double-buffered command encoders to profile raw GPU latency in milliseconds.")
-            }
-        }
-    }
-
-    // MARK: - 11. Hardware Profiles
+    // MARK: - 10. Hardware Profiles
     private var hardwareSection: some View {
         VStack(alignment: .leading, spacing: 16) {
             headerBadge("Hardware Recommendations", color: .mint)
@@ -575,7 +552,7 @@ struct HelpAndSettingsGuideView: View {
         }
     }
 
-    // MARK: - 12. Troubleshooting & FAQs
+    // MARK: - 11. Troubleshooting & FAQs
     private var faqSection: some View {
         VStack(alignment: .leading, spacing: 16) {
             headerBadge("FAQs & Troubleshooting", color: .pink)
