@@ -1068,7 +1068,6 @@ public final class CompletionEngine: @unchecked Sendable {
                                 message: "⏹ Generation stopped by user.",
                                 cancelled: true,
                                 tokensGenerated: output.tokensGenerated,
-                                isTechnicalError: false,
                                 clearStreamingPlaceholders: false
                             )))
                             return
@@ -11125,7 +11124,7 @@ if layer.attnGateProjTensor != nil,
                     if !ok {
                         PrefillTransientPool.shared.drain()
                         let prefillCancelled = Task.isCancelled
-                        emit(.failedTurn(TurnFailure(kind: .prefillFailed, message: prefillCancelled ? "⏹ Generation stopped by user." : "❌ Ingestion failed during prefill.", cancelled: prefillCancelled, tokensGenerated: 0, isTechnicalError: !prefillCancelled, clearStreamingPlaceholders: true)))
+                        emit(.failedTurn(TurnFailure(kind: .prefillFailed, message: prefillCancelled ? "⏹ Generation stopped by user." : "❌ Ingestion failed during prefill.", cancelled: prefillCancelled, tokensGenerated: 0, clearStreamingPlaceholders: true)))
                         return
                     }
                 }
@@ -11170,7 +11169,7 @@ if layer.attnGateProjTensor != nil,
                     }
                     if !ok {
                         let fwdCancelled = Task.isCancelled
-                        emit(.failedTurn(TurnFailure(kind: .forwardPassFailed, message: fwdCancelled ? "⏹ Generation stopped by user." : "❌ Inference forward pass failed.", cancelled: fwdCancelled, tokensGenerated: tokensGenerated, isTechnicalError: !fwdCancelled, clearStreamingPlaceholders: true)))
+                        emit(.failedTurn(TurnFailure(kind: .forwardPassFailed, message: fwdCancelled ? "⏹ Generation stopped by user." : "❌ Inference forward pass failed.", cancelled: fwdCancelled, tokensGenerated: tokensGenerated, clearStreamingPlaceholders: true)))
                         return
                     }
                     currentStep += 1
@@ -11437,7 +11436,7 @@ if layer.attnGateProjTensor != nil,
             // from the streaming updates above, so nothing is lost by returning.
             if Task.isCancelled {
                 print("⏹ [GEN] cancelled at \(tokensGenerated) tokens — skipping finalization")
-                emit(.failedTurn(TurnFailure(kind: .cancelled, message: "⏹ Generation stopped by user.", cancelled: true, tokensGenerated: tokensGenerated, isTechnicalError: false, clearStreamingPlaceholders: false)))
+                emit(.failedTurn(TurnFailure(kind: .cancelled, message: "⏹ Generation stopped by user.", cancelled: true, tokensGenerated: tokensGenerated, clearStreamingPlaceholders: false)))
                 return
             }
 
@@ -11479,7 +11478,7 @@ if layer.attnGateProjTensor != nil,
                 // stop.
                 if Task.isCancelled {
                     print("⏹ [GEN] cancelled during prefix backfill — skipping finalization")
-                    emit(.failedTurn(TurnFailure(kind: .cancelled, message: "⏹ Generation stopped by user.", cancelled: true, tokensGenerated: tokensGenerated, isTechnicalError: false, clearStreamingPlaceholders: false)))
+                    emit(.failedTurn(TurnFailure(kind: .cancelled, message: "⏹ Generation stopped by user.", cancelled: true, tokensGenerated: tokensGenerated, clearStreamingPlaceholders: false)))
                     return
                 }
                 // A failed forward means the tail is short of the tokens the pin
@@ -11489,7 +11488,7 @@ if layer.attnGateProjTensor != nil,
                 if backfillFailed {
                     print("⚠️ [GEN] prefix backfill forward failed at \(backfillPos)/\(totalContextTokens) — dropping the pinned prefix")
                     PrefixCacheManager.shared.invalidate(sessionId: sessionId)
-                    emit(.failedTurn(TurnFailure(kind: .backfillFailed, message: "❌ Prefix backfill failed; generation stopped.", cancelled: false, tokensGenerated: tokensGenerated, isTechnicalError: true, clearStreamingPlaceholders: true)))
+                    emit(.failedTurn(TurnFailure(kind: .backfillFailed, message: "❌ Prefix backfill failed; generation stopped.", cancelled: false, tokensGenerated: tokensGenerated, clearStreamingPlaceholders: true)))
                     return
                 }
             }

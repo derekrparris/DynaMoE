@@ -17,6 +17,22 @@ import SwiftUI
 
 /// What a surface is momentarily saying, and whether it clears itself.
 nonisolated struct StatusNotice: Identifiable, Equatable {
+    /// Which surface raised the notice. Both surfaces mint their serials from
+    /// zero and the floating layer renders them in ONE `ForEach`, so without
+    /// this the first notice from each is identity 1: SwiftUI would drop one
+    /// pill or animate it onto the other's slot.
+    enum Source: Hashable {
+        case window
+        case composer
+    }
+
+    /// A serial plus the surface that minted it. `stacked` keeps both sides when
+    /// their texts differ, so uniqueness has to hold across the pair.
+    struct Identity: Hashable {
+        let source: Source
+        let serial: UInt64
+    }
+
     enum Kind: Equatable {
         case info
         case success
@@ -28,7 +44,7 @@ nonisolated struct StatusNotice: Identifiable, Equatable {
         var autoDismisses: Bool { self != .progress }
     }
 
-    let id: UInt64
+    let id: Identity
     let kind: Kind
     let text: String
 }
@@ -52,15 +68,18 @@ nonisolated enum StatusNoticePolicy {
 
     static let appleFoundationModelGeneratingText = "🍎 Apple Foundation Model — generating…"
 
-    /// True when `text` is already on screen, so a repeated message restarts its
-    /// dismissal timer without re-running the fade.
+    /// True when `text` is already on screen on `source`, so a repeated message
+    /// restarts its dismissal timer without re-running the fade. The surface is
+    /// part of the comparison: the same sentence on the other surface is a
+    /// different pill with its own identity, and the layer may show both.
     static func isRepeat(
         text: String,
         kind: StatusNotice.Kind,
+        source: StatusNotice.Source,
         current: StatusNotice?
     ) -> Bool {
         guard let current else { return false }
-        return current.text == text && current.kind == kind
+        return current.id.source == source && current.text == text && current.kind == kind
     }
 
     /// The severity each leading glyph states. The call sites and this table are
@@ -71,8 +90,9 @@ nonisolated enum StatusNoticePolicy {
     private static let severityByGlyph: [(glyph: String, kind: StatusNotice.Kind)] = [
         ("✅", .success),
         ("✨", .success),
-        // A stop the user asked for is an outcome, not a fault: it reads as
-        // neutral, while a guard or a failure is the thing worth an orange pill.
+        // A stop the user asked for is an outcome, not a fault: it is neutral,
+        // while a guard or a failure is the thing worth an orange pill.
+        ("⏹", .info),
         ("⚠️", .warning),
         ("❌", .warning),
         ("🛡️", .warning)
@@ -137,19 +157,28 @@ struct StatusNoticeBubble: View {
         }
     }
 
+    /// The pill's body size: 11 pt, the size macOS reads body copy at, with a
+    /// floor so a 0.6x zoom does not shrink feedback below what is legible. The
+    /// zoom still governs it up to 2.5x.
+    private static func typeSize(_ zoomScale: CGFloat) -> CGFloat {
+        max(10, 11 * zoomScale)
+    }
+
     var body: some View {
         HStack(spacing: 6) {
             if notice.kind == .progress {
                 ProgressView()
                     .controlSize(.small)
-                    .scaleEffect(0.7)
+                    // Sized to the text beside it rather than to a fixed scale, so
+                    // the wait indicator tracks the pill through a zoom change.
+                    .scaleEffect(max(0.6, 0.7 * zoomScale))
             } else {
                 Image(systemName: glyph)
-                    .font(.system(size: max(9, 10.5 * zoomScale), weight: .semibold))
+                    .font(.system(size: Self.typeSize(zoomScale), weight: .semibold))
                     .foregroundColor(tint)
             }
             Text(notice.text)
-                .font(.system(size: max(9, 10.5 * zoomScale), weight: .medium))
+                .font(.system(size: Self.typeSize(zoomScale), weight: .medium))
                 .foregroundColor(notice.kind == .warning || notice.kind == .success ? tint : .primary)
                 .lineLimit(3)
                 .fixedSize(horizontal: false, vertical: true)

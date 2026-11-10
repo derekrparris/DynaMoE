@@ -323,11 +323,6 @@ internal struct TurnFailure: Sendable {
     var message: String
     var cancelled: Bool
     var tokensGenerated: Int
-    /// True when the failure is a fault rather than a user stop. The chat window
-    /// renders every failure through the same transient notice, whose severity
-    /// comes from the message's own leading glyph, so nothing reads this today;
-    /// it stays as the engine's own record of which kind of ending it reported.
-    var isTechnicalError: Bool
     /// Clear streaming placeholder flags (prefill status, isThinking) on the
     /// live message owned by the consumer.
     var clearStreamingPlaceholders: Bool
@@ -337,14 +332,12 @@ internal struct TurnFailure: Sendable {
         message: String,
         cancelled: Bool,
         tokensGenerated: Int = 0,
-        isTechnicalError: Bool = true,
         clearStreamingPlaceholders: Bool = true
     ) {
         self.kind = kind
         self.message = message
         self.cancelled = cancelled
         self.tokensGenerated = tokensGenerated
-        self.isTechnicalError = isTechnicalError
         self.clearStreamingPlaceholders = clearStreamingPlaceholders
     }
 }

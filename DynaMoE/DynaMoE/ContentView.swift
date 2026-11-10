@@ -256,6 +256,10 @@ struct ContentView: View {
     /// turn outcomes. It is drawn as an overlay like the zoom HUD, never as a
     /// row, so a message can never resize the layout it is reporting on.
     @State private var statusNotice: StatusNotice? = nil
+    /// The conversation a window notice is about, or nil when it is about the app
+    /// itself. Compaction and on-device generation describe work inside one chat,
+    /// so their pills are withheld while another chat is on screen.
+    @State private var statusNoticeSessionId: UUID? = nil
     /// Mints notice identities, so a repeat of the same text still restarts the
     /// dismissal timer.
     @State private var statusSerial: UInt64 = 0
@@ -1337,7 +1341,11 @@ struct ContentView: View {
     /// in place can take down exactly its own pill when it finishes. A notice
     /// that replaced it keeps its own identity and is left alone.
     @discardableResult
-    private func showStatus(_ text: String, kind: StatusNotice.Kind? = nil) -> UInt64 {
+    private func showStatus(
+        _ text: String,
+        kind: StatusNotice.Kind? = nil,
+        sessionId: UUID? = nil
+    ) -> StatusNotice.Identity {
         let resolved = kind ?? StatusNoticePolicy.kind(for: text)
         assert(
             !StatusNoticePolicy.statesContradictorySeverity(text: text, kind: resolved),
@@ -1347,44 +1355,60 @@ struct ContentView: View {
         statusDismissTask = nil
         // A repeat of what is already on screen keeps its identity, so it does
         // not re-run the fade, but it does restart the dismissal timer.
-        let id: UInt64
-        let isRepeat = StatusNoticePolicy.isRepeat(text: text, kind: resolved, current: statusNotice)
-        if isRepeat {
-            id = statusNotice?.id ?? 0
+        let isRepeat = StatusNoticePolicy.isRepeat(
+            text: text, kind: resolved, source: .window, current: statusNotice
+        )
+        let identity: StatusNotice.Identity
+        if isRepeat, let current = statusNotice {
+            identity = current.id
         } else {
             statusSerial &+= 1
-            id = statusSerial
+            identity = StatusNotice.Identity(source: .window, serial: statusSerial)
         }
-        statusNotice = StatusNotice(id: id, kind: resolved, text: text)
+        statusNotice = StatusNotice(id: identity, kind: resolved, text: text)
+        // Every notice states its scope: a work pill belongs to one conversation
+        // and must not float over another, while the rest are about the app.
+        statusNoticeSessionId = sessionId
         // An overlay is not reachable by tabbing, so announce it instead — once
         // per identity, because a repeat is the same sentence continued.
         if !isRepeat {
             AccessibilityNotification.Announcement(text).post()
         }
-        guard resolved.autoDismisses else { return id }
+        guard resolved.autoDismisses else { return identity }
         statusDismissTask = Task {
             try? await Task.sleep(nanoseconds: StatusNoticePolicy.autoDismissNanoseconds)
-            guard !Task.isCancelled, statusNotice?.id == id else { return }
+            guard !Task.isCancelled, statusNotice?.id == identity else { return }
             withAnimation(.easeOut(duration: 0.15)) {
                 statusNotice = nil
             }
             statusDismissTask = nil
         }
-        return id
+        return identity
     }
 
     private func clearStatus() {
         statusDismissTask?.cancel()
         statusDismissTask = nil
         statusNotice = nil
+        statusNoticeSessionId = nil
     }
 
     /// Clears the notice only if it is still the one `id` names. Progress work can
     /// finish after another message has taken the pill — a late finisher must not
     /// retract somebody else's notice.
-    private func clearStatus(ifIdentity id: UInt64) {
+    private func clearStatus(ifIdentity id: StatusNotice.Identity) {
         guard statusNotice?.id == id else { return }
         clearStatus()
+    }
+
+    /// The window notice the visible chat column may draw. A pill about one
+    /// conversation is withheld while another is on screen — the transcript's own
+    /// progress row is keyed to the session for the same reason — while a notice
+    /// about the app stays visible everywhere.
+    private var visibleStatusNotice: StatusNotice? {
+        guard let statusNotice else { return nil }
+        guard let statusNoticeSessionId else { return statusNotice }
+        return statusNoticeSessionId == (selectedSessionId ?? sessions.first?.id) ? statusNotice : nil
     }
 
     /// A load failure is the one status line whose cause is long and whose effect
@@ -1482,7 +1506,7 @@ struct ContentView: View {
                     thinkingEffort: levelCapable ? thinkingEffortForActiveSession : nil,
                     supportsThinkingLevels: levelCapable,
                     supportsVision: activeModelSupportsVision,
-                    windowNotice: statusNotice,
+                    windowNotice: visibleStatusNotice,
                     isHistoryUnavailable: !sessionStore.isPersistenceAvailable,
                     visionCostLabel: { image in
                         guard let estimate = ModelConfig.visionCostEstimate(
@@ -2250,7 +2274,8 @@ struct ContentView: View {
         // silent for the rest of it. The task's own defer retracts it.
         let compactionStatusId = showStatus(
             StatusNoticePolicy.compactionText(messageCount: evictedCount),
-            kind: .progress
+            kind: .progress,
+            sessionId: sessionId
         )
         Task { @MainActor in
             defer {
@@ -3347,7 +3372,8 @@ struct ContentView: View {
         // while the work it named was still running.
         let afmStatusId = showStatus(
             StatusNoticePolicy.appleFoundationModelGeneratingText,
-            kind: .progress
+            kind: .progress,
+            sessionId: sessionId
         )
         if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }),
            let mIdx = sessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) {
@@ -4794,7 +4820,7 @@ struct ContentView: View {
                             guard self.ownsGeneration(myGenerationId) else { return }
                             self.isGeneratingText = false
                             self.generationTask = nil
-                            self.showStatus(failure.message, kind: .warning)
+                            self.showStatus(failure.message)
                             if let sId = sessionId, let mId = messageId,
                                let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
                                let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
@@ -4806,7 +4832,7 @@ struct ContentView: View {
                         await MainActor.run {
                             self.isGeneratingText = false
                             self.generationTask = nil
-                            self.showStatus(failure.message, kind: .warning)
+                            self.showStatus(failure.message)
                             if let sId = sessionId, let mId = messageId,
                                let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
                                let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {
@@ -4822,7 +4848,7 @@ struct ContentView: View {
                             guard self.ownsGeneration(myGenerationId) else { return }
                             self.isGeneratingText = false
                             self.generationTask = nil
-                            self.showStatus(failure.message, kind: .warning)
+                            self.showStatus(failure.message)
                             if let sId = sessionId, let mId = messageId,
                                let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
                                let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }) {

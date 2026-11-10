@@ -1556,20 +1556,26 @@ struct ChatDetailView: View {
         noticeDismissTask = nil
         // A repeat of what is already on screen keeps its identity, so it does
         // not re-run the fade, but it does restart the dismissal timer.
-        let id: UInt64
-        if StatusNoticePolicy.isRepeat(text: text, kind: kind, current: composerNotice) {
-            id = composerNotice?.id ?? 0
+        let isRepeat = StatusNoticePolicy.isRepeat(
+            text: text, kind: kind, source: .composer, current: composerNotice
+        )
+        let identity: StatusNotice.Identity
+        if isRepeat, let current = composerNotice {
+            identity = current.id
         } else {
             noticeSerial &+= 1
-            id = noticeSerial
+            identity = StatusNotice.Identity(source: .composer, serial: noticeSerial)
         }
-        composerNotice = StatusNotice(id: id, kind: kind, text: text)
-        // The old row was reachable by tabbing; an overlay is not, so announce it.
-        AccessibilityNotification.Announcement(text).post()
+        composerNotice = StatusNotice(id: identity, kind: kind, text: text)
+        // The old row was reachable by tabbing; an overlay is not, so announce it
+        // — once per identity, because a repeat is the same sentence continued.
+        if !isRepeat {
+            AccessibilityNotification.Announcement(text).post()
+        }
         guard kind.autoDismisses else { return }
         noticeDismissTask = Task {
             try? await Task.sleep(nanoseconds: StatusNoticePolicy.autoDismissNanoseconds)
-            guard !Task.isCancelled, composerNotice?.id == id else { return }
+            guard !Task.isCancelled, composerNotice?.id == identity else { return }
             withAnimation(.easeOut(duration: 0.15)) {
                 composerNotice = nil
             }
