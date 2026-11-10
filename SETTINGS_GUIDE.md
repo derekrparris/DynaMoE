@@ -1,6 +1,6 @@
 # DynaMoE Settings & User Guide
 
-A comprehensive, practical guide to configuring, tuning, and operating DynaMoE on Apple Silicon. This document details every section of the **Settings & Diagnostics** window (`⌘,`) — which presents a sidebar of sections on the left and their controls on the right, matching the macOS System Settings layout — explains the underlying mathematics and runtime mechanics, provides battle-tested presets for coding versus conversational assistance, and offers memory budgeting advice for Mac hardware configurations.
+A comprehensive, practical guide to configuring, tuning, and operating DynaMoE on Apple Silicon. This document details every section of the **Settings** window (`⌘,`) — which presents a sidebar of sections on the left and their controls on the right, matching the macOS System Settings layout — explains the underlying mathematics and runtime mechanics, provides battle-tested presets for coding versus conversational assistance, and offers memory budgeting advice for Mac hardware configurations.
 
 ---
 
@@ -45,10 +45,7 @@ A comprehensive, practical guide to configuring, tuning, and operating DynaMoE o
    - [Registering Cloud Models](#registering-cloud-models)
    - [Image Input (Vision-Capable Cloud Models)](#image-input-vision-capable-cloud-models)
    - [What a Cloud Turn Supports](#what-a-cloud-turn-supports)
-9. [Advanced Diagnostics](#advanced-diagnostics)
-   - [SafeTensors Sharded Metadata & Search](#safetensors-sharded-metadata--search)
-   - [Direct Metal Kernel Execution Harness](#direct-metal-kernel-execution-harness)
-10. [Hardware Profiles & Recommended Configurations](#10-hardware-profiles--recommended-configurations)
+9. [Hardware Profiles & Recommended Configurations](#9-hardware-profiles--recommended-configurations)
    - [16 GB Unified RAM (M1/M2/M3/M4)](#16-gb-unified-ram-m1m2m3m4)
    - [24 GB – 36 GB Unified RAM](#24-gb--36-gb-unified-ram)
    - [64 GB – 128 GB+ Unified RAM (M-Max / M-Ultra)](#64-gb--128-gb-unified-ram-m-max--m-ultra)
@@ -582,7 +579,7 @@ On the wire an attached user turn becomes `content: [{"type":"text",…}, {"type
 
 A model marked capable that rejects the image part is un-marked automatically (the Settings switch turns off), the turn is retried once without the picture, and a system message records it in the transcript. Only error bodies that name the image part itself trigger this, so an unrelated `400` never disables a working model. Re-mark it only after confirming the model really accepts images. Attachment files live at `~/Library/Application Support/DynaMoE/sessions/assets/<session>/`; deleting a conversation or letting auto-deletion prune it removes its images too.
 
-Local weights and the Apple on-device model are text-only in this release, so attaching an image there is refused with a notice. The local inference server answers an `image_url` / `image` content part with `400` and `"code": "unsupported_content"` rather than silently stripping it.
+For local weights, vision is a property of the checkpoint rather than a switch: a family whose snapshot ships an image tower (`DeepSeek-V4.1-Flash-1017` today) takes images in the chat window and over the local inference server, and every other family plus the Apple on-device model is text-only, so attaching an image there is refused with a notice and the disabled attach menu items say why. The composer writes one image marker per attachment and prices the expanded prompt before the tower runs, so the chip's estimate is the encode it will pay. The local inference server answers an `image_url` / `image` content part with `400` and `"code": "unsupported_content"` when the loaded checkpoint publishes no tower, rather than silently stripping it, and the models list advertises `capabilities.vision` plus what an image costs so a client can discover either without sending one.
 
 ### What a Cloud Turn Supports
 - **Streaming** SSE text and, when the model reports it, `reasoning_content` thinking deltas in the usual accordion. Token counts come from the provider's `usage` when reported and fall back to character estimation. The provider's optional `stream_options.include_usage` field is retried without it if the endpoint rejects it.
@@ -598,38 +595,7 @@ Local weights and the Apple on-device model are text-only in this release, so at
 
 ---
 
-## 9. Advanced Diagnostics
-
-The **Advanced Diagnostics** section is an engineering inspection suite for validating Metal shaders, examining raw SafeTensors tensors, and testing layer forward execution independently of chat generation.
-
-```text
-┌────────────────────────────────────────────────────────────────────────┐
-│  Advanced Diagnostics Section                                          │
-│  Category Filter: [ All ] [ Attention ] [ Experts ] [ Router ] [ Norm ]│
-│  Search Tensors:  [ model.layers.0.mlp... ]                            │
-│                                                                        │
-│  Selected: model.layers.0.mlp.experts.0.gate_proj.weight               │
-│  • Shape: [1024, 2048]  • Dtype: F16  • Offset: 0x0042F000 (1.42 MB)   │
-│                                                                        │
-│  Kernel Execution Harness:                                             │
-│  [ Execute Router Top-K ]  [ Execute Full Layer ]  [ Multi-Layer Test ]│
-└────────────────────────────────────────────────────────────────────────┘
-```
-
-### SafeTensors Sharded Metadata & Search
-- Live search over hundreds of tensors in multi-gigabyte models.
-- Filter by structural category: *Embedding*, *Attention*, *Routing*, *Experts*, *Normalization*, and *LM Head*.
-- Inspect byte offsets, memory shard indices, dimensions, data types, and total tensor memory footprint.
-
-### Direct Metal Kernel Execution Harness
-Test GPU compute pipelines in isolation without running full autoregressive generation:
-- **Execute MoE Router**: Runs the Top-$K$ gating kernel on the selected layer to verify softmax routing probability distribution and expert index selection.
-- **Execute Full Layer**: Computes a complete forward pass through one transformer layer (RMSNorm $\to$ DeltaNet/Attention $\to$ Gated Residual $\to$ MoE/Dense MLP $\to$ PostNorm).
-- **Multi-Layer Test**: Chains $N$ consecutive layers through double-buffered Metal command encoders to measure raw GPU layer compute latency in milliseconds.
-
----
-
-## 10. Hardware Profiles & Recommended Configurations
+## 9. Hardware Profiles & Recommended Configurations
 
 ### 16 GB Unified RAM (M1/M2/M3/M4)
 - **Primary Model**: `ornith-ai/Ornith-1.5-9B` (Dense Hybrid GDN; BF16 weights stream from SSD).

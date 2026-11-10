@@ -68,31 +68,6 @@ inline float read_f32_unaligned(device const uchar* p) {
     return as_type<float>(bits);
 }
 
-/// MSL Kernel: Dequantizes per-row scaled FP8 weights for preview
-kernel void dequantize_fp8_row_scaled(
-    device const uchar* rawBaseBuffer [[buffer(0)]],
-    device float* outputPreview [[buffer(1)]],
-    device const ushort* rawScaleBuffer [[buffer(2)]],
-    constant uint64_t& weightOffset [[buffer(3)]],
-    constant uint64_t& scaleOffset [[buffer(4)]],
-    uint id [[thread_position_in_grid]]
-) {
-    float scale = bf16_to_fp32(rawScaleBuffer[scaleOffset / 2]);
-    uchar rawFp8Byte = rawBaseBuffer[weightOffset + id];
-    outputPreview[id] = unpack_e4m3(rawFp8Byte) * scale;
-}
-
-/// MSL Kernel: Dequantizes raw BF16 weights for preview
-kernel void dequantize_bf16_preview(
-    device const ushort* rawBaseBuffer [[buffer(0)]],
-    device float* outputPreview [[buffer(1)]],
-    constant uint64_t& weightOffset [[buffer(2)]],
-    uint id [[thread_position_in_grid]]
-) {
-    ushort rawBf16 = rawBaseBuffer[(weightOffset / 2) + id];
-    outputPreview[id] = bf16_to_fp32(rawBf16);
-}
-
 /// MSL Kernel: Unpacks 4 FP8 weights per U32 word and scales them via paired U8 block scales
 kernel void dequantize_mxfp8_paired(
     device const uchar* rawBaseBuffer [[buffer(0)]],
@@ -119,28 +94,6 @@ kernel void dequantize_mxfp8_paired(
     float blockScale = decode_e8m0_scale(scaleByte);
     
     outputPreview[id] = unscaledWeight * blockScale;
-}
-
-/// MSL Kernel: Looks up token IDs in mapped FP8 (compressed-tensors) embedding tables with BF16 row scales
-kernel void lookup_embeddings_fp8(
-    device const uchar* rawBaseBuffer [[buffer(0)]],
-    device const uint32_t* tokenIds [[buffer(1)]],
-    device float* outputHiddenStates [[buffer(2)]],
-    device const ushort* rawScaleBuffer [[buffer(3)]],
-    constant uint64_t& weightOffset [[buffer(4)]],
-    constant uint64_t& scaleOffset [[buffer(5)]],
-    constant uint32_t& hiddenDim [[buffer(6)]],
-    uint id [[thread_position_in_grid]]
-) {
-    uint tokenIdx = id / hiddenDim;
-    uint dimIdx = id % hiddenDim;
-    uint32_t targetTokenId = tokenIds[tokenIdx];
-    
-    float rowScale = bf16_to_fp32(rawScaleBuffer[(scaleOffset / 2) + targetTokenId]);
-    uint64_t globalIdx = weightOffset + ((uint64_t)targetTokenId * hiddenDim) + dimIdx;
-    uchar rawFp8Byte = rawBaseBuffer[globalIdx];
-    
-    outputHiddenStates[id] = unpack_e4m3(rawFp8Byte) * rowScale;
 }
 
 /// MSL Kernel: Looks up token IDs in mapped MXFP8 embedding tables and outputs hidden state h_0

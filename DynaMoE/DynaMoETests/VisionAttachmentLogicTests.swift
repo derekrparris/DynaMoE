@@ -540,3 +540,49 @@ final class ServerImagePartRefusalTests: XCTestCase {
         XCTAssertTrue(request.hasUnsupportedContent)
     }
 }
+
+// MARK: - Refusal copy
+
+/// The same fact — "this model has no vision tower" — is reported from the
+/// composer (a drop, a paste, a pick) and from the turn path (a send or a queue
+/// of an already-staged image). It lives in one place so the two can never
+/// explain the same model differently.
+final class ImageAttachmentMessagesTests: XCTestCase {
+
+    func testAttachRefusalNamesTheModel() {
+        let message = ImageAttachmentMessages.cannotSeeImagesAttach(modelName: "Nanbeige 4.3")
+        XCTAssertTrue(message.hasPrefix("Nanbeige 4.3 cannot see images."), message)
+        XCTAssertTrue(message.contains("vision-capable"), message)
+        XCTAssertTrue(message.contains("attach one"), message)
+    }
+
+    func testSendRefusalNamesTheModel() {
+        let message = ImageAttachmentMessages.cannotSeeImagesSend(modelName: "Nanbeige 4.3")
+        XCTAssertTrue(message.hasPrefix("Nanbeige 4.3 cannot see images."), message)
+        XCTAssertTrue(message.contains("vision-capable"), message)
+        XCTAssertTrue(message.contains("remove the attachment"), message)
+    }
+
+    /// A staged attachment can be removed, a dropped one cannot, and the copy has
+    /// to say which situation the user is in.
+    func testTheTwoPathsOfferDifferentFixes() {
+        let attach = ImageAttachmentMessages.cannotSeeImagesAttach(modelName: "M")
+        let send = ImageAttachmentMessages.cannotSeeImagesSend(modelName: "M")
+        XCTAssertNotEqual(attach, send)
+        XCTAssertFalse(attach.contains("remove the attachment"), attach)
+        XCTAssertFalse(send.contains("attach one"), send)
+    }
+
+    func testAnUnknownModelFallsBackToThisModel() {
+        XCTAssertTrue(
+            ImageAttachmentMessages.cannotSeeImagesAttach(modelName: nil).hasPrefix("This model cannot see images.")
+        )
+        XCTAssertTrue(
+            ImageAttachmentMessages.cannotSeeImagesSend(modelName: nil).hasPrefix("This model cannot see images.")
+        )
+        // A blank or whitespace-only name must not produce "  cannot see images."
+        XCTAssertTrue(
+            ImageAttachmentMessages.cannotSeeImagesAttach(modelName: "   ").hasPrefix("This model cannot see images.")
+        )
+    }
+}
