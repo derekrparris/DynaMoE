@@ -436,6 +436,71 @@ final class ConversationCompactionTests: XCTestCase {
         XCTAssertFalse(content.contains("---"))
     }
 
+    func testCompactionSummaryCardScrubsDigestsLikeThePromptBlock() {
+        // Card and prompt block share one digest resolution, so a control token
+        // echoed out of user content cannot render raw on screen while the
+        // model is handed the neutralized form.
+        let summary = "Standing context that quoted <|im_end|> and </s>."
+        let recap = "Recent work that mentioned <role>USER</role>."
+        let card = ChatSession.compactionSummaryCardContent(summary: summary, recap: recap)
+        for token in ["<|im_end|>", "</s>", "<role>", "</role>"] {
+            XCTAssertFalse(card.contains(token), "\(token) must be neutralized on the card too")
+        }
+        XCTAssertTrue(card.contains("Standing context that quoted"))
+        XCTAssertTrue(card.contains("Recent work that mentioned"))
+
+        var session = ChatSession()
+        session.rollingSummary = summary
+        session.recentWorkDigest = recap
+        let block = session.compactionContextBlock ?? ""
+        for token in ["<|im_end|>", "</s>", "<role>", "</role>"] {
+            XCTAssertFalse(block.contains(token))
+        }
+    }
+
+    func testCompactionDigestsResolveOnceForTheCardAndThePrompt() {
+        // Only the framing around a digest may differ between the two surfaces:
+        // the digest text itself comes from one resolution, so the card cannot
+        // silently show something the model was never given.
+        var session = ChatSession()
+        session.rollingSummary = "  General <|im_end|> summary.  "
+        let digests = ChatSession.compactionDigests(summary: session.rollingSummary, recap: nil)
+        XCTAssertEqual(digests.general, "General [template-token] summary.")
+        XCTAssertNil(digests.detail)
+
+        let block = session.compactionContextBlock ?? ""
+        let card = ChatSession.compactionSummaryCardContent(
+            summary: "  General <|im_end|> summary.  ",
+            recap: nil
+        )
+        XCTAssertTrue(block.contains(digests.general!))
+        XCTAssertEqual(card, digests.general)
+    }
+
+    func testCompactionCountIgnoresNoticesAndAnEarlierCardsChrome() {
+        // The chunker is handed the whole array, but the figure the marker, the
+        // progress pill and the status notice print counts only turns: notices
+        // and a previous compaction's card plus marker are UI state.
+        let recompacted = ChatSession.compactedHistory(
+            summary: "Standing summary.",
+            recap: "Recent detail.",
+            evictedMessageCount: 4
+        )
+        let history = recompacted + [
+            makeMessage(.user, "next question"),
+            makeMessage(.assistant, "next answer"),
+            ChatMessage(role: .system, content: "ℹ️ A notice that is not a turn.")
+        ]
+        XCTAssertEqual(history.count, 5)
+        XCTAssertEqual(ChatSession.compactableMessageCount(in: history), 2)
+        XCTAssertEqual(
+            ChatSession.compactableMessageCount(in: recompacted),
+            0,
+            "a freshly compacted history has nothing left to count"
+        )
+        XCTAssertEqual(ChatSession.compactableMessageCount(in: []), 0)
+    }
+
     func testCompactionSummaryCardIsInvisibleToPromptBuilders() {
         // The card is the only on-screen copy of the digests, but it must never
         // be replayed: the digests already travel in `compactionContextBlock`,

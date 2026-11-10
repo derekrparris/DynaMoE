@@ -2184,11 +2184,11 @@ struct ContentView: View {
             sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
             return true
         }
-        // Blank slate: every message is eligible, notices and prior compact
-        // markers included (the transcript builder skips system roles on its
-        // own, so they contribute nothing to the summaries). If nothing has
-        // been said, the transcript comes back empty and that is what "nothing
-        // to compact" keys on.
+        // The whole array is taken, notices and an earlier compaction's card
+        // plus marker included, so the transcript builder's own role filter is
+        // the single place that decides what is summarizable: system rows
+        // contribute nothing. If nothing has been said, the transcript comes
+        // back empty and that is what "nothing to compact" keys on.
         let evicted = sessions[sessionIdx].messages
         guard !evicted.isEmpty else {
             let note = "ℹ️ Nothing to compact — this conversation is still empty."
@@ -2250,7 +2250,7 @@ struct ContentView: View {
         // Only conversation rows count toward the figure the marker and the
         // progress pill show: prior notices, and the card plus marker a previous
         // compaction left behind, are UI state rather than turns.
-        let evictedCount = evicted.filter { $0.role != .system }.count
+        let evictedCount = ChatSession.compactableMessageCount(in: evicted)
         // The progress bubble makes the command visible from the instant it is
         // accepted: before any summary text flows it carries the same spinning
         // composing pill a chat turn shows during prefill, then the general

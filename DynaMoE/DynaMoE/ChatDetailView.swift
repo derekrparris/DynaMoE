@@ -203,12 +203,17 @@ struct ChatDetailView: View {
     /// compaction just produced: following the bottom instead can leave it far
     /// above the viewport when the summary is long. Returns true when it
     /// handled the scroll, so callers fall through to their normal follow.
+    ///
+    /// The pin is left to the geometry handler on purpose. Landing at the top of
+    /// a long card scrolls away from the bottom, and that offset change is what
+    /// unpins. Clearing it here instead would strand a summary that fits the
+    /// viewport as unpinned: the scroll is a no-op there, so no geometry change
+    /// arrives to correct it, and only the next turn would re-pin.
     @discardableResult
     private func landOnCompactedSummary(_ proxy: ScrollViewProxy) -> Bool {
         guard let first = session?.messages.first,
               first.isCompactionSummary == true,
               session?.messages.count == 2 else { return false }
-        isPinnedToBottom = false
         DispatchQueue.main.async {
             withAnimation(.easeOut(duration: 0.2)) {
                 proxy.scrollTo(first.id, anchor: .top)
@@ -2173,6 +2178,11 @@ struct CompactionSummaryCard: View {
                 }
                 .buttonStyle(.plain)
                 .help("Copy the compacted summary")
+                // Icon-only, so VoiceOver would otherwise read the SF Symbol's
+                // own name. The label carries the copied state, which is how the
+                // confirmation that used to be a bare checkmark reaches someone
+                // who cannot see it.
+                .accessibilityLabel(isCopied ? "Compacted summary copied" : "Copy the compacted summary")
             }
 
             if isExpanded {

@@ -428,18 +428,39 @@ public extension ChatSession {
         return latest
     }
 
+    /// The two digests a compaction carries, in the form every consumer uses:
+    /// scrubbed of template control tokens, trimmed, and reported as nil when
+    /// nothing is left. Both the prompt block and the on-screen card are framed
+    /// from this one resolution, so the text a reader sees and the text the
+    /// model is handed cannot drift apart; only the framing around them
+    /// differs. Scrubbing happens here rather than at storage time because the
+    /// digests are derived from arbitrary user content and are kept verbatim.
+    nonisolated static func compactionDigests(
+        summary: String?,
+        recap: String?
+    ) -> (general: String?, detail: String?) {
+        func resolve(_ text: String?) -> String? {
+            let scrubbed = sanitizeCompactionDigest(text ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return scrubbed.isEmpty ? nil : scrubbed
+        }
+        return (resolve(summary), resolve(recap))
+    }
+
     /// The compacted-context block injected into every post-compaction prompt,
     /// for either backend: the standing general summary first, then the
     /// detailed recap of the most recently evicted work. Nil before the first
     /// compaction, and trimmed to nil if both digests are empty.
     nonisolated var compactionContextBlock: String? {
+        let digests = ChatSession.compactionDigests(
+            summary: rollingSummary,
+            recap: recentWorkDigest
+        )
         var blocks: [String] = []
-        let general = ChatSession.sanitizeCompactionDigest(rollingSummary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if !general.isEmpty {
+        if let general = digests.general {
             blocks.append("Summary of this conversation's earlier history (compacted, so reply with that knowledge in mind):\n\(general)")
         }
-        let detail = ChatSession.sanitizeCompactionDigest(recentWorkDigest ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if !detail.isEmpty {
+        if let detail = digests.detail {
             blocks.append("The most recently compacted work, kept in detail:\n\(detail)")
         }
         return blocks.isEmpty ? nil : blocks.joined(separator: "\n\n")
@@ -448,16 +469,16 @@ public extension ChatSession {
     /// The rendered body of the `/compact` digest card: the standing general
     /// summary, then the detailed recap of the most recent work. This is DISPLAY
     /// text only. It mirrors what `compactionContextBlock` injects into the
-    /// system prompt, but it is never itself sent, because the card is a
-    /// system-role message and every prompt builder skips those.
+    /// system prompt, from the same `compactionDigests` resolution, but it is
+    /// never itself sent, because the card is a system-role message and every
+    /// prompt builder skips those.
     nonisolated static func compactionSummaryCardContent(summary: String, recap: String?) -> String {
+        let digests = compactionDigests(summary: summary, recap: recap)
         var blocks: [String] = []
-        let general = summary.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !general.isEmpty {
+        if let general = digests.general {
             blocks.append(general)
         }
-        let detail = (recap ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if !detail.isEmpty {
+        if let detail = digests.detail {
             blocks.append("---")
             blocks.append("**Recent work, in detail**")
             blocks.append(detail)
@@ -486,6 +507,15 @@ public extension ChatSession {
             content: "🗂 \(evictedMessageCount) messages compacted into a rolling summary by Apple Foundation Model. The conversation continues from that summary context."
         )
         return [card, marker]
+    }
+
+    /// How many messages a compaction pass is reported as having folded away.
+    /// The chunker is handed the whole array, but only conversation rows are
+    /// turns: standing notices, and the card plus marker an earlier compaction
+    /// left behind, are UI state, so counting them would inflate the figure the
+    /// progress pill, the committed marker and the status notice all print.
+    nonisolated static func compactableMessageCount(in messages: [ChatMessage]) -> Int {
+        messages.filter { $0.role != .system }.count
     }
 
     /// Odometer arithmetic for one generation step's prompt ingestion: the
