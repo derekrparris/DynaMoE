@@ -405,6 +405,78 @@ final class ConversationCompactionTests: XCTestCase {
         XCTAssertTrue(block!.contains("recent"))
     }
 
+    // MARK: - Committed History
+
+    func testCompactedHistoryKeepsSummaryCardAndMarker() {
+        let rows = ChatSession.compactedHistory(
+            summary: "User is building a Metal-based LLM engine.",
+            recap: "Fixed the pread fallback in ExpertIOThreadPool.",
+            evictedMessageCount: 12
+        )
+        XCTAssertEqual(rows.count, 2)
+        XCTAssertEqual(rows[0].role, .system, "the card is UI state, not a turn")
+        XCTAssertTrue(rows[0].isCompactionSummary == true, "ChatDetailView keys its card rendering on this flag")
+        XCTAssertNil(rows[0].isTransient, "the card must survive a relaunch")
+        XCTAssertNil(rows[1].isCompactionSummary, "the marker is a plain notice")
+        XCTAssertTrue(rows[1].content.contains("12 messages compacted"))
+        XCTAssertTrue(rows[0].content.contains("Metal-based LLM engine"))
+        XCTAssertTrue(rows[0].content.contains("pread fallback"))
+        // The general summary reads first, the detailed recap after it.
+        let summaryRange = rows[0].content.range(of: "Metal-based LLM engine")
+        let recapRange = rows[0].content.range(of: "pread fallback")
+        XCTAssertNotNil(summaryRange)
+        XCTAssertNotNil(recapRange)
+        XCTAssertTrue(summaryRange!.lowerBound < recapRange!.lowerBound)
+    }
+
+    func testCompactionSummaryCardOmitsAnAbsentRecap() {
+        let content = ChatSession.compactionSummaryCardContent(summary: "  Standing summary.  ", recap: "   ")
+        XCTAssertEqual(content, "Standing summary.")
+        XCTAssertFalse(content.contains("Recent work, in detail"))
+        XCTAssertFalse(content.contains("---"))
+    }
+
+    func testCompactionSummaryCardIsInvisibleToPromptBuilders() {
+        // The card is the only on-screen copy of the digests, but it must never
+        // be replayed: the digests already travel in `compactionContextBlock`,
+        // so feeding the card into history would send them twice.
+        let card = ChatSession.compactedHistory(
+            summary: "Standing summary that must not be replayed.",
+            recap: "Recent detail that must not be replayed.",
+            evictedMessageCount: 3
+        )[0]
+        XCTAssertNil(AppleFoundationModelService.compactionTranscriptTurn(for: card))
+
+        let transcript = AppleFoundationModelService.buildConversationTranscript(
+            from: [card, makeMessage(.user, "next question")],
+            charBudget: AppleFoundationModelService.sessionContextChars
+        )
+        XCTAssertFalse(transcript.contains("must not be replayed"), "history must skip the card")
+        XCTAssertTrue(transcript.contains("next question"))
+
+        let cloud = CloudMessageAssembler.assemble(from: [card, makeMessage(.user, "next question")])
+        XCTAssertEqual(cloud.count, 1)
+        XCTAssertEqual(cloud[0].role, "user")
+        XCTAssertFalse(cloud[0].content?.contains("must not be replayed") == true)
+    }
+
+    func testCompactionSummaryCardSurvivesRestore() throws {
+        let session = ChatSession(messages: ChatSession.compactedHistory(
+            summary: "Standing summary.",
+            recap: "Recent detail.",
+            evictedMessageCount: 4
+        ))
+        let data = try JSONEncoder().encode(session)
+        let restored = ChatSessionStore.normalizedForRestore(
+            try JSONDecoder().decode(ChatSession.self, from: data)
+        )
+        XCTAssertEqual(restored.messages.count, 2)
+        XCTAssertEqual(restored.messages[0].isCompactionSummary, true)
+        XCTAssertNil(restored.messages[0].isTransient)
+        XCTAssertTrue(restored.messages[0].content.contains("Standing summary."))
+        XCTAssertNil(restored.messages[1].isCompactionSummary)
+    }
+
     // MARK: - Persistence
 
     func testCompactedSessionFieldsRoundTripThroughPersistence() throws {
