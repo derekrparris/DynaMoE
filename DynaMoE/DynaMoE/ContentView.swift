@@ -1572,6 +1572,16 @@ struct ContentView: View {
                             sessions[idx].isAgentToolsEnabled = enabled
                         }
                     },
+                    onSetPlanMode: { enabled in
+                        if let sid = selectedSessionId ?? sessions.first?.id {
+                            _ = setPlanMode(enabled, sessionId: sid)
+                        }
+                    },
+                    onApprovePlan: { withTurbo in
+                        if let sid = selectedSessionId ?? sessions.first?.id {
+                            approvePlanAndImplement(sessionId: sid, withTurbo: withTurbo)
+                        }
+                    },
                     onRenameSession: { newTitle in
                         let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !trimmed.isEmpty,
@@ -2143,7 +2153,51 @@ struct ContentView: View {
         switch command {
         case .compact(let focus):
             return runManualCompact(sessionIndex: sessionIdx, sessionId: sessionId, focus: focus)
+        case .plan(let enabled):
+            // A bare /plan enters plan mode; it does not toggle, so a user who
+            // types it twice is still in plan mode rather than silently back in
+            // the coder.
+            let entering = enabled ?? true
+            return setPlanMode(entering, sessionId: sessionId)
         }
+    }
+
+    /// Applies the conversation's agent surface. Shared by the composer's mode
+    /// pill, `/plan` and the plan handoff, because all three must do the same
+    /// three things: record the mode, arm the tools plan mode needs, and drop
+    /// the KV pin — the system block's plan section and tool list change with
+    /// the mode, so a prefix recorded in the other mode is stale.
+    @discardableResult
+    private func setPlanMode(_ enabled: Bool, sessionId: UUID) -> Bool {
+        guard let idx = sessions.firstIndex(where: { $0.id == sessionId }) else { return false }
+        let target: AgentMode = enabled ? .plan : .code
+        if (sessions[idx].agentMode ?? .code) == target { return true }
+        sessions[idx].agentMode = target
+        if enabled {
+            // Plan mode is an AGENT mode: with tools off there is nothing to
+            // plan WITH, and the turn would run as plain chat against a prompt
+            // that claims a tool surface it was never given.
+            sessions[idx].isAgentToolsEnabled = true
+        }
+        PrefixCacheManager.shared.invalidate(sessionId: sessionId)
+        AgentHarness.shared.setActiveMode(target)
+        showStatus(enabled
+            ? "🧭 Plan Mode: reads and searches only — approve the plan to start coding."
+            : "⌨️ Code Mode: the agent can write and run commands again.")
+        return true
+    }
+
+    /// The plan handoff's confirm action: switch the conversation back to the
+    /// coder, optionally arm Turbo, then send the continuation that starts the
+    /// implementation. The continuation is an ordinary user turn rather than a
+    /// hidden one, so nothing happens in the conversation that the transcript
+    /// does not show.
+    private func approvePlanAndImplement(sessionId: UUID, withTurbo: Bool) {
+        _ = setPlanMode(false, sessionId: sessionId)
+        if withTurbo {
+            UserDefaults.standard.set(true, forKey: "dynamoe_agent_turbo_mode")
+        }
+        _ = handleSendMessage("Implement the plan.", sessionId: sessionId)
     }
 
     /// Manual compaction via /compact. The Apple Foundation Model folds the
@@ -2599,6 +2653,12 @@ struct ContentView: View {
         // Derive thinking/model from this conversation, not the current
         // selection: an async send may have resumed after the user switched chats.
         let sendSession = sessions[sessionIdx]
+        // The conversation's agent surface, resolved once for the whole send.
+        // The prompt's tool block, the grammar mask, the cloud `tools` array
+        // and every executeTool call read this, so it is set after the send is
+        // accepted and before any prompt is assembled.
+        let sessionMode = sendSession.agentMode ?? .code
+        AgentHarness.shared.setActiveMode(sessionMode)
         let sessionModelName = modelDisplayName(for: sendSession)
         let modelSupportsThinking = supportsThinking(for: sendSession)
         let thinkingEnabled = isThinkingEnabled(for: sendSession) && modelSupportsThinking
@@ -2739,7 +2799,7 @@ struct ContentView: View {
                 }
             } else if cloudAgentMode {
                 AgentHarness.shared.beginAgentSearchGuard()
-                cloudSystemPrompt += "\n\n" + AgentHarness.shared.buildCloudToolGuidance()
+                cloudSystemPrompt += "\n\n" + AgentHarness.shared.buildCloudToolGuidance(mode: sessionMode)
             }
             startCloudGeneration(
                 sessionId: currentSessionId,
@@ -2788,7 +2848,8 @@ struct ContentView: View {
                 currentDate: conversationDate,
                 isLingModel: modelConfig?.isLingModel == true,
                 isGemma4Model: modelConfig?.isGemma4Model == true,
-                isDeepSeekV41Model: modelConfig?.isDeepSeekV41Model == true
+                isDeepSeekV41Model: modelConfig?.isDeepSeekV41Model == true,
+                mode: sessionMode
             )
         }
 
@@ -4354,7 +4415,12 @@ struct ContentView: View {
             )
             agent.recordToolCallOutcome(
                 toolName: call.name,
-                succeeded: execResult.record.status == .success
+                // Only `.error` is the model's own failure. A `.rejected` call
+                // was refused by the environment (plan mode) or by the user, and
+                // counting those towards the failed-call loop guard would end a
+                // plan-mode run for asking once too often for a tool the mode
+                // withholds.
+                succeeded: execResult.record.status != .error
             )
             agent.recordToolCallFingerprint(toolName: call.name, arguments: parsedCall.arguments)
             // `isCompleted` covers every tool that ends the run (the harness's
@@ -4523,6 +4589,9 @@ struct ContentView: View {
         // the current selection, so an async send that resumed after a selection
         // change still formats with the conversation's own model.
         let generationSession = sessionId.flatMap { id in sessions.first(where: { $0.id == id }) }
+        // Each agent step re-enters here, so the turn's mode is re-derived from
+        // the conversation rather than trusted to survive from the first step.
+        AgentHarness.shared.setActiveMode(generationSession?.agentMode ?? .code)
         let generationModelName = modelDisplayName(for: generationSession)
         let cleanSystem = ModelConfig.buildEffectiveSystemPrompt(
             userPrompt: systemPrompt,
@@ -5053,7 +5122,10 @@ struct ContentView: View {
                     </system>
                     """
                     let staleSynthesisPrompt = formattedPrompt + assistantTurnText + synthesisDirective
-                    let synthesisPrompt = AgentHarness.shared.refreshingLoadedToolsSection(inPrompt: staleSynthesisPrompt)
+                    let synthesisPrompt = AgentHarness.shared.refreshingLoadedToolsSection(
+                        inPrompt: staleSynthesisPrompt,
+                        mode: AgentHarness.shared.activeMode
+                    )
                     let synthesisToolsChanged = (synthesisPrompt != staleSynthesisPrompt)
                     let splicedTokens = self.buildSplicedContinuationTokens(
                         basePromptTokens: promptTokenIds,
@@ -5308,7 +5380,9 @@ struct ContentView: View {
                         responseSlots[actionableCallIndices[idx]] = execResult.resultJSON
                         AgentHarness.shared.recordToolCallOutcome(
                             toolName: call.name,
-                            succeeded: execResult.record.status == .success
+                            // `.rejected` is a refusal by the mode or the user,
+                            // not a malformed call; see the cloud path.
+                            succeeded: execResult.record.status != .error
                         )
                         AgentHarness.shared.recordToolCallFingerprint(
                             toolName: call.name,
@@ -5421,7 +5495,10 @@ struct ContentView: View {
                         // the spliced ids carry the prompt's OLD tools block, so when the
                         // section changes the continuation must re-encode (full re-prefill)
                         // rather than splice from the stale tokens.
-                        let nextPrompt = AgentHarness.shared.refreshingLoadedToolsSection(inPrompt: staleNextPrompt)
+                        let nextPrompt = AgentHarness.shared.refreshingLoadedToolsSection(
+                            inPrompt: staleNextPrompt,
+                            mode: AgentHarness.shared.activeMode
+                        )
                         let toolsSectionChanged = (nextPrompt != staleNextPrompt)
                         let splicedTokens = self.buildSplicedContinuationTokens(
                             basePromptTokens: promptTokenIds,
@@ -5479,7 +5556,10 @@ struct ContentView: View {
                             </system>
                             """
                             let staleSynthesisPrompt = formattedPrompt + assistantTurnText + "\n" + toolResponseContext + synthesisDirective
-                            let synthesisPrompt = AgentHarness.shared.refreshingLoadedToolsSection(inPrompt: staleSynthesisPrompt)
+                            let synthesisPrompt = AgentHarness.shared.refreshingLoadedToolsSection(
+                                inPrompt: staleSynthesisPrompt,
+                                mode: AgentHarness.shared.activeMode
+                            )
                             let synthesisToolsChanged = (synthesisPrompt != staleSynthesisPrompt)
                             let splicedTokens = self.buildSplicedContinuationTokens(
                                 basePromptTokens: promptTokenIds,

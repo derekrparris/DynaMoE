@@ -151,6 +151,10 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     public let archetype: SubagentRoleArchetype
     public let taskDescription: String
     public let allowedTools: [String]
+    /// The mode the conversation that spawned this subagent was running.
+    /// Plan mode's promise has to cover the work it hands off: a read-only
+    /// parent can only produce read-only children.
+    public let parentMode: AgentMode
     public let contextSummary: String?
     public let parentSessionId: UUID?
     public let workingDirectory: URL?
@@ -182,6 +186,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         role: String,
         taskDescription: String,
         allowedTools: [String] = [],
+        parentMode: AgentMode = .code,
         contextSummary: String? = nil,
         parentSessionId: UUID? = nil,
         workingDirectory: URL? = nil
@@ -193,6 +198,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         self.allowedTools = allowedTools.isEmpty ? [
             "file_read", "find_files", "grep_search", "codebase_search", "web_search", "web_fetch"
         ] : allowedTools
+        self.parentMode = parentMode
         self.contextSummary = contextSummary
         self.parentSessionId = parentSessionId
         self.workingDirectory = workingDirectory
@@ -768,6 +774,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
 final class SubagentToolExecutor {
     private unowned let owner: SubagentInstance
     private let allowedTools: Set<String>
+    private let parentMode: AgentMode
     private let workingDirectory: URL
     private let stepOutputLimit = 6000
 
@@ -776,7 +783,15 @@ final class SubagentToolExecutor {
         let declared = owner.allowedTools.isEmpty
             ? ["file_read", "find_files", "grep_search", "codebase_search", "web_search", "web_fetch"]
             : owner.allowedTools
-        self.allowedTools = Set(declared)
+        // A read-only parent's whitelist is intersected with the plan-mode
+        // allow-list, so a subagent cannot be handed a write tool the
+        // coordinator itself is forbidden to call.
+        self.parentMode = owner.parentMode
+        self.allowedTools = Set(
+            owner.parentMode == .plan
+                ? declared.filter { !PlanModePolicy.withholds($0) }
+                : declared
+        )
         self.workingDirectory = workingDirectory ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
     }
 
@@ -815,7 +830,8 @@ final class SubagentToolExecutor {
         let exec = await AgentHarness.shared.executeTool(
             call: call,
             workingDirectory: workingDirectory,
-            maxOutputLength: stepOutputLimit
+            maxOutputLength: stepOutputLimit,
+            mode: parentMode
         )
 
         let readable = exec.record.output ?? exec.record.error ?? exec.resultJSON
@@ -1015,6 +1031,7 @@ public final class SubagentManager: ObservableObject {
         role: String,
         taskDescription: String,
         allowedTools: [String] = [],
+        parentMode: AgentMode = .code,
         contextSummary: String? = nil,
         parentSessionId: UUID? = nil,
         workingDirectory: URL? = nil
@@ -1023,6 +1040,7 @@ public final class SubagentManager: ObservableObject {
             role: role,
             taskDescription: taskDescription,
             allowedTools: allowedTools,
+            parentMode: parentMode,
             contextSummary: contextSummary,
             parentSessionId: parentSessionId,
             workingDirectory: workingDirectory

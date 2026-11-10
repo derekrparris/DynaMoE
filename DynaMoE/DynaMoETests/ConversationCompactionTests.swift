@@ -44,7 +44,7 @@ final class ConversationCompactionTests: XCTestCase {
         XCTAssertNil(ChatCommand.parse("how about /compact mid-sentence"))
         XCTAssertNil(ChatCommand.parse("/etc/hosts needs a look"))
         XCTAssertNil(ChatCommand.parse("/compacto"))
-        XCTAssertEqual(ChatCommand.names, ["/compact"])
+        XCTAssertEqual(ChatCommand.names, ["/compact", "/plan"])
     }
 
     // MARK: - Compaction Context Block

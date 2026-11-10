@@ -254,6 +254,11 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
     /// it, and an unsupported stored value clamps to `.high` on read.
     public var thinkingEffort: ThinkingEffort?
     public var isAgentToolsEnabled: Bool?
+    /// The conversation's agent surface: the coder (nil or `.code`) or plan
+    /// mode, which reads and searches but cannot write. Per conversation, like
+    /// `isAgentToolsEnabled`, so a plan survives a relaunch and switching chats
+    /// cannot leave one conversation's read-only promise over another's writes.
+    public var agentMode: AgentMode?
     public var queuedPrompts: [QueuedPrompt]
     /// Rolling general summary of everything a manual /compact removed from
     /// `messages`, written by the Apple Foundation Model and merged forward at
@@ -292,6 +297,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         isThinkingEnabled: Bool? = nil,
         thinkingEffort: ThinkingEffort? = nil,
         isAgentToolsEnabled: Bool? = nil,
+        agentMode: AgentMode? = nil,
         queuedPrompts: [QueuedPrompt] = [],
         rollingSummary: String? = nil,
         recentWorkDigest: String? = nil,
@@ -309,6 +315,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         self.isThinkingEnabled = isThinkingEnabled
         self.thinkingEffort = thinkingEffort
         self.isAgentToolsEnabled = isAgentToolsEnabled
+        self.agentMode = agentMode
         self.queuedPrompts = queuedPrompts
         self.rollingSummary = rollingSummary
         self.recentWorkDigest = recentWorkDigest
@@ -320,6 +327,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         case id, title, messages, createdAt, updatedAt
         case selectedModelId, selectedModelName, selectedModelPath
         case isThinkingEnabled, thinkingEffort, isAgentToolsEnabled
+        case agentMode
         case queuedPrompts
         case rollingSummary, recentWorkDigest
         case titleOrigin
@@ -343,6 +351,11 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
             self.thinkingEffort = nil
         }
         self.isAgentToolsEnabled = try container.decodeIfPresent(Bool.self, forKey: .isAgentToolsEnabled)
+        // An unknown stored value (a hand-edited file, a newer build's mode)
+        // falls back to the coder rather than trapping the conversation in a
+        // read-only surface nobody asked for.
+        self.agentMode = (try container.decodeIfPresent(String.self, forKey: .agentMode))
+            .flatMap(AgentMode.init(rawValue:))
         self.queuedPrompts = try container.decodeIfPresent([QueuedPrompt].self, forKey: .queuedPrompts) ?? []
         self.rollingSummary = try container.decodeIfPresent(String.self, forKey: .rollingSummary)
         self.recentWorkDigest = try container.decodeIfPresent(String.self, forKey: .recentWorkDigest)
@@ -363,6 +376,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         try container.encodeIfPresent(isThinkingEnabled, forKey: .isThinkingEnabled)
         try container.encodeIfPresent(thinkingEffort?.rawValue, forKey: .thinkingEffort)
         try container.encodeIfPresent(isAgentToolsEnabled, forKey: .isAgentToolsEnabled)
+        try container.encodeIfPresent(agentMode?.rawValue, forKey: .agentMode)
         try container.encode(queuedPrompts, forKey: .queuedPrompts)
         try container.encodeIfPresent(rollingSummary, forKey: .rollingSummary)
         try container.encodeIfPresent(recentWorkDigest, forKey: .recentWorkDigest)

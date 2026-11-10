@@ -21,9 +21,14 @@ nonisolated public enum ChatCommand: Equatable {
     /// user's optional extra instructions for the pass.
     case compact(focus: String?)
 
+    /// Switch the conversation between the coder and the read-only planner.
+    /// `enabled` is nil for a bare `/plan` (turn plan mode on), true for
+    /// `/plan on`, false for `/plan off`.
+    case plan(enabled: Bool?)
+
     /// Every recognized command name, lowercase — the composer can render
     /// these as hint UI later without touching the parser.
-    nonisolated static let names = ["/compact"]
+    nonisolated static let names = ["/compact", "/plan"]
 
     /// Parses `text` as a slash command. The command word is the first
     /// whitespace-delimited token; whatever follows is the command's argument
@@ -41,10 +46,19 @@ nonisolated public enum ChatCommand: Equatable {
         )
         guard let first = parts.first else { return nil }
         let argument = parts.count > 1 ? parts[1] : ""
-        let focus = String(argument).trimmingCharacters(in: .whitespacesAndNewlines)
+        let rest = String(argument).trimmingCharacters(in: .whitespacesAndNewlines)
         switch first.lowercased() {
         case "/compact":
-            return .compact(focus: focus.isEmpty ? nil : focus)
+            return .compact(focus: rest.isEmpty ? nil : rest)
+        case "/plan":
+            // A bare `/plan` is the short way to enter plan mode; `on`/`off`
+            // let a conversation state the mode explicitly, which is what a
+            // user who cannot tell which mode they are in needs.
+            switch rest.lowercased() {
+            case "", "on", "enter", "start": return .plan(enabled: true)
+            case "off", "exit", "leave", "code": return .plan(enabled: false)
+            default: return .plan(enabled: true)
+            }
         default:
             return nil
         }

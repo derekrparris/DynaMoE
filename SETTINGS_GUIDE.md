@@ -370,6 +370,16 @@ The **Agent & Tools** section configures DynaMoE's autonomous agent engine, tool
 - **Max Tool Output Character Length**: Caps the maximum length of `stdout`/`stderr` returned by tools (1,000 to 16,000 characters). Prevents large file dumps from exhausting model context windows.
 - **Max Autonomous Steps**: Hard limit on sequential tool execution cycles (1 to 100 steps) per user prompt. Prevents infinite tool-calling loops. Past about 40 steps a local model usually exhausts the KV budget first, so the run stops with a capacity error rather than the step limit.
 
+### Plan Mode (Read-Only Architect)
+Plan Mode makes the agent investigate and propose instead of acting. It is a per-conversation mode, so one chat can be planning while another is coding.
+
+- **Enter**: click the mode pill beside Turbo, press **⇧⌘P**, or type `/plan`. `/plan off` (or clicking the pill again) returns to Code Mode. Entering Plan Mode turns Agent Tools on, because planning needs something to read with.
+- **What it withholds**: `file_write`, `file_edit`, `shell_run`, `git_commit`, `complete`, and every `mcp__*` tool. That is enforced in three places rather than merely asked of the model: the tools are absent from the prompt and the cloud `tools` array, they are withheld from the constrained-sampling grammar, and `executeTool` refuses them if one is somehow emitted.
+- **What it keeps**: file reads, glob/grep, codebase search, symbol and reference lookup, `git_status`/`git_diff`, web search and fetch, lint diagnostics, and the tool-discovery tools. Subagents spawned in Plan Mode inherit the restriction, so delegation cannot route around it.
+- **The deliverable**: the model opens its final reply with `<!-- DYNAMOE_PLAN_START -->` and ends it with `<!-- DYNAMOE_PLAN_READY -->`. That reply renders as an **Implementation Plan** card, and a handoff bar offers **Start coding**, **Code with Turbo**, or **Revise plan**. Approving switches the conversation to Code Mode, re-arms the write tools, and sends "Implement the plan." as a normal user turn.
+- **Turbo** has nothing to auto-approve while planning, because no write tools exist. The handoff asks explicitly, and "Code with Turbo" is how it gets turned on for the implementation turn.
+- **Failure states**: a plan that never reaches the end marker shows no handoff, and the mode pill is always the way back. Dismissing the bar and pressing Return in an empty composer brings it back. Leaving Plan Mode by any route restores the coder surface.
+
 ### Search Integrations
 - **Headless Chrome Web Search (De Facto Built-In)**: Built-in, privacy-preserving web search executed via a local sandboxed browser instance (`--headless=new --dump-dom`). Automatically executes client-side JavaScript, renders complex web pages, and extracts structured titles, URLs, and real-time snippets with **zero API keys or external tracking**. Automatically detects Google Chrome, Chromium, Brave, or Microsoft Edge, with an optional user override for custom binary paths.
 - **Brave Search API**: Optional cloud search integration. Enter your Brave Search API key to route queries through Brave's structured search API.
