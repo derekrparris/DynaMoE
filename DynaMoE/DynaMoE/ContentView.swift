@@ -2150,10 +2150,11 @@ struct ContentView: View {
     /// entire conversation into two digests stored on the session: a rolling
     /// general summary that merges forward across compactions, and a detailed
     /// recap of the most recently evicted work, replaced wholesale each pass.
-    /// The committed history becomes a blank slate — only the compaction
-    /// marker remains on screen — with both digests injected into every later
-    /// prompt on either backend, so the conversation keeps moving with the
-    /// essential detail intact. Because the pass deletes what it summarizes,
+    /// The committed history becomes the visible digest card followed by the
+    /// compaction marker: the card keeps the summary readable at the top of the
+    /// chat, while both digests are injected into every later prompt on either
+    /// backend, so the conversation keeps moving with the essential detail
+    /// intact. Because the pass deletes what it summarizes,
     /// the transcript accounts for every evicted turn including tool calls:
     /// a history longer than one summarizer request is split into chunks,
     /// each older chunk folded into the rolling summary by its own pass, and
@@ -2183,11 +2184,11 @@ struct ContentView: View {
             sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
             return true
         }
-        // Blank slate: every message is eligible, notices and prior compact
-        // markers included (the transcript builder skips system roles on its
-        // own, so they contribute nothing to the summaries). If nothing has
-        // been said, the transcript comes back empty and that is what "nothing
-        // to compact" keys on.
+        // The whole array is taken, notices and an earlier compaction's card
+        // plus marker included, so the transcript builder's own role filter is
+        // the single place that decides what is summarizable: system rows
+        // contribute nothing. If nothing has been said, the transcript comes
+        // back empty and that is what "nothing to compact" keys on.
         let evicted = sessions[sessionIdx].messages
         guard !evicted.isEmpty else {
             let note = "ℹ️ Nothing to compact — this conversation is still empty."
@@ -2246,7 +2247,10 @@ struct ContentView: View {
             sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
             return true
         }
-        let evictedCount = evicted.count
+        // Only conversation rows count toward the figure the marker and the
+        // progress pill show: prior notices, and the card plus marker a previous
+        // compaction left behind, are UI state rather than turns.
+        let evictedCount = ChatSession.compactableMessageCount(in: evicted)
         // The progress bubble makes the command visible from the instant it is
         // accepted: before any summary text flows it carries the same spinning
         // composing pill a chat turn shows during prefill, then the general
@@ -2380,25 +2384,30 @@ struct ContentView: View {
                 guard let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) else { return }
                 self.sessions[liveIdx].rollingSummary = newSummaryText
                 self.sessions[liveIdx].recentWorkDigest = newRecapText
-                // Blank slate: the whole conversation — evicted messages and
-                // the progress bubble — is replaced by a single marker in one
-                // write; both digests carry the context from here on.
-                let marker = ChatMessage(
-                    role: .system,
-                    content: "🗂 \(evictedCount) messages compacted into a rolling summary by Apple Foundation Model. The conversation continues from that summary context."
+                // The whole conversation (evicted messages and the progress
+                // bubble) is replaced in one write by the digest card and the
+                // outcome marker. The card keeps the summary readable at the
+                // top of the chat; both rows are system-role, so neither
+                // reaches a later prompt and the digests carry the context
+                // instead.
+                self.sessions[liveIdx].messages = ChatSession.compactedHistory(
+                    summary: newSummaryText,
+                    recap: newRecapText,
+                    evictedMessageCount: evictedCount
                 )
-                self.sessions[liveIdx].messages = [marker]
                 // The context the odometer was counting is gone: reset it to
                 // unmetered so the next send seeds a fresh total from the
-                // compacted prompt (summary + marker + new message), which is
-                // the conversation's new context size.
+                // compacted prompt (the digest block in the system prompt plus
+                // the new message), which is the conversation's new context
+                // size. The card and marker on screen are system rows and are
+                // never part of that prompt.
                 self.sessions[liveIdx].cumulativeTokenCount = nil
                 // The token prefix changed: any pinned KV state for this
                 // conversation no longer matches, and reusing it would splice
                 // summaries into stale slots. One full re-prefill is the cost
                 // of compaction; it is paid here, deliberately.
                 PrefixCacheManager.shared.invalidate(sessionId: sessionId)
-                self.showStatus("🗂 Compacted \(evictedCount) messages — details live in the rolling summary.")
+                self.showStatus("🗂 Compacted \(evictedCount) messages. The summary stays at the top of this chat.")
             } catch {
                 self.showStatus("⚠️ Compaction failed: \(error.localizedDescription)")
                 postToProgress("⚠️ Compaction failed: \(error.localizedDescription) — the conversation was left unchanged.")

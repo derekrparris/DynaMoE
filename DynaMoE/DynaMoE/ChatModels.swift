@@ -152,6 +152,12 @@ nonisolated public struct ChatMessage: Identifiable, Codable, Equatable, Sendabl
     /// otherwise restore a partial summary as an ordinary settled system
     /// message. `ChatSessionStore.normalizedForRestore` drops these on load.
     public var isTransient: Bool?
+    /// True on the one visible digest card `/compact` leaves at the head of a
+    /// compacted conversation. The row is a `.system` message, so every prompt
+    /// and transcript builder skips it (the same digests already ride in
+    /// `compactionContextBlock`), but it is not a notice: ChatDetailView renders
+    /// it as the collapsible summary card rather than as plain text.
+    public var isCompactionSummary: Bool?
     public var toolCalls: [ToolCallRecord]?
     /// Images the user attached to this message, in display order. Only user
     /// turns carry them; nil for every turn that predates image input.
@@ -172,6 +178,7 @@ nonisolated public struct ChatMessage: Identifiable, Codable, Equatable, Sendabl
         thinkingTimeSeconds: Double? = nil,
         prefillStatus: String? = nil,
         isTransient: Bool? = nil,
+        isCompactionSummary: Bool? = nil,
         toolCalls: [ToolCallRecord]? = nil,
         attachments: [ImageAttachmentRef]? = nil,
         jetSpecTau: Double? = nil,
@@ -189,6 +196,7 @@ nonisolated public struct ChatMessage: Identifiable, Codable, Equatable, Sendabl
         self.thinkingTimeSeconds = thinkingTimeSeconds
         self.prefillStatus = prefillStatus
         self.isTransient = isTransient
+        self.isCompactionSummary = isCompactionSummary
         self.toolCalls = toolCalls
         self.attachments = attachments
         self.jetSpecTau = jetSpecTau
@@ -250,7 +258,9 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
     /// Rolling general summary of everything a manual /compact removed from
     /// `messages`, written by the Apple Foundation Model and merged forward at
     /// every later compaction. Optional and back-compatible: older files
-    /// decode without it, and conversations never compacted carry nil.
+    /// decode without it, and conversations never compacted carry nil. The
+    /// current pair is mirrored on screen by `compactedHistory`, whose card is
+    /// display-only.
     public var rollingSummary: String?
     /// Detailed recap of the most recent evicted work, replaced wholesale by
     /// each /compact so recent context survives summarization at full fidelity
@@ -418,21 +428,94 @@ public extension ChatSession {
         return latest
     }
 
+    /// The two digests a compaction carries, in the form every consumer uses:
+    /// scrubbed of template control tokens, trimmed, and reported as nil when
+    /// nothing is left. Both the prompt block and the on-screen card are framed
+    /// from this one resolution, so the text a reader sees and the text the
+    /// model is handed cannot drift apart; only the framing around them
+    /// differs. Scrubbing happens here rather than at storage time because the
+    /// digests are derived from arbitrary user content and are kept verbatim.
+    nonisolated static func compactionDigests(
+        summary: String?,
+        recap: String?
+    ) -> (general: String?, detail: String?) {
+        func resolve(_ text: String?) -> String? {
+            let scrubbed = sanitizeCompactionDigest(text ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return scrubbed.isEmpty ? nil : scrubbed
+        }
+        return (resolve(summary), resolve(recap))
+    }
+
     /// The compacted-context block injected into every post-compaction prompt,
     /// for either backend: the standing general summary first, then the
     /// detailed recap of the most recently evicted work. Nil before the first
     /// compaction, and trimmed to nil if both digests are empty.
     nonisolated var compactionContextBlock: String? {
+        let digests = ChatSession.compactionDigests(
+            summary: rollingSummary,
+            recap: recentWorkDigest
+        )
         var blocks: [String] = []
-        let general = ChatSession.sanitizeCompactionDigest(rollingSummary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if !general.isEmpty {
+        if let general = digests.general {
             blocks.append("Summary of this conversation's earlier history (compacted, so reply with that knowledge in mind):\n\(general)")
         }
-        let detail = ChatSession.sanitizeCompactionDigest(recentWorkDigest ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if !detail.isEmpty {
+        if let detail = digests.detail {
             blocks.append("The most recently compacted work, kept in detail:\n\(detail)")
         }
         return blocks.isEmpty ? nil : blocks.joined(separator: "\n\n")
+    }
+
+    /// The rendered body of the `/compact` digest card: the standing general
+    /// summary, then the detailed recap of the most recent work. This is DISPLAY
+    /// text only. It mirrors what `compactionContextBlock` injects into the
+    /// system prompt, from the same `compactionDigests` resolution, but it is
+    /// never itself sent, because the card is a system-role message and every
+    /// prompt builder skips those.
+    nonisolated static func compactionSummaryCardContent(summary: String, recap: String?) -> String {
+        let digests = compactionDigests(summary: summary, recap: recap)
+        var blocks: [String] = []
+        if let general = digests.general {
+            blocks.append(general)
+        }
+        if let detail = digests.detail {
+            blocks.append("---")
+            blocks.append("**Recent work, in detail**")
+            blocks.append(detail)
+        }
+        return blocks.joined(separator: "\n\n")
+    }
+
+    /// The transcript `/compact` commits: the visible digest card at the head of
+    /// the conversation, then the outcome marker. Both rows are system-role, so
+    /// neither reaches a later prompt (the digests travel in
+    /// `compactionContextBlock` instead), and both survive a relaunch, unlike
+    /// the transient progress bubble they replace. Rebuilding the pair from the
+    /// fresh digests is what guarantees at most one card per conversation.
+    nonisolated static func compactedHistory(
+        summary: String,
+        recap: String?,
+        evictedMessageCount: Int
+    ) -> [ChatMessage] {
+        let card = ChatMessage(
+            role: .system,
+            content: compactionSummaryCardContent(summary: summary, recap: recap),
+            isCompactionSummary: true
+        )
+        let marker = ChatMessage(
+            role: .system,
+            content: "🗂 \(evictedMessageCount) messages compacted into a rolling summary by Apple Foundation Model. The conversation continues from that summary context."
+        )
+        return [card, marker]
+    }
+
+    /// How many messages a compaction pass is reported as having folded away.
+    /// The chunker is handed the whole array, but only conversation rows are
+    /// turns: standing notices, and the card plus marker an earlier compaction
+    /// left behind, are UI state, so counting them would inflate the figure the
+    /// progress pill, the committed marker and the status notice all print.
+    nonisolated static func compactableMessageCount(in messages: [ChatMessage]) -> Int {
+        messages.filter { $0.role != .system }.count
     }
 
     /// Odometer arithmetic for one generation step's prompt ingestion: the

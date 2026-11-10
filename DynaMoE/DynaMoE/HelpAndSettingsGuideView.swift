@@ -253,7 +253,7 @@ struct HelpAndSettingsGuideView: View {
                         .font(.system(size: 12))
                         .lineSpacing(2)
 
-                    Text("The system model also powers /compact, a manual command usable on any backend: it summarizes the whole conversation into a rolling general summary plus a detailed recap of the latest work, then leaves a blank slate — only the compaction marker stays on screen — with both digests riding along in every later prompt on either backend. When the on-device model is unavailable, history stays untouched rather than being cut down.")
+                    Text("The system model also powers /compact, a manual command usable on any backend: it summarizes the whole conversation into a rolling general summary plus a detailed recap of the latest work, then keeps both on screen in an expandable summary card at the top of the chat, followed by a marker naming how many messages were compacted. Both digests ride along in every later prompt on either backend, and the card is display-only, so it never counts against the context window. When the on-device model is unavailable, history stays untouched rather than being cut down.")
                         .font(.system(size: 12))
                         .lineSpacing(2)
                 }

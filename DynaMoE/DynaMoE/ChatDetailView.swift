@@ -100,6 +100,10 @@ struct ChatDetailView: View {
     @State private var sessionTitleDraft = ""
     @AppStorage("dynamoe_reasoning_expanded_by_default") private var reasoningExpandedByDefault: Bool = false
     @State private var isReasoningExpanded: [UUID: Bool] = [:]
+    /// Expansion state of a `/compact` digest card, keyed by message id. The
+    /// card defaults to expanded: keeping the summary readable is the point of
+    /// the card, and collapsing is the opt-out for reclaiming the space.
+    @State private var isCompactionSummaryExpanded: [UUID: Bool] = [:]
     @State private var promptTokenCount: Int = 0
     @State private var tokenCountTask: Task<Void, Never>? = nil
     @State private var isPinnedToBottom: Bool = true
@@ -192,6 +196,30 @@ struct ChatDetailView: View {
                 proxy.scrollTo(Self.scrollBottomAnchorID, anchor: .bottom)
             }
         }
+    }
+
+    /// Lands a freshly compacted transcript on its digest card. That state is
+    /// exactly two rows, the card followed by its marker, and the card is what
+    /// compaction just produced: following the bottom instead can leave it far
+    /// above the viewport when the summary is long. Returns true when it
+    /// handled the scroll, so callers fall through to their normal follow.
+    ///
+    /// The pin is left to the geometry handler on purpose. Landing at the top of
+    /// a long card scrolls away from the bottom, and that offset change is what
+    /// unpins. Clearing it here instead would strand a summary that fits the
+    /// viewport as unpinned: the scroll is a no-op there, so no geometry change
+    /// arrives to correct it, and only the next turn would re-pin.
+    @discardableResult
+    private func landOnCompactedSummary(_ proxy: ScrollViewProxy) -> Bool {
+        guard let first = session?.messages.first,
+              first.isCompactionSummary == true,
+              session?.messages.count == 2 else { return false }
+        DispatchQueue.main.async {
+            withAnimation(.easeOut(duration: 0.2)) {
+                proxy.scrollTo(first.id, anchor: .top)
+            }
+        }
+        return true
     }
 
     /// True while a /compact pass is streaming into its progress bubble.
@@ -471,17 +499,29 @@ struct ChatDetailView: View {
                         if let session = session, !session.messages.isEmpty {
                             LazyVStack(spacing: 24) {
                                 ForEach(session.messages) { message in
-                                    ChatMessageView(
-                                        message: message,
-                                        isGenerating: isGenerating && message.id == session.messages.last?.id,
-                                        isStreamingOffDisk: isStreamingOffDisk,
-                                        isCompactingConversation: message.id == compactionProgressMessageId,
-                                        isGemmaDialect: isGemmaDialect,
-                                        isExpanded: Binding(
-                                            get: { isReasoningExpanded[message.id] ?? reasoningExpandedByDefault },
-                                            set: { isReasoningExpanded[message.id] = $0 }
-                                        )
-                                    )
+                                    Group {
+                                        if message.isCompactionSummary == true {
+                                            CompactionSummaryCard(
+                                                message: message,
+                                                isExpanded: Binding(
+                                                    get: { isCompactionSummaryExpanded[message.id] ?? true },
+                                                    set: { isCompactionSummaryExpanded[message.id] = $0 }
+                                                )
+                                            )
+                                        } else {
+                                            ChatMessageView(
+                                                message: message,
+                                                isGenerating: isGenerating && message.id == session.messages.last?.id,
+                                                isStreamingOffDisk: isStreamingOffDisk,
+                                                isCompactingConversation: message.id == compactionProgressMessageId,
+                                                isGemmaDialect: isGemmaDialect,
+                                                isExpanded: Binding(
+                                                    get: { isReasoningExpanded[message.id] ?? reasoningExpandedByDefault },
+                                                    set: { isReasoningExpanded[message.id] = $0 }
+                                                )
+                                            )
+                                        }
+                                    }
                                     .id(message.id)
                                 }
                             }
@@ -513,9 +553,11 @@ struct ChatDetailView: View {
                 }
                 .onChange(of: session?.id) { _ in
                     isPinnedToBottom = true
+                    guard !landOnCompactedSummary(proxy) else { return }
                     followBottom(proxy)
                 }
                 .onChange(of: session?.messages.count) { _ in
+                    guard !landOnCompactedSummary(proxy) else { return }
                     guard isPinnedToBottom else { return }
                     followBottom(proxy, animated: true)
                 }
@@ -2064,6 +2106,97 @@ struct TranscriptAttachmentStrip: View {
             }
             thumbnails = loaded
         }
+    }
+}
+
+/// The digest card `/compact` leaves at the head of a compacted conversation.
+///
+/// Deliberately not a `ChatMessageView`: the card is UI state rather than a
+/// turn, and rendering it as chrome (bordered, titled, collapsible) is what
+/// keeps a summary of several thousand characters from reading as something the
+/// assistant just said. The message is system-role, so no prompt builder ever
+/// replays it; `ChatSession.compactionContextBlock` is what the model receives.
+struct CompactionSummaryCard: View {
+    @EnvironmentObject private var zoomManager: AppZoomManager
+    let message: ChatMessage
+    @Binding var isExpanded: Bool
+    @State private var isCopied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Button(action: {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isExpanded.toggle()
+                    }
+                }) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "archivebox.fill")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(
+                                LinearGradient(
+                                    colors: [.purple, .indigo],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+
+                        Text("Compacted conversation summary")
+                            .font(.system(size: max(10, 12 * zoomManager.zoomScale), weight: .semibold))
+                            .foregroundColor(.primary)
+
+                        Spacer(minLength: 0)
+
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(.secondary.opacity(0.8))
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(isExpanded ? "Hide the compacted summary" : "Show the compacted summary")
+                .accessibilityLabel("Compacted conversation summary")
+                .accessibilityHint(isExpanded ? "Collapse the summary" : "Expand the summary")
+
+                // The summary is the only copy of the digests on screen, so it
+                // is offered as one run instead of requiring a selection across
+                // rendered markdown blocks.
+                Button(action: {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(message.content, forType: .string)
+                    isCopied = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                        isCopied = false
+                    }
+                }) {
+                    Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
+                        .foregroundColor(isCopied ? .green : .secondary)
+                        .padding(6)
+                        .background(Color.secondary.opacity(0.06))
+                        .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+                .help("Copy the compacted summary")
+                // Icon-only, so VoiceOver would otherwise read the SF Symbol's
+                // own name. The label carries the copied state, which is how the
+                // confirmation that used to be a bare checkmark reaches someone
+                // who cannot see it.
+                .accessibilityLabel(isCopied ? "Compacted summary copied" : "Copy the compacted summary")
+            }
+
+            if isExpanded {
+                MarkdownMessageView(content: message.content)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(NSColor.controlBackgroundColor).opacity(0.7))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.purple.opacity(0.16), lineWidth: 1)
+        )
     }
 }
 
