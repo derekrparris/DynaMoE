@@ -106,7 +106,8 @@ final class CloudProviderStore: ObservableObject {
     /// Changes the display name, base URL, or documentation link. The
     /// identifier is deliberately immutable: it is the Keychain account
     /// suffix and part of the `cloud://` address saved with every conversation
-    /// that used the provider.
+    /// that used the provider. A new base URL drops the per-model state, since
+    /// every id and capability mark it held described the old endpoint.
     func update(
         _ provider: CloudProvider,
         displayName: String,
@@ -130,8 +131,16 @@ final class CloudProviderStore: ObservableObject {
             existing: existing
         ).get()
 
+        let previousBaseURL = custom[index].openAIBaseURL
         custom[index] = updated
         CloudProviderCatalog.saveCustomProviders(custom, defaults: defaults)
+        // The registered ids, the no-tools list, and the vision marks are all
+        // facts about the server at the old base URL rather than about this
+        // identifier, so keeping them would offer model ids the new endpoint
+        // never listed and fail with that endpoint's own error on the send.
+        if updated.openAIBaseURL != previousBaseURL {
+            CloudModelRegistry.clearProviderState(for: updated, defaults: defaults)
+        }
         publish()
     }
 

@@ -437,7 +437,7 @@ Authentication is `Authorization: Bearer <key>`. Streaming uses SSE with `stream
 | API Key | Optional at creation; it is written to the Keychain (`DRP.DynaMoE.cloud`) and can be saved or rotated on the provider card. |
 | Documentation | Optional `http(s)` link shown on the card. Because the link is stored in plain text with the provider record, `user:password@` and query strings are refused. |
 
-Built-in providers (Synthetic) stay available and cannot be edited or removed. **Remove** on a custom provider deletes its Keychain key, its registered models, its no-tools list, and its vision marks; a conversation pinned to one of its models then refuses to send with a reselect message instead of silently running on local weights.
+Built-in providers (Synthetic) stay available and cannot be edited or removed. **Remove** on a custom provider deletes its Keychain key, its registered models, its no-tools list, and its vision marks; a conversation pinned to one of its models then refuses to send with a reselect message instead of silently running on local weights. Editing a saved provider's **API Base URL** drops those same model registrations, because they describe the old endpoint; press **Test & Sync Models** to register the new one's catalog.
 
 #### OpenCode Zen
 

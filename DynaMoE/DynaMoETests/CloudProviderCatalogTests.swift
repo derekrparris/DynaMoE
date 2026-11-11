@@ -529,6 +529,59 @@ final class CloudProviderStoreTests: XCTestCase {
         )
     }
 
+    func testChangingTheBaseURLDropsThePreviousEndpointsModelFacts() throws {
+        let harness = makeHarness()
+        defer { harness.cleanUp() }
+
+        let provider = try harness.store.add(
+            displayName: "OpenCode Zen",
+            identifier: "opencode-zen",
+            baseURL: "https://opencode.ai/zen/v1"
+        )
+        CloudModelRegistry.setRegisteredModelIds(["qwen3-coder"], for: provider, defaults: harness.defaults)
+        CloudModelRegistry.setVisionSupport(
+            true,
+            forModel: "qwen3-coder",
+            provider: provider,
+            defaults: harness.defaults
+        )
+        CloudModelRegistry.setModelIdsWithoutToolSupport(
+            ["qwen3-coder"],
+            for: provider,
+            defaults: harness.defaults
+        )
+
+        try harness.store.update(
+            provider,
+            displayName: "OpenCode Zen",
+            baseURL: "https://gateway.example.com/v1"
+        )
+
+        XCTAssertTrue(
+            CloudModelRegistry.registeredModelIds(for: provider, defaults: harness.defaults).isEmpty,
+            "the new endpoint has not listed its catalog yet, so nothing from the old one may stay pickable"
+        )
+        XCTAssertTrue(
+            CloudModelRegistry.modelIdsWithVisionSupport(for: provider, defaults: harness.defaults).isEmpty
+        )
+        XCTAssertTrue(
+            CloudModelRegistry.modelIdsWithoutToolSupport(for: provider, defaults: harness.defaults).isEmpty
+        )
+        XCTAssertNil(harness.defaults.string(forKey: CloudModelRegistry.modelsDefaultsKey(for: provider.id)))
+
+        CloudModelRegistry.setRegisteredModelIds(["gateway-chat"], for: provider, defaults: harness.defaults)
+        try harness.store.update(
+            provider,
+            displayName: "Gateway",
+            baseURL: "https://gateway.example.com/v1"
+        )
+        XCTAssertEqual(
+            CloudModelRegistry.registeredModelIds(for: provider, defaults: harness.defaults),
+            ["gateway-chat"],
+            "renaming a provider says nothing about which server it points at"
+        )
+    }
+
     func testACredentialedBaseURLIsRefusedAndNeverPersisted() {
         let harness = makeHarness()
         defer { harness.cleanUp() }
