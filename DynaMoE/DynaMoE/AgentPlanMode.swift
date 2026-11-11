@@ -21,7 +21,7 @@
 import Foundation
 
 /// Which agent persona and tool surface a conversation is running.
-/// Persisted per conversation (`ChatSession.mode`); `nil` there means `.code`.
+/// Persisted per conversation (`ChatSession.agentMode`); `nil` there means `.code`.
 nonisolated public enum AgentMode: String, Codable, Equatable, Sendable {
     /// The normal agent: reads, writes, runs shell commands, commits.
     case code
@@ -108,6 +108,17 @@ nonisolated public enum PlanMarkers {
 /// tool added to the harness later is withheld from plan mode by default
 /// instead of silently gaining write access to a read-only promise.
 nonisolated public enum PlanModePolicy {
+    /// The read tools entering plan mode loads for the turn, so an investigation
+    /// does not open with a `tools_load` step.
+    ///
+    /// Deliberately a small core rather than the whole read surface: every armed
+    /// tool is a schema in each plan turn's prompt, and the rest of
+    /// `allowedToolNames` stays one `tools_load` away for the turns that need it.
+    /// `file_read` plus the two searches cover an ordinary plan.
+    public static let coreToolNames: Set<String> = [
+        "file_read", "grep_search", "find_files", "codebase_search"
+    ]
+
     /// Tools the plan agent may call. Everything installed and not named here
     /// is withheld.
     public static let allowedToolNames: Set<String> = [
@@ -212,7 +223,7 @@ nonisolated public enum PlanModePolicy {
 
         <workflow>
         1. Decompose the request into independent investigation threads (architecture, analogous features, tests, configuration, documentation, user-facing touchpoints).
-        2. Explore with `file_read`, `grep_search`, `find_files`, `codebase_search`, `find_symbol_definition` and `find_references`; delegate independent searches to a subagent when that is useful.
+        2. Explore with `file_read`, `grep_search`, `find_files` and `codebase_search`. Symbol lookup, `git_diff`, lint diagnostics and the web tools load with `tools_load` when a step needs them, and independent searches can be delegated to a subagent.
         3. Synthesize what exists: current patterns, analogous functionality, structural constraints, and the dependencies the change touches.
         4. Critically review the synthesis — name gaps, contradictions and unverified assumptions, then close them with targeted reads. Repeat until confident nothing material is missing.
         5. Assess risks, edge cases and failure modes in the touched areas. Do not expand scope beyond what informs the plan.

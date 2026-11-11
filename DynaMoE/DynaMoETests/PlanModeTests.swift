@@ -23,6 +23,7 @@ final class PlanModeTests: XCTestCase {
     /// assertion below would then be measuring that suite, not this one.
     override func setUp() {
         super.setUp()
+        AgentHarness.shared.beginAgentSearchGuard()
         AgentHarness.shared.setActiveMode(.code)
         AgentHarness.shared.resetLoadedToolsToCore()
     }
@@ -30,6 +31,7 @@ final class PlanModeTests: XCTestCase {
     override func tearDown() {
         // The harness is a singleton: leave it on the coder surface even when a
         // test fails part-way through.
+        AgentHarness.shared.beginAgentSearchGuard()
         AgentHarness.shared.setActiveMode(.code)
         AgentHarness.shared.resetLoadedToolsToCore()
         super.tearDown()
@@ -90,9 +92,22 @@ final class PlanModeTests: XCTestCase {
         for withheld in ["file_write", "file_edit", "shell_run", "git_commit", "complete"] {
             XCTAssertFalse(planNames.contains(withheld), "\(withheld) must not be offered in plan mode")
         }
-        for readTool in ["file_read", "grep_search", "codebase_search", "git_diff", "find_symbol_definition"] {
-            XCTAssertTrue(planNames.contains(readTool), "\(readTool) must stay available in plan mode")
+        // Entering the mode arms a small read core rather than the whole read
+        // surface: the rest of `allowedToolNames` is still callable, but it
+        // arrives through `tools_load` instead of riding in every plan prompt.
+        for readTool in PlanModePolicy.coreToolNames {
+            XCTAssertTrue(planNames.contains(readTool), "\(readTool) must be armed by plan mode")
         }
+        XCTAssertFalse(
+            planNames.contains("find_symbol_definition"),
+            "a tool outside the core is not armed until the turn asks for it"
+        )
+        _ = try? AgentHarness.shared.loadTool(named: "find_symbol_definition")
+        XCTAssertTrue(
+            Set(AgentHarness.shared.availableToolDefinitions(mode: .plan).map { $0.function.name })
+                .contains("find_symbol_definition"),
+            "an allowed read tool stays one tools_load away"
+        )
         XCTAssertTrue(PlanModePolicy.withholds("mcp__anything__do"), "MCP is withheld wholesale")
         XCTAssertFalse(PlanModePolicy.withholds("file_read"))
 
@@ -187,6 +202,10 @@ final class PlanModeTests: XCTestCase {
             PlanModePolicy.allowedToolNames.isDisjoint(with: PlanModePolicy.withheldToolNames),
             "a tool can be callable or named as absent, never both"
         )
+        XCTAssertTrue(
+            PlanModePolicy.coreToolNames.isSubset(of: PlanModePolicy.allowedToolNames),
+            "the tools entering plan mode arms must be ones it may call"
+        )
         for name in PlanModePolicy.withheldToolNames {
             XCTAssertTrue(PlanModePolicy.withholds(name), "\(name) is named as withheld and must be")
         }
@@ -245,6 +264,27 @@ final class PlanModeTests: XCTestCase {
         XCTAssertEqual(
             AgentHarness.shared.consecutiveFailedToolCalls, 0,
             "a policy refusal is the environment's answer, not a malformed call"
+        )
+    }
+
+    /// Both turn loops used to ask `call.name == "complete"` directly, which made
+    /// the withheld `complete` end the run — with no plan, no ready marker and no
+    /// handoff, the exact dead end the plan backstop exists to prevent.
+    func testAWithheldCompleteEndsNothing() {
+        XCTAssertTrue(
+            ToolExecutionStatus.success.endsAgentRun(toolName: "complete", isCompleted: true),
+            "a complete call ends the run"
+        )
+        XCTAssertTrue(
+            ToolExecutionStatus.success.endsAgentRun(toolName: "shell_run", isCompleted: true),
+            "the harness's own loop guards end the run through isCompleted"
+        )
+        XCTAssertFalse(
+            ToolExecutionStatus.withheld.endsAgentRun(toolName: "complete", isCompleted: false),
+            "a withheld complete must let the turn finish with its plan"
+        )
+        XCTAssertFalse(
+            ToolExecutionStatus.success.endsAgentRun(toolName: "file_read", isCompleted: false)
         )
     }
 
@@ -359,6 +399,33 @@ final class PlanModeTests: XCTestCase {
     }
 
     // MARK: - Persistence
+
+    func testAWithheldRecordStaysReadableByABuildWithoutTheCase() throws {
+        // `.withheld` postdates plan mode, and an unknown raw value fails the
+        // decode of the WHOLE record — and with it the session file. It is
+        // therefore persisted as a status every build knows, with the real
+        // meaning in a companion key this build reads back.
+        let withheld = ToolCallRecord(name: "file_write", status: .withheld, error: "PLAN MODE")
+        let data = try JSONEncoder().encode(withheld)
+        let json = try XCTUnwrap(String(data: data, encoding: .utf8))
+        XCTAssertFalse(
+            json.contains("\"status\":\"withheld\""),
+            "an older build would lose the conversation rather than one record's nuance"
+        )
+        XCTAssertTrue(json.contains("\"withheldInPlanMode\":true"))
+        XCTAssertEqual(try JSONDecoder().decode(ToolCallRecord.self, from: data).status, .withheld)
+
+        // Every other status round-trips unchanged, and a plain rejection is not
+        // read back as a mode refusal.
+        for status in [ToolExecutionStatus.running, .success, .error, .awaitingApproval, .rejected] {
+            let record = ToolCallRecord(name: "file_write", status: status)
+            let roundTripped = try JSONDecoder().decode(
+                ToolCallRecord.self,
+                from: JSONEncoder().encode(record)
+            )
+            XCTAssertEqual(roundTripped.status, status)
+        }
+    }
 
     func testAgentModeSurvivesAPersistenceRoundTrip() throws {
         let session = ChatSession(title: "Plan a feature", agentMode: .plan)

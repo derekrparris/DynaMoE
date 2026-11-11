@@ -1567,6 +1567,22 @@ struct ContentView: View {
                         }
                     },
                     onToggleAgentTools: { enabled in
+                        // Plan mode is an agent mode, not a prompt preference:
+                        // with tools off it has no directive, no read tools and
+                        // no handoff, so the pill would claim a mode the turn
+                        // never runs. Turning the tools off therefore leaves the
+                        // mode with them, and a live turn refuses the change for
+                        // the same reason it refuses a mode flip.
+                        if !enabled,
+                           let sid = selectedSessionId ?? sessions.first?.id,
+                           let idx = sessions.firstIndex(where: { $0.id == sid }),
+                           (sessions[idx].agentMode ?? .code) == .plan {
+                            guard !isModeChangeLocked, applyPlanMode(false, sessionId: sid) else {
+                                showStatus("⏳ Plan Mode is running — finish the turn before turning agent tools off.", kind: .warning)
+                                return
+                            }
+                            showStatus("⌨️ Tools off — Plan Mode needs the agent's tools, so this conversation is back in Code Mode.", kind: .warning)
+                        }
                         defaultAgentToolsEnabled = enabled
                         if let sid = selectedSessionId ?? sessions.first?.id,
                            let idx = sessions.firstIndex(where: { $0.id == sid }) {
@@ -2187,6 +2203,16 @@ struct ContentView: View {
     private func setPlanMode(_ enabled: Bool, sessionId: UUID) -> Bool {
         guard !isModeChangeLocked else {
             showStatus("⏳ Finishing the current turn first — the agent's mode cannot change while it runs.", kind: .warning)
+            return false
+        }
+        // The UI hides the pill on a plain-chat backend, but `/plan` is typed
+        // text and would otherwise flip a mode that turn cannot run: the Apple
+        // Foundation Model has no tool loop, so the directive, the read tools and
+        // the handoff all belong to a surface it is not on.
+        if enabled,
+           let idx = sessions.firstIndex(where: { $0.id == sessionId }),
+           sessionUsesAppleFoundationModel(sessions[idx]) {
+            showStatus("🧭 Plan Mode needs a model with tool calling — Apple Foundation Model runs plain chat, so there is nothing to plan with.", kind: .warning)
             return false
         }
         return applyPlanMode(enabled, sessionId: sessionId)
@@ -4480,8 +4506,16 @@ struct ContentView: View {
                 agent.recordToolCallFingerprint(toolName: call.name, arguments: parsedCall.arguments)
             }
             // `isCompleted` covers every tool that ends the run (the harness's
-            // loop guards set it too), matching the weights path.
-            if execResult.isCompleted || call.name == "complete" { ranComplete = true }
+            // loop guards set it too), matching the weights path. The rule lives
+            // on the status so both turn loops read it the same way — a withheld
+            // `complete` must not end the run, because plan mode took it away so
+            // the turn could finish with a plan.
+            if execResult.record.status.endsAgentRun(
+                toolName: call.name,
+                isCompleted: execResult.isCompleted
+            ) {
+                ranComplete = true
+            }
 
             updateRecord(record.id) { rec in
                 rec.status = execResult.record.status
@@ -5448,17 +5482,24 @@ struct ContentView: View {
                             outcome: execResult.record.status.toolCallOutcome
                         )
                         // See the cloud path: a withheld call must not clear the
-                        // repeat guard on the mutating tools.
+                        // repeat guard on the mutating tools, and it ends nothing
+                        // either — plan mode withholds `complete` so the turn can
+                        // finish with a plan, and reading the refusal as
+                        // completion would end the run with no plan and no
+                        // handoff.
                         if execResult.record.status != .withheld {
                             AgentHarness.shared.recordToolCallFingerprint(
                                 toolName: call.name,
                                 arguments: call.arguments
                             )
+                            if execResult.isCompleted {
+                                anyCompleted = true
+                            }
                         }
-                        if execResult.isCompleted {
-                            anyCompleted = true
-                        }
-                        if call.name == "complete" {
+                        if execResult.record.status.endsAgentRun(
+                            toolName: call.name,
+                            isCompleted: execResult.isCompleted
+                        ) {
                             ranCompleteTool = true
                         }
 

@@ -2820,12 +2820,26 @@ extension ToolExecutionStatus {
     /// rejected action should be reeled in like one whose calls error. `.withheld`
     /// is the mode refusing before execution, which is the one case that gets its
     /// own treatment.
-    var toolCallOutcome: ToolCallOutcome {
+    nonisolated var toolCallOutcome: ToolCallOutcome {
         switch self {
         case .error, .rejected: return .failed
         case .withheld: return .withheld
         case .success, .running, .awaitingApproval: return .succeeded
         }
+    }
+
+    /// True when the call that produced this status ENDS the agent run.
+    ///
+    /// A `complete` call is the usual ending, and the harness's loop guards can
+    /// set the same flag, so the name and the flag are both honoured. A WITHHELD
+    /// call ends nothing: plan mode takes `complete` away precisely so the turn
+    /// finishes with a plan instead, and reading that refusal as completion would
+    /// end the run with no plan, no ready marker and nothing to approve. Every
+    /// run-ending decision reads this rather than testing the name itself, which
+    /// is what keeps the two turn loops from disagreeing about it again.
+    nonisolated func endsAgentRun(toolName: String, isCompleted: Bool) -> Bool {
+        guard self != .withheld else { return false }
+        return isCompleted || toolName == "complete"
     }
 }
 
@@ -2863,19 +2877,21 @@ public final class AgentHarness {
     /// `availableToolDefinitions` and `executeTool` all default to
     /// `activeMode`.
     ///
-    /// Entering plan mode also LOADS its read surface. The default registry is
+    /// Entering plan mode also loads a small read core. The default registry is
     /// deliberately minimal (`shell_run`, `complete`, discovery and `web_fetch`),
     /// and `shell_run` is exactly what plan mode withholds — without this a plan
     /// turn would advertise no way to read a file and its first move would be a
-    /// `tools_load`, which is a wasted step and a prompt rewrite. The set armed
-    /// here is removed again on the way out, so the coder prompt does not grow
-    /// permanent schemas because a conversation planned once.
+    /// `tools_load`, which is a wasted step and a prompt rewrite. The rest of the
+    /// read surface stays one `tools_load` away rather than riding in every plan
+    /// prompt as a schema. The set armed here is removed again on the way out, so
+    /// the coder prompt does not grow permanent schemas because a conversation
+    /// planned once.
     public func setActiveMode(_ mode: AgentMode) {
         if activeMode != mode {
             let previous = activeMode
             activeMode = mode
             if mode == .plan {
-                for name in PlanModePolicy.allowedToolNames.sorted()
+                for name in PlanModePolicy.coreToolNames.sorted()
                 where tools[name] != nil && loadedTools[name] == nil {
                     loadedTools[name] = tools[name]
                     armedByPlanMode.insert(name)
@@ -2887,13 +2903,20 @@ public final class AgentHarness {
                 armedByPlanMode.removeAll()
             }
         }
-        // Re-asserted even when the mode did not change. The registry has a
-        // second writer: a server turn installs the client's own schemas for its
-        // duration and restores a snapshot afterwards, so a mode flip that lands
+        // Re-asserted even when the mode did not change, because the registry has
+        // a second writer: a server turn installs the client's own schemas for its
+        // duration and restores a snapshot afterwards, so a mode flip that landed
         // inside one can leave the registry holding the other surface while
-        // `activeMode` disagrees. Re-syncing on every assertion heals that at the
-        // next turn's start, where an early return would have left a coder turn
-        // running on plan mode's grammar indefinitely.
+        // `activeMode` disagrees. An early return would leave a coder turn running
+        // on plan mode's grammar indefinitely.
+        //
+        // It must not run WHILE that second writer is active, though: rebuilding
+        // the shared registry from the harness catalog during a server turn
+        // replaces the client mask mid-generation, and the assertion that would do
+        // it (the start of an in-app send) is refused a moment later by the
+        // single-flight slot anyway. Nothing can then run on stale grammar, and
+        // the next assertion made while the engine is idle heals the registry.
+        guard !CompletionEngine.shared.isActive else { return }
         syncGrammar()
     }
 
@@ -4513,7 +4536,7 @@ public final class AgentHarness {
         // the one place every execution path passes through.
         let effectiveMode = mode ?? activeMode
         if effectiveMode == .plan, PlanModePolicy.withholds(call.name) {
-            let err = "PLAN MODE: '\(call.name)' is withheld in plan mode and was not executed. Do not retry it. Investigate with file_read, grep_search, codebase_search or find_symbol_definition, then answer with the plan ending in \(PlanMarkers.ready) on its own line."
+            let err = "PLAN MODE: '\(call.name)' is withheld in plan mode and was not executed. Do not retry it. Investigate with the read tools you have (file_read, grep_search, find_files, codebase_search), then answer with the plan ending in \(PlanMarkers.ready) on its own line."
             let json = AgentHarness.toolErrorJSON(tool: call.name, error: err)
             let rec = ToolCallRecord(
                 name: call.name,

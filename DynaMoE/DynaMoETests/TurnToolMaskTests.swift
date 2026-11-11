@@ -100,4 +100,40 @@ final class TurnToolMaskTests: XCTestCase {
             "restoring a snapshot must reinstate the previous registry"
         )
     }
+
+    /// A chat send asserts the conversation's mode before it asks for the engine
+    /// slot, so the assertion can land while a server turn holds that slot with
+    /// its own client schemas installed. Rebuilding the shared registry there
+    /// would replace a live turn's mask mid-generation; the send itself is
+    /// refused a moment later, so nothing needs the rebuild.
+    func testAModeAssertionWhileTheSlotIsHeldLeavesTheClientMaskAlone() {
+        let sampler = GrammarConstrainedSampler.shared
+        let harness = AgentHarness.shared
+        sampler.registerToolSchemas([GrammarToolSchema(name: "client_only")])
+        sampler.reset()
+
+        guard let claim = CompletionEngine.shared.reserveTurnSlot() else {
+            return XCTFail("the engine slot must be free in a unit test")
+        }
+        harness.setActiveMode(.plan)
+        claim.release()
+
+        sampler.reset()
+        XCTAssertEqual(
+            masked("<tool_call><function=", tokens: ["client_only>", "shell_run>"]),
+            [false, true],
+            "a mode assertion made under a claim must not rebuild the registry"
+        )
+
+        // Once the slot is free the next assertion heals it, which is what the
+        // re-sync exists for.
+        harness.setActiveMode(.code)
+        sampler.reset()
+        XCTAssertEqual(
+            masked("<tool_call><function=", tokens: ["client_only>", "shell_run>"]),
+            [true, false],
+            "an idle assertion restores the harness surface"
+        )
+        harness.resetLoadedToolsToCore()
+    }
 }

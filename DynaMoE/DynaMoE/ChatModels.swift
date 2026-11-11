@@ -84,6 +84,63 @@ nonisolated public struct ToolCallRecord: Identifiable, Codable, Equatable, Send
         self.timestamp = timestamp
         self.isGesture = isGesture
     }
+
+    // MARK: - Codable
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, arguments, rawArguments, status, output, error
+        case executionDurationSeconds, timestamp, isGesture
+        /// Written beside a withheld `status` and read back as the real meaning.
+        /// See `encode(to:)`.
+        case withheldInPlanMode
+    }
+
+    /// Decodes a record written by this build or any earlier one.
+    ///
+    /// `withheldInPlanMode` is what restores `.withheld`: the status itself is
+    /// written as `.rejected` so that a build predating plan mode (which has no
+    /// `.withheld` case and would fail on it) can still decode the conversation
+    /// instead of losing it. A record written directly with `.withheld` — an
+    /// intermediate build, or a hand-edited file — is accepted too.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        arguments = try container.decode([String: String].self, forKey: .arguments)
+        rawArguments = try container.decode(String.self, forKey: .rawArguments)
+        output = try container.decodeIfPresent(String.self, forKey: .output)
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+        executionDurationSeconds = try container.decodeIfPresent(
+            Double.self,
+            forKey: .executionDurationSeconds
+        )
+        timestamp = try container.decode(Date.self, forKey: .timestamp)
+        isGesture = try container.decodeIfPresent(Bool.self, forKey: .isGesture) ?? false
+        let recorded = try container.decode(ToolExecutionStatus.self, forKey: .status)
+        let flagged = try container.decodeIfPresent(Bool.self, forKey: .withheldInPlanMode) ?? false
+        status = (flagged || recorded == .withheld) ? .withheld : recorded
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(arguments, forKey: .arguments)
+        try container.encode(rawArguments, forKey: .rawArguments)
+        try container.encodeIfPresent(output, forKey: .output)
+        try container.encodeIfPresent(error, forKey: .error)
+        try container.encodeIfPresent(executionDurationSeconds, forKey: .executionDurationSeconds)
+        try container.encode(timestamp, forKey: .timestamp)
+        try container.encode(isGesture, forKey: .isGesture)
+        // `.withheld` did not exist before plan mode, and an unknown raw value
+        // fails the decode of the WHOLE record and with it the session file. It
+        // is therefore persisted as the closest status an older build knows, with
+        // the real meaning beside it for this build to read back.
+        try container.encode(status == .withheld ? .rejected : status, forKey: .status)
+        if status == .withheld {
+            try container.encode(true, forKey: .withheldInPlanMode)
+        }
+    }
 }
 
 /// One image a user attached to a message. The pixels live in the asset store
