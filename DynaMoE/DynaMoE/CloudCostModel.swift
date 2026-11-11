@@ -270,6 +270,26 @@ public nonisolated struct CloudTurnReport: Equatable, Sendable {
         self.cost = cost
     }
 
+    /// A whole run's totals rather than one request's usage block.
+    ///
+    /// A cloud agent turn is several billed requests, so the summary line at
+    /// the end of the run reports what every step cost, matching the session's
+    /// cumulative spend. `wasEstimated` is true when ANY step fell back to the
+    /// app's own token estimate.
+    public init(
+        promptTokens: Int,
+        cachedTokens: Int,
+        outputTokens: Int,
+        cost: Double?,
+        wasEstimated: Bool
+    ) {
+        self.promptTokens = max(0, promptTokens)
+        self.cachedTokens = max(0, cachedTokens)
+        self.outputTokens = max(0, outputTokens)
+        self.cost = cost
+        self.wasEstimated = wasEstimated
+    }
+
     /// `1,204 in (1,000 cached) / 56 out · $0.0031`, or the estimate-marked
     /// form when the provider reported no usage.
     public var statusSuffix: String {

@@ -70,7 +70,9 @@ private nonisolated final class CloudSessionCache: @unchecked Sendable {
 /// A provider that rejects `prompt_cache_key` rejects it on every request, and
 /// paying a rejected round trip per agent step would cost a turn more than the
 /// hint could ever save. One entry per endpoint, process lifetime, and a lock
-/// only on the miss path.
+/// only on the miss path. A rejection is only recorded once a request WITHOUT
+/// the field has been accepted, because an unrelated 400 looks identical (see
+/// `streamTurn`).
 private nonisolated final class CloudCacheHintMemory: @unchecked Sendable {
     static let shared = CloudCacheHintMemory()
 
@@ -244,6 +246,14 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                     // is worth one retry, never a failed turn.
                     var includeUsage = true
                     var includeCacheKey = true
+                    // Remembered only when the retry WITHOUT the field
+                    // succeeds. A 400 is not proof the field was the reason:
+                    // an unknown model name or a malformed tools schema is
+                    // answered the same way, and latching on one of those
+                    // would switch the hint off for every later turn on this
+                    // provider. The retry is free; the memory is not.
+                    var retriedWithoutCacheKey = false
+                    var cacheKeyRejectionStatus: Int?
                     let asksForCacheKey = self.cacheHints.sendsPromptCacheKey
                         && !(params.sessionKey ?? "").isEmpty
                     for _ in 0..<3 {
@@ -271,10 +281,8 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                             if includeCacheKey, asksForCacheKey,
                                Self.shouldRetryWithoutCacheKey(status: http.statusCode) {
                                 includeCacheKey = false
-                                CloudCacheHintMemory.shared.declinePromptCacheKey(
-                                    endpoint: self.chatURL.absoluteString
-                                )
-                                print("☁️ [CACHE] \(self.chatURL.host ?? "provider") rejected prompt_cache_key (HTTP \(http.statusCode)); continuing without it.")
+                                retriedWithoutCacheKey = true
+                                cacheKeyRejectionStatus = http.statusCode
                                 continue
                             }
                             continuation.yield(.failed(.httpStatus(
@@ -283,6 +291,16 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                             )))
                             continuation.finish()
                             return
+                        }
+
+                        // The field is only proven unwelcome once a request
+                        // without it is accepted. Until then the rejection may
+                        // have been about the body's model, tools or size.
+                        if retriedWithoutCacheKey {
+                            CloudCacheHintMemory.shared.declinePromptCacheKey(
+                                endpoint: self.chatURL.absoluteString
+                            )
+                            print("☁️ [CACHE] \(self.chatURL.host ?? "provider") rejected prompt_cache_key (HTTP \(cacheKeyRejectionStatus ?? 0)); the retry without it succeeded, so it will not be sent again.")
                         }
 
                         var lineBuffer = MCPLineBuffer(limit: Self.maxEventBytes)

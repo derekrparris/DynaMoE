@@ -328,17 +328,37 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let details = try? container.decodeIfPresent(PromptTokensDetails.self, forKey: .promptTokensDetails)
-        self.promptTokens = Self.firstInt(container, [.promptTokens, .inputTokens])
-        self.completionTokens = Self.firstInt(container, [.completionTokens, .outputTokens])
-        self.totalTokens = Self.firstInt(container, [.totalTokens])
-        self.cachedTokens = Self.firstInt(
+        let openAIPrompt = Self.firstInt(container, [.promptTokens])
+        let inputTokens = Self.firstInt(container, [.inputTokens])
+        let cachedTokens = Self.firstInt(
             container,
             [.promptCacheHitTokens, .cachedTokens, .cacheReadInputTokens]
         ) ?? details?.cachedTokens
-        self.cacheWriteTokens = Self.firstInt(
+        let cacheWriteTokens = Self.firstInt(
             container,
             [.cacheCreationInputTokens, .cacheWriteTokens]
         )
+        // Anthropic splits the prompt three ways: `input_tokens` is only the
+        // share that was neither read from nor written to its cache, and the
+        // other two columns carry the rest. Its `usage` block is recognised by
+        // those Anthropic-only cache keys, so a provider that publishes
+        // `input_tokens` as the total (OpenAI's Responses shape) keeps that
+        // meaning when no cache columns ride beside it. Normalising to the
+        // total here is what lets `billableInputTokens` and `CloudPricing`
+        // subtract a cache read without clamping the prompt to zero.
+        let usesAnthropicCacheColumns = openAIPrompt == nil
+            && inputTokens != nil
+            && (container.contains(.cacheReadInputTokens)
+                || container.contains(.cacheCreationInputTokens))
+        if usesAnthropicCacheColumns, let inputTokens {
+            self.promptTokens = inputTokens + (cachedTokens ?? 0) + (cacheWriteTokens ?? 0)
+        } else {
+            self.promptTokens = openAIPrompt ?? inputTokens
+        }
+        self.completionTokens = Self.firstInt(container, [.completionTokens, .outputTokens])
+        self.totalTokens = Self.firstInt(container, [.totalTokens])
+        self.cachedTokens = cachedTokens
+        self.cacheWriteTokens = cacheWriteTokens
     }
 
     /// Encodes the canonical OpenAI shape. Nothing in the app persists a usage

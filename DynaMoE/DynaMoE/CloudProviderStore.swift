@@ -175,7 +175,8 @@ final class CloudProviderStore: ObservableObject {
     /// refused with a reselect message rather than falling back to weights.
     /// A built-in throws instead of no-oping, matching `update`: the caller is
     /// asking for something the store cannot do.
-    func remove(_ provider: CloudProvider) throws {        guard !isBuiltIn(provider) else {
+    func remove(_ provider: CloudProvider) throws {
+        guard !isBuiltIn(provider) else {
             throw CloudProviderStoreError.builtInProviderIsImmutable(provider.displayName)
         }
 

@@ -84,6 +84,9 @@ nonisolated struct ServerRequestLog: Identifiable, Codable, Sendable, Equatable,
     /// distinguishable.
     var queueWaitMs: Double?
     var model: String?
+    /// The prompt size the provider billed, or — when it reported no usage at
+    /// all — the app's pre-turn estimate, which `chatTurnLog` writes here and
+    /// `noteProviderUsage` replaces as soon as the provider speaks.
     var inputTokens: Int?
     /// Input tokens the provider served from its prompt cache. Nil on rows the
     /// provider reported no usage split for (and on every row written before
@@ -94,12 +97,6 @@ nonisolated struct ServerRequestLog: Identifiable, Codable, Sendable, Equatable,
     /// Input tokens this request wrote into the provider's cache
     /// (Anthropic-style providers bill writes separately).
     var cacheWriteInputTokens: Int?
-    /// The assembled prompt's size as the app estimated it before the turn ran.
-    /// Kept beside `inputTokens` because the two answer different questions:
-    /// "what did we send" versus "what did the provider bill". The provider's
-    /// number wins when it arrives, and this one stays as the fallback that
-    /// makes an endpoint which drops usage still readable.
-    var estimatedInputTokens: Int?
     var outputTokens: Int?
     var temperature: Double?
     var maxTokens: Int?
@@ -335,6 +332,9 @@ final class ServerRequestLogRecorder: @unchecked Sendable {
             // Cache reads are metadata, not content: the Console line says how
             // much of a re-sent history the provider served from its cache.
             parts.append("cached=\(cached)")
+        }
+        if let write = row.cacheWriteInputTokens, write > 0 {
+            parts.append("cache_write=\(write)")
         }
         if let output = row.outputTokens {
             parts.append("out=\(output)")
@@ -700,7 +700,6 @@ extension ServerRequestLog {
         row.source = .chatUI
         row.model = model
         row.inputTokens = inputTokens
-        row.estimatedInputTokens = inputTokens
         row.requestBody = capturedRequestBody(prompt)
         return ServerRequestLogBox(builder: row)
     }

@@ -2283,8 +2283,14 @@ struct SettingsSheetView: View {
                     serverRequestLogDetailLine("Model", log.model ?? "—")
                     serverRequestLogDetailLine("Tokens", log.inputTokens.map { input in
                         var text = "\(input) in / \(log.outputTokens.map(String.init) ?? "—") out"
-                        if let cached = log.cachedInputTokens, cached > 0 {
-                            text += " (\(cached) cached, \(max(0, input - cached)) billable)"
+                        let cached = log.cachedInputTokens ?? 0
+                        let cacheWrite = log.cacheWriteInputTokens ?? 0
+                        if cached > 0 || cacheWrite > 0 {
+                            var split: [String] = []
+                            if cached > 0 { split.append("\(cached) cached") }
+                            if cacheWrite > 0 { split.append("\(cacheWrite) cache write") }
+                            split.append("\(max(0, input - cached)) billable")
+                            text += " (\(split.joined(separator: ", ")))"
                         }
                         return text
                     } ?? "—")

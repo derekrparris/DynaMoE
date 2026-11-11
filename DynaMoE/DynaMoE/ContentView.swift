@@ -4220,6 +4220,16 @@ struct ContentView: View {
             var turnBilledInput = turnInputTokens
             var inputUsageSettled = false
             var generatedAccumulated = 0
+            // Run-level totals for the final status line. Every agent step is
+            // its own billed request, so the summary must report the sum of
+            // the steps: reporting the last iteration alone named a fraction
+            // of a long run while the header pill and `cumulativeCost`
+            // already accumulated the whole thing.
+            var runPromptTokens = 0
+            var runCachedTokens = 0
+            var runOutputTokens = 0
+            var runCost: Double? = nil
+            var runWasEstimated = false
             func odometerTotal(including generated: Int) -> Int {
                 sessionCumulativeStartResolved + turnBilledInput + generatedAccumulated + generated
             }
@@ -4590,7 +4600,8 @@ struct ContentView: View {
                     }
                     // Spend accumulates per step: every step is its own billed
                     // request, and a run that never reaches its final status
-                    // line still cost what it cost.
+                    // line still cost what it cost. The same number feeds the
+                    // summary line below.
                     if let cost = CloudPricingStore.pricing(
                         forModel: providerModelId,
                         providerId: provider.id
@@ -4598,11 +4609,23 @@ struct ContentView: View {
                         if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
                             self.sessions[sIdx].cumulativeCost = (self.sessions[sIdx].cumulativeCost ?? 0) + cost
                         }
+                        runCost = (runCost ?? 0) + cost
                     }
+                }
+                runPromptTokens += reportedUsage?.promptTokens ?? stepEstimatedPrompt
+                runCachedTokens += reportedUsage?.cachedTokens ?? 0
+                if reportedUsage?.promptTokens == nil {
+                    runWasEstimated = true
                 }
 
                 let finalElapsed = max(CFAbsoluteTimeGetCurrent() - generationStartTime, 0.001)
                 let generatedTokens = generatedTokenCount()
+                runOutputTokens += generatedTokens
+                if reportedUsage?.completionTokens == nil {
+                    // `generatedTokenCount` falls back to a character estimate
+                    // when the provider reported no completion count.
+                    runWasEstimated = true
+                }
                 let finalTokPerSec = Double(generatedTokens) / finalElapsed
 
                 if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
@@ -4807,16 +4830,11 @@ struct ContentView: View {
                 self.generationElapsedMs = finalElapsed * 1000.0
                 self.generationSpeedTokPerSec = finalTokPerSec
                 let turnCost = CloudTurnReport(
-                    usage: reportedUsage,
-                    estimatedPromptTokens: stepEstimatedPrompt,
-                    outputTokens: generatedTokens,
-                    cost: CloudPricingStore.pricing(
-                        forModel: providerModelId,
-                        providerId: provider.id
-                    )?.cost(for: reportedUsage ?? CloudUsage(
-                        promptTokens: stepEstimatedPrompt,
-                        completionTokens: generatedTokens
-                    ))
+                    promptTokens: runPromptTokens,
+                    cachedTokens: runCachedTokens,
+                    outputTokens: runOutputTokens,
+                    cost: runCost,
+                    wasEstimated: runWasEstimated
                 )
                 self.showStatus(
                     "☁️ \(provider.displayName) — \(turnCost.statusSuffix) in \(String(format: "%.2f", finalElapsed * 1000.0)) ms (\(String(format: "%.1f", finalTokPerSec)) tok/s)"

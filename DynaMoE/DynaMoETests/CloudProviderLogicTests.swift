@@ -1151,6 +1151,9 @@ final class CloudStoredKeyLogicTests: XCTestCase {
 private final class CloudStubURLProtocol: URLProtocol {
     nonisolated(unsafe) static var status = 200
     nonisolated(unsafe) static var body = Data()
+    /// Consumed first, one entry per request, so a test can script a rejection
+    /// followed by an acceptance on the same endpoint.
+    nonisolated(unsafe) static var responses: [(status: Int, body: Data)] = []
     nonisolated(unsafe) static var requestBodies: [Data] = []
 
     override class func canInit(with request: URLRequest) -> Bool { true }
@@ -1171,14 +1174,17 @@ private final class CloudStubURLProtocol: URLProtocol {
             stream.close()
             Self.requestBodies.append(data)
         }
+        let reply = Self.responses.isEmpty
+            ? (status: Self.status, body: Self.body)
+            : Self.responses.removeFirst()
         let response = HTTPURLResponse(
             url: request.url ?? URL(string: "https://example.invalid")!,
-            statusCode: Self.status,
+            statusCode: reply.status,
             httpVersion: "HTTP/1.1",
             headerFields: ["Content-Type": "text/event-stream"]
         )!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Self.body)
+        client?.urlProtocol(self, didLoad: reply.body)
         client?.urlProtocolDidFinishLoading(self)
     }
 
@@ -1187,24 +1193,32 @@ private final class CloudStubURLProtocol: URLProtocol {
 
 final class CloudStreamTransportTests: XCTestCase {
 
-    private func makeService() -> OpenAICloudChatService {
+    private func makeService(
+        host: String = "provider.test",
+        hints: CloudCacheHints = .affinity
+    ) -> OpenAICloudChatService {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [CloudStubURLProtocol.self]
+        let base = "https://\(host)/openai/v1"
         return OpenAICloudChatService(
-            chatURL: CloudProviderRegistry.synthetic.chatCompletionsURL,
-            modelsURL: CloudProviderRegistry.synthetic.modelsURL,
+            chatURL: URL(string: "\(base)/chat/completions")!,
+            modelsURL: URL(string: "\(base)/models")!,
             apiKey: "sk-test-key",
             requestTimeout: 5,
-            session: URLSession(configuration: configuration)
+            session: URLSession(configuration: configuration),
+            cacheHints: hints
         )
     }
 
-    private func collect(_ service: OpenAICloudChatService) async -> [CloudTurnEvent] {
+    private func collect(
+        _ service: OpenAICloudChatService,
+        sessionKey: String? = nil
+    ) async -> [CloudTurnEvent] {
         var events: [CloudTurnEvent] = []
         for await event in service.streamTurn(
             model: "hf:org/model",
             messages: [CloudChatMessage(role: "user", content: "hi")],
-            params: CloudChatGenerationParams(),
+            params: CloudChatGenerationParams(sessionKey: sessionKey),
             tools: nil
         ) {
             events.append(event)
@@ -1212,10 +1226,18 @@ final class CloudStreamTransportTests: XCTestCase {
         return events
     }
 
+    private func requestBody(_ index: Int) -> [String: Any]? {
+        guard index < CloudStubURLProtocol.requestBodies.count else { return nil }
+        return try? JSONSerialization.jsonObject(
+            with: CloudStubURLProtocol.requestBodies[index]
+        ) as? [String: Any]
+    }
+
     override func setUp() {
         super.setUp()
         CloudStubURLProtocol.status = 200
         CloudStubURLProtocol.body = Data()
+        CloudStubURLProtocol.responses = []
         CloudStubURLProtocol.requestBodies = []
     }
 
@@ -1277,6 +1299,48 @@ final class CloudStreamTransportTests: XCTestCase {
         }
         XCTAssertEqual(code, 400)
     }
+
+    func testACacheKeyIsRememberedOnlyAfterTheRetrySucceeds() async {
+        let ok = Data("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n".utf8)
+        CloudStubURLProtocol.responses = [
+            (400, Data(#"{"error":"unexpected property prompt_cache_key"}"#.utf8)),
+            (200, ok),
+            // Second turn: the field is already known to be refused, so its
+            // first attempt is the only request this turn makes.
+            (200, ok)
+        ]
+        let service = makeService(host: "cache-latch.test", hints: .openAI)
+        guard case .finished? = await collect(service, sessionKey: "session-a").last else {
+            return XCTFail("the first turn should succeed on its retry")
+        }
+        guard case .finished? = await collect(service, sessionKey: "session-a").last else {
+            return XCTFail("the second turn should succeed on its first attempt")
+        }
+        XCTAssertEqual(CloudStubURLProtocol.requestBodies.count, 3)
+        XCTAssertNotNil(requestBody(0)?["prompt_cache_key"])
+        XCTAssertNil(requestBody(1)?["prompt_cache_key"])
+        XCTAssertNil(requestBody(2)?["prompt_cache_key"])
+    }
+
+    func testAnUnrelatedRejectionDoesNotRememberTheCacheKeyAsRefused() async {
+        // Every attempt fails on a model error, so nothing proves the optional
+        // field was the problem. The next turn must still ask for the cache.
+        let failure = Data(#"{"error":"model not found"}"#.utf8)
+        CloudStubURLProtocol.responses = [(400, failure), (400, failure)]
+        let service = makeService(host: "cache-kept.test", hints: .openAI)
+        guard case .failed? = await collect(service, sessionKey: "session-b").last else {
+            return XCTFail("the first turn should fail")
+        }
+        XCTAssertEqual(CloudStubURLProtocol.requestBodies.count, 2)
+
+        CloudStubURLProtocol.responses = [(400, failure), (400, failure)]
+        guard case .failed? = await collect(service, sessionKey: "session-b").last else {
+            return XCTFail("the second turn should fail")
+        }
+        XCTAssertEqual(CloudStubURLProtocol.requestBodies.count, 4)
+        XCTAssertNotNil(requestBody(2)?["prompt_cache_key"])
+        XCTAssertNil(requestBody(3)?["prompt_cache_key"])
+    }
 }
 
 // MARK: - Cache-aware usage
@@ -1306,10 +1370,32 @@ final class CloudUsageSplitTests: XCTestCase {
         let usage = try decode(
             #"{"input_tokens":500,"output_tokens":20,"cache_read_input_tokens":400,"cache_creation_input_tokens":100}"#
         )
-        XCTAssertEqual(usage.promptTokens, 500)
+        // Anthropic's `input_tokens` is only the uncached share; the prompt is
+        // all three columns. 500 + 400 + 100, not 500.
+        XCTAssertEqual(usage.promptTokens, 1_000)
         XCTAssertEqual(usage.cachedTokens, 400)
         XCTAssertEqual(usage.cacheWriteTokens, 100)
-        XCTAssertEqual(usage.billableInputTokens, 100)
+        XCTAssertEqual(usage.billableInputTokens, 600)
+        XCTAssertEqual(usage.cacheReadFraction, 0.4)
+    }
+
+    func testAnthropicWithoutCacheColumnsKeepsItsPromptTotal() throws {
+        // Without the cache keys the block is indistinguishable from the
+        // Responses shape, where `input_tokens` already is the total.
+        let usage = try decode(#"{"input_tokens":500,"output_tokens":20}"#)
+        XCTAssertEqual(usage.promptTokens, 500)
+        XCTAssertNil(usage.cachedTokens)
+        XCTAssertEqual(usage.billableInputTokens, 500)
+    }
+
+    func testAnthropicTotalsPriceLikeAnyOtherPrompt() throws {
+        let usage = try decode(
+            #"{"input_tokens":500,"output_tokens":20,"cache_read_input_tokens":400,"cache_creation_input_tokens":100}"#
+        )
+        let pricing = CloudPricing(input: 3, cachedInput: 0.3, output: 15)
+        // 600 fresh (500 uncached + 100 cache write) at $3/M plus 400 cached
+        // at $0.30/M plus 20 out at $15/M.
+        XCTAssertEqual(try XCTUnwrap(pricing.cost(for: usage)), 0.0018 + 0.00012 + 0.0003, accuracy: 1e-12)
     }
 
     func testAProviderWithoutACacheSplitStillReportsBillableInput() throws {
@@ -1688,6 +1774,30 @@ final class CloudTurnReportTests: XCTestCase {
         )
         XCTAssertTrue(report.wasEstimated)
         XCTAssertEqual(report.statusSuffix, "1,200 in / 40 out (est.)")
+    }
+
+    func testARunReportsEveryBilledStepsTotals() {
+        // A 20-step agent run is 20 billed requests; the summary must match the
+        // session's cumulative spend, not the last step's usage block.
+        let report = CloudTurnReport(
+            promptTokens: 24_000,
+            cachedTokens: 18_000,
+            outputTokens: 350,
+            cost: 0.0031,
+            wasEstimated: false
+        )
+        XCTAssertEqual(report.statusSuffix, "24,000 in (18,000 cached) / 350 out · $0.0031")
+    }
+
+    func testARunWithOneEstimatedStepIsStillMarked() {
+        let report = CloudTurnReport(
+            promptTokens: 24_000,
+            cachedTokens: 0,
+            outputTokens: 350,
+            cost: nil,
+            wasEstimated: true
+        )
+        XCTAssertEqual(report.statusSuffix, "24,000 in / 350 out (est.)")
     }
 }
 
