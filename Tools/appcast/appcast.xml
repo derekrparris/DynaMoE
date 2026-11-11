@@ -6,6 +6,334 @@
         <description>Most recent changes with links to downloads.</description>
         <language>en</language>
         <item>
+            <title>Version 26.9</title>
+            <sparkle:version>26.9</sparkle:version>
+            <sparkle:shortVersionString>26.9</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <link>https://github.com/derekrparris/DynaMoE/releases/tag/v26.9</link>
+            <description><![CDATA[
+                <style>
+                  :root {
+                    color-scheme: light dark;
+                    --bg: #f2f2f4;
+                    --card: #ffffff;
+                    --card-2: #f7f7f9;
+                    --hairline: rgba(0, 0, 0, 0.08);
+                    --hairline-soft: rgba(0, 0, 0, 0.06);
+                    --text: #1d1d1f;
+                    --text-2: rgba(60, 60, 67, 0.62);
+                    --text-3: rgba(60, 60, 67, 0.44);
+                    --accent: #af52de;
+                    --accent-strong: #8e3cc4;
+                    --accent-soft: rgba(175, 82, 222, 0.12);
+                    --chip-ink: #8e3cc4;
+                    --hero-1: #bf5af2;
+                    --hero-2: #5e5ce6;
+                    --hero-3: #0a84ff;
+                    --glow: rgba(175, 82, 222, 0.35);
+                    --mono: "SF Mono", ui-monospace, Menlo, monospace;
+                    --sans: -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif;
+                    --rounded: "SF Pro Rounded", -apple-system, sans-serif;
+                  }
+                  @media (prefers-color-scheme: dark) {
+                    :root {
+                      --bg: #1e1e20;
+                      --card: rgba(255, 255, 255, 0.05);
+                      --card-2: rgba(255, 255, 255, 0.035);
+                      --hairline: rgba(255, 255, 255, 0.09);
+                      --hairline-soft: rgba(255, 255, 255, 0.06);
+                      --text: #f5f5f7;
+                      --text-2: rgba(235, 235, 245, 0.62);
+                      --text-3: rgba(235, 235, 245, 0.42);
+                      --accent: #bf5af2;
+                      --accent-strong: #d9a8f7;
+                      --accent-soft: rgba(191, 90, 242, 0.16);
+                      --chip-ink: #d9a8f7;
+                      --hero-1: #c95bf8;
+                      --hero-2: #6b6af0;
+                      --hero-3: #2f95ff;
+                      --glow: rgba(191, 90, 242, 0.4);
+                    }
+                  }
+                  * { box-sizing: border-box; margin: 0; padding: 0; }
+                  ::selection { background: var(--accent-soft); }
+                  body {
+                    font-family: var(--sans);
+                    font-size: 13px;
+                    line-height: 1.55;
+                    color: var(--text);
+                    background: var(--bg);
+                    -webkit-font-smoothing: antialiased;
+                    padding: 28px 30px 34px;
+                    max-width: 640px;
+                    margin: 0 auto;
+                  }
+                  a { color: var(--accent-strong); text-decoration: none; }
+                  a:hover { text-decoration: underline; text-underline-offset: 2px; }
+
+                  /* ── Hero header ─────────────────────────────────────────── */
+                  header {
+                    display: flex;
+                    align-items: center;
+                    gap: 16px;
+                    padding-bottom: 18px;
+                    margin-bottom: 22px;
+                    border-bottom: 1px solid var(--hairline-soft);
+                    position: relative;
+                  }
+                  header::after {
+                    content: "";
+                    position: absolute;
+                    top: -10px;
+                    right: -14px;
+                    width: 120px;
+                    height: 120px;
+                    background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 56 56'%3E%3Cg fill='none' stroke='%23af52de' stroke-width='1.4' stroke-linejoin='round' opacity='0.10'%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4'/%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4' transform='translate(13.86,0)'/%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4' transform='translate(-13.86,0)'/%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4' transform='translate(6.93,12)'/%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4' transform='translate(-6.93,12)'/%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4' transform='translate(6.93,-12)'/%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4' transform='translate(-6.93,-12)'/%3E%3C/g%3E%3C/svg%3E") no-repeat center / contain;
+                    pointer-events: none;
+                  }
+                  .app-badge {
+                    width: 64px;
+                    height: 64px;
+                    flex: none;
+                    border-radius: 15px;
+                    background: linear-gradient(135deg, var(--hero-1), var(--hero-2) 52%, var(--hero-3));
+                    box-shadow: 0 4px 14px var(--glow), inset 0 0 0 0.5px rgba(255, 255, 255, 0.25);
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                  }
+                  .app-badge svg { width: 40px; height: 40px; }
+                  h1 {
+                    font-family: var(--rounded);
+                    font-size: 26px;
+                    font-weight: 700;
+                    letter-spacing: -0.4px;
+                    line-height: 1.15;
+                  }
+                  .meta-line {
+                    display: flex;
+                    align-items: baseline;
+                    gap: 8px;
+                    margin-top: 2px;
+                    font-family: var(--mono);
+                  }
+                  .ver-chip {
+                    font-size: 12.5px;
+                    font-weight: 600;
+                    color: var(--chip-ink);
+                    background: var(--accent-soft);
+                    border: 1px solid var(--hairline-soft);
+                    border-radius: 5px;
+                    padding: 1px 7px;
+                  }
+                  .build { font-size: 11px; color: var(--text-3); }
+                  .tagline {
+                    margin-top: 5px;
+                    font-size: 12px;
+                    font-weight: 500;
+                    color: var(--text-2);
+                  }
+
+                  /* ── Sections ────────────────────────────────────────────── */
+                  section { margin-bottom: 24px; }
+                  h2 {
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                    font-size: 14px;
+                    font-weight: 700;
+                    letter-spacing: -0.1px;
+                    margin-bottom: 10px;
+                  }
+                  h2 .icon {
+                    width: 26px;
+                    height: 26px;
+                    flex: none;
+                    border-radius: 7px;
+                    background: var(--accent-soft);
+                    color: var(--chip-ink);
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                  }
+                  h2 .icon svg { width: 14px; height: 14px; }
+
+                  /* Feature cards */
+                  .card {
+                    background: var(--card);
+                    border: 1px solid var(--hairline);
+                    border-radius: 10px;
+                    padding: 13px 15px;
+                    margin-bottom: 8px;
+                  }
+                  .card h3 { font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+                  .card p { color: var(--text-2); font-size: 12.5px; }
+                  .card code, p code, li code {
+                    font-family: var(--mono);
+                    font-size: 11px;
+                    background: var(--accent-soft);
+                    color: var(--chip-ink);
+                    border-radius: 4px;
+                    padding: 1px 5px;
+                  }
+
+                  /* Fixed / changed lists */
+                  ul.changes { list-style: none; }
+                  ul.changes li {
+                    position: relative;
+                    padding-left: 22px;
+                    margin-bottom: 6px;
+                    color: var(--text-2);
+                  }
+                  ul.changes li::before {
+                    content: "";
+                    position: absolute;
+                    left: 4px;
+                    top: 6px;
+                    width: 5px;
+                    height: 5px;
+                    border-radius: 50%;
+                    background: var(--accent);
+                    opacity: 0.75;
+                  }
+                  ul.changes li strong { color: var(--text); font-weight: 600; }
+
+                  /* Spec rows (About-window style) */
+                  .spec {
+                    background: var(--card-2);
+                    border: 1px solid var(--hairline-soft);
+                    border-radius: 10px;
+                    padding: 3px 15px;
+                  }
+                  .spec .row {
+                    display: flex;
+                    align-items: baseline;
+                    justify-content: space-between;
+                    gap: 16px;
+                    padding: 9px 0;
+                  }
+                  .spec .row + .row { border-top: 1px solid var(--hairline-soft); }
+                  .spec .row .k { color: var(--text-2); font-size: 12px; }
+                  .spec .row .v {
+                    font-family: var(--mono);
+                    font-size: 11.5px;
+                    font-weight: 600;
+                    text-align: right;
+                  }
+
+                  /* Footer action buttons */
+                  footer {
+                    display: flex;
+                    gap: 9px;
+                    flex-wrap: wrap;
+                    margin-top: 4px;
+                  }
+                  footer a.btn {
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 6px;
+                    font-size: 11.5px;
+                    font-weight: 500;
+                    color: var(--text);
+                    background: var(--card);
+                    border: 1px solid var(--hairline);
+                    border-radius: 6px;
+                    padding: 6px 12px;
+                  }
+                  footer a.btn:hover { background: var(--accent-soft); text-decoration: none; }
+                  footer a.btn svg { width: 12px; height: 12px; opacity: 0.55; }
+                  .fineprint {
+                    margin-top: 16px;
+                    font-size: 10.5px;
+                    color: var(--text-3);
+                  }
+                </style>
+                </head>
+                <body>
+
+                <header>
+                  <div class="app-badge" aria-hidden="true">
+                    <svg viewBox="0 0 56 56">
+                      <defs>
+                        <linearGradient id="dg" x1="0" y1="0" x2="1" y2="1">
+                          <stop offset="0" stop-color="#bf5af2"/>
+                          <stop offset="0.5" stop-color="#5e5ce6"/>
+                          <stop offset="1" stop-color="#0a84ff"/>
+                        </linearGradient>
+                      </defs>
+                      <circle cx="28" cy="28" r="25" fill="#fff"/>
+                      <g fill="none" stroke="url(#dg)" stroke-width="1.7" stroke-linejoin="round">
+                        <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(28,28)"/>
+                        <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(41.86,28)"/>
+                        <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(14.14,28)"/>
+                        <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(34.93,40)"/>
+                        <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(21.07,40)"/>
+                        <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(34.93,16)"/>
+                        <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(21.07,16)"/>
+                      </g>
+                    </svg>
+                  </div>
+                  <div>
+                    <h1>DynaMoE</h1>
+                    <div class="meta-line">
+                      <span class="ver-chip">v26.9</span>            <!-- EDIT: version -->
+                    </div>
+                    <div class="tagline">High-Performance MoE Inference Engine for Apple Silicon</div>
+                  </div>
+                </header>
+
+                <!-- EDIT: Highlights — one card per user-facing feature -->
+                <section>
+                  <h2>
+                    <span class="icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.5 14 5v6l-6 3.5L2 11V5l6-3.5Zm0 1.73L3.5 5.87v4.26L8 12.77l4.5-2.64V5.87L8 3.23Zm0 1.6 3.2 1.88v2.58L8 11.17 4.8 9.29V6.71L8 4.83Z"/></svg></span>
+                    What's New in 26.9
+                  </h2>
+                  <div class="card">
+                    <h3>Plan Mode:</h3> A new read-only architect mode makes the agent investigate and propose before it touches anything. Enter it from the pill beside Turbo, with &#8679;&#8984;P, or by typing <code>/plan</code>; it is a per-conversation mode, so one chat can be planning while another is coding. The write, edit, shell, <code>git_commit</code>, <code>complete</code> and every MCP tool are withheld rather than discouraged: absent from the prompt and from a cloud model's <code>tools</code> array, withheld from the constrained-sampling grammar, and refused by the tool executor if one is somehow emitted. Subagents inherit the restriction, including the Test Runner pipeline, so delegation cannot route around it. What remains is the reading half of the harness: file reads, glob/grep, codebase and symbol search, <code>git_status</code> / <code>git_diff</code>, web search and fetch, lint diagnostics, and tool discovery, plus a small read core loaded on entry so an investigation does not open with a discovery step. The model ends its answer with a pair of plan markers, which renders as an <strong>Implementation Plan</strong> card with <strong>Start coding</strong>, <strong>Code with Turbo</strong> and <strong>Revise plan</strong>; approving switches the conversation to Code Mode, re-arms the write tools and sends "Implement the plan." as an ordinary user turn. A cloud model that calls tools plans normally; a backend with no tool loop (the Apple on-device model, or a provider registered without tool support) refuses entry with a message rather than flipping a mode its turns could not honour. The mode is fixed for the length of a turn: the pill, <code>/plan</code> and the handoff are all refused while a turn is running, because the live turn's prompt, grammar and tool surface were built for the mode it started in, and an approval whose send is refused puts the conversation back in Plan Mode with the transcript unchanged.
+                  </br></br>
+                    <h3>Cloud providers from Settings:</h3> Adding a remote provider used to mean editing Swift and rebuilding, so the only endpoint the app could reach was the one it shipped with. <strong>Settings &rarr; Cloud Providers &rarr; Add Provider&hellip;</strong> now registers any OpenAI-compatible endpoint at runtime: a display name, an immutable identifier that becomes its Keychain account and the <code>cloud://</code> address saved with each conversation, the API base URL, an optional key written only to the Keychain, and an optional documentation link. The base must be <code>https</code> (plain <code>http</code> is accepted only on loopback), and a URL carrying <code>user:password@</code> or a query string is refused rather than saved, because the key belongs in the API Key field and rides the <code>Authorization</code> header. Any endpoint that answers <code>POST &lt;base&gt;/chat/completions</code> with a Bearer key and lists its catalog over <code>GET &lt;base&gt;/models</code> works, and the model list tolerates the envelope differences between gateways. <strong>Test &amp; Sync Models</strong> validates the key and registers the provider's chat models without spending a completion token, and the catalog fetch filters out embeddings, rerankers, speech, moderation and image generators so they cannot become pickable entries that fail on the first send. <strong>Remove</strong> deletes a custom provider's key, registered models, no-tools list and vision marks; a conversation pinned to one of its models then refuses to send with a reselect message instead of silently falling back to local weights. Editing a provider's base URL drops those registrations too, because they describe the server at the old address. Built-in Synthetic stays, cannot be edited or removed, and the registry can never be empty.
+                  </br></br>
+                    <h3>A summary you can still read:</h3> <code>/compact</code> used to fold the conversation into two digests and then show only a marker, so the summary it had just produced survived only inside the prompt. The committed history now opens with an expandable card carrying the same general summary and detailed recap, followed by the marker naming how many messages were compacted. The card is display-only (the digests still travel in the system block), so nothing is sent twice and it costs no context, and it survives a relaunch, unlike the transient progress bubble it replaces. A copy button puts the whole digest on the clipboard.
+                  </div>
+                </section>
+
+                <!-- EDIT: Fixes — plain bullet list -->
+                <section>
+                  <h2>
+                    <span class="icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M13.78 3.97a.75.75 0 0 1 0 1.06l-6.5 6.5a.75.75 0 0 1-1.06 0l-3-3a.75.75 0 1 1 1.06-1.06l2.47 2.47 5.97-5.97a.75.75 0 0 1 1.06 0Z"/></svg></span>
+                    Fixes
+                  </h2>
+                  <ul class="changes">
+                    <li><strong>Messages that never appeared:</strong> A refused send or a failed model load wrote its reason to state nothing rendered, so the app looked like a dead button at exactly the moment it had something to say, while the feedback that did render (attachment refusals, queued prompts, the history banner) was inserted into the layout around the transcript and shrank it, moving the very text the user was reading. Everything the chat column says now floats in one layer above the composer that cannot resize any pane, with the transcript reserving the layer's height so nothing is held out of reach. Severity is read from the glyph each message already carried, so the tint cannot disagree with the copy; long-running work keeps a progress pill until it finishes instead of vanishing after six seconds; a prompt's ingest counters stay on the transcript row that already showed them instead of re-fading the pill and re-reading it aloud; the history banner sits under the header it used to cover for a whole session; and a failed engine load now records its long reason in the transcript, because a chat that cannot send is permanent rather than six seconds long. The <strong>Advanced Diagnostics</strong> settings tab went with it: its three buttons all depended on a buffer no reachable routine ever filled, so every press could only report failure</li>
+                    <li><strong>Images offered to models that cannot see them:</strong> The attach menu stayed enabled for a text-only model, so picking an image produced a generic refusal that never named the selected model, and sending an already-staged image offered the same "switch models to attach one" advice instead of the fix that applied. Both menu items are now disabled with a tooltip that explains why, the refusal names the selected model and the fix for the situation (switch models before attaching, or remove the attachment before sending), and switching models retracts a stale refusal or raises a fresh one for images already staged</li>
+                    <li><strong>Under the hood:</strong> The README and settings guide document Plan Mode, runtime provider setup and the compaction summary card</li>
+                  </ul>
+                </section>
+
+                <footer>
+                  <a class="btn" href="https://github.com/derekrparris/DynaMoE/releases/tag/v26.9">   <!-- EDIT: release URL -->
+                    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l1.66-1.66a2 2 0 0 0 0-2.83l-.94-.94a2 2 0 0 0-2.83 0L3.51 6.01a2 2 0 0 0 0 2.83l.94.94a.75.75 0 0 0 1.06-1.06l-.94-.94a.5.5 0 0 1 0-.71l2.35-2.35a.5.5 0 0 1 .71 0l.94.94a.5.5 0 0 1 0 .71L6.22 8.72Zm3.56-1.44a.75.75 0 0 0-1.06-1.06L7.06 7.88a2 2 0 0 0 0 2.83l.94.94a2 2 0 0 0 2.83 0l2.35-2.35a2 2 0 0 0 0-2.83l-.94-.94a.75.75 0 0 0-1.06 1.06l.94.94a.5.5 0 0 1 0 .71L9.77 9.59a.5.5 0 0 1-.71 0l-.94-.94a.5.5 0 0 1 0-.71l1.66-1.66Z"/></svg>
+                    GitHub Release
+                  </a>
+                  <a class="btn" href="https://github.com/derekrparris/DynaMoE">
+                    <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.5a6.5 6.5 0 0 0-2.06 12.67c.33.06.45-.14.45-.32v-1.12c-1.8.39-2.18-.87-2.18-.87-.3-.75-.73-.95-.73-.95-.59-.4.05-.4.05-.4.65.05 1 .67 1 .67.58 1 1.53.71 1.9.54.06-.42.23-.71.41-.87-1.44-.16-2.95-.72-2.95-3.2 0-.71.25-1.29.67-1.74-.07-.17-.29-.83.06-1.73 0 0 .54-.17 1.77.66a6.15 6.15 0 0 1 3.22 0c1.23-.83 1.77-.66 1.77-.66.35.9.13 1.56.06 1.73.42.45.67 1.03.67 1.74 0 2.49-1.51 3.04-2.96 3.2.23.2.44.59.44 1.19v1.76c0 .18.12.39.45.32A6.5 6.5 0 0 0 8 1.5Z"/></svg>
+                    Repository
+                  </a>
+                </footer>
+
+                <p class="fineprint">DynaMoE is an independent open-source inference engine. macOS, Metal, and Apple Silicon are trademarks of Apple Inc. Apache 2.0 licensed.</p>
+
+                </body>
+            ]]></description>
+            <pubDate>Wed, 11 Nov 2026 19:01:50 +0000</pubDate>
+            <enclosure
+                url="https://github.com/derekrparris/DynaMoE/releases/download/v26.9/DynaMoE-26.9.app.tar.xz"
+                sparkle:edSignature="x26LWDk+94XxmIrA3Pg5P2TKd26FVKcCcQgzQiC0dPTHjm0xZdFG+JJYRwmi0Yp4fgyaKj4397vpjeQtRNcXCQ=="
+                length="9251236"
+                type="application/octet-stream"
+            />
+        </item>
+        <item>
             <title>Version 26.8</title>
             <sparkle:version>26.8</sparkle:version>
             <sparkle:shortVersionString>26.8</sparkle:shortVersionString>
