@@ -133,4 +133,29 @@ final class AgentStepBudgetTests: XCTestCase {
         XCTAssertFalse(AgentStepBudget.loopGuardStoppedNotice.isEmpty)
         XCTAssertNotEqual(AgentStepBudget.loopGuardStoppedNotice, finite)
     }
+
+    func testRunEndNoticeNamesOnlyTheReasonThatEndedTheRun() {
+        XCTAssertEqual(
+            AgentStepBudget.runEndNotice(anyCompleted: true, loopGuardTripped: false, cap: 15),
+            AgentStepBudget.completedNotice
+        )
+        // Completion outranks a guard that also tripped during the run.
+        XCTAssertEqual(
+            AgentStepBudget.runEndNotice(anyCompleted: true, loopGuardTripped: true, cap: nil),
+            AgentStepBudget.completedNotice
+        )
+        XCTAssertEqual(
+            AgentStepBudget.runEndNotice(anyCompleted: false, loopGuardTripped: true, cap: 15),
+            AgentStepBudget.loopGuardStoppedNotice
+        )
+        XCTAssertEqual(
+            AgentStepBudget.runEndNotice(anyCompleted: false, loopGuardTripped: false, cap: 15),
+            AgentStepBudget.maxStepsReachedNotice(cap: 15)
+        )
+
+        // The uncapped, unfinished, guard-free state cannot be reached from the
+        // loop, because a nil cap always allows another step. It reports no
+        // notice rather than naming a limit that never applied.
+        XCTAssertNil(AgentStepBudget.runEndNotice(anyCompleted: false, loopGuardTripped: false, cap: nil))
+    }
 }

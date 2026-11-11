@@ -1329,7 +1329,7 @@ struct SettingsSheetView: View {
                             .accessibilityLabel("No Limit for Max Multi-Step Agent Iterations")
                     }
                     Slider(value: Binding(
-                        get: { Double(maxAgentSteps) },
+                        get: { Double(max(1, maxAgentSteps)) },
                         set: { maxAgentSteps = Int($0) }
                     ), in: 1...100, step: 1)
                     .disabled(isMaxAgentStepsUnlimited)
@@ -1337,7 +1337,7 @@ struct SettingsSheetView: View {
                     .accessibilityLabel("Max Multi-Step Agent Iterations")
 
                     if isMaxAgentStepsUnlimited {
-                        Text("The run is bounded only by the model calling complete, a tool loop guard (a failed-call streak, a repeated call, or the search budget), the machine's KV capacity, or Stop. Each extra step adds an assistant message to the transcript and grows the prompt.")
+                        Text("The run is bounded only by the model calling complete, a tool loop guard (a failed-call streak, a repeated call, or the search budget), the model's context limit (the KV budget for local weights, the context window for a cloud provider), or Stop. Each extra step adds an assistant message to the transcript and grows the prompt.")
                             .font(.system(size: 11))
                             .foregroundStyle(.orange)
                             .fixedSize(horizontal: false, vertical: true)

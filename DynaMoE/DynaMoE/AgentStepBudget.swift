@@ -109,4 +109,23 @@ public nonisolated enum AgentStepBudget {
     /// it ended — which matters once "no limit" makes that the only way a
     /// tool round can end without `complete`.
     public static let loopGuardStoppedNotice = "🛡️ Agent stopped by the tool loop guard."
+
+    /// The run-end status line for a run the model finished on its own.
+    public static let completedNotice = "✨ Agent completed task."
+
+    /// The single status line a run ends on, chosen by what actually stopped
+    /// it. `nil` means the run ended with nothing to report: an unfinished,
+    /// guard-free run under no cap, which the loop cannot reach because
+    /// `allowsAnotherStep` is true at every step — so a notice that names a
+    /// limit can only be produced when a finite cap is supplied.
+    public static func runEndNotice(
+        anyCompleted: Bool,
+        loopGuardTripped: Bool,
+        cap: Int?
+    ) -> String? {
+        if anyCompleted { return completedNotice }
+        if loopGuardTripped { return loopGuardStoppedNotice }
+        guard let cap else { return nil }
+        return maxStepsReachedNotice(cap: cap)
+    }
 }

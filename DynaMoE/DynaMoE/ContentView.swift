@@ -5923,14 +5923,12 @@ struct ContentView: View {
                         await MainActor.run {
                             self.isGeneratingText = false
                             self.generationTask = nil
-                            if anyCompleted {
-                                self.showStatus("✨ Agent completed task.")
-                            } else if toolFailureLoop {
-                                self.showStatus(AgentStepBudget.loopGuardStoppedNotice)
-                            } else if let cap = stepCap {
-                                // The only remaining reason is an exhausted
-                                // budget, which needs a finite cap to exist.
-                                self.showStatus(AgentStepBudget.maxStepsReachedNotice(cap: cap))
+                            if let notice = AgentStepBudget.runEndNotice(
+                                anyCompleted: anyCompleted,
+                                loopGuardTripped: toolFailureLoop,
+                                cap: stepCap
+                            ) {
+                                self.showStatus(notice)
                             }
                             self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)
                         }
