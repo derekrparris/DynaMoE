@@ -339,11 +339,37 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
 
     // MARK: Models
 
-    private struct ModelsResponse: Decodable {
-        struct Entry: Decodable {
-            let id: String?
+    /// Decodes a provider's `GET /models` payload. The OpenAI shape
+    /// (`{"data":[{"id":…}]}`) is authoritative; the others are tolerated
+    /// because a provider added in Settings may publish a bare array, a
+    /// string array, or a `models` key, and failing a connection test over an
+    /// envelope difference helps nobody.
+    nonisolated static func decodeModelIds(from data: Data) -> [String] {
+        guard let object = try? JSONSerialization.jsonObject(with: data) else { return [] }
+
+        var ids: [String] = []
+        func append(_ value: Any?) {
+            if let id = value as? String {
+                ids.append(id)
+            } else if let entry = value as? [String: Any], let id = entry["id"] as? String {
+                ids.append(id)
+            }
         }
-        let data: [Entry]?
+
+        if let array = object as? [Any] {
+            array.forEach(append)
+        } else if let dictionary = object as? [String: Any] {
+            if let list = dictionary["data"] as? [Any] {
+                list.forEach(append)
+            } else if let list = dictionary["models"] as? [Any] {
+                list.forEach(append)
+            }
+        }
+
+        var seen = Set<String>()
+        return ids
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && seen.insert($0).inserted }
     }
 
     func fetchModelIds() async throws -> [String] {
@@ -364,8 +390,7 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                     summary: MCPHTTPTransport.summarizeErrorBody(body)
                 )
             }
-            let decoded = try JSONDecoder().decode(ModelsResponse.self, from: data)
-            return (decoded.data ?? []).compactMap(\.id)
+            return Self.decodeModelIds(from: data)
         } catch let failure as CloudTurnFailure {
             throw failure
         } catch {

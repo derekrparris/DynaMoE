@@ -185,11 +185,11 @@ public class LocalModelManager: ObservableObject {
                 if AppleFoundationModelService.isOSCompatible {
                     finalModels.append(AppleFoundationModelService.makeDiscoveredModel())
                 }
-                // Connected cloud providers (Synthetic first) surface the same
-                // way: virtual entries appended after every local model, for
-                // the same reason — `discoveredModels.first` must stay a
-                // weights model. Registration comes from each provider's
-                // UserDefaults list; see `CloudModelRegistry`.
+                // Connected cloud providers surface the same way: virtual
+                // entries appended after every local model, for the same
+                // reason: `discoveredModels.first` must stay a weights model.
+                // Registration comes from each provider's UserDefaults list;
+                // see `CloudModelRegistry`.
                 finalModels.append(contentsOf: cloudModels)
                 self.discoveredModels = finalModels
                 self.isScanning = false

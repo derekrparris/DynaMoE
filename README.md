@@ -388,9 +388,9 @@ A `400` carrying `"code": "context_length_exceeded"` means the machine's KV budg
 
 ---
 
-## ☁️ Connected Cloud Providers (Synthetic)
+## ☁️ Connected Cloud Providers
 
-DynaMoE runs local weights by default, but it can also connect to a remote inference provider and drive chat turns against it. **Synthetic** is the first supported provider; its models appear in the chat model picker under **Cloud Models**, next to the local and system-on-device entries.
+DynaMoE runs local weights by default, but it can also connect to a remote inference provider and drive chat turns against it. **Synthetic** ships built in; **Add Provider…** in Settings registers any other OpenAI-compatible endpoint at runtime. A connected provider's models appear in the chat model picker under **Cloud Models**, next to the local and system-on-device entries.
 
 Cloud turns run through the provider's OpenAI-compatible chat-completions API. With **Agent Tools** on (the default), a turn uses the provider's **native function calling**: the loaded tool schemas ride each request, streamed `tool_calls` execute through the same harness as a local turn (HITL approvals, Turbo Mode, the repeated/failed-call loop guards, and the subagent report relay), and the run ends when the model answers, calls `complete`, or exhausts the agent step budget. With Agent Tools off, the same backend runs plain chat.
 
@@ -424,6 +424,31 @@ Synthetic offers both wire dialects. DynaMoE implements the OpenAI-compatible on
 | Anthropic-compatible | `https://api.synthetic.new/anthropic` (`/v1/messages`) | Stub — fails explicitly |
 
 Authentication is `Authorization: Bearer <key>`. Streaming uses SSE with `stream_options.include_usage`, so the turn's final row carries real token counts; a compatible endpoint that rejects that optional field is retried once without it (the turn then reports estimated counts). Reasoning arrives as `reasoning_content` deltas when the model supports it and is shown in the usual thinking accordion.
+
+### Adding a provider
+
+**Settings → Cloud Providers → Add Provider…** registers a provider at runtime. The endpoint must speak the OpenAI Chat-Completions wire used by every cloud turn here (`POST <base>/chat/completions` with a Bearer key, streamed SSE) and list its models over `GET <base>/models`.
+
+| Field | Notes |
+| --- | --- |
+| Display Name | Shown in the composer as `model (name)`. |
+| Identifier | Lowercase slug (`opencode-zen`). It is the Keychain account suffix and the `cloud://` address saved with each conversation, so it cannot change after the provider is added. |
+| API Base URL | Include the version segment, for example `https://opencode.ai/zen/v1`. `https://` is required except on `127.0.0.1`, `localhost`, and `::1`. Enter the base, not `…/chat/completions`. Scheme and host are lowercased; a URL carrying `user:password@` is refused rather than silently stripped, since the key belongs in the key field. A query string is refused too: the app appends the endpoint path, so an Azure-style `?api-version=…` would be dropped and fail later. |
+| API Key | Optional at creation; it is written to the Keychain (`DRP.DynaMoE.cloud`) and can be saved or rotated on the provider card. |
+| Documentation | Optional `http(s)` link shown on the card. Because the link is stored in plain text with the provider record, `user:password@` and query strings are refused. |
+
+Built-in providers (Synthetic) stay available and cannot be edited or removed. **Remove** on a custom provider deletes its Keychain key, its registered models, its no-tools list, and its vision marks; a conversation pinned to one of its models then refuses to send with a reselect message instead of silently running on local weights. Editing a saved provider's **API Base URL** drops those same model registrations, because they describe the old endpoint; press **Test & Sync Models** to register the new one's catalog.
+
+#### OpenCode Zen
+
+| Field | Value |
+| --- | --- |
+| Display Name | OpenCode Zen |
+| Identifier | `opencode-zen` |
+| API Base URL | `https://opencode.ai/zen/v1` |
+| API Key | from `console.opencode.ai` |
+
+Zen's catalog is a superset of what it serves on this wire: the `gpt-5.x` family answers on `/zen/v1/responses` and Claude models on `/zen/v1/messages` (the Anthropic wire, which is a stub in DynaMoE), so only the OpenAI-compatible ids work here (`qwen3-coder`, `kimi-k2`, `kimi-k2-thinking`, `glm-4.6`, `glm-4.7-free`, `grok-code`, `big-pickle`, and their current `-free` variants). After **Test & Sync Models**, remove the rest with the **−** button beside each registered model; sending to one of them returns the gateway's own `Model <id> is not supported` error, surfaced in the conversation and in the request log.
 
 ### Registered models
 
