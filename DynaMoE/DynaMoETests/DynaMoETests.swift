@@ -10979,17 +10979,17 @@ final class DynaMoETests: XCTestCase {
         let harness = AgentHarness.shared
         harness.beginAgentSearchGuard()
 
-        harness.recordToolCallOutcome(toolName: "shell_run", succeeded: false)
-        harness.recordToolCallOutcome(toolName: "shell_run", succeeded: false)
+        harness.recordToolCallOutcome(toolName: "shell_run", outcome: .failed)
+        harness.recordToolCallOutcome(toolName: "shell_run", outcome: .failed)
         XCTAssertEqual(harness.consecutiveFailedToolCalls, 2, "same-tool failures accumulate")
         XCTAssertEqual(harness.totalFailedToolCalls, 2, "the total counts failures too")
 
-        harness.recordToolCallOutcome(toolName: "shell_run", succeeded: true)
+        harness.recordToolCallOutcome(toolName: "shell_run", outcome: .succeeded)
         XCTAssertEqual(harness.consecutiveFailedToolCalls, 0, "a success resets the streak")
         XCTAssertEqual(harness.totalFailedToolCalls, 2, "but the total survives interspersed successes")
 
-        harness.recordToolCallOutcome(toolName: "shell_run", succeeded: false)
-        harness.recordToolCallOutcome(toolName: "web_fetch", succeeded: false)
+        harness.recordToolCallOutcome(toolName: "shell_run", outcome: .failed)
+        harness.recordToolCallOutcome(toolName: "web_fetch", outcome: .failed)
         XCTAssertEqual(harness.consecutiveFailedToolCalls, 1, "switching tools restarts the streak")
         XCTAssertEqual(harness.totalFailedToolCalls, 4)
 

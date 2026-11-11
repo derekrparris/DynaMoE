@@ -75,6 +75,7 @@ struct StepNodeBadge: View {
         case .error: return .red
         case .awaitingApproval: return .orange
         case .rejected: return .secondary
+        case .withheld: return .purple
         }
     }
 
@@ -137,6 +138,7 @@ struct TimelineStepCardView: View {
         case .error: return .red
         case .awaitingApproval: return .orange
         case .rejected: return .secondary
+        case .withheld: return .purple
         }
     }
 
@@ -227,6 +229,15 @@ struct TimelineStepCardView: View {
                             Text("Requires Approval")
                                 .font(.system(size: 10.5, weight: .bold))
                                 .foregroundColor(.orange)
+                        }
+                    case .withheld:
+                        HStack(spacing: 4) {
+                            Image(systemName: "shield.lefthalf.filled")
+                                .font(.system(size: 11))
+                                .foregroundColor(.purple)
+                            Text("Withheld in Plan Mode")
+                                .font(.system(size: 10.5, weight: .medium))
+                                .foregroundColor(.purple)
                         }
                     case .rejected:
                         HStack(spacing: 4) {

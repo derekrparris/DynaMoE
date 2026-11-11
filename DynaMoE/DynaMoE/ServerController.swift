@@ -1930,6 +1930,13 @@ final class ServerController: ObservableObject {
     /// one (or withhold the client's parameter keys) and the call could never be
     /// emitted. The engine is single-flight and this queue serializes server
     /// turns, so the installed registry is never shared by two live turns.
+    ///
+    /// The snapshot/restore has a second writer on the other side: the app's
+    /// agent mode. It cannot move under this pass (the UI refuses a mode change
+    /// while the engine is busy, which is the whole of this call), and
+    /// `AgentHarness.setActiveMode` re-asserts its own registry at the start of
+    /// every turn, so a restore can never leave the harness's mode and the
+    /// grammar disagreeing past the next turn boundary.
     nonisolated private static func withTurnToolMask<T>(
         _ schemas: [GrammarToolSchema],
         _ body: () async throws -> T

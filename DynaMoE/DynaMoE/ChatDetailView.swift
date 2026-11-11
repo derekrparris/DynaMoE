@@ -22,6 +22,11 @@ struct ChatDetailView: View {
     @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
     
     var isGenerating: Bool
+    /// True while any turn is live anywhere in the process, including a
+    /// local-API one. The mode pill is a promise to the turn already running, so
+    /// it is disabled for the duration instead of offering a change the app will
+    /// refuse.
+    var isModeChangeLocked: Bool = false
     /// The progress bubble /compact is streaming its summary into, or nil.
     /// Rendering flags are scoped to this message id, never a bare
     /// "compacting" boolean, so historical bubbles keep their settled
@@ -81,6 +86,60 @@ struct ChatDetailView: View {
     private var isPlainChatOnlyBackend: Bool {
         isAppleFoundationModelActive
     }
+
+    /// The conversation's agent surface. `nil` (every conversation that predates
+    /// plan mode) is the coder.
+    private var isPlanMode: Bool {
+        session?.agentMode == .plan
+    }
+
+    /// The mode pill's tooltip. When a turn is live it says WHY the control is
+    /// unavailable: a disabled pill still explaining what plan mode is reads as
+    /// a broken toggle rather than a promise being kept.
+    private var planPillHelp: String {
+        if isModeChangeLocked {
+            return "The agent's mode cannot change while a turn is running (⇧⌘P)."
+        }
+        return isPlanMode
+            ? "Plan Mode is ON: DynaMoE reads and searches only, then writes an implementation plan for your approval. No file writes, shell commands, git commits or MCP tools (⇧⌘P)."
+            : "Click to plan before implementing: DynaMoE reads and searches only, then proposes a plan you approve (⇧⌘P)."
+    }
+
+    /// The assistant message carrying a finished plan, when the conversation is
+    /// in plan mode, the plan ended, and the user has not dismissed that plan's
+    /// handoff. Derived rather than recorded so it cannot desync from whichever
+    /// asynchronous path ended the turn.
+    ///
+    /// Gated on `!isGenerating`: the marker streams in as the LAST line of the
+    /// answer, so for the rest of that same turn the bar would be on screen
+    /// offering a send the app would refuse. Approving then flipped the mode and
+    /// sent nothing.
+    ///
+    /// Searches for the last READY message rather than taking the last assistant
+    /// message: the harness appends a forced-synthesis or subagent-relay reply
+    /// after a plan, and keying the bar to the final message hid it while the
+    /// plan card still said the plan was ready.
+    ///
+    /// A plan is only current until the next user turn. Once a follow-up has
+    /// been sent, the older plan's handoff must not come back when that
+    /// follow-up is answered without markers — "Implement the plan." would then
+    /// point at a plan the conversation has already moved past. A follow-up that
+    /// itself produces a plan is a NEWER ready message, so this search finds it.
+    private var readyPlanMessage: ChatMessage? {
+        guard isPlanMode, !isGenerating, let session else { return nil }
+        guard let planIndex = session.messages.lastIndex(where: {
+            $0.role == .assistant
+                && PlanMarkers.anyMarkerMentioned(in: $0.content)
+                && PlanMarkers.readyPresent(in: $0.content)
+        }) else { return nil }
+        if let lastUserIndex = session.messages.lastIndex(where: { $0.role == .user }),
+           lastUserIndex > planIndex {
+            return nil
+        }
+        let message = session.messages[planIndex]
+        guard dismissedPlanMessageId != message.id else { return nil }
+        return message
+    }
     var onSendMessage: (String, [PreparedImage]) -> Bool
     var onStopGeneration: () -> Void
     var onQueuePrompt: ((String, [PreparedImage]) -> Bool)? = nil
@@ -92,6 +151,12 @@ struct ChatDetailView: View {
     /// effort (nil for plain on/off models or when disabling).
     var onSetThinking: ((Bool, ThinkingEffort?) -> Void)? = nil
     var onToggleAgentTools: ((Bool) -> Void)? = nil
+    /// Enters or leaves plan mode for this conversation. The composer's mode
+    /// pill and `/plan` both land here.
+    var onSetPlanMode: ((Bool) -> Void)? = nil
+    /// Confirms a ready plan. The Bool asks for Turbo Mode on the implement
+    /// turn — the analogue of Crush's "Code with YOLO".
+    var onApprovePlan: ((Bool) -> Void)? = nil
     var onRenameSession: ((String) -> Void)? = nil
 
     @FocusState private var isInputFocused: Bool
@@ -104,6 +169,11 @@ struct ChatDetailView: View {
     /// card defaults to expanded: keeping the summary readable is the point of
     /// the card, and collapsing is the opt-out for reclaiming the space.
     @State private var isCompactionSummaryExpanded: [UUID: Bool] = [:]
+    /// The plan whose handoff bar the user dismissed. The plan itself is derived
+    /// from message content, so this is the only piece of handoff state that has
+    /// to be remembered; being view state, it resets on relaunch and a dismissed
+    /// plan comes back rather than disappearing for good.
+    @State private var dismissedPlanMessageId: UUID? = nil
     @State private var promptTokenCount: Int = 0
     @State private var tokenCountTask: Task<Void, Never>? = nil
     @State private var isPinnedToBottom: Bool = true
@@ -508,6 +578,19 @@ struct ChatDetailView: View {
                                                     set: { isCompactionSummaryExpanded[message.id] = $0 }
                                                 )
                                             )
+                                        } else if message.role == .assistant,
+                                                  PlanMarkers.anyMarkerMentioned(in: message.content),
+                                                  PlanMarkers.startPresent(in: message.content) {
+                                            PlanCard(
+                                                content: PlanMarkers.strip(message.content),
+                                                thinkingContent: message.thinkingContent,
+                                                isReady: PlanMarkers.readyPresent(in: message.content),
+                                                isStreaming: isGenerating && message.id == session.messages.last?.id,
+                                                isReasoningExpanded: Binding(
+                                                    get: { isReasoningExpanded[message.id] ?? reasoningExpandedByDefault },
+                                                    set: { isReasoningExpanded[message.id] = $0 }
+                                                )
+                                            )
                                         } else {
                                             ChatMessageView(
                                                 message: message,
@@ -625,11 +708,20 @@ struct ChatDetailView: View {
                     // Multi-line Expanding Input
                     MacTextEditor(
                         text: $promptText,
-                        placeholder: isGenerating ? "Ask a follow-up to queue (↵) or send now (⌘↵)..." : "Ask DynaMoE anything... (Enter to send, Shift+Enter for newline)",
+                        placeholder: isGenerating
+                            ? "Ask a follow-up to queue (↵) or send now (⌘↵)..."
+                            : (isPlanMode
+                               ? "Describe what you want built — DynaMoE will plan it first..."
+                               : "Ask DynaMoE anything... (Enter to send, Shift+Enter for newline)"),
                         zoomScale: zoomManager.zoomScale,
                         onCommit: {
                             let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
-                            guard !trimmed.isEmpty || !pendingImages.isEmpty else { return }
+                            guard !trimmed.isEmpty || !pendingImages.isEmpty else {
+                                // Return in an empty composer brings a dismissed
+                                // plan handoff back, the way Crush reopens it.
+                                dismissedPlanMessageId = nil
+                                return
+                            }
                             let accepted: Bool
                             if isGenerating {
                                 accepted = onQueuePrompt?(trimmed, pendingImages) ?? onSendMessage(trimmed, pendingImages)
@@ -969,6 +1061,46 @@ struct ChatDetailView: View {
                             .transition(.opacity.combined(with: .scale))
                         }
 
+                        // Plan Mode pill. Next to Turbo because both change what a
+                        // turn is allowed to DO, but unlike Turbo (app-wide) this is
+                        // per conversation, like the Tools toggle beside it. Shown
+                        // even while tools are OFF: entering plan mode arms them,
+                        // and hiding the only way in would hide that.
+                        //
+                        // Labelled by what a click DOES when plan mode is off and
+                        // by what is ACTIVE when it is on, because "Code Mode" on a
+                        // button read as an offer to switch back to a mode the
+                        // conversation was already in.
+                        if !isPlainChatOnlyBackend {
+                            Button(action: {
+                                onSetPlanMode?(!isPlanMode)
+                            }) {
+                                HStack(spacing: 4) {
+                                    Image(systemName: isPlanMode ? "checklist" : "chevron.left.forwardslash.chevron.right")
+                                        .font(.system(size: max(8.5, 10 * zoomManager.zoomScale)))
+                                        .foregroundColor(isPlanMode ? .purple : .secondary)
+                                    Text(isPlanMode ? "Plan Mode" : "Plan")
+                                        .font(.system(size: max(9.5, 11.5 * zoomManager.zoomScale), weight: .medium))
+                                        .foregroundColor(isPlanMode ? .purple : .secondary)
+                                }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4.5)
+                                .background(isPlanMode ? Color.purple.opacity(0.12) : Color.secondary.opacity(0.08))
+                                .cornerRadius(10)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10)
+                                        .stroke(isPlanMode ? Color.purple.opacity(0.4) : Color.clear, lineWidth: 1)
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            .keyboardShortcut("p", modifiers: [.command, .shift])
+                            .disabled(isModeChangeLocked)
+                            .opacity(isModeChangeLocked ? 0.45 : 1)
+                            .accessibilityLabel(isPlanMode ? "Plan Mode is on" : "Enter Plan Mode")
+                            .help(planPillHelp)
+                            .transition(.opacity.combined(with: .scale))
+                        }
+
                         // Real-time Prompt Token Counter (to the right of Thinking toggle or Model selector)
                         if promptTokenCount > 0 {
                             HStack(spacing: 3.5) {
@@ -1196,6 +1328,10 @@ struct ChatDetailView: View {
     @ViewBuilder
     private var chatFloatingLayer: some View {
         VStack(spacing: 6) {
+            if let plan = readyPlanMessage {
+                planHandoffBar(plan)
+                    .transition(.opacity)
+            }
             if let queued = session?.queuedPrompts, !queued.isEmpty {
                 queuedPromptsCard(queued)
                     .transition(.opacity)
@@ -1217,7 +1353,116 @@ struct ChatDetailView: View {
             }
         )
         .animation(.easeInOut(duration: 0.15), value: session?.queuedPrompts.count ?? 0)
+        .animation(.easeInOut(duration: 0.15), value: readyPlanMessage?.id)
         .animation(.easeInOut(duration: 0.15), value: layerNotices)
+    }
+
+    /// The plan handoff: Crush's "ready to start coding?" prompt, placed where the
+    /// user is already looking when a turn ends. It asks the one question plan
+    /// mode exists to ask — approve (optionally with Turbo) or revise — and it
+    /// deliberately offers no way to start coding without leaving plan mode, so
+    /// approving is what re-arms the write tools.
+    @ViewBuilder
+    private func planHandoffBar(_ plan: ChatMessage) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "checklist")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.purple)
+                Text("Plan ready")
+                    .font(.system(size: max(10, 12 * zoomManager.zoomScale), weight: .bold))
+                Spacer(minLength: 0)
+                Button(action: {
+                    dismissedPlanMessageId = plan.id
+                }) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(.secondary)
+                        .padding(4)
+                        .background(Color.secondary.opacity(0.1))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss the plan prompt")
+                .help("Dismiss this prompt. Press Return in an empty composer to bring it back.")
+            }
+
+            Text("Approve to switch this conversation to Code Mode and start implementing.")
+                .font(.system(size: max(9.5, 11 * zoomManager.zoomScale)))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 8) {
+                Button(action: { onApprovePlan?(false) }) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "play.fill")
+                            .font(.system(size: 9))
+                        Text("Start coding")
+                            .font(.system(size: max(9.5, 11 * zoomManager.zoomScale), weight: .semibold))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Color.purple.opacity(0.9))
+                    .foregroundColor(.white)
+                    .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+                .disabled(isModeChangeLocked)
+                .opacity(isModeChangeLocked ? 0.45 : 1)
+                .help(isModeChangeLocked
+                    ? "Wait for the running turn to finish before starting the implementation"
+                    : "Switch to Code Mode and start implementing the plan")
+
+                Button(action: { onApprovePlan?(true) }) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "bolt.fill")
+                            .font(.system(size: 9))
+                        Text("Code with Turbo")
+                            .font(.system(size: max(9.5, 11 * zoomManager.zoomScale), weight: .medium))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Color.orange.opacity(0.14))
+                    .foregroundColor(.orange)
+                    .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+                .disabled(isModeChangeLocked)
+                .opacity(isModeChangeLocked ? 0.45 : 1)
+                .help(isModeChangeLocked
+                    ? "Wait for the running turn to finish before starting the implementation"
+                    : "Enable Turbo Mode, switch to Code Mode, and start implementing without per-action approval")
+
+                Button(action: {
+                    dismissedPlanMessageId = plan.id
+                    if !promptText.isEmpty { promptText += "\n" }
+                    promptText += "Revise the plan: "
+                    isInputFocused = true
+                }) {
+                    Text("Revise plan")
+                        .font(.system(size: max(9.5, 11 * zoomManager.zoomScale), weight: .medium))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(Color.secondary.opacity(0.09))
+                        .foregroundColor(.primary)
+                        .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+                .help("Stay in plan mode and send feedback in the composer")
+
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(NSColor.controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.purple.opacity(0.35), lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(0.14), radius: 10, x: 0, y: 4)
     }
 
     /// The notices this layer shows, in the order they stack. The window and the
@@ -2197,6 +2442,128 @@ struct CompactionSummaryCard: View {
             RoundedRectangle(cornerRadius: 10)
                 .stroke(Color.purple.opacity(0.16), lineWidth: 1)
         )
+    }
+}
+
+/// The plan-mode deliverable: an assistant turn whose content opens with
+/// `PlanMarkers.start`. Rendered as chrome rather than as an ordinary reply so a
+/// several-hundred-line plan reads as a document to approve, not as chat.
+///
+/// The border is dashed while the plan streams and solid once
+/// `PlanMarkers.ready` arrives — the visual counterpart of Crush's open and
+/// closed plan card. The markers themselves are stripped by the caller.
+struct PlanCard: View {
+    @EnvironmentObject private var zoomManager: AppZoomManager
+    let content: String
+    /// The plan turn's chain of thought. The card replaces `ChatMessageView`
+    /// entirely, so without this the one message a user reads most carefully
+    /// would be the only one whose reasoning could not be inspected.
+    let thinkingContent: String?
+    let isReady: Bool
+    let isStreaming: Bool
+    @Binding var isReasoningExpanded: Bool
+    @State private var isCopied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "checklist")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(
+                        LinearGradient(
+                            colors: [.purple, .indigo],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+
+                Text("Implementation Plan")
+                    .font(.system(size: max(10, 12 * zoomManager.zoomScale), weight: .semibold))
+                    .foregroundColor(.primary)
+
+                Text(isReady ? "Plan ready" : (isStreaming ? "Planning…" : "Plan"))
+                    .font(.system(size: max(8.5, 10 * zoomManager.zoomScale), weight: .bold))
+                    .foregroundColor(isReady ? .purple : .secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background((isReady ? Color.purple : Color.secondary).opacity(0.12))
+                    .cornerRadius(5)
+
+                Spacer(minLength: 0)
+
+                Button(action: {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(content, forType: .string)
+                    isCopied = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                        isCopied = false
+                    }
+                }) {
+                    Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
+                        .font(.system(size: max(9, 11 * zoomManager.zoomScale)))
+                        .foregroundColor(isCopied ? .green : .secondary)
+                        .padding(6)
+                        .background(Color.secondary.opacity(0.06))
+                        .cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+                .help("Copy the plan")
+                .accessibilityLabel(isCopied ? "Plan copied" : "Copy the plan")
+            }
+
+            if let thinking = thinkingContent, !thinking.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Button(action: {
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            isReasoningExpanded.toggle()
+                        }
+                    }) {
+                        HStack(spacing: 5) {
+                            Image(systemName: "brain.head.profile")
+                                .font(.system(size: max(8.5, 10 * zoomManager.zoomScale)))
+                                .foregroundColor(.secondary)
+                            Text("Reasoning")
+                                .font(.system(size: max(9, 11 * zoomManager.zoomScale), weight: .medium))
+                                .foregroundColor(.secondary)
+                            Image(systemName: isReasoningExpanded ? "chevron.down" : "chevron.right")
+                                .font(.system(size: 8, weight: .bold))
+                                .foregroundColor(.secondary.opacity(0.8))
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(isReasoningExpanded ? "Hide the plan's reasoning" : "Show the plan's reasoning")
+
+                    if isReasoningExpanded {
+                        Text(thinking)
+                            .font(.system(size: max(9.5, 11.5 * zoomManager.zoomScale)))
+                            .foregroundColor(.secondary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.secondary.opacity(0.05))
+                            .cornerRadius(6)
+                    }
+                }
+            }
+
+            MarkdownMessageView(content: content, isStreaming: isStreaming && !isReady)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(NSColor.controlBackgroundColor).opacity(0.7))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(
+                    Color.purple.opacity(isReady ? 0.45 : 0.22),
+                    style: StrokeStyle(lineWidth: 1, dash: isReady ? [] : [4, 3])
+                )
+        )
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Implementation plan")
+        .accessibilityValue(isReady ? "Ready to implement" : "In progress")
     }
 }
 
@@ -4272,6 +4639,15 @@ struct ToolCallCardView: View {
                                 .font(.system(size: 10.5, weight: .bold))
                                 .foregroundColor(.orange)
                         }
+                    case .withheld:
+                        HStack(spacing: 4) {
+                            Image(systemName: "shield.lefthalf.filled")
+                                .font(.system(size: 11))
+                                .foregroundColor(.purple)
+                            Text("Withheld in Plan Mode")
+                                .font(.system(size: 10.5, weight: .medium))
+                                .foregroundColor(.purple)
+                        }
                     case .rejected:
                         HStack(spacing: 4) {
                             Image(systemName: "xmark.circle")
@@ -4416,6 +4792,7 @@ struct ToolCallCardView: View {
         case .error: return .red
         case .awaitingApproval: return .orange
         case .rejected: return .secondary
+        case .withheld: return .purple
         }
     }
 }

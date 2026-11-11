@@ -18,8 +18,10 @@ public final class MCPToolBridge: AgentTool {
     /// `mcp__<server>__<tool>`, the Claude Code convention. Server keys may not
     /// contain `__` or end with `_`, so the first separator always terminates
     /// the server key and no two servers can share a tool-name prefix.
-    public static let namePrefix = "mcp__"
-    public static let separator = "__"
+    // `nonisolated` because the plan-mode policy is pure logic and reads this
+    // prefix from nonisolated contexts (it decides whether a tool is withheld).
+    nonisolated public static let namePrefix = "mcp__"
+    nonisolated public static let separator = "__"
 
     /// Servers sometimes ship multi-kilobyte descriptions. Every loaded schema
     /// is paid for on every turn, so descriptions are bounded.

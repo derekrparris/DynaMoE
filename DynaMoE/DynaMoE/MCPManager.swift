@@ -803,10 +803,15 @@ public final class MCPManager: ObservableObject {
 
     /// Loads one discovered tool into the prompt/grammar, exactly like
     /// `tools_load` would. Used by the settings disclosure rows.
+    ///
+    /// Settings is not a turn: the operator asked for this tool directly, so the
+    /// mode of whichever conversation happens to be selected must not refuse a
+    /// control they clicked. A plan turn still cannot load an MCP tool through
+    /// `tools_load`, which is the promise that matters.
     @discardableResult
     public func loadTool(named qualifiedName: String) -> Bool {
         do {
-            _ = try AgentHarness.shared.loadTool(named: qualifiedName)
+            _ = try AgentHarness.shared.loadTool(named: qualifiedName, mode: .code)
             return true
         } catch {
             lastError = error.localizedDescription

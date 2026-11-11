@@ -1787,8 +1787,14 @@ public final class ToolDiscoverTool: AgentTool {
         let harness = AgentHarness.shared
 
         var groups: [String: [[String: Any]]] = [:]
+        // Plan mode lists only what the turn could actually load: offering a
+        // withheld tool here is what sends a model chasing a capability the
+        // harness then refuses, call after call. The TURN's mode is preferred
+        // over the process-global one, which another turn can move.
+        let mode = AgentHarness.executingTurnMode ?? harness.activeMode
         for name in harness.tools.keys.sorted() {
             guard let tool = harness.tools[name], harness.loadedTools[name] == nil else { continue }
+            if PlanModePolicy.withholds(name, in: mode) { continue }
             let cat = tool.catalogCategory
             if let cf = categoryFilter, !cf.isEmpty, cf != "all", cat != cf { continue }
             let summary = tool.catalogSummary
@@ -1814,7 +1820,14 @@ public final class ToolDiscoverTool: AgentTool {
                 total += 1
             }
         }
-        let readable = lines.isEmpty ? "All installed tools are currently loaded. Nothing to discover." : lines.joined(separator: "\n")
+        let readable: String
+        if !lines.isEmpty {
+            readable = lines.joined(separator: "\n")
+        } else if mode == .plan {
+            readable = "Nothing to discover: every installed tool this mode allows is already loaded. Plan mode withholds the write, execute and completion tools, so there is nothing else to load."
+        } else {
+            readable = "All installed tools are currently loaded. Nothing to discover."
+        }
 
         var groupsJSON: [[String: Any]] = []
         for cat in order {
@@ -1823,12 +1836,19 @@ public final class ToolDiscoverTool: AgentTool {
             }
         }
 
-        let res = AgentHarness.toolSuccessJSON(tool: "tools_discover", data: [
+        var payload: [String: Any] = [
             "installed_count": harness.tools.count,
             "loaded_count": harness.loadedTools.count,
             "available_count": total,
             "groups": groupsJSON
-        ])
+        ]
+        if mode == .plan {
+            payload["withheld_in_plan_mode"] = harness.tools.keys
+                .filter { PlanModePolicy.withholds($0) }
+                .sorted()
+        }
+
+        let res = AgentHarness.toolSuccessJSON(tool: "tools_discover", data: payload)
         return (res, readable, nil, false)
     }
 }
@@ -1879,7 +1899,22 @@ public final class ToolLoadTool: AgentTool {
         var loadedResults: [[String: Any]] = []
         var schemas: [String: String] = [:]
         var errors: [String] = []
+        // The turn's mode, applied BEFORE the already-loaded branch: the coder
+        // core (`shell_run`, `complete`) stays in `loadedTools` while plan mode
+        // runs, because unloading it would change the surface every other turn
+        // shares. That branch used to answer a withheld tool with a success and
+        // its full schema, which told the model a capability was available that
+        // `executeTool` then refused on the next step.
+        let turnMode = AgentHarness.executingTurnMode ?? harness.activeMode
         for name in names {
+            // Installed-only: a misspelled name must still be UNKNOWN, not
+            // reported as a policy refusal (the same ordering `executeTool`
+            // learned so a typo is answered with the available-names hint).
+            if harness.tools[name] != nil, PlanModePolicy.withholds(name, in: turnMode) {
+                let reason = AgentHarness.ToolLoadError.withheldInPlanMode(name).localizedDescription
+                errors.append("Failed to load tool '\(name)': \(reason)")
+                continue
+            }
             if let existing = harness.loadedTools[name] {
                 // Repeat the schema even when the tool is already loaded. The pinned
                 // system prompt's tool block is only ever the CORE set (loads do not
@@ -2162,6 +2197,9 @@ public final class SpawnSubagentTool: AgentTool {
             role: role,
             taskDescription: taskDesc,
             allowedTools: allowedTools,
+            // The turn's mode, not the process-global one: another turn can move
+            // `activeMode`, and a plan turn's child must inherit plan mode.
+            parentMode: AgentHarness.executingTurnMode ?? AgentHarness.shared.activeMode,
             contextSummary: contextSummary,
             parentSessionId: AgentHarness.shared.currentSessionId,
             workingDirectory: workingDirectory
@@ -2775,6 +2813,54 @@ public final class LintDiagnosticsTool: AgentTool {
 
 // MARK: - Agent Harness Coordinator
 
+/// How one finished tool call counts towards the harness's loop guards.
+///
+/// Three outcomes rather than a success flag because a policy refusal is not a
+/// failure the model caused: plan mode withholding `file_write` would, if
+/// counted as a success, reset the same-tool streak and let a model re-issue it
+/// until the step budget ran out; counted as a failure it would end a legitimate
+/// plan turn for asking once too often. It is its own thing.
+nonisolated public enum ToolCallOutcome: Sendable {
+    case succeeded
+    case failed
+    /// Refused before execution by the agent mode. Charges the run's TOTAL
+    /// failure budget (a run cannot spend its whole step allowance on calls the
+    /// mode will never allow) and leaves the same-tool streak alone, because the
+    /// tool did not fail, the mode declined.
+    case withheld
+}
+
+extension ToolExecutionStatus {
+    /// How a finished call's status counts towards the loop guards.
+    ///
+    /// `.rejected` is the USER declining a confirmation, which the call sites
+    /// have always charged as a failure: a model that keeps proposing the same
+    /// rejected action should be reeled in like one whose calls error. `.withheld`
+    /// is the mode refusing before execution, which is the one case that gets its
+    /// own treatment.
+    nonisolated var toolCallOutcome: ToolCallOutcome {
+        switch self {
+        case .error, .rejected: return .failed
+        case .withheld: return .withheld
+        case .success, .running, .awaitingApproval: return .succeeded
+        }
+    }
+
+    /// True when the call that produced this status ENDS the agent run.
+    ///
+    /// A `complete` call is the usual ending, and the harness's loop guards can
+    /// set the same flag, so the name and the flag are both honoured. A WITHHELD
+    /// call ends nothing: plan mode takes `complete` away precisely so the turn
+    /// finishes with a plan instead, and reading that refusal as completion would
+    /// end the run with no plan, no ready marker and nothing to approve. Every
+    /// run-ending decision reads this rather than testing the name itself, which
+    /// is what keeps the two turn loops from disagreeing about it again.
+    nonisolated func endsAgentRun(toolName: String, isCompleted: Bool) -> Bool {
+        guard self != .withheld else { return false }
+        return isCompleted || toolName == "complete"
+    }
+}
+
 public final class AgentHarness {
     public static let shared = AgentHarness()
 
@@ -2788,6 +2874,70 @@ public final class AgentHarness {
     /// paths the user named from here, since a tool result is the only place the
     /// model gets told which path it should have used.
     public var lastPromptText: String = ""
+    /// Which agent surface the CURRENT interactive turn runs on.
+    ///
+    /// Turn-scoped, not global: it is re-derived from the conversation at the
+    /// start of every send (`ContentView.handleSendMessage`) and never read by
+    /// the local API server, which installs a client's own schemas per turn.
+    /// It exists because the grammar registry is a single shared object that is
+    /// rebuilt by `syncGrammar()` on every registry change — a scoped mask
+    /// installed around one engine call would be overwritten by the next
+    /// `tools_load`, so the mode has to be the thing `syncGrammar` reads.
+    public private(set) var activeMode: AgentMode = .code
+
+    /// Tools plan mode loaded for itself, so leaving the mode can put the
+    /// registry back the way it was. Kept separate from `loadedTools` because a
+    /// tool the USER loaded must not be unloaded by a mode change.
+    private var armedByPlanMode: Set<String> = []
+
+    /// Enters `mode` and re-registers the grammar mask to match it. Call this
+    /// before building a turn's prompt: `buildSystemPrompt`,
+    /// `availableToolDefinitions` and `executeTool` all default to
+    /// `activeMode`.
+    ///
+    /// Entering plan mode also loads a small read core. The default registry is
+    /// deliberately minimal (`shell_run`, `complete`, discovery and `web_fetch`),
+    /// and `shell_run` is exactly what plan mode withholds — without this a plan
+    /// turn would advertise no way to read a file and its first move would be a
+    /// `tools_load`, which is a wasted step and a prompt rewrite. The rest of the
+    /// read surface stays one `tools_load` away rather than riding in every plan
+    /// prompt as a schema. The set armed here is removed again on the way out, so
+    /// the coder prompt does not grow permanent schemas because a conversation
+    /// planned once.
+    public func setActiveMode(_ mode: AgentMode) {
+        if activeMode != mode {
+            let previous = activeMode
+            activeMode = mode
+            if mode == .plan {
+                for name in PlanModePolicy.coreToolNames.sorted()
+                where tools[name] != nil && loadedTools[name] == nil {
+                    loadedTools[name] = tools[name]
+                    armedByPlanMode.insert(name)
+                }
+            } else if previous == .plan {
+                for name in armedByPlanMode {
+                    loadedTools.removeValue(forKey: name)
+                }
+                armedByPlanMode.removeAll()
+            }
+        }
+        // Re-asserted even when the mode did not change, because the registry has
+        // a second writer: a server turn installs the client's own schemas for its
+        // duration and restores a snapshot afterwards, so a mode flip that landed
+        // inside one can leave the registry holding the other surface while
+        // `activeMode` disagrees. An early return would leave a coder turn running
+        // on plan mode's grammar indefinitely.
+        //
+        // It must not run WHILE that second writer is active, though: rebuilding
+        // the shared registry from the harness catalog during a server turn
+        // replaces the client mask mid-generation, and the assertion that would do
+        // it (the start of an in-app send) is refused a moment later by the
+        // single-flight slot anyway. Nothing can then run on stale grammar, and
+        // the next assertion made while the engine is idle heals the registry.
+        guard !CompletionEngine.shared.isActive else { return }
+        syncGrammar()
+    }
+
     /// Token budget for a single tool result (converted to characters conservatively
     /// via `charBudget(forTokenBudget:)` before tools truncate their output).
     public var maxToolOutputLength: Int = 4000
@@ -3038,11 +3188,12 @@ public final class AgentHarness {
     public private(set) var totalFailedToolCalls: Int = 0
     public var failedToolCallTotalLimit: Int = 6
 
-    public func recordToolCallOutcome(toolName: String, succeeded: Bool) {
-        if succeeded {
+    public func recordToolCallOutcome(toolName: String, outcome: ToolCallOutcome) {
+        switch outcome {
+        case .succeeded:
             consecutiveFailedToolCalls = 0
             lastFailedToolName = nil
-        } else {
+        case .failed:
             totalFailedToolCalls += 1
             if lastFailedToolName == toolName {
                 consecutiveFailedToolCalls += 1
@@ -3050,6 +3201,8 @@ public final class AgentHarness {
                 consecutiveFailedToolCalls = 1
                 lastFailedToolName = toolName
             }
+        case .withheld:
+            totalFailedToolCalls += 1
         }
     }
 
@@ -3251,6 +3404,7 @@ public final class AgentHarness {
     public enum ToolLoadError: LocalizedError {
         case unknownTool(String)
         case nonUnloadable(String)
+        case withheldInPlanMode(String)
 
         public var errorDescription: String? {
             switch self {
@@ -3258,15 +3412,30 @@ public final class AgentHarness {
                 return "Unknown tool '\(name)'. Call tools_discover to see available installed tools."
             case .nonUnloadable(let name):
                 return "Tool '\(name)' is a fundamental tool and cannot be unloaded."
+            case .withheldInPlanMode(let name):
+                return "Tool '\(name)' is withheld in plan mode and cannot be loaded. Investigate with the read tools you already have, then write the plan."
             }
         }
     }
 
     /// Moves an installed tool into the loaded set and re-syncs the grammar sampler.
+    ///
+    /// `mode` is for a caller that is NOT a turn: Settings loads an MCP tool the
+    /// operator asked for, and judging that against the mode of whichever
+    /// conversation happens to be selected refused a control the user had just
+    /// clicked. A turn's own call passes nil and gets the turn's mode.
     @discardableResult
-    public func loadTool(named name: String) throws -> ToolDefinition {
+    public func loadTool(named name: String, mode: AgentMode? = nil) throws -> ToolDefinition {
         guard let tool = tools[name] else {
             throw ToolLoadError.unknownTool(name)
+        }
+        // Plan mode's promise covers what the model can arm, not just what the
+        // prompt lists: a withheld tool that `tools_load` re-activated would be
+        // advertised to the next step with no capability behind it. The turn's
+        // own mode wins over the global, which another turn can move.
+        let effectiveMode = mode ?? AgentHarness.executingTurnMode ?? activeMode
+        guard !PlanModePolicy.withholds(name, in: effectiveMode) else {
+            throw ToolLoadError.withheldInPlanMode(name)
         }
         let didChange = loadedTools[name] == nil
         loadedTools[name] = tool
@@ -3295,6 +3464,7 @@ public final class AgentHarness {
     /// Resets the loaded set back to the fundamental core tools.
     public func resetLoadedToolsToCore() {
         loadedTools.removeAll()
+        armedByPlanMode.removeAll()
         for name in Self.coreLoadedToolNames where tools[name] != nil {
             loadedTools[name] = tools[name]
         }
@@ -3302,7 +3472,7 @@ public final class AgentHarness {
     }
 
     private func syncGrammar() {
-        GrammarConstrainedSampler.shared.registerTools(availableToolDefinitions)
+        GrammarConstrainedSampler.shared.registerTools(availableToolDefinitions(mode: activeMode))
     }
 
     /// MCP tools are treated as state-changing unconditionally. A remote server
@@ -3314,9 +3484,48 @@ public final class AgentHarness {
         return toolName == "file_write" || toolName == "file_edit" || toolName == "shell_run" || toolName == "git_commit"
     }
 
-    /// Definitions currently exposed to the model (drives the prompt AND the grammar mask).
+    /// Whether a call must ask the user before it runs.
+    ///
+    /// Both turn loops gate on this rather than on `isStateChanging` alone: a
+    /// tool plan mode withholds is refused by `executeTool` without running, so
+    /// prompting for it asked the user to approve a write the mode had already
+    /// denied, and the approved call then came back withheld.
+    public static func requiresApproval(toolName: String, mode: AgentMode) -> Bool {
+        isStateChanging(toolName: toolName) && !PlanModePolicy.withholds(toolName, in: mode)
+    }
+
+    /// The mode of the turn whose tool is executing, bound by `executeTool`.
+    ///
+    /// Not every tool takes a `mode:` parameter, and the two that decide what to
+    /// OFFER (`tools_discover`, `tools_load`) used to read the process-global
+    /// `activeMode` instead — a value another turn can move. `executeTool` is the
+    /// one place that knows which turn it is serving, so it publishes the answer
+    /// for the duration of the call. A task-local rather than a stored property
+    /// because subagents execute through this same harness concurrently, each in
+    /// its own task, with its own parent mode.
+    @TaskLocal static var executingTurnMode: AgentMode?
+
+    /// Definitions currently exposed to the model for the turn in flight.
+    /// The explicit `availableToolDefinitions(mode:)` is what a caller uses
+    /// when it knows the conversation's mode; this is the same list for
+    /// `activeMode`, and it is what the prompt, the grammar mask and the
+    /// unknown-tool error all read.
     public var availableToolDefinitions: [ToolDefinition] {
-        return loadedTools.keys.sorted().compactMap { loadedTools[$0]?.definition }
+        availableToolDefinitions(mode: activeMode)
+    }
+
+    /// Definitions currently exposed to the model (drives the prompt AND the grammar mask).
+    ///
+    /// `mode` withholds the tools a read-only pass may not call; the default
+    /// keeps every caller that builds a coder turn on the full surface. Plan
+    /// mode is enforced here as well as in `executeTool` because this array is
+    /// what the prompt advertises, what the cloud path sends as its `tools`
+    /// array, and what a per-turn grammar mask registers.
+    public func availableToolDefinitions(mode: AgentMode = .code) -> [ToolDefinition] {
+        return loadedTools.keys.sorted().compactMap { name -> ToolDefinition? in
+            if PlanModePolicy.withholds(name, in: mode) { return nil }
+            return loadedTools[name]?.definition
+        }
     }
 
     /// Full catalog of every installed tool.
@@ -3328,11 +3537,11 @@ public final class AgentHarness {
     /// unloaded-tool notice). Shared by `buildSystemPrompt` and
     /// `refreshingLoadedToolsSection(inPrompt:)` so a mid-run refresh renders
     /// byte-identical text to a freshly built prompt.
-    public func buildToolsSection() -> String {
+    public func buildToolsSection(mode: AgentMode = .code) -> String {
         var prompt = "# Tools\n\nOnly the following functions are currently loaded and callable:\n\n<tools>\n"
         let toolSchemaEncoder = JSONEncoder()
         toolSchemaEncoder.outputFormatting = [.sortedKeys]
-        for tool in availableToolDefinitions {
+        for tool in availableToolDefinitions(mode: mode) {
             if let data = try? toolSchemaEncoder.encode(tool),
                let jsonStr = String(data: data, encoding: .utf8) {
                 prompt += jsonStr + "\n"
@@ -3340,7 +3549,12 @@ public final class AgentHarness {
         }
         prompt += "</tools>\n\n"
 
-        let unloadedCount = tools.count - loadedTools.count
+        // Count only what this mode could actually load. A withheld tool is not
+        // "installed but not loaded": telling the model to discover one it can
+        // never call sends it looking for a capability the environment denies.
+        let unloadedCount = tools.keys.filter { name in
+            loadedTools[name] == nil && !PlanModePolicy.withholds(name, in: mode)
+        }.count
         if unloadedCount > 0 {
             prompt += """
             NOTE: \(unloadedCount) additional tool(s) are installed but NOT loaded, so their schemas are not shown above and they cannot currently be called.
@@ -3351,13 +3565,32 @@ public final class AgentHarness {
 
             """
         }
+        if mode == .plan {
+            // The directive above already names the write and execute set, and
+            // on a plain installation that set IS everything withheld, so
+            // restating the same five tools here cost a plan turn its tokens for
+            // nothing. The names are printed only when the catalog withholds
+            // something the directive did not describe (an MCP server, a tool
+            // added later), which is the case where the list says anything new.
+            let withheld = tools.keys.filter { PlanModePolicy.withholds($0) }.sorted()
+            if !withheld.isEmpty {
+                let described = PlanModePolicy.withheldToolNames
+                let line = withheld.allSatisfy { described.contains($0) }
+                    ? "Plan mode withholds \(withheld.count) tool(s) for this turn, the write and execute set named above."
+                    : "Plan mode withholds \(withheld.count) tool(s) for this turn: \(withheld.joined(separator: ", "))."
+                prompt += """
+                \(line) They are not missing and cannot be loaded — do not call them. Investigate with the tools listed above, then write the plan.
+
+                """
+            }
+        }
         // Web-research readiness hint: with web_search loaded but web_fetch NOT,
         // the model sees instructions to "read pages via web_fetch" (shell_run's
         // description) yet has no web_fetch schema — observed live: it re-issued
         // web_search query after query trying to obtain page content until the
         // search budget guardrail force-disabled web_search mid-task. Tell it
         // exactly how to gain fetch capability instead.
-        if loadedTools["web_search"] != nil && loadedTools["web_fetch"] == nil {
+        if loadedTools["web_search"] != nil && loadedTools["web_fetch"] == nil && mode == .code {
             prompt += """
             Web research readiness: `web_fetch` (full page content) is NOT loaded yet, so you cannot read pages. Before you need page content, call `tools_load` with `{\"names\": [\"web_fetch\"]}` and then fetch the exact URLs `web_search` returned. Do NOT keep issuing `web_search` queries to obtain page content — search snippets are all web_search can give you.
 
@@ -3371,9 +3604,21 @@ public final class AgentHarness {
     /// `buildSystemPrompt`: that prompt teaches the local `<tool_call>` /
     /// `<parameter>` dialects, which would fight the wire format a cloud model
     /// is actually constrained to. Only the procedural guidance is shared.
-    public func buildCloudToolGuidance() -> String {
-        let unloadedCount = tools.count - loadedTools.count
-        var prompt = """
+    public func buildCloudToolGuidance(mode: AgentMode = .code) -> String {
+        let unloadedCount = tools.keys.filter { name in
+            loadedTools[name] == nil && !PlanModePolicy.withholds(name, in: mode)
+        }.count
+        var prompt = ""
+        // A cloud turn assembles its own prompt, so the plan section has to be
+        // rendered HERE as well as in `buildSystemPrompt`: without it the turn
+        // got a withheld-tools note and no role, no marker contract and no
+        // output contract, and the plan card and approval bar (both keyed on
+        // the markers) could never form — the pill was the only way out.
+        if mode == .plan {
+            let toolNames = availableToolDefinitions(mode: mode).map { $0.function.name }
+            prompt += "\n\n" + PlanModePolicy.directive(toolNames: toolNames) + "\n"
+        }
+        prompt += """
 
         # Tools
 
@@ -3384,20 +3629,39 @@ public final class AgentHarness {
         - Use absolute paths. For a file the user names, call the tool with that exact path.
         - Tool results arrive as PLAIN TEXT: a `[tool_name] status` header, `key: value` metadata lines, then `--- field ---` sections. Read the `--- content ---` section as the actual file/page text; `<<<TRUNCATED: …>>>` markers are harness annotations, not file content.
         """
+        if mode == .plan {
+            // The directive above already enumerates what plan mode withholds;
+            // this only has to say what the WIRE carries, which the model cannot
+            // see for itself.
+            prompt += """
+
+            - The withheld tools are not declared in this request's `tools` array, so the provider will not offer them. Investigate with the declared tools above, then write the plan.
+            """
+        }
         if unloadedCount > 0 {
             prompt += """
 
             - \(unloadedCount) additional tool(s) are installed but not loaded. Call `tools_discover` to list them by category, then `tools_load` with a `names` array to add the schemas you need (one batched call) before using them.
             """
         }
-        prompt += """
+        if mode == .plan {
+            prompt += """
 
-        # Ending Your Turn
+            # Ending Your Turn
 
-        - When the task is finished, answer the user in plain text with no further tool call. A plain-text reply completes the turn.
-        - Call `complete` only when the whole task is done and you are handing back the final result; never mid-task.
-        - Never emit placeholder or no-op calls (`shell_run` with `echo`, `true`, `:`, or similar). The harness discards them and ends the turn.
-        """
+            - A plain-text reply completes the turn. `complete` is withheld, so the reply IS the deliverable: end it with the ready marker on its own line.
+            - Never emit placeholder or no-op calls (`shell_run` with `echo`, `true`, `:`, or similar). The harness discards them and ends the turn.
+            """
+        } else {
+            prompt += """
+
+            # Ending Your Turn
+
+            - When the task is finished, answer the user in plain text with no further tool call. A plain-text reply completes the turn.
+            - Call `complete` only when the whole task is done and you are handing back the final result; never mid-task.
+            - Never emit placeholder or no-op calls (`shell_run` with `echo`, `true`, `:`, or similar). The harness discards them and ends the turn.
+            """
+        }
         return prompt
     }
 
@@ -3410,13 +3674,16 @@ public final class AgentHarness {
     /// block still omitted it (observed live: the model burned 500+ tokens never
     /// committing to a call). Returns the prompt unchanged when it carries no tools
     /// section (non-agent chat) or the rendered section already matches the registry.
-    public func refreshingLoadedToolsSection(inPrompt prompt: String) -> String {
+    public func refreshingLoadedToolsSection(inPrompt prompt: String, mode: AgentMode = .code) -> String {
         let sectionMarker = "# Tools\n\nOnly the following functions are currently loaded and callable:"
         guard let toolsStart = prompt.range(of: sectionMarker)?.lowerBound else { return prompt }
         let heading = "# Subagent Result Delivery Policy"
         guard let headingRange = prompt.range(of: heading, range: toolsStart..<prompt.endIndex),
               headingRange.lowerBound > toolsStart else { return prompt }
-        let refreshed = String(prompt[..<toolsStart]) + buildToolsSection() + "\n" + heading + String(prompt[headingRange.upperBound...])
+        // `mode` must travel with the refresh: rebuilding the block from the
+        // unfiltered registry would hand a plan-mode turn its write tools back
+        // on the very next agent step.
+        let refreshed = String(prompt[..<toolsStart]) + buildToolsSection(mode: mode) + "\n" + heading + String(prompt[headingRange.upperBound...])
         if refreshed == prompt { return prompt }
         print("🔄 [TOOLS] tool block changed since this prompt was built — rewriting system tools section (loaded=\(loadedTools.count))")
         return refreshed
@@ -3452,7 +3719,7 @@ public final class AgentHarness {
         """
     }
 
-    public func buildSystemPrompt(baseSystem: String, modelName: String? = nil, currentDate: Date = Date(), isLingModel: Bool = false, isGemma4Model: Bool = false, isDeepSeekV41Model: Bool = false) -> String {
+    public func buildSystemPrompt(baseSystem: String, modelName: String? = nil, currentDate: Date = Date(), isLingModel: Bool = false, isGemma4Model: Bool = false, isDeepSeekV41Model: Bool = false, mode: AgentMode = .code) -> String {
         var cleanBase = baseSystem.trimmingCharacters(in: .whitespacesAndNewlines)
         if cleanBase.isEmpty {
             cleanBase = "You are an expert AI software engineering and reasoning assistant with direct access to local macOS development tools."
@@ -3465,7 +3732,15 @@ public final class AgentHarness {
             prompt += AgentHarness.formattedDateTimeContext(date: currentDate) + "\n\n"
         }
 
-        prompt += buildToolsSection()
+        // Plan mode leads with its role, before the tool block and before the
+        // coder persona that `baseSystem` contributes: the model reads what it
+        // is and what it therefore may not do before it reads what it can call.
+        if mode == .plan {
+            let toolNames = availableToolDefinitions(mode: mode).map { $0.function.name }
+            prompt += PlanModePolicy.directive(toolNames: toolNames) + "\n\n"
+        }
+
+        prompt += buildToolsSection(mode: mode)
 
         prompt += """
 
@@ -3479,15 +3754,30 @@ public final class AgentHarness {
         - When you relay a subagent's results, always end with a final answer to the user. Do not end your turn after spawning, checking, or acknowledging a subagent — the task is only done when the user has received the outcome.
         """
 
-        prompt += """
+        // The local prompt is assembled here rather than by
+        // `buildCloudToolGuidance`, so its "ending your turn" rule has to be
+        // mode-branched too: telling a plan turn to call `complete` contradicts
+        // the directive a few paragraphs earlier, and the grammar mask cannot
+        // emit that name in the first place.
+        if mode == .plan {
+            prompt += """
 
-        # Ending Your Turn
+            # Ending Your Turn
 
-        - Once you have the information you need, answer the user in plain text and end your turn. A plain-text reply is a complete turn; no tool call is required to finish.
-        - Call `complete` (with a summary) only when the user's whole task is finished and you are handing back the final result. Never call it mid-task.
-        - NEVER emit placeholder or no-op tool calls (`shell_run` with `echo`, `true`, `:`, or similar) to signal that you are done. They cannot advance the task, and the harness discards them and ends the turn.
-        - Do not re-answer or re-summarize a result you already delivered. Deliver one final answer per task.
-        """
+            - A plain-text reply completes the turn. `complete` is withheld, so the reply IS the deliverable: end it with the ready marker on its own line.
+            - NEVER emit placeholder or no-op tool calls (`shell_run` with `echo`, `true`, `:`, or similar). The harness discards them and ends the turn.
+            """
+        } else {
+            prompt += """
+
+            # Ending Your Turn
+
+            - Once you have the information you need, answer the user in plain text and end your turn. A plain-text reply is a complete turn; no tool call is required to finish.
+            - Call `complete` (with a summary) only when the user's whole task is finished and you are handing back the final result. Never call it mid-task.
+            - NEVER emit placeholder or no-op tool calls (`shell_run` with `echo`, `true`, `:`, or similar) to signal that you are done. They cannot advance the task, and the harness discards them and ends the turn.
+            - Do not re-answer or re-summarize a result you already delivered. Deliver one final answer per task.
+            """
+        }
 
         prompt += """
 
@@ -3636,6 +3926,19 @@ public final class AgentHarness {
 
         if !cleanBase.isEmpty {
             prompt += "\n\n" + cleanBase
+        }
+
+        // The persona lands last, and the coder profile's persona is an
+        // implementation brief ("edit, build, run"). In plan mode the final
+        // word has to be the correction, or the recency of that brief wins over
+        // the role stated at the top of the prompt.
+        if mode == .plan {
+            prompt += """
+
+            # Plan Mode Directive (overrides the persona above)
+
+            You are in PLAN MODE. The persona above describes the coder you become after the user approves; it is not this turn's job. Read, search and analyze, then answer with the plan bracketed by \(PlanMarkers.start) on its own first line and \(PlanMarkers.ready) on its own last line. Do not attempt to modify files, run commands, or commit: those tools are withheld and any attempt is refused. If the user asks you to implement something, tell them to approve the plan first.
+            """
         }
 
         return prompt
@@ -4299,7 +4602,27 @@ public final class AgentHarness {
 
     // MARK: - Tool Execution
 
-    public func executeTool(call: ParsedToolCall, workingDirectory: URL? = nil, maxOutputLength: Int? = nil) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool) {
+    /// Runs one parsed call.
+    ///
+    /// `mode` is the TURN's mode. Callers that know it pass it by value, because
+    /// `activeMode` is process-global and another turn can move it; a nil value
+    /// keeps the historical behaviour of reading the active mode.
+    public func executeTool(call: ParsedToolCall, workingDirectory: URL? = nil, maxOutputLength: Int? = nil, mode: AgentMode? = nil) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool) {
+        let effectiveMode = mode ?? activeMode
+        // Bound for the whole call so a tool that takes no `mode:` parameter
+        // (`tools_discover`, `tools_load`) answers for THIS turn rather than for
+        // whatever `activeMode` holds when its own `await` resumes.
+        return await AgentHarness.$executingTurnMode.withValue(effectiveMode) {
+            await self.runToolInTurn(
+                call: call,
+                workingDirectory: workingDirectory,
+                maxOutputLength: maxOutputLength,
+                effectiveMode: effectiveMode
+            )
+        }
+    }
+
+    private func runToolInTurn(call: ParsedToolCall, workingDirectory: URL?, maxOutputLength: Int?, effectiveMode: AgentMode) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool) {
         let startTime = CFAbsoluteTimeGetCurrent()
         // The engine is idle while a tool runs, but the agent operation is not
         // over: subsystems that must not interrupt one (MCP config reloads)
@@ -4308,15 +4631,16 @@ public final class AgentHarness {
         defer { AgentActivity.shared.end(.toolCall) }
         let wd = workingDirectory ?? defaultWorkingDirectory
         let strArgs = call.arguments.mapValues { String(describing: $0) }
-        // maxOutputLength (and maxToolOutputLength) is a TOKEN budget; tools work in
-        // characters, so convert with a conservative chars-per-token estimate.
-        let tokenBudget = maxOutputLength ?? self.maxToolOutputLength
-        let effectiveMaxLen = AgentHarness.charBudget(forTokenBudget: tokenBudget)
-
+        // An INSTALLED tool plan mode withholds is refused; a name nothing
+        // provides is a different answer, and the order matters. The withheld
+        // branch used to run first, so a hallucinated `web_search_fetch` was
+        // reported as "withheld in plan mode, do not retry" instead of with the
+        // available names the unknown-tool branch echoes back specifically to
+        // stop the model repeating the bad string.
         guard let tool = tools[call.name] else {
             // Echo the valid names back: a bare "Unknown tool 'web_search_fetch'"
             // teaches the model to repeat the bad string verbatim on the retry.
-            let available = availableToolDefinitions.map { $0.function.name }
+            let available = availableToolDefinitions(mode: effectiveMode).map { $0.function.name }
             let err = available.isEmpty
                 ? "Unknown tool '\(call.name)'"
                 : "Unknown tool '\(call.name)'. Available tools: \(available.joined(separator: ", "))."
@@ -4332,6 +4656,29 @@ public final class AgentHarness {
             )
             return (json, rec, false)
         }
+        // Plan mode's backstop. The prompt and the grammar already withhold the
+        // write surface, but a subagent, a cloud function call, a stale mask or
+        // a model that emits a withheld name anyway all land here, and this is
+        // the one place every execution path passes through.
+        if PlanModePolicy.withholds(call.name, in: effectiveMode) {
+            let err = "PLAN MODE: '\(call.name)' is withheld in plan mode and was not executed. Do not retry it. Investigate with the read tools you have (file_read, grep_search, find_files, codebase_search), then answer with the plan ending in \(PlanMarkers.ready) on its own line."
+            let json = AgentHarness.toolErrorJSON(tool: call.name, error: err)
+            let rec = ToolCallRecord(
+                name: call.name,
+                arguments: strArgs,
+                rawArguments: call.rawArguments,
+                status: .withheld,
+                output: AgentHarness.renderToolResultForModel(json),
+                error: err,
+                executionDurationSeconds: CFAbsoluteTimeGetCurrent() - startTime
+            )
+            print("🧭 [PLAN] refused '\(call.name)' — withheld in plan mode")
+            return (json, rec, false)
+        }
+        // maxOutputLength (and maxToolOutputLength) is a TOKEN budget; tools work in
+        // characters, so convert with a conservative chars-per-token estimate.
+        let tokenBudget = maxOutputLength ?? self.maxToolOutputLength
+        let effectiveMaxLen = AgentHarness.charBudget(forTokenBudget: tokenBudget)
 
         do {
             let baseResult: (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool)

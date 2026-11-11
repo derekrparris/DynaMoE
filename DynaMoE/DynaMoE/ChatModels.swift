@@ -38,6 +38,12 @@ nonisolated public enum ToolExecutionStatus: String, Codable, Equatable, Sendabl
     case error
     case awaitingApproval
     case rejected
+    /// The agent mode refused the call before it ran (plan mode withholding a
+    /// write tool). Distinct from `.rejected`, which is the USER declining a
+    /// confirmation: a withheld call is neither a failure the model caused nor a
+    /// success. The loop guards read it through `ToolCallOutcome.withheld`, and
+    /// the timeline renders it as a mode refusal rather than an error.
+    case withheld
 }
 
 nonisolated public struct ToolCallRecord: Identifiable, Codable, Equatable, Sendable {
@@ -77,6 +83,63 @@ nonisolated public struct ToolCallRecord: Identifiable, Codable, Equatable, Send
         self.executionDurationSeconds = executionDurationSeconds
         self.timestamp = timestamp
         self.isGesture = isGesture
+    }
+
+    // MARK: - Codable
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, arguments, rawArguments, status, output, error
+        case executionDurationSeconds, timestamp, isGesture
+        /// Written beside a withheld `status` and read back as the real meaning.
+        /// See `encode(to:)`.
+        case withheldInPlanMode
+    }
+
+    /// Decodes a record written by this build or any earlier one.
+    ///
+    /// `withheldInPlanMode` is what restores `.withheld`: the status itself is
+    /// written as `.rejected` so that a build predating plan mode (which has no
+    /// `.withheld` case and would fail on it) can still decode the conversation
+    /// instead of losing it. A record written directly with `.withheld` — an
+    /// intermediate build, or a hand-edited file — is accepted too.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        arguments = try container.decode([String: String].self, forKey: .arguments)
+        rawArguments = try container.decode(String.self, forKey: .rawArguments)
+        output = try container.decodeIfPresent(String.self, forKey: .output)
+        error = try container.decodeIfPresent(String.self, forKey: .error)
+        executionDurationSeconds = try container.decodeIfPresent(
+            Double.self,
+            forKey: .executionDurationSeconds
+        )
+        timestamp = try container.decode(Date.self, forKey: .timestamp)
+        isGesture = try container.decodeIfPresent(Bool.self, forKey: .isGesture) ?? false
+        let recorded = try container.decode(ToolExecutionStatus.self, forKey: .status)
+        let flagged = try container.decodeIfPresent(Bool.self, forKey: .withheldInPlanMode) ?? false
+        status = (flagged || recorded == .withheld) ? .withheld : recorded
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(arguments, forKey: .arguments)
+        try container.encode(rawArguments, forKey: .rawArguments)
+        try container.encodeIfPresent(output, forKey: .output)
+        try container.encodeIfPresent(error, forKey: .error)
+        try container.encodeIfPresent(executionDurationSeconds, forKey: .executionDurationSeconds)
+        try container.encode(timestamp, forKey: .timestamp)
+        try container.encode(isGesture, forKey: .isGesture)
+        // `.withheld` did not exist before plan mode, and an unknown raw value
+        // fails the decode of the WHOLE record and with it the session file. It
+        // is therefore persisted as the closest status an older build knows, with
+        // the real meaning beside it for this build to read back.
+        try container.encode(status == .withheld ? .rejected : status, forKey: .status)
+        if status == .withheld {
+            try container.encode(true, forKey: .withheldInPlanMode)
+        }
     }
 }
 
@@ -254,6 +317,11 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
     /// it, and an unsupported stored value clamps to `.high` on read.
     public var thinkingEffort: ThinkingEffort?
     public var isAgentToolsEnabled: Bool?
+    /// The conversation's agent surface: the coder (nil or `.code`) or plan
+    /// mode, which reads and searches but cannot write. Per conversation, like
+    /// `isAgentToolsEnabled`, so a plan survives a relaunch and switching chats
+    /// cannot leave one conversation's read-only promise over another's writes.
+    public var agentMode: AgentMode?
     public var queuedPrompts: [QueuedPrompt]
     /// Rolling general summary of everything a manual /compact removed from
     /// `messages`, written by the Apple Foundation Model and merged forward at
@@ -292,6 +360,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         isThinkingEnabled: Bool? = nil,
         thinkingEffort: ThinkingEffort? = nil,
         isAgentToolsEnabled: Bool? = nil,
+        agentMode: AgentMode? = nil,
         queuedPrompts: [QueuedPrompt] = [],
         rollingSummary: String? = nil,
         recentWorkDigest: String? = nil,
@@ -308,7 +377,13 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         self.selectedModelPath = selectedModelPath
         self.isThinkingEnabled = isThinkingEnabled
         self.thinkingEffort = thinkingEffort
-        self.isAgentToolsEnabled = isAgentToolsEnabled
+        // Plan mode is an agent MODE, not a prompt preference: with the tool
+        // surface off it has no directive, no read tools and no handoff, so a
+        // turn runs as plain chat under a pill that claims otherwise. Callers
+        // that enable the mode go through `applyPlanMode`, which turns tools on
+        // too; this keeps the pair from ever being representable apart.
+        self.isAgentToolsEnabled = agentMode == .plan ? true : isAgentToolsEnabled
+        self.agentMode = agentMode
         self.queuedPrompts = queuedPrompts
         self.rollingSummary = rollingSummary
         self.recentWorkDigest = recentWorkDigest
@@ -320,6 +395,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         case id, title, messages, createdAt, updatedAt
         case selectedModelId, selectedModelName, selectedModelPath
         case isThinkingEnabled, thinkingEffort, isAgentToolsEnabled
+        case agentMode
         case queuedPrompts
         case rollingSummary, recentWorkDigest
         case titleOrigin
@@ -343,6 +419,20 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
             self.thinkingEffort = nil
         }
         self.isAgentToolsEnabled = try container.decodeIfPresent(Bool.self, forKey: .isAgentToolsEnabled)
+        // An unknown stored value (a hand-edited file, a newer build's mode)
+        // falls back to the coder rather than trapping the conversation in a
+        // read-only surface nobody asked for.
+        self.agentMode = (try container.decodeIfPresent(String.self, forKey: .agentMode))
+            .flatMap(AgentMode.init(rawValue:))
+        // A session written before the pairing was forced (a hand edit, an older
+        // build, a file saved across the moment the tools were toggled) can
+        // carry plan mode with tools off. Restoring that verbatim leaves turns
+        // running as plain chat while the pill promises an agent, and the plan
+        // handoff can never appear because nothing renders the directive. The
+        // mode implies its surface, so normalize on the way in.
+        if self.agentMode == .plan {
+            self.isAgentToolsEnabled = true
+        }
         self.queuedPrompts = try container.decodeIfPresent([QueuedPrompt].self, forKey: .queuedPrompts) ?? []
         self.rollingSummary = try container.decodeIfPresent(String.self, forKey: .rollingSummary)
         self.recentWorkDigest = try container.decodeIfPresent(String.self, forKey: .recentWorkDigest)
@@ -363,6 +453,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         try container.encodeIfPresent(isThinkingEnabled, forKey: .isThinkingEnabled)
         try container.encodeIfPresent(thinkingEffort?.rawValue, forKey: .thinkingEffort)
         try container.encodeIfPresent(isAgentToolsEnabled, forKey: .isAgentToolsEnabled)
+        try container.encodeIfPresent(agentMode?.rawValue, forKey: .agentMode)
         try container.encode(queuedPrompts, forKey: .queuedPrompts)
         try container.encodeIfPresent(rollingSummary, forKey: .rollingSummary)
         try container.encodeIfPresent(recentWorkDigest, forKey: .recentWorkDigest)

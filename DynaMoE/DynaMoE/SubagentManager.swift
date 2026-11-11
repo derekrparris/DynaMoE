@@ -151,6 +151,16 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     public let archetype: SubagentRoleArchetype
     public let taskDescription: String
     public let allowedTools: [String]
+    /// The mode the conversation that spawned this subagent was running.
+    /// Plan mode's promise has to cover the work it hands off: a read-only
+    /// parent can only produce read-only children.
+    public let parentMode: AgentMode
+    /// Whether this subagent's pipelines may execute shell commands. The
+    /// executor's allow-list covers every pipeline that runs its tools through
+    /// it; the Test Runner pipeline calls `AgentHarness.runProcess` directly,
+    /// so it asks this instead. A read-only parent can only produce a read-only
+    /// child on every path.
+    public var canRunShellCommands: Bool { parentMode == .code }
     public let contextSummary: String?
     public let parentSessionId: UUID?
     public let workingDirectory: URL?
@@ -182,6 +192,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         role: String,
         taskDescription: String,
         allowedTools: [String] = [],
+        parentMode: AgentMode = .code,
         contextSummary: String? = nil,
         parentSessionId: UUID? = nil,
         workingDirectory: URL? = nil
@@ -193,6 +204,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         self.allowedTools = allowedTools.isEmpty ? [
             "file_read", "find_files", "grep_search", "codebase_search", "web_search", "web_fetch"
         ] : allowedTools
+        self.parentMode = parentMode
         self.contextSummary = contextSummary
         self.parentSessionId = parentSessionId
         self.workingDirectory = workingDirectory
@@ -434,6 +446,24 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// extracts failures, and produces a structured test result. Coordinator directives
     /// containing commands are executed and folded into the report.
     private func executeTestRunnerPipeline() async -> String {
+        // Plan mode's promise covers what it delegates. This is the one pipeline
+        // that lifts a shell command out of free text and runs it through
+        // `AgentHarness.runProcess` directly, so `SubagentToolExecutor`'s
+        // allow-list never sees the call; the parent's own mode is therefore the
+        // gate. Without it a read-only turn could run arbitrary commands by
+        // spawning a "Test Runner" and putting them in the task description.
+        guard canRunShellCommands else {
+            let note = "Test execution is withheld: this subagent was spawned from a Plan Mode turn, which cannot run shell commands. Investigate with the read tools instead."
+            await recordStep(
+                actionName: "shell_run",
+                arguments: ["command": "<withheld in plan mode>"],
+                output: note,
+                duration: 0,
+                isError: true
+            )
+            return "## Test Runner Report: \(role)\n\n**Status**: withheld in plan mode\n\n\(note)"
+        }
+
         await MainActor.run {
             self.liveStatusText = "Executing unit tests via local runner..."
         }
@@ -768,6 +798,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
 final class SubagentToolExecutor {
     private unowned let owner: SubagentInstance
     private let allowedTools: Set<String>
+    private let parentMode: AgentMode
     private let workingDirectory: URL
     private let stepOutputLimit = 6000
 
@@ -776,7 +807,15 @@ final class SubagentToolExecutor {
         let declared = owner.allowedTools.isEmpty
             ? ["file_read", "find_files", "grep_search", "codebase_search", "web_search", "web_fetch"]
             : owner.allowedTools
-        self.allowedTools = Set(declared)
+        // A read-only parent's whitelist is intersected with the plan-mode
+        // allow-list, so a subagent cannot be handed a write tool the
+        // coordinator itself is forbidden to call.
+        self.parentMode = owner.parentMode
+        self.allowedTools = Set(
+            owner.parentMode == .plan
+                ? declared.filter { !PlanModePolicy.withholds($0) }
+                : declared
+        )
         self.workingDirectory = workingDirectory ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
     }
 
@@ -815,7 +854,8 @@ final class SubagentToolExecutor {
         let exec = await AgentHarness.shared.executeTool(
             call: call,
             workingDirectory: workingDirectory,
-            maxOutputLength: stepOutputLimit
+            maxOutputLength: stepOutputLimit,
+            mode: parentMode
         )
 
         let readable = exec.record.output ?? exec.record.error ?? exec.resultJSON
@@ -1015,6 +1055,7 @@ public final class SubagentManager: ObservableObject {
         role: String,
         taskDescription: String,
         allowedTools: [String] = [],
+        parentMode: AgentMode = .code,
         contextSummary: String? = nil,
         parentSessionId: UUID? = nil,
         workingDirectory: URL? = nil
@@ -1023,6 +1064,7 @@ public final class SubagentManager: ObservableObject {
             role: role,
             taskDescription: taskDescription,
             allowedTools: allowedTools,
+            parentMode: parentMode,
             contextSummary: contextSummary,
             parentSessionId: parentSessionId,
             workingDirectory: workingDirectory
