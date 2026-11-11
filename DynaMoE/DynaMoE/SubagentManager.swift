@@ -155,6 +155,12 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// Plan mode's promise has to cover the work it hands off: a read-only
     /// parent can only produce read-only children.
     public let parentMode: AgentMode
+    /// Whether this subagent's pipelines may execute shell commands. The
+    /// executor's allow-list covers every pipeline that runs its tools through
+    /// it; the Test Runner pipeline calls `AgentHarness.runProcess` directly,
+    /// so it asks this instead. A read-only parent can only produce a read-only
+    /// child on every path.
+    public var canRunShellCommands: Bool { parentMode == .code }
     public let contextSummary: String?
     public let parentSessionId: UUID?
     public let workingDirectory: URL?
@@ -440,6 +446,24 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// extracts failures, and produces a structured test result. Coordinator directives
     /// containing commands are executed and folded into the report.
     private func executeTestRunnerPipeline() async -> String {
+        // Plan mode's promise covers what it delegates. This is the one pipeline
+        // that lifts a shell command out of free text and runs it through
+        // `AgentHarness.runProcess` directly, so `SubagentToolExecutor`'s
+        // allow-list never sees the call; the parent's own mode is therefore the
+        // gate. Without it a read-only turn could run arbitrary commands by
+        // spawning a "Test Runner" and putting them in the task description.
+        guard canRunShellCommands else {
+            let note = "Test execution is withheld: this subagent was spawned from a Plan Mode turn, which cannot run shell commands. Investigate with the read tools instead."
+            await recordStep(
+                actionName: "shell_run",
+                arguments: ["command": "<withheld in plan mode>"],
+                output: note,
+                duration: 0,
+                isError: true
+            )
+            return "## Test Runner Report: \(role)\n\n**Status**: withheld in plan mode\n\n\(note)"
+        }
+
         await MainActor.run {
             self.liveStatusText = "Executing unit tests via local runner..."
         }

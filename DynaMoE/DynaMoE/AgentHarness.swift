@@ -1899,7 +1899,22 @@ public final class ToolLoadTool: AgentTool {
         var loadedResults: [[String: Any]] = []
         var schemas: [String: String] = [:]
         var errors: [String] = []
+        // The turn's mode, applied BEFORE the already-loaded branch: the coder
+        // core (`shell_run`, `complete`) stays in `loadedTools` while plan mode
+        // runs, because unloading it would change the surface every other turn
+        // shares. That branch used to answer a withheld tool with a success and
+        // its full schema, which told the model a capability was available that
+        // `executeTool` then refused on the next step.
+        let turnMode = AgentHarness.executingTurnMode ?? harness.activeMode
         for name in names {
+            // Installed-only: a misspelled name must still be UNKNOWN, not
+            // reported as a policy refusal (the same ordering `executeTool`
+            // learned so a typo is answered with the available-names hint).
+            if harness.tools[name] != nil, PlanModePolicy.withholds(name, in: turnMode) {
+                let reason = AgentHarness.ToolLoadError.withheldInPlanMode(name).localizedDescription
+                errors.append("Failed to load tool '\(name)': \(reason)")
+                continue
+            }
             if let existing = harness.loadedTools[name] {
                 // Repeat the schema even when the tool is already loaded. The pinned
                 // system prompt's tool block is only ever the CORE set (loads do not
@@ -2182,7 +2197,9 @@ public final class SpawnSubagentTool: AgentTool {
             role: role,
             taskDescription: taskDesc,
             allowedTools: allowedTools,
-            parentMode: AgentHarness.shared.activeMode,
+            // The turn's mode, not the process-global one: another turn can move
+            // `activeMode`, and a plan turn's child must inherit plan mode.
+            parentMode: AgentHarness.executingTurnMode ?? AgentHarness.shared.activeMode,
             contextSummary: contextSummary,
             parentSessionId: AgentHarness.shared.currentSessionId,
             workingDirectory: workingDirectory
@@ -3402,8 +3419,13 @@ public final class AgentHarness {
     }
 
     /// Moves an installed tool into the loaded set and re-syncs the grammar sampler.
+    ///
+    /// `mode` is for a caller that is NOT a turn: Settings loads an MCP tool the
+    /// operator asked for, and judging that against the mode of whichever
+    /// conversation happens to be selected refused a control the user had just
+    /// clicked. A turn's own call passes nil and gets the turn's mode.
     @discardableResult
-    public func loadTool(named name: String) throws -> ToolDefinition {
+    public func loadTool(named name: String, mode: AgentMode? = nil) throws -> ToolDefinition {
         guard let tool = tools[name] else {
             throw ToolLoadError.unknownTool(name)
         }
@@ -3411,8 +3433,8 @@ public final class AgentHarness {
         // prompt lists: a withheld tool that `tools_load` re-activated would be
         // advertised to the next step with no capability behind it. The turn's
         // own mode wins over the global, which another turn can move.
-        let mode = AgentHarness.executingTurnMode ?? activeMode
-        guard !PlanModePolicy.withholds(name, in: mode) else {
+        let effectiveMode = mode ?? AgentHarness.executingTurnMode ?? activeMode
+        guard !PlanModePolicy.withholds(name, in: effectiveMode) else {
             throw ToolLoadError.withheldInPlanMode(name)
         }
         let didChange = loadedTools[name] == nil
@@ -3732,15 +3754,30 @@ public final class AgentHarness {
         - When you relay a subagent's results, always end with a final answer to the user. Do not end your turn after spawning, checking, or acknowledging a subagent — the task is only done when the user has received the outcome.
         """
 
-        prompt += """
+        // The local prompt is assembled here rather than by
+        // `buildCloudToolGuidance`, so its "ending your turn" rule has to be
+        // mode-branched too: telling a plan turn to call `complete` contradicts
+        // the directive a few paragraphs earlier, and the grammar mask cannot
+        // emit that name in the first place.
+        if mode == .plan {
+            prompt += """
 
-        # Ending Your Turn
+            # Ending Your Turn
 
-        - Once you have the information you need, answer the user in plain text and end your turn. A plain-text reply is a complete turn; no tool call is required to finish.
-        - Call `complete` (with a summary) only when the user's whole task is finished and you are handing back the final result. Never call it mid-task.
-        - NEVER emit placeholder or no-op tool calls (`shell_run` with `echo`, `true`, `:`, or similar) to signal that you are done. They cannot advance the task, and the harness discards them and ends the turn.
-        - Do not re-answer or re-summarize a result you already delivered. Deliver one final answer per task.
-        """
+            - A plain-text reply completes the turn. `complete` is withheld, so the reply IS the deliverable: end it with the ready marker on its own line.
+            - NEVER emit placeholder or no-op tool calls (`shell_run` with `echo`, `true`, `:`, or similar). The harness discards them and ends the turn.
+            """
+        } else {
+            prompt += """
+
+            # Ending Your Turn
+
+            - Once you have the information you need, answer the user in plain text and end your turn. A plain-text reply is a complete turn; no tool call is required to finish.
+            - Call `complete` (with a summary) only when the user's whole task is finished and you are handing back the final result. Never call it mid-task.
+            - NEVER emit placeholder or no-op tool calls (`shell_run` with `echo`, `true`, `:`, or similar) to signal that you are done. They cannot advance the task, and the harness discards them and ends the turn.
+            - Do not re-answer or re-summarize a result you already delivered. Deliver one final answer per task.
+            """
+        }
 
         prompt += """
 

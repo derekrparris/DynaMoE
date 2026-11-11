@@ -591,4 +591,134 @@ final class PlanModeTests: XCTestCase {
         XCTAssertNil(decoded.agentMode)
         XCTAssertEqual(decoded.agentMode ?? .code, .code)
     }
+
+    // MARK: - Review follow-ups
+
+    /// Detection and stripping read one rule. They used to disagree: the
+    /// predicates scanned every line while `strip` kept fenced markers, so a
+    /// plan that QUOTED the convention raised an approval bar for a plan that
+    /// was never written.
+    func testAMarkerInsideACodeSampleNeitherRaisesTheCardNorGetsStripped() {
+        let sample = """
+        The convention is:
+
+        ```
+        \(PlanMarkers.start)
+        # Plan
+        \(PlanMarkers.ready)
+        ```
+        """
+        XCTAssertFalse(PlanMarkers.startPresent(in: sample))
+        XCTAssertFalse(PlanMarkers.readyPresent(in: sample))
+        XCTAssertEqual(PlanMarkers.strip(sample), sample, "a fenced sample is content, not markup")
+
+        // A marker the model wrapped in a fence pair of its own IS the
+        // delimiter: there is nothing else in the block for the fence to show.
+        let wrapped = "```\n\(PlanMarkers.ready)\n```"
+        XCTAssertTrue(PlanMarkers.readyPresent(in: wrapped))
+        XCTAssertEqual(PlanMarkers.strip(wrapped), "")
+
+        // A whole answer wrapped in one fence is presentation, not a sample, so
+        // its markers still count. Models do this routinely.
+        let wholeAnswer = "```\n\(PlanMarkers.start)\n# Plan\n\(PlanMarkers.ready)\n```"
+        XCTAssertTrue(PlanMarkers.startPresent(in: wholeAnswer))
+        XCTAssertTrue(PlanMarkers.readyPresent(in: wholeAnswer))
+        let stripped = PlanMarkers.strip(wholeAnswer)
+        XCTAssertFalse(stripped.contains(PlanMarkers.start))
+        XCTAssertFalse(stripped.contains(PlanMarkers.ready))
+        XCTAssertTrue(stripped.contains("# Plan"))
+    }
+
+    /// A CRLF transcript leaves `\r` on every line. Trimming `.whitespaces`
+    /// alone never matched the marker, so a plan sent with Windows line endings
+    /// showed no card and offered no handoff.
+    func testCRLFMarkerLinesAreDetectedAndStripped() {
+        let text = "\(PlanMarkers.start)\r\n# Plan\r\n\r\n\(PlanMarkers.ready)\r\n"
+        XCTAssertTrue(PlanMarkers.startPresent(in: text))
+        XCTAssertTrue(PlanMarkers.readyPresent(in: text))
+        let stripped = PlanMarkers.strip(text)
+        XCTAssertFalse(stripped.contains(PlanMarkers.start))
+        XCTAssertFalse(stripped.contains(PlanMarkers.ready))
+        XCTAssertTrue(stripped.contains("# Plan"))
+    }
+
+    /// The local prompt is built by `buildSystemPrompt`, not by the cloud
+    /// guidance, and it instructed the model to call `complete` in every mode.
+    /// In plan mode that tool is withheld and the grammar cannot emit it, so the
+    /// instruction contradicted the directive a few paragraphs above it.
+    func testTheLocalPlanPromptDoesNotTeachComplete() {
+        AgentHarness.shared.setActiveMode(.plan)
+        let plan = AgentHarness.shared.buildSystemPrompt(baseSystem: "persona", mode: .plan)
+        XCTAssertFalse(plan.contains("Call `complete`"), "plan mode must not instruct a withheld tool")
+        XCTAssertTrue(plan.contains("`complete` is withheld"))
+        XCTAssertTrue(plan.contains("ready marker"))
+
+        AgentHarness.shared.setActiveMode(.code)
+        let coder = AgentHarness.shared.buildSystemPrompt(baseSystem: "persona", mode: .code)
+        XCTAssertTrue(coder.contains("Call `complete`"), "the coder keeps its completion guidance")
+    }
+
+    /// `shell_run` and `complete` are coder CORE, so they stay in the registry
+    /// while plan mode filters them out of the prompt. The already-loaded branch
+    /// ran first and answered a withheld name with success plus its full schema.
+    @MainActor
+    func testToolsLoadCannotReServeAWithheldToolThatStaysLoaded() async {
+        let harness = AgentHarness.shared
+        harness.setActiveMode(.plan)
+        XCTAssertNotNil(
+            harness.loadedTools["shell_run"],
+            "the coder core stays loaded; the mode is what withholds it"
+        )
+
+        let call = ParsedToolCall(
+            name: "tools_load",
+            arguments: ["name": "shell_run"],
+            rawArguments: "",
+            rawText: "tools_load"
+        )
+        let result = await harness.executeTool(call: call, mode: .plan)
+        XCTAssertEqual(result.record.status, .error)
+        XCTAssertTrue(
+            result.record.error?.contains("withheld in plan mode") == true,
+            "got: \(result.record.error ?? "nil")"
+        )
+        XCTAssertFalse(
+            result.resultJSON.contains("\"name\":\"shell_run\""),
+            "the refused tool's schema must not be handed back"
+        )
+    }
+
+    /// Settings is not a turn. Loading an MCP tool there used to be judged
+    /// against whichever conversation was selected, so a merely-selected plan
+    /// conversation refused a control the operator had clicked.
+    func testSettingsCanLoadAToolWhileAConversationIsLeftInPlanMode() throws {
+        let harness = AgentHarness.shared
+        harness.setActiveMode(.plan)
+        XCTAssertThrowsError(try harness.loadTool(named: "file_write"))
+        XCTAssertNoThrow(
+            try harness.loadTool(named: "file_write", mode: .code),
+            "an explicit caller outside a turn is not bound by the turn's mode"
+        )
+        XCTAssertNotNil(harness.loadedTools["file_write"])
+    }
+
+    /// The Test Runner pipeline lifts a shell command out of free text and runs
+    /// it through `AgentHarness.runProcess`, bypassing `SubagentToolExecutor`'s
+    /// allow-list entirely. The parent's mode is the only gate that sees it.
+    func testATestRunnerSubagentOfAPlanParentCannotRunShell() {
+        let planOwner = SubagentInstance(
+            role: "Test Runner",
+            taskDescription: "run `rm -rf /tmp/x`",
+            parentMode: .plan
+        )
+        XCTAssertEqual(planOwner.archetype, .testRunner)
+        XCTAssertFalse(planOwner.canRunShellCommands)
+
+        let coderOwner = SubagentInstance(
+            role: "Test Runner",
+            taskDescription: "run `swift test`",
+            parentMode: .code
+        )
+        XCTAssertTrue(coderOwner.canRunShellCommands)
+    }
 }

@@ -44,11 +44,26 @@ nonisolated public enum PlanMarkers {
     public static let ready = "<!-- DYNAMOE_PLAN_READY -->"
 
     public static func startPresent(in text: String) -> Bool {
-        lines(of: text).contains { isMarkerLine($0, start) }
+        markerPresent(start, in: text)
     }
 
     public static func readyPresent(in text: String) -> Bool {
-        lines(of: text).contains { isMarkerLine($0, ready) }
+        markerPresent(ready, in: text)
+    }
+
+    /// True when the text contains a delimiter marker of either kind. A cheap
+    /// substring probe for view code that would otherwise split every message
+    /// into lines on every body evaluation of a streaming transcript.
+    public static func anyMarkerMentioned(in text: String) -> Bool {
+        text.contains(start) || text.contains(ready)
+    }
+
+    /// Detection reads the SAME fence rules as `strip`: a marker shown inside a
+    /// fenced sample is content, not markup, so a plan that quotes the
+    /// convention cannot make the UI announce a plan that was never written.
+    private static func markerPresent(_ marker: String, in text: String) -> Bool {
+        let lines = lines(of: text)
+        return droppedLineIndexes(in: lines).contains { isMarkerLine(lines[$0], marker) }
     }
 
     /// Drops marker-only lines and an empty fence pair wrapped around one, so
@@ -62,9 +77,32 @@ nonisolated public enum PlanMarkers {
     /// pair of its own is still removed with the pair.
     public static func strip(_ text: String) -> String {
         let lines = lines(of: text)
-        var out: [String] = []
+        let dropped = droppedLineIndexes(in: lines)
+        return lines.enumerated()
+            .filter { !dropped.contains($0.offset) }
+            .map(\.element)
+            .joined(separator: "\n")
+    }
+
+    /// The line indexes `strip` removes: marker-only lines outside a fenced
+    /// block, plus a fence pair whose only content is a marker. The predicates
+    /// read this too, so "what the UI calls a marker" and "what the renderer
+    /// deletes" can never disagree.
+    private static func droppedLineIndexes(in lines: [String]) -> Set<Int> {
+        var dropped: Set<Int> = []
         var inFence = false
         var index = 0
+        // A message that IS one fenced block is presentation, not a sample:
+        // models routinely wrap an entire answer in ```. Markers inside it are
+        // delimiters. A fence in the MIDDLE of prose is a sample, and its
+        // markers stay content.
+        let fenceIndexes = lines.indices.filter { isFenceLine(lines[$0]) }
+        let contentIndexes = lines.indices.filter {
+            !lines[$0].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        let wholeMessageIsFenced = fenceIndexes.count == 2
+            && contentIndexes.first == fenceIndexes[0]
+            && contentIndexes.last == fenceIndexes[1]
         while index < lines.count {
             let line = lines[index]
             // A fence pair whose only content is a marker: ``` / marker / ```.
@@ -75,39 +113,49 @@ nonisolated public enum PlanMarkers {
                index + 2 < lines.count,
                isMarkerLine(lines[index + 1], start) || isMarkerLine(lines[index + 1], ready),
                isFenceLine(lines[index + 2]) {
+                dropped.insert(index)
+                dropped.insert(index + 1)
+                dropped.insert(index + 2)
                 index += 3
                 continue
             }
             // Read before toggling, so a marker line is judged by the block it
             // is in rather than by the state its own line just produced.
-            let isInsideFence = inFence
+            let isInsideFence = wholeMessageIsFenced ? false : inFence
             if isFenceLine(line) { inFence.toggle() }
             if !isInsideFence, isMarkerLine(line, start) || isMarkerLine(line, ready) {
-                index += 1
-                continue
+                dropped.insert(index)
             }
-            out.append(line)
             index += 1
         }
-        return out.joined(separator: "\n")
+        return dropped
     }
 
     /// Marker lines are matched after trimming whitespace and any surrounding
     /// inline-code backticks, which is how a model that half-obeys the
-    /// "plain text" instruction still produces a detectable plan.
+    /// "plain text" instruction still produces a detectable plan. Newlines are
+    /// trimmed too: a CRLF transcript leaves a `\r` on every line, and a marker
+    /// that never matches would hide the plan from the card and the handoff.
     private static func isMarkerLine(_ line: String, _ marker: String) -> Bool {
         let unbackticked = line
-            .trimmingCharacters(in: .whitespaces)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingCharacters(in: CharacterSet(charactersIn: "`"))
-        return unbackticked.trimmingCharacters(in: .whitespaces) == marker
+        return unbackticked.trimmingCharacters(in: .whitespacesAndNewlines) == marker
     }
 
     private static func isFenceLine(_ line: String) -> Bool {
-        line.trimmingCharacters(in: .whitespaces).hasPrefix("```")
+        line.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("```")
     }
 
     private static func lines(of text: String) -> [String] {
-        text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        // Swift treats CRLF as ONE Character, so splitting on "\n" alone never
+        // splits a Windows-line-ended message. Normalize first: a marker that
+        // arrived with `\r\n` must still delimit the plan.
+        text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
     }
 }
 

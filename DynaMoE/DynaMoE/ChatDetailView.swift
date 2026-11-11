@@ -114,11 +114,19 @@ struct ChatDetailView: View {
     /// answer, so for the rest of that same turn the bar would be on screen
     /// offering a send the app would refuse. Approving then flipped the mode and
     /// sent nothing.
+    ///
+    /// Searches for the last READY message rather than taking the last assistant
+    /// message: the harness appends a forced-synthesis or subagent-relay reply
+    /// after a plan, and keying the bar to the final message hid it while the
+    /// plan card still said the plan was ready.
     private var readyPlanMessage: ChatMessage? {
-        guard isPlanMode, !isGenerating, let session,
-              let message = session.messages.last(where: { $0.role == .assistant }),
-              PlanMarkers.readyPresent(in: message.content),
-              dismissedPlanMessageId != message.id else { return nil }
+        guard isPlanMode, !isGenerating, let session else { return nil }
+        guard let message = session.messages.last(where: {
+            $0.role == .assistant
+                && PlanMarkers.anyMarkerMentioned(in: $0.content)
+                && PlanMarkers.readyPresent(in: $0.content)
+        }) else { return nil }
+        guard dismissedPlanMessageId != message.id else { return nil }
         return message
     }
     var onSendMessage: (String, [PreparedImage]) -> Bool
@@ -560,6 +568,7 @@ struct ChatDetailView: View {
                                                 )
                                             )
                                         } else if message.role == .assistant,
+                                                  PlanMarkers.anyMarkerMentioned(in: message.content),
                                                   PlanMarkers.startPresent(in: message.content) {
                                             PlanCard(
                                                 content: PlanMarkers.strip(message.content),
@@ -1387,7 +1396,11 @@ struct ChatDetailView: View {
                     .cornerRadius(6)
                 }
                 .buttonStyle(.plain)
-                .help("Switch to Code Mode and start implementing the plan")
+                .disabled(isModeChangeLocked)
+                .opacity(isModeChangeLocked ? 0.45 : 1)
+                .help(isModeChangeLocked
+                    ? "Wait for the running turn to finish before starting the implementation"
+                    : "Switch to Code Mode and start implementing the plan")
 
                 Button(action: { onApprovePlan?(true) }) {
                     HStack(spacing: 5) {
@@ -1403,7 +1416,11 @@ struct ChatDetailView: View {
                     .cornerRadius(6)
                 }
                 .buttonStyle(.plain)
-                .help("Enable Turbo Mode, switch to Code Mode, and start implementing without per-action approval")
+                .disabled(isModeChangeLocked)
+                .opacity(isModeChangeLocked ? 0.45 : 1)
+                .help(isModeChangeLocked
+                    ? "Wait for the running turn to finish before starting the implementation"
+                    : "Enable Turbo Mode, switch to Code Mode, and start implementing without per-action approval")
 
                 Button(action: {
                     dismissedPlanMessageId = plan.id

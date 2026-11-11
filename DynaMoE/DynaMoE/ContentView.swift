@@ -270,6 +270,12 @@ struct ContentView: View {
     /// must not clear this generation's task handle/UI flags, record a prefix,
     /// or schedule another turn — see `ownsGeneration`.
     @State private var generationId: UInt64 = 0
+    /// The agent mode this TURN started in. A continuation re-enters
+    /// `startAutoregressiveGeneration` after the conversation may have been
+    /// deleted (retention, a manual delete), and re-deriving the mode from a
+    /// missing session silently resumed the coder in the middle of a plan turn.
+    /// Resolved once at step 0 and carried by value for every later step.
+    @State private var activeTurnMode: AgentMode? = nil
 
     // Working Set & Dynamic SSD Expert Paging State. Memory settings persist via
     // @AppStorage so the local server reads the same policy the UI configured.
@@ -979,6 +985,9 @@ struct ContentView: View {
         }
         // Warm the on-device model so the first turn does not pay spin-up latency.
         AppleFoundationModelService.prewarm()
+        // The sentinel is installed by now, so this resolves every conversation
+        // that will actually run on the system model.
+        retirePlanModeUnsupportedByActiveBackend()
     }
 
     /// Serializes AFM activation against any in-flight weights load, mirroring
@@ -1109,6 +1118,10 @@ struct ContentView: View {
             metalStatus = message
             showStatus(message, kind: .warning)
         }
+        // A plan conversation needs a tool-calling model, and this backend may
+        // not have one. The cloud sentinel is installed by now, so conversations
+        // without an explicit model resolve to it.
+        retirePlanModeUnsupportedByActiveBackend()
     }
 
     /// Serializes cloud activation against in-flight weights loads and
@@ -2253,6 +2266,33 @@ struct ContentView: View {
         return spec?.supportsTools == false
     }
 
+    /// Ends Plan Mode on every conversation the backend that was just activated
+    /// cannot run it for.
+    ///
+    /// Plan mode is a promise about a TOOL surface, and a switch to the
+    /// on-device model (plain chat) or to a cloud model registered without tool
+    /// support leaves a conversation in a mode whose pill is hidden, whose turn
+    /// runs as plain chat, and whose ready-plan bar would send plain chat when
+    /// the user clicked "Start coding". Clearing the mode is the honest repair;
+    /// keeping it would be a promise the next turn cannot keep.
+    private func retirePlanModeUnsupportedByActiveBackend() {
+        var retiredCount = 0
+        for idx in sessions.indices where (sessions[idx].agentMode ?? .code) == .plan {
+            let unsupported = sessionUsesAppleFoundationModel(sessions[idx])
+                || (cloudModelResolution(for: sessions[idx]) != nil
+                    && cloudModelLacksToolSupport(sessions[idx]))
+            guard unsupported else { continue }
+            sessions[idx].agentMode = .code
+            PrefixCacheManager.shared.invalidate(sessionId: sessions[idx].id)
+            retiredCount += 1
+        }
+        guard retiredCount > 0 else { return }
+        showStatus(
+            "🧭 Plan Mode ended — the selected model cannot call tools, so \(retiredCount == 1 ? "this conversation is" : "those conversations are") back in Code Mode.",
+            kind: .warning
+        )
+    }
+
     /// The write half of `setPlanMode`, without the lock: a caller that has
     /// already established the change is allowed (or is undoing a change of its
     /// own) uses this so a freshly started turn cannot wedge the undo.
@@ -2585,7 +2625,10 @@ struct ContentView: View {
         guard let command = ChatCommand.parse(text) else { return nil }
         guard let cmdSessionId = explicitSessionId ?? selectedSessionId ?? sessions.first?.id,
               let cmdSessionIdx = sessions.firstIndex(where: { $0.id == cmdSessionId }) else { return false }
-        if isCompactingConversation {
+        // Only `/compact` collides with a running compaction. A mode change is
+        // local conversation state — no turn is running — so `/plan` was being
+        // refused with a message about a different command.
+        if isCompactingConversation, case .compact = command {
             let note = "⚠️ A compaction is already running — try /compact again once it finishes."
             sessions[cmdSessionIdx].messages.append(ChatMessage(role: .system, content: note))
             return true
@@ -2906,7 +2949,7 @@ struct ContentView: View {
                 AgentHarness.shared.beginAgentSearchGuard()
                 cloudSystemPrompt += "\n\n" + AgentHarness.shared.buildCloudToolGuidance(mode: sessionMode)
             }
-            startCloudGeneration(
+            return startCloudGeneration(
                 sessionId: currentSessionId,
                 messageId: assistantMsgId,
                 provider: cloud.provider,
@@ -2917,7 +2960,6 @@ struct ContentView: View {
                 mode: sessionMode,
                 isAgentTurn: cloudAgentMode
             )
-            return true
         }
 
         // Runs BEFORE the system prompt is built: beginAgentSearchGuard (re)loads
@@ -3385,13 +3427,15 @@ struct ContentView: View {
                 promptString += "<|im_start|>assistant\n"
             }
         }
-        startAutoregressiveGeneration(
+        // Propagated, not swallowed: a launch refused here has already appended
+        // the turn's messages, so a caller that treats the send as accepted (the
+        // plan handoff does) would be left in the new mode with nothing running.
+        return startAutoregressiveGeneration(
             customPrompt: promptString,
             images: turnImages,
             sessionId: currentSessionId,
             messageId: assistantMsgId
         )
-        return true
     }
 
     // MARK: - Tokenizer Execution
@@ -3486,6 +3530,9 @@ struct ContentView: View {
         CompletionEngine.shared.cancelActiveTurn()
         generationTask?.cancel()
         generationTask = nil
+        // The turn is over, so a continuation that somehow arrives afterwards
+        // must not inherit its mode. The next send resolves a fresh one at step 0.
+        activeTurnMode = nil
         ActionApprovalManager.shared.cancelAll()
         showStatus("⏹ Generation stopped by user.")
     }
@@ -3839,7 +3886,10 @@ struct ContentView: View {
                 sessions[sIdx].messages[mIdx].isThinking = false
             }
             showStatus(err, kind: .warning)
-            return true
+            // A provider with no usable client is a send that never happened,
+            // so the caller must be able to undo what it changed (the plan
+            // handoff's mode switch) rather than read it as accepted work.
+            return false
         }
 
         generationId &+= 1
@@ -4664,7 +4714,12 @@ struct ContentView: View {
     /// matching the image placeholders the caller wrote into `customPrompt`. Only a
     /// family with a vision tower consumes them; the engine refuses a turn whose
     /// placeholder count disagrees with this list rather than dropping pixels.
-    private func startAutoregressiveGeneration(customPrompt: String? = nil, promptTokens: [UInt32]? = nil, images: [TurnImage] = [], carriedImageSpans: [TurnImageSpan] = [], sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false) {
+    /// Returns whether this step actually launched. Most callers are continuations
+    /// inside the turn loop and can ignore it; the composer's send path propagates
+    /// it, because a launch refused AFTER the messages were appended (lost slot,
+    /// engine not ready) is otherwise reported to the caller as accepted work.
+    @discardableResult
+    private func startAutoregressiveGeneration(customPrompt: String? = nil, promptTokens: [UInt32]? = nil, images: [TurnImage] = [], carriedImageSpans: [TurnImageSpan] = [], sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false) -> Bool {
         guard let summary = summary,
               let tokenizer = tokenizer else {
             let err = "❌ Metal or Tokenizer not ready for text generation. Please load model and tokenizer in Settings."
@@ -4677,7 +4732,7 @@ struct ContentView: View {
                 sessions[sIdx].messages[mIdx].isThinking = false
             }
             showStatus(err, kind: .warning)
-            return
+            return false
         }
 
         let prompt: String
@@ -4691,8 +4746,35 @@ struct ContentView: View {
             isGeneratingText = false
             generationTask = nil
             showStatus(err, kind: .warning)
-            return
+            return false
         }
+
+        // Derive model/thinking from the session this generation belongs to, not
+        // the current selection, so an async send that resumed after a selection
+        // change still formats with the conversation's own model.
+        let generationSession = sessionId.flatMap { id in sessions.first(where: { $0.id == id }) }
+        // The turn's agent surface, resolved ONCE and carried by value for the
+        // rest of the turn. `AgentHarness.activeMode` is process-global, so
+        // reading it at each tool call meant a mode flip while the turn ran
+        // could hand a plan turn a write tool. Every tool execution and every
+        // tool-block refresh below takes `turnMode` instead.
+        //
+        // Step 0 resolves it from the conversation; a continuation reuses the
+        // value the turn started with, because the conversation can be deleted
+        // (retention, a manual delete) while the turn is still running, and
+        // re-deriving from a missing session would silently resume the coder.
+        let resolvedMode: AgentMode = generationSession?.agentMode ?? .code
+        let isContinuation = agentStep > 0 || isInThinkingContinuation
+        let turnMode: AgentMode = isContinuation ? (activeTurnMode ?? resolvedMode) : resolvedMode
+        activeTurnMode = turnMode
+        // Asserted BEFORE the slot claim below, deliberately. `setActiveMode`
+        // skips its grammar re-sync while `CompletionEngine.isActive`, and the
+        // claim is exactly that flag, so re-asserting after the claim meant the
+        // heal this call exists for never ran. With the slot free it now does;
+        // with a server turn holding it, the sync is still refused (that turn's
+        // own mask is live) and the claim below fails, so nothing runs on the
+        // stale registry.
+        AgentHarness.shared.setActiveMode(turnMode)
 
         // The single-flight slot is taken HERE, before the preparation below, not
         // left to the launch at the end. A server turn can claim the slot while
@@ -4713,21 +4795,6 @@ struct ContentView: View {
             generationDate = Date()
         }
 
-        // Derive model/thinking from the session this generation belongs to, not
-        // the current selection, so an async send that resumed after a selection
-        // change still formats with the conversation's own model.
-        let generationSession = sessionId.flatMap { id in sessions.first(where: { $0.id == id }) }
-        // The turn's agent surface, resolved ONCE and carried by value for the
-        // rest of the turn. `AgentHarness.activeMode` is process-global, so
-        // reading it at each tool call meant a mode flip while the turn ran
-        // could hand a plan turn a write tool. Every tool execution and every
-        // tool-block refresh below takes `turnMode` instead.
-        //
-        // The step re-derives it from the conversation because an agent
-        // continuation IS a new step; the UI refuses mode changes while a turn
-        // is running, so this cannot differ from the step before it.
-        let turnMode: AgentMode = generationSession?.agentMode ?? .code
-        AgentHarness.shared.setActiveMode(turnMode)
         let generationModelName = modelDisplayName(for: generationSession)
         let cleanSystem = ModelConfig.buildEffectiveSystemPrompt(
             userPrompt: systemPrompt,
@@ -4777,7 +4844,7 @@ struct ContentView: View {
             isGeneratingText = false
             generationTask = nil
             showStatus(err, kind: .warning)
-            return
+            return false
         }
 
         guard !promptTokenIds.isEmpty else {
@@ -4785,7 +4852,7 @@ struct ContentView: View {
             isGeneratingText = false
             generationTask = nil
             showStatus(err, kind: .warning)
-            return
+            return false
         }
 
         // One flag drives both the engine's mid-stream tool-freeze/parse ranges
@@ -4841,7 +4908,7 @@ struct ContentView: View {
                 sessions[sIdx].messages[mIdx].isThinking = false
             }
             showStatus(err, kind: .warning)
-            return
+            return false
         }
 
         // In-app turn log: one request-log row per chat/agent turn (source
@@ -5953,6 +6020,7 @@ struct ContentView: View {
             }
 
         }
+        return true
     }
 
     private func updatePagingStats() {
