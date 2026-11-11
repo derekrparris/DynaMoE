@@ -2287,6 +2287,15 @@ struct ContentView: View {
             retiredCount += 1
         }
         guard retiredCount > 0 else { return }
+        // The harness's surface is process-global and the conversation that
+        // asserted it may be one of the ones just retired below the pill, so a
+        // mode left at `.plan` would keep the shared grammar on the read-only
+        // surface (and its armed read tools loaded) until the next send healed
+        // it. Every send re-asserts its own mode, so clearing here costs the
+        // turn that follows nothing.
+        if AgentHarness.shared.activeMode == .plan {
+            AgentHarness.shared.setActiveMode(.code)
+        }
         showStatus(
             "🧭 Plan Mode ended — the selected model cannot call tools, so \(retiredCount == 1 ? "this conversation is" : "those conversations are") back in Code Mode.",
             kind: .warning
@@ -2324,7 +2333,10 @@ struct ContentView: View {
     ///
     /// A refused send UNDOES the mode change. The bar's whole promise is that
     /// approving starts the implementation turn; leaving the conversation in
-    /// code mode with nothing sent would break it silently.
+    /// code mode with nothing sent would break it silently. It also unwinds the
+    /// messages the refused send had already appended, because "Try again"
+    /// re-sends the continuation: leaving the first copy in the transcript
+    /// would duplicate the user turn on the retry.
     private func approvePlanAndImplement(sessionId: UUID, withTurbo: Bool) {
         guard !isModeChangeLocked else {
             showStatus("⏳ The current turn is still running — approve the plan once it finishes.", kind: .warning)
@@ -2333,11 +2345,20 @@ struct ContentView: View {
         guard let idx = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
         let previousMode = sessions[idx].agentMode ?? .code
         let turboWasEnabled = UserDefaults.standard.bool(forKey: "dynamoe_agent_turbo_mode")
+        // The send appends its user turn and assistant placeholder BEFORE the
+        // launch can be refused, so remember where the transcript ended. A
+        // refusal that happened earlier (another turn running, a model load in
+        // flight) appended nothing and must not cost the conversation two real
+        // messages when the unwind below runs.
+        let messageCountBeforeSend = sessions[idx].messages.count
         guard applyPlanMode(false, sessionId: sessionId) else { return }
         if withTurbo {
             UserDefaults.standard.set(true, forKey: "dynamoe_agent_turbo_mode")
         }
         guard handleSendMessage("Implement the plan.", sessionId: sessionId) else {
+            if sessions[idx].messages.count > messageCountBeforeSend {
+                sessions[idx].messages.removeLast(sessions[idx].messages.count - messageCountBeforeSend)
+            }
             UserDefaults.standard.set(turboWasEnabled, forKey: "dynamoe_agent_turbo_mode")
             _ = applyPlanMode(previousMode == .plan, sessionId: sessionId)
             showStatus("⚠️ Could not start the implementation turn — the conversation is still in Plan Mode. Try again.", kind: .warning)
@@ -3428,8 +3449,9 @@ struct ContentView: View {
             }
         }
         // Propagated, not swallowed: a launch refused here has already appended
-        // the turn's messages, so a caller that treats the send as accepted (the
-        // plan handoff does) would be left in the new mode with nothing running.
+        // the turn's messages, so a caller that treats the send as accepted
+        // would be left in the new mode with nothing running. The plan handoff
+        // unwinds those messages and rolls its mode change back on `false`.
         return startAutoregressiveGeneration(
             customPrompt: promptString,
             images: turnImages,

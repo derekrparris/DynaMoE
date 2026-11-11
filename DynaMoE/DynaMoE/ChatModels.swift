@@ -377,7 +377,12 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         self.selectedModelPath = selectedModelPath
         self.isThinkingEnabled = isThinkingEnabled
         self.thinkingEffort = thinkingEffort
-        self.isAgentToolsEnabled = isAgentToolsEnabled
+        // Plan mode is an agent MODE, not a prompt preference: with the tool
+        // surface off it has no directive, no read tools and no handoff, so a
+        // turn runs as plain chat under a pill that claims otherwise. Callers
+        // that enable the mode go through `applyPlanMode`, which turns tools on
+        // too; this keeps the pair from ever being representable apart.
+        self.isAgentToolsEnabled = agentMode == .plan ? true : isAgentToolsEnabled
         self.agentMode = agentMode
         self.queuedPrompts = queuedPrompts
         self.rollingSummary = rollingSummary
@@ -419,6 +424,15 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         // read-only surface nobody asked for.
         self.agentMode = (try container.decodeIfPresent(String.self, forKey: .agentMode))
             .flatMap(AgentMode.init(rawValue:))
+        // A session written before the pairing was forced (a hand edit, an older
+        // build, a file saved across the moment the tools were toggled) can
+        // carry plan mode with tools off. Restoring that verbatim leaves turns
+        // running as plain chat while the pill promises an agent, and the plan
+        // handoff can never appear because nothing renders the directive. The
+        // mode implies its surface, so normalize on the way in.
+        if self.agentMode == .plan {
+            self.isAgentToolsEnabled = true
+        }
         self.queuedPrompts = try container.decodeIfPresent([QueuedPrompt].self, forKey: .queuedPrompts) ?? []
         self.rollingSummary = try container.decodeIfPresent(String.self, forKey: .rollingSummary)
         self.recentWorkDigest = try container.decodeIfPresent(String.self, forKey: .recentWorkDigest)

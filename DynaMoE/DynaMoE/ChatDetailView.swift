@@ -119,13 +119,24 @@ struct ChatDetailView: View {
     /// message: the harness appends a forced-synthesis or subagent-relay reply
     /// after a plan, and keying the bar to the final message hid it while the
     /// plan card still said the plan was ready.
+    ///
+    /// A plan is only current until the next user turn. Once a follow-up has
+    /// been sent, the older plan's handoff must not come back when that
+    /// follow-up is answered without markers — "Implement the plan." would then
+    /// point at a plan the conversation has already moved past. A follow-up that
+    /// itself produces a plan is a NEWER ready message, so this search finds it.
     private var readyPlanMessage: ChatMessage? {
         guard isPlanMode, !isGenerating, let session else { return nil }
-        guard let message = session.messages.last(where: {
+        guard let planIndex = session.messages.lastIndex(where: {
             $0.role == .assistant
                 && PlanMarkers.anyMarkerMentioned(in: $0.content)
                 && PlanMarkers.readyPresent(in: $0.content)
         }) else { return nil }
+        if let lastUserIndex = session.messages.lastIndex(where: { $0.role == .user }),
+           lastUserIndex > planIndex {
+            return nil
+        }
+        let message = session.messages[planIndex]
         guard dismissedPlanMessageId != message.id else { return nil }
         return message
     }

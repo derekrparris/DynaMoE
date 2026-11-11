@@ -592,6 +592,44 @@ final class PlanModeTests: XCTestCase {
         XCTAssertEqual(decoded.agentMode ?? .code, .code)
     }
 
+    /// Plan mode is an agent mode: a stored pair that says "plan" with tools
+    /// off has no directive, no read tools and no handoff, so its turns would
+    /// run as plain chat under a pill promising an agent. Both construction and
+    /// decode normalize the pair rather than trusting the file.
+    func testAPlanSessionAlwaysRestoresWithToolsOn() throws {
+        let storedApart = ChatSession(
+            title: "Plan with tools off",
+            isAgentToolsEnabled: false,
+            agentMode: .plan
+        )
+        XCTAssertEqual(storedApart.isAgentToolsEnabled, true, "the pair cannot be represented apart")
+
+        let decoded = try JSONDecoder().decode(
+            ChatSession.self,
+            from: JSONEncoder().encode(storedApart)
+        )
+        XCTAssertEqual(decoded.agentMode, .plan)
+        XCTAssertEqual(decoded.isAgentToolsEnabled, true)
+
+        // A hand-edited file that bypasses the initializer still normalizes.
+        var raw = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(storedApart)) as? [String: Any]
+        )
+        raw["isAgentToolsEnabled"] = false
+        let handEdited = try JSONDecoder().decode(
+            ChatSession.self,
+            from: JSONSerialization.data(withJSONObject: raw)
+        )
+        XCTAssertEqual(handEdited.agentMode, .plan)
+        XCTAssertEqual(handEdited.isAgentToolsEnabled, true)
+
+        // The coder keeps whatever the tool toggle says.
+        XCTAssertEqual(
+            ChatSession(title: "Code", isAgentToolsEnabled: false, agentMode: .code).isAgentToolsEnabled,
+            false
+        )
+    }
+
     // MARK: - Review follow-ups
 
     /// Detection and stripping read one rule. They used to disagree: the
