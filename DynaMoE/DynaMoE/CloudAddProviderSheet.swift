@@ -136,7 +136,7 @@ struct CloudAddProviderSheet: View {
                 prompt: "https://opencode.ai/zen/v1",
                 isMonospaced: true
             )
-            caption("Include the version segment. Enter the base, not /chat/completions or /models. https:// is required except for loopback hosts.")
+            caption("Include the version segment. Enter the base, not /chat/completions or /models. https:// is required except for loopback hosts. Put the key in the credential field, never in the URL.")
             labeledField(
                 "Documentation (optional)",
                 text: $docsURL,

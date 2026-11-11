@@ -33,8 +33,8 @@ struct CloudProvidersSettingsView: View {
 
         var id: String {
             switch self {
-            case .add: return "add"
-            case .edit(let provider): return provider.id
+            case .add: return "provider-editor.add"
+            case .edit(let provider): return "provider-editor.\(provider.id)"
             }
         }
 
@@ -76,14 +76,18 @@ struct CloudProvidersSettingsView: View {
             presenting: providerPendingRemoval
         ) { provider in
             Button("Remove", role: .destructive) {
-                providerStore.remove(provider)
-                keyDrafts[provider.id] = ""
-                testStates[provider.id] = .untested
+                do {
+                    try providerStore.remove(provider)
+                    keyDrafts[provider.id] = ""
+                    testStates[provider.id] = .untested
+                } catch {
+                    testStates[provider.id] = .failure(error.localizedDescription)
+                }
                 providerPendingRemoval = nil
             }
             Button("Cancel", role: .cancel) { providerPendingRemoval = nil }
         } message: { provider in
-            Text("\(provider.displayName) is removed together with its Keychain API key, its registered model list, and its vision marks. Conversations pinned to its models will ask you to reselect a model.")
+            Text("\(provider.displayName) is removed together with its Keychain API key, its registered model list, its no-tools list, and its vision marks. Conversations pinned to its models will ask you to reselect a model.")
         }
     }
 

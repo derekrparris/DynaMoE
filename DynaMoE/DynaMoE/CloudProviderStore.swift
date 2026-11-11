@@ -139,8 +139,12 @@ final class CloudProviderStore: ObservableObject {
     /// identifier. Saved conversations that pinned one of its models are
     /// handled by `CloudModelAddress.selectionIsUnresolved`: the send is
     /// refused with a reselect message rather than falling back to weights.
-    func remove(_ provider: CloudProvider) {
-        guard !isBuiltIn(provider) else { return }
+    /// A built-in throws instead of no-oping, matching `update`: the caller is
+    /// asking for something the store cannot do.
+    func remove(_ provider: CloudProvider) throws {
+        guard !isBuiltIn(provider) else {
+            throw CloudProviderStoreError.builtInProviderIsImmutable(provider.displayName)
+        }
 
         secretStore.delete(providerId: provider.id)
         CloudModelRegistry.clearProviderState(for: provider, defaults: defaults)
@@ -154,21 +158,27 @@ final class CloudProviderStore: ObservableObject {
     // MARK: Change propagation
 
     /// Re-reads the persisted list, for a Settings reappearance after an
-    /// external `defaults write`.
+    /// external `defaults write`. An unchanged list does not republish, so
+    /// opening the pane again does not fire `objectWillChange`.
     func reloadFromStorage() {
         if updatesSharedRuntime {
             CloudProviderRuntime.shared.refresh(defaults: defaults)
         }
-        providers = CloudProviderCatalog.all(defaults: defaults)
+        publish(providers: CloudProviderCatalog.all(defaults: defaults))
     }
 
     private func publish() {
         if updatesSharedRuntime {
             CloudProviderRuntime.shared.refresh(defaults: defaults)
         }
-        providers = CloudProviderCatalog.all(defaults: defaults)
+        publish(providers: CloudProviderCatalog.all(defaults: defaults))
         if rescansModels {
             LocalModelManager.shared.scanLocalModels()
         }
+    }
+
+    private func publish(providers fresh: [CloudProvider]) {
+        guard fresh != providers else { return }
+        providers = fresh
     }
 }

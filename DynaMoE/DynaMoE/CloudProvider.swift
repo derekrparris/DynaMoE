@@ -113,6 +113,7 @@ public nonisolated enum CloudProviderValidationError: LocalizedError, Equatable 
     case invalidBaseURL
     case insecureBaseURL
     case baseURLIncludesEndpoint
+    case credentialsInBaseURL
     case invalidDocsURL
 
     public var errorDescription: String? {
@@ -131,8 +132,10 @@ public nonisolated enum CloudProviderValidationError: LocalizedError, Equatable 
             return "Use https://. Plain http:// is accepted only for 127.0.0.1, localhost, and ::1."
         case .baseURLIncludesEndpoint:
             return "Enter the API base, not the whole endpoint: stop before /chat/completions or /models."
+        case .credentialsInBaseURL:
+            return "Remove the user:password from the URL. The API key goes in the key field and rides the Authorization header, never the URL."
         case .invalidDocsURL:
-            return "The documentation link is not a valid URL."
+            return "Enter a documentation link that starts with https:// or http://."
         }
     }
 }
@@ -232,13 +235,18 @@ public nonisolated enum CloudProviderCatalog {
             return .failure(.insecureBaseURL)
         case .includesEndpoint:
             return .failure(.baseURLIncludesEndpoint)
+        case .includesCredentials:
+            return .failure(.credentialsInBaseURL)
         }
 
         let rawDocs = docsURL.trimmingCharacters(in: .whitespacesAndNewlines)
         let docs: URL?
         if rawDocs.isEmpty {
             docs = nil
-        } else if let url = URL(string: rawDocs), url.scheme != nil {
+        } else if let url = URL(string: rawDocs),
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "https" || scheme == "http",
+                  url.host != nil {
             docs = url
         } else {
             return .failure(.invalidDocsURL)
@@ -270,12 +278,16 @@ public nonisolated enum CloudProviderCatalog {
         case invalid
         case insecure
         case includesEndpoint
+        case includesCredentials
     }
 
     /// Accepts an absolute URL, prefixes a missing scheme with https, strips a
     /// trailing slash, and refuses the whole endpoint instead of the base.
-    /// The query and fragment are dropped: the credential rides the
-    /// `Authorization` header, never the URL.
+    /// User-info is refused rather than dropped: a silently stripped credential
+    /// would 401 later with nothing naming the cause. The scheme and host are
+    /// lowercased, so the stored URL is the one the row shows and the one
+    /// URLSession sees. The query and fragment are dropped: the credential
+    /// rides the `Authorization` header, never the URL.
     private static func checkBaseURL(_ raw: String) -> BaseURLCheck {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .invalid }
@@ -285,6 +297,9 @@ public nonisolated enum CloudProviderCatalog {
               let host = components.host, !host.isEmpty else { return .invalid }
         guard scheme == "https" || scheme == "http" else { return .invalid }
         if scheme == "http", !isLoopbackHost(host) { return .insecure }
+        if components.user != nil || components.password != nil {
+            return .includesCredentials
+        }
 
         var path = components.path
         while path.hasSuffix("/") { path.removeLast() }
@@ -293,6 +308,8 @@ public nonisolated enum CloudProviderCatalog {
             return .includesEndpoint
         }
 
+        components.scheme = scheme
+        components.host = host.lowercased()
         components.path = path
         components.query = nil
         components.fragment = nil
@@ -517,7 +534,9 @@ public nonisolated enum CloudModelRegistry {
     }
 
     /// The UserDefaults key that enables one debug model even when the main
-    /// list is empty — the end-to-end smoke-test seam for this branch.
+    /// list is empty — the end-to-end smoke-test seam for this branch. It is a
+    /// single global value rather than a per-provider one, so a per-provider
+    /// prune leaves it alone; clear it with `defaults delete`.
     public static let debugModelDefaultsKey = "dynamoe_cloud_debug_model"
 
     /// Upstream model ids for which this provider rejects a `tools` array
@@ -671,11 +690,6 @@ public nonisolated enum CloudModelRegistry {
         var withVision = modelIdsWithVisionSupport(for: provider, defaults: defaults)
         if withVision.remove(providerModelId) != nil {
             setModelIdsWithVisionSupport(withVision, for: provider, defaults: defaults)
-        }
-        // A development hook can register the same id with no list behind it.
-        if defaults.string(forKey: debugModelDefaultsKey)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) == providerModelId {
-            defaults.removeObject(forKey: debugModelDefaultsKey)
         }
     }
 

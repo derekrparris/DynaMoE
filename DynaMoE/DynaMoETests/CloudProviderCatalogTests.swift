@@ -8,6 +8,7 @@
 //
 
 import XCTest
+import Combine
 @testable import DynaMoE
 
 // MARK: - Catalog
@@ -225,6 +226,24 @@ final class CloudProviderCatalogTests: XCTestCase {
             try zen(baseURL: "http://localhost:4096/v1").openAIBaseURL.absoluteString,
             "http://localhost:4096/v1"
         )
+        XCTAssertEqual(
+            try zen(baseURL: "http://[::1]:4096/v1").openAIBaseURL.absoluteString,
+            "http://[::1]:4096/v1"
+        )
+        XCTAssertEqual(
+            try zen(baseURL: "HTTPS://OpenCode.ai/zen/v1").openAIBaseURL.absoluteString,
+            "https://opencode.ai/zen/v1",
+            "the scheme and host are lowercased, so the stored URL is the one displayed and cached"
+        )
+        XCTAssertEqual(
+            validationFailure(baseURL: "https://user:s3cret@opencode.ai/zen/v1"),
+            .credentialsInBaseURL,
+            "a credential in the URL can never be persisted: it belongs in the Keychain"
+        )
+        XCTAssertEqual(
+            validationFailure(baseURL: "https://user@opencode.ai/zen/v1"),
+            .credentialsInBaseURL
+        )
 
         let provider = try zen()
         XCTAssertEqual(provider.chatCompletionsURL.absoluteString, "https://opencode.ai/zen/v1/chat/completions")
@@ -237,8 +256,18 @@ final class CloudProviderCatalogTests: XCTestCase {
             try zen(docsURL: "https://opencode.ai/docs").docsURL?.absoluteString,
             "https://opencode.ai/docs"
         )
+        XCTAssertEqual(
+            try zen(docsURL: "http://opencode.ai/docs").docsURL?.absoluteString,
+            "http://opencode.ai/docs"
+        )
         XCTAssertEqual(validationFailure(docsURL: "not a url"), .invalidDocsURL)
         XCTAssertEqual(validationFailure(docsURL: "not-a-url"), .invalidDocsURL)
+        XCTAssertEqual(
+            validationFailure(docsURL: "file:///etc/passwd"),
+            .invalidDocsURL,
+            "the docs link is a web link, symmetric with the base URL"
+        )
+        XCTAssertEqual(validationFailure(docsURL: "javascript:alert(1)"), .invalidDocsURL)
     }
 
     // MARK: Slug
@@ -372,7 +401,7 @@ final class CloudProviderStoreTests: XCTestCase {
             defaults: harness.defaults
         )
 
-        harness.store.remove(provider)
+        try harness.store.remove(provider)
 
         XCTAssertNil(harness.secretStore.get(providerId: provider.id))
         XCTAssertTrue(CloudModelRegistry.registeredModelIds(for: provider, defaults: harness.defaults).isEmpty)
@@ -389,7 +418,10 @@ final class CloudProviderStoreTests: XCTestCase {
         let synthetic = try XCTUnwrap(harness.store.providers.first { $0.id == "synthetic" })
         XCTAssertTrue(harness.store.isBuiltIn(synthetic))
 
-        harness.store.remove(synthetic)
+        XCTAssertThrowsError(
+            try harness.store.remove(synthetic),
+            "removal refuses a built-in the same way update does, rather than no-oping"
+        )
         XCTAssertNotNil(
             CloudProviderCatalog.provider(withId: "synthetic", defaults: harness.defaults),
             "a built-in can never be removed, so the registry can never be empty"
@@ -432,6 +464,27 @@ final class CloudProviderStoreTests: XCTestCase {
         )
     }
 
+    func testACredentialedBaseURLIsRefusedAndNeverPersisted() {
+        let harness = makeHarness()
+        defer { harness.cleanUp() }
+
+        do {
+            _ = try harness.store.add(
+                displayName: "OpenCode Zen",
+                identifier: "opencode-zen",
+                baseURL: "https://user:s3cret@opencode.ai/zen/v1"
+            )
+            XCTFail("a credential in the URL must never reach storage")
+        } catch let error as CloudProviderValidationError {
+            XCTAssertEqual(error, .credentialsInBaseURL)
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+
+        XCTAssertFalse(harness.store.providers.contains { $0.id == "opencode-zen" })
+        XCTAssertNil(harness.defaults.data(forKey: CloudProviderCatalog.customDefaultsKey))
+    }
+
     func testPerModelRemovalLeavesTheRestOfTheCatalog() throws {
         let harness = makeHarness()
         defer { harness.cleanUp() }
@@ -457,6 +510,10 @@ final class CloudProviderStoreTests: XCTestCase {
             for: provider,
             defaults: harness.defaults
         )
+        harness.defaults.set(
+            "gpt-5.1-codex",
+            forKey: CloudModelRegistry.debugModelDefaultsKey
+        )
 
         CloudModelRegistry.removeRegisteredModel(
             "gpt-5.1-codex",
@@ -473,6 +530,81 @@ final class CloudProviderStoreTests: XCTestCase {
         )
         XCTAssertTrue(
             CloudModelRegistry.modelIdsWithoutToolSupport(for: provider, defaults: harness.defaults).isEmpty
+        )
+        XCTAssertEqual(
+            harness.defaults.string(forKey: CloudModelRegistry.debugModelDefaultsKey),
+            "gpt-5.1-codex",
+            "the debug hook is one global value that another provider can rely on, so a per-provider prune leaves it alone"
+        )
+    }
+
+    func testTheShippingStoreMakesTheProviderLiveEverywhere() throws {
+        let suite = "dynamoe.cloud.runtime.tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        defer {
+            CloudProviderRuntime.shared.refresh()
+            defaults.removePersistentDomain(forName: suite)
+        }
+
+        CloudProviderRuntime.shared.refresh(defaults: defaults)
+        XCTAssertEqual(CloudProviderRuntime.shared.providers.map(\.id), ["synthetic"])
+
+        let store = CloudProviderStore(
+            defaults: defaults,
+            secretStore: CloudSecretStore(service: "DRP.DynaMoE.cloud.tests.\(UUID().uuidString)"),
+            rescansModels: false
+        )
+
+        let provider = try store.add(
+            displayName: "OpenCode Zen",
+            identifier: "opencode-zen",
+            baseURL: "https://opencode.ai/zen/v1"
+        )
+
+        XCTAssertEqual(
+            CloudProviderRuntime.shared.providers.map(\.id),
+            ["synthetic", "opencode-zen"],
+            "the shipping store updates the snapshot every other surface reads"
+        )
+        XCTAssertEqual(CloudProviderRegistry.all.map(\.id), ["synthetic", "opencode-zen"])
+        XCTAssertEqual(
+            CloudProviderRegistry.provider(withId: "opencode-zen")?.openAIBaseURL.absoluteString,
+            "https://opencode.ai/zen/v1"
+        )
+        XCTAssertEqual(
+            CloudModelAddress.parseModelId(
+                CloudModelAddress.modelId(providerId: "opencode-zen", providerModelId: "qwen3-coder")
+            )?.provider.id,
+            "opencode-zen",
+            "sentinel parsing resolves through the live runtime, so a freshly added provider must resolve there"
+        )
+
+        try store.update(provider, displayName: "OpenCode", baseURL: "https://opencode.ai/zen/v2")
+        XCTAssertEqual(
+            CloudProviderRuntime.shared.providers.first { $0.id == "opencode-zen" }?.displayName,
+            "OpenCode"
+        )
+
+        try store.remove(provider)
+        XCTAssertEqual(CloudProviderRuntime.shared.providers.map(\.id), ["synthetic"])
+        XCTAssertEqual(store.providers.map(\.id), ["synthetic"])
+    }
+
+    func testReloadingAnUnchangedListDoesNotRepublish() {
+        let harness = makeHarness()
+        defer { harness.cleanUp() }
+
+        var publications = 0
+        let token = harness.store.objectWillChange.sink { _ in publications += 1 }
+        defer { token.cancel() }
+
+        harness.store.reloadFromStorage()
+
+        XCTAssertEqual(
+            publications,
+            0,
+            "a pane reappearing must not fire objectWillChange for a list that did not change"
         )
     }
 }

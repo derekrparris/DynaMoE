@@ -433,11 +433,11 @@ Authentication is `Authorization: Bearer <key>`. Streaming uses SSE with `stream
 | --- | --- |
 | Display Name | Shown in the composer as `model (name)`. |
 | Identifier | Lowercase slug (`opencode-zen`). It is the Keychain account suffix and the `cloud://` address saved with each conversation, so it cannot change after the provider is added. |
-| API Base URL | Include the version segment, for example `https://opencode.ai/zen/v1`. `https://` is required except on `127.0.0.1`, `localhost`, and `::1`. Enter the base, not `…/chat/completions`. |
+| API Base URL | Include the version segment, for example `https://opencode.ai/zen/v1`. `https://` is required except on `127.0.0.1`, `localhost`, and `::1`. Enter the base, not `…/chat/completions`. Scheme and host are lowercased; a URL carrying `user:password@` is refused rather than silently stripped, since the key belongs in the key field. |
 | API Key | Optional at creation; it is written to the Keychain (`DRP.DynaMoE.cloud`) and can be saved or rotated on the provider card. |
-| Documentation | Optional link shown on the card. |
+| Documentation | Optional `http(s)` link shown on the card. |
 
-Built-in providers (Synthetic) stay available and cannot be edited or removed. **Remove** on a custom provider deletes its Keychain key, its registered models, and its vision marks; a conversation pinned to one of its models then refuses to send with a reselect message instead of silently running on local weights.
+Built-in providers (Synthetic) stay available and cannot be edited or removed. **Remove** on a custom provider deletes its Keychain key, its registered models, its no-tools list, and its vision marks; a conversation pinned to one of its models then refuses to send with a reselect message instead of silently running on local weights.
 
 #### OpenCode Zen
 

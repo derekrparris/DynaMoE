@@ -543,7 +543,7 @@ The **Cloud Providers** section connects remote inference providers. **Synthetic
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
 │  Cloud Providers Section                                               │
-│  Synthetic (built in)                                [Edit] [Remove]  │
+│  Synthetic (built in)                                                  │
 │  API Key:          [••••••••••••]  [Save]  [Remove]                    │
 │  Connection:       [Test & Sync Models] Connected ✓ 14 registered      │
 │  Documentation:    [Open API Docs]                                     │
@@ -562,7 +562,7 @@ The **Cloud Providers** section connects remote inference providers. **Synthetic
 ### Adding & Removing Providers
 - **Add Provider…** opens a form for any endpoint that speaks `POST <base>/chat/completions` with an `Authorization: Bearer <key>` header (SSE streaming) and lists its catalog at `GET <base>/models`. The key never rides the URL.
 - **Display name** is what the composer shows as `model (name)`. The **identifier** is a lowercase slug derived from it; it becomes the Keychain account suffix (`dynamoe.cloud.<identifier>.apikey`) and the `cloud://<identifier>/<model>` address saved with each conversation, so it cannot be changed later.
-- **API base URL** includes the version segment (`https://opencode.ai/zen/v1`). `https://` is required, except that plain `http://` is accepted on `127.0.0.1`, `localhost`, and `::1` for a local server. Enter the base, not `…/chat/completions` or `…/models`. A missing scheme defaults to `https`, and a trailing slash is removed.
+- **API base URL** includes the version segment (`https://opencode.ai/zen/v1`). `https://` is required, except that plain `http://` is accepted on `127.0.0.1`, `localhost`, and `::1` for a local server. Enter the base, not `…/chat/completions` or `…/models`. A missing scheme defaults to `https`, a trailing slash is removed, and the scheme and host are lowercased. A URL carrying `user:password@` is refused with an inline message instead of being saved or silently stripped: the key belongs in the API Key field and rides the `Authorization` header.
 - **Built-in providers cannot be edited or removed**, so the registry is never empty. **Remove** on a custom provider deletes its Keychain key, its registered model list, its no-tools list, and its vision marks; conversations pinned to its models then refuse the send with a reselect message rather than falling back to local weights.
 - The list persists as a JSON array under `dynamoe_cloud_custom_providers`. A hand-edited entry that cannot be decoded costs only that provider; the rest of the list is kept.
 - **OpenCode Zen** (hosted gateway): name `OpenCode Zen`, identifier `opencode-zen`, base `https://opencode.ai/zen/v1`, key from `console.opencode.ai`. Its `/models` catalog lists models served on other endpoints too: the `gpt-5.x` family uses `/zen/v1/responses` and Claude models use `/zen/v1/messages` (the Anthropic wire, currently a stub), so only the OpenAI-compatible ids answer here (`qwen3-coder`, `kimi-k2`, `kimi-k2-thinking`, `glm-4.6`, `glm-4.7-free`, `grok-code`, `big-pickle`, and their current `-free` variants). The **−** button beside a registered model prunes the rest; sending to one returns the gateway's own "Model … is not supported" error, which the turn surfaces.
@@ -571,7 +571,7 @@ The **Cloud Providers** section connects remote inference providers. **Synthetic
 - **API Key**: Paste a key from the provider's dashboard and press **Save**. It is written only to the Keychain (service `DRP.DynaMoE.cloud`, account `dynamoe.cloud.<provider>.apikey`) — never to UserDefaults, logs, or a config file. The field never pre-fills an existing key; the placeholder says "Stored" and typing a new value replaces it. **Remove** deletes the item from both the current and the older keychain.
 - **Stored Credentials**: shows up only when a credential is still in the keychain an older version wrote; press **Import** in that card. Importing copies each one across (read back and verified) and then removes the older copy, so a new version stops asking for keychain access. macOS asks once per credential during the import; choose **Always Allow**.
 - **Test & Sync Models**: Calls the provider's `GET /models` endpoint with the stored key. A good key validates the credential **and** registers the provider's current chat models, then rescans so the composer's **Cloud Models** section updates immediately. Embeddings, rerankers, speech, moderation, and image generators in the same catalog are skipped (falling back to the unfiltered list only if the filter would register nothing). A bad key returns `401`, a rate-limited endpoint `429`, and an unreachable endpoint a network error — all shown inline. The test spends no completion tokens.
-- **Documentation**: Opens the provider's API reference.
+- **Documentation**: Opens the provider's API reference. The link must be `http(s)`, the same rule the base URL follows.
 
 ### Registered Models
 - **Sync Models** re-runs the catalog fetch and replaces the registered list, which is how provider-side additions and retirements reach the picker. **Clear** unregisters the provider's list.
@@ -584,7 +584,7 @@ The **Cloud Providers** section connects remote inference providers. **Synthetic
   ```
 
   Entries are separated by `;`, `,`, or newlines and duplicates are dropped. A hand-written value may not reach an already-running app because of preference caching — quit and relaunch, or just press **Sync Models**.
-- A single-model development hook exists: `defaults write DRP.DynaMoE dynamoe_cloud_debug_model "hf:org/model"` registers one model when the main list is empty.
+- A single-model development hook exists: `defaults write DRP.DynaMoE dynamoe_cloud_debug_model "hf:org/model"` registers one model when the main list is empty. It is one global value rather than a per-provider one, so the minus button does not clear it; remove it with `defaults delete DRP.DynaMoE dynamoe_cloud_debug_model`.
 
 ### Image Input (Vision-Capable Cloud Models)
 
