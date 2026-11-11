@@ -54,6 +54,12 @@ nonisolated public enum PlanMarkers {
     /// Drops marker-only lines and an empty fence pair wrapped around one, so
     /// the rendered plan reads as a document rather than as markup. Prose that
     /// merely mentions a marker is untouched.
+    ///
+    /// A marker-shaped line INSIDE a fenced block is content and is kept: a plan
+    /// that shows the convention in a code sample (or its own markers, when the
+    /// plan is about this feature) must not have the sample deleted from it. The
+    /// directive forbids fencing the real markers, and one wrapped in a fence
+    /// pair of its own is still removed with the pair.
     public static func strip(_ text: String) -> String {
         let lines = lines(of: text)
         var out: [String] = []
@@ -72,8 +78,11 @@ nonisolated public enum PlanMarkers {
                 index += 3
                 continue
             }
+            // Read before toggling, so a marker line is judged by the block it
+            // is in rather than by the state its own line just produced.
+            let isInsideFence = inFence
             if isFenceLine(line) { inFence.toggle() }
-            if isMarkerLine(line, start) || isMarkerLine(line, ready) {
+            if !isInsideFence, isMarkerLine(line, start) || isMarkerLine(line, ready) {
                 index += 1
                 continue
             }
@@ -184,6 +193,15 @@ nonisolated public enum PlanModePolicy {
     public static func withholds(_ name: String) -> Bool {
         if name.hasPrefix(MCPToolBridge.namePrefix) { return true }
         return !allowedToolNames.contains(name)
+    }
+
+    /// The same question asked the way a caller holding a turn's mode asks it.
+    ///
+    /// Every caller that knows WHICH turn it is serving asks this rather than
+    /// testing `mode == .plan` itself, so "the coder withholds nothing" is stated
+    /// once. `withholds(_:)` stays the policy; this is the gate.
+    public static func withholds(_ name: String, in mode: AgentMode) -> Bool {
+        mode == .plan && withholds(name)
     }
 
     /// The plan-mode system section. Rendered before the tool block so the

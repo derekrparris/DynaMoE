@@ -84,6 +84,40 @@ final class PlanModeTests: XCTestCase {
         XCTAssertEqual(PlanMarkers.strip(fenced), "After")
     }
 
+    /// A plan may legitimately SHOW the convention — or, planning this feature,
+    /// these markers — inside a code sample. Marker-shaped lines are markup only
+    /// outside a fence; deleting one from a real block corrupted the plan's own
+    /// content.
+    func testAMarkerShownInsideACodeFenceIsContentNotMarkup() {
+        let sample = """
+        \(PlanMarkers.start)
+
+        # Plan
+
+        The convention is:
+
+        ```
+        step 1
+        \(PlanMarkers.ready)
+        step 2
+        ```
+
+        \(PlanMarkers.ready)
+        """
+        let stripped = PlanMarkers.strip(sample)
+        XCTAssertTrue(
+            stripped.contains("step 1\n\(PlanMarkers.ready)\nstep 2"),
+            "a fenced sample keeps the marker it shows"
+        )
+        XCTAssertFalse(stripped.hasPrefix(PlanMarkers.start), "the real opening marker is still removed")
+        XCTAssertFalse(stripped.hasSuffix(PlanMarkers.ready), "the real closing marker is still removed")
+        XCTAssertEqual(
+            stripped.components(separatedBy: PlanMarkers.ready).count - 1,
+            1,
+            "only the marker inside the sample survives"
+        )
+    }
+
     // MARK: - Read-only surface
 
     func testPlanModeWithholdsTheWriteExecuteAndCompletionTools() {
@@ -231,10 +265,32 @@ final class PlanModeTests: XCTestCase {
         )
     }
 
-    func testCloudGuidanceNamesTheWithheldTools() {
+    func testCloudGuidanceCarriesThePlanDirectiveAndItsMarkers() {
+        // A cloud turn assembles its own prompt, so the directive has to be
+        // rendered there too. Without it the turn got a withheld-tools note and
+        // no marker contract: the plan card and the approval bar (both keyed on
+        // the markers) could never form, and the pill was the only way out.
         let guidance = AgentHarness.shared.buildCloudToolGuidance(mode: .plan)
-        XCTAssertTrue(guidance.contains("Plan mode withholds"))
-        XCTAssertTrue(guidance.contains("file_write"))
+        XCTAssertTrue(guidance.contains("# Plan Mode"))
+        XCTAssertTrue(guidance.contains(PlanMarkers.start))
+        XCTAssertTrue(guidance.contains(PlanMarkers.ready))
+        XCTAssertTrue(guidance.contains("file_write"), "the withheld set is named")
+        XCTAssertTrue(guidance.contains("# Tools"))
+        // Role before capabilities, as in the local prompt.
+        let role = guidance.range(of: "# Plan Mode")
+        let tools = guidance.range(of: "# Tools")
+        XCTAssertNotNil(role)
+        XCTAssertNotNil(tools)
+        if let role, let tools {
+            XCTAssertLessThan(role.lowerBound, tools.lowerBound)
+        }
+        // `complete` is withheld, so the plan turn must not be told to call it.
+        XCTAssertFalse(guidance.contains("Call `complete` only"))
+
+        // The coder turn gains no plan section and keeps its complete guidance.
+        let coder = AgentHarness.shared.buildCloudToolGuidance(mode: .code)
+        XCTAssertFalse(coder.contains("# Plan Mode"))
+        XCTAssertTrue(coder.contains("Call `complete` only"))
     }
 
     // MARK: - Execution backstop
@@ -339,6 +395,91 @@ final class PlanModeTests: XCTestCase {
         let result = await AgentHarness.shared.executeTool(call: call, mode: .plan)
         XCTAssertEqual(result.record.status, .success)
         XCTAssertTrue(result.record.output?.contains("plan mode reads files") == true)
+    }
+
+    /// Every path that executes a tool asks this, so a withheld call is never
+    /// offered to the user for approval: the approval came first and the write
+    /// was then refused by the mode, which read as a broken control rather than
+    /// as a promise being kept.
+    func testAWithheldCallNeverRaisesAnApprovalPrompt() {
+        XCTAssertTrue(AgentHarness.requiresApproval(toolName: "file_write", mode: .code))
+        XCTAssertTrue(AgentHarness.requiresApproval(toolName: "shell_run", mode: .code))
+        XCTAssertFalse(AgentHarness.requiresApproval(toolName: "file_write", mode: .plan))
+        XCTAssertFalse(AgentHarness.requiresApproval(toolName: "shell_run", mode: .plan))
+        XCTAssertFalse(
+            AgentHarness.requiresApproval(toolName: "mcp__server__write", mode: .plan),
+            "MCP is withheld wholesale in plan mode"
+        )
+        XCTAssertFalse(AgentHarness.requiresApproval(toolName: "file_read", mode: .code))
+    }
+
+    /// A name nothing provides is UNKNOWN, not withheld. The withheld branch ran
+    /// first, so a hallucinated `web_search_fetch` was answered with "do not
+    /// retry it" instead of the available-names hint that exists to stop the
+    /// model repeating the bad string.
+    @MainActor
+    func testAMisspelledToolIsUnknownRatherThanWithheld() async {
+        AgentHarness.shared.setActiveMode(.plan)
+        let call = ParsedToolCall(
+            name: "web_search_fetch",
+            arguments: ["query": "anything"],
+            rawArguments: "",
+            rawText: "web_search_fetch"
+        )
+        let result = await AgentHarness.shared.executeTool(call: call, mode: .plan)
+
+        XCTAssertEqual(result.record.status, .error)
+        XCTAssertTrue(result.record.error?.contains("Unknown tool") == true)
+        XCTAssertFalse(
+            result.record.error?.contains("PLAN MODE") == true,
+            "a typo must not be reported as a policy refusal"
+        )
+        XCTAssertTrue(
+            result.record.error?.contains("file_read") == true,
+            "the unknown-tool answer echoes what can be called"
+        )
+    }
+
+    /// `tools_discover` and `tools_load` take no `mode:` parameter, so they read
+    /// the mode the executor published for THIS turn rather than the
+    /// process-global one another turn can move.
+    @MainActor
+    func testToolDiscoveryAnswersForTheTurnsModeNotTheGlobalOne() async {
+        let harness = AgentHarness.shared
+        harness.setActiveMode(.code)
+        XCTAssertFalse(PlanModePolicy.withholds("file_write", in: harness.activeMode))
+
+        let discover = ParsedToolCall(
+            name: "tools_discover",
+            arguments: [:],
+            rawArguments: "",
+            rawText: "tools_discover"
+        )
+        let listing = await harness.executeTool(call: discover, mode: .plan)
+        XCTAssertEqual(listing.record.status, .success)
+        XCTAssertTrue(
+            listing.resultJSON.contains("withheld_in_plan_mode"),
+            "the listing must answer for the plan turn, got: \(listing.resultJSON)"
+        )
+
+        let load = ParsedToolCall(
+            name: "tools_load",
+            arguments: ["name": "file_write"],
+            rawArguments: "",
+            rawText: "tools_load"
+        )
+        let refused = await harness.executeTool(call: load, mode: .plan)
+        XCTAssertEqual(refused.record.status, .error)
+        XCTAssertTrue(
+            refused.record.error?.contains("withheld in plan mode") == true,
+            "a plan turn cannot arm what the mode withholds, got: \(refused.record.error ?? "nil")"
+        )
+
+        // The same call in the turn's own coder mode still loads it, so the
+        // scoped value is a turn's answer and not a one-way latch.
+        let loaded = await harness.executeTool(call: load, mode: .code)
+        XCTAssertEqual(loaded.record.status, .success)
+        XCTAssertNotNil(harness.loadedTools["file_write"])
     }
 
     func testPlanModeCannotLoadAWithheldToolBackIn() throws {

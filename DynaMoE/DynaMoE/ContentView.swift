@@ -1487,7 +1487,7 @@ struct ContentView: View {
                     session: activeSessionBinding,
                     promptText: $chatPromptText,
                     isGenerating: isGeneratingText && (generatingSessionId == (selectedSessionId ?? sessions.first?.id)),
-                    isModeChangeLocked: isModeChangeLocked,
+                    isModeChangeLocked: isModeChangeLockedByVisibleTurn,
                     compactionProgressMessageId: (isCompactingConversation && compactingSessionId == (selectedSessionId ?? sessions.first?.id)) ? compactingProgressMessageId : nil,
                     isStreamingOffDisk: isStreamingOffDisk,
                     generationSpeed: generationSpeedTokPerSec,
@@ -2179,14 +2179,27 @@ struct ContentView: View {
         }
     }
 
-    /// True while any turn could be reading the process-global agent surface:
-    /// this app's own generation, a stopped turn still unwinding, or a local-API
-    /// turn, which shares `AgentHarness.activeMode` and the grammar registry.
-    /// The mode belongs to the TURN as well as the conversation, so it cannot be
-    /// changed underneath one.
-    private var isModeChangeLocked: Bool {
+    /// True while this view can SEE a turn reading the process-global agent
+    /// surface: its own generation, or a stopped turn still unwinding. This is
+    /// what the composer's pill reflects, because it is the half SwiftUI
+    /// observes.
+    private var isModeChangeLockedByVisibleTurn: Bool {
         isGeneratingText || generationTask != nil || generationTeardownTask != nil
-            || CompletionEngine.shared.isActive
+    }
+
+    /// True while ANY turn could be reading the process-global agent surface,
+    /// including a local-API turn, which shares `AgentHarness.activeMode` and the
+    /// grammar registry. The mode belongs to the TURN as well as to the
+    /// conversation, so it cannot be changed underneath one.
+    ///
+    /// The engine's own single-flight state is the one term the view cannot
+    /// observe (`CompletionEngine` is not an `ObservableObject`), so it is checked
+    /// by the ACTIONS rather than by the pill's disabled state: a server turn
+    /// starting under an on-screen pill leaves the pill enabled, and the click
+    /// then refuses with a status that says why — rather than a control that
+    /// claims a lock it cannot see and stays disabled after the turn is over.
+    private var isModeChangeLocked: Bool {
+        isModeChangeLockedByVisibleTurn || CompletionEngine.shared.isActive
     }
 
     /// Applies the conversation's agent surface. Shared by the composer's mode
@@ -2215,7 +2228,29 @@ struct ContentView: View {
             showStatus("🧭 Plan Mode needs a model with tool calling — Apple Foundation Model runs plain chat, so there is nothing to plan with.", kind: .warning)
             return false
         }
+        // The same rule for a cloud provider registered without tool support:
+        // plan mode's deliverable is a tool-driven investigation ending in a
+        // marker-framed plan, and a turn sent as plain chat produces neither. The
+        // gate mirrors the send path's `supportsTools ?? true` resolution, so a
+        // model this refuses is exactly a model whose plan turn would have no
+        // card and no approval bar.
+        if enabled,
+           let idx = sessions.firstIndex(where: { $0.id == sessionId }),
+           cloudModelLacksToolSupport(sessions[idx]) {
+            let name = modelDisplayName(for: sessions[idx]) ?? "This cloud model"
+            showStatus("🧭 Plan Mode needs a model that can call tools — \(name) is registered without them, so there is nothing to plan with.", kind: .warning)
+            return false
+        }
         return applyPlanMode(enabled, sessionId: sessionId)
+    }
+
+    /// True when the conversation's cloud model is registered without tool
+    /// support, i.e. its turns are sent as plain chat.
+    private func cloudModelLacksToolSupport(_ session: ChatSession) -> Bool {
+        guard let cloud = cloudModelResolution(for: session) else { return false }
+        let spec = CloudModelRegistry.registeredSpecs(for: cloud.provider)
+            .first { $0.providerModelId == cloud.providerModelId }
+        return spec?.supportsTools == false
     }
 
     /// The write half of `setPlanMode`, without the lock: a caller that has
@@ -4468,7 +4503,10 @@ struct ContentView: View {
             agent.recordToolCallValidity(true)
 
             let isTurbo = UserDefaults.standard.bool(forKey: "dynamoe_agent_turbo_mode")
-            if AgentHarness.isStateChanging(toolName: call.name), !isTurbo {
+            // A tool plan mode withholds is refused by `executeTool` without
+            // running, so asking the user first offered them a write the mode had
+            // already denied.
+            if AgentHarness.requiresApproval(toolName: call.name, mode: mode), !isTurbo {
                 updateRecord(record.id) { rec in rec.status = .awaitingApproval }
                 showStatus("🛡️ Action requires confirmation: \(call.name)")
                 let approved = await ActionApprovalManager.shared.waitForApproval(id: record.id)
@@ -5427,7 +5465,10 @@ struct ContentView: View {
 
                         // Human-In-The-Loop (HITL) Safety & Turbo Mode
                         let isTurbo = UserDefaults.standard.bool(forKey: "dynamoe_agent_turbo_mode")
-                        let isDestructive = AgentHarness.isStateChanging(toolName: call.name)
+                        // See the cloud path: a call plan mode withholds is
+                        // refused by `executeTool` without running, so it must not
+                        // raise an approval prompt first.
+                        let isDestructive = AgentHarness.requiresApproval(toolName: call.name, mode: turnMode)
 
                         if isDestructive && !isTurbo {
                             await MainActor.run {
