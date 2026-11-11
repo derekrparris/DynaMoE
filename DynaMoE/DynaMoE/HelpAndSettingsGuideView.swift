@@ -484,7 +484,7 @@ struct HelpAndSettingsGuideView: View {
 
             VStack(alignment: .leading, spacing: 8) {
                 bulletPoint("Working Directory Sandbox", "All file read/write and shell execution operations are constrained to your designated working directory to protect system security.")
-                bulletPoint("Safety Limits", "Configure 'Max Tool Output Length' (to avoid blowing context limits) and 'Max Agent Steps' (to prevent runaway execution loops).")
+                bulletPoint("Safety Limits", "Configure 'Max Tool Output Length' (to avoid blowing context limits) and 'Max Agent Steps' (to prevent runaway execution loops). Turn on 'No Limit' beside the step slider for a long autonomous task: the run is then bounded only by the model calling complete, a tool loop guard (a failed-call streak, a repeated identical call, or the web-search budget), the machine's KV budget, or Stop — and every extra step lengthens the transcript, so a local model will usually hit its KV ceiling first.")
                 bulletPoint("Headless Browser Web Search", "Zero-config, real-time web search powered by a local headless browser (Chrome, Chromium, Brave, or Edge) executing on your Mac with DOM extraction and JavaScript SPA rendering.")
                 bulletPoint("Brave Search API", "Optional remote search integration for structured JSON queries over local headless browser execution.")
                 bulletPoint("MCP Servers", "Connect Model Context Protocol servers declared in ~/Library/Application Support/DynaMoE/mcp.json, over stdio (local child processes) or Streamable HTTP. Their tools reach the model as mcp__<server>__<tool>. The file is authoritative: edit it here with the form or the raw JSON view, or by hand, and changes reload automatically.")
