@@ -2,7 +2,7 @@
 //  CloudProvider.swift
 //  DynaMoE
 //
-//  Connected cloud providers (Synthetic integration).
+//  Connected cloud providers (built-in and user-configured).
 //
 //  DynaMoE is local-weights-first: this file is where REMOTE inference
 //  providers enter the model registry. A cloud provider is a value-only
@@ -41,7 +41,9 @@ public enum CloudApiFlavor: String, CaseIterable, Identifiable, Codable, Sendabl
 public nonisolated struct CloudProvider: Identifiable, Codable, Equatable, Sendable {
     public let id: String
     public let displayName: String
-    public let docsURL: URL
+    /// The provider's own documentation. Optional because a provider added
+    /// from Settings may not have a link worth keeping.
+    public let docsURL: URL?
     /// Base URL of the OpenAI-compatible API, including the `/v1` suffix
     /// ("https://api.synthetic.new/openai/v1").
     public let openAIBaseURL: URL
@@ -49,7 +51,13 @@ public nonisolated struct CloudProvider: Identifiable, Codable, Equatable, Senda
     /// ("https://api.synthetic.new/anthropic"; its client appends `/v1`).
     public let anthropicBaseURL: URL?
 
-    public init(id: String, displayName: String, docsURL: URL, openAIBaseURL: URL, anthropicBaseURL: URL?) {
+    public init(
+        id: String,
+        displayName: String,
+        docsURL: URL? = nil,
+        openAIBaseURL: URL,
+        anthropicBaseURL: URL? = nil
+    ) {
         self.id = id
         self.displayName = displayName
         self.docsURL = docsURL
@@ -69,9 +77,11 @@ public nonisolated struct CloudProvider: Identifiable, Codable, Equatable, Senda
     }
 }
 
-/// The set of cloud providers DynaMoE knows how to reach. Adding a provider
-/// means appending one record here; the Settings UI, registry, and picker
-/// all render from this list.
+/// The set of cloud providers DynaMoE knows how to reach: the built-ins below
+/// plus every provider the user added in Settings. Adding a provider no longer
+/// means appending a record here — Settings writes one into
+/// `CloudProviderCatalog` — but a built-in stays a literal so the registry can
+/// never be empty.
 public nonisolated enum CloudProviderRegistry {
     public static let synthetic = CloudProvider(
         id: "synthetic",
@@ -81,10 +91,280 @@ public nonisolated enum CloudProviderRegistry {
         anthropicBaseURL: URL(string: "https://api.synthetic.new/anthropic")!
     )
 
-    public static let all: [CloudProvider] = [synthetic]
+    /// Built-ins first, then the runtime-configured list in the order it was
+    /// added. Read through `CloudProviderRuntime` because the model scan and
+    /// sentinel parsing call this off the main actor.
+    public static var all: [CloudProvider] { CloudProviderRuntime.shared.providers }
 
     public static func provider(withId id: String) -> CloudProvider? {
         all.first { $0.id == id }
+    }
+}
+
+// MARK: - Provider Validation
+
+/// Why a provider draft cannot be saved. Every case is actionable in the
+/// Settings form, and `errorDescription` is the text that field shows.
+public nonisolated enum CloudProviderValidationError: LocalizedError, Equatable {
+    case emptyDisplayName
+    case invalidIdentifier
+    case duplicateIdentifier(String)
+    case reservedIdentifier(String)
+    case invalidBaseURL
+    case insecureBaseURL
+    case baseURLIncludesEndpoint
+    case invalidDocsURL
+
+    public var errorDescription: String? {
+        switch self {
+        case .emptyDisplayName:
+            return "Give the provider a display name."
+        case .invalidIdentifier:
+            return "Use 1-\(CloudProviderCatalog.maximumIdentifierLength) lowercase letters, digits, or dashes, starting and ending with a letter or digit."
+        case .duplicateIdentifier(let identifier):
+            return "A provider with the identifier \"\(identifier)\" already exists."
+        case .reservedIdentifier(let identifier):
+            return "\"\(identifier)\" belongs to a built-in provider."
+        case .invalidBaseURL:
+            return "Enter an absolute URL, for example https://opencode.ai/zen/v1."
+        case .insecureBaseURL:
+            return "Use https://. Plain http:// is accepted only for 127.0.0.1, localhost, and ::1."
+        case .baseURLIncludesEndpoint:
+            return "Enter the API base, not the whole endpoint: stop before /chat/completions or /models."
+        case .invalidDocsURL:
+            return "The documentation link is not a valid URL."
+        }
+    }
+}
+
+// MARK: - Provider Catalog
+
+/// Built-in plus user-configured providers, persisted in UserDefaults as a
+/// JSON array under `dynamoe_cloud_custom_providers`.
+///
+/// Every function takes the defaults it may read or write, which keeps the
+/// validation and persistence rules testable without mutating the running
+/// app's list. `CloudProviderRuntime` is the cached view the app reads.
+public nonisolated enum CloudProviderCatalog {
+    public static let customDefaultsKey = "dynamoe_cloud_custom_providers"
+    public static let maximumIdentifierLength = 32
+
+    /// Providers that ship with the app. They cannot be edited or removed, so
+    /// the registry can never be empty and `synthetic` always resolves.
+    public static var builtIns: [CloudProvider] { [CloudProviderRegistry.synthetic] }
+
+    public static func customProviders(defaults: UserDefaults = .standard) -> [CloudProvider] {
+        guard let data = defaults.data(forKey: customDefaultsKey) else { return [] }
+        return decodeCustomProviders(from: data)
+    }
+
+    public static func all(defaults: UserDefaults = .standard) -> [CloudProvider] {
+        builtIns + customProviders(defaults: defaults)
+    }
+
+    public static func provider(withId id: String, defaults: UserDefaults = .standard) -> CloudProvider? {
+        all(defaults: defaults).first { $0.id == id }
+    }
+
+    public static func saveCustomProviders(
+        _ providers: [CloudProvider],
+        defaults: UserDefaults = .standard
+    ) {
+        var seen = Set(builtIns.map(\.id))
+        let cleaned = providers.filter { seen.insert($0.id).inserted && isValidIdentifier($0.id) }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        guard let data = try? encoder.encode(cleaned) else { return }
+        defaults.set(data, forKey: customDefaultsKey)
+    }
+
+    /// `"OpenCode Zen"` -> `"opencode-zen"`. Every run of punctuation or
+    /// non-ASCII becomes one dash, so the result is always a valid identifier.
+    public static func slug(forDisplayName name: String) -> String {
+        var slug = ""
+        var pendingDash = false
+        for scalar in name.lowercased().unicodeScalars {
+            let value = scalar.value
+            let isDigit = value >= 48 && value <= 57
+            let isLowercaseLetter = value >= 97 && value <= 122
+            if isDigit || isLowercaseLetter {
+                if pendingDash && !slug.isEmpty { slug.append("-") }
+                slug.unicodeScalars.append(scalar)
+                pendingDash = false
+            } else if !slug.isEmpty {
+                pendingDash = true
+            }
+        }
+        if slug.count > maximumIdentifierLength {
+            slug = String(slug.prefix(maximumIdentifierLength))
+            while slug.hasSuffix("-") { slug.removeLast() }
+        }
+        return slug
+    }
+
+    /// The one place a draft becomes a provider. `existing` is the list the
+    /// identifier must not collide with; a caller editing a provider passes
+    /// the list without that provider so its own identifier stays available.
+    public static func validate(
+        displayName: String,
+        identifier: String,
+        baseURL: String,
+        docsURL: String = "",
+        existing: [CloudProvider]? = nil
+    ) -> Result<CloudProvider, CloudProviderValidationError> {
+        let name = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return .failure(.emptyDisplayName) }
+
+        let id = identifier.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard isValidIdentifier(id) else { return .failure(.invalidIdentifier) }
+        if builtIns.contains(where: { $0.id == id }) { return .failure(.reservedIdentifier(id)) }
+        if (existing ?? all()).contains(where: { $0.id == id }) {
+            return .failure(.duplicateIdentifier(id))
+        }
+
+        let normalizedBase: URL
+        switch checkBaseURL(baseURL) {
+        case .ok(let value):
+            normalizedBase = value
+        case .invalid:
+            return .failure(.invalidBaseURL)
+        case .insecure:
+            return .failure(.insecureBaseURL)
+        case .includesEndpoint:
+            return .failure(.baseURLIncludesEndpoint)
+        }
+
+        let rawDocs = docsURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let docs: URL?
+        if rawDocs.isEmpty {
+            docs = nil
+        } else if let url = URL(string: rawDocs), url.scheme != nil {
+            docs = url
+        } else {
+            return .failure(.invalidDocsURL)
+        }
+
+        return .success(CloudProvider(
+            id: id,
+            displayName: name,
+            docsURL: docs,
+            openAIBaseURL: normalizedBase
+        ))
+    }
+
+    // MARK: Identifier & URL rules
+
+    static func isValidIdentifier(_ id: String) -> Bool {
+        guard !id.isEmpty, id.count <= maximumIdentifierLength else { return false }
+        guard id.first != "-", id.last != "-" else { return false }
+        return id.unicodeScalars.allSatisfy { scalar in
+            let value = scalar.value
+            return (value >= 48 && value <= 57)      // 0-9
+                || (value >= 97 && value <= 122)     // a-z
+                || value == 45                       // -
+        }
+    }
+
+    private enum BaseURLCheck {
+        case ok(URL)
+        case invalid
+        case insecure
+        case includesEndpoint
+    }
+
+    /// Accepts an absolute URL, prefixes a missing scheme with https, strips a
+    /// trailing slash, and refuses the whole endpoint instead of the base.
+    /// The query and fragment are dropped: the credential rides the
+    /// `Authorization` header, never the URL.
+    private static func checkBaseURL(_ raw: String) -> BaseURLCheck {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .invalid }
+        let candidate = trimmed.contains("://") ? trimmed : "https://\(trimmed)"
+        guard var components = URLComponents(string: candidate),
+              let scheme = components.scheme?.lowercased(),
+              let host = components.host, !host.isEmpty else { return .invalid }
+        guard scheme == "https" || scheme == "http" else { return .invalid }
+        if scheme == "http", !isLoopbackHost(host) { return .insecure }
+
+        var path = components.path
+        while path.hasSuffix("/") { path.removeLast() }
+        let lower = path.lowercased()
+        if lower.hasSuffix("/chat/completions") || lower.hasSuffix("/models") {
+            return .includesEndpoint
+        }
+
+        components.path = path
+        components.query = nil
+        components.fragment = nil
+        guard let url = components.url, url.host != nil else { return .invalid }
+        return .ok(url)
+    }
+
+    private static func isLoopbackHost(_ host: String) -> Bool {
+        let normalized = host
+            .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            .lowercased()
+        return normalized == "127.0.0.1" || normalized == "::1" || normalized == "localhost"
+    }
+
+    // MARK: Lenient persistence
+
+    /// One stored entry that may fail to decode without taking the list with
+    /// it: a hand-edited or half-written record must cost that provider, not
+    /// every provider.
+    private struct FailableProvider: Decodable {
+        let provider: CloudProvider?
+
+        init(from decoder: Decoder) throws {
+            provider = try? CloudProvider(from: decoder)
+        }
+    }
+
+    static func decodeCustomProviders(from data: Data) -> [CloudProvider] {
+        guard let decoded = try? JSONDecoder().decode([FailableProvider].self, from: data) else {
+            return []
+        }
+        var seen = Set(builtIns.map(\.id))
+        var providers: [CloudProvider] = []
+        for entry in decoded {
+            guard let provider = entry.provider,
+                  isValidIdentifier(provider.id),
+                  seen.insert(provider.id).inserted else { continue }
+            providers.append(provider)
+        }
+        return providers
+    }
+}
+
+// MARK: - Runtime Snapshot
+
+/// The provider list the app is actually using. `CloudModelAddress` and the
+/// model scan read it off the main actor while Settings writes it, so the
+/// snapshot is a lock-guarded array of `Sendable` values rather than a
+/// main-actor property.
+public nonisolated final class CloudProviderRuntime: @unchecked Sendable {
+    public static let shared = CloudProviderRuntime()
+
+    private let lock = NSLock()
+    private var snapshot: [CloudProvider]
+
+    private init(defaults: UserDefaults = .standard) {
+        snapshot = CloudProviderCatalog.all(defaults: defaults)
+    }
+
+    public var providers: [CloudProvider] {
+        lock.lock()
+        defer { lock.unlock() }
+        return snapshot
+    }
+
+    /// Re-reads the persisted list. Called after every Settings mutation so a
+    /// background scan and the next turn see the same providers.
+    public func refresh(defaults: UserDefaults = .standard) {
+        let loaded = CloudProviderCatalog.all(defaults: defaults)
+        lock.lock()
+        snapshot = loaded
+        lock.unlock()
     }
 }
 
@@ -136,30 +416,43 @@ public nonisolated enum CloudModelAddress {
     }
 
     /// Splits a registry id back into its provider and upstream model id.
-    /// The provider id is matched against the known registry (so
+    /// The provider id is matched against the configured providers (so
     /// `cloud-model-synthetic-hf:org/name` resolves provider `synthetic`,
     /// model `hf:org/name`), which keeps provider ids free to use `-` too.
-    public static func parseModelId(_ id: String) -> (provider: CloudProvider, providerModelId: String)? {
+    ///
+    /// Providers are tried LONGEST id first: with `my` and `my-provider`
+    /// configured, `cloud-model-my-provider-x` belongs to `my-provider`. A
+    /// match that leaves an empty upstream id is not a candidate, so
+    /// `cloud-model-my-provider` still resolves to `my` + `provider`.
+    public static func parseModelId(
+        _ id: String,
+        providers: [CloudProvider] = CloudProviderRegistry.all
+    ) -> (provider: CloudProvider, providerModelId: String)? {
         guard id.hasPrefix(idPrefix) else { return nil }
         let rest = String(id.dropFirst(idPrefix.count))
-        for provider in CloudProviderRegistry.all where rest.hasPrefix(provider.id + "-") {
+        for provider in longestFirst(providers) where rest.hasPrefix(provider.id + "-") {
             let upstream = String(rest.dropFirst(provider.id.count + 1))
-            guard !upstream.isEmpty else { return nil }
-            return (provider, upstream)
+            if !upstream.isEmpty { return (provider, upstream) }
         }
         return nil
     }
 
     /// Splits a sentinel path `cloud://<providerId>/<upstreamModelId>`.
-    public static func parsePath(_ path: String) -> (provider: CloudProvider, providerModelId: String)? {
+    public static func parsePath(
+        _ path: String,
+        providers: [CloudProvider] = CloudProviderRegistry.all
+    ) -> (provider: CloudProvider, providerModelId: String)? {
         guard path.hasPrefix(pathScheme) else { return nil }
         let rest = String(path.dropFirst(pathScheme.count))
-        for provider in CloudProviderRegistry.all where rest.hasPrefix(provider.id + "/") {
+        for provider in longestFirst(providers) where rest.hasPrefix(provider.id + "/") {
             let upstream = String(rest.dropFirst(provider.id.count + 1))
-            guard !upstream.isEmpty else { return nil }
-            return (provider, upstream)
+            if !upstream.isEmpty { return (provider, upstream) }
         }
         return nil
+    }
+
+    private static func longestFirst(_ providers: [CloudProvider]) -> [CloudProvider] {
+        providers.sorted { $0.id.count > $1.id.count }
     }
 }
 
@@ -283,6 +576,19 @@ public nonisolated enum CloudModelRegistry {
         parsedModelIdList(noToolsDefaultsKey(for: provider.id), defaults: defaults)
     }
 
+    /// Replaces the set of models that run without a `tools` array.
+    public static func setModelIdsWithoutToolSupport(
+        _ modelIds: Set<String>,
+        for provider: CloudProvider,
+        defaults: UserDefaults = .standard
+    ) {
+        let cleaned = modelIds
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .sorted()
+        defaults.set(cleaned.joined(separator: "; "), forKey: noToolsDefaultsKey(for: provider.id))
+    }
+
     /// Upstream model ids registered as accepting image parts.
     public static func modelIdsWithVisionSupport(
         for provider: CloudProvider,
@@ -331,6 +637,46 @@ public nonisolated enum CloudModelRegistry {
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
         )
+    }
+
+    /// Drops every per-provider registration fact: the model list, the
+    /// no-tools list, and the vision marks. Used when the provider itself is
+    /// removed, so a re-added identifier starts clean.
+    public static func clearProviderState(
+        for provider: CloudProvider,
+        defaults: UserDefaults = .standard
+    ) {
+        defaults.removeObject(forKey: modelsDefaultsKey(for: provider.id))
+        defaults.removeObject(forKey: noToolsDefaultsKey(for: provider.id))
+        defaults.removeObject(forKey: visionDefaultsKey(for: provider.id))
+    }
+
+    /// Unregisters one model without disturbing the rest of the list. A
+    /// catalog can list models the endpoint does not serve on the wire
+    /// dialect in use, so pruning one has to be possible without Clear-all.
+    public static func removeRegisteredModel(
+        _ providerModelId: String,
+        for provider: CloudProvider,
+        defaults: UserDefaults = .standard
+    ) {
+        setRegisteredModelIds(
+            registeredModelIds(for: provider, defaults: defaults).filter { $0 != providerModelId },
+            for: provider,
+            defaults: defaults
+        )
+        var withoutTools = modelIdsWithoutToolSupport(for: provider, defaults: defaults)
+        if withoutTools.remove(providerModelId) != nil {
+            setModelIdsWithoutToolSupport(withoutTools, for: provider, defaults: defaults)
+        }
+        var withVision = modelIdsWithVisionSupport(for: provider, defaults: defaults)
+        if withVision.remove(providerModelId) != nil {
+            setModelIdsWithVisionSupport(withVision, for: provider, defaults: defaults)
+        }
+        // A development hook can register the same id with no list behind it.
+        if defaults.string(forKey: debugModelDefaultsKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) == providerModelId {
+            defaults.removeObject(forKey: debugModelDefaultsKey)
+        }
     }
 
     /// Whether a `/models` catalog entry looks like a chat completion model.
@@ -444,8 +790,8 @@ public nonisolated enum CloudModelRegistry {
         ))
     }
 
-    /// All registered entries across all known providers. Appended, never
-    /// prepended: `LocalModelManager.getDefaultOrFirstModel()` requires
+    /// All registered entries across all configured providers. Appended,
+    /// never prepended: `LocalModelManager.getDefaultOrFirstModel()` requires
     /// `discoveredModels.first` to be a weights model.
     ///
     /// Entries are only offered once the provider has a stored credential:
@@ -453,9 +799,10 @@ public nonisolated enum CloudModelRegistry {
     /// would put unpickable wishes in the composer.
     public static func makeDiscoveredModels(
         defaults: UserDefaults = .standard,
+        providers: [CloudProvider] = CloudProviderRegistry.all,
         hasCredential: (String) -> Bool = { CloudSecretStore.shared.exists(providerId: $0) }
     ) -> [DiscoveredModel] {
-        CloudProviderRegistry.all.flatMap { provider in
+        providers.flatMap { provider in
             let specs = registeredSpecs(for: provider, defaults: defaults)
             guard !specs.isEmpty, hasCredential(provider.id) else { return [] as [DiscoveredModel] }
             return specs.map { makeDiscoveredModel(for: $0) }

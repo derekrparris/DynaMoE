@@ -53,7 +53,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .agent:
             return "Configure agent tools, workspace, safety limits, web search, codebase indexing, subagents, MCP tool servers, and developer tooling."
         case .cloud:
-            return "Connect remote inference providers such as Synthetic: store API keys in the Keychain, verify the connection, and register cloud chat models."
+            return "Connect remote inference providers such as Synthetic, or add any OpenAI-compatible endpoint: store API keys in the Keychain, verify the connection, and register cloud chat models."
         case .server:
             return "Serve the loaded model over a local OpenAI- and Anthropic-compatible API for clients like Crush; configure access and watch live activity."
         }
@@ -86,7 +86,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .agent:
             return ["agent", "tools", "turbo", "grammar", "workspace", "directory", "search", "brave", "chrome", "index", "rag", "subagent", "git", "lint", "dogfood", "benchmark", "max multi-step agent iterations", "max tool output", "working directory", "mcp", "model context protocol", "keychain", "mcp.json", "stdio", "streamable http", "external tools", "import", "stored credentials", "authorize", "login keychain"]
         case .cloud:
-            return ["cloud", "provider", "synthetic", "synthetic.new", "remote", "api key", "connected provider", "deepseek", "cloud models", "keychain", "import", "stored credentials", "authorize", "login keychain"]
+            return ["cloud", "provider", "synthetic", "synthetic.new", "remote", "api key", "connected provider", "deepseek", "cloud models", "keychain", "import", "stored credentials", "authorize", "login keychain", "add provider", "base url", "openai-compatible", "opencode", "opencode zen", "zen", "endpoint"]
         case .server:
             return ["server", "api", "openai", "endpoint", "port", "api key", "completions", "local server", "crush", "http", "chat completions", "inference", "v1"]
         }

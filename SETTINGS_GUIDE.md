@@ -538,21 +538,34 @@ The **Local Inference Server** section turns DynaMoE into a local API server: th
 
 ## 8. Cloud Providers
 
-The **Cloud Providers** section connects remote inference providers, with **Synthetic** as the first supported provider. A connected provider's models appear in the chat composer under **Cloud Models**, alongside local weights and the Apple on-device model. In agent mode a cloud turn uses the provider's native function calling, while DynaMoE's local engine, KV cache, grammar mask, JetSpec, and memory/SSD machinery stay out of the path.
+The **Cloud Providers** section connects remote inference providers. **Synthetic** ships built in, and **Add Provider…** registers any other OpenAI-compatible endpoint at runtime. A configured provider's models appear in the chat composer under **Cloud Models**, alongside local weights and the Apple on-device model. In agent mode a cloud turn uses the provider's native function calling, while DynaMoE's local engine, KV cache, grammar mask, JetSpec, and memory/SSD machinery stay out of the path.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
 │  Cloud Providers Section                                               │
-│  Synthetic                                                             │
+│  Synthetic (built in)                                [Edit] [Remove]  │
 │  API Key:          [••••••••••••]  [Save]  [Remove]                    │
 │  Connection:       [Test & Sync Models] Connected ✓ 14 registered      │
 │  Documentation:    [Open API Docs]                                     │
+│  Provider:         Identifier synthetic · base https://api.synthetic…  │
 │                                                                        │
 │  Models:           [Sync Models] [Clear]  14 registered                │
+│                                                                        │
+│  Add a Provider                                                        │
+│  OpenAI-Compatible Endpoint                          [Add Provider…]   │
+│                                                                        │
 │  Registered Cloud Models                                               │
 │  Synthetic:        DeepSeek-V4.1-Flash-1017 (Synthetic)  ·  …          │
 └────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Adding & Removing Providers
+- **Add Provider…** opens a form for any endpoint that speaks `POST <base>/chat/completions` with an `Authorization: Bearer <key>` header (SSE streaming) and lists its catalog at `GET <base>/models`. The key never rides the URL.
+- **Display name** is what the composer shows as `model (name)`. The **identifier** is a lowercase slug derived from it; it becomes the Keychain account suffix (`dynamoe.cloud.<identifier>.apikey`) and the `cloud://<identifier>/<model>` address saved with each conversation, so it cannot be changed later.
+- **API base URL** includes the version segment (`https://opencode.ai/zen/v1`). `https://` is required, except that plain `http://` is accepted on `127.0.0.1`, `localhost`, and `::1` for a local server. Enter the base, not `…/chat/completions` or `…/models`. A missing scheme defaults to `https`, and a trailing slash is removed.
+- **Built-in providers cannot be edited or removed**, so the registry is never empty. **Remove** on a custom provider deletes its Keychain key, its registered model list, its no-tools list, and its vision marks; conversations pinned to its models then refuse the send with a reselect message rather than falling back to local weights.
+- The list persists as a JSON array under `dynamoe_cloud_custom_providers`. A hand-edited entry that cannot be decoded costs only that provider; the rest of the list is kept.
+- **OpenCode Zen** (hosted gateway): name `OpenCode Zen`, identifier `opencode-zen`, base `https://opencode.ai/zen/v1`, key from `console.opencode.ai`. Its `/models` catalog lists models served on other endpoints too: the `gpt-5.x` family uses `/zen/v1/responses` and Claude models use `/zen/v1/messages` (the Anthropic wire, currently a stub), so only the OpenAI-compatible ids answer here (`qwen3-coder`, `kimi-k2`, `kimi-k2-thinking`, `glm-4.6`, `glm-4.7-free`, `grok-code`, `big-pickle`, and their current `-free` variants). The **−** button beside a registered model prunes the rest; sending to one returns the gateway's own "Model … is not supported" error, which the turn surfaces.
 
 ### API Key & Connection Test
 - **API Key**: Paste a key from the provider's dashboard and press **Save**. It is written only to the Keychain (service `DRP.DynaMoE.cloud`, account `dynamoe.cloud.<provider>.apikey`) — never to UserDefaults, logs, or a config file. The field never pre-fills an existing key; the placeholder says "Stored" and typing a new value replaces it. **Remove** deletes the item from both the current and the older keychain.

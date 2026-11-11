@@ -2,10 +2,11 @@
 //  CloudSettingsView.swift
 //  DynaMoE
 //
-//  Settings ▸ Cloud Providers: one card per connected provider with a
+//  Settings ▸ Cloud Providers: one card per configured provider with a
 //  Keychain-backed API key, a connection test, and a one-click model sync
 //  that registers the provider's chat models (non-chat catalog entries such as
-//  embeddings and image generators are filtered out).
+//  embeddings and image generators are filtered out). Providers are data:
+//  "Add Provider…" registers any OpenAI-compatible endpoint at runtime.
 //
 //  Secrets are never pre-filled into the field: an existing key shows as a
 //  "stored" placeholder and typing replaces it. "Test & Sync" is the only
@@ -24,20 +25,66 @@ struct CloudProvidersSettingsView: View {
         case failure(String)
     }
 
+    /// One sheet serves both flows: `.add` creates a provider, `.edit` changes
+    /// the display name, base URL, or docs link of an existing one.
+    private enum ProviderEditorTarget: Identifiable {
+        case add
+        case edit(CloudProvider)
+
+        var id: String {
+            switch self {
+            case .add: return "add"
+            case .edit(let provider): return provider.id
+            }
+        }
+
+        var provider: CloudProvider? {
+            if case .edit(let provider) = self { return provider }
+            return nil
+        }
+    }
+
     @ObservedObject private var localModelManager = LocalModelManager.shared
+    @ObservedObject private var providerStore = CloudProviderStore.shared
     @State private var keyDrafts: [String: String] = [:]
     @State private var storedProviders: Set<String> = []
     @State private var testStates: [String: TestState] = [:]
+    @State private var providerEditor: ProviderEditorTarget? = nil
+    @State private var providerPendingRemoval: CloudProvider? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
-            ForEach(CloudProviderRegistry.all) { provider in
+            ForEach(providerStore.providers) { provider in
                 providerCard(provider)
             }
 
+            addProviderCard
             registeredModelsCard
         }
         .onAppear(perform: refreshState)
+        .sheet(item: $providerEditor) { target in
+            CloudAddProviderSheet(store: providerStore, provider: target.provider) { _ in
+                refreshState()
+            }
+        }
+        .alert(
+            "Remove provider?",
+            isPresented: Binding(
+                get: { providerPendingRemoval != nil },
+                set: { if !$0 { providerPendingRemoval = nil } }
+            ),
+            presenting: providerPendingRemoval
+        ) { provider in
+            Button("Remove", role: .destructive) {
+                providerStore.remove(provider)
+                keyDrafts[provider.id] = ""
+                testStates[provider.id] = .untested
+                providerPendingRemoval = nil
+            }
+            Button("Cancel", role: .cancel) { providerPendingRemoval = nil }
+        } message: { provider in
+            Text("\(provider.displayName) is removed together with its Keychain API key, its registered model list, and its vision marks. Conversations pinned to its models will ask you to reselect a model.")
+        }
     }
 
     // MARK: - Cards
@@ -115,26 +162,59 @@ struct CloudProvidersSettingsView: View {
 
             SettingsRowDivider()
 
+            if let docsURL = provider.docsURL {
+                SettingsRow(
+                    title: "Documentation",
+                    subtitle: "API reference, model catalog, and dashboard access.",
+                    icon: "book.fill",
+                    iconTint: .cyan
+                ) {
+                    Link("Open API Docs", destination: docsURL)
+                }
+
+                SettingsRowDivider()
+            }
+
             SettingsRow(
-                title: "Documentation",
-                subtitle: "API reference, model catalog, and dashboard access.",
-                icon: "book.fill",
+                title: "Provider",
+                subtitle: "Identifier \(provider.id) · OpenAI-compatible base \(provider.openAIBaseURL.absoluteString). Built-in providers stay available and cannot be edited.",
+                icon: "gearshape.2.fill",
                 iconTint: .cyan
             ) {
-                Link("Open API Docs", destination: provider.docsURL)
+                HStack(spacing: 8) {
+                    Button("Edit") { providerEditor = .edit(provider) }
+                        .disabled(providerStore.isBuiltIn(provider))
+                    Button("Remove") { providerPendingRemoval = provider }
+                        .disabled(providerStore.isBuiltIn(provider))
+                }
+            }
+        }
+    }
+
+    /// The generic seam: any endpoint that speaks OpenAI Chat Completions and
+    /// lists models over GET /models can be added without a code change.
+    private var addProviderCard: some View {
+        SettingsCard(header: "Add a Provider") {
+            SettingsRow(
+                title: "OpenAI-Compatible Endpoint",
+                subtitle: "DynaMoE drives an added provider through POST chat/completions with an Authorization: Bearer key and reads its catalog from GET models. Paste the API base including its version segment; OpenCode Zen, for example, is https://opencode.ai/zen/v1.",
+                icon: "plus.circle.fill",
+                iconTint: .cyan
+            ) {
+                Button("Add Provider…") { providerEditor = .add }
             }
         }
     }
 
     private var registeredModelsCard: some View {
         SettingsCard(header: "Registered Cloud Models") {
-            ForEach(Array(CloudProviderRegistry.all.enumerated()), id: \.element.id) { index, provider in
+            ForEach(Array(providerStore.providers.enumerated()), id: \.element.id) { index, provider in
                 let specs = registeredSpecs(for: provider)
                 SettingsRow(
                     title: provider.displayName,
                     subtitle: specs.isEmpty
                         ? "Nothing registered yet. Press \"Test & Sync Models\" to register the provider's chat models (embedding, speech, rerank, and image models are skipped)."
-                        : "Mark which models accept image input. No provider catalog publishes modalities, so this is opt-in; a model that rejects an image is un-marked automatically and the turn retries without it.",
+                        : "Mark which models accept image input. No provider catalog publishes modalities, so this is opt-in; a model that rejects an image is un-marked automatically and the turn retries without it. Use the minus button to drop a model the provider does not serve on this wire.",
                     icon: "cloud.fill",
                     iconTint: .cyan
                 ) {
@@ -148,22 +228,37 @@ struct CloudProvidersSettingsView: View {
                         ScrollView {
                             VStack(alignment: .trailing, spacing: 6) {
                                 ForEach(specs, id: \.providerModelId) { spec in
-                                    Toggle(isOn: visionBinding(for: spec, provider: provider)) {
-                                        Text(spec.displayName)
-                                            .font(.system(size: 10.5))
-                                            .lineLimit(1)
-                                            .truncationMode(.middle)
+                                    HStack(spacing: 6) {
+                                        Toggle(isOn: visionBinding(for: spec, provider: provider)) {
+                                            Text(spec.displayName)
+                                                .font(.system(size: 10.5))
+                                                .lineLimit(1)
+                                                .truncationMode(.middle)
+                                        }
+                                        .toggleStyle(.switch)
+                                        .controlSize(.mini)
+                                        .help("Let this model receive images")
+
+                                        Button {
+                                            CloudModelRegistry.removeRegisteredModel(
+                                                spec.providerModelId,
+                                                for: provider
+                                            )
+                                            LocalModelManager.shared.scanLocalModels()
+                                        } label: {
+                                            Image(systemName: "minus.circle")
+                                                .font(.system(size: 10.5))
+                                        }
+                                        .buttonStyle(.borderless)
+                                        .help("Remove this model from the picker")
                                     }
-                                    .toggleStyle(.switch)
-                                    .controlSize(.mini)
-                                    .help("Let this model receive images")
                                 }
                             }
                         }
                         .frame(maxHeight: 180)
                     }
                 }
-                if index < CloudProviderRegistry.all.count - 1 {
+                if index < providerStore.providers.count - 1 {
                     SettingsRowDivider()
                 }
             }
@@ -207,7 +302,10 @@ struct CloudProvidersSettingsView: View {
     }
 
     private func refreshState() {
-        storedProviders = Set(CloudProviderRegistry.all.filter {
+        // Re-read the persisted list so a `defaults write` made outside the
+        // app is visible the next time this pane appears.
+        providerStore.reloadFromStorage()
+        storedProviders = Set(providerStore.providers.filter {
             CloudSecretStore.shared.exists(providerId: $0.id)
         }.map(\.id))
     }
