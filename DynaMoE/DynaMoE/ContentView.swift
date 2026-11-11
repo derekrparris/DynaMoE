@@ -401,7 +401,10 @@ struct ContentView: View {
     @AppStorage("dynamoe_agent_tools_enabled") private var defaultAgentToolsEnabled: Bool = false
     @AppStorage("dynamoe_agent_working_directory") private var agentWorkingDirectory: String = ""
     @AppStorage("dynamoe_max_tool_output_length") private var maxToolOutputLength: Int = 4000
-    @AppStorage("dynamoe_max_agent_steps") private var maxAgentSteps: Int = 15
+    /// The agent step budget lives in UserDefaults rather than an `@AppStorage`
+    /// mirror here: the generation loops read it from inside `Task.detached`,
+    /// and `@AppStorage`'s wrapper is main-actor isolated. Settings owns the
+    /// controls; `agentStepCap` is how this view reads what they wrote.
     @AppStorage("dynamoe_chat_auto_delete_enabled") private var chatAutoDeleteEnabled: Bool = true
     @AppStorage("dynamoe_chat_retention_limit") private var chatRetentionLimit: Int = 10
     @State private var hasLoadedPersistedSessions: Bool = false
@@ -413,6 +416,13 @@ struct ContentView: View {
     @State private var isLoadingPersistedSessions: Bool = false
     @State private var sessionPersistTask: Task<Void, Never>? = nil
     @State private var hasPendingSessionPersist: Bool = false
+
+    /// The step cap every agent loop in this view enforces. `nil` is "no
+    /// limit". Resolved per call, so a change made in Settings applies to the
+    /// next comparison of a run already in flight.
+    nonisolated var agentStepCap: Int? {
+        AgentStepBudget.resolvedFromDefaults()
+    }
 
     var isAgentToolsEnabledForActiveSession: Bool {
         if let active = activeSessionBinding.wrappedValue, let enabled = active.isAgentToolsEnabled {
@@ -3881,7 +3891,8 @@ struct ContentView: View {
     /// schemas ride the request, streamed `tool_calls` are committed to the
     /// assistant message, each call gates on the same HITL approval and
     /// executes through `AgentHarness`, and the next step continues until the
-    /// model answers, calls `complete`, or exhausts `maxAgentSteps`. The whole
+    /// model answers, calls `complete`, a loop guard trips, or it exhausts the
+    /// step budget (`agentStepCap`; no cap at all when "no limit" is on). The whole
     /// loop lives in ONE task, so Stop aborts streaming, approvals, and tool
     /// execution together.
     @discardableResult
@@ -4325,7 +4336,7 @@ struct ContentView: View {
                     if CloudAgentLoopPolicy.shouldContinue(
                         stepCallCount: stepToolCalls.count,
                         step: step,
-                        maxSteps: self.maxAgentSteps,
+                        maxSteps: AgentStepBudget.compareCap(self.agentStepCap),
                         ranComplete: outcome.ranComplete,
                         failureLoop: outcome.failureLoop,
                         cancelled: outcome.cancelled
@@ -4362,7 +4373,8 @@ struct ContentView: View {
                 // answer. Spend ONE tools-disabled turn, mirroring the weights
                 // path, and let the model present what it already learned.
                 let wantedAnotherToolRound = stepToolCalls.count > 0 && !ranComplete && !failureLoop
-                let budgetExhausted = wantedAnotherToolRound && step + 1 >= self.maxAgentSteps
+                let budgetExhausted = wantedAnotherToolRound
+                    && AgentStepBudget.isExhausted(step: step, cap: self.agentStepCap)
                 if toolsEnabled,
                    CloudAgentLoopPolicy.shouldForceSynthesis(
                        failureLoop: failureLoop,
@@ -4404,11 +4416,11 @@ struct ContentView: View {
                 // it here would end the run while a report is still being
                 // written.
                 if toolsEnabled, !ranComplete, !ranSynthesisTurn,
-                   step + 1 < self.maxAgentSteps {
+                   AgentStepBudget.allowsAnotherStep(step: step, cap: self.agentStepCap) {
                     await self.awaitSessionSubagents(sessionId: sessionId, timeout: 120)
                 }
                 if toolsEnabled, !ranComplete, !ranSynthesisTurn,
-                   step + 1 < self.maxAgentSteps,
+                   AgentStepBudget.allowsAnotherStep(step: step, cap: self.agentStepCap),
                    takeSubagentRelayDirective() {
                     ranSynthesisTurn = true
                     let nextMessageId = UUID()
@@ -5242,7 +5254,9 @@ struct ContentView: View {
             if !gestureSplit.skipNotices.isEmpty {
                 print("🧹 [AGENT] dropped \(gestureSplit.skipNotices.count) no-op gesture call(s) — treating turn as finished")
             }
-            let hasUncalledIntent = runAgentTools && actionableCalls.isEmpty && agentStep == 0 && (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink)
+            let hasUncalledIntent = runAgentTools && actionableCalls.isEmpty && agentStep == 0
+                && AgentStepBudget.allowsAnotherStep(step: agentStep, cap: self.agentStepCap)
+                && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink)
             let willContinueAgent = (!actionableCalls.isEmpty || hasUncalledIntent)
             // Collapse guard: the agent run ended with no tool calls and no usable answer,
             // but this run saw repeated degenerate (empty-argument) tool calls — force one
@@ -5671,8 +5685,14 @@ struct ContentView: View {
                         || agent.totalFailedToolCalls >= agent.failedToolCallTotalLimit
                         || agent.maxRepeatedToolCallCount >= agent.repeatedToolCallLimit
 
+                    // Resolve the cap once for this post-turn decision, so the
+                    // status below names the budget that actually applied even
+                    // if Settings changed while the turn was generating.
+                    let stepCap = self.agentStepCap
+
                     // If not finished and steps remaining, invoke next step
-                    if !anyCompleted && !toolFailureLoop && (agentStep + 1 < self.maxAgentSteps) {
+                    if !anyCompleted && !toolFailureLoop,
+                       AgentStepBudget.allowsAnotherStep(step: agentStep, cap: stepCap) {
                         // Auto-relay: completed background subagents whose final reports have
                         // not yet reached the conversation get injected as SUBAGENT_RESULT
                         // blocks here, so the coordinator can present them to the user.
@@ -5903,12 +5923,18 @@ struct ContentView: View {
                         await MainActor.run {
                             self.isGeneratingText = false
                             self.generationTask = nil
-                            self.showStatus(anyCompleted ? "✨ Agent completed task." : "✨ Agent completed maximum allowed steps (\(self.maxAgentSteps)).")
+                            if let notice = AgentStepBudget.runEndNotice(
+                                anyCompleted: anyCompleted,
+                                loopGuardTripped: toolFailureLoop,
+                                cap: stepCap
+                            ) {
+                                self.showStatus(notice)
+                            }
                             self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)
                         }
                         return
                     }
-                } else if (agentStep + 1 < self.maxAgentSteps)
+                } else if AgentStepBudget.allowsAnotherStep(step: agentStep, cap: self.agentStepCap)
                     && gestureSplit.skipNotices.isEmpty
                     && AgentHarness.shared.hasToolCallMarkup(in: finalDecoded) {
                     // The model attempted a tool call that the parser could not turn into
@@ -5979,7 +6005,9 @@ struct ContentView: View {
                         )
                     }
                     return
-                } else if agentStep == 0 && (agentStep + 1 < self.maxAgentSteps) && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink) {
+                } else if agentStep == 0
+                    && AgentStepBudget.allowsAnotherStep(step: agentStep, cap: self.agentStepCap)
+                    && AgentHarness.shared.detectUncalledActionIntent(content: finalResp, thinking: finalThink) {
                     if Task.isCancelled {
                         await MainActor.run {
                             guard self.ownsGeneration(myGenerationId) else { return }

@@ -84,7 +84,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .memory:
             return ["memory", "ram", "budget", "kv cache", "precision", "fp8", "fp16", "prefetch", "ssd", "paging", "diagnostics", "cache", "lookahead depth", "execution mode", "working set budget"]
         case .agent:
-            return ["agent", "tools", "turbo", "grammar", "workspace", "directory", "search", "brave", "chrome", "index", "rag", "subagent", "git", "lint", "dogfood", "benchmark", "max multi-step agent iterations", "max tool output", "working directory", "mcp", "model context protocol", "keychain", "mcp.json", "stdio", "streamable http", "external tools", "import", "stored credentials", "authorize", "login keychain"]
+            return ["agent", "tools", "turbo", "grammar", "workspace", "directory", "search", "brave", "chrome", "index", "rag", "subagent", "git", "lint", "dogfood", "benchmark", "max multi-step agent iterations", "no limit", "unlimited", "max tool output", "working directory", "mcp", "model context protocol", "keychain", "mcp.json", "stdio", "streamable http", "external tools", "import", "stored credentials", "authorize", "login keychain"]
         case .cloud:
             return ["cloud", "provider", "synthetic", "synthetic.new", "remote", "api key", "connected provider", "deepseek", "cloud models", "keychain", "import", "stored credentials", "authorize", "login keychain", "add provider", "base url", "openai-compatible", "opencode", "opencode zen", "zen", "endpoint"]
         case .server:
@@ -112,7 +112,8 @@ struct SettingsSheetView: View {
     @AppStorage("dynamoe_agent_grammar_masking") private var isGrammarMaskingEnabled: Bool = true
     @AppStorage("dynamoe_agent_working_directory") private var agentWorkingDirectory: String = ""
     @AppStorage("dynamoe_max_tool_output_length") private var maxToolOutputLength: Int = 4000
-    @AppStorage("dynamoe_max_agent_steps") private var maxAgentSteps: Int = 15
+    @AppStorage(AgentStepBudget.finiteStepsDefaultsKey) private var maxAgentSteps: Int = AgentStepBudget.defaultFiniteSteps
+    @AppStorage(AgentStepBudget.unlimitedDefaultsKey) private var isMaxAgentStepsUnlimited: Bool = false
     @AppStorage("dynamoe_brave_search_api_key") private var braveApiKey: String = ""
     @AppStorage("dynamoe_chrome_binary_path") private var customChromeBinaryPath: String = ""
     @AppStorage("dynamoe_jetspec_enabled") private var jetSpecEnabled: Bool = false
@@ -123,6 +124,12 @@ struct SettingsSheetView: View {
     @ObservedObject private var dogfoodRunner = ModelDogfoodBenchmarkRunner.shared
     @ObservedObject private var updaterViewModel = UpdaterViewModel.shared
     @State private var showDogfoodReportModal: Bool = false
+
+    /// The step cap as the agent loops resolve it, so this tab's value label
+    /// reads the same number the run enforces.
+    private var agentStepCap: Int? {
+        AgentStepBudget.resolvedCap(unlimited: isMaxAgentStepsUnlimited, configured: maxAgentSteps)
+    }
 
     // Local Inference Server bindings & live dashboard state
     @ObservedObject private var serverController = ServerController.shared
@@ -1311,17 +1318,30 @@ struct SettingsSheetView: View {
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
-                        Text("\(maxAgentSteps) steps")
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundStyle(.secondary)
+                        if let cap = agentStepCap {
+                            Text(AgentStepBudget.statusLabel(cap: cap))
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+                        Toggle("No limit", isOn: $isMaxAgentStepsUnlimited)
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
+                            .accessibilityLabel("No Limit for Max Multi-Step Agent Iterations")
                     }
                     Slider(value: Binding(
-                        get: { Double(maxAgentSteps) },
+                        get: { Double(max(1, maxAgentSteps)) },
                         set: { maxAgentSteps = Int($0) }
                     ), in: 1...100, step: 1)
+                    .disabled(isMaxAgentStepsUnlimited)
+                    .opacity(isMaxAgentStepsUnlimited ? 0.4 : 1.0)
                     .accessibilityLabel("Max Multi-Step Agent Iterations")
 
-                    if maxAgentSteps > 40 {
+                    if isMaxAgentStepsUnlimited {
+                        Text("The run is bounded only by the model calling complete, a tool loop guard (a failed-call streak, a repeated call, or the search budget), the model's context limit (the KV budget for local weights, the context window for a cloud provider), or Stop. Each extra step adds an assistant message to the transcript and grows the prompt.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if maxAgentSteps > 40 {
                         Text("Past about 40 steps a local model usually runs out of KV budget first, so the run stops with a capacity error rather than the step limit.")
                             .font(.system(size: 11))
                             .foregroundStyle(.orange)
