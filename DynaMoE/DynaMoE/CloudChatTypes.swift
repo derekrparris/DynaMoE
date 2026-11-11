@@ -796,6 +796,7 @@ public nonisolated enum CloudMessageAssembler {
         if let error = record.error, !error.isEmpty { return error }
         switch record.status {
         case .rejected: return "Action rejected by user."
+        case .withheld: return "Withheld by the agent mode; this call was not executed."
         case .awaitingApproval: return "Awaiting approval."
         case .running: return "The call did not finish before the turn ended."
         case .error: return "The tool call failed."

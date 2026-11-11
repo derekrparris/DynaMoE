@@ -53,11 +53,14 @@ nonisolated public enum ChatCommand: Equatable {
         case "/plan":
             // A bare `/plan` is the short way to enter plan mode; `on`/`off`
             // let a conversation state the mode explicitly, which is what a
-            // user who cannot tell which mode they are in needs.
+            // user who cannot tell which mode they are in needs. An argument
+            // that is neither is NOT a command: `/plan off.` used to enter the
+            // mode, which does the opposite of what was typed, and returning nil
+            // sends the text as an ordinary message where the typo is visible.
             switch rest.lowercased() {
             case "", "on", "enter", "start": return .plan(enabled: true)
             case "off", "exit", "leave", "code": return .plan(enabled: false)
-            default: return .plan(enabled: true)
+            default: return nil
             }
         default:
             return nil

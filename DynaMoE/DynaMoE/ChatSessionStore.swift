@@ -262,7 +262,7 @@ final class ChatSessionStore: ObservableObject {
                     calls[cIdx].status = .error
                     calls[cIdx].error = "Interrupted when the app closed."
                     calls[cIdx].output = nil
-                case .success, .error, .rejected:
+                case .success, .error, .rejected, .withheld:
                     break
                 }
             }

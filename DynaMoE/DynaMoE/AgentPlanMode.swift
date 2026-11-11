@@ -118,11 +118,52 @@ nonisolated public enum PlanModePolicy {
         "tools_discover", "tools_load", "tools_unload"
     ]
 
-    /// The write and execute tools, named explicitly so the prompt can tell the
-    /// model they are absent rather than leaving it to infer that from a list.
-    public static let withheldToolNames: Set<String> = [
-        "file_write", "file_edit", "shell_run", "git_commit", "complete"
+    /// A coder tool plan mode takes away, and what it is for.
+    public struct WithheldTool: Sendable, Hashable {
+        public let name: String
+        public let purpose: String
+    }
+
+    /// The write, execute and completion tools, each with the purpose the
+    /// directive prints beside it.
+    ///
+    /// This is the ONE place those names are written down: the directive's
+    /// bullet list is generated from it (`directive(toolNames:)`), so a rename
+    /// or an addition here cannot leave the prompt describing a tool that no
+    /// longer exists, or omit one that does. It is deliberately not the
+    /// enforcement rule — `allowedToolNames` is. A tool that is neither allowed
+    /// nor named here is still withheld; the tools section enumerates the
+    /// ACTUAL withheld set for the installed catalog every turn.
+    public static let withheldTools: [WithheldTool] = [
+        WithheldTool(name: "file_write", purpose: "file creation and editing"),
+        WithheldTool(name: "file_edit", purpose: "file creation and editing"),
+        WithheldTool(name: "shell_run", purpose: "shell execution"),
+        WithheldTool(name: "git_commit", purpose: "committing"),
+        WithheldTool(name: "complete", purpose: "ending the task with a summary")
     ]
+
+    /// The same set by name, for callers that only need membership.
+    public static var withheldToolNames: Set<String> {
+        Set(withheldTools.map(\.name))
+    }
+
+    /// The `<capabilities>` bullet list, generated from `withheldTools`.
+    ///
+    /// Names that share a purpose are grouped onto one bullet, which is how the
+    /// prompt reads (`- file_write, file_edit (file creation and editing)`) and
+    /// keeps the list from spelling the same description out twice. Generation
+    /// order follows the constant, so the prompt is stable across runs.
+    static var withheldToolBullets: String {
+        var order: [String] = []
+        var namesByPurpose: [String: [String]] = [:]
+        for tool in withheldTools {
+            if namesByPurpose[tool.purpose] == nil { order.append(tool.purpose) }
+            namesByPurpose[tool.purpose, default: []].append("`\(tool.name)`")
+        }
+        return order
+            .map { "- \(namesByPurpose[$0, default: []].joined(separator: ", ")) (\($0))" }
+            .joined(separator: "\n")
+    }
 
     /// True when plan mode must withhold `name`.
     ///
@@ -149,10 +190,7 @@ nonisolated public enum PlanModePolicy {
 
         <capabilities>
         You do NOT have access to file-modification or shell tools. These tools are physically absent from your environment — calling them fails immediately:
-        - `file_write`, `file_edit` (file creation and editing)
-        - `shell_run` (shell execution)
-        - `git_commit` (committing)
-        - `complete` (ending the task with a summary)
+        \(withheldToolBullets)
         - every `mcp__*` tool
 
         Your available tools are: \(available).

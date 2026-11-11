@@ -22,6 +22,11 @@ struct ChatDetailView: View {
     @ObservedObject var localModelManager: LocalModelManager = LocalModelManager.shared
     
     var isGenerating: Bool
+    /// True while any turn is live anywhere in the process, including a
+    /// local-API one. The mode pill is a promise to the turn already running, so
+    /// it is disabled for the duration instead of offering a change the app will
+    /// refuse.
+    var isModeChangeLocked: Bool = false
     /// The progress bubble /compact is streaming its summary into, or nil.
     /// Rendering flags are scoped to this message id, never a bare
     /// "compacting" boolean, so historical bubbles keep their settled
@@ -88,12 +93,29 @@ struct ChatDetailView: View {
         session?.agentMode == .plan
     }
 
+    /// The mode pill's tooltip. When a turn is live it says WHY the control is
+    /// unavailable: a disabled pill still explaining what plan mode is reads as
+    /// a broken toggle rather than a promise being kept.
+    private var planPillHelp: String {
+        if isModeChangeLocked {
+            return "The agent's mode cannot change while a turn is running (⇧⌘P)."
+        }
+        return isPlanMode
+            ? "Plan Mode is ON: DynaMoE reads and searches only, then writes an implementation plan for your approval. No file writes, shell commands, git commits or MCP tools (⇧⌘P)."
+            : "Click to plan before implementing: DynaMoE reads and searches only, then proposes a plan you approve (⇧⌘P)."
+    }
+
     /// The assistant message carrying a finished plan, when the conversation is
     /// in plan mode, the plan ended, and the user has not dismissed that plan's
     /// handoff. Derived rather than recorded so it cannot desync from whichever
     /// asynchronous path ended the turn.
+    ///
+    /// Gated on `!isGenerating`: the marker streams in as the LAST line of the
+    /// answer, so for the rest of that same turn the bar would be on screen
+    /// offering a send the app would refuse. Approving then flipped the mode and
+    /// sent nothing.
     private var readyPlanMessage: ChatMessage? {
-        guard isPlanMode, let session,
+        guard isPlanMode, !isGenerating, let session,
               let message = session.messages.last(where: { $0.role == .assistant }),
               PlanMarkers.readyPresent(in: message.content),
               dismissedPlanMessageId != message.id else { return nil }
@@ -1024,6 +1046,11 @@ struct ChatDetailView: View {
                         // per conversation, like the Tools toggle beside it. Shown
                         // even while tools are OFF: entering plan mode arms them,
                         // and hiding the only way in would hide that.
+                        //
+                        // Labelled by what a click DOES when plan mode is off and
+                        // by what is ACTIVE when it is on, because "Code Mode" on a
+                        // button read as an offer to switch back to a mode the
+                        // conversation was already in.
                         if !isPlainChatOnlyBackend {
                             Button(action: {
                                 onSetPlanMode?(!isPlanMode)
@@ -1032,7 +1059,7 @@ struct ChatDetailView: View {
                                     Image(systemName: isPlanMode ? "checklist" : "chevron.left.forwardslash.chevron.right")
                                         .font(.system(size: max(8.5, 10 * zoomManager.zoomScale)))
                                         .foregroundColor(isPlanMode ? .purple : .secondary)
-                                    Text(isPlanMode ? "Plan Mode" : "Code Mode")
+                                    Text(isPlanMode ? "Plan Mode" : "Plan")
                                         .font(.system(size: max(9.5, 11.5 * zoomManager.zoomScale), weight: .medium))
                                         .foregroundColor(isPlanMode ? .purple : .secondary)
                                 }
@@ -1047,9 +1074,10 @@ struct ChatDetailView: View {
                             }
                             .buttonStyle(.plain)
                             .keyboardShortcut("p", modifiers: [.command, .shift])
-                            .help(isPlanMode
-                                  ? "Plan Mode is ON: DynaMoE reads and searches only, then writes an implementation plan for your approval. No file writes, shell commands, git commits or MCP tools (⇧⌘P)."
-                                  : "Code Mode: DynaMoE can read, write and run commands. Click to plan before implementing (⇧⌘P).")
+                            .disabled(isModeChangeLocked)
+                            .opacity(isModeChangeLocked ? 0.45 : 1)
+                            .accessibilityLabel(isPlanMode ? "Plan Mode is on" : "Enter Plan Mode")
+                            .help(planPillHelp)
                             .transition(.opacity.combined(with: .scale))
                         }
 
@@ -1335,6 +1363,7 @@ struct ChatDetailView: View {
                         .clipShape(Circle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Dismiss the plan prompt")
                 .help("Dismiss this prompt. Press Return in an empty composer to bring it back.")
             }
 
@@ -4582,6 +4611,15 @@ struct ToolCallCardView: View {
                                 .font(.system(size: 10.5, weight: .bold))
                                 .foregroundColor(.orange)
                         }
+                    case .withheld:
+                        HStack(spacing: 4) {
+                            Image(systemName: "shield.lefthalf.filled")
+                                .font(.system(size: 11))
+                                .foregroundColor(.purple)
+                            Text("Withheld in Plan Mode")
+                                .font(.system(size: 10.5, weight: .medium))
+                                .foregroundColor(.purple)
+                        }
                     case .rejected:
                         HStack(spacing: 4) {
                             Image(systemName: "xmark.circle")
@@ -4726,6 +4764,7 @@ struct ToolCallCardView: View {
         case .error: return .red
         case .awaitingApproval: return .orange
         case .rejected: return .secondary
+        case .withheld: return .purple
         }
     }
 }

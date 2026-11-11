@@ -1487,6 +1487,7 @@ struct ContentView: View {
                     session: activeSessionBinding,
                     promptText: $chatPromptText,
                     isGenerating: isGeneratingText && (generatingSessionId == (selectedSessionId ?? sessions.first?.id)),
+                    isModeChangeLocked: isModeChangeLocked,
                     compactionProgressMessageId: (isCompactingConversation && compactingSessionId == (selectedSessionId ?? sessions.first?.id)) ? compactingProgressMessageId : nil,
                     isStreamingOffDisk: isStreamingOffDisk,
                     generationSpeed: generationSpeedTokPerSec,
@@ -2162,13 +2163,40 @@ struct ContentView: View {
         }
     }
 
+    /// True while any turn could be reading the process-global agent surface:
+    /// this app's own generation, a stopped turn still unwinding, or a local-API
+    /// turn, which shares `AgentHarness.activeMode` and the grammar registry.
+    /// The mode belongs to the TURN as well as the conversation, so it cannot be
+    /// changed underneath one.
+    private var isModeChangeLocked: Bool {
+        isGeneratingText || generationTask != nil || generationTeardownTask != nil
+            || CompletionEngine.shared.isActive
+    }
+
     /// Applies the conversation's agent surface. Shared by the composer's mode
     /// pill, `/plan` and the plan handoff, because all three must do the same
     /// three things: record the mode, arm the tools plan mode needs, and drop
     /// the KV pin — the system block's plan section and tool list change with
     /// the mode, so a prefix recorded in the other mode is stale.
+    ///
+    /// Refused while a turn is running. `AgentHarness.activeMode` is
+    /// process-global and the live turn's prompt, grammar mask and tool
+    /// executions were all built against it, so a flip mid-turn would be a
+    /// change to a promise already made.
     @discardableResult
     private func setPlanMode(_ enabled: Bool, sessionId: UUID) -> Bool {
+        guard !isModeChangeLocked else {
+            showStatus("⏳ Finishing the current turn first — the agent's mode cannot change while it runs.", kind: .warning)
+            return false
+        }
+        return applyPlanMode(enabled, sessionId: sessionId)
+    }
+
+    /// The write half of `setPlanMode`, without the lock: a caller that has
+    /// already established the change is allowed (or is undoing a change of its
+    /// own) uses this so a freshly started turn cannot wedge the undo.
+    @discardableResult
+    private func applyPlanMode(_ enabled: Bool, sessionId: UUID) -> Bool {
         guard let idx = sessions.firstIndex(where: { $0.id == sessionId }) else { return false }
         let target: AgentMode = enabled ? .plan : .code
         if (sessions[idx].agentMode ?? .code) == target { return true }
@@ -2192,12 +2220,28 @@ struct ContentView: View {
     /// implementation. The continuation is an ordinary user turn rather than a
     /// hidden one, so nothing happens in the conversation that the transcript
     /// does not show.
+    ///
+    /// A refused send UNDOES the mode change. The bar's whole promise is that
+    /// approving starts the implementation turn; leaving the conversation in
+    /// code mode with nothing sent would break it silently.
     private func approvePlanAndImplement(sessionId: UUID, withTurbo: Bool) {
-        _ = setPlanMode(false, sessionId: sessionId)
+        guard !isModeChangeLocked else {
+            showStatus("⏳ The current turn is still running — approve the plan once it finishes.", kind: .warning)
+            return
+        }
+        guard let idx = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
+        let previousMode = sessions[idx].agentMode ?? .code
+        let turboWasEnabled = UserDefaults.standard.bool(forKey: "dynamoe_agent_turbo_mode")
+        guard applyPlanMode(false, sessionId: sessionId) else { return }
         if withTurbo {
             UserDefaults.standard.set(true, forKey: "dynamoe_agent_turbo_mode")
         }
-        _ = handleSendMessage("Implement the plan.", sessionId: sessionId)
+        guard handleSendMessage("Implement the plan.", sessionId: sessionId) else {
+            UserDefaults.standard.set(turboWasEnabled, forKey: "dynamoe_agent_turbo_mode")
+            _ = applyPlanMode(previousMode == .plan, sessionId: sessionId)
+            showStatus("⚠️ Could not start the implementation turn — the conversation is still in Plan Mode. Try again.", kind: .warning)
+            return
+        }
     }
 
     /// Manual compaction via /compact. The Apple Foundation Model folds the
@@ -2809,6 +2853,7 @@ struct ContentView: View {
                 modelDisplayName: sessionModelName
                     ?? CloudModelRegistry.defaultDisplayName(provider: cloud.provider, providerModelId: cloud.providerModelId),
                 systemPrompt: cloudSystemPrompt,
+                mode: sessionMode,
                 isAgentTurn: cloudAgentMode
             )
             return true
@@ -3717,6 +3762,7 @@ struct ContentView: View {
         providerModelId: String,
         modelDisplayName: String,
         systemPrompt: String,
+        mode: AgentMode,
         isAgentTurn: Bool = false
     ) -> Bool {
         let displayName = modelDisplayName.isEmpty ? providerModelId : modelDisplayName
@@ -3867,7 +3913,7 @@ struct ContentView: View {
                 let tools = CloudAgentStepPlan.offersTools(
                     agentTurn: toolsEnabled,
                     isSynthesisTurn: ranSynthesisTurn
-                ) ? AgentHarness.shared.availableToolDefinitions : []
+                ) ? AgentHarness.shared.availableToolDefinitions(mode: mode) : []
                 let stepMessageId = currentMessageId
                 let generationStartTime = CFAbsoluteTimeGetCurrent()
 
@@ -4118,6 +4164,7 @@ struct ContentView: View {
                     self.showStatus("⚙️ Executing \(stepToolCalls.count) tool call(s)...")
                     let outcome = await self.executeCloudToolCalls(
                         calls: stepToolCalls,
+                        mode: mode,
                         sessionId: sessionId,
                         messageId: stepMessageId,
                         myGenerationId: myGenerationId
@@ -4294,8 +4341,15 @@ struct ContentView: View {
     /// spending an approval, state-changing tools gate on HITL unless Turbo
     /// Mode is on, and outcomes feed the shared failure/repeat counters that
     /// decide whether the loop must stop.
+    ///
+    /// `mode` is the TURN's mode, carried by value from the step that started
+    /// it. `executeTool` defaults it to `AgentHarness.shared.activeMode`, which
+    /// is process-global and therefore mutable mid-turn; a plan turn that read
+    /// the global could execute a write if the user flipped the pill while it
+    /// ran.
     private func executeCloudToolCalls(
         calls: [CloudToolCall],
+        mode: AgentMode,
         sessionId: UUID,
         messageId: UUID,
         myGenerationId: UInt64
@@ -4332,7 +4386,7 @@ struct ContentView: View {
                     error: error
                 ))
                 agent.recordToolCallValidity(false)
-                agent.recordToolCallOutcome(toolName: call.name, succeeded: false)
+                agent.recordToolCallOutcome(toolName: call.name, outcome: .failed)
             }
         }
 
@@ -4373,7 +4427,7 @@ struct ContentView: View {
             // scaffold: reject it without executing and without a HITL prompt.
             if AgentHarness.hasEmptyRequiredArguments(toolName: call.name, arguments: parsedCall.arguments) {
                 agent.recordToolCallValidity(false)
-                agent.recordToolCallOutcome(toolName: call.name, succeeded: false)
+                agent.recordToolCallOutcome(toolName: call.name, outcome: .failed)
                 let emptyArgJSON = AgentHarness.toolErrorJSON(
                     tool: call.name,
                     error: "Empty arguments — this call carried no usable parameters and was not executed. Either provide real arguments, or stop calling tools and answer the user directly from what you already know."
@@ -4394,7 +4448,7 @@ struct ContentView: View {
                 let approved = await ActionApprovalManager.shared.waitForApproval(id: record.id)
                 if !approved {
                     let rejectJSON = AgentHarness.toolErrorJSON(tool: call.name, error: "Action rejected by user.")
-                    agent.recordToolCallOutcome(toolName: call.name, succeeded: false)
+                    agent.recordToolCallOutcome(toolName: call.name, outcome: .failed)
                     updateRecord(record.id) { rec in
                         rec.status = .rejected
                         rec.error = "Action rejected by user."
@@ -4411,18 +4465,20 @@ struct ContentView: View {
             let execResult = await agent.executeTool(
                 call: parsedCall,
                 workingDirectory: baseWorkingDirectory,
-                maxOutputLength: maxToolOutputLength
+                maxOutputLength: maxToolOutputLength,
+                mode: mode
             )
             agent.recordToolCallOutcome(
                 toolName: call.name,
-                // Only `.error` is the model's own failure. A `.rejected` call
-                // was refused by the environment (plan mode) or by the user, and
-                // counting those towards the failed-call loop guard would end a
-                // plan-mode run for asking once too often for a tool the mode
-                // withholds.
-                succeeded: execResult.record.status != .error
+                outcome: execResult.record.status.toolCallOutcome
             )
-            agent.recordToolCallFingerprint(toolName: call.name, arguments: parsedCall.arguments)
+            // A withheld call is not fingerprinted: `recordToolCallFingerprint`
+            // CLEARS every count for the mutating tools, so counting a refusal of
+            // `file_write` would reset the repeat guard on each attempt and leave
+            // only the step budget bounding the loop.
+            if execResult.record.status != .withheld {
+                agent.recordToolCallFingerprint(toolName: call.name, arguments: parsedCall.arguments)
+            }
             // `isCompleted` covers every tool that ends the run (the harness's
             // loop guards set it too), matching the weights path.
             if execResult.isCompleted || call.name == "complete" { ranComplete = true }
@@ -4589,9 +4645,17 @@ struct ContentView: View {
         // the current selection, so an async send that resumed after a selection
         // change still formats with the conversation's own model.
         let generationSession = sessionId.flatMap { id in sessions.first(where: { $0.id == id }) }
-        // Each agent step re-enters here, so the turn's mode is re-derived from
-        // the conversation rather than trusted to survive from the first step.
-        AgentHarness.shared.setActiveMode(generationSession?.agentMode ?? .code)
+        // The turn's agent surface, resolved ONCE and carried by value for the
+        // rest of the turn. `AgentHarness.activeMode` is process-global, so
+        // reading it at each tool call meant a mode flip while the turn ran
+        // could hand a plan turn a write tool. Every tool execution and every
+        // tool-block refresh below takes `turnMode` instead.
+        //
+        // The step re-derives it from the conversation because an agent
+        // continuation IS a new step; the UI refuses mode changes while a turn
+        // is running, so this cannot differ from the step before it.
+        let turnMode: AgentMode = generationSession?.agentMode ?? .code
+        AgentHarness.shared.setActiveMode(turnMode)
         let generationModelName = modelDisplayName(for: generationSession)
         let cleanSystem = ModelConfig.buildEffectiveSystemPrompt(
             userPrompt: systemPrompt,
@@ -5124,7 +5188,7 @@ struct ContentView: View {
                     let staleSynthesisPrompt = formattedPrompt + assistantTurnText + synthesisDirective
                     let synthesisPrompt = AgentHarness.shared.refreshingLoadedToolsSection(
                         inPrompt: staleSynthesisPrompt,
-                        mode: AgentHarness.shared.activeMode
+                        mode: turnMode
                     )
                     let synthesisToolsChanged = (synthesisPrompt != staleSynthesisPrompt)
                     let splicedTokens = self.buildSplicedContinuationTokens(
@@ -5294,7 +5358,7 @@ struct ContentView: View {
                         // broken scaffold never burns an execution step or an approval.
                         if AgentHarness.hasEmptyRequiredArguments(toolName: call.name, arguments: call.arguments) {
                             AgentHarness.shared.recordToolCallValidity(false)
-                            AgentHarness.shared.recordToolCallOutcome(toolName: call.name, succeeded: false)
+                            AgentHarness.shared.recordToolCallOutcome(toolName: call.name, outcome: .failed)
                             await MainActor.run {
                                 if let sId = sessionId, let mId = messageId,
                                    let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
@@ -5359,7 +5423,7 @@ struct ContentView: View {
                                 }
                                 let rejectJSON = AgentHarness.toolErrorJSON(tool: call.name, error: "Action rejected by user.")
                                 responseSlots[actionableCallIndices[idx]] = rejectJSON
-                                AgentHarness.shared.recordToolCallOutcome(toolName: call.name, succeeded: false)
+                                AgentHarness.shared.recordToolCallOutcome(toolName: call.name, outcome: .failed)
                                 if let sId = sessionId, let mId = messageId,
                                    let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
                                    let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }),
@@ -5375,19 +5439,22 @@ struct ContentView: View {
                         let execResult = await AgentHarness.shared.executeTool(
                             call: call,
                             workingDirectory: baseWdURL,
-                            maxOutputLength: self.maxToolOutputLength
+                            maxOutputLength: self.maxToolOutputLength,
+                            mode: turnMode
                         )
                         responseSlots[actionableCallIndices[idx]] = execResult.resultJSON
                         AgentHarness.shared.recordToolCallOutcome(
                             toolName: call.name,
-                            // `.rejected` is a refusal by the mode or the user,
-                            // not a malformed call; see the cloud path.
-                            succeeded: execResult.record.status != .error
+                            outcome: execResult.record.status.toolCallOutcome
                         )
-                        AgentHarness.shared.recordToolCallFingerprint(
-                            toolName: call.name,
-                            arguments: call.arguments
-                        )
+                        // See the cloud path: a withheld call must not clear the
+                        // repeat guard on the mutating tools.
+                        if execResult.record.status != .withheld {
+                            AgentHarness.shared.recordToolCallFingerprint(
+                                toolName: call.name,
+                                arguments: call.arguments
+                            )
+                        }
                         if execResult.isCompleted {
                             anyCompleted = true
                         }
@@ -5497,7 +5564,7 @@ struct ContentView: View {
                         // rather than splice from the stale tokens.
                         let nextPrompt = AgentHarness.shared.refreshingLoadedToolsSection(
                             inPrompt: staleNextPrompt,
-                            mode: AgentHarness.shared.activeMode
+                            mode: turnMode
                         )
                         let toolsSectionChanged = (nextPrompt != staleNextPrompt)
                         let splicedTokens = self.buildSplicedContinuationTokens(
@@ -5558,7 +5625,7 @@ struct ContentView: View {
                             let staleSynthesisPrompt = formattedPrompt + assistantTurnText + "\n" + toolResponseContext + synthesisDirective
                             let synthesisPrompt = AgentHarness.shared.refreshingLoadedToolsSection(
                                 inPrompt: staleSynthesisPrompt,
-                                mode: AgentHarness.shared.activeMode
+                                mode: turnMode
                             )
                             let synthesisToolsChanged = (synthesisPrompt != staleSynthesisPrompt)
                             let splicedTokens = self.buildSplicedContinuationTokens(

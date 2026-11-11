@@ -1819,7 +1819,14 @@ public final class ToolDiscoverTool: AgentTool {
                 total += 1
             }
         }
-        let readable = lines.isEmpty ? "All installed tools are currently loaded. Nothing to discover." : lines.joined(separator: "\n")
+        let readable: String
+        if !lines.isEmpty {
+            readable = lines.joined(separator: "\n")
+        } else if mode == .plan {
+            readable = "Nothing to discover: every installed tool this mode allows is already loaded. Plan mode withholds the write, execute and completion tools, so there is nothing else to load."
+        } else {
+            readable = "All installed tools are currently loaded. Nothing to discover."
+        }
 
         var groupsJSON: [[String: Any]] = []
         for cat in order {
@@ -2788,6 +2795,40 @@ public final class LintDiagnosticsTool: AgentTool {
 
 // MARK: - Agent Harness Coordinator
 
+/// How one finished tool call counts towards the harness's loop guards.
+///
+/// Three outcomes rather than a success flag because a policy refusal is not a
+/// failure the model caused: plan mode withholding `file_write` would, if
+/// counted as a success, reset the same-tool streak and let a model re-issue it
+/// until the step budget ran out; counted as a failure it would end a legitimate
+/// plan turn for asking once too often. It is its own thing.
+nonisolated public enum ToolCallOutcome: Sendable {
+    case succeeded
+    case failed
+    /// Refused before execution by the agent mode. Charges the run's TOTAL
+    /// failure budget (a run cannot spend its whole step allowance on calls the
+    /// mode will never allow) and leaves the same-tool streak alone, because the
+    /// tool did not fail, the mode declined.
+    case withheld
+}
+
+extension ToolExecutionStatus {
+    /// How a finished call's status counts towards the loop guards.
+    ///
+    /// `.rejected` is the USER declining a confirmation, which the call sites
+    /// have always charged as a failure: a model that keeps proposing the same
+    /// rejected action should be reeled in like one whose calls error. `.withheld`
+    /// is the mode refusing before execution, which is the one case that gets its
+    /// own treatment.
+    var toolCallOutcome: ToolCallOutcome {
+        switch self {
+        case .error, .rejected: return .failed
+        case .withheld: return .withheld
+        case .success, .running, .awaitingApproval: return .succeeded
+        }
+    }
+}
+
 public final class AgentHarness {
     public static let shared = AgentHarness()
 
@@ -2830,21 +2871,29 @@ public final class AgentHarness {
     /// here is removed again on the way out, so the coder prompt does not grow
     /// permanent schemas because a conversation planned once.
     public func setActiveMode(_ mode: AgentMode) {
-        guard activeMode != mode else { return }
-        let previous = activeMode
-        activeMode = mode
-        if mode == .plan {
-            for name in PlanModePolicy.allowedToolNames.sorted()
-            where tools[name] != nil && loadedTools[name] == nil {
-                loadedTools[name] = tools[name]
-                armedByPlanMode.insert(name)
+        if activeMode != mode {
+            let previous = activeMode
+            activeMode = mode
+            if mode == .plan {
+                for name in PlanModePolicy.allowedToolNames.sorted()
+                where tools[name] != nil && loadedTools[name] == nil {
+                    loadedTools[name] = tools[name]
+                    armedByPlanMode.insert(name)
+                }
+            } else if previous == .plan {
+                for name in armedByPlanMode {
+                    loadedTools.removeValue(forKey: name)
+                }
+                armedByPlanMode.removeAll()
             }
-        } else if previous == .plan {
-            for name in armedByPlanMode {
-                loadedTools.removeValue(forKey: name)
-            }
-            armedByPlanMode.removeAll()
         }
+        // Re-asserted even when the mode did not change. The registry has a
+        // second writer: a server turn installs the client's own schemas for its
+        // duration and restores a snapshot afterwards, so a mode flip that lands
+        // inside one can leave the registry holding the other surface while
+        // `activeMode` disagrees. Re-syncing on every assertion heals that at the
+        // next turn's start, where an early return would have left a coder turn
+        // running on plan mode's grammar indefinitely.
         syncGrammar()
     }
 
@@ -3098,11 +3147,12 @@ public final class AgentHarness {
     public private(set) var totalFailedToolCalls: Int = 0
     public var failedToolCallTotalLimit: Int = 6
 
-    public func recordToolCallOutcome(toolName: String, succeeded: Bool) {
-        if succeeded {
+    public func recordToolCallOutcome(toolName: String, outcome: ToolCallOutcome) {
+        switch outcome {
+        case .succeeded:
             consecutiveFailedToolCalls = 0
             lastFailedToolName = nil
-        } else {
+        case .failed:
             totalFailedToolCalls += 1
             if lastFailedToolName == toolName {
                 consecutiveFailedToolCalls += 1
@@ -3110,6 +3160,8 @@ public final class AgentHarness {
                 consecutiveFailedToolCalls = 1
                 lastFailedToolName = toolName
             }
+        case .withheld:
+            totalFailedToolCalls += 1
         }
     }
 
@@ -3445,10 +3497,20 @@ public final class AgentHarness {
             """
         }
         if mode == .plan {
+            // The directive above already names the write and execute set, and
+            // on a plain installation that set IS everything withheld, so
+            // restating the same five tools here cost a plan turn its tokens for
+            // nothing. The names are printed only when the catalog withholds
+            // something the directive did not describe (an MCP server, a tool
+            // added later), which is the case where the list says anything new.
             let withheld = tools.keys.filter { PlanModePolicy.withholds($0) }.sorted()
             if !withheld.isEmpty {
+                let described = PlanModePolicy.withheldToolNames
+                let line = withheld.allSatisfy { described.contains($0) }
+                    ? "Plan mode withholds \(withheld.count) tool(s) for this turn, the write and execute set named above."
+                    : "Plan mode withholds \(withheld.count) tool(s) for this turn: \(withheld.joined(separator: ", "))."
                 prompt += """
-                Plan mode withholds \(withheld.count) tool(s) for this turn: \(withheld.joined(separator: ", ")). They are not missing and cannot be loaded — do not call them. Investigate with the tools listed above, then write the plan.
+                \(line) They are not missing and cannot be loaded — do not call them. Investigate with the tools listed above, then write the plan.
 
                 """
             }
@@ -3771,7 +3833,7 @@ public final class AgentHarness {
 
             # Plan Mode Directive (overrides the persona above)
 
-            You are in PLAN MODE. The persona above describes the coder you become after the user approves; it is not this turn's job. Read, search and analyze, then answer with the plan bracketed by \(PlanMarkers.start) on its own first line and \(PlanMarkers.ready) on its own last line. Do not attempt to modify files, run commands, commit, or call `complete` — those tools are withheld and any attempt is refused. If the user asks you to implement something, tell them to approve the plan first.
+            You are in PLAN MODE. The persona above describes the coder you become after the user approves; it is not this turn's job. Read, search and analyze, then answer with the plan bracketed by \(PlanMarkers.start) on its own first line and \(PlanMarkers.ready) on its own last line. Do not attempt to modify files, run commands, or commit: those tools are withheld and any attempt is refused. If the user asks you to implement something, tell them to approve the plan first.
             """
         }
 
@@ -4457,7 +4519,7 @@ public final class AgentHarness {
                 name: call.name,
                 arguments: strArgs,
                 rawArguments: call.rawArguments,
-                status: .rejected,
+                status: .withheld,
                 output: AgentHarness.renderToolResultForModel(json),
                 error: err,
                 executionDurationSeconds: CFAbsoluteTimeGetCurrent() - startTime

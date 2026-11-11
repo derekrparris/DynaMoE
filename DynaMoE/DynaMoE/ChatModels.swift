@@ -38,6 +38,12 @@ nonisolated public enum ToolExecutionStatus: String, Codable, Equatable, Sendabl
     case error
     case awaitingApproval
     case rejected
+    /// The agent mode refused the call before it ran (plan mode withholding a
+    /// write tool). Distinct from `.rejected`, which is the USER declining a
+    /// confirmation: a withheld call is neither a failure the model caused nor a
+    /// success. The loop guards read it through `ToolCallOutcome.withheld`, and
+    /// the timeline renders it as a mode refusal rather than an error.
+    case withheld
 }
 
 nonisolated public struct ToolCallRecord: Identifiable, Codable, Equatable, Sendable {

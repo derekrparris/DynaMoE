@@ -16,6 +16,17 @@ import XCTest
 
 final class PlanModeTests: XCTestCase {
 
+    /// The harness is a process-wide singleton and other suites load tools into
+    /// it, so each case starts from the coder surface. `tearDown` alone is not
+    /// enough: a suite that ran before this one and failed part-way through can
+    /// leave `grep_search` loaded, and the "leaving plan mode unloads it"
+    /// assertion below would then be measuring that suite, not this one.
+    override func setUp() {
+        super.setUp()
+        AgentHarness.shared.setActiveMode(.code)
+        AgentHarness.shared.resetLoadedToolsToCore()
+    }
+
     override func tearDown() {
         // The harness is a singleton: leave it on the coder surface even when a
         // test fails part-way through.
@@ -157,6 +168,30 @@ final class PlanModeTests: XCTestCase {
         }
     }
 
+    func testThePlanDirectiveNamesEveryWithheldToolItsPolicyDeclares() {
+        let directive = PlanModePolicy.directive(toolNames: ["file_read"])
+        // The bullet list is GENERATED from `withheldTools`, which is the only
+        // place those names are written down. This pins the property the dead
+        // constant never had: adding a tool to the list cannot leave the prompt
+        // describing the old one, and the prompt cannot name a tool the policy
+        // does not withhold.
+        for tool in PlanModePolicy.withheldTools {
+            XCTAssertTrue(
+                directive.contains("`\(tool.name)`"),
+                "the directive must name \(tool.name), with its purpose: \(tool.purpose)"
+            )
+        }
+        XCTAssertTrue(directive.contains("every `mcp__*` tool"))
+
+        XCTAssertTrue(
+            PlanModePolicy.allowedToolNames.isDisjoint(with: PlanModePolicy.withheldToolNames),
+            "a tool can be callable or named as absent, never both"
+        )
+        for name in PlanModePolicy.withheldToolNames {
+            XCTAssertTrue(PlanModePolicy.withholds(name), "\(name) is named as withheld and must be")
+        }
+    }
+
     func testRefreshingTheToolBlockKeepsPlanModeWithheldToolsOut() throws {
         let harness = AgentHarness.shared
         // Load a write tool on the coder surface, then rebuild the block as a
@@ -200,7 +235,7 @@ final class PlanModeTests: XCTestCase {
         )
         let result = await AgentHarness.shared.executeTool(call: call, mode: .plan)
 
-        XCTAssertEqual(result.record.status, .rejected)
+        XCTAssertEqual(result.record.status, .withheld)
         XCTAssertTrue(result.record.error?.contains("PLAN MODE") == true)
         XCTAssertFalse(result.isCompleted)
         XCTAssertFalse(
@@ -211,6 +246,42 @@ final class PlanModeTests: XCTestCase {
             AgentHarness.shared.consecutiveFailedToolCalls, 0,
             "a policy refusal is the environment's answer, not a malformed call"
         )
+    }
+
+    func testAWithheldCallChargesTheTotalBudgetButNotTheStreak() {
+        let harness = AgentHarness.shared
+        harness.beginAgentSearchGuard()
+
+        harness.recordToolCallOutcome(toolName: "file_write", outcome: .failed)
+        harness.recordToolCallOutcome(toolName: "file_write", outcome: .failed)
+        XCTAssertEqual(harness.consecutiveFailedToolCalls, 2)
+
+        // A refusal must neither extend the streak (which would end a plan turn
+        // for asking once too often) nor reset it (which would let a model
+        // alternate real failures with refusals forever).
+        harness.recordToolCallOutcome(toolName: "file_write", outcome: .withheld)
+        XCTAssertEqual(harness.consecutiveFailedToolCalls, 2)
+        XCTAssertEqual(harness.totalFailedToolCalls, 3)
+
+        harness.recordToolCallOutcome(toolName: "file_write", outcome: .withheld)
+        harness.recordToolCallOutcome(toolName: "file_write", outcome: .withheld)
+        harness.recordToolCallOutcome(toolName: "file_write", outcome: .withheld)
+        harness.recordToolCallOutcome(toolName: "file_write", outcome: .withheld)
+        XCTAssertGreaterThanOrEqual(
+            harness.totalFailedToolCalls, harness.failedToolCallTotalLimit,
+            "the total budget is what bounds a loop the mode keeps refusing"
+        )
+        harness.beginAgentSearchGuard()
+    }
+
+    func testAWithheldStatusCountsAsItsOwnOutcome() {
+        XCTAssertEqual(ToolExecutionStatus.error.toolCallOutcome, .failed)
+        XCTAssertEqual(ToolExecutionStatus.withheld.toolCallOutcome, .withheld)
+        XCTAssertEqual(
+            ToolExecutionStatus.rejected.toolCallOutcome, .failed,
+            "a call the user declined has always been charged as a failure"
+        )
+        XCTAssertEqual(ToolExecutionStatus.success.toolCallOutcome, .succeeded)
     }
 
     func testExecuteToolStillRunsAReadToolInPlanMode() async throws {
@@ -278,6 +349,12 @@ final class PlanModeTests: XCTestCase {
         XCTAssertEqual(ChatCommand.parse("/plan off"), .plan(enabled: false))
         XCTAssertEqual(ChatCommand.parse("/plan exit"), .plan(enabled: false))
         XCTAssertNil(ChatCommand.parse("/planning"))
+        // An argument that is neither a known on-spelling nor a known
+        // off-spelling is not a command: `/plan off.` used to ENTER the mode,
+        // the opposite of what was typed. Falling through to ordinary text
+        // leaves the typo visible instead of acting on a guess.
+        XCTAssertNil(ChatCommand.parse("/plan off."))
+        XCTAssertNil(ChatCommand.parse("/plan please"))
         XCTAssertEqual(ChatCommand.names, ["/compact", "/plan"])
     }
 
