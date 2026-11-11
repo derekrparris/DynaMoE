@@ -144,14 +144,38 @@ final class CloudProviderStore: ObservableObject {
         publish()
     }
 
+    /// Records what a custom provider is willing to be told about prompt
+    /// caching. Only the capability changes; the endpoint, the key and the
+    /// registered models are untouched, so flipping it mid-conversation cannot
+    /// drop a registration fact that still describes the same server.
+    func setCacheHints(_ hints: CloudCacheHints, for provider: CloudProvider) throws {
+        guard !isBuiltIn(provider) else {
+            throw CloudProviderStoreError.builtInProviderIsImmutable(provider.displayName)
+        }
+        var custom = CloudProviderCatalog.customProviders(defaults: defaults)
+        guard let index = custom.firstIndex(where: { $0.id == provider.id }) else {
+            throw CloudProviderStoreError.providerNotFound(provider.id)
+        }
+        let current = custom[index]
+        custom[index] = CloudProvider(
+            id: current.id,
+            displayName: current.displayName,
+            docsURL: current.docsURL,
+            openAIBaseURL: current.openAIBaseURL,
+            anthropicBaseURL: current.anthropicBaseURL,
+            cacheHints: hints
+        )
+        CloudProviderCatalog.saveCustomProviders(custom, defaults: defaults)
+        publish()
+    }
+
     /// Removes a custom provider together with everything keyed by its
     /// identifier. Saved conversations that pinned one of its models are
     /// handled by `CloudModelAddress.selectionIsUnresolved`: the send is
     /// refused with a reselect message rather than falling back to weights.
     /// A built-in throws instead of no-oping, matching `update`: the caller is
     /// asking for something the store cannot do.
-    func remove(_ provider: CloudProvider) throws {
-        guard !isBuiltIn(provider) else {
+    func remove(_ provider: CloudProvider) throws {        guard !isBuiltIn(provider) else {
             throw CloudProviderStoreError.builtInProviderIsImmutable(provider.displayName)
         }
 

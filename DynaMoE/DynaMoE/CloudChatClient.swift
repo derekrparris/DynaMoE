@@ -63,6 +63,33 @@ private nonisolated final class CloudSessionCache: @unchecked Sendable {
     }
 }
 
+// MARK: - Cache Hint Memory
+
+/// Remembers, per endpoint, that an optional cache field was refused.
+///
+/// A provider that rejects `prompt_cache_key` rejects it on every request, and
+/// paying a rejected round trip per agent step would cost a turn more than the
+/// hint could ever save. One entry per endpoint, process lifetime, and a lock
+/// only on the miss path.
+private nonisolated final class CloudCacheHintMemory: @unchecked Sendable {
+    static let shared = CloudCacheHintMemory()
+
+    private let lock = NSLock()
+    private var declined: Set<String> = []
+
+    func acceptsPromptCacheKey(endpoint: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !declined.contains(endpoint)
+    }
+
+    func declinePromptCacheKey(endpoint: String) {
+        lock.lock()
+        declined.insert(endpoint)
+        lock.unlock()
+    }
+}
+
 // MARK: - OpenAI-Compatible Service
 
 nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked Sendable {
@@ -74,17 +101,20 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
     private let modelsURL: URL
     private let apiKey: String
     private let session: URLSession
+    private let cacheHints: CloudCacheHints
 
     init(
         chatURL: URL,
         modelsURL: URL,
         apiKey: String,
         requestTimeout: TimeInterval,
-        session: URLSession? = nil
+        session: URLSession? = nil,
+        cacheHints: CloudCacheHints = .affinity
     ) {
         self.chatURL = chatURL
         self.modelsURL = modelsURL
         self.apiKey = apiKey
+        self.cacheHints = cacheHints
 
         if let session {
             self.session = session
@@ -122,6 +152,7 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         let maxTokens: Int?
         let tools: [ToolDefinition]?
         let toolChoice: String?
+        let promptCacheKey: String?
 
         enum CodingKeys: String, CodingKey {
             case model, messages, stream, temperature, tools
@@ -130,7 +161,18 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
             case presencePenalty = "presence_penalty"
             case maxTokens = "max_tokens"
             case toolChoice = "tool_choice"
+            case promptCacheKey = "prompt_cache_key"
         }
+    }
+
+    /// Headers every chat request carries. `x-session-id` and
+    /// `x-session-affinity` are read by routers that keep one conversation on
+    /// one replica; a provider that does not know them ignores them by the
+    /// HTTP contract, so they are sent unless the provider opts out.
+    private func applyCacheAffinity(to request: inout URLRequest, params: CloudChatGenerationParams) {
+        guard cacheHints.sendsAffinityHeaders, let sessionKey = params.sessionKey else { return }
+        request.setValue(sessionKey, forHTTPHeaderField: "x-session-id")
+        request.setValue(sessionKey, forHTTPHeaderField: "x-session-affinity")
     }
 
     /// Internal so a test can pin the request shape without a live endpoint.
@@ -139,8 +181,13 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         messages: [CloudChatMessage],
         params: CloudChatGenerationParams,
         tools: [ToolDefinition]? = nil,
-        includeUsage: Bool = true
+        includeUsage: Bool = true,
+        includeCacheKey: Bool = true
     ) throws -> URLRequest {
+        let wantsCacheKey = includeCacheKey
+            && cacheHints.sendsPromptCacheKey
+            && !(params.sessionKey ?? "").isEmpty
+            && CloudCacheHintMemory.shared.acceptsPromptCacheKey(endpoint: chatURL.absoluteString)
         let body = Body(
             model: model,
             messages: messages,
@@ -151,14 +198,22 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
             presencePenalty: params.presencePenalty,
             maxTokens: params.maxTokens,
             tools: (tools?.isEmpty == false) ? tools : nil,
-            toolChoice: (tools?.isEmpty == false) ? "auto" : nil
+            toolChoice: (tools?.isEmpty == false) ? "auto" : nil,
+            promptCacheKey: wantsCacheKey ? params.sessionKey : nil
         )
         var request = URLRequest(url: chatURL)
         request.httpMethod = "POST"
-        request.httpBody = try JSONEncoder().encode(body)
+        // Sorted keys is a cache requirement, not a style choice: the body is
+        // the provider's token prefix once templated, and an unsorted
+        // dictionary (`ToolDefinition.parameters` is a Swift dictionary) can
+        // reorder a schema between requests and invalidate the whole prompt.
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        request.httpBody = try encoder.encode(body)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        applyCacheAffinity(to: &request, params: params)
         return request
     }
 
@@ -184,14 +239,21 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                     // some compatible endpoints reject with a 400. Retry once
                     // without it rather than failing the whole turn over usage
                     // stats (the turn then reports estimated token counts).
+                    // `prompt_cache_key` gets the same treatment: a strict
+                    // endpoint may reject the unknown body field, and the hint
+                    // is worth one retry, never a failed turn.
                     var includeUsage = true
-                    for attempt in 0..<2 {
+                    var includeCacheKey = true
+                    let asksForCacheKey = self.cacheHints.sendsPromptCacheKey
+                        && !(params.sessionKey ?? "").isEmpty
+                    for _ in 0..<3 {
                         let request = try self.makeRequest(
                             model: model,
                             messages: messages,
                             params: params,
                             tools: tools,
-                            includeUsage: includeUsage
+                            includeUsage: includeUsage,
+                            includeCacheKey: includeCacheKey
                         )
                         let (bytes, response) = try await self.session.bytes(for: request)
                         guard let http = response as? HTTPURLResponse else {
@@ -201,9 +263,18 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                         }
                         guard (200..<300).contains(http.statusCode) else {
                             let body = await Self.drain(bytes, limit: 4096)
-                            if attempt == 0, includeUsage,
+                            if includeUsage,
                                Self.shouldRetryWithoutStreamOptions(status: http.statusCode, body: body) {
                                 includeUsage = false
+                                continue
+                            }
+                            if includeCacheKey, asksForCacheKey,
+                               Self.shouldRetryWithoutCacheKey(status: http.statusCode) {
+                                includeCacheKey = false
+                                CloudCacheHintMemory.shared.declinePromptCacheKey(
+                                    endpoint: self.chatURL.absoluteString
+                                )
+                                print("☁️ [CACHE] \(self.chatURL.host ?? "provider") rejected prompt_cache_key (HTTP \(http.statusCode)); continuing without it.")
                                 continue
                             }
                             continuation.yield(.failed(.httpStatus(
@@ -335,6 +406,17 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         guard status == 400 || status == 422 else { return false }
         let lower = body.lowercased()
         return lower.contains("stream_options") || lower.contains("include_usage")
+    }
+
+    /// Whether a rejection is worth retrying without `prompt_cache_key`.
+    ///
+    /// Deliberately not keyed on the body: a provider rejecting an unknown body
+    /// field usually names the field vaguely ("invalid request", "unexpected
+    /// property"), and a rejected request is not billed, so one blind retry
+    /// costs nothing. It is bounded to 4xx because a 5xx or a 429 is not about
+    /// the field.
+    nonisolated static func shouldRetryWithoutCacheKey(status: Int) -> Bool {
+        status == 400 || status == 422
     }
 
     // MARK: Models
@@ -481,7 +563,8 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
                 chatURL: provider.chatCompletionsURL,
                 modelsURL: provider.modelsURL,
                 apiKey: apiKey,
-                requestTimeout: requestTimeout
+                requestTimeout: requestTimeout,
+                cacheHints: provider.resolvedCacheHints
             )
         case .anthropic:
             self.service = AnthropicCloudChatService()
@@ -551,6 +634,50 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
         tools: [ToolDefinition]? = nil
     ) -> AsyncStream<CloudTurnEvent> {
         service.streamTurn(model: model, messages: messages, params: params, tools: tools)
+    }
+
+    /// One plain completion, collected into a string.
+    ///
+    /// This exists for compaction: the summary has to come from the model the
+    /// conversation is actually using, because the on-device system model is
+    /// not guaranteed to exist and a user's cloud-only Mac had no working
+    /// `/compact` at all. No tools, no agent loop, temperature 0.
+    public func completeText(
+        model: String,
+        systemPrompt: String,
+        userPrompt: String,
+        maxTokens: Int,
+        sessionKey: String?
+    ) async throws -> String {
+        var messages: [CloudChatMessage] = []
+        if !systemPrompt.isEmpty {
+            messages.append(CloudChatMessage(role: "system", content: systemPrompt))
+        }
+        messages.append(CloudChatMessage(role: "user", content: userPrompt))
+        let params = CloudChatGenerationParams(
+            temperature: 0,
+            maxTokens: maxTokens,
+            sessionKey: sessionKey
+        )
+        var text = ""
+        var failure: CloudTurnFailure?
+        for await event in streamTurn(model: model, messages: messages, params: params, tools: nil) {
+            switch event {
+            case .started, .thinkingDelta:
+                break
+            case .contentDelta(let delta):
+                text += delta
+            case .finished(let result):
+                // The parser's accumulated text and the result's text are the
+                // same string; prefer the result because it is what the
+                // transport certified as complete.
+                if !result.text.isEmpty { text = result.text }
+            case .failed(let reported):
+                failure = reported
+            }
+        }
+        if let failure { throw failure }
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     public func testConnection() async -> CloudConnectionTestResult {

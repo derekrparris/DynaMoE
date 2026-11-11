@@ -50,20 +50,30 @@ public nonisolated struct CloudProvider: Identifiable, Codable, Equatable, Senda
     /// Base of the Anthropic-compatible API when the provider offers one
     /// ("https://api.synthetic.new/anthropic"; its client appends `/v1`).
     public let anthropicBaseURL: URL?
+    /// What this endpoint is willing to be told about prompt caching. Optional
+    /// so a record written before the field existed still decodes; nil means
+    /// the default (`affinity`), which cannot break a turn.
+    public let cacheHints: CloudCacheHints?
 
     public init(
         id: String,
         displayName: String,
         docsURL: URL? = nil,
         openAIBaseURL: URL,
-        anthropicBaseURL: URL? = nil
+        anthropicBaseURL: URL? = nil,
+        cacheHints: CloudCacheHints? = nil
     ) {
         self.id = id
         self.displayName = displayName
         self.docsURL = docsURL
         self.openAIBaseURL = openAIBaseURL
         self.anthropicBaseURL = anthropicBaseURL
+        self.cacheHints = cacheHints
     }
+
+    /// The capability in force: an unset record gets session-affinity headers,
+    /// which every HTTP server ignores safely, and nothing else.
+    public var resolvedCacheHints: CloudCacheHints { cacheHints ?? .affinity }
 
     public var chatCompletionsURL: URL {
         openAIBaseURL.appendingPathComponent("chat/completions")
@@ -88,7 +98,11 @@ public nonisolated enum CloudProviderRegistry {
         displayName: "Synthetic",
         docsURL: URL(string: "https://dev.synthetic.new/docs/api/overview")!,
         openAIBaseURL: URL(string: "https://api.synthetic.new/openai/v1")!,
-        anthropicBaseURL: URL(string: "https://api.synthetic.new/anthropic")!
+        anthropicBaseURL: URL(string: "https://api.synthetic.new/anthropic")!,
+        // Synthetic fronts OpenAI-shaped backends, so the documented
+        // `prompt_cache_key` routing hint is the one body field worth sending;
+        // a rejection is retried once without it.
+        cacheHints: .openAI
     )
 
     /// Built-ins first, then the runtime-configured list in the order it was
@@ -432,7 +446,8 @@ public nonisolated enum CloudProviderCatalog {
             displayName: stored.displayName,
             docsURL: docs,
             openAIBaseURL: base,
-            anthropicBaseURL: anthropic
+            anthropicBaseURL: anthropic,
+            cacheHints: stored.cacheHints
         )
     }
 }
@@ -580,6 +595,11 @@ public nonisolated struct CloudModelSpec: Equatable, Sendable {
     /// left off the vision list is treated as text-only: the composer disables
     /// attachment and a rejected image turn retries once without it.
     public let supportsVision: Bool
+    /// What this model's context window is believed to be, or nil when nobody
+    /// recorded one. A registration fact, not provider truth: the catalog
+    /// publishes no window, and a wrong guess would compact at the wrong time.
+    /// Nil disables auto-compaction for the model.
+    public let contextWindowTokens: Int?
 
     public init(
         providerId: String,
@@ -587,7 +607,8 @@ public nonisolated struct CloudModelSpec: Equatable, Sendable {
         displayName: String,
         supportsThinking: Bool,
         supportsTools: Bool = true,
-        supportsVision: Bool = false
+        supportsVision: Bool = false,
+        contextWindowTokens: Int? = nil
     ) {
         self.providerId = providerId
         self.providerModelId = providerModelId
@@ -595,6 +616,7 @@ public nonisolated struct CloudModelSpec: Equatable, Sendable {
         self.supportsThinking = supportsThinking
         self.supportsTools = supportsTools
         self.supportsVision = supportsVision
+        self.contextWindowTokens = contextWindowTokens
     }
 }
 
@@ -743,8 +765,9 @@ public nonisolated enum CloudModelRegistry {
     }
 
     /// Drops every per-provider registration fact: the model list, the
-    /// no-tools list, and the vision marks. Used when the provider itself is
-    /// removed, so a re-added identifier starts clean.
+    /// no-tools list, the vision marks, the context windows and the prices.
+    /// Used when the provider itself is removed, so a re-added identifier
+    /// starts clean.
     public static func clearProviderState(
         for provider: CloudProvider,
         defaults: UserDefaults = .standard
@@ -752,6 +775,8 @@ public nonisolated enum CloudModelRegistry {
         defaults.removeObject(forKey: modelsDefaultsKey(for: provider.id))
         defaults.removeObject(forKey: noToolsDefaultsKey(for: provider.id))
         defaults.removeObject(forKey: visionDefaultsKey(for: provider.id))
+        defaults.removeObject(forKey: CloudContextPolicy.defaultsKey(for: provider.id))
+        defaults.removeObject(forKey: CloudPricingStore.defaultsKey(for: provider.id))
     }
 
     /// Unregisters one model without disturbing the rest of the list. A
@@ -774,6 +799,14 @@ public nonisolated enum CloudModelRegistry {
         var withVision = modelIdsWithVisionSupport(for: provider, defaults: defaults)
         if withVision.remove(providerModelId) != nil {
             setModelIdsWithVisionSupport(withVision, for: provider, defaults: defaults)
+        }
+        var windows = CloudContextPolicy.overrides(for: provider.id, defaults: defaults)
+        if windows.removeValue(forKey: providerModelId) != nil {
+            CloudContextPolicy.setOverrides(windows, for: provider.id, defaults: defaults)
+        }
+        var prices = CloudPricingStore.pricing(for: provider.id, defaults: defaults)
+        if prices.removeValue(forKey: providerModelId) != nil {
+            CloudPricingStore.setPricing(prices, for: provider.id, defaults: defaults)
         }
     }
 
@@ -813,6 +846,7 @@ public nonisolated enum CloudModelRegistry {
         }
         let withoutTools = modelIdsWithoutToolSupport(for: provider, defaults: defaults)
         let withVision = modelIdsWithVisionSupport(for: provider, defaults: defaults)
+        let windows = CloudContextPolicy.overrides(for: provider.id, defaults: defaults)
         return ids.map { id in
             CloudModelSpec(
                 providerId: provider.id,
@@ -820,7 +854,8 @@ public nonisolated enum CloudModelRegistry {
                 displayName: defaultDisplayName(provider: provider, providerModelId: id),
                 supportsThinking: id.lowercased().contains("thinking"),
                 supportsTools: !withoutTools.contains(id),
-                supportsVision: withVision.contains(id)
+                supportsVision: withVision.contains(id),
+                contextWindowTokens: windows[id]
             )
         }
     }

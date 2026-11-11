@@ -85,6 +85,21 @@ nonisolated struct ServerRequestLog: Identifiable, Codable, Sendable, Equatable,
     var queueWaitMs: Double?
     var model: String?
     var inputTokens: Int?
+    /// Input tokens the provider served from its prompt cache. Nil on rows the
+    /// provider reported no usage split for (and on every row written before
+    /// the field existed), so "no cache detail" never reads as "nothing
+    /// cached". A cloud agent step re-sends its whole history; this is the
+    /// column that shows how much of that was a cache read.
+    var cachedInputTokens: Int?
+    /// Input tokens this request wrote into the provider's cache
+    /// (Anthropic-style providers bill writes separately).
+    var cacheWriteInputTokens: Int?
+    /// The assembled prompt's size as the app estimated it before the turn ran.
+    /// Kept beside `inputTokens` because the two answer different questions:
+    /// "what did we send" versus "what did the provider bill". The provider's
+    /// number wins when it arrives, and this one stays as the fallback that
+    /// makes an endpoint which drops usage still readable.
+    var estimatedInputTokens: Int?
     var outputTokens: Int?
     var temperature: Double?
     var maxTokens: Int?
@@ -315,6 +330,11 @@ final class ServerRequestLogRecorder: @unchecked Sendable {
         }
         if let input = row.inputTokens {
             parts.append("in=\(input)")
+        }
+        if let cached = row.cachedInputTokens, cached > 0 {
+            // Cache reads are metadata, not content: the Console line says how
+            // much of a re-sent history the provider served from its cache.
+            parts.append("cached=\(cached)")
         }
         if let output = row.outputTokens {
             parts.append("out=\(output)")
@@ -680,6 +700,7 @@ extension ServerRequestLog {
         row.source = .chatUI
         row.model = model
         row.inputTokens = inputTokens
+        row.estimatedInputTokens = inputTokens
         row.requestBody = capturedRequestBody(prompt)
         return ServerRequestLogBox(builder: row)
     }
@@ -693,6 +714,25 @@ extension ServerRequestLogBox {
         if builder.firstTokenMs == nil {
             builder.firstTokenMs = Date().timeIntervalSince(startedAt) * 1000
         }
+        lock.unlock()
+    }
+
+    /// Replaces the row's estimated prompt size with the provider's own counts.
+    ///
+    /// The estimate is written when the box is created, before the turn runs,
+    /// because a stream can fail without ever reporting usage. When the
+    /// provider does report, its number is the one worth keeping — and the
+    /// cache split beside it is what turns "this step sent 90k tokens" into
+    /// "90k tokens, 81k of them a cache read".
+    nonisolated func noteProviderUsage(
+        promptTokens: Int?,
+        cachedTokens: Int?,
+        cacheWriteTokens: Int?
+    ) {
+        lock.lock()
+        if let promptTokens { builder.inputTokens = promptTokens }
+        if let cachedTokens { builder.cachedInputTokens = cachedTokens }
+        if let cacheWriteTokens { builder.cacheWriteInputTokens = cacheWriteTokens }
         lock.unlock()
     }
 

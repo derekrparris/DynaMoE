@@ -310,6 +310,20 @@ struct ChatDetailView: View {
         return lineHeight + MacTextEditor.textContainerInsetHeight * 2
     }
 
+    /// The context window recorded for this conversation's cloud model, or nil.
+    ///
+    /// Nil for a weights model (whose capacity is the KV budget's business, not
+    /// a provider's) and for any cloud model nobody recorded a window for — in
+    /// which case the header shows the plain token total instead of inventing a
+    /// ceiling.
+    private func cloudContextWindow(for session: ChatSession?) -> Int? {
+        guard let id = session?.selectedModelId,
+              let parsed = CloudModelAddress.parseModelId(id) else { return nil }
+        let spec = CloudModelRegistry.registeredSpecs(for: parsed.provider)
+            .first { $0.providerModelId == parsed.providerModelId }
+        return CloudContextPolicy.window(for: spec)
+    }
+
     private func modelIconName(for name: String?, isCloud: Bool = false) -> String {
         if isCloud {
             return "cloud.fill"
@@ -486,17 +500,46 @@ struct ChatDetailView: View {
                                 }
                             }
                             if let cumulativeTokens = session?.cumulativeTokenCount, cumulativeTokens > 0 {
+                                let contextWindow = cloudContextWindow(for: session)
                                 Text("•")
                                     .foregroundColor(.secondary)
                                 HStack(spacing: 3) {
                                     Image(systemName: "number.circle")
                                         .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .semibold))
                                         .foregroundColor(.secondary)
-                                    Text(cumulativeTokens.formatted())
+                                    if let window = contextWindow,
+                                       let percent = CloudContextPolicy.usagePercent(
+                                           promptTokens: cumulativeTokens,
+                                           window: window
+                                       ) {
+                                        // A cloud conversation can see its own
+                                        // ceiling: the window is a recorded
+                                        // registration fact, and the percentage
+                                        // is what turns "12,345 tokens" into
+                                        // "how much room is left".
+                                        Text("\(cumulativeTokens.formatted()) · \(percent)% of \(window.formatted())")
+                                            .font(.system(size: max(9, 11 * zoomManager.zoomScale), design: .monospaced))
+                                            .foregroundColor(percent >= 80 ? .orange : .secondary)
+                                    } else {
+                                        Text(cumulativeTokens.formatted())
+                                            .font(.system(size: max(9, 11 * zoomManager.zoomScale), design: .monospaced))
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                                .help("Running total of context the model ingested: prompt tokens not already covered by a reused or cached prefix, plus tokens generated. A cached cloud re-send counts only what was billed at the full rate.")
+                            }
+                            if let spend = session?.cumulativeCost, spend > 0 {
+                                Text("•")
+                                    .foregroundColor(.secondary)
+                                HStack(spacing: 3) {
+                                    Image(systemName: "dollarsign.circle")
+                                        .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .semibold))
+                                        .foregroundColor(.secondary)
+                                    Text(CloudPricingStore.formatted(spend))
                                         .font(.system(size: max(9, 11 * zoomManager.zoomScale), design: .monospaced))
                                         .foregroundColor(.secondary)
                                 }
-                                .help("Running total of session context: prompt tokens ingested plus tokens generated across every turn")
+                                .help("Reported spend for this conversation, summed from provider usage and the price list in Settings → Cloud Providers")
                             }
                         }
                         .padding(.horizontal, 10)

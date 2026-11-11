@@ -42,9 +42,10 @@ A comprehensive, practical guide to configuring, tuning, and operating DynaMoE o
    - [Client Setup](#client-setup)
 8. [Cloud Providers](#8-cloud-providers)
    - [API Key & Connection Test](#api-key--connection-test)
-   - [Registering Cloud Models](#registering-cloud-models)
-   - [Image Input (Vision-Capable Cloud Models)](#image-input-vision-capable-cloud-models)
-   - [What a Cloud Turn Supports](#what-a-cloud-turn-supports)
+  - [Registering Cloud Models](#registering-cloud-models)
+  - [Request Behaviour](#request-behaviour)
+  - [Image Input (Vision-Capable Cloud Models)](#image-input-vision-capable-cloud-models)
+  - [What a Cloud Turn Supports](#what-a-cloud-turn-supports)
 9. [Hardware Profiles & Recommended Configurations](#9-hardware-profiles--recommended-configurations)
    - [16 GB Unified RAM (M1/M2/M3/M4)](#16-gb-unified-ram-m1m2m3m4)
    - [24 GB – 36 GB Unified RAM](#24-gb--36-gb-unified-ram)
@@ -587,6 +588,15 @@ The **Cloud Providers** section connects remote inference providers. **Synthetic
   Entries are separated by `;`, `,`, or newlines and duplicates are dropped. A hand-written value may not reach an already-running app because of preference caching — quit and relaunch, or just press **Sync Models**.
 - A single-model development hook exists: `defaults write DRP.DynaMoE dynamoe_cloud_debug_model "hf:org/model"` registers one model when the main list is empty. It is one global value rather than a per-provider one, so the minus button does not clear it; remove it with `defaults delete DRP.DynaMoE dynamoe_cloud_debug_model`.
 
+### Request Behaviour
+
+The **Request Behaviour** card holds the provider-independent settings that decide what every cloud request asks for and how its cost is reported.
+
+- **Re-send Images** (default on): a stateless provider must be re-told about a picture on every request that should still see it, and those tokens are billed every time. Off sends only the newest user turn's pictures and replaces older ones in the request with `[N images omitted: older turn, not re-sent]`. The choice depends on the conversation, not the step, so it stays prefix-stable.
+- **Prompt Caching**: each provider card has its own row — `Session affinity` (default: two opaque `x-…` headers, which no HTTP server is obliged to understand) or `Session affinity + cache key` (adds OpenAI's `prompt_cache_key`). Synthetic is registered with the cache key. A provider that rejects the field is retried once without it and remembered for the process.
+- **Context Window**: `dynamoe_cloud_<provider>_context`, `model=window` entries separated by `;`. Without one, nothing auto-compacts and the chat header shows the plain token total.
+- **Prices**: `dynamoe_cloud_<provider>_pricing`, JSON in USD per million tokens. Without one, no cost is reported.
+
 ### Image Input (Vision-Capable Cloud Models)
 
 Each row in the **Registered Cloud Models** card carries a per-model **switch** that marks it as accepting images. Vision is opt-in because no provider catalog publishes modalities: a model left off the list is treated as text-only, and the composer refuses an attachment with a notice instead of sending pixels it would never receive. The list persists in `dynamoe_cloud_<provider>_vision` (`;`/`,`/newline separated):
@@ -600,7 +610,7 @@ To attach an image to a turn: paste a screenshot (⌘V), drag an image file onto
 
 Preparation policy: EXIF orientation is baked into the pixels, metadata is stripped, the longest edge is downscaled to 1024 px, and the bytes are re-encoded as PNG for screenshots, including TIFF clipboard captures, so text stays legible, or JPEG for photos. Limits are 4 MB per image, 6 images per message, and 32 MB per source file; anything else is refused with a message. The same picture attached twice is stored once per message.
 
-On the wire an attached user turn becomes `content: [{"type":"text",…}, {"type":"image_url","image_url":{"url":"data:image/png;base64,…"}}]`. Text-only turns keep the bare-string `content` they always had. Images are re-sent with their original message on every later request (including each agent step), so the model keeps its visual context; each later turn therefore pays that image's tokens again, and the pre-turn estimate prices each image as a flat allowance until the provider reports real usage.
+On the wire an attached user turn becomes `content: [{"type":"text",…}, {"type":"image_url","image_url":{"url":"data:image/png;base64,…"}}]`. Text-only turns keep the bare-string `content` they always had. Images are re-sent with their original message on every later request (including each agent step), so the model keeps its visual context; each later turn therefore pays that image's tokens again, and the pre-turn estimate prices each image as a flat allowance until the provider reports real usage. **Request Behaviour → Re-send Images** turns that off: only the newest user turn's pictures then ride the request, and older ones become a one-line notice instead of a repeated charge.
 
 A model marked capable that rejects the image part is un-marked automatically (the Settings switch turns off), the turn is retried once without the picture, and a system message records it in the transcript. Only error bodies that name the image part itself trigger this, so an unrelated `400` never disables a working model. Re-mark it only after confirming the model really accepts images. Attachment files live at `~/Library/Application Support/DynaMoE/sessions/assets/<session>/`; deleting a conversation or letting auto-deletion prune it removes its images too.
 
@@ -613,10 +623,13 @@ For local weights, vision is a property of the checkpoint rather than a switch: 
 - **Models without tool support**: list them under `dynamoe_cloud_<provider>_no_tools` (`;`/`,`/newline separated); that model then runs plain chat with a visible notice instead of failing mid-loop on an HTTP 400.
 - **Reasoning control**: the Thinking menu is hidden for cloud models because the OpenAI-compatible surface has no portable on/off switch — the provider's default applies, and reported reasoning still renders in the accordion.
 - **History**: the conversation is sent as a standard `messages` array, with the persona as the leading system message and UI notice messages skipped.
-- **Images**: only when the model is marked vision-capable. The request carries a multi-part `content` array with `image_url` data URLs; earlier images are re-sent with their message on every step so the model keeps its visual context. A model that rejects an image is un-marked and the step retries once without it.
+- **Images**: only when the model is marked vision-capable. The request carries a multi-part `content` array with `image_url` data URLs; earlier images are re-sent with their message on every step so the model keeps its visual context. **Request Behaviour → Re-send Images** (Cloud Providers) can switch that to newest-turn-only, where older pictures become a one-line notice instead of being billed on every step. A model that rejects an image is un-marked and the step retries once without it.
+- **Prompt caching**: every request carries `x-session-id` / `x-session-affinity` (a hash of the conversation, not the UUID) so a router can keep the conversation on one replica. Each provider card has a **Prompt Caching** row: `Session affinity` (headers only) or `Session affinity + cache key`, the latter adding OpenAI's `prompt_cache_key`. A provider that rejects the field is retried once without it and remembered. Cache reads are decoded from `prompt_tokens_details.cached_tokens`, `prompt_cache_hit_tokens`, or `cache_read_input_tokens`, shown on the Request Log row (`1000→50 tok · 800 cached`) and in its detail sheet (`800 cached, 200 billable`), and the console line carries `cached=800`.
+- **Context window**: record it per model in `dynamoe_cloud_<provider>_context` (`model=window`, `;` separated). With a window known, the chat header shows `tokens · N% of window`; a send projected past 80% compacts older history with the active provider model first, and a provider context-overflow rejection compacts and retries that step once. `/compact` uses the active provider model for a cloud conversation, so it no longer requires Apple Intelligence.
+- **Cost**: record prices in `dynamoe_cloud_<provider>_pricing` (JSON, USD per million tokens, `{"model":{"input":0.27,"cached_input":0.07,"output":1.1}}`). Each turn's status line then ends with the provider's own numbers, e.g. `1,204 in (1,000 cached) / 56 out · $0.0031`; a provider that reports no usage is marked `(est.)`.
 - **Logging**: every cloud turn records a row in **Settings → Server → Request Log**, with the rendered prompt (system + messages) under the content-capture toggle. An agent run writes one row per step.
 - **Timeouts**: the idle (between-bytes) timeout is 120 s, so a large prompt or a reasoning model can take its time to first token; a connection that stops sending bytes for two minutes fails with "The request timed out."
-- **Not supported in this phase**: grammar masking, JetSpec, prefix pinning, and the memory budgets. Switching to a cloud model releases any resident local engine so the RAM budget is not held.
+- **Not supported in this phase**: grammar masking, JetSpec, local KV prefix pinning, and the memory budgets. Switching to a cloud model releases any resident local engine so the RAM budget is not held.
 
 ---
 

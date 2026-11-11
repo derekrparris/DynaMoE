@@ -156,6 +156,41 @@ public nonisolated struct CloudToolCall: Equatable, Sendable {
 
 // MARK: - Sampling
 
+/// What a provider is willing to be told about prompt caching.
+///
+/// The prefix is byte-identical on every step of an agent run either way; the
+/// difference is whether the request ASKS for the reuse. `affinity` is the
+/// safe default: two custom `x-…` headers, which no HTTP server is obliged to
+/// understand and therefore cannot break a turn. `openAI` adds
+/// `prompt_cache_key`, the documented OpenAI routing hint, and is opt-in
+/// because a strict compatible endpoint is allowed to reject unknown body
+/// fields (the request path retries once without it if that happens).
+public nonisolated enum CloudCacheHints: String, Codable, Equatable, Hashable, Sendable, CaseIterable {
+    /// Send nothing. For an endpoint that is known to reject extra headers.
+    case none
+    /// Session-affinity headers only.
+    case affinity
+    /// Affinity headers plus `prompt_cache_key`.
+    case openAI
+
+    /// A session-affinity header is what lets a router keep one conversation on
+    /// one replica, which is the only way an automatic per-instance prefix
+    /// cache ever hits.
+    public var sendsAffinityHeaders: Bool { self != .none }
+
+    /// `prompt_cache_key` is an OpenAI-documented field; other compatible
+    /// endpoints may ignore it or reject the body, so it is opt-in.
+    public var sendsPromptCacheKey: Bool { self == .openAI }
+
+    public var displayName: String {
+        switch self {
+        case .none: return "Off"
+        case .affinity: return "Session affinity"
+        case .openAI: return "Session affinity + cache key"
+        }
+    }
+}
+
 /// Sampling knobs the OpenAI-compatible surface understands. DynaMoE also
 /// samples with Min-P, Top-K, and a repetition penalty; remote providers do
 /// not expose those, so they are deliberately not forwarded (same silent-gap
@@ -165,37 +200,159 @@ public nonisolated struct CloudChatGenerationParams: Equatable, Sendable {
     public var topP: Double?
     public var presencePenalty: Double?
     public var maxTokens: Int?
+    /// Stable per-conversation identifier carrying the cache hint. Hashed
+    /// before it leaves the machine (see `CloudSessionKey`) so a provider never
+    /// receives a raw DynaMoE session UUID.
+    public var sessionKey: String?
 
     public init(
         temperature: Double? = nil,
         topP: Double? = nil,
         presencePenalty: Double? = nil,
-        maxTokens: Int? = nil
+        maxTokens: Int? = nil,
+        sessionKey: String? = nil
     ) {
         self.temperature = temperature
         self.topP = topP
         self.presencePenalty = presencePenalty
         self.maxTokens = maxTokens
+        self.sessionKey = sessionKey
+    }
+}
+
+/// The opaque value a provider sees instead of a conversation UUID.
+///
+/// Cache affinity only needs the value to be stable for one conversation and
+/// unlikely to collide, so it is a 64-bit FNV-1a digest in hex: no dependency,
+/// no key material, and nothing that identifies the user or the machine. It is
+/// deliberately not the session UUID — that would write the app's identifiers
+/// into a third party's logs for no benefit.
+public nonisolated enum CloudSessionKey {
+    public static func hashed(_ sessionId: UUID) -> String {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in sessionId.uuidString.lowercased().utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x0000_0100_0000_01B3
+        }
+        return String(hash, radix: 16)
     }
 }
 
 // MARK: - Usage & Results
 
+/// The usage block a provider reports at the end of a stream.
+///
+/// `cachedTokens` is the part of `promptTokens` the provider served from its
+/// prompt cache. It is the single number that tells a multi-step agent run
+/// apart from a conversation that re-prefills everything: the same prompt
+/// costs a fraction as much when most of it is a cache read. Three wire shapes
+/// carry it — OpenAI's nested `prompt_tokens_details.cached_tokens`, DeepSeek's
+/// top-level `prompt_cache_hit_tokens`, and Anthropic's
+/// `cache_read_input_tokens` — so all three are decoded here rather than
+/// guessed at the call site.
 public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
     public let promptTokens: Int?
     public let completionTokens: Int?
     public let totalTokens: Int?
+    /// Input tokens served from the provider's prompt cache.
+    public let cachedTokens: Int?
+    /// Tokens written into the provider's cache by this request
+    /// (Anthropic-style providers bill this separately from a cache read).
+    public let cacheWriteTokens: Int?
 
-    public init(promptTokens: Int? = nil, completionTokens: Int? = nil, totalTokens: Int? = nil) {
+    public init(
+        promptTokens: Int? = nil,
+        completionTokens: Int? = nil,
+        totalTokens: Int? = nil,
+        cachedTokens: Int? = nil,
+        cacheWriteTokens: Int? = nil
+    ) {
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
         self.totalTokens = totalTokens
+        self.cachedTokens = cachedTokens
+        self.cacheWriteTokens = cacheWriteTokens
+    }
+
+    /// The input tokens actually billed at the full rate: everything the
+    /// provider processed minus what it served from cache. Nil when the
+    /// provider reported no prompt count at all (an endpoint that drops usage).
+    public var billableInputTokens: Int? {
+        guard let promptTokens else { return nil }
+        return max(0, promptTokens - (cachedTokens ?? 0))
+    }
+
+    /// Fraction of the prompt served from cache, 0...1, or nil when the
+    /// provider reported no cache split at all. A reported zero is a real
+    /// answer ("nothing was cached"); silence is not.
+    public var cacheReadFraction: Double? {
+        guard let promptTokens, promptTokens > 0, let cachedTokens else { return nil }
+        return Double(min(cachedTokens, promptTokens)) / Double(promptTokens)
     }
 
     enum CodingKeys: String, CodingKey {
         case promptTokens = "prompt_tokens"
         case completionTokens = "completion_tokens"
         case totalTokens = "total_tokens"
+        case promptTokensDetails = "prompt_tokens_details"
+        case cachedTokens = "cached_tokens"
+        case promptCacheHitTokens = "prompt_cache_hit_tokens"
+        case cacheReadInputTokens = "cache_read_input_tokens"
+        case cacheCreationInputTokens = "cache_creation_input_tokens"
+        case cacheWriteTokens = "cache_write_tokens"
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+    }
+
+    private struct PromptTokensDetails: Decodable {
+        let cachedTokens: Int?
+
+        enum CodingKeys: String, CodingKey { case cachedTokens = "cached_tokens" }
+    }
+
+    /// The first key that decodes to a value. A provider that spells a field
+    /// differently should not cost the whole usage block, so an unreadable key
+    /// falls through to the next spelling instead of throwing.
+    private static func firstInt(
+        _ container: KeyedDecodingContainer<CodingKeys>,
+        _ keys: [CodingKeys]
+    ) -> Int? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(Int.self, forKey: key) {
+                return value
+            }
+        }
+        return nil
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let details = try? container.decodeIfPresent(PromptTokensDetails.self, forKey: .promptTokensDetails)
+        self.promptTokens = Self.firstInt(container, [.promptTokens, .inputTokens])
+        self.completionTokens = Self.firstInt(container, [.completionTokens, .outputTokens])
+        self.totalTokens = Self.firstInt(container, [.totalTokens])
+        self.cachedTokens = Self.firstInt(
+            container,
+            [.promptCacheHitTokens, .cachedTokens, .cacheReadInputTokens]
+        ) ?? details?.cachedTokens
+        self.cacheWriteTokens = Self.firstInt(
+            container,
+            [.cacheCreationInputTokens, .cacheWriteTokens]
+        )
+    }
+
+    /// Encodes the canonical OpenAI shape. Nothing in the app persists a usage
+    /// block, so this exists only so the type stays round-trippable in tests.
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(promptTokens, forKey: .promptTokens)
+        try container.encodeIfPresent(completionTokens, forKey: .completionTokens)
+        try container.encodeIfPresent(totalTokens, forKey: .totalTokens)
+        if let cachedTokens {
+            var details = container.nestedContainer(keyedBy: PromptTokensDetails.CodingKeys.self, forKey: .promptTokensDetails)
+            try details.encode(cachedTokens, forKey: .cachedTokens)
+        }
+        try container.encodeIfPresent(cacheWriteTokens, forKey: .cacheCreationInputTokens)
     }
 }
 
@@ -641,6 +798,22 @@ public nonisolated enum CloudAgentStepPlan {
 }
 
 // MARK: - Message Assembly
+
+/// How much of a conversation's pictures one request carries.
+///
+/// A stateless API has to be told about an image on every step that should
+/// still see it, and those tokens are billed every time. Attaching a picture
+/// to one question and then asking ten follow-ups re-sends it ten times. The
+/// cheaper policy sends the newest turn's pictures and replaces older ones
+/// with a one-line notice, which is also prefix-stable: the choice depends on
+/// the conversation, not on the step.
+public nonisolated enum CloudImageDelivery: Equatable, Sendable {
+    /// Every picture in the conversation rides every request (the default).
+    case all
+    /// Only the newest user turn's pictures ride; older ones become notices.
+    case newestUserTurnOnly
+}
+
 /// Builds the outbound messages array from a conversation. The provider owns
 /// chat templating, so history travels as messages; tool turns are replayed in
 /// the OpenAI exchange shape (assistant `tool_calls` followed by one `tool`
@@ -654,8 +827,17 @@ public nonisolated enum CloudMessageAssembler {
         from messages: [ChatMessage],
         excludingMessageIds: Set<UUID> = [],
         imageDataURLs: [UUID: [String]] = [:],
-        imagesSupported: Bool = true
+        imagesSupported: Bool = true,
+        imageDelivery: CloudImageDelivery = .all
     ) -> [CloudChatMessage] {
+        // Resolved before the loop: "newest" must mean the newest in the
+        // conversation, not the newest seen so far.
+        var newestImageTurnId: UUID?
+        if imageDelivery == .newestUserTurnOnly {
+            newestImageTurnId = messages
+                .last(where: { $0.role == .user && !($0.attachments ?? []).isEmpty })?
+                .id
+        }
         var assembled: [CloudChatMessage] = []
         for message in messages {
             if excludingMessageIds.contains(message.id) { continue }
@@ -667,12 +849,16 @@ public nonisolated enum CloudMessageAssembler {
                 continue
             }
             let attachments = message.role == .user ? (message.attachments ?? []) : []
-            let resolvedURLs = attachments.isEmpty ? [] : (imageDataURLs[message.id] ?? [])
+            let omittedByPolicy = newestImageTurnId != nil && message.id != newestImageTurnId
+            let resolvedURLs = (attachments.isEmpty || omittedByPolicy)
+                ? []
+                : (imageDataURLs[message.id] ?? [])
             let (text, parts, descriptions) = attachmentCarryingContent(
                 content: content,
                 attachments: attachments,
                 resolvedURLs: resolvedURLs,
-                imagesSupported: imagesSupported
+                imagesSupported: imagesSupported,
+                omittedForPolicy: omittedByPolicy
             )
             // A user turn that carries only images is still a real turn: sending
             // nothing for it would silently drop the picture from the history.
@@ -692,21 +878,29 @@ public nonisolated enum CloudMessageAssembler {
     /// step (history is rebuilt per step), so an agent run keeps the model's
     /// visual context instead of forgetting the picture after turn one.
     ///
-    /// When the model cannot take images — or an asset is missing on disk — the
-    /// turn carries a metadata-only notice instead of silently losing the
-    /// picture: a model told "an image was attached" answers about it, while a
-    /// model that never hears about it invents an answer about nothing.
+    /// When the model cannot take images — or an asset is missing on disk, or
+    /// the turn is older than the delivery policy allows — the turn carries a
+    /// metadata-only notice instead of silently losing the picture: a model
+    /// told "an image was attached" answers about it, while a model that never
+    /// hears about it invents an answer about nothing.
     static func attachmentCarryingContent(
         content: String,
         attachments: [ImageAttachmentRef],
         resolvedURLs: [String],
-        imagesSupported: Bool
+        imagesSupported: Bool,
+        omittedForPolicy: Bool = false
     ) -> (text: String, parts: [String], descriptions: [String]) {
         guard !attachments.isEmpty else { return (content, [], []) }
         let descriptions = attachments.map(\.logDescription)
         guard imagesSupported else {
             return (appendingNotice(
                 omittedImagesNotice(count: attachments.count, reason: "model has no vision support"),
+                to: content
+            ), [], descriptions)
+        }
+        if omittedForPolicy {
+            return (appendingNotice(
+                omittedImagesNotice(count: attachments.count, reason: "older turn, not re-sent"),
                 to: content
             ), [], descriptions)
         }

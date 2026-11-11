@@ -2217,7 +2217,11 @@ struct SettingsSheetView: View {
                 .foregroundStyle(.secondary)
 
             if let input = log.inputTokens, let output = log.outputTokens {
-                Text("\(input)→\(output) tok")
+                Text(
+                    (log.cachedInputTokens ?? 0) > 0
+                        ? "\(input)→\(output) tok · \(log.cachedInputTokens ?? 0) cached"
+                        : "\(input)→\(output) tok"
+                )
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
@@ -2278,7 +2282,11 @@ struct SettingsSheetView: View {
                     }
                     serverRequestLogDetailLine("Model", log.model ?? "—")
                     serverRequestLogDetailLine("Tokens", log.inputTokens.map { input in
-                        "\(input) in / \(log.outputTokens.map(String.init) ?? "—") out"
+                        var text = "\(input) in / \(log.outputTokens.map(String.init) ?? "—") out"
+                        if let cached = log.cachedInputTokens, cached > 0 {
+                            text += " (\(cached) cached, \(max(0, input - cached)) billable)"
+                        }
+                        return text
                     } ?? "—")
                     serverRequestLogDetailLine("Finish", log.finishReason ?? "—")
                     serverRequestLogDetailLine("Request Size", log.requestBytes.map { "\(ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file)) (\($0) bytes)" } ?? "—")

@@ -342,11 +342,19 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
     /// Running total of every token this conversation has consumed: the prompt
     /// tokens each turn actually ingested (the portion the pinned prefix did
     /// not already cover) plus every generated token, across all agent steps.
+    /// A cloud turn's provider cache reads are subtracted the same way a local
+    /// pinned prefix is, so a cheap re-send never reads as fresh context.
     /// `nil` when unmetered — a history from before the counter existed, or a
     /// conversation freshly compacted by /compact, which resets the total —
     /// and the next send then initializes it from that turn's full prompt,
     /// which is the conversation's context size.
     public var cumulativeTokenCount: Int?
+    /// Running spend for this conversation, in whatever currency the recorded
+    /// price list uses (USD by convention). Only a cloud turn contributes: a
+    /// weights model has no invoice. `nil` when the conversation has never had
+    /// a priced provider turn, and never reset by compaction — the money was
+    /// already spent.
+    public var cumulativeCost: Double?
 
     public init(
         id: UUID = UUID(),
@@ -365,7 +373,8 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         rollingSummary: String? = nil,
         recentWorkDigest: String? = nil,
         titleOrigin: SessionTitleOrigin? = nil,
-        cumulativeTokenCount: Int? = nil
+        cumulativeTokenCount: Int? = nil,
+        cumulativeCost: Double? = nil
     ) {
         self.id = id
         self.title = title
@@ -389,6 +398,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         self.recentWorkDigest = recentWorkDigest
         self.titleOrigin = titleOrigin
         self.cumulativeTokenCount = cumulativeTokenCount
+        self.cumulativeCost = cumulativeCost
     }
 
     enum CodingKeys: String, CodingKey {
@@ -400,6 +410,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         case rollingSummary, recentWorkDigest
         case titleOrigin
         case cumulativeTokenCount
+        case cumulativeCost
     }
 
     public init(from decoder: Decoder) throws {
@@ -438,6 +449,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         self.recentWorkDigest = try container.decodeIfPresent(String.self, forKey: .recentWorkDigest)
         self.titleOrigin = try container.decodeIfPresent(SessionTitleOrigin.self, forKey: .titleOrigin)
         self.cumulativeTokenCount = try container.decodeIfPresent(Int.self, forKey: .cumulativeTokenCount)
+        self.cumulativeCost = try container.decodeIfPresent(Double.self, forKey: .cumulativeCost)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -459,6 +471,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         try container.encodeIfPresent(recentWorkDigest, forKey: .recentWorkDigest)
         try container.encodeIfPresent(titleOrigin, forKey: .titleOrigin)
         try container.encodeIfPresent(cumulativeTokenCount, forKey: .cumulativeTokenCount)
+        try container.encodeIfPresent(cumulativeCost, forKey: .cumulativeCost)
     }
 }
 
@@ -586,7 +599,8 @@ public extension ChatSession {
     nonisolated static func compactedHistory(
         summary: String,
         recap: String?,
-        evictedMessageCount: Int
+        evictedMessageCount: Int,
+        modelLabel: String = "Apple Foundation Model"
     ) -> [ChatMessage] {
         let card = ChatMessage(
             role: .system,
@@ -595,7 +609,7 @@ public extension ChatSession {
         )
         let marker = ChatMessage(
             role: .system,
-            content: "🗂 \(evictedMessageCount) messages compacted into a rolling summary by Apple Foundation Model. The conversation continues from that summary context."
+            content: "🗂 \(evictedMessageCount) messages compacted into a rolling summary by \(modelLabel). The conversation continues from that summary context."
         )
         return [card, marker]
     }

@@ -93,6 +93,7 @@ struct CloudProvidersSettingsView: View {
     @State private var testStates: [String: TestState] = [:]
     @State private var providerEditor: ProviderEditorTarget? = nil
     @State private var pendingConfirmation: RemovalConfirmation? = nil
+    @AppStorage("dynamoe_cloud_resend_images") private var resendImages: Bool = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -100,6 +101,7 @@ struct CloudProvidersSettingsView: View {
                 providerCard(provider)
             }
 
+            requestBehaviourCard
             addProviderCard
             registeredModelsCard
         }
@@ -129,6 +131,51 @@ struct CloudProvidersSettingsView: View {
     }
 
     // MARK: - Cards
+
+    /// Provider-independent request behaviour: what every cloud turn asks for,
+    /// and where its cost and context ceiling come from.
+    private var requestBehaviourCard: some View {
+        SettingsCard(header: "Request Behaviour") {
+            SettingsRow(
+                title: "Re-send Images",
+                subtitle: "A stateless provider has to be re-told about a picture on every request that should still see it, and those tokens are billed every time. Off sends only the newest user turn's pictures and replaces older ones with a one-line notice, so a twenty-step agent run stops paying for the same image twenty times.",
+                icon: "photo.on.rectangle.angled",
+                iconTint: .cyan
+            ) {
+                Toggle("", isOn: $resendImages)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .accessibilityLabel("Re-send images on every request")
+            }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Prompt Caching",
+                subtitle: "Every request carries a stable session-affinity header so a router can keep this conversation on one replica; Synthetic also gets OpenAI's prompt_cache_key. A provider that rejects the field is retried once without it and remembered for the rest of the session. Cache reads are reported in the Request Log beside the input total.",
+                icon: "internaldrive.fill",
+                iconTint: .cyan
+            ) { EmptyView() }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Context Window",
+                subtitle: "Auto-compaction needs the model's window. Record it per model with: defaults write DRP.DynaMoE dynamoe_cloud_<provider>_context -string \"<model>=128000\" (entries separated by \"; \"). Without one, nothing auto-compacts and the header shows the plain token total.",
+                icon: "ruler.fill",
+                iconTint: .cyan
+            ) { EmptyView() }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Prices",
+                subtitle: "Cost reporting needs per-model prices in USD per million tokens: defaults write DRP.DynaMoE dynamoe_cloud_<provider>_pricing -string '{\"<model>\":{\"input\":0.27,\"cached_input\":0.07,\"output\":1.1}}'. A model with no price simply reports no cost.",
+                icon: "dollarsign.circle.fill",
+                iconTint: .cyan
+            ) { EmptyView() }
+        }
+    }
 
     private func providerCard(_ provider: CloudProvider) -> some View {
         SettingsCard(header: provider.displayName) {
@@ -188,6 +235,33 @@ struct CloudProvidersSettingsView: View {
                     if !registeredSpecs(for: provider).isEmpty {
                         Button("Clear") { clearModels(for: provider) }
                     }
+                }
+            }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Prompt Caching",
+                subtitle: "Session-affinity headers ride every request so a router can keep this conversation on one replica; the cache key is OpenAI's documented routing hint. A provider that rejects the field is retried once without it and remembered.",
+                icon: "internaldrive.fill",
+                iconTint: .cyan
+            ) {
+                if providerStore.isBuiltIn(provider) {
+                    Text(provider.resolvedCacheHints.displayName)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                } else {
+                    Picker("", selection: Binding(
+                        get: { provider.resolvedCacheHints },
+                        set: { try? providerStore.setCacheHints($0, for: provider) }
+                    )) {
+                        ForEach(CloudCacheHints.allCases, id: \.self) { hint in
+                            Text(hint.displayName).tag(hint)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 230)
+                    .accessibilityLabel("Prompt caching support for \(provider.displayName)")
                 }
             }
 

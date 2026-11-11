@@ -1278,3 +1278,437 @@ final class CloudStreamTransportTests: XCTestCase {
         XCTAssertEqual(code, 400)
     }
 }
+
+// MARK: - Cache-aware usage
+
+final class CloudUsageSplitTests: XCTestCase {
+    private func decode(_ json: String) throws -> CloudUsage {
+        try JSONDecoder().decode(CloudUsage.self, from: Data(json.utf8))
+    }
+
+    func testOpenAINestedCacheDetailIsDecoded() throws {
+        let usage = try decode(
+            #"{"prompt_tokens":1000,"completion_tokens":50,"total_tokens":1050,"prompt_tokens_details":{"cached_tokens":800}}"#
+        )
+        XCTAssertEqual(usage.promptTokens, 1000)
+        XCTAssertEqual(usage.cachedTokens, 800)
+        XCTAssertEqual(usage.billableInputTokens, 200)
+        XCTAssertEqual(usage.cacheReadFraction, 0.8)
+    }
+
+    func testDeepSeekTopLevelCacheHitIsDecoded() throws {
+        let usage = try decode(#"{"prompt_tokens":900,"completion_tokens":10,"prompt_cache_hit_tokens":600}"#)
+        XCTAssertEqual(usage.cachedTokens, 600)
+        XCTAssertEqual(usage.billableInputTokens, 300)
+    }
+
+    func testAnthropicCacheColumnsAreDecoded() throws {
+        let usage = try decode(
+            #"{"input_tokens":500,"output_tokens":20,"cache_read_input_tokens":400,"cache_creation_input_tokens":100}"#
+        )
+        XCTAssertEqual(usage.promptTokens, 500)
+        XCTAssertEqual(usage.cachedTokens, 400)
+        XCTAssertEqual(usage.cacheWriteTokens, 100)
+        XCTAssertEqual(usage.billableInputTokens, 100)
+    }
+
+    func testAProviderWithoutACacheSplitStillReportsBillableInput() throws {
+        let usage = try decode(#"{"prompt_tokens":250,"completion_tokens":5}"#)
+        XCTAssertNil(usage.cachedTokens)
+        XCTAssertEqual(usage.billableInputTokens, 250)
+        XCTAssertNil(usage.cacheReadFraction)
+    }
+
+    func testNoPromptCountMeansNoBillableNumber() throws {
+        let usage = try decode(#"{"completion_tokens":5}"#)
+        XCTAssertNil(usage.billableInputTokens)
+        XCTAssertNil(usage.cacheReadFraction)
+    }
+
+    func testCachedCannotExceedThePrompt() throws {
+        let usage = try decode(#"{"prompt_tokens":10,"cached_tokens":50}"#)
+        XCTAssertEqual(usage.billableInputTokens, 0)
+        XCTAssertEqual(usage.cacheReadFraction, 1.0)
+    }
+
+    func testTheUsageBlockRoundTrips() throws {
+        let original = CloudUsage(
+            promptTokens: 100,
+            completionTokens: 7,
+            totalTokens: 107,
+            cachedTokens: 40,
+            cacheWriteTokens: 5
+        )
+        let data = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(CloudUsage.self, from: data)
+        XCTAssertEqual(decoded, original)
+    }
+}
+
+// MARK: - Cache hints on the wire
+
+final class CloudCacheHintRequestTests: XCTestCase {
+    private func makeRequest(
+        hints: CloudCacheHints,
+        sessionKey: String? = "abc123",
+        host: String = "provider.test"
+    ) throws -> URLRequest {
+        let base = "https://\(host)/openai/v1"
+        let service = OpenAICloudChatService(
+            chatURL: URL(string: "\(base)/chat/completions")!,
+            modelsURL: URL(string: "\(base)/models")!,
+            apiKey: "sk-test",
+            requestTimeout: 5,
+            cacheHints: hints
+        )
+        return try service.makeRequest(
+            model: "m",
+            messages: [CloudChatMessage(role: "user", content: "hi")],
+            params: CloudChatGenerationParams(sessionKey: sessionKey)
+        )
+    }
+
+    private func body(_ request: URLRequest) throws -> [String: Any] {
+        let data = try XCTUnwrap(request.httpBody)
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    func testAffinityHeadersRideTheRequestWithoutACacheKey() throws {
+        let request = try makeRequest(hints: .affinity, host: "affinity.test")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "x-session-id"), "abc123")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "x-session-affinity"), "abc123")
+        XCTAssertNil(try body(request)["prompt_cache_key"])
+    }
+
+    func testTheOpenAIHintAddsTheDocumentedCacheKey() throws {
+        let request = try makeRequest(hints: .openAI, host: "openai-key.test")
+        XCTAssertEqual(try body(request)["prompt_cache_key"] as? String, "abc123")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "x-session-affinity"), "abc123")
+    }
+
+    func testNoSessionKeySendsNoCacheHintAtAll() throws {
+        let request = try makeRequest(hints: .openAI, sessionKey: nil, host: "no-session.test")
+        XCTAssertNil(request.value(forHTTPHeaderField: "x-session-id"))
+        XCTAssertNil(request.value(forHTTPHeaderField: "x-session-affinity"))
+        XCTAssertNil(try body(request)["prompt_cache_key"])
+    }
+
+    func testTheOffHintSendsNothing() throws {
+        let request = try makeRequest(hints: .none, host: "off.test")
+        XCTAssertNil(request.value(forHTTPHeaderField: "x-session-id"))
+        XCTAssertNil(try body(request)["prompt_cache_key"])
+    }
+
+    func testTheBodyIsDeterministicAsWellAsCorrect() throws {
+        // Sorted JSON keys are a cache requirement, not a style choice: tool
+        // schemas are Swift dictionaries, and an order that flips between
+        // requests invalidates the provider's whole prompt prefix.
+        let request = try makeRequest(hints: .affinity, host: "sorted.test")
+        let data = try XCTUnwrap(request.httpBody)
+        let text = try XCTUnwrap(String(data: data, encoding: .utf8))
+        let messages = try XCTUnwrap(text.range(of: "\"messages\""))
+        let model = try XCTUnwrap(text.range(of: "\"model\""))
+        let stream = try XCTUnwrap(text.range(of: "\"stream\""))
+        XCTAssertLessThan(messages.lowerBound, model.lowerBound)
+        XCTAssertLessThan(model.lowerBound, stream.lowerBound)
+    }
+
+    func testOnlyClientErrorsAreRetriedWithoutTheCacheKey() {
+        XCTAssertTrue(OpenAICloudChatService.shouldRetryWithoutCacheKey(status: 400))
+        XCTAssertTrue(OpenAICloudChatService.shouldRetryWithoutCacheKey(status: 422))
+        XCTAssertFalse(OpenAICloudChatService.shouldRetryWithoutCacheKey(status: 401))
+        XCTAssertFalse(OpenAICloudChatService.shouldRetryWithoutCacheKey(status: 429))
+        XCTAssertFalse(OpenAICloudChatService.shouldRetryWithoutCacheKey(status: 500))
+    }
+}
+
+final class CloudSessionKeyTests: XCTestCase {
+    func testTheKeyIsStableOpaqueAndPerConversation() {
+        let first = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
+        let second = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
+        XCTAssertEqual(CloudSessionKey.hashed(first), CloudSessionKey.hashed(first))
+        XCTAssertNotEqual(CloudSessionKey.hashed(first), CloudSessionKey.hashed(second))
+        let key = CloudSessionKey.hashed(first)
+        XCTAssertFalse(key.contains("-"))
+        XCTAssertTrue(key.allSatisfy { $0.isHexDigit })
+    }
+}
+
+// MARK: - Image delivery policy
+
+final class CloudImageDeliveryPolicyTests: XCTestCase {
+    private func ref(_ name: String) -> ImageAttachmentRef {
+        ImageAttachmentRef(
+            fileName: name,
+            pixelWidth: 10,
+            pixelHeight: 10,
+            byteCount: 10,
+            sha256: name,
+            relativePath: "images/\(name)",
+            mimeType: "image/png"
+        )
+    }
+
+    private func conversation() -> [ChatMessage] {
+        [
+            ChatMessage(role: .user, content: "first picture", attachments: [ref("a.png")]),
+            ChatMessage(role: .assistant, content: "saw it"),
+            ChatMessage(role: .user, content: "second picture", attachments: [ref("b.png")])
+        ]
+    }
+
+    private func urls(for messages: [ChatMessage]) -> [UUID: [String]] {
+        var map: [UUID: [String]] = [:]
+        for message in messages {
+            guard let attachments = message.attachments else { continue }
+            map[message.id] = attachments.map { "data:image/png;base64,\($0.fileName)" }
+        }
+        return map
+    }
+
+    func testTheDefaultKeepsEveryPicture() {
+        let messages = conversation()
+        let assembled = CloudMessageAssembler.assemble(
+            from: messages,
+            imageDataURLs: urls(for: messages)
+        )
+        XCTAssertEqual(assembled.filter { ($0.imageParts?.count ?? 0) > 0 }.count, 2)
+    }
+
+    func testNewestTurnOnlyDropsOlderPicturesWithANotice() {
+        let messages = conversation()
+        let assembled = CloudMessageAssembler.assemble(
+            from: messages,
+            imageDataURLs: urls(for: messages),
+            imageDelivery: .newestUserTurnOnly
+        )
+        // Only the newest user turn carries pixels.
+        XCTAssertEqual(assembled.filter { ($0.imageParts?.count ?? 0) > 0 }.count, 1)
+        let firstTurn = assembled.first { $0.role == "user" }
+        XCTAssertNil(firstTurn?.imageParts)
+        XCTAssertTrue(firstTurn?.content?.contains("older turn, not re-sent") ?? false)
+        // The conversation is otherwise unchanged, so the prefix still extends.
+        XCTAssertEqual(assembled.count, 3)
+    }
+
+    func testThePolicyIsStableAcrossRepeatedRenders() {
+        let messages = conversation()
+        let map = urls(for: messages)
+        let first = CloudMessageAssembler.assemble(
+            from: messages,
+            imageDataURLs: map,
+            imageDelivery: .newestUserTurnOnly
+        )
+        let second = CloudMessageAssembler.assemble(
+            from: messages,
+            imageDataURLs: map,
+            imageDelivery: .newestUserTurnOnly
+        )
+        XCTAssertEqual(first, second)
+    }
+}
+
+// MARK: - Prefix stability
+
+final class CloudPrefixStabilityTests: XCTestCase {
+    func testAStepExtendsThePreviousPromptInsteadOfRewritingIt() {
+        let record = ToolCallRecord(
+            name: "file_read",
+            arguments: ["path": "/a"],
+            rawArguments: #"{"path":"/a"}"#,
+            status: .success,
+            output: "hello"
+        )
+        let history = [
+            ChatMessage(role: .user, content: "read it"),
+            ChatMessage(role: .assistant, content: "Reading.", toolCalls: [record]),
+            ChatMessage(role: .assistant, content: "It says hello.")
+        ]
+        let firstStep = CloudMessageAssembler.assemble(from: Array(history.prefix(2)))
+        let secondStep = CloudMessageAssembler.assemble(from: history)
+        XCTAssertEqual(Array(secondStep.prefix(firstStep.count)), firstStep)
+        XCTAssertEqual(secondStep.count, firstStep.count + 1)
+    }
+}
+
+// MARK: - Context budget
+
+final class CloudContextPolicyTests: XCTestCase {
+    private func scratchDefaults() -> UserDefaults {
+        let suite = "CloudContextPolicyTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        return defaults
+    }
+
+    func testOverridesParseBothSpellingsAndDropNonsense() {
+        let defaults = scratchDefaults()
+        CloudContextPolicy.setOverrides(
+            ["a": 128_000, "b": 32_000],
+            for: "p",
+            defaults: defaults
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.overrides(for: "p", defaults: defaults),
+            ["a": 128_000, "b": 32_000]
+        )
+        defaults.set(
+            "model@64000; other=8192; bad=12; =5",
+            forKey: CloudContextPolicy.defaultsKey(for: "q")
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.overrides(for: "q", defaults: defaults),
+            ["model": 64_000, "other": 8_192]
+        )
+    }
+
+    func testTheThresholdIsEightyPercentOfAKnownWindow() {
+        XCTAssertFalse(CloudContextPolicy.shouldCompact(promptTokens: 79_999, window: 100_000))
+        XCTAssertTrue(CloudContextPolicy.shouldCompact(promptTokens: 80_000, window: 100_000))
+        XCTAssertFalse(CloudContextPolicy.shouldCompact(promptTokens: 1_000_000, window: nil))
+        XCTAssertFalse(CloudContextPolicy.shouldCompact(promptTokens: 1_000, window: 512))
+    }
+
+    func testTheSpecWindowWinsOverTheProviderFallback() {
+        let defaults = scratchDefaults()
+        defaults.set(64_000, forKey: CloudContextPolicy.globalWindowKey)
+        let spec = CloudModelSpec(
+            providerId: "p",
+            providerModelId: "m",
+            displayName: "m",
+            supportsThinking: false,
+            contextWindowTokens: 200_000
+        )
+        XCTAssertEqual(CloudContextPolicy.window(for: spec, defaults: defaults), 200_000)
+        XCTAssertEqual(CloudContextPolicy.window(for: nil, defaults: defaults), 64_000)
+        defaults.removeObject(forKey: CloudContextPolicy.globalWindowKey)
+        XCTAssertNil(CloudContextPolicy.window(for: nil, defaults: defaults))
+    }
+
+    func testPercentagesAndChunkBudgetsStaySane() {
+        XCTAssertEqual(CloudContextPolicy.usagePercent(promptTokens: 64_000, window: 128_000), 50)
+        XCTAssertNil(CloudContextPolicy.usagePercent(promptTokens: 64_000, window: nil))
+        XCTAssertEqual(CloudContextPolicy.chunkCharacterBudget(window: 128_000), 168_960)
+        // Unknown windows still get a usable chunk rather than zero.
+        XCTAssertEqual(CloudContextPolicy.chunkCharacterBudget(window: nil), 24_000)
+    }
+}
+
+final class CloudCompactionBoundaryTests: XCTestCase {
+    func testTheKeptTailStartsAtAUserTurn() {
+        let messages = [
+            ChatMessage(role: .user, content: "one"),
+            ChatMessage(role: .assistant, content: "a"),
+            ChatMessage(role: .user, content: "two"),
+            ChatMessage(role: .assistant, content: "b")
+        ]
+        XCTAssertEqual(CloudCompactionBoundary.tailStart(messages: messages, keepRecentMessages: 2), 2)
+        XCTAssertEqual(CloudCompactionBoundary.tailStart(messages: messages, keepRecentMessages: 1), 2)
+        XCTAssertEqual(CloudCompactionBoundary.tailStart(messages: messages, keepRecentMessages: 0), 4)
+        XCTAssertNil(CloudCompactionBoundary.tailStart(
+            messages: [ChatMessage(role: .assistant, content: "a")],
+            keepRecentMessages: 1
+        ))
+        XCTAssertNil(CloudCompactionBoundary.tailStart(messages: [], keepRecentMessages: 1))
+    }
+
+    func testACompactedHistoryCanCompactAgain() {
+        // The head is the system-role card and marker a previous compaction
+        // left behind, so the backward walk lands on a system row. Keeping the
+        // NEXT user turn is what stops a conversation from compacting once and
+        // then silently refusing forever.
+        let messages = [
+            ChatMessage(role: .system, content: "card"),
+            ChatMessage(role: .system, content: "marker"),
+            ChatMessage(role: .user, content: "continue"),
+            ChatMessage(role: .assistant, content: "ok")
+        ]
+        XCTAssertEqual(CloudCompactionBoundary.tailStart(messages: messages, keepRecentMessages: 8), 2)
+    }
+}
+
+// MARK: - Pricing
+
+final class CloudPricingTests: XCTestCase {
+    func testCachedInputIsDiscountedAndAnUnknownRateFallsBackToInput() throws {
+        let usage = CloudUsage(promptTokens: 1_000_000, completionTokens: 100_000, cachedTokens: 800_000)
+        let priced = CloudPricing(input: 2, cachedInput: 0.5, output: 10)
+        // 200k fresh * $2 + 800k cached * $0.50 + 100k out * $10.
+        XCTAssertEqual(try XCTUnwrap(priced.cost(for: usage)), 1.8, accuracy: 1e-9)
+        let noCacheRate = CloudPricing(input: 2, output: 10)
+        XCTAssertEqual(try XCTUnwrap(noCacheRate.cost(for: usage)), 3.0, accuracy: 1e-9)
+    }
+
+    func testNoPromptCountMeansNoCost() {
+        let usage = CloudUsage(completionTokens: 10)
+        XCTAssertNil(CloudPricing(input: 1, output: 1).cost(for: usage))
+    }
+
+    func testTheStoreRoundTripsAndIgnoresGarbage() {
+        let suite = "CloudPricingTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        CloudPricingStore.setPricing(
+            ["m": CloudPricing(input: 0.27, cachedInput: 0.07, output: 1.1)],
+            for: "p",
+            defaults: defaults
+        )
+        XCTAssertEqual(
+            CloudPricingStore.pricing(forModel: "m", providerId: "p", defaults: defaults),
+            CloudPricing(input: 0.27, cachedInput: 0.07, output: 1.1)
+        )
+        defaults.set("{not json", forKey: CloudPricingStore.defaultsKey(for: "p"))
+        XCTAssertTrue(CloudPricingStore.pricing(for: "p", defaults: defaults).isEmpty)
+    }
+
+    func testSmallAmountsStayVisible() {
+        XCTAssertEqual(CloudPricingStore.formatted(0.00012), "$0.0001")
+        XCTAssertEqual(CloudPricingStore.formatted(1.234), "$1.23")
+        XCTAssertEqual(CloudPricingStore.formatted(0), "$0")
+    }
+}
+
+final class CloudTurnReportTests: XCTestCase {
+    func testTheSuffixNamesCachedTokensAndCost() {
+        let report = CloudTurnReport(
+            usage: CloudUsage(promptTokens: 1204, completionTokens: 56, cachedTokens: 1000),
+            estimatedPromptTokens: 999,
+            outputTokens: 50,
+            cost: 0.0031
+        )
+        XCTAssertEqual(report.statusSuffix, "1,204 in (1,000 cached) / 56 out · $0.0031")
+    }
+
+    func testAnEndpointThatDropsUsageIsMarkedAsEstimated() {
+        let report = CloudTurnReport(
+            usage: nil,
+            estimatedPromptTokens: 1200,
+            outputTokens: 40,
+            cost: nil
+        )
+        XCTAssertTrue(report.wasEstimated)
+        XCTAssertEqual(report.statusSuffix, "1,200 in / 40 out (est.)")
+    }
+}
+
+// MARK: - Session spend
+
+final class ChatSessionCostPersistenceTests: XCTestCase {
+    func testReportedSpendSurvivesARoundTrip() throws {
+        let session = ChatSession(title: "priced", cumulativeCost: 0.1234)
+        let data = try JSONEncoder().encode(session)
+        let decoded = try JSONDecoder().decode(ChatSession.self, from: data)
+        XCTAssertEqual(try XCTUnwrap(decoded.cumulativeCost), 0.1234, accuracy: 1e-9)
+    }
+
+    func testASessionWrittenBeforeTheFieldDecodesWithNoCost() throws {
+        let session = ChatSession(title: "legacy", cumulativeCost: 0.5)
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try JSONEncoder().encode(session)) as? [String: Any]
+        )
+        object.removeValue(forKey: "cumulativeCost")
+        let data = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(ChatSession.self, from: data)
+        XCTAssertNil(decoded.cumulativeCost)
+    }
+}
