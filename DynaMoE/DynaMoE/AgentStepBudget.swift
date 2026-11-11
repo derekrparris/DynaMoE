@@ -65,9 +65,11 @@ public nonisolated enum AgentStepBudget {
     /// `step` is zero-based, so a cap of N allows steps 0…N-1 — the same
     /// `step + 1 < cap` arithmetic both loops used inline before this existed.
     /// Written as a subtraction so a cap of `Int.max` (see `compareCap`) can
-    /// never overflow the comparison.
+    /// never overflow the comparison. `Int.min` is the other edge, where the
+    /// subtraction would trap, and no cap that small allows a step.
     public static func allowsAnotherStep(step: Int, cap: Int?) -> Bool {
         guard let cap else { return true }
+        guard cap != Int.min else { return false }
         return step < cap - 1
     }
 
@@ -84,21 +86,21 @@ public nonisolated enum AgentStepBudget {
         cap ?? Int.max
     }
 
-    /// The value shown beside the settings slider: `"15 steps"`, `"1 step"`,
-    /// or `"No limit"`.
-    public static func statusLabel(cap: Int?) -> String {
-        guard let cap else { return "No limit" }
-        return cap == 1 ? "1 step" : "\(cap) steps"
+    /// The value shown beside the settings slider: `"15 steps"` or `"1 step"`.
+    /// Only a finite cap reaches here: the settings row's own "No limit"
+    /// switch is what says a run is uncapped, so this label never repeats it.
+    public static func statusLabel(cap: Int) -> String {
+        cap == 1 ? "1 step" : "\(cap) steps"
     }
 
-    /// The run-end status line for a run that stopped on its step budget.
-    /// With no cap the old "maximum allowed steps (15)" wording would name a
-    /// limit that never applied, so the unlimited case says what did end it.
-    public static func maxStepsReachedNotice(cap: Int?) -> String {
-        guard let cap else {
-            return "✨ Agent stopped — no step limit, so the run ended on its own tool loop."
-        }
-        return "✨ Agent completed maximum allowed steps (\(cap))."
+    /// The run-end status line for a run that spent a finite step budget.
+    ///
+    /// A run with no cap cannot reach this: `allowsAnotherStep` is true at
+    /// every step, so only `complete` or a tool-loop guard ends it, and each
+    /// of those has its own status line. Naming the cap here therefore always
+    /// names a limit that applied.
+    public static func maxStepsReachedNotice(cap: Int) -> String {
+        "✨ Agent completed maximum allowed steps (\(cap))."
     }
 
     /// The run-end status line for a run one of the harness guards stopped

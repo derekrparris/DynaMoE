@@ -5685,9 +5685,14 @@ struct ContentView: View {
                         || agent.totalFailedToolCalls >= agent.failedToolCallTotalLimit
                         || agent.maxRepeatedToolCallCount >= agent.repeatedToolCallLimit
 
+                    // Resolve the cap once for this post-turn decision, so the
+                    // status below names the budget that actually applied even
+                    // if Settings changed while the turn was generating.
+                    let stepCap = self.agentStepCap
+
                     // If not finished and steps remaining, invoke next step
                     if !anyCompleted && !toolFailureLoop,
-                       AgentStepBudget.allowsAnotherStep(step: agentStep, cap: self.agentStepCap) {
+                       AgentStepBudget.allowsAnotherStep(step: agentStep, cap: stepCap) {
                         // Auto-relay: completed background subagents whose final reports have
                         // not yet reached the conversation get injected as SUBAGENT_RESULT
                         // blocks here, so the coordinator can present them to the user.
@@ -5918,13 +5923,15 @@ struct ContentView: View {
                         await MainActor.run {
                             self.isGeneratingText = false
                             self.generationTask = nil
-                            self.showStatus(
-                                anyCompleted
-                                    ? "✨ Agent completed task."
-                                    : (toolFailureLoop
-                                        ? AgentStepBudget.loopGuardStoppedNotice
-                                        : AgentStepBudget.maxStepsReachedNotice(cap: self.agentStepCap))
-                            )
+                            if anyCompleted {
+                                self.showStatus("✨ Agent completed task.")
+                            } else if toolFailureLoop {
+                                self.showStatus(AgentStepBudget.loopGuardStoppedNotice)
+                            } else if let cap = stepCap {
+                                // The only remaining reason is an exhausted
+                                // budget, which needs a finite cap to exist.
+                                self.showStatus(AgentStepBudget.maxStepsReachedNotice(cap: cap))
+                            }
                             self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)
                         }
                         return

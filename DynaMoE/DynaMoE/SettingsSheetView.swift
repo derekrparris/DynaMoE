@@ -1318,19 +1318,15 @@ struct SettingsSheetView: View {
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
-                        Text(AgentStepBudget.statusLabel(cap: agentStepCap))
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                        HStack(spacing: 6) {
-                            Text("No limit")
-                                .font(.system(size: 12))
+                        if let cap = agentStepCap {
+                            Text(AgentStepBudget.statusLabel(cap: cap))
+                                .font(.system(size: 12, design: .monospaced))
                                 .foregroundStyle(.secondary)
-                            Toggle("No Limit", isOn: $isMaxAgentStepsUnlimited)
-                                .toggleStyle(.switch)
-                                .labelsHidden()
-                                .controlSize(.small)
-                                .accessibilityLabel("No Limit for Max Multi-Step Agent Iterations")
                         }
+                        Toggle("No limit", isOn: $isMaxAgentStepsUnlimited)
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
+                            .accessibilityLabel("No Limit for Max Multi-Step Agent Iterations")
                     }
                     Slider(value: Binding(
                         get: { Double(maxAgentSteps) },
