@@ -31,9 +31,13 @@ struct CloudProvidersSettingsView: View {
         case add
         case edit(CloudProvider)
 
+        /// `.add` uses a separator no identifier can contain: identifiers are
+        /// lowercase letters, digits, and dashes, so a suffix of `.add` would
+        /// collide with a provider whose id is literally `add`, while a colon
+        /// cannot appear in one.
         var id: String {
             switch self {
-            case .add: return "provider-editor.add"
+            case .add: return "provider-editor:add"
             case .edit(let provider): return "provider-editor.\(provider.id)"
             }
         }
@@ -44,13 +48,51 @@ struct CloudProvidersSettingsView: View {
         }
     }
 
+    /// One alert covers both destructive actions: SwiftUI only reliably hosts
+    /// one alert on a view, so provider removal and key removal share state
+    /// rather than racing two modifiers.
+    private enum RemovalConfirmation: Identifiable {
+        case provider(CloudProvider)
+        case apiKey(CloudProvider)
+
+        var id: String {
+            switch self {
+            case .provider(let provider): return "remove-provider.\(provider.id)"
+            case .apiKey(let provider): return "remove-key.\(provider.id)"
+            }
+        }
+
+        var provider: CloudProvider {
+            switch self {
+            case .provider(let provider), .apiKey(let provider):
+                return provider
+            }
+        }
+
+        var title: String {
+            switch self {
+            case .provider: return "Remove provider?"
+            case .apiKey: return "Remove API key?"
+            }
+        }
+
+        var message: String {
+            switch self {
+            case .provider(let provider):
+                return "\(provider.displayName) is removed together with its Keychain API key, its registered model list, its no-tools list, and its vision marks. Conversations pinned to its models will ask you to reselect a model."
+            case .apiKey(let provider):
+                return "The API key for \(provider.displayName) is deleted from the login Keychain. Its registered models stay in the picker but cannot answer until a new key is saved."
+            }
+        }
+    }
+
     @ObservedObject private var localModelManager = LocalModelManager.shared
     @ObservedObject private var providerStore = CloudProviderStore.shared
     @State private var keyDrafts: [String: String] = [:]
     @State private var storedProviders: Set<String> = []
     @State private var testStates: [String: TestState] = [:]
     @State private var providerEditor: ProviderEditorTarget? = nil
-    @State private var providerPendingRemoval: CloudProvider? = nil
+    @State private var pendingConfirmation: RemovalConfirmation? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -63,31 +105,26 @@ struct CloudProvidersSettingsView: View {
         }
         .onAppear(perform: refreshState)
         .sheet(item: $providerEditor) { target in
-            CloudAddProviderSheet(store: providerStore, provider: target.provider) { _ in
+            CloudAddProviderSheet(store: providerStore, provider: target.provider) { saved in
+                // The URL may have changed, so a "Connected ✓" line from the
+                // previous endpoint would be a claim about a server this
+                // provider no longer points at.
+                testStates[saved.id] = .untested
                 refreshState()
             }
         }
         .alert(
-            "Remove provider?",
+            pendingConfirmation?.title ?? "",
             isPresented: Binding(
-                get: { providerPendingRemoval != nil },
-                set: { if !$0 { providerPendingRemoval = nil } }
+                get: { pendingConfirmation != nil },
+                set: { if !$0 { pendingConfirmation = nil } }
             ),
-            presenting: providerPendingRemoval
-        ) { provider in
-            Button("Remove", role: .destructive) {
-                do {
-                    try providerStore.remove(provider)
-                    keyDrafts[provider.id] = ""
-                    testStates[provider.id] = .untested
-                } catch {
-                    testStates[provider.id] = .failure(error.localizedDescription)
-                }
-                providerPendingRemoval = nil
-            }
-            Button("Cancel", role: .cancel) { providerPendingRemoval = nil }
-        } message: { provider in
-            Text("\(provider.displayName) is removed together with its Keychain API key, its registered model list, its no-tools list, and its vision marks. Conversations pinned to its models will ask you to reselect a model.")
+            presenting: pendingConfirmation
+        ) { confirmation in
+            Button("Remove", role: .destructive) { confirmRemoval(confirmation) }
+            Button("Cancel", role: .cancel) { pendingConfirmation = nil }
+        } message: { confirmation in
+            Text(confirmation.message)
         }
     }
 
@@ -108,12 +145,13 @@ struct CloudProvidersSettingsView: View {
                     )
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 200)
+                    .accessibilityLabel("\(provider.displayName) API key")
 
                     Button("Save") { saveKey(for: provider) }
                         .disabled(draft(for: provider.id).isEmpty)
 
                     if storedProviders.contains(provider.id) {
-                        Button("Remove") { removeKey(for: provider) }
+                        Button("Remove") { pendingConfirmation = .apiKey(provider) }
                     }
                 }
             }
@@ -187,9 +225,9 @@ struct CloudProvidersSettingsView: View {
             ) {
                 HStack(spacing: 8) {
                     Button("Edit") { providerEditor = .edit(provider) }
-                        .disabled(providerStore.isBuiltIn(provider))
-                    Button("Remove") { providerPendingRemoval = provider }
-                        .disabled(providerStore.isBuiltIn(provider))
+                        .disabled(providerStore.isBuiltIn(provider) || isTesting(provider))
+                    Button("Remove") { pendingConfirmation = .provider(provider) }
+                        .disabled(providerStore.isBuiltIn(provider) || isTesting(provider))
                 }
             }
         }
@@ -353,7 +391,18 @@ struct CloudProvidersSettingsView: View {
         }
         testStates[provider.id] = .testing
         Task {
-            switch await client.fetchModelIds() {
+            let result = await client.fetchModelIds()
+            // The request can outlive the provider: the card is only disabled
+            // while testing, but Settings can be closed, storage reloaded, or
+            // the record replaced. Writing the catalog for a record that is
+            // gone (or now points somewhere else) would stamp one server's
+            // models onto another and leave a stale "Connected" row for a
+            // future provider that reuses the identifier.
+            guard providerStore.providers.contains(provider) else {
+                testStates[provider.id] = .untested
+                return
+            }
+            switch result {
             case .success(let ids):
                 guard !ids.isEmpty else {
                     testStates[provider.id] = .failure("The provider returned an empty model list.")
@@ -376,6 +425,28 @@ struct CloudProvidersSettingsView: View {
                 testStates[provider.id] = .failure(failure.localizedDescription)
             }
         }
+    }
+
+    private func isTesting(_ provider: CloudProvider) -> Bool {
+        testStates[provider.id] == .testing
+    }
+
+    private func confirmRemoval(_ confirmation: RemovalConfirmation) {
+        let provider = confirmation.provider
+        switch confirmation {
+        case .provider:
+            do {
+                try providerStore.remove(provider)
+                keyDrafts[provider.id] = ""
+                storedProviders.remove(provider.id)
+                testStates[provider.id] = .untested
+            } catch {
+                testStates[provider.id] = .failure(error.localizedDescription)
+            }
+        case .apiKey:
+            removeKey(for: provider)
+        }
+        pendingConfirmation = nil
     }
 
     private func clearModels(for provider: CloudProvider) {

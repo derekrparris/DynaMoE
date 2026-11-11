@@ -113,8 +113,11 @@ public nonisolated enum CloudProviderValidationError: LocalizedError, Equatable 
     case invalidBaseURL
     case insecureBaseURL
     case baseURLIncludesEndpoint
+    case baseURLIncludesQuery
     case credentialsInBaseURL
     case invalidDocsURL
+    case credentialsInDocsURL
+    case docsURLIncludesQuery
 
     public var errorDescription: String? {
         switch self {
@@ -132,10 +135,16 @@ public nonisolated enum CloudProviderValidationError: LocalizedError, Equatable 
             return "Use https://. Plain http:// is accepted only for 127.0.0.1, localhost, and ::1."
         case .baseURLIncludesEndpoint:
             return "Enter the API base, not the whole endpoint: stop before /chat/completions or /models."
+        case .baseURLIncludesQuery:
+            return "Remove the query string from the API base URL. DynaMoE appends the endpoint path itself, so a query such as ?api-version=… would be dropped and the request would fail later."
         case .credentialsInBaseURL:
             return "Remove the user:password from the URL. The API key goes in the key field and rides the Authorization header, never the URL."
         case .invalidDocsURL:
             return "Enter a documentation link that starts with https:// or http://."
+        case .credentialsInDocsURL:
+            return "Remove the user:password from the documentation link. It is stored in plain text with the provider record, so a credential there would be written to disk."
+        case .docsURLIncludesQuery:
+            return "Remove the query string from the documentation link. DynaMoE stores the link verbatim, so a query can carry a credential onto disk."
         }
     }
 }
@@ -235,6 +244,8 @@ public nonisolated enum CloudProviderCatalog {
             return .failure(.insecureBaseURL)
         case .includesEndpoint:
             return .failure(.baseURLIncludesEndpoint)
+        case .includesQuery:
+            return .failure(.baseURLIncludesQuery)
         case .includesCredentials:
             return .failure(.credentialsInBaseURL)
         }
@@ -243,13 +254,17 @@ public nonisolated enum CloudProviderCatalog {
         let docs: URL?
         if rawDocs.isEmpty {
             docs = nil
-        } else if let url = URL(string: rawDocs),
-                  let scheme = url.scheme?.lowercased(),
-                  scheme == "https" || scheme == "http",
-                  url.host != nil {
-            docs = url
         } else {
-            return .failure(.invalidDocsURL)
+            switch checkDocsURL(rawDocs) {
+            case .ok(let url):
+                docs = url
+            case .invalid:
+                return .failure(.invalidDocsURL)
+            case .includesCredentials:
+                return .failure(.credentialsInDocsURL)
+            case .includesQuery:
+                return .failure(.docsURLIncludesQuery)
+            }
         }
 
         return .success(CloudProvider(
@@ -278,16 +293,20 @@ public nonisolated enum CloudProviderCatalog {
         case invalid
         case insecure
         case includesEndpoint
+        case includesQuery
         case includesCredentials
     }
 
     /// Accepts an absolute URL, prefixes a missing scheme with https, strips a
     /// trailing slash, and refuses the whole endpoint instead of the base.
     /// User-info is refused rather than dropped: a silently stripped credential
-    /// would 401 later with nothing naming the cause. The scheme and host are
-    /// lowercased, so the stored URL is the one the row shows and the one
-    /// URLSession sees. The query and fragment are dropped: the credential
-    /// rides the `Authorization` header, never the URL.
+    /// would 401 later with nothing naming the cause. A query is refused for
+    /// the same reason a credential in the path would be: the request URL is
+    /// built by appending a path, so a base that needs `?api-version=…` would
+    /// have its query dropped and fail later with nothing naming the cause.
+    /// The scheme and host are lowercased, so the stored URL is the one the row
+    /// shows and the one URLSession sees. The fragment is dropped: it is never
+    /// sent to a server.
     private static func checkBaseURL(_ raw: String) -> BaseURLCheck {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .invalid }
@@ -300,6 +319,7 @@ public nonisolated enum CloudProviderCatalog {
         if components.user != nil || components.password != nil {
             return .includesCredentials
         }
+        if components.query != nil { return .includesQuery }
 
         var path = components.path
         while path.hasSuffix("/") { path.removeLast() }
@@ -314,6 +334,32 @@ public nonisolated enum CloudProviderCatalog {
         components.query = nil
         components.fragment = nil
         guard let url = components.url, url.host != nil else { return .invalid }
+        return .ok(url)
+    }
+
+    private enum DocsURLCheck {
+        case ok(URL)
+        case invalid
+        case includesCredentials
+        case includesQuery
+    }
+
+    /// The docs link is displayed and opened from Settings and persisted
+    /// verbatim in the plaintext provider list, so it refuses user-info and a
+    /// query for the same reason the base URL does: neither may carry a secret
+    /// onto disk. The fragment is kept (a section anchor is meaningful and
+    /// never sent to a server) and the URL is otherwise not normalized, since
+    /// documentation paths are case-sensitive.
+    private static func checkDocsURL(_ raw: String) -> DocsURLCheck {
+        guard let components = URLComponents(string: raw),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              let host = components.host, !host.isEmpty else { return .invalid }
+        if components.user != nil || components.password != nil {
+            return .includesCredentials
+        }
+        if components.query != nil { return .includesQuery }
+        guard let url = components.url else { return .invalid }
         return .ok(url)
     }
 
@@ -344,12 +390,50 @@ public nonisolated enum CloudProviderCatalog {
         var seen = Set(builtIns.map(\.id))
         var providers: [CloudProvider] = []
         for entry in decoded {
-            guard let provider = entry.provider,
-                  isValidIdentifier(provider.id),
-                  seen.insert(provider.id).inserted else { continue }
-            providers.append(provider)
+            guard let stored = entry.provider,
+                  isValidIdentifier(stored.id),
+                  seen.insert(stored.id).inserted,
+                  let restored = restoredProvider(from: stored) else { continue }
+            providers.append(restored)
         }
         return providers
+    }
+
+    /// A persisted record is re-validated when it is READ, not only when it is
+    /// written: the bytes may predate the URL rules or have been hand-edited,
+    /// and a turn must never run on a plaintext `http://` base or one carrying
+    /// a credential. The record is normalized the same way a fresh draft is, so
+    /// a stored trailing slash cannot make the row disagree with the request.
+    /// A record that fails costs itself, not the list.
+    private static func restoredProvider(from stored: CloudProvider) -> CloudProvider? {
+        guard case .ok(let base) = checkBaseURL(stored.openAIBaseURL.absoluteString) else {
+            return nil
+        }
+        let anthropic: URL?
+        if let raw = stored.anthropicBaseURL {
+            guard case .ok(let normalized) = checkBaseURL(raw.absoluteString) else {
+                return nil
+            }
+            anthropic = normalized
+        } else {
+            anthropic = nil
+        }
+        let docs: URL?
+        if let raw = stored.docsURL {
+            guard case .ok(let normalized) = checkDocsURL(raw.absoluteString) else {
+                return nil
+            }
+            docs = normalized
+        } else {
+            docs = nil
+        }
+        return CloudProvider(
+            id: stored.id,
+            displayName: stored.displayName,
+            docsURL: docs,
+            openAIBaseURL: base,
+            anthropicBaseURL: anthropic
+        )
     }
 }
 

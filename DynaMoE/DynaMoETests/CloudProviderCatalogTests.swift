@@ -46,6 +46,10 @@ final class CloudProviderCatalogTests: XCTestCase {
         ).get()
     }
 
+    /// The defaults are deliberately not consulted: `validate` falls back to
+    /// `UserDefaults.standard` when `existing` is nil, which makes a URL-rule
+    /// test depend on whether this Mac ever saved a provider. Every case here
+    /// compares against the built-ins unless it says otherwise.
     private func validationFailure(
         displayName: String = "OpenCode Zen",
         identifier: String = "opencode-zen",
@@ -58,7 +62,7 @@ final class CloudProviderCatalogTests: XCTestCase {
             identifier: identifier,
             baseURL: baseURL,
             docsURL: docsURL,
-            existing: existing
+            existing: existing ?? CloudProviderCatalog.builtIns
         ) {
             return failure
         }
@@ -207,6 +211,13 @@ final class CloudProviderCatalogTests: XCTestCase {
             validationFailure(baseURL: "https://opencode.ai/zen/v1/models"),
             .baseURLIncludesEndpoint
         )
+        XCTAssertEqual(
+            validationFailure(
+                baseURL: "https://my.openai.azure.com/openai/deployments/gpt4?api-version=2024-02-01"
+            ),
+            .baseURLIncludesQuery,
+            "a query is refused rather than silently dropped, so an Azure-style base fails with a reason instead of a 404"
+        )
 
         XCTAssertEqual(
             try zen(baseURL: "https://opencode.ai/zen/v1/").openAIBaseURL.absoluteString,
@@ -268,6 +279,52 @@ final class CloudProviderCatalogTests: XCTestCase {
             "the docs link is a web link, symmetric with the base URL"
         )
         XCTAssertEqual(validationFailure(docsURL: "javascript:alert(1)"), .invalidDocsURL)
+        XCTAssertEqual(
+            validationFailure(docsURL: "https://user:s3cret@opencode.ai/docs"),
+            .credentialsInDocsURL,
+            "the docs link is persisted verbatim in plain text, so a credential there is a leak even though it never reaches a request"
+        )
+        XCTAssertEqual(
+            validationFailure(docsURL: "https://user@opencode.ai/docs"),
+            .credentialsInDocsURL
+        )
+        XCTAssertEqual(
+            validationFailure(docsURL: "https://opencode.ai/docs?token=s3cret"),
+            .docsURLIncludesQuery,
+            "a query is refused because the link is stored verbatim and can carry a credential onto disk"
+        )
+        XCTAssertEqual(
+            try zen(docsURL: "https://opencode.ai/docs#authentication").docsURL?.absoluteString,
+            "https://opencode.ai/docs#authentication",
+            "a fragment is a section anchor, never sent to a server, so it is kept"
+        )
+    }
+
+    func testRestoredProvidersAreRevalidated() throws {
+        let json = #"""
+        [
+          {"id":"plain-http","displayName":"Plain HTTP","openAIBaseURL":"http://opencode.ai/zen/v1"},
+          {"id":"creds-base","displayName":"Creds","openAIBaseURL":"https://user:s3cret@opencode.ai/zen/v1"},
+          {"id":"creds-docs","displayName":"Creds Docs","openAIBaseURL":"https://opencode.ai/zen/v1","docsURL":"https://user:s3cret@opencode.ai/docs"},
+          {"id":"query-docs","displayName":"Query Docs","openAIBaseURL":"https://opencode.ai/zen/v1","docsURL":"https://opencode.ai/docs?token=x"},
+          {"id":"insecure-anthropic","displayName":"Insecure Anthropic","openAIBaseURL":"https://opencode.ai/zen/v1","anthropicBaseURL":"http://opencode.ai/anthropic"},
+          {"id":"loopback","displayName":"Loopback","openAIBaseURL":"http://127.0.0.1:8787/v1"},
+          {"id":"trailing","displayName":"Trailing","openAIBaseURL":"https://opencode.ai/zen/v1/"}
+        ]
+        """#
+        defaults.set(Data(json.utf8), forKey: CloudProviderCatalog.customDefaultsKey)
+
+        let restored = CloudProviderCatalog.customProviders(defaults: defaults)
+        XCTAssertEqual(
+            restored.map(\.id),
+            ["loopback", "trailing"],
+            "a stored record that no longer satisfies the URL rules is dropped, and costs only itself"
+        )
+        XCTAssertEqual(
+            restored.last?.openAIBaseURL.absoluteString,
+            "https://opencode.ai/zen/v1",
+            "a restored record is normalized the same way a fresh draft is"
+        )
     }
 
     // MARK: Slug
@@ -310,6 +367,7 @@ final class CloudProviderCatalogTests: XCTestCase {
         let path = CloudModelAddress.sentinelPath(providerId: "my-provider", providerModelId: "model-x")
         let parsedPath = try XCTUnwrap(CloudModelAddress.parsePath(path, providers: providers))
         XCTAssertEqual(parsedPath.provider.id, "my-provider")
+        XCTAssertEqual(parsedPath.providerModelId, "model-x")
     }
 
     func testAddressParsingFallsThroughAnEmptyUpstreamID() throws {
@@ -350,6 +408,12 @@ final class CloudProviderStoreTests: XCTestCase {
         let secretStore: CloudSecretStore
 
         func cleanUp() {
+            // Reap the throwaway service's items as well: a test that adds a
+            // provider and never removes it would otherwise leave a live
+            // Keychain entry behind on the machine that ran the suite.
+            for provider in CloudProviderCatalog.customProviders(defaults: defaults) {
+                secretStore.delete(providerId: provider.id)
+            }
             defaults.removePersistentDomain(forName: suite)
         }
     }
@@ -422,13 +486,14 @@ final class CloudProviderStoreTests: XCTestCase {
             try harness.store.remove(synthetic),
             "removal refuses a built-in the same way update does, rather than no-oping"
         )
-        XCTAssertNotNil(
-            CloudProviderCatalog.provider(withId: "synthetic", defaults: harness.defaults),
-            "a built-in can never be removed, so the registry can never be empty"
-        )
         XCTAssertThrowsError(
             try harness.store.update(synthetic, displayName: "Mine", baseURL: "https://example.com/v1")
         )
+        XCTAssertNil(
+            harness.defaults.data(forKey: CloudProviderCatalog.customDefaultsKey),
+            "a refused mutation must not write a custom list, which is the only thing that could resurrect the built-in under another base"
+        )
+        XCTAssertEqual(harness.store.providers.map(\.id), ["synthetic"])
     }
 
     func testUpdateKeepsTheIdentifierAndRevalidatesTheBase() throws {

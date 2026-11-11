@@ -55,11 +55,17 @@ struct CloudAddProviderSheet: View {
                     if !isEditing {
                         credentialSection
                     }
-                    if let message = validationMessage ?? errorText {
-                        errorLabel(message)
-                    }
                 }
                 .padding(18)
+            }
+            // Pinned above the footer rather than scrolled with the form: the
+            // reason "Add Provider" is disabled must be visible without
+            // discovering that the sheet scrolls.
+            if let message = validationMessage ?? errorText {
+                errorLabel(message)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             Divider()
             footer
@@ -153,6 +159,7 @@ struct CloudAddProviderSheet: View {
                     .font(.system(size: 11, weight: .medium))
                 SecureField("sk-…", text: $apiKey)
                     .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel("API key")
             }
             caption("You can also save or replace it later on the provider card.")
         }
