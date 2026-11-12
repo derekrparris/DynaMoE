@@ -2728,13 +2728,14 @@ struct ContentView: View {
                     "⚠️ Compaction failed: \(error.localizedDescription)",
                     sessionId: sessionId
                 )
-                postToProgress(notice)
                 // The progress bubble is transient and `normalizedForRestore`
                 // drops it, so a failure recorded only there disappeared the
                 // next time the chat opened — leaving a conversation that was
                 // never compacted with no trace of the attempt. The cloud path
-                // already parks a persistent `.system` row; this one does too.
+                // parks a persistent `.system` row and takes its bubble down;
+                // this one does the same, so the failure is stated once.
                 if let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
+                    self.sessions[liveIdx].messages.removeAll { $0.id == progressId }
                     self.sessions[liveIdx].messages.append(
                         ChatMessage(role: .system, content: notice)
                     )
@@ -2852,47 +2853,38 @@ struct ContentView: View {
             forModel: providerModelId,
             providerId: provider.id
         )
-        var spent: Double = 0
-        var summarizerPromptTokens = 0
-        var summarizerCachedTokens = 0
-        var summarizerCompletionTokens = 0
-        var summarizerWasEstimated = false
-        // Summarizer requests are billed whether or not the pass completes, so
-        // every exit settles them against the live session before returning.
+        // The summarizer requests this pass spent, accumulated by the same
+        // rules the run's own totals use. Every exit settles them against the
+        // live session, which is why the cost is charged here and the token
+        // columns travel in the outcome.
+        var summarizerTotals = CloudRunTotals()
         func finish(_ failure: CloudCompactionFailure?) -> CloudCompactionOutcome {
-            if spent > 0, let liveIdx = sessions.firstIndex(where: { $0.id == sessionId }) {
-                sessions[liveIdx].cumulativeCost = (sessions[liveIdx].cumulativeCost ?? 0) + spent
+            if let cost = summarizerTotals.cost, cost > 0,
+               let liveIdx = sessions.firstIndex(where: { $0.id == sessionId }) {
+                sessions[liveIdx].cumulativeCost = (sessions[liveIdx].cumulativeCost ?? 0) + cost
             }
             return CloudCompactionOutcome(
                 didCompact: failure == nil,
-                cost: spent,
-                promptTokens: summarizerPromptTokens,
-                cachedTokens: summarizerCachedTokens,
-                completionTokens: summarizerCompletionTokens,
-                wasEstimated: summarizerWasEstimated,
+                cost: summarizerTotals.cost ?? 0,
+                promptTokens: summarizerTotals.promptTokens,
+                cachedTokens: summarizerTotals.cachedTokens,
+                completionTokens: summarizerTotals.outputTokens,
+                wasEstimated: summarizerTotals.wasEstimated,
                 failure: failure
             )
         }
         func charge(_ completion: CloudTextCompletion, estimatedPromptTokens: Int) {
-            guard let usage = completion.usage else {
-                // A pass that reported no usage still ran and still billed: the
-                // app's own estimate keeps the run's token figures covering the
-                // same requests as its cost, and `(est.)` says so.
-                summarizerWasEstimated = true
-                summarizerPromptTokens += max(0, estimatedPromptTokens)
-                summarizerCompletionTokens += AppleFoundationModelService.recordedOutputTokenCount(
+            // A pass that reported no usage still ran and still billed: the
+            // app's own estimate keeps the pass's token figures covering the
+            // same requests as its cost, and `(est.)` says so.
+            summarizerTotals.add(
+                usage: completion.usage,
+                estimatedPromptTokens: estimatedPromptTokens,
+                estimatedOutputTokens: AppleFoundationModelService.recordedOutputTokenCount(
                     for: completion.text
-                )
-                return
-            }
-            summarizerPromptTokens += max(0, usage.promptTokens ?? 0)
-            summarizerCachedTokens += max(0, usage.cachedTokens ?? 0)
-            summarizerCompletionTokens += max(0, usage.completionTokens ?? 0)
-            if usage.promptTokens == nil || usage.completionTokens == nil {
-                summarizerWasEstimated = true
-            }
-            guard let pricing, let cost = pricing.cost(for: usage) else { return }
-            spent += cost
+                ),
+                cost: completion.usage.flatMap { pricing?.cost(for: $0) }
+            )
         }
         // A summarizer request that was sent and did not come back — cancelled
         // mid-stream, or failed on the wire — was still billed for its prompt.
@@ -2900,14 +2892,15 @@ struct ContentView: View {
         // `(est.)` marks the run; charging nothing here is what made a
         // cancelled pass report a cost its own status line called billed.
         func chargeUnreturnedRequest(estimatedPromptTokens: Int) {
-            summarizerWasEstimated = true
-            summarizerPromptTokens += max(0, estimatedPromptTokens)
-            guard let pricing,
-                  let cost = pricing.cost(for: CloudUsage(
-                      promptTokens: estimatedPromptTokens,
-                      completionTokens: 0
-                  )) else { return }
-            spent += cost
+            summarizerTotals.add(
+                promptTokens: estimatedPromptTokens,
+                outputTokens: 0,
+                cost: pricing?.cost(for: CloudUsage(
+                    promptTokens: estimatedPromptTokens,
+                    completionTokens: 0
+                )),
+                estimated: true
+            )
         }
         // One summarizer pass that may replace messages. A summary cut off at
         // the output limit is refused rather than committed: the messages it
@@ -2941,9 +2934,11 @@ struct ContentView: View {
                 throw error
             }
             charge(completion, estimatedPromptTokens: estimatedPromptTokens)
-            guard !completion.text.isEmpty else { throw CloudCompactionFailure.emptySummary }
-            guard !completion.stoppedAtOutputLimit else {
-                throw CloudCompactionFailure.truncatedSummary
+            // The destructive decision lives in `CloudCompactionGate` so it is
+            // testable: a summary that is empty or did not finish cleanly must
+            // not replace the messages it was written from.
+            if let refusal = CloudCompactionGate.refusal(for: completion) {
+                throw refusal
             }
             return completion.text
         }
@@ -4282,7 +4277,7 @@ struct ContentView: View {
             + AppleFoundationModelService.approximateTokenCount(for: userPrompt)
         let afmCumulativeBase = ChatSession.contextTokenBase(promptTokenCount: afmTurnInputTokens)
         if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }) {
-            sessions[sIdx].cumulativeTokenCount = afmCumulativeBase
+            sessions[sIdx].seedContextTotal(promptTokenCount: afmTurnInputTokens)
         }
 
         // In-app turn log for the on-device path — the same row contract as
@@ -4658,11 +4653,19 @@ struct ContentView: View {
             // the steps: reporting the last iteration alone named a fraction
             // of a long run while the header pill and `cumulativeCost`
             // already accumulated the whole thing.
-            var runPromptTokens = 0
-            var runCachedTokens = 0
-            var runOutputTokens = 0
-            var runCost: Double? = nil
-            var runWasEstimated = false
+            var runTotals = CloudRunTotals()
+            // The summarizer is billed like any other request, so its spend AND
+            // its tokens join the run totals: a cost that covers requests its
+            // token counts omit cannot be reconciled with the figures beside it.
+            func absorbCompaction(_ outcome: CloudCompactionOutcome) {
+                runTotals.add(
+                    promptTokens: outcome.promptTokens,
+                    cachedTokens: outcome.cachedTokens,
+                    outputTokens: outcome.completionTokens,
+                    cost: outcome.cost,
+                    estimated: outcome.wasEstimated
+                )
+            }
             func odometerTotal(including generated: Int) -> Int {
                 CloudContextOdometer.total(
                     promptTokens: turnContextTokens,
@@ -4707,6 +4710,18 @@ struct ContentView: View {
             // every later step then carries the metadata-only notice instead.
             var imagesAllowed = visionCapable
             var didRetryWithoutImages = false
+            // The tool schemas a step would carry, resolved by ONE rule that
+            // both the pre-flight projection and the post-compaction estimate
+            // consult: a relay or synthesis turn is a final-answer pass and
+            // offers none. Leaving them in the rewrite estimate made the
+            // header's context figure jump UP right after the compaction that
+            // shrank it.
+            @MainActor func offeredToolDefinitions(isSynthesisTurn: Bool) -> [ToolDefinition] {
+                CloudAgentStepPlan.offersTools(
+                    agentTurn: toolsEnabled,
+                    isSynthesisTurn: isSynthesisTurn
+                ) ? AgentHarness.shared.availableToolDefinitions(mode: mode) : []
+            }
             // What the rewritten history costs as a prompt. Used only right
             // after a compaction, which is the one moment the pre-turn estimate
             // stops describing what is being sent.
@@ -4715,7 +4730,7 @@ struct ContentView: View {
             // a local function does not inherit the enclosing task's isolation
             // under the project's approachable-concurrency mode, and without it
             // both reads are concurrency warnings.
-            @MainActor func rewrittenPromptEstimate() -> Int {
+            @MainActor func rewrittenPromptEstimate(isSynthesisTurn: Bool) -> Int {
                 guard let live = self.sessions.first(where: { $0.id == sessionId }) else { return 0 }
                 return CloudMessageAssembler.approximatePromptTokens(
                     system: currentPersona(),
@@ -4726,9 +4741,7 @@ struct ContentView: View {
                         imagesSupported: imagesAllowed,
                         imageDelivery: imageDeliveryPolicy
                     ),
-                    tools: toolsEnabled
-                        ? AgentHarness.shared.availableToolDefinitions(mode: mode)
-                        : []
+                    tools: offeredToolDefinitions(isSynthesisTurn: isSynthesisTurn)
                 )
             }
             // A compaction rewrites the conversation the odometer was counting,
@@ -4739,8 +4752,8 @@ struct ContentView: View {
             // leaves a number describing what was sent. Returns the figure so
             // the caller's own copy is written in one hop rather than mutated
             // from an isolated nested function.
-            @MainActor func odometerAfterCompaction() -> Int {
-                let rewritten = rewrittenPromptEstimate()
+            @MainActor func odometerAfterCompaction(isSynthesisTurn: Bool) -> Int {
+                let rewritten = rewrittenPromptEstimate(isSynthesisTurn: isSynthesisTurn)
                 if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
                     self.sessions[sIdx].cumulativeTokenCount = rewritten
                 }
@@ -4754,6 +4767,14 @@ struct ContentView: View {
             // trailing position is what keeps the leading system message — the
             // cached prefix — byte-identical between steps.
             var relayDirective = ""
+            // A directive belongs to the step that carries it, and both retries
+            // below (an image rejection and a context overflow) re-enter this
+            // loop through `continue`. The relay it names was already marked
+            // delivered when it was gathered, so losing it on a retry dropped
+            // those subagent reports — or the forced-synthesis instruction —
+            // permanently. Holds the directive only BETWEEN a failed attempt and
+            // that attempt's retry.
+            var carriedStepDirective: String?
             // At most one tools-disabled synthesis turn per run, mirroring the
             // weights path's forced-synthesis pass. It also bounds the subagent
             // result-delivery relay below.
@@ -4790,10 +4811,7 @@ struct ContentView: View {
                 // tool-heavy run crossed the real ceiling having "measured"
                 // 80% of it. A relay or synthesis turn is a final-answer pass
                 // and offers none, which the projection has to know too.
-                let stepTools = CloudAgentStepPlan.offersTools(
-                    agentTurn: toolsEnabled,
-                    isSynthesisTurn: ranSynthesisTurn
-                ) ? AgentHarness.shared.availableToolDefinitions(mode: mode) : []
+                let stepTools = offeredToolDefinitions(isSynthesisTurn: ranSynthesisTurn)
                 if compactionAttempts.allowsPreflightCheck, let window = contextWindow {
                     let projected = CloudMessageAssembler.approximatePromptTokens(
                         system: currentPersona(),
@@ -4816,17 +4834,7 @@ struct ContentView: View {
                             window: window,
                             keepRecentMessages: 8
                         )
-                        // The summarizer is billed like any other request, so
-                        // its spend AND its tokens join the run totals: a cost
-                        // that covers requests its token counts omit cannot be
-                        // reconciled with the figures beside it.
-                        runPromptTokens += outcome.promptTokens
-                        runCachedTokens += outcome.cachedTokens
-                        runOutputTokens += outcome.completionTokens
-                        if outcome.wasEstimated { runWasEstimated = true }
-                        if outcome.cost > 0 {
-                            runCost = (runCost ?? 0) + outcome.cost
-                        }
+                        absorbCompaction(outcome)
                         if outcome.didCompact {
                             // The size the pass decided about becomes the floor
                             // a later pre-flight has to grow past: below it the
@@ -4834,7 +4842,9 @@ struct ContentView: View {
                             // digest.
                             compactionAttempts.recordRewrite(promptTokens: projected)
                             contextCompactionFailure = nil
-                            turnContextTokens = odometerAfterCompaction()
+                            turnContextTokens = odometerAfterCompaction(
+                                isSynthesisTurn: ranSynthesisTurn
+                            )
                             self.showStatus(
                                 "🗂 Context was near this model's limit — compacted older history before continuing.",
                                 sessionId: sessionId
@@ -4881,8 +4891,16 @@ struct ContentView: View {
                 // A directive applies to exactly one step. Keeping it set while
                 // tool rounds continue told every later step to "write the final
                 // answer now" even though that answer was not due yet.
-                let stepDirective = relayDirective
-                relayDirective = ""
+                let stepDirective: String
+                if let carried = carriedStepDirective {
+                    // This iteration is a RETRY of the step that carried the
+                    // directive; send the same request shape again.
+                    stepDirective = carried
+                    carriedStepDirective = nil
+                } else {
+                    stepDirective = relayDirective
+                    relayDirective = ""
+                }
                 // A coordinator directive is APPENDED, never merged into the
                 // system message: that is the prefix the provider cached.
                 let outbound = CloudStepPrompt.assemble(
@@ -4970,20 +4988,23 @@ struct ContentView: View {
                     let prompt = max(0, measured?.promptTokens ?? stepEstimatedPrompt)
                     // Output the provider streamed before the stop is billed too.
                     let output = max(0, measured?.completionTokens ?? generatedTokenCount())
-                    runPromptTokens += prompt
-                    runCachedTokens += max(0, measured?.cachedTokens ?? 0)
-                    runOutputTokens += output
-                    if measured == nil { runWasEstimated = true }
-                    guard let pricing = CloudPricingStore.pricing(
+                    let cost = CloudPricingStore.pricing(
                         forModel: providerModelId,
                         providerId: provider.id
-                    ), let cost = pricing.cost(for: CloudUsage(
+                    )?.cost(for: CloudUsage(
                         promptTokens: prompt,
                         completionTokens: output,
                         cachedTokens: measured?.cachedTokens,
                         cacheWriteTokens: measured?.cacheWriteTokens
-                    )) else { return }
-                    runCost = (runCost ?? 0) + cost
+                    ))
+                    runTotals.add(
+                        promptTokens: prompt,
+                        cachedTokens: max(0, measured?.cachedTokens ?? 0),
+                        outputTokens: output,
+                        cost: cost,
+                        estimated: measured == nil
+                    )
+                    guard let cost else { return }
                     if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
                         self.sessions[sIdx].cumulativeCost
                             = (self.sessions[sIdx].cumulativeCost ?? 0) + cost
@@ -5070,7 +5091,13 @@ struct ContentView: View {
                 // The request itself was sent, so it is priced here rather than
                 // left out of the conversation's spend.
                 if Task.isCancelled || !self.ownsGeneration(myGenerationId) {
-                    chargeUnreturnedStep()
+                    // A failure that never reached the provider (a missing or
+                    // unreadable key) was not billed, so it is not priced from
+                    // the estimate the way a sent request is. The failure
+                    // branch below applies the same filter.
+                    if serviceFailure?.spentRequest != false {
+                        chargeUnreturnedStep()
+                    }
                     commitOdometerTail()
                     turnLog.recordChatTurn(
                         status: Task.isCancelled ? 200 : 500,
@@ -5121,6 +5148,9 @@ struct ContentView: View {
                         response: latestText,
                         toolCalls: []
                     )
+                    // The retry is the SAME step: its directive (a subagent
+                    // relay or the synthesis instruction) has to ride it again.
+                    carriedStepDirective = stepDirective
                     continue
                 }
 
@@ -5142,20 +5172,16 @@ struct ContentView: View {
                         window: contextWindow,
                         keepRecentMessages: 4
                     )
-                    runPromptTokens += outcome.promptTokens
-                    runCachedTokens += outcome.cachedTokens
-                    runOutputTokens += outcome.completionTokens
-                    if outcome.wasEstimated { runWasEstimated = true }
-                    if outcome.cost > 0 {
-                        runCost = (runCost ?? 0) + outcome.cost
-                    }
+                    absorbCompaction(outcome)
                     if outcome.didCompact {
                         // The rejected request's own size is the floor: the
                         // provider has just proved the pre-flight estimate was
                         // under it.
                         compactionAttempts.recordRewrite(promptTokens: stepEstimatedPrompt)
                         contextCompactionFailure = nil
-                        turnContextTokens = odometerAfterCompaction()
+                        turnContextTokens = odometerAfterCompaction(
+                            isSynthesisTurn: ranSynthesisTurn
+                        )
                         turnLog.recordChatTurn(
                             status: 400,
                             errorMessage: "Context overflow; compacted older history and retrying this step.",
@@ -5169,6 +5195,9 @@ struct ContentView: View {
                             "🗂 The conversation exceeded this model's context window — compacted older history and retrying the step.",
                             sessionId: sessionId
                         )
+                        // Same step, same directive: a compaction must not eat
+                        // the report or the instruction this attempt carried.
+                        carriedStepDirective = stepDirective
                         continue
                     }
                     contextCompactionFailure = outcome.failure
@@ -5218,15 +5247,8 @@ struct ContentView: View {
                     // that total is reported on this path; the transcript row
                     // keeps the error itself.
                     var statusText = errText
-                    if runPromptTokens > 0 || runOutputTokens > 0 || runCost != nil {
-                        let spent = CloudTurnReport(
-                            promptTokens: runPromptTokens,
-                            cachedTokens: runCachedTokens,
-                            outputTokens: runOutputTokens,
-                            cost: runCost,
-                            wasEstimated: runWasEstimated
-                        )
-                        statusText += " · ☁️ run total so far: \(spent.statusSuffix)"
+                    if !runTotals.isEmpty {
+                        statusText += " · ☁️ run total so far: \(runTotals.report.statusSuffix)"
                     }
                     self.showStatus(statusText, kind: .warning)
                     if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
@@ -5253,6 +5275,7 @@ struct ContentView: View {
                 // It is the FULL prompt (cache reads included), because the
                 // header reports the context the model was given, not the part
                 // of it that was billed at the fresh rate.
+                var stepCost: Double?
                 if let usage = reportedUsage {
                     turnLog.noteProviderUsage(
                         promptTokens: usage.promptTokens,
@@ -5270,26 +5293,24 @@ struct ContentView: View {
                         forModel: providerModelId,
                         providerId: provider.id
                     )?.cost(for: usage) {
+                        stepCost = cost
                         if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
                             self.sessions[sIdx].cumulativeCost = (self.sessions[sIdx].cumulativeCost ?? 0) + cost
                         }
-                        runCost = (runCost ?? 0) + cost
                     }
-                }
-                runPromptTokens += reportedUsage?.promptTokens ?? stepEstimatedPrompt
-                runCachedTokens += reportedUsage?.cachedTokens ?? 0
-                if reportedUsage?.promptTokens == nil {
-                    runWasEstimated = true
                 }
 
                 let finalElapsed = max(CFAbsoluteTimeGetCurrent() - generationStartTime, 0.001)
                 let generatedTokens = generatedTokenCount()
-                runOutputTokens += generatedTokens
-                if reportedUsage?.completionTokens == nil {
-                    // `generatedTokenCount` falls back to a character estimate
-                    // when the provider reported no completion count.
-                    runWasEstimated = true
-                }
+                // One request's contribution, with the app's estimate standing
+                // in for each column the provider omitted (and marking the run
+                // `(est.)` when it had to).
+                runTotals.add(
+                    usage: reportedUsage,
+                    estimatedPromptTokens: stepEstimatedPrompt,
+                    estimatedOutputTokens: generatedTokens,
+                    cost: stepCost
+                )
                 let finalTokPerSec = Double(generatedTokens) / finalElapsed
 
                 if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
@@ -5472,7 +5493,10 @@ struct ContentView: View {
                 // app says it. Park the notice in the transcript either way,
                 // because the status line is transient and `.system` rows are
                 // never replayed into the provider's history.
-                let truncatedAtLimit = finishReason == "length" || finishReason == "max_tokens"
+                // Classified rather than compared: the wire spelling is the
+                // provider's, so an endpoint that says `MAX_TOKENS` hit the
+                // same limit this notice exists for.
+                let truncatedAtLimit = CloudFinishDisposition(finishReason: finishReason) == .outputLimit
                 let truncationNotice: String?
                 if truncatedAtLimit {
                     truncationNotice = "⚠️ This answer stopped at the Max Output Tokens limit and may be truncated. Raise it in Settings ▸ Sampling for a longer reply."
@@ -5499,13 +5523,7 @@ struct ContentView: View {
                 self.generationTotalTokens = generatedTokens
                 self.generationElapsedMs = finalElapsed * 1000.0
                 self.generationSpeedTokPerSec = finalTokPerSec
-                let turnCost = CloudTurnReport(
-                    promptTokens: runPromptTokens,
-                    cachedTokens: runCachedTokens,
-                    outputTokens: runOutputTokens,
-                    cost: runCost,
-                    wasEstimated: runWasEstimated
-                )
+                let turnCost = runTotals.report
                 // `4.20 s` rather than "in 4200.00 ms": the old phrasing put the
                 // duration straight after the token counts, so "… in 4200.00 ms"
                 // read as another input figure.

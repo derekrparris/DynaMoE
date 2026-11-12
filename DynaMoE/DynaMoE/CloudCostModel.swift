@@ -704,8 +704,10 @@ public nonisolated enum CloudCompactionFailure: Equatable, Error, Sendable {
     case noTranscript
     /// A pass came back with no text at all.
     case emptySummary
-    /// A pass stopped at its output limit, so its text never covered the chunk
-    /// it was given. Committing it would delete work the summary omits.
+    /// A pass did not report a clean stop, so its text never proved it covered
+    /// the chunk it was given. That is the output limit, a provider's own
+    /// filter, or a reason this app does not recognise — all of which look the
+    /// same from here. Committing it would delete work the summary omits.
     case truncatedSummary
     /// Stop was pressed while the summary was being written.
     case cancelled
@@ -759,7 +761,7 @@ public nonisolated enum CloudCompactionFailure: Equatable, Error, Sendable {
         case .emptySummary:
             return "⚠️ \(providerName) returned an empty summary — the conversation was left unchanged."
         case .truncatedSummary:
-            return "⚠️ \(providerName)'s summary stopped at its output limit before it covered the whole conversation, so the conversation was left unchanged."
+            return "⚠️ \(providerName)'s summary did not finish cleanly (it hit its output limit or was cut off), so the conversation was left unchanged."
         case .cancelled:
             return "⏹ Compaction stopped — the conversation was left unchanged."
         case .provider(let description):
@@ -784,12 +786,36 @@ public nonisolated enum CloudCompactionFailure: Equatable, Error, Sendable {
         case .emptySummary:
             return "\(providerName) returned an empty summary"
         case .truncatedSummary:
-            return "\(providerName)'s summary hit its output limit before it covered the conversation"
+            return "\(providerName)'s summary did not finish cleanly before it covered the conversation"
         case .cancelled:
             return "the summary was stopped"
         case .provider(let description):
             return "summarizing failed: \(description)"
         }
+    }
+}
+
+// MARK: - Compaction gate
+
+/// The refusal a summarizer pass's completion earns, if any.
+///
+/// This is the one branch where being wrong is DESTRUCTIVE: an accepted summary
+/// replaces the messages it was written from, so a pass that came back empty,
+/// or without a clean finish it can be trusted over, must be refused rather
+/// than committed. It lives here, as a pure function of the completion, because
+/// the call site is a closure inside the chat view's turn loop and that branch
+/// cannot be reached from a test.
+public nonisolated enum CloudCompactionGate {
+    public static func refusal(for completion: CloudTextCompletion) -> CloudCompactionFailure? {
+        if completion.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return .emptySummary
+        }
+        // The ALLOWLIST (`finishedCleanly`), not "not `length`": an unknown
+        // reason is exactly what a dialect spelling `MAX_TOKENS` or a
+        // provider-side `content_filter` stop looks like, and either one
+        // committed here would delete messages the summary never covered.
+        guard completion.finishedCleanly else { return .truncatedSummary }
+        return nil
     }
 }
 
@@ -896,5 +922,93 @@ public nonisolated struct CloudTurnReport: Equatable, Sendable {
         formatter.numberStyle = .decimal
         formatter.groupingSeparator = ","
         return formatter.string(from: NSNumber(value: value)) ?? String(value)
+    }
+}
+
+/// One cloud run's billed totals, accumulated request by request.
+///
+/// The alternative is five `+=` lines at every call site, which is how a rule
+/// about what counts (a retry, a summarizer pass, a request that was sent and
+/// never answered) reaches the status line of one path and not another. The
+/// rules live here instead: every request the provider processed contributes
+/// its prompt, its cached share and its output; a request whose usage never
+/// arrived contributes the app's own estimate and marks the whole total
+/// `(est.)`; and a cost joins the total only when there is one, so an estimate
+/// alone never invents a price.
+public nonisolated struct CloudRunTotals: Equatable, Sendable {
+    public private(set) var promptTokens: Int = 0
+    public private(set) var cachedTokens: Int = 0
+    public private(set) var outputTokens: Int = 0
+    public private(set) var cost: Double?
+    public private(set) var wasEstimated = false
+
+    public init() {}
+
+    /// Whether any request contributed anything. The failure path uses this to
+    /// decide whether a "run total so far" line would say anything at all.
+    public var isEmpty: Bool {
+        promptTokens == 0 && outputTokens == 0 && cost == nil
+    }
+
+    /// Adds one request's already-resolved columns.
+    ///
+    /// `estimated` is the caller's answer to "did any column here come from the
+    /// app's estimate", because only the caller knows which fallbacks it used.
+    /// A non-positive or non-finite cost is ignored rather than credited: no
+    /// provider pays the user.
+    public mutating func add(
+        promptTokens: Int,
+        cachedTokens: Int = 0,
+        outputTokens: Int,
+        cost: Double?,
+        estimated: Bool
+    ) {
+        self.promptTokens += max(0, promptTokens)
+        self.cachedTokens += max(0, cachedTokens)
+        self.outputTokens += max(0, outputTokens)
+        if estimated { wasEstimated = true }
+        guard let cost, cost.isFinite, cost > 0 else { return }
+        self.cost = (self.cost ?? 0) + cost
+    }
+
+    /// Adds one request from its provider usage block, with the app's estimates
+    /// standing in for the columns it omitted.
+    ///
+    /// The mapping is `CloudTurnReport(usage:...)`'s, so a run total and that
+    /// request's own report cannot disagree about which figure was measured.
+    /// `cost` is passed in because pricing belongs to the caller: a request with
+    /// no usable usage block has no cost, and one that was sent but never
+    /// answered is priced from its estimate deliberately.
+    public mutating func add(
+        usage: CloudUsage?,
+        estimatedPromptTokens: Int,
+        estimatedOutputTokens: Int,
+        cost: Double?
+    ) {
+        let one = CloudTurnReport(
+            usage: usage,
+            estimatedPromptTokens: estimatedPromptTokens,
+            outputTokens: estimatedOutputTokens,
+            cost: cost
+        )
+        add(
+            promptTokens: one.promptTokens ?? 0,
+            cachedTokens: one.cachedTokens,
+            outputTokens: one.outputTokens,
+            cost: cost,
+            estimated: one.wasEstimated
+        )
+    }
+
+    /// The run's summary line: several requests' billed prompts, so it says
+    /// `billed in` rather than reading as one conversation's context size.
+    public var report: CloudTurnReport {
+        CloudTurnReport(
+            promptTokens: promptTokens,
+            cachedTokens: cachedTokens,
+            outputTokens: outputTokens,
+            cost: cost,
+            wasEstimated: wasEstimated
+        )
     }
 }

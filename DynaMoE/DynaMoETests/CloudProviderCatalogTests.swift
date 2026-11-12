@@ -825,11 +825,12 @@ final class CloudProviderStoreTests: XCTestCase {
             baseURL: "https://opencode.ai/zen/v1"
         )
         let endpoint = provider.chatCompletionsURL.absoluteString
-        CloudCacheHintMemory.shared.declinePromptCacheKey(endpoint: endpoint)
+        CloudCacheHintMemory.shared.declinePromptCacheKey(endpoint: endpoint, model: "gpt-5.2")
         XCTAssertFalse(OpenAICloudChatService.sendsCacheKey(
             hints: .openAI,
             sessionKey: "abc123",
-            endpoint: endpoint
+            endpoint: endpoint,
+            model: "gpt-5.2"
         ))
 
         try harness.store.setCacheHints(.openAI, for: provider)
@@ -837,7 +838,8 @@ final class CloudProviderStoreTests: XCTestCase {
         XCTAssertTrue(OpenAICloudChatService.sendsCacheKey(
             hints: .openAI,
             sessionKey: "abc123",
-            endpoint: endpoint
+            endpoint: endpoint,
+            model: "gpt-5.2"
         ))
     }
 

@@ -127,8 +127,18 @@ final class CompletionEngineLogicTests: XCTestCase {
         // history twice, and a chat that moved here from a cloud model (whose
         // stored figure is also a context size) does not jump by a whole
         // conversation on the switch.
-        XCTAssertEqual(ChatSession.contextTokenBase(promptTokenCount: 100), 100)
-        XCTAssertEqual(ChatSession.contextTokenBase(promptTokenCount: 1200), 1200)
+        //
+        // Asserted through the seed a turn actually calls, with a large stored
+        // total in place: an additive regression (the old bug) fails here,
+        // where comparing the identity function with itself could not.
+        var session = ChatSession(title: "seeded")
+        session.cumulativeTokenCount = 120_000
+        session.seedContextTotal(promptTokenCount: 1_200)
+        XCTAssertEqual(session.cumulativeTokenCount, 1_200)
+
+        session.cumulativeTokenCount = 120_000
+        session.seedContextTotal(promptTokenCount: 0)
+        XCTAssertEqual(session.cumulativeTokenCount, 0, "an empty prompt seeds zero, not the old total")
     }
 
     func testTheOdometerBaseIsNeverNegative() {

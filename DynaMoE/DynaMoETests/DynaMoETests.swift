@@ -16265,11 +16265,20 @@ final class ChatSessionPersistenceTests: XCTestCase {
         // context size) was added to the next local turn's prompt, and the
         // header pill jumped by a whole conversation whenever the backend
         // changed.
-        XCTAssertEqual(ChatSession.contextTokenBase(promptTokenCount: 1200), 1200)
-        XCTAssertEqual(
-            ChatSession.contextTokenBase(promptTokenCount: 1200),
-            ChatSession.contextTokenBase(promptTokenCount: 1200)
-        )
+        //
+        // The stored total is the INPUT here, which is what makes this able to
+        // fail: comparing `contextTokenBase(prompt)` with `prompt` proves only
+        // that the function is the identity.
+        var session = ChatSession(title: "odometer")
+        session.cumulativeTokenCount = 9_000
+        session.seedContextTotal(promptTokenCount: 1_200)
+        XCTAssertEqual(session.cumulativeTokenCount, 1_200, "a seed replaces the stored total, it does not add to it")
+
+        // A turn that stored nothing seeds the same way.
+        var fresh = ChatSession(title: "fresh")
+        fresh.cumulativeTokenCount = nil
+        fresh.seedContextTotal(promptTokenCount: 1_200)
+        XCTAssertEqual(fresh.cumulativeTokenCount, 1_200)
     }
 
     func testTheOdometerBaseClampsAndAddsGeneratedTokens() {

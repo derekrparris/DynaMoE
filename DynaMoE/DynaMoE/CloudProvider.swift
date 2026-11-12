@@ -52,7 +52,9 @@ public nonisolated struct CloudProvider: Identifiable, Codable, Equatable, Senda
     public let anthropicBaseURL: URL?
     /// What this endpoint is willing to be told about prompt caching. Optional
     /// so a record written before the field existed still decodes; nil means
-    /// the default (`affinity`), which cannot break a turn.
+    /// the default (`affinity`): headers an HTTP server is required to ignore
+    /// when it does not recognise them, so they change nothing for an endpoint
+    /// that does not route on them.
     public let cacheHints: CloudCacheHints?
 
     public init(

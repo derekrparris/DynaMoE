@@ -160,8 +160,12 @@ public nonisolated struct CloudToolCall: Equatable, Sendable {
 ///
 /// The prefix is byte-identical on every step of an agent run either way; the
 /// difference is whether the request ASKS for the reuse. `affinity` is the
-/// safe default: two custom `x-…` headers, which no HTTP server is obliged to
-/// understand and therefore cannot break a turn. `openAI` adds
+/// safe default: two custom `x-…` headers, which HTTP requires a server to
+/// ignore when it does not know them, so under the protocol they change
+/// nothing for an endpoint that does not route on them. (A gateway that
+/// rejects unrecognised headers anyway is not conforming; `none` is the
+/// setting for one that does, and no retry guesses at it because the same 400
+/// covers every other request-shape complaint.) `openAI` adds
 /// `prompt_cache_key`, the documented OpenAI routing hint, and is opt-in
 /// because a strict compatible endpoint is allowed to reject unknown body
 /// fields (the request path retries once without it if that happens).
@@ -312,6 +316,21 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
     public var cacheReadFraction: Double? {
         guard let promptTokens, promptTokens > 0, let cachedTokens else { return nil }
         return Double(min(cachedTokens, promptTokens)) / Double(promptTokens)
+    }
+
+    /// Equality is the NUMBERS, not the wire shape they arrived in.
+    ///
+    /// `inputTokensExcludeCache` and `inputTokensFromInputColumn` describe how a
+    /// block was decoded, so two blocks carrying the same counts from different
+    /// dialects are the same usage. The synthesized memberwise comparison made
+    /// them unequal, which is a trap for the next test or dedupe that compares
+    /// usage blocks instead of reading their columns.
+    public static func == (lhs: CloudUsage, rhs: CloudUsage) -> Bool {
+        lhs.promptTokens == rhs.promptTokens
+            && lhs.completionTokens == rhs.completionTokens
+            && lhs.totalTokens == rhs.totalTokens
+            && lhs.cachedTokens == rhs.cachedTokens
+            && lhs.cacheWriteTokens == rhs.cacheWriteTokens
     }
 
     /// This block with `newer`'s columns laid over it, field by field.
@@ -544,9 +563,11 @@ public nonisolated struct CloudTurnResult: Equatable, Sendable {
 /// provider's invoice.
 ///
 /// `finishReason` is the provider's own reason for stopping. It exists so a
-/// caller can tell a finished summary from one the output limit cut off:
-/// `length`/`max_tokens` means the text stops mid-thought, and a compaction
-/// that committed it would delete messages the summary never covered.
+/// caller can tell a finished summary from one that was cut off: `length` and
+/// `max_tokens` mean the text ran out of budget, and a compaction that
+/// committed it would delete messages the summary never covered.
+/// `CloudFinishDisposition` classifies the reason; `finishedCleanly` is the
+/// allowlist the destructive path checks.
 public nonisolated struct CloudTextCompletion: Equatable, Sendable {
     public let text: String
     public let usage: CloudUsage?
@@ -560,7 +581,73 @@ public nonisolated struct CloudTextCompletion: Equatable, Sendable {
 
     /// Whether the provider stopped because the reply ran out of budget.
     public var stoppedAtOutputLimit: Bool {
-        finishReason == "length" || finishReason == "max_tokens"
+        CloudFinishDisposition(finishReason: finishReason) == .outputLimit
+    }
+
+    /// Whether the reply is known to be the whole answer.
+    ///
+    /// Deliberately the ALLOWLIST, not "anything but `length`": only the
+    /// spellings this app recognises as a finished reply count, and an unknown
+    /// reason is treated as a cut-off. That direction is the safe one where the
+    /// answer decides whether a compaction may delete messages — a dialect that
+    /// says `MAX_TOKENS` or `content_filter` must not be read as "done" just
+    /// because it is not one of the two words the app knows.
+    ///
+    /// A nil reason counts as complete: a stream only yields a result once it
+    /// saw `[DONE]` or a `finish_reason`, so an absent reason means the
+    /// protocol's own end marker arrived, which is the strongest completion
+    /// signal there is (`CloudTurnResult.terminated`). A connection that closed
+    /// with neither is refused before a completion is built.
+    public var finishedCleanly: Bool {
+        finishReason == nil || CloudFinishDisposition(finishReason: finishReason) == .complete
+    }
+}
+
+/// What a provider's `finish_reason` says about the text it accompanied.
+///
+/// Both wire dialects are covered (`length`/`max_tokens`, and Anthropic's
+/// `end_turn`/`stop_sequence`/`tool_use`), matched case-insensitively after
+/// trimming, because a compatible endpoint is free to spell its own reason and
+/// the old exact-match test read `MAX_TOKENS` as a finished reply.
+public nonisolated enum CloudFinishDisposition: Equatable, Sendable {
+    /// The reply ended because the model finished (or handed off to a tool).
+    case complete
+    /// The reply ran out of its output budget.
+    case outputLimit
+    /// The provider stopped the reply for its own reason, so the text is not
+    /// the answer that was asked for.
+    case halted
+    /// A reason this app does not recognise.
+    case unrecognized
+
+    /// The reasons on both protocols that mean "the model finished".
+    static let completeReasons: Set<String> = [
+        "stop", "end_turn", "stop_sequence", "tool_calls", "tool_use", "function_call"
+    ]
+
+    /// The reasons that mean the reply was stopped before the conversation
+    /// ended, for a reason other than the output budget.
+    static let haltedReasons: Set<String> = [
+        "content_filter", "refusal", "pause_turn"
+    ]
+
+    static let outputLimitReasons: Set<String> = ["length", "max_tokens"]
+
+    public init(finishReason: String?) {
+        guard let finishReason else {
+            self = .unrecognized
+            return
+        }
+        let normalized = finishReason.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if Self.completeReasons.contains(normalized) {
+            self = .complete
+        } else if Self.outputLimitReasons.contains(normalized) {
+            self = .outputLimit
+        } else if Self.haltedReasons.contains(normalized) {
+            self = .halted
+        } else {
+            self = .unrecognized
+        }
     }
 }
 

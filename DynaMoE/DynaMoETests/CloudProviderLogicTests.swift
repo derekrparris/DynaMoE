@@ -1310,6 +1310,25 @@ final class CloudStreamTransportTests: XCTestCase {
         XCTAssertTrue(events.contains(.contentDelta("Hel")))
     }
 
+    func testATrailingSentinelWithNoNewlineStillCountsAsTerminal() async {
+        // The final line of a stream reaches the parser through
+        // `lineBuffer.flush()`, not through the line splitter. Its answer used
+        // to be discarded, so a `[DONE]` that arrived without the blank line
+        // after it left the sentinel flag unset: a complete answer was reported
+        // as a connection that closed early (a spurious "cut off" row), and a
+        // compaction — which refuses a non-terminal stream — refused its own
+        // finished summary.
+        CloudStubURLProtocol.body = Data(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]".utf8
+        )
+        let events = await collect(makeService())
+        guard case .finished(let result)? = events.last else {
+            return XCTFail("expected a finished event, got \(String(describing: events.last))")
+        }
+        XCTAssertEqual(result.text, "ok")
+        XCTAssertTrue(result.terminated, "a trailing [DONE] is the protocol's end marker")
+    }
+
     func testUnknownJSONBodyFailsInsteadOfFinishingEmpty() async {
         CloudStubURLProtocol.body = Data("data: {\"unexpected\":true}\n\n".utf8)
         let events = await collect(makeService())
@@ -1389,7 +1408,8 @@ final class CloudStreamTransportTests: XCTestCase {
             OpenAICloudChatService.sendsCacheKey(
                 hints: .openAI,
                 sessionKey: "session-two-stage",
-                endpoint: "https://\(host)/openai/v1/chat/completions"
+                endpoint: "https://\(host)/openai/v1/chat/completions",
+                model: "hf:org/model"
             ),
             "the accepted retry without the field is what proves it was refused"
         )
@@ -1478,7 +1498,7 @@ final class CloudStreamTransportTests: XCTestCase {
         ]
         CloudStubURLProtocol.onRequest = { _ in
             if CloudStubURLProtocol.requestBodies.count == 1 {
-                CloudCacheHintMemory.shared.declinePromptCacheKey(endpoint: endpoint)
+                CloudCacheHintMemory.shared.declinePromptCacheKey(endpoint: endpoint, model: "hf:org/model")
             }
         }
         defer {
@@ -1852,13 +1872,15 @@ final class CloudCacheHintRequestTests: XCTestCase {
         XCTAssertTrue(OpenAICloudChatService.sendsCacheKey(
             hints: .openAI,
             sessionKey: "abc123",
-            endpoint: endpoint
+            endpoint: endpoint,
+            model: "m"
         ))
-        CloudCacheHintMemory.shared.declinePromptCacheKey(endpoint: endpoint)
+        CloudCacheHintMemory.shared.declinePromptCacheKey(endpoint: endpoint, model: "m")
         XCTAssertFalse(OpenAICloudChatService.sendsCacheKey(
             hints: .openAI,
             sessionKey: "abc123",
-            endpoint: endpoint
+            endpoint: endpoint,
+            model: "m"
         ))
         let request = try service.makeRequest(
             model: "m",
@@ -1877,18 +1899,21 @@ final class CloudCacheHintRequestTests: XCTestCase {
         XCTAssertTrue(OpenAICloudChatService.sendsCacheKey(
             hints: .openAI,
             sessionKey: "abc123",
-            endpoint: first
+            endpoint: first,
+            model: "m"
         ))
-        CloudCacheHintMemory.shared.declinePromptCacheKey(endpoint: first)
+        CloudCacheHintMemory.shared.declinePromptCacheKey(endpoint: first, model: "m")
         XCTAssertFalse(OpenAICloudChatService.sendsCacheKey(
             hints: .openAI,
             sessionKey: "abc123",
-            endpoint: first
+            endpoint: first,
+            model: "m"
         ))
         XCTAssertTrue(OpenAICloudChatService.sendsCacheKey(
             hints: .openAI,
             sessionKey: "abc123",
-            endpoint: second
+            endpoint: second,
+            model: "m"
         ))
         // The reset seam restores the first endpoint, so a repeat-on-failure
         // rerun of this case starts where it did the first time.
@@ -1896,8 +1921,36 @@ final class CloudCacheHintRequestTests: XCTestCase {
         XCTAssertTrue(OpenAICloudChatService.sendsCacheKey(
             hints: .openAI,
             sessionKey: "abc123",
-            endpoint: first
+            endpoint: first,
+            model: "m"
         ))
+    }
+
+    func testTheLatchIsScopedToTheModelThatRefused() {
+        // A compatible gateway fronts several backends under one base URL (the
+        // built-in Synthetic provider says so itself), so a 400 from one model
+        // says nothing about the model beside it. An endpoint-only latch
+        // switched the hint off for every one of them, and for a built-in the
+        // Settings control that clears a latch is read-only — the headline
+        // saving vanished until relaunch with no way to recover.
+        let endpoint = "https://latch-model-\(UUID().uuidString).test/openai/v1/chat/completions"
+        CloudCacheHintMemory.shared.declinePromptCacheKey(endpoint: endpoint, model: "strict-model")
+        // Cleared even when an assertion fails: a latched shared entry would
+        // otherwise leave the next case (or a rerun) starting from state it
+        // did not set up.
+        defer { CloudCacheHintMemory.shared.reset() }
+        XCTAssertFalse(OpenAICloudChatService.sendsCacheKey(
+            hints: .openAI,
+            sessionKey: "abc123",
+            endpoint: endpoint,
+            model: "strict-model"
+        ))
+        XCTAssertTrue(OpenAICloudChatService.sendsCacheKey(
+            hints: .openAI,
+            sessionKey: "abc123",
+            endpoint: endpoint,
+            model: "neighbour-model"
+        ), "one model's refusal must not silence its neighbour on the same endpoint")
     }
 
     func testAnUnknownCacheHintDecodesToTheSafeDefault() throws {
@@ -1938,7 +1991,7 @@ final class CloudCacheHintRequestTests: XCTestCase {
             cacheHints: .openAI,
             cacheHintMemory: memory
         )
-        memory.declinePromptCacheKey(endpoint: endpoint)
+        memory.declinePromptCacheKey(endpoint: endpoint, model: "m")
         let request = try service.makeRequest(
             model: "m",
             messages: [CloudChatMessage(role: "user", content: "hi")],
@@ -1950,7 +2003,8 @@ final class CloudCacheHintRequestTests: XCTestCase {
         XCTAssertTrue(OpenAICloudChatService.sendsCacheKey(
             hints: .openAI,
             sessionKey: "abc123",
-            endpoint: endpoint
+            endpoint: endpoint,
+            model: "m"
         ))
     }
 }
@@ -2806,9 +2860,50 @@ final class CloudCompactionFailureTests: XCTestCase {
     }
 
     func testATruncatedSummaryIsRefusedWithItsReason() {
+        // The GATE, not just the wording: this is the branch that decides
+        // whether a summary replaces the messages it was written from, so the
+        // assertion has to be about what blocks the rewrite.
+        XCTAssertEqual(
+            CloudCompactionGate.refusal(for: CloudTextCompletion(
+                text: "half a sentence", usage: nil, finishReason: "length"
+            )),
+            .truncatedSummary
+        )
+        XCTAssertEqual(
+            CloudCompactionGate.refusal(for: CloudTextCompletion(
+                text: "cut", usage: nil, finishReason: "MAX_TOKENS"
+            )),
+            .truncatedSummary,
+            "the wire spelling is the provider's, so an exact-match test reads this as a finished reply"
+        )
+        XCTAssertEqual(
+            CloudCompactionGate.refusal(for: CloudTextCompletion(
+                text: "cut", usage: nil, finishReason: "content_filter"
+            )),
+            .truncatedSummary,
+            "a provider-side filter also stops before the text covered the chunk"
+        )
+        XCTAssertEqual(
+            CloudCompactionGate.refusal(for: CloudTextCompletion(
+                text: "   ", usage: nil, finishReason: "stop"
+            )),
+            .emptySummary
+        )
+        XCTAssertNil(CloudCompactionGate.refusal(for: CloudTextCompletion(
+            text: "the conversation so far", usage: nil, finishReason: "stop"
+        )))
+        XCTAssertNil(CloudCompactionGate.refusal(for: CloudTextCompletion(
+            text: "the conversation so far", usage: nil, finishReason: "end_turn"
+        )))
+        // A stream that ended on `[DONE]` reports no reason, and that is the
+        // protocol's own completion marker.
+        XCTAssertNil(CloudCompactionGate.refusal(for: CloudTextCompletion(
+            text: "the conversation so far", usage: nil
+        )))
+
         let reason = CloudCompactionFailure.truncatedSummary
-        XCTAssertTrue(reason.notice(providerName: "Synthetic").contains("output limit"))
-        XCTAssertTrue(reason.clause(providerName: "Synthetic").contains("output limit"))
+        XCTAssertTrue(reason.notice(providerName: "Synthetic").contains("did not finish cleanly"))
+        XCTAssertTrue(reason.clause(providerName: "Synthetic").contains("did not finish cleanly"))
     }
 
     func testAStopReadsAsAnOutcomeRatherThanAFault() {
@@ -2898,8 +2993,19 @@ final class CloudCompactionFailureTests: XCTestCase {
             usage: nil,
             finishReason: "max_tokens"
         ).stoppedAtOutputLimit)
+        // Case and spacing are the provider's, not ours.
+        XCTAssertTrue(CloudTextCompletion(
+            text: "half a sent",
+            usage: nil,
+            finishReason: " MAX_TOKENS "
+        ).stoppedAtOutputLimit)
         // A provider that reports no reason is not assumed to have truncated.
         XCTAssertFalse(CloudTextCompletion(text: "done", usage: nil).stoppedAtOutputLimit)
+        XCTAssertFalse(CloudTextCompletion(text: "done", usage: nil).finishedCleanly == false)
+        // A clean stop is the only thing the destructive gate accepts.
+        XCTAssertTrue(CloudTextCompletion(text: "done", usage: nil, finishReason: "stop").finishedCleanly)
+        XCTAssertFalse(CloudTextCompletion(text: "done", usage: nil, finishReason: "content_filter").finishedCleanly)
+        XCTAssertFalse(CloudTextCompletion(text: "done", usage: nil, finishReason: "some_new_dialect").finishedCleanly)
     }
 }
 
@@ -3344,6 +3450,79 @@ final class CloudTurnReportTests: XCTestCase {
             wasEstimated: false
         )
         XCTAssertEqual(report.statusSuffix, "24,000 billed in (18,000 of it cached) / 350 out · $0.0031")
+    }
+
+    func testARunTotalSumsEveryStepRatherThanReportingTheLastOne() throws {
+        // The regression this covers: the status line used to report the LAST
+        // iteration's usage, naming a fraction of a long run while the header
+        // pill and the session spend had already accumulated the whole thing.
+        var totals = CloudRunTotals()
+        totals.add(
+            usage: CloudUsage(promptTokens: 1_000, completionTokens: 50, cachedTokens: 800),
+            estimatedPromptTokens: 0,
+            estimatedOutputTokens: 0,
+            cost: 0.001
+        )
+        totals.add(
+            usage: CloudUsage(promptTokens: 1_200, completionTokens: 60, cachedTokens: 900),
+            estimatedPromptTokens: 0,
+            estimatedOutputTokens: 0,
+            cost: 0.0012
+        )
+        // A summarizer pass spends money without being an agent step, and its
+        // tokens join the run's counts exactly as its cost joins its spend.
+        totals.add(promptTokens: 4_000, outputTokens: 0, cost: 0.0004, estimated: false)
+        XCTAssertEqual(totals.promptTokens, 6_200)
+        XCTAssertEqual(totals.cachedTokens, 1_700)
+        XCTAssertEqual(totals.outputTokens, 110)
+        XCTAssertEqual(try XCTUnwrap(totals.cost), 0.0026, accuracy: 1e-12)
+        XCTAssertFalse(totals.wasEstimated)
+        XCTAssertEqual(
+            totals.report.statusSuffix,
+            "6,200 billed in (1,700 of it cached) / 110 out · $0.0026"
+        )
+    }
+
+    func testAnEstimatedStepMarksTheRunAndDoesNotInventACost() throws {
+        var totals = CloudRunTotals()
+        totals.add(usage: nil, estimatedPromptTokens: 900, estimatedOutputTokens: 40, cost: nil)
+        XCTAssertTrue(totals.wasEstimated)
+        XCTAssertNil(totals.cost, "an estimate on its own does not produce a price")
+
+        // A later measured step accumulates, and the estimate flag stays: the
+        // line has to say one figure on it was estimated.
+        totals.add(
+            usage: CloudUsage(promptTokens: 1_000, completionTokens: 10),
+            estimatedPromptTokens: 0,
+            estimatedOutputTokens: 0,
+            cost: 0.5
+        )
+        XCTAssertTrue(totals.wasEstimated)
+        XCTAssertEqual(totals.promptTokens, 1_900)
+        XCTAssertEqual(totals.outputTokens, 50)
+        XCTAssertEqual(try XCTUnwrap(totals.cost), 0.5, accuracy: 1e-12)
+
+        // The ONE case where estimated tokens carry a cost: a request that was
+        // sent and never answered, priced from the estimate on purpose.
+        totals.add(promptTokens: 500, outputTokens: 3, cost: 0.0002, estimated: true)
+        XCTAssertEqual(try XCTUnwrap(totals.cost), 0.5002, accuracy: 1e-12)
+    }
+
+    func testARunTotalWithNoPricedStepReportsNoCost() {
+        var totals = CloudRunTotals()
+        XCTAssertTrue(totals.isEmpty)
+        totals.add(
+            usage: CloudUsage(promptTokens: 10, completionTokens: 2),
+            estimatedPromptTokens: 0,
+            estimatedOutputTokens: 0,
+            cost: nil
+        )
+        XCTAssertFalse(totals.isEmpty)
+        XCTAssertNil(totals.cost)
+        XCTAssertFalse(totals.wasEstimated)
+        // A provider that returns a nonsense (negative) cost is never credited.
+        totals.add(promptTokens: 1, outputTokens: 1, cost: -5, estimated: false)
+        XCTAssertNil(totals.cost)
     }
 
     func testARunWithOneEstimatedStepIsStillMarked() {

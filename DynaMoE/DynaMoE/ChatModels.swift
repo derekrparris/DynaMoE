@@ -665,6 +665,18 @@ public extension ChatSession {
         max(0, promptTokenCount)
     }
 
+    /// Reseeds the odometer from this turn's prompt.
+    ///
+    /// Takes no previous total on purpose: the stored figure is REPLACED, never
+    /// added to (see `contextTokenBase`). Written as one method so every seed
+    /// point shares the rule, and so the rule is testable — a test can set a
+    /// large stored total and prove it is ignored, which is exactly the
+    /// regression the old code shipped (each backend added its own delta, so a
+    /// cloud total plus the next prompt counted the same history twice).
+    nonisolated mutating func seedContextTotal(promptTokenCount: Int) {
+        cumulativeTokenCount = Self.contextTokenBase(promptTokenCount: promptTokenCount)
+    }
+
     /// Neutralizes chat-template control tokens in a compaction digest before it
     /// rides inside the system block. The digests are derived from arbitrary
     /// user messages and tool output, and every weights dialect wraps the system

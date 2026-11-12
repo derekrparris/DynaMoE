@@ -65,42 +65,51 @@ private nonisolated final class CloudSessionCache: @unchecked Sendable {
 
 // MARK: - Cache Hint Memory
 
-/// Remembers, per endpoint, that an optional cache field was refused.
+/// Remembers that an optional cache field was refused, per endpoint AND model.
 ///
 /// A provider that rejects `prompt_cache_key` rejects it on every request, and
 /// paying a rejected round trip per agent step would cost a turn more than the
-/// hint could ever save. One entry per endpoint, process lifetime, and a lock
-/// only on the miss path. A rejection is only recorded once a request WITHOUT
-/// the field has been accepted, because an unrelated 400 looks identical (see
-/// `streamTurn`). Internal rather than private so a test can pin the latch.
+/// hint could ever save. The key is the model as well as the endpoint because a
+/// compatible gateway fronts several backends under one base URL (the built-in
+/// Synthetic provider says so in its own description): one model answering 400
+/// says nothing about the model beside it, and latching the whole endpoint
+/// switched the hint off for every one of them with no way back — built-ins are
+/// read-only in Settings, so the control that clears a latch is not even
+/// reachable there.
+///
+/// One entry per (endpoint, model), process lifetime, and a lock only on the
+/// miss path. A rejection is only recorded once a request WITHOUT the field has
+/// been accepted, because an unrelated 400 looks identical (see `streamTurn`).
+/// Internal rather than private so a test can pin the latch.
 nonisolated final class CloudCacheHintMemory: @unchecked Sendable {
     static let shared = CloudCacheHintMemory()
 
     private let lock = NSLock()
-    private var declined: Set<String> = []
+    private var declined: [String: Set<String>] = [:]
 
-    func acceptsPromptCacheKey(endpoint: String) -> Bool {
+    func acceptsPromptCacheKey(endpoint: String, model: String) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return !declined.contains(endpoint)
+        return declined[endpoint]?.contains(model) != true
     }
 
-    func declinePromptCacheKey(endpoint: String) {
+    func declinePromptCacheKey(endpoint: String, model: String) {
         lock.lock()
-        declined.insert(endpoint)
+        declined[endpoint, default: []].insert(model)
         lock.unlock()
     }
 
-    /// Forgets one endpoint's refusal. A latch is a statement about what a
-    /// SERVER accepts, and the operator can know better: changing the cache
-    /// hint in Settings, or pointing the provider at a different base URL,
-    /// describes a different server, so the old answer must not silently
-    /// override the new setting. Without this a provider that refused the
-    /// field once kept it switched off for the life of the process, and the
-    /// control that turns it back on did nothing until relaunch.
+    /// Forgets one endpoint's refusals for every model it names.
+    ///
+    /// A latch is a statement about what a MODEL accepts, and the operator can
+    /// know better: changing the cache hint in Settings, or pointing the
+    /// provider at a different base URL, describes a different server and
+    /// therefore a different set of answers. Without this a provider that
+    /// refused the field once kept it switched off for the life of the process,
+    /// and the control that turns it back on did nothing until relaunch.
     func allowPromptCacheKey(endpoint: String) {
         lock.lock()
-        declined.remove(endpoint)
+        declined.removeValue(forKey: endpoint)
         lock.unlock()
     }
 
@@ -222,28 +231,32 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
     /// retry can only be about the field if the rejected request carried it.
     /// After the process has latched the field off, every request is already
     /// key-free, so a 4xx must fail rather than re-upload the identical body.
-    private func willSendCacheKey(params: CloudChatGenerationParams) -> Bool {
+    private func willSendCacheKey(params: CloudChatGenerationParams, model: String) -> Bool {
         Self.sendsCacheKey(
             hints: cacheHints,
             sessionKey: params.sessionKey,
             endpoint: chatURL.absoluteString,
+            model: model,
             memory: cacheHintMemory
         )
     }
 
-    /// The same rule as a pure function of the three inputs, so a test can pin
-    /// it without a live endpoint or a URLSession. `memory` is a parameter for
-    /// the same reason the service holds one: a case that latches must not be
-    /// seen by the next case or by the app's own requests.
+    /// The same rule as a pure function of its inputs, so a test can pin it
+    /// without a live endpoint or a URLSession. `memory` is a parameter for the
+    /// same reason the service holds one: a case that latches must not be seen
+    /// by the next case or by the app's own requests. `model` is part of the
+    /// latch key, not of the decision about the hint: one model on a shared
+    /// gateway can refuse the field while its neighbours accept it.
     nonisolated static func sendsCacheKey(
         hints: CloudCacheHints,
         sessionKey: String?,
         endpoint: String,
+        model: String,
         memory: CloudCacheHintMemory = .shared
     ) -> Bool {
         hints.sendsPromptCacheKey
             && !(sessionKey ?? "").isEmpty
-            && memory.acceptsPromptCacheKey(endpoint: endpoint)
+            && memory.acceptsPromptCacheKey(endpoint: endpoint, model: model)
     }
 
     /// Internal so a test can pin the request shape without a live endpoint.
@@ -263,7 +276,7 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         cacheKeyIsSent: Bool? = nil
     ) throws -> URLRequest {
         let wantsCacheKey = cacheKeyIsSent
-            ?? (includeCacheKey && willSendCacheKey(params: params))
+            ?? (includeCacheKey && willSendCacheKey(params: params, model: model))
         let body = Body(
             model: model,
             messages: messages,
@@ -335,7 +348,7 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                         // indifferent between now and the response would
                         // otherwise suppress the retry this request earned and
                         // fail the turn on a field it had, in fact, sent.
-                        let sentCacheKey = includeCacheKey && self.willSendCacheKey(params: params)
+                        let sentCacheKey = includeCacheKey && self.willSendCacheKey(params: params, model: model)
                         let request = try self.makeRequest(
                             model: model,
                             messages: messages,
@@ -382,7 +395,8 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                         // have been about the body's model, tools or size.
                         if retriedWithoutCacheKey {
                             self.cacheHintMemory.declinePromptCacheKey(
-                                endpoint: self.chatURL.absoluteString
+                                endpoint: self.chatURL.absoluteString,
+                                model: model
                             )
                             // Metadata only, through the app's own log: the
                             // host and the HTTP status, never the request.
@@ -467,10 +481,23 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
 
                         if !finishedBySentinel && !sawFailure {
                             if !lineBuffer.overflowed && !frames.overflowed {
+                                // The tail is where a `[DONE]` that arrived in
+                                // the final batch lands, so its answer has to be
+                                // kept: discarding `false` here left
+                                // `finishedBySentinel` unset and reported a
+                                // complete answer as a connection that closed
+                                // early (a spurious "cut off" row, and a
+                                // compaction that refused its own summary).
                                 if let trailing = lineBuffer.flush() {
-                                    _ = dispatch(frames.consume(line: trailing))
+                                    if !dispatch(frames.consume(line: trailing)) {
+                                        finishedBySentinel = true
+                                    }
                                 }
-                                _ = dispatch(frames.finish())
+                                if !finishedBySentinel && !sawFailure {
+                                    if !dispatch(frames.finish()) {
+                                        finishedBySentinel = true
+                                    }
+                                }
                             }
                         }
 
@@ -800,7 +827,7 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
     /// closes the connection without `[DONE]` and without a `finish_reason` has
     /// written a prefix of an answer, and committing that would delete every
     /// message it never covered — which is exactly why the flag is checked here
-    /// as well as in `stoppedAtOutputLimit`.
+    /// as well as in `CloudCompactionGate.refusal(for:)`.
     public func completeText(
         model: String,
         systemPrompt: String,
