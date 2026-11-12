@@ -1931,6 +1931,73 @@ final class CloudImageDeliveryPolicyTests: XCTestCase {
         )
         XCTAssertNotEqual(keepAll, first)
     }
+
+    func testThePreTurnImageCountMatchesWhatTheFirstRequestCarries() {
+        // The odometer is seeded before the turn's bytes are encoded, so the
+        // flat per-image allowance has to price the same pictures `assemble`
+        // will actually send. Comparing against the assembled parts is the
+        // drift check: a policy added on one side but not the other fails here.
+        let messages = conversation()
+        let map = urls(for: messages)
+        let cases: [(delivery: CloudImageDelivery, supported: Bool)] = [
+            (.all, true),
+            (.newestUserTurnOnly, true),
+            (.all, false)
+        ]
+        for item in cases {
+            let assembled = CloudMessageAssembler.assemble(
+                from: messages,
+                imageDataURLs: map,
+                imagesSupported: item.supported,
+                imageDelivery: item.delivery
+            )
+            let carried = assembled.reduce(0) { $0 + ($1.imageParts?.count ?? 0) }
+            XCTAssertEqual(
+                CloudMessageAssembler.carriedImageCount(
+                    from: messages,
+                    delivery: item.delivery,
+                    imagesSupported: item.supported
+                ),
+                carried,
+                "delivery \(item.delivery), supported \(item.supported)"
+            )
+        }
+    }
+
+    func testATextFollowUpCarriesNoImageUnderTheResendOffPolicy() {
+        let messages = conversation() + [ChatMessage(role: .user, content: "and in text?")]
+        XCTAssertEqual(
+            CloudMessageAssembler.carriedImageCount(
+                from: messages,
+                delivery: .newestUserTurnOnly,
+                imagesSupported: true
+            ),
+            0
+        )
+        XCTAssertEqual(
+            CloudMessageAssembler.carriedImageCount(
+                from: messages,
+                delivery: .all,
+                imagesSupported: true
+            ),
+            2
+        )
+    }
+
+    func testThePreTurnImageCountIgnoresAttachmentsOnNonUserTurns() {
+        let messages = [
+            ChatMessage(role: .assistant, content: "look", attachments: [ref("a.png")]),
+            ChatMessage(role: .user, content: "hello")
+        ]
+        XCTAssertEqual(
+            CloudMessageAssembler.carriedImageCount(
+                from: messages,
+                delivery: .all,
+                imagesSupported: true
+            ),
+            0
+        )
+    }
 }
 
 // MARK: - Prefix stability

@@ -1567,7 +1567,7 @@ struct ContentView: View {
                         handleSendMessage(prompt, preparedImages: images)
                     },
                     onStopGeneration: {
-                        stopAutoregressiveGeneration()
+                        stopVisibleWork()
                     },
                     onQueuePrompt: { text, images in
                         handleQueuePrompt(text, preparedImages: images)
@@ -2794,7 +2794,11 @@ struct ContentView: View {
         guard let startIdx = sessions.firstIndex(where: { $0.id == sessionId }) else {
             return .failed(.conversationUnavailable)
         }
-        let all = sessions[startIdx].messages
+        // Transient rows are UI progress (the bubble this pass draws into),
+        // never conversation. Counting them would shift the
+        // `keepRecentMessages` cut by one and offer a row the user never saw
+        // for summarising.
+        let all = sessions[startIdx].messages.filter { $0.isTransient != true }
         guard all.count > 2 else { return .failed(.conversationTooShort) }
 
         // A message boundary is a safe cut: a tool exchange is emitted from one
@@ -3026,6 +3030,48 @@ struct ContentView: View {
             print("☁️ [COMPACT] cloud compaction failed: \(error.localizedDescription)")
             return finish(.provider(error.localizedDescription))
         }
+    }
+
+    /// An automatic compaction with the same visible progress a `/compact` pass
+    /// shows. Both in-run call sites suspend for minutes inside the summarizer
+    /// while the turn stays active; a status line alone left the conversation
+    /// looking frozen, so a transient bubble marks where the rewritten history
+    /// will land and is retitled as each pass starts. It is removed before the
+    /// caller assembles its next request.
+    private func compactCloudHistoryWithProgress(
+        sessionId: UUID,
+        provider: CloudProvider,
+        providerModelId: String,
+        window: Int?,
+        keepRecentMessages: Int
+    ) async -> CloudCompactionOutcome {
+        let progressId = UUID()
+        if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
+            sessions[idx].messages.append(ChatMessage(
+                id: progressId,
+                role: .system,
+                content: "",
+                prefillStatus: "🗂 \(provider.displayName): compacting older history…",
+                isTransient: true
+            ))
+        }
+        let outcome = await compactCloudHistory(
+            sessionId: sessionId,
+            provider: provider,
+            providerModelId: providerModelId,
+            window: window,
+            keepRecentMessages: keepRecentMessages,
+            onProgress: { text in
+                guard let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
+                      let msgIdx = self.sessions[liveIdx].messages.firstIndex(where: { $0.id == progressId })
+                else { return }
+                self.sessions[liveIdx].messages[msgIdx].prefillStatus = text
+            }
+        )
+        if let liveIdx = sessions.firstIndex(where: { $0.id == sessionId }) {
+            sessions[liveIdx].messages.removeAll { $0.id == progressId }
+        }
+        return outcome
     }
 
     /// `/compact` for a cloud conversation. The provider model that is already
@@ -4045,26 +4091,42 @@ struct ContentView: View {
         )
     }
 
+    /// The Stop control's entry point. A manual `/compact` has no generation
+    /// attached, so the button is the only way to interrupt it, and it acts on
+    /// the conversation the user is looking at: when chat B is compacting while
+    /// chat A generates, Stop belongs to B, and cancelling A's background turn
+    /// from B's window is not what was asked for. Generation stops only when the
+    /// visible conversation has no compaction to interrupt.
+    private func stopVisibleWork() {
+        if stopVisibleCompaction() { return }
+        stopAutoregressiveGeneration()
+    }
+
+    /// Cancels the visible conversation's manual compaction, if one is running,
+    /// and reports whether it handled the stop. Deliberately separate from
+    /// `stopAutoregressiveGeneration`: callers that must tear a generation down
+    /// (model switches, interrupt-and-send, teardown before a load) cannot be
+    /// diverted by a compaction in whichever chat happens to be selected.
+    @discardableResult
+    private func stopVisibleCompaction() -> Bool {
+        guard let visibleSessionId = selectedSessionId ?? sessions.first?.id,
+              let run = manualCompactions[visibleSessionId] else { return false }
+        // `/compact` refuses to start while a turn runs, so this conversation
+        // is not the one generating. The pass reports its own `.cancelled`
+        // outcome when the summarizer request settles.
+        run.task?.cancel()
+        showStatus(
+            "⏹ Stopping the compaction — the conversation is left unchanged.",
+            sessionId: visibleSessionId
+        )
+        return true
+    }
+
+    /// Stops any running generation: cancels the engine's compute task and the
+    /// event consumer, drops queued approvals, and shields the generating
+    /// session from retention until the task exits. Generation only; the Stop
+    /// control first offers a visible compaction to `stopVisibleCompaction`.
     private func stopAutoregressiveGeneration() {
-        // A manual /compact has no generation attached, so the stop control is
-        // the only way to interrupt it. Scoped to the conversation the button
-        // was pressed for: compacting chat A and pressing Stop on chat B must
-        // not cancel A's pass.
-        if let visibleSessionId = selectedSessionId ?? sessions.first?.id,
-           let run = manualCompactions[visibleSessionId] {
-            // A conversation being compacted is never the one generating —
-            // `/compact` refuses to start while a turn runs — so any live
-            // generation belongs to a DIFFERENT chat, and falling through to
-            // the global teardown below would cancel it and announce it as a
-            // stop the user asked for here. The pass reports its own
-            // `.cancelled` outcome when the summarizer request settles.
-            run.task?.cancel()
-            showStatus(
-                "⏹ Stopping the compaction — the conversation is left unchanged.",
-                sessionId: visibleSessionId
-            )
-            return
-        }
         // Shield the generating session from retention *before* flipping
         // `isGeneratingText` false, since that flip can trigger a retention pass
         // while the cancelled task is still unwinding and appending to it. The
@@ -4521,12 +4583,21 @@ struct ContentView: View {
             excludingMessageIds: [messageId]
         )
         let sessionMessagesForImages = sessions.first(where: { $0.id == sessionId })?.messages ?? []
+        let visionCapable = visionSupport(forProvider: provider, providerModelId: providerModelId)
+        // Resolved on the main actor before the task: an AppStorage read from
+        // inside the loop would be a main-actor hop per step.
+        let imageDeliveryPolicy: CloudImageDelivery = cloudResendImages ? .all : .newestUserTurnOnly
         // Images are priced flat in the pre-turn estimate: the assembler is not
         // given their bytes here (that happens off the main actor inside the
-        // turn), so count the refs directly.
-        let attachmentImageCount = sessionMessagesForImages.reduce(0) {
-            $0 + ($1.attachments?.count ?? 0)
-        }
+        // turn), so count the refs directly. The count mirrors the delivery
+        // policy and vision support, because an attachment the first request
+        // will not carry must not seed the odometer: a turn that fails before
+        // its first step would otherwise persist that inflated figure.
+        let attachmentImageCount = CloudMessageAssembler.carriedImageCount(
+            from: sessionMessagesForImages,
+            delivery: imageDeliveryPolicy,
+            imagesSupported: visionCapable
+        )
         let turnInputTokens = CloudMessageAssembler.approximatePromptTokens(
             system: currentPersona(),
             messages: openingMessages
@@ -4541,7 +4612,6 @@ struct ContentView: View {
             sessions[sIdx].cumulativeTokenCount = turnInputTokens
         }
 
-        let visionCapable = visionSupport(forProvider: provider, providerModelId: providerModelId)
         // nil when nobody recorded a window for this model: an unknown window
         // never triggers a compaction, because guessing one would spend money
         // to lose context. Resolved by model id — the same lookup the chat
@@ -4552,9 +4622,6 @@ struct ContentView: View {
             forModelId: providerModelId,
             providerId: provider.id
         )
-        // Resolved on the main actor before the task: an AppStorage read from
-        // inside the loop would be a main-actor hop per step.
-        let imageDeliveryPolicy: CloudImageDelivery = cloudResendImages ? .all : .newestUserTurnOnly
         generationTask = Task(priority: .userInitiated) {
             var currentMessageId = messageId
             var step = 0
@@ -4695,7 +4762,7 @@ struct ContentView: View {
                     )
                     if CloudContextPolicy.shouldCompact(promptTokens: projected, window: window) {
                         compactionAttempts.beginPreflight()
-                        let outcome = await self.compactCloudHistory(
+                        let outcome = await self.compactCloudHistoryWithProgress(
                             sessionId: sessionId,
                             provider: provider,
                             providerModelId: providerModelId,
@@ -4973,7 +5040,7 @@ struct ContentView: View {
                    code == 400 || code == 422,
                    CloudTurnFailure.indicatesContextOverflow(summary) {
                     compactionAttempts.beginOverflowRecovery()
-                    let outcome = await self.compactCloudHistory(
+                    let outcome = await self.compactCloudHistoryWithProgress(
                         sessionId: sessionId,
                         provider: provider,
                         providerModelId: providerModelId,

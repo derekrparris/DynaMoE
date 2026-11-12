@@ -569,7 +569,7 @@ struct ChatDetailView: View {
                                             .foregroundColor(.secondary)
                                     }
                                 }
-                                .help("Context this conversation is carrying: the prompt the model last ingested plus the tokens it generated. Local turns count only prompt tokens the pinned prefix had not already supplied; cloud turns report the last request's full prompt, because a stateless provider is re-sent the whole conversation and only the newest step describes its size.")
+                                .help("Context this conversation is carrying: the prompt the model last ingested plus the tokens it generated. Every backend counts the full prompt the request carried (a cached or pinned prefix is still context the model was given), so this is the latest request's size, not a running total of what each step billed.")
                             }
                             if let spend = session?.cumulativeCost, spend > 0 {
                                 Text("•")

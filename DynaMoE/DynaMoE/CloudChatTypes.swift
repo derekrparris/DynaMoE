@@ -1036,6 +1036,31 @@ public nonisolated enum CloudMessageAssembler {
         return assembled
     }
 
+    /// How many images the first request of a turn will actually carry, before
+    /// any bytes are encoded. Mirrors `assemble`'s rules: attachments travel
+    /// only on user turns, only when the model takes images, and under
+    /// `.newestUserTurnOnly` only from the newest user turn. A pre-turn estimate
+    /// then prices what will be sent instead of every attachment the transcript
+    /// happens to hold.
+    public static func carriedImageCount(
+        from messages: [ChatMessage],
+        delivery: CloudImageDelivery,
+        imagesSupported: Bool
+    ) -> Int {
+        guard imagesSupported else { return 0 }
+        let carrying: [ChatMessage]
+        switch delivery {
+        case .all:
+            carrying = messages
+        case .newestUserTurnOnly:
+            carrying = messages.last(where: { $0.role == .user }).map { [$0] } ?? []
+        }
+        return carrying.reduce(0) { total, message in
+            guard message.role == .user else { return total }
+            return total + (message.attachments?.count ?? 0)
+        }
+    }
+
     /// Splits one user turn into the text the model reads and the image parts it
     /// is sent. Attachments are re-sent with their original message on every
     /// step (history is rebuilt per step), so an agent run keeps the model's
