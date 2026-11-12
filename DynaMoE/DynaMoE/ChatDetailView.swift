@@ -299,8 +299,8 @@ struct ChatDetailView: View {
     }
 
     /// True while a /compact pass is streaming into its progress bubble.
-    /// Only the scroll handlers need the conversation-level bit; everything
-    /// rendered is keyed to `compactionProgressMessageId` instead.
+    /// The scroll handlers and the Stop control need the conversation-level
+    /// bit; everything rendered is keyed to `compactionProgressMessageId`.
     private var isCompactingConversation: Bool {
         compactionProgressMessageId != nil
     }
@@ -591,7 +591,7 @@ struct ChatDetailView: View {
                         .cornerRadius(8)
                     }
                     
-                    if isGenerating {
+                    if isGenerating || isCompactingConversation {
                         Button(action: onStopGeneration) {
                             HStack(spacing: 4) {
                                 Image(systemName: "stop.fill")
@@ -1217,9 +1217,13 @@ struct ChatDetailView: View {
                         .buttonStyle(.plain)
 
                         // Send / Stop / Queue Buttons
-                        if isGenerating {
+                        // A manual /compact also gets the Stop control: it runs
+                        // for minutes and has no generation attached, so this is
+                        // the only way to interrupt it.
+                        if isGenerating || isCompactingConversation {
                             HStack(spacing: 8) {
-                                if !promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingImages.isEmpty {
+                                if isGenerating,
+                                   !promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingImages.isEmpty {
                                     Button(action: {
                                         let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
                                         guard !trimmed.isEmpty || !pendingImages.isEmpty else { return }
@@ -1262,7 +1266,7 @@ struct ChatDetailView: View {
                                         .foregroundColor(.red)
                                 }
                                 .buttonStyle(.plain)
-                                .help("Stop generating")
+                                .help(isCompactingConversation ? "Stop compacting" : "Stop generating")
                             }
                         } else {
                             // Slash commands are backend-independent app actions

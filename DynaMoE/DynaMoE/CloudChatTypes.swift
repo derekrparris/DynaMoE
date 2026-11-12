@@ -173,6 +173,16 @@ public nonisolated enum CloudCacheHints: String, Codable, Equatable, Hashable, S
     /// Affinity headers plus `prompt_cache_key`.
     case openAI
 
+    /// An unrecognised spelling decodes to the safe default rather than
+    /// failing the whole provider record. The value lives in hand-editable
+    /// JSON and a newer build may write one this build does not know; losing
+    /// the provider from the list over a label is worse than falling back to
+    /// headers every HTTP server is free to ignore.
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = CloudCacheHints(rawValue: raw) ?? .affinity
+    }
+
     /// A session-affinity header is what lets a router keep one conversation on
     /// one replica, which is the only way an automatic per-instance prefix
     /// cache ever hits.
@@ -257,7 +267,8 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
     /// Input tokens served from the provider's prompt cache.
     public let cachedTokens: Int?
     /// Tokens written into the provider's cache by this request
-    /// (Anthropic-style providers bill this separately from a cache read).
+    /// (Anthropic-style providers bill this separately from a cache read,
+    /// and at a premium the price list can record as `cache_write_input`).
     public let cacheWriteTokens: Int?
 
     public init(
@@ -295,6 +306,7 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
         case completionTokens = "completion_tokens"
         case totalTokens = "total_tokens"
         case promptTokensDetails = "prompt_tokens_details"
+        case inputTokensDetails = "input_tokens_details"
         case cachedTokens = "cached_tokens"
         case promptCacheHitTokens = "prompt_cache_hit_tokens"
         case cacheReadInputTokens = "cache_read_input_tokens"
@@ -304,15 +316,34 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
         case outputTokens = "output_tokens"
     }
 
-    private struct PromptTokensDetails: Decodable {
+    private struct TokenDetails: Decodable {
         let cachedTokens: Int?
 
         enum CodingKeys: String, CodingKey { case cachedTokens = "cached_tokens" }
+
+        /// The same tolerance as `firstInt`: one stringified number inside a
+        /// detail object must not cost the whole nested block.
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            if let value = try? container.decodeIfPresent(Int.self, forKey: .cachedTokens) {
+                cachedTokens = value
+            } else if let text = try? container.decodeIfPresent(String.self, forKey: .cachedTokens) {
+                cachedTokens = Int(text.trimmingCharacters(in: .whitespaces))
+            } else if let number = try? container.decodeIfPresent(Double.self, forKey: .cachedTokens),
+                      number.isFinite,
+                      number.magnitude < 9e15 {
+                cachedTokens = Int(number.rounded())
+            } else {
+                cachedTokens = nil
+            }
+        }
     }
 
-    /// The first key that decodes to a value. A provider that spells a field
-    /// differently should not cost the whole usage block, so an unreadable key
-    /// falls through to the next spelling instead of throwing.
+    /// The first key that yields a count. A provider that spells a field
+    /// differently, or stringifies its numbers, should not cost the whole
+    /// usage block, so an unreadable key falls through to the next spelling
+    /// instead of throwing. Numbers written as strings matter in practice:
+    /// losing them marks a measured usage block as estimated.
     private static func firstInt(
         _ container: KeyedDecodingContainer<CodingKeys>,
         _ keys: [CodingKeys]
@@ -321,19 +352,43 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
             if let value = try? container.decodeIfPresent(Int.self, forKey: key) {
                 return value
             }
+            if let text = try? container.decodeIfPresent(String.self, forKey: key),
+               let value = Int(text.trimmingCharacters(in: .whitespaces)) {
+                return value
+            }
+            if let number = try? container.decodeIfPresent(Double.self, forKey: key),
+               number.isFinite,
+               number.magnitude < 9e15 {
+                return Int(number.rounded())
+            }
         }
         return nil
     }
 
+    /// Adds wire counts without trapping. A broken or hostile usage block can
+    /// carry `Int.max` in every column; an overflow is clamped, never a crash.
+    private static func summed(_ values: [Int]) -> Int {
+        values.reduce(0) { total, value in
+            let (sum, overflow) = total.addingReportingOverflow(max(0, value))
+            return overflow ? Int.max : sum
+        }
+    }
+
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        let details = try? container.decodeIfPresent(PromptTokensDetails.self, forKey: .promptTokensDetails)
+        let details = try? container.decodeIfPresent(TokenDetails.self, forKey: .promptTokensDetails)
+        let inputDetails = try? container.decodeIfPresent(TokenDetails.self, forKey: .inputTokensDetails)
         let openAIPrompt = Self.firstInt(container, [.promptTokens])
         let inputTokens = Self.firstInt(container, [.inputTokens])
-        let cachedTokens = Self.firstInt(
-            container,
-            [.promptCacheHitTokens, .cachedTokens, .cacheReadInputTokens]
-        ) ?? details?.cachedTokens
+        // The nested detail is the documented OpenAI spelling and wins over a
+        // stray flat `cached_tokens`, which is a generic column some
+        // compatible endpoints use for something else. DeepSeek's dedicated
+        // top-level name still wins over both, and Anthropic's column is its
+        // own protocol's only spelling.
+        let cachedTokens = Self.firstInt(container, [.promptCacheHitTokens])
+            ?? details?.cachedTokens
+            ?? inputDetails?.cachedTokens
+            ?? Self.firstInt(container, [.cacheReadInputTokens, .cachedTokens])
         let cacheWriteTokens = Self.firstInt(
             container,
             [.cacheCreationInputTokens, .cacheWriteTokens]
@@ -361,14 +416,15 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
             && (container.contains(.cacheReadInputTokens)
                 || container.contains(.cacheCreationInputTokens))
         if usesAnthropicCacheColumns, let inputTokens {
-            self.promptTokens = inputTokens + (cachedTokens ?? 0) + (cacheWriteTokens ?? 0)
+            self.promptTokens = Self.summed([inputTokens, cachedTokens ?? 0, cacheWriteTokens ?? 0])
         } else {
-            self.promptTokens = openAIPrompt ?? inputTokens
+            self.promptTokens = (openAIPrompt ?? inputTokens).map { max(0, $0) }
         }
         self.completionTokens = Self.firstInt(container, [.completionTokens, .outputTokens])
-        self.totalTokens = Self.firstInt(container, [.totalTokens])
-        self.cachedTokens = cachedTokens
-        self.cacheWriteTokens = cacheWriteTokens
+            .map { max(0, $0) }
+        self.totalTokens = Self.firstInt(container, [.totalTokens]).map { max(0, $0) }
+        self.cachedTokens = cachedTokens.map { max(0, $0) }
+        self.cacheWriteTokens = cacheWriteTokens.map { max(0, $0) }
     }
 
     /// Encodes the canonical OpenAI shape. Nothing in the app persists a usage
@@ -379,7 +435,7 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
         try container.encodeIfPresent(completionTokens, forKey: .completionTokens)
         try container.encodeIfPresent(totalTokens, forKey: .totalTokens)
         if let cachedTokens {
-            var details = container.nestedContainer(keyedBy: PromptTokensDetails.CodingKeys.self, forKey: .promptTokensDetails)
+            var details = container.nestedContainer(keyedBy: TokenDetails.CodingKeys.self, forKey: .promptTokensDetails)
             try details.encode(cachedTokens, forKey: .cachedTokens)
         }
         try container.encodeIfPresent(cacheWriteTokens, forKey: .cacheCreationInputTokens)
@@ -914,9 +970,11 @@ public nonisolated enum CloudMessageAssembler {
         // conversation, not the newest seen so far.
         var newestImageTurnId: UUID?
         if imageDelivery == .newestUserTurnOnly {
-            newestImageTurnId = messages
-                .last(where: { $0.role == .user && !($0.attachments ?? []).isEmpty })?
-                .id
+            // The NEWEST user turn, not the newest image-bearing one. Selecting
+            // an older picture because a later question carried no file defeats
+            // the setting: the user asked for text-only follow-ups not to keep
+            // paying for a picture they already stopped asking about.
+            newestImageTurnId = messages.last(where: { $0.role == .user })?.id
         }
         var assembled: [CloudChatMessage] = []
         for message in messages {

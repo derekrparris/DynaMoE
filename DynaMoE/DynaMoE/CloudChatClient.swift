@@ -72,8 +72,8 @@ private nonisolated final class CloudSessionCache: @unchecked Sendable {
 /// hint could ever save. One entry per endpoint, process lifetime, and a lock
 /// only on the miss path. A rejection is only recorded once a request WITHOUT
 /// the field has been accepted, because an unrelated 400 looks identical (see
-/// `streamTurn`).
-private nonisolated final class CloudCacheHintMemory: @unchecked Sendable {
+/// `streamTurn`). Internal rather than private so a test can pin the latch.
+nonisolated final class CloudCacheHintMemory: @unchecked Sendable {
     static let shared = CloudCacheHintMemory()
 
     private let lock = NSLock()
@@ -184,6 +184,32 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         request.setValue(sessionKey, forHTTPHeaderField: "x-session-affinity")
     }
 
+    /// Whether the next request would actually carry `prompt_cache_key`.
+    ///
+    /// Shared by `makeRequest` and the retry predicate, which is the point: a
+    /// retry can only be about the field if the rejected request carried it.
+    /// After the process has latched the field off, every request is already
+    /// key-free, so a 4xx must fail rather than re-upload the identical body.
+    private func willSendCacheKey(params: CloudChatGenerationParams) -> Bool {
+        Self.sendsCacheKey(
+            hints: cacheHints,
+            sessionKey: params.sessionKey,
+            endpoint: chatURL.absoluteString
+        )
+    }
+
+    /// The same rule as a pure function of the three inputs, so a test can pin
+    /// it without a live endpoint or a URLSession.
+    nonisolated static func sendsCacheKey(
+        hints: CloudCacheHints,
+        sessionKey: String?,
+        endpoint: String
+    ) -> Bool {
+        hints.sendsPromptCacheKey
+            && !(sessionKey ?? "").isEmpty
+            && CloudCacheHintMemory.shared.acceptsPromptCacheKey(endpoint: endpoint)
+    }
+
     /// Internal so a test can pin the request shape without a live endpoint.
     func makeRequest(
         model: String,
@@ -193,10 +219,7 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         includeUsage: Bool = true,
         includeCacheKey: Bool = true
     ) throws -> URLRequest {
-        let wantsCacheKey = includeCacheKey
-            && cacheHints.sendsPromptCacheKey
-            && !(params.sessionKey ?? "").isEmpty
-            && CloudCacheHintMemory.shared.acceptsPromptCacheKey(endpoint: chatURL.absoluteString)
+        let wantsCacheKey = includeCacheKey && willSendCacheKey(params: params)
         let body = Body(
             model: model,
             messages: messages,
@@ -261,8 +284,6 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                     // provider. The retry is free; the memory is not.
                     var retriedWithoutCacheKey = false
                     var cacheKeyRejectionStatus: Int?
-                    let asksForCacheKey = self.cacheHints.sendsPromptCacheKey
-                        && !(params.sessionKey ?? "").isEmpty
                     for _ in 0..<3 {
                         let request = try self.makeRequest(
                             model: model,
@@ -285,8 +306,8 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                                 includeUsage = false
                                 continue
                             }
-                            if includeCacheKey, asksForCacheKey,
-                               Self.shouldRetryWithoutCacheKey(status: http.statusCode) {
+                            if includeCacheKey, self.willSendCacheKey(params: params),
+                               Self.shouldRetryWithoutCacheKey(status: http.statusCode, body: body) {
                                 includeCacheKey = false
                                 retriedWithoutCacheKey = true
                                 cacheKeyRejectionStatus = http.statusCode
@@ -435,13 +456,19 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
 
     /// Whether a rejection is worth retrying without `prompt_cache_key`.
     ///
-    /// Deliberately not keyed on the body: a provider rejecting an unknown body
-    /// field usually names the field vaguely ("invalid request", "unexpected
-    /// property"), and a rejected request is not billed, so one blind retry
-    /// costs nothing. It is bounded to 4xx because a 5xx or a 429 is not about
-    /// the field.
-    nonisolated static func shouldRetryWithoutCacheKey(status: Int) -> Bool {
-        status == 400 || status == 422
+    /// Deliberately not keyed on the body naming the field: a provider
+    /// rejecting an unknown body field usually words it vaguely ("invalid
+    /// request", "unexpected property"), and a rejected request is not billed,
+    /// so one blind retry costs nothing. It is bounded to 4xx because a 5xx or
+    /// a 429 is not about the field, and it excludes the two 400s that are
+    /// about the request's CONTENT: a context overflow or an image refusal is
+    /// answered by uploading the same megabytes again, and the chat turn has
+    /// its own recovery for each.
+    nonisolated static func shouldRetryWithoutCacheKey(status: Int, body: String) -> Bool {
+        guard status == 400 || status == 422 else { return false }
+        if CloudTurnFailure.indicatesContextOverflow(body) { return false }
+        if CloudTurnFailure.indicatesImageRejection(body) { return false }
+        return true
     }
 
     // MARK: Models

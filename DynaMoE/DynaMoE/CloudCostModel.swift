@@ -28,44 +28,79 @@ public nonisolated struct CloudPricing: Codable, Equatable, Sendable {
     public let cachedInput: Double?
     /// USD per 1,000,000 output tokens.
     public let output: Double
+    /// USD per 1,000,000 cache-WRITE input tokens. Nil means the provider
+    /// charges a write at the fresh-input rate, which is what OpenAI-shaped
+    /// endpoints do. Record it for a provider that bills a write premium
+    /// (Anthropic charges 1.25x) or every cached write is understated.
+    public let cacheWriteInput: Double?
 
-    public init(input: Double, cachedInput: Double? = nil, output: Double) {
+    public init(
+        input: Double,
+        cachedInput: Double? = nil,
+        output: Double,
+        cacheWriteInput: Double? = nil
+    ) {
         self.input = input
         self.cachedInput = cachedInput
         self.output = output
+        self.cacheWriteInput = cacheWriteInput
     }
 
     enum CodingKeys: String, CodingKey {
         case input
         case cachedInput = "cached_input"
         case output
+        case cacheWriteInput = "cache_write_input"
+    }
+
+    /// Whether every recorded rate is a usable price. Prices are hand-typed
+    /// JSON, so a negative or non-finite number is a typo; a cost built from it
+    /// would be negative or absurd and the display's `> 0` guard would hide it
+    /// as "$0", which is worse than reporting no cost at all.
+    public var isValid: Bool {
+        func usable(_ value: Double) -> Bool { value.isFinite && value >= 0 }
+        return usable(input) && usable(output)
+            && (cachedInput.map(usable) ?? true)
+            && (cacheWriteInput.map(usable) ?? true)
     }
 
     /// What one reported usage block cost. Nil when the provider reported no
     /// prompt count, because a cost built from half the numbers is worse than
     /// no cost at all.
     ///
-    /// Cache-write tokens are charged at the fresh-input rate: Anthropic bills
-    /// them at a premium, but this record has no fourth price, and overstating
-    /// an unknown premium is the honest direction for a display figure.
+    /// Cache-write tokens are charged at `cacheWriteInput` when the operator
+    /// recorded it, and at the fresh-input rate otherwise. Every rate is
+    /// clamped non-negative here as well as at decode, because this type is
+    /// also constructed in code where a negative rate would otherwise turn a
+    /// turn's spend negative.
     public func cost(for usage: CloudUsage) -> Double? {
-        guard let promptTokens = usage.promptTokens else { return nil }
+        guard let reportedPrompt = usage.promptTokens else { return nil }
+        let promptTokens = max(0, reportedPrompt)
         let cached = max(0, min(usage.cachedTokens ?? 0, promptTokens))
-        let fresh = Double(promptTokens - cached)
-        let cachedRate = cachedInput ?? input
-        let inputCost = (fresh * input + Double(cached) * cachedRate) / 1_000_000
-        let outputCost = Double(max(0, usage.completionTokens ?? 0)) * output / 1_000_000
+        let written = max(0, min(usage.cacheWriteTokens ?? 0, promptTokens - cached))
+        let fresh = Double(promptTokens - cached - written)
+        let inputCost = (fresh * Self.rate(input)
+            + Double(cached) * Self.rate(cachedInput ?? input)
+            + Double(written) * Self.rate(cacheWriteInput ?? input)) / 1_000_000
+        let outputCost = Double(max(0, usage.completionTokens ?? 0)) * Self.rate(output) / 1_000_000
         return inputCost + outputCost
+    }
+
+    private static func rate(_ value: Double) -> Double {
+        value.isFinite ? max(0, value) : 0
     }
 }
 
 /// Per-provider price registrations, stored as one JSON object under a
 /// provider-scoped key:
 ///
-///     defaults write DRP.DynaMoE dynamoe_cloud_synthetic_pricing \
+///     defaults write DRP.DynaMoE dynamoe_cloud_synthetic_pricing -string \
 ///       '{"hf:org/model":{"input":0.27,"cached_input":0.07,"output":1.1}}'
 ///
-/// A malformed value costs the price list and never a turn.
+/// A malformed entry costs that model's price and never the turn. Decoding is
+/// per key on purpose: the whole-list decoder used to drop every price on the
+/// provider when one hand-typed entry had a typo, which read as "this provider
+/// reports no cost" and hid the mistake.
 public nonisolated enum CloudPricingStore {
     public static func defaultsKey(for providerId: String) -> String {
         "dynamoe_cloud_\(providerId)_pricing"
@@ -77,10 +112,18 @@ public nonisolated enum CloudPricingStore {
     ) -> [String: CloudPricing] {
         guard let raw = defaults.string(forKey: defaultsKey(for: providerId)),
               let data = raw.data(using: .utf8),
-              let decoded = try? JSONDecoder().decode([String: CloudPricing].self, from: data) else {
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return [:]
         }
-        return decoded
+        let decoder = JSONDecoder()
+        var prices: [String: CloudPricing] = [:]
+        for (model, value) in object {
+            guard let entry = try? JSONSerialization.data(withJSONObject: value),
+                  let price = try? decoder.decode(CloudPricing.self, from: entry),
+                  price.isValid else { continue }
+            prices[model] = price
+        }
+        return prices
     }
 
     public static func pricing(
@@ -118,7 +161,12 @@ public nonisolated enum CloudPricingStore {
     public static func formatted(_ cost: Double) -> String {
         guard cost.isFinite, cost > 0 else { return "$0" }
         if cost < 0.0001 { return "<$0.0001" }
-        if cost < 0.01 { return String(format: "$%.4f", cost) }
+        if cost < 0.01 {
+            let text = String(format: "$%.4f", cost)
+            // 0.009999 renders as "$0.0100", which claims a cent it is under.
+            // Say it is below the smallest figure at this scale instead.
+            return text == "$0.0100" ? "<$0.0100" : text
+        }
         return String(format: "$%.2f", cost)
     }
 }
@@ -160,7 +208,8 @@ public nonisolated enum CloudOverflowAdvice {
 /// pre-flight pass and one overflow-recovery pass:
 ///
 /// - the pre-flight pass is marked when it STARTS, because the request is
-///   billed before its outcome is known;
+///   billed before its outcome is known; an attempt that turns out to have
+///   sent nothing is given back, because it spent nothing (`abandonPreflight`);
 /// - overflow recovery keeps its own attempt, because the provider rejecting
 ///   the request is evidence the pre-flight estimate did not have.
 ///
@@ -186,6 +235,15 @@ public nonisolated struct CloudCompactionAttempts: Equatable, Sendable {
 
     public mutating func beginPreflight() {
         preflightAttempted = true
+    }
+
+    /// Gives the pre-flight attempt back when the pass never reached the
+    /// provider. A refusal that sent no request costs nothing and says nothing
+    /// about the next step, so holding the gate shut would make a one-attempt
+    /// budget cost a compaction that became possible later.
+    public mutating func abandonPreflight() {
+        guard !historyWasRewritten else { return }
+        preflightAttempted = false
     }
 
     public mutating func beginOverflowRecovery() {
@@ -324,6 +382,22 @@ public nonisolated enum CloudContextPolicy {
         guard let window, window >= minimumPlausibleWindow else { return 24_000 }
         return max(4_000, Int(Double(window) * 0.33) * 4)
     }
+
+    /// Tokens one summarizer pass may write.
+    ///
+    /// A fixed cap is wrong at both ends. The chunk budget scales to a third
+    /// of the window (about 66k tokens for a 200k model, roughly 264k
+    /// characters), and a 2,000-token summary of that is not necessarily
+    /// complete: when it stops at the limit the pass is billed, refused for
+    /// fear of deleting messages it never covered, and the run's one pre-flight
+    /// attempt is gone. Ten percent of the chunk's estimated tokens, floored at
+    /// 2,000 (so a short transcript keeps the detailed summary it always had)
+    /// and capped at 8,000 (so a runaway summary cannot cost more than the turn
+    /// it makes room for).
+    public static func summaryResponseTokens(window: Int?) -> Int {
+        let chunkTokens = chunkCharacterBudget(window: window) / 4
+        return max(2_000, min(8_000, chunkTokens / 10))
+    }
 }
 
 // MARK: - Compaction boundary
@@ -337,6 +411,16 @@ public nonisolated enum CloudContextPolicy {
 /// was evicted. The user-turn preference below is therefore about where a
 /// conversation reads naturally, not about validity.
 public nonisolated enum CloudCompactionBoundary {
+    /// How far before the requested cut a user turn may pull that cut.
+    ///
+    /// The preference exists so the kept tail opens with a question instead of
+    /// mid-answer. It is bounded because an unbounded look-back finds the head
+    /// of a long agent run: one user turn followed by two hundred assistant
+    /// turns is a single question, and moving the cut all the way back there
+    /// evicts a handful of rows, bills a summary, and shrinks nothing. Eight
+    /// messages is wider than the alternating shape ever needs.
+    public static let maximumUserTurnLookback = 8
+
     /// Index of the first message to KEEP, or nil when the history offers no
     /// cut that would evict any of the conversation.
     ///
@@ -355,9 +439,16 @@ public nonisolated enum CloudCompactionBoundary {
         func evictsConversation(at cut: Int) -> Bool {
             messages[..<cut].contains { $0.role != .system }
         }
-        // Preferred: the newest user turn at or before the requested cut.
+        // Preferred: the newest user turn within a short look-back at or
+        // before the requested cut.
         var userBoundary = target
-        while userBoundary > 0, messages[userBoundary].role != .user { userBoundary -= 1 }
+        var stepsBack = 0
+        while userBoundary > 0,
+              messages[userBoundary].role != .user,
+              stepsBack < Self.maximumUserTurnLookback {
+            userBoundary -= 1
+            stepsBack += 1
+        }
         if messages[userBoundary].role == .user, userBoundary > 0,
            evictsConversation(at: userBoundary) {
             return userBoundary
@@ -455,6 +546,36 @@ public nonisolated enum CloudCompactionFailure: Equatable, Error, Sendable {
     /// The provider request failed; the payload is the failure's description.
     case provider(String)
 
+    /// Whether this outcome sent a summarizer request, and was therefore
+    /// billed. A refusal that never reached the provider is a precondition and
+    /// spends nothing; the pre-flight gate is reopened for those whose reason
+    /// the next step could change (see `isRetryableOnNextStep`).
+    public var spentRequest: Bool {
+        switch self {
+        case .conversationTooShort, .nothingToEvict, .conversationUnavailable,
+             .noCredential, .noTranscript:
+            return false
+        case .emptySummary, .truncatedSummary, .cancelled, .provider:
+            return true
+        }
+    }
+
+    /// Whether the same pre-flight attempt is worth making again on the next
+    /// step. A refusal that sent no request and depends only on the history's
+    /// SHAPE can change as the run appends rows (an empty tail, too few rows,
+    /// nothing renderable), so it gives the attempt back. A key that could not
+    /// be read is not re-read at every step, and a vanished conversation ends
+    /// the run.
+    public var isRetryableOnNextStep: Bool {
+        switch self {
+        case .conversationTooShort, .nothingToEvict, .noTranscript:
+            return true
+        case .conversationUnavailable, .noCredential,
+             .emptySummary, .truncatedSummary, .cancelled, .provider:
+            return false
+        }
+    }
+
     /// What the chat surface prints for this outcome. A cause that sent no
     /// request is reported as a precondition, never as a provider fault.
     public func notice(providerName: String) -> String {
@@ -546,9 +667,12 @@ public nonisolated struct CloudTurnReport: Equatable, Sendable {
         outputTokens: Int,
         cost: Double?
     ) {
-        self.wasEstimated = usage?.promptTokens == nil
-        self.promptTokens = usage?.promptTokens ?? estimatedPromptTokens
-        self.cachedTokens = usage?.cachedTokens ?? 0
+        // A missing completion count is as much an estimate as a missing prompt
+        // count: the output figure then comes from the app's character
+        // estimate, and the suffix has to say so.
+        self.wasEstimated = usage?.promptTokens == nil || usage?.completionTokens == nil
+        self.promptTokens = max(0, usage?.promptTokens ?? estimatedPromptTokens)
+        self.cachedTokens = max(0, usage?.cachedTokens ?? 0)
         self.outputTokens = max(0, usage?.completionTokens ?? outputTokens)
         self.cost = cost
         self.countsBilledInput = false

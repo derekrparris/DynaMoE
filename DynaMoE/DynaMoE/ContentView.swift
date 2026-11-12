@@ -225,6 +225,11 @@ struct ContentView: View {
     /// "compacting" flag to the list would mark every historical bubble as
     /// live-streaming for the duration of the pass.
     @State private var compactingProgressMessageId: UUID? = nil
+    /// The running manual `/compact` task (cloud or on-device), held so Stop can
+    /// interrupt it. Without a handle the task could never be cancelled, which
+    /// made the cloud path's already-written `.cancelled` outcome unreachable
+    /// and left a multi-minute pass with no way out but waiting (or quitting).
+    @State private var compactionTask: Task<Void, Never>? = nil
     @State private var generatingSessionId: UUID? = nil
     /// Sessions pinned against retention while a generation unwinds or a
     /// replacement is being sent. `stopAutoregressiveGeneration` flips
@@ -2529,11 +2534,12 @@ struct ContentView: View {
             kind: .progress,
             sessionId: sessionId
         )
-        Task { @MainActor in
+        compactionTask = Task { @MainActor in
             defer {
                 self.isCompactingConversation = false
                 self.compactingSessionId = nil
                 self.compactingProgressMessageId = nil
+                self.compactionTask = nil
                 self.releaseRetentionProtection(sessionId)
                 self.clearStatus(ifIdentity: compactionStatusId)
             }
@@ -2656,6 +2662,12 @@ struct ContentView: View {
                 // of compaction; it is paid here, deliberately.
                 PrefixCacheManager.shared.invalidate(sessionId: sessionId)
                 self.showStatus("🗂 Compacted \(evictedCount) messages. The summary stays at the top of this chat.")
+            } catch is CancellationError {
+                // Stop is an outcome the user asked for, not a fault: nothing
+                // was rewritten, so say the conversation is untouched instead
+                // of reporting a compaction failure.
+                self.showStatus("⏹ Compaction stopped — the conversation was left unchanged.")
+                postToProgress("⏹ Compaction stopped — the conversation was left unchanged.")
             } catch {
                 self.showStatus("⚠️ Compaction failed: \(error.localizedDescription)")
                 postToProgress("⚠️ Compaction failed: \(error.localizedDescription) — the conversation was left unchanged.")
@@ -2760,9 +2772,9 @@ struct ContentView: View {
         let summaryInstructions = AppleFoundationModelService.compactionSummaryInstructions(focus: focus)
         let recapInstructions = AppleFoundationModelService.compactionRecapInstructions(focus: focus)
         let sessionKey = CloudSessionKey.hashed(sessionId)
-        // Generous enough for a detailed recap, bounded so a runaway summary
-        // cannot cost more than the turn it is making room for.
-        let responseTokens = 2_000
+        // Scales with the chunk: a fixed cap is too small for a third-of-window
+        // chunk, and a summary cut off at the limit is billed and then refused.
+        let responseTokens = CloudContextPolicy.summaryResponseTokens(window: window)
         let pricing = CloudPricingStore.pricing(
             forModel: providerModelId,
             providerId: provider.id
@@ -2952,11 +2964,12 @@ struct ContentView: View {
             kind: .progress,
             sessionId: sessionId
         )
-        Task { @MainActor in
+        compactionTask = Task { @MainActor in
             defer {
                 self.isCompactingConversation = false
                 self.compactingSessionId = nil
                 self.compactingProgressMessageId = nil
+                self.compactionTask = nil
                 // The history rewrite drops the bubble on success; every other
                 // outcome leaves it behind, so take it down before the next
                 // body evaluation can paint an empty progress row.
@@ -3025,7 +3038,7 @@ struct ContentView: View {
         // Only `/compact` collides with a running compaction. A mode change is
         // local conversation state — no turn is running — so `/plan` was being
         // refused with a message about a different command.
-        if isCompactingConversation, case .compact = command {
+        if isCompactingConversation, compactingSessionId == cmdSessionId, case .compact = command {
             let note = "⚠️ A compaction is already running — try /compact again once it finishes."
             sessions[cmdSessionIdx].messages.append(ChatMessage(role: .system, content: note))
             return true
@@ -3152,9 +3165,10 @@ struct ContentView: View {
             showStatus(err, kind: .warning)
             return false
         }
-        // A running compaction rewrites this session's messages when its
+        // A running compaction rewrites its own session's messages when its
         // summaries land; an interleaved send would be part of the rewrite.
-        if isCompactingConversation {
+        // Other conversations are unaffected and must stay sendable.
+        if isCompactingConversation, compactingSessionId == currentSessionId {
             showStatus("⚠️ Conversation is being compacted — try again in a moment.")
             return false
         }
@@ -3900,6 +3914,25 @@ struct ContentView: View {
     }
 
     private func stopAutoregressiveGeneration() {
+        // A manual /compact has no generation attached, so the stop control is
+        // the only way to interrupt it. Scoped to the conversation the button
+        // was pressed for: compacting chat A and pressing Stop on chat B must
+        // not cancel A's pass.
+        var stoppedCompaction = false
+        if isCompactingConversation,
+           let task = compactionTask,
+           compactingSessionId == (selectedSessionId ?? sessions.first?.id) {
+            task.cancel()
+            stoppedCompaction = true
+        }
+        if stoppedCompaction, !isGeneratingText, generationTask == nil {
+            // Nothing else is running. The compaction task reports its own
+            // `.cancelled` outcome when the summarizer request settles; the
+            // generation teardown below would announce a stop that never
+            // happened and clear state that was already clear.
+            showStatus("⏹ Stopping the compaction — the conversation is left unchanged.")
+            return
+        }
         // Shield the generating session from retention *before* flipping
         // `isGeneratingText` false, since that flip can trigger a retention pass
         // while the cancelled task is still unwinding and appending to it. The
@@ -4401,6 +4434,17 @@ struct ContentView: View {
                     generatedTokens: generated
                 )
             }
+            // A long await can outlive the conversation: deleting a chat does
+            // not stop a turn, so the next lookup finds nothing. Returning is
+            // only half the fix — leaving `isGeneratingText` set would refuse
+            // every later send until relaunch — and the flags belong to the
+            // replacement if one has already been minted.
+            @MainActor func endTurnBecauseSessionVanished(_ generation: UInt64) {
+                guard self.ownsGeneration(generation) else { return }
+                self.isGeneratingText = false
+                self.generationTask = nil
+                self.showStatus("⚠️ This conversation was closed — the turn ended.", kind: .warning)
+            }
             // One pre-flight pass and one overflow-recovery pass per run.
             // The pre-flight flag is set when the pass STARTS, not when it
             // succeeds: a failed pass has already spent its request, and
@@ -4481,7 +4525,10 @@ struct ContentView: View {
                 // cancels the task without minting a new generation id, so both
                 // checks matter.
                 guard !Task.isCancelled, self.ownsGeneration(myGenerationId) else { return }
-                guard let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) else { return }
+                guard var sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) else {
+                    endTurnBecauseSessionVanished(myGenerationId)
+                    return
+                }
                 // Auto-compaction is priced before the request is sent, so the
                 // turn never meets a context wall it could have avoided. It
                 // runs between steps, never mid-request, and the in-flight
@@ -4526,9 +4573,37 @@ struct ContentView: View {
                             continue
                         }
                         contextCompactionFailure = outcome.failure
+                        if outcome.failure?.isRetryableOnNextStep == true {
+                            // Refused before any request was sent: nothing was
+                            // billed, and the reason depends on the history's
+                            // shape, which the next step changes.
+                            compactionAttempts.abandonPreflight()
+                        }
                         // A Stop during the summary cancelled this task; the
                         // loop must not spend a request on a turn that is over.
                         guard !Task.isCancelled, self.ownsGeneration(myGenerationId) else { return }
+                        // The pass awaited for minutes. New Chat inserts at
+                        // index 0 and deleting a chat removes one, so `sIdx`
+                        // may now address a different conversation, or nothing
+                        // at all. Re-resolve by identity before anything reads
+                        // the messages again — a stale index either traps or
+                        // sends another conversation's history to the provider.
+                        guard let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) else {
+                            endTurnBecauseSessionVanished(myGenerationId)
+                            return
+                        }
+                        sIdx = liveIdx
+                        if outcome.failure?.spentRequest == true,
+                           let notice = outcome.failure?.notice(providerName: provider.displayName) {
+                            // The pass was billed and left the history alone.
+                            // Say so: without a row, the paid summary is
+                            // invisible and the next step looks identical to
+                            // one that never needed compacting.
+                            self.sessions[sIdx].messages.append(ChatMessage(
+                                role: .system,
+                                content: "Auto-compaction. \(notice)"
+                            ))
+                        }
                     }
                 }
                 // The digest is read here, per step, so a compaction that ran
@@ -4779,6 +4854,14 @@ struct ContentView: View {
                     }
                     contextCompactionFailure = outcome.failure
                     guard !Task.isCancelled, self.ownsGeneration(myGenerationId) else { return }
+                    // Same reason as the pre-flight: the pass suspended long
+                    // enough for the sessions array to be reordered or pruned,
+                    // and every later read below must use a fresh index.
+                    guard let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) else {
+                        endTurnBecauseSessionVanished(myGenerationId)
+                        return
+                    }
+                    sIdx = liveIdx
                 }
 
                 if let failure = serviceFailure {
@@ -4802,7 +4885,22 @@ struct ContentView: View {
                     }
                     self.isGeneratingText = false
                     self.generationTask = nil
-                    self.showStatus(errText, kind: .warning)
+                    // Earlier steps (and any summarizer pass) were billed even
+                    // though this one failed. The status line is the only place
+                    // that total is reported on this path; the transcript row
+                    // keeps the error itself.
+                    var statusText = errText
+                    if runPromptTokens > 0 || runOutputTokens > 0 || runCost != nil {
+                        let spent = CloudTurnReport(
+                            promptTokens: runPromptTokens,
+                            cachedTokens: runCachedTokens,
+                            outputTokens: runOutputTokens,
+                            cost: runCost,
+                            wasEstimated: runWasEstimated
+                        )
+                        statusText += " · ☁️ run total so far: \(spent.statusSuffix)"
+                    }
+                    self.showStatus(statusText, kind: .warning)
                     if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
                        let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == stepMessageId }) {
                         let partialPrefix = latestText.isEmpty ? "" : latestText + "\n\n"
@@ -5073,8 +5171,14 @@ struct ContentView: View {
                     cost: runCost,
                     wasEstimated: runWasEstimated
                 )
+                // `4.20 s` rather than "in 4200.00 ms": the old phrasing put the
+                // duration straight after the token counts, so "… in 4200.00 ms"
+                // read as another input figure.
+                let durationText = finalElapsed >= 1
+                    ? String(format: "%.2f s", finalElapsed)
+                    : String(format: "%.0f ms", finalElapsed * 1000.0)
                 self.showStatus(
-                    "☁️ \(provider.displayName) — \(turnCost.statusSuffix) in \(String(format: "%.2f", finalElapsed * 1000.0)) ms (\(String(format: "%.1f", finalTokPerSec)) tok/s)"
+                    "☁️ \(provider.displayName) — \(turnCost.statusSuffix) · \(durationText) · \(String(format: "%.1f", finalTokPerSec)) tok/s"
                         + (truncatedAtLimit ? " — truncated at the Max Output Tokens limit." : "")
                 )
                 self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)

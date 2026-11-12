@@ -138,7 +138,7 @@ struct CloudProvidersSettingsView: View {
         SettingsCard(header: "Request Behaviour") {
             SettingsRow(
                 title: "Re-send Images",
-                subtitle: "A stateless provider has to be re-told about a picture on every request that should still see it, and those tokens are billed every time. Off sends only the newest user turn's pictures and replaces older ones with a one-line notice, so a twenty-step agent run stops paying for the same image twenty times.",
+                subtitle: "A stateless provider has to be re-told about a picture on every request that should still see it, and those tokens are billed every time. Off sends only the newest user turn's pictures and replaces pictures from earlier turns with a one-line notice, so a text follow-up does not keep paying for a picture from an earlier question.",
                 icon: "photo.on.rectangle.angled",
                 iconTint: .cyan
             ) {
@@ -233,7 +233,7 @@ struct CloudProvidersSettingsView: View {
 
             SettingsRow(
                 title: "Prompt Caching",
-                subtitle: "Every request carries a stable session-affinity header so a router can keep this conversation on one replica. The setting beside this row can add OpenAI's prompt_cache_key where the endpoint accepts it; a provider that rejects the field is retried once without it and remembered for the rest of the session. Cache reads are reported in the Request Log beside the input total.",
+                subtitle: "Requests carry a stable session-affinity header (unless this provider's setting is Off) so a router can keep this conversation on one replica. The setting beside this row can add OpenAI's prompt_cache_key where the endpoint accepts it; a provider that rejects the field is retried once without it and remembered for the rest of the process. Cache reads are reported in the Request Log beside the input total.",
                 icon: "internaldrive.fill",
                 iconTint: .cyan
             ) {

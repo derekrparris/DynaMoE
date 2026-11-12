@@ -396,11 +396,11 @@ Cloud turns run through the provider's OpenAI-compatible chat-completions API. W
 
 Grammar masking, JetSpec, local KV prefix caching, KV precision, and the memory/SSD controls do not apply to a cloud turn. Switching to a cloud model releases any resident weights engine (the same principle as the Apple on-device model), so the RAM budget is not held by a backend that will not use it.
 
-**Provider prompt caching does apply, and the app asks for it.** Every step of an agent run re-sends the whole conversation, so the only thing that keeps that from costing the full prompt every time is the provider's own prefix cache. Each request carries stable `x-session-id` / `x-session-affinity` headers (so a router keeps one conversation on one replica), and providers registered with the `Session affinity + cache key` capability also send OpenAI's `prompt_cache_key`; a provider that rejects that field is retried once without it, and the field stays disabled only if that retry succeeds. Per-model capability is set per provider under **Settings → Cloud Providers → Prompt Caching**.
+**Provider prompt caching does apply, and the app asks for it.** Every step of an agent run re-sends the whole conversation, so the only thing that keeps that from costing the full prompt every time is the provider's own prefix cache. Unless a provider's **Prompt Caching** row is set to `Off`, each request carries stable `x-session-id` / `x-session-affinity` headers (so a router keeps one conversation on one replica), and providers registered with the `Session affinity + cache key` capability also send OpenAI's `prompt_cache_key`; a provider that rejects that field is retried once without it, and the field stays disabled only if that retry succeeds. The capability is set per provider under **Settings → Cloud Providers → Prompt Caching**.
 
 Cache reads are reported rather than hidden: a usage block is decoded from all three wire shapes (`prompt_tokens_details.cached_tokens`, `prompt_cache_hit_tokens`, `cache_read_input_tokens`), the Request Log row shows `input→output tok · N cached` (and `N cached, M billable` in its detail sheet), and the session odometer reports the context the last request carried rather than the sum of what each step billed. The Console line carries `cached=N` too. Anthropic's three-column split is decoded and priced as well — its `input_tokens` is only the uncached share, so the app normalises to `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` before pricing — but that decoding is ahead of the transport that will carry it: the Anthropic cloud flavor is a stub, so every cloud turn today goes over the OpenAI-compatible surface and its two spellings.
 
-Re-sending pictures is optional: **Settings → Cloud Providers → Request Behaviour → Re-send Images** (default on) controls whether every picture in the conversation rides every request, or only the newest user turn's (older ones become a one-line notice). A twenty-step agent run otherwise pays for the same image twenty times.
+Re-sending pictures is optional: **Settings → Cloud Providers → Request Behaviour → Re-send Images** (default on) controls whether every picture in the conversation rides every request, or only the newest user turn's (pictures from earlier turns become a one-line notice). Turning it off stops a text follow-up from paying again for a picture attached to an earlier question; the newest user turn's own pictures still ride while that turn is being answered.
 
 Two registration facts feed the cost and context displays, both settable from `defaults` because no provider catalog publishes them:
 
@@ -409,12 +409,13 @@ Two registration facts feed the cost and context displays, both settable from `d
 defaults write DRP.DynaMoE dynamoe_cloud_synthetic_context -string \
   "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017=1000000"
 
-# Prices in USD per million tokens; cached_input is the cache-read rate
+# Prices in USD per million tokens; cached_input is the cache-read rate and
+# cache_write_input the cache-write rate (Anthropic bills a write at 1.25× input).
 defaults write DRP.DynaMoE dynamoe_cloud_synthetic_pricing -string \
-  '{"hf:deepseek-ai/DeepSeek-V4.1-Flash-1017":{"input":0.27,"cached_input":0.07,"output":1.1}}'
+  '{"hf:deepseek-ai/DeepSeek-V4.1-Flash-1017":{"input":0.27,"cached_input":0.07,"cache_write_input":0.34,"output":1.1}}'
 ```
 
-With a window recorded, the chat header shows `tokens · N% of window`, a send that would cross 80% compacts older history with the active provider model before spending the request, and a provider `context_length_exceeded` rejection compacts and retries the step once instead of ending the turn. `/compact` also uses the active provider model for a cloud conversation (and honours `/compact <focus>`), so it works on a Mac without Apple Intelligence. With a price recorded, each turn's status line ends with its cost, e.g. `1,204 in (1,000 cached) / 56 out · $0.0031`, and the session's cumulative spend includes the summarizer requests a compaction spent.
+With a window recorded, the chat header shows `tokens · N% of window`, a send that would cross 80% compacts older history with the active provider model before spending the request, and a provider `context_length_exceeded` rejection compacts and retries the step once instead of ending the turn. `/compact` also uses the active provider model for a cloud conversation (and honours `/compact <focus>`), so it works on a Mac without Apple Intelligence. With a price recorded, each turn's status line ends with its cost, e.g. `1,204 billed in (1,000 cached) / 56 out · $0.0031`, and the session's cumulative spend includes the summarizer requests a compaction spent.
 
 A model that rejects a `tools` array is handled without turning Agent Tools off globally: list it under the provider's no-tools key, and that model runs plain chat with a visible notice in the conversation instead.
 
