@@ -1479,6 +1479,16 @@ final class CloudCacheHintRequestTests: XCTestCase {
         XCTAssertNil(try body(request)["prompt_cache_key"])
     }
 
+    func testAnEmptySessionKeySendsNoAffinityHeadersEither() throws {
+        // An empty header value is a value routers may treat as a real (shared)
+        // session, so the headers are withheld on the same condition as the
+        // body key rather than set to "".
+        let request = try makeRequest(hints: .openAI, sessionKey: "", host: "empty-session.test")
+        XCTAssertNil(request.value(forHTTPHeaderField: "x-session-id"))
+        XCTAssertNil(request.value(forHTTPHeaderField: "x-session-affinity"))
+        XCTAssertNil(try body(request)["prompt_cache_key"])
+    }
+
     func testTheOffHintSendsNothing() throws {
         let request = try makeRequest(hints: .none, host: "off.test")
         XCTAssertNil(request.value(forHTTPHeaderField: "x-session-id"))
@@ -1671,6 +1681,38 @@ final class CloudContextPolicyTests: XCTestCase {
         XCTAssertNil(CloudContextPolicy.window(for: nil, defaults: defaults))
     }
 
+    func testTheModelLookupAgreesWithTheRegistrySpec() {
+        // The chat header resolves a window straight from the recorded
+        // overrides so it does not rebuild the provider's whole registry on
+        // every frame. Both paths read the same fact, so they cannot disagree.
+        let defaults = scratchDefaults()
+        defaults.set(
+            "m=200000; other=8192",
+            forKey: CloudContextPolicy.defaultsKey(for: "p")
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.window(forModelId: "m", providerId: "p", defaults: defaults),
+            200_000
+        )
+        // A model with no recorded window falls through to the global default,
+        // which is provider-agnostic by design.
+        defaults.set(64_000, forKey: CloudContextPolicy.globalWindowKey)
+        XCTAssertEqual(
+            CloudContextPolicy.window(forModelId: "unrecorded", providerId: "p", defaults: defaults),
+            64_000
+        )
+        defaults.removeObject(forKey: CloudContextPolicy.globalWindowKey)
+        XCTAssertNil(
+            CloudContextPolicy.window(forModelId: "unrecorded", providerId: "p", defaults: defaults)
+        )
+        // A sub-plausible value is a units mistake, not a window.
+        defaults.set(
+            "m=12",
+            forKey: CloudContextPolicy.defaultsKey(for: "p")
+        )
+        XCTAssertNil(CloudContextPolicy.window(forModelId: "m", providerId: "p", defaults: defaults))
+    }
+
     func testPercentagesAndChunkBudgetsStaySane() {
         XCTAssertEqual(CloudContextPolicy.usagePercent(promptTokens: 64_000, window: 128_000), 50)
         XCTAssertNil(CloudContextPolicy.usagePercent(promptTokens: 64_000, window: nil))
@@ -1710,6 +1752,50 @@ final class CloudCompactionBoundaryTests: XCTestCase {
             ChatMessage(role: .assistant, content: "ok")
         ]
         XCTAssertEqual(CloudCompactionBoundary.tailStart(messages: messages, keepRecentMessages: 8), 2)
+    }
+
+    func testAnAgentRunCutsAtTheRequestedBoundary() {
+        // One user turn, then N assistant turns: an agent run has no later user
+        // turn to back up to, so a user-turn-only rule always cut at index 0
+        // and evicted nothing: the exact history auto-compaction exists to
+        // shorten could never be compacted, and the turn ended at the context
+        // wall instead.
+        var messages = [ChatMessage(role: .user, content: "build the thing")]
+        for step in 0..<12 {
+            var turn = ChatMessage(role: .assistant, content: "step \(step)")
+            turn.toolCalls = [ToolCallRecord(name: "shell_run", arguments: ["command": "ls"])]
+            messages.append(turn)
+        }
+        XCTAssertEqual(messages.count, 13)
+        // keep 4 -> cut 9 messages back, which lands inside the run.
+        XCTAssertEqual(CloudCompactionBoundary.tailStart(messages: messages, keepRecentMessages: 4), 9)
+        XCTAssertEqual(CloudCompactionBoundary.tailStart(messages: messages, keepRecentMessages: 12), 1)
+        // A cut ALWAYS lands on a message boundary, so the assistant message
+        // that carries a tool exchange keeps every result it emitted.
+        let cut = try! XCTUnwrap(CloudCompactionBoundary.tailStart(messages: messages, keepRecentMessages: 4))
+        XCTAssertTrue((1..<messages.count).contains(cut))
+    }
+
+    func testTheCutStillPrefersAUserTurnWhenOneIsInRange() {
+        // The agent-run fallback must not override the user-turn preference: a
+        // conversation with several questions still cuts at the question.
+        let messages = [
+            ChatMessage(role: .user, content: "one"),
+            ChatMessage(role: .assistant, content: "a"),
+            ChatMessage(role: .assistant, content: "b"),
+            ChatMessage(role: .user, content: "two"),
+            ChatMessage(role: .assistant, content: "c"),
+            ChatMessage(role: .assistant, content: "d")
+        ]
+        // Target 2 lands on an assistant turn; backing up finds the user turn
+        // at 0, which is the head of the conversation, so the raw cut wins.
+        XCTAssertEqual(CloudCompactionBoundary.tailStart(messages: messages, keepRecentMessages: 4), 2)
+        // Target 1 backs up to no user turn before it, and the next user turn
+        // is at 3. The raw cut is still the answer, and it evicts something.
+        XCTAssertEqual(CloudCompactionBoundary.tailStart(messages: messages, keepRecentMessages: 5), 1)
+        // A target that lands inside a run still backs up to the user turn that
+        // precedes it when that turn is not the head of the conversation.
+        XCTAssertEqual(CloudCompactionBoundary.tailStart(messages: messages, keepRecentMessages: 2), 3)
     }
 }
 

@@ -171,8 +171,15 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
     /// `x-session-affinity` are read by routers that keep one conversation on
     /// one replica; a provider that does not know them ignores them by the
     /// HTTP contract, so they are sent unless the provider opts out.
+    ///
+    /// An empty key sends nothing: an empty header value is not "no affinity",
+    /// it is a value routers are free to treat as a real (and therefore
+    /// shared) session, and `prompt_cache_key` is already withheld on the same
+    /// condition.
     private func applyCacheAffinity(to request: inout URLRequest, params: CloudChatGenerationParams) {
-        guard cacheHints.sendsAffinityHeaders, let sessionKey = params.sessionKey else { return }
+        guard cacheHints.sendsAffinityHeaders,
+              let sessionKey = params.sessionKey,
+              !sessionKey.isEmpty else { return }
         request.setValue(sessionKey, forHTTPHeaderField: "x-session-id")
         request.setValue(sessionKey, forHTTPHeaderField: "x-session-affinity")
     }

@@ -2693,9 +2693,10 @@ struct ContentView: View {
         let all = sessions[startIdx].messages
         guard all.count > 2 else { return false }
 
-        // The kept tail must begin at a user turn. A tool result whose assistant
-        // call was evicted is a hard API error on the next request, and a
-        // keep-by-count rule would happily cut an exchange in half.
+        // A message boundary is a safe cut: a tool exchange is emitted from one
+        // assistant message, so a call can never be separated from its result.
+        // The tail starts at a user turn when there is one to start at, and at
+        // the requested cut when the conversation is a single agent run.
         guard let keptStart = CloudCompactionBoundary.tailStart(
             messages: all,
             keepRecentMessages: keepRecentMessages
@@ -4184,7 +4185,9 @@ struct ContentView: View {
             messages: openingMessages
         ) + attachmentImageCount * ImageAttachmentPreparer.estimatedTokensPerImage
         let sessionCumulativeStart = sessions.first(where: { $0.id == sessionId })?.cumulativeTokenCount
-        let sessionCumulativeStartResolved = sessionCumulativeStart ?? 0
+        // Mutable: a compaction mid-run deletes the context this base
+        // describes, so the turn has to stop counting from it.
+        var sessionCumulativeStartResolved = sessionCumulativeStart ?? 0
         if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }) {
             // The odometer measures context, not invoices: an unmetered
             // conversation seeds from the whole prompt, and the provider's
@@ -4252,6 +4255,38 @@ struct ContentView: View {
             // every later step then carries the metadata-only notice instead.
             var imagesAllowed = visionCapable
             var didRetryWithoutImages = false
+            // What the rewritten history costs as a prompt. Used only right
+            // after a compaction, which is the one moment the pre-turn estimate
+            // stops describing what is being sent.
+            func rewrittenPromptEstimate() -> Int {
+                guard let live = self.sessions.first(where: { $0.id == sessionId }) else { return 0 }
+                return CloudMessageAssembler.approximatePromptTokens(
+                    system: persona,
+                    messages: CloudMessageAssembler.assemble(
+                        from: live.messages,
+                        excludingMessageIds: [currentMessageId],
+                        imageDataURLs: imagesAllowed ? imageDataURLs : [:],
+                        imagesSupported: imagesAllowed,
+                        imageDelivery: imageDeliveryPolicy
+                    )
+                )
+            }
+            // A compaction rewrites the conversation the odometer was counting,
+            // so every term of it describes a prompt that no longer exists.
+            // Resetting only the session's stored total (which the rewrite
+            // already nils) would leave this turn adding the pre-compaction
+            // base and the evicted input to every later step, and the header
+            // would keep reporting the old total (at or above the
+            // auto-compaction threshold) for a history that no longer holds
+            // that much. Reseed from the rewritten prompt instead: the next
+            // step's reported usage replaces this exactly, and a provider that
+            // reports none still leaves a number describing what was sent.
+            func resetOdometerAfterCompaction() {
+                sessionCumulativeStartResolved = 0
+                turnBilledInput = rewrittenPromptEstimate()
+                inputUsageSettled = false
+                generatedAccumulated = 0
+            }
             // Prompt-only coordinator directive carrying subagent reports that
             // landed mid-run. Cloud history is re-assembled from the session on
             // every step, so the reports ride the leading system message of the
@@ -4304,6 +4339,7 @@ struct ContentView: View {
                             keepRecentMessages: 8
                         )
                         if compacted {
+                            resetOdometerAfterCompaction()
                             self.showStatus("🗂 Context was near this model's limit — compacted older history before continuing.")
                             continue
                         }
@@ -4527,6 +4563,7 @@ struct ContentView: View {
                         keepRecentMessages: 4
                     )
                     if compacted {
+                        resetOdometerAfterCompaction()
                         turnLog.recordChatTurn(
                             status: 400,
                             errorMessage: "Context overflow; compacted older history and retrying this step.",

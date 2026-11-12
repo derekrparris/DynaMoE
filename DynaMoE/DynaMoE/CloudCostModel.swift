@@ -181,11 +181,41 @@ public nonisolated enum CloudContextPolicy {
 
     /// The window this model is believed to have, or nil when nobody recorded
     /// one. The per-model value wins over the provider-wide fallback.
+    ///
+    /// The fallback is a SINGLE global key, so it answers for every provider.
+    /// A default recorded for one provider's large-window model therefore also
+    /// describes a smaller-window model elsewhere, and under-compacting that
+    /// one is the failure mode: the turn runs until the provider refuses it,
+    /// and the overflow path compacts then. Record a per-model window wherever
+    /// the difference matters.
     public static func window(
         for spec: CloudModelSpec?,
         defaults: UserDefaults = .standard
     ) -> Int? {
-        if let recorded = spec?.contextWindowTokens, recorded >= minimumPlausibleWindow {
+        resolvedWindow(recorded: spec?.contextWindowTokens, defaults: defaults)
+    }
+
+    /// The window recorded for one model id, resolved without building the
+    /// provider's whole registry.
+    ///
+    /// `CloudModelRegistry.registeredSpecs` rebuilds every spec on the provider
+    /// to answer one lookup, and the chat header asks this on every body
+    /// evaluation (including 60 fps streaming updates). The recorded fact it
+    /// would report is the same per-model override this reads, so the two
+    /// answers cannot disagree.
+    public static func window(
+        forModelId modelId: String,
+        providerId: String,
+        defaults: UserDefaults = .standard
+    ) -> Int? {
+        resolvedWindow(
+            recorded: overrides(for: providerId, defaults: defaults)[modelId],
+            defaults: defaults
+        )
+    }
+
+    private static func resolvedWindow(recorded: Int?, defaults: UserDefaults) -> Int? {
+        if let recorded, recorded >= minimumPlausibleWindow {
             return recorded
         }
         let fallback = defaults.integer(forKey: globalWindowKey)
@@ -219,28 +249,39 @@ public nonisolated enum CloudContextPolicy {
 
 /// Where a compaction is allowed to cut a conversation.
 ///
-/// The kept tail must begin at a user turn. A tool result whose assistant call
-/// was evicted is a hard API error on the next request, and a keep-by-count
-/// rule would happily cut an exchange in half — this is the one rule that makes
-/// mid-run compaction safe.
+/// The cut is always a message boundary. That is the whole safety rule in this
+/// data model: a tool exchange is emitted from ONE assistant message
+/// (`CloudMessageAssembler.toolExchange` derives the `tool_calls` message and
+/// every `tool` result from it), so no boundary can leave a result whose call
+/// was evicted. The user-turn preference below is therefore about where a
+/// conversation reads naturally, not about validity.
 public nonisolated enum CloudCompactionBoundary {
-    /// Index of the first message to KEEP, or nil when no safe cut exists.
+    /// Index of the first message to KEEP, or nil when the history offers no
+    /// cut that would evict anything.
     ///
     /// `keepRecentMessages <= 0` keeps nothing (manual `/compact`); every
-    /// returned index is either `messages.count` or the position of a user
-    /// turn, so the caller can split without validating the tail again.
+    /// returned index is a message boundary, so the caller can split without
+    /// validating the tail again.
     public static func tailStart(messages: [ChatMessage], keepRecentMessages: Int) -> Int? {
         guard !messages.isEmpty else { return nil }
         guard keepRecentMessages > 0 else { return messages.count }
-        var index = max(0, messages.count - keepRecentMessages)
-        while index > 0, messages[index].role != .user { index -= 1 }
-        if messages[index].role == .user { return index }
-        // No user turn at or before the target index: a short conversation, or
-        // one whose head is the system-role card and marker a previous
-        // compaction left behind. Keep the NEXT user turn instead, so a
-        // compacted history can compact again rather than silently refusing
-        // forever.
-        return messages[index...].firstIndex(where: { $0.role == .user })
+        let target = max(0, messages.count - keepRecentMessages)
+        // Preferred: the newest user turn at or before the requested cut.
+        var userBoundary = target
+        while userBoundary > 0, messages[userBoundary].role != .user { userBoundary -= 1 }
+        if messages[userBoundary].role == .user, userBoundary > 0 { return userBoundary }
+        // The only user turn in range is the head of the conversation: one
+        // long agent run, which is one question followed by assistant and tool
+        // turns and therefore has no later user turn to cut at. Cutting at the
+        // user turn would evict nothing, which is what made auto-compaction a
+        // silent no-op for the case it exists for. Take the requested cut
+        // instead; the recap digest is what carries the evicted work forward.
+        if target > 0 { return target }
+        // Nothing to evict at the target, and no user turn at or before it: a
+        // compacted head is the system card and marker a previous compaction
+        // left behind. Keep the NEXT user turn, so that history can compact
+        // again rather than refusing forever.
+        return messages[target...].firstIndex(where: { $0.role == .user })
     }
 }
 

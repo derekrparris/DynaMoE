@@ -316,12 +316,20 @@ struct ChatDetailView: View {
     /// a provider's) and for any cloud model nobody recorded a window for — in
     /// which case the header shows the plain token total instead of inventing a
     /// ceiling.
+    ///
+    /// Resolved from the recorded window facts directly rather than through
+    /// `CloudModelRegistry.registeredSpecs`: this runs on every body
+    /// evaluation, and that call rebuilds every spec on the provider (its model
+    /// list, its no-tools list, its vision marks) to answer one lookup. A
+    /// Settings edit still lands on the next evaluation, because nothing is
+    /// cached.
     private func cloudContextWindow(for session: ChatSession?) -> Int? {
         guard let id = session?.selectedModelId,
               let parsed = CloudModelAddress.parseModelId(id) else { return nil }
-        let spec = CloudModelRegistry.registeredSpecs(for: parsed.provider)
-            .first { $0.providerModelId == parsed.providerModelId }
-        return CloudContextPolicy.window(for: spec)
+        return CloudContextPolicy.window(
+            forModelId: parsed.providerModelId,
+            providerId: parsed.provider.id
+        )
     }
 
     private func modelIconName(for name: String?, isCloud: Bool = false) -> String {
