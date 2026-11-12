@@ -151,15 +151,6 @@ struct CloudProvidersSettingsView: View {
             SettingsRowDivider()
 
             SettingsRow(
-                title: "Prompt Caching",
-                subtitle: "Every request carries a stable session-affinity header so a router can keep this conversation on one replica; Synthetic also gets OpenAI's prompt_cache_key. A provider that rejects the field is retried once without it and remembered for the rest of the session. Cache reads are reported in the Request Log beside the input total.",
-                icon: "internaldrive.fill",
-                iconTint: .cyan
-            ) { EmptyView() }
-
-            SettingsRowDivider()
-
-            SettingsRow(
                 title: "Context Window",
                 subtitle: "Auto-compaction needs the model's window. Record it per model with: defaults write DRP.DynaMoE dynamoe_cloud_<provider>_context -string \"<model>=128000\" (entries separated by \"; \"). Without one, nothing auto-compacts and the header shows the plain token total.",
                 icon: "ruler.fill",
@@ -242,7 +233,7 @@ struct CloudProvidersSettingsView: View {
 
             SettingsRow(
                 title: "Prompt Caching",
-                subtitle: "Session-affinity headers ride every request so a router can keep this conversation on one replica; the cache key is OpenAI's documented routing hint. A provider that rejects the field is retried once without it and remembered.",
+                subtitle: "Every request carries a stable session-affinity header so a router can keep this conversation on one replica. The setting beside this row can add OpenAI's prompt_cache_key where the endpoint accepts it; a provider that rejects the field is retried once without it and remembered for the rest of the session. Cache reads are reported in the Request Log beside the input total.",
                 icon: "internaldrive.fill",
                 iconTint: .cyan
             ) {

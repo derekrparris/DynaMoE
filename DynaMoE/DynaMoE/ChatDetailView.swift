@@ -534,7 +534,7 @@ struct ChatDetailView: View {
                                             .foregroundColor(.secondary)
                                     }
                                 }
-                                .help("Running total of context the model ingested: prompt tokens not already covered by a reused or cached prefix, plus tokens generated. A cached cloud re-send counts only what was billed at the full rate.")
+                                .help("Context this conversation is carrying: the prompt the model last ingested plus the tokens it generated. Local turns count only prompt tokens the pinned prefix had not already supplied; cloud turns report the last request's full prompt, because a stateless provider is re-sent the whole conversation and only the newest step describes its size.")
                             }
                             if let spend = session?.cumulativeCost, spend > 0 {
                                 Text("•")

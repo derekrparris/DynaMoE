@@ -398,6 +398,20 @@ public nonisolated struct CloudTurnResult: Equatable, Sendable {
     }
 }
 
+/// One collected text completion (compaction's summarizer passes). The usage
+/// rides along because those requests are billed like any other: a summary
+/// whose cost vanished would make the session's spend disagree with the
+/// provider's invoice.
+public nonisolated struct CloudTextCompletion: Equatable, Sendable {
+    public let text: String
+    public let usage: CloudUsage?
+
+    public init(text: String, usage: CloudUsage?) {
+        self.text = text
+        self.usage = usage
+    }
+}
+
 /// Everything one streamed cloud turn can report to the chat surface.
 public nonisolated enum CloudTurnEvent: Equatable, Sendable {
     case started

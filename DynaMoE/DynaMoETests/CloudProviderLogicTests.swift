@@ -1797,6 +1797,76 @@ final class CloudCompactionBoundaryTests: XCTestCase {
         // precedes it when that turn is not the head of the conversation.
         XCTAssertEqual(CloudCompactionBoundary.tailStart(messages: messages, keepRecentMessages: 2), 3)
     }
+
+    func testAnAgentRunKeepsItsQuestionSoTheRequestOpensWithAUserTurn() throws {
+        // The cut the agent-run fallback chooses lands on an assistant turn,
+        // so the plan has to bring the question back: a request whose first
+        // message is an assistant turn is rejected by some endpoints, and the
+        // question is what the evicted work answered.
+        var messages = [ChatMessage(role: .user, content: "build the thing")]
+        for step in 0..<12 {
+            messages.append(ChatMessage(role: .assistant, content: "step \(step)"))
+        }
+        XCTAssertEqual(CloudCompactionBoundary.tailStart(messages: messages, keepRecentMessages: 4), 9)
+
+        let plan = try XCTUnwrap(
+            CloudCompactionBoundary.plan(messages: messages, keepRecentMessages: 4)
+        )
+        XCTAssertEqual(plan.kept.first?.role, .user)
+        XCTAssertEqual(plan.kept.first?.content, "build the thing")
+        XCTAssertEqual(plan.kept.count, 5)
+        XCTAssertEqual(plan.evicted.count, 8)
+        XCTAssertFalse(
+            plan.evicted.contains { $0.id == messages[0].id },
+            "a kept message must not be summarized as well"
+        )
+        XCTAssertEqual(plan.kept.map(\.id), [messages[0].id] + messages[9...].map(\.id))
+    }
+
+    func testAUserTurnAtTheCutIsKeptOnce() throws {
+        let messages = [
+            ChatMessage(role: .user, content: "one"),
+            ChatMessage(role: .assistant, content: "a"),
+            ChatMessage(role: .user, content: "two"),
+            ChatMessage(role: .assistant, content: "b")
+        ]
+        let plan = try XCTUnwrap(
+            CloudCompactionBoundary.plan(messages: messages, keepRecentMessages: 2)
+        )
+        XCTAssertEqual(plan.kept.map(\.content), ["two", "b"])
+        XCTAssertEqual(plan.evicted.map(\.content), ["one", "a"])
+    }
+
+    func testAManualCompactionStillKeepsNothing() throws {
+        let messages = [
+            ChatMessage(role: .user, content: "one"),
+            ChatMessage(role: .assistant, content: "a")
+        ]
+        let plan = try XCTUnwrap(
+            CloudCompactionBoundary.plan(messages: messages, keepRecentMessages: 0)
+        )
+        XCTAssertTrue(plan.kept.isEmpty)
+        XCTAssertEqual(plan.evicted.map(\.id), messages.map(\.id))
+    }
+}
+
+// MARK: - Context odometer
+
+final class CloudContextOdometerTests: XCTestCase {
+    func testTheFigureTracksTheLastRequestRatherThanTheSumOfSteps() {
+        // A cloud run re-sends the whole conversation on every step. Summing
+        // the prompts (what a provider with no cache split bills) would read as
+        // several conversations; the last request IS the context.
+        let stepPrompts = [1_000, 1_040, 1_100, 1_150]
+        let total = CloudContextOdometer.total(promptTokens: stepPrompts.last!, generatedTokens: 40)
+        XCTAssertEqual(total, 1_190)
+        XCTAssertLessThan(total, stepPrompts.reduce(0, +))
+    }
+
+    func testNegativeCountsAreClampedRatherThanDisplayed() {
+        XCTAssertEqual(CloudContextOdometer.total(promptTokens: -5, generatedTokens: 0), 0)
+        XCTAssertEqual(CloudContextOdometer.total(promptTokens: 10, generatedTokens: -7), 10)
+    }
 }
 
 // MARK: - Pricing

@@ -2439,7 +2439,8 @@ struct ContentView: View {
             return runManualCloudCompact(
                 sessionId: sessionId,
                 provider: cloud.provider,
-                providerModelId: cloud.providerModelId
+                providerModelId: cloud.providerModelId,
+                focus: focus
             )
         }
         let availability = AppleFoundationModelService.checkAvailability()
@@ -2665,6 +2666,16 @@ struct ContentView: View {
 
     // MARK: - Cloud compaction
 
+    /// What one cloud compaction did: whether the history was rewritten, and
+    /// what the summarizer requests cost. The spend is reported even when the
+    /// pass fails, because the provider billed the requests that did run.
+    private struct CloudCompactionOutcome {
+        let didCompact: Bool
+        let cost: Double
+
+        static let failed = CloudCompactionOutcome(didCompact: false, cost: 0)
+    }
+
     /// Summarizes a cloud conversation's older half with the ACTIVE provider
     /// model and rewrites the session in place.
     ///
@@ -2677,41 +2688,45 @@ struct ContentView: View {
     /// `keepRecentMessages` is where those two callers differ. Auto-compaction
     /// keeps a tail (moved back to a user turn, so a tool exchange is never
     /// split across the boundary); `/compact` keeps nothing, matching the
-    /// on-device command's "fold the whole conversation" contract.
+    /// on-device command's "fold the whole conversation" contract. `focus` is
+    /// the `/compact <focus>` steer and applies only to the manual command.
     ///
-    /// Returns false and leaves the conversation untouched on any failure: a
-    /// half-rewritten history is worse than no compaction.
+    /// Returns a failed outcome and leaves the conversation untouched on any
+    /// failure: a half-rewritten history is worse than no compaction.
     @discardableResult
     private func compactCloudHistory(
         sessionId: UUID,
         provider: CloudProvider,
         providerModelId: String,
         window: Int?,
-        keepRecentMessages: Int
-    ) async -> Bool {
-        guard let startIdx = sessions.firstIndex(where: { $0.id == sessionId }) else { return false }
+        keepRecentMessages: Int,
+        focus: String? = nil
+    ) async -> CloudCompactionOutcome {
+        guard let startIdx = sessions.firstIndex(where: { $0.id == sessionId }) else { return .failed }
         let all = sessions[startIdx].messages
-        guard all.count > 2 else { return false }
+        guard all.count > 2 else { return .failed }
 
         // A message boundary is a safe cut: a tool exchange is emitted from one
         // assistant message, so a call can never be separated from its result.
-        // The tail starts at a user turn when there is one to start at, and at
-        // the requested cut when the conversation is a single agent run.
-        guard let keptStart = CloudCompactionBoundary.tailStart(
+        // The tail starts at a user turn when there is one to start at, at the
+        // requested cut when the conversation is a single agent run, and keeps
+        // that run's question when the cut would otherwise leave the request
+        // opening with an assistant turn.
+        guard let plan = CloudCompactionBoundary.plan(
             messages: all,
             keepRecentMessages: keepRecentMessages
-        ) else { return false }
-        let evicted = Array(all[..<keptStart])
-        let kept = Array(all[keptStart...])
+        ) else { return .failed }
+        let evicted = plan.evicted
+        let kept = plan.kept
         let evictedCount = ChatSession.compactableMessageCount(in: evicted)
-        guard evictedCount >= 2 else { return false }
+        guard evictedCount >= 2 else { return .failed }
 
         let client: CloudChatClient
         switch CloudChatClient.makeStoredResult(provider: provider) {
         case .success(let ready):
             client = ready
         case .failure:
-            return false
+            return .failed
         }
 
         let chunks = AppleFoundationModelService.buildCompactionTranscriptChunks(
@@ -2719,14 +2734,31 @@ struct ContentView: View {
             excludingMessageIds: [],
             charBudget: CloudContextPolicy.chunkCharacterBudget(window: window)
         )
-        guard let recentChunk = chunks.last else { return false }
+        guard let recentChunk = chunks.last else { return .failed }
 
-        let summaryInstructions = AppleFoundationModelService.compactionSummaryInstructions(focus: nil)
-        let recapInstructions = AppleFoundationModelService.compactionRecapInstructions(focus: nil)
+        let summaryInstructions = AppleFoundationModelService.compactionSummaryInstructions(focus: focus)
+        let recapInstructions = AppleFoundationModelService.compactionRecapInstructions(focus: focus)
         let sessionKey = CloudSessionKey.hashed(sessionId)
         // Generous enough for a detailed recap, bounded so a runaway summary
         // cannot cost more than the turn it is making room for.
         let responseTokens = 2_000
+        let pricing = CloudPricingStore.pricing(
+            forModel: providerModelId,
+            providerId: provider.id
+        )
+        var spent: Double = 0
+        // Summarizer requests are billed whether or not the pass completes, so
+        // every exit settles them against the live session before returning.
+        func finish(_ didCompact: Bool) -> CloudCompactionOutcome {
+            if spent > 0, let liveIdx = sessions.firstIndex(where: { $0.id == sessionId }) {
+                sessions[liveIdx].cumulativeCost = (sessions[liveIdx].cumulativeCost ?? 0) + spent
+            }
+            return CloudCompactionOutcome(didCompact: didCompact, cost: spent)
+        }
+        func charge(_ completion: CloudTextCompletion) {
+            guard let pricing, let usage = completion.usage else { return }
+            spent += pricing.cost(for: usage) ?? 0
+        }
         var mergedSummary = sessions[startIdx].rollingSummary
         var mergedRecap = sessions[startIdx].recentWorkDigest
 
@@ -2743,15 +2775,16 @@ struct ContentView: View {
                     maxTokens: responseTokens,
                     sessionKey: sessionKey
                 )
-                guard !merged.isEmpty else { return false }
-                mergedSummary = merged
+                charge(merged)
+                guard !merged.text.isEmpty else { return finish(false) }
+                mergedSummary = merged.text
                 // The recap describes work older than the newest chunk, and it
                 // has just been folded into the summary; the pass at the end
                 // writes a fresh one.
                 mergedRecap = nil
             }
 
-            let summaryText = try await client.completeText(
+            let summary = try await client.completeText(
                 model: providerModelId,
                 systemPrompt: summaryInstructions,
                 userPrompt: AppleFoundationModelService.compactionPrompt(
@@ -2762,25 +2795,29 @@ struct ContentView: View {
                 maxTokens: responseTokens,
                 sessionKey: sessionKey
             )
-            guard !summaryText.isEmpty else { return false }
+            charge(summary)
+            guard !summary.text.isEmpty else { return finish(false) }
 
-            let recapText = try await client.completeText(
+            let recap = try await client.completeText(
                 model: providerModelId,
                 systemPrompt: recapInstructions,
                 userPrompt: "Conversation excerpt, oldest messages first — the most recent work last:\n\n\(recentChunk)",
                 maxTokens: responseTokens,
                 sessionKey: sessionKey
             )
+            charge(recap)
 
             // Re-resolve by identity: the user may have switched chats, and a
             // retention sweep may have removed this conversation, while the
             // provider was summarizing.
-            guard let liveIdx = sessions.firstIndex(where: { $0.id == sessionId }) else { return false }
-            sessions[liveIdx].rollingSummary = summaryText
-            sessions[liveIdx].recentWorkDigest = recapText.isEmpty ? nil : recapText
+            guard let liveIdx = sessions.firstIndex(where: { $0.id == sessionId }) else {
+                return finish(false)
+            }
+            sessions[liveIdx].rollingSummary = summary.text
+            sessions[liveIdx].recentWorkDigest = recap.text.isEmpty ? nil : recap.text
             sessions[liveIdx].messages = ChatSession.compactedHistory(
-                summary: summaryText,
-                recap: recapText.isEmpty ? nil : recapText,
+                summary: summary.text,
+                recap: recap.text.isEmpty ? nil : recap.text,
                 evictedMessageCount: evictedCount,
                 modelLabel: provider.displayName
             ) + kept
@@ -2790,10 +2827,10 @@ struct ContentView: View {
             // The token prefix changed: a pinned KV state for this conversation
             // no longer matches. One full re-prefill is the cost of compaction.
             PrefixCacheManager.shared.invalidate(sessionId: sessionId)
-            return true
+            return finish(true)
         } catch {
             print("☁️ [COMPACT] cloud compaction failed: \(error.localizedDescription)")
-            return false
+            return finish(false)
         }
     }
 
@@ -2803,7 +2840,8 @@ struct ContentView: View {
     private func runManualCloudCompact(
         sessionId: UUID,
         provider: CloudProvider,
-        providerModelId: String
+        providerModelId: String,
+        focus: String?
     ) -> Bool {
         isCompactingConversation = true
         compactingSessionId = sessionId
@@ -2823,15 +2861,19 @@ struct ContentView: View {
                 for: CloudModelRegistry.registeredSpecs(for: provider)
                     .first { $0.providerModelId == providerModelId }
             )
-            let didCompact = await self.compactCloudHistory(
+            let outcome = await self.compactCloudHistory(
                 sessionId: sessionId,
                 provider: provider,
                 providerModelId: providerModelId,
                 window: window,
-                keepRecentMessages: 0
+                keepRecentMessages: 0,
+                focus: focus
             )
-            if didCompact {
-                self.showStatus("🗂 Compacted this conversation with \(provider.displayName). The summary stays at the top of the chat.")
+            if outcome.didCompact {
+                let spend = outcome.cost > 0
+                    ? " Summarizing cost \(CloudPricingStore.formatted(outcome.cost))."
+                    : ""
+                self.showStatus("🗂 Compacted this conversation with \(provider.displayName). The summary stays at the top of the chat.\(spend)")
             } else {
                 if let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
                     self.sessions[liveIdx].messages.append(ChatMessage(
@@ -3142,6 +3184,11 @@ struct ContentView: View {
         // request's `tools`, so the local XML tool dialect prompt must not be
         // injected — only the procedural guidance is.
         if let cloud = cloudModelResolution(for: sendSession) {
+            // The compaction digest is deliberately NOT folded in here. An
+            // auto-compaction can run between this turn's steps, and a digest
+            // captured at send time would be the pre-compaction one for every
+            // step after it; `startCloudGeneration` appends the session's live
+            // digest to each step's system message instead.
             var cloudSystemPrompt = ModelConfig.buildEffectiveSystemPrompt(
                 userPrompt: systemPrompt,
                 config: nil,
@@ -3150,9 +3197,6 @@ struct ContentView: View {
                 modelPath: nil,
                 currentDate: sessions[sessionIdx].createdAt
             ).trimmingCharacters(in: .whitespacesAndNewlines)
-            if let compactedContext = sessions[sessionIdx].compactionContextBlock {
-                cloudSystemPrompt += "\n\n" + compactedContext
-            }
             let agentToolsRequested = sessions[sessionIdx].isAgentToolsEnabled ?? defaultAgentToolsEnabled
             let cloudSpec = CloudModelRegistry.registeredSpecs(for: cloud.provider)
                 .first { $0.providerModelId == cloud.providerModelId }
@@ -4161,8 +4205,16 @@ struct ContentView: View {
             sessionKey: CloudSessionKey.hashed(sessionId)
         )
         // The persona rides as a leading system message; the provider's own
-        // templating consumes it verbatim.
-        let persona = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        // templating consumes it verbatim. The compaction digest is composed
+        // per request rather than captured here: an auto-compaction can run
+        // between this turn's steps, and a digest frozen at send time would
+        // leave every step after it describing a history that is already gone.
+        let personaBase = systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        func currentPersona() -> String {
+            guard let digest = sessions.first(where: { $0.id == sessionId })?.compactionContextBlock,
+                  !digest.isEmpty else { return personaBase }
+            return personaBase.isEmpty ? digest : personaBase + "\n\n" + digest
+        }
         // Loaded tools only, read fresh on each step so a `tools_load` issued
         // inside the loop is visible to the next request. The full catalog stays
         // discoverable through `tools_discover`; every schema sent costs prompt
@@ -4181,23 +4233,17 @@ struct ContentView: View {
             $0 + ($1.attachments?.count ?? 0)
         }
         let turnInputTokens = CloudMessageAssembler.approximatePromptTokens(
-            system: persona,
+            system: currentPersona(),
             messages: openingMessages
         ) + attachmentImageCount * ImageAttachmentPreparer.estimatedTokensPerImage
-        let sessionCumulativeStart = sessions.first(where: { $0.id == sessionId })?.cumulativeTokenCount
-        // Mutable: a compaction mid-run deletes the context this base
-        // describes, so the turn has to stop counting from it.
-        var sessionCumulativeStartResolved = sessionCumulativeStart ?? 0
+        // The odometer measures the context in flight, not the invoice: a cloud
+        // request re-sends the whole conversation, so the figure is the last
+        // request's prompt plus the tokens generated after it. Seeding it with
+        // the assembled prompt's size keeps the header right before the first
+        // provider usage report arrives.
+        var turnContextTokens = turnInputTokens
         if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }) {
-            // The odometer measures context, not invoices: an unmetered
-            // conversation seeds from the whole prompt, and the provider's
-            // reported cache split replaces this estimate as soon as a step
-            // reports one, so a cached re-send stops looking like new context.
-            sessions[sIdx].cumulativeTokenCount = ChatSession.cumulativeTokenBase(
-                previousTotal: sessionCumulativeStart,
-                promptTokenCount: turnInputTokens,
-                prefixTokensReused: 0
-            )
+            sessions[sIdx].cumulativeTokenCount = turnInputTokens
         }
 
         let visionCapable = visionSupport(forProvider: provider, providerModelId: providerModelId)
@@ -4214,15 +4260,6 @@ struct ContentView: View {
         generationTask = Task(priority: .userInitiated) {
             var currentMessageId = messageId
             var step = 0
-            // The turn's input contribution. It starts as the pre-turn
-            // estimate and is replaced by the provider's own billable count
-            // (prompt minus cache reads) on the first step that reports usage,
-            // then extended by each later step's billable share. With a working
-            // cache that converges on the conversation's real size; without
-            // one it grows the way the invoice does.
-            var turnBilledInput = turnInputTokens
-            var inputUsageSettled = false
-            var generatedAccumulated = 0
             // Run-level totals for the final status line. Every agent step is
             // its own billed request, so the summary must report the sum of
             // the steps: reporting the last iteration alone named a fraction
@@ -4234,10 +4271,15 @@ struct ContentView: View {
             var runCost: Double? = nil
             var runWasEstimated = false
             func odometerTotal(including generated: Int) -> Int {
-                sessionCumulativeStartResolved + turnBilledInput + generatedAccumulated + generated
+                CloudContextOdometer.total(
+                    promptTokens: turnContextTokens,
+                    generatedTokens: generated
+                )
             }
-            // Once per run: a compaction that could not shrink the prompt must
-            // not loop.
+            // Once per run, and only after a compaction that actually rewrote
+            // the history: a successful compaction that could not shrink the
+            // prompt must not loop, while a failed attempt must leave the
+            // overflow-recovery retry below available.
             var attemptedContextCompaction = false
             // Image parts are built once per turn, off the main actor. History is
             // re-assembled on every step, but the turn's pictures never change.
@@ -4261,7 +4303,7 @@ struct ContentView: View {
             func rewrittenPromptEstimate() -> Int {
                 guard let live = self.sessions.first(where: { $0.id == sessionId }) else { return 0 }
                 return CloudMessageAssembler.approximatePromptTokens(
-                    system: persona,
+                    system: currentPersona(),
                     messages: CloudMessageAssembler.assemble(
                         from: live.messages,
                         excludingMessageIds: [currentMessageId],
@@ -4272,20 +4314,16 @@ struct ContentView: View {
                 )
             }
             // A compaction rewrites the conversation the odometer was counting,
-            // so every term of it describes a prompt that no longer exists.
-            // Resetting only the session's stored total (which the rewrite
-            // already nils) would leave this turn adding the pre-compaction
-            // base and the evicted input to every later step, and the header
-            // would keep reporting the old total (at or above the
-            // auto-compaction threshold) for a history that no longer holds
-            // that much. Reseed from the rewritten prompt instead: the next
-            // step's reported usage replaces this exactly, and a provider that
-            // reports none still leaves a number describing what was sent.
+            // so its figure describes a prompt that no longer exists. Reseed
+            // from the rewritten prompt (which now includes the digest the
+            // compaction just installed): the next step's reported prompt
+            // replaces this exactly, and a provider that reports none still
+            // leaves a number describing what was sent.
             func resetOdometerAfterCompaction() {
-                sessionCumulativeStartResolved = 0
-                turnBilledInput = rewrittenPromptEstimate()
-                inputUsageSettled = false
-                generatedAccumulated = 0
+                turnContextTokens = rewrittenPromptEstimate()
+                if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
+                    self.sessions[sIdx].cumulativeTokenCount = turnContextTokens
+                }
             }
             // Prompt-only coordinator directive carrying subagent reports that
             // landed mid-run. Cloud history is re-assembled from the session on
@@ -4320,7 +4358,7 @@ struct ContentView: View {
                 // messages.
                 if !attemptedContextCompaction, let window = contextWindow {
                     let projected = CloudMessageAssembler.approximatePromptTokens(
-                        system: persona,
+                        system: currentPersona(),
                         messages: CloudMessageAssembler.assemble(
                             from: self.sessions[sIdx].messages,
                             excludingMessageIds: [currentMessageId],
@@ -4330,21 +4368,27 @@ struct ContentView: View {
                         )
                     )
                     if CloudContextPolicy.shouldCompact(promptTokens: projected, window: window) {
-                        attemptedContextCompaction = true
-                        let compacted = await self.compactCloudHistory(
+                        let outcome = await self.compactCloudHistory(
                             sessionId: sessionId,
                             provider: provider,
                             providerModelId: providerModelId,
                             window: window,
                             keepRecentMessages: 8
                         )
-                        if compacted {
+                        if outcome.cost > 0 {
+                            runCost = (runCost ?? 0) + outcome.cost
+                        }
+                        if outcome.didCompact {
+                            attemptedContextCompaction = true
                             resetOdometerAfterCompaction()
                             self.showStatus("🗂 Context was near this model's limit — compacted older history before continuing.")
                             continue
                         }
                     }
                 }
+                // The digest is read here, per step, so a compaction that ran
+                // above is already in this request's system message.
+                let persona = currentPersona()
                 var outbound: [CloudChatMessage] = []
                 // A directive applies to exactly one step. Keeping it set while
                 // tool rounds continue told every later step to "write the final
@@ -4370,6 +4414,15 @@ struct ContentView: View {
                     outbound.append(CloudChatMessage(role: "user", content: stepDirective))
                 }
                 let stepCarriesImages = outbound.contains { ($0.imageParts?.count ?? 0) > 0 }
+                // What this step's request carries. The odometer reports this
+                // prompt (not a sum of billable input): it already contains
+                // every earlier step's output, so adding steps together would
+                // count the same history once per step.
+                let stepEstimatedPrompt = CloudMessageAssembler.approximatePromptTokens(
+                    system: nil,
+                    messages: outbound
+                )
+                turnContextTokens = stepEstimatedPrompt
                 // The relay/synthesis turn is a final-answer pass: the model must
                 // present the reports, not start another tool round.
                 let tools = CloudAgentStepPlan.offersTools(
@@ -4383,7 +4436,7 @@ struct ContentView: View {
                 // assistant message, and the box is one-shot.
                 let turnLog = ServerRequestLog.chatTurnLog(
                     model: displayName,
-                    inputTokens: CloudMessageAssembler.approximatePromptTokens(system: nil, messages: outbound),
+                    inputTokens: stepEstimatedPrompt,
                     isAgentTurn: isAgentTurn,
                     prompt: CloudMessageAssembler.renderedPromptForLog(system: nil, messages: outbound)
                 )
@@ -4554,15 +4607,18 @@ struct ContentView: View {
                    case .httpStatus(let code, let summary) = failure,
                    code == 400 || code == 422,
                    CloudTurnFailure.indicatesContextOverflow(summary) {
-                    attemptedContextCompaction = true
-                    let compacted = await self.compactCloudHistory(
+                    let outcome = await self.compactCloudHistory(
                         sessionId: sessionId,
                         provider: provider,
                         providerModelId: providerModelId,
                         window: contextWindow,
                         keepRecentMessages: 4
                     )
-                    if compacted {
+                    if outcome.cost > 0 {
+                        runCost = (runCost ?? 0) + outcome.cost
+                    }
+                    if outcome.didCompact {
+                        attemptedContextCompaction = true
                         resetOdometerAfterCompaction()
                         turnLog.recordChatTurn(
                             status: 400,
@@ -4613,27 +4669,18 @@ struct ContentView: View {
                     return
                 }
 
-                // The provider's own counts replace the estimate the row was
-                // created with, and the cache split is what makes a re-sent
-                // history readable as a cache read instead of new input.
-                let stepEstimatedPrompt = CloudMessageAssembler.approximatePromptTokens(
-                    system: nil,
-                    messages: outbound
-                )
+                // The provider's own prompt count replaces the step's estimate.
+                // It is the FULL prompt (cache reads included), because the
+                // header reports the context the model was given, not the part
+                // of it that was billed at the fresh rate.
                 if let usage = reportedUsage {
                     turnLog.noteProviderUsage(
                         promptTokens: usage.promptTokens,
                         cachedTokens: usage.cachedTokens,
                         cacheWriteTokens: usage.cacheWriteTokens
                     )
-                    let stepBillable = usage.billableInputTokens ?? stepEstimatedPrompt
-                    if inputUsageSettled {
-                        turnBilledInput += stepBillable
-                    } else {
-                        // Replaces the pre-turn estimate: it described this
-                        // same prompt.
-                        turnBilledInput = stepBillable
-                        inputUsageSettled = true
+                    if let promptTokens = usage.promptTokens {
+                        turnContextTokens = promptTokens
                     }
                     // Spend accumulates per step: every step is its own billed
                     // request, and a run that never reaches its final status
@@ -4680,7 +4727,6 @@ struct ContentView: View {
                     }
                     self.sessions[sIdx].cumulativeTokenCount = odometerTotal(including: generatedTokens)
                 }
-                generatedAccumulated += generatedTokens
                 turnLog.recordChatTurn(
                     status: 200,
                     errorMessage: nil,

@@ -108,6 +108,11 @@ final class CloudProviderStore: ObservableObject {
     /// suffix and part of the `cloud://` address saved with every conversation
     /// that used the provider. A new base URL drops the per-model state, since
     /// every id and capability mark it held described the old endpoint.
+    ///
+    /// The fields this form does not edit — the Anthropic base and the
+    /// prompt-caching capability — are carried over from the stored record.
+    /// Validating from a bare draft rebuilt them as nil, so renaming a
+    /// provider quietly reset its caching choice to the default.
     func update(
         _ provider: CloudProvider,
         displayName: String,
@@ -128,7 +133,8 @@ final class CloudProviderStore: ObservableObject {
             identifier: provider.id,
             baseURL: baseURL,
             docsURL: docsURL,
-            existing: existing
+            existing: existing,
+            preserving: custom[index]
         ).get()
 
         let previousBaseURL = custom[index].openAIBaseURL

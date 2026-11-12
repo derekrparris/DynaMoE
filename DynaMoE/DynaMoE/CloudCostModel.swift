@@ -15,8 +15,11 @@ import Foundation
 
 // MARK: - Pricing
 
-/// Per-million-token prices for one model, in the currency the user keeps
-/// their provider bill in (USD by convention; nothing here assumes it).
+/// Per-million-token prices for one model, in US dollars. The price list is a
+/// registration fact the operator writes by hand, so there is nothing here to
+/// convert: a provider that bills in another currency is entered in USD by
+/// whoever registers it, and the display renders the same `$` it was typed
+/// with.
 public nonisolated struct CloudPricing: Codable, Equatable, Sendable {
     /// USD per 1,000,000 fresh input tokens.
     public let input: Double
@@ -106,7 +109,8 @@ public nonisolated enum CloudPricingStore {
 
     /// A cost rendered for a status line. Small amounts keep enough precision
     /// to be non-zero, because "$0.00" on a turn that did cost something reads
-    /// as "free".
+    /// as "free". The symbol is fixed because the price list is entered in USD
+    /// (see `CloudPricing`); nothing is converted.
     public static func formatted(_ cost: Double) -> String {
         if cost <= 0 { return "$0" }
         if cost < 0.01 { return String(format: "$%.4f", cost) }
@@ -282,6 +286,63 @@ public nonisolated enum CloudCompactionBoundary {
         // left behind. Keep the NEXT user turn, so that history can compact
         // again rather than refusing forever.
         return messages[target...].firstIndex(where: { $0.role == .user })
+    }
+
+    /// The messages a compaction evicts and the ones it keeps.
+    ///
+    /// The cut is `tailStart`'s, with one adjustment: a tail that would open
+    /// with an assistant message gets the newest user turn before the cut
+    /// moved into it. Two reasons, and both are real. A request whose first
+    /// message is an assistant turn is refused by some OpenAI-compatible
+    /// endpoints, and a mid-run cut leaves exactly that shape; and that user
+    /// turn is the question the evicted work answered, so keeping it verbatim
+    /// beats relying on the digest to restate it.
+    public static func plan(
+        messages: [ChatMessage],
+        keepRecentMessages: Int
+    ) -> CloudCompactionPlan? {
+        guard let keptStart = tailStart(
+            messages: messages,
+            keepRecentMessages: keepRecentMessages
+        ) else { return nil }
+        var evicted = Array(messages[..<keptStart])
+        var kept = Array(messages[keptStart...])
+        // A manual compaction (`keepRecentMessages <= 0`) keeps nothing on
+        // purpose, so the anchor rule must not pull a message back into it.
+        if let first = kept.first, first.role != .user,
+           let anchor = evicted.lastIndex(where: { $0.role == .user }) {
+            kept.insert(evicted.remove(at: anchor), at: 0)
+        }
+        return CloudCompactionPlan(evicted: evicted, kept: kept)
+    }
+}
+
+/// What one compaction pass folds away and what it leaves in the transcript.
+public nonisolated struct CloudCompactionPlan: Equatable, Sendable {
+    /// Messages summarized and removed from the conversation.
+    public let evicted: [ChatMessage]
+    /// Messages kept verbatim, in their original order.
+    public let kept: [ChatMessage]
+
+    public init(evicted: [ChatMessage], kept: [ChatMessage]) {
+        self.evicted = evicted
+        self.kept = kept
+    }
+}
+
+// MARK: - Context odometer
+
+/// The context figure the chat header renders.
+///
+/// This is a CONTEXT size, not an invoice. A cloud turn re-sends the whole
+/// conversation on every step, so what the model has seen is the last
+/// request's prompt plus the tokens generated after it. Summing what each step
+/// billed would only agree while the provider reports a cache split; a
+/// provider that reports none bills the whole prompt every step, and a
+/// twenty-step agent run would then read as twenty conversations' worth.
+public nonisolated enum CloudContextOdometer {
+    public static func total(promptTokens: Int, generatedTokens: Int) -> Int {
+        max(0, promptTokens) + max(0, generatedTokens)
     }
 }
 

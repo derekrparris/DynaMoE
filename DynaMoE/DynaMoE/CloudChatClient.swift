@@ -661,19 +661,23 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
         service.streamTurn(model: model, messages: messages, params: params, tools: tools)
     }
 
-    /// One plain completion, collected into a string.
+    /// One plain completion, collected with the usage it was billed at.
     ///
     /// This exists for compaction: the summary has to come from the model the
     /// conversation is actually using, because the on-device system model is
     /// not guaranteed to exist and a user's cloud-only Mac had no working
     /// `/compact` at all. No tools, no agent loop, temperature 0.
+    ///
+    /// The result carries the provider's usage block as well as the text: a
+    /// summarizer pass is a billed request like any other, and dropping its
+    /// usage made the session's spend understate the invoice.
     public func completeText(
         model: String,
         systemPrompt: String,
         userPrompt: String,
         maxTokens: Int,
         sessionKey: String?
-    ) async throws -> String {
+    ) async throws -> CloudTextCompletion {
         var messages: [CloudChatMessage] = []
         if !systemPrompt.isEmpty {
             messages.append(CloudChatMessage(role: "system", content: systemPrompt))
@@ -685,6 +689,7 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
             sessionKey: sessionKey
         )
         var text = ""
+        var usage: CloudUsage?
         var failure: CloudTurnFailure?
         for await event in streamTurn(model: model, messages: messages, params: params, tools: nil) {
             switch event {
@@ -697,12 +702,16 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
                 // same string; prefer the result because it is what the
                 // transport certified as complete.
                 if !result.text.isEmpty { text = result.text }
+                usage = result.usage
             case .failed(let reported):
                 failure = reported
             }
         }
         if let failure { throw failure }
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return CloudTextCompletion(
+            text: text.trimmingCharacters(in: .whitespacesAndNewlines),
+            usage: usage
+        )
     }
 
     public func testConnection() async -> CloudConnectionTestResult {

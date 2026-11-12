@@ -231,12 +231,16 @@ public nonisolated enum CloudProviderCatalog {
     /// The one place a draft becomes a provider. `existing` is the list the
     /// identifier must not collide with; a caller editing a provider passes
     /// the list without that provider so its own identifier stays available.
+    /// `preserving` carries the fields the edit form does not own — the
+    /// Anthropic base and the prompt-caching capability — so a rename or a new
+    /// docs link cannot silently reset them to their defaults.
     public static func validate(
         displayName: String,
         identifier: String,
         baseURL: String,
         docsURL: String = "",
-        existing: [CloudProvider]? = nil
+        existing: [CloudProvider]? = nil,
+        preserving preserved: CloudProvider? = nil
     ) -> Result<CloudProvider, CloudProviderValidationError> {
         let name = displayName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return .failure(.emptyDisplayName) }
@@ -285,7 +289,9 @@ public nonisolated enum CloudProviderCatalog {
             id: id,
             displayName: name,
             docsURL: docs,
-            openAIBaseURL: normalizedBase
+            openAIBaseURL: normalizedBase,
+            anthropicBaseURL: preserved?.anthropicBaseURL,
+            cacheHints: preserved?.cacheHints
         ))
     }
 

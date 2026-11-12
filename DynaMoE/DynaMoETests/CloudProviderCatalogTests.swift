@@ -529,6 +529,48 @@ final class CloudProviderStoreTests: XCTestCase {
         )
     }
 
+    func testEditingAProviderKeepsItsPromptCachingChoice() throws {
+        let harness = makeHarness()
+        defer { harness.cleanUp() }
+
+        let provider = try harness.store.add(
+            displayName: "OpenCode Zen",
+            identifier: "opencode-zen",
+            baseURL: "https://opencode.ai/zen/v1"
+        )
+        XCTAssertNil(provider.cacheHints, "a new provider starts on the safe default")
+        try harness.store.setCacheHints(.openAI, for: provider)
+
+        try harness.store.update(
+            provider,
+            displayName: "OpenCode",
+            baseURL: "https://opencode.ai/zen/v1",
+            docsURL: "https://opencode.ai/docs"
+        )
+
+        let renamed = try XCTUnwrap(
+            CloudProviderCatalog.provider(withId: "opencode-zen", defaults: harness.defaults)
+        )
+        XCTAssertEqual(
+            renamed.cacheHints,
+            .openAI,
+            "the edit form does not own the caching capability, so a rename must not reset it"
+        )
+        XCTAssertEqual(renamed.resolvedCacheHints, .openAI)
+
+        // A new base URL goes through the same rebuild: the endpoint moved, the
+        // capability the user recorded for it did not.
+        try harness.store.update(
+            renamed,
+            displayName: "OpenCode",
+            baseURL: "https://gateway.example.com/v1"
+        )
+        XCTAssertEqual(
+            CloudProviderCatalog.provider(withId: "opencode-zen", defaults: harness.defaults)?.cacheHints,
+            .openAI
+        )
+    }
+
     func testChangingTheBaseURLDropsThePreviousEndpointsModelFacts() throws {
         let harness = makeHarness()
         defer { harness.cleanUp() }
