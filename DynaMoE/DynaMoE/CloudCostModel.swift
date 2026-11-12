@@ -639,7 +639,8 @@ public nonisolated enum CloudCompactionFailure: Equatable, Error, Sendable {
 /// twenty-step agent run would then read as twenty conversations' worth.
 public nonisolated enum CloudContextOdometer {
     public static func total(promptTokens: Int, generatedTokens: Int) -> Int {
-        max(0, promptTokens) + max(0, generatedTokens)
+        let (sum, overflow) = max(0, promptTokens).addingReportingOverflow(max(0, generatedTokens))
+        return overflow ? Int.max : sum
     }
 }
 

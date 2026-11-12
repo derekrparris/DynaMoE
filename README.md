@@ -41,7 +41,7 @@ DynaMoE supports sparse Mixture-of-Experts, hybrid recurrent SSM/attention archi
 
 **Important Note:** DynaMoE uses custom Metal kernels and shaders to run models efficiently and to take full advantage of Apple's unified memory architecture. **There is no need to use MLX quantizations** in DynaMoE. In fact, in many cases, an MLX version will run slower or not run at all in DynaMoE. It is advisable to run the native (non MLX and non-GGUF) versions of models in DynaMoE.
 
-On macOS 26 or later with Apple Intelligence enabled, Apple's built-in **on-device Foundation Model** is also selectable as a zero-install chat backend (plain chat; agent tools, JetSpec, thinking blocks, and KV-cache prefixing are local-weights features that do not apply). It appears in the chat model picker under **System Models**, and it powers `/compact` manual conversation compaction on any backend: a rolling general summary plus a detailed recap of the most recent work replace the evicted history, stay visible in an expandable summary card at the top of the chat, and ride into every later prompt. The system model is a chat-only backend: the local inference server (below) always serves the locally loaded weights.
+On macOS 26 or later with Apple Intelligence enabled, Apple's built-in **on-device Foundation Model** is also selectable as a zero-install chat backend (plain chat; agent tools, JetSpec, thinking blocks, and KV-cache prefixing are local-weights features that do not apply). It appears in the chat model picker under **System Models**, and it summarizes `/compact` manual conversation compaction for local conversations; a cloud conversation is summarized by the provider model already answering it, so that command needs no Apple Intelligence. Either way a rolling general summary plus a detailed recap of the most recent work replace the evicted history, stay visible in an expandable summary card at the top of the chat, and ride into every later prompt. Cloud turns also compact automatically as they approach the model's recorded context window. The system model is a chat-only backend: the local inference server (below) always serves the locally loaded weights.
 
 **The following models have been tested and should run well in DynaMoE:**
 
@@ -276,7 +276,7 @@ DynaMoE/
 If you're interested in building and running the app in your own development environment:
 
 ### Prerequisites
-* macOS 26+ (Apple Intelligence enabled for the on-device Apple system model and `/compact` conversation compaction)
+* macOS 26+ (Apple Intelligence enabled for the on-device Apple system model and for `/compact` on local conversations; a cloud conversation compacts with its own provider model)
 * Apple Silicon Mac (M1/M2/M3/M4/M5/M6, 16 GB+ Unified Memory recommended)
 * Xcode 26 or later with Command Line Tools (the project builds in Swift 5 language mode with default `MainActor` actor isolation)
 * Rust toolchain (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
@@ -511,7 +511,7 @@ Each image is oriented, stripped of metadata, downscaled so its longest edge is 
 
 On the wire, an attached user turn becomes a multi-part `content` array: `{"type":"text",…}` plus one `{"type":"image_url","image_url":{"url":"data:image/png;base64,…"}}` per image. Text-only turns still send `content` as a bare string, so nothing changes for models without vision.
 
-A slash command cannot carry images: the composer refuses the send and keeps the draft/chips, and removing a queued prompt deletes the images it staged. Images are re-sent with their original message on every later request, including each agent step, so the model keeps its visual context. That also means each later turn pays the image's prompt tokens again; the token estimate prices each image as a flat allowance until the provider reports real usage.
+A slash command cannot carry images: the composer refuses the send and keeps the draft/chips, and removing a queued prompt deletes the images it staged. Images are re-sent with their original message on every later request, including each agent step, so the model keeps its visual context. That also means each later turn pays the image's prompt tokens again; the token estimate prices each image as a flat allowance until the provider reports real usage. Cloud Providers → **Request Behaviour → Re-send Images** turns that off: only the newest user turn then carries pixels, and a picture from an earlier turn is replaced with a one-line notice instead of being billed again on every step.
 
 Attachments live beside the conversation files in `~/Library/Application Support/DynaMoE/sessions/assets/<session>/`, never inside the session JSON (base64 there would rewrite megabytes on every streaming save). Deleting a conversation, auto-deletion, and the orphan pass all remove their images.
 

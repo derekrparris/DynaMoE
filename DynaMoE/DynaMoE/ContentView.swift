@@ -212,24 +212,27 @@ struct ContentView: View {
     @AppStorage("dynamoe_max_tokens") private var maxNewTokens: Int = 8192
     @State private var activeProfile: ModelProfileType = .coder
     @State private var isGeneratingText: Bool = false
-    /// True while a manual /compact is summarizing history. The summarizer's
-    /// commit rewrites the conversation's message array, so normal sends are
-    /// rejected until it settles — whatever interleaved would be dropped.
-    @State private var isCompactingConversation: Bool = false
-    /// The conversation /compact is currently rewriting, so its progress is
-    /// shown only in the chat the user is looking at, matching how generation
-    /// state is session-scoped.
-    @State private var compactingSessionId: UUID? = nil
-    /// The progress bubble /compact streams its summary into. Only this
-    /// message renders with the spinner/typewriter treatment; passing a bare
-    /// "compacting" flag to the list would mark every historical bubble as
-    /// live-streaming for the duration of the pass.
-    @State private var compactingProgressMessageId: UUID? = nil
-    /// The running manual `/compact` task (cloud or on-device), held so Stop can
-    /// interrupt it. Without a handle the task could never be cancelled, which
-    /// made the cloud path's already-written `.cancelled` outcome unreachable
-    /// and left a multi-minute pass with no way out but waiting (or quitting).
-    @State private var compactionTask: Task<Void, Never>? = nil
+    /// One in-flight manual `/compact`, keyed by the conversation it rewrites.
+    ///
+    /// A pass replaces its session's whole message array, so a send or a second
+    /// pass in THAT conversation is refused until it settles — whatever
+    /// interleaved would be dropped. Keying the state by conversation is what
+    /// makes the refusal trustworthy: a single optional let a pass in chat B
+    /// clear the state a pass in chat A still needed, after which a send could
+    /// land in A's rewrite and A's Stop control cancelled nothing. `id`
+    /// identifies the run, so only the pass that owns the entry clears it.
+    private struct ManualCompaction {
+        let id: UUID
+        /// The bubble this pass streams its summary into. Only this message
+        /// renders with the spinner/typewriter treatment; passing a bare
+        /// "compacting" flag to the list would mark every historical bubble as
+        /// live-streaming for the duration of the pass.
+        let progressMessageId: UUID
+        /// Held so Stop can interrupt a pass. Without a handle a multi-minute
+        /// cloud compaction had no way out but waiting (or quitting).
+        var task: Task<Void, Never>?
+    }
+    @State private var manualCompactions: [UUID: ManualCompaction] = [:]
     @State private var generatingSessionId: UUID? = nil
     /// Sessions pinned against retention while a generation unwinds or a
     /// replacement is being sent. `stopAutoregressiveGeneration` flips
@@ -1522,7 +1525,8 @@ struct ContentView: View {
                     promptText: $chatPromptText,
                     isGenerating: isGeneratingText && (generatingSessionId == (selectedSessionId ?? sessions.first?.id)),
                     isModeChangeLocked: isModeChangeLockedByVisibleTurn,
-                    compactionProgressMessageId: (isCompactingConversation && compactingSessionId == (selectedSessionId ?? sessions.first?.id)) ? compactingProgressMessageId : nil,
+                    compactionProgressMessageId: (selectedSessionId ?? sessions.first?.id)
+                        .flatMap { manualCompactions[$0]?.progressMessageId },
                     isStreamingOffDisk: isStreamingOffDisk,
                     generationSpeed: generationSpeedTokPerSec,
                     generationTokens: generationTotalTokens,
@@ -2415,6 +2419,10 @@ struct ContentView: View {
         // silently keep the draft. A weights model being loaded does not
         // block: the summarizer is the system model, and a load touches
         // engine state, not the conversation.
+        // `generatingSessionId` is not checked here: it keeps the last turn's
+        // session after that turn ends, so it would refuse compaction in a
+        // conversation forever. The global flag plus the teardown task are the
+        // live-turn states.
         if isGeneratingText {
             let note = "⚠️ Stop the running turn before compacting — /compact rewrites the conversation while it works."
             sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
@@ -2422,6 +2430,14 @@ struct ContentView: View {
         }
         if generationTeardownTask != nil {
             let note = "⚠️ The previous turn is still winding down — run /compact again in a moment."
+            sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
+            return true
+        }
+        // The composer refuses a second `/compact` for the same conversation
+        // before dispatching it; this is the same rule one layer down, so no
+        // caller can start a pass over a history another pass is rewriting.
+        if manualCompactions[sessionId] != nil {
+            let note = "⚠️ A compaction is already running — try /compact again once it finishes."
             sessions[sessionIdx].messages.append(ChatMessage(role: .system, content: note))
             return true
         }
@@ -2517,9 +2533,10 @@ struct ContentView: View {
             prefillStatus: "🍎 Apple Foundation Model — summarizing \(evictedCount) messages…",
             isTransient: true
         ))
-        isCompactingConversation = true
-        compactingSessionId = sessionId
-        compactingProgressMessageId = progressId
+        let compactionRunId = beginManualCompaction(
+            sessionId: sessionId,
+            progressMessageId: progressId
+        )
         // The summarizer suspends for seconds at a time while the user stays
         // free to create or switch chats; an unpinned conversation sitting at
         // the retention limit could be deleted mid-pass, and the commit guard
@@ -2534,12 +2551,9 @@ struct ContentView: View {
             kind: .progress,
             sessionId: sessionId
         )
-        compactionTask = Task { @MainActor in
+        let compactionTask = Task { @MainActor in
             defer {
-                self.isCompactingConversation = false
-                self.compactingSessionId = nil
-                self.compactingProgressMessageId = nil
-                self.compactionTask = nil
+                self.finishManualCompaction(sessionId: sessionId, runId: compactionRunId)
                 self.releaseRetentionProtection(sessionId)
                 self.clearStatus(ifIdentity: compactionStatusId)
             }
@@ -2673,6 +2687,7 @@ struct ContentView: View {
                 postToProgress("⚠️ Compaction failed: \(error.localizedDescription) — the conversation was left unchanged.")
             }
         }
+        attachManualCompaction(compactionTask, sessionId: sessionId, runId: compactionRunId)
         return true
     }
 
@@ -2955,21 +2970,19 @@ struct ContentView: View {
                 isTransient: true
             ))
         }
-        isCompactingConversation = true
-        compactingSessionId = sessionId
-        compactingProgressMessageId = progressId
+        let compactionRunId = beginManualCompaction(
+            sessionId: sessionId,
+            progressMessageId: progressId
+        )
         retainRetentionProtection(sessionId)
         let compactionStatusId = showStatus(
             "🗂 \(provider.displayName) — compacting this conversation…",
             kind: .progress,
             sessionId: sessionId
         )
-        compactionTask = Task { @MainActor in
+        let compactionTask = Task { @MainActor in
             defer {
-                self.isCompactingConversation = false
-                self.compactingSessionId = nil
-                self.compactingProgressMessageId = nil
-                self.compactionTask = nil
+                self.finishManualCompaction(sessionId: sessionId, runId: compactionRunId)
                 // The history rewrite drops the bubble on success; every other
                 // outcome leaves it behind, so take it down before the next
                 // body evaluation can paint an empty progress row.
@@ -3022,7 +3035,35 @@ struct ContentView: View {
                 self.showStatus(notice)
             }
         }
+        attachManualCompaction(compactionTask, sessionId: sessionId, runId: compactionRunId)
         return true
+    }
+
+    // MARK: - Manual compaction state
+
+    /// Registers a pass before its first await, so the composer's per-session
+    /// gate and Stop control can see it from the runloop turn that accepted the
+    /// command. Returns the run identity the pass uses to clear it.
+    private func beginManualCompaction(sessionId: UUID, progressMessageId: UUID) -> UUID {
+        let runId = UUID()
+        manualCompactions[sessionId] = ManualCompaction(
+            id: runId,
+            progressMessageId: progressMessageId
+        )
+        return runId
+    }
+
+    private func attachManualCompaction(_ task: Task<Void, Never>, sessionId: UUID, runId: UUID) {
+        guard var run = manualCompactions[sessionId], run.id == runId else { return }
+        run.task = task
+        manualCompactions[sessionId] = run
+    }
+
+    /// Clears the entry only when it still belongs to this run: a superseded
+    /// pass must not reopen a gate a newer pass holds.
+    private func finishManualCompaction(sessionId: UUID, runId: UUID) {
+        guard manualCompactions[sessionId]?.id == runId else { return }
+        manualCompactions.removeValue(forKey: sessionId)
     }
 
     /// Dispatches a composer slash command as an app action, independent of any
@@ -3038,7 +3079,7 @@ struct ContentView: View {
         // Only `/compact` collides with a running compaction. A mode change is
         // local conversation state — no turn is running — so `/plan` was being
         // refused with a message about a different command.
-        if isCompactingConversation, compactingSessionId == cmdSessionId, case .compact = command {
+        if manualCompactions[cmdSessionId] != nil, case .compact = command {
             let note = "⚠️ A compaction is already running — try /compact again once it finishes."
             sessions[cmdSessionIdx].messages.append(ChatMessage(role: .system, content: note))
             return true
@@ -3168,7 +3209,7 @@ struct ContentView: View {
         // A running compaction rewrites its own session's messages when its
         // summaries land; an interleaved send would be part of the rewrite.
         // Other conversations are unaffected and must stay sendable.
-        if isCompactingConversation, compactingSessionId == currentSessionId {
+        if manualCompactions[currentSessionId] != nil {
             showStatus("⚠️ Conversation is being compacted — try again in a moment.")
             return false
         }
@@ -3919,9 +3960,9 @@ struct ContentView: View {
         // was pressed for: compacting chat A and pressing Stop on chat B must
         // not cancel A's pass.
         var stoppedCompaction = false
-        if isCompactingConversation,
-           let task = compactionTask,
-           compactingSessionId == (selectedSessionId ?? sessions.first?.id) {
+        if let visibleSessionId = selectedSessionId ?? sessions.first?.id,
+           let run = manualCompactions[visibleSessionId],
+           let task = run.task {
             task.cancel()
             stoppedCompaction = true
         }

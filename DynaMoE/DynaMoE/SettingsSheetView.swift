@@ -2289,7 +2289,11 @@ struct SettingsSheetView: View {
                             var split: [String] = []
                             if cached > 0 { split.append("\(cached) cached") }
                             if cacheWrite > 0 { split.append("\(cacheWrite) cache write") }
-                            split.append("\(max(0, input - cached)) billable")
+                            // A cache write is its own line on the bill, exactly
+                            // like a cache read: subtracting only the read
+                            // charges the write twice and overstates the fresh
+                            // share the row exists to show.
+                            split.append("\(max(0, input - cached - cacheWrite)) billable")
                             text += " (\(split.joined(separator: ", ")))"
                         }
                         return text

@@ -90,6 +90,16 @@ nonisolated final class CloudCacheHintMemory: @unchecked Sendable {
         declined.insert(endpoint)
         lock.unlock()
     }
+
+    /// Forgets every endpoint. Process lifetime is the shipping behaviour, but
+    /// a test process runs many cases against one latch: without this a case
+    /// that latched an endpoint leaves the next one — and a repeat-on-failure
+    /// rerun of itself — starting from a state it did not set up.
+    func reset() {
+        lock.lock()
+        declined.removeAll()
+        lock.unlock()
+    }
 }
 
 // MARK: - OpenAI-Compatible Service

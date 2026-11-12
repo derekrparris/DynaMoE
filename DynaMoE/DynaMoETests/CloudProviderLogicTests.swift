@@ -1195,7 +1195,10 @@ final class CloudStreamTransportTests: XCTestCase {
 
     private func makeService(
         host: String = "provider.test",
-        hints: CloudCacheHints = .affinity
+        // The SHIPPED built-in (`CloudProviderRegistry.synthetic`) sends the
+        // OpenAI hint, so the default request shape under test is the one a
+        // real turn produces: both optional body fields present.
+        hints: CloudCacheHints = .openAI
     ) -> OpenAICloudChatService {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [CloudStubURLProtocol.self]
@@ -1283,21 +1286,66 @@ final class CloudStreamTransportTests: XCTestCase {
     func testRejectedUsageExtensionIsRetriedOnceWithoutIt() async {
         CloudStubURLProtocol.status = 400
         CloudStubURLProtocol.body = Data(#"{"error":"Unsupported parameter: stream_options"}"#.utf8)
-        let events = await collect(makeService())
+        // The shipped provider sends the cache key as well, and that is the
+        // request shape this retry has to preserve: dropping the usage
+        // extension must not also drop the routing hint.
+        let events = await collect(makeService(), sessionKey: "usage-retry")
         guard case .failed(let failure)? = events.last else {
             return XCTFail("expected a failure, got \(String(describing: events.last))")
         }
-        // The stub rejects both attempts, so the turn fails, but the retry must
-        // have been attempted: two request bodies, the second without the field.
-        XCTAssertEqual(CloudStubURLProtocol.requestBodies.count, 2)
+        // The stub rejects every attempt, so the turn fails, but both retries
+        // must have been attempted. Attempt 2 drops only the usage extension,
+        // which is the shape that proves the cache key survives it; its
+        // continued 400 then earns the blind cache-key retry, and attempt 3
+        // carries neither optional field.
+        XCTAssertEqual(CloudStubURLProtocol.requestBodies.count, 3)
         let first = try? JSONSerialization.jsonObject(with: CloudStubURLProtocol.requestBodies[0]) as? [String: Any]
         let second = try? JSONSerialization.jsonObject(with: CloudStubURLProtocol.requestBodies[1]) as? [String: Any]
+        let third = try? JSONSerialization.jsonObject(with: CloudStubURLProtocol.requestBodies[2]) as? [String: Any]
         XCTAssertNotNil(first?["stream_options"])
+        XCTAssertEqual(first?["prompt_cache_key"] as? String, "usage-retry")
         XCTAssertNil(second?["stream_options"])
+        XCTAssertEqual(second?["prompt_cache_key"] as? String, "usage-retry")
+        XCTAssertNil(third?["stream_options"])
+        XCTAssertNil(third?["prompt_cache_key"])
         guard case .httpStatus(let code, _) = failure else {
             return XCTFail("expected an HTTP failure, got \(failure)")
         }
         XCTAssertEqual(code, 400)
+    }
+
+    func testAUsageRejectionThenACacheKeyRejectionTakesTwoRetries() async {
+        // The two optional fields are dropped one at a time, and the second
+        // attempt still carries the cache key. A retry that cleared both at
+        // once would look identical to a turn that never asked for the cache.
+        let ok = Data("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n".utf8)
+        CloudStubURLProtocol.responses = [
+            (400, Data(#"{"error":"Unsupported parameter: stream_options"}"#.utf8)),
+            (400, Data(#"{"error":"unexpected property prompt_cache_key"}"#.utf8)),
+            (200, ok)
+        ]
+        // A fresh endpoint per invocation keeps the process-wide latch out of
+        // the picture, so a rerun starts on its first attempt again.
+        let host = "two-stage-\(UUID().uuidString).test"
+        let service = makeService(host: host)
+        guard case .finished? = await collect(service, sessionKey: "session-two-stage").last else {
+            return XCTFail("the third attempt should succeed")
+        }
+        XCTAssertEqual(CloudStubURLProtocol.requestBodies.count, 3)
+        XCTAssertNotNil(requestBody(0)?["stream_options"])
+        XCTAssertEqual(requestBody(0)?["prompt_cache_key"] as? String, "session-two-stage")
+        XCTAssertNil(requestBody(1)?["stream_options"])
+        XCTAssertEqual(requestBody(1)?["prompt_cache_key"] as? String, "session-two-stage")
+        XCTAssertNil(requestBody(2)?["stream_options"])
+        XCTAssertNil(requestBody(2)?["prompt_cache_key"])
+        XCTAssertFalse(
+            OpenAICloudChatService.sendsCacheKey(
+                hints: .openAI,
+                sessionKey: "session-two-stage",
+                endpoint: "https://\(host)/openai/v1/chat/completions"
+            ),
+            "the accepted retry without the field is what proves it was refused"
+        )
     }
 
     func testACacheKeyIsRememberedOnlyAfterTheRetrySucceeds() async {
@@ -1309,7 +1357,12 @@ final class CloudStreamTransportTests: XCTestCase {
             // first attempt is the only request this turn makes.
             (200, ok)
         ]
-        let service = makeService(host: "cache-latch.test", hints: .openAI)
+        // The latch is process-lifetime and keyed by endpoint, so a fixed host
+        // would carry one run's answer into the next: a repeat-on-failure
+        // rerun (or a second pass at this case) would find the key already
+        // withheld and fail its first assertion. A fresh endpoint per
+        // invocation is the isolation, without mutating the shared latch.
+        let service = makeService(host: "cache-latch-\(UUID().uuidString).test", hints: .openAI)
         guard case .finished? = await collect(service, sessionKey: "session-a").last else {
             return XCTFail("the first turn should succeed on its retry")
         }
@@ -1327,7 +1380,7 @@ final class CloudStreamTransportTests: XCTestCase {
         // field was the problem. The next turn must still ask for the cache.
         let failure = Data(#"{"error":"model not found"}"#.utf8)
         CloudStubURLProtocol.responses = [(400, failure), (400, failure)]
-        let service = makeService(host: "cache-kept.test", hints: .openAI)
+        let service = makeService(host: "cache-kept-\(UUID().uuidString).test", hints: .openAI)
         guard case .failed? = await collect(service, sessionKey: "session-b").last else {
             return XCTFail("the first turn should fail")
         }
@@ -1364,6 +1417,19 @@ final class CloudUsageSplitTests: XCTestCase {
         let usage = try decode(#"{"prompt_tokens":900,"completion_tokens":10,"prompt_cache_hit_tokens":600}"#)
         XCTAssertEqual(usage.cachedTokens, 600)
         XCTAssertEqual(usage.billableInputTokens, 300)
+    }
+
+    func testDeepSeekTopLevelHitBeatsANestedCachedCount() throws {
+        // A gateway that fronts DeepSeek can publish both spellings, and they
+        // are not the same number. The dedicated top-level field is DeepSeek's
+        // own; the nested detail is OpenAI's generic one, so the dedicated
+        // name wins. Reading the nested value here would under-report the
+        // cache hit and over-report what the turn billed.
+        let usage = try decode(
+            #"{"prompt_tokens":1000,"completion_tokens":10,"prompt_cache_hit_tokens":600,"prompt_tokens_details":{"cached_tokens":200}}"#
+        )
+        XCTAssertEqual(usage.cachedTokens, 600)
+        XCTAssertEqual(usage.billableInputTokens, 400)
     }
 
     func testAnthropicCacheColumnsAreDecoded() throws {
@@ -1603,6 +1669,38 @@ final class CloudCacheHintRequestTests: XCTestCase {
         XCTAssertNil(try body(request)["prompt_cache_key"])
     }
 
+    func testTheLatchIsScopedToItsOwnEndpoint() {
+        // One provider refusing the body field says nothing about another
+        // endpoint. A set that was not keyed would switch the hint off for
+        // every provider the app talks to after one strict server said no.
+        let first = "https://latch-a-\(UUID().uuidString).test/openai/v1/chat/completions"
+        let second = "https://latch-b-\(UUID().uuidString).test/openai/v1/chat/completions"
+        XCTAssertTrue(OpenAICloudChatService.sendsCacheKey(
+            hints: .openAI,
+            sessionKey: "abc123",
+            endpoint: first
+        ))
+        CloudCacheHintMemory.shared.declinePromptCacheKey(endpoint: first)
+        XCTAssertFalse(OpenAICloudChatService.sendsCacheKey(
+            hints: .openAI,
+            sessionKey: "abc123",
+            endpoint: first
+        ))
+        XCTAssertTrue(OpenAICloudChatService.sendsCacheKey(
+            hints: .openAI,
+            sessionKey: "abc123",
+            endpoint: second
+        ))
+        // The reset seam restores the first endpoint, so a repeat-on-failure
+        // rerun of this case starts where it did the first time.
+        CloudCacheHintMemory.shared.reset()
+        XCTAssertTrue(OpenAICloudChatService.sendsCacheKey(
+            hints: .openAI,
+            sessionKey: "abc123",
+            endpoint: first
+        ))
+    }
+
     func testAnUnknownCacheHintDecodesToTheSafeDefault() throws {
         // The value is hand-editable and a newer build may write one this build
         // does not know. Failing the whole record silently removed the
@@ -1620,11 +1718,17 @@ final class CloudSessionKeyTests: XCTestCase {
     func testTheKeyIsStableOpaqueAndPerConversation() {
         let first = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
         let second = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
-        XCTAssertEqual(CloudSessionKey.hashed(first), CloudSessionKey.hashed(first))
-        XCTAssertNotEqual(CloudSessionKey.hashed(first), CloudSessionKey.hashed(second))
         let key = CloudSessionKey.hashed(first)
+        XCTAssertEqual(key, CloudSessionKey.hashed(first))
+        XCTAssertNotEqual(key, CloudSessionKey.hashed(second))
         XCTAssertFalse(key.contains("-"))
         XCTAssertTrue(key.allSatisfy { $0.isHexDigit })
+        // A GOLDEN value, not a second call to the same function. The provider
+        // keys its prefix cache on this string, so changing the FNV offset,
+        // prime or input spelling must fail here: every upgraded install would
+        // otherwise silently lose the affinity of conversations already in
+        // progress, with no test noticing.
+        XCTAssertEqual(key, "c155f09940d24ca1")
     }
 }
 
@@ -1712,6 +1816,11 @@ final class CloudImageDeliveryPolicyTests: XCTestCase {
     }
 
     func testThePolicyIsStableAcrossRepeatedRenders() {
+        // Prefix stability means an EXTENDED history re-renders the earlier
+        // turns identically. Comparing two renders of the same array proves
+        // nothing: a policy that ignored `imageDelivery` or inverted it would
+        // pass that and still invalidate the provider's cached prefix on every
+        // step of an agent run.
         let messages = conversation()
         let map = urls(for: messages)
         let first = CloudMessageAssembler.assemble(
@@ -1719,12 +1828,21 @@ final class CloudImageDeliveryPolicyTests: XCTestCase {
             imageDataURLs: map,
             imageDelivery: .newestUserTurnOnly
         )
-        let second = CloudMessageAssembler.assemble(
-            from: messages,
+        let extended = CloudMessageAssembler.assemble(
+            from: messages + [ChatMessage(role: .assistant, content: "next")],
             imageDataURLs: map,
             imageDelivery: .newestUserTurnOnly
         )
-        XCTAssertEqual(first, second)
+        XCTAssertEqual(Array(extended.prefix(first.count)), first)
+        XCTAssertEqual(extended.count, first.count + 1)
+        // And the policy is actually ON: keeping every picture must produce a
+        // different prefix, or the comparison above would hold for a no-op.
+        let keepAll = CloudMessageAssembler.assemble(
+            from: messages,
+            imageDataURLs: map,
+            imageDelivery: .all
+        )
+        XCTAssertNotEqual(keepAll, first)
     }
 }
 
@@ -1843,9 +1961,16 @@ final class CloudContextPolicyTests: XCTestCase {
     func testOverridesParseBothSpellingsAndDropNonsense() {
         let defaults = scratchDefaults()
         CloudContextPolicy.setOverrides(
-            ["a": 128_000, "b": 32_000],
+            ["b": 32_000, "a": 128_000, "units": 12],
             for: "p",
             defaults: defaults
+        )
+        // The WRITE side is pinned literally, not through its own reader: a
+        // writer and parser that agreed on a wrong format would round-trip
+        // perfectly, and the value is hand-edited JSON an operator reads.
+        XCTAssertEqual(
+            defaults.string(forKey: CloudContextPolicy.defaultsKey(for: "p")),
+            "a=128000; b=32000"
         )
         XCTAssertEqual(
             CloudContextPolicy.overrides(for: "p", defaults: defaults),
@@ -1859,6 +1984,10 @@ final class CloudContextPolicyTests: XCTestCase {
             CloudContextPolicy.overrides(for: "q", defaults: defaults),
             ["model": 64_000, "other": 8_192]
         )
+        // Nothing usable means no stored key at all, so a later reader cannot
+        // mistake an empty string for "recorded, but zero".
+        CloudContextPolicy.setOverrides(["units": 12], for: "r", defaults: defaults)
+        XCTAssertNil(defaults.string(forKey: CloudContextPolicy.defaultsKey(for: "r")))
     }
 
     func testTheThresholdIsEightyPercentOfAKnownWindow() {
@@ -1884,15 +2013,29 @@ final class CloudContextPolicyTests: XCTestCase {
         XCTAssertNil(CloudContextPolicy.window(for: nil, defaults: defaults))
     }
 
-    func testTheModelLookupAgreesWithTheRegistrySpec() {
+    func testTheModelLookupAgreesWithTheRegistrySpec() throws {
         // The chat header resolves a window straight from the recorded
         // overrides so it does not rebuild the provider's whole registry on
-        // every frame. Both paths read the same fact, so they cannot disagree.
+        // every frame. The other path builds the spec through
+        // `registeredSpecs`. This compares the two for real: a comment that
+        // claimed they agree without calling the registry would pass even if
+        // the spec stopped reading the override map.
         let defaults = scratchDefaults()
-        defaults.set(
-            "m=200000; other=8192",
-            forKey: CloudContextPolicy.defaultsKey(for: "p")
+        let provider = CloudProvider(
+            id: "p",
+            displayName: "P",
+            openAIBaseURL: URL(string: "https://p.test/v1")!
         )
+        CloudModelRegistry.setRegisteredModelIds(["m", "other"], for: provider, defaults: defaults)
+        CloudContextPolicy.setOverrides(
+            ["m": 200_000, "other": 8_192],
+            for: provider.id,
+            defaults: defaults
+        )
+        let specs = CloudModelRegistry.registeredSpecs(for: provider, defaults: defaults)
+        let spec = try XCTUnwrap(specs.first { $0.providerModelId == "m" })
+        XCTAssertEqual(spec.contextWindowTokens, 200_000)
+        XCTAssertEqual(CloudContextPolicy.window(for: spec, defaults: defaults), 200_000)
         XCTAssertEqual(
             CloudContextPolicy.window(forModelId: "m", providerId: "p", defaults: defaults),
             200_000
@@ -1902,6 +2045,10 @@ final class CloudContextPolicyTests: XCTestCase {
         defaults.set(64_000, forKey: CloudContextPolicy.globalWindowKey)
         XCTAssertEqual(
             CloudContextPolicy.window(forModelId: "unrecorded", providerId: "p", defaults: defaults),
+            64_000
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.window(for: nil, defaults: defaults),
             64_000
         )
         defaults.removeObject(forKey: CloudContextPolicy.globalWindowKey)
@@ -1976,7 +2123,12 @@ final class CloudCompactionBoundaryTests: XCTestCase {
         let plan = try XCTUnwrap(
             CloudCompactionBoundary.plan(messages: messages, keepRecentMessages: 8)
         )
-        XCTAssertGreaterThanOrEqual(ChatSession.compactableMessageCount(in: plan.evicted), 2)
+        // The anchor rule pulls the run's question back into the tail, so the
+        // evicted half is the two system rows plus twelve assistant steps. A
+        // bound like `>= 2` would pass a regression that re-kept most of the
+        // run and shrank nothing, which is the failure this case exists for.
+        XCTAssertEqual(ChatSession.compactableMessageCount(in: plan.evicted), 12)
+        XCTAssertEqual(plan.evicted.count, 14)
         // The run's question stays as the request's opening user turn.
         XCTAssertEqual(plan.kept.first?.content, "build the thing")
         XCTAssertEqual(plan.kept.count, 9)
@@ -2015,7 +2167,7 @@ final class CloudCompactionBoundaryTests: XCTestCase {
         XCTAssertTrue(manual.kept.isEmpty)
     }
 
-    func testAnAgentRunCutsAtTheRequestedBoundary() {
+    func testAnAgentRunCutsAtTheRequestedBoundary() throws {
         // One user turn, then N assistant turns: an agent run has no later user
         // turn to back up to, so a user-turn-only rule always cut at index 0
         // and evicted nothing: the exact history auto-compaction exists to
@@ -2031,10 +2183,20 @@ final class CloudCompactionBoundaryTests: XCTestCase {
         // keep 4 -> cut 9 messages back, which lands inside the run.
         XCTAssertEqual(CloudCompactionBoundary.tailStart(messages: messages, keepRecentMessages: 4), 9)
         XCTAssertEqual(CloudCompactionBoundary.tailStart(messages: messages, keepRecentMessages: 12), 1)
-        // A cut ALWAYS lands on a message boundary, so the assistant message
-        // that carries a tool exchange keeps every result it emitted.
-        let cut = try! XCTUnwrap(CloudCompactionBoundary.tailStart(messages: messages, keepRecentMessages: 4))
-        XCTAssertTrue((1..<messages.count).contains(cut))
+        // What the bound actually promises is checked on the PLAN, not on the
+        // cut: a cut is a message boundary by construction, so
+        // `(1..<count).contains(cut)` could only fail at the ends and says
+        // nothing about the tool exchange. Every result the evicted steps
+        // emitted is evicted with its call, and every kept call keeps its
+        // results — that is the rule the comment claims.
+        let plan = try XCTUnwrap(
+            CloudCompactionBoundary.plan(messages: messages, keepRecentMessages: 4)
+        )
+        XCTAssertEqual(plan.evicted.flatMap { $0.toolCalls ?? [] }.count, 8)
+        XCTAssertEqual(plan.kept.flatMap { $0.toolCalls ?? [] }.count, 4)
+        XCTAssertEqual(plan.kept.count, 5)
+        XCTAssertEqual(plan.kept.first?.content, "build the thing")
+        XCTAssertTrue(Set(plan.kept.map(\.id)).isDisjoint(with: Set(plan.evicted.map(\.id))))
     }
 
     func testTheCutStillPrefersAUserTurnWhenOneIsInRange() {
@@ -2440,7 +2602,12 @@ final class CloudContextOdometerTests: XCTestCase {
         let stepPrompts = [1_000, 1_040, 1_100, 1_150]
         let total = CloudContextOdometer.total(promptTokens: stepPrompts.last!, generatedTokens: 40)
         XCTAssertEqual(total, 1_190)
-        XCTAssertLessThan(total, stepPrompts.reduce(0, +))
+        // The four prompts summed is 4,290. Naming it keeps the intent in the
+        // assertion instead of restating the addition above.
+        XCTAssertNotEqual(total, 4_290)
+        // A hostile usage block can carry `Int.max` in the prompt column; the
+        // addition must clamp rather than trap.
+        XCTAssertEqual(CloudContextOdometer.total(promptTokens: .max, generatedTokens: 1), .max)
     }
 
     func testNegativeCountsAreClampedRatherThanDisplayed() {
@@ -2491,13 +2658,42 @@ final class CloudPricingTests: XCTestCase {
         )
     }
 
+    func testACacheWriteCannotBeChargedBeyondWhatTheCacheReadLeft() throws {
+        // A hostile or buggy usage block can claim more written tokens than the
+        // prompt has left after the cache read. The clamp is
+        // `min(written, prompt - cached)`, so 900 written over a 1,000 prompt
+        // with 400 cached can only bill 600 — and the fresh share is zero, not
+        // negative (which would discount the turn).
+        let usage = CloudUsage(
+            promptTokens: 1_000,
+            completionTokens: 0,
+            cachedTokens: 400,
+            cacheWriteTokens: 900
+        )
+        let priced = CloudPricing(input: 3, cachedInput: 0.3, output: 15, cacheWriteInput: 3.75)
+        // 400 cached * $0.30 + 600 written * $3.75, all per million tokens.
+        XCTAssertEqual(
+            try XCTUnwrap(priced.cost(for: usage)),
+            (120 + 2_250) / 1_000_000,
+            accuracy: 1e-12
+        )
+        // The same block with no cache-write rate bills the clamp at input.
+        let withoutPremium = CloudPricing(input: 3, cachedInput: 0.3, output: 15)
+        XCTAssertEqual(
+            try XCTUnwrap(withoutPremium.cost(for: usage)),
+            (120 + 1_800) / 1_000_000,
+            accuracy: 1e-12
+        )
+    }
+
     func testANegativeRateCannotProduceANegativeSpend() throws {
         let usage = CloudUsage(promptTokens: 1_000, completionTokens: 100)
         let negative = CloudPricing(input: -2, output: 10)
-        let clamped = CloudPricing(input: 0, output: 10)
+        // Only the output column is billed: 100 * $10/M. Comparing against a
+        // second `CloudPricing` would pass for any shared bug in the pricing.
         XCTAssertEqual(
             try XCTUnwrap(negative.cost(for: usage)),
-            try XCTUnwrap(clamped.cost(for: usage)),
+            0.001,
             accuracy: 1e-12
         )
     }
