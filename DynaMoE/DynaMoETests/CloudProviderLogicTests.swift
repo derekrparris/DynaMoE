@@ -1627,7 +1627,71 @@ final class CloudPrefixStabilityTests: XCTestCase {
     }
 }
 
+// MARK: - Step prompt ordering
+
+final class CloudStepPromptTests: XCTestCase {
+    private let history = [
+        CloudChatMessage(role: "user", content: "hello"),
+        CloudChatMessage(role: "assistant", content: "hi")
+    ]
+
+    func testACoordinatorDirectiveRidesTheEndAsItsOwnUserTurn() {
+        let outbound = CloudStepPrompt.assemble(
+            persona: "You are the coordinator.",
+            history: history,
+            directive: "[subagent report]"
+        )
+        XCTAssertEqual(outbound.map(\.role), ["system", "user", "assistant", "user"])
+        XCTAssertEqual(outbound.first?.content, "You are the coordinator.")
+        XCTAssertEqual(outbound.last?.content, "[subagent report]")
+    }
+
+    func testADirectiveExtendsThePrefixInsteadOfRewritingIt() {
+        let without = CloudStepPrompt.assemble(persona: "persona", history: history, directive: "")
+        let with = CloudStepPrompt.assemble(persona: "persona", history: history, directive: "[report]")
+        // The system message and every history turn are identical, which is
+        // what lets the provider reuse its cached prefix; only the trailing
+        // turn is new.
+        XCTAssertEqual(Array(with.prefix(without.count)), without)
+        XCTAssertEqual(with.count, without.count + 1)
+        XCTAssertEqual(with.last?.role, "user")
+        // The directive is never merged into the system prompt.
+        XCTAssertEqual(with.first?.content, "persona")
+    }
+
+    func testAnEmptyPersonaStillLeadsWithHistory() {
+        let outbound = CloudStepPrompt.assemble(persona: "", history: history, directive: "")
+        XCTAssertEqual(outbound, history)
+        XCTAssertFalse(outbound.contains { $0.role == "system" })
+    }
+}
+
 // MARK: - Context budget
+
+final class CloudCompactionAttemptsTests: XCTestCase {
+    func testAFailedPreflightPassIsNotRetriedOnEveryStep() {
+        var attempts = CloudCompactionAttempts()
+        XCTAssertTrue(attempts.shouldAttemptPreflight)
+        attempts.beginPreflight()
+        // The pass failed (empty summary, truncated summary, provider error):
+        // it already spent its request, so no later step may spend another.
+        XCTAssertFalse(attempts.shouldAttemptPreflight)
+        XCTAssertFalse(attempts.historyWasRewritten)
+        // A provider overflow is different evidence and keeps its own attempt.
+        XCTAssertTrue(attempts.shouldAttemptOverflowRecovery)
+    }
+
+    func testEachPassHasOneAttemptAndARewriteClosesThePreflightGate() {
+        var attempts = CloudCompactionAttempts()
+        attempts.beginPreflight()
+        attempts.recordRewrite()
+        XCTAssertFalse(attempts.shouldAttemptPreflight)
+        XCTAssertTrue(attempts.historyWasRewritten)
+        XCTAssertTrue(attempts.shouldAttemptOverflowRecovery)
+        attempts.beginOverflowRecovery()
+        XCTAssertFalse(attempts.shouldAttemptOverflowRecovery)
+    }
+}
 
 final class CloudContextPolicyTests: XCTestCase {
     private func scratchDefaults() -> UserDefaults {
@@ -2246,7 +2310,7 @@ final class CloudTurnReportTests: XCTestCase {
             cost: 0.0031,
             wasEstimated: false
         )
-        XCTAssertEqual(report.statusSuffix, "24,000 in (18,000 cached) / 350 out · $0.0031")
+        XCTAssertEqual(report.statusSuffix, "24,000 billed in (18,000 cached) / 350 out · $0.0031")
     }
 
     func testARunWithOneEstimatedStepIsStillMarked() {
@@ -2257,7 +2321,7 @@ final class CloudTurnReportTests: XCTestCase {
             cost: nil,
             wasEstimated: true
         )
-        XCTAssertEqual(report.statusSuffix, "24,000 in / 350 out (est.)")
+        XCTAssertEqual(report.statusSuffix, "24,000 billed in / 350 out (est.)")
     }
 }
 

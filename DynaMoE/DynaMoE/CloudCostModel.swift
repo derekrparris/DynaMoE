@@ -150,6 +150,53 @@ public nonisolated enum CloudOverflowAdvice {
     }
 }
 
+/// How many compaction passes one cloud run may spend.
+///
+/// A cloud agent run re-sends the whole conversation every step, so a gate
+/// that only closed on a SUCCESSFUL pass retried a failed one (an empty or
+/// truncated summary, a provider error) at the top of every remaining step.
+/// Each retry re-resolved the keychain, re-chunked the history and issued a
+/// billed summarizer request with no new chance of success. The budget is one
+/// pre-flight pass and one overflow-recovery pass:
+///
+/// - the pre-flight pass is marked when it STARTS, because the request is
+///   billed before its outcome is known;
+/// - overflow recovery keeps its own attempt, because the provider rejecting
+///   the request is evidence the pre-flight estimate did not have.
+///
+/// `historyWasRewritten` rides beside the two flags so the overflow advice can
+/// still tell "already compacted and still too long" from "compaction left the
+/// history alone".
+public nonisolated struct CloudCompactionAttempts: Equatable, Sendable {
+    public private(set) var preflightAttempted = false
+    public private(set) var overflowAttempted = false
+    public private(set) var historyWasRewritten = false
+
+    public init() {}
+
+    /// The pre-flight pass is skipped after a rewrite too: it would
+    /// immediately re-summarize the digest it just wrote.
+    public var shouldAttemptPreflight: Bool {
+        !preflightAttempted && !historyWasRewritten
+    }
+
+    public var shouldAttemptOverflowRecovery: Bool {
+        !overflowAttempted
+    }
+
+    public mutating func beginPreflight() {
+        preflightAttempted = true
+    }
+
+    public mutating func beginOverflowRecovery() {
+        overflowAttempted = true
+    }
+
+    public mutating func recordRewrite() {
+        historyWasRewritten = true
+    }
+}
+
 /// How much of a cloud model's context window may be used before the next send
 /// compacts first, and how large a summarizer chunk may be.
 ///
@@ -487,6 +534,11 @@ public nonisolated struct CloudTurnReport: Equatable, Sendable {
     public let outputTokens: Int
     public let cost: Double?
     public let wasEstimated: Bool
+    /// Whether `promptTokens` sums the billed prompts of several requests
+    /// rather than describing one request's context. A run total has to say
+    /// so: the same figure beside the header's context pill otherwise reads
+    /// as the size of the conversation.
+    public let countsBilledInput: Bool
 
     public init(
         usage: CloudUsage?,
@@ -499,6 +551,7 @@ public nonisolated struct CloudTurnReport: Equatable, Sendable {
         self.cachedTokens = usage?.cachedTokens ?? 0
         self.outputTokens = max(0, usage?.completionTokens ?? outputTokens)
         self.cost = cost
+        self.countsBilledInput = false
     }
 
     /// A whole run's totals rather than one request's usage block.
@@ -519,18 +572,22 @@ public nonisolated struct CloudTurnReport: Equatable, Sendable {
         self.outputTokens = max(0, outputTokens)
         self.cost = cost
         self.wasEstimated = wasEstimated
+        self.countsBilledInput = true
     }
 
     /// `1,204 in (1,000 cached) / 56 out · $0.0031`, or the estimate-marked
-    /// form when the provider reported no usage.
+    /// form when the provider reported no usage. A run total says `billed in`
+    /// instead: it sums several requests' prompts and is not the conversation's
+    /// context size.
     public var statusSuffix: String {
         var parts: [String] = []
         if let promptTokens {
             let number = Self.format(promptTokens)
+            let inputLabel = countsBilledInput ? " billed in" : " in"
             if cachedTokens > 0 {
-                parts.append("\(number) in (\(Self.format(cachedTokens)) cached)")
+                parts.append("\(number)\(inputLabel) (\(Self.format(cachedTokens)) cached)")
             } else {
-                parts.append("\(number) in")
+                parts.append("\(number)\(inputLabel)")
             }
         }
         parts.append("\(Self.format(outputTokens)) out")

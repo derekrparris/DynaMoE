@@ -346,6 +346,16 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
         // meaning when no cache columns ride beside it. Normalising to the
         // total here is what lets `billableInputTokens` and `CloudPricing`
         // subtract a cache read without clamping the prompt to zero.
+        //
+        // The cache columns are the only signal available for that split, so
+        // an endpoint that published `input_tokens` as the TOTAL and also one
+        // Anthropic cache column would be normalised as if the input column
+        // excluded the cached share and would double-count. No transport this
+        // app speaks publishes that combination: Anthropic defines the field
+        // as the uncached share, and an OpenAI-shaped response uses
+        // `prompt_tokens` for the total, which wins above. A provider that
+        // ever does needs an explicit flavor signal, not a second heuristic
+        // on which keys happen to be present.
         let usesAnthropicCacheColumns = openAIPrompt == nil
             && inputTokens != nil
             && (container.contains(.cacheReadInputTokens)
@@ -858,6 +868,30 @@ public nonisolated enum CloudImageDelivery: Equatable, Sendable {
     case all
     /// Only the newest user turn's pictures ride; older ones become notices.
     case newestUserTurnOnly
+}
+
+/// Builds one agent step's request. The ordering is the whole point: the
+/// system message is the request's first token, so a mid-run coordinator
+/// directive is APPENDED as its own user turn rather than merged into the
+/// system prompt. Rewriting the prefix would throw away the provider's cached
+/// prompt for this step and the one after it; a trailing user turn extends the
+/// prefix instead.
+public nonisolated enum CloudStepPrompt {
+    public static func assemble(
+        persona: String,
+        history: [CloudChatMessage],
+        directive: String
+    ) -> [CloudChatMessage] {
+        var outbound: [CloudChatMessage] = []
+        if !persona.isEmpty {
+            outbound.append(CloudChatMessage(role: "system", content: persona))
+        }
+        outbound.append(contentsOf: history)
+        if !directive.isEmpty {
+            outbound.append(CloudChatMessage(role: "user", content: directive))
+        }
+        return outbound
+    }
 }
 
 /// Builds the outbound messages array from a conversation. The provider owns

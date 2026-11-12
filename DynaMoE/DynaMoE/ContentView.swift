@@ -2718,7 +2718,8 @@ struct ContentView: View {
         providerModelId: String,
         window: Int?,
         keepRecentMessages: Int,
-        focus: String? = nil
+        focus: String? = nil,
+        onProgress: ((String) -> Void)? = nil
     ) async -> CloudCompactionOutcome {
         guard let startIdx = sessions.firstIndex(where: { $0.id == sessionId }) else {
             return .failed(.conversationUnavailable)
@@ -2837,7 +2838,9 @@ struct ContentView: View {
         var mergedRecap = sessions[startIdx].recentWorkDigest
 
         do {
-            for chunk in chunks.dropLast() {
+            let olderChunkCount = max(0, chunks.count - 1)
+            for (offset, chunk) in chunks.dropLast().enumerated() {
+                onProgress?("🗂 \(provider.displayName) — folding older history into the summary (part \(offset + 1) of \(olderChunkCount))…")
                 mergedSummary = try await summarize(
                     system: summaryInstructions,
                     prompt: AppleFoundationModelService.compactionPrompt(
@@ -2852,6 +2855,7 @@ struct ContentView: View {
                 mergedRecap = nil
             }
 
+            onProgress?("🗂 \(provider.displayName) — writing the summary…")
             let summaryText = try await summarize(
                 system: summaryInstructions,
                 prompt: AppleFoundationModelService.compactionPrompt(
@@ -2862,6 +2866,7 @@ struct ContentView: View {
             )
 
             let recapPrompt = "Conversation excerpt, oldest messages first — the most recent work last:\n\n\(recentChunk)"
+            onProgress?("🗂 \(provider.displayName) — capturing the detailed recap…")
             let recap = try await client.completeText(
                 model: providerModelId,
                 systemPrompt: recapInstructions,
@@ -2924,10 +2929,25 @@ struct ContentView: View {
         providerModelId: String,
         focus: String?
     ) -> Bool {
+        // A multi-pass compaction runs for minutes, and a status pill alone
+        // leaves the conversation looking frozen. Mirror the on-device path:
+        // a transient bubble where the rewrite will land, retitled as each
+        // pass starts, and taken down by the defer when the pass ends.
+        let progressId = UUID()
+        if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
+            sessions[idx].messages.append(ChatMessage(
+                id: progressId,
+                role: .system,
+                content: "",
+                prefillStatus: "🗂 \(provider.displayName) — summarizing the conversation…",
+                isTransient: true
+            ))
+        }
         isCompactingConversation = true
         compactingSessionId = sessionId
+        compactingProgressMessageId = progressId
         retainRetentionProtection(sessionId)
-        _ = showStatus(
+        let compactionStatusId = showStatus(
             "🗂 \(provider.displayName) — compacting this conversation…",
             kind: .progress,
             sessionId: sessionId
@@ -2936,7 +2956,21 @@ struct ContentView: View {
             defer {
                 self.isCompactingConversation = false
                 self.compactingSessionId = nil
+                self.compactingProgressMessageId = nil
+                // The history rewrite drops the bubble on success; every other
+                // outcome leaves it behind, so take it down before the next
+                // body evaluation can paint an empty progress row.
+                if let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
+                    self.sessions[liveIdx].messages.removeAll { $0.id == progressId }
+                }
                 self.releaseRetentionProtection(sessionId)
+                self.clearStatus(ifIdentity: compactionStatusId)
+            }
+            @MainActor func updateProgressStatus(_ text: String) {
+                guard let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
+                      let msgIdx = self.sessions[liveIdx].messages.firstIndex(where: { $0.id == progressId })
+                else { return }
+                self.sessions[liveIdx].messages[msgIdx].prefillStatus = text
             }
             let window = CloudContextPolicy.window(
                 for: CloudModelRegistry.registeredSpecs(for: provider)
@@ -2948,7 +2982,8 @@ struct ContentView: View {
                 providerModelId: providerModelId,
                 window: window,
                 keepRecentMessages: 0,
-                focus: focus
+                focus: focus,
+                onProgress: updateProgressStatus
             )
             if outcome.didCompact {
                 let spend = outcome.cost > 0
@@ -4366,11 +4401,13 @@ struct ContentView: View {
                     generatedTokens: generated
                 )
             }
-            // Once per run, and only after a compaction that actually rewrote
-            // the history: a successful compaction that could not shrink the
-            // prompt must not loop, while a failed attempt must leave the
-            // overflow-recovery retry below available.
-            var attemptedContextCompaction = false
+            // One pre-flight pass and one overflow-recovery pass per run.
+            // The pre-flight flag is set when the pass STARTS, not when it
+            // succeeds: a failed pass has already spent its request, and
+            // leaving the gate open retried it at the top of every remaining
+            // step — re-resolving the keychain, re-chunking the history and
+            // re-billing the summarizer with no new chance of success.
+            var compactionAttempts = CloudCompactionAttempts()
             // Why the last attempt left the history alone, so the error at the
             // context wall names what happened rather than blaming the provider
             // for a pass that summarised nothing.
@@ -4450,7 +4487,7 @@ struct ContentView: View {
                 // runs between steps, never mid-request, and the in-flight
                 // placeholder survives it because the rewrite keeps the newest
                 // messages.
-                if !attemptedContextCompaction, let window = contextWindow {
+                if compactionAttempts.shouldAttemptPreflight, let window = contextWindow {
                     let projected = CloudMessageAssembler.approximatePromptTokens(
                         system: currentPersona(),
                         messages: CloudMessageAssembler.assemble(
@@ -4462,6 +4499,7 @@ struct ContentView: View {
                         )
                     )
                     if CloudContextPolicy.shouldCompact(promptTokens: projected, window: window) {
+                        compactionAttempts.beginPreflight()
                         let outcome = await self.compactCloudHistory(
                             sessionId: sessionId,
                             provider: provider,
@@ -4481,7 +4519,7 @@ struct ContentView: View {
                             runCost = (runCost ?? 0) + outcome.cost
                         }
                         if outcome.didCompact {
-                            attemptedContextCompaction = true
+                            compactionAttempts.recordRewrite()
                             contextCompactionFailure = nil
                             resetOdometerAfterCompaction()
                             self.showStatus("🗂 Context was near this model's limit — compacted older history before continuing.")
@@ -4496,30 +4534,24 @@ struct ContentView: View {
                 // The digest is read here, per step, so a compaction that ran
                 // above is already in this request's system message.
                 let persona = currentPersona()
-                var outbound: [CloudChatMessage] = []
                 // A directive applies to exactly one step. Keeping it set while
                 // tool rounds continue told every later step to "write the final
                 // answer now" even though that answer was not due yet.
                 let stepDirective = relayDirective
                 relayDirective = ""
-                if !persona.isEmpty {
-                    outbound.append(CloudChatMessage(role: "system", content: persona))
-                }
-                outbound.append(contentsOf: CloudMessageAssembler.assemble(
-                    from: self.sessions[sIdx].messages,
-                    excludingMessageIds: [currentMessageId],
-                    imageDataURLs: imagesAllowed ? imageDataURLs : [:],
-                    imagesSupported: imagesAllowed,
-                    imageDelivery: imageDeliveryPolicy
-                ))
                 // A coordinator directive is APPENDED, never merged into the
-                // system message. The system message is the request's first
-                // token, so rewriting it would throw away the provider's cached
-                // prefix for this step and for the one after it; a trailing
-                // user turn extends the prefix instead.
-                if !stepDirective.isEmpty {
-                    outbound.append(CloudChatMessage(role: "user", content: stepDirective))
-                }
+                // system message: that is the prefix the provider cached.
+                let outbound = CloudStepPrompt.assemble(
+                    persona: persona,
+                    history: CloudMessageAssembler.assemble(
+                        from: self.sessions[sIdx].messages,
+                        excludingMessageIds: [currentMessageId],
+                        imageDataURLs: imagesAllowed ? imageDataURLs : [:],
+                        imagesSupported: imagesAllowed,
+                        imageDelivery: imageDeliveryPolicy
+                    ),
+                    directive: stepDirective
+                )
                 let stepCarriesImages = outbound.contains { ($0.imageParts?.count ?? 0) > 0 }
                 // What this step's request carries. The odometer reports this
                 // prompt (not a sum of billable input): it already contains
@@ -4709,11 +4741,12 @@ struct ContentView: View {
                 // alternative — what the app did before — was to end the turn
                 // and tell the user to run a command that needs a different
                 // model to be available on their Mac.
-                if !attemptedContextCompaction,
+                if compactionAttempts.shouldAttemptOverflowRecovery,
                    let failure = serviceFailure,
                    case .httpStatus(let code, let summary) = failure,
                    code == 400 || code == 422,
                    CloudTurnFailure.indicatesContextOverflow(summary) {
+                    compactionAttempts.beginOverflowRecovery()
                     let outcome = await self.compactCloudHistory(
                         sessionId: sessionId,
                         provider: provider,
@@ -4729,7 +4762,7 @@ struct ContentView: View {
                         runCost = (runCost ?? 0) + outcome.cost
                     }
                     if outcome.didCompact {
-                        attemptedContextCompaction = true
+                        compactionAttempts.recordRewrite()
                         contextCompactionFailure = nil
                         resetOdometerAfterCompaction()
                         turnLog.recordChatTurn(
@@ -4759,7 +4792,7 @@ struct ContentView: View {
                             // one whose compaction failed, or one with no
                             // attempt at all.
                             errText += CloudOverflowAdvice.text(
-                                alreadyCompacted: attemptedContextCompaction,
+                                alreadyCompacted: compactionAttempts.historyWasRewritten,
                                 failure: contextCompactionFailure,
                                 providerName: provider.displayName
                             )

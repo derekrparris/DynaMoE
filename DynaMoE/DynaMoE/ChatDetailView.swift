@@ -177,6 +177,12 @@ struct ChatDetailView: View {
     @State private var promptTokenCount: Int = 0
     @State private var tokenCountTask: Task<Void, Never>? = nil
     @State private var isPinnedToBottom: Bool = true
+    /// Memoizes the cloud context-window lookup the header pill uses. The body
+    /// runs on every streamed frame and the policy re-parses the provider's
+    /// `model=window` string on each call; the key includes the raw recorded
+    /// values, so a Settings edit still lands on the next evaluation instead of
+    /// serving a stale ceiling.
+    @State private var cloudWindowMemo = CloudWindowMemo()
     /// Identity of the invisible marker at the end of the transcript. It must
     /// stay constant: bumping it per streamed chunk re-lays out the whole
     /// transcript several times a frame, which SwiftUI flags as an invalid
@@ -310,6 +316,17 @@ struct ChatDetailView: View {
         return lineHeight + MacTextEditor.textContainerInsetHeight * 2
     }
 
+    /// Cache for `cloudContextWindow`. Reference type because the body
+    /// refreshes it in place without writing `@State` (see the memoization note
+    /// at the top of this file).
+    private final class CloudWindowMemo {
+        var modelId: String?
+        var providerId: String?
+        var rawOverrides: String?
+        var globalWindow = 0
+        var window: Int?
+    }
+
     /// The context window recorded for this conversation's cloud model, or nil.
     ///
     /// Nil for a weights model (whose capacity is the KV budget's business, not
@@ -320,16 +337,34 @@ struct ChatDetailView: View {
     /// Resolved from the recorded window facts directly rather than through
     /// `CloudModelRegistry.registeredSpecs`: this runs on every body
     /// evaluation, and that call rebuilds every spec on the provider (its model
-    /// list, its no-tools list, its vision marks) to answer one lookup. A
-    /// Settings edit still lands on the next evaluation, because nothing is
-    /// cached.
+    /// list, its no-tools list, its vision marks) to answer one lookup. The
+    /// memo also keeps the provider's `model=window` string from being re-parsed
+    /// per streaming frame; it is keyed on the raw values, so a Settings edit
+    /// still lands on the next evaluation.
     private func cloudContextWindow(for session: ChatSession?) -> Int? {
         guard let id = session?.selectedModelId,
               let parsed = CloudModelAddress.parseModelId(id) else { return nil }
-        return CloudContextPolicy.window(
+        let defaults = UserDefaults.standard
+        let rawOverrides = defaults.string(forKey: CloudContextPolicy.defaultsKey(for: parsed.provider.id))
+        let globalWindow = defaults.integer(forKey: CloudContextPolicy.globalWindowKey)
+        let memo = cloudWindowMemo
+        if memo.modelId == parsed.providerModelId,
+           memo.providerId == parsed.provider.id,
+           memo.rawOverrides == rawOverrides,
+           memo.globalWindow == globalWindow {
+            return memo.window
+        }
+        let window = CloudContextPolicy.window(
             forModelId: parsed.providerModelId,
-            providerId: parsed.provider.id
+            providerId: parsed.provider.id,
+            defaults: defaults
         )
+        memo.modelId = parsed.providerModelId
+        memo.providerId = parsed.provider.id
+        memo.rawOverrides = rawOverrides
+        memo.globalWindow = globalWindow
+        memo.window = window
+        return window
     }
 
     private func modelIconName(for name: String?, isCloud: Bool = false) -> String {
