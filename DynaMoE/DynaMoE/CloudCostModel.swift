@@ -111,14 +111,44 @@ public nonisolated enum CloudPricingStore {
     /// to be non-zero, because "$0.00" on a turn that did cost something reads
     /// as "free". The symbol is fixed because the price list is entered in USD
     /// (see `CloudPricing`); nothing is converted.
+    ///
+    /// Below a ten-thousandth of a dollar there is no rendering that is both
+    /// short and non-zero (`$%.4f` prints "$0.0000"), so the figure says it is
+    /// smaller than the smallest one it can show rather than claiming zero.
     public static func formatted(_ cost: Double) -> String {
-        if cost <= 0 { return "$0" }
+        guard cost.isFinite, cost > 0 else { return "$0" }
+        if cost < 0.0001 { return "<$0.0001" }
         if cost < 0.01 { return String(format: "$%.4f", cost) }
         return String(format: "$%.2f", cost)
     }
 }
 
 // MARK: - Context budget
+
+/// The advice appended to a context-overflow error.
+///
+/// Three different histories reach that error and they call for different next
+/// steps, so the sentence has to say which one it is: a compaction that ran and
+/// the request still did not fit, a compaction that ran and failed, or no
+/// attempt at all. The old copy claimed "could not be compacted automatically"
+/// for all three, including the run that had already compacted once.
+public nonisolated enum CloudOverflowAdvice {
+    public static func text(
+        alreadyCompacted: Bool,
+        failure: CloudCompactionFailure?,
+        providerName: String
+    ) -> String {
+        if alreadyCompacted {
+            return " This turn already compacted older history once and the request still exceeded the window — start a new chat or run /compact."
+        }
+        if let failure {
+            var detail = failure.clause(providerName: providerName)
+            if !detail.hasSuffix(".") { detail += "." }
+            return " Auto-compaction left the history unchanged: \(detail)"
+        }
+        return " The conversation exceeded this model's context window — older history could not be compacted automatically, so start a new chat or run /compact."
+    }
+}
 
 /// How much of a cloud model's context window may be used before the next send
 /// compacts first, and how large a summarizer chunk may be.
@@ -261,7 +291,7 @@ public nonisolated enum CloudContextPolicy {
 /// conversation reads naturally, not about validity.
 public nonisolated enum CloudCompactionBoundary {
     /// Index of the first message to KEEP, or nil when the history offers no
-    /// cut that would evict anything.
+    /// cut that would evict any of the conversation.
     ///
     /// `keepRecentMessages <= 0` keeps nothing (manual `/compact`); every
     /// returned index is a message boundary, so the caller can split without
@@ -270,22 +300,37 @@ public nonisolated enum CloudCompactionBoundary {
         guard !messages.isEmpty else { return nil }
         guard keepRecentMessages > 0 else { return messages.count }
         let target = max(0, messages.count - keepRecentMessages)
+        // A cut is only useful when it folds away something the summary can
+        // describe. System rows are UI state (standing notices, and the digest
+        // card plus marker a previous pass left behind), so a cut that only
+        // evicts those summarises nothing and the pass that receives it
+        // reports a failure.
+        func evictsConversation(at cut: Int) -> Bool {
+            messages[..<cut].contains { $0.role != .system }
+        }
         // Preferred: the newest user turn at or before the requested cut.
         var userBoundary = target
         while userBoundary > 0, messages[userBoundary].role != .user { userBoundary -= 1 }
-        if messages[userBoundary].role == .user, userBoundary > 0 { return userBoundary }
-        // The only user turn in range is the head of the conversation: one
-        // long agent run, which is one question followed by assistant and tool
-        // turns and therefore has no later user turn to cut at. Cutting at the
-        // user turn would evict nothing, which is what made auto-compaction a
-        // silent no-op for the case it exists for. Take the requested cut
-        // instead; the recap digest is what carries the evicted work forward.
-        if target > 0 { return target }
-        // Nothing to evict at the target, and no user turn at or before it: a
-        // compacted head is the system card and marker a previous compaction
-        // left behind. Keep the NEXT user turn, so that history can compact
-        // again rather than refusing forever.
-        return messages[target...].firstIndex(where: { $0.role == .user })
+        if messages[userBoundary].role == .user, userBoundary > 0,
+           evictsConversation(at: userBoundary) {
+            return userBoundary
+        }
+        // Either the only user turn in range is the head of the conversation,
+        // or the user turn in range sits behind a compacted head. One long
+        // agent run is one question followed by assistant and tool turns, so
+        // the newest user turn before the cut is that question and the rows
+        // before it are the digest card and marker: cutting there evicted the
+        // two system rows and nothing else, which is what made auto-compaction
+        // fail for every pass after its first. Take the requested cut instead;
+        // the recap digest is what carries the evicted work forward.
+        if target > 0, evictsConversation(at: target) { return target }
+        // Nothing to evict at the target, and no usable user turn at or before
+        // it. Keep the NEXT user turn when that cut evicts conversation rows;
+        // otherwise this history has nothing worth compacting, and saying so is
+        // better than returning a cut that folds away only the card.
+        guard let nextUser = messages[target...].firstIndex(where: { $0.role == .user }),
+              evictsConversation(at: nextUser) else { return nil }
+        return nextUser
     }
 
     /// The messages a compaction evicts and the ones it keeps.
@@ -297,6 +342,10 @@ public nonisolated enum CloudCompactionBoundary {
     /// endpoints, and a mid-run cut leaves exactly that shape; and that user
     /// turn is the question the evicted work answered, so keeping it verbatim
     /// beats relying on the digest to restate it.
+    ///
+    /// Nil when the plan would fold away no conversation at all: the anchor
+    /// move can put back the only non-system row the cut had, and a pass that
+    /// rewrote the history for nothing would report a success it did not have.
     public static func plan(
         messages: [ChatMessage],
         keepRecentMessages: Int
@@ -313,6 +362,7 @@ public nonisolated enum CloudCompactionBoundary {
            let anchor = evicted.lastIndex(where: { $0.role == .user }) {
             kept.insert(evicted.remove(at: anchor), at: 0)
         }
+        guard evicted.contains(where: { $0.role != .system }) else { return nil }
         return CloudCompactionPlan(evicted: evicted, kept: kept)
     }
 }
@@ -327,6 +377,85 @@ public nonisolated struct CloudCompactionPlan: Equatable, Sendable {
     public init(evicted: [ChatMessage], kept: [ChatMessage]) {
         self.evicted = evicted
         self.kept = kept
+    }
+}
+
+/// Why a cloud compaction left the conversation untouched.
+///
+/// Every refusal used to be reported as "<provider> could not summarize this
+/// conversation", which blamed the provider for outcomes that never sent a
+/// request: no stored key, a chat with nothing evictable, an empty transcript.
+/// Each cause has its own fix, so each gets its own sentence.
+public nonisolated enum CloudCompactionFailure: Equatable, Error, Sendable {
+    /// Too few messages for a summary to replace anything.
+    case conversationTooShort
+    /// The history offers no cut that folds away conversation rows.
+    case nothingToEvict
+    /// The conversation was closed or pruned while the summary was running.
+    case conversationUnavailable
+    /// No summarizer request could be made; the payload is the credential
+    /// failure's own description, which already says where the key lives.
+    case noCredential(String)
+    /// The evicted messages carry no content the transcript builder renders.
+    case noTranscript
+    /// A pass came back with no text at all.
+    case emptySummary
+    /// A pass stopped at its output limit, so its text never covered the chunk
+    /// it was given. Committing it would delete work the summary omits.
+    case truncatedSummary
+    /// Stop was pressed while the summary was being written.
+    case cancelled
+    /// The provider request failed; the payload is the failure's description.
+    case provider(String)
+
+    /// What the chat surface prints for this outcome. A cause that sent no
+    /// request is reported as a precondition, never as a provider fault.
+    public func notice(providerName: String) -> String {
+        switch self {
+        case .conversationTooShort:
+            return "ℹ️ Nothing to compact — this conversation has too few messages."
+        case .nothingToEvict:
+            return "ℹ️ Nothing to compact — there is no older history to summarize yet."
+        case .conversationUnavailable:
+            return "⚠️ This conversation is no longer available — nothing was compacted."
+        case .noCredential(let description):
+            return "⚠️ \(description)"
+        case .noTranscript:
+            return "ℹ️ Nothing to compact — no user or assistant content to summarize yet."
+        case .emptySummary:
+            return "⚠️ \(providerName) returned an empty summary — the conversation was left unchanged."
+        case .truncatedSummary:
+            return "⚠️ \(providerName)'s summary stopped at its output limit before it covered the whole conversation, so the conversation was left unchanged."
+        case .cancelled:
+            return "⏹ Compaction stopped — the conversation was left unchanged."
+        case .provider(let description):
+            return "⚠️ \(providerName) could not summarize this conversation: \(description) — it was left unchanged."
+        }
+    }
+
+    /// The same cause as a clause with no glyph, for embedding in a longer
+    /// sentence (the context-overflow error names why compaction did not run).
+    public func clause(providerName: String) -> String {
+        switch self {
+        case .conversationTooShort:
+            return "there are too few messages to summarize"
+        case .nothingToEvict:
+            return "there is no older history to fold away"
+        case .conversationUnavailable:
+            return "the conversation is no longer available"
+        case .noCredential:
+            return "the summarizer's API key could not be used"
+        case .noTranscript:
+            return "no user or assistant content could be summarized"
+        case .emptySummary:
+            return "\(providerName) returned an empty summary"
+        case .truncatedSummary:
+            return "\(providerName)'s summary hit its output limit before it covered the conversation"
+        case .cancelled:
+            return "the summary was stopped"
+        case .provider(let description):
+            return "summarizing failed: \(description)"
+        }
     }
 }
 

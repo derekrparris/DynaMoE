@@ -596,6 +596,14 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
         }
     }
 
+    /// The same facade over an injected transport, so a test can drive the
+    /// terminal-event rules of `completeText` without a network.
+    init(provider: CloudProvider, flavor: CloudApiFlavor = .openAI, service: CloudChatServicing) {
+        self.provider = provider
+        self.flavor = flavor
+        self.service = service
+    }
+
     /// Builds a client from the Keychain, or nil when the provider has no
     /// stored key — the send path turns that into an actionable chat error.
     public static func makeStored(
@@ -671,6 +679,14 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
     /// The result carries the provider's usage block as well as the text: a
     /// summarizer pass is a billed request like any other, and dropping its
     /// usage made the session's spend understate the invoice.
+    ///
+    /// It also refuses to report a fragment as a completion. A `for await` over
+    /// an `AsyncStream` ends the moment its task is cancelled, with no terminal
+    /// event, so a Stop mid-summary used to return the characters collected so
+    /// far as if the provider had finished them. Cancellation now throws, and a
+    /// stream that ends without a terminal event throws instead of returning:
+    /// a compaction that deletes the messages behind a half-written summary
+    /// cannot be undone.
     public func completeText(
         model: String,
         systemPrompt: String,
@@ -690,6 +706,7 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
         )
         var text = ""
         var usage: CloudUsage?
+        var result: CloudTurnResult?
         var failure: CloudTurnFailure?
         for await event in streamTurn(model: model, messages: messages, params: params, tools: nil) {
             switch event {
@@ -697,20 +714,30 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
                 break
             case .contentDelta(let delta):
                 text += delta
-            case .finished(let result):
+            case .finished(let finished):
                 // The parser's accumulated text and the result's text are the
                 // same string; prefer the result because it is what the
                 // transport certified as complete.
-                if !result.text.isEmpty { text = result.text }
-                usage = result.usage
+                if !finished.text.isEmpty { text = finished.text }
+                usage = finished.usage
+                result = finished
             case .failed(let reported):
                 failure = reported
             }
         }
         if let failure { throw failure }
+        // A cancelled consumer leaves the loop with neither an outcome nor an
+        // error; whatever text it collected was abandoned mid-sentence.
+        try Task.checkCancellation()
+        guard let result else {
+            throw CloudTurnFailure.invalidResponse(
+                "The provider's stream ended before the completion was finished."
+            )
+        }
         return CloudTextCompletion(
             text: text.trimmingCharacters(in: .whitespacesAndNewlines),
-            usage: usage
+            usage: usage,
+            finishReason: result.finishReason
         )
     }
 

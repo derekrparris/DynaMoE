@@ -402,13 +402,25 @@ public nonisolated struct CloudTurnResult: Equatable, Sendable {
 /// rides along because those requests are billed like any other: a summary
 /// whose cost vanished would make the session's spend disagree with the
 /// provider's invoice.
+///
+/// `finishReason` is the provider's own reason for stopping. It exists so a
+/// caller can tell a finished summary from one the output limit cut off:
+/// `length`/`max_tokens` means the text stops mid-thought, and a compaction
+/// that committed it would delete messages the summary never covered.
 public nonisolated struct CloudTextCompletion: Equatable, Sendable {
     public let text: String
     public let usage: CloudUsage?
+    public let finishReason: String?
 
-    public init(text: String, usage: CloudUsage?) {
+    public init(text: String, usage: CloudUsage?, finishReason: String? = nil) {
         self.text = text
         self.usage = usage
+        self.finishReason = finishReason
+    }
+
+    /// Whether the provider stopped because the reply ran out of budget.
+    public var stoppedAtOutputLimit: Bool {
+        finishReason == "length" || finishReason == "max_tokens"
     }
 }
 

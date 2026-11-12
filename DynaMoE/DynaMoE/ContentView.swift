@@ -2666,14 +2666,32 @@ struct ContentView: View {
 
     // MARK: - Cloud compaction
 
-    /// What one cloud compaction did: whether the history was rewritten, and
-    /// what the summarizer requests cost. The spend is reported even when the
-    /// pass fails, because the provider billed the requests that did run.
+    /// What one cloud compaction did: whether the history was rewritten, what
+    /// the summarizer requests cost, the tokens they billed, and why nothing
+    /// happened when nothing did. Spend and tokens are reported even when the
+    /// pass fails, because the provider billed every request that did run; the
+    /// run's summary line adds them so its cost and its token totals describe
+    /// the same set of requests.
     private struct CloudCompactionOutcome {
         let didCompact: Bool
         let cost: Double
+        let promptTokens: Int
+        let cachedTokens: Int
+        let completionTokens: Int
+        let wasEstimated: Bool
+        let failure: CloudCompactionFailure?
 
-        static let failed = CloudCompactionOutcome(didCompact: false, cost: 0)
+        static func failed(_ reason: CloudCompactionFailure) -> CloudCompactionOutcome {
+            CloudCompactionOutcome(
+                didCompact: false,
+                cost: 0,
+                promptTokens: 0,
+                cachedTokens: 0,
+                completionTokens: 0,
+                wasEstimated: false,
+                failure: reason
+            )
+        }
     }
 
     /// Summarizes a cloud conversation's older half with the ACTIVE provider
@@ -2702,31 +2720,33 @@ struct ContentView: View {
         keepRecentMessages: Int,
         focus: String? = nil
     ) async -> CloudCompactionOutcome {
-        guard let startIdx = sessions.firstIndex(where: { $0.id == sessionId }) else { return .failed }
+        guard let startIdx = sessions.firstIndex(where: { $0.id == sessionId }) else {
+            return .failed(.conversationUnavailable)
+        }
         let all = sessions[startIdx].messages
-        guard all.count > 2 else { return .failed }
+        guard all.count > 2 else { return .failed(.conversationTooShort) }
 
         // A message boundary is a safe cut: a tool exchange is emitted from one
         // assistant message, so a call can never be separated from its result.
-        // The tail starts at a user turn when there is one to start at, at the
-        // requested cut when the conversation is a single agent run, and keeps
-        // that run's question when the cut would otherwise leave the request
-        // opening with an assistant turn.
+        // The tail starts at a user turn when that cut evicts conversation, at
+        // the requested cut when the conversation is a single agent run, and
+        // keeps that run's question when the cut would otherwise leave the
+        // request opening with an assistant turn.
         guard let plan = CloudCompactionBoundary.plan(
             messages: all,
             keepRecentMessages: keepRecentMessages
-        ) else { return .failed }
+        ) else { return .failed(.nothingToEvict) }
         let evicted = plan.evicted
         let kept = plan.kept
         let evictedCount = ChatSession.compactableMessageCount(in: evicted)
-        guard evictedCount >= 2 else { return .failed }
+        guard evictedCount >= 2 else { return .failed(.nothingToEvict) }
 
         let client: CloudChatClient
         switch CloudChatClient.makeStoredResult(provider: provider) {
         case .success(let ready):
             client = ready
-        case .failure:
-            return .failed
+        case .failure(let missing):
+            return .failed(.noCredential(missing.localizedDescription))
         }
 
         let chunks = AppleFoundationModelService.buildCompactionTranscriptChunks(
@@ -2734,7 +2754,7 @@ struct ContentView: View {
             excludingMessageIds: [],
             charBudget: CloudContextPolicy.chunkCharacterBudget(window: window)
         )
-        guard let recentChunk = chunks.last else { return .failed }
+        guard let recentChunk = chunks.last else { return .failed(.noTranscript) }
 
         let summaryInstructions = AppleFoundationModelService.compactionSummaryInstructions(focus: focus)
         let recapInstructions = AppleFoundationModelService.compactionRecapInstructions(focus: focus)
@@ -2747,76 +2767,133 @@ struct ContentView: View {
             providerId: provider.id
         )
         var spent: Double = 0
+        var summarizerPromptTokens = 0
+        var summarizerCachedTokens = 0
+        var summarizerCompletionTokens = 0
+        var summarizerWasEstimated = false
         // Summarizer requests are billed whether or not the pass completes, so
         // every exit settles them against the live session before returning.
-        func finish(_ didCompact: Bool) -> CloudCompactionOutcome {
+        func finish(_ failure: CloudCompactionFailure?) -> CloudCompactionOutcome {
             if spent > 0, let liveIdx = sessions.firstIndex(where: { $0.id == sessionId }) {
                 sessions[liveIdx].cumulativeCost = (sessions[liveIdx].cumulativeCost ?? 0) + spent
             }
-            return CloudCompactionOutcome(didCompact: didCompact, cost: spent)
+            return CloudCompactionOutcome(
+                didCompact: failure == nil,
+                cost: spent,
+                promptTokens: summarizerPromptTokens,
+                cachedTokens: summarizerCachedTokens,
+                completionTokens: summarizerCompletionTokens,
+                wasEstimated: summarizerWasEstimated,
+                failure: failure
+            )
         }
-        func charge(_ completion: CloudTextCompletion) {
-            guard let pricing, let usage = completion.usage else { return }
-            spent += pricing.cost(for: usage) ?? 0
+        func charge(_ completion: CloudTextCompletion, estimatedPromptTokens: Int) {
+            guard let usage = completion.usage else {
+                // A pass that reported no usage still ran and still billed: the
+                // app's own estimate keeps the run's token figures covering the
+                // same requests as its cost, and `(est.)` says so.
+                summarizerWasEstimated = true
+                summarizerPromptTokens += max(0, estimatedPromptTokens)
+                summarizerCompletionTokens += AppleFoundationModelService.recordedOutputTokenCount(
+                    for: completion.text
+                )
+                return
+            }
+            summarizerPromptTokens += max(0, usage.promptTokens ?? 0)
+            summarizerCachedTokens += max(0, usage.cachedTokens ?? 0)
+            summarizerCompletionTokens += max(0, usage.completionTokens ?? 0)
+            if usage.promptTokens == nil || usage.completionTokens == nil {
+                summarizerWasEstimated = true
+            }
+            guard let pricing, let cost = pricing.cost(for: usage) else { return }
+            spent += cost
+        }
+        // One summarizer pass that may replace messages. A summary cut off at
+        // the output limit is refused rather than committed: the messages it
+        // was going to replace are deleted permanently, and the text that
+        // would take their place never covered the end of the chunk.
+        func summarize(system: String, prompt: String) async throws -> String {
+            let completion = try await client.completeText(
+                model: providerModelId,
+                systemPrompt: system,
+                userPrompt: prompt,
+                maxTokens: responseTokens,
+                sessionKey: sessionKey
+            )
+            charge(
+                completion,
+                estimatedPromptTokens: CloudMessageAssembler.approximatePromptTokens(
+                    system: system,
+                    messages: [CloudChatMessage(role: "user", content: prompt)]
+                )
+            )
+            guard !completion.text.isEmpty else { throw CloudCompactionFailure.emptySummary }
+            guard !completion.stoppedAtOutputLimit else {
+                throw CloudCompactionFailure.truncatedSummary
+            }
+            return completion.text
         }
         var mergedSummary = sessions[startIdx].rollingSummary
         var mergedRecap = sessions[startIdx].recentWorkDigest
 
         do {
             for chunk in chunks.dropLast() {
-                let merged = try await client.completeText(
-                    model: providerModelId,
-                    systemPrompt: summaryInstructions,
-                    userPrompt: AppleFoundationModelService.compactionPrompt(
+                mergedSummary = try await summarize(
+                    system: summaryInstructions,
+                    prompt: AppleFoundationModelService.compactionPrompt(
                         previousSummary: mergedSummary,
                         previousRecap: mergedRecap,
                         evictedTranscript: chunk
-                    ),
-                    maxTokens: responseTokens,
-                    sessionKey: sessionKey
+                    )
                 )
-                charge(merged)
-                guard !merged.text.isEmpty else { return finish(false) }
-                mergedSummary = merged.text
                 // The recap describes work older than the newest chunk, and it
                 // has just been folded into the summary; the pass at the end
                 // writes a fresh one.
                 mergedRecap = nil
             }
 
-            let summary = try await client.completeText(
-                model: providerModelId,
-                systemPrompt: summaryInstructions,
-                userPrompt: AppleFoundationModelService.compactionPrompt(
+            let summaryText = try await summarize(
+                system: summaryInstructions,
+                prompt: AppleFoundationModelService.compactionPrompt(
                     previousSummary: mergedSummary,
                     previousRecap: mergedRecap,
                     evictedTranscript: recentChunk
-                ),
-                maxTokens: responseTokens,
-                sessionKey: sessionKey
+                )
             )
-            charge(summary)
-            guard !summary.text.isEmpty else { return finish(false) }
 
+            let recapPrompt = "Conversation excerpt, oldest messages first — the most recent work last:\n\n\(recentChunk)"
             let recap = try await client.completeText(
                 model: providerModelId,
                 systemPrompt: recapInstructions,
-                userPrompt: "Conversation excerpt, oldest messages first — the most recent work last:\n\n\(recentChunk)",
+                userPrompt: recapPrompt,
                 maxTokens: responseTokens,
                 sessionKey: sessionKey
             )
-            charge(recap)
+            charge(
+                recap,
+                estimatedPromptTokens: CloudMessageAssembler.approximatePromptTokens(
+                    system: recapInstructions,
+                    messages: [CloudChatMessage(role: "user", content: recapPrompt)]
+                )
+            )
+            // The recap supplements a complete summary rather than replacing
+            // anything, so a truncated one costs detail and nothing else; the
+            // next compaction asks for a fresh one.
 
+            // Cancellation is checked LAST, immediately before the rewrite: a
+            // Stop during any pass must leave the history it was about to
+            // replace exactly as it was.
+            try Task.checkCancellation()
             // Re-resolve by identity: the user may have switched chats, and a
             // retention sweep may have removed this conversation, while the
             // provider was summarizing.
             guard let liveIdx = sessions.firstIndex(where: { $0.id == sessionId }) else {
-                return finish(false)
+                return finish(.conversationUnavailable)
             }
-            sessions[liveIdx].rollingSummary = summary.text
+            sessions[liveIdx].rollingSummary = summaryText
             sessions[liveIdx].recentWorkDigest = recap.text.isEmpty ? nil : recap.text
             sessions[liveIdx].messages = ChatSession.compactedHistory(
-                summary: summary.text,
+                summary: summaryText,
                 recap: recap.text.isEmpty ? nil : recap.text,
                 evictedMessageCount: evictedCount,
                 modelLabel: provider.displayName
@@ -2827,10 +2904,14 @@ struct ContentView: View {
             // The token prefix changed: a pinned KV state for this conversation
             // no longer matches. One full re-prefill is the cost of compaction.
             PrefixCacheManager.shared.invalidate(sessionId: sessionId)
-            return finish(true)
+            return finish(nil)
+        } catch let reason as CloudCompactionFailure {
+            return finish(reason)
+        } catch is CancellationError {
+            return finish(.cancelled)
         } catch {
             print("☁️ [COMPACT] cloud compaction failed: \(error.localizedDescription)")
-            return finish(false)
+            return finish(.provider(error.localizedDescription))
         }
     }
 
@@ -2874,14 +2955,23 @@ struct ContentView: View {
                     ? " Summarizing cost \(CloudPricingStore.formatted(outcome.cost))."
                     : ""
                 self.showStatus("🗂 Compacted this conversation with \(provider.displayName). The summary stays at the top of the chat.\(spend)")
+            } else if outcome.failure == .cancelled {
+                // Stop is an outcome the user asked for, not a fault, and the
+                // history it interrupted was never touched.
+                self.showStatus("⏹ Compaction stopped — the conversation was left unchanged.")
             } else {
+                // Every refusal names its own cause: a missing key, a chat with
+                // nothing evictable and an empty summary are not the provider
+                // failing to summarize, and each has a different next step.
+                let notice = outcome.failure?.notice(providerName: provider.displayName)
+                    ?? "⚠️ Cloud compaction failed — the conversation was left unchanged."
                 if let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
                     self.sessions[liveIdx].messages.append(ChatMessage(
                         role: .system,
-                        content: "⚠️ \(provider.displayName) could not summarize this conversation — it was left unchanged."
+                        content: notice
                     ))
                 }
-                self.showStatus("⚠️ Cloud compaction failed — the conversation was left unchanged.", kind: .warning)
+                self.showStatus(notice)
             }
         }
         return true
@@ -4281,6 +4371,10 @@ struct ContentView: View {
             // prompt must not loop, while a failed attempt must leave the
             // overflow-recovery retry below available.
             var attemptedContextCompaction = false
+            // Why the last attempt left the history alone, so the error at the
+            // context wall names what happened rather than blaming the provider
+            // for a pass that summarised nothing.
+            var contextCompactionFailure: CloudCompactionFailure?
             // Image parts are built once per turn, off the main actor. History is
             // re-assembled on every step, but the turn's pictures never change.
             // Skipped entirely for a text-only model: encoding megabytes of base64
@@ -4375,15 +4469,28 @@ struct ContentView: View {
                             window: window,
                             keepRecentMessages: 8
                         )
+                        // The summarizer is billed like any other request, so
+                        // its spend AND its tokens join the run totals: a cost
+                        // that covers requests its token counts omit cannot be
+                        // reconciled with the figures beside it.
+                        runPromptTokens += outcome.promptTokens
+                        runCachedTokens += outcome.cachedTokens
+                        runOutputTokens += outcome.completionTokens
+                        if outcome.wasEstimated { runWasEstimated = true }
                         if outcome.cost > 0 {
                             runCost = (runCost ?? 0) + outcome.cost
                         }
                         if outcome.didCompact {
                             attemptedContextCompaction = true
+                            contextCompactionFailure = nil
                             resetOdometerAfterCompaction()
                             self.showStatus("🗂 Context was near this model's limit — compacted older history before continuing.")
                             continue
                         }
+                        contextCompactionFailure = outcome.failure
+                        // A Stop during the summary cancelled this task; the
+                        // loop must not spend a request on a turn that is over.
+                        guard !Task.isCancelled, self.ownsGeneration(myGenerationId) else { return }
                     }
                 }
                 // The digest is read here, per step, so a compaction that ran
@@ -4614,11 +4721,16 @@ struct ContentView: View {
                         window: contextWindow,
                         keepRecentMessages: 4
                     )
+                    runPromptTokens += outcome.promptTokens
+                    runCachedTokens += outcome.cachedTokens
+                    runOutputTokens += outcome.completionTokens
+                    if outcome.wasEstimated { runWasEstimated = true }
                     if outcome.cost > 0 {
                         runCost = (runCost ?? 0) + outcome.cost
                     }
                     if outcome.didCompact {
                         attemptedContextCompaction = true
+                        contextCompactionFailure = nil
                         resetOdometerAfterCompaction()
                         turnLog.recordChatTurn(
                             status: 400,
@@ -4632,6 +4744,8 @@ struct ContentView: View {
                         self.showStatus("🗂 The conversation exceeded this model's context window — compacted older history and retrying the step.")
                         continue
                     }
+                    contextCompactionFailure = outcome.failure
+                    guard !Task.isCancelled, self.ownsGeneration(myGenerationId) else { return }
                 }
 
                 if let failure = serviceFailure {
@@ -4640,8 +4754,15 @@ struct ContentView: View {
                         if CloudTurnFailure.indicatesContextOverflow(summary) {
                             // A long agent run overflows the provider's context
                             // window too; blaming tool schemas there sends the
-                            // user after the wrong setting.
-                            errText += " The conversation exceeded this model's context window — older history could not be compacted automatically, so start a new chat or run /compact."
+                            // user after the wrong setting. The advice names
+                            // which history this is: one that already compacted,
+                            // one whose compaction failed, or one with no
+                            // attempt at all.
+                            errText += CloudOverflowAdvice.text(
+                                alreadyCompacted: attemptedContextCompaction,
+                                failure: contextCompactionFailure,
+                                providerName: provider.displayName
+                            )
                         } else {
                             errText += " Tool schemas may be unsupported for this model — turn Agent Tools off, or register the model under the provider's no-tools key (`dynamoe_cloud_\(provider.id)_no_tools`)."
                         }

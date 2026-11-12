@@ -1740,18 +1740,66 @@ final class CloudCompactionBoundaryTests: XCTestCase {
         XCTAssertNil(CloudCompactionBoundary.tailStart(messages: [], keepRecentMessages: 1))
     }
 
-    func testACompactedHistoryCanCompactAgain() {
+    func testACompactedAgentRunCompactsAgain() throws {
         // The head is the system-role card and marker a previous compaction
-        // left behind, so the backward walk lands on a system row. Keeping the
-        // NEXT user turn is what stops a conversation from compacting once and
-        // then silently refusing forever.
+        // left behind, and a long agent run has exactly ONE user turn — at
+        // index 2, behind that head. Cutting there evicted the two system rows
+        // and nothing else, so the second compaction reported a failure and
+        // every later overflow was unrecoverable. The cut must fall through to
+        // the requested boundary and fold away the run itself.
+        var messages = [
+            ChatMessage(role: .system, content: "card"),
+            ChatMessage(role: .system, content: "marker"),
+            ChatMessage(role: .user, content: "build the thing")
+        ]
+        for step in 0..<20 {
+            messages.append(ChatMessage(role: .assistant, content: "step \(step)"))
+        }
+        XCTAssertEqual(messages.count, 23)
+        XCTAssertEqual(
+            CloudCompactionBoundary.tailStart(messages: messages, keepRecentMessages: 8),
+            15
+        )
+        let plan = try XCTUnwrap(
+            CloudCompactionBoundary.plan(messages: messages, keepRecentMessages: 8)
+        )
+        XCTAssertGreaterThanOrEqual(ChatSession.compactableMessageCount(in: plan.evicted), 2)
+        // The run's question stays as the request's opening user turn.
+        XCTAssertEqual(plan.kept.first?.content, "build the thing")
+        XCTAssertEqual(plan.kept.count, 9)
+        // Nothing is both summarized and kept.
+        XCTAssertTrue(Set(plan.kept.map(\.id)).isDisjoint(with: Set(plan.evicted.map(\.id))))
+    }
+
+    func testAShortCompactedHistorySaysThereIsNothingToCompact() {
+        // The only cut a compacted head offers is the two system rows. A plan
+        // that evicts them rewrites the history for nothing and reports a
+        // failure, so the honest answer is nil — not an unusable plan.
         let messages = [
             ChatMessage(role: .system, content: "card"),
             ChatMessage(role: .system, content: "marker"),
             ChatMessage(role: .user, content: "continue"),
             ChatMessage(role: .assistant, content: "ok")
         ]
-        XCTAssertEqual(CloudCompactionBoundary.tailStart(messages: messages, keepRecentMessages: 8), 2)
+        XCTAssertNil(CloudCompactionBoundary.tailStart(messages: messages, keepRecentMessages: 8))
+        XCTAssertNil(CloudCompactionBoundary.plan(messages: messages, keepRecentMessages: 8))
+    }
+
+    func testAPlanNeverFoldsAwayOnlySystemRows() throws {
+        // The anchor rule can put back the only conversation row the cut had,
+        // which leaves a plan whose summary replaces nothing.
+        let messages = [
+            ChatMessage(role: .user, content: "the only question"),
+            ChatMessage(role: .assistant, content: "the only answer")
+        ]
+        let plan = CloudCompactionBoundary.plan(messages: messages, keepRecentMessages: 1)
+        XCTAssertNil(plan)
+        // The manual form still folds the whole conversation away.
+        let manual = try XCTUnwrap(
+            CloudCompactionBoundary.plan(messages: messages, keepRecentMessages: 0)
+        )
+        XCTAssertEqual(manual.evicted.count, 2)
+        XCTAssertTrue(manual.kept.isEmpty)
     }
 
     func testAnAgentRunCutsAtTheRequestedBoundary() {
@@ -1850,6 +1898,257 @@ final class CloudCompactionBoundaryTests: XCTestCase {
     }
 }
 
+// MARK: - Compaction outcomes
+
+final class CloudCompactionFailureTests: XCTestCase {
+    func testAPreflightRefusalDoesNotBlameTheProvider() {
+        // "\(provider) could not summarize this conversation" was printed for
+        // every refusal, including the ones that never sent a request. The two
+        // bulletins and the empty transcript are the caller's own state.
+        for reason in [
+            CloudCompactionFailure.conversationTooShort,
+            .nothingToEvict,
+            .noTranscript
+        ] {
+            let notice = reason.notice(providerName: "Synthetic")
+            XCTAssertTrue(notice.hasPrefix("ℹ️"), notice)
+            XCTAssertFalse(notice.contains("Synthetic"), notice)
+        }
+    }
+
+    func testAMissingKeySaysWhereTheKeyLives() {
+        let failure = CloudTurnFailure.missingAPIKey(providerName: "Synthetic")
+        let notice = CloudCompactionFailure.noCredential(failure.localizedDescription)
+            .notice(providerName: "Synthetic")
+        XCTAssertTrue(notice.contains("No API key is stored for Synthetic"), notice)
+        XCTAssertTrue(notice.contains("Settings"), notice)
+    }
+
+    func testAProviderFaultIsNamedAsOne() {
+        let notice = CloudCompactionFailure.provider("The provider returned HTTP 429.")
+            .notice(providerName: "Synthetic")
+        XCTAssertTrue(notice.hasPrefix("⚠️"))
+        XCTAssertTrue(notice.contains("HTTP 429"))
+        XCTAssertTrue(notice.hasSuffix("it was left unchanged."))
+    }
+
+    func testATruncatedSummaryIsRefusedWithItsReason() {
+        let reason = CloudCompactionFailure.truncatedSummary
+        XCTAssertTrue(reason.notice(providerName: "Synthetic").contains("output limit"))
+        XCTAssertTrue(reason.clause(providerName: "Synthetic").contains("output limit"))
+    }
+
+    func testAStopReadsAsAnOutcomeRatherThanAFault() {
+        let notice = CloudCompactionFailure.cancelled.notice(providerName: "Synthetic")
+        XCTAssertTrue(notice.hasPrefix("⏹"), notice)
+        XCTAssertTrue(notice.contains("left unchanged"), notice)
+    }
+
+    func testEveryClauseCanEndASentence() {
+        // The overflow error embeds the clause: it must be one line and must
+        // not carry the pill's glyph.
+        for reason in [
+            CloudCompactionFailure.conversationTooShort,
+            .nothingToEvict,
+            .conversationUnavailable,
+            .noCredential("ignored"),
+            .noTranscript,
+            .emptySummary,
+            .truncatedSummary,
+            .cancelled,
+            .provider("HTTP 400")
+        ] {
+            let clause = reason.clause(providerName: "Synthetic")
+            XCTAssertFalse(clause.isEmpty)
+            XCTAssertFalse(clause.hasPrefix("⚠️") || clause.hasPrefix("ℹ️") || clause.hasPrefix("⏹"))
+            XCTAssertFalse(clause.contains("\n"), clause)
+        }
+    }
+
+    func testASecondOverflowNamesTheCompactionItAlreadyRan() {
+        // A run that compacted once and still overflowed used to be told the
+        // history "could not be compacted automatically", which was true of no
+        // attempt at all and false of this one.
+        let alreadyRan = CloudOverflowAdvice.text(
+            alreadyCompacted: true,
+            failure: .nothingToEvict,
+            providerName: "Synthetic"
+        )
+        XCTAssertTrue(alreadyRan.contains("already compacted older history once"), alreadyRan)
+        XCTAssertFalse(alreadyRan.contains("could not be compacted"), alreadyRan)
+
+        // A failed attempt names its cause instead of the generic line.
+        let failed = CloudOverflowAdvice.text(
+            alreadyCompacted: false,
+            failure: .nothingToEvict,
+            providerName: "Synthetic"
+        )
+        XCTAssertTrue(failed.contains("left the history unchanged"), failed)
+        XCTAssertTrue(failed.contains("no older history to fold away"), failed)
+
+        // No attempt at all keeps the original advice.
+        let untouched = CloudOverflowAdvice.text(
+            alreadyCompacted: false,
+            failure: nil,
+            providerName: "Synthetic"
+        )
+        XCTAssertTrue(untouched.contains("could not be compacted automatically"), untouched)
+    }
+
+    func testAReplyThatHitItsLimitIsDistinguishable() {
+        let complete = CloudTextCompletion(
+            text: "done",
+            usage: nil,
+            finishReason: "stop"
+        )
+        XCTAssertFalse(complete.stoppedAtOutputLimit)
+        let truncated = CloudTextCompletion(
+            text: "half a sent",
+            usage: nil,
+            finishReason: "length"
+        )
+        XCTAssertTrue(truncated.stoppedAtOutputLimit)
+        XCTAssertTrue(CloudTextCompletion(
+            text: "half a sent",
+            usage: nil,
+            finishReason: "max_tokens"
+        ).stoppedAtOutputLimit)
+        // A provider that reports no reason is not assumed to have truncated.
+        XCTAssertFalse(CloudTextCompletion(text: "done", usage: nil).stoppedAtOutputLimit)
+    }
+}
+
+// MARK: - Summarizer completions
+
+/// A transport with a scripted stream, for the terminal-event rules a real
+/// provider cannot be asked to reproduce on demand.
+private nonisolated final class ScriptedCloudService: CloudChatServicing, @unchecked Sendable {
+    private let script: @Sendable (AsyncStream<CloudTurnEvent>.Continuation) -> Void
+
+    init(script: @escaping @Sendable (AsyncStream<CloudTurnEvent>.Continuation) -> Void) {
+        self.script = script
+    }
+
+    func streamTurn(
+        model: String,
+        messages: [CloudChatMessage],
+        params: CloudChatGenerationParams,
+        tools: [ToolDefinition]?
+    ) -> AsyncStream<CloudTurnEvent> {
+        AsyncStream { continuation in
+            script(continuation)
+        }
+    }
+
+    func fetchModelIds() async throws -> [String] { [] }
+}
+
+final class CloudTextCompletionTests: XCTestCase {
+    private func client(_ script: @escaping @Sendable (AsyncStream<CloudTurnEvent>.Continuation) -> Void) -> CloudChatClient {
+        CloudChatClient(
+            provider: CloudProvider(
+                id: "p",
+                displayName: "Synthetic",
+                openAIBaseURL: URL(string: "https://example.invalid/v1")!
+            ),
+            service: ScriptedCloudService(script: script)
+        )
+    }
+
+    private func complete(_ client: CloudChatClient) async throws -> CloudTextCompletion {
+        try await client.completeText(
+            model: "m",
+            systemPrompt: "summarize",
+            userPrompt: "the chunk",
+            maxTokens: 2_000,
+            sessionKey: nil
+        )
+    }
+
+    func testAFinishedStreamReturnsItsTextUsageAndReason() async throws {
+        let usage = CloudUsage(promptTokens: 100, completionTokens: 20)
+        let client = client { continuation in
+            continuation.yield(.started)
+            continuation.yield(.contentDelta("a summary"))
+            continuation.yield(.finished(CloudTurnResult(
+                text: "a summary",
+                thinking: "",
+                finishReason: "stop",
+                usage: usage
+            )))
+            continuation.finish()
+        }
+        let completion = try await complete(client)
+        XCTAssertEqual(completion.text, "a summary")
+        XCTAssertEqual(completion.usage, usage)
+        XCTAssertEqual(completion.finishReason, "stop")
+        XCTAssertFalse(completion.stoppedAtOutputLimit)
+    }
+
+    func testAStreamThatEndsWithoutATerminalEventThrows() async {
+        // A provider that closes the stream mid-reply must not be read as
+        // having finished one: the fragment would replace the messages a
+        // compaction is about to delete.
+        let client = client { continuation in
+            continuation.yield(.started)
+            continuation.yield(.contentDelta("half a sent"))
+            continuation.finish()
+        }
+        do {
+            let completion = try await complete(client)
+            XCTFail("expected a refusal, got \(completion.text)")
+        } catch let failure as CloudTurnFailure {
+            guard case .invalidResponse = failure else {
+                return XCTFail("unexpected failure: \(failure)")
+            }
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
+    func testACancelledSummaryThrowsInsteadOfReturningItsFragment() async {
+        // `for await` over an AsyncStream ends the moment its task is
+        // cancelled, with no event of any kind. Stop used to be indistinguishable
+        // from a finished summary, so a half-written one was committed.
+        let client = client { continuation in
+            continuation.yield(.started)
+            continuation.yield(.contentDelta("half a sent"))
+            let held = Task {
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+            }
+            continuation.onTermination = { _ in held.cancel() }
+        }
+        let task = Task { try await complete(client) }
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        task.cancel()
+        do {
+            let completion = try await task.value
+            XCTFail("expected cancellation, got \(completion.text)")
+        } catch is CancellationError {
+            // The expected outcome.
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
+    func testAProviderFailureIsRaisedRatherThanReturnedAsText() async {
+        let client = client { continuation in
+            continuation.yield(.started)
+            continuation.yield(.contentDelta("half"))
+            continuation.yield(.failed(.httpStatus(code: 429, summary: "slow down")))
+            continuation.finish()
+        }
+        do {
+            _ = try await complete(client)
+            XCTFail("expected the provider failure to be raised")
+        } catch let failure as CloudTurnFailure {
+            XCTAssertEqual(failure, .httpStatus(code: 429, summary: "slow down"))
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+}
+
 // MARK: - Context odometer
 
 final class CloudContextOdometerTests: XCTestCase {
@@ -1907,6 +2206,11 @@ final class CloudPricingTests: XCTestCase {
         XCTAssertEqual(CloudPricingStore.formatted(0.00012), "$0.0001")
         XCTAssertEqual(CloudPricingStore.formatted(1.234), "$1.23")
         XCTAssertEqual(CloudPricingStore.formatted(0), "$0")
+        // A cost too small to render at four places used to print "$0.0000",
+        // which reads as free on a turn that was billed.
+        XCTAssertEqual(CloudPricingStore.formatted(0.00004), "<$0.0001")
+        XCTAssertEqual(CloudPricingStore.formatted(-1), "$0")
+        XCTAssertEqual(CloudPricingStore.formatted(.nan), "$0")
     }
 }
 

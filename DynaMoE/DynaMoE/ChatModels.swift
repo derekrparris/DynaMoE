@@ -339,15 +339,19 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
     /// Persisted so the truncation marker survives compaction (which replaces
     /// `messages` and would otherwise erase the evidence) and renames.
     public var titleOrigin: SessionTitleOrigin?
-    /// Running total of every token this conversation has consumed: the prompt
-    /// tokens each turn actually ingested (the portion the pinned prefix did
-    /// not already cover) plus every generated token, across all agent steps.
-    /// A cloud turn's provider cache reads are subtracted the same way a local
-    /// pinned prefix is, so a cheap re-send never reads as fresh context.
-    /// `nil` when unmetered — a history from before the counter existed, or a
-    /// conversation freshly compacted by /compact, which resets the total —
-    /// and the next send then initializes it from that turn's full prompt,
-    /// which is the conversation's context size.
+    /// Running total of every token this conversation has consumed. A local
+    /// turn contributes the prompt tokens it actually ingested (the portion
+    /// the pinned prefix did not already cover) plus every generated token,
+    /// across all agent steps. A cloud turn is different in kind: every step
+    /// re-sends the whole conversation, so it contributes the LAST request's
+    /// full prompt — cache reads included — plus the tokens generated after
+    /// it. That figure is the context in flight, not a sum of billable input:
+    /// a provider cache read is still context the model was given, so unlike
+    /// a local pinned prefix it is not subtracted. `nil` when unmetered — a
+    /// history from before the counter existed, or a conversation freshly
+    /// compacted by /compact, which resets the total — and the next send then
+    /// initializes it from that turn's full prompt, which is the
+    /// conversation's context size.
     public var cumulativeTokenCount: Int?
     /// Running spend for this conversation, in whatever currency the recorded
     /// price list uses (USD by convention). Only a cloud turn contributes: a
