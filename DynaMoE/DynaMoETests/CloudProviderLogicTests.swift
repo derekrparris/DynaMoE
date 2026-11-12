@@ -1539,6 +1539,51 @@ final class CloudUsageSplitTests: XCTestCase {
         let decoded = try JSONDecoder().decode(CloudUsage.self, from: data)
         XCTAssertEqual(decoded, original)
     }
+
+    func testALaterPartialUsageBlockKeepsTheColumnsItOmits() {
+        // Some endpoints send a running `output_tokens` mid-stream and the
+        // prompt only at the end (or the other way round). Replacing the
+        // accumulated block with the newest one dropped the prompt and its
+        // cache split, which silently turned a measured block into an estimate
+        // — exactly where the cache reporting matters.
+        let full = CloudUsage(
+            promptTokens: 1_000,
+            completionTokens: 5,
+            totalTokens: nil,
+            cachedTokens: 800,
+            cacheWriteTokens: 100
+        )
+        let later = CloudUsage(promptTokens: nil, completionTokens: 50, totalTokens: nil)
+        let merged = full.merging(later)
+        XCTAssertEqual(merged.promptTokens, 1_000)
+        XCTAssertEqual(merged.cachedTokens, 800)
+        XCTAssertEqual(merged.cacheWriteTokens, 100)
+        XCTAssertEqual(merged.completionTokens, 50)
+    }
+
+    func testALaterUsageBlockOverwritesTheColumnsItReports() {
+        let earlier = CloudUsage(promptTokens: 10, completionTokens: 1, cachedTokens: 4)
+        let later = CloudUsage(promptTokens: 1_000, completionTokens: 50, cachedTokens: 900)
+        let merged = earlier.merging(later)
+        XCTAssertEqual(merged.promptTokens, 1_000)
+        XCTAssertEqual(merged.completionTokens, 50)
+        XCTAssertEqual(merged.cachedTokens, 900)
+    }
+
+    func testTheStreamParserMergesUsageAcrossChunks() throws {
+        var parser = CloudStreamParser()
+        _ = try parser.consume(
+            dataPayload: #"{"choices":[{"delta":{"content":"hi"}}],"usage":{"prompt_tokens":900,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":700}}}"#
+        )
+        // A trailing chunk that carries only the final output count.
+        _ = try parser.consume(
+            dataPayload: #"{"choices":[],"usage":{"completion_tokens":42}}"#
+        )
+        let usage = try XCTUnwrap(parser.usage)
+        XCTAssertEqual(usage.promptTokens, 900)
+        XCTAssertEqual(usage.cachedTokens, 700)
+        XCTAssertEqual(usage.completionTokens, 42)
+    }
 }
 
 // MARK: - Cache hints on the wire
@@ -1711,6 +1756,48 @@ final class CloudCacheHintRequestTests: XCTestCase {
         let provider = try JSONDecoder().decode(CloudProvider.self, from: Data(json.utf8))
         XCTAssertEqual(provider.cacheHints, .affinity)
         XCTAssertEqual(provider.resolvedCacheHints, .affinity)
+    }
+
+    func testACacheHintThatIsNotEvenAStringStillDecodes() throws {
+        // The same tolerance as an unrecognised spelling. A number here threw
+        // out of the provider's decoder, which `FailableProvider` turned into a
+        // dropped provider — a whole account lost over one wrong value in a
+        // label the app can default.
+        let json = #"""
+        {"id":"custom","displayName":"Custom","openAIBaseURL":"https://custom.test/v1","cacheHints":1}
+        """#
+        let provider = try JSONDecoder().decode(CloudProvider.self, from: Data(json.utf8))
+        XCTAssertEqual(provider.cacheHints, .affinity)
+    }
+
+    func testTheLatchedHintIsInjectedRatherThanGlobal() throws {
+        // The latch is keyed by endpoint and lives for the process. A service
+        // that holds its own instance keeps one case (or one app run) from
+        // leaving a state the next one did not set up.
+        let endpoint = "https://injected-\(UUID().uuidString).test/openai/v1/chat/completions"
+        let memory = CloudCacheHintMemory()
+        let service = OpenAICloudChatService(
+            chatURL: URL(string: endpoint)!,
+            modelsURL: URL(string: "https://injected.test/openai/v1/models")!,
+            apiKey: "sk-test",
+            requestTimeout: 5,
+            cacheHints: .openAI,
+            cacheHintMemory: memory
+        )
+        memory.declinePromptCacheKey(endpoint: endpoint)
+        let request = try service.makeRequest(
+            model: "m",
+            messages: [CloudChatMessage(role: "user", content: "hi")],
+            params: CloudChatGenerationParams(sessionKey: "abc123")
+        )
+        XCTAssertNil(try body(request)["prompt_cache_key"])
+        // The process-wide latch never saw this endpoint, so another service
+        // (which defaults to it) still sends the key.
+        XCTAssertTrue(OpenAICloudChatService.sendsCacheKey(
+            hints: .openAI,
+            sessionKey: "abc123",
+            endpoint: endpoint
+        ))
     }
 }
 
@@ -2069,6 +2156,26 @@ final class CloudContextPolicyTests: XCTestCase {
         XCTAssertEqual(CloudContextPolicy.chunkCharacterBudget(window: 128_000), 168_960)
         // Unknown windows still get a usable chunk rather than zero.
         XCTAssertEqual(CloudContextPolicy.chunkCharacterBudget(window: nil), 24_000)
+    }
+
+    func testAnAbsurdWindowCannotTrapTheChunkBudget() {
+        // The window is hand-typed. `Int(Double(window) * 0.33) * 4` trapped on
+        // a value near Int.max; a budget that large is a units mistake, so it
+        // clamps instead of crashing the /compact command.
+        XCTAssertEqual(
+            CloudContextPolicy.chunkCharacterBudget(window: Int.max),
+            CloudContextPolicy.maximumChunkCharacters
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.chunkCharacterBudget(window: Int.max / 2),
+            CloudContextPolicy.maximumChunkCharacters
+        )
+        XCTAssertLessThanOrEqual(
+            CloudContextPolicy.summaryResponseTokens(window: Int.max),
+            8_000
+        )
+        // The sensible range is untouched.
+        XCTAssertEqual(CloudContextPolicy.chunkCharacterBudget(window: 1_048_576), 1_384_120)
     }
 
     func testTheSummarizerBudgetScalesWithTheChunk() {
@@ -2790,7 +2897,7 @@ final class CloudTurnReportTests: XCTestCase {
             cost: 0.0031,
             wasEstimated: false
         )
-        XCTAssertEqual(report.statusSuffix, "24,000 billed in (18,000 cached) / 350 out · $0.0031")
+        XCTAssertEqual(report.statusSuffix, "24,000 billed in (18,000 of it cached) / 350 out · $0.0031")
     }
 
     func testARunWithOneEstimatedStepIsStillMarked() {

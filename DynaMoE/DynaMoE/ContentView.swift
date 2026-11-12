@@ -2603,6 +2603,12 @@ struct ContentView: View {
                         temperature: 0.0,
                         maximumResponseTokens: AppleFoundationModelService.compactionSummaryResponseTokens
                     )
+                    // A Stop during the pass must not be read as a finished
+                    // digest: the summarizer can return the text it had
+                    // produced before the cancellation, and folding that
+                    // fragment in would commit a summary whose omissions are
+                    // permanent once the rewrite below deletes the messages.
+                    try Task.checkCancellation()
                     let mergedText = merged.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !mergedText.isEmpty else {
                         throw AppleFoundationModelUnavailableError(reason: "An older-history digest came back empty.")
@@ -2629,6 +2635,14 @@ struct ContentView: View {
                     lastUIWrite = now
                     postToProgress("🗂 Compacting \(evictedCount) messages — general summary so far:\n\n\(partial)")
                 }
+                // `streamChatTurn` RETURNS the partial text when the task is
+                // cancelled (it breaks out of the reveal loop rather than
+                // throwing), so without this check a Stop after the first
+                // token committed a truncated summary and deleted every
+                // message it failed to cover. Checked before the emptiness
+                // guard below, because a Stop before the first token would
+                // otherwise be reported as "the summary came back empty".
+                try Task.checkCancellation()
                 let newSummaryText = newSummary.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !newSummaryText.isEmpty else {
                     throw AppleFoundationModelUnavailableError(reason: "The summary came back empty.")
@@ -2642,14 +2656,31 @@ struct ContentView: View {
                     temperature: 0.0,
                     maximumResponseTokens: AppleFoundationModelService.compactionRecapResponseTokens
                 )
+                // Same rule as the pass above: a cancelled one-shot can still
+                // return what it had produced.
+                try Task.checkCancellation()
                 let newRecapText = newRecap.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !newRecapText.isEmpty else {
                     throw AppleFoundationModelUnavailableError(reason: "The recap came back empty.")
                 }
+                // Cancellation is checked LAST as well, immediately before the
+                // rewrite: every await above suspended long enough for Stop to
+                // arrive, and the array below is the destructive step.
+                try Task.checkCancellation()
                 // Re-resolve by identity: the user may have switched chats while
                 // the on-device model worked, and a pruning retention pass may
                 // have removed this conversation in the meantime.
                 guard let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) else { return }
+                // Rows appended while the summarizer ran (a `/plan` notice, a
+                // command report) are newer than anything the pass summarized
+                // and are not in the snapshot it rewrites from; carry them
+                // forward rather than deleting them. The progress bubble is
+                // excluded: the rewrite replaces it with the digest card.
+                let carried = ChatSession.messagesAdded(
+                    to: self.sessions[liveIdx].messages,
+                    since: evicted,
+                    excluding: [progressId]
+                )
                 self.sessions[liveIdx].rollingSummary = newSummaryText
                 self.sessions[liveIdx].recentWorkDigest = newRecapText
                 // The whole conversation (evicted messages and the progress
@@ -2662,7 +2693,7 @@ struct ContentView: View {
                     summary: newSummaryText,
                     recap: newRecapText,
                     evictedMessageCount: evictedCount
-                )
+                ) + carried
                 // The context the odometer was counting is gone: reset it to
                 // unmetered so the next send seeds a fresh total from the
                 // compacted prompt (the digest block in the system prompt plus
@@ -2675,15 +2706,27 @@ struct ContentView: View {
                 // summaries into stale slots. One full re-prefill is the cost
                 // of compaction; it is paid here, deliberately.
                 PrefixCacheManager.shared.invalidate(sessionId: sessionId)
-                self.showStatus("🗂 Compacted \(evictedCount) messages. The summary stays at the top of this chat.")
+                self.showStatus(
+                    "🗂 Compacted \(evictedCount) messages. The summary stays at the top of this chat.",
+                    sessionId: sessionId
+                )
             } catch is CancellationError {
                 // Stop is an outcome the user asked for, not a fault: nothing
                 // was rewritten, so say the conversation is untouched instead
                 // of reporting a compaction failure.
-                self.showStatus("⏹ Compaction stopped — the conversation was left unchanged.")
+                self.showStatus(
+                    "⏹ Compaction stopped — the conversation was left unchanged.",
+                    sessionId: sessionId
+                )
                 postToProgress("⏹ Compaction stopped — the conversation was left unchanged.")
             } catch {
-                self.showStatus("⚠️ Compaction failed: \(error.localizedDescription)")
+                // Scoped to the conversation it happened in: the pill says
+                // "the conversation", and an unscoped notice drew it over
+                // whichever chat was on screen.
+                self.showStatus(
+                    "⚠️ Compaction failed: \(error.localizedDescription)",
+                    sessionId: sessionId
+                )
                 postToProgress("⚠️ Compaction failed: \(error.localizedDescription) — the conversation was left unchanged.")
             }
         }
@@ -2836,25 +2879,48 @@ struct ContentView: View {
             guard let pricing, let cost = pricing.cost(for: usage) else { return }
             spent += cost
         }
+        // A summarizer request that was sent and did not come back — cancelled
+        // mid-stream, or failed on the wire — was still billed for its prompt.
+        // Its token counts are unknown, so the app's own estimate stands in and
+        // `(est.)` marks the run; charging nothing here is what made a
+        // cancelled pass report a cost its own status line called billed.
+        func chargeUnreturnedRequest(estimatedPromptTokens: Int) {
+            summarizerWasEstimated = true
+            summarizerPromptTokens += max(0, estimatedPromptTokens)
+            guard let pricing,
+                  let cost = pricing.cost(for: CloudUsage(
+                      promptTokens: estimatedPromptTokens,
+                      completionTokens: 0
+                  )) else { return }
+            spent += cost
+        }
         // One summarizer pass that may replace messages. A summary cut off at
         // the output limit is refused rather than committed: the messages it
         // was going to replace are deleted permanently, and the text that
         // would take their place never covered the end of the chunk.
         func summarize(system: String, prompt: String) async throws -> String {
-            let completion = try await client.completeText(
-                model: providerModelId,
-                systemPrompt: system,
-                userPrompt: prompt,
-                maxTokens: responseTokens,
-                sessionKey: sessionKey
+            let estimatedPromptTokens = CloudMessageAssembler.approximatePromptTokens(
+                system: system,
+                messages: [CloudChatMessage(role: "user", content: prompt)]
             )
-            charge(
-                completion,
-                estimatedPromptTokens: CloudMessageAssembler.approximatePromptTokens(
-                    system: system,
-                    messages: [CloudChatMessage(role: "user", content: prompt)]
+            let completion: CloudTextCompletion
+            do {
+                completion = try await client.completeText(
+                    model: providerModelId,
+                    systemPrompt: system,
+                    userPrompt: prompt,
+                    maxTokens: responseTokens,
+                    sessionKey: sessionKey
                 )
-            )
+            } catch {
+                // The request was SENT before it failed or was cancelled, so
+                // the provider billed its prompt even though nothing came
+                // back. `CloudCompactionFailure.spentRequest` says so in the
+                // status line; the run's own figures have to agree with it.
+                chargeUnreturnedRequest(estimatedPromptTokens: estimatedPromptTokens)
+                throw error
+            }
+            charge(completion, estimatedPromptTokens: estimatedPromptTokens)
             guard !completion.text.isEmpty else { throw CloudCompactionFailure.emptySummary }
             guard !completion.stoppedAtOutputLimit else {
                 throw CloudCompactionFailure.truncatedSummary
@@ -2894,20 +2960,26 @@ struct ContentView: View {
 
             let recapPrompt = "Conversation excerpt, oldest messages first — the most recent work last:\n\n\(recentChunk)"
             onProgress?("🗂 \(provider.displayName) — capturing the detailed recap…")
-            let recap = try await client.completeText(
-                model: providerModelId,
-                systemPrompt: recapInstructions,
-                userPrompt: recapPrompt,
-                maxTokens: responseTokens,
-                sessionKey: sessionKey
+            let recapEstimatedPromptTokens = CloudMessageAssembler.approximatePromptTokens(
+                system: recapInstructions,
+                messages: [CloudChatMessage(role: "user", content: recapPrompt)]
             )
-            charge(
-                recap,
-                estimatedPromptTokens: CloudMessageAssembler.approximatePromptTokens(
-                    system: recapInstructions,
-                    messages: [CloudChatMessage(role: "user", content: recapPrompt)]
+            let recap: CloudTextCompletion
+            do {
+                recap = try await client.completeText(
+                    model: providerModelId,
+                    systemPrompt: recapInstructions,
+                    userPrompt: recapPrompt,
+                    maxTokens: responseTokens,
+                    sessionKey: sessionKey
                 )
-            )
+            } catch {
+                // Same rule as `summarize`: a sent request is billed whether or
+                // not its answer arrived.
+                chargeUnreturnedRequest(estimatedPromptTokens: recapEstimatedPromptTokens)
+                throw error
+            }
+            charge(recap, estimatedPromptTokens: recapEstimatedPromptTokens)
             // The recap supplements a complete summary rather than replacing
             // anything, so a truncated one costs detail and nothing else; the
             // next compaction asks for a fresh one.
@@ -2922,6 +2994,15 @@ struct ContentView: View {
             guard let liveIdx = sessions.firstIndex(where: { $0.id == sessionId }) else {
                 return finish(.conversationUnavailable)
             }
+            // A multi-pass compaction runs for minutes, and the transcript is
+            // rewritten from the snapshot taken before the first pass. Rows
+            // appended since then (a `/plan` notice, a command's report) are
+            // newer than everything summarized, so they follow the kept tail
+            // rather than being deleted by the rewrite.
+            let carried = ChatSession.messagesAdded(
+                to: sessions[liveIdx].messages,
+                since: all
+            )
             sessions[liveIdx].rollingSummary = summaryText
             sessions[liveIdx].recentWorkDigest = recap.text.isEmpty ? nil : recap.text
             sessions[liveIdx].messages = ChatSession.compactedHistory(
@@ -2929,7 +3010,7 @@ struct ContentView: View {
                 recap: recap.text.isEmpty ? nil : recap.text,
                 evictedMessageCount: evictedCount,
                 modelLabel: provider.displayName
-            ) + kept
+            ) + kept + carried
             // The context the odometer counted is gone; the next send seeds a
             // fresh total from the compacted prompt.
             sessions[liveIdx].cumulativeTokenCount = nil
@@ -2998,9 +3079,13 @@ struct ContentView: View {
                 else { return }
                 self.sessions[liveIdx].messages[msgIdx].prefillStatus = text
             }
+            // The same id-based lookup the chat header uses: resolving through
+            // `registeredSpecs` falls back to the global window when the
+            // conversation's model was never registered, which made /compact
+            // size its chunks for a different ceiling than the header showed.
             let window = CloudContextPolicy.window(
-                for: CloudModelRegistry.registeredSpecs(for: provider)
-                    .first { $0.providerModelId == providerModelId }
+                forModelId: providerModelId,
+                providerId: provider.id
             )
             let outcome = await self.compactCloudHistory(
                 sessionId: sessionId,
@@ -3015,11 +3100,17 @@ struct ContentView: View {
                 let spend = outcome.cost > 0
                     ? " Summarizing cost \(CloudPricingStore.formatted(outcome.cost))."
                     : ""
-                self.showStatus("🗂 Compacted this conversation with \(provider.displayName). The summary stays at the top of the chat.\(spend)")
+                self.showStatus(
+                    "🗂 Compacted this conversation with \(provider.displayName). The summary stays at the top of the chat.\(spend)",
+                    sessionId: sessionId
+                )
             } else if outcome.failure == .cancelled {
                 // Stop is an outcome the user asked for, not a fault, and the
                 // history it interrupted was never touched.
-                self.showStatus("⏹ Compaction stopped — the conversation was left unchanged.")
+                self.showStatus(
+                    "⏹ Compaction stopped — the conversation was left unchanged.",
+                    sessionId: sessionId
+                )
             } else {
                 // Every refusal names its own cause: a missing key, a chat with
                 // nothing evictable and an empty summary are not the provider
@@ -3032,7 +3123,7 @@ struct ContentView: View {
                         content: notice
                     ))
                 }
-                self.showStatus(notice)
+                self.showStatus(notice, sessionId: sessionId)
             }
         }
         attachManualCompaction(compactionTask, sessionId: sessionId, runId: compactionRunId)
@@ -3959,19 +4050,19 @@ struct ContentView: View {
         // the only way to interrupt it. Scoped to the conversation the button
         // was pressed for: compacting chat A and pressing Stop on chat B must
         // not cancel A's pass.
-        var stoppedCompaction = false
         if let visibleSessionId = selectedSessionId ?? sessions.first?.id,
-           let run = manualCompactions[visibleSessionId],
-           let task = run.task {
-            task.cancel()
-            stoppedCompaction = true
-        }
-        if stoppedCompaction, !isGeneratingText, generationTask == nil {
-            // Nothing else is running. The compaction task reports its own
-            // `.cancelled` outcome when the summarizer request settles; the
-            // generation teardown below would announce a stop that never
-            // happened and clear state that was already clear.
-            showStatus("⏹ Stopping the compaction — the conversation is left unchanged.")
+           let run = manualCompactions[visibleSessionId] {
+            // A conversation being compacted is never the one generating —
+            // `/compact` refuses to start while a turn runs — so any live
+            // generation belongs to a DIFFERENT chat, and falling through to
+            // the global teardown below would cancel it and announce it as a
+            // stop the user asked for here. The pass reports its own
+            // `.cancelled` outcome when the summarizer request settles.
+            run.task?.cancel()
+            showStatus(
+                "⏹ Stopping the compaction — the conversation is left unchanged.",
+                sessionId: visibleSessionId
+            )
             return
         }
         // Shield the generating session from retention *before* flipping
@@ -4097,13 +4188,18 @@ struct ContentView: View {
         // loop uses Task.detached because its per-token Metal work must not
         // occupy the main actor; this path only suspends on the on-device
         // model's snapshots between paced reveals, so nothing blocks here.
-        // The framework re-sends the whole context (persona + history transcript)
-        // every turn and reports no token accounting, so the session odometer's
-        // input side uses the same character-based approximation; streaming and
+        // The framework re-sends the whole context (persona + history
+        // transcript) every turn and reports no token accounting, so the
+        // session odometer's input side uses the same character-based
+        // approximation. The stored figure is the CONTEXT SIZE, like every
+        // other backend (see `ChatSession.contextTokenBase`): this turn's
+        // assembled input, not the previous total plus it, which counted the
+        // same history again on every turn and jumped by a whole conversation
+        // when a chat moved here from a cloud model. Streaming and
         // finalization add the generated tokens on top of this base.
         let afmTurnInputTokens = AppleFoundationModelService.approximateTokenCount(for: instructionsText)
             + AppleFoundationModelService.approximateTokenCount(for: userPrompt)
-        let afmCumulativeBase = (sessions.first(where: { $0.id == sessionId })?.cumulativeTokenCount ?? 0) + afmTurnInputTokens
+        let afmCumulativeBase = ChatSession.contextTokenBase(promptTokenCount: afmTurnInputTokens)
         if let sIdx = sessions.firstIndex(where: { $0.id == sessionId }) {
             sessions[sIdx].cumulativeTokenCount = afmCumulativeBase
         }
@@ -4448,10 +4544,13 @@ struct ContentView: View {
         let visionCapable = visionSupport(forProvider: provider, providerModelId: providerModelId)
         // nil when nobody recorded a window for this model: an unknown window
         // never triggers a compaction, because guessing one would spend money
-        // to lose context.
+        // to lose context. Resolved by model id — the same lookup the chat
+        // header uses — so the ceiling the send compacts against and the
+        // ceiling the header reports are one answer even for a model that was
+        // never added to the provider's registered list.
         let contextWindow = CloudContextPolicy.window(
-            for: CloudModelRegistry.registeredSpecs(for: provider)
-                .first { $0.providerModelId == providerModelId }
+            forModelId: providerModelId,
+            providerId: provider.id
         )
         // Resolved on the main actor before the task: an AppStorage read from
         // inside the loop would be a main-actor hop per step.
@@ -4516,7 +4615,12 @@ struct ContentView: View {
             // What the rewritten history costs as a prompt. Used only right
             // after a compaction, which is the one moment the pre-turn estimate
             // stops describing what is being sent.
-            func rewrittenPromptEstimate() -> Int {
+            //
+            // `@MainActor` because it reads the session array and the persona:
+            // a local function does not inherit the enclosing task's isolation
+            // under the project's approachable-concurrency mode, and without it
+            // both reads are concurrency warnings.
+            @MainActor func rewrittenPromptEstimate() -> Int {
                 guard let live = self.sessions.first(where: { $0.id == sessionId }) else { return 0 }
                 return CloudMessageAssembler.approximatePromptTokens(
                     system: currentPersona(),
@@ -4534,12 +4638,15 @@ struct ContentView: View {
             // from the rewritten prompt (which now includes the digest the
             // compaction just installed): the next step's reported prompt
             // replaces this exactly, and a provider that reports none still
-            // leaves a number describing what was sent.
-            func resetOdometerAfterCompaction() {
-                turnContextTokens = rewrittenPromptEstimate()
+            // leaves a number describing what was sent. Returns the figure so
+            // the caller's own copy is written in one hop rather than mutated
+            // from an isolated nested function.
+            @MainActor func odometerAfterCompaction() -> Int {
+                let rewritten = rewrittenPromptEstimate()
                 if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
-                    self.sessions[sIdx].cumulativeTokenCount = turnContextTokens
+                    self.sessions[sIdx].cumulativeTokenCount = rewritten
                 }
+                return rewritten
             }
             // Prompt-only coordinator directive carrying subagent reports that
             // landed mid-run. Cloud history is re-assembled from the session on
@@ -4609,8 +4716,11 @@ struct ContentView: View {
                         if outcome.didCompact {
                             compactionAttempts.recordRewrite()
                             contextCompactionFailure = nil
-                            resetOdometerAfterCompaction()
-                            self.showStatus("🗂 Context was near this model's limit — compacted older history before continuing.")
+                            turnContextTokens = odometerAfterCompaction()
+                            self.showStatus(
+                                "🗂 Context was near this model's limit — compacted older history before continuing.",
+                                sessionId: sessionId
+                            )
                             continue
                         }
                         contextCompactionFailure = outcome.failure
@@ -4880,7 +4990,7 @@ struct ContentView: View {
                     if outcome.didCompact {
                         compactionAttempts.recordRewrite()
                         contextCompactionFailure = nil
-                        resetOdometerAfterCompaction()
+                        turnContextTokens = odometerAfterCompaction()
                         turnLog.recordChatTurn(
                             status: 400,
                             errorMessage: "Context overflow; compacted older history and retrying this step.",
@@ -4890,7 +5000,10 @@ struct ContentView: View {
                             response: latestText,
                             toolCalls: []
                         )
-                        self.showStatus("🗂 The conversation exceeded this model's context window — compacted older history and retrying the step.")
+                        self.showStatus(
+                            "🗂 The conversation exceeded this model's context window — compacted older history and retrying the step.",
+                            sessionId: sessionId
+                        )
                         continue
                     }
                     contextCompactionFailure = outcome.failure
@@ -5709,16 +5822,14 @@ struct ContentView: View {
         )
 
         // Session token odometer seeding: resolved from turn-start state (it is
-        // deterministic — the seeded base reads the same conversation total the
-        // old code read at prefill completion, plus the engine-reported prefix
-        // reuse) so a failed or cancelled prefill never writes a phantom base.
+        // deterministic — the seeded base is this turn's prompt, the
+        // conversation's context size) so a failed or cancelled prefill never
+        // writes a phantom base.
         var cumulativeStepBase: Int = 0
         var cumulativeStepTracked = false
-        if let sId = sessionId, let sIdx = sessions.firstIndex(where: { $0.id == sId }) {
-            cumulativeStepBase = ChatSession.cumulativeTokenBase(
-                previousTotal: sessions[sIdx].cumulativeTokenCount,
-                promptTokenCount: promptTokenIds.count,
-                prefixTokensReused: launch.prep.prefixTokensReused
+        if let sId = sessionId, sessions.firstIndex(where: { $0.id == sId }) != nil {
+            cumulativeStepBase = ChatSession.contextTokenBase(
+                promptTokenCount: promptTokenIds.count
             )
             cumulativeStepTracked = true
         }

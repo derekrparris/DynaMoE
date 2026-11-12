@@ -377,7 +377,13 @@ final class ServerRequestLogRecorder: @unchecked Sendable {
 /// closures retain it past the registry entry (the HTTP response is already
 /// 200 by the time the stream drains, so the row is finalized when the
 /// stream does).
-final class ServerRequestLogBox: @unchecked Sendable {
+///
+/// `nonisolated`: the class is a lock-guarded box with no actor state of its
+/// own, and the project's default main-actor isolation would otherwise make
+/// every `nonisolated` method that touches `builder` a concurrency warning
+/// (the middleware, the streaming writers and the in-app turn loop all note
+/// into it from wherever they happen to run).
+nonisolated final class ServerRequestLogBox: @unchecked Sendable {
     private let lock = NSLock()
     private var builder: ServerRequestLog
     private var claimed = false

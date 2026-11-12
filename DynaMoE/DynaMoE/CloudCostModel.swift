@@ -373,14 +373,26 @@ public nonisolated enum CloudContextPolicy {
         return Int((Double(promptTokens) / Double(window) * 100).rounded())
     }
 
+    /// Upper bound on a derived chunk budget. A third of a 128k-token window is
+    /// ~170k characters; anything past this is a typo, and the transcript
+    /// builder truncates to the budget either way.
+    public static let maximumChunkCharacters = 8_000_000
+
     /// Characters of transcript one summarizer pass may carry.
     ///
     /// Four characters per token is the same estimate the rest of the cloud
     /// path uses. A third of the window leaves room for the digest being folded
     /// in, the pass instructions, and the summary itself.
+    ///
+    /// The window is a hand-typed value, so the arithmetic is done in `Double`
+    /// and clamped before the conversion: `Int(Double(window) * 0.33) * 4`
+    /// traps on a window near `Int.max`, and a budget that large is a units
+    /// mistake rather than a chunk anybody can send.
     public static func chunkCharacterBudget(window: Int?) -> Int {
         guard let window, window >= minimumPlausibleWindow else { return 24_000 }
-        return max(4_000, Int(Double(window) * 0.33) * 4)
+        let scaled = (Double(window) * 0.33 * 4).rounded(.down)
+        let ceiling = Double(maximumChunkCharacters)
+        return max(4_000, Int(min(scaled, ceiling)))
     }
 
     /// Tokens one summarizer pass may write.
@@ -703,14 +715,17 @@ public nonisolated struct CloudTurnReport: Equatable, Sendable {
     /// `1,204 in (1,000 cached) / 56 out · $0.0031`, or the estimate-marked
     /// form when the provider reported no usage. A run total says `billed in`
     /// instead: it sums several requests' prompts and is not the conversation's
-    /// context size.
+    /// context size. The cache figure is always phrased as part of that prompt
+    /// (`1,000 of it cached`) rather than beside it, so "billed" and "cached"
+    /// cannot read as two different totals.
     public var statusSuffix: String {
         var parts: [String] = []
         if let promptTokens {
             let number = Self.format(promptTokens)
             let inputLabel = countsBilledInput ? " billed in" : " in"
             if cachedTokens > 0 {
-                parts.append("\(number)\(inputLabel) (\(Self.format(cachedTokens)) cached)")
+                let cachedLabel = countsBilledInput ? " of it cached" : " cached"
+                parts.append("\(number)\(inputLabel) (\(Self.format(cachedTokens))\(cachedLabel))")
             } else {
                 parts.append("\(number)\(inputLabel)")
             }

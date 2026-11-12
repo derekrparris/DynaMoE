@@ -161,6 +161,73 @@ final class ServerRequestLogLogicTests: XCTestCase {
         )
     }
 
+    // MARK: Cache columns
+
+    func testComposedLineNamesCacheReadsAndWrites() {
+        // The two columns a cache-aware cloud turn adds. They are metadata, so
+        // they belong on the Console line beside the input total; a zero is
+        // silence rather than a line that says nothing was cached.
+        var row = ServerRequestLog()
+        row.method = "POST"
+        row.path = "/v1/chat/completions"
+        row.inputTokens = 24_000
+        row.cachedInputTokens = 18_000
+        row.cacheWriteInputTokens = 2_500
+        row.outputTokens = 350
+        let line = ServerRequestLogRecorder.composeLine(row)
+        XCTAssertTrue(line.contains("in=24000"))
+        XCTAssertTrue(line.contains("cached=18000"))
+        XCTAssertTrue(line.contains("cache_write=2500"))
+        XCTAssertTrue(line.contains("out=350"))
+
+        row.cachedInputTokens = 0
+        row.cacheWriteInputTokens = nil
+        let withoutCache = ServerRequestLogRecorder.composeLine(row)
+        XCTAssertFalse(withoutCache.contains("cached="))
+        XCTAssertFalse(withoutCache.contains("cache_write="))
+    }
+
+    func testProviderUsageReplacesTheEstimateAndItsCacheColumns() {
+        // The prompt estimate is written when the box is created, before the
+        // turn runs. When the provider speaks, its own numbers take over —
+        // including the cache split that turns "90k tokens" into "90k, 81k of
+        // them a cache read".
+        var row = ServerRequestLog()
+        row.method = "POST"
+        row.path = "/v1/chat/completions"
+        row.inputTokens = 1200
+        let box = ServerRequestLogBox(builder: row)
+        box.noteProviderUsage(promptTokens: 90_000, cachedTokens: 81_000, cacheWriteTokens: 4_000)
+        let noted = box.snapshot()
+        XCTAssertEqual(noted.inputTokens, 90_000)
+        XCTAssertEqual(noted.cachedInputTokens, 81_000)
+        XCTAssertEqual(noted.cacheWriteInputTokens, 4_000)
+        // A partial report only replaces the columns it carries: a later
+        // chunk's completion count must not erase the prompt.
+        box.noteProviderUsage(promptTokens: nil, cachedTokens: nil, cacheWriteTokens: nil)
+        let unchanged = box.snapshot()
+        XCTAssertEqual(unchanged.inputTokens, 90_000)
+        XCTAssertEqual(unchanged.cachedInputTokens, 81_000)
+        XCTAssertEqual(unchanged.cacheWriteInputTokens, 4_000)
+    }
+
+    func testAClientRetentionRefusalWithholdsCaptureAndTheCacheColumnsAreMetadata() {
+        // `store: false` withholds bodies, never metadata: the cache columns
+        // are counted tokens the row exists to report.
+        var row = ServerRequestLog()
+        row.method = "POST"
+        row.path = "/v1/chat/completions"
+        row.inputTokens = 5_000
+        row.cachedInputTokens = 4_000
+        let box = ServerRequestLogBox(builder: row)
+        box.withholdBodiesForClientRetention()
+        box.noteProviderUsage(promptTokens: 5_000, cachedTokens: 4_000, cacheWriteTokens: nil)
+        let withheld = box.snapshot()
+        XCTAssertEqual(withheld.retentionWithheldByClient, true)
+        XCTAssertEqual(withheld.inputTokens, 5_000)
+        XCTAssertEqual(withheld.cachedInputTokens, 4_000)
+    }
+
     // MARK: Error message policy
 
     func testErrorMessageExtraction() {

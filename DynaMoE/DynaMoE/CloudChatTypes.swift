@@ -177,9 +177,12 @@ public nonisolated enum CloudCacheHints: String, Codable, Equatable, Hashable, S
     /// failing the whole provider record. The value lives in hand-editable
     /// JSON and a newer build may write one this build does not know; losing
     /// the provider from the list over a label is worse than falling back to
-    /// headers every HTTP server is free to ignore.
+    /// headers every HTTP server is free to ignore. A value that is not even a
+    /// string (`"cacheHints": 1`) takes the same path: refusing to decode it
+    /// would drop the provider for a field the fallback already answers.
     public init(from decoder: Decoder) throws {
-        let raw = try decoder.singleValueContainer().decode(String.self)
+        let container = try decoder.singleValueContainer()
+        let raw = (try? container.decode(String.self)) ?? ""
         self = CloudCacheHints(rawValue: raw) ?? .affinity
     }
 
@@ -299,6 +302,26 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
     public var cacheReadFraction: Double? {
         guard let promptTokens, promptTokens > 0, let cachedTokens else { return nil }
         return Double(min(cachedTokens, promptTokens)) / Double(promptTokens)
+    }
+
+    /// This block with `newer`'s columns laid over it, field by field.
+    ///
+    /// A stream can report usage more than once, and the later block is not
+    /// obliged to repeat every column: some endpoints send a running
+    /// `output_tokens` mid-stream and the prompt count only at the end (or the
+    /// other way round). Replacing the accumulated block with the newest one
+    /// dropped the columns the newest omitted, which silently turned a
+    /// measured prompt and its cache split into the app's estimate — exactly
+    /// where the cache reporting matters. A nil column means "not reported
+    /// here", so it inherits the earlier value instead of erasing it.
+    public func merging(_ newer: CloudUsage) -> CloudUsage {
+        CloudUsage(
+            promptTokens: newer.promptTokens ?? promptTokens,
+            completionTokens: newer.completionTokens ?? completionTokens,
+            totalTokens: newer.totalTokens ?? totalTokens,
+            cachedTokens: newer.cachedTokens ?? cachedTokens,
+            cacheWriteTokens: newer.cacheWriteTokens ?? cacheWriteTokens
+        )
     }
 
     enum CodingKeys: String, CodingKey {
@@ -745,7 +768,9 @@ nonisolated struct CloudStreamParser {
             carriedPayload = true
         }
         if let reported = chunk.usage {
-            usage = reported
+            // Merge rather than replace: a later chunk may carry only part of
+            // the block (see `CloudUsage.merging`).
+            usage = usage?.merging(reported) ?? reported
             carriedPayload = true
         }
         if carriedPayload { decodedChunkCount += 1 }

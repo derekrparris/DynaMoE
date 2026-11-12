@@ -91,10 +91,12 @@ nonisolated final class CloudCacheHintMemory: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Forgets every endpoint. Process lifetime is the shipping behaviour, but
-    /// a test process runs many cases against one latch: without this a case
-    /// that latched an endpoint leaves the next one — and a repeat-on-failure
-    /// rerun of itself — starting from a state it did not set up.
+    /// Forgets every endpoint. Process lifetime is the shipping behaviour, and a
+    /// service can now hold its OWN instance (`OpenAICloudChatService(cacheHintMemory:)`),
+    /// so a test should prefer injection over this: a case that latched the
+    /// shared latch would otherwise leave the next case — and a
+    /// repeat-on-failure rerun of itself — starting from a state it did not set
+    /// up.
     func reset() {
         lock.lock()
         declined.removeAll()
@@ -114,6 +116,11 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
     private let apiKey: String
     private let session: URLSession
     private let cacheHints: CloudCacheHints
+    /// The latch this service consults and updates. Injected rather than
+    /// reached through the singleton so a case can hold a private one: a shared
+    /// latch keyed by endpoint leaks state between tests and between cases of
+    /// one test, which is why the singleton needed a `reset()` seam at all.
+    private let cacheHintMemory: CloudCacheHintMemory
 
     init(
         chatURL: URL,
@@ -121,12 +128,14 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         apiKey: String,
         requestTimeout: TimeInterval,
         session: URLSession? = nil,
-        cacheHints: CloudCacheHints = .affinity
+        cacheHints: CloudCacheHints = .affinity,
+        cacheHintMemory: CloudCacheHintMemory = .shared
     ) {
         self.chatURL = chatURL
         self.modelsURL = modelsURL
         self.apiKey = apiKey
         self.cacheHints = cacheHints
+        self.cacheHintMemory = cacheHintMemory
 
         if let session {
             self.session = session
@@ -204,20 +213,24 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         Self.sendsCacheKey(
             hints: cacheHints,
             sessionKey: params.sessionKey,
-            endpoint: chatURL.absoluteString
+            endpoint: chatURL.absoluteString,
+            memory: cacheHintMemory
         )
     }
 
     /// The same rule as a pure function of the three inputs, so a test can pin
-    /// it without a live endpoint or a URLSession.
+    /// it without a live endpoint or a URLSession. `memory` is a parameter for
+    /// the same reason the service holds one: a case that latches must not be
+    /// seen by the next case or by the app's own requests.
     nonisolated static func sendsCacheKey(
         hints: CloudCacheHints,
         sessionKey: String?,
-        endpoint: String
+        endpoint: String,
+        memory: CloudCacheHintMemory = .shared
     ) -> Bool {
         hints.sendsPromptCacheKey
             && !(sessionKey ?? "").isEmpty
-            && CloudCacheHintMemory.shared.acceptsPromptCacheKey(endpoint: endpoint)
+            && memory.acceptsPromptCacheKey(endpoint: endpoint)
     }
 
     /// Internal so a test can pin the request shape without a live endpoint.
@@ -335,10 +348,15 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                         // without it is accepted. Until then the rejection may
                         // have been about the body's model, tools or size.
                         if retriedWithoutCacheKey {
-                            CloudCacheHintMemory.shared.declinePromptCacheKey(
+                            self.cacheHintMemory.declinePromptCacheKey(
                                 endpoint: self.chatURL.absoluteString
                             )
-                            print("☁️ [CACHE] \(self.chatURL.host ?? "provider") rejected prompt_cache_key (HTTP \(cacheKeyRejectionStatus ?? 0)); the retry without it succeeded, so it will not be sent again.")
+                            // Metadata only, through the app's own log: the
+                            // host and the HTTP status, never the request.
+                            DiagLog.info(
+                                "CloudCache",
+                                "endpoint=\(self.chatURL.host ?? "provider") rejected prompt_cache_key status=\(cacheKeyRejectionStatus ?? 0) retry_without_it_succeeded=true latched=true"
+                            )
                         }
 
                         var lineBuffer = MCPLineBuffer(limit: Self.maxEventBytes)

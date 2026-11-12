@@ -171,6 +171,56 @@ final class ConversationCompactionTests: XCTestCase {
         )
     }
 
+    func testAnImageOnlyTurnReachesTheTranscriptAsANotice() {
+        // The compact that follows DELETES the rows it summarized, so a turn
+        // whose only content was a picture used to contribute nothing at all
+        // while still being counted as evicted: the summary lost the fact that
+        // an image was ever part of the conversation.
+        let image = ImageAttachmentRef(
+            fileName: "screenshot.png",
+            pixelWidth: 640,
+            pixelHeight: 480,
+            byteCount: 12_345,
+            sha256: "abc",
+            relativePath: "attachments/screenshot.png",
+            mimeType: "image/png"
+        )
+        let turn = AppleFoundationModelService.compactionTranscriptTurn(
+            for: ChatMessage(role: .user, content: "", attachments: [image])
+        )
+        XCTAssertEqual(turn, "User shared 1 image (not included in this summary)")
+        // A turn with text keeps the text and says the picture was there too.
+        let withText = AppleFoundationModelService.compactionTranscriptTurn(
+            for: ChatMessage(role: .user, content: "what is wrong here?", attachments: [image, image])
+        ) ?? ""
+        XCTAssertTrue(withText.contains("User: what is wrong here?"))
+        XCTAssertTrue(withText.contains("User shared 2 images (not included in this summary)"))
+    }
+
+    func testRowsAppendedDuringAPassAreNotDroppedByTheRewrite() {
+        // A /plan notice (or any command report) can land while the summarizer
+        // runs; the rewrite is built from the older snapshot, so those rows
+        // have to be carried forward explicitly.
+        let snapshot = [
+            ChatMessage(role: .user, content: "one"),
+            ChatMessage(role: .assistant, content: "a")
+        ]
+        let notice = ChatMessage(role: .system, content: "🧭 Plan Mode enabled")
+        let later = ChatMessage(role: .user, content: "two")
+        let live = snapshot + [notice, later]
+        let carried = ChatSession.messagesAdded(to: live, since: snapshot)
+        XCTAssertEqual(carried.map(\.id), [notice.id, later.id])
+        // The progress bubble a /compact inserted is UI state the rewrite
+        // replaces, so a caller excludes it.
+        let progress = ChatMessage(role: .system, content: "", isTransient: true)
+        XCTAssertEqual(
+            ChatSession.messagesAdded(to: live + [progress], since: snapshot, excluding: [progress.id]).count,
+            2
+        )
+        // Nothing new means nothing to carry.
+        XCTAssertTrue(ChatSession.messagesAdded(to: snapshot, since: snapshot).isEmpty)
+    }
+
     func testCompactionChunksCoverEveryTurnOldestFirst() {
         // Six ~430-character turns with a 1,200-character budget: two turns
         // per chunk, three chunks, and no turn silently dropped the way the

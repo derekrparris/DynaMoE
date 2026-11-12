@@ -402,6 +402,19 @@ public enum AppleFoundationModelService {
         if !content.isEmpty {
             parts.append("\(speaker): \(content)")
         }
+        // A picture is part of the turn even when the text is empty, and the
+        // compact that follows DELETES the row it summarises. Dropping the
+        // attachment with the row loses the one fact the summary could carry:
+        // that an image was discussed. A metadata notice is what a later
+        // transcript render does for a history the model cannot see
+        // (`buildConversationTranscript`), so this is the same treatment for a
+        // turn that has no text at all.
+        if let attachments = message.attachments, !attachments.isEmpty {
+            let noun = attachments.count == 1 ? "image" : "images"
+            parts.append(
+                "\(speaker) shared \(attachments.count) \(noun) (not included in this summary)"
+            )
+        }
         if let calls = message.toolCalls, !calls.isEmpty {
             for call in calls where !call.isGesture {
                 let arguments = call.arguments

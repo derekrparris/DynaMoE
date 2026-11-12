@@ -121,16 +121,23 @@ final class CompletionEngineLogicTests: XCTestCase {
 
     // MARK: - Odometer seeding rule (turn-start, mirrored from old prefill seam)
 
-    func testCumulativeTokenBaseCountsOnlyDeltaForMeteredConversation() {
-        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: 120, promptTokenCount: 100, prefixTokensReused: 60), 160)
+    func testTheOdometerIsThePromptSizeNotARunningSum() {
+        // One meaning for every backend: the conversation's context size. A
+        // previous total is not an input, so a turn cannot count the same
+        // history twice, and a chat that moved here from a cloud model (whose
+        // stored figure is also a context size) does not jump by a whole
+        // conversation on the switch.
+        XCTAssertEqual(ChatSession.contextTokenBase(promptTokenCount: 100), 100)
+        XCTAssertEqual(ChatSession.contextTokenBase(promptTokenCount: 1200), 1200)
     }
 
-    func testCumulativeTokenBaseSeedsFullPromptForUnmeteredConversation() {
-        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: nil, promptTokenCount: 100, prefixTokensReused: 60), 100)
+    func testTheOdometerBaseIsNeverNegative() {
+        XCTAssertEqual(ChatSession.contextTokenBase(promptTokenCount: -5), 0)
     }
 
-    func testCumulativeTokenBaseToleratesPrefixLongerThanPrompt() {
-        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: 50, promptTokenCount: 100, prefixTokensReused: 140), 50)
+    func testTheOdometerAddsGeneratedTokensOnTopOfThePrompt() {
+        let seeded = ChatSession.contextTokenBase(promptTokenCount: 1200)
+        XCTAssertEqual(seeded + 300, 1500)
     }
 
     // MARK: - Sampler penalties (frequency_penalty / logit_bias)

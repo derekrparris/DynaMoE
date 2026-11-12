@@ -674,6 +674,23 @@ final class CloudProviderStoreTests: XCTestCase {
             "gpt-5.1-codex",
             forKey: CloudModelRegistry.debugModelDefaultsKey
         )
+        // The two registration facts a cache-aware cloud path added: a
+        // per-model window and a per-model price. Removing the model must take
+        // them with it, or re-adding the same id silently inherits a context
+        // ceiling and a rate somebody set for the model that was removed.
+        CloudContextPolicy.setOverrides(
+            ["gpt-5.1-codex": 400_000, "qwen3-coder": 262_144],
+            for: provider.id,
+            defaults: harness.defaults
+        )
+        CloudPricingStore.setPricing(
+            [
+                "gpt-5.1-codex": CloudPricing(input: 1.25, cachedInput: 0.125, output: 10),
+                "qwen3-coder": CloudPricing(input: 0.3, output: 1.2)
+            ],
+            for: provider.id,
+            defaults: harness.defaults
+        )
 
         CloudModelRegistry.removeRegisteredModel(
             "gpt-5.1-codex",
@@ -692,10 +709,44 @@ final class CloudProviderStoreTests: XCTestCase {
             CloudModelRegistry.modelIdsWithoutToolSupport(for: provider, defaults: harness.defaults).isEmpty
         )
         XCTAssertEqual(
+            CloudContextPolicy.overrides(for: provider.id, defaults: harness.defaults),
+            ["qwen3-coder": 262_144]
+        )
+        XCTAssertEqual(
+            Array(CloudPricingStore.pricing(for: provider.id, defaults: harness.defaults).keys),
+            ["qwen3-coder"]
+        )
+        XCTAssertEqual(
             harness.defaults.string(forKey: CloudModelRegistry.debugModelDefaultsKey),
             "gpt-5.1-codex",
             "the debug hook is one global value that another provider can rely on, so a per-provider prune leaves it alone"
         )
+    }
+
+    func testClearingAProviderDropsItsWindowsAndPrices() throws {
+        let harness = makeHarness()
+        defer { harness.cleanUp() }
+        let provider = try harness.store.add(
+            displayName: "OpenCode Zen",
+            identifier: "opencode-zen",
+            baseURL: "https://opencode.ai/zen/v1"
+        )
+        CloudContextPolicy.setOverrides(
+            ["qwen3-coder": 262_144],
+            for: provider.id,
+            defaults: harness.defaults
+        )
+        CloudPricingStore.setPricing(
+            ["qwen3-coder": CloudPricing(input: 0.3, output: 1.2)],
+            for: provider.id,
+            defaults: harness.defaults
+        )
+        CloudModelRegistry.clearProviderState(for: provider, defaults: harness.defaults)
+        // A re-added identifier starts clean: neither a window nor a rate from
+        // the removed registration may describe a model the operator has not
+        // configured again.
+        XCTAssertTrue(CloudContextPolicy.overrides(for: provider.id, defaults: harness.defaults).isEmpty)
+        XCTAssertTrue(CloudPricingStore.pricing(for: provider.id, defaults: harness.defaults).isEmpty)
     }
 
     func testTheShippingStoreMakesTheProviderLiveEverywhere() throws {

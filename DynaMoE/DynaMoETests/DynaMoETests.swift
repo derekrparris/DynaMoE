@@ -16258,28 +16258,26 @@ final class ChatSessionPersistenceTests: XCTestCase {
 
     // MARK: - Cumulative token odometer (pure logic)
 
-    func testUnmeteredSessionSeedsOdometerFromFullPrompt() {
-        // A conversation with no meter yet — a pre-feature history, or a fresh
-        // /compact reset — counts its next turn's entire prompt as the base,
-        // because that prompt IS the conversation's context size. Seeding
-        // ignores prefix reuse: the unmetered tail was never counted before.
-        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: nil, promptTokenCount: 1200, prefixTokensReused: 0), 1200)
-        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: nil, promptTokenCount: 1200, prefixTokensReused: 800), 1200)
-        // Generated tokens add on top of the seeded base as the turn streams.
-        let seeded = ChatSession.cumulativeTokenBase(previousTotal: nil, promptTokenCount: 1200, prefixTokensReused: 0)
-        XCTAssertEqual(seeded + 300, 1500)
+    func testTheOdometerSeedsFromThePromptNotThePreviousTotal() {
+        // One meaning for every backend — the conversation's context size — so
+        // a turn's base is its own prompt regardless of what the last turn
+        // stored. Before this rule a meter left by a cloud turn (already a
+        // context size) was added to the next local turn's prompt, and the
+        // header pill jumped by a whole conversation whenever the backend
+        // changed.
+        XCTAssertEqual(ChatSession.contextTokenBase(promptTokenCount: 1200), 1200)
+        XCTAssertEqual(
+            ChatSession.contextTokenBase(promptTokenCount: 1200),
+            ChatSession.contextTokenBase(promptTokenCount: 1200)
+        )
     }
 
-    func testMeteredSessionAddsOnlyNonReusedPromptTokens() {
-        // Only the part of the prompt the pinned prefix did not already cover
-        // counts again, so prefix reuse never double-counts context.
-        let base = ChatSession.cumulativeTokenBase(previousTotal: 5000, promptTokenCount: 1200, prefixTokensReused: 800)
-        XCTAssertEqual(base, 5400)
-        XCTAssertEqual(base + 300, 5700)
-        // Reuse at or beyond the prompt's length contributes nothing, never a
-        // negative delta.
-        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: 5000, promptTokenCount: 100, prefixTokensReused: 100), 5000)
-        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: 5000, promptTokenCount: 100, prefixTokensReused: 300), 5000)
+    func testTheOdometerBaseClampsAndAddsGeneratedTokens() {
+        // Generated tokens add on top of the seeded base as the turn streams,
+        // and a nonsense prompt count seeds zero rather than a negative total.
+        let seeded = ChatSession.contextTokenBase(promptTokenCount: 1200)
+        XCTAssertEqual(seeded + 300, 1500)
+        XCTAssertEqual(ChatSession.contextTokenBase(promptTokenCount: -10), 0)
     }
 
     func testPlaceholderIsUnusedOnlyWhenEmptyAndUntitled() {
