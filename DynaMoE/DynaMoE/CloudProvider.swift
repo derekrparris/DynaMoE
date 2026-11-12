@@ -770,6 +770,27 @@ public nonisolated enum CloudModelRegistry {
         )
     }
 
+    /// Drops every registration fact about the SERVER at the provider's base
+    /// URL: the model list, the no-tools list and the vision marks. Used when
+    /// the base URL changes, where the old ids and capability marks describe an
+    /// endpoint that is no longer being talked to.
+    ///
+    /// Prices and context windows deliberately survive, because they describe
+    /// the MODEL rather than the endpoint. They are typed by hand from the
+    /// provider's own price sheet, neither has a Settings control to retype
+    /// one, and re-pointing a provider (a proxy, a regional host, a corrected
+    /// path) says nothing about what its models cost or how much context they
+    /// hold. Deleting them silently also deleted the spend figure and the
+    /// auto-compaction ceiling for every model on it.
+    public static func clearEndpointState(
+        for provider: CloudProvider,
+        defaults: UserDefaults = .standard
+    ) {
+        defaults.removeObject(forKey: modelsDefaultsKey(for: provider.id))
+        defaults.removeObject(forKey: noToolsDefaultsKey(for: provider.id))
+        defaults.removeObject(forKey: visionDefaultsKey(for: provider.id))
+    }
+
     /// Drops every per-provider registration fact: the model list, the
     /// no-tools list, the vision marks, the context windows and the prices.
     /// Used when the provider itself is removed, so a re-added identifier
@@ -778,9 +799,7 @@ public nonisolated enum CloudModelRegistry {
         for provider: CloudProvider,
         defaults: UserDefaults = .standard
     ) {
-        defaults.removeObject(forKey: modelsDefaultsKey(for: provider.id))
-        defaults.removeObject(forKey: noToolsDefaultsKey(for: provider.id))
-        defaults.removeObject(forKey: visionDefaultsKey(for: provider.id))
+        clearEndpointState(for: provider, defaults: defaults)
         defaults.removeObject(forKey: CloudContextPolicy.defaultsKey(for: provider.id))
         defaults.removeObject(forKey: CloudPricingStore.defaultsKey(for: provider.id))
     }
@@ -788,6 +807,11 @@ public nonisolated enum CloudModelRegistry {
     /// Unregisters one model without disturbing the rest of the list. A
     /// catalog can list models the endpoint does not serve on the wire
     /// dialect in use, so pruning one has to be possible without Clear-all.
+    ///
+    /// The price and window removals go through their own key-by-key helpers
+    /// rather than through the readers: those readers drop entries they cannot
+    /// decode, so rewriting their output deleted a neighbouring model's
+    /// hand-typed value that merely had a typo.
     public static func removeRegisteredModel(
         _ providerModelId: String,
         for provider: CloudProvider,
@@ -806,14 +830,16 @@ public nonisolated enum CloudModelRegistry {
         if withVision.remove(providerModelId) != nil {
             setModelIdsWithVisionSupport(withVision, for: provider, defaults: defaults)
         }
-        var windows = CloudContextPolicy.overrides(for: provider.id, defaults: defaults)
-        if windows.removeValue(forKey: providerModelId) != nil {
-            CloudContextPolicy.setOverrides(windows, for: provider.id, defaults: defaults)
-        }
-        var prices = CloudPricingStore.pricing(for: provider.id, defaults: defaults)
-        if prices.removeValue(forKey: providerModelId) != nil {
-            CloudPricingStore.setPricing(prices, for: provider.id, defaults: defaults)
-        }
+        CloudContextPolicy.removeOverride(
+            model: providerModelId,
+            providerId: provider.id,
+            defaults: defaults
+        )
+        CloudPricingStore.removePrice(
+            forModel: providerModelId,
+            providerId: provider.id,
+            defaults: defaults
+        )
     }
 
     /// Whether a `/models` catalog entry looks like a chat completion model.

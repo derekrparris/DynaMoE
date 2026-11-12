@@ -144,8 +144,9 @@ final class CloudProviderStore: ObservableObject {
         // facts about the server at the old base URL rather than about this
         // identifier, so keeping them would offer model ids the new endpoint
         // never listed and fail with that endpoint's own error on the send.
+        // Prices and windows are facts about the MODEL and are kept.
         if updated.openAIBaseURL != previousBaseURL {
-            CloudModelRegistry.clearProviderState(for: updated, defaults: defaults)
+            CloudModelRegistry.clearEndpointState(for: updated, defaults: defaults)
         }
         publish()
     }
@@ -172,6 +173,14 @@ final class CloudProviderStore: ObservableObject {
             cacheHints: hints
         )
         CloudProviderCatalog.saveCustomProviders(custom, defaults: defaults)
+        // A refusal is a statement about the SERVER, and this control is the
+        // operator saying they know better. Leaving the latch in place made
+        // the setting a silent no-op for the rest of the process: the hint was
+        // re-read on every request, but the endpoint was remembered as having
+        // refused the field, so nothing was ever sent.
+        CloudCacheHintMemory.shared.allowPromptCacheKey(
+            endpoint: current.chatCompletionsURL.absoluteString
+        )
         publish()
     }
 

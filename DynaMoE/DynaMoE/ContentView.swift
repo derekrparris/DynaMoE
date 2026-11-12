@@ -2723,11 +2723,22 @@ struct ContentView: View {
                 // Scoped to the conversation it happened in: the pill says
                 // "the conversation", and an unscoped notice drew it over
                 // whichever chat was on screen.
+                let notice = "⚠️ Compaction failed: \(error.localizedDescription) — the conversation was left unchanged."
                 self.showStatus(
                     "⚠️ Compaction failed: \(error.localizedDescription)",
                     sessionId: sessionId
                 )
-                postToProgress("⚠️ Compaction failed: \(error.localizedDescription) — the conversation was left unchanged.")
+                postToProgress(notice)
+                // The progress bubble is transient and `normalizedForRestore`
+                // drops it, so a failure recorded only there disappeared the
+                // next time the chat opened — leaving a conversation that was
+                // never compacted with no trace of the attempt. The cloud path
+                // already parks a persistent `.system` row; this one does too.
+                if let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
+                    self.sessions[liveIdx].messages.append(
+                        ChatMessage(role: .system, content: notice)
+                    )
+                }
             }
         }
         attachManualCompaction(compactionTask, sessionId: sessionId, runId: compactionRunId)
@@ -2903,6 +2914,11 @@ struct ContentView: View {
         // was going to replace are deleted permanently, and the text that
         // would take their place never covered the end of the chunk.
         func summarize(system: String, prompt: String) async throws -> String {
+            // Checked BEFORE the request: a Stop that arrived while the history
+            // was being chunked must not spend one more billed summarizer pass.
+            // Nothing has been sent at this point, so throwing here is also the
+            // reason nothing is charged for it.
+            try Task.checkCancellation()
             let estimatedPromptTokens = CloudMessageAssembler.approximatePromptTokens(
                 system: system,
                 messages: [CloudChatMessage(role: "user", content: prompt)]
@@ -2964,6 +2980,9 @@ struct ContentView: View {
 
             let recapPrompt = "Conversation excerpt, oldest messages first — the most recent work last:\n\n\(recentChunk)"
             onProgress?("🗂 \(provider.displayName) — capturing the detailed recap…")
+            // Same rule as `summarize`: a Stop before the request is sent costs
+            // nothing, and this pass is not owed a request of its own.
+            try Task.checkCancellation()
             let recapEstimatedPromptTokens = CloudMessageAssembler.approximatePromptTokens(
                 system: recapInstructions,
                 messages: [CloudChatMessage(role: "user", content: recapPrompt)]
@@ -4598,9 +4617,18 @@ struct ContentView: View {
             delivery: imageDeliveryPolicy,
             imagesSupported: visionCapable
         )
+        // Loaded tools for the first step, resolved before anything is priced:
+        // the provider serialises every schema into the prompt, so an estimate
+        // that leaves them out measures a tool-heavy agent run one to three
+        // thousand tokens light on every request. Inside the loop the list is
+        // re-read per step, because `tools_load` can grow it mid-run.
+        let openingTools = toolsEnabled
+            ? AgentHarness.shared.availableToolDefinitions(mode: mode)
+            : []
         let turnInputTokens = CloudMessageAssembler.approximatePromptTokens(
             system: currentPersona(),
-            messages: openingMessages
+            messages: openingMessages,
+            tools: openingTools
         ) + attachmentImageCount * ImageAttachmentPreparer.estimatedTokensPerImage
         // The odometer measures the context in flight, not the invoice: a cloud
         // request re-sends the whole conversation, so the figure is the last
@@ -4697,7 +4725,10 @@ struct ContentView: View {
                         imageDataURLs: imagesAllowed ? imageDataURLs : [:],
                         imagesSupported: imagesAllowed,
                         imageDelivery: imageDeliveryPolicy
-                    )
+                    ),
+                    tools: toolsEnabled
+                        ? AgentHarness.shared.availableToolDefinitions(mode: mode)
+                        : []
                 )
             }
             // A compaction rewrites the conversation the odometer was counting,
@@ -4717,9 +4748,11 @@ struct ContentView: View {
             }
             // Prompt-only coordinator directive carrying subagent reports that
             // landed mid-run. Cloud history is re-assembled from the session on
-            // every step, so the reports ride the leading system message of the
-            // remaining steps instead of a stored message (which would render in
-            // the transcript as if the user sent them).
+            // every step, so the reports ride a TRAILING user turn
+            // (`CloudStepPrompt.assemble`) instead of a stored message (which
+            // would render in the transcript as if the user sent them). The
+            // trailing position is what keeps the leading system message — the
+            // cached prefix — byte-identical between steps.
             var relayDirective = ""
             // At most one tools-disabled synthesis turn per run, mirroring the
             // weights path's forced-synthesis pass. It also bounds the subagent
@@ -4749,7 +4782,19 @@ struct ContentView: View {
                 // runs between steps, never mid-request, and the in-flight
                 // placeholder survives it because the rewrite keeps the newest
                 // messages.
-                if compactionAttempts.shouldAttemptPreflight, let window = contextWindow {
+                //
+                // The tools the request will carry, resolved before the
+                // pre-flight because they are part of the prompt: a loaded
+                // agent toolset is one to three thousand tokens of schema on
+                // EVERY request, and leaving it out of the projection meant a
+                // tool-heavy run crossed the real ceiling having "measured"
+                // 80% of it. A relay or synthesis turn is a final-answer pass
+                // and offers none, which the projection has to know too.
+                let stepTools = CloudAgentStepPlan.offersTools(
+                    agentTurn: toolsEnabled,
+                    isSynthesisTurn: ranSynthesisTurn
+                ) ? AgentHarness.shared.availableToolDefinitions(mode: mode) : []
+                if compactionAttempts.allowsPreflightCheck, let window = contextWindow {
                     let projected = CloudMessageAssembler.approximatePromptTokens(
                         system: currentPersona(),
                         messages: CloudMessageAssembler.assemble(
@@ -4758,9 +4803,11 @@ struct ContentView: View {
                             imageDataURLs: imagesAllowed ? imageDataURLs : [:],
                             imagesSupported: imagesAllowed,
                             imageDelivery: imageDeliveryPolicy
-                        )
+                        ),
+                        tools: stepTools
                     )
-                    if CloudContextPolicy.shouldCompact(promptTokens: projected, window: window) {
+                    if CloudContextPolicy.shouldCompact(promptTokens: projected, window: window),
+                       compactionAttempts.shouldAttemptPreflight(projectedTokens: projected) {
                         compactionAttempts.beginPreflight()
                         let outcome = await self.compactCloudHistoryWithProgress(
                             sessionId: sessionId,
@@ -4781,7 +4828,11 @@ struct ContentView: View {
                             runCost = (runCost ?? 0) + outcome.cost
                         }
                         if outcome.didCompact {
-                            compactionAttempts.recordRewrite()
+                            // The size the pass decided about becomes the floor
+                            // a later pre-flight has to grow past: below it the
+                            // new summary would only re-summarize its own
+                            // digest.
+                            compactionAttempts.recordRewrite(promptTokens: projected)
                             contextCompactionFailure = nil
                             turnContextTokens = odometerAfterCompaction()
                             self.showStatus(
@@ -4852,15 +4903,14 @@ struct ContentView: View {
                 // count the same history once per step.
                 let stepEstimatedPrompt = CloudMessageAssembler.approximatePromptTokens(
                     system: nil,
-                    messages: outbound
+                    messages: outbound,
+                    tools: stepTools
                 )
                 turnContextTokens = stepEstimatedPrompt
                 // The relay/synthesis turn is a final-answer pass: the model must
-                // present the reports, not start another tool round.
-                let tools = CloudAgentStepPlan.offersTools(
-                    agentTurn: toolsEnabled,
-                    isSynthesisTurn: ranSynthesisTurn
-                ) ? AgentHarness.shared.availableToolDefinitions(mode: mode) : []
+                // present the reports, not start another tool round. Resolved
+                // above so the pre-flight prices the same request this sends.
+                let tools = stepTools
                 let stepMessageId = currentMessageId
                 let generationStartTime = CFAbsoluteTimeGetCurrent()
 
@@ -4882,6 +4932,9 @@ struct ContentView: View {
                 var thinkingDuration: Double? = nil
                 var reportedUsage: CloudUsage? = nil
                 var finishReason: String? = nil
+                // Set when the provider closed the stream without `[DONE]` or a
+                // `finish_reason`: the text above is a prefix, not an answer.
+                var endedWithoutTerminal = false
                 var serviceFailure: CloudTurnFailure? = nil
                 var stepToolCalls: [CloudToolCall] = []
 
@@ -4897,6 +4950,44 @@ struct ContentView: View {
                     guard self.ownsGeneration(myGenerationId),
                           let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) else { return }
                     self.sessions[sIdx].cumulativeTokenCount = odometerTotal(including: generatedTokenCount())
+                }
+
+                /// Prices a request that was sent and never came back.
+                ///
+                /// Every provider bills the prompt of a request it processed,
+                /// and a stopped or failed turn has no terminal usage block to
+                /// price, so the app's own estimate stands in and `(est.)`
+                /// marks the run. Charging nothing here is what made
+                /// `cumulativeCost` (and the spend pill) under-report by a
+                /// whole prompt on every Stop, while the summarizer path
+                /// charged the same situation correctly. A usage block that DID
+                /// arrive before the stop is measured, and measured wins.
+                @MainActor func chargeUnreturnedStep() {
+                    let measured = reportedUsage.flatMap { usage -> CloudUsage? in
+                        guard usage.promptTokens != nil, usage.completionTokens != nil else { return nil }
+                        return usage
+                    }
+                    let prompt = max(0, measured?.promptTokens ?? stepEstimatedPrompt)
+                    // Output the provider streamed before the stop is billed too.
+                    let output = max(0, measured?.completionTokens ?? generatedTokenCount())
+                    runPromptTokens += prompt
+                    runCachedTokens += max(0, measured?.cachedTokens ?? 0)
+                    runOutputTokens += output
+                    if measured == nil { runWasEstimated = true }
+                    guard let pricing = CloudPricingStore.pricing(
+                        forModel: providerModelId,
+                        providerId: provider.id
+                    ), let cost = pricing.cost(for: CloudUsage(
+                        promptTokens: prompt,
+                        completionTokens: output,
+                        cachedTokens: measured?.cachedTokens,
+                        cacheWriteTokens: measured?.cacheWriteTokens
+                    )) else { return }
+                    runCost = (runCost ?? 0) + cost
+                    if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
+                        self.sessions[sIdx].cumulativeCost
+                            = (self.sessions[sIdx].cumulativeCost ?? 0) + cost
+                    }
                 }
 
                 // 60fps-throttled streaming UI updates, mirroring the weights and
@@ -4966,6 +5057,7 @@ struct ContentView: View {
                         reportedUsage = result.usage
                         finishReason = result.finishReason
                         stepToolCalls = result.toolCalls
+                        endedWithoutTerminal = !result.terminated
                     case .failed(let failure):
                         serviceFailure = failure
                     }
@@ -4975,7 +5067,10 @@ struct ContentView: View {
                 // success finalizer: the replacement generation owns the UI
                 // flags. Partials already streamed stay in the message, and the
                 // row keeps the stopped/aborted contract the weights path uses.
+                // The request itself was sent, so it is priced here rather than
+                // left out of the conversation's spend.
                 if Task.isCancelled || !self.ownsGeneration(myGenerationId) {
+                    chargeUnreturnedStep()
                     commitOdometerTail()
                     turnLog.recordChatTurn(
                         status: Task.isCancelled ? 200 : 500,
@@ -5055,7 +5150,10 @@ struct ContentView: View {
                         runCost = (runCost ?? 0) + outcome.cost
                     }
                     if outcome.didCompact {
-                        compactionAttempts.recordRewrite()
+                        // The rejected request's own size is the floor: the
+                        // provider has just proved the pre-flight estimate was
+                        // under it.
+                        compactionAttempts.recordRewrite(promptTokens: stepEstimatedPrompt)
                         contextCompactionFailure = nil
                         turnContextTokens = odometerAfterCompaction()
                         turnLog.recordChatTurn(
@@ -5086,6 +5184,15 @@ struct ContentView: View {
                 }
 
                 if let failure = serviceFailure {
+                    // A request that reached the provider and failed was still
+                    // billed for its prompt, and this step has no usage block to
+                    // price: charge the estimate so the run total and the
+                    // session's spend describe every request the provider saw.
+                    // A credential refusal the client reports before it connects
+                    // is the exception (`spentRequest`).
+                    if failure.spentRequest {
+                        chargeUnreturnedStep()
+                    }
                     var errText = "⚠️ \(provider.displayName) error: \(failure.localizedDescription)"
                     if isAgentTurn, case .httpStatus(let code, let summary) = failure, code == 400 || code == 422 {
                         if CloudTurnFailure.indicatesContextOverflow(summary) {
@@ -5360,20 +5467,27 @@ struct ContentView: View {
 
                 // A max-token cut ends the turn looking complete: the provider
                 // reports `finish_reason: "length"` (or `"max_tokens"`) and just
-                // stops. Park the notice in the transcript, because the status
-                // line is transient and `.system` rows are never replayed into
-                // the provider's history.
+                // stops. The same is true of a stream closed without any
+                // terminal marker — the provider reports nothing at all, so the
+                // app says it. Park the notice in the transcript either way,
+                // because the status line is transient and `.system` rows are
+                // never replayed into the provider's history.
                 let truncatedAtLimit = finishReason == "length" || finishReason == "max_tokens"
+                let truncationNotice: String?
                 if truncatedAtLimit {
-                    let notice = "⚠️ This answer stopped at the Max Output Tokens limit and may be truncated. Raise it in Settings ▸ Sampling for a longer reply."
-                    if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
-                        let insertAt = self.sessions[sIdx].messages.firstIndex(where: { $0.id == stepMessageId })
-                            .map { $0 + 1 } ?? self.sessions[sIdx].messages.count
-                        self.sessions[sIdx].messages.insert(
-                            ChatMessage(role: .system, content: notice),
-                            at: insertAt
-                        )
-                    }
+                    truncationNotice = "⚠️ This answer stopped at the Max Output Tokens limit and may be truncated. Raise it in Settings ▸ Sampling for a longer reply."
+                } else if endedWithoutTerminal {
+                    truncationNotice = "⚠️ \(provider.displayName) closed the connection before the reply finished, so the answer above may be incomplete."
+                } else {
+                    truncationNotice = nil
+                }
+                if let truncationNotice, let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
+                    let insertAt = self.sessions[sIdx].messages.firstIndex(where: { $0.id == stepMessageId })
+                        .map { $0 + 1 } ?? self.sessions[sIdx].messages.count
+                    self.sessions[sIdx].messages.insert(
+                        ChatMessage(role: .system, content: truncationNotice),
+                        at: insertAt
+                    )
                 }
 
                 self.isGeneratingText = false
@@ -5401,6 +5515,7 @@ struct ContentView: View {
                 self.showStatus(
                     "☁️ \(provider.displayName) — \(turnCost.statusSuffix) · \(durationText) · \(String(format: "%.1f", finalTokPerSec)) tok/s"
                         + (truncatedAtLimit ? " — truncated at the Max Output Tokens limit." : "")
+                        + (truncationNotice != nil && !truncatedAtLimit ? " — stream ended early." : "")
                 )
                 self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)
                 return

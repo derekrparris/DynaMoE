@@ -91,6 +91,19 @@ nonisolated final class CloudCacheHintMemory: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Forgets one endpoint's refusal. A latch is a statement about what a
+    /// SERVER accepts, and the operator can know better: changing the cache
+    /// hint in Settings, or pointing the provider at a different base URL,
+    /// describes a different server, so the old answer must not silently
+    /// override the new setting. Without this a provider that refused the
+    /// field once kept it switched off for the life of the process, and the
+    /// control that turns it back on did nothing until relaunch.
+    func allowPromptCacheKey(endpoint: String) {
+        lock.lock()
+        declined.remove(endpoint)
+        lock.unlock()
+    }
+
     /// Forgets every endpoint. Process lifetime is the shipping behaviour, and a
     /// service can now hold its OWN instance (`OpenAICloudChatService(cacheHintMemory:)`),
     /// so a test should prefer injection over this: a case that latched the
@@ -234,15 +247,23 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
     }
 
     /// Internal so a test can pin the request shape without a live endpoint.
+    ///
+    /// `cacheKeyIsSent` is the already-resolved decision. `streamTurn` passes
+    /// the answer it took before the send so its retry predicate can test the
+    /// request it actually made; re-deriving it there re-read a process-wide
+    /// latch a concurrent request can flip in between, which suppressed the
+    /// retry this request had earned and failed the turn instead.
     func makeRequest(
         model: String,
         messages: [CloudChatMessage],
         params: CloudChatGenerationParams,
         tools: [ToolDefinition]? = nil,
         includeUsage: Bool = true,
-        includeCacheKey: Bool = true
+        includeCacheKey: Bool = true,
+        cacheKeyIsSent: Bool? = nil
     ) throws -> URLRequest {
-        let wantsCacheKey = includeCacheKey && willSendCacheKey(params: params)
+        let wantsCacheKey = cacheKeyIsSent
+            ?? (includeCacheKey && willSendCacheKey(params: params))
         let body = Body(
             model: model,
             messages: messages,
@@ -308,13 +329,21 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                     var retriedWithoutCacheKey = false
                     var cacheKeyRejectionStatus: Int?
                     for _ in 0..<3 {
+                        // Resolved BEFORE the send and reused by the retry
+                        // predicate below: the latch is process-wide, so a
+                        // concurrent request declaring this endpoint
+                        // indifferent between now and the response would
+                        // otherwise suppress the retry this request earned and
+                        // fail the turn on a field it had, in fact, sent.
+                        let sentCacheKey = includeCacheKey && self.willSendCacheKey(params: params)
                         let request = try self.makeRequest(
                             model: model,
                             messages: messages,
                             params: params,
                             tools: tools,
                             includeUsage: includeUsage,
-                            includeCacheKey: includeCacheKey
+                            includeCacheKey: includeCacheKey,
+                            cacheKeyIsSent: sentCacheKey
                         )
                         let (bytes, response) = try await self.session.bytes(for: request)
                         guard let http = response as? HTTPURLResponse else {
@@ -324,12 +353,16 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                         }
                         guard (200..<300).contains(http.statusCode) else {
                             let body = await Self.drain(bytes, limit: 4096)
+                            // Stop may have arrived while the error body was
+                            // draining. Either retry below re-uploads the whole
+                            // prompt, which nobody is waiting for any more.
+                            try Task.checkCancellation()
                             if includeUsage,
                                Self.shouldRetryWithoutStreamOptions(status: http.statusCode, body: body) {
                                 includeUsage = false
                                 continue
                             }
-                            if includeCacheKey, self.willSendCacheKey(params: params),
+                            if sentCacheKey,
                                Self.shouldRetryWithoutCacheKey(status: http.statusCode, body: body) {
                                 includeCacheKey = false
                                 retriedWithoutCacheKey = true
@@ -451,7 +484,16 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                                     "The provider closed the stream without sending any content."
                                 )))
                             } else {
-                                continuation.yield(.finished(parser.result()))
+                                // A clean EOF is not a finished answer. The
+                                // protocol marks the end with `[DONE]` or with
+                                // a `finish_reason`, and a connection that
+                                // closes mid-reply looks exactly like this; the
+                                // flag travels with the result so the chat
+                                // surface can say the reply was cut off and a
+                                // compaction can refuse to commit it.
+                                continuation.yield(.finished(parser.result(
+                                    terminated: finishedBySentinel || parser.finishReason != nil
+                                )))
                             }
                         }
                         continuation.finish()
@@ -487,16 +529,27 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
     /// Deliberately not keyed on the body naming the field: a provider
     /// rejecting an unknown body field usually words it vaguely ("invalid
     /// request", "unexpected property"), and a rejected request is not billed,
-    /// so one blind retry costs nothing. It is bounded to 4xx because a 5xx or
-    /// a 429 is not about the field, and it excludes the two 400s that are
-    /// about the request's CONTENT: a context overflow or an image refusal is
-    /// answered by uploading the same megabytes again, and the chat turn has
-    /// its own recovery for each.
+    /// so one blind retry costs nothing but the upload.
+    ///
+    /// The upload is the cost, and it is the whole prompt. A body that names
+    /// another part of the request — the model, the tool schemas, the messages
+    /// — is about that part, and re-sending the same megabytes would fail
+    /// identically, so those are refused here. The two content refusals the
+    /// chat path recovers from on its own (a context overflow, an image
+    /// rejection) are refused for the same reason, and were already.
     nonisolated static func shouldRetryWithoutCacheKey(status: Int, body: String) -> Bool {
         guard status == 400 || status == 422 else { return false }
-        if CloudTurnFailure.indicatesContextOverflow(body) { return false }
-        if CloudTurnFailure.indicatesImageRejection(body) { return false }
-        return true
+        let lower = body.lowercased()
+        if CloudTurnFailure.indicatesContextOverflow(lower) { return false }
+        if CloudTurnFailure.indicatesImageRejection(lower) { return false }
+        // Words that name a different part of the request. "function" is here
+        // for the tool-calling refusals some endpoints answer with, not for the
+        // field itself; a body that mentions it is not about the cache hint.
+        let otherParts = [
+            "invalid model", "unknown model", "model not found", "does not exist",
+            "tool", "function", "schema", "messages"
+        ]
+        return !otherParts.contains { lower.contains($0) }
     }
 
     // MARK: Models
@@ -742,6 +795,12 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
     /// stream that ends without a terminal event throws instead of returning:
     /// a compaction that deletes the messages behind a half-written summary
     /// cannot be undone.
+    ///
+    /// "Terminal" is the protocol's own marker, not a clean EOF. A provider that
+    /// closes the connection without `[DONE]` and without a `finish_reason` has
+    /// written a prefix of an answer, and committing that would delete every
+    /// message it never covered — which is exactly why the flag is checked here
+    /// as well as in `stoppedAtOutputLimit`.
     public func completeText(
         model: String,
         systemPrompt: String,
@@ -787,6 +846,11 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
         guard let result else {
             throw CloudTurnFailure.invalidResponse(
                 "The provider's stream ended before the completion was finished."
+            )
+        }
+        guard result.terminated else {
+            throw CloudTurnFailure.invalidResponse(
+                "The provider's stream closed before the completion was finished, so its text is only a fragment."
             )
         }
         return CloudTextCompletion(

@@ -274,6 +274,22 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
     /// and at a premium the price list can record as `cache_write_input`).
     public let cacheWriteTokens: Int?
 
+    /// Whether `promptTokens` was rebuilt from Anthropic's three-way split,
+    /// i.e. whether the wire `input_tokens` column was the UNCACHED share
+    /// rather than the prompt total.
+    ///
+    /// It describes how the block was DECODED, which is the one thing a stream
+    /// holding several usage blocks has to know: a later block that repeats
+    /// `input_tokens` without the cache columns cannot be compared with — or
+    /// laid over — a total that included them (`merging`).
+    var inputTokensExcludeCache: Bool
+
+    /// Whether the prompt count came from the wire's `input_tokens` rather than
+    /// from `prompt_tokens`. Both spellings exist, and only this one can be an
+    /// uncached share; it is what lets `merging` recognise a later block that
+    /// repeats the column without repeating the cache split.
+    var inputTokensFromInputColumn: Bool
+
     public init(
         promptTokens: Int? = nil,
         completionTokens: Int? = nil,
@@ -286,14 +302,8 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
         self.totalTokens = totalTokens
         self.cachedTokens = cachedTokens
         self.cacheWriteTokens = cacheWriteTokens
-    }
-
-    /// The input tokens actually billed at the full rate: everything the
-    /// provider processed minus what it served from cache. Nil when the
-    /// provider reported no prompt count at all (an endpoint that drops usage).
-    public var billableInputTokens: Int? {
-        guard let promptTokens else { return nil }
-        return max(0, promptTokens - (cachedTokens ?? 0))
+        self.inputTokensExcludeCache = false
+        self.inputTokensFromInputColumn = false
     }
 
     /// Fraction of the prompt served from cache, 0...1, or nil when the
@@ -314,14 +324,39 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
     /// measured prompt and its cache split into the app's estimate — exactly
     /// where the cache reporting matters. A nil column means "not reported
     /// here", so it inherits the earlier value instead of erasing it.
+    ///
+    /// The prompt count is the exception a nil check cannot cover. Anthropic's
+    /// `message_start` carries the cache columns and its `message_delta` may
+    /// repeat `input_tokens` alone, which decodes to the UNCACHED share; laying
+    /// that over a total that included the cached and written tokens shrinks
+    /// the prompt by exactly the cache split, so the billed total and the
+    /// `cached` figure beside it stop adding up. A later block that names no
+    /// cache columns therefore leaves an earlier three-way split's total alone.
     public func merging(_ newer: CloudUsage) -> CloudUsage {
-        CloudUsage(
-            promptTokens: newer.promptTokens ?? promptTokens,
+        // A later block that repeats the bare `input_tokens` column names no
+        // cache split, so it cannot replace a total that included one. An
+        // OpenAI-shaped `prompt_tokens` IS the total and still wins, which is
+        // why both wire spellings are tracked rather than just the normalised
+        // number.
+        let newerRepeatsOnlyTheInputColumn = newer.inputTokensFromInputColumn
+            && newer.cachedTokens == nil
+            && newer.cacheWriteTokens == nil
+        let keepsEarlierSplit = inputTokensExcludeCache && newerRepeatsOnlyTheInputColumn
+        let keepsEarlierPrompt = newer.promptTokens == nil || keepsEarlierSplit
+        var merged = CloudUsage(
+            promptTokens: keepsEarlierPrompt ? promptTokens : newer.promptTokens,
             completionTokens: newer.completionTokens ?? completionTokens,
             totalTokens: newer.totalTokens ?? totalTokens,
             cachedTokens: newer.cachedTokens ?? cachedTokens,
             cacheWriteTokens: newer.cacheWriteTokens ?? cacheWriteTokens
         )
+        merged.inputTokensExcludeCache = keepsEarlierPrompt
+            ? inputTokensExcludeCache
+            : newer.inputTokensExcludeCache
+        merged.inputTokensFromInputColumn = keepsEarlierPrompt
+            ? inputTokensFromInputColumn
+            : newer.inputTokensFromInputColumn
+        return merged
     }
 
     enum CodingKeys: String, CodingKey {
@@ -422,8 +457,8 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
         // those Anthropic-only cache keys, so a provider that publishes
         // `input_tokens` as the total (OpenAI's Responses shape) keeps that
         // meaning when no cache columns ride beside it. Normalising to the
-        // total here is what lets `billableInputTokens` and `CloudPricing`
-        // subtract a cache read without clamping the prompt to zero.
+        // total here is what lets `CloudPricing` subtract a cache read without
+        // clamping the prompt to zero.
         //
         // The cache columns are the only signal available for that split, so
         // an endpoint that published `input_tokens` as the TOTAL and also one
@@ -443,6 +478,8 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
         } else {
             self.promptTokens = (openAIPrompt ?? inputTokens).map { max(0, $0) }
         }
+        self.inputTokensExcludeCache = usesAnthropicCacheColumns
+        self.inputTokensFromInputColumn = openAIPrompt == nil && inputTokens != nil
         self.completionTokens = Self.firstInt(container, [.completionTokens, .outputTokens])
             .map { max(0, $0) }
         self.totalTokens = Self.firstInt(container, [.totalTokens]).map { max(0, $0) }
@@ -465,25 +502,39 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
     }
 }
 
+/// One streamed turn's collected result.
+///
+/// `terminated` says the stream reached a marker the protocol defines as the
+/// end of a completion — the `[DONE]` sentinel or a non-nil `finish_reason`.
+/// A connection that closes cleanly in the middle of a reply looks identical
+/// to a finished one at the transport level, and the difference matters where
+/// the text is about to delete something: a summary committed from a partial
+/// answer permanently removes the messages it never covered.
 public nonisolated struct CloudTurnResult: Equatable, Sendable {
     public let text: String
     public let thinking: String
     public let finishReason: String?
     public let usage: CloudUsage?
     public let toolCalls: [CloudToolCall]
+    /// Whether the stream ended with a terminal marker. Defaults to true so a
+    /// hand-built result in a test or a non-streaming source is not reported
+    /// as truncated by omission.
+    public let terminated: Bool
 
     public init(
         text: String,
         thinking: String,
         finishReason: String?,
         usage: CloudUsage?,
-        toolCalls: [CloudToolCall] = []
+        toolCalls: [CloudToolCall] = [],
+        terminated: Bool = true
     ) {
         self.text = text
         self.thinking = thinking
         self.finishReason = finishReason
         self.usage = usage
         self.toolCalls = toolCalls
+        self.terminated = terminated
     }
 }
 
@@ -565,6 +616,25 @@ public nonisolated enum CloudTurnFailure: Equatable, Sendable, LocalizedError {
         }
     }
 
+    /// Whether this failure means a request reached the provider, and was
+    /// therefore billed for at least its prompt.
+    ///
+    /// A missing or unreadable key, and a flavor with no implementation, fail
+    /// before anything is built; a transport error, a malformed stream and an
+    /// HTTP status all come back from a request that was sent. The distinction
+    /// is what stops the chat path reporting a spend for a turn that never left
+    /// the machine — and, on the other side, from omitting the prompt of a turn
+    /// the provider did process. It is the same posture the compaction path
+    /// takes with `CloudCompactionFailure.spentRequest`.
+    public var spentRequest: Bool {
+        switch self {
+        case .missingAPIKey, .credentialAccessDenied, .credentialNeedsImport, .unsupportedFlavor:
+            return false
+        case .httpStatus, .transport, .invalidResponse:
+            return true
+        }
+    }
+
     /// Whether a provider's 400/422 body is a context-window rejection rather
     /// than a schema or request-shape complaint. Providers word it differently,
     /// and the same status code covers "tools are unsupported", so the body has
@@ -605,8 +675,9 @@ public nonisolated enum CloudTurnFailure: Equatable, Sendable, LocalizedError {
 /// The coordinator directive that carries completed subagent reports into a
 /// cloud agent turn. The cloud path rebuilds its messages from the session on
 /// every step, so unlike the weights path the reports cannot be appended to a
-/// rendered prompt: they ride the leading system message instead, which
-/// keeps the transcript free of synthetic user turns.
+/// rendered prompt: they travel as a TRAILING user message
+/// (`CloudStepPrompt.assemble`), which keeps the transcript free of synthetic
+/// turns and still leaves the leading cached prefix byte-identical.
 public nonisolated enum CloudSubagentRelay {
     public static func directive(reports: [String]) -> String {
         let context = reports.joined(separator: "\n\n")
@@ -691,6 +762,23 @@ nonisolated struct CloudChatStreamChunk: Decodable {
     let choices: [Choice]?
     let usage: CloudUsage?
     let error: WireError?
+
+    enum CodingKeys: String, CodingKey {
+        case choices, usage, error
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.choices = try container.decodeIfPresent([Choice].self, forKey: .choices)
+        self.error = try container.decodeIfPresent(WireError.self, forKey: .error)
+        // Usage is the one optional block decoded leniently. It rides the last
+        // chunks of a stream, and a provider that spells one column wrong
+        // (`"usage": "n/a"`, a nested detail that is not an object) used to
+        // throw away the DELTAS in the same chunk — the reply lost text because
+        // its token accounting was malformed. An unreadable usage block costs
+        // the app's estimate and the `(est.)` mark, nothing else.
+        self.usage = (try? container.decodeIfPresent(CloudUsage.self, forKey: .usage)) ?? nil
+    }
 }
 
 // MARK: - Stream Parser
@@ -846,13 +934,17 @@ nonisolated struct CloudStreamParser {
         }
     }
 
-    func result() -> CloudTurnResult {
+    /// The accumulated turn. `terminated` comes from the transport, which is the
+    /// only layer that sees the `[DONE]` sentinel; it defaults to true so a
+    /// parser-level caller that never looks at the flag reads what it expects.
+    func result(terminated: Bool = true) -> CloudTurnResult {
         CloudTurnResult(
             text: text,
             thinking: thinking,
             finishReason: finishReason,
             usage: usage,
-            toolCalls: toolCalls
+            toolCalls: toolCalls,
+            terminated: terminated
         )
     }
 }
@@ -1190,7 +1282,20 @@ public nonisolated enum CloudMessageAssembler {
     /// usage only in the final streamed chunk, which may never arrive). Images
     /// contribute a flat allowance rather than their base64 length: a data URL
     /// counted as text would report tens of thousands of phantom tokens.
-    public static func approximatePromptTokens(system: String?, messages: [CloudChatMessage]) -> Int {
+    ///
+    /// `tools` is not decoration. The provider serialises every schema into the
+    /// prompt, so a loaded agent toolset adds one to three thousand tokens to
+    /// EVERY request of the loop, and a pre-flight estimate that left them out
+    /// read a tool-heavy run at 80% of the window while the real prompt was
+    /// already past it. The schemas are counted at three characters per token
+    /// rather than the prose ratio below, because they are JSON: the same
+    /// density that makes a code block cost more than its length suggests, and
+    /// erring high is what keeps the pre-flight on the safe side of the wall.
+    public static func approximatePromptTokens(
+        system: String?,
+        messages: [CloudChatMessage],
+        tools: [ToolDefinition]? = nil
+    ) -> Int {
         let imageTokens = messages.reduce(0) { total, message in
             total + (message.imageParts?.count ?? 0) * ImageAttachmentPreparer.estimatedTokensPerImage
         }
@@ -1198,7 +1303,19 @@ public nonisolated enum CloudMessageAssembler {
             total + (message.content ?? "").count
                 + (message.toolCalls ?? []).reduce(0) { $0 + $1.function.name.count + $1.function.arguments.count }
         }
-        return max(1, characters / 4 + imageTokens)
+        return max(1, characters / 4 + toolSchemaCharacters(tools) / 3 + imageTokens)
+    }
+
+    /// Characters the `tools` array occupies in the encoded request body. Zero
+    /// for no tools, and zero rather than a guess if the schemas cannot be
+    /// encoded: an unencodable tool set fails the request itself, so the
+    /// estimate must not invent a size for it.
+    static func toolSchemaCharacters(_ tools: [ToolDefinition]?) -> Int {
+        guard let tools, !tools.isEmpty else { return 0 }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(tools) else { return 0 }
+        return data.count
     }
 
     /// The prompt as the provider sees it, for the Settings ▸ Server log's

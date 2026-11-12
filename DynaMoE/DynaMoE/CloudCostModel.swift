@@ -54,19 +54,37 @@ public nonisolated struct CloudPricing: Codable, Equatable, Sendable {
     }
 
     /// Whether every recorded rate is a usable price. Prices are hand-typed
-    /// JSON, so a negative or non-finite number is a typo; a cost built from it
-    /// would be negative or absurd and the display's `> 0` guard would hide it
-    /// as "$0", which is worse than reporting no cost at all.
+    /// JSON, so a negative, non-finite, or absurd number is a typo; a cost
+    /// built from it would be negative or absurd and the display's `> 0` guard
+    /// would hide it as "$0", which is worse than reporting no cost at all.
+    ///
+    /// The ceiling matters as much as the floor. A finite rate of `1e300` per
+    /// million tokens overflows the arithmetic once it meets a real token
+    /// count: the product is `+inf`, `formatted` prints "$0" for it, and the
+    /// infinite cost is then added to `cumulativeCost`, which stays infinite
+    /// for the rest of the conversation. A million dollars per million tokens
+    /// is already past every list price by three orders of magnitude, so
+    /// anything above it is a units or decimal-point mistake.
     public var isValid: Bool {
-        func usable(_ value: Double) -> Bool { value.isFinite && value >= 0 }
+        func usable(_ value: Double) -> Bool {
+            value.isFinite && value >= 0 && value <= Self.maximumUsableRate
+        }
         return usable(input) && usable(output)
             && (cachedInput.map(usable) ?? true)
             && (cacheWriteInput.map(usable) ?? true)
     }
 
+    /// The largest rate a price entry may record, in USD per million tokens.
+    public static let maximumUsableRate: Double = 1_000_000
+
     /// What one reported usage block cost. Nil when the provider reported no
     /// prompt count, because a cost built from half the numbers is worse than
     /// no cost at all.
+    ///
+    /// A block with a prompt count and no COMPLETION count is refused for the
+    /// same reason: it would price the input and silently charge nothing for
+    /// the reply, so the status line shows a definite, understated figure
+    /// beside `(est.)`. Both halves are required or neither is priced.
     ///
     /// Cache-write tokens are charged at `cacheWriteInput` when the operator
     /// recorded it, and at the fresh-input rate otherwise. Every rate is
@@ -74,7 +92,8 @@ public nonisolated struct CloudPricing: Codable, Equatable, Sendable {
     /// also constructed in code where a negative rate would otherwise turn a
     /// turn's spend negative.
     public func cost(for usage: CloudUsage) -> Double? {
-        guard let reportedPrompt = usage.promptTokens else { return nil }
+        guard let reportedPrompt = usage.promptTokens,
+              let reportedCompletion = usage.completionTokens else { return nil }
         let promptTokens = max(0, reportedPrompt)
         let cached = max(0, min(usage.cachedTokens ?? 0, promptTokens))
         let written = max(0, min(usage.cacheWriteTokens ?? 0, promptTokens - cached))
@@ -82,8 +101,12 @@ public nonisolated struct CloudPricing: Codable, Equatable, Sendable {
         let inputCost = (fresh * Self.rate(input)
             + Double(cached) * Self.rate(cachedInput ?? input)
             + Double(written) * Self.rate(cacheWriteInput ?? input)) / 1_000_000
-        let outputCost = Double(max(0, usage.completionTokens ?? 0)) * Self.rate(output) / 1_000_000
-        return inputCost + outputCost
+        let outputCost = Double(max(0, reportedCompletion)) * Self.rate(output) / 1_000_000
+        let total = inputCost + outputCost
+        // Rates are bounded at decode, but this type is constructible in code:
+        // an infinite total would be laid into `cumulativeCost` once and never
+        // recover, so it is reported as "no price" instead.
+        return total.isFinite ? total : nil
     }
 
     private static func rate(_ value: Double) -> Double {
@@ -150,6 +173,36 @@ public nonisolated enum CloudPricingStore {
         defaults.set(raw, forKey: defaultsKey(for: providerId))
     }
 
+    /// Removes ONE model's price without rewriting the rest of the list.
+    ///
+    /// Pairing the reader above with `setPricing` loses data: `pricing(for:)`
+    /// returns only the entries that DECODE, so writing that dictionary back
+    /// deletes every other model's hand-typed price that happened to have a
+    /// typo. That is exactly what unregistering a different model did. This
+    /// edits the stored object key by key, so an entry with a typo stays where
+    /// the operator can see and fix it.
+    public static func removePrice(
+        forModel model: String,
+        providerId: String,
+        defaults: UserDefaults = .standard
+    ) {
+        let key = defaultsKey(for: providerId)
+        guard let raw = defaults.string(forKey: key),
+              let data = raw.data(using: .utf8),
+              var object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              object.removeValue(forKey: model) != nil else { return }
+        if object.isEmpty {
+            defaults.removeObject(forKey: key)
+            return
+        }
+        guard let updated = try? JSONSerialization.data(
+                  withJSONObject: object,
+                  options: [.sortedKeys]
+              ),
+              let text = String(data: updated, encoding: .utf8) else { return }
+        defaults.set(text, forKey: key)
+    }
+
     /// A cost rendered for a status line. Small amounts keep enough precision
     /// to be non-zero, because "$0.00" on a turn that did cost something reads
     /// as "free". The symbol is fixed because the price list is entered in USD
@@ -186,13 +239,23 @@ public nonisolated enum CloudOverflowAdvice {
         failure: CloudCompactionFailure?,
         providerName: String
     ) -> String {
-        if alreadyCompacted {
-            return " This turn already compacted older history once and the request still exceeded the window — start a new chat or run /compact."
-        }
+        // The recorded failure describes the MOST RECENT attempt, so it is the
+        // more actionable sentence even when an earlier pass did rewrite the
+        // history: "it compacted once and then the summary came back empty" is
+        // a different situation from "it compacted once and the result still
+        // did not fit". Reaching the wall with no failure means the last pass
+        // succeeded, which is the only case the already-compacted sentence
+        // describes.
         if let failure {
             var detail = failure.clause(providerName: providerName)
             if !detail.hasSuffix(".") { detail += "." }
-            return " Auto-compaction left the history unchanged: \(detail)"
+            let prefix = alreadyCompacted
+                ? " This turn compacted older history once and a later attempt failed"
+                : " Auto-compaction left the history unchanged"
+            return prefix + ": \(detail)"
+        }
+        if alreadyCompacted {
+            return " This turn already compacted older history once and the request still exceeded the window — start a new chat or run /compact."
         }
         return " The conversation exceeded this model's context window — older history could not be compacted automatically, so start a new chat or run /compact."
     }
@@ -215,18 +278,51 @@ public nonisolated enum CloudOverflowAdvice {
 ///
 /// `historyWasRewritten` rides beside the two flags so the overflow advice can
 /// still tell "already compacted and still too long" from "compaction left the
-/// history alone".
+/// history alone". It used to close the pre-flight gate for the rest of the
+/// run, which starved an uncapped agent run: after one rewrite the third wall
+/// ended the turn with no further attempt. A rewrite now records the prompt
+/// size it left behind, and a later pre-flight is allowed once the
+/// conversation has GROWN past what was already compacted — the pass would
+/// summarize new work rather than the digest it just wrote, which is the only
+/// reason the gate was closed. `rewriteCount` bounds the spend at one pass per
+/// `maximumRewritesPerRun` collapses.
 public nonisolated struct CloudCompactionAttempts: Equatable, Sendable {
     public private(set) var preflightAttempted = false
     public private(set) var overflowAttempted = false
     public private(set) var historyWasRewritten = false
+    /// The prompt size a rewrite left behind, when the caller recorded one.
+    public private(set) var promptTokensAtLastRewrite: Int?
+    /// Passes that actually replaced the history, across the whole run.
+    public private(set) var rewriteCount = 0
+
+    /// A run that keeps refilling its window is not paying for summaries that
+    /// can help; each one costs a full conversation's prompt. Three is enough
+    /// for a long agent run to cross two windows and stop.
+    public static let maximumRewritesPerRun = 3
 
     public init() {}
 
-    /// The pre-flight pass is skipped after a rewrite too: it would
-    /// immediately re-summarize the digest it just wrote.
-    public var shouldAttemptPreflight: Bool {
-        !preflightAttempted && !historyWasRewritten
+    /// Whether a pre-flight pass is worth running for a prompt of this size.
+    ///
+    /// Before any rewrite this is the old one-attempt gate. After one, it
+    /// reopens only when the new projection exceeds the size the last rewrite
+    /// left behind: below that there is nothing the last summary did not
+    /// already cover, and above it the conversation has genuinely refilled.
+    public func shouldAttemptPreflight(projectedTokens: Int) -> Bool {
+        guard !preflightAttempted else { return false }
+        guard historyWasRewritten else { return true }
+        guard rewriteCount < Self.maximumRewritesPerRun else { return false }
+        guard let baseline = promptTokensAtLastRewrite else { return false }
+        return projectedTokens > baseline
+    }
+
+    /// The cheap half of the same question, for the caller that has to get the
+    /// projected size before it can ask: false once the budget is spent or
+    /// once a rewrite left no baseline, so an exhausted run does not assemble
+    /// and tokenise its history on every step just to decline.
+    public var allowsPreflightCheck: Bool {
+        guard !preflightAttempted, rewriteCount < Self.maximumRewritesPerRun else { return false }
+        return !historyWasRewritten || promptTokensAtLastRewrite != nil
     }
 
     public var shouldAttemptOverflowRecovery: Bool {
@@ -242,7 +338,6 @@ public nonisolated struct CloudCompactionAttempts: Equatable, Sendable {
     /// about the next step, so holding the gate shut would make a one-attempt
     /// budget cost a compaction that became possible later.
     public mutating func abandonPreflight() {
-        guard !historyWasRewritten else { return }
         preflightAttempted = false
     }
 
@@ -250,8 +345,21 @@ public nonisolated struct CloudCompactionAttempts: Equatable, Sendable {
         overflowAttempted = true
     }
 
-    public mutating func recordRewrite() {
+    /// Records a pass that replaced the history. `promptTokens` is the size of
+    /// the prompt the pass was deciding about, which becomes the floor a later
+    /// pre-flight has to exceed.
+    ///
+    /// The in-flight attempt is released here rather than left spent: a pass
+    /// that SUCCEEDED is not a pending question, and a later pre-flight is a new
+    /// attempt whose worth `shouldAttemptPreflight(projectedTokens:)` and the
+    /// rewrite cap decide.
+    public mutating func recordRewrite(promptTokens: Int? = nil) {
         historyWasRewritten = true
+        rewriteCount += 1
+        preflightAttempted = false
+        if let promptTokens {
+            promptTokensAtLastRewrite = max(0, promptTokens)
+        }
     }
 }
 
@@ -318,6 +426,41 @@ public nonisolated enum CloudContextPolicy {
         }
     }
 
+    /// Removes ONE model's window from the stored list, leaving every other
+    /// entry — including one this build could not parse — exactly as typed.
+    ///
+    /// The `overrides(for:)` + `setOverrides` pair cannot do that: the reader
+    /// drops unparseable entries, so writing its result back erased an
+    /// operator's typo AND their valid neighbours in the same pass. Unregistering
+    /// an unrelated model used to take that path.
+    public static func removeOverride(
+        model: String,
+        providerId: String,
+        defaults: UserDefaults = .standard
+    ) {
+        let key = defaultsKey(for: providerId)
+        guard let raw = defaults.string(forKey: key) else { return }
+        var kept: [String] = []
+        var removed = false
+        for chunk in raw.split(whereSeparator: { $0 == ";" || $0 == "," || $0 == "\n" }) {
+            let entry = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !entry.isEmpty else { continue }
+            let parts = entry.split(maxSplits: 1, whereSeparator: { $0 == "=" || $0 == "@" })
+            if parts.count == 2,
+               parts[0].trimmingCharacters(in: .whitespacesAndNewlines) == model {
+                removed = true
+                continue
+            }
+            kept.append(entry)
+        }
+        guard removed else { return }
+        if kept.isEmpty {
+            defaults.removeObject(forKey: key)
+        } else {
+            defaults.set(kept.joined(separator: "; "), forKey: key)
+        }
+    }
+
     /// The window this model is believed to have, or nil when nobody recorded
     /// one. The per-model value wins over the provider-wide fallback.
     ///
@@ -368,9 +511,20 @@ public nonisolated enum CloudContextPolicy {
     }
 
     /// The share of the window a prompt occupies, for a status line.
+    ///
+    /// The window is hand-typed, so it can be as small as 1; `Int.max` tokens
+    /// over such a window overflows a Double multiplication into `+inf`, and
+    /// the `Int(...)` conversion of either that or a value above `Int.max`
+    /// traps. Both are clamped: a 100%-plus figure is the same answer either
+    /// way, and the header must never crash over a unit mistake.
     public static func usagePercent(promptTokens: Int, window: Int?) -> Int? {
         guard let window, window > 0 else { return nil }
-        return Int((Double(promptTokens) / Double(window) * 100).rounded())
+        let percent = (Double(max(0, promptTokens)) / Double(window) * 100).rounded()
+        // `Double(Int.max)` rounds UP to 2^63, so comparing against it and then
+        // converting is still a trap; the comparison must be the conversion's
+        // guard, not a clamp applied to a value that is already out of range.
+        guard percent.isFinite, percent < Double(Int.max) else { return .max }
+        return Int(percent)
     }
 
     /// Upper bound on a derived chunk budget. A third of a 128k-token window is
