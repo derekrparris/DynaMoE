@@ -440,11 +440,10 @@ public enum AppleFoundationModelService {
 
     /// Groups serialized compaction turns into chunks the summarizer can
     /// digest one request at a time, oldest first, whole turns per chunk.
-    /// Every chunk stays within `charBudget` characters; a turn too large
-    /// for any chunk is truncated into a chunk of its own rather than
-    /// dropped, because the compact that follows deletes the messages it
-    /// never summarized. Empty when the conversation holds nothing worth
-    /// keeping.
+    /// Every chunk stays within `charBudget` characters; a turn too large for
+    /// any chunk is SPLIT across as many chunks as it needs rather than cut
+    /// short, because the compact that follows deletes the messages it never
+    /// summarized. Empty when the conversation holds nothing worth keeping.
     nonisolated public static func buildCompactionTranscriptChunks(
         from messages: [ChatMessage],
         excludingMessageIds: Set<UUID> = [],
@@ -454,25 +453,52 @@ public enum AppleFoundationModelService {
         var chunks: [String] = []
         var current: [String] = []
         var usedChars = 0
+        func flush() {
+            guard !current.isEmpty else { return }
+            chunks.append(current.joined(separator: "\n\n"))
+            current = []
+            usedChars = 0
+        }
         for message in messages {
             if excludingMessageIds.contains(message.id) { continue }
-            guard var turn = compactionTranscriptTurn(for: message) else { continue }
-            if turn.count > charBudget {
-                let marker = " […turn truncated to fit the digest window]"
-                turn = String(turn.prefix(max(0, charBudget - marker.count))) + marker
+            guard let turn = compactionTranscriptTurn(for: message) else { continue }
+            // One turn becoming several chunks is safe for the summary: the
+            // passes carry their predecessor's digest forward, so the turn is
+            // read in order across them. A truncated turn is not recoverable:
+            // its tail is deleted with the message it came from.
+            for slice in compactionTranscriptSlices(of: turn, charBudget: charBudget) {
+                if usedChars + slice.count + 2 > charBudget { flush() }
+                current.append(slice)
+                usedChars += slice.count + 2
             }
-            if usedChars + turn.count + 2 > charBudget, !current.isEmpty {
-                chunks.append(current.joined(separator: "\n\n"))
-                current = []
-                usedChars = 0
-            }
-            current.append(turn)
-            usedChars += turn.count + 2
         }
-        if !current.isEmpty {
-            chunks.append(current.joined(separator: "\n\n"))
-        }
+        flush()
         return chunks
+    }
+
+    /// Cuts one serialized turn into consecutive, budget-sized pieces.
+    ///
+    /// A turn that already fits comes back whole, so the caller's packing of
+    /// ordinary turns is unchanged; only an oversized turn is affected, and it
+    /// is split at character boundaries rather than dropped or shortened. The
+    /// pieces are consecutive, so concatenating them reproduces the turn
+    /// byte for byte — which is the property the compaction rewrite depends on,
+    /// since it deletes the message the text came from.
+    nonisolated public static func compactionTranscriptSlices(
+        of turn: String,
+        charBudget: Int
+    ) -> [String] {
+        guard charBudget > 0 else { return [] }
+        guard turn.count > charBudget else { return [turn] }
+        var slices: [String] = []
+        var start = turn.startIndex
+        while start < turn.endIndex {
+            let end = turn.index(start, offsetBy: charBudget, limitedBy: turn.endIndex)
+                ?? turn.endIndex
+            slices.append(String(turn[start..<end]))
+            start = end
+        }
+        return slices
     }
 
     // MARK: - Pure Helpers (unit tested)

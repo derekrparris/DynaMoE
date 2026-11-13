@@ -660,6 +660,17 @@ public nonisolated enum CloudTurnEvent: Equatable, Sendable {
     case contentDelta(String)
     case finished(CloudTurnResult)
     case failed(CloudTurnFailure)
+
+    /// Whether this event carries a failure.
+    ///
+    /// The chat loop reads a failure even after Stop, because a failure is the
+    /// only thing that can say the request never left the Mac — and the cancel
+    /// path prices everything it cannot prove was unsent. Text arriving after
+    /// Stop belongs to a turn nobody is waiting for.
+    public var isFailure: Bool {
+        if case .failed = self { return true }
+        return false
+    }
 }
 
 // MARK: - Failures
@@ -798,12 +809,20 @@ public nonisolated enum CloudTurnFailure: Equatable, Sendable, LocalizedError {
     /// The summarizer path catches an arbitrary `Error`, not just this type:
     /// `completeText` reports a provider failure as `CloudTurnFailure` and an
     /// abandoned stream as `CancellationError`, and a pass that gave up
-    /// mid-answer was still charged for its prompt. Everything that is not a
-    /// classified failure is treated as sent, because under-reporting a real
-    /// invoice is the error that cannot be corrected afterwards.
+    /// mid-answer was still charged for its prompt. A raw URL loading error is
+    /// classified the same way the transport classifies it — an offline or
+    /// unroutable connection carried nothing — and everything else is treated
+    /// as sent, because under-reporting a real invoice is the error that cannot
+    /// be corrected afterwards.
     public nonisolated static func spentRequest(for error: Error) -> Bool {
         if let failure = error as? CloudTurnFailure { return failure.spentRequest }
         if let refusal = error as? CloudCompactionFailure { return refusal.spentRequest }
+        // A `URLError` that proves the prompt never left the Mac was not
+        // billed. This is the same predicate the transport uses, so a failure
+        // that reached this path unclassified still gets the same answer.
+        if let urlError = error as? URLError {
+            return !neverReachedProvider(urlError)
+        }
         return true
     }
 
@@ -1193,8 +1212,19 @@ public nonisolated enum CloudAgentStepPlan {
     /// A provider can stream `tool_calls` even when the request carried no
     /// `tools` array. Executing those would let a tools-disabled synthesis turn
     /// re-enter the loop, so calls only run when the step actually offered tools.
-    public static func shouldExecuteToolCalls(offeredToolCount: Int, callCount: Int) -> Bool {
-        offeredToolCount > 0 && callCount > 0
+    ///
+    /// `streamTerminated` is the third condition, because a stream that closed
+    /// without a terminal marker never proves it finished writing its call set.
+    /// The parser hands back whole call objects either way, so a cut-off stream
+    /// and a complete one are indistinguishable at that layer, and the calls
+    /// this loop runs include irreversible writes. Refusing them costs a retry;
+    /// running one the model had not finished can cost the file.
+    public static func shouldExecuteToolCalls(
+        offeredToolCount: Int,
+        callCount: Int,
+        streamTerminated: Bool
+    ) -> Bool {
+        offeredToolCount > 0 && callCount > 0 && streamTerminated
     }
 }
 

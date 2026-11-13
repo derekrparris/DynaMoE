@@ -79,7 +79,11 @@ struct CloudProvidersSettingsView: View {
         var message: String {
             switch self {
             case .provider(let provider):
-                return "\(provider.displayName) is removed together with its Keychain API key, its registered model list, its no-tools list, and its vision marks. Conversations pinned to its models will ask you to reselect a model."
+                // Names every registration fact the removal deletes: prices and
+                // context windows are lost with it, and they are typed by hand
+                // from the provider's own price sheet with no other control to
+                // retype them.
+                return "\(provider.displayName) is removed together with its Keychain API key, its registered model list, its no-tools list, its vision marks, and every model price and context window recorded for it. Conversations pinned to its models will ask you to reselect a model."
             case .apiKey(let provider):
                 return "The API key for \(provider.displayName) is deleted from the login Keychain. Its registered models stay in the picker but cannot answer until a new key is saved."
             }
@@ -225,6 +229,11 @@ struct CloudProvidersSettingsView: View {
                         .disabled(!storedProviders.contains(provider.id) || testStates[provider.id] == .testing)
                     if !registeredSpecs(for: provider).isEmpty {
                         Button("Clear") { clearModels(for: provider) }
+                            // Clear is not "remove the provider": it forgets the
+                            // catalog, while the facts that describe the MODELS
+                            // (hand-typed prices, recorded windows) survive, so a
+                            // re-sync does not lose them.
+                            .help("Forgets the registered model list. Recorded model prices and context windows are kept.")
                     }
                 }
             }
@@ -542,6 +551,14 @@ struct CloudProvidersSettingsView: View {
         pendingConfirmation = nil
     }
 
+    /// Forgets the registered catalog only.
+    ///
+    /// Deliberately NOT `CloudModelRegistry.clearProviderState`: that is the
+    /// provider-removal path, and it also drops every recorded price and
+    /// context window. Clear answers "the endpoint's catalog is stale", which
+    /// says nothing about what its models cost or how much context they hold;
+    /// those are hand-typed registration facts with no other control to retype
+    /// one, so a re-sync must not delete them.
     private func clearModels(for provider: CloudProvider) {
         CloudModelRegistry.setRegisteredModelIds([], for: provider)
         testStates[provider.id] = .untested

@@ -4914,15 +4914,21 @@ struct ContentView: View {
                         )
                         absorbCompaction(outcome)
                         if outcome.didCompact {
-                            // The size the pass decided about becomes the floor
-                            // a later pre-flight has to grow past: below it the
-                            // new summary would only re-summarize its own
-                            // digest.
-                            compactionAttempts.recordRewrite(promptTokens: projected)
-                            contextCompactionFailure = nil
-                            turnContextTokens = odometerAfterCompaction(
+                            // The floor a later pre-flight has to grow past is
+                            // the size the rewrite LEFT, not the size it was
+                            // deciding about. `projected` describes a prompt
+                            // that no longer exists: the rewritten one is
+                            // smaller by construction, so recording the old
+                            // figure closed the gate until the history refilled
+                            // past a prompt the pass had already removed — a
+                            // window that a small model's reply budget can
+                            // never reopen.
+                            let rewritten = odometerAfterCompaction(
                                 isSynthesisTurn: ranSynthesisTurn
                             )
+                            compactionAttempts.recordRewrite(promptTokens: rewritten)
+                            contextCompactionFailure = nil
+                            turnContextTokens = rewritten
                             self.showStatus(
                                 "🗂 Context was near this model's limit — compacted older history before continuing.",
                                 sessionId: sessionId
@@ -5056,31 +5062,40 @@ struct ContentView: View {
                 /// marks the run. Charging nothing here is what made
                 /// `cumulativeCost` (and the spend pill) under-report by a
                 /// whole prompt on every Stop, while the summarizer path
-                /// charged the same situation correctly. A usage block that DID
-                /// arrive before the stop is measured, and measured wins.
+                /// charged the same situation correctly.
+                ///
+                /// Measured columns are kept INDIVIDUALLY: a usage block that
+                /// arrived before the stop carries the provider's prompt count
+                /// (and its cache split) even when the answer never finished, so
+                /// only the missing completion count falls back to the app's
+                /// estimate. Rejecting the whole block because one column was
+                /// absent replaced a measured prompt with a guess. The column
+                /// rule is `CloudTurnReport`'s, so this charge cannot disagree
+                /// with the report the same usage block produces on a turn that
+                /// finishes.
                 @MainActor func chargeUnreturnedStep() {
-                    let measured = reportedUsage.flatMap { usage -> CloudUsage? in
-                        guard usage.promptTokens != nil, usage.completionTokens != nil else { return nil }
-                        return usage
-                    }
-                    let prompt = max(0, measured?.promptTokens ?? stepEstimatedPrompt)
-                    // Output the provider streamed before the stop is billed too.
-                    let output = max(0, measured?.completionTokens ?? generatedTokenCount())
+                    let one = CloudTurnReport(
+                        usage: reportedUsage,
+                        estimatedPromptTokens: stepEstimatedPrompt,
+                        outputTokens: generatedTokenCount(),
+                        cost: nil
+                    )
+                    let prompt = one.promptTokens ?? 0
                     let cost = CloudPricingStore.pricing(
                         forModel: providerModelId,
                         providerId: provider.id
                     )?.cost(for: CloudUsage(
                         promptTokens: prompt,
-                        completionTokens: output,
-                        cachedTokens: measured?.cachedTokens,
-                        cacheWriteTokens: measured?.cacheWriteTokens
+                        completionTokens: one.outputTokens,
+                        cachedTokens: one.cachedTokens,
+                        cacheWriteTokens: reportedUsage?.cacheWriteTokens
                     ))
                     runTotals.add(
                         promptTokens: prompt,
-                        cachedTokens: max(0, measured?.cachedTokens ?? 0),
-                        outputTokens: output,
+                        cachedTokens: one.cachedTokens,
+                        outputTokens: one.outputTokens,
                         cost: cost,
-                        estimated: measured == nil
+                        estimated: one.wasEstimated
                     )
                     guard let cost else { return }
                     if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
@@ -5134,7 +5149,12 @@ struct ContentView: View {
                     params: params,
                     tools: tools
                 ) {
-                    if Task.isCancelled { break }
+                    // Stop ends the turn, but a failure is still read: it is
+                    // the only evidence that the request never reached the
+                    // provider, and the cancel path below prices whatever it
+                    // cannot prove was unsent. Text arriving after Stop belongs
+                    // to a turn nobody is waiting for.
+                    if Task.isCancelled, !event.isFailure { break }
                     switch event {
                     case .started:
                         break
@@ -5257,14 +5277,18 @@ struct ContentView: View {
                     )
                     absorbCompaction(outcome)
                     if outcome.didCompact {
-                        // The rejected request's own size is the floor: the
-                        // provider has just proved the pre-flight estimate was
-                        // under it.
-                        compactionAttempts.recordRewrite(promptTokens: stepEstimatedPrompt)
-                        contextCompactionFailure = nil
-                        turnContextTokens = odometerAfterCompaction(
+                        // Same baseline rule as the pre-flight pass: the
+                        // rejected request's size is evidence the provider
+                        // refused it, not a floor for the next pass. The
+                        // rewritten prompt is what the following steps
+                        // actually send, and it is measured the same way the
+                        // pre-flight measures its own.
+                        let rewritten = odometerAfterCompaction(
                             isSynthesisTurn: ranSynthesisTurn
                         )
+                        compactionAttempts.recordRewrite(promptTokens: rewritten)
+                        contextCompactionFailure = nil
+                        turnContextTokens = rewritten
                         turnLog.recordChatTurn(
                             status: 400,
                             errorMessage: "Context overflow; compacted older history and retrying this step.",
@@ -5431,9 +5455,19 @@ struct ContentView: View {
                 // === Native function-calling agent step ===
                 var ranComplete = false
                 var failureLoop = false
+                // A step whose stream closed without `[DONE]` or a finish
+                // reason asked for calls the provider never proved it finished
+                // writing. The parser hands back whole call objects either way,
+                // so a cut-off call and a complete one cannot be told apart, and
+                // these calls include irreversible writes: they do not run. The
+                // truncation notice below says the step was cut off, which is
+                // the warning the user would otherwise read only after the file
+                // had already changed.
+                let unprovenCallCount = endedWithoutTerminal ? stepToolCalls.count : 0
                 if CloudAgentStepPlan.shouldExecuteToolCalls(
                     offeredToolCount: tools.count,
-                    callCount: stepToolCalls.count
+                    callCount: stepToolCalls.count,
+                    streamTerminated: !endedWithoutTerminal
                 ) {
                     self.showStatus("⚙️ Executing \(stepToolCalls.count) tool call(s)...")
                     let outcome = await self.executeCloudToolCalls(
@@ -5584,7 +5618,15 @@ struct ContentView: View {
                 if truncatedAtLimit {
                     truncationNotice = "⚠️ This answer stopped at the Max Output Tokens limit and may be truncated. Raise it in Settings ▸ Sampling for a longer reply."
                 } else if endedWithoutTerminal {
-                    truncationNotice = "⚠️ \(provider.displayName) closed the connection before the reply finished, so the answer above may be incomplete."
+                    // Naming the refused calls matters: the assistant message
+                    // shows none of them (a call record is only written when it
+                    // runs), so without this line the request simply vanished.
+                    if unprovenCallCount > 0 {
+                        let noun = unprovenCallCount == 1 ? "tool call it had started was" : "\(unprovenCallCount) tool calls it had started were"
+                        truncationNotice = "⚠️ \(provider.displayName) closed the connection before the reply finished, so this step was cut off. The \(noun) not run."
+                    } else {
+                        truncationNotice = "⚠️ \(provider.displayName) closed the connection before the reply finished, so the answer above may be incomplete."
+                    }
                 } else {
                     truncationNotice = nil
                 }

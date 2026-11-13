@@ -550,9 +550,29 @@ final class CloudAgentStepPlanTests: XCTestCase {
     func testStreamedCallsAreIgnoredWhenTheRequestOfferedNoTools() {
         // The provider can emit tool_calls on a tools-disabled turn; executing
         // them would re-enter the loop the synthesis pass was meant to end.
-        XCTAssertTrue(CloudAgentStepPlan.shouldExecuteToolCalls(offeredToolCount: 3, callCount: 1))
-        XCTAssertFalse(CloudAgentStepPlan.shouldExecuteToolCalls(offeredToolCount: 0, callCount: 2))
-        XCTAssertFalse(CloudAgentStepPlan.shouldExecuteToolCalls(offeredToolCount: 1, callCount: 0))
+        XCTAssertTrue(CloudAgentStepPlan.shouldExecuteToolCalls(
+            offeredToolCount: 3, callCount: 1, streamTerminated: true
+        ))
+        XCTAssertFalse(CloudAgentStepPlan.shouldExecuteToolCalls(
+            offeredToolCount: 0, callCount: 2, streamTerminated: true
+        ))
+        XCTAssertFalse(CloudAgentStepPlan.shouldExecuteToolCalls(
+            offeredToolCount: 1, callCount: 0, streamTerminated: true
+        ))
+    }
+
+    func testACutOffStreamRunsNoneOfItsCalls() {
+        // A stream that closed without `[DONE]` or a finish reason proves
+        // nothing about whether the model finished writing its call set, and
+        // the parser cannot tell a cut-off call from a whole one. The write it
+        // did emit is irreversible, so the step runs nothing and the turn ends
+        // with the cut-off notice.
+        XCTAssertFalse(CloudAgentStepPlan.shouldExecuteToolCalls(
+            offeredToolCount: 4, callCount: 1, streamTerminated: false
+        ))
+        XCTAssertFalse(CloudAgentStepPlan.shouldExecuteToolCalls(
+            offeredToolCount: 4, callCount: 0, streamTerminated: false
+        ))
     }
 
     func testForcedSynthesisTripsOnFailureLoopOrBudgetOnly() {
@@ -1997,6 +2017,34 @@ final class CloudCacheHintRequestTests: XCTestCase {
         XCTAssertFalse(OpenAICloudChatService.namesCacheKeyField("concurrency limit exceeded"))
     }
 
+    func testABodyNamingTheCacheKeyOutranksATransientOrModelWord() {
+        // A body that names the field is the strongest evidence there is about
+        // this endpoint's schema, and it is the one thing the retry can fix.
+        // "unavailable" and "model" used to claim these bodies first, so an
+        // endpoint saying exactly what was wrong failed every turn.
+        XCTAssertTrue(OpenAICloudChatService.shouldRetryWithoutCacheKey(
+            status: 400,
+            body: #"{"error":"prompt_cache_key is unavailable for this model"}"#
+        ))
+        XCTAssertTrue(OpenAICloudChatService.shouldRetryWithoutCacheKey(
+            status: 422,
+            body: "The prompt cache key field is temporarily unavailable."
+        ))
+        XCTAssertTrue(OpenAICloudChatService.shouldRetryWithoutCacheKey(
+            status: 400,
+            body: "unsupported tool schema alongside prompt_cache_key"
+        ))
+        // Without the field's own name those readings still win.
+        XCTAssertFalse(OpenAICloudChatService.shouldRetryWithoutCacheKey(
+            status: 400,
+            body: "this model is temporarily unavailable"
+        ))
+        XCTAssertFalse(OpenAICloudChatService.shouldRetryWithoutCacheKey(
+            status: 400,
+            body: "tools are unavailable for this model"
+        ))
+    }
+
     func testALatchedCacheKeyIsNotRetriedAndIsNotSent() throws {
         // After the process latched the field off, a request body no longer
         // carries it. The retry predicate must agree: otherwise every 4xx for
@@ -3131,8 +3179,33 @@ final class CloudCompactionFailureTests: XCTestCase {
         XCTAssertFalse(CloudTurnFailure.spentRequest(
             for: CloudTurnFailure.httpStatus(code: 401, summary: "expired")
         ))
+        // A raw URL loading error is classified the way the transport
+        // classifies it. An offline failure racing Stop used to arrive here as
+        // a `CancellationError` (the client dropped it) and was charged a
+        // prompt the provider never saw; once the client reports it, this is
+        // the second gate that has to agree.
+        XCTAssertFalse(CloudTurnFailure.spentRequest(for: URLError(.notConnectedToInternet)))
+        XCTAssertFalse(CloudTurnFailure.spentRequest(for: URLError(.cannotFindHost)))
+        XCTAssertTrue(CloudTurnFailure.spentRequest(for: URLError(.timedOut)))
+        XCTAssertTrue(CloudTurnFailure.spentRequest(for: URLError(.networkConnectionLost)))
         struct UnknownFault: Error {}
         XCTAssertTrue(CloudTurnFailure.spentRequest(for: UnknownFault()))
+    }
+
+    func testAFailureEventIsReadableAfterStop() {
+        // The chat loop reads a failure even when the user has just stopped the
+        // turn: it is the only event that can say the request never left the
+        // Mac, and the cancel path prices whatever it cannot prove was unsent.
+        XCTAssertTrue(CloudTurnEvent.failed(.transport("offline", billed: false)).isFailure)
+        XCTAssertFalse(CloudTurnEvent.started.isFailure)
+        XCTAssertFalse(CloudTurnEvent.contentDelta("hi").isFailure)
+        XCTAssertFalse(CloudTurnEvent.thinkingDelta("hm").isFailure)
+        XCTAssertFalse(CloudTurnEvent.finished(CloudTurnResult(
+            text: "ok",
+            thinking: "",
+            finishReason: "stop",
+            usage: nil
+        )).isFailure)
     }
 
     func testAnOfflineSendIsNotBilledAndALostResponseIs() {

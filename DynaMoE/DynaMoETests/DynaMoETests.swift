@@ -16589,6 +16589,38 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertFalse(ChatSessionStore.isSupportedSchema(-1), "Negative versions are not valid")
     }
 
+    func testAnOlderSessionsTokenTotalIsNotRestoredAsAContextSize() throws {
+        // Version 1 stored a RUNNING SUM of everything each request billed;
+        // version 2 stores the conversation's current context size. Restoring
+        // the old figure renders it as "N% of <window>", so a long-running chat
+        // could claim several times its window. It is dropped instead, and the
+        // next send reseeds it — the first moment the figure is knowable again.
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+
+        var oldRules = session(title: "Old Meter", updatedAt: Date())
+        oldRules.cumulativeTokenCount = 120_000
+        try encoder
+            .encode(PersistedChatSession(schemaVersion: 1, session: oldRules))
+            .write(to: dir.appendingPathComponent("\(oldRules.id.uuidString).json"))
+
+        var current = session(title: "New Meter", updatedAt: Date())
+        current.cumulativeTokenCount = 9_000
+        try encoder
+            .encode(PersistedChatSession(
+                schemaVersion: ChatSessionStore.currentSchemaVersion,
+                session: current
+            ))
+            .write(to: dir.appendingPathComponent("\(current.id.uuidString).json"))
+
+        let loaded = ChatSessionStore(directory: dir).loadSessions() ?? []
+        let byId = Dictionary(uniqueKeysWithValues: loaded.map { ($0.id, $0) })
+        XCTAssertNil(byId[oldRules.id]?.cumulativeTokenCount)
+        XCTAssertEqual(byId[current.id]?.cumulativeTokenCount, 9_000)
+    }
+
     func testUnreadableSessionFileIsPreservedDuringOrphanCleanup() throws {
         let dir = makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }

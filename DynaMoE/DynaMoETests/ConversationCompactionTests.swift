@@ -244,25 +244,61 @@ final class ConversationCompactionTests: XCTestCase {
         XCTAssertTrue(chunks[2].contains("turn 5:"), "the newest work must land in the recap chunk")
     }
 
-    func testCompactionChunksTruncateOversizedTurnInsteadOfDroppingIt() {
-        let huge = makeMessage(.user, String(repeating: "a", count: 5_000))
+    func testCompactionSplitsOversizedTurnAcrossChunksInsteadOfTruncatingIt() {
+        // "z" so the payload count below cannot pick up a letter from the
+        // neighbouring turn's own text.
+        let body = String(repeating: "z", count: 5_000)
+        let huge = makeMessage(.user, body)
         let small = makeMessage(.user, "final note")
         let chunks = AppleFoundationModelService.buildCompactionTranscriptChunks(
             from: [huge, small],
             charBudget: 1_200
         )
-        // A turn too large for any chunk becomes its own truncated chunk with
-        // a marker instead of vanishing, and the turn after it still gets
-        // summarized.
-        XCTAssertEqual(chunks.count, 2)
-        XCTAssertTrue(chunks[0].contains("turn truncated"))
-        XCTAssertLessThanOrEqual(chunks[0].count, 1_200)
-        XCTAssertTrue(chunks[1].contains("final note"))
+        // The rewrite that follows a pass DELETES the messages it summarized,
+        // so a turn cut short to fit one chunk loses its tail for good. It is
+        // split across passes instead, and the turn after it still gets
+        // summarized in its own chunk.
+        XCTAssertGreaterThan(chunks.count, 2)
+        for (index, chunk) in chunks.enumerated() {
+            XCTAssertLessThanOrEqual(chunk.count, 1_200, "chunk \(index) exceeds the budget")
+        }
+        XCTAssertFalse(chunks.contains { $0.contains("turn truncated") })
+        // Every character of the oversized turn has to reach a summarizer pass:
+        // the rewrite that follows deletes the message it came from, so a
+        // dropped character is gone. Counting the payload rather than comparing
+        // a reassembled string keeps the assertion independent of how the
+        // pieces are packed into chunks.
+        XCTAssertEqual(
+            chunks.reduce(0) { total, chunk in total + chunk.filter { $0 == "z" }.count },
+            5_000,
+            "every character of the oversized turn must reach a summarizer pass"
+        )
+        XCTAssertEqual(chunks.first?.hasPrefix("User: zzz"), true, "the turn must still run oldest first")
+        XCTAssertEqual(chunks.last?.contains("final note"), true)
         // A system-only history has nothing worth keeping.
         XCTAssertTrue(AppleFoundationModelService.buildCompactionTranscriptChunks(
             from: [makeMessage(.system, "notice")],
             charBudget: 1_200
         ).isEmpty)
+    }
+
+    func testACompactionTurnThatAlreadyFitsIsOneSlice() {
+        // The packing rule for ordinary turns must not change: a turn inside
+        // the budget comes back whole, so chunks can still hold several of them.
+        XCTAssertEqual(
+            AppleFoundationModelService.compactionTranscriptSlices(
+                of: "User: short",
+                charBudget: 1_200
+            ),
+            ["User: short"]
+        )
+        // Exactly at the budget is still one slice, not an empty second one.
+        let exact = String(repeating: "b", count: 1_200)
+        XCTAssertEqual(
+            AppleFoundationModelService.compactionTranscriptSlices(of: exact, charBudget: 1_200),
+            [exact]
+        )
+        XCTAssertTrue(AppleFoundationModelService.compactionTranscriptSlices(of: exact, charBudget: 0).isEmpty)
     }
 
     func testCompactionChunkBudgetShrinksForStoredDigests() {

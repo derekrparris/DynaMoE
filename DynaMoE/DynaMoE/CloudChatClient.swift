@@ -430,7 +430,15 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                         do {
                             exchange = try await self.session.bytes(for: request)
                         } catch {
-                            if Task.isCancelled {
+                            // A failure that PROVES the request never left the
+                            // Mac is reported even when Stop has just arrived.
+                            // The caller's cancel path prices everything it
+                            // cannot prove was unsent, so swallowing this one
+                            // turned a known-free request into a billed one.
+                            // Every other failure under cancellation is the
+                            // cancellation itself: nobody is waiting for it.
+                            if Task.isCancelled,
+                               !CloudTurnFailure.neverReachedProvider(error) {
                                 continuation.finish()
                                 return
                             }
@@ -708,9 +716,17 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
     /// a 429, and the retry neither clears it nor says anything about the
     /// field: dropping the hint because the provider was busy would disable the
     /// optimisation the hint exists for.
+    ///
+    /// A body that NAMES `prompt_cache_key` outranks both of those readings:
+    /// "prompt_cache_key is unavailable for this model" contains a transient
+    /// marker and a word from the model family, but the field it names is the
+    /// one thing that can be dropped and retried. Refusing it left an endpoint
+    /// that says exactly what is wrong failing every turn until the operator
+    /// found the setting.
     nonisolated static func shouldRetryWithoutCacheKey(status: Int, body: String) -> Bool {
         guard status == 400 || status == 422 else { return false }
         let lower = body.lowercased()
+        if namesCacheKeyField(lower) { return true }
         if CloudTurnFailure.indicatesContextOverflow(lower) { return false }
         if CloudTurnFailure.indicatesImageRejection(lower) { return false }
         // Words that name a different part of the request. "function" is here

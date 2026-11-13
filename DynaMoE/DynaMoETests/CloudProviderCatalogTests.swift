@@ -756,6 +756,50 @@ final class CloudProviderStoreTests: XCTestCase {
         )
     }
 
+    func testClearingTheModelListKeepsItsWindowsAndPrices() throws {
+        // Settings ▸ Cloud Providers ▸ Clear forgets the catalog, not the
+        // provider: prices and windows describe the MODEL and are typed by hand
+        // from a price sheet, with no other control to retype them. Only
+        // removing the provider takes them away, and a test for that rule sits
+        // below.
+        let harness = makeHarness()
+        defer { harness.cleanUp() }
+        let provider = try harness.store.add(
+            displayName: "OpenCode Zen",
+            identifier: "opencode-zen",
+            baseURL: "https://opencode.ai/zen/v1"
+        )
+        CloudModelRegistry.setRegisteredModelIds(
+            ["qwen3-coder"],
+            for: provider,
+            defaults: harness.defaults
+        )
+        CloudContextPolicy.setOverrides(
+            ["qwen3-coder": 262_144],
+            for: provider.id,
+            defaults: harness.defaults
+        )
+        CloudPricingStore.setPricing(
+            ["qwen3-coder": CloudPricing(input: 0.3, output: 1.2)],
+            for: provider.id,
+            defaults: harness.defaults
+        )
+
+        CloudModelRegistry.setRegisteredModelIds([], for: provider, defaults: harness.defaults)
+
+        XCTAssertTrue(
+            CloudModelRegistry.registeredModelIds(for: provider, defaults: harness.defaults).isEmpty
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.overrides(for: provider.id, defaults: harness.defaults),
+            ["qwen3-coder": 262_144]
+        )
+        XCTAssertEqual(
+            Array(CloudPricingStore.pricing(for: provider.id, defaults: harness.defaults).keys),
+            ["qwen3-coder"]
+        )
+    }
+
     func testClearingAProviderDropsItsWindowsAndPrices() throws {
         let harness = makeHarness()
         defer { harness.cleanUp() }
