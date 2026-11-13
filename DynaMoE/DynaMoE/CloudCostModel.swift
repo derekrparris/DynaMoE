@@ -505,9 +505,26 @@ public nonisolated enum CloudContextPolicy {
     }
 
     /// Whether a send of `promptTokens` should compact first.
-    public static func shouldCompact(promptTokens: Int, window: Int?) -> Bool {
+    ///
+    /// Two things can make a request not fit, and only one of them used to be
+    /// checked. The fraction is the "large context" trigger. `reservedTokens` is
+    /// the reply budget the same request carries, and a prompt under the
+    /// fraction can still overflow the window beside it: 0.8 x a 16k window is
+    /// 12.8k tokens, and the app's default 8,192-token reply makes that request
+    /// 21k against 16k. Compacting at the fraction alone therefore burned the
+    /// run's one pre-flight attempt on a wall it could not clear and left the
+    /// overflow path to recover — which is the path that refuses when the
+    /// attempt is already spent.
+    public static func shouldCompact(
+        promptTokens: Int,
+        window: Int?,
+        reservedTokens: Int = 0
+    ) -> Bool {
         guard let window, window >= minimumPlausibleWindow else { return false }
-        return Double(promptTokens) >= Double(window) * autoCompactFraction
+        let prompt = Double(max(0, promptTokens))
+        let reserve = Double(max(0, reservedTokens))
+        if prompt >= Double(window) * autoCompactFraction { return true }
+        return prompt + reserve > Double(window)
     }
 
     /// The share of the window a prompt occupies, for a status line.
@@ -551,18 +568,33 @@ public nonisolated enum CloudContextPolicy {
 
     /// Tokens one summarizer pass may write.
     ///
-    /// A fixed cap is wrong at both ends. The chunk budget scales to a third
-    /// of the window (about 66k tokens for a 200k model, roughly 264k
-    /// characters), and a 2,000-token summary of that is not necessarily
-    /// complete: when it stops at the limit the pass is billed, refused for
-    /// fear of deleting messages it never covered, and the run's one pre-flight
-    /// attempt is gone. Ten percent of the chunk's estimated tokens, floored at
-    /// 2,000 (so a short transcript keeps the detailed summary it always had)
-    /// and capped at 8,000 (so a runaway summary cannot cost more than the turn
-    /// it makes room for).
+    /// A fixed cap is wrong at both ends. The chunk budget scales to a third of
+    /// the window (about 66k tokens for a 200k model, roughly 264k characters),
+    /// and a 2,000-token summary of that is not necessarily complete: when it
+    /// stops at the limit the pass is billed, refused for fear of deleting
+    /// messages it never covered, and the run's one pre-flight attempt is gone.
+    /// Ten percent of the chunk's estimated tokens, floored at 2,000 so a short
+    /// transcript keeps the detailed summary it always had.
+    ///
+    /// The ceiling is the WINDOW's, not a constant. It used to be 8,000, which
+    /// sat above the proportion for every window up to about 250k and below it
+    /// past that: at the README's 1M-token example the chunk is ~345k tokens, so
+    /// an 8,000-token cap asks for a 43:1 compression the model cannot finish,
+    /// and the one pass that could have compacted the conversation comes back
+    /// truncated, billed, and refused. A pass may write at most a quarter of the
+    /// window: the chunk it is given is a third, and the instructions and the
+    /// rolling digest take a little more, so a quarter still leaves room for
+    /// what is already there.
     public static func summaryResponseTokens(window: Int?) -> Int {
         let chunkTokens = chunkCharacterBudget(window: window) / 4
-        return max(2_000, min(8_000, chunkTokens / 10))
+        let proportion = max(2_000, chunkTokens / 10)
+        guard let window, window >= minimumPlausibleWindow else { return proportion }
+        // The window is hand-typed, so the conversion is guarded the way
+        // `usagePercent`'s is: a value at or above `Int.max` is a units mistake,
+        // and the proportion is the smaller answer either way.
+        let room = Double(window) * 0.25
+        guard room.isFinite, room < Double(Int.max) else { return proportion }
+        return min(proportion, Int(room))
     }
 }
 
@@ -711,8 +743,11 @@ public nonisolated enum CloudCompactionFailure: Equatable, Error, Sendable {
     case truncatedSummary
     /// Stop was pressed while the summary was being written.
     case cancelled
-    /// The provider request failed; the payload is the failure's description.
-    case provider(String)
+    /// The provider request failed; the payload is the failure's description,
+    /// and `spent` says whether that request was billed. A 4xx refusal (an
+    /// expired key, an unknown model, a rate limit) never reached inference and
+    /// is not invoiced; a 5xx or a stream that died mid-answer was.
+    case provider(String, spent: Bool)
 
     /// Whether this outcome sent a summarizer request, and was therefore
     /// billed. A refusal that never reached the provider is a precondition and
@@ -723,8 +758,10 @@ public nonisolated enum CloudCompactionFailure: Equatable, Error, Sendable {
         case .conversationTooShort, .nothingToEvict, .conversationUnavailable,
              .noCredential, .noTranscript:
             return false
-        case .emptySummary, .truncatedSummary, .cancelled, .provider:
+        case .emptySummary, .truncatedSummary, .cancelled:
             return true
+        case .provider(_, let spent):
+            return spent
         }
     }
 
@@ -764,7 +801,7 @@ public nonisolated enum CloudCompactionFailure: Equatable, Error, Sendable {
             return "⚠️ \(providerName)'s summary did not finish cleanly (it hit its output limit or was cut off), so the conversation was left unchanged."
         case .cancelled:
             return "⏹ Compaction stopped — the conversation was left unchanged."
-        case .provider(let description):
+        case .provider(let description, _):
             return "⚠️ \(providerName) could not summarize this conversation: \(description) — it was left unchanged."
         }
     }
@@ -789,7 +826,7 @@ public nonisolated enum CloudCompactionFailure: Equatable, Error, Sendable {
             return "\(providerName)'s summary did not finish cleanly before it covered the conversation"
         case .cancelled:
             return "the summary was stopped"
-        case .provider(let description):
+        case .provider(let description, _):
             return "summarizing failed: \(description)"
         }
     }
@@ -864,8 +901,14 @@ public nonisolated struct CloudTurnReport: Equatable, Sendable {
         // count: the output figure then comes from the app's character
         // estimate, and the suffix has to say so.
         self.wasEstimated = usage?.promptTokens == nil || usage?.completionTokens == nil
-        self.promptTokens = max(0, usage?.promptTokens ?? estimatedPromptTokens)
-        self.cachedTokens = max(0, usage?.cachedTokens ?? 0)
+        let prompt = max(0, usage?.promptTokens ?? estimatedPromptTokens)
+        self.promptTokens = prompt
+        // Cached input is a SUBSET of the prompt, so the two columns have to
+        // agree: pricing clamps the cached share to what was billed, and a
+        // provider that reports more cached than prompt tokens (some gateways
+        // count a cache write in both) otherwise printed "1,000 in (5,000
+        // cached)" beside a correctly discounted price.
+        self.cachedTokens = min(max(0, usage?.cachedTokens ?? 0), prompt)
         self.outputTokens = max(0, usage?.completionTokens ?? outputTokens)
         self.cost = cost
         self.countsBilledInput = false
@@ -884,8 +927,11 @@ public nonisolated struct CloudTurnReport: Equatable, Sendable {
         cost: Double?,
         wasEstimated: Bool
     ) {
-        self.promptTokens = max(0, promptTokens)
-        self.cachedTokens = max(0, cachedTokens)
+        let prompt = max(0, promptTokens)
+        self.promptTokens = prompt
+        // Same subset rule as the single-request form: the cached column can
+        // never say more than the prompt it is part of.
+        self.cachedTokens = min(max(0, cachedTokens), prompt)
         self.outputTokens = max(0, outputTokens)
         self.cost = cost
         self.wasEstimated = wasEstimated
@@ -963,8 +1009,12 @@ public nonisolated struct CloudRunTotals: Equatable, Sendable {
         cost: Double?,
         estimated: Bool
     ) {
-        self.promptTokens += max(0, promptTokens)
-        self.cachedTokens += max(0, cachedTokens)
+        let prompt = max(0, promptTokens)
+        self.promptTokens += prompt
+        // The cached share is part of the prompt, so it is clamped to it here
+        // too: a total that summed an over-reported column would print a cache
+        // figure larger than the input it belongs to.
+        self.cachedTokens += min(max(0, cachedTokens), prompt)
         self.outputTokens += max(0, outputTokens)
         if estimated { wasEstimated = true }
         guard let cost, cost.isFinite, cost > 0 else { return }

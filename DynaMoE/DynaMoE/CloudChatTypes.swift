@@ -162,13 +162,15 @@ public nonisolated struct CloudToolCall: Equatable, Sendable {
 /// difference is whether the request ASKS for the reuse. `affinity` is the
 /// safe default: two custom `x-…` headers, which HTTP requires a server to
 /// ignore when it does not know them, so under the protocol they change
-/// nothing for an endpoint that does not route on them. (A gateway that
-/// rejects unrecognised headers anyway is not conforming; `none` is the
-/// setting for one that does, and no retry guesses at it because the same 400
-/// covers every other request-shape complaint.) `openAI` adds
-/// `prompt_cache_key`, the documented OpenAI routing hint, and is opt-in
-/// because a strict compatible endpoint is allowed to reject unknown body
-/// fields (the request path retries once without it if that happens).
+/// nothing for an endpoint that does not route on them. A gateway that rejects
+/// unrecognised headers anyway is not conforming, so the request path retries
+/// once without them — but only when the rejection body NAMES a header, which
+/// is the one signal that separates "we do not take this header" from every
+/// other request-shape complaint. `none` is for an endpoint known to reject
+/// them, and skips the wasted round trip. `openAI` adds `prompt_cache_key`,
+/// the documented OpenAI routing hint, and is opt-in because a strict
+/// compatible endpoint is allowed to reject unknown body fields (the request
+/// path retries once without it if that happens).
 public nonisolated enum CloudCacheHints: String, Codable, Equatable, Hashable, Sendable, CaseIterable {
     /// Send nothing. For an endpoint that is known to reject extra headers.
     case none
@@ -703,23 +705,44 @@ public nonisolated enum CloudTurnFailure: Equatable, Sendable, LocalizedError {
         }
     }
 
-    /// Whether this failure means a request reached the provider, and was
-    /// therefore billed for at least its prompt.
+    /// Whether this failure means the provider processed the prompt, and so
+    /// billed for it.
     ///
     /// A missing or unreadable key, and a flavor with no implementation, fail
-    /// before anything is built; a transport error, a malformed stream and an
-    /// HTTP status all come back from a request that was sent. The distinction
-    /// is what stops the chat path reporting a spend for a turn that never left
-    /// the machine — and, on the other side, from omitting the prompt of a turn
-    /// the provider did process. It is the same posture the compaction path
-    /// takes with `CloudCompactionFailure.spentRequest`.
+    /// before anything is built. A 4xx is a REJECTION: the provider refused the
+    /// request without running the model — an expired key, an unknown model, a
+    /// rate limit, a schema complaint — and none of those are invoiced. A 5xx,
+    /// a transport error and a malformed stream all come back from a request
+    /// the provider had already accepted, and a prompt that reached its
+    /// inference path is charged whether or not the answer arrived.
+    ///
+    /// The distinction is what stops the chat path reporting a spend for a turn
+    /// the provider threw away — and, on the other side, from omitting the
+    /// prompt of a turn it did process. It is the same posture the compaction
+    /// path takes with `CloudCompactionFailure.spentRequest`.
     public var spentRequest: Bool {
         switch self {
         case .missingAPIKey, .credentialAccessDenied, .credentialNeedsImport, .unsupportedFlavor:
             return false
-        case .httpStatus, .transport, .invalidResponse:
+        case .httpStatus(let code, _):
+            return code >= 500
+        case .transport, .invalidResponse:
             return true
         }
+    }
+
+    /// Whether any error a sent request can throw means it was billed.
+    ///
+    /// The summarizer path catches an arbitrary `Error`, not just this type:
+    /// `completeText` reports a provider failure as `CloudTurnFailure` and an
+    /// abandoned stream as `CancellationError`, and a pass that gave up
+    /// mid-answer was still charged for its prompt. Everything that is not a
+    /// classified failure is treated as sent, because under-reporting a real
+    /// invoice is the error that cannot be corrected afterwards.
+    public nonisolated static func spentRequest(for error: Error) -> Bool {
+        if let failure = error as? CloudTurnFailure { return failure.spentRequest }
+        if let refusal = error as? CloudCompactionFailure { return refusal.spentRequest }
+        return true
     }
 
     /// Whether a provider's 400/422 body is a context-window rejection rather

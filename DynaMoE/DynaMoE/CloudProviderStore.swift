@@ -177,8 +177,9 @@ final class CloudProviderStore: ObservableObject {
         // operator saying they know better. Leaving the latch in place made
         // the setting a silent no-op for the rest of the process: the hint was
         // re-read on every request, but the endpoint was remembered as having
-        // refused the field, so nothing was ever sent.
-        CloudCacheHintMemory.shared.allowPromptCacheKey(
+        // refused the field, so nothing was ever sent. Both hints are cleared:
+        // the affinity headers can be refused just as the body field can.
+        CloudCacheHintMemory.shared.allowCacheHints(
             endpoint: current.chatCompletionsURL.absoluteString
         )
         publish()

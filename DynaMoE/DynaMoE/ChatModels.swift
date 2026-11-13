@@ -643,6 +643,21 @@ public extension ChatSession {
         return live.filter { !known.contains($0.id) && !excluding.contains($0.id) }
     }
 
+    /// The rows of a snapshot the user has NOT deleted since it was taken.
+    ///
+    /// The other half of `messagesAdded`'s rule. A compaction rewrites the
+    /// transcript from a snapshot, and the half it keeps is written back
+    /// verbatim; if the user deleted one of those rows while the passes ran,
+    /// writing the snapshot back resurrected it. Identity decides here too, for
+    /// the same reason: the conversation may have been reordered or pruned.
+    nonisolated static func stillPresent(
+        _ snapshot: [ChatMessage],
+        in live: [ChatMessage]
+    ) -> [ChatMessage] {
+        let present = Set(live.map(\.id))
+        return snapshot.filter { present.contains($0.id) }
+    }
+
     /// Odometer seeding for one generation step's prompt.
     ///
     /// The number every backend stores is the conversation's CONTEXT SIZE — the

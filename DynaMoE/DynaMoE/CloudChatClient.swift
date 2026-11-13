@@ -86,6 +86,11 @@ nonisolated final class CloudCacheHintMemory: @unchecked Sendable {
 
     private let lock = NSLock()
     private var declined: [String: Set<String>] = [:]
+    /// Endpoints that rejected the session-affinity HEADERS. Keyed by endpoint
+    /// alone: a header is answered by the gateway in front of every model, so
+    /// one model's refusal is not evidence about its neighbours the way
+    /// `prompt_cache_key`'s body-field refusal is.
+    private var declinedAffinity: Set<String> = []
 
     func acceptsPromptCacheKey(endpoint: String, model: String) -> Bool {
         lock.lock()
@@ -99,17 +104,30 @@ nonisolated final class CloudCacheHintMemory: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Forgets one endpoint's refusals for every model it names.
+    func acceptsAffinityHeaders(endpoint: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !declinedAffinity.contains(endpoint)
+    }
+
+    func declineAffinityHeaders(endpoint: String) {
+        lock.lock()
+        declinedAffinity.insert(endpoint)
+        lock.unlock()
+    }
+
+    /// Forgets one endpoint's refusals of both cache hints.
     ///
-    /// A latch is a statement about what a MODEL accepts, and the operator can
+    /// A latch is a statement about what a SERVER accepts, and the operator can
     /// know better: changing the cache hint in Settings, or pointing the
     /// provider at a different base URL, describes a different server and
-    /// therefore a different set of answers. Without this a provider that
-    /// refused the field once kept it switched off for the life of the process,
-    /// and the control that turns it back on did nothing until relaunch.
-    func allowPromptCacheKey(endpoint: String) {
+    /// therefore different answers. Without this a provider that refused a hint
+    /// once kept it switched off for the life of the process, and the control
+    /// that turns it back on did nothing until relaunch.
+    func allowCacheHints(endpoint: String) {
         lock.lock()
         declined.removeValue(forKey: endpoint)
+        declinedAffinity.remove(endpoint)
         lock.unlock()
     }
 
@@ -122,6 +140,7 @@ nonisolated final class CloudCacheHintMemory: @unchecked Sendable {
     func reset() {
         lock.lock()
         declined.removeAll()
+        declinedAffinity.removeAll()
         lock.unlock()
     }
 }
@@ -211,18 +230,35 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
     /// Headers every chat request carries. `x-session-id` and
     /// `x-session-affinity` are read by routers that keep one conversation on
     /// one replica; a provider that does not know them ignores them by the
-    /// HTTP contract, so they are sent unless the provider opts out.
+    /// HTTP contract, so they are sent unless the provider opts out — or until
+    /// this endpoint refuses them once and the retry proves that was the
+    /// reason (see `shouldRetryWithoutAffinity`).
     ///
     /// An empty key sends nothing: an empty header value is not "no affinity",
     /// it is a value routers are free to treat as a real (and therefore
     /// shared) session, and `prompt_cache_key` is already withheld on the same
     /// condition.
-    private func applyCacheAffinity(to request: inout URLRequest, params: CloudChatGenerationParams) {
-        guard cacheHints.sendsAffinityHeaders,
+    private func applyCacheAffinity(
+        to request: inout URLRequest,
+        params: CloudChatGenerationParams,
+        sendsAffinity: Bool
+    ) {
+        guard sendsAffinity,
               let sessionKey = params.sessionKey,
               !sessionKey.isEmpty else { return }
         request.setValue(sessionKey, forHTTPHeaderField: "x-session-id")
         request.setValue(sessionKey, forHTTPHeaderField: "x-session-affinity")
+    }
+
+    /// Whether the next request would carry the session-affinity headers.
+    ///
+    /// The same resolved decision `makeRequest` applies, so the retry predicate
+    /// can test the request it actually sent. A latch keyed by endpoint is
+    /// process-wide, which is exactly why the answer is taken before the send
+    /// rather than re-derived from the response.
+    private func willSendAffinityHeaders() -> Bool {
+        cacheHints.sendsAffinityHeaders
+            && cacheHintMemory.acceptsAffinityHeaders(endpoint: chatURL.absoluteString)
     }
 
     /// Whether the next request would actually carry `prompt_cache_key`.
@@ -273,10 +309,13 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         tools: [ToolDefinition]? = nil,
         includeUsage: Bool = true,
         includeCacheKey: Bool = true,
-        cacheKeyIsSent: Bool? = nil
+        includeAffinity: Bool = true,
+        cacheKeyIsSent: Bool? = nil,
+        affinityIsSent: Bool? = nil
     ) throws -> URLRequest {
         let wantsCacheKey = cacheKeyIsSent
             ?? (includeCacheKey && willSendCacheKey(params: params, model: model))
+        let sendsAffinity = affinityIsSent ?? (includeAffinity && willSendAffinityHeaders())
         let body = Body(
             model: model,
             messages: messages,
@@ -302,7 +341,7 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        applyCacheAffinity(to: &request, params: params)
+        applyCacheAffinity(to: &request, params: params, sendsAffinity: sendsAffinity)
         return request
     }
 
@@ -333,6 +372,7 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                     // is worth one retry, never a failed turn.
                     var includeUsage = true
                     var includeCacheKey = true
+                    var includeAffinity = true
                     // Remembered only when the retry WITHOUT the field
                     // succeeds. A 400 is not proof the field was the reason:
                     // an unknown model name or a malformed tools schema is
@@ -341,14 +381,20 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                     // provider. The retry is free; the memory is not.
                     var retriedWithoutCacheKey = false
                     var cacheKeyRejectionStatus: Int?
-                    for _ in 0..<3 {
+                    var retriedWithoutAffinity = false
+                    var affinityRejectionStatus: Int?
+                    // Four attempts: the initial one plus one per optional
+                    // hint, because an endpoint can refuse `stream_options`
+                    // and then a header, or a header and then the body field.
+                    for _ in 0..<4 {
                         // Resolved BEFORE the send and reused by the retry
                         // predicate below: the latch is process-wide, so a
                         // concurrent request declaring this endpoint
                         // indifferent between now and the response would
                         // otherwise suppress the retry this request earned and
-                        // fail the turn on a field it had, in fact, sent.
+                        // fail the turn on a hint it had, in fact, sent.
                         let sentCacheKey = includeCacheKey && self.willSendCacheKey(params: params, model: model)
+                        let sentAffinity = includeAffinity && self.willSendAffinityHeaders()
                         let request = try self.makeRequest(
                             model: model,
                             messages: messages,
@@ -356,7 +402,9 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                             tools: tools,
                             includeUsage: includeUsage,
                             includeCacheKey: includeCacheKey,
-                            cacheKeyIsSent: sentCacheKey
+                            includeAffinity: includeAffinity,
+                            cacheKeyIsSent: sentCacheKey,
+                            affinityIsSent: sentAffinity
                         )
                         let (bytes, response) = try await self.session.bytes(for: request)
                         guard let http = response as? HTTPURLResponse else {
@@ -373,6 +421,18 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                             if includeUsage,
                                Self.shouldRetryWithoutStreamOptions(status: http.statusCode, body: body) {
                                 includeUsage = false
+                                continue
+                            }
+                            // Checked BEFORE the cache-key predicate: a body
+                            // that names a header is about the headers, and
+                            // the cache-key rule's "does not mention another
+                            // part" fallback would otherwise claim it and drop
+                            // the wrong hint.
+                            if sentAffinity,
+                               Self.shouldRetryWithoutAffinity(status: http.statusCode, body: body) {
+                                includeAffinity = false
+                                retriedWithoutAffinity = true
+                                affinityRejectionStatus = http.statusCode
                                 continue
                             }
                             if sentCacheKey,
@@ -403,6 +463,20 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                             DiagLog.info(
                                 "CloudCache",
                                 "endpoint=\(self.chatURL.host ?? "provider") rejected prompt_cache_key status=\(cacheKeyRejectionStatus ?? 0) retry_without_it_succeeded=true latched=true"
+                            )
+                        }
+                        // Same rule for the affinity headers, and the same
+                        // reason to latch only after the retry is accepted: the
+                        // default hint sends them to every provider, so a
+                        // non-conforming endpoint would otherwise fail every
+                        // turn for a hint nobody chose.
+                        if retriedWithoutAffinity {
+                            self.cacheHintMemory.declineAffinityHeaders(
+                                endpoint: self.chatURL.absoluteString
+                            )
+                            DiagLog.info(
+                                "CloudCache",
+                                "endpoint=\(self.chatURL.host ?? "provider") rejected session-affinity headers status=\(affinityRejectionStatus ?? 0) retry_without_them_succeeded=true latched=true"
                             )
                         }
 
@@ -549,6 +623,22 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         guard status == 400 || status == 422 else { return false }
         let lower = body.lowercased()
         return lower.contains("stream_options") || lower.contains("include_usage")
+    }
+
+    /// Whether a rejection is specifically about the session-affinity HEADERS.
+    ///
+    /// Affinity is the default hint and is sent for every provider, including
+    /// ones configured before the setting existed, so an endpoint that is not
+    /// HTTP-conforming used to have no recovery: every turn failed on a hint
+    /// nobody chose. The retry is earned only by a body that NAMES one of the
+    /// headers, which keeps it a targeted fix rather than a blind re-upload —
+    /// the same discipline `shouldRetryWithoutCacheKey` applies to the body
+    /// field, and the reason a bare "invalid request" is not evidence enough
+    /// here either.
+    nonisolated static func shouldRetryWithoutAffinity(status: Int, body: String) -> Bool {
+        guard status == 400 || status == 422 else { return false }
+        let lower = body.lowercased()
+        return lower.contains("x-session-affinity") || lower.contains("x-session-id")
     }
 
     /// Whether a rejection is worth retrying without `prompt_cache_key`.

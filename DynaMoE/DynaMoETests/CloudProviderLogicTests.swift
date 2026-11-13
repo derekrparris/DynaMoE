@@ -1196,6 +1196,8 @@ private final class CloudStubURLProtocol: URLProtocol {
     /// followed by an acceptance on the same endpoint.
     nonisolated(unsafe) static var responses: [(status: Int, body: Data)] = []
     nonisolated(unsafe) static var requestBodies: [Data] = []
+    /// The affinity header each request carried, `""` when it carried none.
+    nonisolated(unsafe) static var affinityHeaders: [String] = []
     /// Runs while a request is in flight, before its scripted reply. A test
     /// uses it to act on shared state MID-REQUEST, which is the only way to
     /// reproduce a latch closing between a send and its response.
@@ -1219,6 +1221,7 @@ private final class CloudStubURLProtocol: URLProtocol {
             stream.close()
             Self.requestBodies.append(data)
         }
+        Self.affinityHeaders.append(request.value(forHTTPHeaderField: "x-session-affinity") ?? "")
         let reply = Self.responses.isEmpty
             ? (status: Self.status, body: Self.body)
             : Self.responses.removeFirst()
@@ -1288,7 +1291,114 @@ final class CloudStreamTransportTests: XCTestCase {
         CloudStubURLProtocol.body = Data()
         CloudStubURLProtocol.responses = []
         CloudStubURLProtocol.requestBodies = []
+        CloudStubURLProtocol.affinityHeaders = []
         CloudStubURLProtocol.onRequest = nil
+    }
+
+    func testAFinishReasonAloneCountsAsTerminal() async {
+        // Not every endpoint sends `[DONE]`; a non-nil `finish_reason` is the
+        // other marker the protocol defines. The hand-built result this used to
+        // assert (`terminated: true` written by the test itself) tested nothing
+        // about the transport's rule, so this drives a real SSE body with no
+        // sentinel and lets `streamTurn` decide.
+        CloudStubURLProtocol.body = Data(
+            """
+            data: {"choices":[{"delta":{"content":"a summary"},"finish_reason":"stop"}]}
+
+            """.utf8
+        )
+        let events = await collect(makeService())
+        guard case .finished(let result)? = events.last else {
+            return XCTFail("expected a finished event, got \(String(describing: events.last))")
+        }
+        XCTAssertEqual(result.text, "a summary")
+        XCTAssertEqual(result.finishReason, "stop")
+        XCTAssertTrue(result.terminated, "finish_reason is the protocol's other end marker")
+    }
+
+    func testACleanEOFWithoutAnyMarkerIsNotTerminal() async {
+        // The negative case of the same rule: a body that carries text and
+        // closes without `[DONE]` and without a `finish_reason` is a prefix,
+        // and a compaction that committed it would delete messages the summary
+        // never covered.
+        CloudStubURLProtocol.body = Data(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"half a sent\"}}]}\n\n".utf8
+        )
+        let events = await collect(makeService())
+        guard case .finished(let result)? = events.last else {
+            return XCTFail("expected a finished event, got \(String(describing: events.last))")
+        }
+        XCTAssertEqual(result.text, "half a sent")
+        XCTAssertNil(result.finishReason)
+        XCTAssertFalse(result.terminated, "a clean EOF is not a finished answer")
+    }
+
+    func testARejectedAffinityHeaderIsRetriedWithoutItAndLatched() async {
+        // Affinity is the DEFAULT hint and is sent to providers configured
+        // before the setting existed, so an endpoint that rejects unknown
+        // headers used to fail every turn for a hint nobody chose. The retry is
+        // earned only by a body that NAMES a header, which is what makes it a
+        // targeted fix rather than a blind re-upload.
+        let ok = Data("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n".utf8)
+        CloudStubURLProtocol.responses = [
+            (400, Data(#"{"error":"unexpected header x-session-affinity"}"#.utf8)),
+            (200, ok),
+            // Second turn: the latch is closed, so this turn's first attempt
+            // already carries no affinity headers.
+            (200, ok)
+        ]
+        // A fresh endpoint per invocation keeps the process-wide latch out of
+        // the picture, so a repeat-on-failure rerun starts clean.
+        let host = "affinity-retry-\(UUID().uuidString).test"
+        let endpoint = "https://\(host)/openai/v1/chat/completions"
+        let service = makeService(host: host, hints: .affinity)
+        let memory = CloudCacheHintMemory.shared
+        defer { memory.allowCacheHints(endpoint: endpoint) }
+
+        guard case .finished? = await collect(service, sessionKey: "affinity-a").last else {
+            return XCTFail("the retry should succeed without the headers")
+        }
+        XCTAssertEqual(CloudStubURLProtocol.affinityHeaders, ["affinity-a", ""])
+        XCTAssertFalse(
+            memory.acceptsAffinityHeaders(endpoint: endpoint),
+            "the accepted retry should have latched the headers off"
+        )
+
+        guard case .finished? = await collect(service, sessionKey: "affinity-a").last else {
+            return XCTFail("the second turn should succeed on its first attempt")
+        }
+        XCTAssertEqual(
+            CloudStubURLProtocol.affinityHeaders,
+            ["affinity-a", "", ""],
+            "the latch is what makes the second turn's first attempt header-free"
+        )
+    }
+
+    func testAnUnrelatedRejectionDoesNotDropTheAffinityHeaders() {
+        // The predicate is the whole safety argument: a 400 that does not name a
+        // header could be about the model, the tools or the prompt, and
+        // re-uploading the same megabytes without a header it never mentioned
+        // would fail identically.
+        XCTAssertTrue(OpenAICloudChatService.shouldRetryWithoutAffinity(
+            status: 400,
+            body: "unexpected header x-session-affinity"
+        ))
+        XCTAssertTrue(OpenAICloudChatService.shouldRetryWithoutAffinity(
+            status: 422,
+            body: "header x-session-id is not allowed"
+        ))
+        XCTAssertFalse(OpenAICloudChatService.shouldRetryWithoutAffinity(
+            status: 400,
+            body: "invalid request"
+        ))
+        XCTAssertFalse(OpenAICloudChatService.shouldRetryWithoutAffinity(
+            status: 401,
+            body: "x-session-affinity"
+        ))
+        XCTAssertFalse(OpenAICloudChatService.shouldRetryWithoutAffinity(
+            status: 500,
+            body: "x-session-affinity"
+        ))
     }
 
     func testContentStreamFinishesWithAccumulatedText() async {
@@ -1503,7 +1613,7 @@ final class CloudStreamTransportTests: XCTestCase {
         }
         defer {
             CloudStubURLProtocol.onRequest = nil
-            CloudCacheHintMemory.shared.allowPromptCacheKey(endpoint: endpoint)
+            CloudCacheHintMemory.shared.allowCacheHints(endpoint: endpoint)
         }
         let service = makeService(host: endpointHost)
         guard case .finished? = await collect(service, sessionKey: "session-race").last else {
@@ -2427,6 +2537,48 @@ final class CloudContextPolicyTests: XCTestCase {
         XCTAssertFalse(CloudContextPolicy.shouldCompact(promptTokens: 1_000, window: 512))
     }
 
+    func testThePreflightReservesRoomForTheReply() {
+        // A 16k window with the app's default 8,192-token reply: a prompt of
+        // 12,800 is exactly the fraction, but the request that carries it is
+        // 20,992 tokens and cannot fit. The old check ignored the reply budget,
+        // so it compacted too late to help and spent the run's one pre-flight
+        // attempt on a wall it could not clear.
+        XCTAssertTrue(CloudContextPolicy.shouldCompact(
+            promptTokens: 12_000,
+            window: 16_000,
+            reservedTokens: 8_192
+        ), "12,000 + 8,192 does not fit a 16k window")
+        XCTAssertFalse(CloudContextPolicy.shouldCompact(
+            promptTokens: 6_000,
+            window: 16_000,
+            reservedTokens: 8_192
+        ), "6,000 + 8,192 does fit a 16k window")
+        // The fraction still applies on its own, whatever the reply budget.
+        XCTAssertTrue(CloudContextPolicy.shouldCompact(
+            promptTokens: 80_000,
+            window: 100_000,
+            reservedTokens: 100
+        ))
+        // A big window keeps the old answer: the reply budget is nowhere near
+        // the remaining room, so nothing here compacts a healthy conversation.
+        XCTAssertFalse(CloudContextPolicy.shouldCompact(
+            promptTokens: 100_000,
+            window: 1_048_576,
+            reservedTokens: 8_192
+        ))
+        // No window is still no answer, and a negative reserve cannot buy room.
+        XCTAssertFalse(CloudContextPolicy.shouldCompact(
+            promptTokens: 100_000,
+            window: nil,
+            reservedTokens: 8_192
+        ))
+        XCTAssertFalse(CloudContextPolicy.shouldCompact(
+            promptTokens: 1_000,
+            window: 16_000,
+            reservedTokens: -50_000
+        ))
+    }
+
     func testTheSpecWindowWinsOverTheProviderFallback() {
         let defaults = scratchDefaults()
         defaults.set(64_000, forKey: CloudContextPolicy.globalWindowKey)
@@ -2524,9 +2676,13 @@ final class CloudContextPolicyTests: XCTestCase {
             CloudContextPolicy.chunkCharacterBudget(window: Int.max / 2),
             CloudContextPolicy.maximumChunkCharacters
         )
-        XCTAssertLessThanOrEqual(
+        // The reply budget is proportional to the CHUNK, so the absurd-window
+        // ceiling is the chunk cap's tenth rather than a trap: the window's own
+        // quarter is computed in `Double` and compared before it is converted,
+        // which is the conversion that used to trap.
+        XCTAssertEqual(
             CloudContextPolicy.summaryResponseTokens(window: Int.max),
-            8_000
+            CloudContextPolicy.maximumChunkCharacters / 4 / 10
         )
         // The sensible range is untouched.
         XCTAssertEqual(CloudContextPolicy.chunkCharacterBudget(window: 1_048_576), 1_384_120)
@@ -2539,11 +2695,36 @@ final class CloudContextPolicyTests: XCTestCase {
         XCTAssertEqual(CloudContextPolicy.summaryResponseTokens(window: nil), 2_000)
         XCTAssertEqual(CloudContextPolicy.summaryResponseTokens(window: 32_000), 2_000)
         XCTAssertEqual(CloudContextPolicy.summaryResponseTokens(window: 200_000), 6_600)
-        XCTAssertEqual(CloudContextPolicy.summaryResponseTokens(window: 1_048_576), 8_000)
+        XCTAssertEqual(CloudContextPolicy.summaryResponseTokens(window: 1_048_576), 34_603)
     }
 }
 
 final class CloudCompactionBoundaryTests: XCTestCase {
+    func testARewriteKeepsAddedRowsAndDropsDeletedOnes() {
+        // A long compaction suspends for minutes, and the transcript it
+        // rewrites from is the one it snapshotted. Two rows can change while it
+        // runs, and both used to be handled wrongly: a row appended since the
+        // snapshot was deleted by the rewrite, and a row the user deleted from
+        // that snapshot was resurrected by it.
+        let first = ChatMessage(role: .user, content: "one")
+        let second = ChatMessage(role: .assistant, content: "two")
+        let third = ChatMessage(role: .user, content: "three")
+        let snapshot = [first, second, third]
+        let appended = ChatMessage(role: .system, content: "a /plan notice")
+        // The live list: `second` was deleted, `appended` arrived.
+        let live = [first, third, appended]
+
+        XCTAssertEqual(
+            ChatSession.messagesAdded(to: live, since: snapshot).map(\.content),
+            ["a /plan notice"]
+        )
+        XCTAssertEqual(
+            ChatSession.stillPresent(snapshot, in: live).map(\.content),
+            ["one", "three"],
+            "the row deleted during the pass must not come back"
+        )
+    }
+
     func testTheKeptTailStartsAtAUserTurn() {
         let messages = [
             ChatMessage(role: .user, content: "one"),
@@ -2780,10 +2961,16 @@ final class CloudCompactionFailureTests: XCTestCase {
             CloudCompactionFailure.emptySummary,
             .truncatedSummary,
             .cancelled,
-            .provider("HTTP 429")
+            .provider("HTTP 500", spent: true)
         ] {
             XCTAssertTrue(reason.spentRequest, "\(reason) was billed")
         }
+        // A refusal the provider ANSWERED with a 4xx was never invoiced: an
+        // expired key, a rate limit or a schema complaint never reaches
+        // inference, and charging the prompt for one made the spend grow on
+        // every failed turn. Only a request the provider accepted — a 5xx, a
+        // dropped connection, a stream that died mid-answer — is billed.
+        XCTAssertFalse(CloudCompactionFailure.provider("HTTP 401", spent: false).spentRequest)
         // A refusal that sent no request and depends on the history's shape
         // gives the attempt back, because a later step can change that shape.
         for reason in [
@@ -2799,7 +2986,7 @@ final class CloudCompactionFailureTests: XCTestCase {
             .emptySummary,
             .truncatedSummary,
             .cancelled,
-            .provider("HTTP 429")
+            .provider("HTTP 500", spent: true)
         ] {
             XCTAssertFalse(reason.isRetryableOnNextStep, "\(reason) is not retryable")
         }
@@ -2808,9 +2995,8 @@ final class CloudCompactionFailureTests: XCTestCase {
     func testAChatFailureKnowsWhetherItSpentARequest() {
         // The same rule the summarizer path applies, for the turn path: a
         // credential refusal the client reports before connecting is not a
-        // request, and pricing one would report a spend the provider never saw.
-        // A status, a transport error and a malformed stream all come back from
-        // a request that was built and sent.
+        // request, and a 4xx is a rejection the provider never invoiced.
+        // Pricing either one invented a spend that grew on every failed turn.
         for reason in [
             CloudTurnFailure.missingAPIKey(providerName: "Synthetic"),
             .credentialAccessDenied(providerName: "Synthetic"),
@@ -2819,13 +3005,33 @@ final class CloudCompactionFailureTests: XCTestCase {
         ] {
             XCTAssertFalse(reason.spentRequest, "\(reason) never left the machine")
         }
+        for code in [400, 401, 403, 404, 422, 429] {
+            XCTAssertFalse(
+                CloudTurnFailure.httpStatus(code: code, summary: "refused").spentRequest,
+                "HTTP \(code) is a rejection, not an invoice"
+            )
+        }
+        // A status the provider answered AFTER accepting the request, a
+        // transport failure and a malformed stream are all billed: the prompt
+        // reached the inference path and nothing came back to say otherwise.
         for reason in [
-            CloudTurnFailure.httpStatus(code: 429, summary: "slow down"),
+            CloudTurnFailure.httpStatus(code: 500, summary: "boom"),
+            .httpStatus(code: 503, summary: "overloaded"),
             .transport("connection reset"),
             .invalidResponse("the stream ended early")
         ] {
             XCTAssertTrue(reason.spentRequest, "\(reason) was sent")
         }
+        // The summarizer catches an arbitrary `Error`, not just this type: a
+        // cancelled stream arrives as `CancellationError` and an unclassified
+        // fault is treated as sent rather than silently refunded.
+        XCTAssertTrue(CloudTurnFailure.spentRequest(for: CancellationError()))
+        XCTAssertTrue(CloudTurnFailure.spentRequest(for: CloudTurnFailure.transport("reset")))
+        XCTAssertFalse(CloudTurnFailure.spentRequest(
+            for: CloudTurnFailure.httpStatus(code: 401, summary: "expired")
+        ))
+        struct UnknownFault: Error {}
+        XCTAssertTrue(CloudTurnFailure.spentRequest(for: UnknownFault()))
     }
 
     func testAPreflightRefusalDoesNotBlameTheProvider() {
@@ -2852,10 +3058,10 @@ final class CloudCompactionFailureTests: XCTestCase {
     }
 
     func testAProviderFaultIsNamedAsOne() {
-        let notice = CloudCompactionFailure.provider("The provider returned HTTP 429.")
+        let notice = CloudCompactionFailure.provider("The provider returned HTTP 500.", spent: true)
             .notice(providerName: "Synthetic")
         XCTAssertTrue(notice.hasPrefix("⚠️"))
-        XCTAssertTrue(notice.contains("HTTP 429"))
+        XCTAssertTrue(notice.contains("HTTP 500"))
         XCTAssertTrue(notice.hasSuffix("it was left unchanged."))
     }
 
@@ -2924,7 +3130,7 @@ final class CloudCompactionFailureTests: XCTestCase {
             .emptySummary,
             .truncatedSummary,
             .cancelled,
-            .provider("HTTP 400")
+            .provider("HTTP 400", spent: false)
         ] {
             let clause = reason.clause(providerName: "Synthetic")
             XCTAssertFalse(clause.isEmpty)
@@ -3151,26 +3357,6 @@ final class CloudTextCompletionTests: XCTestCase {
         }
     }
 
-    func testAFinishReasonAloneCountsAsTerminal() async {
-        // Not every endpoint sends `[DONE]`; a non-nil `finish_reason` is the
-        // other marker the protocol defines, so a result carrying one is a
-        // completion even when the sentinel never arrived.
-        let client = client { continuation in
-            continuation.yield(.started)
-            continuation.yield(.contentDelta("a summary"))
-            continuation.yield(.finished(CloudTurnResult(
-                text: "a summary",
-                thinking: "",
-                finishReason: "stop",
-                usage: nil,
-                terminated: true
-            )))
-            continuation.finish()
-        }
-        let completion = try? await complete(client)
-        XCTAssertEqual(completion?.text, "a summary")
-    }
-
     func testAProviderFailureIsRaisedRatherThanReturnedAsText() async {
         let client = client { continuation in
             continuation.yield(.started)
@@ -3250,7 +3436,9 @@ final class CloudPricingTests: XCTestCase {
     func testAnUnknownModelIsSimplyUnpriced() {
         // No recorded price means no cost figure, not a guessed one: the status
         // line shows the token counts without a `$`, which is what the app did
-        // before any price list existed.
+        // before any price list existed. Asserting only that the resolved
+        // pricing is nil would pass even if the report invented a price, so the
+        // check is the RENDERED line.
         let suite = "CloudPricingTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
@@ -3259,14 +3447,31 @@ final class CloudPricingTests: XCTestCase {
             for: "p",
             defaults: defaults
         )
-        XCTAssertNotNil(CloudPricingStore.pricing(
+        let known = CloudPricingStore.pricing(
             forModel: "known",
             providerId: "p",
             defaults: defaults
-        ))
+        )
+        XCTAssertNotNil(known)
         let unknown = CloudPricingStore.pricing(forModel: "unknown", providerId: "p", defaults: defaults)
         XCTAssertNil(unknown)
-        XCTAssertNil(unknown?.cost(for: CloudUsage(promptTokens: 1_000, completionTokens: 10)))
+        let usage = CloudUsage(promptTokens: 1_000, completionTokens: 10)
+        let priced = CloudTurnReport(
+            usage: usage,
+            estimatedPromptTokens: 0,
+            outputTokens: 0,
+            cost: known?.cost(for: usage)
+        )
+        XCTAssertTrue(priced.statusSuffix.contains("$"), priced.statusSuffix)
+        let unpriced = CloudTurnReport(
+            usage: usage,
+            estimatedPromptTokens: 0,
+            outputTokens: 0,
+            cost: unknown?.cost(for: usage)
+        )
+        XCTAssertFalse(unpriced.statusSuffix.contains("$"), unpriced.statusSuffix)
+        XCTAssertFalse(unpriced.wasEstimated, unpriced.statusSuffix)
+        XCTAssertEqual(unpriced.statusSuffix, "1,000 in / 10 out")
     }
 
     func testAnAbsurdRateIsRefusedRatherThanPoisoningTheSpend() {
@@ -3412,6 +3617,34 @@ final class CloudTurnReportTests: XCTestCase {
             cost: 0.0031
         )
         XCTAssertEqual(report.statusSuffix, "1,204 in (1,000 cached) / 56 out · $0.0031")
+    }
+
+    func testAnOverReportedCacheShareIsClampedToThePrompt() {
+        // Cached input is a SUBSET of the prompt. Pricing already clamps it, so
+        // a gateway that counts a cache write in both columns used to print
+        // "1,000 in (5,000 cached)" beside a correctly discounted price: the
+        // status line disagreed with the invoice.
+        let one = CloudTurnReport(
+            usage: CloudUsage(promptTokens: 1_000, completionTokens: 10, cachedTokens: 5_000),
+            estimatedPromptTokens: 0,
+            outputTokens: 10,
+            cost: nil
+        )
+        XCTAssertEqual(one.cachedTokens, 1_000)
+        XCTAssertEqual(one.statusSuffix, "1,000 in (1,000 cached) / 10 out")
+
+        // The same rule on a run total, which accumulates one request at a
+        // time: a single over-reported step cannot make the sum exceed the
+        // prompt it is part of.
+        var totals = CloudRunTotals()
+        totals.add(
+            usage: CloudUsage(promptTokens: 1_000, completionTokens: 10, cachedTokens: 5_000),
+            estimatedPromptTokens: 0,
+            estimatedOutputTokens: 0,
+            cost: nil
+        )
+        XCTAssertEqual(totals.cachedTokens, 1_000)
+        XCTAssertEqual(totals.report.statusSuffix, "1,000 billed in (1,000 of it cached) / 10 out")
     }
 
     func testAMissingCompletionCountIsMarkedAsEstimated() {

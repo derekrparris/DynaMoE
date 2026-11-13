@@ -2790,6 +2790,9 @@ struct ContentView: View {
     /// split across the boundary); `/compact` keeps nothing, matching the
     /// on-device command's "fold the whole conversation" contract. `focus` is
     /// the `/compact <focus>` steer and applies only to the manual command.
+    /// `excludingMessageIds` names the caller's transient progress bubble,
+    /// which is UI rather than conversation and must not be carried into the
+    /// rewritten history.
     ///
     /// Returns a failed outcome and leaves the conversation untouched on any
     /// failure: a half-rewritten history is worse than no compaction.
@@ -2801,6 +2804,7 @@ struct ContentView: View {
         window: Int?,
         keepRecentMessages: Int,
         focus: String? = nil,
+        excludingMessageIds: Set<UUID> = [],
         onProgress: ((String) -> Void)? = nil
     ) async -> CloudCompactionOutcome {
         guard let startIdx = sessions.firstIndex(where: { $0.id == sessionId }) else {
@@ -2928,9 +2932,13 @@ struct ContentView: View {
             } catch {
                 // The request was SENT before it failed or was cancelled, so
                 // the provider billed its prompt even though nothing came
-                // back. `CloudCompactionFailure.spentRequest` says so in the
-                // status line; the run's own figures have to agree with it.
-                chargeUnreturnedRequest(estimatedPromptTokens: estimatedPromptTokens)
+                // back — unless it was REFUSED (a 4xx), which never reaches
+                // inference and is never invoiced. `CloudCompactionFailure`
+                // reports the same distinction in the status line; the run's
+                // own figures have to agree with it.
+                if CloudTurnFailure.spentRequest(for: error) {
+                    chargeUnreturnedRequest(estimatedPromptTokens: estimatedPromptTokens)
+                }
                 throw error
             }
             charge(completion, estimatedPromptTokens: estimatedPromptTokens)
@@ -2993,8 +3001,10 @@ struct ContentView: View {
                 )
             } catch {
                 // Same rule as `summarize`: a sent request is billed whether or
-                // not its answer arrived.
-                chargeUnreturnedRequest(estimatedPromptTokens: recapEstimatedPromptTokens)
+                // not its answer arrived, and a refused one is not.
+                if CloudTurnFailure.spentRequest(for: error) {
+                    chargeUnreturnedRequest(estimatedPromptTokens: recapEstimatedPromptTokens)
+                }
                 throw error
             }
             charge(recap, estimatedPromptTokens: recapEstimatedPromptTokens)
@@ -3016,11 +3026,18 @@ struct ContentView: View {
             // rewritten from the snapshot taken before the first pass. Rows
             // appended since then (a `/plan` notice, a command's report) are
             // newer than everything summarized, so they follow the kept tail
-            // rather than being deleted by the rewrite.
+            // rather than being deleted by the rewrite; the caller's progress
+            // bubble is the one row that must NOT follow it, because the
+            // rewrite replaces it with the digest card.
             let carried = ChatSession.messagesAdded(
                 to: sessions[liveIdx].messages,
-                since: all
+                since: all,
+                excluding: excludingMessageIds
             )
+            // The tail is a snapshot too, and a row deleted while the passes
+            // ran must stay deleted: writing `kept` back unconditionally
+            // resurrected a message the user had removed from the transcript.
+            let survivingKept = ChatSession.stillPresent(kept, in: sessions[liveIdx].messages)
             sessions[liveIdx].rollingSummary = summaryText
             sessions[liveIdx].recentWorkDigest = recap.text.isEmpty ? nil : recap.text
             sessions[liveIdx].messages = ChatSession.compactedHistory(
@@ -3028,7 +3045,7 @@ struct ContentView: View {
                 recap: recap.text.isEmpty ? nil : recap.text,
                 evictedMessageCount: evictedCount,
                 modelLabel: provider.displayName
-            ) + kept + carried
+            ) + survivingKept + carried
             // The context the odometer counted is gone; the next send seeds a
             // fresh total from the compacted prompt.
             sessions[liveIdx].cumulativeTokenCount = nil
@@ -3042,7 +3059,13 @@ struct ContentView: View {
             return finish(.cancelled)
         } catch {
             print("☁️ [COMPACT] cloud compaction failed: \(error.localizedDescription)")
-            return finish(.provider(error.localizedDescription))
+            // Whether this pass was billed travels with the outcome: the chat
+            // surface says "the pass was billed" only when a request the
+            // provider processed failed, not when it refused one.
+            return finish(.provider(
+                error.localizedDescription,
+                spent: CloudTurnFailure.spentRequest(for: error)
+            ))
         }
     }
 
@@ -3075,6 +3098,7 @@ struct ContentView: View {
             providerModelId: providerModelId,
             window: window,
             keepRecentMessages: keepRecentMessages,
+            excludingMessageIds: [progressId],
             onProgress: { text in
                 guard let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
                       let msgIdx = self.sessions[liveIdx].messages.firstIndex(where: { $0.id == progressId })
@@ -3154,6 +3178,7 @@ struct ContentView: View {
                 window: window,
                 keepRecentMessages: 0,
                 focus: focus,
+                excludingMessageIds: [progressId],
                 onProgress: updateProgressStatus
             )
             if outcome.didCompact {
@@ -4824,7 +4849,15 @@ struct ContentView: View {
                         ),
                         tools: stepTools
                     )
-                    if CloudContextPolicy.shouldCompact(promptTokens: projected, window: window),
+                    // The reply budget is reserved too: this step sends
+                    // `maxTokens: maxNewTokens`, and past ~0.8 of a small
+                    // window the prompt alone clears the fraction while the
+                    // prompt PLUS its reply is already over the ceiling.
+                    if CloudContextPolicy.shouldCompact(
+                        promptTokens: projected,
+                        window: window,
+                        reservedTokens: maxNewTokens
+                    ),
                        compactionAttempts.shouldAttemptPreflight(projectedTokens: projected) {
                         compactionAttempts.beginPreflight()
                         let outcome = await self.compactCloudHistoryWithProgress(
