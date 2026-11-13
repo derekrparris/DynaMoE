@@ -1,0 +1,330 @@
+        <item>
+            <title>Version 26.10</title>
+            <sparkle:version>26.10</sparkle:version>
+            <sparkle:shortVersionString>26.10</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <link>https://github.com/derekrparris/DynaMoE/releases/tag/v26.10</link>
+            <description><![CDATA[
+                <style>
+                :root {
+                  color-scheme: light dark;
+                  --bg: #f2f2f4;
+                  --card: #ffffff;
+                  --card-2: #f7f7f9;
+                  --hairline: rgba(0, 0, 0, 0.08);
+                  --hairline-soft: rgba(0, 0, 0, 0.06);
+                  --text: #1d1d1f;
+                  --text-2: rgba(60, 60, 67, 0.62);
+                  --text-3: rgba(60, 60, 67, 0.44);
+                  --accent: #af52de;
+                  --accent-strong: #8e3cc4;
+                  --accent-soft: rgba(175, 82, 222, 0.12);
+                  --chip-ink: #8e3cc4;
+                  --hero-1: #bf5af2;
+                  --hero-2: #5e5ce6;
+                  --hero-3: #0a84ff;
+                  --glow: rgba(175, 82, 222, 0.35);
+                  --mono: "SF Mono", ui-monospace, Menlo, monospace;
+                  --sans: -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif;
+                  --rounded: "SF Pro Rounded", -apple-system, sans-serif;
+                }
+                @media (prefers-color-scheme: dark) {
+                  :root {
+                    --bg: #1e1e20;
+                    --card: rgba(255, 255, 255, 0.05);
+                    --card-2: rgba(255, 255, 255, 0.035);
+                    --hairline: rgba(255, 255, 255, 0.09);
+                    --hairline-soft: rgba(255, 255, 255, 0.06);
+                    --text: #f5f5f7;
+                    --text-2: rgba(235, 235, 245, 0.62);
+                    --text-3: rgba(235, 235, 245, 0.42);
+                    --accent: #bf5af2;
+                    --accent-strong: #d9a8f7;
+                    --accent-soft: rgba(191, 90, 242, 0.16);
+                    --chip-ink: #d9a8f7;
+                    --hero-1: #c95bf8;
+                    --hero-2: #6b6af0;
+                    --hero-3: #2f95ff;
+                    --glow: rgba(191, 90, 242, 0.4);
+                  }
+                }
+                * { box-sizing: border-box; margin: 0; padding: 0; }
+                ::selection { background: var(--accent-soft); }
+                body {
+                  font-family: var(--sans);
+                  font-size: 13px;
+                  line-height: 1.55;
+                  color: var(--text);
+                  background: var(--bg);
+                  -webkit-font-smoothing: antialiased;
+                  padding: 28px 30px 34px;
+                  max-width: 640px;
+                  margin: 0 auto;
+                }
+                a { color: var(--accent-strong); text-decoration: none; }
+                a:hover { text-decoration: underline; text-underline-offset: 2px; }
+
+                /* ── Hero header ─────────────────────────────────────────── */
+                header {
+                  display: flex;
+                  align-items: center;
+                  gap: 16px;
+                  padding-bottom: 18px;
+                  margin-bottom: 22px;
+                  border-bottom: 1px solid var(--hairline-soft);
+                  position: relative;
+                }
+                header::after {
+                  content: "";
+                  position: absolute;
+                  top: -10px;
+                  right: -14px;
+                  width: 120px;
+                  height: 120px;
+                  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 56 56'%3E%3Cg fill='none' stroke='%23af52de' stroke-width='1.4' stroke-linejoin='round' opacity='0.10'%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4'/%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4' transform='translate(13.86,0)'/%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4' transform='translate(-13.86,0)'/%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4' transform='translate(6.93,12)'/%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4' transform='translate(-6.93,12)'/%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4' transform='translate(6.93,-12)'/%3E%3Cpolygon points='0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4' transform='translate(-6.93,-12)'/%3E%3C/g%3E%3C/svg%3E") no-repeat center / contain;
+                  pointer-events: none;
+                }
+                .app-badge {
+                  width: 64px;
+                  height: 64px;
+                  flex: none;
+                  border-radius: 15px;
+                  background: linear-gradient(135deg, var(--hero-1), var(--hero-2) 52%, var(--hero-3));
+                  box-shadow: 0 4px 14px var(--glow), inset 0 0 0 0.5px rgba(255, 255, 255, 0.25);
+                  display: flex;
+                  align-items: center;
+                  justify-content: center;
+                }
+                .app-badge svg { width: 40px; height: 40px; }
+                h1 {
+                  font-family: var(--rounded);
+                  font-size: 26px;
+                  font-weight: 700;
+                  letter-spacing: -0.4px;
+                  line-height: 1.15;
+                }
+                .meta-line {
+                  display: flex;
+                  align-items: baseline;
+                  gap: 8px;
+                  margin-top: 2px;
+                  font-family: var(--mono);
+                }
+                .ver-chip {
+                  font-size: 12.5px;
+                  font-weight: 600;
+                  color: var(--chip-ink);
+                  background: var(--accent-soft);
+                  border: 1px solid var(--hairline-soft);
+                  border-radius: 5px;
+                  padding: 1px 7px;
+                }
+                .build { font-size: 11px; color: var(--text-3); }
+                .tagline {
+                  margin-top: 5px;
+                  font-size: 12px;
+                  font-weight: 500;
+                  color: var(--text-2);
+                }
+
+                /* ── Sections ────────────────────────────────────────────── */
+                section { margin-bottom: 24px; }
+                h2 {
+                  display: flex;
+                  align-items: center;
+                  gap: 8px;
+                  font-size: 14px;
+                  font-weight: 700;
+                  letter-spacing: -0.1px;
+                  margin-bottom: 10px;
+                }
+                h2 .icon {
+                  width: 26px;
+                  height: 26px;
+                  flex: none;
+                  border-radius: 7px;
+                  background: var(--accent-soft);
+                  color: var(--chip-ink);
+                  display: flex;
+                  align-items: center;
+                  justify-content: center;
+                }
+                h2 .icon svg { width: 14px; height: 14px; }
+
+                /* Feature cards */
+                .card {
+                  background: var(--card);
+                  border: 1px solid var(--hairline);
+                  border-radius: 10px;
+                  padding: 13px 15px;
+                  margin-bottom: 8px;
+                }
+                .card h3 { font-size: 13px; font-weight: 600; margin-bottom: 2px; }
+                .card p { color: var(--text-2); font-size: 12.5px; }
+                .card code, p code, li code {
+                  font-family: var(--mono);
+                  font-size: 11px;
+                  background: var(--accent-soft);
+                  color: var(--chip-ink);
+                  border-radius: 4px;
+                  padding: 1px 5px;
+                }
+
+                /* Fixed / changed lists */
+                ul.changes { list-style: none; }
+                ul.changes li {
+                  position: relative;
+                  padding-left: 22px;
+                  margin-bottom: 6px;
+                  color: var(--text-2);
+                }
+                ul.changes li::before {
+                  content: "";
+                  position: absolute;
+                  left: 4px;
+                  top: 6px;
+                  width: 5px;
+                  height: 5px;
+                  border-radius: 50%;
+                  background: var(--accent);
+                  opacity: 0.75;
+                }
+                ul.changes li strong { color: var(--text); font-weight: 600; }
+
+                /* Spec rows (About-window style) */
+                .spec {
+                  background: var(--card-2);
+                  border: 1px solid var(--hairline-soft);
+                  border-radius: 10px;
+                  padding: 3px 15px;
+                }
+                .spec .row {
+                  display: flex;
+                  align-items: baseline;
+                  justify-content: space-between;
+                  gap: 16px;
+                  padding: 9px 0;
+                }
+                .spec .row + .row { border-top: 1px solid var(--hairline-soft); }
+                .spec .row .k { color: var(--text-2); font-size: 12px; }
+                .spec .row .v {
+                  font-family: var(--mono);
+                  font-size: 11.5px;
+                  font-weight: 600;
+                  text-align: right;
+                }
+
+                /* Footer action buttons */
+                footer {
+                  display: flex;
+                  gap: 9px;
+                  flex-wrap: wrap;
+                  margin-top: 4px;
+                }
+                footer a.btn {
+                  display: inline-flex;
+                  align-items: center;
+                  gap: 6px;
+                  font-size: 11.5px;
+                  font-weight: 500;
+                  color: var(--text);
+                  background: var(--card);
+                  border: 1px solid var(--hairline);
+                  border-radius: 6px;
+                  padding: 6px 12px;
+                }
+                footer a.btn:hover { background: var(--accent-soft); text-decoration: none; }
+                footer a.btn svg { width: 12px; height: 12px; opacity: 0.55; }
+                .fineprint {
+                  margin-top: 16px;
+                  font-size: 10.5px;
+                  color: var(--text-3);
+                }
+              </style>
+              </head>
+              <body>
+
+              <header>
+                <div class="app-badge" aria-hidden="true">
+                  <svg viewBox="0 0 56 56">
+                    <defs>
+                      <linearGradient id="dg" x1="0" y1="0" x2="1" y2="1">
+                        <stop offset="0" stop-color="#bf5af2"/>
+                        <stop offset="0.5" stop-color="#5e5ce6"/>
+                        <stop offset="1" stop-color="#0a84ff"/>
+                      </linearGradient>
+                    </defs>
+                    <circle cx="28" cy="28" r="25" fill="#fff"/>
+                    <g fill="none" stroke="url(#dg)" stroke-width="1.7" stroke-linejoin="round">
+                      <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(28,28)"/>
+                      <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(41.86,28)"/>
+                      <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(14.14,28)"/>
+                      <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(34.93,40)"/>
+                      <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(21.07,40)"/>
+                      <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(34.93,16)"/>
+                      <polygon points="0,-8 6.93,-4 6.93,4 0,8 -6.93,4 -6.93,-4" transform="translate(21.07,16)"/>
+                    </g>
+                  </svg>
+                </div>
+                <div>
+                  <h1>DynaMoE</h1>
+                  <div class="meta-line">
+                    <span class="ver-chip">v26.10</span>            <!-- EDIT: version -->
+                  </div>
+                  <div class="tagline">High-Performance MoE Inference Engine for Apple Silicon</div>
+                </div>
+              </header>
+
+              <!-- EDIT: Highlights — one card per user-facing feature -->
+              <section>
+                <h2>
+                  <span class="icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.5 14 5v6l-6 3.5L2 11V5l6-3.5Zm0 1.73L3.5 5.87v4.26L8 12.77l4.5-2.64V5.87L8 3.23Zm0 1.6 3.2 1.88v2.58L8 11.17 4.8 9.29V6.71L8 4.83Z"/></svg></span>
+                  What's New in 26.10
+                </h2>
+                <div class="card">
+                  <h3>No limit on agent steps:</h3> The Max Multi-Step Agent Iterations slider stopped at 100, so a long autonomous task could not say "keep going until it is done" and always ended on a count. A <strong>No limit</strong> switch beside the slider now uncaps the run: the slider keeps the user's last finite number and goes inert, so turning the switch back off restores it rather than leaving a sentinel behind. Both agent loops read the budget through one rule, so the weights path and a cloud run cannot disagree about what "no limit" means, and the cap is resolved per step so a settings change applies to a run already in flight. An uncapped run ends on the model's own <code>complete</code>, a tool loop guard (a failed-call streak, a repeated call, the search budget), the model's context limit (the KV budget for local weights, the context window for a cloud provider), or Stop, and the run-end status names only the limit that actually applied, distinguishing a run the model completed, one a tool loop guard stopped, and one that spent its budget. Settings search finds it under "no limit" and "unlimited".
+                </br></br>
+                  <h3>Cloud turns ask for the provider's cache:</h3> A cloud agent run re-sends its whole history on every step, and the app neither asked for the provider's prefix cache nor showed what it was billed. Every request now carries a stable session identity (<code>x-session-id</code> / <code>x-session-affinity</code>, a hash of the conversation rather than its UUID) so a router keeps one conversation on one replica, and providers registered with <strong>Session affinity + cache key</strong> also send OpenAI's <code>prompt_cache_key</code>. Both hints are recoverable: a provider that rejects the body field is retried once without it, and the refusal is remembered for the rest of the process only when the retry succeeds and the refusal names the field, so a vague or transient 400 (a concurrency limit, a rate-limit message) cannot switch caching off. The cache key's refusal is remembered per endpoint and model, the affinity headers' per endpoint, so one model on a shared gateway cannot silence its neighbours; a built-in's read-only row offers <strong>Forget Refusals</strong>. The system prompt is no longer rewritten mid-run, so each step extends the cached prefix instead of invalidating it. Cache reads are decoded from every wire shape they arrive in (<code>prompt_tokens_details.cached_tokens</code>, <code>prompt_cache_hit_tokens</code>, <code>cache_read_input_tokens</code>) and merged across a stream's chunks rather than replaced: the Request Log row reads <code>1,000&rarr;50 tok &middot; 800 cached</code>, its detail sheet splits <code>800 cached, 100 cache write, 600 billable</code>, and the Console line carries <code>cached=800</code>. <strong>Re-send Images</strong> (Settings &rarr; Cloud Providers &rarr; Request Behaviour, default on) decides whether every picture rides every request or only the newest user turn's; pictures from earlier turns become a one-line notice instead of a repeated charge.
+                </br></br>
+                  <h3>A cloud conversation that knows its ceiling and its bill:</h3> Two registration facts feed the displays, both set from <code>defaults</code> because no provider catalog publishes them: context windows per model (<code>dynamoe_cloud_&lt;provider&gt;_context</code>, <code>model=window</code> entries) and prices per model (<code>dynamoe_cloud_&lt;provider&gt;_pricing</code>, JSON in USD per million tokens with <code>cached_input</code> and <code>cache_write_input</code> rates). With a window recorded the header shows <code>tokens &middot; N% of window</code>, where the figure is the context the last request carried (one meaning on every backend, so moving a conversation between a local and a cloud model no longer inflates it) and a send projected past 80% of the window compacts older history with the active provider model before spending the request. The reply budget is capped to the room that threshold leaves, so a Max Output Tokens setting larger than a small window's room is lowered rather than compacting forever against a wall it can never clear; a provider <code>context_length_exceeded</code> rejection compacts and retries that step once; a run may compact more than once as it refills its window, and one pass reads at most eight summarizer excerpts, with a longer history summarized as a head-and-tail excerpt that names how much middle history it omitted. <code>/compact</code> now uses the active provider model for a cloud conversation and honours <code>/compact &lt;focus&gt;</code>, so it works on a Mac without Apple Intelligence. With a price recorded, each turn's status line ends with its cost (<code>1,204 billed in (1,000 of it cached) / 56 out &middot; $0.0031</code>) and the header carries the conversation's cumulative spend, summarizer requests included. A step that completed and reported no usage is counted from the app's own estimate and marked <code>(est.)</code>, and no cost is invented for it from estimated tokens; a request that was sent and then stopped, failed or was cut off is charged from the same estimate, because the provider billed the prompt it received. A request the provider refused without running the model (an expired key, an unknown model, a rate limit, any 4xx) is not charged, and neither is anything that never left the Mac; a figure below a ten-thousandth of a dollar prints <code>&lt;$0.0001</code>. Cloud compaction also shows its progress in the transcript, and its digest rides every step of the run.
+                </div>
+              </section>
+
+              <!-- EDIT: Fixes — plain bullet list -->
+              <section>
+                <h2>
+                  <span class="icon"><svg viewBox="0 0 16 16" fill="currentColor"><path d="M13.78 3.97a.75.75 0 0 1 0 1.06l-6.5 6.5a.75.75 0 0 1-1.06 0l-3-3a.75.75 0 1 1 1.06-1.06l2.47 2.47 5.97-5.97a.75.75 0 0 1 1.06 0Z"/></svg></span>
+                  Fixes
+                </h2>
+                <ul class="changes">
+                  <li><strong>Stop during /compact:</strong> Stop used to commit the partial summary the cancelled summarizer returned and delete every message it never covered. The pass is now checked at each pass boundary and immediately before the rewrite, Stop reports itself instead of a failure or a success, and Stop in a compacting chat no longer cancels an unrelated chat's generation</li>
+                  <li><strong>A turn /compact cut short:</strong> A message larger than one summarizer request was truncated to fit and then deleted along with the summary, so the omitted tail was gone for good. Oversized turns are split across passes instead, which keeps every character while each request stays inside the budget</li>
+                  <li><strong>Two chats compacting at once:</strong> A single compaction flag let a pass in one chat clear the gate another pass still needed, so a send could land in a rewrite and Stop could cancel nothing. Manual compaction state is now keyed by conversation, with a run id so only the owning pass clears it</li>
+                  <li><strong>A finished cloud reply that read as cut off:</strong> A <code>[DONE]</code> arriving as the final line of a stream was discarded, so a complete answer was reported as a connection that closed early. The end of a stream is no longer dropped, and finish reasons are classified rather than matched by exact spelling, so only a recognised clean stop lets a summary replace the messages it was written from</li>
+                  <li><strong>Under the hood:</strong> The README and settings guide document the No limit switch, provider prompt caching, Re-send Images, context-window and price registration, and cloud compaction</li>
+                </ul>
+              </section>
+
+              <footer>
+                <a class="btn" href="https://github.com/derekrparris/DynaMoE/releases/tag/v26.10">   <!-- EDIT: release URL -->
+                  <svg viewBox="0 0 16 16" fill="currentColor"><path d="M6.22 8.72a.75.75 0 0 0 1.06 1.06l1.66-1.66a2 2 0 0 0 0-2.83l-.94-.94a2 2 0 0 0-2.83 0L3.51 6.01a2 2 0 0 0 0 2.83l.94.94a.75.75 0 0 0 1.06-1.06l-.94-.94a.5.5 0 0 1 0-.71l2.35-2.35a.5.5 0 0 1 .71 0l.94.94a.5.5 0 0 1 0 .71L6.22 8.72Zm3.56-1.44a.75.75 0 0 0-1.06-1.06L7.06 7.88a2 2 0 0 0 0 2.83l.94.94a2 2 0 0 0 2.83 0l2.35-2.35a2 2 0 0 0 0-2.83l-.94-.94a.75.75 0 0 0-1.06 1.06l.94.94a.5.5 0 0 1 0 .71L9.77 9.59a.5.5 0 0 1-.71 0l-.94-.94a.5.5 0 0 1 0-.71l1.66-1.66Z"/></svg>
+                  GitHub Release
+                </a>
+                <a class="btn" href="https://github.com/derekrparris/DynaMoE">
+                  <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1.5a6.5 6.5 0 0 0-2.06 12.67c.33.06.45-.14.45-.32v-1.12c-1.8.39-2.18-.87-2.18-.87-.3-.75-.73-.95-.73-.95-.59-.4.05-.4.05-.4.65.05 1 .67 1 .67.58 1 1.53.71 1.9.54.06-.42.23-.71.41-.87-1.44-.16-2.95-.72-2.95-3.2 0-.71.25-1.29.67-1.74-.07-.17-.29-.83.06-1.73 0 0 .54-.17 1.77.66a6.15 6.15 0 0 1 3.22 0c1.23-.83 1.77-.66 1.77-.66.35.9.13 1.56.06 1.73.42.45.67 1.03.67 1.74 0 2.49-1.51 3.04-2.96 3.2.23.2.44.59.44 1.19v1.76c0 .18.12.39.45.32A6.5 6.5 0 0 0 8 1.5Z"/></svg>
+                  Repository
+                </a>
+              </footer>
+
+              <p class="fineprint">DynaMoE is an independent open-source inference engine. macOS, Metal, and Apple Silicon are trademarks of Apple Inc. Apache 2.0 licensed.</p>
+
+              </body>
+            ]]></description>
+            <pubDate>Fri, 13 Nov 2026 18:21:13 +0000</pubDate>
+            <enclosure
+                url="https://github.com/derekrparris/DynaMoE/releases/download/v26.10/DynaMoE-26.10.app.tar.xz"
+                sparkle:edSignature="s6XVygUevtcK3qyhd1GJlUnclIR6VzAYVt39xPz4arCKo3dGhqFoji708onWAtiWV2Qk0aFcEi8aTYPHZESOCg=="
+                length="9335176"
+                type="application/octet-stream"
+            />
+        </item>
