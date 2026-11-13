@@ -46,17 +46,24 @@ final class CloudProviderStore: ObservableObject {
     private let secretStore: CloudSecretStore
     private let rescansModels: Bool
     private let updatesSharedRuntime: Bool
+    /// The process-wide latch `setCacheHints` forgets. Injected so a test can
+    /// hold its own: the shared one is keyed by endpoint, and a case that
+    /// latched it would leak into the next (and into a repeat-on-failure
+    /// rerun of itself).
+    private let cacheHintMemory: CloudCacheHintMemory
 
     init(
         defaults: UserDefaults = .standard,
         secretStore: CloudSecretStore = .shared,
         rescansModels: Bool = true,
-        updatesSharedRuntime: Bool = true
+        updatesSharedRuntime: Bool = true,
+        cacheHintMemory: CloudCacheHintMemory = .shared
     ) {
         self.defaults = defaults
         self.secretStore = secretStore
         self.rescansModels = rescansModels
         self.updatesSharedRuntime = updatesSharedRuntime
+        self.cacheHintMemory = cacheHintMemory
         self.providers = CloudProviderCatalog.all(defaults: defaults)
     }
 
@@ -106,8 +113,15 @@ final class CloudProviderStore: ObservableObject {
     /// Changes the display name, base URL, or documentation link. The
     /// identifier is deliberately immutable: it is the Keychain account
     /// suffix and part of the `cloud://` address saved with every conversation
-    /// that used the provider. A new base URL drops the per-model state, since
-    /// every id and capability mark it held described the old endpoint.
+    /// that used the provider. A new base URL drops the ENDPOINT state — the
+    /// registered ids, the no-tools list and the vision marks all described
+    /// that server — while prices and context windows are facts about the MODEL
+    /// and are kept.
+    ///
+    /// The fields this form does not edit — the Anthropic base and the
+    /// prompt-caching capability — are carried over from the stored record.
+    /// Validating from a bare draft rebuilt them as nil, so renaming a
+    /// provider quietly reset its caching choice to the default.
     func update(
         _ provider: CloudProvider,
         displayName: String,
@@ -128,7 +142,8 @@ final class CloudProviderStore: ObservableObject {
             identifier: provider.id,
             baseURL: baseURL,
             docsURL: docsURL,
-            existing: existing
+            existing: existing,
+            preserving: custom[index]
         ).get()
 
         let previousBaseURL = custom[index].openAIBaseURL
@@ -138,9 +153,44 @@ final class CloudProviderStore: ObservableObject {
         // facts about the server at the old base URL rather than about this
         // identifier, so keeping them would offer model ids the new endpoint
         // never listed and fail with that endpoint's own error on the send.
+        // Prices and windows are facts about the MODEL and are kept.
         if updated.openAIBaseURL != previousBaseURL {
-            CloudModelRegistry.clearProviderState(for: updated, defaults: defaults)
+            CloudModelRegistry.clearEndpointState(for: updated, defaults: defaults)
         }
+        publish()
+    }
+
+    /// Records what a custom provider is willing to be told about prompt
+    /// caching. Only the capability changes; the endpoint, the key and the
+    /// registered models are untouched, so flipping it mid-conversation cannot
+    /// drop a registration fact that still describes the same server.
+    func setCacheHints(_ hints: CloudCacheHints, for provider: CloudProvider) throws {
+        guard !isBuiltIn(provider) else {
+            throw CloudProviderStoreError.builtInProviderIsImmutable(provider.displayName)
+        }
+        var custom = CloudProviderCatalog.customProviders(defaults: defaults)
+        guard let index = custom.firstIndex(where: { $0.id == provider.id }) else {
+            throw CloudProviderStoreError.providerNotFound(provider.id)
+        }
+        let current = custom[index]
+        custom[index] = CloudProvider(
+            id: current.id,
+            displayName: current.displayName,
+            docsURL: current.docsURL,
+            openAIBaseURL: current.openAIBaseURL,
+            anthropicBaseURL: current.anthropicBaseURL,
+            cacheHints: hints
+        )
+        CloudProviderCatalog.saveCustomProviders(custom, defaults: defaults)
+        // A refusal is a statement about the SERVER, and this control is the
+        // operator saying they know better. Leaving the latch in place made
+        // the setting a silent no-op for the rest of the process: the hint was
+        // re-read on every request, but the endpoint was remembered as having
+        // refused the field, so nothing was ever sent. Both hints are cleared:
+        // the affinity headers can be refused just as the body field can.
+        cacheHintMemory.allowCacheHints(
+            endpoint: current.chatCompletionsURL.absoluteString
+        )
         publish()
     }
 

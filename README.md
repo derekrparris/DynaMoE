@@ -41,7 +41,7 @@ DynaMoE supports sparse Mixture-of-Experts, hybrid recurrent SSM/attention archi
 
 **Important Note:** DynaMoE uses custom Metal kernels and shaders to run models efficiently and to take full advantage of Apple's unified memory architecture. **There is no need to use MLX quantizations** in DynaMoE. In fact, in many cases, an MLX version will run slower or not run at all in DynaMoE. It is advisable to run the native (non MLX and non-GGUF) versions of models in DynaMoE.
 
-On macOS 26 or later with Apple Intelligence enabled, Apple's built-in **on-device Foundation Model** is also selectable as a zero-install chat backend (plain chat; agent tools, JetSpec, thinking blocks, and KV-cache prefixing are local-weights features that do not apply). It appears in the chat model picker under **System Models**, and it powers `/compact` manual conversation compaction on any backend: a rolling general summary plus a detailed recap of the most recent work replace the evicted history, stay visible in an expandable summary card at the top of the chat, and ride into every later prompt. The system model is a chat-only backend: the local inference server (below) always serves the locally loaded weights.
+On macOS 26 or later with Apple Intelligence enabled, Apple's built-in **on-device Foundation Model** is also selectable as a zero-install chat backend (plain chat; agent tools, JetSpec, thinking blocks, and KV-cache prefixing are local-weights features that do not apply). It appears in the chat model picker under **System Models**, and it summarizes `/compact` manual conversation compaction for local conversations; a cloud conversation is summarized by the provider model already answering it, so that command needs no Apple Intelligence. Either way a rolling general summary plus a detailed recap of the most recent work replace the evicted history, stay visible in an expandable summary card at the top of the chat, and ride into every later prompt. Cloud turns also compact automatically as they approach the model's recorded context window. The system model is a chat-only backend: the local inference server (below) always serves the locally loaded weights.
 
 **The following models have been tested and should run well in DynaMoE:**
 
@@ -276,7 +276,7 @@ DynaMoE/
 If you're interested in building and running the app in your own development environment:
 
 ### Prerequisites
-* macOS 26+ (Apple Intelligence enabled for the on-device Apple system model and `/compact` conversation compaction)
+* macOS 26+ (Apple Intelligence enabled for the on-device Apple system model and for `/compact` on local conversations; a cloud conversation compacts with its own provider model)
 * Apple Silicon Mac (M1/M2/M3/M4/M5/M6, 16 GB+ Unified Memory recommended)
 * Xcode 26 or later with Command Line Tools (the project builds in Swift 5 language mode with default `MainActor` actor isolation)
 * Rust toolchain (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
@@ -394,7 +394,28 @@ DynaMoE runs local weights by default, but it can also connect to a remote infer
 
 Cloud turns run through the provider's OpenAI-compatible chat-completions API. With **Agent Tools** on (the default), a turn uses the provider's **native function calling**: the loaded tool schemas ride each request, streamed `tool_calls` execute through the same harness as a local turn (HITL approvals, Turbo Mode, the repeated/failed-call loop guards, and the subagent report relay), and the run ends when the model answers, calls `complete`, or exhausts the agent step budget (turned off entirely by the Agent & Tools **No limit** switch). With Agent Tools off, the same backend runs plain chat.
 
-Grammar masking, JetSpec, prefix caching, KV precision, and the memory/SSD controls do not apply to a cloud turn. Switching to a cloud model releases any resident weights engine (the same principle as the Apple on-device model), so the RAM budget is not held by a backend that will not use it.
+Grammar masking, JetSpec, local KV prefix caching, KV precision, and the memory/SSD controls do not apply to a cloud turn. Switching to a cloud model releases any resident weights engine (the same principle as the Apple on-device model), so the RAM budget is not held by a backend that will not use it.
+
+**Provider prompt caching does apply, and the app asks for it.** Every step of an agent run re-sends the whole conversation, so the only thing that keeps that from costing the full prompt every time is the provider's own prefix cache. Unless a provider's **Prompt Caching** row is set to `Off`, each request carries stable `x-session-id` / `x-session-affinity` headers (so a router keeps one conversation on one replica), and providers registered with the `Session affinity + cache key` capability also send OpenAI's `prompt_cache_key`. Both hints are recoverable: a provider that rejects the body field is retried once without it and the field stays disabled for that model only if the retry succeeds **and the refusal names the field** (the refusal is remembered per model, so one model on a shared gateway cannot switch the hint off for the rest, and a vague or transient `400` — a concurrency limit, a rate-limit message — never latches it), while a provider that answers with a body naming one of the headers is retried once without the headers — the default is on for providers configured before the setting existed, so a non-conforming endpoint would otherwise fail every turn over a hint nobody chose. A built-in's read-only row offers **Forget Refusals** so a remembered rejection can still be cleared. The capability is set per provider under **Settings → Cloud Providers → Prompt Caching**.
+
+Cache reads are reported rather than hidden: a usage block is decoded from all three wire shapes (`prompt_tokens_details.cached_tokens`, `prompt_cache_hit_tokens`, `cache_read_input_tokens`) and merged across a stream's chunks rather than replaced, the Request Log row shows `input→output tok · N cached` (and `N cached, M billable` in its detail sheet), and the session odometer reports the context the last request carried rather than the sum of what each step billed — one meaning on every backend, so moving a conversation between a local and a cloud model does not inflate it. The Console line carries `cached=N` too. Anthropic's three-column split is decoded and priced as well — its `input_tokens` is only the uncached share, so the app normalises to `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` before pricing — but that decoding is ahead of the transport that will carry it: the Anthropic cloud flavor is a stub, so every cloud turn today goes over the OpenAI-compatible surface and its two spellings.
+
+Re-sending pictures is optional: **Settings → Cloud Providers → Request Behaviour → Re-send Images** (default on) controls whether every picture in the conversation rides every request, or only the newest user turn's (pictures from earlier turns become a one-line notice). Turning it off stops a text follow-up from paying again for a picture attached to an earlier question; the newest user turn's own pictures still ride while that turn is being answered.
+
+Two registration facts feed the cost and context displays, both settable from `defaults` because no provider catalog publishes them:
+
+```bash
+# Context windows, per model ("model=window", entries separated by "; ")
+defaults write DRP.DynaMoE dynamoe_cloud_synthetic_context -string \
+  "hf:deepseek-ai/DeepSeek-V4.1-Flash-1017=1000000"
+
+# Prices in USD per million tokens; cached_input is the cache-read rate and
+# cache_write_input the cache-write rate (Anthropic bills a write at 1.25× input).
+defaults write DRP.DynaMoE dynamoe_cloud_synthetic_pricing -string \
+  '{"hf:deepseek-ai/DeepSeek-V4.1-Flash-1017":{"input":0.27,"cached_input":0.07,"cache_write_input":0.34,"output":1.1}}'
+```
+
+With a window recorded, the chat header shows `tokens · N% of window`, a send that would cross 80% of it — or whose prompt plus its `max_tokens` reply budget would not fit inside it at all — compacts older history with the active provider model before spending the request, and a provider `context_length_exceeded` rejection compacts and retries the step once instead of ending the turn. The reply budget is capped to the room the 80% threshold leaves, so a Max Output Tokens setting larger than a small window's room is lowered rather than compacting forever against a wall it can never clear. `/compact` also uses the active provider model for a cloud conversation (and honours `/compact <focus>`), so it works on a Mac without Apple Intelligence. With a price recorded, each turn's status line ends with its cost, e.g. `1,204 billed in (1,000 of it cached) / 56 out · $0.0031`, and the session's cumulative spend includes the summarizer requests a compaction spent. A request the provider was actually billed for is charged even when its answer never arrived (a 5xx, a dropped connection, a stream cut mid-reply); a refusal it threw away without running the model — an expired key, an unknown model, a rate limit, any `4xx` — is not, so a failing turn stops growing the spend pill. So is anything that never left the Mac: an offline Mac, a host that does not resolve, a TLS handshake that fails, or a local fault before the request is submitted. A timeout or a lost connection after submission stays billed, because the provider may already have processed it. The cached column is always shown as part of the input it belongs to, clamped to it when a gateway reports more cached than prompt tokens.
 
 A model that rejects a `tools` array is handled without turning Agent Tools off globally: list it under the provider's no-tools key, and that model runs plain chat with a visible notice in the conversation instead.
 
@@ -437,7 +458,7 @@ Authentication is `Authorization: Bearer <key>`. Streaming uses SSE with `stream
 | API Key | Optional at creation; it is written to the Keychain (`DRP.DynaMoE.cloud`) and can be saved or rotated on the provider card. |
 | Documentation | Optional `http(s)` link shown on the card. Because the link is stored in plain text with the provider record, `user:password@` and query strings are refused. |
 
-Built-in providers (Synthetic) stay available and cannot be edited or removed. **Remove** on a custom provider deletes its Keychain key, its registered models, its no-tools list, and its vision marks; a conversation pinned to one of its models then refuses to send with a reselect message instead of silently running on local weights. Editing a saved provider's **API Base URL** drops those same model registrations, because they describe the old endpoint; press **Test & Sync Models** to register the new one's catalog.
+Built-in providers (Synthetic) stay available and cannot be edited or removed. **Remove** on a custom provider deletes its Keychain key, its registered models, its no-tools list, its vision marks, its context windows, and its prices; a conversation pinned to one of its models then refuses to send with a reselect message instead of silently running on local weights. Editing a saved provider's **API Base URL** drops those same model registrations, because they describe the old endpoint; press **Test & Sync Models** to register the new one's catalog.
 
 #### OpenCode Zen
 
@@ -448,7 +469,7 @@ Built-in providers (Synthetic) stay available and cannot be edited or removed. *
 | API Base URL | `https://opencode.ai/zen/v1` |
 | API Key | from `console.opencode.ai` |
 
-Zen's catalog is a superset of what it serves on this wire: the `gpt-5.x` family answers on `/zen/v1/responses` and Claude models on `/zen/v1/messages` (the Anthropic wire, which is a stub in DynaMoE), so only the OpenAI-compatible ids work here (`qwen3-coder`, `kimi-k2`, `kimi-k2-thinking`, `glm-4.6`, `glm-4.7-free`, `grok-code`, `big-pickle`, and their current `-free` variants). After **Test & Sync Models**, remove the rest with the **−** button beside each registered model; sending to one of them returns the gateway's own `Model <id> is not supported` error, surfaced in the conversation and in the request log.
+Zen's catalog is a superset of what it serves on this wire: the `gpt-5.x` family answers on `/zen/v1/responses` and Claude models on `/zen/v1/messages` (the Anthropic wire, which is a stub in DynaMoE), so only the OpenAI-compatible ids work here (`qwen3-coder`, `kimi-k2`, `kimi-k2-thinking`, `glm-4.6`, `glm-4.7-free`, `grok-code`, `big-pickle`, and their current `-free` variants). After **Test & Sync Models**, remove the rest with the **−** button beside each registered model; the model's recorded window and price are deleted with it, so re-adding the same id starts clean. Sending to one of them returns the gateway's own `Model <id> is not supported` error, surfaced in the conversation and in the request log.
 
 ### Registered models
 
@@ -490,7 +511,7 @@ Each image is oriented, stripped of metadata, downscaled so its longest edge is 
 
 On the wire, an attached user turn becomes a multi-part `content` array: `{"type":"text",…}` plus one `{"type":"image_url","image_url":{"url":"data:image/png;base64,…"}}` per image. Text-only turns still send `content` as a bare string, so nothing changes for models without vision.
 
-A slash command cannot carry images: the composer refuses the send and keeps the draft/chips, and removing a queued prompt deletes the images it staged. Images are re-sent with their original message on every later request, including each agent step, so the model keeps its visual context. That also means each later turn pays the image's prompt tokens again; the token estimate prices each image as a flat allowance until the provider reports real usage.
+A slash command cannot carry images: the composer refuses the send and keeps the draft/chips, and removing a queued prompt deletes the images it staged. Images are re-sent with their original message on every later request, including each agent step, so the model keeps its visual context. That also means each later turn pays the image's prompt tokens again; the token estimate prices each image as a flat allowance until the provider reports real usage. Cloud Providers → **Request Behaviour → Re-send Images** turns that off: only the newest user turn then carries pixels, and a picture from an earlier turn is replaced with a one-line notice instead of being billed again on every step.
 
 Attachments live beside the conversation files in `~/Library/Application Support/DynaMoE/sessions/assets/<session>/`, never inside the session JSON (base64 there would rewrite megabytes on every streaming save). Deleting a conversation, auto-deletion, and the orphan pass all remove their images.
 

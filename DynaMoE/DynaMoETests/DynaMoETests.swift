@@ -16258,28 +16258,35 @@ final class ChatSessionPersistenceTests: XCTestCase {
 
     // MARK: - Cumulative token odometer (pure logic)
 
-    func testUnmeteredSessionSeedsOdometerFromFullPrompt() {
-        // A conversation with no meter yet — a pre-feature history, or a fresh
-        // /compact reset — counts its next turn's entire prompt as the base,
-        // because that prompt IS the conversation's context size. Seeding
-        // ignores prefix reuse: the unmetered tail was never counted before.
-        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: nil, promptTokenCount: 1200, prefixTokensReused: 0), 1200)
-        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: nil, promptTokenCount: 1200, prefixTokensReused: 800), 1200)
-        // Generated tokens add on top of the seeded base as the turn streams.
-        let seeded = ChatSession.cumulativeTokenBase(previousTotal: nil, promptTokenCount: 1200, prefixTokensReused: 0)
-        XCTAssertEqual(seeded + 300, 1500)
+    func testTheOdometerSeedsFromThePromptNotThePreviousTotal() {
+        // One meaning for every backend — the conversation's context size — so
+        // a turn's base is its own prompt regardless of what the last turn
+        // stored. Before this rule a meter left by a cloud turn (already a
+        // context size) was added to the next local turn's prompt, and the
+        // header pill jumped by a whole conversation whenever the backend
+        // changed.
+        //
+        // The stored total is the INPUT here, which is what makes this able to
+        // fail: comparing `contextTokenBase(prompt)` with `prompt` proves only
+        // that the function is the identity.
+        var session = ChatSession(title: "odometer")
+        session.cumulativeTokenCount = 9_000
+        session.seedContextTotal(promptTokenCount: 1_200)
+        XCTAssertEqual(session.cumulativeTokenCount, 1_200, "a seed replaces the stored total, it does not add to it")
+
+        // A turn that stored nothing seeds the same way.
+        var fresh = ChatSession(title: "fresh")
+        fresh.cumulativeTokenCount = nil
+        fresh.seedContextTotal(promptTokenCount: 1_200)
+        XCTAssertEqual(fresh.cumulativeTokenCount, 1_200)
     }
 
-    func testMeteredSessionAddsOnlyNonReusedPromptTokens() {
-        // Only the part of the prompt the pinned prefix did not already cover
-        // counts again, so prefix reuse never double-counts context.
-        let base = ChatSession.cumulativeTokenBase(previousTotal: 5000, promptTokenCount: 1200, prefixTokensReused: 800)
-        XCTAssertEqual(base, 5400)
-        XCTAssertEqual(base + 300, 5700)
-        // Reuse at or beyond the prompt's length contributes nothing, never a
-        // negative delta.
-        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: 5000, promptTokenCount: 100, prefixTokensReused: 100), 5000)
-        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: 5000, promptTokenCount: 100, prefixTokensReused: 300), 5000)
+    func testTheOdometerBaseClampsAndAddsGeneratedTokens() {
+        // Generated tokens add on top of the seeded base as the turn streams,
+        // and a nonsense prompt count seeds zero rather than a negative total.
+        let seeded = ChatSession.contextTokenBase(promptTokenCount: 1200)
+        XCTAssertEqual(seeded + 300, 1500)
+        XCTAssertEqual(ChatSession.contextTokenBase(promptTokenCount: -10), 0)
     }
 
     func testPlaceholderIsUnusedOnlyWhenEmptyAndUntitled() {
@@ -16531,14 +16538,23 @@ final class ChatSessionPersistenceTests: XCTestCase {
         let dir = makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
 
-        // Simulate a file written before the versioned envelope existed.
-        let legacy = session(title: "Legacy", updatedAt: Date())
+        // Simulate a file written before the versioned envelope existed. It
+        // carries a running-sum token total, which is the v1 MEANING: an
+        // unstamped file is version 0 and must be normalised by the same rule,
+        // or a legacy chat relaunches claiming several hundred percent of a
+        // window it never carried.
+        var legacy = session(title: "Legacy", updatedAt: Date())
+        legacy.cumulativeTokenCount = 120_000
         let file = dir.appendingPathComponent("\(legacy.id.uuidString).json")
         try JSONEncoder().encode(legacy).write(to: file)
 
         let store = ChatSessionStore(directory: dir)
         let loaded = store.loadSessions() ?? []
         XCTAssertEqual(loaded.map(\.id), [legacy.id])
+        XCTAssertNil(
+            loaded.first?.cumulativeTokenCount,
+            "an unstamped (v0) file stores the old running sum, not a context size"
+        )
 
         store.saveAll(loaded)
         store.flushPendingIO()
@@ -16580,6 +16596,38 @@ final class ChatSessionPersistenceTests: XCTestCase {
         XCTAssertFalse(ChatSessionStore.isSupportedSchema(ChatSessionStore.currentSchemaVersion + 1))
         XCTAssertFalse(ChatSessionStore.isSupportedSchema(0), "Version 0 is not a valid stamped format")
         XCTAssertFalse(ChatSessionStore.isSupportedSchema(-1), "Negative versions are not valid")
+    }
+
+    func testAnOlderSessionsTokenTotalIsNotRestoredAsAContextSize() throws {
+        // Version 1 stored a RUNNING SUM of everything each request billed;
+        // version 2 stores the conversation's current context size. Restoring
+        // the old figure renders it as "N% of <window>", so a long-running chat
+        // could claim several times its window. It is dropped instead, and the
+        // next send reseeds it — the first moment the figure is knowable again.
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+
+        var oldRules = session(title: "Old Meter", updatedAt: Date())
+        oldRules.cumulativeTokenCount = 120_000
+        try encoder
+            .encode(PersistedChatSession(schemaVersion: 1, session: oldRules))
+            .write(to: dir.appendingPathComponent("\(oldRules.id.uuidString).json"))
+
+        var current = session(title: "New Meter", updatedAt: Date())
+        current.cumulativeTokenCount = 9_000
+        try encoder
+            .encode(PersistedChatSession(
+                schemaVersion: ChatSessionStore.currentSchemaVersion,
+                session: current
+            ))
+            .write(to: dir.appendingPathComponent("\(current.id.uuidString).json"))
+
+        let loaded = ChatSessionStore(directory: dir).loadSessions() ?? []
+        let byId = Dictionary(uniqueKeysWithValues: loaded.map { ($0.id, $0) })
+        XCTAssertNil(byId[oldRules.id]?.cumulativeTokenCount)
+        XCTAssertEqual(byId[current.id]?.cumulativeTokenCount, 9_000)
     }
 
     func testUnreadableSessionFileIsPreservedDuringOrphanCleanup() throws {

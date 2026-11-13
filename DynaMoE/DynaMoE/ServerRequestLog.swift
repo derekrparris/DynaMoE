@@ -84,7 +84,19 @@ nonisolated struct ServerRequestLog: Identifiable, Codable, Sendable, Equatable,
     /// distinguishable.
     var queueWaitMs: Double?
     var model: String?
+    /// The prompt size the provider billed, or — when it reported no usage at
+    /// all — the app's pre-turn estimate, which `chatTurnLog` writes here and
+    /// `noteProviderUsage` replaces as soon as the provider speaks.
     var inputTokens: Int?
+    /// Input tokens the provider served from its prompt cache. Nil on rows the
+    /// provider reported no usage split for (and on every row written before
+    /// the field existed), so "no cache detail" never reads as "nothing
+    /// cached". A cloud agent step re-sends its whole history; this is the
+    /// column that shows how much of that was a cache read.
+    var cachedInputTokens: Int?
+    /// Input tokens this request wrote into the provider's cache
+    /// (Anthropic-style providers bill writes separately).
+    var cacheWriteInputTokens: Int?
     var outputTokens: Int?
     var temperature: Double?
     var maxTokens: Int?
@@ -203,7 +215,11 @@ nonisolated struct ServerRequestLog: Identifiable, Codable, Sendable, Equatable,
 /// completed row reaches the unified log and the persisted store. Thread-safe:
 /// route handlers run on arbitrary executor threads.
 final class ServerRequestLogRecorder: @unchecked Sendable {
-    static let shared = ServerRequestLogRecorder()
+    /// `nonisolated`: the box records from wherever a turn happens to run, and
+    /// an immutable reference to a thread-safe recorder carries no actor state.
+    /// The default main-actor isolation otherwise made this a warning at the
+    /// in-app turn loop's one `record` call.
+    nonisolated static let shared = ServerRequestLogRecorder()
 
     static let captureBodiesKey = "dynamoe_server_log_store_bodies"
     static let requestCategory = "server.request"
@@ -316,6 +332,14 @@ final class ServerRequestLogRecorder: @unchecked Sendable {
         if let input = row.inputTokens {
             parts.append("in=\(input)")
         }
+        if let cached = row.cachedInputTokens, cached > 0 {
+            // Cache reads are metadata, not content: the Console line says how
+            // much of a re-sent history the provider served from its cache.
+            parts.append("cached=\(cached)")
+        }
+        if let write = row.cacheWriteInputTokens, write > 0 {
+            parts.append("cache_write=\(write)")
+        }
         if let output = row.outputTokens {
             parts.append("out=\(output)")
         }
@@ -357,7 +381,13 @@ final class ServerRequestLogRecorder: @unchecked Sendable {
 /// closures retain it past the registry entry (the HTTP response is already
 /// 200 by the time the stream drains, so the row is finalized when the
 /// stream does).
-final class ServerRequestLogBox: @unchecked Sendable {
+///
+/// `nonisolated`: the class is a lock-guarded box with no actor state of its
+/// own, and the project's default main-actor isolation would otherwise make
+/// every `nonisolated` method that touches `builder` a concurrency warning
+/// (the middleware, the streaming writers and the in-app turn loop all note
+/// into it from wherever they happen to run).
+nonisolated final class ServerRequestLogBox: @unchecked Sendable {
     private let lock = NSLock()
     private var builder: ServerRequestLog
     private var claimed = false
@@ -692,6 +722,37 @@ extension ServerRequestLogBox {
         lock.lock()
         if builder.firstTokenMs == nil {
             builder.firstTokenMs = Date().timeIntervalSince(startedAt) * 1000
+        }
+        lock.unlock()
+    }
+
+    /// Replaces the row's estimated prompt size with the provider's own counts.
+    ///
+    /// The estimate is written when the box is created, before the turn runs,
+    /// because a stream can fail without ever reporting usage. When the
+    /// provider does report, its number is the one worth keeping — and the
+    /// cache split beside it is what turns "this step sent 90k tokens" into
+    /// "90k tokens, 81k of them a cache read".
+    nonisolated func noteProviderUsage(
+        promptTokens: Int?,
+        cachedTokens: Int?,
+        cacheWriteTokens: Int?
+    ) {
+        lock.lock()
+        if let promptTokens { builder.inputTokens = max(0, promptTokens) }
+        // A provider reports these columns unchecked, and every reader
+        // subtracts them from the prompt. `Int.max` cached tokens traps the
+        // dashboard's `input - cached`, and the row is persisted, so the crash
+        // outlives the request. Clamped once here, at the only place the
+        // columns enter a row.
+        if let cachedTokens {
+            let prompt = builder.inputTokens ?? 0
+            builder.cachedInputTokens = min(max(0, cachedTokens), max(0, prompt))
+        }
+        if let cacheWriteTokens {
+            let prompt = max(0, builder.inputTokens ?? 0)
+            let cached = max(0, builder.cachedInputTokens ?? 0)
+            builder.cacheWriteInputTokens = min(max(0, cacheWriteTokens), max(0, prompt - cached))
         }
         lock.unlock()
     }

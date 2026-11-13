@@ -29,11 +29,19 @@ public nonisolated enum CloudConnectionTestResult: Equatable, Sendable {
 // MARK: - Service Protocol
 
 nonisolated protocol CloudChatServicing: Sendable {
+    /// Streams one turn and records its terminal classification in `receipt`.
+    ///
+    /// The receipt is not an optimisation of the event stream: it is the only
+    /// way a caller whose task was cancelled can learn whether the request was
+    /// billed. A cancelled `for await` over an `AsyncStream` ends with no
+    /// terminal event, so the same answer sent as an event is undeliverable
+    /// exactly when it matters (see `CloudTurnReceipt`).
     func streamTurn(
         model: String,
         messages: [CloudChatMessage],
         params: CloudChatGenerationParams,
-        tools: [ToolDefinition]?
+        tools: [ToolDefinition]?,
+        receipt: CloudTurnReceipt?
     ) -> AsyncStream<CloudTurnEvent>
 
     /// GET the provider's model listing. Used by the Settings connection test
@@ -63,6 +71,112 @@ private nonisolated final class CloudSessionCache: @unchecked Sendable {
     }
 }
 
+// MARK: - Cache Hint Memory
+
+/// Individual session-affinity HTTP headers sent to compatible routers.
+/// Tracked independently so a gateway rejecting only `x-session-affinity`
+/// keeps `x-session-id` working instead of dropping and latching both off.
+enum CloudAffinityHeader: String, CaseIterable, Hashable, Sendable {
+    case sessionId = "x-session-id"
+    case sessionAffinity = "x-session-affinity"
+}
+
+/// Remembers that an optional cache field was refused, per endpoint AND model.
+///
+/// A provider that rejects `prompt_cache_key` rejects it on every request, and
+/// paying a rejected round trip per agent step would cost a turn more than the
+/// hint could ever save. The key is the model as well as the endpoint because a
+/// compatible gateway fronts several backends under one base URL (the built-in
+/// Synthetic provider says so in its own description): one model answering 400
+/// says nothing about the model beside it, and latching the whole endpoint
+/// switched the hint off for every one of them with no way back — built-ins are
+/// read-only in Settings, so the control that clears a latch is not even
+/// reachable there.
+///
+/// One entry per (endpoint, model), process lifetime. The lock is taken on
+/// every read and write: the set is small and the reads happen once per
+/// request, so a lock-free fast path would buy nothing and the old "lock only
+/// on the miss path" claim was never what the code did. A rejection is only
+/// recorded once a request WITHOUT the field has been accepted AND the refusal
+/// named the field, because an unrelated 400 looks identical (see
+/// `streamTurn`), and a vague or transient one must not disable the hint for
+/// the rest of the process.
+/// Internal rather than private so a test can pin the latch.
+nonisolated final class CloudCacheHintMemory: @unchecked Sendable {
+    static let shared = CloudCacheHintMemory()
+
+    private let lock = NSLock()
+    private var declined: [String: Set<String>] = [:]
+    /// Which session-affinity HEADERS each endpoint rejected. Keyed by endpoint
+    /// and header name: a header is answered by the gateway in front of every
+    /// model, while tracking headers individually keeps a working
+    /// `x-session-id` alive when a gateway rejects only `x-session-affinity`.
+    private var declinedAffinity: [String: Set<CloudAffinityHeader>] = [:]
+
+    func acceptsPromptCacheKey(endpoint: String, model: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return declined[endpoint]?.contains(model) != true
+    }
+
+    func declinePromptCacheKey(endpoint: String, model: String) {
+        lock.lock()
+        declined[endpoint, default: []].insert(model)
+        lock.unlock()
+    }
+
+    func acceptsAffinityHeader(_ header: CloudAffinityHeader, endpoint: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return declinedAffinity[endpoint]?.contains(header) != true
+    }
+
+    func acceptsAffinityHeaders(endpoint: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return (declinedAffinity[endpoint] ?? []).isEmpty
+    }
+
+    func declineAffinityHeaders(_ headers: Set<CloudAffinityHeader>, endpoint: String) {
+        guard !headers.isEmpty else { return }
+        lock.lock()
+        declinedAffinity[endpoint, default: []].formUnion(headers)
+        lock.unlock()
+    }
+
+    func declineAffinityHeaders(endpoint: String) {
+        declineAffinityHeaders(Set(CloudAffinityHeader.allCases), endpoint: endpoint)
+    }
+
+    /// Forgets one endpoint's refusals of both cache hints.
+    ///
+    /// A latch is a statement about what a SERVER accepts, and the operator can
+    /// know better: changing the cache hint in Settings, or pointing the
+    /// provider at a different base URL, describes a different server and
+    /// therefore different answers. Without this a provider that refused a hint
+    /// once kept it switched off for the life of the process, and the control
+    /// that turns it back on did nothing until relaunch.
+    func allowCacheHints(endpoint: String) {
+        lock.lock()
+        declined.removeValue(forKey: endpoint)
+        declinedAffinity.removeValue(forKey: endpoint)
+        lock.unlock()
+    }
+
+    /// Forgets every endpoint. Process lifetime is the shipping behaviour, and a
+    /// service can now hold its OWN instance (`OpenAICloudChatService(cacheHintMemory:)`),
+    /// so a test should prefer injection over this: a case that latched the
+    /// shared latch would otherwise leave the next case — and a
+    /// repeat-on-failure rerun of itself — starting from a state it did not set
+    /// up.
+    func reset() {
+        lock.lock()
+        declined.removeAll()
+        declinedAffinity.removeAll()
+        lock.unlock()
+    }
+}
+
 // MARK: - OpenAI-Compatible Service
 
 nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked Sendable {
@@ -74,17 +188,27 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
     private let modelsURL: URL
     private let apiKey: String
     private let session: URLSession
+    private let cacheHints: CloudCacheHints
+    /// The latch this service consults and updates. Injected rather than
+    /// reached through the singleton so a case can hold a private one: a shared
+    /// latch keyed by endpoint leaks state between tests and between cases of
+    /// one test, which is why the singleton needed a `reset()` seam at all.
+    private let cacheHintMemory: CloudCacheHintMemory
 
     init(
         chatURL: URL,
         modelsURL: URL,
         apiKey: String,
         requestTimeout: TimeInterval,
-        session: URLSession? = nil
+        session: URLSession? = nil,
+        cacheHints: CloudCacheHints = .affinity,
+        cacheHintMemory: CloudCacheHintMemory = .shared
     ) {
         self.chatURL = chatURL
         self.modelsURL = modelsURL
         self.apiKey = apiKey
+        self.cacheHints = cacheHints
+        self.cacheHintMemory = cacheHintMemory
 
         if let session {
             self.session = session
@@ -122,6 +246,7 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         let maxTokens: Int?
         let tools: [ToolDefinition]?
         let toolChoice: String?
+        let promptCacheKey: String?
 
         enum CodingKeys: String, CodingKey {
             case model, messages, stream, temperature, tools
@@ -130,17 +255,118 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
             case presencePenalty = "presence_penalty"
             case maxTokens = "max_tokens"
             case toolChoice = "tool_choice"
+            case promptCacheKey = "prompt_cache_key"
         }
     }
 
+    /// Headers every chat request carries. `x-session-id` and
+    /// `x-session-affinity` are read by routers that keep one conversation on
+    /// one replica; a provider that does not know them ignores them by the
+    /// HTTP contract, so they are sent unless the provider opts out — or until
+    /// this endpoint refuses them once and the retry proves that was the
+    /// reason (see `shouldRetryWithoutAffinity`).
+    ///
+    /// An empty key sends nothing: an empty header value is not "no affinity",
+    /// it is a value routers are free to treat as a real (and therefore
+    /// shared) session, and `prompt_cache_key` is already withheld on the same
+    /// condition.
+    private func applyCacheAffinity(
+        to request: inout URLRequest,
+        params: CloudChatGenerationParams,
+        sendSessionId: Bool,
+        sendSessionAffinity: Bool
+    ) {
+        guard let sessionKey = params.sessionKey, !sessionKey.isEmpty else { return }
+        if sendSessionId {
+            request.setValue(sessionKey, forHTTPHeaderField: CloudAffinityHeader.sessionId.rawValue)
+        }
+        if sendSessionAffinity {
+            request.setValue(sessionKey, forHTTPHeaderField: CloudAffinityHeader.sessionAffinity.rawValue)
+        }
+    }
+
+    /// Whether the next request would carry a specific session-affinity header.
+    ///
+    /// The same resolved decision `makeRequest` applies, so the retry predicate
+    /// can test the request it actually sent. A latch keyed by endpoint is
+    /// process-wide, which is exactly why the answer is taken before the send
+    /// rather than re-derived from the response.
+    ///
+    /// The empty-key rule lives here as well as in `applyCacheAffinity`: a
+    /// request with no session key sends no header, so a body that happens to
+    /// name `x-session-affinity` must not earn a retry (and, worse, a latch)
+    /// for headers that never left the Mac.
+    private func willSendAffinityHeader(
+        _ header: CloudAffinityHeader,
+        params: CloudChatGenerationParams
+    ) -> Bool {
+        guard let sessionKey = params.sessionKey, !sessionKey.isEmpty else { return false }
+        return cacheHints.sendsAffinityHeaders
+            && cacheHintMemory.acceptsAffinityHeader(header, endpoint: chatURL.absoluteString)
+    }
+
+    /// Whether the next request would actually carry `prompt_cache_key`.
+    ///
+    /// Shared by `makeRequest` and the retry predicate, which is the point: a
+    /// retry can only be about the field if the rejected request carried it.
+    /// After the process has latched the field off, every request is already
+    /// key-free, so a 4xx must fail rather than re-upload the identical body.
+    private func willSendCacheKey(params: CloudChatGenerationParams, model: String) -> Bool {
+        Self.sendsCacheKey(
+            hints: cacheHints,
+            sessionKey: params.sessionKey,
+            endpoint: chatURL.absoluteString,
+            model: model,
+            memory: cacheHintMemory
+        )
+    }
+
+    /// The same rule as a pure function of its inputs, so a test can pin it
+    /// without a live endpoint or a URLSession. `memory` is a parameter for the
+    /// same reason the service holds one: a case that latches must not be seen
+    /// by the next case or by the app's own requests. `model` is part of the
+    /// latch key, not of the decision about the hint: one model on a shared
+    /// gateway can refuse the field while its neighbours accept it.
+    nonisolated static func sendsCacheKey(
+        hints: CloudCacheHints,
+        sessionKey: String?,
+        endpoint: String,
+        model: String,
+        memory: CloudCacheHintMemory = .shared
+    ) -> Bool {
+        hints.sendsPromptCacheKey
+            && !(sessionKey ?? "").isEmpty
+            && memory.acceptsPromptCacheKey(endpoint: endpoint, model: model)
+    }
+
     /// Internal so a test can pin the request shape without a live endpoint.
+    ///
+    /// `cacheKeyIsSent` is the already-resolved decision. `streamTurn` passes
+    /// the answer it took before the send so its retry predicate can test the
+    /// request it actually made; re-deriving it there re-read a process-wide
+    /// latch a concurrent request can flip in between, which suppressed the
+    /// retry this request had earned and failed the turn instead.
     func makeRequest(
         model: String,
         messages: [CloudChatMessage],
         params: CloudChatGenerationParams,
         tools: [ToolDefinition]? = nil,
-        includeUsage: Bool = true
+        includeUsage: Bool = true,
+        includeCacheKey: Bool = true,
+        includeAffinity: Bool = true,
+        cacheKeyIsSent: Bool? = nil,
+        affinityIsSent: Bool? = nil,
+        sessionIdIsSent: Bool? = nil,
+        sessionAffinityIsSent: Bool? = nil
     ) throws -> URLRequest {
+        let wantsCacheKey = cacheKeyIsSent
+            ?? (includeCacheKey && willSendCacheKey(params: params, model: model))
+        let sendSessionId = sessionIdIsSent
+            ?? affinityIsSent
+            ?? (includeAffinity && willSendAffinityHeader(.sessionId, params: params))
+        let sendSessionAffinity = sessionAffinityIsSent
+            ?? affinityIsSent
+            ?? (includeAffinity && willSendAffinityHeader(.sessionAffinity, params: params))
         let body = Body(
             model: model,
             messages: messages,
@@ -151,14 +377,27 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
             presencePenalty: params.presencePenalty,
             maxTokens: params.maxTokens,
             tools: (tools?.isEmpty == false) ? tools : nil,
-            toolChoice: (tools?.isEmpty == false) ? "auto" : nil
+            toolChoice: (tools?.isEmpty == false) ? "auto" : nil,
+            promptCacheKey: wantsCacheKey ? params.sessionKey : nil
         )
         var request = URLRequest(url: chatURL)
         request.httpMethod = "POST"
-        request.httpBody = try JSONEncoder().encode(body)
+        // Sorted keys is a cache requirement, not a style choice: the body is
+        // the provider's token prefix once templated, and an unsorted
+        // dictionary (`ToolDefinition.parameters` is a Swift dictionary) can
+        // reorder a schema between requests and invalidate the whole prompt.
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        request.httpBody = try encoder.encode(body)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        applyCacheAffinity(
+            to: &request,
+            params: params,
+            sendSessionId: sendSessionId,
+            sendSessionAffinity: sendSessionAffinity
+        )
         return request
     }
 
@@ -168,7 +407,8 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         model: String,
         messages: [CloudChatMessage],
         params: CloudChatGenerationParams,
-        tools: [ToolDefinition]?
+        tools: [ToolDefinition]?,
+        receipt: CloudTurnReceipt?
     ) -> AsyncStream<CloudTurnEvent> {
         AsyncStream { continuation in
             // Framing and JSON decoding are CPU work on a per-token hot path;
@@ -184,34 +424,211 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                     // some compatible endpoints reject with a 400. Retry once
                     // without it rather than failing the whole turn over usage
                     // stats (the turn then reports estimated token counts).
+                    // `prompt_cache_key` gets the same treatment: a strict
+                    // endpoint may reject the unknown body field, and the hint
+                    // is worth one retry, never a failed turn.
                     var includeUsage = true
-                    for attempt in 0..<2 {
-                        let request = try self.makeRequest(
-                            model: model,
-                            messages: messages,
-                            params: params,
-                            tools: tools,
-                            includeUsage: includeUsage
-                        )
-                        let (bytes, response) = try await self.session.bytes(for: request)
+                    var includeCacheKey = true
+                    var includeSessionId = true
+                    var includeSessionAffinity = true
+                    // Remembered only when the retry WITHOUT the field
+                    // succeeds AND the refusal named the field. A 400 is not
+                    // proof the field was the reason: an unknown model name, a
+                    // malformed tools schema or a gateway's transient
+                    // "concurrency limit exceeded" are answered the same way,
+                    // and latching on one of those switched the hint off for
+                    // the rest of the process — for a built-in provider the
+                    // Settings row is read-only, so only a relaunch cleared it.
+                    // The retry is free; the memory is not.
+                    var retriedWithoutCacheKey = false
+                    var cacheKeyRejectionStatus: Int?
+                    var cacheKeyRejectionBody: String?
+                    var retriedWithoutAffinity: Set<CloudAffinityHeader> = []
+                    var affinityRejectionStatus: Int?
+                    // Five attempts: the initial one plus one per optional
+                    // hint (`stream_options`, `x-session-affinity`,
+                    // `x-session-id`, `prompt_cache_key`).
+                    for _ in 0..<5 {
+                        // Resolved BEFORE the send and reused by the retry
+                        // predicate below: the latch is process-wide, so a
+                        // concurrent request declaring this endpoint
+                        // indifferent between now and the response would
+                        // otherwise suppress the retry this request earned and
+                        // fail the turn on a hint it had, in fact, sent.
+                        let sentCacheKey = includeCacheKey && self.willSendCacheKey(params: params, model: model)
+                        let sentSessionId = includeSessionId && self.willSendAffinityHeader(.sessionId, params: params)
+                        let sentSessionAffinity = includeSessionAffinity && self.willSendAffinityHeader(.sessionAffinity, params: params)
+                        // Encoding happens before URLSession is touched: a
+                        // throw here is a local fault with no request to bill.
+                        let request: URLRequest
+                        do {
+                            request = try self.makeRequest(
+                                model: model,
+                                messages: messages,
+                                params: params,
+                                tools: tools,
+                                includeUsage: includeUsage,
+                                includeCacheKey: includeCacheKey,
+                                cacheKeyIsSent: sentCacheKey,
+                                sessionIdIsSent: sentSessionId,
+                                sessionAffinityIsSent: sentSessionAffinity
+                            )
+                        } catch {
+                            let failure = CloudTurnFailure.transport(
+                                error.localizedDescription,
+                                billed: false
+                            )
+                            receipt?.record(failure: failure)
+                            continuation.yield(.failed(failure))
+                            continuation.finish()
+                            return
+                        }
+                        // `bytes(for:)` returns once the response HEADERS
+                        // arrive. Until then the request may not have left the
+                        // Mac at all (offline, no DNS, no TLS); afterwards it
+                        // certainly did. The classifier separates those cases
+                        // instead of calling every transport error billed.
+                        let exchange: (URLSession.AsyncBytes, URLResponse)
+                        do {
+                            exchange = try await self.session.bytes(for: request)
+                        } catch {
+                            // Classified BEFORE the cancellation check, and
+                            // recorded on the receipt: a Stream whose consumer
+                            // was cancelled cannot deliver this event, so the
+                            // cancel path would otherwise price a request the
+                            // transport could prove never left the Mac.
+                            let failure = CloudTurnFailure.transportFailure(
+                                error,
+                                requestWasSent: true
+                            )
+                            receipt?.record(failure: failure)
+                            // A failure that PROVES the request never left the
+                            // Mac is reported even when Stop has just arrived.
+                            // The caller's cancel path prices everything it
+                            // cannot prove was unsent, so swallowing this one
+                            // turned a known-free request into a billed one.
+                            // Every other failure under cancellation is the
+                            // cancellation itself: nobody is waiting for it.
+                            if Task.isCancelled,
+                               !CloudTurnFailure.neverReachedProvider(error) {
+                                continuation.finish()
+                                return
+                            }
+                            continuation.yield(.failed(failure))
+                            continuation.finish()
+                            return
+                        }
+                        let (bytes, response) = exchange
                         guard let http = response as? HTTPURLResponse else {
-                            continuation.yield(.failed(.invalidResponse("The provider returned a non-HTTP response.")))
+                            let failure = CloudTurnFailure.invalidResponse(
+                                "The provider returned a non-HTTP response."
+                            )
+                            receipt?.record(failure: failure)
+                            continuation.yield(.failed(failure))
                             continuation.finish()
                             return
                         }
                         guard (200..<300).contains(http.statusCode) else {
                             let body = await Self.drain(bytes, limit: 4096)
-                            if attempt == 0, includeUsage,
+                            // The status class is the billing answer this
+                            // attempt produced: a 4xx was refused before
+                            // inference and is not invoiced, a 5xx was
+                            // accepted. Recorded BEFORE the cancellation check
+                            // below, because Stop may have arrived while the
+                            // error body drained and this is the only place the
+                            // answer survives a cancelled stream.
+                            receipt?.record(spent: http.statusCode >= 500)
+                            // Stop may have arrived while the error body was
+                            // draining. Either retry below re-uploads the whole
+                            // prompt, which nobody is waiting for any more.
+                            try Task.checkCancellation()
+                            if includeUsage,
                                Self.shouldRetryWithoutStreamOptions(status: http.statusCode, body: body) {
                                 includeUsage = false
                                 continue
                             }
-                            continuation.yield(.failed(.httpStatus(
+                            // Checked BEFORE the cache-key predicate: a body
+                            // that names a header is about the headers, and
+                            // only the header(s) named are dropped so a
+                            // working `x-session-id` survives when only
+                            // `x-session-affinity` is rejected.
+                            let rejectedAffinity = Self.rejectedAffinityHeaders(
+                                status: http.statusCode,
+                                body: body,
+                                sentSessionId: sentSessionId,
+                                sentSessionAffinity: sentSessionAffinity
+                            )
+                            if !rejectedAffinity.isEmpty {
+                                if rejectedAffinity.contains(.sessionId) {
+                                    includeSessionId = false
+                                    retriedWithoutAffinity.insert(.sessionId)
+                                }
+                                if rejectedAffinity.contains(.sessionAffinity) {
+                                    includeSessionAffinity = false
+                                    retriedWithoutAffinity.insert(.sessionAffinity)
+                                }
+                                affinityRejectionStatus = http.statusCode
+                                continue
+                            }
+                            if sentCacheKey,
+                               Self.shouldRetryWithoutCacheKey(status: http.statusCode, body: body) {
+                                includeCacheKey = false
+                                retriedWithoutCacheKey = true
+                                cacheKeyRejectionStatus = http.statusCode
+                                cacheKeyRejectionBody = body
+                                continue
+                            }
+                            let failure = CloudTurnFailure.httpStatus(
                                 code: http.statusCode,
                                 summary: MCPHTTPTransport.summarizeErrorBody(body)
-                            )))
+                            )
+                            receipt?.record(failure: failure)
+                            continuation.yield(.failed(failure))
                             continuation.finish()
                             return
+                        }
+                        // The provider accepted the request, so the prompt
+                        // reached its inference path from here on. Recorded as
+                        // soon as the headers prove it, not when the answer
+                        // completes: a Stop mid-answer is still billed.
+                        receipt?.record(spent: true)
+
+                        // The field is only proven unwelcome once a request
+                        // without it is accepted AND the refusal names the
+                        // field. Until then the rejection may have been about
+                        // the body's model, tools, size, or a transient gateway
+                        // condition; a vague 400 is not evidence about this
+                        // endpoint's schema, and the latch outlives the turn.
+                        if retriedWithoutCacheKey {
+                            let named = Self.namesCacheKeyField(cacheKeyRejectionBody ?? "")
+                            if named {
+                                self.cacheHintMemory.declinePromptCacheKey(
+                                    endpoint: self.chatURL.absoluteString,
+                                    model: model
+                                )
+                            }
+                            // Metadata only, through the app's own log: the
+                            // host and the HTTP status, never the request.
+                            DiagLog.info(
+                                "CloudCache",
+                                "endpoint=\(self.chatURL.host ?? "provider") rejected prompt_cache_key status=\(cacheKeyRejectionStatus ?? 0) retry_without_it_succeeded=true latched=\(named)"
+                            )
+                        }
+                        // Same rule for the affinity headers, and the same
+                        // reason to latch only after the retry is accepted: the
+                        // default hint sends them to every provider, so a
+                        // non-conforming endpoint would otherwise fail every
+                        // turn for a hint nobody chose.
+                        if !retriedWithoutAffinity.isEmpty {
+                            self.cacheHintMemory.declineAffinityHeaders(
+                                retriedWithoutAffinity,
+                                endpoint: self.chatURL.absoluteString
+                            )
+                            let dropped = retriedWithoutAffinity.map(\.rawValue).sorted().joined(separator: ",")
+                            DiagLog.info(
+                                "CloudCache",
+                                "endpoint=\(self.chatURL.host ?? "provider") rejected session-affinity header(s)=\(dropped) status=\(affinityRejectionStatus ?? 0) retry_without_them_succeeded=true latched=true"
+                            )
                         }
 
                         var lineBuffer = MCPLineBuffer(limit: Self.maxEventBytes)
@@ -230,13 +647,16 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                                 }
                             } catch let failure as CloudTurnFailure {
                                 sawFailure = true
+                                receipt?.record(failure: failure)
                                 continuation.yield(.failed(failure))
                                 return false
                             } catch {
                                 sawFailure = true
-                                continuation.yield(.failed(.invalidResponse(
+                                let failure = CloudTurnFailure.invalidResponse(
                                     "The provider sent a response chunk DynaMoE could not decode."
-                                )))
+                                )
+                                receipt?.record(failure: failure)
+                                continuation.yield(.failed(failure))
                                 return false
                             }
                             return true
@@ -289,24 +709,55 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
 
                         if !finishedBySentinel && !sawFailure {
                             if !lineBuffer.overflowed && !frames.overflowed {
+                                // The tail is where a `[DONE]` that arrived in
+                                // the final batch lands, so its answer has to be
+                                // kept: discarding `false` here left
+                                // `finishedBySentinel` unset and reported a
+                                // complete answer as a connection that closed
+                                // early (a spurious "cut off" row, and a
+                                // compaction that refused its own summary).
                                 if let trailing = lineBuffer.flush() {
-                                    _ = dispatch(frames.consume(line: trailing))
+                                    if !dispatch(frames.consume(line: trailing)) {
+                                        finishedBySentinel = true
+                                    }
                                 }
-                                _ = dispatch(frames.finish())
+                                if !finishedBySentinel && !sawFailure {
+                                    if !dispatch(frames.finish()) {
+                                        finishedBySentinel = true
+                                    }
+                                }
                             }
                         }
 
                         if !sawFailure {
                             if lineBuffer.overflowed || frames.overflowed {
-                                continuation.yield(.failed(.invalidResponse(
+                                let failure = CloudTurnFailure.invalidResponse(
                                     "The provider sent a stream event larger than \(Self.maxEventBytes) bytes."
-                                )))
+                                )
+                                receipt?.record(failure: failure)
+                                continuation.yield(.failed(failure))
                             } else if parser.decodedChunkCount == 0 {
-                                continuation.yield(.failed(.invalidResponse(
+                                let failure = CloudTurnFailure.invalidResponse(
                                     "The provider closed the stream without sending any content."
-                                )))
+                                )
+                                receipt?.record(failure: failure)
+                                continuation.yield(.failed(failure))
                             } else {
-                                continuation.yield(.finished(parser.result()))
+                                // A clean EOF is not a finished answer. The
+                                // protocol marks the end with `[DONE]` or with
+                                // a `finish_reason`, and a connection that
+                                // closes mid-reply looks exactly like this; the
+                                // flag travels with the result so the chat
+                                // surface can say the reply was cut off and a
+                                // compaction can refuse to commit it.
+                                let result = parser.result(
+                                    terminated: finishedBySentinel || parser.finishReason != nil
+                                )
+                                // Recorded before the event is yielded: the
+                                // caller may be cancelled between the two, and
+                                // the measured usage is still the provider's.
+                                receipt?.record(result: result)
+                                continuation.yield(.finished(result))
                             }
                         }
                         continuation.finish()
@@ -315,12 +766,24 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                 } catch {
                     // A cancelled turn is the Stop button, not an error: the
                     // caller keeps whatever partial text already streamed.
+                    // The receipt still carries whatever was classified before
+                    // the cancellation, which is the only thing the cancel path
+                    // can price from.
                     if !Task.isCancelled {
-                        if let failure = error as? CloudTurnFailure {
-                            continuation.yield(.failed(failure))
+                        let failure: CloudTurnFailure
+                        if let typed = error as? CloudTurnFailure {
+                            failure = typed
                         } else {
-                            continuation.yield(.failed(.transport(error.localizedDescription)))
+                            // Reached only after a response was accepted: the
+                            // prompt reached the provider's inference path, so
+                            // this one is billed whatever the connection did.
+                            failure = .transport(
+                                error.localizedDescription,
+                                billed: true
+                            )
                         }
+                        receipt?.record(failure: failure)
+                        continuation.yield(.failed(failure))
                     }
                 }
                 continuation.finish()
@@ -335,6 +798,113 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         guard status == 400 || status == 422 else { return false }
         let lower = body.lowercased()
         return lower.contains("stream_options") || lower.contains("include_usage")
+    }
+
+    /// Which sent session-affinity header(s) a 400/422 body specifically
+    /// names as rejected.
+    nonisolated static func rejectedAffinityHeaders(
+        status: Int,
+        body: String,
+        sentSessionId: Bool,
+        sentSessionAffinity: Bool
+    ) -> Set<CloudAffinityHeader> {
+        guard status == 400 || status == 422 else { return [] }
+        let lower = body.lowercased()
+        var rejected: Set<CloudAffinityHeader> = []
+        if sentSessionAffinity, lower.contains(CloudAffinityHeader.sessionAffinity.rawValue) {
+            rejected.insert(.sessionAffinity)
+        }
+        if sentSessionId, lower.contains(CloudAffinityHeader.sessionId.rawValue) {
+            rejected.insert(.sessionId)
+        }
+        return rejected
+    }
+
+    nonisolated static func shouldRetryWithoutAffinity(status: Int, body: String) -> Bool {
+        !rejectedAffinityHeaders(
+            status: status,
+            body: body,
+            sentSessionId: true,
+            sentSessionAffinity: true
+        ).isEmpty
+    }
+
+    /// Whether a rejection is worth retrying without `prompt_cache_key`.
+    ///
+    /// Deliberately not keyed on the body naming the field: a provider
+    /// rejecting an unknown body field usually words it vaguely ("invalid
+    /// request", "unexpected property"), and a rejected request is not billed,
+    /// so one blind retry costs nothing but the upload.
+    ///
+    /// The upload is the cost, and it is the whole prompt. A body that names
+    /// another part of the request — the model, the tool schemas, the messages
+    /// — is about that part, and re-sending the same megabytes would fail
+    /// identically, so those are refused here. The two content refusals the
+    /// chat path recovers from on its own (a context overflow, an image
+    /// rejection) are refused for the same reason, and were already.
+    ///
+    /// A transient condition is refused too. A gateway answers "concurrency
+    /// limit exceeded" or "rate limit, try again" with a 400 as readily as with
+    /// a 429, and the retry neither clears it nor says anything about the
+    /// field: dropping the hint because the provider was busy would disable the
+    /// optimisation the hint exists for.
+    ///
+    /// A body that NAMES `prompt_cache_key` outranks both of those readings:
+    /// "prompt_cache_key is unavailable for this model" contains a transient
+    /// marker and a word from the model family, but the field it names is the
+    /// one thing that can be dropped and retried. Refusing it left an endpoint
+    /// that says exactly what is wrong failing every turn until the operator
+    /// found the setting.
+    ///
+    /// The app sends a handful of sampling parameters too, and a 400 that names
+    /// one of them is about that value, not about the cache field: retrying a
+    /// "max_tokens too large" or "temperature must be between 0 and 2" without
+    /// `prompt_cache_key` re-uploads the entire prompt (base64 images included)
+    /// once per agent step and fails again. Those names are refused here for
+    /// the same reason the model and tool names are.
+    nonisolated static func shouldRetryWithoutCacheKey(status: Int, body: String) -> Bool {
+        guard status == 400 || status == 422 else { return false }
+        let lower = body.lowercased()
+        if namesCacheKeyField(lower) { return true }
+        if CloudTurnFailure.indicatesContextOverflow(lower) { return false }
+        if CloudTurnFailure.indicatesImageRejection(lower) { return false }
+        // Words that name a different part of the request. "function" is here
+        // for the tool-calling refusals some endpoints answer with, not for the
+        // field itself; a body that mentions it is not about the cache hint.
+        let otherParts = [
+            "invalid model", "unknown model", "model not found", "does not exist",
+            "tool", "function", "schema", "messages",
+            // Session-affinity headers handled by their own retry path: once
+            // already dropped or withheld, a 400 naming them must fail rather
+            // than re-upload the prompt without `prompt_cache_key`.
+            "x-session-affinity", "x-session-id",
+            // The sampling parameters this app actually sends. A 400 naming one
+            // is a value problem no retry can fix.
+            "max_tokens", "max_completion_tokens", "temperature", "top_p",
+            "presence_penalty", "frequency_penalty", "tool_choice"
+        ]
+        if otherParts.contains(where: { lower.contains($0) }) { return false }
+        return !transientRefusalMarkers.contains { lower.contains($0) }
+    }
+
+    /// Phrases a gateway uses for a condition that clears by itself. Re-sending
+    /// the request without a hint cannot fix any of them, and the refusal must
+    /// never be read as a statement about the endpoint's schema.
+    nonisolated static let transientRefusalMarkers = [
+        "concurrency", "rate limit", "rate-limit", "rate_limit",
+        "too many requests", "try again", "temporarily", "temporary",
+        "overloaded", "quota", "busy", "unavailable", "timeout", "timed out"
+    ]
+
+    /// Whether a rejection body points at `prompt_cache_key` itself.
+    ///
+    /// This is the only evidence that lets the latch switch the field off for
+    /// the rest of the process. A vague 400 proves nothing about the endpoint's
+    /// schema, and a transient one is worse: the built-in providers' Settings
+    /// row is read-only, so a wrongly latched hint stayed off until relaunch.
+    nonisolated static func namesCacheKeyField(_ body: String) -> Bool {
+        let lower = body.lowercased()
+        return lower.contains("prompt_cache_key") || lower.contains("prompt cache key")
     }
 
     // MARK: Models
@@ -394,7 +964,8 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         } catch let failure as CloudTurnFailure {
             throw failure
         } catch {
-            throw CloudTurnFailure.transport(error.localizedDescription)
+            // A model listing never reaches inference, so nothing here is billed.
+            throw CloudTurnFailure.transportFailure(error, requestWasSent: false)
         }
     }
 
@@ -438,10 +1009,13 @@ nonisolated final class AnthropicCloudChatService: CloudChatServicing, @unchecke
         model: String,
         messages: [CloudChatMessage],
         params: CloudChatGenerationParams,
-        tools: [ToolDefinition]?
+        tools: [ToolDefinition]?,
+        receipt: CloudTurnReceipt?
     ) -> AsyncStream<CloudTurnEvent> {
         AsyncStream { continuation in
-            continuation.yield(.failed(.unsupportedFlavor(flavor: CloudApiFlavor.anthropic.rawValue)))
+            let failure = CloudTurnFailure.unsupportedFlavor(flavor: CloudApiFlavor.anthropic.rawValue)
+            receipt?.record(failure: failure)
+            continuation.yield(.failed(failure))
             continuation.finish()
         }
     }
@@ -481,11 +1055,20 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
                 chatURL: provider.chatCompletionsURL,
                 modelsURL: provider.modelsURL,
                 apiKey: apiKey,
-                requestTimeout: requestTimeout
+                requestTimeout: requestTimeout,
+                cacheHints: provider.resolvedCacheHints
             )
         case .anthropic:
             self.service = AnthropicCloudChatService()
         }
+    }
+
+    /// The same facade over an injected transport, so a test can drive the
+    /// terminal-event rules of `completeText` without a network.
+    init(provider: CloudProvider, flavor: CloudApiFlavor = .openAI, service: CloudChatServicing) {
+        self.provider = provider
+        self.flavor = flavor
+        self.service = service
     }
 
     /// Builds a client from the Keychain, or nil when the provider has no
@@ -548,9 +1131,108 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
         model: String,
         messages: [CloudChatMessage],
         params: CloudChatGenerationParams,
-        tools: [ToolDefinition]? = nil
+        tools: [ToolDefinition]? = nil,
+        receipt: CloudTurnReceipt? = nil
     ) -> AsyncStream<CloudTurnEvent> {
-        service.streamTurn(model: model, messages: messages, params: params, tools: tools)
+        service.streamTurn(
+            model: model,
+            messages: messages,
+            params: params,
+            tools: tools,
+            receipt: receipt
+        )
+    }
+
+    /// One plain completion, collected with the usage it was billed at.
+    ///
+    /// This exists for compaction: the summary has to come from the model the
+    /// conversation is actually using, because the on-device system model is
+    /// not guaranteed to exist and a user's cloud-only Mac had no working
+    /// `/compact` at all. No tools, no agent loop, temperature 0.
+    ///
+    /// The result carries the provider's usage block as well as the text: a
+    /// summarizer pass is a billed request like any other, and dropping its
+    /// usage made the session's spend understate the invoice.
+    ///
+    /// It also refuses to report a fragment as a completion. A `for await` over
+    /// an `AsyncStream` ends the moment its task is cancelled, with no terminal
+    /// event, so a Stop mid-summary used to return the characters collected so
+    /// far as if the provider had finished them. Cancellation now throws, and a
+    /// stream that ends without a terminal event throws instead of returning:
+    /// a compaction that deletes the messages behind a half-written summary
+    /// cannot be undone.
+    ///
+    /// "Terminal" is the protocol's own marker, not a clean EOF. A provider that
+    /// closes the connection without `[DONE]` and without a `finish_reason` has
+    /// written a prefix of an answer, and committing that would delete every
+    /// message it never covered — which is exactly why the flag is checked here
+    /// as well as in `CloudCompactionGate.refusal(for:)`.
+    public func completeText(
+        model: String,
+        systemPrompt: String,
+        userPrompt: String,
+        budget: CloudSummarizerBudget,
+        sessionKey: String?,
+        receipt: CloudTurnReceipt? = nil
+    ) async throws -> CloudTextCompletion {
+        var messages: [CloudChatMessage] = []
+        if !systemPrompt.isEmpty {
+            messages.append(CloudChatMessage(role: "system", content: systemPrompt))
+        }
+        messages.append(CloudChatMessage(role: "user", content: userPrompt))
+        let params = CloudChatGenerationParams(
+            temperature: 0,
+            maxTokens: budget.maxTokens,
+            sessionKey: sessionKey
+        )
+        var text = ""
+        var usage: CloudUsage?
+        var result: CloudTurnResult?
+        var failure: CloudTurnFailure?
+        for await event in streamTurn(
+            model: model,
+            messages: messages,
+            params: params,
+            tools: nil,
+            receipt: receipt
+        ) {
+            if Task.isCancelled, !event.isTerminal { break }
+            switch event {
+            case .started, .thinkingDelta:
+                break
+            case .contentDelta(let delta):
+                text += delta
+            case .finished(let finished):
+                // The parser's accumulated text and the result's text are the
+                // same string; prefer the result because it is what the
+                // transport certified as complete.
+                if !finished.text.isEmpty { text = finished.text }
+                usage = finished.usage
+                result = finished
+            case .failed(let reported):
+                failure = reported
+            }
+        }
+        // A cancelled consumer leaves the loop with CancellationError even if a
+        // terminal event raced Stop: the caller reads `receipt` for billing
+        // and usage, while the outcome still reports that the user stopped.
+        try Task.checkCancellation()
+        if let failure { throw failure }
+        guard let result else {
+            throw CloudTurnFailure.invalidResponse(
+                "The provider's stream ended before the completion was finished."
+            )
+        }
+        guard result.terminated else {
+            throw CloudTurnFailure.invalidResponse(
+                "The provider's stream closed before the completion was finished, so its text is only a fragment."
+            )
+        }
+        return CloudTextCompletion(
+            text: text.trimmingCharacters(in: .whitespacesAndNewlines),
+            usage: usage,
+            finishReason: result.finishReason
+        )
     }
 
     public func testConnection() async -> CloudConnectionTestResult {
@@ -560,7 +1242,8 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
         } catch let failure as CloudTurnFailure {
             return .failure(failure)
         } catch {
-            return .failure(.transport(error.localizedDescription))
+            // The model listing is not an inference request: no prompt ran.
+            return .failure(CloudTurnFailure.transportFailure(error, requestWasSent: false))
         }
     }
 
@@ -573,7 +1256,8 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
         } catch let failure as CloudTurnFailure {
             return .failure(failure)
         } catch {
-            return .failure(.transport(error.localizedDescription))
+            // Same rule as the connection test: a catalog read is not billed.
+            return .failure(CloudTurnFailure.transportFailure(error, requestWasSent: false))
         }
     }
 }

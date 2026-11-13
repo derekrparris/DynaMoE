@@ -22,7 +22,19 @@ final class ChatSessionStore: ObservableObject {
 
     /// Stamped into every file so a future format change can migrate old
     /// conversations instead of silently discarding them.
-    nonisolated static let currentSchemaVersion = 1
+    ///
+    /// Version 2 changed what `cumulativeTokenCount` MEANS: it is now the
+    /// conversation's current context size (the last prompt plus what it
+    /// generated), where version 1 stored a running sum of everything each
+    /// request billed. The old number reads as a context share and can exceed
+    /// 100%, so a version-1 file restores it as nil and the pill stays hidden
+    /// until the next send reseeds it — a missing figure is honest, a wrong one
+    /// is not.
+    nonisolated static let currentSchemaVersion = 2
+
+    /// The first schema version whose `cumulativeTokenCount` is a context size.
+    /// Anything older carries the running sum.
+    nonisolated static let contextSizeSchemaVersion = 2
 
     /// `nil` only when Application Support itself could not be resolved, in which
     /// case there is no durable location to fall back to and the store refuses to
@@ -211,14 +223,19 @@ final class ChatSessionStore: ObservableObject {
             guard let data = try? Data(contentsOf: url) else { continue }
             if let envelope = try? decoder.decode(PersistedChatSession.self, from: data) {
                 guard ChatSessionStore.isSupportedSchema(envelope.schemaVersion) else { continue }
-                decoded.append(ChatSessionStore.normalizedForRestore(envelope.session))
+                decoded.append(ChatSessionStore.normalizedForRestore(
+                    envelope.session,
+                    schemaVersion: envelope.schemaVersion
+                ))
                 managedIds.insert(envelope.session.id)
                 if writtenSignatures[envelope.session.id] == nil,
                    let encoded = try? encoder.encode(envelope) {
                     writtenSignatures[envelope.session.id] = SHA256.hash(data: encoded)
                 }
             } else if let bare = try? decoder.decode(ChatSession.self, from: data) {
-                decoded.append(ChatSessionStore.normalizedForRestore(bare))
+                // An unstamped file predates the envelope, and therefore every
+                // meaning the stamp records.
+                decoded.append(ChatSessionStore.normalizedForRestore(bare, schemaVersion: 0))
                 managedIds.insert(bare.id)
             }
         }
@@ -245,8 +262,22 @@ final class ChatSessionStore: ObservableObject {
     /// approval action that has no continuation to finish it) and a message that
     /// looks like it is still thinking, so interrupted calls become a terminal
     /// error and transient flags clear.
-    nonisolated static func normalizedForRestore(_ session: ChatSession) -> ChatSession {
+    ///
+    /// `schemaVersion` is the version the FILE was written under (0 for an
+    /// unstamped legacy file), not this build's. It decides which stored fields
+    /// already mean what they mean now: version 1's `cumulativeTokenCount` is a
+    /// running sum, and restoring it as a context size would show a
+    /// conversation carrying several times its window.
+    nonisolated static func normalizedForRestore(
+        _ session: ChatSession,
+        schemaVersion: Int
+    ) -> ChatSession {
         var restored = session
+        if schemaVersion < contextSizeSchemaVersion {
+            // The next send reseeds it from that turn's prompt, which is the
+            // first moment this figure can be known again.
+            restored.cumulativeTokenCount = nil
+        }
         // Transient runtime-only messages (the compaction progress bubble, which
         // streams an uncommitted summary into the array) are dropped entirely:
         // clearing their flags would still leave a partial summary on screen as

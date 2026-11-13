@@ -121,16 +121,45 @@ final class CompletionEngineLogicTests: XCTestCase {
 
     // MARK: - Odometer seeding rule (turn-start, mirrored from old prefill seam)
 
-    func testCumulativeTokenBaseCountsOnlyDeltaForMeteredConversation() {
-        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: 120, promptTokenCount: 100, prefixTokensReused: 60), 160)
+    func testTheOdometerIsThePromptSizeNotARunningSum() {
+        // One meaning for every backend: the conversation's context size. A
+        // previous total is not an input, so a turn cannot count the same
+        // history twice, and a chat that moved here from a cloud model (whose
+        // stored figure is also a context size) does not jump by a whole
+        // conversation on the switch.
+        //
+        // Asserted through the seed a turn actually calls, with a large stored
+        // total in place: an additive regression (the old bug) fails here,
+        // where comparing the identity function with itself could not.
+        var session = ChatSession(title: "seeded")
+        session.cumulativeTokenCount = 120_000
+        session.seedContextTotal(promptTokenCount: 1_200)
+        XCTAssertEqual(session.cumulativeTokenCount, 1_200)
+
+        session.cumulativeTokenCount = 120_000
+        session.seedContextTotal(promptTokenCount: 0)
+        XCTAssertEqual(session.cumulativeTokenCount, 0, "an empty prompt seeds zero, not the old total")
     }
 
-    func testCumulativeTokenBaseSeedsFullPromptForUnmeteredConversation() {
-        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: nil, promptTokenCount: 100, prefixTokensReused: 60), 100)
+    func testTheOdometerBaseIsNeverNegative() {
+        XCTAssertEqual(ChatSession.contextTokenBase(promptTokenCount: -5), 0)
     }
 
-    func testCumulativeTokenBaseToleratesPrefixLongerThanPrompt() {
-        XCTAssertEqual(ChatSession.cumulativeTokenBase(previousTotal: 50, promptTokenCount: 100, prefixTokensReused: 140), 50)
+    func testTheOdometerAddsGeneratedTokensOnTopOfThePrompt() {
+        // The composition a turn actually uses: seed from the prompt, then add
+        // what streamed. Asserted through `CloudContextOdometer.total`, not
+        // through `contextTokenBase`'s identity, which would only prove its own
+        // arithmetic.
+        var session = ChatSession(title: "seeded")
+        session.seedContextTotal(promptTokenCount: 1_200)
+        XCTAssertEqual(session.cumulativeTokenCount, 1_200)
+        XCTAssertEqual(
+            CloudContextOdometer.total(promptTokens: session.cumulativeTokenCount ?? 0, generatedTokens: 300),
+            1_500
+        )
+        // A provider column near Int.max saturates rather than trapping the
+        // header.
+        XCTAssertEqual(CloudContextOdometer.total(promptTokens: Int.max, generatedTokens: 1), Int.max)
     }
 
     // MARK: - Sampler penalties (frequency_penalty / logit_bias)

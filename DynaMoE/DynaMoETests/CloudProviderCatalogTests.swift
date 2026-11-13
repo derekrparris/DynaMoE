@@ -406,6 +406,7 @@ final class CloudProviderStoreTests: XCTestCase {
         let defaults: UserDefaults
         let suite: String
         let secretStore: CloudSecretStore
+        let cacheHintMemory: CloudCacheHintMemory
 
         func cleanUp() {
             // Reap the throwaway service's items as well: a test that adds a
@@ -423,13 +424,23 @@ final class CloudProviderStoreTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
         let secretStore = CloudSecretStore(service: "DRP.DynaMoE.cloud.tests.\(UUID().uuidString)")
+        // A private latch: the shared one is keyed by endpoint and a case that
+        // forgot it would leak into the next case (and a rerun of itself).
+        let cacheHintMemory = CloudCacheHintMemory()
         let store = CloudProviderStore(
             defaults: defaults,
             secretStore: secretStore,
             rescansModels: false,
-            updatesSharedRuntime: false
+            updatesSharedRuntime: false,
+            cacheHintMemory: cacheHintMemory
         )
-        return Harness(store: store, defaults: defaults, suite: suite, secretStore: secretStore)
+        return Harness(
+            store: store,
+            defaults: defaults,
+            suite: suite,
+            secretStore: secretStore,
+            cacheHintMemory: cacheHintMemory
+        )
     }
 
     func testAddStoresTheKeyThenRemovalErasesEverything() throws {
@@ -529,6 +540,48 @@ final class CloudProviderStoreTests: XCTestCase {
         )
     }
 
+    func testEditingAProviderKeepsItsPromptCachingChoice() throws {
+        let harness = makeHarness()
+        defer { harness.cleanUp() }
+
+        let provider = try harness.store.add(
+            displayName: "OpenCode Zen",
+            identifier: "opencode-zen",
+            baseURL: "https://opencode.ai/zen/v1"
+        )
+        XCTAssertNil(provider.cacheHints, "a new provider starts on the safe default")
+        try harness.store.setCacheHints(.openAI, for: provider)
+
+        try harness.store.update(
+            provider,
+            displayName: "OpenCode",
+            baseURL: "https://opencode.ai/zen/v1",
+            docsURL: "https://opencode.ai/docs"
+        )
+
+        let renamed = try XCTUnwrap(
+            CloudProviderCatalog.provider(withId: "opencode-zen", defaults: harness.defaults)
+        )
+        XCTAssertEqual(
+            renamed.cacheHints,
+            .openAI,
+            "the edit form does not own the caching capability, so a rename must not reset it"
+        )
+        XCTAssertEqual(renamed.resolvedCacheHints, .openAI)
+
+        // A new base URL goes through the same rebuild: the endpoint moved, the
+        // capability the user recorded for it did not.
+        try harness.store.update(
+            renamed,
+            displayName: "OpenCode",
+            baseURL: "https://gateway.example.com/v1"
+        )
+        XCTAssertEqual(
+            CloudProviderCatalog.provider(withId: "opencode-zen", defaults: harness.defaults)?.cacheHints,
+            .openAI
+        )
+    }
+
     func testChangingTheBaseURLDropsThePreviousEndpointsModelFacts() throws {
         let harness = makeHarness()
         defer { harness.cleanUp() }
@@ -550,6 +603,19 @@ final class CloudProviderStoreTests: XCTestCase {
             for: provider,
             defaults: harness.defaults
         )
+        // Prices and windows are facts about the MODEL, typed by hand from the
+        // provider's own price sheet. Re-pointing the provider says nothing
+        // about either, and neither has a Settings control to retype it.
+        CloudContextPolicy.setOverrides(
+            ["qwen3-coder": 262_144],
+            for: provider.id,
+            defaults: harness.defaults
+        )
+        CloudPricingStore.setPricing(
+            ["qwen3-coder": CloudPricing(input: 0.3, output: 1.2)],
+            for: provider.id,
+            defaults: harness.defaults
+        )
 
         try harness.store.update(
             provider,
@@ -568,6 +634,15 @@ final class CloudProviderStoreTests: XCTestCase {
             CloudModelRegistry.modelIdsWithoutToolSupport(for: provider, defaults: harness.defaults).isEmpty
         )
         XCTAssertNil(harness.defaults.string(forKey: CloudModelRegistry.modelsDefaultsKey(for: provider.id)))
+        XCTAssertEqual(
+            CloudContextPolicy.overrides(for: provider.id, defaults: harness.defaults),
+            ["qwen3-coder": 262_144],
+            "a window describes the model, not the endpoint"
+        )
+        XCTAssertEqual(
+            CloudPricingStore.pricing(for: provider.id, defaults: harness.defaults),
+            ["qwen3-coder": CloudPricing(input: 0.3, output: 1.2)]
+        )
 
         CloudModelRegistry.setRegisteredModelIds(["gateway-chat"], for: provider, defaults: harness.defaults)
         try harness.store.update(
@@ -632,6 +707,23 @@ final class CloudProviderStoreTests: XCTestCase {
             "gpt-5.1-codex",
             forKey: CloudModelRegistry.debugModelDefaultsKey
         )
+        // The two registration facts a cache-aware cloud path added: a
+        // per-model window and a per-model price. Removing the model must take
+        // them with it, or re-adding the same id silently inherits a context
+        // ceiling and a rate somebody set for the model that was removed.
+        CloudContextPolicy.setOverrides(
+            ["gpt-5.1-codex": 400_000, "qwen3-coder": 262_144],
+            for: provider.id,
+            defaults: harness.defaults
+        )
+        CloudPricingStore.setPricing(
+            [
+                "gpt-5.1-codex": CloudPricing(input: 1.25, cachedInput: 0.125, output: 10),
+                "qwen3-coder": CloudPricing(input: 0.3, output: 1.2)
+            ],
+            for: provider.id,
+            defaults: harness.defaults
+        )
 
         CloudModelRegistry.removeRegisteredModel(
             "gpt-5.1-codex",
@@ -650,10 +742,170 @@ final class CloudProviderStoreTests: XCTestCase {
             CloudModelRegistry.modelIdsWithoutToolSupport(for: provider, defaults: harness.defaults).isEmpty
         )
         XCTAssertEqual(
+            CloudContextPolicy.overrides(for: provider.id, defaults: harness.defaults),
+            ["qwen3-coder": 262_144]
+        )
+        XCTAssertEqual(
+            Array(CloudPricingStore.pricing(for: provider.id, defaults: harness.defaults).keys),
+            ["qwen3-coder"]
+        )
+        XCTAssertEqual(
             harness.defaults.string(forKey: CloudModelRegistry.debugModelDefaultsKey),
             "gpt-5.1-codex",
             "the debug hook is one global value that another provider can rely on, so a per-provider prune leaves it alone"
         )
+    }
+
+    func testClearingTheModelListKeepsItsWindowsAndPrices() throws {
+        // Settings ▸ Cloud Providers ▸ Clear forgets the catalog, not the
+        // provider: prices and windows describe the MODEL and are typed by hand
+        // from a price sheet, with no other control to retype them. Only
+        // removing the provider takes them away, and a test for that rule sits
+        // below.
+        let harness = makeHarness()
+        defer { harness.cleanUp() }
+        let provider = try harness.store.add(
+            displayName: "OpenCode Zen",
+            identifier: "opencode-zen",
+            baseURL: "https://opencode.ai/zen/v1"
+        )
+        CloudModelRegistry.setRegisteredModelIds(
+            ["qwen3-coder"],
+            for: provider,
+            defaults: harness.defaults
+        )
+        CloudContextPolicy.setOverrides(
+            ["qwen3-coder": 262_144],
+            for: provider.id,
+            defaults: harness.defaults
+        )
+        CloudPricingStore.setPricing(
+            ["qwen3-coder": CloudPricing(input: 0.3, output: 1.2)],
+            for: provider.id,
+            defaults: harness.defaults
+        )
+
+        CloudModelRegistry.setRegisteredModelIds([], for: provider, defaults: harness.defaults)
+
+        XCTAssertTrue(
+            CloudModelRegistry.registeredModelIds(for: provider, defaults: harness.defaults).isEmpty
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.overrides(for: provider.id, defaults: harness.defaults),
+            ["qwen3-coder": 262_144]
+        )
+        XCTAssertEqual(
+            Array(CloudPricingStore.pricing(for: provider.id, defaults: harness.defaults).keys),
+            ["qwen3-coder"]
+        )
+    }
+
+    func testClearingAProviderDropsItsWindowsAndPrices() throws {
+        let harness = makeHarness()
+        defer { harness.cleanUp() }
+        let provider = try harness.store.add(
+            displayName: "OpenCode Zen",
+            identifier: "opencode-zen",
+            baseURL: "https://opencode.ai/zen/v1"
+        )
+        CloudContextPolicy.setOverrides(
+            ["qwen3-coder": 262_144],
+            for: provider.id,
+            defaults: harness.defaults
+        )
+        CloudPricingStore.setPricing(
+            ["qwen3-coder": CloudPricing(input: 0.3, output: 1.2)],
+            for: provider.id,
+            defaults: harness.defaults
+        )
+        // Through the STORE, not the registry directly. The registry call is
+        // one line inside `remove`; the test used to invoke that line and never
+        // proved removal actually drops the state, so a `remove` that stopped
+        // calling it would have passed.
+        try harness.store.remove(provider)
+        // A re-added identifier starts clean: neither a window nor a rate from
+        // the removed registration may describe a model the operator has not
+        // configured again.
+        XCTAssertTrue(CloudContextPolicy.overrides(for: provider.id, defaults: harness.defaults).isEmpty)
+        XCTAssertTrue(CloudPricingStore.pricing(for: provider.id, defaults: harness.defaults).isEmpty)
+        XCTAssertFalse(
+            harness.store.providers.contains { $0.id == provider.id },
+            "the provider itself must be gone, not only its registrations"
+        )
+    }
+
+    func testPruningOneModelKeepsANeighbouringPriceWithATypo() throws {
+        // The reader drops entries it cannot decode, so unregistering a model
+        // through read-then-write deleted every OTHER model's hand-typed value
+        // that merely had a typo — a silent loss of operator data caused by
+        // pruning a different row. The removals edit the stored text directly.
+        let harness = makeHarness()
+        defer { harness.cleanUp() }
+        let provider = try harness.store.add(
+            displayName: "OpenCode Zen",
+            identifier: "opencode-zen",
+            baseURL: "https://opencode.ai/zen/v1"
+        )
+        CloudModelRegistry.setRegisteredModelIds(
+            ["pruned", "kept"],
+            for: provider,
+            defaults: harness.defaults
+        )
+        harness.defaults.set(
+            #"{"kept":{"input":1,"output":2},"typo":{"input":"cheap","output":2},"pruned":{"input":0.3,"output":1.2}}"#,
+            forKey: CloudPricingStore.defaultsKey(for: provider.id)
+        )
+        harness.defaults.set(
+            "kept=64000; typo=twelve; pruned=32000",
+            forKey: CloudContextPolicy.defaultsKey(for: provider.id)
+        )
+
+        CloudModelRegistry.removeRegisteredModel("pruned", for: provider, defaults: harness.defaults)
+
+        let rawPrices = harness.defaults.string(forKey: CloudPricingStore.defaultsKey(for: provider.id)) ?? ""
+        XCTAssertTrue(rawPrices.contains("\"typo\""), rawPrices)
+        XCTAssertTrue(rawPrices.contains("\"kept\""), rawPrices)
+        XCTAssertFalse(rawPrices.contains("\"pruned\""), rawPrices)
+        XCTAssertEqual(
+            harness.defaults.string(forKey: CloudContextPolicy.defaultsKey(for: provider.id)),
+            "kept=64000; typo=twelve",
+            "an entry this build cannot parse still belongs to the operator"
+        )
+        // The model that WAS removed really is gone from both lists.
+        XCTAssertNil(CloudPricingStore.pricing(forModel: "pruned", providerId: provider.id, defaults: harness.defaults))
+        XCTAssertNil(CloudContextPolicy.overrides(for: provider.id, defaults: harness.defaults)["pruned"])
+    }
+
+    func testChangingTheCacheHintReopensALatchedEndpoint() throws {
+        // A latch records that a SERVER refused the field. The Settings control
+        // is the operator saying they know better, so leaving the latch in
+        // place made the option a silent no-op until relaunch.
+        let harness = makeHarness()
+        defer { harness.cleanUp() }
+        let provider = try harness.store.add(
+            displayName: "OpenCode Zen",
+            identifier: "opencode-zen",
+            baseURL: "https://opencode.ai/zen/v1"
+        )
+        let endpoint = provider.chatCompletionsURL.absoluteString
+        harness.cacheHintMemory.declinePromptCacheKey(endpoint: endpoint, model: "gpt-5.2")
+        XCTAssertFalse(OpenAICloudChatService.sendsCacheKey(
+            hints: .openAI,
+            sessionKey: "abc123",
+            endpoint: endpoint,
+            model: "gpt-5.2",
+            memory: harness.cacheHintMemory
+        ))
+
+        try harness.store.setCacheHints(.openAI, for: provider)
+
+        XCTAssertTrue(OpenAICloudChatService.sendsCacheKey(
+            hints: .openAI,
+            sessionKey: "abc123",
+            endpoint: endpoint,
+            model: "gpt-5.2",
+            memory: harness.cacheHintMemory
+        ))
     }
 
     func testTheShippingStoreMakesTheProviderLiveEverywhere() throws {

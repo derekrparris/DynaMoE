@@ -339,14 +339,25 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
     /// Persisted so the truncation marker survives compaction (which replaces
     /// `messages` and would otherwise erase the evidence) and renames.
     public var titleOrigin: SessionTitleOrigin?
-    /// Running total of every token this conversation has consumed: the prompt
-    /// tokens each turn actually ingested (the portion the pinned prefix did
-    /// not already cover) plus every generated token, across all agent steps.
-    /// `nil` when unmetered — a history from before the counter existed, or a
-    /// conversation freshly compacted by /compact, which resets the total —
-    /// and the next send then initializes it from that turn's full prompt,
-    /// which is the conversation's context size.
+    /// How much context this conversation is carrying: the prompt the model
+    /// last ingested plus the tokens generated after it. One meaning for every
+    /// backend, because the header renders it as a share of a cloud model's
+    /// window — a cloud step re-sends the whole history, a local turn
+    /// re-renders it, and a cache read is still context the model was given,
+    /// so none of those subtract. Each turn RESEEDS it from its own prompt
+    /// (see `contextTokenBase`); it is never a running sum, which counted the
+    /// same conversation once per turn and inflated by a whole history when a
+    /// chat switched backends. `nil` when unmetered — a history from before
+    /// the counter existed, or a conversation freshly compacted by /compact,
+    /// which resets it — and the next send then initializes it from that
+    /// turn's prompt.
     public var cumulativeTokenCount: Int?
+    /// Running spend for this conversation, in whatever currency the recorded
+    /// price list uses (USD by convention). Only a cloud turn contributes: a
+    /// weights model has no invoice. `nil` when the conversation has never had
+    /// a priced provider turn, and never reset by compaction — the money was
+    /// already spent.
+    public var cumulativeCost: Double?
 
     public init(
         id: UUID = UUID(),
@@ -365,7 +376,8 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         rollingSummary: String? = nil,
         recentWorkDigest: String? = nil,
         titleOrigin: SessionTitleOrigin? = nil,
-        cumulativeTokenCount: Int? = nil
+        cumulativeTokenCount: Int? = nil,
+        cumulativeCost: Double? = nil
     ) {
         self.id = id
         self.title = title
@@ -389,6 +401,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         self.recentWorkDigest = recentWorkDigest
         self.titleOrigin = titleOrigin
         self.cumulativeTokenCount = cumulativeTokenCount
+        self.cumulativeCost = cumulativeCost
     }
 
     enum CodingKeys: String, CodingKey {
@@ -400,6 +413,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         case rollingSummary, recentWorkDigest
         case titleOrigin
         case cumulativeTokenCount
+        case cumulativeCost
     }
 
     public init(from decoder: Decoder) throws {
@@ -438,6 +452,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         self.recentWorkDigest = try container.decodeIfPresent(String.self, forKey: .recentWorkDigest)
         self.titleOrigin = try container.decodeIfPresent(SessionTitleOrigin.self, forKey: .titleOrigin)
         self.cumulativeTokenCount = try container.decodeIfPresent(Int.self, forKey: .cumulativeTokenCount)
+        self.cumulativeCost = try container.decodeIfPresent(Double.self, forKey: .cumulativeCost)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -459,6 +474,7 @@ nonisolated public struct ChatSession: Identifiable, Codable, Equatable, Sendabl
         try container.encodeIfPresent(recentWorkDigest, forKey: .recentWorkDigest)
         try container.encodeIfPresent(titleOrigin, forKey: .titleOrigin)
         try container.encodeIfPresent(cumulativeTokenCount, forKey: .cumulativeTokenCount)
+        try container.encodeIfPresent(cumulativeCost, forKey: .cumulativeCost)
     }
 }
 
@@ -586,7 +602,8 @@ public extension ChatSession {
     nonisolated static func compactedHistory(
         summary: String,
         recap: String?,
-        evictedMessageCount: Int
+        evictedMessageCount: Int,
+        modelLabel: String = "Apple Foundation Model"
     ) -> [ChatMessage] {
         let card = ChatMessage(
             role: .system,
@@ -595,7 +612,7 @@ public extension ChatSession {
         )
         let marker = ChatMessage(
             role: .system,
-            content: "🗂 \(evictedMessageCount) messages compacted into a rolling summary by Apple Foundation Model. The conversation continues from that summary context."
+            content: "🗂 \(evictedMessageCount) messages compacted into a rolling summary by \(modelLabel). The conversation continues from that summary context."
         )
         return [card, marker]
     }
@@ -609,20 +626,70 @@ public extension ChatSession {
         messages.filter { $0.role != .system }.count
     }
 
-    /// Odometer arithmetic for one generation step's prompt ingestion: the
-    /// conversation total after a turn's prompt tokens land on it. An unmetered
-    /// conversation (`nil` — a pre-feature history, or one just compacted, whose
-    /// pin is also invalid) seeds from the entire prompt, because that prompt
-    /// IS its context size; a metered one adds only the tokens the pinned prefix
-    /// did not already supply, so prefix reuse never double counts. Generated
-    /// tokens are added on top of the returned base as they stream.
-    nonisolated static func cumulativeTokenBase(
-        previousTotal: Int?,
-        promptTokenCount: Int,
-        prefixTokensReused: Int
-    ) -> Int {
-        guard let previousTotal else { return promptTokenCount }
-        return previousTotal + max(0, promptTokenCount - prefixTokensReused)
+    /// Rows appended to a conversation while a long pass held an older snapshot
+    /// of it.
+    ///
+    /// Compaction rewrites `messages` from the snapshot it summarized, and any
+    /// row the app appended in the meantime (a `/plan` notice, a command's own
+    /// report) is not in that snapshot — replacing the array would drop it
+    /// after the user watched it appear. Identity decides rather than an index:
+    /// the snapshot may have been reordered or pruned while the pass ran.
+    nonisolated static func messagesAdded(
+        to live: [ChatMessage],
+        since snapshot: [ChatMessage],
+        excluding: Set<UUID> = []
+    ) -> [ChatMessage] {
+        let known = Set(snapshot.map(\.id))
+        return live.filter { !known.contains($0.id) && !excluding.contains($0.id) }
+    }
+
+    /// The rows of a snapshot the user has NOT deleted since it was taken.
+    ///
+    /// The other half of `messagesAdded`'s rule. A compaction rewrites the
+    /// transcript from a snapshot, and the half it keeps is written back
+    /// verbatim; if the user deleted one of those rows while the passes ran,
+    /// writing the snapshot back resurrected it. Identity decides here too, for
+    /// the same reason: the conversation may have been reordered or pruned.
+    nonisolated static func stillPresent(
+        _ snapshot: [ChatMessage],
+        in live: [ChatMessage]
+    ) -> [ChatMessage] {
+        let present = Set(live.map(\.id))
+        return snapshot.filter { present.contains($0.id) }
+    }
+
+    /// Odometer seeding for one generation step's prompt.
+    ///
+    /// The number every backend stores is the conversation's CONTEXT SIZE — the
+    /// prompt the last request carried plus the tokens generated after it —
+    /// because that is the quantity the header renders and the only one a
+    /// context-window percentage can be taken from. A cloud turn re-sends its
+    /// whole history and a local turn re-renders it, so this turn's prompt
+    /// alone IS that size.
+    ///
+    /// It deliberately does not build on the stored total. Every backend used
+    /// to add its own delta here, which counted the same conversation once per
+    /// turn; once a cloud turn stored its context size (that path reseeds),
+    /// the next local turn added the whole history to it and the pill jumped by
+    /// a conversation's worth of tokens on a backend switch. Prefix reuse does
+    /// not subtract either: a cached prefix is still context the model was
+    /// given, and the pinned-vs-sent distinction is the cloud path's cache
+    /// columns, not this figure. Generated tokens are added on top as they
+    /// stream.
+    nonisolated static func contextTokenBase(promptTokenCount: Int) -> Int {
+        max(0, promptTokenCount)
+    }
+
+    /// Reseeds the odometer from this turn's prompt.
+    ///
+    /// Takes no previous total on purpose: the stored figure is REPLACED, never
+    /// added to (see `contextTokenBase`). Written as one method so every seed
+    /// point shares the rule, and so the rule is testable — a test can set a
+    /// large stored total and prove it is ignored, which is exactly the
+    /// regression the old code shipped (each backend added its own delta, so a
+    /// cloud total plus the next prompt counted the same history twice).
+    nonisolated mutating func seedContextTotal(promptTokenCount: Int) {
+        cumulativeTokenCount = Self.contextTokenBase(promptTokenCount: promptTokenCount)
     }
 
     /// Neutralizes chat-template control tokens in a compaction digest before it

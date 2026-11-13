@@ -79,7 +79,11 @@ struct CloudProvidersSettingsView: View {
         var message: String {
             switch self {
             case .provider(let provider):
-                return "\(provider.displayName) is removed together with its Keychain API key, its registered model list, its no-tools list, and its vision marks. Conversations pinned to its models will ask you to reselect a model."
+                // Names every registration fact the removal deletes: prices and
+                // context windows are lost with it, and they are typed by hand
+                // from the provider's own price sheet with no other control to
+                // retype them.
+                return "\(provider.displayName) is removed together with its Keychain API key, its registered model list, its no-tools list, its vision marks, and every model price and context window recorded for it. Conversations pinned to its models will ask you to reselect a model."
             case .apiKey(let provider):
                 return "The API key for \(provider.displayName) is deleted from the login Keychain. Its registered models stay in the picker but cannot answer until a new key is saved."
             }
@@ -93,6 +97,7 @@ struct CloudProvidersSettingsView: View {
     @State private var testStates: [String: TestState] = [:]
     @State private var providerEditor: ProviderEditorTarget? = nil
     @State private var pendingConfirmation: RemovalConfirmation? = nil
+    @AppStorage("dynamoe_cloud_resend_images") private var resendImages: Bool = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -100,6 +105,7 @@ struct CloudProvidersSettingsView: View {
                 providerCard(provider)
             }
 
+            requestBehaviourCard
             addProviderCard
             registeredModelsCard
         }
@@ -129,6 +135,42 @@ struct CloudProvidersSettingsView: View {
     }
 
     // MARK: - Cards
+
+    /// Provider-independent request behaviour: what every cloud turn asks for,
+    /// and where its cost and context ceiling come from.
+    private var requestBehaviourCard: some View {
+        SettingsCard(header: "Request Behaviour") {
+            SettingsRow(
+                title: "Re-send Images",
+                subtitle: "A stateless provider has to be re-told about a picture on every request that should still see it, and those tokens are billed every time. Off sends only the newest user turn's pictures and replaces pictures from earlier turns with a one-line notice, so a text follow-up does not keep paying for a picture from an earlier question.",
+                icon: "photo.on.rectangle.angled",
+                iconTint: .cyan
+            ) {
+                Toggle("", isOn: $resendImages)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .accessibilityLabel("Re-send images on every request")
+            }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Context Window",
+                subtitle: "Compacting before a request would overflow needs the model's window. Record it per model with: defaults write DRP.DynaMoE dynamoe_cloud_<provider>_context -string \"<model>=128000\" (entries separated by \"; \"), or set a global fallback with dynamoe_cloud_context_window_tokens. Without either, the turn skips that pre-flight check and compacts only after the provider refuses the request, and the header shows the plain token total.",
+                icon: "ruler.fill",
+                iconTint: .cyan
+            ) { EmptyView() }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Prices",
+                subtitle: "Cost reporting needs per-model prices in USD per million tokens: defaults write DRP.DynaMoE dynamoe_cloud_<provider>_pricing -string '{\"<model>\":{\"input\":0.27,\"cached_input\":0.07,\"output\":1.1}}'. A model with no price simply reports no cost.",
+                icon: "dollarsign.circle.fill",
+                iconTint: .cyan
+            ) { EmptyView() }
+        }
+    }
 
     private func providerCard(_ provider: CloudProvider) -> some View {
         SettingsCard(header: provider.displayName) {
@@ -187,7 +229,58 @@ struct CloudProvidersSettingsView: View {
                         .disabled(!storedProviders.contains(provider.id) || testStates[provider.id] == .testing)
                     if !registeredSpecs(for: provider).isEmpty {
                         Button("Clear") { clearModels(for: provider) }
+                            // Clear is not "remove the provider": it forgets the
+                            // catalog, while the facts that describe the MODELS
+                            // (hand-typed prices, recorded windows) survive, so a
+                            // re-sync does not lose them.
+                            .help("Forgets the registered model list. Recorded model prices and context windows are kept.")
                     }
+                }
+            }
+
+            SettingsRowDivider()
+
+            SettingsRow(
+                title: "Prompt Caching",
+                subtitle: "Requests carry a stable session-affinity header (unless this provider's setting is Off) so a router can keep this conversation on one replica. The setting beside this row can add OpenAI's prompt_cache_key where the endpoint accepts it; a provider that rejects the field is retried once without it and remembered for the rest of the process only when its refusal NAMES the field (a vague or transient 400 never latches it off). Cache reads are reported in the Request Log beside the input total.",
+                icon: "internaldrive.fill",
+                iconTint: .cyan
+            ) {
+                if providerStore.isBuiltIn(provider) {
+                    HStack(spacing: 8) {
+                        Text(provider.resolvedCacheHints.displayName)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        // A built-in's hint is fixed, so the picker that would
+                        // forget a latch is unreachable. The latch is still a
+                        // process-lifetime fact learned from a 400, and the
+                        // operator may know it was wrong (the gateway had a bad
+                        // minute); give them the one control the record needs.
+                        Button("Forget Refusals") {
+                            CloudCacheHintMemory.shared.allowCacheHints(
+                                endpoint: provider.chatCompletionsURL.absoluteString
+                            )
+                        }
+                        .controlSize(.small)
+                        .disabled(isTesting(provider))
+                        .help("Forgets this endpoint's remembered refusals of the prompt-cache key and session-affinity headers.")
+                    }
+                } else {
+                    Picker("", selection: Binding(
+                        get: { provider.resolvedCacheHints },
+                        set: { try? providerStore.setCacheHints($0, for: provider) }
+                    )) {
+                        ForEach(CloudCacheHints.allCases, id: \.self) { hint in
+                            Text(hint.displayName).tag(hint)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 230)
+                    .accessibilityLabel("Prompt caching support for \(provider.displayName)")
+                    // A mid-sync change is now tolerated by the post-fetch
+                    // guard, but the catalog still describes the server this
+                    // request asked, so keep the record stable while it runs.
+                    .disabled(isTesting(provider))
                 }
             }
 
@@ -256,7 +349,7 @@ struct CloudProvidersSettingsView: View {
                     title: provider.displayName,
                     subtitle: specs.isEmpty
                         ? "Nothing registered yet. Press \"Test & Sync Models\" to register the provider's chat models (embedding, speech, rerank, and image models are skipped)."
-                        : "Mark which models accept image input. No provider catalog publishes modalities, so this is opt-in; a model that rejects an image is un-marked automatically and the turn retries without it. Use the minus button to drop a model the provider does not serve on this wire.",
+                        : "Mark which models accept image input. No provider catalog publishes modalities, so this is opt-in; a model that rejects an image is un-marked automatically and the turn retries without it. Use the minus button to drop a model the provider does not serve on this wire; its recorded context window and price are removed with it, so re-adding the same id starts clean.",
                     icon: "cloud.fill",
                     iconTint: .cyan
                 ) {
@@ -398,7 +491,16 @@ struct CloudProvidersSettingsView: View {
             // gone (or now points somewhere else) would stamp one server's
             // models onto another and leave a stale "Connected" row for a
             // future provider that reuses the identifier.
-            guard providerStore.providers.contains(provider) else {
+            //
+            // Compared by identity and endpoints, not by the whole record: the
+            // Prompt Caching picker is a fact about the same server, and
+            // flipping it mid-sync used to discard the catalog this request
+            // had just fetched.
+            guard providerStore.providers.contains(where: {
+                $0.id == provider.id
+                    && $0.openAIBaseURL == provider.openAIBaseURL
+                    && $0.anthropicBaseURL == provider.anthropicBaseURL
+            }) else {
                 testStates[provider.id] = .untested
                 return
             }
@@ -449,6 +551,14 @@ struct CloudProvidersSettingsView: View {
         pendingConfirmation = nil
     }
 
+    /// Forgets the registered catalog only.
+    ///
+    /// Deliberately NOT `CloudModelRegistry.clearProviderState`: that is the
+    /// provider-removal path, and it also drops every recorded price and
+    /// context window. Clear answers "the endpoint's catalog is stale", which
+    /// says nothing about what its models cost or how much context they hold;
+    /// those are hand-typed registration facts with no other control to retype
+    /// one, so a re-sync must not delete them.
     private func clearModels(for provider: CloudProvider) {
         CloudModelRegistry.setRegisteredModelIds([], for: provider)
         testStates[provider.id] = .untested

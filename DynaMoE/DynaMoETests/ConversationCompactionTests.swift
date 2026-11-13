@@ -171,6 +171,56 @@ final class ConversationCompactionTests: XCTestCase {
         )
     }
 
+    func testAnImageOnlyTurnReachesTheTranscriptAsANotice() {
+        // The compact that follows DELETES the rows it summarized, so a turn
+        // whose only content was a picture used to contribute nothing at all
+        // while still being counted as evicted: the summary lost the fact that
+        // an image was ever part of the conversation.
+        let image = ImageAttachmentRef(
+            fileName: "screenshot.png",
+            pixelWidth: 640,
+            pixelHeight: 480,
+            byteCount: 12_345,
+            sha256: "abc",
+            relativePath: "attachments/screenshot.png",
+            mimeType: "image/png"
+        )
+        let turn = AppleFoundationModelService.compactionTranscriptTurn(
+            for: ChatMessage(role: .user, content: "", attachments: [image])
+        )
+        XCTAssertEqual(turn, "User shared 1 image (not included in this summary)")
+        // A turn with text keeps the text and says the picture was there too.
+        let withText = AppleFoundationModelService.compactionTranscriptTurn(
+            for: ChatMessage(role: .user, content: "what is wrong here?", attachments: [image, image])
+        ) ?? ""
+        XCTAssertTrue(withText.contains("User: what is wrong here?"))
+        XCTAssertTrue(withText.contains("User shared 2 images (not included in this summary)"))
+    }
+
+    func testRowsAppendedDuringAPassAreNotDroppedByTheRewrite() {
+        // A /plan notice (or any command report) can land while the summarizer
+        // runs; the rewrite is built from the older snapshot, so those rows
+        // have to be carried forward explicitly.
+        let snapshot = [
+            ChatMessage(role: .user, content: "one"),
+            ChatMessage(role: .assistant, content: "a")
+        ]
+        let notice = ChatMessage(role: .system, content: "🧭 Plan Mode enabled")
+        let later = ChatMessage(role: .user, content: "two")
+        let live = snapshot + [notice, later]
+        let carried = ChatSession.messagesAdded(to: live, since: snapshot)
+        XCTAssertEqual(carried.map(\.id), [notice.id, later.id])
+        // The progress bubble a /compact inserted is UI state the rewrite
+        // replaces, so a caller excludes it.
+        let progress = ChatMessage(role: .system, content: "", isTransient: true)
+        XCTAssertEqual(
+            ChatSession.messagesAdded(to: live + [progress], since: snapshot, excluding: [progress.id]).count,
+            2
+        )
+        // Nothing new means nothing to carry.
+        XCTAssertTrue(ChatSession.messagesAdded(to: snapshot, since: snapshot).isEmpty)
+    }
+
     func testCompactionChunksCoverEveryTurnOldestFirst() {
         // Six ~430-character turns with a 1,200-character budget: two turns
         // per chunk, three chunks, and no turn silently dropped the way the
@@ -194,25 +244,112 @@ final class ConversationCompactionTests: XCTestCase {
         XCTAssertTrue(chunks[2].contains("turn 5:"), "the newest work must land in the recap chunk")
     }
 
-    func testCompactionChunksTruncateOversizedTurnInsteadOfDroppingIt() {
-        let huge = makeMessage(.user, String(repeating: "a", count: 5_000))
+    func testCompactionSplitsOversizedTurnAcrossChunksInsteadOfTruncatingIt() {
+        // "z" so the payload count below cannot pick up a letter from the
+        // neighbouring turn's own text.
+        let body = String(repeating: "z", count: 5_000)
+        let huge = makeMessage(.user, body)
         let small = makeMessage(.user, "final note")
         let chunks = AppleFoundationModelService.buildCompactionTranscriptChunks(
             from: [huge, small],
             charBudget: 1_200
         )
-        // A turn too large for any chunk becomes its own truncated chunk with
-        // a marker instead of vanishing, and the turn after it still gets
-        // summarized.
-        XCTAssertEqual(chunks.count, 2)
-        XCTAssertTrue(chunks[0].contains("turn truncated"))
-        XCTAssertLessThanOrEqual(chunks[0].count, 1_200)
-        XCTAssertTrue(chunks[1].contains("final note"))
+        // The rewrite that follows a pass DELETES the messages it summarized,
+        // so a turn cut short to fit one chunk loses its tail for good. It is
+        // split across passes instead, and the turn after it still gets
+        // summarized in its own chunk.
+        XCTAssertGreaterThan(chunks.count, 2)
+        for (index, chunk) in chunks.enumerated() {
+            XCTAssertLessThanOrEqual(chunk.count, 1_200, "chunk \(index) exceeds the budget")
+        }
+        XCTAssertFalse(chunks.contains { $0.contains("turn truncated") })
+        // Every character of the oversized turn has to reach a summarizer pass:
+        // the rewrite that follows deletes the message it came from, so a
+        // dropped character is gone. Counting the payload rather than comparing
+        // a reassembled string keeps the assertion independent of how the
+        // pieces are packed into chunks.
+        XCTAssertEqual(
+            chunks.reduce(0) { total, chunk in total + chunk.filter { $0 == "z" }.count },
+            5_000,
+            "every character of the oversized turn must reach a summarizer pass"
+        )
+        XCTAssertEqual(chunks.first?.hasPrefix("User: zzz"), true, "the turn must still run oldest first")
+        XCTAssertEqual(chunks.last?.contains("final note"), true)
         // A system-only history has nothing worth keeping.
         XCTAssertTrue(AppleFoundationModelService.buildCompactionTranscriptChunks(
             from: [makeMessage(.system, "notice")],
             charBudget: 1_200
         ).isEmpty)
+    }
+
+    func testOneOversizedMessageCannotSpendUnboundedSummarizerRequests() {
+        // A 1 MB paste at a 4,000-character cloud budget used to become ~250
+        // billed summarizer requests; the on-device budget produced ~175. Every
+        // split is a request, so the number of passes — not the number of turns
+        // — is the thing an attacker (or a careless paste) controls.
+        let huge = makeMessage(.user, String(repeating: "z", count: 100_000))
+        let chunks = AppleFoundationModelService.buildCompactionTranscriptChunks(
+            from: [huge],
+            charBudget: 1_000
+        )
+        XCTAssertEqual(
+            chunks.count,
+            AppleFoundationModelService.maximumCompactionChunks,
+            "the pass cap is what bounds the spend"
+        )
+        // Head and tail both reach a pass: the setup at the top of a paste and
+        // the conclusion at the bottom are what a summary can least afford to
+        // lose.
+        XCTAssertTrue(chunks.first?.contains("z") == true)
+        XCTAssertTrue(chunks.last?.contains("z") == true)
+        // And the transcript itself says the middle was never read, because the
+        // rewrite that follows deletes the messages either way.
+        XCTAssertTrue(
+            chunks.contains { $0.contains("characters of middle history were omitted") },
+            "a bounded excerpt must state what it omitted"
+        )
+        XCTAssertTrue(
+            chunks.allSatisfy { $0.count <= 1_000 },
+            "adding the omission note must not exceed the derived chunk budget"
+        )
+    }
+
+    func testABoundedCompactionKeepsItsNewestChunkForTheRecap() {
+        // The last chunk is the one the summary pass and the detailed recap
+        // read. A cap that trimmed the tail would leave the recap describing
+        // work that is no longer in any pass.
+        let messages = (0..<20).map { index in
+            makeMessage(.user, "turn \(index): " + String(repeating: "detail ", count: 60))
+        }
+        let chunks = AppleFoundationModelService.buildCompactionTranscriptChunks(
+            from: messages,
+            charBudget: 600,
+            maximumChunks: 4
+        )
+        XCTAssertEqual(chunks.count, 4)
+        XCTAssertTrue(chunks[0].contains("turn 0:"), "the head keeps the beginning of the conversation")
+        XCTAssertTrue(chunks.last?.contains("turn 19:") == true, "the newest turn must land in the recap chunk")
+        XCTAssertTrue(chunks.contains { $0.contains("middle history were omitted") })
+        XCTAssertTrue(chunks.allSatisfy { $0.count <= 600 })
+    }
+
+    func testACompactionTurnThatAlreadyFitsIsOneSlice() {
+        // The packing rule for ordinary turns must not change: a turn inside
+        // the budget comes back whole, so chunks can still hold several of them.
+        XCTAssertEqual(
+            AppleFoundationModelService.compactionTranscriptSlices(
+                of: "User: short",
+                charBudget: 1_200
+            ),
+            ["User: short"]
+        )
+        // Exactly at the budget is still one slice, not an empty second one.
+        let exact = String(repeating: "b", count: 1_200)
+        XCTAssertEqual(
+            AppleFoundationModelService.compactionTranscriptSlices(of: exact, charBudget: 1_200),
+            [exact]
+        )
+        XCTAssertTrue(AppleFoundationModelService.compactionTranscriptSlices(of: exact, charBudget: 0).isEmpty)
     }
 
     func testCompactionChunkBudgetShrinksForStoredDigests() {
@@ -533,7 +670,8 @@ final class ConversationCompactionTests: XCTestCase {
         ))
         let data = try JSONEncoder().encode(session)
         let restored = ChatSessionStore.normalizedForRestore(
-            try JSONDecoder().decode(ChatSession.self, from: data)
+            try JSONDecoder().decode(ChatSession.self, from: data),
+            schemaVersion: ChatSessionStore.currentSchemaVersion
         )
         XCTAssertEqual(restored.messages.count, 2)
         XCTAssertEqual(restored.messages[0].isCompactionSummary, true)
@@ -564,7 +702,10 @@ final class ConversationCompactionTests: XCTestCase {
         // Round-trip through persistence the way the store does, then normalize.
         let data = try JSONEncoder().encode(session)
         let decoded = try JSONDecoder().decode(ChatSession.self, from: data)
-        let restored = ChatSessionStore.normalizedForRestore(decoded)
+        let restored = ChatSessionStore.normalizedForRestore(
+            decoded,
+            schemaVersion: ChatSessionStore.currentSchemaVersion
+        )
         // The transient progress bubble is gone; the real turns survive.
         XCTAssertEqual(restored.messages.count, 2)
         XCTAssertFalse(restored.messages.contains { $0.isTransient == true })

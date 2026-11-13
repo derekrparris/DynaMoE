@@ -177,6 +177,12 @@ struct ChatDetailView: View {
     @State private var promptTokenCount: Int = 0
     @State private var tokenCountTask: Task<Void, Never>? = nil
     @State private var isPinnedToBottom: Bool = true
+    /// Memoizes the cloud context-window lookup the header pill uses. The body
+    /// runs on every streamed frame and the policy re-parses the provider's
+    /// `model=window` string on each call; the key includes the raw recorded
+    /// values, so a Settings edit still lands on the next evaluation instead of
+    /// serving a stale ceiling.
+    @State private var cloudWindowMemo = CloudWindowMemo()
     /// Identity of the invisible marker at the end of the transcript. It must
     /// stay constant: bumping it per streamed chunk re-lays out the whole
     /// transcript several times a frame, which SwiftUI flags as an invalid
@@ -293,8 +299,8 @@ struct ChatDetailView: View {
     }
 
     /// True while a /compact pass is streaming into its progress bubble.
-    /// Only the scroll handlers need the conversation-level bit; everything
-    /// rendered is keyed to `compactionProgressMessageId` instead.
+    /// The scroll handlers and the Stop control need the conversation-level
+    /// bit; everything rendered is keyed to `compactionProgressMessageId`.
     private var isCompactingConversation: Bool {
         compactionProgressMessageId != nil
     }
@@ -308,6 +314,57 @@ struct ChatDetailView: View {
         let font = NSFont.systemFont(ofSize: max(10, 13.5 * zoomManager.zoomScale))
         let lineHeight = ceil(font.ascender - font.descender + font.leading)
         return lineHeight + MacTextEditor.textContainerInsetHeight * 2
+    }
+
+    /// Cache for `cloudContextWindow`. Reference type because the body
+    /// refreshes it in place without writing `@State` (see the memoization note
+    /// at the top of this file).
+    private final class CloudWindowMemo {
+        var modelId: String?
+        var providerId: String?
+        var rawOverrides: String?
+        var globalWindow = 0
+        var window: Int?
+    }
+
+    /// The context window recorded for this conversation's cloud model, or nil.
+    ///
+    /// Nil for a weights model (whose capacity is the KV budget's business, not
+    /// a provider's) and for any cloud model nobody recorded a window for — in
+    /// which case the header shows the plain token total instead of inventing a
+    /// ceiling.
+    ///
+    /// Resolved from the recorded window facts directly rather than through
+    /// `CloudModelRegistry.registeredSpecs`: this runs on every body
+    /// evaluation, and that call rebuilds every spec on the provider (its model
+    /// list, its no-tools list, its vision marks) to answer one lookup. The
+    /// memo also keeps the provider's `model=window` string from being re-parsed
+    /// per streaming frame; it is keyed on the raw values, so a Settings edit
+    /// still lands on the next evaluation.
+    private func cloudContextWindow(for session: ChatSession?) -> Int? {
+        guard let id = session?.selectedModelId,
+              let parsed = CloudModelAddress.parseModelId(id) else { return nil }
+        let defaults = UserDefaults.standard
+        let rawOverrides = defaults.string(forKey: CloudContextPolicy.defaultsKey(for: parsed.provider.id))
+        let globalWindow = defaults.integer(forKey: CloudContextPolicy.globalWindowKey)
+        let memo = cloudWindowMemo
+        if memo.modelId == parsed.providerModelId,
+           memo.providerId == parsed.provider.id,
+           memo.rawOverrides == rawOverrides,
+           memo.globalWindow == globalWindow {
+            return memo.window
+        }
+        let window = CloudContextPolicy.window(
+            forModelId: parsed.providerModelId,
+            providerId: parsed.provider.id,
+            defaults: defaults
+        )
+        memo.modelId = parsed.providerModelId
+        memo.providerId = parsed.provider.id
+        memo.rawOverrides = rawOverrides
+        memo.globalWindow = globalWindow
+        memo.window = window
+        return window
     }
 
     private func modelIconName(for name: String?, isCloud: Bool = false) -> String {
@@ -486,17 +543,46 @@ struct ChatDetailView: View {
                                 }
                             }
                             if let cumulativeTokens = session?.cumulativeTokenCount, cumulativeTokens > 0 {
+                                let contextWindow = cloudContextWindow(for: session)
                                 Text("•")
                                     .foregroundColor(.secondary)
                                 HStack(spacing: 3) {
                                     Image(systemName: "number.circle")
                                         .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .semibold))
                                         .foregroundColor(.secondary)
-                                    Text(cumulativeTokens.formatted())
+                                    if let window = contextWindow,
+                                       let percent = CloudContextPolicy.usagePercent(
+                                           promptTokens: cumulativeTokens,
+                                           window: window
+                                       ) {
+                                        // A cloud conversation can see its own
+                                        // ceiling: the window is a recorded
+                                        // registration fact, and the percentage
+                                        // is what turns "12,345 tokens" into
+                                        // "how much room is left".
+                                        Text("\(cumulativeTokens.formatted()) · \(percent)% of \(window.formatted())")
+                                            .font(.system(size: max(9, 11 * zoomManager.zoomScale), design: .monospaced))
+                                            .foregroundColor(percent >= 80 ? .orange : .secondary)
+                                    } else {
+                                        Text(cumulativeTokens.formatted())
+                                            .font(.system(size: max(9, 11 * zoomManager.zoomScale), design: .monospaced))
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                                .help("Context this conversation is carrying: the prompt the model last ingested plus the tokens it generated. Every backend counts the full prompt the request carried (a cached or pinned prefix is still context the model was given), so this is the latest request's size, not a running total of what each step billed.")
+                            }
+                            if let spend = session?.cumulativeCost, spend > 0 {
+                                Text("•")
+                                    .foregroundColor(.secondary)
+                                HStack(spacing: 3) {
+                                    Image(systemName: "dollarsign.circle")
+                                        .font(.system(size: max(8, 10 * zoomManager.zoomScale), weight: .semibold))
+                                        .foregroundColor(.secondary)
+                                    Text(CloudPricingStore.formatted(spend))
                                         .font(.system(size: max(9, 11 * zoomManager.zoomScale), design: .monospaced))
                                         .foregroundColor(.secondary)
                                 }
-                                .help("Running total of session context: prompt tokens ingested plus tokens generated across every turn")
+                                .help("Reported spend for this conversation: the provider's own usage blocks priced against the per-model list under Settings → Cloud Providers → Request Behaviour ▸ Prices (recorded with defaults write), plus the app's estimate for a stopped or failed step that was sent and never reported usage (the run line marks those `(est.)`). A model with no recorded price reports no cost.")
                             }
                         }
                         .padding(.horizontal, 10)
@@ -505,7 +591,7 @@ struct ChatDetailView: View {
                         .cornerRadius(8)
                     }
                     
-                    if isGenerating {
+                    if isGenerating || isCompactingConversation {
                         Button(action: onStopGeneration) {
                             HStack(spacing: 4) {
                                 Image(systemName: "stop.fill")
@@ -1131,9 +1217,13 @@ struct ChatDetailView: View {
                         .buttonStyle(.plain)
 
                         // Send / Stop / Queue Buttons
-                        if isGenerating {
+                        // A manual /compact also gets the Stop control: it runs
+                        // for minutes and has no generation attached, so this is
+                        // the only way to interrupt it.
+                        if isGenerating || isCompactingConversation {
                             HStack(spacing: 8) {
-                                if !promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingImages.isEmpty {
+                                if isGenerating,
+                                   !promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !pendingImages.isEmpty {
                                     Button(action: {
                                         let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
                                         guard !trimmed.isEmpty || !pendingImages.isEmpty else { return }
@@ -1176,7 +1266,7 @@ struct ChatDetailView: View {
                                         .foregroundColor(.red)
                                 }
                                 .buttonStyle(.plain)
-                                .help("Stop generating")
+                                .help(isCompactingConversation ? "Stop compacting" : "Stop generating")
                             }
                         } else {
                             // Slash commands are backend-independent app actions

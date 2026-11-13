@@ -2217,7 +2217,11 @@ struct SettingsSheetView: View {
                 .foregroundStyle(.secondary)
 
             if let input = log.inputTokens, let output = log.outputTokens {
-                Text("\(input)→\(output) tok")
+                Text(
+                    (log.cachedInputTokens ?? 0) > 0
+                        ? "\(input)→\(output) tok · \(log.cachedInputTokens ?? 0) cached"
+                        : "\(input)→\(output) tok"
+                )
                     .font(.system(size: 10, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
@@ -2278,7 +2282,31 @@ struct SettingsSheetView: View {
                     }
                     serverRequestLogDetailLine("Model", log.model ?? "—")
                     serverRequestLogDetailLine("Tokens", log.inputTokens.map { input in
-                        "\(input) in / \(log.outputTokens.map(String.init) ?? "—") out"
+                        var text = "\(input) in / \(log.outputTokens.map(String.init) ?? "—") out"
+                        // Both columns are provider-reported and were stored
+                        // unclamped until the box learned to clamp them; a row
+                        // already on disk can still hold a figure larger than
+                        // the prompt, and `input - cached` traps on overflow.
+                        // Clamped here as well so an old row opens instead of
+                        // crashing the log on every launch.
+                        let prompt = max(0, input)
+                        let cached = min(max(0, log.cachedInputTokens ?? 0), prompt)
+                        let cacheWrite = min(
+                            max(0, log.cacheWriteInputTokens ?? 0),
+                            max(0, prompt - cached)
+                        )
+                        if cached > 0 || cacheWrite > 0 {
+                            var split: [String] = []
+                            if cached > 0 { split.append("\(cached) cached") }
+                            if cacheWrite > 0 { split.append("\(cacheWrite) cache write") }
+                            // A cache write is its own line on the bill, exactly
+                            // like a cache read: subtracting only the read
+                            // charges the write twice and overstates the fresh
+                            // share the row exists to show.
+                            split.append("\(max(0, prompt - cached - cacheWrite)) billable")
+                            text += " (\(split.joined(separator: ", ")))"
+                        }
+                        return text
                     } ?? "—")
                     serverRequestLogDetailLine("Finish", log.finishReason ?? "—")
                     serverRequestLogDetailLine("Request Size", log.requestBytes.map { "\(ByteCountFormatter.string(fromByteCount: Int64($0), countStyle: .file)) (\($0) bytes)" } ?? "—")
