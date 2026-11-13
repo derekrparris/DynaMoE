@@ -113,8 +113,10 @@ final class CloudProviderStore: ObservableObject {
     /// Changes the display name, base URL, or documentation link. The
     /// identifier is deliberately immutable: it is the Keychain account
     /// suffix and part of the `cloud://` address saved with every conversation
-    /// that used the provider. A new base URL drops the per-model state, since
-    /// every id and capability mark it held described the old endpoint.
+    /// that used the provider. A new base URL drops the ENDPOINT state — the
+    /// registered ids, the no-tools list and the vision marks all described
+    /// that server — while prices and context windows are facts about the MODEL
+    /// and are kept.
     ///
     /// The fields this form does not edit — the Anthropic base and the
     /// prompt-caching capability — are carried over from the stored record.

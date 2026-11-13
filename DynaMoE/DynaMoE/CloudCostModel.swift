@@ -250,12 +250,16 @@ public nonisolated enum CloudOverflowAdvice {
             var detail = failure.clause(providerName: providerName)
             if !detail.hasSuffix(".") { detail += "." }
             let prefix = alreadyCompacted
-                ? " This turn compacted older history once and a later attempt failed"
+                ? " This turn compacted older history and a later attempt failed"
                 : " Auto-compaction left the history unchanged"
             return prefix + ": \(detail)"
         }
         if alreadyCompacted {
-            return " This turn already compacted older history once and the request still exceeded the window — start a new chat or run /compact."
+            // No count: a run may spend up to `CloudCompactionAttempts`'
+            // budget, so "once" was wrong after the second pass. What the
+            // reader needs is that compaction has been tried and did not
+            // clear the wall.
+            return " This turn already compacted older history and the request still exceeded the window — start a new chat or run /compact."
         }
         return " The conversation exceeded this model's context window — older history could not be compacted automatically, so start a new chat or run /compact."
     }
@@ -267,12 +271,19 @@ public nonisolated enum CloudOverflowAdvice {
 /// that only closed on a SUCCESSFUL pass retried a failed one (an empty or
 /// truncated summary, a provider error) at the top of every remaining step.
 /// Each retry re-resolved the keychain, re-chunked the history and issued a
-/// billed summarizer request with no new chance of success. The budget is one
-/// pre-flight pass and one overflow-recovery pass:
+/// billed summarizer request with no new chance of success.
 ///
-/// - the pre-flight pass is marked when it STARTS, because the request is
-///   billed before its outcome is known; an attempt that turns out to have
-///   sent nothing is given back, because it spent nothing (`abandonPreflight`);
+/// The budget is up to `maximumRewritesPerRun` PRE-FLIGHT passes plus one
+/// overflow-recovery pass:
+///
+/// - a pre-flight pass is marked when it STARTS, because the request is billed
+///   before its outcome is known; an attempt that turns out to have sent
+///   nothing is given back, because it spent nothing (`abandonPreflight`), and
+///   a pass that SUCCEEDED releases the gate for a later one;
+/// - a later pre-flight is allowed only after the conversation has grown past
+///   the size the previous rewrite left behind, and only until the rewrite cap
+///   is reached, so a run pays for summaries only when they can cover new
+///   work;
 /// - overflow recovery keeps its own attempt, because the provider rejecting
 ///   the request is evidence the pre-flight estimate did not have.
 ///
@@ -345,9 +356,10 @@ public nonisolated struct CloudCompactionAttempts: Equatable, Sendable {
         overflowAttempted = true
     }
 
-    /// Records a pass that replaced the history. `promptTokens` is the size of
-    /// the prompt the pass was deciding about, which becomes the floor a later
-    /// pre-flight has to exceed.
+    /// Records a pass that replaced the history. `promptTokens` is the size the
+    /// rewritten prompt LEFT behind, not the size the pass was deciding about:
+    /// it becomes the floor a later pre-flight has to exceed, and the surviving
+    /// prompt is what following steps actually send.
     ///
     /// The in-flight attempt is released here rather than left spent: a pass
     /// that SUCCEEDED is not a pending question, and a later pre-flight is a new
@@ -524,11 +536,20 @@ public nonisolated enum CloudContextPolicy {
     /// checked. The fraction is the "large context" trigger. `reservedTokens` is
     /// the reply budget the same request carries, and a prompt under the
     /// fraction can still overflow the window beside it: 0.8 x a 16k window is
-    /// 12.8k tokens, and the app's default 8,192-token reply makes that request
-    /// 21k against 16k. Compacting at the fraction alone therefore burned the
-    /// run's one pre-flight attempt on a wall it could not clear and left the
-    /// overflow path to recover — which is the path that refuses when the
-    /// attempt is already spent.
+    /// 12.8k tokens, and an 8,192-token reply makes that request 21k against
+    /// 16k. Compacting at the fraction alone therefore spent a pre-flight
+    /// attempt on a wall it could not clear and left the overflow path to
+    /// recover — which is the path that refuses when its own attempt is already
+    /// spent.
+    ///
+    /// A reply budget that is itself as large as the window makes every send
+    /// pre-flight and still overflow, however much history is summarized: no
+    /// compaction can leave room for a reply that alone fills the model's
+    /// context. That is not a compaction problem, so this answers false and the
+    /// caller sends the budget `replyBudget(requested:window:)` clamps to the
+    /// room the threshold leaves. Without the guard, a 1,024-token model with
+    /// the default 8,192-token reply paid for up to three summarizer passes on
+    /// every single send.
     public static func shouldCompact(
         promptTokens: Int,
         window: Int?,
@@ -537,8 +558,29 @@ public nonisolated enum CloudContextPolicy {
         guard let window, window >= minimumPlausibleWindow else { return false }
         let prompt = Double(max(0, promptTokens))
         let reserve = Double(max(0, reservedTokens))
+        // Compaction cannot make room for a reply larger than the window.
+        guard reserve < Double(window) else { return false }
         if prompt >= Double(window) * autoCompactFraction { return true }
         return prompt + reserve > Double(window)
+    }
+
+    /// The reply budget a request may carry and still share the window with a
+    /// prompt this app would send.
+    ///
+    /// `max_tokens` is a ceiling, so lowering it never breaks a turn that would
+    /// otherwise have fitted; leaving it above the window guarantees the
+    /// request is refused (or truncated) no matter how short the prompt is.
+    /// The cap is the room the auto-compaction threshold leaves — 20% of the
+    /// window — so the two rules agree: once the prompt is under 80%, the
+    /// prompt plus this reply fits, and the pre-flight is only triggered by a
+    /// prompt compaction can actually shrink. A model with no recorded window
+    /// is left alone, as is a caller that asked for no budget (`nil`/`0`).
+    public static func replyBudget(requested: Int, window: Int?) -> Int {
+        guard requested > 0 else { return max(0, requested) }
+        guard let window, window >= minimumPlausibleWindow else { return requested }
+        let room = (Double(window) * (1 - autoCompactFraction)).rounded()
+        guard room.isFinite, room >= 1, room < Double(Int.max) else { return requested }
+        return min(requested, Int(room))
     }
 
     /// The share of the window a prompt occupies, for a status line.
@@ -548,14 +590,21 @@ public nonisolated enum CloudContextPolicy {
     /// the `Int(...)` conversion of either that or a value above `Int.max`
     /// traps. Both are clamped: a 100%-plus figure is the same answer either
     /// way, and the header must never crash over a unit mistake.
+    ///
+    /// The result is also capped at 100. A conversation carried over from a
+    /// larger-window model can genuinely hold more context than the new
+    /// model's window, but "150% of 16,000" reads as a broken meter rather than
+    /// a fact about the conversation; the token count beside it still shows the
+    /// true size. This mirrors `CloudUsage.cacheReadFraction`, which clamps the
+    /// same way for the same reason.
     public static func usagePercent(promptTokens: Int, window: Int?) -> Int? {
         guard let window, window > 0 else { return nil }
         let percent = (Double(max(0, promptTokens)) / Double(window) * 100).rounded()
         // `Double(Int.max)` rounds UP to 2^63, so comparing against it and then
         // converting is still a trap; the comparison must be the conversion's
         // guard, not a clamp applied to a value that is already out of range.
-        guard percent.isFinite, percent < Double(Int.max) else { return .max }
-        return Int(percent)
+        guard percent.isFinite, percent < Double(Int.max) else { return 100 }
+        return min(100, Int(percent))
     }
 
     /// Upper bound on a derived chunk budget. A third of a 128k-token window is
@@ -586,9 +635,10 @@ public nonisolated enum CloudContextPolicy {
     /// the window (about 66k tokens for a 200k model, roughly 264k characters),
     /// and a 2,000-token summary of that is not necessarily complete: when it
     /// stops at the limit the pass is billed, refused for fear of deleting
-    /// messages it never covered, and the run's one pre-flight attempt is gone.
-    /// Ten percent of the chunk's estimated tokens, floored at 2,000 so a short
-    /// transcript keeps the detailed summary it always had.
+    /// messages it never covered, and the compact that needed it has to try
+    /// again against its rewrite budget. Ten percent of the chunk's estimated
+    /// tokens, floored at 2,000 so a short transcript keeps the detailed
+    /// summary it always had.
     ///
     /// The ceiling is the WINDOW's, not a constant. It used to be 8,000, which
     /// sat above the proportion for every window up to about 250k and below it

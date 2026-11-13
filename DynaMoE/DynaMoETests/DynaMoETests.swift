@@ -16538,14 +16538,23 @@ final class ChatSessionPersistenceTests: XCTestCase {
         let dir = makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: dir) }
 
-        // Simulate a file written before the versioned envelope existed.
-        let legacy = session(title: "Legacy", updatedAt: Date())
+        // Simulate a file written before the versioned envelope existed. It
+        // carries a running-sum token total, which is the v1 MEANING: an
+        // unstamped file is version 0 and must be normalised by the same rule,
+        // or a legacy chat relaunches claiming several hundred percent of a
+        // window it never carried.
+        var legacy = session(title: "Legacy", updatedAt: Date())
+        legacy.cumulativeTokenCount = 120_000
         let file = dir.appendingPathComponent("\(legacy.id.uuidString).json")
         try JSONEncoder().encode(legacy).write(to: file)
 
         let store = ChatSessionStore(directory: dir)
         let loaded = store.loadSessions() ?? []
         XCTAssertEqual(loaded.map(\.id), [legacy.id])
+        XCTAssertNil(
+            loaded.first?.cumulativeTokenCount,
+            "an unstamped (v0) file stores the old running sum, not a context size"
+        )
 
         store.saveAll(loaded)
         store.flushPendingIO()

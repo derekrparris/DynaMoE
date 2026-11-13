@@ -582,7 +582,7 @@ struct ChatDetailView: View {
                                         .font(.system(size: max(9, 11 * zoomManager.zoomScale), design: .monospaced))
                                         .foregroundColor(.secondary)
                                 }
-                                .help("Reported spend for this conversation: the provider's own usage blocks priced against the per-model list under Settings → Cloud Providers → Request Behaviour ▸ Prices (recorded with defaults write). A model with no recorded price reports no cost.")
+                                .help("Reported spend for this conversation: the provider's own usage blocks priced against the per-model list under Settings → Cloud Providers → Request Behaviour ▸ Prices (recorded with defaults write), plus the app's estimate for a stopped or failed step that was sent and never reported usage (the run line marks those `(est.)`). A model with no recorded price reports no cost.")
                             }
                         }
                         .padding(.horizontal, 10)

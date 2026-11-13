@@ -4635,16 +4635,6 @@ struct ContentView: View {
             sessions[sIdx].messages[mIdx].prefillStatus = "☁️ \(provider.displayName) — contacting the model…"
         }
 
-        let params = CloudChatGenerationParams(
-            temperature: Double(temperature),
-            topP: Double(topP),
-            presencePenalty: Double(presencePenalty),
-            maxTokens: maxNewTokens > 0 ? maxNewTokens : nil,
-            // The affinity/cache-key value is a hash, never the UUID: a
-            // provider only needs a stable opaque token, and an app identifier
-            // in a third party's logs buys nothing.
-            sessionKey: CloudSessionKey.hashed(sessionId)
-        )
         // The persona rides as a leading system message; the provider's own
         // templating consumes it verbatim. The compaction digest is composed
         // per request rather than captured here: an auto-compaction can run
@@ -4714,6 +4704,28 @@ struct ContentView: View {
         let contextWindow = CloudContextPolicy.window(
             forModelId: providerModelId,
             providerId: provider.id
+        )
+        // The reply budget the request actually carries. Left at the app's
+        // setting it can be larger than a small model's whole window (the
+        // default is 8,192 tokens against models that register 1,024-8,192),
+        // which makes the request impossible no matter how short the prompt
+        // is and, before the pre-flight knew better, paid for a summarizer
+        // pass on every send without ever clearing the wall. Clamped to the
+        // room the compaction threshold leaves, so a prompt under 80% of the
+        // window plus this reply always fits.
+        let replyBudget = CloudContextPolicy.replyBudget(
+            requested: maxNewTokens,
+            window: contextWindow
+        )
+        let params = CloudChatGenerationParams(
+            temperature: Double(temperature),
+            topP: Double(topP),
+            presencePenalty: Double(presencePenalty),
+            maxTokens: replyBudget > 0 ? replyBudget : nil,
+            // The affinity/cache-key value is a hash, never the UUID: a
+            // provider only needs a stable opaque token, and an app identifier
+            // in a third party's logs buys nothing.
+            sessionKey: CloudSessionKey.hashed(sessionId)
         )
         generationTask = Task(priority: .userInitiated) {
             var currentMessageId = messageId
@@ -4894,14 +4906,17 @@ struct ContentView: View {
                         ),
                         tools: stepTools
                     )
-                    // The reply budget is reserved too: this step sends
-                    // `maxTokens: maxNewTokens`, and past ~0.8 of a small
-                    // window the prompt alone clears the fraction while the
-                    // prompt PLUS its reply is already over the ceiling.
+                    // The reply budget is reserved too: this step sends the
+                    // same clamped budget `params` carries, and past ~0.8 of a
+                    // small window the prompt alone clears the fraction while
+                    // the prompt PLUS its reply is already over the ceiling.
+                    // The clamped figure is the one on the wire: reserving the
+                    // raw setting here made an oversized reply look like a
+                    // reason to compact that no compaction could answer.
                     if CloudContextPolicy.shouldCompact(
                         promptTokens: projected,
                         window: window,
-                        reservedTokens: maxNewTokens
+                        reservedTokens: replyBudget
                     ),
                        compactionAttempts.shouldAttemptPreflight(projectedTokens: projected) {
                         compactionAttempts.beginPreflight()
@@ -5074,6 +5089,18 @@ struct ContentView: View {
                 /// with the report the same usage block produces on a turn that
                 /// finishes.
                 @MainActor func chargeUnreturnedStep() {
+                    // The provider's usage block can arrive before a stop or a
+                    // failure. The row's measured columns must reflect it: a
+                    // stopped step that reported a cache split used to be
+                    // recorded as all-estimate because only the success path
+                    // called `noteProviderUsage`.
+                    if let usage = reportedUsage {
+                        turnLog.noteProviderUsage(
+                            promptTokens: usage.promptTokens,
+                            cachedTokens: usage.cachedTokens,
+                            cacheWriteTokens: usage.cacheWriteTokens
+                        )
+                    }
                     let one = CloudTurnReport(
                         usage: reportedUsage,
                         estimatedPromptTokens: stepEstimatedPrompt,
@@ -5143,18 +5170,28 @@ struct ContentView: View {
                     }
                 }
 
+                // What the transport concluded about this request. Stop
+                // cancels this task, and a cancelled `for await` over an
+                // `AsyncStream` ends with no terminal event at all, so the
+                // failure that proves a request was never billed is
+                // undeliverable exactly when Stop needs it. Read after the
+                // loop instead of waiting for an event; the receipt also
+                // keeps a finished result that raced Stop, whose usage is the
+                // provider's own measurement.
+                let stepReceipt = CloudTurnReceipt()
                 for await event in client.streamTurn(
                     model: providerModelId,
                     messages: outbound,
                     params: params,
-                    tools: tools
+                    tools: tools,
+                    receipt: stepReceipt
                 ) {
-                    // Stop ends the turn, but a failure is still read: it is
-                    // the only evidence that the request never reached the
-                    // provider, and the cancel path below prices whatever it
-                    // cannot prove was unsent. Text arriving after Stop belongs
-                    // to a turn nobody is waiting for.
-                    if Task.isCancelled, !event.isFailure { break }
+                    // Stop ends the turn, but a TERMINAL event is still read: a
+                    // failure is the only evidence that the request never
+                    // reached the provider, and a result carries the measured
+                    // usage and cache split. Text arriving after Stop belongs
+                    // to a turn nobody is waiting for, so deltas break.
+                    if Task.isCancelled, !event.isTerminal { break }
                     switch event {
                     case .started:
                         break
@@ -5171,29 +5208,51 @@ struct ContentView: View {
                         turnLog.noteFirstToken()
                         pushPartial()
                     case .finished(let result):
-                        latestText = result.text
-                        latestThinking = result.thinking
+                        // A result that races Stop is still the provider's
+                        // measurement of this request. Keep its usage, but do
+                        // not replace the partial text the user watched with
+                        // an answer they stopped.
                         reportedUsage = result.usage
                         finishReason = result.finishReason
-                        stepToolCalls = result.toolCalls
-                        endedWithoutTerminal = !result.terminated
+                        if !Task.isCancelled {
+                            latestText = result.text
+                            latestThinking = result.thinking
+                            stepToolCalls = result.toolCalls
+                            endedWithoutTerminal = !result.terminated
+                        }
                     case .failed(let failure):
                         serviceFailure = failure
                     }
+                }
+                // Events are not the only evidence: a cancelled stream delivers
+                // none. The receipt is the transport's last word, so a failure
+                // or usage block it recorded still reaches the paths below.
+                if serviceFailure == nil, let recorded = stepReceipt.failure {
+                    serviceFailure = recorded
+                }
+                if let recorded = stepReceipt.result {
+                    if reportedUsage == nil { reportedUsage = recorded.usage }
+                    if finishReason == nil { finishReason = recorded.finishReason }
                 }
 
                 // Stop-button cancellation and superseded turns bypass the
                 // success finalizer: the replacement generation owns the UI
                 // flags. Partials already streamed stay in the message, and the
                 // row keeps the stopped/aborted contract the weights path uses.
-                // The request itself was sent, so it is priced here rather than
-                // left out of the conversation's spend.
+                // The request itself may have been sent, so it is priced here
+                // rather than left out of the conversation's spend.
                 if Task.isCancelled || !self.ownsGeneration(myGenerationId) {
-                    // A failure that never reached the provider (a missing or
-                    // unreadable key) was not billed, so it is not priced from
-                    // the estimate the way a sent request is. The failure
-                    // branch below applies the same filter.
-                    if serviceFailure?.spentRequest != false {
+                    // A request that never reached the provider was not billed,
+                    // so it is not priced from the estimate a sent request
+                    // uses. The event and the receipt carry the same
+                    // classification; the receipt is what survives a cancel
+                    // that swallowed the event. `nil` keeps the conservative
+                    // default (price it), because a timeout or a connection
+                    // lost after submission can still have been processed.
+                    let spent = serviceFailure?.spentRequest
+                        ?? stepReceipt.spentRequest
+                        ?? true
+                    if spent {
                         chargeUnreturnedStep()
                     }
                     commitOdometerTail()
@@ -5201,7 +5260,7 @@ struct ContentView: View {
                         status: Task.isCancelled ? 200 : 500,
                         errorMessage: Task.isCancelled ? "⏹ Generation stopped by user." : "Generation stream closed without a result",
                         outputTokens: AppleFoundationModelService.recordedOutputTokenCount(for: latestText),
-                        finishReason: nil,
+                        finishReason: finishReason,
                         thinking: latestThinking,
                         response: latestText,
                         toolCalls: []

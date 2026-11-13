@@ -282,6 +282,52 @@ final class ConversationCompactionTests: XCTestCase {
         ).isEmpty)
     }
 
+    func testOneOversizedMessageCannotSpendUnboundedSummarizerRequests() {
+        // A 1 MB paste at a 4,000-character cloud budget used to become ~250
+        // billed summarizer requests; the on-device budget produced ~175. Every
+        // split is a request, so the number of passes — not the number of turns
+        // — is the thing an attacker (or a careless paste) controls.
+        let huge = makeMessage(.user, String(repeating: "z", count: 100_000))
+        let chunks = AppleFoundationModelService.buildCompactionTranscriptChunks(
+            from: [huge],
+            charBudget: 1_000
+        )
+        XCTAssertEqual(
+            chunks.count,
+            AppleFoundationModelService.maximumCompactionChunks,
+            "the pass cap is what bounds the spend"
+        )
+        // Head and tail both reach a pass: the setup at the top of a paste and
+        // the conclusion at the bottom are what a summary can least afford to
+        // lose.
+        XCTAssertTrue(chunks.first?.contains("z") == true)
+        XCTAssertTrue(chunks.last?.contains("z") == true)
+        // And the transcript itself says the middle was never read, because the
+        // rewrite that follows deletes the messages either way.
+        XCTAssertTrue(
+            chunks.contains { $0.contains("characters of middle history were omitted") },
+            "a bounded excerpt must state what it omitted"
+        )
+    }
+
+    func testABoundedCompactionKeepsItsNewestChunkForTheRecap() {
+        // The last chunk is the one the summary pass and the detailed recap
+        // read. A cap that trimmed the tail would leave the recap describing
+        // work that is no longer in any pass.
+        let messages = (0..<20).map { index in
+            makeMessage(.user, "turn \(index): " + String(repeating: "detail ", count: 60))
+        }
+        let chunks = AppleFoundationModelService.buildCompactionTranscriptChunks(
+            from: messages,
+            charBudget: 600,
+            maximumChunks: 4
+        )
+        XCTAssertEqual(chunks.count, 4)
+        XCTAssertTrue(chunks[0].contains("turn 0:"), "the head keeps the beginning of the conversation")
+        XCTAssertTrue(chunks.last?.contains("turn 19:") == true, "the newest turn must land in the recap chunk")
+        XCTAssertTrue(chunks.contains { $0.contains("middle history were omitted") })
+    }
+
     func testACompactionTurnThatAlreadyFitsIsOneSlice() {
         // The packing rule for ordinary turns must not change: a turn inside
         // the budget comes back whole, so chunks can still hold several of them.

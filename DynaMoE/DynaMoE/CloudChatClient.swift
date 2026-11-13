@@ -29,11 +29,19 @@ public nonisolated enum CloudConnectionTestResult: Equatable, Sendable {
 // MARK: - Service Protocol
 
 nonisolated protocol CloudChatServicing: Sendable {
+    /// Streams one turn and records its terminal classification in `receipt`.
+    ///
+    /// The receipt is not an optimisation of the event stream: it is the only
+    /// way a caller whose task was cancelled can learn whether the request was
+    /// billed. A cancelled `for await` over an `AsyncStream` ends with no
+    /// terminal event, so the same answer sent as an event is undeliverable
+    /// exactly when it matters (see `CloudTurnReceipt`).
     func streamTurn(
         model: String,
         messages: [CloudChatMessage],
         params: CloudChatGenerationParams,
-        tools: [ToolDefinition]?
+        tools: [ToolDefinition]?,
+        receipt: CloudTurnReceipt?
     ) -> AsyncStream<CloudTurnEvent>
 
     /// GET the provider's model listing. Used by the Settings connection test
@@ -77,11 +85,14 @@ private nonisolated final class CloudSessionCache: @unchecked Sendable {
 /// read-only in Settings, so the control that clears a latch is not even
 /// reachable there.
 ///
-/// One entry per (endpoint, model), process lifetime, and a lock only on the
-/// miss path. A rejection is only recorded once a request WITHOUT the field has
-/// been accepted AND the refusal named the field, because an unrelated 400
-/// looks identical (see `streamTurn`), and a vague or transient one must not
-/// disable the hint for the rest of the process.
+/// One entry per (endpoint, model), process lifetime. The lock is taken on
+/// every read and write: the set is small and the reads happen once per
+/// request, so a lock-free fast path would buy nothing and the old "lock only
+/// on the miss path" claim was never what the code did. A rejection is only
+/// recorded once a request WITHOUT the field has been accepted AND the refusal
+/// named the field, because an unrelated 400 looks identical (see
+/// `streamTurn`), and a vague or transient one must not disable the hint for
+/// the rest of the process.
 /// Internal rather than private so a test can pin the latch.
 nonisolated final class CloudCacheHintMemory: @unchecked Sendable {
     static let shared = CloudCacheHintMemory()
@@ -258,8 +269,14 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
     /// can test the request it actually sent. A latch keyed by endpoint is
     /// process-wide, which is exactly why the answer is taken before the send
     /// rather than re-derived from the response.
-    private func willSendAffinityHeaders() -> Bool {
-        cacheHints.sendsAffinityHeaders
+    ///
+    /// The empty-key rule lives here as well as in `applyCacheAffinity`: a
+    /// request with no session key sends no header, so a body that happens to
+    /// name `x-session-affinity` must not earn a retry (and, worse, a latch)
+    /// for headers that never left the Mac.
+    private func willSendAffinityHeaders(params: CloudChatGenerationParams) -> Bool {
+        guard let sessionKey = params.sessionKey, !sessionKey.isEmpty else { return false }
+        return cacheHints.sendsAffinityHeaders
             && cacheHintMemory.acceptsAffinityHeaders(endpoint: chatURL.absoluteString)
     }
 
@@ -317,7 +334,8 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
     ) throws -> URLRequest {
         let wantsCacheKey = cacheKeyIsSent
             ?? (includeCacheKey && willSendCacheKey(params: params, model: model))
-        let sendsAffinity = affinityIsSent ?? (includeAffinity && willSendAffinityHeaders())
+        let sendsAffinity = affinityIsSent
+            ?? (includeAffinity && willSendAffinityHeaders(params: params))
         let body = Body(
             model: model,
             messages: messages,
@@ -353,7 +371,8 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         model: String,
         messages: [CloudChatMessage],
         params: CloudChatGenerationParams,
-        tools: [ToolDefinition]?
+        tools: [ToolDefinition]?,
+        receipt: CloudTurnReceipt?
     ) -> AsyncStream<CloudTurnEvent> {
         AsyncStream { continuation in
             // Framing and JSON decoding are CPU work on a per-token hot path;
@@ -400,7 +419,7 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                         // otherwise suppress the retry this request earned and
                         // fail the turn on a hint it had, in fact, sent.
                         let sentCacheKey = includeCacheKey && self.willSendCacheKey(params: params, model: model)
-                        let sentAffinity = includeAffinity && self.willSendAffinityHeaders()
+                        let sentAffinity = includeAffinity && self.willSendAffinityHeaders(params: params)
                         // Encoding happens before URLSession is touched: a
                         // throw here is a local fault with no request to bill.
                         let request: URLRequest
@@ -417,7 +436,12 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                                 affinityIsSent: sentAffinity
                             )
                         } catch {
-                            continuation.yield(.failed(.transport(error.localizedDescription, billed: false)))
+                            let failure = CloudTurnFailure.transport(
+                                error.localizedDescription,
+                                billed: false
+                            )
+                            receipt?.record(failure: failure)
+                            continuation.yield(.failed(failure))
                             continuation.finish()
                             return
                         }
@@ -430,6 +454,16 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                         do {
                             exchange = try await self.session.bytes(for: request)
                         } catch {
+                            // Classified BEFORE the cancellation check, and
+                            // recorded on the receipt: a Stream whose consumer
+                            // was cancelled cannot deliver this event, so the
+                            // cancel path would otherwise price a request the
+                            // transport could prove never left the Mac.
+                            let failure = CloudTurnFailure.transportFailure(
+                                error,
+                                requestWasSent: true
+                            )
+                            receipt?.record(failure: failure)
                             // A failure that PROVES the request never left the
                             // Mac is reported even when Stop has just arrived.
                             // The caller's cancel path prices everything it
@@ -442,21 +476,30 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                                 continuation.finish()
                                 return
                             }
-                            continuation.yield(.failed(CloudTurnFailure.transportFailure(
-                                error,
-                                requestWasSent: true
-                            )))
+                            continuation.yield(.failed(failure))
                             continuation.finish()
                             return
                         }
                         let (bytes, response) = exchange
                         guard let http = response as? HTTPURLResponse else {
-                            continuation.yield(.failed(.invalidResponse("The provider returned a non-HTTP response.")))
+                            let failure = CloudTurnFailure.invalidResponse(
+                                "The provider returned a non-HTTP response."
+                            )
+                            receipt?.record(failure: failure)
+                            continuation.yield(.failed(failure))
                             continuation.finish()
                             return
                         }
                         guard (200..<300).contains(http.statusCode) else {
                             let body = await Self.drain(bytes, limit: 4096)
+                            // The status class is the billing answer this
+                            // attempt produced: a 4xx was refused before
+                            // inference and is not invoiced, a 5xx was
+                            // accepted. Recorded BEFORE the cancellation check
+                            // below, because Stop may have arrived while the
+                            // error body drained and this is the only place the
+                            // answer survives a cancelled stream.
+                            receipt?.record(spent: http.statusCode >= 500)
                             // Stop may have arrived while the error body was
                             // draining. Either retry below re-uploads the whole
                             // prompt, which nobody is waiting for any more.
@@ -486,13 +529,20 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                                 cacheKeyRejectionBody = body
                                 continue
                             }
-                            continuation.yield(.failed(.httpStatus(
+                            let failure = CloudTurnFailure.httpStatus(
                                 code: http.statusCode,
                                 summary: MCPHTTPTransport.summarizeErrorBody(body)
-                            )))
+                            )
+                            receipt?.record(failure: failure)
+                            continuation.yield(.failed(failure))
                             continuation.finish()
                             return
                         }
+                        // The provider accepted the request, so the prompt
+                        // reached its inference path from here on. Recorded as
+                        // soon as the headers prove it, not when the answer
+                        // completes: a Stop mid-answer is still billed.
+                        receipt?.record(spent: true)
 
                         // The field is only proven unwelcome once a request
                         // without it is accepted AND the refusal names the
@@ -546,13 +596,16 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                                 }
                             } catch let failure as CloudTurnFailure {
                                 sawFailure = true
+                                receipt?.record(failure: failure)
                                 continuation.yield(.failed(failure))
                                 return false
                             } catch {
                                 sawFailure = true
-                                continuation.yield(.failed(.invalidResponse(
+                                let failure = CloudTurnFailure.invalidResponse(
                                     "The provider sent a response chunk DynaMoE could not decode."
-                                )))
+                                )
+                                receipt?.record(failure: failure)
+                                continuation.yield(.failed(failure))
                                 return false
                             }
                             return true
@@ -627,13 +680,17 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
 
                         if !sawFailure {
                             if lineBuffer.overflowed || frames.overflowed {
-                                continuation.yield(.failed(.invalidResponse(
+                                let failure = CloudTurnFailure.invalidResponse(
                                     "The provider sent a stream event larger than \(Self.maxEventBytes) bytes."
-                                )))
+                                )
+                                receipt?.record(failure: failure)
+                                continuation.yield(.failed(failure))
                             } else if parser.decodedChunkCount == 0 {
-                                continuation.yield(.failed(.invalidResponse(
+                                let failure = CloudTurnFailure.invalidResponse(
                                     "The provider closed the stream without sending any content."
-                                )))
+                                )
+                                receipt?.record(failure: failure)
+                                continuation.yield(.failed(failure))
                             } else {
                                 // A clean EOF is not a finished answer. The
                                 // protocol marks the end with `[DONE]` or with
@@ -642,9 +699,14 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                                 // flag travels with the result so the chat
                                 // surface can say the reply was cut off and a
                                 // compaction can refuse to commit it.
-                                continuation.yield(.finished(parser.result(
+                                let result = parser.result(
                                     terminated: finishedBySentinel || parser.finishReason != nil
-                                )))
+                                )
+                                // Recorded before the event is yielded: the
+                                // caller may be cancelled between the two, and
+                                // the measured usage is still the provider's.
+                                receipt?.record(result: result)
+                                continuation.yield(.finished(result))
                             }
                         }
                         continuation.finish()
@@ -653,18 +715,24 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                 } catch {
                     // A cancelled turn is the Stop button, not an error: the
                     // caller keeps whatever partial text already streamed.
+                    // The receipt still carries whatever was classified before
+                    // the cancellation, which is the only thing the cancel path
+                    // can price from.
                     if !Task.isCancelled {
-                        if let failure = error as? CloudTurnFailure {
-                            continuation.yield(.failed(failure))
+                        let failure: CloudTurnFailure
+                        if let typed = error as? CloudTurnFailure {
+                            failure = typed
                         } else {
                             // Reached only after a response was accepted: the
                             // prompt reached the provider's inference path, so
                             // this one is billed whatever the connection did.
-                            continuation.yield(.failed(.transport(
+                            failure = .transport(
                                 error.localizedDescription,
                                 billed: true
-                            )))
+                            )
                         }
+                        receipt?.record(failure: failure)
+                        continuation.yield(.failed(failure))
                     }
                 }
                 continuation.finish()
@@ -723,6 +791,13 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
     /// one thing that can be dropped and retried. Refusing it left an endpoint
     /// that says exactly what is wrong failing every turn until the operator
     /// found the setting.
+    ///
+    /// The app sends a handful of sampling parameters too, and a 400 that names
+    /// one of them is about that value, not about the cache field: retrying a
+    /// "max_tokens too large" or "temperature must be between 0 and 2" without
+    /// `prompt_cache_key` re-uploads the entire prompt (base64 images included)
+    /// once per agent step and fails again. Those names are refused here for
+    /// the same reason the model and tool names are.
     nonisolated static func shouldRetryWithoutCacheKey(status: Int, body: String) -> Bool {
         guard status == 400 || status == 422 else { return false }
         let lower = body.lowercased()
@@ -734,7 +809,11 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         // field itself; a body that mentions it is not about the cache hint.
         let otherParts = [
             "invalid model", "unknown model", "model not found", "does not exist",
-            "tool", "function", "schema", "messages"
+            "tool", "function", "schema", "messages",
+            // The sampling parameters this app actually sends. A 400 naming one
+            // is a value problem no retry can fix.
+            "max_tokens", "max_completion_tokens", "temperature", "top_p",
+            "presence_penalty", "frequency_penalty", "tool_choice"
         ]
         if otherParts.contains(where: { lower.contains($0) }) { return false }
         return !transientRefusalMarkers.contains { lower.contains($0) }
@@ -862,10 +941,13 @@ nonisolated final class AnthropicCloudChatService: CloudChatServicing, @unchecke
         model: String,
         messages: [CloudChatMessage],
         params: CloudChatGenerationParams,
-        tools: [ToolDefinition]?
+        tools: [ToolDefinition]?,
+        receipt: CloudTurnReceipt?
     ) -> AsyncStream<CloudTurnEvent> {
         AsyncStream { continuation in
-            continuation.yield(.failed(.unsupportedFlavor(flavor: CloudApiFlavor.anthropic.rawValue)))
+            let failure = CloudTurnFailure.unsupportedFlavor(flavor: CloudApiFlavor.anthropic.rawValue)
+            receipt?.record(failure: failure)
+            continuation.yield(.failed(failure))
             continuation.finish()
         }
     }
@@ -981,9 +1063,16 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
         model: String,
         messages: [CloudChatMessage],
         params: CloudChatGenerationParams,
-        tools: [ToolDefinition]? = nil
+        tools: [ToolDefinition]? = nil,
+        receipt: CloudTurnReceipt? = nil
     ) -> AsyncStream<CloudTurnEvent> {
-        service.streamTurn(model: model, messages: messages, params: params, tools: tools)
+        service.streamTurn(
+            model: model,
+            messages: messages,
+            params: params,
+            tools: tools,
+            receipt: receipt
+        )
     }
 
     /// One plain completion, collected with the usage it was billed at.

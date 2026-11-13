@@ -818,12 +818,20 @@ final class CloudProviderStoreTests: XCTestCase {
             for: provider.id,
             defaults: harness.defaults
         )
-        CloudModelRegistry.clearProviderState(for: provider, defaults: harness.defaults)
+        // Through the STORE, not the registry directly. The registry call is
+        // one line inside `remove`; the test used to invoke that line and never
+        // proved removal actually drops the state, so a `remove` that stopped
+        // calling it would have passed.
+        try harness.store.remove(provider)
         // A re-added identifier starts clean: neither a window nor a rate from
         // the removed registration may describe a model the operator has not
         // configured again.
         XCTAssertTrue(CloudContextPolicy.overrides(for: provider.id, defaults: harness.defaults).isEmpty)
         XCTAssertTrue(CloudPricingStore.pricing(for: provider.id, defaults: harness.defaults).isEmpty)
+        XCTAssertFalse(
+            harness.store.providers.contains { $0.id == provider.id },
+            "the provider itself must be gone, not only its registrations"
+        )
     }
 
     func testPruningOneModelKeepsANeighbouringPriceWithATypo() throws {

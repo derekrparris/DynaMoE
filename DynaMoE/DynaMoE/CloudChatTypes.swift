@@ -463,15 +463,18 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
         // stray flat `cached_tokens`, which is a generic column some
         // compatible endpoints use for something else. DeepSeek's dedicated
         // top-level name still wins over both, and Anthropic's column is its
-        // own protocol's only spelling.
+        // own protocol's only spelling. The Anthropic names are read once so
+        // the dialect check below can ask what they SAY, not only whether the
+        // keys exist.
+        let anthropicCacheRead = Self.firstInt(container, [.cacheReadInputTokens])
+        let anthropicCacheWrite = Self.firstInt(container, [.cacheCreationInputTokens])
         let cachedTokens = Self.firstInt(container, [.promptCacheHitTokens])
             ?? details?.cachedTokens
             ?? inputDetails?.cachedTokens
-            ?? Self.firstInt(container, [.cacheReadInputTokens, .cachedTokens])
-        let cacheWriteTokens = Self.firstInt(
-            container,
-            [.cacheCreationInputTokens, .cacheWriteTokens]
-        )
+            ?? anthropicCacheRead
+            ?? Self.firstInt(container, [.cachedTokens])
+        let cacheWriteTokens = anthropicCacheWrite
+            ?? Self.firstInt(container, [.cacheWriteTokens])
         // Anthropic splits the prompt three ways: `input_tokens` is only the
         // share that was neither read from nor written to its cache, and the
         // other two columns carry the rest. Its `usage` block is recognised by
@@ -481,19 +484,21 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
         // total here is what lets `CloudPricing` subtract a cache read without
         // clamping the prompt to zero.
         //
-        // The cache columns are the only signal available for that split, so
-        // an endpoint that published `input_tokens` as the TOTAL and also one
-        // Anthropic cache column would be normalised as if the input column
-        // excluded the cached share and would double-count. No transport this
-        // app speaks publishes that combination: Anthropic defines the field
-        // as the uncached share, and an OpenAI-shaped response uses
-        // `prompt_tokens` for the total, which wins above. A provider that
-        // ever does needs an explicit flavor signal, not a second heuristic
-        // on which keys happen to be present.
+        // The signal is a cache column with a NON-ZERO value, not the key's
+        // presence. Some OpenAI-shaped gateways emit the Anthropic spelling as
+        // an explicit zero while publishing `input_tokens` as the total;
+        // treating that zero as proof normalised 1,000 (total) + 600 (cached
+        // detail) + 0 into 1,600 and billed a prompt the provider never had.
+        // A zero column also carries no split to normalise: the total is
+        // already the answer. No transport this app speaks publishes
+        // `input_tokens` as a total beside a POSITIVE Anthropic column:
+        // Anthropic defines the field as the uncached share, and an
+        // OpenAI-shaped response uses `prompt_tokens` for the total, which
+        // wins above. A provider that ever does needs an explicit flavor
+        // signal, not a second heuristic on which keys happen to be present.
         let usesAnthropicCacheColumns = openAIPrompt == nil
             && inputTokens != nil
-            && (container.contains(.cacheReadInputTokens)
-                || container.contains(.cacheCreationInputTokens))
+            && ((anthropicCacheRead ?? 0) > 0 || (anthropicCacheWrite ?? 0) > 0)
         if usesAnthropicCacheColumns, let inputTokens {
             self.promptTokens = Self.summed([inputTokens, cachedTokens ?? 0, cacheWriteTokens ?? 0])
         } else {
@@ -671,6 +676,99 @@ public nonisolated enum CloudTurnEvent: Equatable, Sendable {
         if case .failed = self { return true }
         return false
     }
+
+    /// Whether this event ends a turn: a completed result or a failure.
+    ///
+    /// The chat loop treats these as readable after Stop, because a completed
+    /// result still carries the provider's measured usage and a failure still
+    /// carries the send classification. Deltas that arrive after Stop are not.
+    public var isTerminal: Bool {
+        if case .finished = self { return true }
+        return isFailure
+    }
+}
+
+// MARK: - Turn receipt
+
+/// What the transport concluded about one turn, readable after its stream ends.
+///
+/// Stop cancels the consumer task, and a cancelled `for await` over an
+/// `AsyncStream` ends immediately with no terminal event of any kind — the
+/// repo's own cancellation case pins that. So the chat loop's only evidence
+/// that a request never reached the provider (a 4xx refusal, an offline send,
+/// a local encode fault) could not arrive exactly when the user pressed Stop,
+/// and the cancel path priced the request anyway. A result that raced Stop was
+/// dropped the same way, losing the provider's measured usage and cache split.
+///
+/// The transport writes its last classification here, and the caller reads it
+/// after the loop instead of waiting for a delivery that may never happen. One
+/// receipt belongs to one turn; every field is lock-guarded because the
+/// transport writes from its own detached task. `spentRequest` is tri-state on
+/// purpose: nil means the transport never reached a decision (a scripted one
+/// that only yields events), which leaves the caller its conservative default.
+public nonisolated final class CloudTurnReceipt: @unchecked Sendable {
+    private let lock = NSLock()
+    private var spent: Bool?
+    private var terminalResult: CloudTurnResult?
+    private var terminalFailure: CloudTurnFailure?
+
+    public init() {}
+
+    /// Whether the request reached the provider's inference path, as far as
+    /// the transport could tell. Nil when nothing decided it.
+    public var spentRequest: Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return spent
+    }
+
+    /// The terminal result the provider produced, when it produced one before
+    /// the stream was cut off. Present even when Stop discarded the event that
+    /// carried it: the provider still measured the turn.
+    public var result: CloudTurnResult? {
+        lock.lock()
+        defer { lock.unlock() }
+        return terminalResult
+    }
+
+    /// The terminal failure the transport classified, when one arrived before
+    /// the stream was cut off.
+    public var failure: CloudTurnFailure? {
+        lock.lock()
+        defer { lock.unlock() }
+        return terminalFailure
+    }
+
+    /// Records the transport's current answer. A later attempt or a terminal
+    /// event can overwrite it; the last word describes the request the provider
+    /// answered.
+    func record(spent: Bool) {
+        lock.lock()
+        self.spent = spent
+        lock.unlock()
+    }
+
+    /// Records a completed answer. A finished result is proof the prompt
+    /// reached inference, so it also settles the billing question. Any failure
+    /// an earlier attempt classified is cleared: a retry that succeeded ends
+    /// the turn successfully, and a stale failure must not make the caller read
+    /// a completed turn as an error.
+    func record(result: CloudTurnResult) {
+        lock.lock()
+        spent = true
+        terminalResult = result
+        terminalFailure = nil
+        lock.unlock()
+    }
+
+    /// Records a classified failure. `spentRequest` is the same distinction
+    /// the event carries, so the receipt and the event cannot disagree.
+    func record(failure: CloudTurnFailure) {
+        lock.lock()
+        spent = failure.spentRequest
+        terminalFailure = failure
+        lock.unlock()
+    }
 }
 
 // MARK: - Failures
@@ -777,10 +875,16 @@ public nonisolated enum CloudTurnFailure: Equatable, Sendable, LocalizedError {
     }
 
     /// Whether a URL loading error happened before any HTTP request could be
-    /// delivered: no route, no host, no DNS answer, no TLS session. Each of
-    /// these is a connection that never carried the prompt, so the provider
-    /// had nothing to bill. Errors that can arrive after the request was sent
-    /// (a timeout, a lost connection) are deliberately absent.
+    /// delivered: no route, no host, no DNS answer, no TLS session, or a
+    /// connection policy that refused to open one at all. Each of these is a
+    /// connection that never carried the prompt, so the provider had nothing to
+    /// bill. Errors that can arrive after the request was sent (a timeout, a
+    /// lost connection) are deliberately absent.
+    ///
+    /// The three policy codes — no cellular data, international roaming off,
+    /// a call holding the connection — are pre-send on the same argument: the
+    /// system declines to open a connection, so nothing reached the provider.
+    /// Leaving them out priced each of those sends as if a prompt had arrived.
     nonisolated static func neverReachedProvider(_ error: Error) -> Bool {
         guard let urlError = error as? URLError else { return false }
         switch urlError.code {
@@ -790,6 +894,9 @@ public nonisolated enum CloudTurnFailure: Equatable, Sendable, LocalizedError {
              .dnsLookupFailed,
              .badURL,
              .unsupportedURL,
+             .dataNotAllowed,
+             .internationalRoamingOff,
+             .callIsActive,
              .secureConnectionFailed,
              .serverCertificateUntrusted,
              .serverCertificateHasBadDate,
@@ -1356,9 +1463,12 @@ public nonisolated enum CloudMessageAssembler {
     }
 
     /// Splits one user turn into the text the model reads and the image parts it
-    /// is sent. Attachments are re-sent with their original message on every
-    /// step (history is rebuilt per step), so an agent run keeps the model's
-    /// visual context instead of forgetting the picture after turn one.
+    /// is sent. History is rebuilt per step, so whether a historical turn's
+    /// attachments ride again is decided by `CloudImageDelivery` (Request
+    /// Behaviour → Re-send Images): `.all` keeps the model's visual context for
+    /// the whole run, `.newestUserTurnOnly` sends only the newest user turn's
+    /// pictures and turns older ones into the notice below rather than billing
+    /// them on every step.
     ///
     /// When the model cannot take images — or an asset is missing on disk, or
     /// the turn is older than the delivery policy allows — the turn carries a

@@ -254,9 +254,26 @@ public enum AppleFoundationModelService {
     /// summarizer. This is the ceiling: the working budget is derived per
     /// request by `compactionChunkCharBudget`, because compaction is
     /// destructive and a digest pass must never drop a turn to fit. A longer
-    /// history is split across several merge passes instead, and only a single
-    /// turn too large for any chunk is truncated (with a marker saying so).
+    /// history is split across several merge passes instead; a history longer
+    /// than `maximumCompactionChunks` passes is summarized as a bounded
+    /// excerpt (head and tail), and the transcript says how much middle
+    /// history was omitted. The old rule truncated a single oversized turn;
+    /// turns are split now, so the bound is on the number of passes.
     nonisolated public static let compactionTranscriptCharBudget = 6_000
+
+    /// The most chunks one compaction may hand the summarizer.
+    ///
+    /// Each chunk is one billed request on the cloud path and one long
+    /// on-device pass, and the number of chunks grows with the transcript, not
+    /// with the number of turns: a 1 MB paste at a 4,000-character cloud
+    /// budget was roughly 250 requests for one compaction. Eight bounds a
+    /// compaction at nine requests (seven older-history merges, the summary
+    /// pass and the recap), which is enough to fold away a long conversation at
+    /// the on-device budget. When the transcript needs more, the chunker keeps
+    /// the head and tail and puts an explicit omission note between them, so
+    /// the summary says what it never saw instead of silently losing the
+    /// middle of the history it is about to delete.
+    nonisolated public static let maximumCompactionChunks = 8
 
     /// Cap on any single serialized tool result inside a compaction transcript
     /// turn. Tool outputs can run to tens of thousands of characters; the
@@ -347,7 +364,13 @@ public enum AppleFoundationModelService {
                 + "Prioritize, in order: the user's overall goals and current task; decisions made and their reasons; file paths, directories, and code being worked on; "
                 + "commands and configurations that mattered; errors or blockers and their current status; open threads and concrete next steps. "
                 + "Drop small talk, restatements, and anything superseded by later turns. Write compact prose with short bullet lines where lists aid scanning, "
-                + "and be precise rather than vague. Do not invent facts that are not present. Reply with the updated summary only — no preamble, no questions."
+                + "and be precise rather than vague. Do not invent facts that are not present. "
+                // The chunker bounds one compaction at `maximumCompactionChunks`
+                // excerpts and puts a note where it dropped the middle. The
+                // digest is what survives, so it has to carry that fact forward
+                // rather than reading as a complete account of the history.
+                + "If the excerpt contains a compaction note that middle history was omitted, say so in the summary rather than implying you read it. "
+                + "Reply with the updated summary only — no preamble, no questions."
         )
         let cleaned = clampCompactionFocus(focus)
         if !cleaned.isEmpty {
@@ -443,13 +466,22 @@ public enum AppleFoundationModelService {
     /// Every chunk stays within `charBudget` characters; a turn too large for
     /// any chunk is SPLIT across as many chunks as it needs rather than cut
     /// short, because the compact that follows deletes the messages it never
-    /// summarized. Empty when the conversation holds nothing worth keeping.
+    /// summarized.
+    ///
+    /// `maximumChunks` bounds the passes one compaction may spend. A
+    /// transcript that needs more is returned as a bounded EXCERPT: the head
+    /// and the tail of the history, with a marker between them naming how much
+    /// middle history was omitted. That is the only honest way to bound the
+    /// spend — the messages are deleted either way, so the summary has to say
+    /// what it never saw rather than quietly pretending it covered everything.
+    /// Empty when the conversation holds nothing worth keeping.
     nonisolated public static func buildCompactionTranscriptChunks(
         from messages: [ChatMessage],
         excludingMessageIds: Set<UUID> = [],
-        charBudget: Int
+        charBudget: Int,
+        maximumChunks: Int = AppleFoundationModelService.maximumCompactionChunks
     ) -> [String] {
-        guard charBudget > 0 else { return [] }
+        guard charBudget > 0, maximumChunks > 0 else { return [] }
         var chunks: [String] = []
         var current: [String] = []
         var usedChars = 0
@@ -473,7 +505,40 @@ public enum AppleFoundationModelService {
             }
         }
         flush()
-        return chunks
+        return boundedCompactionChunks(chunks, maximumChunks: maximumChunks)
+    }
+
+    /// Keeps a head and a tail of the history when there are more chunks than
+    /// one compaction may summarize, and says what it dropped.
+    ///
+    /// The middle is what goes, not the oldest: the newest work is what the
+    /// detailed recap reconstructs, and the head is where a conversation's
+    /// goals and setup live. The note rides the first tail chunk, so it arrives
+    /// in the pass immediately after the omitted stretch — the point where the
+    /// summarizer would otherwise read two disconnected excerpts as contiguous.
+    /// The note is shorter than the 192-character pad `compactionChunkCharBudget`
+    /// already reserves for labels, so it does not push the chunk past the
+    /// window the budget was derived from. The result never exceeds
+    /// `maximumChunks`, so this cannot spend an extra request to say it spent
+    /// fewer.
+    nonisolated static func boundedCompactionChunks(
+        _ chunks: [String],
+        maximumChunks: Int
+    ) -> [String] {
+        guard maximumChunks > 0, chunks.count > maximumChunks else { return chunks }
+        // A third head, the rest tail. `min(..., maximumChunks - 1)` keeps at
+        // least one tail chunk for the note to ride, including when a caller
+        // asks for a single chunk.
+        let headCount = min(max(1, maximumChunks / 3), maximumChunks - 1)
+        let tailCount = maximumChunks - headCount
+        let omitted = chunks[headCount..<(chunks.count - tailCount)]
+        let omittedChars = omitted.reduce(0) { $0 + $1.count + 2 }
+        let note = "… [Compaction note: \(omittedChars.formatted()) characters of middle history "
+            + "were omitted here (one compaction reads at most \(maximumChunks) excerpts). Do not "
+            + "imply that omitted work was covered.] …"
+        var tail = Array(chunks.suffix(tailCount))
+        tail[0] = note + "\n\n" + tail[0]
+        return Array(chunks.prefix(headCount)) + tail
     }
 
     /// Cuts one serialized turn into consecutive, budget-sized pieces.
