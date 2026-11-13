@@ -270,7 +270,7 @@ final class ChatSessionStore: ObservableObject {
     /// conversation carrying several times its window.
     nonisolated static func normalizedForRestore(
         _ session: ChatSession,
-        schemaVersion: Int = ChatSessionStore.currentSchemaVersion
+        schemaVersion: Int
     ) -> ChatSession {
         var restored = session
         if schemaVersion < contextSizeSchemaVersion {

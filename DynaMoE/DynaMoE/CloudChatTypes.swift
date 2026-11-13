@@ -468,13 +468,23 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
         // keys exist.
         let anthropicCacheRead = Self.firstInt(container, [.cacheReadInputTokens])
         let anthropicCacheWrite = Self.firstInt(container, [.cacheCreationInputTokens])
-        let cachedTokens = Self.firstInt(container, [.promptCacheHitTokens])
-            ?? details?.cachedTokens
-            ?? inputDetails?.cachedTokens
-            ?? anthropicCacheRead
-            ?? Self.firstInt(container, [.cachedTokens])
-        let cacheWriteTokens = anthropicCacheWrite
-            ?? Self.firstInt(container, [.cacheWriteTokens])
+        let cachedCandidates = [
+            Self.firstInt(container, [.promptCacheHitTokens]),
+            details?.cachedTokens,
+            inputDetails?.cachedTokens,
+            anthropicCacheRead,
+            Self.firstInt(container, [.cachedTokens])
+        ].compactMap { $0 }
+        let cachedTokens = cachedCandidates.first(where: { $0 > 0 })
+            ?? cachedCandidates.first(where: { $0 >= 0 })
+            ?? cachedCandidates.first
+        let cacheWriteCandidates = [
+            anthropicCacheWrite,
+            Self.firstInt(container, [.cacheWriteTokens])
+        ].compactMap { $0 }
+        let cacheWriteTokens = cacheWriteCandidates.first(where: { $0 > 0 })
+            ?? cacheWriteCandidates.first(where: { $0 >= 0 })
+            ?? cacheWriteCandidates.first
         // Anthropic splits the prompt three ways: `input_tokens` is only the
         // share that was neither read from nor written to its cache, and the
         // other two columns carry the rest. Its `usage` block is recognised by
@@ -1055,6 +1065,26 @@ nonisolated struct CloudChatStreamChunk: Decodable {
 
     struct WireError: Decodable {
         let message: String?
+
+        enum CodingKeys: String, CodingKey {
+            case message, detail, error
+        }
+
+        init(message: String?) {
+            self.message = message
+        }
+
+        init(from decoder: Decoder) throws {
+            if let single = try? decoder.singleValueContainer(),
+               let text = try? single.decode(String.self) {
+                self.message = text
+                return
+            }
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.message = (try? container.decodeIfPresent(String.self, forKey: .message))
+                ?? (try? container.decodeIfPresent(String.self, forKey: .detail))
+                ?? (try? container.decodeIfPresent(String.self, forKey: .error))
+        }
     }
 
     let choices: [Choice]?
@@ -1068,14 +1098,35 @@ nonisolated struct CloudChatStreamChunk: Decodable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.choices = try container.decodeIfPresent([Choice].self, forKey: .choices)
-        self.error = try container.decodeIfPresent(WireError.self, forKey: .error)
-        // Usage is the one optional block decoded leniently. It rides the last
-        // chunks of a stream, and a provider that spells one column wrong
-        // (`"usage": "n/a"`, a nested detail that is not an object) used to
-        // throw away the DELTAS in the same chunk — the reply lost text because
-        // its token accounting was malformed. An unreadable usage block costs
-        // the app's estimate and the `(est.)` mark, nothing else.
+        self.error = Self.decodeError(from: container)
+        // Usage is also decoded leniently. It rides the last chunks of a stream,
+        // and a provider that spells one column wrong (`"usage": "n/a"`, a
+        // nested detail that is not an object) used to throw away the DELTAS in
+        // the same chunk — the reply lost text because its token accounting was
+        // malformed. An unreadable usage block costs the app's estimate and the
+        // `(est.)` mark, nothing else.
         self.usage = (try? container.decodeIfPresent(CloudUsage.self, forKey: .usage)) ?? nil
+    }
+
+    private static func decodeError(from container: KeyedDecodingContainer<CodingKeys>) -> WireError? {
+        guard container.contains(.error),
+              (try? container.decodeNil(forKey: .error)) == false else {
+            return nil
+        }
+        if let flag = try? container.decode(Bool.self, forKey: .error) {
+            return flag ? WireError(message: nil) : nil
+        }
+        if let text = try? container.decode(String.self, forKey: .error) {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : WireError(message: text)
+        }
+        if let wire = try? container.decode(WireError.self, forKey: .error) {
+            return wire
+        }
+        if let number = try? container.decode(Double.self, forKey: .error), number.isFinite {
+            return WireError(message: String(number))
+        }
+        return nil
     }
 }
 

@@ -505,7 +505,11 @@ public enum AppleFoundationModelService {
             }
         }
         flush()
-        return boundedCompactionChunks(chunks, maximumChunks: maximumChunks)
+        return boundedCompactionChunks(
+            chunks,
+            maximumChunks: maximumChunks,
+            charBudget: charBudget
+        )
     }
 
     /// Keeps a head and a tail of the history when there are more chunks than
@@ -516,14 +520,15 @@ public enum AppleFoundationModelService {
     /// goals and setup live. The note rides the first tail chunk, so it arrives
     /// in the pass immediately after the omitted stretch — the point where the
     /// summarizer would otherwise read two disconnected excerpts as contiguous.
-    /// The note is shorter than the 192-character pad `compactionChunkCharBudget`
-    /// already reserves for labels, so it does not push the chunk past the
-    /// window the budget was derived from. The result never exceeds
-    /// `maximumChunks`, so this cannot spend an extra request to say it spent
-    /// fewer.
+    /// When prepending the note would push that chunk past `charBudget`, the
+    /// oldest prefix of `tail[0]` is folded into `omittedChars` so every
+    /// returned chunk still respects the derived budget. The result never
+    /// exceeds `maximumChunks`, so this cannot spend an extra request to say it
+    /// spent fewer.
     nonisolated static func boundedCompactionChunks(
         _ chunks: [String],
-        maximumChunks: Int
+        maximumChunks: Int,
+        charBudget: Int
     ) -> [String] {
         guard maximumChunks > 0, chunks.count > maximumChunks else { return chunks }
         // A third head, the rest tail. `min(..., maximumChunks - 1)` keeps at
@@ -532,12 +537,33 @@ public enum AppleFoundationModelService {
         let headCount = min(max(1, maximumChunks / 3), maximumChunks - 1)
         let tailCount = maximumChunks - headCount
         let omitted = chunks[headCount..<(chunks.count - tailCount)]
-        let omittedChars = omitted.reduce(0) { $0 + $1.count + 2 }
-        let note = "… [Compaction note: \(omittedChars.formatted()) characters of middle history "
-            + "were omitted here (one compaction reads at most \(maximumChunks) excerpts). Do not "
-            + "imply that omitted work was covered.] …"
+        var omittedChars = omitted.reduce(0) { $0 + $1.count + 2 }
         var tail = Array(chunks.suffix(tailCount))
-        tail[0] = note + "\n\n" + tail[0]
+        let posixNumber = IntegerFormatStyle<Int>.number.locale(Locale(identifier: "en_US_POSIX"))
+        func makeNote(_ count: Int) -> String {
+            "… [Compaction note: \(count.formatted(posixNumber)) characters of middle history "
+                + "were omitted here (one compaction reads at most \(maximumChunks) excerpts). Do not "
+                + "imply that omitted work was covered.] …"
+        }
+        var note = makeNote(omittedChars)
+        if charBudget > 0, note.count + 2 + tail[0].count > charBudget {
+            if charBudget > note.count + 2 {
+                let initialRoom = charBudget - note.count - 2
+                let extraDropped = max(0, tail[0].count - initialRoom)
+                if extraDropped > 0 {
+                    omittedChars += extraDropped
+                    note = makeNote(omittedChars)
+                }
+                let room = max(0, charBudget - note.count - 2)
+                tail[0] = room > 0
+                    ? (note + "\n\n" + String(tail[0].suffix(room)))
+                    : String(note.prefix(charBudget))
+            } else {
+                tail[0] = String(note.prefix(charBudget))
+            }
+        } else {
+            tail[0] = note + "\n\n" + tail[0]
+        }
         return Array(chunks.prefix(headCount)) + tail
     }
 

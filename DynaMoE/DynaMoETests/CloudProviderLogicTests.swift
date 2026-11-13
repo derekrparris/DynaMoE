@@ -346,6 +346,25 @@ final class CloudStreamParserTests: XCTestCase {
         }
         XCTAssertEqual(parser.decodedChunkCount, 0)
     }
+
+    func testStringErrorPayloadAndFalseErrorFlagAreHandledLeniently() throws {
+        var parser = CloudStreamParser()
+        XCTAssertThrowsError(try parser.consume(
+            dataPayload: #"{"error":"rate limited"}"#
+        )) { error in
+            guard case CloudTurnFailure.invalidResponse(let message) = error else {
+                return XCTFail("expected invalidResponse, got \(error)")
+            }
+            XCTAssertTrue(message.contains("rate limited"))
+        }
+
+        // A false/empty error marker alongside deltas must not discard the reply.
+        let events = try parser.consume(
+            dataPayload: #"{"choices":[{"delta":{"content":"still alive"}}],"error":false}"#
+        )
+        XCTAssertEqual(events, [.contentDelta("still alive")])
+        XCTAssertEqual(parser.text, "still alive")
+    }
 }
 
 // MARK: - Streamed Tool Call Assembly
@@ -1216,8 +1235,9 @@ private final class CloudStubURLProtocol: URLProtocol {
     /// followed by an acceptance on the same endpoint.
     nonisolated(unsafe) static var responses: [(status: Int, body: Data)] = []
     nonisolated(unsafe) static var requestBodies: [Data] = []
-    /// The affinity header each request carried, `""` when it carried none.
+    /// The affinity headers each request carried, `""` when absent.
     nonisolated(unsafe) static var affinityHeaders: [String] = []
+    nonisolated(unsafe) static var sessionIdHeaders: [String] = []
     /// Runs while a request is in flight, before its scripted reply. A test
     /// uses it to act on shared state MID-REQUEST, which is the only way to
     /// reproduce a latch closing between a send and its response.
@@ -1242,6 +1262,7 @@ private final class CloudStubURLProtocol: URLProtocol {
             Self.requestBodies.append(data)
         }
         Self.affinityHeaders.append(request.value(forHTTPHeaderField: "x-session-affinity") ?? "")
+        Self.sessionIdHeaders.append(request.value(forHTTPHeaderField: "x-session-id") ?? "")
         let reply = Self.responses.isEmpty
             ? (status: Self.status, body: Self.body)
             : Self.responses.removeFirst()
@@ -1316,6 +1337,7 @@ final class CloudStreamTransportTests: XCTestCase {
         CloudStubURLProtocol.responses = []
         CloudStubURLProtocol.requestBodies = []
         CloudStubURLProtocol.affinityHeaders = []
+        CloudStubURLProtocol.sessionIdHeaders = []
         CloudStubURLProtocol.onRequest = nil
     }
 
@@ -1383,9 +1405,22 @@ final class CloudStreamTransportTests: XCTestCase {
             return XCTFail("the retry should succeed without the headers")
         }
         XCTAssertEqual(CloudStubURLProtocol.affinityHeaders, ["affinity-a", ""])
+        XCTAssertEqual(
+            CloudStubURLProtocol.sessionIdHeaders,
+            ["affinity-a", "affinity-a"],
+            "rejecting x-session-affinity alone must keep x-session-id on the retry"
+        )
+        XCTAssertFalse(
+            memory.acceptsAffinityHeader(.sessionAffinity, endpoint: endpoint),
+            "the accepted retry should have latched x-session-affinity off"
+        )
+        XCTAssertTrue(
+            memory.acceptsAffinityHeader(.sessionId, endpoint: endpoint),
+            "x-session-id was never rejected and must stay enabled"
+        )
         XCTAssertFalse(
             memory.acceptsAffinityHeaders(endpoint: endpoint),
-            "the accepted retry should have latched the headers off"
+            "acceptsAffinityHeaders reflects that at least one header was latched off"
         )
 
         guard case .finished? = await collect(service, sessionKey: "affinity-a").last else {
@@ -1394,8 +1429,28 @@ final class CloudStreamTransportTests: XCTestCase {
         XCTAssertEqual(
             CloudStubURLProtocol.affinityHeaders,
             ["affinity-a", "", ""],
-            "the latch is what makes the second turn's first attempt header-free"
+            "the latch is what makes the second turn's first attempt free of x-session-affinity"
         )
+        XCTAssertEqual(
+            CloudStubURLProtocol.sessionIdHeaders,
+            ["affinity-a", "affinity-a", "affinity-a"],
+            "x-session-id stays active on subsequent turns"
+        )
+
+        // Forget Refusals re-tries both headers and, if x-session-affinity is
+        // still rejected, re-latches only x-session-affinity while keeping x-session-id.
+        memory.allowCacheHints(endpoint: endpoint)
+        CloudStubURLProtocol.responses = [
+            (400, Data(#"{"error":"unexpected header x-session-affinity"}"#.utf8)),
+            (200, ok)
+        ]
+        guard case .finished? = await collect(service, sessionKey: "affinity-a").last else {
+            return XCTFail("clearing refusals should recover cleanly while preserving x-session-id")
+        }
+        XCTAssertEqual(CloudStubURLProtocol.affinityHeaders, ["affinity-a", "", "", "affinity-a", ""])
+        XCTAssertEqual(CloudStubURLProtocol.sessionIdHeaders, ["affinity-a", "affinity-a", "affinity-a", "affinity-a", "affinity-a"])
+        XCTAssertTrue(memory.acceptsAffinityHeader(.sessionId, endpoint: endpoint))
+        XCTAssertFalse(memory.acceptsAffinityHeader(.sessionAffinity, endpoint: endpoint))
     }
 
     func testAnUnrelatedRejectionDoesNotDropTheAffinityHeaders() {
@@ -2196,6 +2251,19 @@ final class CloudUsageSplitTests: XCTestCase {
         XCTAssertNil(parser.usage)
         XCTAssertEqual(parser.decodedChunkCount, 1)
     }
+
+    func testExplicitZeroTopLevelCacheColumnDoesNotHidePositiveNestedCount() throws {
+        let usage = try decode(
+            #"{"prompt_tokens":1000,"completion_tokens":20,"prompt_cache_hit_tokens":0,"prompt_tokens_details":{"cached_tokens":800},"cache_creation_input_tokens":0,"cache_write_tokens":150}"#
+        )
+        XCTAssertEqual(usage.cachedTokens, 800)
+        XCTAssertEqual(usage.cacheWriteTokens, 150)
+
+        let genuineZero = try decode(
+            #"{"prompt_tokens":1000,"completion_tokens":20,"prompt_cache_hit_tokens":0}"#
+        )
+        XCTAssertEqual(genuineZero.cachedTokens, 0)
+    }
 }
 
 // MARK: - Cache hints on the wire
@@ -2352,6 +2420,17 @@ final class CloudCacheHintRequestTests: XCTestCase {
             status: 400,
             body: "tools are unavailable for this model"
         ))
+        // Once affinity was already dropped/withheld, a 400 naming an affinity
+        // header must fail rather than trigger an extra full-prompt upload.
+        for marker in ["x-session-affinity", "x-session-id"] {
+            XCTAssertFalse(
+                OpenAICloudChatService.shouldRetryWithoutCacheKey(
+                    status: 400,
+                    body: "unsupported header \(marker)"
+                ),
+                marker
+            )
+        }
     }
 
     func testALatchedCacheKeyIsNotRetriedAndIsNotSent() throws {
@@ -3166,28 +3245,74 @@ final class CloudContextPolicyTests: XCTestCase {
             CloudContextPolicy.chunkCharacterBudget(window: Int.max / 2),
             8_000_000
         )
-        // The reply budget is proportional to the CHUNK, so the absurd-window
-        // ceiling is the chunk cap's tenth rather than a trap: the window's own
-        // quarter is computed in `Double` and compared before it is converted,
-        // which is the conversion that used to trap. Asserted as a literal: a
-        // check against the constant being clamped proves only that the clamp
-        // was written down twice.
+        // The reply budget is bounded by `maximumSummaryResponseTokens` so
+        // gateways that cap `max_tokens` at 8–32k do not answer 400 on 1M-window
+        // models, while absurd windows cannot trap the quarter-window guard.
         XCTAssertEqual(
             CloudContextPolicy.summaryResponseTokens(window: Int.max),
-            200_000
+            CloudContextPolicy.maximumSummaryResponseTokens
         )
         // The sensible range is untouched.
         XCTAssertEqual(CloudContextPolicy.chunkCharacterBudget(window: 1_048_576), 1_384_120)
     }
 
-    func testTheSummarizerBudgetScalesWithTheChunk() {
-        // A fixed 2,000-token cap is too small for a third-of-window chunk:
-        // the summary stops at its limit, is billed, and is refused. Short
-        // transcripts keep the cap they always had.
+    func testTheSummarizerBudgetScalesWithTheChunkAndRespectsTheOutputCeiling() {
         XCTAssertEqual(CloudContextPolicy.summaryResponseTokens(window: nil), 2_000)
+        XCTAssertEqual(CloudContextPolicy.summaryResponseTokens(window: 2_000), 500)
         XCTAssertEqual(CloudContextPolicy.summaryResponseTokens(window: 32_000), 2_000)
         XCTAssertEqual(CloudContextPolicy.summaryResponseTokens(window: 200_000), 6_600)
-        XCTAssertEqual(CloudContextPolicy.summaryResponseTokens(window: 1_048_576), 34_603)
+        XCTAssertEqual(
+            CloudContextPolicy.summaryResponseTokens(window: 1_000_000),
+            CloudContextPolicy.maximumSummaryResponseTokens
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.summaryResponseTokens(window: 1_048_576),
+            CloudContextPolicy.maximumSummaryResponseTokens
+        )
+    }
+
+    func testWindowOverridesTolerateThousandsSeparatorsAndPruneCleanly() {
+        let defaults = scratchDefaults()
+        let key = CloudContextPolicy.defaultsKey(for: "p")
+        defaults.set("m=1,048,576; n=128,000, o=64,000", forKey: key)
+        XCTAssertEqual(
+            CloudContextPolicy.overrides(for: "p", defaults: defaults),
+            ["m": 1_048_576, "n": 128_000, "o": 64_000]
+        )
+
+        CloudContextPolicy.removeOverride(model: "m", providerId: "p", defaults: defaults)
+        XCTAssertEqual(
+            defaults.string(forKey: key),
+            "n=128,000; o=64,000",
+            "removing a grouped-number entry must not leave orphan comma groups behind"
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.overrides(for: "p", defaults: defaults),
+            ["n": 128_000, "o": 64_000]
+        )
+    }
+
+    func testCloudCompactionChunkBudgetReservesInstructionsDigestAndReplyCap() {
+        // On a small window (< 3k), fixed occupants shrink the chunk budget or
+        // report 0 rather than returning the 4,000-character floor and failing with 400.
+        let smallBudget = CloudContextPolicy.chunkCharacterBudget(
+            window: 1_024,
+            previousSummary: nil,
+            previousRecap: nil,
+            instructions: String(repeating: "x", count: 1_100),
+            responseTokens: CloudContextPolicy.summaryResponseTokens(window: 1_024)
+        )
+        XCTAssertGreaterThan(smallBudget, 0)
+        XCTAssertLessThan(smallBudget, 2_000)
+
+        let exhausted = CloudContextPolicy.chunkCharacterBudget(
+            window: 1_024,
+            previousSummary: String(repeating: "s", count: 1_500),
+            previousRecap: String(repeating: "r", count: 1_500),
+            instructions: String(repeating: "x", count: 1_100),
+            responseTokens: CloudContextPolicy.summaryResponseTokens(window: 1_024)
+        )
+        XCTAssertEqual(exhausted, 0)
     }
 }
 
@@ -3445,7 +3570,8 @@ final class CloudCompactionFailureTests: XCTestCase {
             .nothingToEvict,
             .conversationUnavailable,
             .noCredential("ignored"),
-            .noTranscript
+            .noTranscript,
+            .digestExceedsWindow
         ] {
             XCTAssertFalse(reason.spentRequest, "\(reason) sent no request")
         }
@@ -3489,6 +3615,7 @@ final class CloudCompactionFailureTests: XCTestCase {
         for reason in [
             CloudCompactionFailure.conversationUnavailable,
             .noCredential("ignored"),
+            .digestExceedsWindow,
             .emptySummary,
             .truncatedSummary,
             .cancelled,

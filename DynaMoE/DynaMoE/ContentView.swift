@@ -2853,13 +2853,6 @@ struct ContentView: View {
             return .failed(.noCredential(missing.localizedDescription))
         }
 
-        let chunks = AppleFoundationModelService.buildCompactionTranscriptChunks(
-            from: evicted,
-            excludingMessageIds: [],
-            charBudget: CloudContextPolicy.chunkCharacterBudget(window: window)
-        )
-        guard let recentChunk = chunks.last else { return .failed(.noTranscript) }
-
         let summaryInstructions = AppleFoundationModelService.compactionSummaryInstructions(focus: focus)
         let recapInstructions = AppleFoundationModelService.compactionRecapInstructions(focus: focus)
         let sessionKey = CloudSessionKey.hashed(sessionId)
@@ -2868,6 +2861,28 @@ struct ContentView: View {
         // Built through the budget type so the cap can only come from the same
         // window this pass was priced against.
         let summarizerBudget = CloudSummarizerBudget(window: window)
+        var mergedSummary = sessions[startIdx].rollingSummary
+        var mergedRecap = sessions[startIdx].recentWorkDigest
+        let reservingInstructions = summaryInstructions.count >= recapInstructions.count
+            ? summaryInstructions
+            : recapInstructions
+        let chunkBudget = CloudContextPolicy.chunkCharacterBudget(
+            window: window,
+            previousSummary: mergedSummary,
+            previousRecap: mergedRecap,
+            instructions: reservingInstructions,
+            responseTokens: summarizerBudget.maxTokens
+        )
+        guard chunkBudget > 0 else {
+            return .failed(.digestExceedsWindow)
+        }
+
+        let chunks = AppleFoundationModelService.buildCompactionTranscriptChunks(
+            from: evicted,
+            excludingMessageIds: [],
+            charBudget: chunkBudget
+        )
+        guard let recentChunk = chunks.last else { return .failed(.noTranscript) }
         let pricing = CloudPricingStore.pricing(
             forModel: providerModelId,
             providerId: provider.id
@@ -2979,8 +2994,6 @@ struct ContentView: View {
             }
             return completion.text
         }
-        var mergedSummary = sessions[startIdx].rollingSummary
-        var mergedRecap = sessions[startIdx].recentWorkDigest
 
         do {
             let olderChunkCount = max(0, chunks.count - 1)
@@ -5437,46 +5450,58 @@ struct ContentView: View {
                     return
                 }
 
-                // The provider's own prompt count replaces the step's estimate.
-                // It is the FULL prompt (cache reads included), because the
-                // header reports the context the model was given, not the part
-                // of it that was billed at the fresh rate.
-                var stepCost: Double?
-                if let usage = reportedUsage {
-                    turnLog.noteProviderUsage(
-                        promptTokens: usage.promptTokens,
-                        cachedTokens: usage.cachedTokens,
-                        cacheWriteTokens: usage.cacheWriteTokens
-                    )
-                    if let promptTokens = usage.promptTokens {
-                        turnContextTokens = promptTokens
-                    }
-                    // Spend accumulates per step: every step is its own billed
-                    // request, and a run that never reaches its final status
-                    // line still cost what it cost. The same number feeds the
-                    // summary line below.
-                    if let cost = CloudPricingStore.pricing(
-                        forModel: providerModelId,
-                        providerId: provider.id
-                    )?.cost(for: usage) {
-                        stepCost = cost
-                        if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
-                            self.sessions[sIdx].cumulativeCost = (self.sessions[sIdx].cumulativeCost ?? 0) + cost
-                        }
-                    }
-                }
-
                 let finalElapsed = max(CFAbsoluteTimeGetCurrent() - generationStartTime, 0.001)
                 let generatedTokens = generatedTokenCount()
-                // One request's contribution, with the app's estimate standing
-                // in for each column the provider omitted (and marking the run
-                // `(est.)` when it had to).
-                runTotals.add(
-                    usage: reportedUsage,
-                    estimatedPromptTokens: stepEstimatedPrompt,
-                    estimatedOutputTokens: generatedTokens,
-                    cost: stepCost
-                )
+                // A stream cut mid-reply after sending chunks was still
+                // processed by the provider (the same physical event as a
+                // mid-stream failure), so when no complete usage arrived,
+                // charge the prompt and generated prefix from the estimate
+                // rather than leaving `cumulativeCost` unchanged.
+                if endedWithoutTerminal, reportedUsage?.completionTokens == nil {
+                    if let promptTokens = reportedUsage?.promptTokens {
+                        turnContextTokens = promptTokens
+                    }
+                    chargeUnreturnedStep()
+                } else {
+                    // The provider's own prompt count replaces the step's estimate.
+                    // It is the FULL prompt (cache reads included), because the
+                    // header reports the context the model was given, not the part
+                    // of it that was billed at the fresh rate.
+                    var stepCost: Double?
+                    if let usage = reportedUsage {
+                        turnLog.noteProviderUsage(
+                            promptTokens: usage.promptTokens,
+                            cachedTokens: usage.cachedTokens,
+                            cacheWriteTokens: usage.cacheWriteTokens
+                        )
+                        if let promptTokens = usage.promptTokens {
+                            turnContextTokens = promptTokens
+                        }
+                        // Spend accumulates per step: every step is its own billed
+                        // request, and a run that never reaches its final status
+                        // line still cost what it cost. The same number feeds the
+                        // summary line below.
+                        if let cost = CloudPricingStore.pricing(
+                            forModel: providerModelId,
+                            providerId: provider.id
+                        )?.cost(for: usage) {
+                            stepCost = cost
+                            if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
+                                self.sessions[sIdx].cumulativeCost = (self.sessions[sIdx].cumulativeCost ?? 0) + cost
+                            }
+                        }
+                    }
+
+                    // One request's contribution, with the app's estimate standing
+                    // in for each column the provider omitted (and marking the run
+                    // `(est.)` when it had to).
+                    runTotals.add(
+                        usage: reportedUsage,
+                        estimatedPromptTokens: stepEstimatedPrompt,
+                        estimatedOutputTokens: generatedTokens,
+                        cost: stepCost
+                    )
+                }
                 let finalTokPerSec = Double(generatedTokens) / finalElapsed
 
                 if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),

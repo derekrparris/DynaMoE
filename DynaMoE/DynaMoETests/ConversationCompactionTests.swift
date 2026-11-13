@@ -308,6 +308,10 @@ final class ConversationCompactionTests: XCTestCase {
             chunks.contains { $0.contains("characters of middle history were omitted") },
             "a bounded excerpt must state what it omitted"
         )
+        XCTAssertTrue(
+            chunks.allSatisfy { $0.count <= 1_000 },
+            "adding the omission note must not exceed the derived chunk budget"
+        )
     }
 
     func testABoundedCompactionKeepsItsNewestChunkForTheRecap() {
@@ -326,6 +330,7 @@ final class ConversationCompactionTests: XCTestCase {
         XCTAssertTrue(chunks[0].contains("turn 0:"), "the head keeps the beginning of the conversation")
         XCTAssertTrue(chunks.last?.contains("turn 19:") == true, "the newest turn must land in the recap chunk")
         XCTAssertTrue(chunks.contains { $0.contains("middle history were omitted") })
+        XCTAssertTrue(chunks.allSatisfy { $0.count <= 600 })
     }
 
     func testACompactionTurnThatAlreadyFitsIsOneSlice() {
@@ -665,7 +670,8 @@ final class ConversationCompactionTests: XCTestCase {
         ))
         let data = try JSONEncoder().encode(session)
         let restored = ChatSessionStore.normalizedForRestore(
-            try JSONDecoder().decode(ChatSession.self, from: data)
+            try JSONDecoder().decode(ChatSession.self, from: data),
+            schemaVersion: ChatSessionStore.currentSchemaVersion
         )
         XCTAssertEqual(restored.messages.count, 2)
         XCTAssertEqual(restored.messages[0].isCompactionSummary, true)
@@ -696,7 +702,10 @@ final class ConversationCompactionTests: XCTestCase {
         // Round-trip through persistence the way the store does, then normalize.
         let data = try JSONEncoder().encode(session)
         let decoded = try JSONDecoder().decode(ChatSession.self, from: data)
-        let restored = ChatSessionStore.normalizedForRestore(decoded)
+        let restored = ChatSessionStore.normalizedForRestore(
+            decoded,
+            schemaVersion: ChatSessionStore.currentSchemaVersion
+        )
         // The transient progress bubble is gone; the real turns survive.
         XCTAssertEqual(restored.messages.count, 2)
         XCTAssertFalse(restored.messages.contains { $0.isTransient == true })

@@ -400,18 +400,17 @@ public nonisolated enum CloudContextPolicy {
     }
 
     /// One provider's per-model windows, parsed from `model=window` entries
-    /// separated by `;`, `,` or newline. Tolerates `model@window` and bare
-    /// integers, because those are the two spellings a person types.
+    /// separated by `;`, `,` or newline. Tolerates `model@window`, grouped
+    /// integers (`1,048,576`), and bare integers.
     public static func overrides(
         for providerId: String,
         defaults: UserDefaults = .standard
     ) -> [String: Int] {
         let raw = defaults.string(forKey: defaultsKey(for: providerId)) ?? ""
         var result: [String: Int] = [:]
-        for chunk in raw.split(whereSeparator: { $0 == ";" || $0 == "," || $0 == "\n" }) {
-            let entry = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !entry.isEmpty, let parts = splitEntry(entry) else { continue }
-            let window = Int(parts.value) ?? 0
+        for entry in splitOverrideEntries(raw) {
+            guard let parts = splitEntry(entry) else { continue }
+            let window = parseWindowValue(parts.value) ?? 0
             guard window >= minimumPlausibleWindow else { continue }
             result[parts.model] = window
         }
@@ -451,9 +450,7 @@ public nonisolated enum CloudContextPolicy {
         guard let raw = defaults.string(forKey: key) else { return }
         var kept: [String] = []
         var removed = false
-        for chunk in raw.split(whereSeparator: { $0 == ";" || $0 == "," || $0 == "\n" }) {
-            let entry = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !entry.isEmpty else { continue }
+        for entry in splitOverrideEntries(raw) {
             if let parts = splitEntry(entry), parts.model == model {
                 removed = true
                 continue
@@ -466,6 +463,60 @@ public nonisolated enum CloudContextPolicy {
         } else {
             defaults.set(kept.joined(separator: "; "), forKey: key)
         }
+    }
+
+    /// Splits `;`, `,`, or newline-separated entries without tearing apart a
+    /// comma-grouped integer such as `m=1,048,576`.
+    private static func splitOverrideEntries(_ raw: String) -> [String] {
+        var entries: [String] = []
+        for lineOrSemicolon in raw.split(whereSeparator: { $0 == ";" || $0 == "\n" }) {
+            var current: String?
+            for piece in lineOrSemicolon.split(separator: ",", omittingEmptySubsequences: false) {
+                let trimmed = piece.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let existing = current,
+                   trimmed.count == 3,
+                   trimmed.allSatisfy({ $0 >= "0" && $0 <= "9" }),
+                   let lastChar = existing.last,
+                   lastChar >= "0" && lastChar <= "9" {
+                    current = existing + "," + trimmed
+                } else {
+                    if let existing = current, !existing.isEmpty {
+                        entries.append(existing)
+                    }
+                    current = trimmed
+                }
+            }
+            if let existing = current, !existing.isEmpty {
+                entries.append(existing)
+            }
+        }
+        return entries
+    }
+
+    /// Parses a positive integer window, tolerating ASCII thousands separators
+    /// (`1,048,576` or `1_048_576`).
+    private static func parseWindowValue(_ raw: String) -> Int? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let direct = Int(trimmed) {
+            return direct
+        }
+        if trimmed.contains(",") {
+            let groups = trimmed.split(separator: ",", omittingEmptySubsequences: false)
+            if groups.count >= 2,
+               let first = groups.first,
+               (1...3).contains(first.count),
+               first.allSatisfy({ $0 >= "0" && $0 <= "9" }),
+               groups.dropFirst().allSatisfy({ $0.count == 3 && $0.allSatisfy({ $0 >= "0" && $0 <= "9" }) }) {
+                return Int(groups.joined())
+            }
+        }
+        if trimmed.contains("_") {
+            let stripped = trimmed.replacingOccurrences(of: "_", with: "")
+            if !stripped.isEmpty, stripped.allSatisfy({ $0 >= "0" && $0 <= "9" }) {
+                return Int(stripped)
+            }
+        }
+        return nil
     }
 
     /// Splits one `model=window` (or `model@window`) entry at its LAST
@@ -488,7 +539,7 @@ public nonisolated enum CloudContextPolicy {
     }
 
     /// The window this model is believed to have, or nil when nobody recorded
-    /// one. The per-model value wins over the provider-wide fallback.
+    /// one. The per-model value wins over the global fallback.
     ///
     /// The fallback is a SINGLE global key, so it answers for every provider.
     /// A default recorded for one provider's large-window model therefore also
@@ -526,8 +577,16 @@ public nonisolated enum CloudContextPolicy {
         if let recorded, recorded >= minimumPlausibleWindow {
             return recorded
         }
-        let fallback = defaults.integer(forKey: globalWindowKey)
-        return fallback >= minimumPlausibleWindow ? fallback : nil
+        let intFallback = defaults.integer(forKey: globalWindowKey)
+        if intFallback >= minimumPlausibleWindow {
+            return intFallback
+        }
+        if let raw = defaults.string(forKey: globalWindowKey),
+           let parsed = parseWindowValue(raw),
+           parsed >= minimumPlausibleWindow {
+            return parsed
+        }
+        return nil
     }
 
     /// Whether a send of `promptTokens` should compact first.
@@ -629,29 +688,49 @@ public nonisolated enum CloudContextPolicy {
         return max(4_000, Int(min(scaled, ceiling)))
     }
 
+    /// Derives the chunk character budget for one cloud compaction pass after
+    /// reserving the fixed occupants of that request's window: the prior
+    /// standing summary, the prior recap, the pass instructions (including any
+    /// `/compact` focus), the output budget, and prompt framing.
+    ///
+    /// Returns `0` when those fixed occupants already fill the window so the
+    /// caller refuses before sending a guaranteed 400.
+    public static func chunkCharacterBudget(
+        window: Int?,
+        previousSummary: String?,
+        previousRecap: String?,
+        instructions: String,
+        responseTokens: Int
+    ) -> Int {
+        let base = chunkCharacterBudget(window: window)
+        guard let window, window >= minimumPlausibleWindow else { return base }
+        let summaryChars = (previousSummary ?? "").trimmingCharacters(in: .whitespacesAndNewlines).count
+        let recapChars = (previousRecap ?? "").trimmingCharacters(in: .whitespacesAndNewlines).count
+        let reserved = Double(max(0, responseTokens)) * 4.0
+            + Double(summaryChars)
+            + Double(recapChars)
+            + Double(instructions.count)
+            + 256.0
+        let remaining = (Double(window) * 4.0 - reserved).rounded(.down)
+        guard remaining.isFinite, remaining > 0 else { return 0 }
+        let cappedRemaining = remaining < Double(Int.max) ? Int(remaining) : Int.max
+        return min(base, cappedRemaining)
+    }
+
+    /// Output ceiling for a single summarizer pass. Most gateways cap
+    /// `max_tokens` at 8–32k and answer 400 above it; the cap's job is avoiding
+    /// summary truncation without triggering an impossible-length refusal on
+    /// 1M-window models.
+    public static let maximumSummaryResponseTokens = 8_000
+
     /// Tokens one summarizer pass may write.
     ///
-    /// A fixed cap is wrong at both ends. The chunk budget scales to a third of
-    /// the window (about 66k tokens for a 200k model, roughly 264k characters),
-    /// and a 2,000-token summary of that is not necessarily complete: when it
-    /// stops at the limit the pass is billed, refused for fear of deleting
-    /// messages it never covered, and the compact that needed it has to try
-    /// again against its rewrite budget. Ten percent of the chunk's estimated
-    /// tokens, floored at 2,000 so a short transcript keeps the detailed
-    /// summary it always had.
-    ///
-    /// The ceiling is the WINDOW's, not a constant. It used to be 8,000, which
-    /// sat above the proportion for every window up to about 250k and below it
-    /// past that: at the README's 1M-token example the chunk is ~345k tokens, so
-    /// an 8,000-token cap asks for a 43:1 compression the model cannot finish,
-    /// and the one pass that could have compacted the conversation comes back
-    /// truncated, billed, and refused. A pass may write at most a quarter of the
-    /// window: the chunk it is given is a third, and the instructions and the
-    /// rolling digest take a little more, so a quarter still leaves room for
-    /// what is already there.
+    /// Scales from 2,000 up to `maximumSummaryResponseTokens` (10% of the
+    /// chunk's estimated tokens, bounded by a quarter of the window for small
+    /// models and by the output ceiling for large ones).
     public static func summaryResponseTokens(window: Int?) -> Int {
         let chunkTokens = chunkCharacterBudget(window: window) / 4
-        let proportion = max(2_000, chunkTokens / 10)
+        let proportion = min(maximumSummaryResponseTokens, max(2_000, chunkTokens / 10))
         guard let window, window >= minimumPlausibleWindow else { return proportion }
         // The window is hand-typed, so the conversion is guarded the way
         // `usagePercent`'s is: a value at or above `Int.max` is a units mistake,
@@ -814,6 +893,9 @@ public nonisolated enum CloudCompactionFailure: Equatable, Error, Sendable {
     case noCredential(String)
     /// The evicted messages carry no content the transcript builder renders.
     case noTranscript
+    /// Existing digests, instructions, and reply budget already fill this model's
+    /// context window, leaving no room for any transcript chunk.
+    case digestExceedsWindow
     /// A pass came back with no text at all.
     case emptySummary
     /// A pass did not report a clean stop, so its text never proved it covered
@@ -836,7 +918,7 @@ public nonisolated enum CloudCompactionFailure: Equatable, Error, Sendable {
     public var spentRequest: Bool {
         switch self {
         case .conversationTooShort, .nothingToEvict, .conversationUnavailable,
-             .noCredential, .noTranscript:
+             .noCredential, .noTranscript, .digestExceedsWindow:
             return false
         case .emptySummary, .truncatedSummary, .cancelled:
             return true
@@ -867,7 +949,7 @@ public nonisolated enum CloudCompactionFailure: Equatable, Error, Sendable {
         switch self {
         case .conversationTooShort, .nothingToEvict, .noTranscript:
             return true
-        case .conversationUnavailable, .noCredential,
+        case .conversationUnavailable, .noCredential, .digestExceedsWindow,
              .emptySummary, .truncatedSummary, .cancelled, .provider:
             return false
         }
@@ -887,6 +969,8 @@ public nonisolated enum CloudCompactionFailure: Equatable, Error, Sendable {
             return "⚠️ \(description)"
         case .noTranscript:
             return "ℹ️ Nothing to compact — no user or assistant content to summarize yet."
+        case .digestExceedsWindow:
+            return "⚠️ Cannot compact — the existing summary, instructions, and reply budget already fill this model's context window."
         case .emptySummary:
             return "⚠️ \(providerName) returned an empty summary — the conversation was left unchanged."
         case .truncatedSummary:
@@ -912,6 +996,8 @@ public nonisolated enum CloudCompactionFailure: Equatable, Error, Sendable {
             return "the summarizer's API key could not be used"
         case .noTranscript:
             return "no user or assistant content could be summarized"
+        case .digestExceedsWindow:
+            return "the existing summary, instructions, and reply budget already fill this model's context window"
         case .emptySummary:
             return "\(providerName) returned an empty summary"
         case .truncatedSummary:

@@ -606,7 +606,7 @@ public nonisolated struct CloudModelSpec: Equatable, Sendable {
     /// What this model's context window is believed to be, or nil when nobody
     /// recorded one for THIS model. A registration fact, not provider truth:
     /// the catalog publishes no window, and a wrong guess would compact at the
-    /// wrong time. Nil falls back to the provider-wide
+    /// wrong time. Nil falls back to the global
     /// `dynamoe_cloud_context_window_tokens` default; only when that is unset
     /// too is auto-compaction off for the model.
     public let contextWindowTokens: Int?

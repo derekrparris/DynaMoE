@@ -156,7 +156,7 @@ struct CloudProvidersSettingsView: View {
 
             SettingsRow(
                 title: "Context Window",
-                subtitle: "Compacting before a request would overflow needs the model's window. Record it per model with: defaults write DRP.DynaMoE dynamoe_cloud_<provider>_context -string \"<model>=128000\" (entries separated by \"; \"). Without one the turn skips that pre-flight check and compacts only after the provider refuses the request, and the header shows the plain token total.",
+                subtitle: "Compacting before a request would overflow needs the model's window. Record it per model with: defaults write DRP.DynaMoE dynamoe_cloud_<provider>_context -string \"<model>=128000\" (entries separated by \"; \"), or set a global fallback with dynamoe_cloud_context_window_tokens. Without either, the turn skips that pre-flight check and compacts only after the provider refuses the request, and the header shows the plain token total.",
                 icon: "ruler.fill",
                 iconTint: .cyan
             ) { EmptyView() }
