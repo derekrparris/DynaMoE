@@ -1497,6 +1497,15 @@ struct ContentView: View {
                     },
                     onDeleteSession: { id in
                         PrefixCacheManager.shared.invalidate(sessionId: id)
+                        // A manual compaction is a task, not a per-session view
+                        // flag: deleting the conversation removed the session
+                        // but left the task summarizing (and billing) it. The
+                        // liveness guard in `compactCloudHistory` stops the
+                        // next pass; cancelling here stops the one in flight.
+                        if let run = manualCompactions[id] {
+                            run.task?.cancel()
+                            manualCompactions.removeValue(forKey: id)
+                        }
                         sessions.removeAll(where: { $0.id == id })
                         // The conversation JSON is cleaned by the next save pass's
                         // orphan sweep, but its asset directory is a separate tree.
@@ -2713,12 +2722,16 @@ struct ContentView: View {
             } catch is CancellationError {
                 // Stop is an outcome the user asked for, not a fault: nothing
                 // was rewritten, so say the conversation is untouched instead
-                // of reporting a compaction failure.
-                self.showStatus(
-                    "⏹ Compaction stopped — the conversation was left unchanged.",
-                    sessionId: sessionId
-                )
-                postToProgress("⏹ Compaction stopped — the conversation was left unchanged.")
+                // of reporting a compaction failure. Recorded as a real row
+                // because the progress bubble is transient and the status pill
+                // is gone after relaunch; a compaction that visibly stopped
+                // then left no trace at all.
+                let notice = "⏹ Compaction stopped — the conversation was left unchanged."
+                self.showStatus(notice, sessionId: sessionId)
+                if let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
+                    self.sessions[liveIdx].messages.removeAll { $0.id == progressId }
+                    self.sessions[liveIdx].messages.append(ChatMessage(role: .system, content: notice))
+                }
             } catch {
                 // Scoped to the conversation it happened in: the pill says
                 // "the conversation", and an unscoped notice drew it over
@@ -2852,7 +2865,9 @@ struct ContentView: View {
         let sessionKey = CloudSessionKey.hashed(sessionId)
         // Scales with the chunk: a fixed cap is too small for a third-of-window
         // chunk, and a summary cut off at the limit is billed and then refused.
-        let responseTokens = CloudContextPolicy.summaryResponseTokens(window: window)
+        // Built through the budget type so the cap can only come from the same
+        // window this pass was priced against.
+        let summarizerBudget = CloudSummarizerBudget(window: window)
         let pricing = CloudPricingStore.pricing(
             forModel: providerModelId,
             providerId: provider.id
@@ -2906,6 +2921,16 @@ struct ContentView: View {
                 estimated: true
             )
         }
+        // A compaction pass runs for minutes, and deleting the conversation
+        // while one is in flight is not a Stop: nothing cancels the task. Left
+        // unchecked, the remaining passes ran, were billed, and could not be
+        // recorded because `finish` has no live session to charge. Checked
+        // beside every cancellation point, because each one precedes a request.
+        func requireLiveConversation() throws {
+            guard sessions.contains(where: { $0.id == sessionId }) else {
+                throw CloudCompactionFailure.conversationUnavailable
+            }
+        }
         // One summarizer pass that may replace messages. A summary cut off at
         // the output limit is refused rather than committed: the messages it
         // was going to replace are deleted permanently, and the text that
@@ -2916,6 +2941,10 @@ struct ContentView: View {
             // Nothing has been sent at this point, so throwing here is also the
             // reason nothing is charged for it.
             try Task.checkCancellation()
+            // A cancelled task is a Stop; a DELETED conversation is not, and
+            // without this check its remaining passes kept running and being
+            // billed against a session that no longer exists to record them.
+            try requireLiveConversation()
             let estimatedPromptTokens = CloudMessageAssembler.approximatePromptTokens(
                 system: system,
                 messages: [CloudChatMessage(role: "user", content: prompt)]
@@ -2926,7 +2955,7 @@ struct ContentView: View {
                     model: providerModelId,
                     systemPrompt: system,
                     userPrompt: prompt,
-                    maxTokens: responseTokens,
+                    budget: summarizerBudget,
                     sessionKey: sessionKey
                 )
             } catch {
@@ -2986,6 +3015,9 @@ struct ContentView: View {
             // Same rule as `summarize`: a Stop before the request is sent costs
             // nothing, and this pass is not owed a request of its own.
             try Task.checkCancellation()
+            // The conversation can also be DELETED while a pass runs, and a
+            // deleted chat has nobody to bill: stop before the next request.
+            try requireLiveConversation()
             let recapEstimatedPromptTokens = CloudMessageAssembler.approximatePromptTokens(
                 system: recapInstructions,
                 messages: [CloudChatMessage(role: "user", content: recapPrompt)]
@@ -2996,7 +3028,7 @@ struct ContentView: View {
                     model: providerModelId,
                     systemPrompt: recapInstructions,
                     userPrompt: recapPrompt,
-                    maxTokens: responseTokens,
+                    budget: summarizerBudget,
                     sessionKey: sessionKey
                 )
             } catch {
@@ -3062,10 +3094,7 @@ struct ContentView: View {
             // Whether this pass was billed travels with the outcome: the chat
             // surface says "the pass was billed" only when a request the
             // provider processed failed, not when it refused one.
-            return finish(.provider(
-                error.localizedDescription,
-                spent: CloudTurnFailure.spentRequest(for: error)
-            ))
+            return finish(CloudCompactionFailure.fromProviderError(error))
         }
     }
 
@@ -3191,17 +3220,33 @@ struct ContentView: View {
                 )
             } else if outcome.failure == .cancelled {
                 // Stop is an outcome the user asked for, not a fault, and the
-                // history it interrupted was never touched.
-                self.showStatus(
-                    "⏹ Compaction stopped — the conversation was left unchanged.",
-                    sessionId: sessionId
-                )
+                // history it interrupted was never touched. Any pass that did
+                // run was still billed, so its cost is printed here rather
+                // than disappearing with the cancelled outcome.
+                let spend = outcome.cost > 0
+                    ? " Summarizing cost \(CloudPricingStore.formatted(outcome.cost))."
+                    : ""
+                let notice = "⏹ Compaction stopped — the conversation was left unchanged." + spend
+                self.showStatus(notice, sessionId: sessionId)
+                if let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
+                    self.sessions[liveIdx].messages.append(ChatMessage(role: .system, content: notice))
+                }
             } else {
                 // Every refusal names its own cause: a missing key, a chat with
                 // nothing evictable and an empty summary are not the provider
                 // failing to summarize, and each has a different next step.
-                let notice = outcome.failure?.notice(providerName: provider.displayName)
+                var notice = outcome.failure?.notice(providerName: provider.displayName)
                     ?? "⚠️ Cloud compaction failed — the conversation was left unchanged."
+                // The automatic path says when a failed pass was billed; the
+                // manual one said nothing, so a paid summary that left the
+                // history alone looked identical to a refusal that never sent
+                // a request. The cost is only known when a price is recorded,
+                // but the FACT is known either way.
+                if outcome.failure?.spentRequest == true {
+                    notice += outcome.cost > 0
+                        ? " The pass was billed \(CloudPricingStore.formatted(outcome.cost))."
+                        : " The pass was billed."
+                }
                 if let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
                     self.sessions[liveIdx].messages.append(ChatMessage(
                         role: .system,
@@ -5168,10 +5213,15 @@ struct ContentView: View {
                     // The status line is overwritten by the next streamed partial,
                     // so record the downgrade in the transcript too. Otherwise the
                     // model silently stops accepting images with no later clue why.
-                    self.sessions[sIdx].messages.append(ChatMessage(
-                        role: .system,
-                        content: "⚠️ \(provider.displayName) rejected an image for \(CloudModelRegistry.defaultDisplayName(provider: provider, providerModelId: providerModelId)). The model is now marked text-only; re-enable it under Settings → Cloud Providers if that was wrong. Retrying this turn without the image."
-                    ))
+                    // Re-resolved by identity: the stream above suspended for the
+                    // whole answer, and a chat inserted or deleted meanwhile
+                    // leaves `sIdx` addressing a different conversation.
+                    if let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
+                        self.sessions[liveIdx].messages.append(ChatMessage(
+                            role: .system,
+                            content: "⚠️ \(provider.displayName) rejected an image for \(CloudModelRegistry.defaultDisplayName(provider: provider, providerModelId: providerModelId)). The model is now marked text-only; re-enable it under Settings → Cloud Providers if that was wrong. Retrying this turn without the image."
+                        ))
+                    }
                     turnLog.recordChatTurn(
                         status: 400,
                         errorMessage: "Image content rejected by the provider; retrying without images.",

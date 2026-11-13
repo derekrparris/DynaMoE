@@ -398,13 +398,10 @@ public nonisolated enum CloudContextPolicy {
         var result: [String: Int] = [:]
         for chunk in raw.split(whereSeparator: { $0 == ";" || $0 == "," || $0 == "\n" }) {
             let entry = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !entry.isEmpty else { continue }
-            let parts = entry.split(maxSplits: 1, whereSeparator: { $0 == "=" || $0 == "@" })
-            guard parts.count == 2 else { continue }
-            let model = parts[0].trimmingCharacters(in: .whitespacesAndNewlines)
-            let window = Int(parts[1].trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
-            guard !model.isEmpty, window >= minimumPlausibleWindow else { continue }
-            result[model] = window
+            guard !entry.isEmpty, let parts = splitEntry(entry) else { continue }
+            let window = Int(parts.value) ?? 0
+            guard window >= minimumPlausibleWindow else { continue }
+            result[parts.model] = window
         }
         return result
     }
@@ -445,9 +442,7 @@ public nonisolated enum CloudContextPolicy {
         for chunk in raw.split(whereSeparator: { $0 == ";" || $0 == "," || $0 == "\n" }) {
             let entry = chunk.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !entry.isEmpty else { continue }
-            let parts = entry.split(maxSplits: 1, whereSeparator: { $0 == "=" || $0 == "@" })
-            if parts.count == 2,
-               parts[0].trimmingCharacters(in: .whitespacesAndNewlines) == model {
+            if let parts = splitEntry(entry), parts.model == model {
                 removed = true
                 continue
             }
@@ -459,6 +454,25 @@ public nonisolated enum CloudContextPolicy {
         } else {
             defaults.set(kept.joined(separator: "; "), forKey: key)
         }
+    }
+
+    /// Splits one `model=window` (or `model@window`) entry at its LAST
+    /// separator.
+    ///
+    /// Splitting at the first one made a revision-pinned id unreadable and
+    /// un-removable: `model@rev=8192` parted at the `@`, so the model became
+    /// `model`, the window became `rev=8192` (which is not a number, so the
+    /// entry was dropped), and unregistering `model@rev` could never match it.
+    /// The window is the trailing value, so the last separator is the boundary.
+    private static func splitEntry(_ entry: String) -> (model: String, value: String)? {
+        guard let separator = entry.lastIndex(where: { $0 == "=" || $0 == "@" }) else {
+            return nil
+        }
+        let model = entry[..<separator].trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = entry[entry.index(after: separator)...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !model.isEmpty, !value.isEmpty else { return nil }
+        return (model, value)
     }
 
     /// The window this model is believed to have, or nil when nobody recorded
@@ -518,7 +532,7 @@ public nonisolated enum CloudContextPolicy {
     public static func shouldCompact(
         promptTokens: Int,
         window: Int?,
-        reservedTokens: Int = 0
+        reservedTokens: Int
     ) -> Bool {
         guard let window, window >= minimumPlausibleWindow else { return false }
         let prompt = Double(max(0, promptTokens))
@@ -595,6 +609,22 @@ public nonisolated enum CloudContextPolicy {
         let room = Double(window) * 0.25
         guard room.isFinite, room < Double(Int.max) else { return proportion }
         return min(proportion, Int(room))
+    }
+}
+
+/// The output budget one summarizer request may carry.
+///
+/// A raw `Int` at the call site is indistinguishable from a constant, and the
+/// cap has to scale with the model's window or a long conversation's summary
+/// stops at the limit and is refused after being billed. This type exists so
+/// the only way to build a summarizer request's budget is from the window the
+/// compaction was priced against (`CloudContextPolicy.summaryResponseTokens`),
+/// and a caller cannot silently pass a fixed number instead.
+public nonisolated struct CloudSummarizerBudget: Equatable, Sendable {
+    public let maxTokens: Int
+
+    public init(window: Int?) {
+        self.maxTokens = CloudContextPolicy.summaryResponseTokens(window: window)
     }
 }
 
@@ -763,6 +793,18 @@ public nonisolated enum CloudCompactionFailure: Equatable, Error, Sendable {
         case .provider(_, let spent):
             return spent
         }
+    }
+
+    /// The same rule applied to an arbitrary error the summarizer path caught,
+    /// so the outcome the chat surface prints and the spend it records cannot
+    /// disagree about whether the pass was billed.
+    ///
+    /// This lives here rather than inline in the catch because the mapping is
+    /// the rule: a `.provider(..., spent: false)` built by hand in a test
+    /// proves only that the enum stores its own flag. Classifying a real 4xx
+    /// through this function is what proves the 4xx-to-unbilled rule.
+    public static func fromProviderError(_ error: Error) -> CloudCompactionFailure {
+        .provider(error.localizedDescription, spent: CloudTurnFailure.spentRequest(for: error))
     }
 
     /// Whether the same pre-flight attempt is worth making again on the next
@@ -1010,15 +1052,32 @@ public nonisolated struct CloudRunTotals: Equatable, Sendable {
         estimated: Bool
     ) {
         let prompt = max(0, promptTokens)
-        self.promptTokens += prompt
+        self.promptTokens = Self.clampedSum(self.promptTokens, prompt)
         // The cached share is part of the prompt, so it is clamped to it here
         // too: a total that summed an over-reported column would print a cache
-        // figure larger than the input it belongs to.
-        self.cachedTokens += min(max(0, cachedTokens), prompt)
-        self.outputTokens += max(0, outputTokens)
+        // figure larger than the input it belongs to, and an `Int.max` column
+        // would trap the display's subtraction.
+        self.cachedTokens = Self.clampedSum(
+            self.cachedTokens,
+            min(max(0, cachedTokens), prompt)
+        )
+        self.outputTokens = Self.clampedSum(self.outputTokens, max(0, outputTokens))
         if estimated { wasEstimated = true }
         guard let cost, cost.isFinite, cost > 0 else { return }
-        self.cost = (self.cost ?? 0) + cost
+        // A run total is sums of sums; a gateway reporting absurd columns must
+        // saturate rather than trap the status line.
+        let total = (self.cost ?? 0) + cost
+        self.cost = total.isFinite ? total : Double.greatestFiniteMagnitude
+    }
+
+    /// Adds two token counts, saturating at `Int.max`.
+    ///
+    /// Every column here comes from a provider's usage block, and nothing
+    /// validates an integer beyond its sign. `a += b` traps on overflow, so a
+    /// hostile or broken gateway could crash the run's summary line.
+    private static func clampedSum(_ left: Int, _ right: Int) -> Int {
+        let (sum, overflow) = left.addingReportingOverflow(right)
+        return overflow ? Int.max : sum
     }
 
     /// Adds one request from its provider usage block, with the app's estimates

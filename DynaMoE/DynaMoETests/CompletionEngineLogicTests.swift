@@ -146,8 +146,20 @@ final class CompletionEngineLogicTests: XCTestCase {
     }
 
     func testTheOdometerAddsGeneratedTokensOnTopOfThePrompt() {
-        let seeded = ChatSession.contextTokenBase(promptTokenCount: 1200)
-        XCTAssertEqual(seeded + 300, 1500)
+        // The composition a turn actually uses: seed from the prompt, then add
+        // what streamed. Asserted through `CloudContextOdometer.total`, not
+        // through `contextTokenBase`'s identity, which would only prove its own
+        // arithmetic.
+        var session = ChatSession(title: "seeded")
+        session.seedContextTotal(promptTokenCount: 1_200)
+        XCTAssertEqual(session.cumulativeTokenCount, 1_200)
+        XCTAssertEqual(
+            CloudContextOdometer.total(promptTokens: session.cumulativeTokenCount ?? 0, generatedTokens: 300),
+            1_500
+        )
+        // A provider column near Int.max saturates rather than trapping the
+        // header.
+        XCTAssertEqual(CloudContextOdometer.total(promptTokens: Int.max, generatedTokens: 1), Int.max)
     }
 
     // MARK: - Sampler penalties (frequency_penalty / logit_bias)

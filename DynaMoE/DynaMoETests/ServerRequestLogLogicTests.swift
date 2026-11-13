@@ -211,6 +211,31 @@ final class ServerRequestLogLogicTests: XCTestCase {
         XCTAssertEqual(unchanged.cacheWriteInputTokens, 4_000)
     }
 
+    func testTheCacheColumnsAreClampedToThePromptTheyBelongTo() {
+        // A gateway can report more cached than prompt tokens (some count a
+        // cache write in both). The dashboard subtracts the columns from the
+        // prompt, and an `Int.max` cached count traps that subtraction — the
+        // row is persisted, so it used to crash again on every reopening.
+        var row = ServerRequestLog()
+        row.method = "POST"
+        row.path = "/v1/chat/completions"
+        row.inputTokens = 1_000
+        let box = ServerRequestLogBox(builder: row)
+        box.noteProviderUsage(
+            promptTokens: 1_000,
+            cachedTokens: Int.max,
+            cacheWriteTokens: Int.max
+        )
+        let noted = box.snapshot()
+        XCTAssertEqual(noted.cachedInputTokens, 1_000)
+        XCTAssertEqual(noted.cacheWriteInputTokens, 0, "the write cannot exceed what the read left")
+        // A negative column is a units mistake, not a credit.
+        box.noteProviderUsage(promptTokens: nil, cachedTokens: -5, cacheWriteTokens: -1)
+        let clamped = box.snapshot()
+        XCTAssertEqual(clamped.cachedInputTokens, 0)
+        XCTAssertEqual(clamped.cacheWriteInputTokens, 0)
+    }
+
     func testAClientRetentionRefusalWithholdsCaptureAndTheCacheColumnsAreMetadata() {
         // `store: false` withholds bodies, never metadata: the cache columns
         // are counted tokens the row exists to report.

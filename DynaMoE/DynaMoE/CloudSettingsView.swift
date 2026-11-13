@@ -233,14 +233,29 @@ struct CloudProvidersSettingsView: View {
 
             SettingsRow(
                 title: "Prompt Caching",
-                subtitle: "Requests carry a stable session-affinity header (unless this provider's setting is Off) so a router can keep this conversation on one replica. The setting beside this row can add OpenAI's prompt_cache_key where the endpoint accepts it; a provider that rejects the field is retried once without it and remembered for the rest of the process. Cache reads are reported in the Request Log beside the input total.",
+                subtitle: "Requests carry a stable session-affinity header (unless this provider's setting is Off) so a router can keep this conversation on one replica. The setting beside this row can add OpenAI's prompt_cache_key where the endpoint accepts it; a provider that rejects the field is retried once without it and remembered for the rest of the process only when its refusal NAMES the field (a vague or transient 400 never latches it off). Cache reads are reported in the Request Log beside the input total.",
                 icon: "internaldrive.fill",
                 iconTint: .cyan
             ) {
                 if providerStore.isBuiltIn(provider) {
-                    Text(provider.resolvedCacheHints.displayName)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        Text(provider.resolvedCacheHints.displayName)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        // A built-in's hint is fixed, so the picker that would
+                        // forget a latch is unreachable. The latch is still a
+                        // process-lifetime fact learned from a 400, and the
+                        // operator may know it was wrong (the gateway had a bad
+                        // minute); give them the one control the record needs.
+                        Button("Forget Refusals") {
+                            CloudCacheHintMemory.shared.allowCacheHints(
+                                endpoint: provider.chatCompletionsURL.absoluteString
+                            )
+                        }
+                        .controlSize(.small)
+                        .disabled(isTesting(provider))
+                        .help("Forgets this endpoint's remembered refusals of the prompt-cache key and session-affinity headers.")
+                    }
                 } else {
                     Picker("", selection: Binding(
                         get: { provider.resolvedCacheHints },
@@ -253,6 +268,10 @@ struct CloudProvidersSettingsView: View {
                     .labelsHidden()
                     .frame(width: 230)
                     .accessibilityLabel("Prompt caching support for \(provider.displayName)")
+                    // A mid-sync change is now tolerated by the post-fetch
+                    // guard, but the catalog still describes the server this
+                    // request asked, so keep the record stable while it runs.
+                    .disabled(isTesting(provider))
                 }
             }
 
@@ -321,7 +340,7 @@ struct CloudProvidersSettingsView: View {
                     title: provider.displayName,
                     subtitle: specs.isEmpty
                         ? "Nothing registered yet. Press \"Test & Sync Models\" to register the provider's chat models (embedding, speech, rerank, and image models are skipped)."
-                        : "Mark which models accept image input. No provider catalog publishes modalities, so this is opt-in; a model that rejects an image is un-marked automatically and the turn retries without it. Use the minus button to drop a model the provider does not serve on this wire.",
+                        : "Mark which models accept image input. No provider catalog publishes modalities, so this is opt-in; a model that rejects an image is un-marked automatically and the turn retries without it. Use the minus button to drop a model the provider does not serve on this wire; its recorded context window and price are removed with it, so re-adding the same id starts clean.",
                     icon: "cloud.fill",
                     iconTint: .cyan
                 ) {
@@ -463,7 +482,16 @@ struct CloudProvidersSettingsView: View {
             // gone (or now points somewhere else) would stamp one server's
             // models onto another and leave a stale "Connected" row for a
             // future provider that reuses the identifier.
-            guard providerStore.providers.contains(provider) else {
+            //
+            // Compared by identity and endpoints, not by the whole record: the
+            // Prompt Caching picker is a fact about the same server, and
+            // flipping it mid-sync used to discard the catalog this request
+            // had just fetched.
+            guard providerStore.providers.contains(where: {
+                $0.id == provider.id
+                    && $0.openAIBaseURL == provider.openAIBaseURL
+                    && $0.anthropicBaseURL == provider.anthropicBaseURL
+            }) else {
                 testStates[provider.id] = .untested
                 return
             }

@@ -46,17 +46,24 @@ final class CloudProviderStore: ObservableObject {
     private let secretStore: CloudSecretStore
     private let rescansModels: Bool
     private let updatesSharedRuntime: Bool
+    /// The process-wide latch `setCacheHints` forgets. Injected so a test can
+    /// hold its own: the shared one is keyed by endpoint, and a case that
+    /// latched it would leak into the next (and into a repeat-on-failure
+    /// rerun of itself).
+    private let cacheHintMemory: CloudCacheHintMemory
 
     init(
         defaults: UserDefaults = .standard,
         secretStore: CloudSecretStore = .shared,
         rescansModels: Bool = true,
-        updatesSharedRuntime: Bool = true
+        updatesSharedRuntime: Bool = true,
+        cacheHintMemory: CloudCacheHintMemory = .shared
     ) {
         self.defaults = defaults
         self.secretStore = secretStore
         self.rescansModels = rescansModels
         self.updatesSharedRuntime = updatesSharedRuntime
+        self.cacheHintMemory = cacheHintMemory
         self.providers = CloudProviderCatalog.all(defaults: defaults)
     }
 
@@ -179,7 +186,7 @@ final class CloudProviderStore: ObservableObject {
         // re-read on every request, but the endpoint was remembered as having
         // refused the field, so nothing was ever sent. Both hints are cleared:
         // the affinity headers can be refused just as the body field can.
-        CloudCacheHintMemory.shared.allowCacheHints(
+        cacheHintMemory.allowCacheHints(
             endpoint: current.chatCompletionsURL.absoluteString
         )
         publish()

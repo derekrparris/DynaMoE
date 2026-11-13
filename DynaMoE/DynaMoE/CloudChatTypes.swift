@@ -673,7 +673,13 @@ public nonisolated enum CloudTurnFailure: Equatable, Sendable, LocalizedError {
     case credentialNeedsImport(providerName: String)
     case unsupportedFlavor(flavor: String)
     case httpStatus(code: Int, summary: String)
-    case transport(String)
+    /// A failure below HTTP: no connection, a connection that died, or a local
+    /// fault before the request could be encoded. `billed` says whether the
+    /// provider could have processed the prompt. A transport error is not
+    /// evidence of a send — the app produced one for "offline" and for a
+    /// `JSONEncoder` throw before URLSession was touched — so the flag travels
+    /// with the failure instead of being inferred from its case.
+    case transport(String, billed: Bool)
     case invalidResponse(String)
 
     public var errorDescription: String? {
@@ -698,8 +704,13 @@ public nonisolated enum CloudTurnFailure: Equatable, Sendable, LocalizedError {
                     ? "The provider returned HTTP \(code)."
                     : "The provider returned HTTP \(code): \(detail)"
             }
-        case .transport(let message):
-            return "Network error reaching the provider: \(message)"
+        case .transport(let message, let billed):
+            // A failure the client classified as pre-send is not "reaching the
+            // provider": the request never left the Mac, and saying otherwise
+            // sends the reader looking at the wrong end of the connection.
+            return billed
+                ? "Network error reaching the provider: \(message)"
+                : "The request could not be sent: \(message)"
         case .invalidResponse(let message):
             return message
         }
@@ -711,10 +722,13 @@ public nonisolated enum CloudTurnFailure: Equatable, Sendable, LocalizedError {
     /// A missing or unreadable key, and a flavor with no implementation, fail
     /// before anything is built. A 4xx is a REJECTION: the provider refused the
     /// request without running the model — an expired key, an unknown model, a
-    /// rate limit, a schema complaint — and none of those are invoiced. A 5xx,
-    /// a transport error and a malformed stream all come back from a request
-    /// the provider had already accepted, and a prompt that reached its
-    /// inference path is charged whether or not the answer arrived.
+    /// rate limit, a schema complaint — and none of those are invoiced. A 5xx
+    /// and a malformed stream come back from a request the provider had
+    /// already accepted, and a prompt that reached its inference path is
+    /// charged whether or not the answer arrived. A transport failure carries
+    /// its own answer because "the connection failed" can mean the request
+    /// never left this Mac (`notConnectedToInternet`, a local encode throw) or
+    /// that a request the provider had accepted died on the way back.
     ///
     /// The distinction is what stops the chat path reporting a spend for a turn
     /// the provider threw away — and, on the other side, from omitting the
@@ -726,8 +740,56 @@ public nonisolated enum CloudTurnFailure: Equatable, Sendable, LocalizedError {
             return false
         case .httpStatus(let code, _):
             return code >= 500
-        case .transport, .invalidResponse:
+        case .transport(_, let billed):
+            return billed
+        case .invalidResponse:
             return true
+        }
+    }
+
+    /// Classifies an error thrown on the send path.
+    ///
+    /// The caller knows one thing this helper cannot: whether it had finished
+    /// building and submitting the request. Before that point nothing left the
+    /// Mac, so the request cannot have been billed; after it, only a failure
+    /// that PROVES no connection was established is refunded. A timeout or a
+    /// lost connection is billed, because both can happen after the provider
+    /// accepted the prompt and under-reporting a real invoice is the error
+    /// that cannot be corrected afterwards.
+    public nonisolated static func transportFailure(
+        _ error: Error,
+        requestWasSent: Bool
+    ) -> CloudTurnFailure {
+        if let failure = error as? CloudTurnFailure { return failure }
+        let billed = requestWasSent && !neverReachedProvider(error)
+        return .transport(error.localizedDescription, billed: billed)
+    }
+
+    /// Whether a URL loading error happened before any HTTP request could be
+    /// delivered: no route, no host, no DNS answer, no TLS session. Each of
+    /// these is a connection that never carried the prompt, so the provider
+    /// had nothing to bill. Errors that can arrive after the request was sent
+    /// (a timeout, a lost connection) are deliberately absent.
+    nonisolated static func neverReachedProvider(_ error: Error) -> Bool {
+        guard let urlError = error as? URLError else { return false }
+        switch urlError.code {
+        case .notConnectedToInternet,
+             .cannotFindHost,
+             .cannotConnectToHost,
+             .dnsLookupFailed,
+             .badURL,
+             .unsupportedURL,
+             .secureConnectionFailed,
+             .serverCertificateUntrusted,
+             .serverCertificateHasBadDate,
+             .serverCertificateNotYetValid,
+             .serverCertificateHasUnknownRoot,
+             .clientCertificateRejected,
+             .clientCertificateRequired,
+             .appTransportSecurityRequiresSecureConnection:
+            return true
+        default:
+            return false
         }
     }
 

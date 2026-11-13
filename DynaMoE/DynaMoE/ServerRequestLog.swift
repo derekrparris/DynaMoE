@@ -215,7 +215,11 @@ nonisolated struct ServerRequestLog: Identifiable, Codable, Sendable, Equatable,
 /// completed row reaches the unified log and the persisted store. Thread-safe:
 /// route handlers run on arbitrary executor threads.
 final class ServerRequestLogRecorder: @unchecked Sendable {
-    static let shared = ServerRequestLogRecorder()
+    /// `nonisolated`: the box records from wherever a turn happens to run, and
+    /// an immutable reference to a thread-safe recorder carries no actor state.
+    /// The default main-actor isolation otherwise made this a warning at the
+    /// in-app turn loop's one `record` call.
+    nonisolated static let shared = ServerRequestLogRecorder()
 
     static let captureBodiesKey = "dynamoe_server_log_store_bodies"
     static let requestCategory = "server.request"
@@ -735,9 +739,21 @@ extension ServerRequestLogBox {
         cacheWriteTokens: Int?
     ) {
         lock.lock()
-        if let promptTokens { builder.inputTokens = promptTokens }
-        if let cachedTokens { builder.cachedInputTokens = cachedTokens }
-        if let cacheWriteTokens { builder.cacheWriteInputTokens = cacheWriteTokens }
+        if let promptTokens { builder.inputTokens = max(0, promptTokens) }
+        // A provider reports these columns unchecked, and every reader
+        // subtracts them from the prompt. `Int.max` cached tokens traps the
+        // dashboard's `input - cached`, and the row is persisted, so the crash
+        // outlives the request. Clamped once here, at the only place the
+        // columns enter a row.
+        if let cachedTokens {
+            let prompt = builder.inputTokens ?? 0
+            builder.cachedInputTokens = min(max(0, cachedTokens), max(0, prompt))
+        }
+        if let cacheWriteTokens {
+            let prompt = max(0, builder.inputTokens ?? 0)
+            let cached = max(0, builder.cachedInputTokens ?? 0)
+            builder.cacheWriteInputTokens = min(max(0, cacheWriteTokens), max(0, prompt - cached))
+        }
         lock.unlock()
     }
 

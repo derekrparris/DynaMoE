@@ -406,6 +406,7 @@ final class CloudProviderStoreTests: XCTestCase {
         let defaults: UserDefaults
         let suite: String
         let secretStore: CloudSecretStore
+        let cacheHintMemory: CloudCacheHintMemory
 
         func cleanUp() {
             // Reap the throwaway service's items as well: a test that adds a
@@ -423,13 +424,23 @@ final class CloudProviderStoreTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
         let secretStore = CloudSecretStore(service: "DRP.DynaMoE.cloud.tests.\(UUID().uuidString)")
+        // A private latch: the shared one is keyed by endpoint and a case that
+        // forgot it would leak into the next case (and a rerun of itself).
+        let cacheHintMemory = CloudCacheHintMemory()
         let store = CloudProviderStore(
             defaults: defaults,
             secretStore: secretStore,
             rescansModels: false,
-            updatesSharedRuntime: false
+            updatesSharedRuntime: false,
+            cacheHintMemory: cacheHintMemory
         )
-        return Harness(store: store, defaults: defaults, suite: suite, secretStore: secretStore)
+        return Harness(
+            store: store,
+            defaults: defaults,
+            suite: suite,
+            secretStore: secretStore,
+            cacheHintMemory: cacheHintMemory
+        )
     }
 
     func testAddStoresTheKeyThenRemovalErasesEverything() throws {
@@ -825,12 +836,13 @@ final class CloudProviderStoreTests: XCTestCase {
             baseURL: "https://opencode.ai/zen/v1"
         )
         let endpoint = provider.chatCompletionsURL.absoluteString
-        CloudCacheHintMemory.shared.declinePromptCacheKey(endpoint: endpoint, model: "gpt-5.2")
+        harness.cacheHintMemory.declinePromptCacheKey(endpoint: endpoint, model: "gpt-5.2")
         XCTAssertFalse(OpenAICloudChatService.sendsCacheKey(
             hints: .openAI,
             sessionKey: "abc123",
             endpoint: endpoint,
-            model: "gpt-5.2"
+            model: "gpt-5.2",
+            memory: harness.cacheHintMemory
         ))
 
         try harness.store.setCacheHints(.openAI, for: provider)
@@ -839,7 +851,8 @@ final class CloudProviderStoreTests: XCTestCase {
             hints: .openAI,
             sessionKey: "abc123",
             endpoint: endpoint,
-            model: "gpt-5.2"
+            model: "gpt-5.2",
+            memory: harness.cacheHintMemory
         ))
     }
 
