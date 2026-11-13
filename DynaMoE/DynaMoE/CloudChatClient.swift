@@ -1172,7 +1172,8 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
         systemPrompt: String,
         userPrompt: String,
         budget: CloudSummarizerBudget,
-        sessionKey: String?
+        sessionKey: String?,
+        receipt: CloudTurnReceipt? = nil
     ) async throws -> CloudTextCompletion {
         var messages: [CloudChatMessage] = []
         if !systemPrompt.isEmpty {
@@ -1188,7 +1189,14 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
         var usage: CloudUsage?
         var result: CloudTurnResult?
         var failure: CloudTurnFailure?
-        for await event in streamTurn(model: model, messages: messages, params: params, tools: nil) {
+        for await event in streamTurn(
+            model: model,
+            messages: messages,
+            params: params,
+            tools: nil,
+            receipt: receipt
+        ) {
+            if Task.isCancelled, !event.isTerminal { break }
             switch event {
             case .started, .thinkingDelta:
                 break
@@ -1205,10 +1213,11 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
                 failure = reported
             }
         }
-        if let failure { throw failure }
-        // A cancelled consumer leaves the loop with neither an outcome nor an
-        // error; whatever text it collected was abandoned mid-sentence.
+        // A cancelled consumer leaves the loop with CancellationError even if a
+        // terminal event raced Stop: the caller reads `receipt` for billing
+        // and usage, while the outcome still reports that the user stopped.
         try Task.checkCancellation()
+        if let failure { throw failure }
         guard let result else {
             throw CloudTurnFailure.invalidResponse(
                 "The provider's stream ended before the completion was finished."

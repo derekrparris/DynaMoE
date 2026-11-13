@@ -2264,6 +2264,30 @@ final class CloudUsageSplitTests: XCTestCase {
         )
         XCTAssertEqual(genuineZero.cachedTokens, 0)
     }
+
+    func testTrailingAnthropicDeltaWithExplicitZeroCacheColumnsPreservesEarlierSplit() throws {
+        let messageStart = try decode(
+            #"{"input_tokens":100,"cache_read_input_tokens":500,"cache_creation_input_tokens":50,"output_tokens":5}"#
+        )
+        let trailingDelta = try decode(
+            #"{"input_tokens":100,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":42}"#
+        )
+        let merged = messageStart.merging(trailingDelta)
+        XCTAssertEqual(merged.promptTokens, 650)
+        XCTAssertEqual(merged.cachedTokens, 500)
+        XCTAssertEqual(merged.cacheWriteTokens, 50)
+        XCTAssertEqual(merged.completionTokens, 42)
+        XCTAssertTrue(merged.inputTokensExcludeCache)
+
+        // An OpenAI-style prompt_tokens block still overrides the Anthropic total.
+        let openAIOverride = try decode(
+            #"{"prompt_tokens":900,"completion_tokens":50,"prompt_tokens_details":{"cached_tokens":300}}"#
+        )
+        let overridden = merged.merging(openAIOverride)
+        XCTAssertEqual(overridden.promptTokens, 900)
+        XCTAssertEqual(overridden.cachedTokens, 300)
+        XCTAssertEqual(overridden.completionTokens, 50)
+    }
 }
 
 // MARK: - Cache hints on the wire
@@ -4147,6 +4171,118 @@ final class CloudTextCompletionTests: XCTestCase {
         } catch {
             XCTFail("unexpected error: \(error)")
         }
+    }
+
+    func testACancelledSummaryForwardsReceiptForRefusedAttempt() async {
+        let service = ReceiptAwareCloudService { continuation, receipt in
+            receipt?.record(spent: false)
+            continuation.yield(.started)
+            let held = Task {
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+            }
+            continuation.onTermination = { _ in held.cancel() }
+        }
+        let client = CloudChatClient(
+            provider: CloudProvider(
+                id: "p",
+                displayName: "Synthetic",
+                openAIBaseURL: URL(string: "https://example.invalid/v1")!
+            ),
+            service: service
+        )
+        let receipt = CloudTurnReceipt()
+        let task = Task {
+            try await client.completeText(
+                model: "m",
+                systemPrompt: "summarize",
+                userPrompt: "the chunk",
+                budget: CloudSummarizerBudget(window: nil),
+                sessionKey: nil,
+                receipt: receipt
+            )
+        }
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("expected CancellationError")
+        } catch is CancellationError {
+            XCTAssertEqual(receipt.spentRequest, false)
+            XCTAssertNil(receipt.result)
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
+    func testACancelledSummaryPreservesReceiptUsageWhenTerminalResultRacesCancellation() async {
+        let measuredUsage = CloudUsage(
+            promptTokens: 320,
+            completionTokens: 18,
+            cachedTokens: 200,
+            cacheWriteTokens: 0
+        )
+        let terminalResult = CloudTurnResult(
+            text: "summary",
+            thinking: "",
+            finishReason: "stop",
+            usage: measuredUsage
+        )
+        let service = ReceiptAwareCloudService { continuation, receipt in
+            // Mirrors OpenAICloudChatService, which records the terminal result
+            // on the receipt before yielding `.finished` / cancelling.
+            receipt?.record(result: terminalResult)
+            continuation.yield(.finished(terminalResult))
+            continuation.finish()
+        }
+        let client = CloudChatClient(
+            provider: CloudProvider(
+                id: "p",
+                displayName: "Synthetic",
+                openAIBaseURL: URL(string: "https://example.invalid/v1")!
+            ),
+            service: service
+        )
+        let receipt = CloudTurnReceipt()
+        let task = Task {
+            try await client.completeText(
+                model: "m",
+                systemPrompt: "summarize",
+                userPrompt: "the chunk",
+                budget: CloudSummarizerBudget(window: nil),
+                sessionKey: nil,
+                receipt: receipt
+            )
+        }
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("expected CancellationError even when terminal result raced")
+        } catch is CancellationError {
+            XCTAssertEqual(receipt.spentRequest, true)
+            XCTAssertEqual(receipt.result?.usage, measuredUsage)
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+}
+
+private nonisolated struct ReceiptAwareCloudService: CloudChatServicing {
+    let script: @Sendable (AsyncStream<CloudTurnEvent>.Continuation, CloudTurnReceipt?) -> Void
+
+    func streamTurn(
+        model: String,
+        messages: [CloudChatMessage],
+        params: CloudChatGenerationParams,
+        tools: [ToolDefinition]?,
+        receipt: CloudTurnReceipt?
+    ) -> AsyncStream<CloudTurnEvent> {
+        AsyncStream { continuation in
+            script(continuation, receipt)
+        }
+    }
+
+    func fetchModelIds() async throws -> [String] {
+        []
     }
 }
 

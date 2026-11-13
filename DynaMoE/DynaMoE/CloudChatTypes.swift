@@ -354,22 +354,23 @@ public nonisolated struct CloudUsage: Codable, Equatable, Sendable {
     /// `cached` figure beside it stop adding up. A later block that names no
     /// cache columns therefore leaves an earlier three-way split's total alone.
     public func merging(_ newer: CloudUsage) -> CloudUsage {
-        // A later block that repeats the bare `input_tokens` column names no
-        // cache split, so it cannot replace a total that included one. An
-        // OpenAI-shaped `prompt_tokens` IS the total and still wins, which is
-        // why both wire spellings are tracked rather than just the normalised
-        // number.
-        let newerRepeatsOnlyTheInputColumn = newer.inputTokensFromInputColumn
-            && newer.cachedTokens == nil
-            && newer.cacheWriteTokens == nil
-        let keepsEarlierSplit = inputTokensExcludeCache && newerRepeatsOnlyTheInputColumn
+        // A later block that repeats `input_tokens` without a non-zero cache
+        // split (either omitting the cache keys or emitting them as zero)
+        // cannot replace an earlier Anthropic total or zero out its split. An
+        // OpenAI-shaped `prompt_tokens` IS the total and still wins, as does an
+        // `input_tokens` block carrying a positive cache count.
+        let newerRepeatsInputWithoutSplit = newer.inputTokensFromInputColumn
+            && !newer.inputTokensExcludeCache
+            && (newer.cachedTokens ?? 0) == 0
+            && (newer.cacheWriteTokens ?? 0) == 0
+        let keepsEarlierSplit = inputTokensExcludeCache && newerRepeatsInputWithoutSplit
         let keepsEarlierPrompt = newer.promptTokens == nil || keepsEarlierSplit
         var merged = CloudUsage(
             promptTokens: keepsEarlierPrompt ? promptTokens : newer.promptTokens,
             completionTokens: newer.completionTokens ?? completionTokens,
             totalTokens: newer.totalTokens ?? totalTokens,
-            cachedTokens: newer.cachedTokens ?? cachedTokens,
-            cacheWriteTokens: newer.cacheWriteTokens ?? cacheWriteTokens
+            cachedTokens: keepsEarlierSplit ? (cachedTokens ?? newer.cachedTokens) : (newer.cachedTokens ?? cachedTokens),
+            cacheWriteTokens: keepsEarlierSplit ? (cacheWriteTokens ?? newer.cacheWriteTokens) : (newer.cacheWriteTokens ?? cacheWriteTokens)
         )
         merged.inputTokensExcludeCache = keepsEarlierPrompt
             ? inputTokensExcludeCache

@@ -2920,20 +2920,38 @@ struct ContentView: View {
                 cost: completion.usage.flatMap { pricing?.cost(for: $0) }
             )
         }
-        // A summarizer request that was sent and did not come back — cancelled
-        // mid-stream, or failed on the wire — was still billed for its prompt.
-        // Its token counts are unknown, so the app's own estimate stands in and
-        // `(est.)` marks the run; charging nothing here is what made a
-        // cancelled pass report a cost its own status line called billed.
-        func chargeUnreturnedRequest(estimatedPromptTokens: Int) {
+        // A summarizer request that was sent and did not return a clean
+        // completion — cancelled mid-stream, cut off, or failed on the wire —
+        // was still billed for its prompt. Measured columns from a usage block
+        // that arrived before the interruption are kept; missing columns fall
+        // back to the app's own estimate and mark the run `(est.)`.
+        func chargeInterruptedRequest(
+            estimatedPromptTokens: Int,
+            reportedUsage: CloudUsage?,
+            generatedText: String = ""
+        ) {
+            let estimatedOutputTokens = AppleFoundationModelService.recordedOutputTokenCount(
+                for: generatedText
+            )
+            let one = CloudTurnReport(
+                usage: reportedUsage,
+                estimatedPromptTokens: estimatedPromptTokens,
+                outputTokens: estimatedOutputTokens,
+                cost: nil
+            )
+            let prompt = one.promptTokens ?? 0
+            let cost = pricing?.cost(for: CloudUsage(
+                promptTokens: prompt,
+                completionTokens: one.outputTokens,
+                cachedTokens: one.cachedTokens,
+                cacheWriteTokens: reportedUsage?.cacheWriteTokens
+            ))
             summarizerTotals.add(
-                promptTokens: estimatedPromptTokens,
-                outputTokens: 0,
-                cost: pricing?.cost(for: CloudUsage(
-                    promptTokens: estimatedPromptTokens,
-                    completionTokens: 0
-                )),
-                estimated: true
+                promptTokens: prompt,
+                cachedTokens: one.cachedTokens,
+                outputTokens: one.outputTokens,
+                cost: cost,
+                estimated: one.wasEstimated
             )
         }
         // A compaction pass runs for minutes, and deleting the conversation
@@ -2946,11 +2964,10 @@ struct ContentView: View {
                 throw CloudCompactionFailure.conversationUnavailable
             }
         }
-        // One summarizer pass that may replace messages. A summary cut off at
-        // the output limit is refused rather than committed: the messages it
-        // was going to replace are deleted permanently, and the text that
-        // would take their place never covered the end of the chunk.
-        func summarize(system: String, prompt: String) async throws -> String {
+        // Runs one summarizer request and settles its billing from `passReceipt`
+        // so a cancelled or interrupted pass neither charges an unsent/4xx
+        // refusal nor drops usage that raced cancellation.
+        func runSummarizerPass(system: String, prompt: String) async throws -> CloudTextCompletion {
             // Checked BEFORE the request: a Stop that arrived while the history
             // was being chunked must not spend one more billed summarizer pass.
             // Nothing has been sent at this point, so throwing here is also the
@@ -2964,6 +2981,7 @@ struct ContentView: View {
                 system: system,
                 messages: [CloudChatMessage(role: "user", content: prompt)]
             )
+            let passReceipt = CloudTurnReceipt()
             let completion: CloudTextCompletion
             do {
                 completion = try await client.completeText(
@@ -2971,21 +2989,40 @@ struct ContentView: View {
                     systemPrompt: system,
                     userPrompt: prompt,
                     budget: summarizerBudget,
-                    sessionKey: sessionKey
+                    sessionKey: sessionKey,
+                    receipt: passReceipt
                 )
             } catch {
-                // The request was SENT before it failed or was cancelled, so
-                // the provider billed its prompt even though nothing came
-                // back — unless it was REFUSED (a 4xx), which never reaches
-                // inference and is never invoiced. `CloudCompactionFailure`
-                // reports the same distinction in the status line; the run's
-                // own figures have to agree with it.
-                if CloudTurnFailure.spentRequest(for: error) {
-                    chargeUnreturnedRequest(estimatedPromptTokens: estimatedPromptTokens)
+                if let recorded = passReceipt.result {
+                    chargeInterruptedRequest(
+                        estimatedPromptTokens: estimatedPromptTokens,
+                        reportedUsage: recorded.usage,
+                        generatedText: recorded.text
+                    )
+                } else {
+                    // The receipt preserves pre-send/4xx classifications even
+                    // when `CancellationError` swallowed the failure event.
+                    let spent = passReceipt.failure?.spentRequest
+                        ?? passReceipt.spentRequest
+                        ?? CloudTurnFailure.spentRequest(for: error)
+                    if spent {
+                        chargeInterruptedRequest(
+                            estimatedPromptTokens: estimatedPromptTokens,
+                            reportedUsage: nil
+                        )
+                    }
                 }
                 throw error
             }
             charge(completion, estimatedPromptTokens: estimatedPromptTokens)
+            return completion
+        }
+        // One summarizer pass that may replace messages. A summary cut off at
+        // the output limit is refused rather than committed: the messages it
+        // was going to replace are deleted permanently, and the text that
+        // would take their place never covered the end of the chunk.
+        func summarize(system: String, prompt: String) async throws -> String {
+            let completion = try await runSummarizerPass(system: system, prompt: prompt)
             // The destructive decision lives in `CloudCompactionGate` so it is
             // testable: a summary that is empty or did not finish cleanly must
             // not replace the messages it was written from.
@@ -3025,34 +3062,7 @@ struct ContentView: View {
 
             let recapPrompt = "Conversation excerpt, oldest messages first — the most recent work last:\n\n\(recentChunk)"
             onProgress?("🗂 \(provider.displayName) — capturing the detailed recap…")
-            // Same rule as `summarize`: a Stop before the request is sent costs
-            // nothing, and this pass is not owed a request of its own.
-            try Task.checkCancellation()
-            // The conversation can also be DELETED while a pass runs, and a
-            // deleted chat has nobody to bill: stop before the next request.
-            try requireLiveConversation()
-            let recapEstimatedPromptTokens = CloudMessageAssembler.approximatePromptTokens(
-                system: recapInstructions,
-                messages: [CloudChatMessage(role: "user", content: recapPrompt)]
-            )
-            let recap: CloudTextCompletion
-            do {
-                recap = try await client.completeText(
-                    model: providerModelId,
-                    systemPrompt: recapInstructions,
-                    userPrompt: recapPrompt,
-                    budget: summarizerBudget,
-                    sessionKey: sessionKey
-                )
-            } catch {
-                // Same rule as `summarize`: a sent request is billed whether or
-                // not its answer arrived, and a refused one is not.
-                if CloudTurnFailure.spentRequest(for: error) {
-                    chargeUnreturnedRequest(estimatedPromptTokens: recapEstimatedPromptTokens)
-                }
-                throw error
-            }
-            charge(recap, estimatedPromptTokens: recapEstimatedPromptTokens)
+            let recap = try await runSummarizerPass(system: recapInstructions, prompt: recapPrompt)
             // The recap supplements a complete summary rather than replacing
             // anything, so a truncated one costs detail and nothing else; the
             // next compaction asks for a fresh one.
@@ -4665,15 +4675,17 @@ struct ContentView: View {
         // tokens on every request of the loop.
         let toolsEnabled = isAgentTurn
 
-        let openingMessages = CloudMessageAssembler.assemble(
-            from: sessions.first(where: { $0.id == sessionId })?.messages ?? [],
-            excludingMessageIds: [messageId]
-        )
         let sessionMessagesForImages = sessions.first(where: { $0.id == sessionId })?.messages ?? []
         let visionCapable = visionSupport(forProvider: provider, providerModelId: providerModelId)
         // Resolved on the main actor before the task: an AppStorage read from
         // inside the loop would be a main-actor hop per step.
         let imageDeliveryPolicy: CloudImageDelivery = cloudResendImages ? .all : .newestUserTurnOnly
+        let openingMessages = CloudMessageAssembler.assemble(
+            from: sessionMessagesForImages,
+            excludingMessageIds: [messageId],
+            imagesSupported: visionCapable,
+            imageDelivery: imageDeliveryPolicy
+        )
         // Images are priced flat in the pre-turn estimate: the assembler is not
         // given their bytes here (that happens off the main actor inside the
         // turn), so count the refs directly. The count mirrors the delivery
