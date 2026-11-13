@@ -498,6 +498,13 @@ struct SettingsSheetView: View {
     /// (no discovered row) reads the checkpoint `config.json`.
     private func resolveActiveModelCeiling() -> Int {
         guard let model = activeGenerationModel() else {
+            // The registry row can be absent while the on-device backend is
+            // still the active one (a scan that has not run yet), and in that
+            // state `modelConfig` is nil, so the local branch would answer with
+            // the 32,768 policy floor for a backend that honours 2,048.
+            if activeModelPath == AppleFoundationModelService.modelPath {
+                return AppleFoundationModelService.maxResponseTokenCeiling
+            }
             return KVCacheProvisioning.localMaxOutputTokens(config: modelConfig)
         }
         return ceilingRows(for: model)
@@ -519,6 +526,15 @@ struct SettingsSheetView: View {
                 )
             )
         }
+        // The on-device model has no checkpoint and no config: `activate` clears
+        // `modelConfig`, so the local branch would answer with the 32,768 policy
+        // floor while `AppleFoundationModelService` clamps every request to
+        // `maxResponseTokenCeiling`. Three backends, three limits — advertising
+        // the local one here is the same "limit nothing enforces" defect this
+        // change exists to remove, one backend over.
+        if model.isAppleFoundationModel {
+            return AppleFoundationModelService.maxResponseTokenCeiling
+        }
         let isActive = activeModelPath != nil
             && (activeModelPath == model.snapshotPath || activeModelPath == model.weightsEntryPath)
         let config = isActive
@@ -530,9 +546,17 @@ struct SettingsSheetView: View {
     /// What the ceiling is bound by, for the row that shows the number. A
     /// ceiling with no stated reason reads as an arbitrary app limit.
     private func ceilingExplanation(for model: DiscoveredModel?) -> String {
-        let isCloud = model.map { CloudModelAddress.isCloudModelId($0.id) } ?? false
+        let isCloud = model.map {
+            CloudModelAddress.isCloudModelId($0.id) || CloudModelAddress.isCloudPath($0.snapshotPath)
+        } ?? false
         if isCloud {
             return "Capped by 20% of this model's recorded context window — a reply budget larger than that cannot share the window with any prompt. Record a larger window on the Cloud tab to raise it."
+        }
+        // No checkpoint: the system model's own framework refuses a larger
+        // budget, so saying "this checkpoint's position limit" would name a file
+        // that does not exist.
+        if model?.isAppleFoundationModel == true {
+            return "Capped by the on-device model's own response limit (\(AppleFoundationModelService.maxResponseTokenCeiling.formatted()) tokens); a larger value is clamped before the framework sees it."
         }
         return "Capped by this checkpoint's own position limit. The KV cache budget also lowers the effective ceiling for a long prompt."
     }
@@ -959,6 +983,12 @@ struct SettingsSheetView: View {
                     title: "Max Output Tokens",
                     subtitle: "Hard cap on tokens generated per response. \(ceilingExplanation(for: activeGenerationModel()))"
                 ) {
+                    // Step 32 is a dragging convenience, not the resolution of
+                    // the setting: a cloud ceiling can be any fraction of a
+                    // window (a 1,024-token window allows 205) and a profile can
+                    // hold a value this model's slider cannot reach. Those are
+                    // entered in the field or taken from the presets below, both
+                    // of which are exact.
                     SettingsValueSlider(
                         label: "Max Output Tokens",
                         value: doubleBinding($maxNewTokens),
@@ -967,6 +997,25 @@ struct SettingsSheetView: View {
                         fractionDigits: 0,
                         fieldWidth: 72
                     )
+                }
+
+                // The stored value can legitimately exceed the ceiling being
+                // shown: a profile is per-model and a cloud window can be lowered
+                // after a value was saved against it. The engine still honours
+                // the stored number, so explain it rather than silently rewriting
+                // it — the same treatment the profile editor gives the same case.
+                if maxNewTokens > activeModelCeilingRows {
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9))
+                            .foregroundColor(.orange)
+                        Text("This setting (\(maxNewTokens.formatted())) exceeds the \(activeModelCeilingRows.formatted())-token ceiling for the selected model. It is still sent; a backend that cannot hold it lowers the allocation for that turn. Editing this control rewrites it.")
+                            .font(.system(size: 9))
+                            .foregroundColor(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.leading, 2)
+                    .padding(.bottom, 2)
                 }
 
                 HStack(spacing: 6) {

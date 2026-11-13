@@ -359,6 +359,49 @@ struct HelpAndSettingsGuideView: View {
                 .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.green.opacity(0.3), lineWidth: 1))
             }
 
+            // Generic / cloud profiles
+            Text("Generic Profile (Every Cloud Model)")
+                .font(.headline)
+                .padding(.top, 4)
+
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Image(systemName: "cloud.fill")
+                            .foregroundColor(.cyan)
+                        Text("Coder")
+                            .font(.headline).bold()
+                    }
+                    Text("• Temperature: 0.60\n• Top-P: 0.95 | Top-K: 20\n• Min-P: 0.00\n• Repetition Penalty: 1.00\n• Presence Penalty: 0.00\n• Max Tokens: 16,384\n• JetSpec: Enabled")
+                        .font(.system(size: 12, design: .monospaced))
+                        .lineSpacing(4)
+                }
+                .padding(14)
+                .background(Color(NSColor.controlBackgroundColor).opacity(0.4))
+                .cornerRadius(10)
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.cyan.opacity(0.3), lineWidth: 1))
+
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Image(systemName: "cloud.fill")
+                            .foregroundColor(.teal)
+                        Text("Assistant")
+                            .font(.headline).bold()
+                    }
+                    Text("• Temperature: 0.70\n• Top-P: 0.90 | Top-K: 50\n• Min-P: 0.05\n• Repetition Penalty: 1.10\n• Presence Penalty: 0.00\n• Max Tokens: 8,192\n• JetSpec: Enabled")
+                        .font(.system(size: 12, design: .monospaced))
+                        .lineSpacing(4)
+                }
+                .padding(14)
+                .background(Color(NSColor.controlBackgroundColor).opacity(0.4))
+                .cornerRadius(10)
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.teal.opacity(0.3), lineWidth: 1))
+            }
+
+            Text("Every cloud model uses this profile, even when the provider's model id names a local family (`qwen3-coder` on Zen, `hf:Qwen/...` on Synthetic): a remote id describes someone else's checkpoint, so it gets neither a local family's token budget nor its sampling tuning. An ungated local checkpoint (Llama, Gemma, Spark, DeepSeek) uses these budgets too.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+
             infoBox(title: "Why Repetition Penalty is 1.00 for Coding", icon: "exclamationmark.triangle.fill") {
                 Text("Programming languages require repetitive keywords, variable names, indentation, and structural syntax (e.g. braces). Setting repetition penalty > 1.0 causes the model to invent erroneous synonyms for identifiers and omit closing brackets. For code, keep repetition penalty at 1.00.")
                     .font(.system(size: 12))

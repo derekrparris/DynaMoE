@@ -186,13 +186,15 @@ DynaMoE automatically defaults to and persists the official publisher-tuned prof
   - **Presence Penalty**: $1.50$ (fresh conversational flow)
   - **Max Tokens**: $4,096$ | **JetSpec**: Enabled (draft speculative decoding)
 
-#### Generic Profile (Every Cloud Model)
-A cloud model's id (`deepseek-ai/DeepSeek-V4.1-Flash`, `hf:minimax/M2`) matches none of the name-gated families above, so **every cloud model runs on the generic profile**. Its budgets are therefore what a cloud turn actually sends, and they are sized for a capable remote model rather than a local checkpoint's KV appetite:
+#### Generic Profile (Every Cloud Model, and Ungated Local Checkpoints)
+**Every cloud model runs on the generic profile**, and it does so because the family gate above skips cloud addresses — not because a provider's model id happens to match no family name. Providers ship family-named ids as first-class entries (`qwen3-coder` on Zen, `hf:Qwen/...` on Synthetic), and a name match there would hand a remote model a local checkpoint's 8,192-token budget *and* its sampling tuning. The gate is a statement about models this app runs locally, so the whole thing is bypassed for a cloud id:
 
 - **Coder**: Temperature $0.60$, Top-P $0.95$, Top-K $20$, Min-P $0.00$, Repetition Penalty $1.00$, **Max Tokens $16,384$**
 - **Assistant**: Temperature $0.70$, Top-P $0.90$, Top-K $50$, Min-P $0.05$, Repetition Penalty $1.10$, **Max Tokens $8,192$**
 
 The coder budget sits exactly at the **16,384-token ceiling applied to a provider with no recorded context window**. Recording a window on the Cloud tab is what raises it: a model with a 200,000-token window is allowed 40,000.
+
+The same generic profile is also the default for a **local checkpoint that is not Ornith, Qwen, or Nanbeige** — Llama, Gemma, Spark, DeepSeek. For those, the raised budget is a real change too: it is the reply budget a local turn asks for, and on a machine whose KV budget cannot hold prompt + reply, `turnFit` **lowers the allocation** (`.maxTokensReduced`) rather than refusing the turn, so a long local prompt now clamps to a smaller reply more often than it did at 8,192. Nothing fails; the reply is shorter than the setting asked for. It exists for the cloud case, and the local case pays a little for it.
 
 #### Profile Customization & Persistence
 1. Open the **Models** section, click the **⋯** (ellipsis) menu on your model, and choose **"Configure Profiles…"**.
@@ -267,10 +269,11 @@ At the top of the Generation section, an active profile banner indicates which p
 
 #### 7. Max Tokens
 - **What it does**: Hard ceiling on the maximum number of new tokens generated per turn. It is the **upper bound of the slider**, and it is not one number: it depends on which backend the selected model runs on.
-  - **Local checkpoint**: 32 to the checkpoint's own `max_position_embeddings`, floored at 32,768 so no model loses range and capped at 262,144 rows. This is `policyMaxRows`, the same figure the launch path uses. The KV cache budget can lower the effective ceiling further for a long prompt, and the turn logs the clamp (`clamped max_tokens N -> M`) rather than failing.
+  - **Local checkpoint**: 32 to the checkpoint's own `max_position_embeddings`, floored at 32,768 so no model loses range and capped at 262,144 rows. This is `policyMaxRows`, the same figure the launch path uses. The KV cache budget can lower the effective ceiling further for a long prompt, and the turn logs the clamp rather than failing: `⚠️ [KVCACHE] clamping max_tokens 16384 -> 9216: <N>-token prompt fits a <M>-token KV provision (budget <B> GB)` in the Console.
   - **Cloud model**: 20% of the model's **recorded context window** — the room the auto-compaction threshold leaves, so a prompt under 80% of the window plus this reply always fits. A model with **no recorded window** is held to 16,384 tokens instead of being sent an arbitrary `max_tokens`; record its window in Settings ▸ Cloud Providers ▸ Request Behaviour to raise it.
 - **Setting it high is safe but is not a promise.** The number is a ceiling. A local turn is ratcheted down by the KV budget; a cloud turn by the model's window. Nothing generates past what the backend can hold.
-- **Recommended Values**: $8192$ for Coder; $4096$ for Assistant. The generic profile — which is what every cloud model uses — ships $16384$ / $8192$.
+- **Recommended Values**: $8192$ for Coder; $4096$ for Assistant. The generic profile — which is what every cloud model uses, and what an ungated local checkpoint uses — ships $16384$ / $8192$.
+  - **The Apple Foundation Model is a third ceiling**: $2{,}048$ tokens, enforced by the on-device framework before the request leaves the app (`AppleFoundationModelService.maxResponseTokenCeiling`). Selecting it on the on-device backend shows that number, not the local 32,768 floor, because it has no checkpoint and no position limit of its own.
 
 ---
 

@@ -173,9 +173,22 @@ struct CloudProvidersSettingsView: View {
                 iconTint: .cyan
             ) { EmptyView() }
 
-            ForEach(contextWindowSpecs(), id: \.id) { entry in
-                SettingsRowDivider()
-                contextWindowRow(provider: entry.provider, spec: entry.spec)
+            // A card header followed by "record it per model below" and nothing
+            // below it is a dead end: with no provider registered, say so and
+            // point at the action that produces rows.
+            let windowEntries = contextWindowSpecs()
+            if windowEntries.isEmpty {
+                SettingsRow(
+                    title: "No registered models",
+                    subtitle: "Register a provider's models with \u{201C}Sync\u{201D} on a provider below; each one then gets its own window field here.",
+                    icon: "square.stack.3d.up.slash",
+                    iconTint: .gray
+                ) { EmptyView() }
+            } else {
+                ForEach(Array(windowEntries.enumerated()), id: \.element.id) { index, entry in
+                    if index > 0 { SettingsRowDivider() }
+                    contextWindowRow(provider: entry.provider, spec: entry.spec)
+                }
             }
 
             SettingsRowDivider()
@@ -478,12 +491,24 @@ struct CloudProvidersSettingsView: View {
     /// no-window budget.
     @ViewBuilder
     private func contextWindowRow(provider: CloudProvider, spec: CloudModelSpec) -> some View {
+        // The per-model override, NOT the value this save would store: the row
+        // reports what the turn will actually send with. Reading the override
+        // alone advertised 16,384 for a model the send path resolved to 40,000
+        // through the global fallback, and disagreed with the ceiling Settings
+        // shows for the same model (that one resolves through the fallback).
         let recorded = CloudContextPolicy.overrides(for: provider.id)[spec.providerModelId]
-        let budget = CloudContextPolicy.maximumOutputTokens(window: recorded)
+        let budget = CloudContextPolicy.maximumOutputTokens(
+            window: CloudContextPolicy.window(
+                forModelId: spec.providerModelId,
+                providerId: provider.id
+            )
+        )
+        let fallback = CloudContextPolicy.globalWindow(defaults: .standard)
         SettingsRow(
             title: spec.displayName,
             subtitle: recorded == nil
-                ? "No window recorded — reply budget \(budget.formatted())."
+                ? (fallback.map { "No window of its own — the global \($0.formatted()) applies, reply budget \(budget.formatted())." }
+                    ?? "No window recorded — reply budget \(budget.formatted()).")
                 : "\(recorded!.formatted()) tokens — reply budget \(budget.formatted())."
         ) {
             VStack(alignment: .trailing, spacing: 3) {
@@ -542,31 +567,63 @@ struct CloudProvidersSettingsView: View {
     /// Stores one model's context window, or removes it when the field is empty
     /// (empty means "no recorded window", which is a real state: the reply
     /// budget and the compaction pre-flight both treat it differently).
+    ///
+    /// Writes through `setOverride`, never through `overrides(for:)` +
+    /// `setOverrides`: that pair drops every entry the reader cannot parse, so
+    /// saving one row silently deleted a neighbour's hand-typed window (and an
+    /// operator's typo, which is theirs to fix, not this button's to erase).
+    ///
+    /// Only the saved model's draft is replaced. Refreshing the whole provider's
+    /// drafts would discard an in-progress edit on a sibling row.
     private func saveWindow(for provider: CloudProvider, modelId: String) {
         let typed = (windowDrafts[provider.id]?[modelId] ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        var overrides = CloudContextPolicy.overrides(for: provider.id)
-
         let feedbackKey = "\(provider.id)/\(modelId)"
+
+        var stored: Int?
         if typed.isEmpty {
-            overrides.removeValue(forKey: modelId)
-            windowFeedback[feedbackKey] = "Cleared — reply budget now \(CloudContextPolicy.unknownWindowReplyCeiling.formatted())."
+            CloudContextPolicy.setOverride(
+                model: modelId,
+                window: nil,
+                providerId: provider.id
+            )
         } else if let window = Int(typed.replacingOccurrences(of: ",", with: "")
             .replacingOccurrences(of: "_", with: "")),
             window >= CloudContextPolicy.minimumPlausibleWindow {
-            overrides[modelId] = window
-            let budget = CloudContextPolicy.maximumOutputTokens(window: window)
-            windowFeedback[feedbackKey] = "Saved — reply budget up to \(budget.formatted())."
+            guard CloudContextPolicy.setOverride(
+                model: modelId,
+                window: window,
+                providerId: provider.id
+            ) else {
+                // The parser would drop it, so storing it would look saved and
+                // read back as absent.
+                windowFeedback[feedbackKey] = "Not saved: enter a whole number of at least \(CloudContextPolicy.minimumPlausibleWindow.formatted()) tokens."
+                return
+            }
+            stored = window
         } else {
-            // Never write a value the parser would drop: `setOverrides` filters
-            // sub-plausible numbers, so storing one would look saved and read
-            // back as absent.
             windowFeedback[feedbackKey] = "Not saved: enter a whole number of at least \(CloudContextPolicy.minimumPlausibleWindow.formatted()) tokens."
             return
         }
 
-        CloudContextPolicy.setOverrides(overrides, for: provider.id)
-        windowDrafts[provider.id] = overrides.mapValues(String.init)
+        // The budget this row reports must be the one the send path will use,
+        // which resolves the per-model window AND the global fallback. Asking
+        // the override alone advertised 16,384 for a model the turn would send
+        // 40,000 to, and disagreed with the same model's row in Settings.
+        let budget = CloudContextPolicy.maximumOutputTokens(
+            window: CloudContextPolicy.window(
+                forModelId: modelId,
+                providerId: provider.id
+            )
+        )
+        // Only this model's draft. Assigning the whole provider's map would
+        // discard an in-progress edit on a sibling row that shares the provider.
+        windowDrafts[provider.id, default: [:]][modelId] = stored.map(String.init) ?? ""
+        if typed.isEmpty {
+            windowFeedback[feedbackKey] = "Cleared — reply budget now \(budget.formatted())."
+        } else {
+            windowFeedback[feedbackKey] = "Saved — reply budget up to \(budget.formatted())."
+        }
     }
 
     private func saveKey(for provider: CloudProvider) {

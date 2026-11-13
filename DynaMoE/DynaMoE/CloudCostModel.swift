@@ -480,6 +480,55 @@ public nonisolated enum CloudContextPolicy {
         }
     }
 
+    /// Stores ONE model's window, leaving every other entry — including one this
+    /// build could not parse — exactly as typed. `window == nil` removes it.
+    ///
+    /// The `overrides(for:)` + `setOverrides` pair is the wrong tool for a
+    /// single-model save for the same reason it was wrong for unregister: the
+    /// reader drops unparseable entries, so writing its result back deletes an
+    /// operator's typo AND every valid neighbour the same pass could not
+    /// represent. Saving one row must not erase another.
+    ///
+    /// Returns false when nothing was written (a sub-plausible window, which the
+    /// reader would drop and therefore read back as absent). Callers validate the
+    /// typed value first; this is the last line of defence.
+    @discardableResult
+    public static func setOverride(
+        model: String,
+        window: Int?,
+        providerId: String,
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        guard !model.isEmpty else { return false }
+        guard let window else {
+            removeOverride(model: model, providerId: providerId, defaults: defaults)
+            return true
+        }
+        guard window >= minimumPlausibleWindow else { return false }
+
+        let key = defaultsKey(for: providerId)
+        let raw = defaults.string(forKey: key) ?? ""
+        let replacement = "\(model)=\(window)"
+        var kept: [String] = []
+        var replaced = false
+        for entry in splitOverrideEntries(raw) {
+            guard let parts = splitEntry(entry), parts.model == model else {
+                kept.append(entry)
+                continue
+            }
+            // First match takes the new value in place; a later duplicate is
+            // dropped rather than left to win the reader's last-one-wins merge.
+            if !replaced {
+                kept.append(replacement)
+                replaced = true
+            }
+        }
+        if !replaced { kept.append(replacement) }
+
+        defaults.set(kept.joined(separator: "; "), forKey: key)
+        return true
+    }
+
     /// Splits `;`, `,`, or newline-separated entries without tearing apart a
     /// comma-grouped integer such as `m=1,048,576`.
     private static func splitOverrideEntries(_ raw: String) -> [String] {
@@ -588,10 +637,10 @@ public nonisolated enum CloudContextPolicy {
         )
     }
 
-    private static func resolvedWindow(recorded: Int?, defaults: UserDefaults) -> Int? {
-        if let recorded, recorded >= minimumPlausibleWindow {
-            return recorded
-        }
+    /// The single global fallback value, or nil when none is set. Exposed so a
+    /// UI row can say WHICH window it is reporting against instead of implying
+    /// the model has none.
+    public static func globalWindow(defaults: UserDefaults = .standard) -> Int? {
         let intFallback = defaults.integer(forKey: globalWindowKey)
         if intFallback >= minimumPlausibleWindow {
             return intFallback
@@ -602,6 +651,13 @@ public nonisolated enum CloudContextPolicy {
             return parsed
         }
         return nil
+    }
+
+    private static func resolvedWindow(recorded: Int?, defaults: UserDefaults) -> Int? {
+        if let recorded, recorded >= minimumPlausibleWindow {
+            return recorded
+        }
+        return globalWindow(defaults: defaults)
     }
 
     /// Whether a send of `promptTokens` should compact first.

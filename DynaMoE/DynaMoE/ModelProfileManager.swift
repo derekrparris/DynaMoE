@@ -115,16 +115,29 @@ public struct GenerationProfileSettings: Codable, Equatable, Hashable {
     /// so a renamed copy would otherwise fall through to the generic profile.
     /// Every other family here is matched by name because its name is the only
     /// discriminator that exists.
+    ///
+    /// A cloud model id is asked about NEITHER. The name of a provider model
+    /// id describes someone else's checkpoint on someone else's hardware: Zen
+    /// ships `qwen3-coder` and Synthetic serves `hf:Qwen/...` as first-class
+    /// ids, and matching `qwen` in those names handed a remote model this app's
+    /// 8,192-token local budget plus a `temperature 1.00` /
+    /// `presencePenalty 1.50` pair tuned for a checkpoint the provider is not
+    /// running. Name-gating is a statement about LOCAL families, so the whole
+    /// gate is skipped for a cloud address and the generic (cloud) branch below
+    /// answers instead.
     public static func defaultFor(
         type: ModelProfileType,
         modelName: String? = nil,
         modelPath: String? = nil
     ) -> GenerationProfileSettings {
-        let nameLower = (modelName ?? "").lowercased()
+        let isCloud = CloudModelAddress.isCloudModelId(modelName)
+            || CloudModelAddress.isCloudPath(modelName)
+            || CloudModelAddress.isCloudPath(modelPath)
+        let nameLower = isCloud ? "" : (modelName ?? "").lowercased()
         let isQwen = nameLower.contains("qwen")
         let isOrnith = nameLower.contains("ornith")
         let isNanbeige = nameLower.contains("nanbeige")
-            || (modelPath.map { ModelConfig.isNanbeige43Snapshot($0) } ?? false)
+            || (!isCloud && (modelPath.map { ModelConfig.isNanbeige43Snapshot($0) } ?? false))
 
         if isQwen {
             switch type {
@@ -246,10 +259,17 @@ public struct GenerationProfileSettings: Codable, Equatable, Hashable {
 
         // Generic fallback defaults.
         //
-        // This branch is the CLOUD profile. A provider's model id ("deepseek-ai/
-        // DeepSeek-V4.1", "hf:minimax/M2") matches none of the name-gated
-        // families above, so every cloud model lands here — the budgets below are
-        // what a cloud turn sends, not a leftover for unrecognized local files.
+        // This branch is the CLOUD profile, and it is reached by every cloud
+        // model because the family gate above skips a cloud address entirely —
+        // not because a provider's model id happens to match no family name
+        // (several do: `qwen3-coder` is a shipped Zen id).
+        //
+        // It is also the default for an ungated LOCAL checkpoint (Llama, Gemma,
+        // Spark, DeepSeek), which is why these numbers cannot be cloud-only
+        // reasoning: a local turn resolves them as its reply budget too, and
+        // `turnFit` lowers the allocation rather than refusing the turn when the
+        // KV budget cannot hold `prompt + this`. On the 16 GB reference machine
+        // a long local prompt therefore clamps more often than it did at 8,192.
         //
         // They were 8,192 / 4,096, a budget sized for a local checkpoint's KV
         // appetite, which crippled a capable remote model's ability to use the
@@ -372,9 +392,19 @@ public final class ModelProfileManager: ObservableObject {
             }
         }
 
-        // 4. Model family matching for known profiles
-        let keyLower = key.lowercased()
-        let idLower = modelId.lowercased()
+        // 4. Model family matching for known profiles.
+        //
+        // Skipped for a cloud address for the same reason `defaultFor` skips it:
+        // `cloud-model-zen-qwen3-coder` contains "qwen" and would otherwise
+        // inherit the seeded 9B Qwen profile — an 8,192-token budget and a
+        // sampling pair tuned for a checkpoint the provider is not serving.
+        // Steps 1-3 still apply, so a cloud id with a profile saved against it
+        // is honoured: those are matched by exact key, not by substring.
+        let isCloudAddress = CloudModelAddress.isCloudModelId(modelId)
+            || CloudModelAddress.isCloudPath(modelId)
+            || CloudModelAddress.isCloudPath(key)
+        let keyLower = isCloudAddress ? "" : key.lowercased()
+        let idLower = isCloudAddress ? "" : modelId.lowercased()
         let isOrnith = keyLower.contains("ornith") || idLower.contains("ornith")
         let isQwen = keyLower.contains("qwen") || idLower.contains("qwen")
 

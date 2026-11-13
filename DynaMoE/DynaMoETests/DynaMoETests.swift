@@ -4891,10 +4891,38 @@ final class DynaMoETests: XCTestCase {
     // must still resolve through normalizeKey + family matching. If Assistant is the
     // active profile, getProfile(for:type:.assistant) must return assistant settings --
     // never the coder prompt that used to leak in via the async model-load completion.
-    /// The generic fallback IS the cloud profile: a provider model id matches
-    /// none of the name-gated families, so every cloud model resolves here. Its
-    /// budgets are therefore what a cloud turn sends, which is why they were
-    /// raised (8,192/4,096 -> 16,384/8,192) to let a capable remote model use the
+    func testOrnith35BFamilyProfileResolution() throws {
+        let manager = ModelProfileManager.shared
+
+        let repoId = "ornith-ai/Ornith-1.5-35B-A3B-FP8"
+        let normalized = manager.normalizeKey(repoId)
+        XCTAssertEqual(normalized, "ornith-ai/ornith-1.5-35b-a3b-fp8")
+
+        // Every call site (repoId, snapshot path) must normalize to the same key so the
+        // active-profile lookup and setActiveProfile agree.
+        let snapshotPath = "/Users/x/.cache/huggingface/hub/models--ornith-ai--Ornith-1.5-35B-A3B-FP8/snapshots/0123456789abcdef0123456789abcdef01234567"
+        XCTAssertEqual(manager.normalizeKey(snapshotPath), normalized)
+
+        let assistant = manager.getProfile(for: repoId, type: .assistant)
+        XCTAssertEqual(assistant.temperature, 1.00, accuracy: 0.01)
+        XCTAssertEqual(assistant.presencePenalty, 1.50, accuracy: 0.01)
+        XCTAssertEqual(assistant.maxNewTokens, 4096)
+        XCTAssertTrue(assistant.systemPrompt.contains("helpful, respectful"),
+                      "Assistant resolution for the 35B must not return the coder prompt")
+
+        print("  ✅ [TEST] Ornith 35B profile resolution verified (normalizeKey + family match).")
+    }
+
+    /// The generic fallback IS the cloud profile, and it is reached by EVERY
+    /// cloud model — but not for the reason a name test would suggest. A
+    /// provider id often does contain a family name (`qwen3-coder` is a shipped
+    /// Zen id, Synthetic serves `hf:Qwen/...`), so the gate that produces this
+    /// profile has to skip cloud addresses rather than rely on the name not
+    /// matching. Matching it left the exact models this change exists to
+    /// un-truncate on the local 8,192 budget.
+    ///
+    /// Its budgets are what a cloud turn sends, which is why they were raised
+    /// (8,192/4,096 -> 16,384/8,192) to let a capable remote model use the
     /// harness — a long tool step or a full file rewrite used to truncate
     /// mid-answer.
     ///
@@ -4918,6 +4946,44 @@ final class DynaMoETests: XCTestCase {
         )
         XCTAssertEqual(cloudCoder.maxNewTokens, coder.maxNewTokens, "a cloud model gets the generic budget")
 
+        // A cloud id that DOES match a family name must resolve generically too.
+        // Both address forms, because the gate reads whichever one it is handed.
+        for cloudName in [
+            "cloud-model-zen-qwen3-coder",
+            "cloud://zen/qwen3-coder",
+            "cloud-model-synthetic-hf:Qwen/Qwen3-235B",
+            "cloud-model-zen-ornith-1.5-9b"
+        ] {
+            let resolved = GenerationProfileSettings.defaultFor(type: .coder, modelName: cloudName)
+            XCTAssertEqual(resolved.maxNewTokens, coder.maxNewTokens,
+                           "\(cloudName) must not inherit a local family budget")
+            // And none of the family tuning leaks in either — a Qwen profile
+            // carries temperature 1.00 / presencePenalty 1.50, the generic 0.60 / 0.00.
+            XCTAssertEqual(resolved.temperature, coder.temperature, accuracy: 0.0001,
+                           "\(cloudName) must not inherit a local family sampling pair")
+            XCTAssertEqual(resolved.presencePenalty, coder.presencePenalty, accuracy: 0.0001,
+                           "\(cloudName) must not inherit a local family sampling pair")
+        }
+
+        // The same id through the manager, which is the path the app actually
+        // takes: steps 1-3 still honour a profile saved against an exact cloud
+        // key, but the SUBSTRING family match must not fire for a cloud address.
+        let manager = ModelProfileManager.shared
+        let qwenCloudAssistant = manager.getProfile(
+            for: "cloud-model-zen-qwen3-coder",
+            type: .assistant
+        )
+        XCTAssertEqual(qwenCloudAssistant.maxNewTokens, assistant.maxNewTokens,
+                       "a qwen-named cloud id must resolve to the generic budget, not the 9B Qwen one")
+        XCTAssertEqual(qwenCloudAssistant.temperature, assistant.temperature, accuracy: 0.0001)
+        XCTAssertEqual(qwenCloudAssistant.presencePenalty, assistant.presencePenalty, accuracy: 0.0001)
+
+        // A LOCAL qwen checkpoint still gets its own family profile: the skip is
+        // keyed on the address, not on the name being present.
+        let localQwen = manager.getProfile(for: "qwen/qwen3.8-flash-next-fp8", type: .assistant)
+        XCTAssertEqual(localQwen.maxNewTokens, 4_096)
+        XCTAssertEqual(localQwen.presencePenalty, 1.50, accuracy: 0.0001)
+
         // And it survives the no-window clamp unchanged.
         XCTAssertEqual(
             CloudContextPolicy.replyBudget(requested: coder.maxNewTokens, window: nil),
@@ -4928,39 +4994,8 @@ final class DynaMoETests: XCTestCase {
             coder.maxNewTokens,
             CloudContextPolicy.unknownWindowReplyCeiling
         )
-
-        // The name-gated families are untouched by the generic change.
-        XCTAssertEqual(
-            GenerationProfileSettings.defaultFor(type: .coder, modelName: "ornith").maxNewTokens,
-            8_192
-        )
-        XCTAssertEqual(
-            GenerationProfileSettings.defaultFor(type: .coder, modelName: "qwen").maxNewTokens,
-            8_192
-        )
     }
 
-    func testOrnith35BFamilyProfileResolution() throws {
-        let manager = ModelProfileManager.shared
-
-        let repoId = "ornith-ai/Ornith-1.5-35B-A3B-FP8"
-        let normalized = manager.normalizeKey(repoId)
-        XCTAssertEqual(normalized, "ornith-ai/ornith-1.5-35b-a3b-fp8")
-
-        // Every call site (repoId, snapshot path) must normalize to the same key so the
-        // active-profile lookup and setActiveProfile agree.
-        let snapshotPath = "/Users/x/.cache/huggingface/hub/models--ornith-ai--Ornith-1.5-35B-A3B-FP8/snapshots/0123456789abcdef0123456789abcdef01234567"
-        XCTAssertEqual(manager.normalizeKey(snapshotPath), normalized)
-
-        let assistant = manager.getProfile(for: repoId, type: .assistant)
-        XCTAssertEqual(assistant.temperature, 1.00, accuracy: 0.01)
-        XCTAssertEqual(assistant.presencePenalty, 1.50, accuracy: 0.01)
-        XCTAssertEqual(assistant.maxNewTokens, 4096)
-        XCTAssertTrue(assistant.systemPrompt.contains("helpful, respectful"),
-                      "Assistant resolution for the 35B must not return the coder prompt")
-
-        print("  ✅ [TEST] Ornith 35B profile resolution verified (normalizeKey + family match).")
-    }
 
     func testHelpTopicsAndSettingsGuideCoverage() throws {
         // 1. Verify all 11 HelpTopic enum cases are present

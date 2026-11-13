@@ -3400,6 +3400,108 @@ final class CloudContextPolicyTests: XCTestCase {
         )
     }
 
+    /// Saving one model's window must not delete another's — including an entry
+    /// this build cannot parse, which is the operator's to fix rather than the
+    /// Save button's to erase.
+    ///
+    /// The UI writer used to read `overrides(for:)` and write the dictionary
+    /// back. That reader drops every entry it cannot parse, so saving `a` in
+    /// `a=200000; typo=12k; b=128000` left `a` and `b` and silently deleted the
+    /// typo. `removeOverride` exists because unregister had the same bug; the
+    /// single-model writer had taken the unsafe route back.
+    func testSavingOneWindowLeavesItsNeighboursExactlyAsTyped() {
+        let defaults = scratchDefaults()
+        let key = CloudContextPolicy.defaultsKey(for: "p")
+        defaults.set("a=200000; typo=12k; b=128000", forKey: key)
+
+        XCTAssertTrue(
+            CloudContextPolicy.setOverride(model: "a", window: 300_000, providerId: "p", defaults: defaults)
+        )
+        let afterSave = defaults.string(forKey: key) ?? ""
+        XCTAssertTrue(afterSave.contains("typo=12k"), "an unparseable neighbour must survive a save")
+        XCTAssertTrue(afterSave.contains("b=128000"), "a valid neighbour must survive a save")
+        XCTAssertEqual(
+            CloudContextPolicy.overrides(for: "p", defaults: defaults),
+            ["a": 300_000, "b": 128_000],
+            "the parse view still reports only what it can read"
+        )
+
+        // A model with no entry is appended, and the neighbours still stand.
+        XCTAssertTrue(
+            CloudContextPolicy.setOverride(model: "c", window: 64_000, providerId: "p", defaults: defaults)
+        )
+        let afterAdd = defaults.string(forKey: key) ?? ""
+        XCTAssertTrue(afterAdd.contains("typo=12k"))
+        XCTAssertTrue(afterAdd.contains("b=128000"))
+        XCTAssertEqual(CloudContextPolicy.overrides(for: "p", defaults: defaults)["c"], 64_000)
+
+        // Saving the same model again REPLACES rather than duplicating: a
+        // duplicate would leave the reader's last-one-wins merge to decide.
+        XCTAssertTrue(
+            CloudContextPolicy.setOverride(model: "c", window: 96_000, providerId: "p", defaults: defaults)
+        )
+        let afterReplace = defaults.string(forKey: key) ?? ""
+        XCTAssertEqual(afterReplace.components(separatedBy: "c=").count - 1, 1, "one entry per model")
+        XCTAssertEqual(CloudContextPolicy.overrides(for: "p", defaults: defaults)["c"], 96_000)
+        XCTAssertTrue(afterReplace.contains("typo=12k"))
+
+        // Clearing goes through the same in-place path.
+        XCTAssertTrue(
+            CloudContextPolicy.setOverride(model: "b", window: nil, providerId: "p", defaults: defaults)
+        )
+        let afterClear = defaults.string(forKey: key) ?? ""
+        XCTAssertFalse(afterClear.contains("b=128000"))
+        XCTAssertTrue(afterClear.contains("typo=12k"), "clearing one window must not touch the typo either")
+        XCTAssertTrue(afterClear.contains("a=300000"))
+    }
+
+    /// A sub-plausible window is refused rather than stored: the reader would
+    /// drop it, so storing it would look saved and read back as absent.
+    func testAnImplausibleWindowIsRefusedRatherThanStored() {
+        let defaults = scratchDefaults()
+        let key = CloudContextPolicy.defaultsKey(for: "p")
+        defaults.set("a=200000", forKey: key)
+
+        XCTAssertFalse(
+            CloudContextPolicy.setOverride(model: "a", window: 512, providerId: "p", defaults: defaults)
+        )
+        XCTAssertEqual(
+            defaults.string(forKey: key),
+            "a=200000",
+            "a refused write must not modify the stored list at all"
+        )
+        XCTAssertFalse(
+            CloudContextPolicy.setOverride(model: "", window: 200_000, providerId: "p", defaults: defaults)
+        )
+    }
+
+    /// The Cloud tab's row and the send path must report one window. The row used
+    /// to read the per-model override alone, so with a global fallback recorded it
+    /// advertised 16,384 for a model the turn resolved to 40,000.
+    func testTheRowAndTheSendPathAgreeOnTheWindow() {
+        let defaults = scratchDefaults()
+        defaults.set("a=200000", forKey: CloudContextPolicy.defaultsKey(for: "p"))
+        defaults.set(200_000, forKey: CloudContextPolicy.globalWindowKey)
+
+        // Per-model wins.
+        XCTAssertEqual(
+            CloudContextPolicy.window(forModelId: "a", providerId: "p", defaults: defaults),
+            200_000
+        )
+        // A model with no entry falls through to the single global value, and the
+        // ceiling that follows is the one the send path enforces.
+        let fallbackWindow = CloudContextPolicy.window(forModelId: "b", providerId: "p", defaults: defaults)
+        XCTAssertEqual(fallbackWindow, 200_000)
+        XCTAssertEqual(CloudContextPolicy.globalWindow(defaults: defaults), 200_000)
+        XCTAssertEqual(
+            CloudContextPolicy.maximumOutputTokens(window: fallbackWindow),
+            40_000,
+            "a fallback-resolved window must advertise the fallback budget, not the no-window ceiling"
+        )
+        // With neither recorded, the no-window ceiling is the answer.
+        XCTAssertNil(CloudContextPolicy.globalWindow(defaults: scratchDefaults()))
+    }
+
     func testCloudCompactionChunkBudgetReservesInstructionsDigestAndReplyCap() {
         // On a small window (< 3k), fixed occupants shrink the chunk budget or
         // report 0 rather than returning the 4,000-character floor and failing with 400.
