@@ -7,14 +7,36 @@ import SwiftUI
 import Combine
 import Metal
 
-/// Quick-pick values for Max Output Tokens.
+/// Quick-pick values for Max Output Tokens, bounded by the ceiling of whichever
+/// backend the selected model runs on.
 ///
-/// Deduplicated and sorted once: the buttons are keyed by value (`ForEach(_:id:
-/// \.self)`), so a duplicate — which a future `maxProvisionedRows` value could
-/// silently introduce — is a SwiftUI runtime crash rather than a cosmetic glitch.
-let maxTokenPresets: [Int] = Array(Set([
-    1024, 4096, 8192, 16000, KVCacheProvisioning.maxProvisionedRows
-])).sorted()
+/// Deduplicated and sorted: the buttons are keyed by value (`ForEach(_:id:
+/// \.self)`), so a duplicate — which an appended ceiling equal to a rung would
+/// silently introduce — is a SwiftUI runtime crash rather than a cosmetic
+/// glitch. The ceiling is appended rather than assumed to be a rung, because a
+/// cloud model's ceiling is a fraction of its window (40,960 for a 200k model)
+/// and would otherwise snap the control to a neighbour.
+///
+/// Values above 16,000 are all powers of two on purpose: the range now reaches
+/// 262,144, and step-32 dragging over that span is ~8,000 steps, so these
+/// buttons and the text field are where precision actually lives.
+func maxTokenPresets(upTo ceiling: Int) -> [Int] {
+    let rungs = [1024, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
+    var values = rungs.filter { $0 < ceiling }
+    values.append(ceiling)
+    return Array(Set(values)).sorted()
+}
+
+/// Identity of the backend the Max Output Tokens ceiling must be recomputed for.
+///
+/// `task(id:)` re-runs whenever this changes, so it carries exactly the inputs
+/// that can move the ceiling: the loaded weights, the default pick (a cloud
+/// registry entry when no weights are active), and the config's model type.
+struct ActiveCeilingKey: Equatable {
+    var modelPath: String?
+    var defaultModelId: String?
+    var modelType: String?
+}
 
 enum SettingsTab: String, CaseIterable, Identifiable {
     case general = "General"
@@ -163,6 +185,13 @@ struct SettingsSheetView: View {
     @State private var inspectingProfileType: ModelProfileType = .coder
     @State private var editingDraft: GenerationProfileSettings = GenerationProfileSettings.defaultFor(type: .coder)
     @State private var profileFeedbackText: String? = nil
+    /// Max Output Tokens ceiling for the model whose profile is being edited.
+    /// Resolved in `loadProfileDraft` (an action) because the inspected model is
+    /// not necessarily the active one, so its ceiling cannot come from the
+    /// already-loaded `modelConfig`.
+    @State private var editingModelCeilingRows: Int = KVCacheProvisioning.maxProvisionedRows
+    /// Max Output Tokens ceiling for the ACTIVE model, for the Sampling card.
+    @State private var activeModelCeilingRows: Int = KVCacheProvisioning.maxProvisionedRows
 
     // Model & Tokenizer bindings
     var summary: ModelSummary?
@@ -276,6 +305,18 @@ struct SettingsSheetView: View {
                     modelsSettingsSection
                 case .generation:
                     generationSettingsSection
+                        // Resolve the Max Output Tokens ceiling when the tab is
+                        // shown, and again whenever the active model or its
+                        // backend changes. Both are actions, not `body` work: a
+                        // cloud ceiling rebuilds the provider registry and a
+                        // local one may read `config.json`.
+                        .task(id: ActiveCeilingKey(
+                            modelPath: activeModelPath,
+                            defaultModelId: localModelManager.defaultModelId,
+                            modelType: modelConfig?.modelType
+                        )) {
+                            activeModelCeilingRows = resolveActiveModelCeiling()
+                        }
                 case .memory:
                     memorySettingsSection
                 case .agent:
@@ -427,6 +468,73 @@ struct SettingsSheetView: View {
             get: { Double(source.wrappedValue) },
             set: { source.wrappedValue = Float($0) }
         )
+    }
+
+    // MARK: - Max Output Tokens ceilings
+
+    /// The model the Generation tab's Sampling card is currently authoring for:
+    /// the loaded weights when a path is known, else the default pick (which may
+    /// be a cloud registry entry, whose "path" is a `cloud://` sentinel).
+    private func activeGenerationModel() -> DiscoveredModel? {
+        if let path = activeModelPath,
+           let model = localModelManager.discoveredModels.first(where: {
+               $0.snapshotPath == path || $0.weightsEntryPath == path
+           }) {
+            return model
+        }
+        guard let id = localModelManager.defaultModelId else { return nil }
+        return localModelManager.discoveredModels.first(where: { $0.id == id })
+    }
+
+    /// The Max Output Tokens ceiling for the ACTIVE model.
+    ///
+    /// Two backends answer to different limits, and a single flat number was
+    /// wrong for both: a local checkpoint's ceiling is its KV policy, while a
+    /// cloud model's is a fraction of the context window its provider records.
+    /// The slider has to show whichever one binds, or it either advertises a
+    /// budget the launch path lowers or invites one no provider will accept.
+    ///
+    /// Called from `.onAppear`/`.onChange` rather than `body`: the fallback path
+    /// (no discovered row) reads the checkpoint `config.json`.
+    private func resolveActiveModelCeiling() -> Int {
+        guard let model = activeGenerationModel() else {
+            return KVCacheProvisioning.localMaxOutputTokens(config: modelConfig)
+        }
+        return ceilingRows(for: model)
+    }
+
+    /// The Max Output Tokens ceiling for the model whose PROFILE is being edited.
+    ///
+    /// The active `modelConfig` is reused only when the edited model IS the
+    /// active one; otherwise the checkpoint's `config.json` is read here, in the
+    /// action that opens the editor. Never called from `body`: a cloud lookup
+    /// rebuilds the provider registry and a local one reads a file.
+    private func ceilingRows(for model: DiscoveredModel) -> Int {
+        if let parsed = CloudModelAddress.parseModelId(model.id)
+            ?? CloudModelAddress.parsePath(model.snapshotPath) {
+            return CloudContextPolicy.maximumOutputTokens(
+                window: CloudContextPolicy.window(
+                    forModelId: parsed.providerModelId,
+                    providerId: parsed.provider.id
+                )
+            )
+        }
+        let isActive = activeModelPath != nil
+            && (activeModelPath == model.snapshotPath || activeModelPath == model.weightsEntryPath)
+        let config = isActive
+            ? modelConfig
+            : ModelConfig.load(from: URL(fileURLWithPath: model.snapshotPath))
+        return KVCacheProvisioning.localMaxOutputTokens(config: config)
+    }
+
+    /// What the ceiling is bound by, for the row that shows the number. A
+    /// ceiling with no stated reason reads as an arbitrary app limit.
+    private func ceilingExplanation(for model: DiscoveredModel?) -> String {
+        let isCloud = model.map { CloudModelAddress.isCloudModelId($0.id) } ?? false
+        if isCloud {
+            return "Capped by 20% of this model's recorded context window — a reply budget larger than that cannot share the window with any prompt. Record a larger window on the Cloud tab to raise it."
+        }
+        return "Capped by this checkpoint's own position limit. The KV cache budget also lowers the effective ceiling for a long prompt."
     }
 
     /// Label-left settings row carrying a slider-plus-field numeric control,
@@ -849,15 +957,15 @@ struct SettingsSheetView: View {
                 // Max Output Tokens: slider, editable field, and quick presets.
                 SettingsRow(
                     title: "Max Output Tokens",
-                    subtitle: "Hard cap on tokens generated per response. The KV cache budget also caps it for a long prompt."
+                    subtitle: "Hard cap on tokens generated per response. \(ceilingExplanation(for: activeGenerationModel()))"
                 ) {
                     SettingsValueSlider(
                         label: "Max Output Tokens",
                         value: doubleBinding($maxNewTokens),
-                        range: 32...Double(KVCacheProvisioning.maxProvisionedRows),
+                        range: 32...Double(activeModelCeilingRows),
                         step: 32,
                         fractionDigits: 0,
-                        fieldWidth: 64
+                        fieldWidth: 72
                     )
                 }
 
@@ -866,7 +974,7 @@ struct SettingsSheetView: View {
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
 
-                    ForEach(maxTokenPresets, id: \.self) { preset in
+                    ForEach(maxTokenPresets(upTo: activeModelCeilingRows), id: \.self) { preset in
                         Button("\(preset)") {
                             maxNewTokens = preset
                         }
@@ -2537,6 +2645,19 @@ struct SettingsSheetView: View {
     private func loadProfileDraft(modelId: String, type: ModelProfileType) {
         inspectingProfileType = type
         editingDraft = profileManager.getProfile(for: modelId, type: type)
+        // Resolve the ceiling here, with the draft, so the slider and the stored
+        // value are opened against the same limit. The stored value is NOT
+        // clamped: a profile saved under a wider ceiling is honoured by the
+        // engine, and rewriting it on open would silently discard the setting
+        // this screen exists to edit. The control clamps on edit, which is the
+        // only moment the user has asked for a new number.
+        if let model = localModelManager.discoveredModels.first(where: {
+            $0.id == modelId || $0.snapshotPath == modelId
+        }) {
+            editingModelCeilingRows = ceilingRows(for: model)
+        } else {
+            editingModelCeilingRows = KVCacheProvisioning.maxProvisionedRows
+        }
     }
 
     private func saveProfileDraft(model: DiscoveredModel, type: ModelProfileType) {
@@ -2752,14 +2873,26 @@ struct SettingsSheetView: View {
                     Slider(value: Binding(
                         get: { Float(editingDraft.maxNewTokens) },
                         set: { editingDraft.maxNewTokens = Int($0) }
-                    ), in: 32...Float(KVCacheProvisioning.maxProvisionedRows), step: 32)
+                    ), in: 32...Float(editingModelCeilingRows), step: 32)
                     .accessibilityLabel("Max Output Tokens")
+
+                    // Shown only when the draft sits above this model's ceiling:
+                    // a profile is per-model, so a value saved against a wider
+                    // model (or a cloud window since lowered) can legitimately
+                    // exceed the slider. The engine still honours it, so this
+                    // explains the number instead of silently rewriting it.
+                    if editingDraft.maxNewTokens > editingModelCeilingRows {
+                        Text("Saved value exceeds this model's ceiling of \(editingModelCeilingRows); the engine still honours it. Editing the slider lowers it.")
+                            .font(.system(size: 9))
+                            .foregroundColor(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
 
                     HStack(spacing: 5) {
                         Text("Presets:")
                             .font(.system(size: 9))
                             .foregroundColor(.secondary)
-                        ForEach(maxTokenPresets, id: \.self) { preset in
+                        ForEach(maxTokenPresets(upTo: editingModelCeilingRows), id: \.self) { preset in
                             Button("\(preset)") {
                                 editingDraft.maxNewTokens = preset
                             }

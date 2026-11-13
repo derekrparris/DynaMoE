@@ -244,7 +244,21 @@ public struct GenerationProfileSettings: Codable, Equatable, Hashable {
             }
         }
 
-        // Generic fallback defaults
+        // Generic fallback defaults.
+        //
+        // This branch is the CLOUD profile. A provider's model id ("deepseek-ai/
+        // DeepSeek-V4.1", "hf:minimax/M2") matches none of the name-gated
+        // families above, so every cloud model lands here — the budgets below are
+        // what a cloud turn sends, not a leftover for unrecognized local files.
+        //
+        // They were 8,192 / 4,096, a budget sized for a local checkpoint's KV
+        // appetite, which crippled a capable remote model's ability to use the
+        // harness (a long tool step or a full file rewrite truncated mid-answer).
+        // Doubled, and deliberately NOT raised to the policy ceiling: the slider
+        // is the ceiling and the cloud path derives it per window
+        // (`CloudContextPolicy.maximumOutputTokens`), while this default has to be
+        // safe for a provider nobody recorded a window for — which is exactly
+        // `unknownWindowReplyCeiling`.
         switch type {
         case .coder:
             return GenerationProfileSettings(
@@ -254,7 +268,7 @@ public struct GenerationProfileSettings: Codable, Equatable, Hashable {
                 topK: 20,
                 repetitionPenalty: 1.00,
                 presencePenalty: 0.00,
-                maxNewTokens: 8192,
+                maxNewTokens: 16384,
                 systemPrompt: "You are an expert software engineer and programming assistant. Provide clear, correct, and high-performance code with minimal filler.",
                 jetSpecEnabled: true,
                 jetSpecMaxDepth: 3,
@@ -269,7 +283,7 @@ public struct GenerationProfileSettings: Codable, Equatable, Hashable {
                 topK: 50,
                 repetitionPenalty: 1.10,
                 presencePenalty: 0.00,
-                maxNewTokens: 4096,
+                maxNewTokens: 8192,
                 systemPrompt: "You are a helpful, respectful, and honest AI assistant.",
                 jetSpecEnabled: true,
                 jetSpecMaxDepth: 3,

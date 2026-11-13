@@ -395,6 +395,21 @@ public nonisolated enum CloudContextPolicy {
     /// Below this a "window" is a units mistake, not a context size.
     public static let minimumPlausibleWindow = 1_024
 
+    /// The reply budget a cloud model is held to when it records NO window.
+    ///
+    /// An unrecorded window used to mean "no cap": `replyBudget` passed the
+    /// caller's request straight through, so whatever Max Output Tokens the
+    /// settings slider allowed was sent verbatim as `max_tokens`. At the slider's
+    /// old 32,768 that was already generous; once the slider became honest about
+    /// a 128k-window model it became a budget no provider asked for and several
+    /// refuse outright. With no window there is no capacity to justify a larger
+    /// number, so this is the number instead.
+    ///
+    /// It is deliberately the value the generic (cloud) profile's coder default
+    /// now carries, so an unconfigured provider gets a coherent budget rather
+    /// than a value that is then clamped by a different constant.
+    public static let unknownWindowReplyCeiling = 16_384
+
     public static func defaultsKey(for providerId: String) -> String {
         "dynamoe_cloud_\(providerId)_context"
     }
@@ -632,14 +647,39 @@ public nonisolated enum CloudContextPolicy {
     /// The cap is the room the auto-compaction threshold leaves — 20% of the
     /// window — so the two rules agree: once the prompt is under 80%, the
     /// prompt plus this reply fits, and the pre-flight is only triggered by a
-    /// prompt compaction can actually shrink. A model with no recorded window
-    /// is left alone, as is a caller that asked for no budget (`nil`/`0`).
+    /// prompt compaction can actually shrink.
+    ///
+    /// A model with NO recorded window is capped at `unknownWindowReplyCeiling`
+    /// rather than passed through. The pass-through was safe only while the
+    /// settings slider topped out at a budget most providers accept; it let the
+    /// app send an arbitrary `max_tokens` to a provider whose capacity nobody had
+    /// written down, which is a 400 (or an expensive success) with no local
+    /// evidence behind it. The ceiling is the same number
+    /// `maximumOutputTokens(window:)` advertises, so the slider and this clamp
+    /// cannot disagree. A caller that asked for no budget (`nil`/`0`) is still
+    /// left alone.
     public static func replyBudget(requested: Int, window: Int?) -> Int {
         guard requested > 0 else { return max(0, requested) }
-        guard let window, window >= minimumPlausibleWindow else { return requested }
+        guard let window, window >= minimumPlausibleWindow else {
+            return min(requested, unknownWindowReplyCeiling)
+        }
         let room = (Double(window) * (1 - autoCompactFraction)).rounded()
-        guard room.isFinite, room >= 1, room < Double(Int.max) else { return requested }
+        guard room.isFinite, room >= 1, room < Double(Int.max) else {
+            return min(requested, unknownWindowReplyCeiling)
+        }
         return min(requested, Int(room))
+    }
+
+    /// The Max Output Tokens ceiling Settings should advertise for a cloud
+    /// model — the same number `replyBudget` enforces for it.
+    ///
+    /// Written against `replyBudget`'s own arithmetic on purpose: a slider that
+    /// computed its range independently would eventually advertise a budget the
+    /// send path silently lowers, which reads as the app ignoring a setting.
+    /// An unrecorded (or sub-plausible) window answers with
+    /// `unknownWindowReplyCeiling`, exactly as the clamp does.
+    public static func maximumOutputTokens(window: Int?) -> Int {
+        replyBudget(requested: Int.max, window: window)
     }
 
     /// The share of the window a prompt occupies, for a status line.

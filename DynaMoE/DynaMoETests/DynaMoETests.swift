@@ -4891,6 +4891,55 @@ final class DynaMoETests: XCTestCase {
     // must still resolve through normalizeKey + family matching. If Assistant is the
     // active profile, getProfile(for:type:.assistant) must return assistant settings --
     // never the coder prompt that used to leak in via the async model-load completion.
+    /// The generic fallback IS the cloud profile: a provider model id matches
+    /// none of the name-gated families, so every cloud model resolves here. Its
+    /// budgets are therefore what a cloud turn sends, which is why they were
+    /// raised (8,192/4,096 -> 16,384/8,192) to let a capable remote model use the
+    /// harness — a long tool step or a full file rewrite used to truncate
+    /// mid-answer.
+    ///
+    /// Pinned deliberately, and pinned TOGETHER with
+    /// `CloudContextPolicy.unknownWindowReplyCeiling`: an unrecorded-window turn
+    /// is clamped to that ceiling, so a generic default above it would be silently
+    /// lowered on every send and the setting would look ignored.
+    func testTheGenericProfileIsTheCloudProfileAndFitsUnderTheUnsetWindowCeiling() {
+        let coder = GenerationProfileSettings.defaultFor(type: .coder)
+        let assistant = GenerationProfileSettings.defaultFor(type: .assistant)
+
+        XCTAssertEqual(coder.maxNewTokens, 16_384)
+        XCTAssertEqual(assistant.maxNewTokens, 8_192)
+        // The 2:1 coder:assistant ratio the shipped profiles keep.
+        XCTAssertEqual(coder.maxNewTokens, assistant.maxNewTokens * 2)
+
+        // A cloud id that matches no family resolves to the generic profile.
+        let cloudCoder = GenerationProfileSettings.defaultFor(
+            type: .coder,
+            modelName: "deepseek-ai/DeepSeek-V4.1-Flash"
+        )
+        XCTAssertEqual(cloudCoder.maxNewTokens, coder.maxNewTokens, "a cloud model gets the generic budget")
+
+        // And it survives the no-window clamp unchanged.
+        XCTAssertEqual(
+            CloudContextPolicy.replyBudget(requested: coder.maxNewTokens, window: nil),
+            coder.maxNewTokens,
+            "the default must not be lowered by the unset-window ceiling"
+        )
+        XCTAssertLessThanOrEqual(
+            coder.maxNewTokens,
+            CloudContextPolicy.unknownWindowReplyCeiling
+        )
+
+        // The name-gated families are untouched by the generic change.
+        XCTAssertEqual(
+            GenerationProfileSettings.defaultFor(type: .coder, modelName: "ornith").maxNewTokens,
+            8_192
+        )
+        XCTAssertEqual(
+            GenerationProfileSettings.defaultFor(type: .coder, modelName: "qwen").maxNewTokens,
+            8_192
+        )
+    }
+
     func testOrnith35BFamilyProfileResolution() throws {
         let manager = ModelProfileManager.shared
 

@@ -132,7 +132,7 @@ Typing `/compact` in the composer — on **any** backend, with optional extra em
 - The chat keeps a **summary card** at the top afterwards: an expandable card showing the general summary and the detailed recap, followed by a marker naming how many messages were compacted. Earlier turns vanish from the screen, but the card is display-only (the digests reach the model through the system block), so it never counts against the context window and never double-counts what the model already knows.
 - The history rewrite is transactional: the conversation is only replaced once both summaries exist, so a failed or cancelled pass — an unavailable on-device model, a missing provider key, a truncated summary — leaves everything untouched. Compaction never degrades into silent truncation.
 - The compacted prefix no longer matches the pinned KV state, so the next turn on a weights model pays one full re-prefill by design.
-- `/compact` is the manual pass. A cloud turn also compacts **automatically**: before a step whose prompt is projected past 80% of the model's recorded window, or whose prompt plus the request's own reply budget would not fit inside the window at all, and once more if the provider still answers with a context-length rejection. The reply budget is itself capped to the room the 80% threshold leaves, so a Max Output Tokens setting larger than a small window's room (a 16k window leaves 3,200) is lowered instead of making every send impossible. With no recorded window the pre-flight check is skipped and only the rejection path runs. See **Request Behaviour → Context Window**.
+- `/compact` is the manual pass. A cloud turn also compacts **automatically**: before a step whose prompt is projected past 80% of the model's recorded window, or whose prompt plus the request's own reply budget would not fit inside the window at all, and once more if the provider still answers with a context-length rejection. The reply budget is itself capped to the room the 80% threshold leaves, so a Max Output Tokens setting larger than a small window's room (a 16k window leaves 3,200) is lowered instead of making every send impossible. With no recorded window the pre-flight check is skipped and only the rejection path runs, and the reply budget is held to 16,384 rather than sent unbounded. See **Request Behaviour → Context Window**.
 
 ### MoE Contiguous Binary Repackaging (Flash-MoE)
 Sparse MoE models with hundreds of experts (e.g., Qwen 3.8 Flash Next with 512 routed experts) distribute their tensor weights across dozens of multi-gigabyte `.safetensors` shard files. During token-by-token generation under SSD streaming:
@@ -185,6 +185,14 @@ DynaMoE automatically defaults to and persists the official publisher-tuned prof
   - **Repetition Penalty**: $1.00$
   - **Presence Penalty**: $1.50$ (fresh conversational flow)
   - **Max Tokens**: $4,096$ | **JetSpec**: Enabled (draft speculative decoding)
+
+#### Generic Profile (Every Cloud Model)
+A cloud model's id (`deepseek-ai/DeepSeek-V4.1-Flash`, `hf:minimax/M2`) matches none of the name-gated families above, so **every cloud model runs on the generic profile**. Its budgets are therefore what a cloud turn actually sends, and they are sized for a capable remote model rather than a local checkpoint's KV appetite:
+
+- **Coder**: Temperature $0.60$, Top-P $0.95$, Top-K $20$, Min-P $0.00$, Repetition Penalty $1.00$, **Max Tokens $16,384$**
+- **Assistant**: Temperature $0.70$, Top-P $0.90$, Top-K $50$, Min-P $0.05$, Repetition Penalty $1.10$, **Max Tokens $8,192$**
+
+The coder budget sits exactly at the **16,384-token ceiling applied to a provider with no recorded context window**. Recording a window on the Cloud tab is what raises it: a model with a 200,000-token window is allowed 40,000.
 
 #### Profile Customization & Persistence
 1. Open the **Models** section, click the **⋯** (ellipsis) menu on your model, and choose **"Configure Profiles…"**.
@@ -258,8 +266,11 @@ At the top of the Generation section, an active profile banner indicates which p
 - **Recommended Values**: $0.00$ for coding; $0.10\text{–}0.40$ for open conversation.
 
 #### 7. Max Tokens
-- **What it does**: Hard ceiling on the maximum number of new tokens generated per turn (32 to the KV cache provision ceiling, 32,768 here; a turn may provision up to the checkpoint's own `max_position_embeddings`, capped at 262,144 rows). The KV cache budget can lower the effective ceiling further for a long prompt.
-- **Recommended Values**: $8192$ for Coder; $4096$ for Assistant.
+- **What it does**: Hard ceiling on the maximum number of new tokens generated per turn. It is the **upper bound of the slider**, and it is not one number: it depends on which backend the selected model runs on.
+  - **Local checkpoint**: 32 to the checkpoint's own `max_position_embeddings`, floored at 32,768 so no model loses range and capped at 262,144 rows. This is `policyMaxRows`, the same figure the launch path uses. The KV cache budget can lower the effective ceiling further for a long prompt, and the turn logs the clamp (`clamped max_tokens N -> M`) rather than failing.
+  - **Cloud model**: 20% of the model's **recorded context window** — the room the auto-compaction threshold leaves, so a prompt under 80% of the window plus this reply always fits. A model with **no recorded window** is held to 16,384 tokens instead of being sent an arbitrary `max_tokens`; record its window in Settings ▸ Cloud Providers ▸ Request Behaviour to raise it.
+- **Setting it high is safe but is not a promise.** The number is a ceiling. A local turn is ratcheted down by the KV budget; a cloud turn by the model's window. Nothing generates past what the backend can hold.
+- **Recommended Values**: $8192$ for Coder; $4096$ for Assistant. The generic profile — which is what every cloud model uses — ships $16384$ / $8192$.
 
 ---
 
@@ -594,7 +605,7 @@ The **Cloud Providers** section connects remote inference providers. **Synthetic
 The **Request Behaviour** card holds the provider-independent settings that decide what every cloud request asks for and how its cost is reported.
 
 - **Re-send Images** (default on): a stateless provider must be re-told about a picture on every request that should still see it, and those tokens are billed every time. Off sends only the newest user turn's pictures and replaces pictures from earlier turns in the request with `[N images omitted: older turn, not re-sent]`, so a text follow-up does not keep paying for a picture attached to an earlier question. The choice depends on the conversation, not the step, so it stays prefix-stable.
-- **Context Window**: `dynamoe_cloud_<provider>_context`, `model=window` entries separated by `;`. A single `dynamoe_cloud_context_window_tokens` value stands in for every model that records no window of its own. Without either, the turn skips the pre-flight check — so it cannot compact BEFORE a request would overflow, and instead compacts once after the provider refuses it — and the chat header shows the plain token total. With one, the header's figure is the context the last request carried (the whole prompt, cached reads included) plus the tokens generated after it — not a running sum of what each step billed, so a long cached re-send cannot read as several conversations' worth.
+- **Context Window**: one editable field per registered model, saved to `dynamoe_cloud_<provider>_context` as `model=window` entries separated by `;` (the field is the supported path; `defaults write` still works and is picked up the next time the pane appears). A single `dynamoe_cloud_context_window_tokens` value stands in for every model that records no window of its own. The window is load-bearing twice: it triggers compaction, and it sets the **Max Output Tokens ceiling** for that model at 20% of the window. With no window recorded, the turn skips the pre-flight check — so it cannot compact BEFORE a request would overflow, and instead compacts once after the provider refuses it — the reply budget is held to 16,384 tokens, and the chat header shows the plain token total. With one, the header's figure is the context the last request carried (the whole prompt, cached reads included) plus the tokens generated after it — not a running sum of what each step billed, so a long cached re-send cannot read as several conversations' worth. Emptying a field clears that model's window rather than storing a zero: "no recorded window" is a distinct state with its own budget.
 - **Prices**: `dynamoe_cloud_<provider>_pricing`, JSON in USD per million tokens (`input`, optional `cached_input`, optional `cache_write_input`, `output`). A malformed or negative entry costs that model's price, not the provider's whole list. Without one, no cost is reported. Summarizer requests spent by a compaction are counted in the conversation's spend and in the run's status line like any other provider request.
 - Both registrations are hand-typed and describe the MODEL, not the endpoint: re-pointing the provider's base URL keeps them. **Remove** deletes them, and so does the **−** prune beside a registered model (the note under the list says so): that model's window and price are facts about an id you just said this wire does not serve, so re-adding the same id starts clean rather than inheriting a ceiling and a rate nobody re-entered.
 

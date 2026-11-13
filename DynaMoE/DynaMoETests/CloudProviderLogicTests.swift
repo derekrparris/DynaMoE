@@ -3146,7 +3146,7 @@ final class CloudContextPolicyTests: XCTestCase {
         // guarantees a refusal.
         XCTAssertEqual(CloudContextPolicy.replyBudget(requested: 8_192, window: 16_000), 3_200)
         XCTAssertEqual(CloudContextPolicy.replyBudget(requested: 8_192, window: 1_024), 205)
-        // Nothing to clamp.
+        // Nothing to clamp: a request already under the room passes through.
         XCTAssertEqual(CloudContextPolicy.replyBudget(requested: 8_192, window: nil), 8_192)
         XCTAssertEqual(CloudContextPolicy.replyBudget(requested: 1_000, window: 16_000), 1_000)
         XCTAssertEqual(CloudContextPolicy.replyBudget(requested: 8_192, window: 512), 8_192)
@@ -3159,6 +3159,90 @@ final class CloudContextPolicyTests: XCTestCase {
             window: 16_000,
             reservedTokens: budget
         ), "12,000 + 3,200 fits a 16k window, and 12,000 is under the threshold")
+    }
+
+    /// The regression this whole change exists for.
+    ///
+    /// `replyBudget` used to hand back the caller's request untouched when no
+    /// window was recorded. That was harmless only while the settings slider
+    /// topped out at a budget most providers accept: once the Max Output Tokens
+    /// ceiling became the model's real capacity, an unrecorded provider would
+    /// have received an arbitrary `max_tokens` — a 400, or an expensive success,
+    /// with no local evidence behind it.
+    func testAnUnrecordedWindowIsCappedRatherThanPassedThrough() {
+        XCTAssertEqual(
+            CloudContextPolicy.replyBudget(requested: 131_072, window: nil),
+            CloudContextPolicy.unknownWindowReplyCeiling
+        )
+        // A sub-plausible window is a units mistake, not capacity, so it takes
+        // the same ceiling instead of the (tiny) "window" arithmetic.
+        XCTAssertEqual(
+            CloudContextPolicy.replyBudget(requested: 131_072, window: 512),
+            CloudContextPolicy.unknownWindowReplyCeiling
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.replyBudget(requested: 131_072, window: 1_023),
+            CloudContextPolicy.unknownWindowReplyCeiling
+        )
+        // Under the ceiling nothing is lowered: the cap is a ceiling, not a floor.
+        XCTAssertEqual(
+            CloudContextPolicy.replyBudget(requested: 4_096, window: nil),
+            4_096
+        )
+        // A recorded window still wins over the fallback.
+        XCTAssertEqual(
+            CloudContextPolicy.replyBudget(requested: 131_072, window: 200_000),
+            40_000
+        )
+    }
+
+    /// The Settings slider must advertise exactly what the send path enforces.
+    /// A slider that computed its own range would eventually show a budget the
+    /// clamp silently lowered, which reads as the app ignoring the setting.
+    func testTheAdvertisedCeilingIsTheEnforcedBudget() {
+        // No window: the conservative ceiling, in both directions.
+        XCTAssertEqual(
+            CloudContextPolicy.maximumOutputTokens(window: nil),
+            CloudContextPolicy.unknownWindowReplyCeiling
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.maximumOutputTokens(window: 512),
+            CloudContextPolicy.unknownWindowReplyCeiling
+        )
+
+        // A recorded window: 20% of it, identical to the clamp.
+        XCTAssertEqual(CloudContextPolicy.maximumOutputTokens(window: 200_000), 40_000)
+        XCTAssertEqual(
+            CloudContextPolicy.maximumOutputTokens(window: 200_000),
+            CloudContextPolicy.replyBudget(requested: Int.max, window: 200_000),
+            "the slider and the clamp cannot disagree"
+        )
+
+        // A window small enough that 20% is under the fallback yields the smaller
+        // number: capacity, not a floor, is what binds.
+        XCTAssertEqual(CloudContextPolicy.maximumOutputTokens(window: 32_000), 6_400)
+    }
+
+    /// `maxTokenPresets(upTo:)` feeds `ForEach(_:id: \.self)`, so a duplicate is a
+    /// SwiftUI runtime crash rather than a cosmetic glitch, and a preset above
+    /// the ceiling would set a value the control immediately clamps.
+    func testMaxTokenPresetsRespectTheCeilingAndStayUnique() {
+        for ceiling in [16_384, 32_768, 40_000, 262_144] {
+            let presets = maxTokenPresets(upTo: ceiling)
+            XCTAssertEqual(presets, Array(Set(presets)).sorted(), "unique and ascending at \(ceiling)")
+            XCTAssertTrue(presets.allSatisfy { $0 <= ceiling }, "no preset above the ceiling at \(ceiling)")
+            XCTAssertEqual(presets.filter { $0 == ceiling }.count, 1, "the ceiling is offered exactly once at \(ceiling)")
+            XCTAssertFalse(presets.isEmpty)
+        }
+        // The default ceiling keeps every value the old fixed list offered.
+        let standard = maxTokenPresets(upTo: 32_768)
+        for legacy in [1024, 4096, 8192] {
+            XCTAssertTrue(standard.contains(legacy))
+        }
+        XCTAssertEqual(standard.last, 32_768)
+        // A cloud ceiling that is not a rung is still offered verbatim.
+        XCTAssertEqual(maxTokenPresets(upTo: 40_000).last, 40_000)
+        XCTAssertFalse(maxTokenPresets(upTo: 40_000).contains(65_536))
     }
 
     func testAContextPercentageAboveTheWindowStopsAtOneHundred() {
