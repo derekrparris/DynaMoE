@@ -91,6 +91,10 @@ build/
 /config.local.json
 DynaMoE Architectural Overview.md
 AGENTS.md
+.codex
+Product.md
+Design.md
+.impeccable
 
 # Compiled streaming benchmark binary (built from Benchmarks/dynamoe_stream_bench.swift)
 Benchmarks/dynamoe_stream_bench
