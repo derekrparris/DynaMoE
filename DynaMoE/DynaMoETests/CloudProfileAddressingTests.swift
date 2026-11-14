@@ -373,4 +373,108 @@ final class CloudProfileAddressingTests: XCTestCase {
                 .contains("checkpoint's own position limit")
         )
     }
+
+    // MARK: - A saved cloud profile is not a local family's fallback
+
+    /// A scratch manager whose seedable family keys are EMPTY entries.
+    ///
+    /// `seedOfficialProfiles` refills a family key only when it is absent, so
+    /// empty entries keep it from adding the official profiles without hiding
+    /// the family key from `getProfile`. That leaves any saved cloud key as the
+    /// only candidate the step-4 scan could return, which is what makes these
+    /// assertions deterministic rather than dependent on dictionary order.
+    private func managerWithEmptyFamilySeeds() -> (ModelProfileManager, UserDefaults, String) {
+        let suite = "CloudProfileAddressingTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+
+        let emptySeeds: [String: [String: GenerationProfileSettings]] = [
+            "qwen": [:],
+            "ornith": [:],
+            "nanbeige": [:]
+        ]
+        defaults.set(try? JSONEncoder().encode(emptySeeds), forKey: "dynamoe_model_profiles_v1")
+        defaults.set(true, forKey: "dynamoe_seeded_official_profiles_v3")
+        return (ModelProfileManager(defaults: defaults), defaults, suite)
+    }
+
+    /// The one-sided half of the family gate.
+    ///
+    /// Step 4 already skipped the incoming cloud address, but it scans
+    /// `profilesByModel` for any key containing the family name. Once a user
+    /// saves a profile for a family-named cloud model, that key is a candidate,
+    /// and the unordered dictionary decides whether an unseeded local sibling
+    /// receives the cloud model's budget. Family matching is a statement about
+    /// local checkpoints, so a cloud key must never be one.
+    func testASavedCloudProfileIsNotAFamilyFallbackForLocalModels() {
+        let (manager, defaults, suite) = managerWithEmptyFamilySeeds()
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        var cloud = GenerationProfileSettings.defaultFor(type: .assistant)
+        cloud.temperature = 0.11
+        cloud.maxNewTokens = 40_000
+        cloud.presencePenalty = 0.00
+        manager.saveProfile(
+            for: "cloud-model-synthetic-qwen3-coder",
+            type: .assistant,
+            settings: cloud
+        )
+
+        // An unseeded LOCAL sibling (steps 1-3 miss; step 4 would scan).
+        let localSibling = manager.getProfile(
+            for: "mlx-community/Qwen3-30B-A3B-4bit",
+            type: .assistant
+        )
+        let localDefault = GenerationProfileSettings.defaultFor(
+            type: .assistant,
+            modelName: "mlx-community/Qwen3-30B-A3B-4bit"
+        )
+        XCTAssertEqual(localSibling, localDefault,
+                       "a local Qwen sibling must not be answered by a saved cloud Qwen profile")
+        XCTAssertEqual(localSibling.maxNewTokens, 4_096)
+        XCTAssertEqual(localSibling.presencePenalty, 1.50, accuracy: 0.0001)
+
+        // The filter must not make the cloud profile unreachable by its own
+        // address: steps 1-2 are exact-key lookups, not family scans.
+        let savedCloud = manager.getProfile(
+            for: "cloud-model-synthetic-qwen3-coder",
+            type: .assistant
+        )
+        XCTAssertEqual(savedCloud.maxNewTokens, 40_000)
+        XCTAssertEqual(savedCloud.temperature, 0.11, accuracy: 0.0001)
+    }
+
+    /// Resetting a seeded family restores ITS official profile, not whichever
+    /// other key the family scan happens to find first.
+    ///
+    /// Nanbeige is seeded by `seedOfficialProfiles` exactly as Ornith and Qwen
+    /// are, but `resetProfile` used to omit it from the "store the default under
+    /// this key" branch. It therefore removed the entry, and step 4 was free to
+    /// return a DIFFERENT Nanbeige profile the user had saved under another key.
+    func testResettingASeededFamilyStoresItsOfficialProfile() {
+        let (manager, defaults, suite) = managerWithEmptyFamilySeeds()
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        var sibling = GenerationProfileSettings.defaultFor(type: .assistant, modelName: "nanbeige")
+        sibling.maxNewTokens = 40_000
+        manager.saveProfile(for: "custom/nanbeige-finetune", type: .assistant, settings: sibling)
+
+        var custom = GenerationProfileSettings.defaultFor(type: .assistant, modelName: "nanbeige")
+        custom.maxNewTokens = 2_048
+        manager.saveProfile(for: "nanbeige/nanbeige4.3-33b", type: .assistant, settings: custom)
+
+        manager.resetProfile(for: "nanbeige/nanbeige4.3-33b", type: .assistant)
+
+        let expected = GenerationProfileSettings.defaultFor(
+            type: .assistant,
+            modelName: "nanbeige/nanbeige4.3-33b"
+        )
+        let reset = manager.getProfile(for: "nanbeige/nanbeige4.3-33b", type: .assistant)
+        XCTAssertEqual(reset, expected)
+        XCTAssertEqual(reset.maxNewTokens, 262_144)
+        XCTAssertNotNil(
+            manager.profilesByModel[manager.normalizeKey("nanbeige/nanbeige4.3-33b")],
+            "a reset seeded family must be stored under its own key, not removed"
+        )
+    }
 }

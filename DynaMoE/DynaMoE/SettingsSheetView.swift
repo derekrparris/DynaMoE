@@ -9,8 +9,11 @@ import Metal
 
 /// The lowest Max Output Tokens the slider can express.
 ///
-/// It is a UI floor, not a backend one: nothing in the engine refuses a smaller
+/// It is a UI floor, not a backend one: no local or cloud turn refuses a smaller
 /// reply, but a slider whose lower bound is 0 invites a value no turn can use.
+/// The on-device backend does have a floor of its own — `AppleFoundationModel`
+/// raises a smaller request to 64 (`clampMaximumResponseTokens`) — so a value
+/// entered between this floor and 64 is lifted before the framework sees it.
 let maxTokenSliderFloor = 32
 
 /// Quick-pick values for Max Output Tokens, bounded by the ceiling of whichever
@@ -153,8 +156,27 @@ struct ActiveCeilingKey: Equatable {
     var modelPath: String?
     var defaultModelId: String?
     var modelType: String?
+    /// The declared position limit, not just the model type. Two checkpoints can
+    /// share a `model_type` and still have different ceilings (an 8k Llama next
+    /// to Nanbeige 4.3, which is also `"llama"`), so keying on the type alone
+    /// left the slider on the outgoing model's range after a switch.
+    var declaredMaxPositionEmbeddings: Int?
     /// The raw window facts for the active model's provider, so an edit landed
     /// in the Cloud pane re-resolves the ceiling here.
+    var cloudWindowFacts: String?
+}
+
+/// Identity of the inputs the Models tab's profile editor re-prices against.
+///
+/// The editor's ceiling is resolved in an action (`loadProfileDraft`), but the
+/// inputs can move while it is open: a model switch assigns `activeModelPath`
+/// before the new `modelConfig` lands, and a cloud window saved on the Cloud tab
+/// invalidates a cloud row's provider facts. `task(id:)` re-resolves on any of
+/// them rather than leaving the slider on the value it was opened with.
+struct EditingModelCeilingKey: Equatable {
+    var modelId: String
+    var activeModelPath: String?
+    var declaredMaxPositionEmbeddings: Int?
     var cloudWindowFacts: String?
 }
 
@@ -640,7 +662,13 @@ struct SettingsSheetView: View {
     /// facts. Two reads of a defaults key, cheap enough for a body pass, and one
     /// string that already exists in the domain rather than a copy of its parse.
     private var activeCloudWindowFacts: String? {
-        guard let address = activeGenerationAddress,
+        cloudWindowFacts(for: activeGenerationAddress)
+    }
+
+    /// The recorded-window inputs for one cloud address, or nil when it is not
+    /// a cloud address at all.
+    private func cloudWindowFacts(for address: String?) -> String? {
+        guard let address,
               let parsed = CloudModelAddress.parseModelId(address)
                 ?? CloudModelAddress.parsePath(address) else { return nil }
         let defaults = UserDefaults.standard
@@ -655,6 +683,7 @@ struct SettingsSheetView: View {
             modelPath: activeModelPath,
             defaultModelId: localModelManager.defaultModelId,
             modelType: modelConfig?.modelType,
+            declaredMaxPositionEmbeddings: modelConfig?.declaredMaxPositionEmbeddings,
             cloudWindowFacts: activeCloudWindowFacts
         )
     }
@@ -688,16 +717,39 @@ struct SettingsSheetView: View {
             ) {
                 return nonLocal
             }
-            return KVCacheProvisioning.localMaxOutputTokens(config: modelConfig)
+            // `modelConfig` is nil while a local load is in flight, and
+            // `activeModelPath` is assigned BEFORE the detached load begins, so
+            // a checkpoint that is still loading would otherwise advertise the
+            // policy floor rather than its own position limit.
+            return KVCacheProvisioning.localMaxOutputTokens(
+                config: localConfig(atPath: activeModelPath) ?? modelConfig
+            )
         }
         return ceilingRows(for: model)
     }
 
+    /// The inputs the profile editor's ceiling depends on, as a value the
+    /// `task(id:)` in `modelProfileEditorSection` can compare. Recomputed only
+    /// from what can actually move the answer, so a keystroke elsewhere in
+    /// Settings does not re-read the checkpoint.
+    private func editingCeilingKey(for model: DiscoveredModel) -> EditingModelCeilingKey {
+        EditingModelCeilingKey(
+            modelId: model.id,
+            activeModelPath: activeModelPath,
+            declaredMaxPositionEmbeddings: modelConfig?.declaredMaxPositionEmbeddings,
+            cloudWindowFacts: cloudWindowFacts(for: model.id)
+                ?? cloudWindowFacts(for: model.snapshotPath)
+        )
+    }
+
     /// The Max Output Tokens ceiling for the model whose PROFILE is being edited.
     ///
-    /// The active `modelConfig` is reused only when the edited model IS the
-    /// active one; otherwise the checkpoint's `config.json` is read here, in the
-    /// action that opens the editor. Never called from `body`: a cloud lookup
+    /// The checkpoint's `config.json` is read from disk for a LOCAL entry, even
+    /// when it is the active model. `modelConfig` belongs to whatever the
+    /// engine has loaded, while `activeModelPath` is assigned before the
+    /// detached load begins (and stays stale if the load fails); reusing it
+    /// because the paths matched priced the incoming checkpoint with the
+    /// outgoing one's position limit. Never called from `body`: a cloud lookup
     /// rebuilds the provider registry and a local one reads a file.
     private func ceilingRows(for model: DiscoveredModel) -> Int {
         if let nonLocal = resolveNonLocalMaxOutputCeiling(model: model, fallbackAddress: nil) {
@@ -705,10 +757,25 @@ struct SettingsSheetView: View {
         }
         let isActive = activeModelPath != nil
             && (activeModelPath == model.snapshotPath || activeModelPath == model.weightsEntryPath)
-        let config = isActive
-            ? modelConfig
-            : ModelConfig.load(from: URL(fileURLWithPath: model.snapshotPath))
+        let config = localConfig(atPath: model.snapshotPath)
+            ?? (isActive ? modelConfig : nil)
         return KVCacheProvisioning.localMaxOutputTokens(config: config)
+    }
+
+    /// The `config.json` for a LOCAL address, read from disk.
+    ///
+    /// `ModelConfig.load(from:)` expects a DIRECTORY, while a custom entry's
+    /// address can be the `.safetensors` or index file inside its snapshot, so
+    /// one failed read falls back to the containing directory. Nil for a cloud
+    /// or on-device address: neither has a checkpoint file.
+    private func localConfig(atPath path: String?) -> ModelConfig? {
+        guard let path, !path.isEmpty,
+              !CloudModelAddress.isCloudPath(path),
+              path != AppleFoundationModelService.modelPath,
+              path != AppleFoundationModelService.modelId else { return nil }
+        let url = URL(fileURLWithPath: path)
+        if let config = ModelConfig.load(from: url) { return config }
+        return ModelConfig.load(from: url.deletingLastPathComponent())
     }
 
     /// What the ceiling is bound by, for the row that shows the number. A
@@ -2908,16 +2975,29 @@ struct SettingsSheetView: View {
     }
 
     private func resetProfileDraft(model: DiscoveredModel, type: ModelProfileType) {
-        let defaults = GenerationProfileSettings.defaultFor(
+        // Route through the manager rather than saving a locally computed copy.
+        // The manager owns the two rules the button has to obey: a cloud entry is
+        // REMOVED (so a later default change is visible instead of frozen under
+        // a cloud key), and a seeded family's official profile is stored under
+        // the checkpoint's own key. Writing `saveProfile` from here bypassed both
+        // and left the active session on its old budget while the button said
+        // "Reset to Defaults".
+        profileManager.resetProfile(
+            for: model.id,
             type: type,
-            modelName: model.displayName,
             modelPath: model.snapshotPath
         )
-        editingDraft = defaults
-        profileManager.saveProfile(for: model.id, type: type, settings: defaults)
+        // Read back what the reset RESOLVED to: for a removed cloud entry that
+        // is the generic profile (not the family default this view could have
+        // guessed), and for a seeded family it is the stored official profile.
+        editingDraft = profileManager.getProfile(for: model.id, type: type)
         profileFeedbackText = "Reset to Defaults!"
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
             profileFeedbackText = nil
+        }
+        let isCurrentActive = (activeModelPath != nil && (activeModelPath == model.snapshotPath || activeModelPath == model.weightsEntryPath || (summary != nil && (modelConfig?.modelType ?? "").localizedCaseInsensitiveContains(model.displayName))))
+        if isCurrentActive && type == activeProfile {
+            applyDraftToActiveSession()
         }
     }
 
@@ -3110,10 +3190,15 @@ struct SettingsSheetView: View {
                     // withheld. A slider with a guessed upper bound silently
                     // rewrites the number the moment it is touched.
                     if let ceiling = editingModelCeilingRows {
+                        // Double, through the shared range helper: a cloud
+                        // ceiling can be an arbitrary fraction of a hand-typed
+                        // window, and Float cannot represent every Int in the
+                        // 262,144 range, so the clamp must not be recomputed
+                        // here in a narrower type.
                         Slider(value: Binding(
-                            get: { Float(editingDraft.maxNewTokens) },
+                            get: { Double(editingDraft.maxNewTokens) },
                             set: { editingDraft.maxNewTokens = Int($0) }
-                        ), in: Float(maxTokenSliderFloor)...Float(max(ceiling, maxTokenSliderFloor)), step: 32)
+                        ), in: maxTokenSliderRange(upTo: ceiling), step: 32)
                         .accessibilityLabel("Max Output Tokens")
 
                         // Shown only when the draft sits above this model's
@@ -3235,6 +3320,12 @@ struct SettingsSheetView: View {
         .padding(12)
         .background(Color.purple.opacity(0.05))
         .cornerRadius(10)
+        // The ceiling is resolved with the draft on open, but the inputs can
+        // move while the editor is visible. Re-resolve from the same action so
+        // the slider never keeps a range the backend has already left.
+        .task(id: editingCeilingKey(for: model)) {
+            editingModelCeilingRows = ceilingRows(for: model)
+        }
     }
 
     /// Dense counterpart of `repackModel`: no expert axis, so the whole weight set

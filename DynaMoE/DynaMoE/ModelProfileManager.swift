@@ -429,6 +429,16 @@ public final class ModelProfileManager: ObservableObject {
         return trimmed.lowercased()
     }
 
+    /// Whether a stored profile key belongs to a LOCAL checkpoint family.
+    ///
+    /// The family scan in `getProfile` is a guess about local checkpoints, and
+    /// a cloud profile key carries the provider's model id, which can name a
+    /// local family (`cloud-model-zen-qwen3-coder`). Such a key is reachable by
+    /// its exact address, never by substring.
+    static func isLocalFamilyProfileKey(_ key: String) -> Bool {
+        !CloudModelAddress.isCloudModelId(key) && !CloudModelAddress.isCloudPath(key)
+    }
+
     public func getProfile(for modelId: String?, type: ModelProfileType) -> GenerationProfileSettings {
         guard let modelId = modelId, !modelId.isEmpty else {
             return GenerationProfileSettings.defaultFor(type: type)
@@ -473,25 +483,40 @@ public final class ModelProfileManager: ObservableObject {
         // sampling pair tuned for a checkpoint the provider is not serving.
         // Steps 1-3 still apply, so a cloud id with a profile saved against it
         // is honoured: those are matched by exact key, not by substring.
+        //
+        // The scan also skips CLOUD candidate keys. Gating only the incoming
+        // address was one-sided: once a user saves a profile for a family-named
+        // cloud model, its key (`cloud-model-zen-qwen3-coder`) lives in
+        // `profilesByModel` and matches the same substring, so an unseeded
+        // local sibling could be answered with the cloud model's budget and
+        // sampling values depending on dictionary order. Family matching is a
+        // statement about local checkpoints only; a cloud profile is reachable
+        // by its exact key, which is steps 1-2.
         let keyLower = isCloudAddress ? "" : key.lowercased()
         let idLower = isCloudAddress ? "" : modelId.lowercased()
         let isOrnith = keyLower.contains("ornith") || idLower.contains("ornith")
         let isQwen = keyLower.contains("qwen") || idLower.contains("qwen")
 
         if isOrnith {
-            for (candidateKey, profiles) in profilesByModel where candidateKey.lowercased().contains("ornith") {
+            for (candidateKey, profiles) in profilesByModel
+            where Self.isLocalFamilyProfileKey(candidateKey)
+                && candidateKey.lowercased().contains("ornith") {
                 if let settings = profiles[type.rawValue] {
                     return settings
                 }
             }
         } else if isQwen {
-            for (candidateKey, profiles) in profilesByModel where candidateKey.lowercased().contains("qwen") {
+            for (candidateKey, profiles) in profilesByModel
+            where Self.isLocalFamilyProfileKey(candidateKey)
+                && candidateKey.lowercased().contains("qwen") {
                 if let settings = profiles[type.rawValue] {
                     return settings
                 }
             }
         } else if keyLower.contains("nanbeige") || idLower.contains("nanbeige") {
-            for (candidateKey, profiles) in profilesByModel where candidateKey.lowercased().contains("nanbeige") {
+            for (candidateKey, profiles) in profilesByModel
+            where Self.isLocalFamilyProfileKey(candidateKey)
+                && candidateKey.lowercased().contains("nanbeige") {
                 if let settings = profiles[type.rawValue] {
                     return settings
                 }
@@ -530,9 +555,18 @@ public final class ModelProfileManager: ObservableObject {
         }
     }
 
-    public func resetProfile(for modelId: String?, type: ModelProfileType) {
+    /// Resets one profile to the checkpoint's default.
+    ///
+    /// `modelPath` answers the one question a name cannot: a renamed Nanbeige
+    /// 4.3 copy is still one of the SEEDED families, and its identity is
+    /// structural (`ModelConfig.isNanbeige43Snapshot`). Nil keeps the old
+    /// name-only behaviour for callers that hold no path.
+    public func resetProfile(
+        for modelId: String?,
+        type: ModelProfileType,
+        modelPath: String? = nil
+    ) {
         let key = normalizeKey(modelId ?? "default")
-        let defaultSettings = GenerationProfileSettings.defaultFor(type: type, modelName: modelId)
 
         // A cloud address takes the REMOVAL branch even when its upstream id
         // names a local family: the family check below exists to keep a seeded
@@ -542,9 +576,24 @@ public final class ModelProfileManager: ObservableObject {
         // is what step 5 would have answered with anyway.
         let isCloudAddress = CloudModelAddress.isCloudModelId(modelId)
             || CloudModelAddress.isCloudPath(modelId)
+        let defaultSettings = GenerationProfileSettings.defaultFor(
+            type: type,
+            modelName: modelId,
+            modelPath: modelPath
+        )
 
         let lower = isCloudAddress ? "" : (modelId ?? "").lowercased()
-        if lower.contains("ornith") || lower.contains("qwen") {
+        // The three families `seedOfficialProfiles` seeds are the ones whose
+        // defaults must stay stored under the checkpoint's own key. Nanbeige
+        // belongs here for the same reason Ornith and Qwen do; leaving it out
+        // deleted the entry and let the unordered family scan decide what the
+        // reset landed on. The structural check covers a renamed copy, whose
+        // name no longer says Nanbeige but whose tensors still do.
+        let isSeededFamily = lower.contains("ornith")
+            || lower.contains("qwen")
+            || lower.contains("nanbeige")
+            || (!isCloudAddress && (modelPath.map { ModelConfig.isNanbeige43Snapshot($0) } ?? false))
+        if isSeededFamily {
             if profilesByModel[key] == nil {
                 profilesByModel[key] = [:]
             }
