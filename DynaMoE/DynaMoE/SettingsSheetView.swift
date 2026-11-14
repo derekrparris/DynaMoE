@@ -51,6 +51,94 @@ func maxTokenSliderRange(upTo ceiling: Int) -> ClosedRange<Double> {
     Double(maxTokenSliderFloor)...Double(max(ceiling, maxTokenSliderFloor))
 }
 
+private enum MaxOutputCeilingBackend {
+    case cloud(window: Int?)
+    case appleFoundationModel
+    case local
+
+    static func classify(
+        model: DiscoveredModel?,
+        fallbackAddress: String?,
+        defaults: UserDefaults = .standard
+    ) -> MaxOutputCeilingBackend {
+        if let model {
+            if let parsed = CloudModelAddress.parseModelId(model.id)
+                ?? CloudModelAddress.parsePath(model.snapshotPath) {
+                return .cloud(window: CloudContextPolicy.window(
+                    forModelId: parsed.providerModelId,
+                    providerId: parsed.provider.id,
+                    defaults: defaults
+                ))
+            }
+            if CloudModelAddress.isCloudModelId(model.id) || CloudModelAddress.isCloudPath(model.snapshotPath) {
+                return .cloud(window: CloudContextPolicy.globalWindow(defaults: defaults))
+            }
+            if model.isAppleFoundationModel {
+                return .appleFoundationModel
+            }
+            return .local
+        }
+        guard let address = fallbackAddress, !address.isEmpty else {
+            return .local
+        }
+        if address == AppleFoundationModelService.modelPath
+            || address == AppleFoundationModelService.modelId {
+            return .appleFoundationModel
+        }
+        if let parsed = CloudModelAddress.parseModelId(address)
+            ?? CloudModelAddress.parsePath(address) {
+            return .cloud(window: CloudContextPolicy.window(
+                forModelId: parsed.providerModelId,
+                providerId: parsed.provider.id,
+                defaults: defaults
+            ))
+        }
+        if CloudModelAddress.isCloudModelId(address) || CloudModelAddress.isCloudPath(address) {
+            return .cloud(window: CloudContextPolicy.globalWindow(defaults: defaults))
+        }
+        return .local
+    }
+}
+
+/// Resolves the Max Output Tokens ceiling for a non-local backend (cloud or
+/// Apple Foundation Model), returning nil when the backend is a local checkpoint
+/// whose `config.json` position limit governs instead.
+func resolveNonLocalMaxOutputCeiling(
+    model: DiscoveredModel?,
+    fallbackAddress: String?,
+    defaults: UserDefaults = .standard
+) -> Int? {
+    switch MaxOutputCeilingBackend.classify(model: model, fallbackAddress: fallbackAddress, defaults: defaults) {
+    case .cloud(let window):
+        return CloudContextPolicy.maximumOutputTokens(window: window)
+    case .appleFoundationModel:
+        return AppleFoundationModelService.maxResponseTokenCeiling
+    case .local:
+        return nil
+    }
+}
+
+/// Explains why the Max Output Tokens ceiling sits where it does, handling both
+/// discovered entries and fallback addresses (e.g., an ad-hoc cloud model or
+/// the on-device model before a scan completes).
+func maxOutputCeilingExplanation(
+    for model: DiscoveredModel?,
+    fallbackAddress: String?,
+    defaults: UserDefaults = .standard
+) -> String {
+    switch MaxOutputCeilingBackend.classify(model: model, fallbackAddress: fallbackAddress, defaults: defaults) {
+    case .cloud(let recorded):
+        if let recorded {
+            return "Capped by 20% of this model's \(recorded.formatted())-token context window — a reply budget larger than that cannot share the window with any prompt. Record a larger window on the Cloud tab to raise it."
+        }
+        return "No context window is recorded for this model, so the reply budget is held to \(CloudContextPolicy.unknownWindowReplyCeiling.formatted()) tokens. Record its window on the Cloud tab to raise the ceiling to 20% of it."
+    case .appleFoundationModel:
+        return "Capped by the on-device model's own response limit (\(AppleFoundationModelService.maxResponseTokenCeiling.formatted()) tokens); a larger value is clamped before the framework sees it."
+    case .local:
+        return "Capped by this checkpoint's own position limit. The KV cache budget also lowers the effective ceiling for a long prompt."
+    }
+}
+
 /// Identity of the backend the Max Output Tokens ceiling must be recomputed for.
 ///
 /// `task(id:)` re-runs whenever this changes, so it carries exactly the inputs
@@ -524,15 +612,23 @@ struct SettingsSheetView: View {
 
     // MARK: - Max Output Tokens ceilings
 
+    /// The address of the active backend when no `DiscoveredModel` row exists
+    /// (ad-hoc/unregistered cloud models or before a scan completes).
+    private var activeGenerationAddress: String? {
+        if let path = activeModelPath, !path.isEmpty {
+            return path
+        }
+        return localModelManager.defaultModelId
+    }
+
     /// The model the Generation tab's Sampling card is currently authoring for:
     /// the loaded weights when a path is known, else the default pick (which may
     /// be a cloud registry entry, whose "path" is a `cloud://` sentinel).
     private func activeGenerationModel() -> DiscoveredModel? {
-        if let path = activeModelPath,
-           let model = localModelManager.discoveredModels.first(where: {
-               $0.snapshotPath == path || $0.weightsEntryPath == path
-           }) {
-            return model
+        if let path = activeModelPath, !path.isEmpty {
+            return localModelManager.discoveredModels.first(where: {
+                $0.snapshotPath == path || $0.weightsEntryPath == path
+            })
         }
         guard let id = localModelManager.defaultModelId else { return nil }
         return localModelManager.discoveredModels.first(where: { $0.id == id })
@@ -544,14 +640,13 @@ struct SettingsSheetView: View {
     /// facts. Two reads of a defaults key, cheap enough for a body pass, and one
     /// string that already exists in the domain rather than a copy of its parse.
     private var activeCloudWindowFacts: String? {
-        let address = activeModelPath ?? localModelManager.defaultModelId
-        guard let address,
+        guard let address = activeGenerationAddress,
               let parsed = CloudModelAddress.parseModelId(address)
                 ?? CloudModelAddress.parsePath(address) else { return nil }
         let defaults = UserDefaults.standard
         return [
             defaults.string(forKey: CloudContextPolicy.defaultsKey(for: parsed.provider.id)) ?? "",
-            String(defaults.integer(forKey: CloudContextPolicy.globalWindowKey))
+            CloudContextPolicy.globalWindow(defaults: defaults).map(String.init) ?? ""
         ].joined(separator: "|")
     }
 
@@ -587,12 +682,11 @@ struct SettingsSheetView: View {
     /// discovered row) reads the checkpoint `config.json`.
     private func resolveActiveModelCeiling() -> Int {
         guard let model = activeGenerationModel() else {
-            // The registry row can be absent while the on-device backend is
-            // still the active one (a scan that has not run yet), and in that
-            // state `modelConfig` is nil, so the local branch would answer with
-            // the 32,768 policy floor for a backend that honours 2,048.
-            if activeModelPath == AppleFoundationModelService.modelPath {
-                return AppleFoundationModelService.maxResponseTokenCeiling
+            if let nonLocal = resolveNonLocalMaxOutputCeiling(
+                model: nil,
+                fallbackAddress: activeGenerationAddress
+            ) {
+                return nonLocal
             }
             return KVCacheProvisioning.localMaxOutputTokens(config: modelConfig)
         }
@@ -606,23 +700,8 @@ struct SettingsSheetView: View {
     /// action that opens the editor. Never called from `body`: a cloud lookup
     /// rebuilds the provider registry and a local one reads a file.
     private func ceilingRows(for model: DiscoveredModel) -> Int {
-        if let parsed = CloudModelAddress.parseModelId(model.id)
-            ?? CloudModelAddress.parsePath(model.snapshotPath) {
-            return CloudContextPolicy.maximumOutputTokens(
-                window: CloudContextPolicy.window(
-                    forModelId: parsed.providerModelId,
-                    providerId: parsed.provider.id
-                )
-            )
-        }
-        // The on-device model has no checkpoint and no config: `activate` clears
-        // `modelConfig`, so the local branch would answer with the 32,768 policy
-        // floor while `AppleFoundationModelService` clamps every request to
-        // `maxResponseTokenCeiling`. Three backends, three limits — advertising
-        // the local one here is the same "limit nothing enforces" defect this
-        // change exists to remove, one backend over.
-        if model.isAppleFoundationModel {
-            return AppleFoundationModelService.maxResponseTokenCeiling
+        if let nonLocal = resolveNonLocalMaxOutputCeiling(model: model, fallbackAddress: nil) {
+            return nonLocal
         }
         let isActive = activeModelPath != nil
             && (activeModelPath == model.snapshotPath || activeModelPath == model.weightsEntryPath)
@@ -641,30 +720,7 @@ struct SettingsSheetView: View {
     /// recorded window" for a model that has none would name a fact that does
     /// not exist.
     private func ceilingExplanation(for model: DiscoveredModel?) -> String {
-        let recorded = model.flatMap { entry -> Int? in
-            guard let parsed = CloudModelAddress.parseModelId(entry.id)
-                ?? CloudModelAddress.parsePath(entry.snapshotPath) else { return nil }
-            return CloudContextPolicy.window(
-                forModelId: parsed.providerModelId,
-                providerId: parsed.provider.id
-            )
-        }
-        let isCloud = model.map {
-            CloudModelAddress.isCloudModelId($0.id) || CloudModelAddress.isCloudPath($0.snapshotPath)
-        } ?? false
-        if isCloud {
-            if let recorded {
-                return "Capped by 20% of this model's \(recorded.formatted())-token context window — a reply budget larger than that cannot share the window with any prompt. Record a larger window on the Cloud tab to raise it."
-            }
-            return "No context window is recorded for this model, so the reply budget is held to \(CloudContextPolicy.unknownWindowReplyCeiling.formatted()) tokens. Record its window on the Cloud tab to raise the ceiling to 20% of it."
-        }
-        // No checkpoint: the system model's own framework refuses a larger
-        // budget, so saying "this checkpoint's position limit" would name a file
-        // that does not exist.
-        if model?.isAppleFoundationModel == true {
-            return "Capped by the on-device model's own response limit (\(AppleFoundationModelService.maxResponseTokenCeiling.formatted()) tokens); a larger value is clamped before the framework sees it."
-        }
-        return "Capped by this checkpoint's own position limit. The KV cache budget also lowers the effective ceiling for a long prompt."
+        maxOutputCeilingExplanation(for: model, fallbackAddress: activeGenerationAddress)
     }
 
     /// Label-left settings row carrying a slider-plus-field numeric control,
@@ -2915,7 +2971,7 @@ struct SettingsSheetView: View {
                     HStack(spacing: 6) {
                         Image(systemName: inspectingProfileType.icon)
                             .foregroundColor(.purple)
-                        Text("\(inspectingProfileType.profileDisplayName(for: model.displayName)) Settings")
+                        Text("\(inspectingProfileType.profileDisplayName(for: model.id)) Settings")
                             .font(.system(size: 13, weight: .bold))
                         Text("•")
                             .foregroundColor(.secondary)
@@ -2923,7 +2979,7 @@ struct SettingsSheetView: View {
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
-                    Text(inspectingProfileType.description(for: model.displayName))
+                    Text(inspectingProfileType.description(for: model.id))
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }

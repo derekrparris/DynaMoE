@@ -99,11 +99,11 @@ struct CloudProvidersSettingsView: View {
     @State private var pendingConfirmation: RemovalConfirmation? = nil
     @AppStorage("dynamoe_cloud_resend_images") private var resendImages: Bool = true
 
-    /// Per-provider context-window drafts, keyed by provider id then by upstream
-    /// model id. The stored form is one `model=window` string per provider,
-    /// parsed by `CloudContextPolicy`; these drafts are the editable mirror, and
-    /// they are seeded from the parsed facts on appear rather than lazily so a
-    /// row never shows a stale number after a reload.
+    /// Per-provider in-progress context-window edits, keyed by provider id then
+    /// by upstream model id. An entry is populated only while the user is
+    /// editing a row, cleared in `refreshState()` and per-model on Save; when
+    /// absent, the field and Save both fall back to `CloudContextPolicy`'s
+    /// stored value so a row never shows or overwrites a stale number.
     @State private var windowDrafts: [String: [String: String]] = [:]
 
     /// Confirmation line per MODEL (`provider/model`), so a Save that stored
@@ -180,7 +180,7 @@ struct CloudProvidersSettingsView: View {
             if windowEntries.isEmpty {
                 SettingsRow(
                     title: "No registered models",
-                    subtitle: "Register a provider's models with \u{201C}Sync\u{201D} on a provider below; each one then gets its own window field here.",
+                    subtitle: "Register a provider's models with \u{201C}Test & Sync Models\u{201D} on a provider above; each one then gets its own window field here.",
                     icon: "square.stack.3d.up.slash",
                     iconTint: .gray
                 ) { EmptyView() }
@@ -409,6 +409,10 @@ struct CloudProvidersSettingsView: View {
                                                 spec.providerModelId,
                                                 for: provider
                                             )
+                                            clearWindowState(
+                                                forProviderId: provider.id,
+                                                modelId: spec.providerModelId
+                                            )
                                             LocalModelManager.shared.scanLocalModels()
                                         } label: {
                                             Image(systemName: "minus.circle")
@@ -607,9 +611,20 @@ struct CloudProvidersSettingsView: View {
     ///
     /// Only the saved model's draft is replaced. Refreshing the whole provider's
     /// drafts would discard an in-progress edit on a sibling row.
+    /// Resolves the string a Save click should persist: an explicit edit draft
+    /// wins (including an empty draft that intentionally clears the stored
+    /// value), whereas `nil` means the field was never edited and keeps the
+    /// stored window it is displaying.
+    static func effectiveWindowInput(draft: String?, stored: Int?) -> String {
+        draft ?? stored.map(String.init) ?? ""
+    }
+
     private func saveWindow(for provider: CloudProvider, modelId: String) {
-        let typed = (windowDrafts[provider.id]?[modelId] ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawInput = Self.effectiveWindowInput(
+            draft: windowDrafts[provider.id]?[modelId],
+            stored: CloudContextPolicy.overrides(for: provider.id)[modelId]
+        )
+        let typed = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
         let feedbackKey = "\(provider.id)/\(modelId)"
 
         var stored: Int?
@@ -653,10 +668,7 @@ struct CloudProvidersSettingsView: View {
         // exactly what was stored and there is nothing left to drift. Assigning
         // the whole provider's map would also discard an in-progress edit on a
         // sibling row that shares the provider.
-        windowDrafts[provider.id]?[modelId] = nil
-        if windowDrafts[provider.id]?.isEmpty == true {
-            windowDrafts[provider.id] = nil
-        }
+        clearWindowDraft(forProviderId: provider.id, modelId: modelId)
 
         // A save with no window of its own lands on the global fallback, and a
         // budget line that did not say so would read as if this row's clearing
@@ -768,6 +780,7 @@ struct CloudProvidersSettingsView: View {
                 keyDrafts[provider.id] = ""
                 storedProviders.remove(provider.id)
                 testStates[provider.id] = .untested
+                clearWindowState(forProviderId: provider.id)
             } catch {
                 testStates[provider.id] = .failure(error.localizedDescription)
             }
@@ -775,6 +788,24 @@ struct CloudProvidersSettingsView: View {
             removeKey(for: provider)
         }
         pendingConfirmation = nil
+    }
+
+    private func clearWindowDraft(forProviderId providerId: String, modelId: String) {
+        windowDrafts[providerId]?[modelId] = nil
+        if windowDrafts[providerId]?.isEmpty == true {
+            windowDrafts[providerId] = nil
+        }
+    }
+
+    private func clearWindowState(forProviderId providerId: String, modelId: String? = nil) {
+        if let modelId {
+            clearWindowDraft(forProviderId: providerId, modelId: modelId)
+            windowFeedback["\(providerId)/\(modelId)"] = nil
+        } else {
+            windowDrafts[providerId] = nil
+            let prefix = "\(providerId)/"
+            windowFeedback = windowFeedback.filter { !$0.key.hasPrefix(prefix) }
+        }
     }
 
     /// Forgets the registered catalog only.
@@ -788,6 +819,7 @@ struct CloudProvidersSettingsView: View {
     private func clearModels(for provider: CloudProvider) {
         CloudModelRegistry.setRegisteredModelIds([], for: provider)
         testStates[provider.id] = .untested
+        clearWindowState(forProviderId: provider.id)
         LocalModelManager.shared.scanLocalModels()
     }
 

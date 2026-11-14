@@ -31,40 +31,58 @@ public enum ModelProfileType: String, Codable, CaseIterable, Identifiable {
         }
     }
 
-    public func profileDisplayName(for modelName: String? = nil) -> String {
+    private enum LocalFamily {
+        case qwen
+        case ornith
+    }
+
+    private static func localFamily(for modelName: String?) -> LocalFamily? {
+        guard !CloudModelAddress.isCloudModelId(modelName),
+              !CloudModelAddress.isCloudPath(modelName) else {
+            return nil
+        }
         let nameLower = (modelName ?? "").lowercased()
-        if nameLower.contains("qwen") {
+        if nameLower.contains("qwen") { return .qwen }
+        if nameLower.contains("ornith") { return .ornith }
+        return nil
+    }
+
+    public func profileDisplayName(for modelName: String? = nil) -> String {
+        switch Self.localFamily(for: modelName) {
+        case .qwen:
             switch self {
             case .coder: return "Coding & Agentic (Thinking Mode)"
             case .assistant: return "General Assistant (Instruct Mode)"
             }
-        } else if nameLower.contains("ornith") {
+        case .ornith:
             switch self {
             case .coder: return "Precise Coding & Tool Calling"
             case .assistant: return "General Chat / Agent Loops"
             }
+        case nil:
+            return self.rawValue
         }
-        return self.rawValue
     }
 
     public func description(for modelName: String? = nil) -> String {
-        let nameLower = (modelName ?? "").lowercased()
-        if nameLower.contains("qwen") {
+        switch Self.localFamily(for: modelName) {
+        case .qwen:
             switch self {
             case .coder:
                 return "Official Qwen Thinking Mode: High-entropy exploration (Temp 1.0, Pres 0.0) optimized for SWE-bench, complex code, and multi-tool execution."
             case .assistant:
                 return "Official Qwen Instruct Mode: Direct non-reasoning responses (Temp 0.70, Pres 1.5) optimized for quick chat and summarization."
             }
-        } else if nameLower.contains("ornith") {
+        case .ornith:
             switch self {
             case .coder:
                 return "Official Ornith Precise Profile: Low entropy (Temp 0.60, Pres 0.0) preventing code syntax drift and schema violation."
             case .assistant:
                 return "Official Ornith Agentic Loop Profile: Dynamic variety (Temp 1.00, Pres 1.5) for open-ended benchmark reproduction and chat."
             }
+        case nil:
+            return self.description
         }
-        return self.description
     }
 }
 

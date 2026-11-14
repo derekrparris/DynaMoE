@@ -23,6 +23,7 @@
 import XCTest
 @testable import DynaMoE
 
+@MainActor
 final class CloudProfileAddressingTests: XCTestCase {
 
     /// A manager over its own domain, plus the suite name to tear down.
@@ -281,5 +282,95 @@ final class CloudProfileAddressingTests: XCTestCase {
         let range = maxTokenSliderRange(upTo: 20)
         XCTAssertEqual(range.lowerBound, Double(maxTokenSliderFloor))
         XCTAssertGreaterThanOrEqual(range.upperBound, range.lowerBound)
+    }
+
+    // MARK: - Profile labels and fallback ceilings
+
+    func testCloudAddressesDoNotUseLocalFamilyDisplayNamesOrDescriptions() {
+        for cloudAddress in [
+            "cloud://synthetic/qwen3-coder",
+            "cloud-model-synthetic-qwen3-coder",
+            "cloud://synthetic/ornith-1.5-9b",
+            "cloud-model-synthetic-ornith-1.5-9b"
+        ] {
+            for profile in ModelProfileType.allCases {
+                XCTAssertEqual(
+                    profile.profileDisplayName(for: cloudAddress),
+                    profile.rawValue,
+                    "\(cloudAddress) must show the generic profile title"
+                )
+                XCTAssertEqual(
+                    profile.description(for: cloudAddress),
+                    profile.description,
+                    "\(cloudAddress) must show the generic profile description"
+                )
+            }
+        }
+
+        // Local checkpoints keep their family labels and descriptions.
+        XCTAssertEqual(
+            ModelProfileType.coder.profileDisplayName(for: "qwen/qwen3.8-flash-next-fp8"),
+            "Coding & Agentic (Thinking Mode)"
+        )
+        XCTAssertEqual(
+            ModelProfileType.coder.profileDisplayName(for: "ornith-ai/Ornith-1.5-35B-A3B-FP8"),
+            "Precise Coding & Tool Calling"
+        )
+    }
+
+    func testUneditedContextWindowSavePreservesStoredValue() {
+        XCTAssertEqual(CloudProvidersSettingsView.effectiveWindowInput(draft: nil, stored: 128_000), "128000")
+        XCTAssertEqual(CloudProvidersSettingsView.effectiveWindowInput(draft: nil, stored: nil), "")
+        XCTAssertEqual(CloudProvidersSettingsView.effectiveWindowInput(draft: "", stored: 128_000), "")
+        XCTAssertEqual(CloudProvidersSettingsView.effectiveWindowInput(draft: "200000", stored: 128_000), "200000")
+    }
+
+    func testFallbackAddressResolvesCloudAndOnDeviceCeilingsWhenModelIsNil() {
+        let suite = "CloudProfileAddressingTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        // Unregistered/ad-hoc cloud model with no recorded window -> 16,384 + cloud explanation.
+        let adHocCloud = "cloud://synthetic/unregistered-model"
+        XCTAssertEqual(
+            resolveNonLocalMaxOutputCeiling(model: nil, fallbackAddress: adHocCloud, defaults: defaults),
+            CloudContextPolicy.unknownWindowReplyCeiling
+        )
+        XCTAssertTrue(
+            maxOutputCeilingExplanation(for: nil, fallbackAddress: adHocCloud, defaults: defaults)
+                .contains("No context window is recorded for this model")
+        )
+
+        // String-formatted global window (e.g. "200,000") applies to fallback address too.
+        defaults.set("200,000", forKey: CloudContextPolicy.globalWindowKey)
+        XCTAssertEqual(
+            resolveNonLocalMaxOutputCeiling(model: nil, fallbackAddress: adHocCloud, defaults: defaults),
+            40_000
+        )
+        XCTAssertTrue(
+            maxOutputCeilingExplanation(for: nil, fallbackAddress: adHocCloud, defaults: defaults)
+                .contains("200,000-token context window")
+        )
+
+        // Apple Foundation Model fallback before discovery scan finishes.
+        for afmAddress in [AppleFoundationModelService.modelPath, AppleFoundationModelService.modelId] {
+            XCTAssertEqual(
+                resolveNonLocalMaxOutputCeiling(model: nil, fallbackAddress: afmAddress, defaults: defaults),
+                AppleFoundationModelService.maxResponseTokenCeiling
+            )
+            XCTAssertTrue(
+                maxOutputCeilingExplanation(for: nil, fallbackAddress: afmAddress, defaults: defaults)
+                    .contains("on-device model's own response limit")
+            )
+        }
+
+        // Local fallback defers to KVCacheProvisioning and local checkpoint explanation.
+        XCTAssertNil(
+            resolveNonLocalMaxOutputCeiling(model: nil, fallbackAddress: "/tmp/local-model", defaults: defaults)
+        )
+        XCTAssertTrue(
+            maxOutputCeilingExplanation(for: nil, fallbackAddress: "/tmp/local-model", defaults: defaults)
+                .contains("checkpoint's own position limit")
+        )
     }
 }

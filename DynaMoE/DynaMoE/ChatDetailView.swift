@@ -925,7 +925,7 @@ struct ChatDetailView: View {
                         .menuStyle(.borderlessButton)
                         .fixedSize()
 
-                        let currentProfileModel = session?.selectedModelName ?? modelName
+                        let currentProfileModel = isCloudModelActive ? nil : (session?.selectedModelName ?? modelName)
                         // Profile Selector Menu (Coder / Assistant)
                         Menu {
                             Section("Generation Profile") {
