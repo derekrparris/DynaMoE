@@ -192,9 +192,11 @@ DynaMoE automatically defaults to and persists the official publisher-tuned prof
 - **Coder**: Temperature $0.60$, Top-P $0.95$, Top-K $20$, Min-P $0.00$, Repetition Penalty $1.00$, **Max Tokens $16,384$**
 - **Assistant**: Temperature $0.70$, Top-P $0.90$, Top-K $50$, Min-P $0.05$, Repetition Penalty $1.10$, **Max Tokens $8,192$**
 
-The coder budget sits exactly at the **16,384-token ceiling applied to a provider with no recorded context window**. Recording a window on the Cloud tab is what raises it: a model with a 200,000-token window is allowed 40,000.
+The coder budget sits exactly at the **16,384-token ceiling applied to a provider with no recorded context window** — it is that constant, not a second copy of the number. Recording a window on the Cloud tab is what raises it: a model with a 200,000-token window is allowed 40,000.
 
 The same generic profile is also the default for a **local checkpoint that is not Ornith, Qwen, or Nanbeige** — Llama, Gemma, Spark, DeepSeek. For those, the raised budget is a real change too: it is the reply budget a local turn asks for, and on a machine whose KV budget cannot hold prompt + reply, `turnFit` **lowers the allocation** (`.maxTokensReduced`) rather than refusing the turn, so a long local prompt now clamps to a smaller reply more often than it did at 8,192. Nothing fails; the reply is shorter than the setting asked for. It exists for the cloud case, and the local case pays a little for it.
+
+> **Already-saved profiles keep the value they were saved with.** These are *defaults*, so they reach a model that has no profile stored for it. The Generation tab's Max Output Tokens is a single stored setting (`dynamoe_max_tokens`, default 8,192), and pressing **Save** on a profile writes the current value under that model's key. A model you have saved before therefore still carries its stored budget — open its profile and press **Reset to Defaults** (or raise the slider) to take the new one. Nothing on the send path changed for those models: the value you saved is the value they use.
 
 #### Profile Customization & Persistence
 1. Open the **Models** section, click the **⋯** (ellipsis) menu on your model, and choose **"Configure Profiles…"**.

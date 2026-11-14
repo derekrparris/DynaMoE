@@ -176,7 +176,7 @@ struct CloudProvidersSettingsView: View {
             // A card header followed by "record it per model below" and nothing
             // below it is a dead end: with no provider registered, say so and
             // point at the action that produces rows.
-            let windowEntries = contextWindowSpecs()
+            let windowEntries = contextWindowEntries()
             if windowEntries.isEmpty {
                 SettingsRow(
                     title: "No registered models",
@@ -187,7 +187,7 @@ struct CloudProvidersSettingsView: View {
             } else {
                 ForEach(Array(windowEntries.enumerated()), id: \.element.id) { index, entry in
                     if index > 0 { SettingsRowDivider() }
-                    contextWindowRow(provider: entry.provider, spec: entry.spec)
+                    contextWindowRow(entry)
                 }
             }
 
@@ -466,20 +466,55 @@ struct CloudProvidersSettingsView: View {
         CloudModelRegistry.registeredSpecs(for: provider)
     }
 
-    /// Every registered model across every provider, flattened so the window
-    /// rows can be one `ForEach` (a nested `for` is control flow inside a
-    /// `ViewBuilder` and does not compile). Identity is provider + upstream id,
-    /// which is unique because a model id belongs to exactly one provider.
+    /// One registered model's window facts, resolved ONCE per body pass so the
+    /// row does not re-parse the provider's `model=window` string on every
+    /// keystroke in any of the fields beside it.
+    ///
+    /// Identity is provider + upstream id, which is unique because a model id
+    /// belongs to exactly one provider.
     private struct ContextWindowEntry: Identifiable {
         var provider: CloudProvider
         var spec: CloudModelSpec
+        /// The window recorded for THIS model, or nil when it has none.
+        var recorded: Int?
+        /// The window the send path resolves: the model's own, else the single
+        /// global fallback. The reply budget is derived from this one, because
+        /// this is the one the turn is priced and clamped against.
+        var resolvedWindow: Int?
+
         var id: String { "\(provider.id)/\(spec.providerModelId)" }
+        /// What the field shows when the user has not typed into it: the stored
+        /// value, so a window recorded out of band (or by a Sync that arrived
+        /// after this pane opened) can never sit beside an empty field.
+        var recordedText: String { recorded.map(String.init) ?? "" }
+        var budget: Int {
+            CloudContextPolicy.maximumOutputTokens(window: resolvedWindow)
+        }
     }
 
-    private func contextWindowSpecs() -> [ContextWindowEntry] {
-        providerStore.providers.flatMap { provider in
-            registeredSpecs(for: provider).map {
-                ContextWindowEntry(provider: provider, spec: $0)
+    /// Every registered model across every provider, flattened so the window
+    /// rows can be one `ForEach` (a nested `for` is control flow inside a
+    /// `ViewBuilder` and does not compile).
+    ///
+    /// Each provider's `model=window` string is parsed ONCE here and the result
+    /// is carried on the entry. Reading it per row meant N full splits and
+    /// parses for N models on every evaluation, and a text field re-evaluates
+    /// its row on every keystroke.
+    private func contextWindowEntries() -> [ContextWindowEntry] {
+        let globalWindow = CloudContextPolicy.globalWindow(defaults: .standard)
+        return providerStore.providers.flatMap { provider -> [ContextWindowEntry] in
+            let recordedWindows = CloudContextPolicy.overrides(for: provider.id)
+            return registeredSpecs(for: provider).map { spec in
+                // `overrides(for:)` already drops anything below
+                // `minimumPlausibleWindow`, so a value it returned is capacity
+                // and the fallback only applies when the model has none.
+                let recorded = recordedWindows[spec.providerModelId]
+                return ContextWindowEntry(
+                    provider: provider,
+                    spec: spec,
+                    recorded: recorded,
+                    resolvedWindow: recorded ?? globalWindow
+                )
             }
         }
     }
@@ -490,33 +525,32 @@ struct CloudProvidersSettingsView: View {
     /// so a knob nobody can find would leave every cloud model on the
     /// no-window budget.
     @ViewBuilder
-    private func contextWindowRow(provider: CloudProvider, spec: CloudModelSpec) -> some View {
+    private func contextWindowRow(_ entry: ContextWindowEntry) -> some View {
+        let provider = entry.provider
+        let spec = entry.spec
+        let budget = entry.budget
         // The per-model override, NOT the value this save would store: the row
-        // reports what the turn will actually send with. Reading the override
-        // alone advertised 16,384 for a model the send path resolved to 40,000
-        // through the global fallback, and disagreed with the ceiling Settings
-        // shows for the same model (that one resolves through the fallback).
-        let recorded = CloudContextPolicy.overrides(for: provider.id)[spec.providerModelId]
-        let budget = CloudContextPolicy.maximumOutputTokens(
-            window: CloudContextPolicy.window(
-                forModelId: spec.providerModelId,
-                providerId: provider.id
-            )
-        )
-        let fallback = CloudContextPolicy.globalWindow(defaults: .standard)
+        // reports what the turn will actually send with, and the global fallback
+        // is named rather than implied, because "no window of its own" and "no
+        // window at all" are two different budgets.
         SettingsRow(
             title: spec.displayName,
-            subtitle: recorded == nil
-                ? (fallback.map { "No window of its own — the global \($0.formatted()) applies, reply budget \(budget.formatted())." }
+            subtitle: entry.recorded.map { "\($0.formatted()) tokens — reply budget \(budget.formatted())." }
+                ?? (entry.resolvedWindow.map { "No window of its own — the global \($0.formatted()) applies, reply budget \(budget.formatted())." }
                     ?? "No window recorded — reply budget \(budget.formatted()).")
-                : "\(recorded!.formatted()) tokens — reply budget \(budget.formatted())."
         ) {
             VStack(alignment: .trailing, spacing: 3) {
                 HStack(spacing: 6) {
                     TextField(
                         "none",
                         text: Binding(
-                            get: { windowDrafts[provider.id]?[spec.providerModelId] ?? "" },
+                            get: {
+                                // A draft is an EDIT. With none, the field reads
+                                // the same storage the subtitle and the ceiling
+                                // read, so the two cannot disagree after a Sync
+                                // or a `defaults write` lands mid-session.
+                                windowDrafts[provider.id]?[spec.providerModelId] ?? entry.recordedText
+                            },
                             set: { newValue in
                                 windowDrafts[provider.id, default: [:]][spec.providerModelId] = newValue
                             }
@@ -532,7 +566,7 @@ struct CloudProvidersSettingsView: View {
                         .controlSize(.small)
                 }
 
-                if let feedback = windowFeedback["\(provider.id)/\(spec.providerModelId)"] {
+                if let feedback = windowFeedback[entry.id] {
                     Text(feedback)
                         .font(.system(size: 9))
                         .foregroundColor(.secondary)
@@ -551,16 +585,14 @@ struct CloudProvidersSettingsView: View {
         storedProviders = Set(providerStore.providers.filter {
             CloudSecretStore.shared.exists(providerId: $0.id)
         }.map(\.id))
-        // Seed the window drafts from the stored facts, so an out-of-band
-        // `defaults write` shows up here and a Save can never write back a
-        // number nobody entered.
-        var drafts: [String: [String: String]] = [:]
-        for provider in providerStore.providers {
-            drafts[provider.id] = CloudContextPolicy
-                .overrides(for: provider.id)
-                .mapValues(String.init)
-        }
-        windowDrafts = drafts
+        // Drop every window draft rather than copying the stored values into
+        // one: a draft is an EDIT, and a field that reads through to storage
+        // when it has none cannot go stale against the subtitle beside it.
+        // Seeding meant a row could report the recorded window while the field
+        // held whatever this pane snapshotted on appear — which is exactly what
+        // a Sync that registers a model whose window was recorded out of band
+        // produced: the recorded number in the subtitle, an empty field.
+        windowDrafts = [:]
         windowFeedback = [:]
     }
 
@@ -610,17 +642,30 @@ struct CloudProvidersSettingsView: View {
         // which resolves the per-model window AND the global fallback. Asking
         // the override alone advertised 16,384 for a model the turn would send
         // 40,000 to, and disagreed with the same model's row in Settings.
-        let budget = CloudContextPolicy.maximumOutputTokens(
-            window: CloudContextPolicy.window(
-                forModelId: modelId,
-                providerId: provider.id
-            )
+        let resolvedWindow = CloudContextPolicy.window(
+            forModelId: modelId,
+            providerId: provider.id
         )
-        // Only this model's draft. Assigning the whole provider's map would
-        // discard an in-progress edit on a sibling row that shares the provider.
-        windowDrafts[provider.id, default: [:]][modelId] = stored.map(String.init) ?? ""
+        let budget = CloudContextPolicy.maximumOutputTokens(window: resolvedWindow)
+
+        // Only this model's draft, and it is REMOVED rather than written back:
+        // the field reads storage when it has no draft, so the row now shows
+        // exactly what was stored and there is nothing left to drift. Assigning
+        // the whole provider's map would also discard an in-progress edit on a
+        // sibling row that shares the provider.
+        windowDrafts[provider.id]?[modelId] = nil
+        if windowDrafts[provider.id]?.isEmpty == true {
+            windowDrafts[provider.id] = nil
+        }
+
+        // A save with no window of its own lands on the global fallback, and a
+        // budget line that did not say so would read as if this row's clearing
+        // chose the number.
+        let bindsGlobal = stored == nil && resolvedWindow != nil
         if typed.isEmpty {
-            windowFeedback[feedbackKey] = "Cleared — reply budget now \(budget.formatted())."
+            windowFeedback[feedbackKey] = bindsGlobal
+                ? "Cleared — the global \(resolvedWindow!.formatted()) applies, reply budget \(budget.formatted())."
+                : "Cleared — reply budget now \(budget.formatted())."
         } else {
             windowFeedback[feedbackKey] = "Saved — reply budget up to \(budget.formatted())."
         }

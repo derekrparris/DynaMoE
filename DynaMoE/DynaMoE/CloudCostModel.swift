@@ -405,9 +405,11 @@ public nonisolated enum CloudContextPolicy {
     /// refuse outright. With no window there is no capacity to justify a larger
     /// number, so this is the number instead.
     ///
-    /// It is deliberately the value the generic (cloud) profile's coder default
-    /// now carries, so an unconfigured provider gets a coherent budget rather
-    /// than a value that is then clamped by a different constant.
+    /// It is what the generic (cloud) profile's coder default carries —
+    /// `GenerationProfileSettings.defaultFor` reads this constant rather than
+    /// restating the number, so an unconfigured provider gets a coherent budget
+    /// rather than a value that is then clamped by a different constant, and the
+    /// two cannot drift apart unnoticed.
     public static let unknownWindowReplyCeiling = 16_384
 
     public static func defaultsKey(for providerId: String) -> String {
@@ -456,13 +458,17 @@ public nonisolated enum CloudContextPolicy {
     /// drops unparseable entries, so writing its result back erased an
     /// operator's typo AND their valid neighbours in the same pass. Unregistering
     /// an unrelated model used to take that path.
+    ///
+    /// Returns whether anything changed, so a caller that pairs this with a write
+    /// can stay a true no-op instead of rewriting identical bytes.
+    @discardableResult
     public static func removeOverride(
         model: String,
         providerId: String,
         defaults: UserDefaults = .standard
-    ) {
+    ) -> Bool {
         let key = defaultsKey(for: providerId)
-        guard let raw = defaults.string(forKey: key) else { return }
+        guard let raw = defaults.string(forKey: key) else { return false }
         var kept: [String] = []
         var removed = false
         for entry in splitOverrideEntries(raw) {
@@ -472,12 +478,13 @@ public nonisolated enum CloudContextPolicy {
             }
             kept.append(entry)
         }
-        guard removed else { return }
+        guard removed else { return false }
         if kept.isEmpty {
             defaults.removeObject(forKey: key)
         } else {
             defaults.set(kept.joined(separator: "; "), forKey: key)
         }
+        return true
     }
 
     /// Stores ONE model's window, leaving every other entry — including one this
@@ -489,9 +496,11 @@ public nonisolated enum CloudContextPolicy {
     /// operator's typo AND every valid neighbour the same pass could not
     /// represent. Saving one row must not erase another.
     ///
-    /// Returns false when nothing was written (a sub-plausible window, which the
-    /// reader would drop and therefore read back as absent). Callers validate the
-    /// typed value first; this is the last line of defence.
+    /// Returns false when nothing was written: a sub-plausible window (which the
+    /// reader would drop and therefore read back as absent), an empty model id,
+    /// or a clear of a model that had no entry — a write that changes nothing is
+    /// reported as such rather than as a save. Callers validate the typed value
+    /// first; this is the last line of defence.
     @discardableResult
     public static func setOverride(
         model: String,
@@ -501,8 +510,7 @@ public nonisolated enum CloudContextPolicy {
     ) -> Bool {
         guard !model.isEmpty else { return false }
         guard let window else {
-            removeOverride(model: model, providerId: providerId, defaults: defaults)
-            return true
+            return removeOverride(model: model, providerId: providerId, defaults: defaults)
         }
         guard window >= minimumPlausibleWindow else { return false }
 
@@ -525,7 +533,13 @@ public nonisolated enum CloudContextPolicy {
         }
         if !replaced { kept.append(replacement) }
 
-        defaults.set(kept.joined(separator: "; "), forKey: key)
+        // A save that stores what is already stored is a success with nothing
+        // to do: rewriting the key would churn defaults (and every observer of
+        // the domain) for a value nobody changed. `true` because the store now
+        // holds the requested value, which is what the return answers.
+        let updated = kept.joined(separator: "; ")
+        guard updated != raw else { return true }
+        defaults.set(updated, forKey: key)
         return true
     }
 
