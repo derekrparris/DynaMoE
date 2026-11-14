@@ -4913,6 +4913,90 @@ final class DynaMoETests: XCTestCase {
         print("  ✅ [TEST] Ornith 35B profile resolution verified (normalizeKey + family match).")
     }
 
+    /// The generic fallback IS the cloud profile, and it is reached by EVERY
+    /// cloud model — but not for the reason a name test would suggest. A
+    /// provider id often does contain a family name (`qwen3-coder` is a shipped
+    /// Zen id, Synthetic serves `hf:Qwen/...`), so the gate that produces this
+    /// profile has to skip cloud addresses rather than rely on the name not
+    /// matching. Matching it left the exact models this change exists to
+    /// un-truncate on the local 8,192 budget.
+    ///
+    /// Its budgets are what a cloud turn sends, which is why they were raised
+    /// (8,192/4,096 -> 16,384/8,192) to let a capable remote model use the
+    /// harness — a long tool step or a full file rewrite used to truncate
+    /// mid-answer.
+    ///
+    /// Pinned deliberately, and pinned TOGETHER with
+    /// `CloudContextPolicy.unknownWindowReplyCeiling`: an unrecorded-window turn
+    /// is clamped to that ceiling, so a generic default above it would be silently
+    /// lowered on every send and the setting would look ignored.
+    func testTheGenericProfileIsTheCloudProfileAndFitsUnderTheUnsetWindowCeiling() {
+        let coder = GenerationProfileSettings.defaultFor(type: .coder)
+        let assistant = GenerationProfileSettings.defaultFor(type: .assistant)
+
+        XCTAssertEqual(coder.maxNewTokens, 16_384)
+        XCTAssertEqual(assistant.maxNewTokens, 8_192)
+        // The 2:1 coder:assistant ratio the shipped profiles keep.
+        XCTAssertEqual(coder.maxNewTokens, assistant.maxNewTokens * 2)
+
+        // A cloud id that matches no family resolves to the generic profile.
+        let cloudCoder = GenerationProfileSettings.defaultFor(
+            type: .coder,
+            modelName: "deepseek-ai/DeepSeek-V4.1-Flash"
+        )
+        XCTAssertEqual(cloudCoder.maxNewTokens, coder.maxNewTokens, "a cloud model gets the generic budget")
+
+        // A cloud id that DOES match a family name must resolve generically too.
+        // Both address forms, because the gate reads whichever one it is handed.
+        for cloudName in [
+            "cloud-model-zen-qwen3-coder",
+            "cloud://zen/qwen3-coder",
+            "cloud-model-synthetic-hf:Qwen/Qwen3-235B",
+            "cloud-model-zen-ornith-1.5-9b"
+        ] {
+            let resolved = GenerationProfileSettings.defaultFor(type: .coder, modelName: cloudName)
+            XCTAssertEqual(resolved.maxNewTokens, coder.maxNewTokens,
+                           "\(cloudName) must not inherit a local family budget")
+            // And none of the family tuning leaks in either — a Qwen profile
+            // carries temperature 1.00 / presencePenalty 1.50, the generic 0.60 / 0.00.
+            XCTAssertEqual(resolved.temperature, coder.temperature, accuracy: 0.0001,
+                           "\(cloudName) must not inherit a local family sampling pair")
+            XCTAssertEqual(resolved.presencePenalty, coder.presencePenalty, accuracy: 0.0001,
+                           "\(cloudName) must not inherit a local family sampling pair")
+        }
+
+        // The same id through the manager, which is the path the app actually
+        // takes: steps 1-3 still honour a profile saved against an exact cloud
+        // key, but the SUBSTRING family match must not fire for a cloud address.
+        let manager = ModelProfileManager.shared
+        let qwenCloudAssistant = manager.getProfile(
+            for: "cloud-model-zen-qwen3-coder",
+            type: .assistant
+        )
+        XCTAssertEqual(qwenCloudAssistant.maxNewTokens, assistant.maxNewTokens,
+                       "a qwen-named cloud id must resolve to the generic budget, not the 9B Qwen one")
+        XCTAssertEqual(qwenCloudAssistant.temperature, assistant.temperature, accuracy: 0.0001)
+        XCTAssertEqual(qwenCloudAssistant.presencePenalty, assistant.presencePenalty, accuracy: 0.0001)
+
+        // A LOCAL qwen checkpoint still gets its own family profile: the skip is
+        // keyed on the address, not on the name being present.
+        let localQwen = manager.getProfile(for: "qwen/qwen3.8-flash-next-fp8", type: .assistant)
+        XCTAssertEqual(localQwen.maxNewTokens, 4_096)
+        XCTAssertEqual(localQwen.presencePenalty, 1.50, accuracy: 0.0001)
+
+        // And it survives the no-window clamp unchanged.
+        XCTAssertEqual(
+            CloudContextPolicy.replyBudget(requested: coder.maxNewTokens, window: nil),
+            coder.maxNewTokens,
+            "the default must not be lowered by the unset-window ceiling"
+        )
+        XCTAssertLessThanOrEqual(
+            coder.maxNewTokens,
+            CloudContextPolicy.unknownWindowReplyCeiling
+        )
+    }
+
+
     func testHelpTopicsAndSettingsGuideCoverage() throws {
         // 1. Verify all 11 HelpTopic enum cases are present
         let topics = HelpTopic.allCases

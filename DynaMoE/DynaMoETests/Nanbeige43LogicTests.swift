@@ -246,6 +246,45 @@ final class Nanbeige43KVGeometryTests: XCTestCase {
         XCTAssertGreaterThan(new, old)
     }
 
+    /// `localMaxOutputTokens` is what the Settings slider advertises for a local
+    /// checkpoint, and it must be the number `launchTurn` honours. The two
+    /// constants it is built from are deliberately NOT moved: `maxProvisionedRows`
+    /// is the policy floor used as a default argument by `sessionFloor` and
+    /// `neededSeqLen`, so raising it would widen the reserve for every caller
+    /// that omits `policyMaxRows`.
+    func testTheLocalOutputCeilingMatchesTheProvisionPolicy() throws {
+        // No config: the flat floor is still the answer, so the slider never
+        // narrows below the range every existing turn already had.
+        XCTAssertEqual(
+            KVCacheProvisioning.localMaxOutputTokens(config: nil),
+            KVCacheProvisioning.maxProvisionedRows
+        )
+        XCTAssertEqual(KVCacheProvisioning.maxProvisionedRows, 32_768)
+
+        // A model declaring less than the floor keeps the floor.
+        let small = try JSONDecoder().decode(
+            ModelConfig.self,
+            from: Data("{\"model_type\":\"llama\",\"max_position_embeddings\":8192}".utf8)
+        )
+        XCTAssertEqual(
+            KVCacheProvisioning.localMaxOutputTokens(config: small),
+            KVCacheProvisioning.maxProvisionedRows
+        )
+
+        // A large window raises the ceiling, and the 262,144 absolute cap holds.
+        let large = try JSONDecoder().decode(
+            ModelConfig.self,
+            from: Data("{\"model_type\":\"llama\",\"max_position_embeddings\":524288}".utf8)
+        )
+        XCTAssertEqual(KVCacheProvisioning.localMaxOutputTokens(config: large), 262_144)
+
+        // It is exactly the policy, so the slider and `turnFit` cannot drift.
+        XCTAssertEqual(
+            KVCacheProvisioning.localMaxOutputTokens(config: large),
+            KVCacheProvisioning.policyMaxRows(config: large)
+        )
+    }
+
     func testAPrefillIsChunkedForEveryFamilyNowNotOnlyGemma() throws {
         // The transient buffers scale with the chunk, so ingesting a long dense
         // prompt in one call allocates them for the whole prompt.

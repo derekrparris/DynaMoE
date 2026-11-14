@@ -7,14 +7,156 @@ import SwiftUI
 import Combine
 import Metal
 
-/// Quick-pick values for Max Output Tokens.
+/// The lowest Max Output Tokens the slider can express.
 ///
-/// Deduplicated and sorted once: the buttons are keyed by value (`ForEach(_:id:
-/// \.self)`), so a duplicate — which a future `maxProvisionedRows` value could
-/// silently introduce — is a SwiftUI runtime crash rather than a cosmetic glitch.
-let maxTokenPresets: [Int] = Array(Set([
-    1024, 4096, 8192, 16000, KVCacheProvisioning.maxProvisionedRows
-])).sorted()
+/// It is a UI floor, not a backend one: nothing in the engine refuses a smaller
+/// reply, but a slider whose lower bound is 0 invites a value no turn can use.
+let maxTokenSliderFloor = 32
+
+/// Quick-pick values for Max Output Tokens, bounded by the ceiling of whichever
+/// backend the selected model runs on.
+///
+/// Deduplicated and sorted: the buttons are keyed by value (`ForEach(_:id:
+/// \.self)`), so a duplicate — which an appended ceiling equal to a rung would
+/// silently introduce — is a SwiftUI runtime crash rather than a cosmetic
+/// glitch. The ceiling is appended rather than assumed to be a rung, because a
+/// cloud model's ceiling is a fraction of its window (40,000 for a 200k model)
+/// and would otherwise snap the control to a neighbour.
+///
+/// Nothing below the slider's own floor is offered, and a ceiling under that
+/// floor is offered as itself. Every backend today clears it (a 1,024-token
+/// cloud window allows 205, Apple's on-device model 2,048, local checkpoints
+/// 32,768), so this is the guard a backend added later needs rather than a case
+/// that happens to be reachable now: a preset under the floor would be a button
+/// that sets a value the control immediately clamps back up.
+///
+/// Values above 16,000 are all powers of two on purpose: the range now reaches
+/// 262,144, and step-32 dragging over that span is ~8,000 steps, so these
+/// buttons and the text field are where precision actually lives.
+func maxTokenPresets(upTo ceiling: Int) -> [Int] {
+    let rungs = [1024, 4096, 8192, 16384, 32768, 65536, 131072, 262144]
+    var values = rungs.filter { $0 > maxTokenSliderFloor && $0 < ceiling }
+    values.append(max(ceiling, maxTokenSliderFloor))
+    return Array(Set(values)).sorted()
+}
+
+/// The slider range a ceiling describes.
+///
+/// `ClosedRange(lowerBound...upperBound)` traps when the lower bound exceeds the
+/// upper one, and the ceiling comes from a model's own recorded facts: a
+/// provider window is hand-typed, and a sub-floor one would crash the pane
+/// rather than show a small number. The upper bound is therefore lifted to the
+/// floor, which is the smallest range the control can express anyway.
+func maxTokenSliderRange(upTo ceiling: Int) -> ClosedRange<Double> {
+    Double(maxTokenSliderFloor)...Double(max(ceiling, maxTokenSliderFloor))
+}
+
+private enum MaxOutputCeilingBackend {
+    case cloud(window: Int?)
+    case appleFoundationModel
+    case local
+
+    static func classify(
+        model: DiscoveredModel?,
+        fallbackAddress: String?,
+        defaults: UserDefaults = .standard
+    ) -> MaxOutputCeilingBackend {
+        if let model {
+            if let parsed = CloudModelAddress.parseModelId(model.id)
+                ?? CloudModelAddress.parsePath(model.snapshotPath) {
+                return .cloud(window: CloudContextPolicy.window(
+                    forModelId: parsed.providerModelId,
+                    providerId: parsed.provider.id,
+                    defaults: defaults
+                ))
+            }
+            if CloudModelAddress.isCloudModelId(model.id) || CloudModelAddress.isCloudPath(model.snapshotPath) {
+                return .cloud(window: CloudContextPolicy.globalWindow(defaults: defaults))
+            }
+            if model.isAppleFoundationModel {
+                return .appleFoundationModel
+            }
+            return .local
+        }
+        guard let address = fallbackAddress, !address.isEmpty else {
+            return .local
+        }
+        if address == AppleFoundationModelService.modelPath
+            || address == AppleFoundationModelService.modelId {
+            return .appleFoundationModel
+        }
+        if let parsed = CloudModelAddress.parseModelId(address)
+            ?? CloudModelAddress.parsePath(address) {
+            return .cloud(window: CloudContextPolicy.window(
+                forModelId: parsed.providerModelId,
+                providerId: parsed.provider.id,
+                defaults: defaults
+            ))
+        }
+        if CloudModelAddress.isCloudModelId(address) || CloudModelAddress.isCloudPath(address) {
+            return .cloud(window: CloudContextPolicy.globalWindow(defaults: defaults))
+        }
+        return .local
+    }
+}
+
+/// Resolves the Max Output Tokens ceiling for a non-local backend (cloud or
+/// Apple Foundation Model), returning nil when the backend is a local checkpoint
+/// whose `config.json` position limit governs instead.
+func resolveNonLocalMaxOutputCeiling(
+    model: DiscoveredModel?,
+    fallbackAddress: String?,
+    defaults: UserDefaults = .standard
+) -> Int? {
+    switch MaxOutputCeilingBackend.classify(model: model, fallbackAddress: fallbackAddress, defaults: defaults) {
+    case .cloud(let window):
+        return CloudContextPolicy.maximumOutputTokens(window: window)
+    case .appleFoundationModel:
+        return AppleFoundationModelService.maxResponseTokenCeiling
+    case .local:
+        return nil
+    }
+}
+
+/// Explains why the Max Output Tokens ceiling sits where it does, handling both
+/// discovered entries and fallback addresses (e.g., an ad-hoc cloud model or
+/// the on-device model before a scan completes).
+func maxOutputCeilingExplanation(
+    for model: DiscoveredModel?,
+    fallbackAddress: String?,
+    defaults: UserDefaults = .standard
+) -> String {
+    switch MaxOutputCeilingBackend.classify(model: model, fallbackAddress: fallbackAddress, defaults: defaults) {
+    case .cloud(let recorded):
+        if let recorded {
+            return "Capped by 20% of this model's \(recorded.formatted())-token context window — a reply budget larger than that cannot share the window with any prompt. Record a larger window on the Cloud tab to raise it."
+        }
+        return "No context window is recorded for this model, so the reply budget is held to \(CloudContextPolicy.unknownWindowReplyCeiling.formatted()) tokens. Record its window on the Cloud tab to raise the ceiling to 20% of it."
+    case .appleFoundationModel:
+        return "Capped by the on-device model's own response limit (\(AppleFoundationModelService.maxResponseTokenCeiling.formatted()) tokens); a larger value is clamped before the framework sees it."
+    case .local:
+        return "Capped by this checkpoint's own position limit. The KV cache budget also lowers the effective ceiling for a long prompt."
+    }
+}
+
+/// Identity of the backend the Max Output Tokens ceiling must be recomputed for.
+///
+/// `task(id:)` re-runs whenever this changes, so it carries exactly the inputs
+/// that can move the ceiling: the loaded weights, the default pick (a cloud
+/// registry entry when no weights are active), and the config's model type.
+///
+/// `cloudWindowFacts` covers the one input that is not a model choice: a cloud
+/// model's ceiling moves when its recorded window is edited, and that edit
+/// happens in a different pane of this same window. Without it the slider kept
+/// the range it resolved when the tab appeared.
+struct ActiveCeilingKey: Equatable {
+    var modelPath: String?
+    var defaultModelId: String?
+    var modelType: String?
+    /// The raw window facts for the active model's provider, so an edit landed
+    /// in the Cloud pane re-resolves the ceiling here.
+    var cloudWindowFacts: String?
+}
 
 enum SettingsTab: String, CaseIterable, Identifiable {
     case general = "General"
@@ -163,6 +305,28 @@ struct SettingsSheetView: View {
     @State private var inspectingProfileType: ModelProfileType = .coder
     @State private var editingDraft: GenerationProfileSettings = GenerationProfileSettings.defaultFor(type: .coder)
     @State private var profileFeedbackText: String? = nil
+    /// Max Output Tokens ceiling for the model whose profile is being edited, or
+    /// nil when its backend cannot be identified (the registry row a scan
+    /// dropped). Resolved in `loadProfileDraft` (an action) because the inspected
+    /// model is not necessarily the active one, so its ceiling cannot come from
+    /// the already-loaded `modelConfig`.
+    ///
+    /// Nil is a real state and not a number: answering it with
+    /// `maxProvisionedRows` advertised the local policy floor for a backend that
+    /// may answer differently, which is the exact defect this ceiling exists to
+    /// remove.
+    @State private var editingModelCeilingRows: Int? = nil
+    /// Max Output Tokens ceiling for the ACTIVE model, for the Sampling card,
+    /// carried TOGETHER with the key it was resolved for. Keeping them apart let
+    /// a cancelled or superseded task leave one model's ceiling on screen under
+    /// another model's name; an unresolved key now reads as unknown.
+    @State private var activeCeiling: ResolvedCeiling? = nil
+
+    /// A ceiling and the backend it describes.
+    private struct ResolvedCeiling: Equatable {
+        var key: ActiveCeilingKey
+        var rows: Int
+    }
 
     // Model & Tokenizer bindings
     var summary: ModelSummary?
@@ -276,6 +440,23 @@ struct SettingsSheetView: View {
                     modelsSettingsSection
                 case .generation:
                     generationSettingsSection
+                        // Resolve the Max Output Tokens ceiling when the tab is
+                        // shown, and again whenever the active model or its
+                        // backend changes. Both are actions, not `body` work: a
+                        // cloud ceiling rebuilds the provider registry and a
+                        // local one may read `config.json`.
+                        //
+                        // The resolved key is stored WITH the number, so the
+                        // panel can tell "this ceiling is the one for the model
+                        // on screen" from "a previous task's answer is still
+                        // installed". Nothing is written until the first resolve
+                        // finishes, which is why the unknown state is explicit
+                        // rather than a placeholder number.
+                        .task(id: activeCeilingKey) {
+                            let key = activeCeilingKey
+                            let rows = resolveActiveModelCeiling()
+                            activeCeiling = ResolvedCeiling(key: key, rows: rows)
+                        }
                 case .memory:
                     memorySettingsSection
                 case .agent:
@@ -427,6 +608,119 @@ struct SettingsSheetView: View {
             get: { Double(source.wrappedValue) },
             set: { source.wrappedValue = Float($0) }
         )
+    }
+
+    // MARK: - Max Output Tokens ceilings
+
+    /// The address of the active backend when no `DiscoveredModel` row exists
+    /// (ad-hoc/unregistered cloud models or before a scan completes).
+    private var activeGenerationAddress: String? {
+        if let path = activeModelPath, !path.isEmpty {
+            return path
+        }
+        return localModelManager.defaultModelId
+    }
+
+    /// The model the Generation tab's Sampling card is currently authoring for:
+    /// the loaded weights when a path is known, else the default pick (which may
+    /// be a cloud registry entry, whose "path" is a `cloud://` sentinel).
+    private func activeGenerationModel() -> DiscoveredModel? {
+        if let path = activeModelPath, !path.isEmpty {
+            return localModelManager.discoveredModels.first(where: {
+                $0.snapshotPath == path || $0.weightsEntryPath == path
+            })
+        }
+        guard let id = localModelManager.defaultModelId else { return nil }
+        return localModelManager.discoveredModels.first(where: { $0.id == id })
+    }
+
+    /// The raw window facts for the active model's provider, so `task(id:)` can
+    /// re-resolve the ceiling when a window is recorded or cleared in the Cloud
+    /// pane of this same window. Nil for a non-cloud backend, which has no such
+    /// facts. Two reads of a defaults key, cheap enough for a body pass, and one
+    /// string that already exists in the domain rather than a copy of its parse.
+    private var activeCloudWindowFacts: String? {
+        guard let address = activeGenerationAddress,
+              let parsed = CloudModelAddress.parseModelId(address)
+                ?? CloudModelAddress.parsePath(address) else { return nil }
+        let defaults = UserDefaults.standard
+        return [
+            defaults.string(forKey: CloudContextPolicy.defaultsKey(for: parsed.provider.id)) ?? "",
+            CloudContextPolicy.globalWindow(defaults: defaults).map(String.init) ?? ""
+        ].joined(separator: "|")
+    }
+
+    private var activeCeilingKey: ActiveCeilingKey {
+        ActiveCeilingKey(
+            modelPath: activeModelPath,
+            defaultModelId: localModelManager.defaultModelId,
+            modelType: modelConfig?.modelType,
+            cloudWindowFacts: activeCloudWindowFacts
+        )
+    }
+
+    /// The Max Output Tokens ceiling for the ACTIVE model, or nil while the key
+    /// it was resolved for no longer matches the backend on screen.
+    ///
+    /// Nil is the honest answer to "not resolved yet": substituting the local
+    /// policy floor made a cloud model's slider briefly offer 32,768 with a
+    /// ceiling that was about to change under it.
+    private var activeModelCeilingRows: Int? {
+        guard let activeCeiling, activeCeiling.key == activeCeilingKey else { return nil }
+        return activeCeiling.rows
+    }
+
+    /// The Max Output Tokens ceiling for the ACTIVE model.
+    ///
+    /// Two backends answer to different limits, and a single flat number was
+    /// wrong for both: a local checkpoint's ceiling is its KV policy, while a
+    /// cloud model's is a fraction of the context window its provider records.
+    /// The slider has to show whichever one binds, or it either advertises a
+    /// budget the launch path lowers or invites one no provider will accept.
+    ///
+    /// Called from `.task(id:)` rather than `body`: the fallback path (no
+    /// discovered row) reads the checkpoint `config.json`.
+    private func resolveActiveModelCeiling() -> Int {
+        guard let model = activeGenerationModel() else {
+            if let nonLocal = resolveNonLocalMaxOutputCeiling(
+                model: nil,
+                fallbackAddress: activeGenerationAddress
+            ) {
+                return nonLocal
+            }
+            return KVCacheProvisioning.localMaxOutputTokens(config: modelConfig)
+        }
+        return ceilingRows(for: model)
+    }
+
+    /// The Max Output Tokens ceiling for the model whose PROFILE is being edited.
+    ///
+    /// The active `modelConfig` is reused only when the edited model IS the
+    /// active one; otherwise the checkpoint's `config.json` is read here, in the
+    /// action that opens the editor. Never called from `body`: a cloud lookup
+    /// rebuilds the provider registry and a local one reads a file.
+    private func ceilingRows(for model: DiscoveredModel) -> Int {
+        if let nonLocal = resolveNonLocalMaxOutputCeiling(model: model, fallbackAddress: nil) {
+            return nonLocal
+        }
+        let isActive = activeModelPath != nil
+            && (activeModelPath == model.snapshotPath || activeModelPath == model.weightsEntryPath)
+        let config = isActive
+            ? modelConfig
+            : ModelConfig.load(from: URL(fileURLWithPath: model.snapshotPath))
+        return KVCacheProvisioning.localMaxOutputTokens(config: config)
+    }
+
+    /// What the ceiling is bound by, for the row that shows the number. A
+    /// ceiling with no stated reason reads as an arbitrary app limit.
+    ///
+    /// A cloud model with no window of its own is told which of the two numbers
+    /// binds: `unknownWindowReplyCeiling` when nothing is recorded anywhere, the
+    /// global fallback's 20% when only that is set. Saying "20% of this model's
+    /// recorded window" for a model that has none would name a fact that does
+    /// not exist.
+    private func ceilingExplanation(for model: DiscoveredModel?) -> String {
+        maxOutputCeilingExplanation(for: model, fallbackAddress: activeGenerationAddress)
     }
 
     /// Label-left settings row carrying a slider-plus-field numeric control,
@@ -847,39 +1141,86 @@ struct SettingsSheetView: View {
                 SettingsRowDivider()
 
                 // Max Output Tokens: slider, editable field, and quick presets.
+                //
+                // The ceiling is OPTIONAL, and the unresolved state draws a
+                // disabled control rather than a range with a guessed bound: a
+                // cloud model's ceiling is a fraction of a hand-typed window, so
+                // a placeholder number would either forbid a value the backend
+                // accepts or invite one it refuses. `SettingsValueSlider` clamps
+                // whatever it is handed on the first edit, so a range invented
+                // here is a range the user cannot leave.
+                let ceiling = activeModelCeilingRows
                 SettingsRow(
                     title: "Max Output Tokens",
-                    subtitle: "Hard cap on tokens generated per response. The KV cache budget also caps it for a long prompt."
+                    subtitle: "Hard cap on tokens generated per response. \(ceilingExplanation(for: activeGenerationModel()))"
                 ) {
-                    SettingsValueSlider(
-                        label: "Max Output Tokens",
-                        value: doubleBinding($maxNewTokens),
-                        range: 32...Double(KVCacheProvisioning.maxProvisionedRows),
-                        step: 32,
-                        fractionDigits: 0,
-                        fieldWidth: 64
-                    )
-                }
-
-                HStack(spacing: 6) {
-                    Text("Presets")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-
-                    ForEach(maxTokenPresets, id: \.self) { preset in
-                        Button("\(preset)") {
-                            maxNewTokens = preset
+                    if let ceiling {
+                        // Step 32 is a dragging convenience, not the resolution
+                        // of the setting: a cloud ceiling can be any fraction of
+                        // a window (a 1,024-token window allows 205) and a
+                        // profile can hold a value this model's slider cannot
+                        // reach. Those are entered in the field or taken from the
+                        // presets below, both of which are exact.
+                        SettingsValueSlider(
+                            label: "Max Output Tokens",
+                            value: doubleBinding($maxNewTokens),
+                            range: maxTokenSliderRange(upTo: ceiling),
+                            step: 32,
+                            fractionDigits: 0,
+                            fieldWidth: 72
+                        )
+                    } else {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Resolving this model's ceiling…")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
                         }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 10.5, weight: maxNewTokens == preset ? .bold : .regular, design: .monospaced))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2.5)
-                        .background(maxNewTokens == preset ? Color.purple.opacity(0.18) : Color.secondary.opacity(0.08))
-                        .foregroundColor(maxNewTokens == preset ? .purple : .primary)
-                        .cornerRadius(4)
                     }
                 }
-                .padding(.vertical, 4)
+
+                if let ceiling {
+                    // The stored value can legitimately exceed the ceiling being
+                    // shown: a profile is per-model and a cloud window can be
+                    // lowered after a value was saved against it. The engine
+                    // still honours the stored number, so explain it rather than
+                    // silently rewriting it — the same treatment the profile
+                    // editor gives the same case.
+                    if maxNewTokens > ceiling {
+                        HStack(alignment: .top, spacing: 6) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 9))
+                                .foregroundColor(.orange)
+                            Text("This setting (\(maxNewTokens.formatted())) exceeds the \(ceiling.formatted())-token ceiling for the selected model. It is still sent; a backend that cannot hold it lowers the allocation for that turn. Editing this control rewrites it.")
+                                .font(.system(size: 9))
+                                .foregroundColor(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(.leading, 2)
+                        .padding(.bottom, 2)
+                    }
+
+                    HStack(spacing: 6) {
+                        Text("Presets")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+
+                        ForEach(maxTokenPresets(upTo: ceiling), id: \.self) { preset in
+                            Button("\(preset)") {
+                                maxNewTokens = preset
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 10.5, weight: maxNewTokens == preset ? .bold : .regular, design: .monospaced))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2.5)
+                            .background(maxNewTokens == preset ? Color.purple.opacity(0.18) : Color.secondary.opacity(0.08))
+                            .foregroundColor(maxNewTokens == preset ? .purple : .primary)
+                            .cornerRadius(4)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
             }
 
             // JetSpec Causal Speculative Tree Acceleration
@@ -2537,6 +2878,21 @@ struct SettingsSheetView: View {
     private func loadProfileDraft(modelId: String, type: ModelProfileType) {
         inspectingProfileType = type
         editingDraft = profileManager.getProfile(for: modelId, type: type)
+        // Resolve the ceiling here, with the draft, so the slider and the stored
+        // value are opened against the same limit. The stored value is NOT
+        // clamped: a profile saved under a wider ceiling is honoured by the
+        // engine, and rewriting it on open would silently discard the setting
+        // this screen exists to edit. The control clamps on edit, which is the
+        // only moment the user has asked for a new number.
+        //
+        // No registry row means no known ceiling, and nil says so. Answering
+        // `maxProvisionedRows` here advertised the LOCAL policy floor for
+        // whatever backend the dropped row ran on — the very "a limit nothing
+        // enforces" defect this ceiling exists to remove, and the flat constant
+        // the rest of this change stops treating as a ceiling.
+        editingModelCeilingRows = localModelManager.discoveredModels
+            .first { $0.id == modelId || $0.snapshotPath == modelId }
+            .map { ceilingRows(for: $0) }
     }
 
     private func saveProfileDraft(model: DiscoveredModel, type: ModelProfileType) {
@@ -2615,7 +2971,7 @@ struct SettingsSheetView: View {
                     HStack(spacing: 6) {
                         Image(systemName: inspectingProfileType.icon)
                             .foregroundColor(.purple)
-                        Text("\(inspectingProfileType.profileDisplayName(for: model.displayName)) Settings")
+                        Text("\(inspectingProfileType.profileDisplayName(for: model.id)) Settings")
                             .font(.system(size: 13, weight: .bold))
                         Text("•")
                             .foregroundColor(.secondary)
@@ -2623,7 +2979,7 @@ struct SettingsSheetView: View {
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
-                    Text(inspectingProfileType.description(for: model.displayName))
+                    Text(inspectingProfileType.description(for: model.id))
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
@@ -2749,28 +3105,52 @@ struct SettingsSheetView: View {
                             .font(.system(.caption, design: .monospaced))
                             .foregroundStyle(.secondary)
                     }
-                    Slider(value: Binding(
-                        get: { Float(editingDraft.maxNewTokens) },
-                        set: { editingDraft.maxNewTokens = Int($0) }
-                    ), in: 32...Float(KVCacheProvisioning.maxProvisionedRows), step: 32)
-                    .accessibilityLabel("Max Output Tokens")
+                    // No known ceiling for this model: the value is still shown
+                    // and still saved, but the control that would clamp it is
+                    // withheld. A slider with a guessed upper bound silently
+                    // rewrites the number the moment it is touched.
+                    if let ceiling = editingModelCeilingRows {
+                        Slider(value: Binding(
+                            get: { Float(editingDraft.maxNewTokens) },
+                            set: { editingDraft.maxNewTokens = Int($0) }
+                        ), in: Float(maxTokenSliderFloor)...Float(max(ceiling, maxTokenSliderFloor)), step: 32)
+                        .accessibilityLabel("Max Output Tokens")
 
-                    HStack(spacing: 5) {
-                        Text("Presets:")
-                            .font(.system(size: 9))
-                            .foregroundColor(.secondary)
-                        ForEach(maxTokenPresets, id: \.self) { preset in
-                            Button("\(preset)") {
-                                editingDraft.maxNewTokens = preset
-                            }
-                            .buttonStyle(.plain)
-                            .font(.system(size: 9.5, weight: editingDraft.maxNewTokens == preset ? .bold : .regular, design: .monospaced))
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 2)
-                            .background(editingDraft.maxNewTokens == preset ? Color.purple.opacity(0.18) : Color.secondary.opacity(0.08))
-                            .foregroundColor(editingDraft.maxNewTokens == preset ? .purple : .primary)
-                            .cornerRadius(3)
+                        // Shown only when the draft sits above this model's
+                        // ceiling: a profile is per-model, so a value saved
+                        // against a wider model (or a cloud window since
+                        // lowered) can legitimately exceed the slider. The
+                        // engine still honours it, so this explains the number
+                        // instead of silently rewriting it.
+                        if editingDraft.maxNewTokens > ceiling {
+                            Text("Saved value exceeds this model's ceiling of \(ceiling); the engine still honours it. Editing the slider lowers it.")
+                                .font(.system(size: 9))
+                                .foregroundColor(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
+
+                        HStack(spacing: 5) {
+                            Text("Presets:")
+                                .font(.system(size: 9))
+                                .foregroundColor(.secondary)
+                            ForEach(maxTokenPresets(upTo: ceiling), id: \.self) { preset in
+                                Button("\(preset)") {
+                                    editingDraft.maxNewTokens = preset
+                                }
+                                .buttonStyle(.plain)
+                                .font(.system(size: 9.5, weight: editingDraft.maxNewTokens == preset ? .bold : .regular, design: .monospaced))
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 2)
+                                .background(editingDraft.maxNewTokens == preset ? Color.purple.opacity(0.18) : Color.secondary.opacity(0.08))
+                                .foregroundColor(editingDraft.maxNewTokens == preset ? .purple : .primary)
+                                .cornerRadius(3)
+                            }
+                        }
+                    } else {
+                        Text("This model's Max Output Tokens ceiling is unknown — rescan to identify it. The saved value is used as-is; the backend lowers an allocation it cannot hold.")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
 

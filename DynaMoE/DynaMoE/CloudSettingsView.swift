@@ -99,6 +99,18 @@ struct CloudProvidersSettingsView: View {
     @State private var pendingConfirmation: RemovalConfirmation? = nil
     @AppStorage("dynamoe_cloud_resend_images") private var resendImages: Bool = true
 
+    /// Per-provider in-progress context-window edits, keyed by provider id then
+    /// by upstream model id. An entry is populated only while the user is
+    /// editing a row, cleared in `refreshState()` and per-model on Save; when
+    /// absent, the field and Save both fall back to `CloudContextPolicy`'s
+    /// stored value so a row never shows or overwrites a stale number.
+    @State private var windowDrafts: [String: [String: String]] = [:]
+
+    /// Confirmation line per MODEL (`provider/model`), so a Save that stored
+    /// nothing (an unparseable value) says so on the row it belongs to instead
+    /// of appearing to work — and without repeating on every row of a provider.
+    @State private var windowFeedback: [String: String] = [:]
+
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             ForEach(providerStore.providers) { provider in
@@ -156,10 +168,28 @@ struct CloudProvidersSettingsView: View {
 
             SettingsRow(
                 title: "Context Window",
-                subtitle: "Compacting before a request would overflow needs the model's window. Record it per model with: defaults write DRP.DynaMoE dynamoe_cloud_<provider>_context -string \"<model>=128000\" (entries separated by \"; \"), or set a global fallback with dynamoe_cloud_context_window_tokens. Without either, the turn skips that pre-flight check and compacts only after the provider refuses the request, and the header shows the plain token total.",
+                subtitle: "A model's window sets both when the turn compacts and how large a reply it may ask for (20% of the window). Record it per model below. A model with no recorded window is held to a \(CloudContextPolicy.unknownWindowReplyCeiling.formatted())-token reply budget and compacts only after the provider refuses a request.",
                 icon: "ruler.fill",
                 iconTint: .cyan
             ) { EmptyView() }
+
+            // A card header followed by "record it per model below" and nothing
+            // below it is a dead end: with no provider registered, say so and
+            // point at the action that produces rows.
+            let windowEntries = contextWindowEntries()
+            if windowEntries.isEmpty {
+                SettingsRow(
+                    title: "No registered models",
+                    subtitle: "Register a provider's models with \u{201C}Test & Sync Models\u{201D} on a provider above; each one then gets its own window field here.",
+                    icon: "square.stack.3d.up.slash",
+                    iconTint: .gray
+                ) { EmptyView() }
+            } else {
+                ForEach(Array(windowEntries.enumerated()), id: \.element.id) { index, entry in
+                    if index > 0 { SettingsRowDivider() }
+                    contextWindowRow(entry)
+                }
+            }
 
             SettingsRowDivider()
 
@@ -379,6 +409,10 @@ struct CloudProvidersSettingsView: View {
                                                 spec.providerModelId,
                                                 for: provider
                                             )
+                                            clearWindowState(
+                                                forProviderId: provider.id,
+                                                modelId: spec.providerModelId
+                                            )
                                             LocalModelManager.shared.scanLocalModels()
                                         } label: {
                                             Image(systemName: "minus.circle")
@@ -436,6 +470,118 @@ struct CloudProvidersSettingsView: View {
         CloudModelRegistry.registeredSpecs(for: provider)
     }
 
+    /// One registered model's window facts, resolved ONCE per body pass so the
+    /// row does not re-parse the provider's `model=window` string on every
+    /// keystroke in any of the fields beside it.
+    ///
+    /// Identity is provider + upstream id, which is unique because a model id
+    /// belongs to exactly one provider.
+    private struct ContextWindowEntry: Identifiable {
+        var provider: CloudProvider
+        var spec: CloudModelSpec
+        /// The window recorded for THIS model, or nil when it has none.
+        var recorded: Int?
+        /// The window the send path resolves: the model's own, else the single
+        /// global fallback. The reply budget is derived from this one, because
+        /// this is the one the turn is priced and clamped against.
+        var resolvedWindow: Int?
+
+        var id: String { "\(provider.id)/\(spec.providerModelId)" }
+        /// What the field shows when the user has not typed into it: the stored
+        /// value, so a window recorded out of band (or by a Sync that arrived
+        /// after this pane opened) can never sit beside an empty field.
+        var recordedText: String { recorded.map(String.init) ?? "" }
+        var budget: Int {
+            CloudContextPolicy.maximumOutputTokens(window: resolvedWindow)
+        }
+    }
+
+    /// Every registered model across every provider, flattened so the window
+    /// rows can be one `ForEach` (a nested `for` is control flow inside a
+    /// `ViewBuilder` and does not compile).
+    ///
+    /// Each provider's `model=window` string is parsed ONCE here and the result
+    /// is carried on the entry. Reading it per row meant N full splits and
+    /// parses for N models on every evaluation, and a text field re-evaluates
+    /// its row on every keystroke.
+    private func contextWindowEntries() -> [ContextWindowEntry] {
+        let globalWindow = CloudContextPolicy.globalWindow(defaults: .standard)
+        return providerStore.providers.flatMap { provider -> [ContextWindowEntry] in
+            let recordedWindows = CloudContextPolicy.overrides(for: provider.id)
+            return registeredSpecs(for: provider).map { spec in
+                // `overrides(for:)` already drops anything below
+                // `minimumPlausibleWindow`, so a value it returned is capacity
+                // and the fallback only applies when the model has none.
+                let recorded = recordedWindows[spec.providerModelId]
+                return ContextWindowEntry(
+                    provider: provider,
+                    spec: spec,
+                    recorded: recorded,
+                    resolvedWindow: recorded ?? globalWindow
+                )
+            }
+        }
+    }
+
+    /// One model's context window, editable. This used to be a subtitle telling
+    /// the user to run `defaults write`; that was acceptable while the window
+    /// only drove compaction, but it now also sets the Max Output Tokens ceiling,
+    /// so a knob nobody can find would leave every cloud model on the
+    /// no-window budget.
+    @ViewBuilder
+    private func contextWindowRow(_ entry: ContextWindowEntry) -> some View {
+        let provider = entry.provider
+        let spec = entry.spec
+        let budget = entry.budget
+        // The per-model override, NOT the value this save would store: the row
+        // reports what the turn will actually send with, and the global fallback
+        // is named rather than implied, because "no window of its own" and "no
+        // window at all" are two different budgets.
+        SettingsRow(
+            title: spec.displayName,
+            subtitle: entry.recorded.map { "\($0.formatted()) tokens — reply budget \(budget.formatted())." }
+                ?? (entry.resolvedWindow.map { "No window of its own — the global \($0.formatted()) applies, reply budget \(budget.formatted())." }
+                    ?? "No window recorded — reply budget \(budget.formatted()).")
+        ) {
+            VStack(alignment: .trailing, spacing: 3) {
+                HStack(spacing: 6) {
+                    TextField(
+                        "none",
+                        text: Binding(
+                            get: {
+                                // A draft is an EDIT. With none, the field reads
+                                // the same storage the subtitle and the ceiling
+                                // read, so the two cannot disagree after a Sync
+                                // or a `defaults write` lands mid-session.
+                                windowDrafts[provider.id]?[spec.providerModelId] ?? entry.recordedText
+                            },
+                            set: { newValue in
+                                windowDrafts[provider.id, default: [:]][spec.providerModelId] = newValue
+                            }
+                        )
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12, design: .monospaced))
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 96)
+                    .accessibilityLabel("Context window for \(spec.displayName)")
+
+                    Button("Save") { saveWindow(for: provider, modelId: spec.providerModelId) }
+                        .controlSize(.small)
+                }
+
+                if let feedback = windowFeedback[entry.id] {
+                    Text(feedback)
+                        .font(.system(size: 9))
+                        .foregroundColor(.secondary)
+                        .lineLimit(2)
+                        .frame(maxWidth: 240, alignment: .trailing)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
     private func refreshState() {
         // Re-read the persisted list so a `defaults write` made outside the
         // app is visible the next time this pane appears.
@@ -443,6 +589,98 @@ struct CloudProvidersSettingsView: View {
         storedProviders = Set(providerStore.providers.filter {
             CloudSecretStore.shared.exists(providerId: $0.id)
         }.map(\.id))
+        // Drop every window draft rather than copying the stored values into
+        // one: a draft is an EDIT, and a field that reads through to storage
+        // when it has none cannot go stale against the subtitle beside it.
+        // Seeding meant a row could report the recorded window while the field
+        // held whatever this pane snapshotted on appear — which is exactly what
+        // a Sync that registers a model whose window was recorded out of band
+        // produced: the recorded number in the subtitle, an empty field.
+        windowDrafts = [:]
+        windowFeedback = [:]
+    }
+
+    /// Stores one model's context window, or removes it when the field is empty
+    /// (empty means "no recorded window", which is a real state: the reply
+    /// budget and the compaction pre-flight both treat it differently).
+    ///
+    /// Writes through `setOverride`, never through `overrides(for:)` +
+    /// `setOverrides`: that pair drops every entry the reader cannot parse, so
+    /// saving one row silently deleted a neighbour's hand-typed window (and an
+    /// operator's typo, which is theirs to fix, not this button's to erase).
+    ///
+    /// Only the saved model's draft is replaced. Refreshing the whole provider's
+    /// drafts would discard an in-progress edit on a sibling row.
+    /// Resolves the string a Save click should persist: an explicit edit draft
+    /// wins (including an empty draft that intentionally clears the stored
+    /// value), whereas `nil` means the field was never edited and keeps the
+    /// stored window it is displaying.
+    static func effectiveWindowInput(draft: String?, stored: Int?) -> String {
+        draft ?? stored.map(String.init) ?? ""
+    }
+
+    private func saveWindow(for provider: CloudProvider, modelId: String) {
+        let rawInput = Self.effectiveWindowInput(
+            draft: windowDrafts[provider.id]?[modelId],
+            stored: CloudContextPolicy.overrides(for: provider.id)[modelId]
+        )
+        let typed = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let feedbackKey = "\(provider.id)/\(modelId)"
+
+        var stored: Int?
+        if typed.isEmpty {
+            CloudContextPolicy.setOverride(
+                model: modelId,
+                window: nil,
+                providerId: provider.id
+            )
+        } else if let window = Int(typed.replacingOccurrences(of: ",", with: "")
+            .replacingOccurrences(of: "_", with: "")),
+            window >= CloudContextPolicy.minimumPlausibleWindow {
+            guard CloudContextPolicy.setOverride(
+                model: modelId,
+                window: window,
+                providerId: provider.id
+            ) else {
+                // The parser would drop it, so storing it would look saved and
+                // read back as absent.
+                windowFeedback[feedbackKey] = "Not saved: enter a whole number of at least \(CloudContextPolicy.minimumPlausibleWindow.formatted()) tokens."
+                return
+            }
+            stored = window
+        } else {
+            windowFeedback[feedbackKey] = "Not saved: enter a whole number of at least \(CloudContextPolicy.minimumPlausibleWindow.formatted()) tokens."
+            return
+        }
+
+        // The budget this row reports must be the one the send path will use,
+        // which resolves the per-model window AND the global fallback. Asking
+        // the override alone advertised 16,384 for a model the turn would send
+        // 40,000 to, and disagreed with the same model's row in Settings.
+        let resolvedWindow = CloudContextPolicy.window(
+            forModelId: modelId,
+            providerId: provider.id
+        )
+        let budget = CloudContextPolicy.maximumOutputTokens(window: resolvedWindow)
+
+        // Only this model's draft, and it is REMOVED rather than written back:
+        // the field reads storage when it has no draft, so the row now shows
+        // exactly what was stored and there is nothing left to drift. Assigning
+        // the whole provider's map would also discard an in-progress edit on a
+        // sibling row that shares the provider.
+        clearWindowDraft(forProviderId: provider.id, modelId: modelId)
+
+        // A save with no window of its own lands on the global fallback, and a
+        // budget line that did not say so would read as if this row's clearing
+        // chose the number.
+        let bindsGlobal = stored == nil && resolvedWindow != nil
+        if typed.isEmpty {
+            windowFeedback[feedbackKey] = bindsGlobal
+                ? "Cleared — the global \(resolvedWindow!.formatted()) applies, reply budget \(budget.formatted())."
+                : "Cleared — reply budget now \(budget.formatted())."
+        } else {
+            windowFeedback[feedbackKey] = "Saved — reply budget up to \(budget.formatted())."
+        }
     }
 
     private func saveKey(for provider: CloudProvider) {
@@ -542,6 +780,7 @@ struct CloudProvidersSettingsView: View {
                 keyDrafts[provider.id] = ""
                 storedProviders.remove(provider.id)
                 testStates[provider.id] = .untested
+                clearWindowState(forProviderId: provider.id)
             } catch {
                 testStates[provider.id] = .failure(error.localizedDescription)
             }
@@ -549,6 +788,24 @@ struct CloudProvidersSettingsView: View {
             removeKey(for: provider)
         }
         pendingConfirmation = nil
+    }
+
+    private func clearWindowDraft(forProviderId providerId: String, modelId: String) {
+        windowDrafts[providerId]?[modelId] = nil
+        if windowDrafts[providerId]?.isEmpty == true {
+            windowDrafts[providerId] = nil
+        }
+    }
+
+    private func clearWindowState(forProviderId providerId: String, modelId: String? = nil) {
+        if let modelId {
+            clearWindowDraft(forProviderId: providerId, modelId: modelId)
+            windowFeedback["\(providerId)/\(modelId)"] = nil
+        } else {
+            windowDrafts[providerId] = nil
+            let prefix = "\(providerId)/"
+            windowFeedback = windowFeedback.filter { !$0.key.hasPrefix(prefix) }
+        }
     }
 
     /// Forgets the registered catalog only.
@@ -562,6 +819,7 @@ struct CloudProvidersSettingsView: View {
     private func clearModels(for provider: CloudProvider) {
         CloudModelRegistry.setRegisteredModelIds([], for: provider)
         testStates[provider.id] = .untested
+        clearWindowState(forProviderId: provider.id)
         LocalModelManager.shared.scanLocalModels()
     }
 

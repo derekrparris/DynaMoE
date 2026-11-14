@@ -395,6 +395,23 @@ public nonisolated enum CloudContextPolicy {
     /// Below this a "window" is a units mistake, not a context size.
     public static let minimumPlausibleWindow = 1_024
 
+    /// The reply budget a cloud model is held to when it records NO window.
+    ///
+    /// An unrecorded window used to mean "no cap": `replyBudget` passed the
+    /// caller's request straight through, so whatever Max Output Tokens the
+    /// settings slider allowed was sent verbatim as `max_tokens`. At the slider's
+    /// old 32,768 that was already generous; once the slider became honest about
+    /// a 128k-window model it became a budget no provider asked for and several
+    /// refuse outright. With no window there is no capacity to justify a larger
+    /// number, so this is the number instead.
+    ///
+    /// It is what the generic (cloud) profile's coder default carries —
+    /// `GenerationProfileSettings.defaultFor` reads this constant rather than
+    /// restating the number, so an unconfigured provider gets a coherent budget
+    /// rather than a value that is then clamped by a different constant, and the
+    /// two cannot drift apart unnoticed.
+    public static let unknownWindowReplyCeiling = 16_384
+
     public static func defaultsKey(for providerId: String) -> String {
         "dynamoe_cloud_\(providerId)_context"
     }
@@ -441,13 +458,17 @@ public nonisolated enum CloudContextPolicy {
     /// drops unparseable entries, so writing its result back erased an
     /// operator's typo AND their valid neighbours in the same pass. Unregistering
     /// an unrelated model used to take that path.
+    ///
+    /// Returns whether anything changed, so a caller that pairs this with a write
+    /// can stay a true no-op instead of rewriting identical bytes.
+    @discardableResult
     public static func removeOverride(
         model: String,
         providerId: String,
         defaults: UserDefaults = .standard
-    ) {
+    ) -> Bool {
         let key = defaultsKey(for: providerId)
-        guard let raw = defaults.string(forKey: key) else { return }
+        guard let raw = defaults.string(forKey: key) else { return false }
         var kept: [String] = []
         var removed = false
         for entry in splitOverrideEntries(raw) {
@@ -457,12 +478,69 @@ public nonisolated enum CloudContextPolicy {
             }
             kept.append(entry)
         }
-        guard removed else { return }
+        guard removed else { return false }
         if kept.isEmpty {
             defaults.removeObject(forKey: key)
         } else {
             defaults.set(kept.joined(separator: "; "), forKey: key)
         }
+        return true
+    }
+
+    /// Stores ONE model's window, leaving every other entry — including one this
+    /// build could not parse — exactly as typed. `window == nil` removes it.
+    ///
+    /// The `overrides(for:)` + `setOverrides` pair is the wrong tool for a
+    /// single-model save for the same reason it was wrong for unregister: the
+    /// reader drops unparseable entries, so writing its result back deletes an
+    /// operator's typo AND every valid neighbour the same pass could not
+    /// represent. Saving one row must not erase another.
+    ///
+    /// Returns false when nothing was written: a sub-plausible window (which the
+    /// reader would drop and therefore read back as absent), an empty model id,
+    /// or a clear of a model that had no entry — a write that changes nothing is
+    /// reported as such rather than as a save. Callers validate the typed value
+    /// first; this is the last line of defence.
+    @discardableResult
+    public static func setOverride(
+        model: String,
+        window: Int?,
+        providerId: String,
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        guard !model.isEmpty else { return false }
+        guard let window else {
+            return removeOverride(model: model, providerId: providerId, defaults: defaults)
+        }
+        guard window >= minimumPlausibleWindow else { return false }
+
+        let key = defaultsKey(for: providerId)
+        let raw = defaults.string(forKey: key) ?? ""
+        let replacement = "\(model)=\(window)"
+        var kept: [String] = []
+        var replaced = false
+        for entry in splitOverrideEntries(raw) {
+            guard let parts = splitEntry(entry), parts.model == model else {
+                kept.append(entry)
+                continue
+            }
+            // First match takes the new value in place; a later duplicate is
+            // dropped rather than left to win the reader's last-one-wins merge.
+            if !replaced {
+                kept.append(replacement)
+                replaced = true
+            }
+        }
+        if !replaced { kept.append(replacement) }
+
+        // A save that stores what is already stored is a success with nothing
+        // to do: rewriting the key would churn defaults (and every observer of
+        // the domain) for a value nobody changed. `true` because the store now
+        // holds the requested value, which is what the return answers.
+        let updated = kept.joined(separator: "; ")
+        guard updated != raw else { return true }
+        defaults.set(updated, forKey: key)
+        return true
     }
 
     /// Splits `;`, `,`, or newline-separated entries without tearing apart a
@@ -573,10 +651,10 @@ public nonisolated enum CloudContextPolicy {
         )
     }
 
-    private static func resolvedWindow(recorded: Int?, defaults: UserDefaults) -> Int? {
-        if let recorded, recorded >= minimumPlausibleWindow {
-            return recorded
-        }
+    /// The single global fallback value, or nil when none is set. Exposed so a
+    /// UI row can say WHICH window it is reporting against instead of implying
+    /// the model has none.
+    public static func globalWindow(defaults: UserDefaults = .standard) -> Int? {
         let intFallback = defaults.integer(forKey: globalWindowKey)
         if intFallback >= minimumPlausibleWindow {
             return intFallback
@@ -587,6 +665,13 @@ public nonisolated enum CloudContextPolicy {
             return parsed
         }
         return nil
+    }
+
+    private static func resolvedWindow(recorded: Int?, defaults: UserDefaults) -> Int? {
+        if let recorded, recorded >= minimumPlausibleWindow {
+            return recorded
+        }
+        return globalWindow(defaults: defaults)
     }
 
     /// Whether a send of `promptTokens` should compact first.
@@ -632,14 +717,39 @@ public nonisolated enum CloudContextPolicy {
     /// The cap is the room the auto-compaction threshold leaves — 20% of the
     /// window — so the two rules agree: once the prompt is under 80%, the
     /// prompt plus this reply fits, and the pre-flight is only triggered by a
-    /// prompt compaction can actually shrink. A model with no recorded window
-    /// is left alone, as is a caller that asked for no budget (`nil`/`0`).
+    /// prompt compaction can actually shrink.
+    ///
+    /// A model with NO recorded window is capped at `unknownWindowReplyCeiling`
+    /// rather than passed through. The pass-through was safe only while the
+    /// settings slider topped out at a budget most providers accept; it let the
+    /// app send an arbitrary `max_tokens` to a provider whose capacity nobody had
+    /// written down, which is a 400 (or an expensive success) with no local
+    /// evidence behind it. The ceiling is the same number
+    /// `maximumOutputTokens(window:)` advertises, so the slider and this clamp
+    /// cannot disagree. A caller that asked for no budget (`nil`/`0`) is still
+    /// left alone.
     public static func replyBudget(requested: Int, window: Int?) -> Int {
         guard requested > 0 else { return max(0, requested) }
-        guard let window, window >= minimumPlausibleWindow else { return requested }
+        guard let window, window >= minimumPlausibleWindow else {
+            return min(requested, unknownWindowReplyCeiling)
+        }
         let room = (Double(window) * (1 - autoCompactFraction)).rounded()
-        guard room.isFinite, room >= 1, room < Double(Int.max) else { return requested }
+        guard room.isFinite, room >= 1, room < Double(Int.max) else {
+            return min(requested, unknownWindowReplyCeiling)
+        }
         return min(requested, Int(room))
+    }
+
+    /// The Max Output Tokens ceiling Settings should advertise for a cloud
+    /// model — the same number `replyBudget` enforces for it.
+    ///
+    /// Written against `replyBudget`'s own arithmetic on purpose: a slider that
+    /// computed its range independently would eventually advertise a budget the
+    /// send path silently lowers, which reads as the app ignoring a setting.
+    /// An unrecorded (or sub-plausible) window answers with
+    /// `unknownWindowReplyCeiling`, exactly as the clamp does.
+    public static func maximumOutputTokens(window: Int?) -> Int {
+        replyBudget(requested: Int.max, window: window)
     }
 
     /// The share of the window a prompt occupies, for a status line.

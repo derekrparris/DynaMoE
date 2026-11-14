@@ -3146,7 +3146,7 @@ final class CloudContextPolicyTests: XCTestCase {
         // guarantees a refusal.
         XCTAssertEqual(CloudContextPolicy.replyBudget(requested: 8_192, window: 16_000), 3_200)
         XCTAssertEqual(CloudContextPolicy.replyBudget(requested: 8_192, window: 1_024), 205)
-        // Nothing to clamp.
+        // Nothing to clamp: a request already under the room passes through.
         XCTAssertEqual(CloudContextPolicy.replyBudget(requested: 8_192, window: nil), 8_192)
         XCTAssertEqual(CloudContextPolicy.replyBudget(requested: 1_000, window: 16_000), 1_000)
         XCTAssertEqual(CloudContextPolicy.replyBudget(requested: 8_192, window: 512), 8_192)
@@ -3159,6 +3159,90 @@ final class CloudContextPolicyTests: XCTestCase {
             window: 16_000,
             reservedTokens: budget
         ), "12,000 + 3,200 fits a 16k window, and 12,000 is under the threshold")
+    }
+
+    /// The regression this whole change exists for.
+    ///
+    /// `replyBudget` used to hand back the caller's request untouched when no
+    /// window was recorded. That was harmless only while the settings slider
+    /// topped out at a budget most providers accept: once the Max Output Tokens
+    /// ceiling became the model's real capacity, an unrecorded provider would
+    /// have received an arbitrary `max_tokens` — a 400, or an expensive success,
+    /// with no local evidence behind it.
+    func testAnUnrecordedWindowIsCappedRatherThanPassedThrough() {
+        XCTAssertEqual(
+            CloudContextPolicy.replyBudget(requested: 131_072, window: nil),
+            CloudContextPolicy.unknownWindowReplyCeiling
+        )
+        // A sub-plausible window is a units mistake, not capacity, so it takes
+        // the same ceiling instead of the (tiny) "window" arithmetic.
+        XCTAssertEqual(
+            CloudContextPolicy.replyBudget(requested: 131_072, window: 512),
+            CloudContextPolicy.unknownWindowReplyCeiling
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.replyBudget(requested: 131_072, window: 1_023),
+            CloudContextPolicy.unknownWindowReplyCeiling
+        )
+        // Under the ceiling nothing is lowered: the cap is a ceiling, not a floor.
+        XCTAssertEqual(
+            CloudContextPolicy.replyBudget(requested: 4_096, window: nil),
+            4_096
+        )
+        // A recorded window still wins over the fallback.
+        XCTAssertEqual(
+            CloudContextPolicy.replyBudget(requested: 131_072, window: 200_000),
+            40_000
+        )
+    }
+
+    /// The Settings slider must advertise exactly what the send path enforces.
+    /// A slider that computed its own range would eventually show a budget the
+    /// clamp silently lowered, which reads as the app ignoring the setting.
+    func testTheAdvertisedCeilingIsTheEnforcedBudget() {
+        // No window: the conservative ceiling, in both directions.
+        XCTAssertEqual(
+            CloudContextPolicy.maximumOutputTokens(window: nil),
+            CloudContextPolicy.unknownWindowReplyCeiling
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.maximumOutputTokens(window: 512),
+            CloudContextPolicy.unknownWindowReplyCeiling
+        )
+
+        // A recorded window: 20% of it, identical to the clamp.
+        XCTAssertEqual(CloudContextPolicy.maximumOutputTokens(window: 200_000), 40_000)
+        XCTAssertEqual(
+            CloudContextPolicy.maximumOutputTokens(window: 200_000),
+            CloudContextPolicy.replyBudget(requested: Int.max, window: 200_000),
+            "the slider and the clamp cannot disagree"
+        )
+
+        // A window small enough that 20% is under the fallback yields the smaller
+        // number: capacity, not a floor, is what binds.
+        XCTAssertEqual(CloudContextPolicy.maximumOutputTokens(window: 32_000), 6_400)
+    }
+
+    /// `maxTokenPresets(upTo:)` feeds `ForEach(_:id: \.self)`, so a duplicate is a
+    /// SwiftUI runtime crash rather than a cosmetic glitch, and a preset above
+    /// the ceiling would set a value the control immediately clamps.
+    func testMaxTokenPresetsRespectTheCeilingAndStayUnique() {
+        for ceiling in [16_384, 32_768, 40_000, 262_144] {
+            let presets = maxTokenPresets(upTo: ceiling)
+            XCTAssertEqual(presets, Array(Set(presets)).sorted(), "unique and ascending at \(ceiling)")
+            XCTAssertTrue(presets.allSatisfy { $0 <= ceiling }, "no preset above the ceiling at \(ceiling)")
+            XCTAssertEqual(presets.filter { $0 == ceiling }.count, 1, "the ceiling is offered exactly once at \(ceiling)")
+            XCTAssertFalse(presets.isEmpty)
+        }
+        // The default ceiling keeps every value the old fixed list offered.
+        let standard = maxTokenPresets(upTo: 32_768)
+        for legacy in [1024, 4096, 8192] {
+            XCTAssertTrue(standard.contains(legacy))
+        }
+        XCTAssertEqual(standard.last, 32_768)
+        // A cloud ceiling that is not a rung is still offered verbatim.
+        XCTAssertEqual(maxTokenPresets(upTo: 40_000).last, 40_000)
+        XCTAssertFalse(maxTokenPresets(upTo: 40_000).contains(65_536))
     }
 
     func testAContextPercentageAboveTheWindowStopsAtOneHundred() {
@@ -3314,6 +3398,108 @@ final class CloudContextPolicyTests: XCTestCase {
             CloudContextPolicy.overrides(for: "p", defaults: defaults),
             ["n": 128_000, "o": 64_000]
         )
+    }
+
+    /// Saving one model's window must not delete another's — including an entry
+    /// this build cannot parse, which is the operator's to fix rather than the
+    /// Save button's to erase.
+    ///
+    /// The UI writer used to read `overrides(for:)` and write the dictionary
+    /// back. That reader drops every entry it cannot parse, so saving `a` in
+    /// `a=200000; typo=12k; b=128000` left `a` and `b` and silently deleted the
+    /// typo. `removeOverride` exists because unregister had the same bug; the
+    /// single-model writer had taken the unsafe route back.
+    func testSavingOneWindowLeavesItsNeighboursExactlyAsTyped() {
+        let defaults = scratchDefaults()
+        let key = CloudContextPolicy.defaultsKey(for: "p")
+        defaults.set("a=200000; typo=12k; b=128000", forKey: key)
+
+        XCTAssertTrue(
+            CloudContextPolicy.setOverride(model: "a", window: 300_000, providerId: "p", defaults: defaults)
+        )
+        let afterSave = defaults.string(forKey: key) ?? ""
+        XCTAssertTrue(afterSave.contains("typo=12k"), "an unparseable neighbour must survive a save")
+        XCTAssertTrue(afterSave.contains("b=128000"), "a valid neighbour must survive a save")
+        XCTAssertEqual(
+            CloudContextPolicy.overrides(for: "p", defaults: defaults),
+            ["a": 300_000, "b": 128_000],
+            "the parse view still reports only what it can read"
+        )
+
+        // A model with no entry is appended, and the neighbours still stand.
+        XCTAssertTrue(
+            CloudContextPolicy.setOverride(model: "c", window: 64_000, providerId: "p", defaults: defaults)
+        )
+        let afterAdd = defaults.string(forKey: key) ?? ""
+        XCTAssertTrue(afterAdd.contains("typo=12k"))
+        XCTAssertTrue(afterAdd.contains("b=128000"))
+        XCTAssertEqual(CloudContextPolicy.overrides(for: "p", defaults: defaults)["c"], 64_000)
+
+        // Saving the same model again REPLACES rather than duplicating: a
+        // duplicate would leave the reader's last-one-wins merge to decide.
+        XCTAssertTrue(
+            CloudContextPolicy.setOverride(model: "c", window: 96_000, providerId: "p", defaults: defaults)
+        )
+        let afterReplace = defaults.string(forKey: key) ?? ""
+        XCTAssertEqual(afterReplace.components(separatedBy: "c=").count - 1, 1, "one entry per model")
+        XCTAssertEqual(CloudContextPolicy.overrides(for: "p", defaults: defaults)["c"], 96_000)
+        XCTAssertTrue(afterReplace.contains("typo=12k"))
+
+        // Clearing goes through the same in-place path.
+        XCTAssertTrue(
+            CloudContextPolicy.setOverride(model: "b", window: nil, providerId: "p", defaults: defaults)
+        )
+        let afterClear = defaults.string(forKey: key) ?? ""
+        XCTAssertFalse(afterClear.contains("b=128000"))
+        XCTAssertTrue(afterClear.contains("typo=12k"), "clearing one window must not touch the typo either")
+        XCTAssertTrue(afterClear.contains("a=300000"))
+    }
+
+    /// A sub-plausible window is refused rather than stored: the reader would
+    /// drop it, so storing it would look saved and read back as absent.
+    func testAnImplausibleWindowIsRefusedRatherThanStored() {
+        let defaults = scratchDefaults()
+        let key = CloudContextPolicy.defaultsKey(for: "p")
+        defaults.set("a=200000", forKey: key)
+
+        XCTAssertFalse(
+            CloudContextPolicy.setOverride(model: "a", window: 512, providerId: "p", defaults: defaults)
+        )
+        XCTAssertEqual(
+            defaults.string(forKey: key),
+            "a=200000",
+            "a refused write must not modify the stored list at all"
+        )
+        XCTAssertFalse(
+            CloudContextPolicy.setOverride(model: "", window: 200_000, providerId: "p", defaults: defaults)
+        )
+    }
+
+    /// The Cloud tab's row and the send path must report one window. The row used
+    /// to read the per-model override alone, so with a global fallback recorded it
+    /// advertised 16,384 for a model the turn resolved to 40,000.
+    func testTheRowAndTheSendPathAgreeOnTheWindow() {
+        let defaults = scratchDefaults()
+        defaults.set("a=200000", forKey: CloudContextPolicy.defaultsKey(for: "p"))
+        defaults.set(200_000, forKey: CloudContextPolicy.globalWindowKey)
+
+        // Per-model wins.
+        XCTAssertEqual(
+            CloudContextPolicy.window(forModelId: "a", providerId: "p", defaults: defaults),
+            200_000
+        )
+        // A model with no entry falls through to the single global value, and the
+        // ceiling that follows is the one the send path enforces.
+        let fallbackWindow = CloudContextPolicy.window(forModelId: "b", providerId: "p", defaults: defaults)
+        XCTAssertEqual(fallbackWindow, 200_000)
+        XCTAssertEqual(CloudContextPolicy.globalWindow(defaults: defaults), 200_000)
+        XCTAssertEqual(
+            CloudContextPolicy.maximumOutputTokens(window: fallbackWindow),
+            40_000,
+            "a fallback-resolved window must advertise the fallback budget, not the no-window ceiling"
+        )
+        // With neither recorded, the no-window ceiling is the answer.
+        XCTAssertNil(CloudContextPolicy.globalWindow(defaults: scratchDefaults()))
     }
 
     func testCloudCompactionChunkBudgetReservesInstructionsDigestAndReplyCap() {

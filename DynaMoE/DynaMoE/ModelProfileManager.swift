@@ -31,40 +31,58 @@ public enum ModelProfileType: String, Codable, CaseIterable, Identifiable {
         }
     }
 
-    public func profileDisplayName(for modelName: String? = nil) -> String {
+    private enum LocalFamily {
+        case qwen
+        case ornith
+    }
+
+    private static func localFamily(for modelName: String?) -> LocalFamily? {
+        guard !CloudModelAddress.isCloudModelId(modelName),
+              !CloudModelAddress.isCloudPath(modelName) else {
+            return nil
+        }
         let nameLower = (modelName ?? "").lowercased()
-        if nameLower.contains("qwen") {
+        if nameLower.contains("qwen") { return .qwen }
+        if nameLower.contains("ornith") { return .ornith }
+        return nil
+    }
+
+    public func profileDisplayName(for modelName: String? = nil) -> String {
+        switch Self.localFamily(for: modelName) {
+        case .qwen:
             switch self {
             case .coder: return "Coding & Agentic (Thinking Mode)"
             case .assistant: return "General Assistant (Instruct Mode)"
             }
-        } else if nameLower.contains("ornith") {
+        case .ornith:
             switch self {
             case .coder: return "Precise Coding & Tool Calling"
             case .assistant: return "General Chat / Agent Loops"
             }
+        case nil:
+            return self.rawValue
         }
-        return self.rawValue
     }
 
     public func description(for modelName: String? = nil) -> String {
-        let nameLower = (modelName ?? "").lowercased()
-        if nameLower.contains("qwen") {
+        switch Self.localFamily(for: modelName) {
+        case .qwen:
             switch self {
             case .coder:
                 return "Official Qwen Thinking Mode: High-entropy exploration (Temp 1.0, Pres 0.0) optimized for SWE-bench, complex code, and multi-tool execution."
             case .assistant:
                 return "Official Qwen Instruct Mode: Direct non-reasoning responses (Temp 0.70, Pres 1.5) optimized for quick chat and summarization."
             }
-        } else if nameLower.contains("ornith") {
+        case .ornith:
             switch self {
             case .coder:
                 return "Official Ornith Precise Profile: Low entropy (Temp 0.60, Pres 0.0) preventing code syntax drift and schema violation."
             case .assistant:
                 return "Official Ornith Agentic Loop Profile: Dynamic variety (Temp 1.00, Pres 1.5) for open-ended benchmark reproduction and chat."
             }
+        case nil:
+            return self.description
         }
-        return self.description
     }
 }
 
@@ -115,16 +133,36 @@ public struct GenerationProfileSettings: Codable, Equatable, Hashable {
     /// so a renamed copy would otherwise fall through to the generic profile.
     /// Every other family here is matched by name because its name is the only
     /// discriminator that exists.
+    ///
+    /// A cloud model id is asked about NEITHER. The name of a provider model
+    /// id describes someone else's checkpoint on someone else's hardware: Zen
+    /// ships `qwen3-coder` and Synthetic serves `hf:Qwen/...` as first-class
+    /// ids, and matching `qwen` in those names handed a remote model this app's
+    /// 8,192-token local budget plus a `temperature 1.00` /
+    /// `presencePenalty 1.50` pair tuned for a checkpoint the provider is not
+    /// running. Name-gating is a statement about LOCAL families, so the whole
+    /// gate is skipped for a cloud address and the generic (cloud) branch below
+    /// answers instead.
+    ///
+    /// Both cloud address forms are recognised, and the sentinel is not merely
+    /// decorative: `ContentView.applyProfile` is handed `cloud://<provider>/<model>`
+    /// (`activeLoadedModelPath`) after every cloud activation, while the registry id
+    /// `cloud-model-<provider>-<model>` is what `switchModel` passes. A gate that
+    /// only understood the id form would leave the path the app actually uses on
+    /// the family branch.
     public static func defaultFor(
         type: ModelProfileType,
         modelName: String? = nil,
         modelPath: String? = nil
     ) -> GenerationProfileSettings {
-        let nameLower = (modelName ?? "").lowercased()
+        let isCloud = CloudModelAddress.isCloudModelId(modelName)
+            || CloudModelAddress.isCloudPath(modelName)
+            || CloudModelAddress.isCloudPath(modelPath)
+        let nameLower = isCloud ? "" : (modelName ?? "").lowercased()
         let isQwen = nameLower.contains("qwen")
         let isOrnith = nameLower.contains("ornith")
         let isNanbeige = nameLower.contains("nanbeige")
-            || (modelPath.map { ModelConfig.isNanbeige43Snapshot($0) } ?? false)
+            || (!isCloud && (modelPath.map { ModelConfig.isNanbeige43Snapshot($0) } ?? false))
 
         if isQwen {
             switch type {
@@ -244,7 +282,35 @@ public struct GenerationProfileSettings: Codable, Equatable, Hashable {
             }
         }
 
-        // Generic fallback defaults
+        // Generic fallback defaults.
+        //
+        // This branch is the CLOUD profile, and it is reached by every cloud
+        // model because the family gate above skips a cloud address entirely —
+        // not because a provider's model id happens to match no family name
+        // (several do: `qwen3-coder` is a shipped Zen id).
+        //
+        // It is also the default for an ungated LOCAL checkpoint (Llama, Gemma,
+        // Spark, DeepSeek), which is why these numbers cannot be cloud-only
+        // reasoning: a local turn resolves them as its reply budget too, and
+        // `turnFit` lowers the allocation rather than refusing the turn when the
+        // KV budget cannot hold `prompt + this`. On the 16 GB reference machine
+        // a long local prompt therefore clamps more often than it did at 8,192.
+        //
+        // They were 8,192 / 4,096, a budget sized for a local checkpoint's KV
+        // appetite, which crippled a capable remote model's ability to use the
+        // harness (a long tool step or a full file rewrite truncated mid-answer).
+        // Doubled, and deliberately NOT raised to the policy ceiling: the slider
+        // is the ceiling and the cloud path derives it per window
+        // (`CloudContextPolicy.maximumOutputTokens`), while this default has to be
+        // safe for a provider nobody recorded a window for — which is exactly
+        // `CloudContextPolicy.unknownWindowReplyCeiling`.
+        //
+        // That constant IS the coder budget, read from it rather than restated: a
+        // literal here would be a second copy of a number whose whole job is to
+        // be the budget an unrecorded-window turn is clamped to, and the two
+        // could drift apart with nothing to notice. The assistant budget is half
+        // of it, the 2:1 coder:assistant ratio the shipped profiles keep.
+        let cloudReplyCeiling = CloudContextPolicy.unknownWindowReplyCeiling
         switch type {
         case .coder:
             return GenerationProfileSettings(
@@ -254,7 +320,7 @@ public struct GenerationProfileSettings: Codable, Equatable, Hashable {
                 topK: 20,
                 repetitionPenalty: 1.00,
                 presencePenalty: 0.00,
-                maxNewTokens: 8192,
+                maxNewTokens: cloudReplyCeiling,
                 systemPrompt: "You are an expert software engineer and programming assistant. Provide clear, correct, and high-performance code with minimal filler.",
                 jetSpecEnabled: true,
                 jetSpecMaxDepth: 3,
@@ -269,7 +335,7 @@ public struct GenerationProfileSettings: Codable, Equatable, Hashable {
                 topK: 50,
                 repetitionPenalty: 1.10,
                 presencePenalty: 0.00,
-                maxNewTokens: 4096,
+                maxNewTokens: cloudReplyCeiling / 2,
                 systemPrompt: "You are a helpful, respectful, and honest AI assistant.",
                 jetSpecEnabled: true,
                 jetSpecMaxDepth: 3,
@@ -287,21 +353,52 @@ public final class ModelProfileManager: ObservableObject {
     private let activeProfilesKey = "dynamoe_model_active_profiles_v1"
     private let globalActiveProfileKey = "dynamoe_global_active_profile_v1"
 
+    /// Where these profiles are persisted.
+    ///
+    /// Injectable because the app's domain (`DRP.DynaMoE`) is shared with the
+    /// test host: a test that saves through `shared` rewrites the developer's own
+    /// profiles, and no write is distinguishable from a real one afterwards. A
+    /// test that exercises a WRITE path builds a manager over its own suite
+    /// (`ModelProfileManager(defaults:)`) instead, the way
+    /// `VisionAttachmentLogicTests` already does for its own keys.
+    private let defaults: UserDefaults
+
     @Published public private(set) var profilesByModel: [String: [String: GenerationProfileSettings]] = [:]
     @Published public private(set) var activeProfileByModel: [String: String] = [:]
     @Published public var globalActiveProfile: ModelProfileType = .coder {
         didSet {
-            UserDefaults.standard.set(globalActiveProfile.rawValue, forKey: globalActiveProfileKey)
+            defaults.set(globalActiveProfile.rawValue, forKey: globalActiveProfileKey)
         }
     }
 
-    public init() {
+    public init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
         loadFromStorage()
         seedOfficialProfiles()
     }
 
+    /// The storage key for one address.
+    ///
+    /// Cloud addresses come FIRST, before any of the local path rules, because
+    /// those rules are what broke them: a sentinel `cloud://zen/qwen` contains
+    /// `/`, so the local rules collapsed it to its last path component
+    /// (`qwen`) — the key of the seeded LOCAL Qwen profile. `getProfile` then
+    /// answered a cloud activation with the local checkpoint's 8,192-token
+    /// budget and its `presencePenalty 1.50`, and `saveProfile` through the same
+    /// sentinel overwrote that local profile with cloud sampling values.
+    ///
+    /// Both cloud forms collapse to ONE canonical key
+    /// (`CloudModelAddress.profileKey`), so a read and a write through different
+    /// forms of the same model meet. A cloud-shaped address whose provider has
+    /// gone unresolvable keeps its own key — the whole lowercased address —
+    /// rather than degrading to a local family name it must never inherit.
     public func normalizeKey(_ modelIdentifier: String) -> String {
         let trimmed = modelIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if CloudModelAddress.isCloudModelId(trimmed) || CloudModelAddress.isCloudPath(trimmed) {
+            return CloudModelAddress.profileKey(trimmed) ?? trimmed.lowercased()
+        }
+
         let lower = trimmed.lowercased()
 
         // 1. If it's a HuggingFace hub path with "models--"
@@ -336,6 +433,16 @@ public final class ModelProfileManager: ObservableObject {
         guard let modelId = modelId, !modelId.isEmpty else {
             return GenerationProfileSettings.defaultFor(type: type)
         }
+        // A cloud address answers only to a cloud key. Every rule below this
+        // point is a guess about LOCAL checkpoints — a short repo name, a family
+        // name — and both of them are wrong for a provider's model id, whose name
+        // describes someone else's checkpoint (`qwen3-coder` is a shipped Zen id).
+        // The check is made once, before the guesses, because the guesses are
+        // what used to answer: `cloud://zen/qwen` collapsed to `qwen` and matched
+        // the seeded 9B profile at step 1 outright, and an unresolvable sentinel
+        // would reach step 3's `/` rule and land on the same key.
+        let isCloudAddress = CloudModelAddress.isCloudModelId(modelId)
+            || CloudModelAddress.isCloudPath(modelId)
         let key = normalizeKey(modelId)
 
         // 1. Exact match on normalized key
@@ -351,16 +458,23 @@ public final class ModelProfileManager: ObservableObject {
         }
 
         // 3. Short repo name (e.g. qwen3.8-flash-next-fp8 from qwen/qwen3.8-flash-next-fp8)
-        if key.contains("/") {
+        if !isCloudAddress, key.contains("/") {
             let short = String(key.split(separator: "/").last ?? "")
             if !short.isEmpty, let modelProfiles = profilesByModel[short], let settings = modelProfiles[type.rawValue] {
                 return settings
             }
         }
 
-        // 4. Model family matching for known profiles
-        let keyLower = key.lowercased()
-        let idLower = modelId.lowercased()
+        // 4. Model family matching for known profiles.
+        //
+        // Skipped for a cloud address for the same reason `defaultFor` skips it:
+        // `cloud-model-zen-qwen3-coder` contains "qwen" and would otherwise
+        // inherit the seeded 9B Qwen profile — an 8,192-token budget and a
+        // sampling pair tuned for a checkpoint the provider is not serving.
+        // Steps 1-3 still apply, so a cloud id with a profile saved against it
+        // is honoured: those are matched by exact key, not by substring.
+        let keyLower = isCloudAddress ? "" : key.lowercased()
+        let idLower = isCloudAddress ? "" : modelId.lowercased()
         let isOrnith = keyLower.contains("ornith") || idLower.contains("ornith")
         let isQwen = keyLower.contains("qwen") || idLower.contains("qwen")
 
@@ -412,7 +526,7 @@ public final class ModelProfileManager: ObservableObject {
         if let modelId = modelId, !modelId.isEmpty {
             let key = normalizeKey(modelId)
             activeProfileByModel[key] = type.rawValue
-            UserDefaults.standard.set(activeProfileByModel, forKey: activeProfilesKey)
+            defaults.set(activeProfileByModel, forKey: activeProfilesKey)
         }
     }
 
@@ -420,7 +534,16 @@ public final class ModelProfileManager: ObservableObject {
         let key = normalizeKey(modelId ?? "default")
         let defaultSettings = GenerationProfileSettings.defaultFor(type: type, modelName: modelId)
 
-        let lower = (modelId ?? "").lowercased()
+        // A cloud address takes the REMOVAL branch even when its upstream id
+        // names a local family: the family check below exists to keep a seeded
+        // official profile in place for the checkpoints it was written for, and
+        // a remote model id was never one of them. Storing the generic profile
+        // under a cloud key would also outlive the reset, because `defaultFor`
+        // is what step 5 would have answered with anyway.
+        let isCloudAddress = CloudModelAddress.isCloudModelId(modelId)
+            || CloudModelAddress.isCloudPath(modelId)
+
+        let lower = isCloudAddress ? "" : (modelId ?? "").lowercased()
         if lower.contains("ornith") || lower.contains("qwen") {
             if profilesByModel[key] == nil {
                 profilesByModel[key] = [:]
@@ -468,7 +591,7 @@ public final class ModelProfileManager: ObservableObject {
         // bumping it would make `alreadySeeded` false for every existing user and
         // overwrite customised ornith and qwen generation settings.
         let seedFlagKey = "dynamoe_seeded_official_profiles_v3"
-        let alreadySeeded = UserDefaults.standard.bool(forKey: seedFlagKey)
+        let alreadySeeded = defaults.bool(forKey: seedFlagKey)
 
         var changed = false
         if !alreadySeeded || force {
@@ -490,7 +613,7 @@ public final class ModelProfileManager: ObservableObject {
                     ModelProfileType.assistant.rawValue: nanbeigeAssistant
                 ]
             }
-            UserDefaults.standard.set(true, forKey: seedFlagKey)
+            defaults.set(true, forKey: seedFlagKey)
             changed = true
         } else {
             for key in ornithKeys {
@@ -528,16 +651,16 @@ public final class ModelProfileManager: ObservableObject {
     }
 
     private func loadFromStorage() {
-        if let savedGlobal = UserDefaults.standard.string(forKey: globalActiveProfileKey),
+        if let savedGlobal = defaults.string(forKey: globalActiveProfileKey),
            let profile = ModelProfileType(rawValue: savedGlobal) {
             self.globalActiveProfile = profile
         }
 
-        if let savedActive = UserDefaults.standard.dictionary(forKey: activeProfilesKey) as? [String: String] {
+        if let savedActive = defaults.dictionary(forKey: activeProfilesKey) as? [String: String] {
             self.activeProfileByModel = savedActive
         }
 
-        if let data = UserDefaults.standard.data(forKey: profilesKey),
+        if let data = defaults.data(forKey: profilesKey),
            let decoded = try? JSONDecoder().decode([String: [String: GenerationProfileSettings]].self, from: data) {
             self.profilesByModel = decoded
         }
@@ -545,7 +668,7 @@ public final class ModelProfileManager: ObservableObject {
 
     private func saveToStorage() {
         if let encoded = try? JSONEncoder().encode(profilesByModel) {
-            UserDefaults.standard.set(encoded, forKey: profilesKey)
+            defaults.set(encoded, forKey: profilesKey)
         }
     }
 }

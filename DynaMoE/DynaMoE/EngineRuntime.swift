@@ -906,6 +906,24 @@ enum KVCacheProvisioning {
         return max(maxProvisionedRows, min(declared, absoluteMaxProvisionedRows))
     }
 
+    /// The Max Output Tokens ceiling a LOCAL checkpoint should advertise in
+    /// Settings. It is `policyMaxRows` and nothing else: the slider is only
+    /// honest if the number it shows is the number `launchTurn` will honour, and
+    /// the launch path already resolves its ceiling from the checkpoint rather
+    /// than from `maxProvisionedRows`.
+    ///
+    /// `maxProvisionedRows` stays untouched as the POLICY FLOOR: it is the
+    /// default argument of `sessionFloor` and `neededSeqLen`, so raising it would
+    /// widen the reserve for every caller that omits `policyMaxRows`. Reading it
+    /// through this helper keeps the constant's job and the UI's question apart.
+    ///
+    /// Cloud models do NOT come through here — see
+    /// `CloudContextPolicy.maximumOutputTokens(window:)`, where the ceiling is
+    /// derived from the provider's recorded context window instead.
+    static func localMaxOutputTokens(config: ModelConfig?) -> Int {
+        policyMaxRows(config: config)
+    }
+
     /// The reserve this turn asks for. `configured` is the persisted
     /// `dynamoe_agent_session_floor` value (nil when unset) and only applies to
     /// agent sessions; it is clamped to the row ceiling, so the key can only
