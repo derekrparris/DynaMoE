@@ -1086,6 +1086,11 @@ final class CloudModelListDecodingTests: XCTestCase {
     /// A missing, zero, negative, boolean, or sub-plausible value is not
     /// capacity. Each must stay absent rather than becoming a guess: a bogus
     /// window would price every turn against a number the model does not have.
+    ///
+    /// The output cap has its own floor for the same reason, and it is the one
+    /// with a silent failure mode: a published `limit.output` of `1` would send
+    /// `max_tokens: 1` and truncate every answer at a single token, while the
+    /// notice blamed the model's own "published 1-token output limit".
     func testMissingInvalidAndBooleanLimitsStayAbsent() {
         let catalog = OpenAICloudChatService.decodeModelCatalog(from: Data("""
         {"data":[
@@ -1107,9 +1112,27 @@ final class CloudModelListDecodingTests: XCTestCase {
         XCTAssertNil(catalog[3].contextWindowTokens)
         XCTAssertNil(catalog[3].maxOutputTokens)
         XCTAssertNil(catalog[4].contextWindowTokens)
-        XCTAssertEqual(catalog[4].maxOutputTokens, 1)
+        XCTAssertNil(
+            catalog[4].maxOutputTokens,
+            "a 1-token output cap is a units mistake, not a reply limit"
+        )
         XCTAssertNil(catalog[5].contextWindowTokens, "a fractional window is not a fact")
         XCTAssertNil(catalog[5].maxOutputTokens)
+    }
+
+    /// The output floor is a line, not a trend: one below it is refused and the
+    /// smallest legal value is kept, so a rounding change cannot move both sides.
+    func testTheSmallestUsablePublishedOutputLimitIsKept() {
+        let floor = CloudContextPolicy.minimumPlausibleOutputLimit
+        let catalog = OpenAICloudChatService.decodeModelCatalog(from: Data("""
+        {"data":[
+          {"id":"below","limit":{"output":\(floor - 1)}},
+          {"id":"at","limit":{"output":\(floor)}}
+        ]}
+        """.utf8))
+
+        XCTAssertNil(catalog[0].maxOutputTokens)
+        XCTAssertEqual(catalog[1].maxOutputTokens, floor)
     }
 
     /// The first entry wins for a duplicated id, and its limits travel with it.

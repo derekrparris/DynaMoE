@@ -353,6 +353,11 @@ struct ChatDetailView: View {
         var modelId: String?
         var providerId: String?
         var rawOverrides: String?
+        /// The provider's catalog-learned capacity facts, exactly as stored.
+        /// Compared as DATA rather than decoded: the resolution depends on this
+        /// blob, and `#95`'s sync writes it while a conversation can already be
+        /// on screen.
+        var observedLimits: Data?
         var globalWindow = 0
         var window: Int?
     }
@@ -371,16 +376,26 @@ struct ChatDetailView: View {
     /// memo also keeps the provider's `model=window` string from being re-parsed
     /// per streaming frame; it is keyed on the raw values, so a Settings edit
     /// still lands on the next evaluation.
+    ///
+    /// "Every raw value" includes the catalog-learned limits, not only the
+    /// hand-typed ones. The resolution reads both, and a sync that records a
+    /// window while this conversation is open must move the header with it; a
+    /// memo keyed on the hand-typed facts alone would keep reporting the window
+    /// the turn is no longer priced against (`#95` review).
     private func cloudContextWindow(for session: ChatSession?) -> Int? {
         guard let id = session?.selectedModelId,
               let parsed = CloudModelAddress.parseModelId(id) else { return nil }
         let defaults = UserDefaults.standard
         let rawOverrides = defaults.string(forKey: CloudContextPolicy.defaultsKey(for: parsed.provider.id))
+        let observedLimits = defaults.data(
+            forKey: CloudContextPolicy.observedLimitsKey(for: parsed.provider.id)
+        )
         let globalWindow = defaults.integer(forKey: CloudContextPolicy.globalWindowKey)
         let memo = cloudWindowMemo
         if memo.modelId == parsed.providerModelId,
            memo.providerId == parsed.provider.id,
            memo.rawOverrides == rawOverrides,
+           memo.observedLimits == observedLimits,
            memo.globalWindow == globalWindow {
             return memo.window
         }
@@ -392,6 +407,7 @@ struct ChatDetailView: View {
         memo.modelId = parsed.providerModelId
         memo.providerId = parsed.provider.id
         memo.rawOverrides = rawOverrides
+        memo.observedLimits = observedLimits
         memo.globalWindow = globalWindow
         memo.window = window
         return window
@@ -2154,6 +2170,37 @@ nonisolated enum ComposerLayoutPolicy {
         text.utf8.count > measurementByteLimit
     }
 
+    /// The inputs that decide how tall the editor has to be.
+    ///
+    /// The text is represented by its LENGTH, not its contents: a character
+    /// count is O(1) on the text storage, while comparing two strings walks the
+    /// whole paste once per update pass. An edit that changes the text without
+    /// changing its length still arrives through `textDidChange`, which asks for
+    /// the measurement unconditionally.
+    nonisolated struct Measurement: Equatable {
+        var width: CGFloat
+        var fontPointSize: CGFloat
+        var minHeight: CGFloat
+        var maxHeight: CGFloat
+        var textLength: Int
+    }
+
+    /// Whether a layout pass has to measure at all.
+    ///
+    /// `updateNSView` runs on every SwiftUI update, including each frame of a
+    /// streaming answer, and measuring there lays text out for something nobody
+    /// typed. A pass that changes none of these inputs cannot move the height,
+    /// so it reuses the last answer; an EDIT always measures, even when the
+    /// length is unchanged, because that is the case the length cannot see.
+    static func needsMeasurement(
+        previous: Measurement?,
+        current: Measurement,
+        textChanged: Bool
+    ) -> Bool {
+        if textChanged || previous == nil { return true }
+        return previous != current
+    }
+
     /// The editor height for `contentHeight` points of laid-out text, clamped to
     /// the one-line floor and the growth cap. A cap at or below the floor means
     /// there is no room to grow, so the floor wins.
@@ -2219,6 +2266,11 @@ struct MacTextEditor: NSViewRepresentable {
     /// the composer's minimum-height math so a single line of text plus these
     /// insets always fits without vertical clipping.
     static let textContainerInsetHeight: CGFloat = 2
+
+    /// Right-hand strip kept clear of text once the composer is scrolling, so
+    /// the overlay scroller cannot paint over the last glyphs of a wrapped line.
+    /// Wide enough for a regular-size overlay scroller plus its own inset.
+    static let scrollerGutter: CGFloat = 12
 
     @Binding var text: String
     var placeholder: String
@@ -2330,13 +2382,23 @@ struct MacTextEditor: NSViewRepresentable {
         // Keep the document at the scroll view's width. The autoresizing mask
         // covers a live window resize, but SwiftUI sizes the scroll view without
         // resizing a document view it did not create.
+        //
+        // A composer that is already taller than its visible area also keeps a
+        // gutter on the right, so the overlay scroller cannot paint over the
+        // last glyphs of a wrapped line. The gutter follows the OVERFLOW state
+        // rather than the scroller's visibility: an overlay scroller that fades
+        // in while the user scrolls must not re-wrap the text under them.
         let contentWidth = nsView.contentSize.width
-        if contentWidth > 0, abs(textView.frame.width - contentWidth) > 0.5 {
+        let contentHeight = nsView.contentSize.height
+        let overflowing = contentHeight > 0 && textView.frame.height > contentHeight + 0.5
+        let targetWidth = overflowing ? max(1, contentWidth - Self.scrollerGutter) : contentWidth
+        if contentWidth > 0, abs(textView.frame.width - targetWidth) > 0.5 {
             textView.setFrameSize(
-                NSSize(width: contentWidth, height: max(textView.frame.height, minHeight))
+                NSSize(width: targetWidth, height: max(textView.frame.height, minHeight))
             )
         }
 
+        var textWasAssigned = false
         if textView.string != text {
             // Assigning `.string` does not fire `textDidChange`, and it drops
             // the insertion point. Keep the caret where it was (clamped to the
@@ -2347,13 +2409,21 @@ struct MacTextEditor: NSViewRepresentable {
             textView.setSelectedRange(
                 NSRange(location: min(previousSelection.location, length), length: 0)
             )
+            textWasAssigned = true
         }
 
-        // Remeasure after every update pass, not only after a text change: the
-        // first pass is when the scroll view receives the width the text wraps
-        // at, and a zoom change alters both the font and the height bounds. The
+        // Remeasure after an update pass that could have changed the height:
+        // the first pass is when the scroll view receives the width the text
+        // wraps at, a zoom change alters both the font and the bounds, and an
+        // assigned string is an edit. A pass that changes none of those (every
+        // frame of a streaming answer) skips the measurement, and the
         // coordinator publishes only real changes, so this cannot loop.
-        scheduleRemeasure(textView: textView, scrollView: nsView, context: context)
+        scheduleRemeasure(
+            textView: textView,
+            scrollView: nsView,
+            context: context,
+            textChanged: textWasAssigned
+        )
     }
 
     /// Measures after the current update pass, because publishing a height is a
@@ -2361,11 +2431,16 @@ struct MacTextEditor: NSViewRepresentable {
     private func scheduleRemeasure(
         textView: ComposerTextView,
         scrollView: NSScrollView,
-        context: Context
+        context: Context,
+        textChanged: Bool
     ) {
         DispatchQueue.main.async { [weak textView, weak scrollView] in
             guard let textView, let scrollView else { return }
-            context.coordinator.measureAndPublishHeight(for: textView, in: scrollView)
+            context.coordinator.measureAndPublishHeight(
+                for: textView,
+                in: scrollView,
+                textChanged: textChanged
+            )
         }
     }
 
@@ -2374,6 +2449,9 @@ struct MacTextEditor: NSViewRepresentable {
         /// Last height handed to SwiftUI, so the layout pass cannot publish the
         /// same value twice and bounce the composer's frame.
         private var publishedHeight: CGFloat?
+        /// The inputs the last measurement was taken for, so a layout pass that
+        /// cannot move the height skips the TextKit query entirely.
+        private var lastMeasurement: ComposerLayoutPolicy.Measurement?
 
         init(_ parent: MacTextEditor) {
             self.parent = parent
@@ -2381,10 +2459,28 @@ struct MacTextEditor: NSViewRepresentable {
 
         /// The height the text needs at the editor's current width, clamped to
         /// the composer's floor and cap.
-        func measureAndPublishHeight(for textView: NSTextView, in scrollView: NSScrollView) {
+        func measureAndPublishHeight(
+            for textView: NSTextView,
+            in scrollView: NSScrollView,
+            textChanged: Bool = false
+        ) {
             // A zero-width text view wraps every word onto its own line and
             // would report a height no width needs; wait for real layout.
             guard textView.frame.width > 0, scrollView.contentSize.width > 0 else { return }
+            let measurement = ComposerLayoutPolicy.Measurement(
+                width: textView.frame.width,
+                fontPointSize: textView.font?.pointSize ?? 0,
+                minHeight: parent.minHeight,
+                maxHeight: parent.maxHeight,
+                // O(1) on the storage, unlike any String count.
+                textLength: textView.textStorage?.length ?? 0
+            )
+            guard ComposerLayoutPolicy.needsMeasurement(
+                previous: lastMeasurement,
+                current: measurement,
+                textChanged: textChanged
+            ) else { return }
+            lastMeasurement = measurement
             let height = Self.desiredHeight(
                 for: textView,
                 minHeight: parent.minHeight,
@@ -2434,7 +2530,9 @@ struct MacTextEditor: NSViewRepresentable {
             guard let textView = notification.object as? NSTextView else { return }
             self.parent.text = textView.string
             if let scrollView = textView.enclosingScrollView {
-                measureAndPublishHeight(for: textView, in: scrollView)
+                // An edit is the one change the measurement inputs can miss (a
+                // replacement of the same length), so it always measures.
+                measureAndPublishHeight(for: textView, in: scrollView, textChanged: true)
             }
         }
 

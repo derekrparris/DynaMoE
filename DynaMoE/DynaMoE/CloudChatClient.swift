@@ -1026,7 +1026,11 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
             entry["max_completion_tokens"]
         ]
         for candidate in candidates {
-            if let maxOutput = positiveInt(candidate), maxOutput >= 1 {
+            // The same plausibility rule the resolution applies, so a row can
+            // never show a cap the budget silently ignores: a published `1`
+            // would truncate every answer to one token.
+            if let maxOutput = positiveInt(candidate),
+               maxOutput >= CloudContextPolicy.minimumPlausibleOutputLimit {
                 return maxOutput
             }
         }

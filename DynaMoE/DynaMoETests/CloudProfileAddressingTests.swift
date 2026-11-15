@@ -1033,6 +1033,84 @@ final class CloudProfileAddressingTests: XCTestCase {
         )
     }
 
+    /// The single global fallback is one number set with some OTHER model in
+    /// mind, so it is not evidence about this one. Seeding from it raised every
+    /// cloud model's default budget to 20% of whatever the operator typed, which
+    /// is the un-evidenced `max_tokens` the unrecorded ceiling exists to stop.
+    func testTheGlobalFallbackAloneDoesNotSeedTheGenericBudget() {
+        let (manager, defaults, suite) = scratchManager()
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        defaults.set(200_000, forKey: CloudContextPolicy.globalWindowKey)
+        XCTAssertEqual(
+            CloudContextPolicy.window(
+                forModelId: "unrecorded-model",
+                providerId: "synthetic",
+                defaults: defaults
+            ),
+            200_000,
+            "the reader still falls back to it"
+        )
+
+        for type in [ModelProfileType.coder, .assistant] {
+            XCTAssertEqual(
+                manager.getProfile(for: "cloud://synthetic/unrecorded-model", type: type).maxNewTokens,
+                GenerationProfileSettings.defaultFor(type: type).maxNewTokens,
+                "a fallback the model did not publish is not known capacity"
+            )
+        }
+    }
+
+    /// A catalog that publishes an output cap WITHOUT a window is still telling
+    /// the app what the model can produce. Holding it at the unrecorded-window
+    /// ceiling made the one fact the provider published change nothing, which is
+    /// the defect the capacity work set out to remove.
+    func testAPublishedOutputLimitStandsInForAMissingWindow() {
+        let resolution = CloudContextPolicy.replyBudgetResolution(
+            requested: 131_072,
+            window: nil,
+            outputLimit: 32_768
+        )
+        XCTAssertEqual(resolution.effective, 32_768)
+        XCTAssertEqual(resolution.binding, .outputLimit)
+        XCTAssertEqual(
+            CloudContextPolicy.maximumOutputTokens(window: nil, outputLimit: 32_768),
+            32_768,
+            "the slider must advertise the same number the turn sends"
+        )
+        XCTAssertTrue(
+            CloudContextPolicy.outputLimitNotice(resolution)
+                .contains("published 32,768-token output limit")
+        )
+
+        // Below the plausibility floor the value is a units mistake, so the
+        // unrecorded ceiling stands rather than truncating every answer.
+        let nonsense = CloudContextPolicy.replyBudgetResolution(
+            requested: 131_072,
+            window: nil,
+            outputLimit: CloudContextPolicy.minimumPlausibleOutputLimit - 1
+        )
+        XCTAssertEqual(nonsense.effective, CloudContextPolicy.unknownWindowReplyCeiling)
+        XCTAssertEqual(nonsense.binding, .unrecordedWindow)
+    }
+
+    /// A catalog that publishes ONLY an output cap is capacity evidence too, so
+    /// its unsaved profile follows it — the same rule the window gets.
+    func testAnOutputOnlyCatalogAlsoSeedsTheGenericBudget() {
+        let (manager, defaults, suite) = scratchManager()
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        CloudContextPolicy.setObservedLimits(
+            ["output-only": .init(maxOutput: 65_536)],
+            forProviderId: "synthetic",
+            defaults: defaults
+        )
+        XCTAssertEqual(
+            manager.getProfile(for: "cloud://synthetic/output-only", type: .coder).maxNewTokens,
+            65_536
+        )
+    }
+
     /// A tie belongs to the CONSTRAINT: when the setting already equals the
     /// ceiling, raising the setting cannot move the number, so the notice must
     /// not name that control.

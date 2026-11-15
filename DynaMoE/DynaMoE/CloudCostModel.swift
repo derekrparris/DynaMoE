@@ -395,6 +395,14 @@ public nonisolated enum CloudContextPolicy {
     /// Below this a "window" is a units mistake, not a context size.
     public static let minimumPlausibleWindow = 1_024
 
+    /// Below this a published `max output` is a units mistake or a mis-keyed
+    /// field, not a reply limit. The window has a floor for the same reason: a
+    /// catalog is machine-written, and one bad number must not silently become
+    /// the app's policy. Nothing real publishes a cap this small — the smallest
+    /// chat limits in the wild are in the hundreds — while a `limit.output` of
+    /// `1` would truncate every answer to a single token.
+    public static let minimumPlausibleOutputLimit = 64
+
     /// The reply budget a cloud model is held to when it records NO window.
     ///
     /// An unrecorded window used to mean "no cap": `replyBudget` passed the
@@ -1034,7 +1042,9 @@ public nonisolated enum CloudContextPolicy {
             case unrecordedWindow
             /// 20% of the model's context window is the smallest cap.
             case windowFraction
-            /// The catalog publishes a max output smaller than the window room.
+            /// The catalog publishes a max output that binds: it is either
+            /// smaller than the window room, or (with no usable window) the
+            /// only capacity fact the app has.
             case outputLimit
         }
 
@@ -1067,8 +1077,19 @@ public nonisolated enum CloudContextPolicy {
     ///
     /// A model whose catalog publishes its own `max output` is capped by that
     /// too: the window fraction is this app's reserve, not a promise the model
-    /// will accept a reply longer than its own published limit. A caller that
-    /// asked for no budget (`nil`/`0`) is still left alone.
+    /// will accept a reply longer than its own published limit.
+    ///
+    /// With no usable window, a published output limit stands IN for the
+    /// missing window rather than being clamped by `unknownWindowReplyCeiling`.
+    /// That ceiling exists for the ABSENCE of evidence — it stops the app
+    /// sending an arbitrary `max_tokens` to a provider whose capacity nobody
+    /// recorded — and a published output limit is evidence about this model.
+    /// Clamping it to the ceiling made the catalog's one useful number change
+    /// nothing for an endpoint that publishes output caps without context
+    /// windows. A sub-plausible published value is treated as absent, because
+    /// that is a units mistake and not capacity.
+    ///
+    /// A caller that asked for no budget (`nil`/`0`) is still left alone.
     public static func replyBudgetResolution(
         requested: Int,
         window: Int?,
@@ -1090,16 +1111,20 @@ public nonisolated enum CloudContextPolicy {
         // end this type exists to remove.
         var effective = unknownWindowReplyCeiling
         var binding = ReplyBudget.Binding.unrecordedWindow
+        var windowBinds = false
         if let window, window >= minimumPlausibleWindow {
             let room = (Double(window) * (1 - autoCompactFraction)).rounded()
             if room.isFinite, room >= 1, room < Double(Int.max) {
                 effective = Int(room)
                 binding = .windowFraction
+                windowBinds = true
             }
         }
-        if let outputLimit, outputLimit >= 1, outputLimit < effective {
-            effective = outputLimit
-            binding = .outputLimit
+        if let outputLimit, outputLimit >= minimumPlausibleOutputLimit {
+            if !windowBinds || outputLimit < effective {
+                effective = outputLimit
+                binding = .outputLimit
+            }
         }
         if requested < effective {
             effective = requested

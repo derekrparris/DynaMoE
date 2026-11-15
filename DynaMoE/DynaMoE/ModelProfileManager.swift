@@ -560,6 +560,15 @@ public final class ModelProfileManager: ObservableObject {
     /// No known capacity means no seeding: an unknown model keeps the shipped
     /// defaults, including the Assistant's half-of-Coder ratio. The seed is a
     /// response to evidence, not a blanket increase.
+    ///
+    /// The evidence has to be about THIS model. The single global fallback
+    /// (`dynamoe_cloud_context_window_tokens`) is not: it is one number the
+    /// operator set with some other model in mind, and `window(forModelId:)`
+    /// would answer it for every cloud model on every provider. Treating it as
+    /// capacity would raise the default budget of a model whose window nobody
+    /// knows — from 16,384 to 20% of whatever the operator typed elsewhere —
+    /// which is exactly the un-evidenced `max_tokens` the unrecorded ceiling
+    /// exists to prevent. Only a recorded or catalog-published window counts.
     private func seedingKnownCapacity(
         _ settings: GenerationProfileSettings,
         modelId: String?
@@ -572,14 +581,20 @@ public final class ModelProfileManager: ObservableObject {
             providerId: parsed.provider.id,
             defaults: defaults
         )
-        let window = CloudContextPolicy.window(
+        let windowSource = CloudContextPolicy.windowSource(
             forModelId: parsed.providerModelId,
             providerId: parsed.provider.id,
             defaults: defaults
         )
-        guard window != nil || limits?.maxOutput != nil else { return settings }
+        // `.global` is a fallback for the READER, not a fact about the model.
+        let perModelWindow: Int?
+        switch windowSource {
+        case .model(let window), .observed(let window): perModelWindow = window
+        case .global, .none: perModelWindow = nil
+        }
+        guard perModelWindow != nil || limits?.maxOutput != nil else { return settings }
         let ceiling = CloudContextPolicy.maximumOutputTokens(
-            window: window,
+            window: perModelWindow,
             outputLimit: limits?.maxOutput
         )
         guard ceiling > settings.maxNewTokens else { return settings }

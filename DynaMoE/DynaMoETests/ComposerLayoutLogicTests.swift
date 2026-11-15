@@ -115,4 +115,62 @@ final class ComposerLayoutLogicTests: XCTestCase {
             200
         )
     }
+
+    /// The update pass runs on every SwiftUI update, including each frame of a
+    /// streaming answer. Measuring there lays the prompt out for a change nobody
+    /// made, so a pass whose inputs are identical has to be skipped — and one
+    /// that moved any of them, or that carries an edit, must not be.
+    func testALayoutPassOnlyMeasuresWhenItsInputsMoved() {
+        let base = ComposerLayoutPolicy.Measurement(
+            width: 320,
+            fontPointSize: 13.5,
+            minHeight: 21,
+            maxHeight: 204,
+            textLength: 40
+        )
+
+        XCTAssertTrue(
+            ComposerLayoutPolicy.needsMeasurement(
+                previous: nil,
+                current: base,
+                textChanged: false
+            ),
+            "the first pass has nothing to reuse"
+        )
+        XCTAssertFalse(
+            ComposerLayoutPolicy.needsMeasurement(
+                previous: base,
+                current: base,
+                textChanged: false
+            ),
+            "an unchanged pass must not re-lay the text out"
+        )
+
+        func changed(_ mutate: (inout ComposerLayoutPolicy.Measurement) -> Void) -> Bool {
+            var next = base
+            mutate(&next)
+            return ComposerLayoutPolicy.needsMeasurement(
+                previous: base,
+                current: next,
+                textChanged: false
+            )
+        }
+        XCTAssertTrue(changed { $0.width = 321 }, "a resize re-wraps the text")
+        XCTAssertTrue(changed { $0.fontPointSize = 16 }, "a zoom changes every line")
+        XCTAssertTrue(changed { $0.minHeight = 24 }, "the floor moves with the font")
+        XCTAssertTrue(changed { $0.maxHeight = 320 }, "so does the cap")
+        XCTAssertTrue(changed { $0.textLength = 41 }, "an edit changes the content")
+
+        // A same-length replacement (typing over a selection, or assigning a
+        // differently-wrapped string of equal length) leaves every input equal,
+        // so the edit itself is what has to force the measurement.
+        XCTAssertTrue(
+            ComposerLayoutPolicy.needsMeasurement(
+                previous: base,
+                current: base,
+                textChanged: true
+            ),
+            "an edit always measures, even when the text length did not move"
+        )
+    }
 }

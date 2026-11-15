@@ -553,8 +553,14 @@ struct CloudProvidersSettingsView: View {
                 }
                 return "\(window.formatted()) tokens detected from the provider's catalog, reply budget \(budget.formatted()). Enter a value to override."
             case .global(let window):
+                if let maxOutput = observed?.maxOutput, budget == maxOutput {
+                    return "No window of its own — the global \(window.formatted()) applies, but the provider publishes a \(maxOutput.formatted())-token output limit; reply budget \(budget.formatted())."
+                }
                 return "No window of its own — the global \(window.formatted()) applies, reply budget \(budget.formatted())."
             case .none:
+                if let maxOutput = observed?.maxOutput, budget == maxOutput {
+                    return "No window recorded, but the provider publishes a \(maxOutput.formatted())-token output limit; reply budget \(budget.formatted())."
+                }
                 return "No window recorded — reply budget \(budget.formatted())."
             }
         }
