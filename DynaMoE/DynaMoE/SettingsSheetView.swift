@@ -54,94 +54,6 @@ func maxTokenSliderRange(upTo ceiling: Int) -> ClosedRange<Double> {
     Double(maxTokenSliderFloor)...Double(max(ceiling, maxTokenSliderFloor))
 }
 
-private enum MaxOutputCeilingBackend {
-    case cloud(window: Int?)
-    case appleFoundationModel
-    case local
-
-    static func classify(
-        model: DiscoveredModel?,
-        fallbackAddress: String?,
-        defaults: UserDefaults = .standard
-    ) -> MaxOutputCeilingBackend {
-        if let model {
-            if let parsed = CloudModelAddress.parseModelId(model.id)
-                ?? CloudModelAddress.parsePath(model.snapshotPath) {
-                return .cloud(window: CloudContextPolicy.window(
-                    forModelId: parsed.providerModelId,
-                    providerId: parsed.provider.id,
-                    defaults: defaults
-                ))
-            }
-            if CloudModelAddress.isCloudModelId(model.id) || CloudModelAddress.isCloudPath(model.snapshotPath) {
-                return .cloud(window: CloudContextPolicy.globalWindow(defaults: defaults))
-            }
-            if model.isAppleFoundationModel {
-                return .appleFoundationModel
-            }
-            return .local
-        }
-        guard let address = fallbackAddress, !address.isEmpty else {
-            return .local
-        }
-        if address == AppleFoundationModelService.modelPath
-            || address == AppleFoundationModelService.modelId {
-            return .appleFoundationModel
-        }
-        if let parsed = CloudModelAddress.parseModelId(address)
-            ?? CloudModelAddress.parsePath(address) {
-            return .cloud(window: CloudContextPolicy.window(
-                forModelId: parsed.providerModelId,
-                providerId: parsed.provider.id,
-                defaults: defaults
-            ))
-        }
-        if CloudModelAddress.isCloudModelId(address) || CloudModelAddress.isCloudPath(address) {
-            return .cloud(window: CloudContextPolicy.globalWindow(defaults: defaults))
-        }
-        return .local
-    }
-}
-
-/// Resolves the Max Output Tokens ceiling for a non-local backend (cloud or
-/// Apple Foundation Model), returning nil when the backend is a local checkpoint
-/// whose `config.json` position limit governs instead.
-func resolveNonLocalMaxOutputCeiling(
-    model: DiscoveredModel?,
-    fallbackAddress: String?,
-    defaults: UserDefaults = .standard
-) -> Int? {
-    switch MaxOutputCeilingBackend.classify(model: model, fallbackAddress: fallbackAddress, defaults: defaults) {
-    case .cloud(let window):
-        return CloudContextPolicy.maximumOutputTokens(window: window)
-    case .appleFoundationModel:
-        return AppleFoundationModelService.maxResponseTokenCeiling
-    case .local:
-        return nil
-    }
-}
-
-/// Explains why the Max Output Tokens ceiling sits where it does, handling both
-/// discovered entries and fallback addresses (e.g., an ad-hoc cloud model or
-/// the on-device model before a scan completes).
-func maxOutputCeilingExplanation(
-    for model: DiscoveredModel?,
-    fallbackAddress: String?,
-    defaults: UserDefaults = .standard
-) -> String {
-    switch MaxOutputCeilingBackend.classify(model: model, fallbackAddress: fallbackAddress, defaults: defaults) {
-    case .cloud(let recorded):
-        if let recorded {
-            return "Capped by 20% of this model's \(recorded.formatted())-token context window — a reply budget larger than that cannot share the window with any prompt. Record a larger window on the Cloud tab to raise it."
-        }
-        return "No context window is recorded for this model, so the reply budget is held to \(CloudContextPolicy.unknownWindowReplyCeiling.formatted()) tokens. Record its window on the Cloud tab to raise the ceiling to 20% of it."
-    case .appleFoundationModel:
-        return "Capped by the on-device model's own response limit (\(AppleFoundationModelService.maxResponseTokenCeiling.formatted()) tokens); a larger value is clamped before the framework sees it."
-    case .local:
-        return "Capped by this checkpoint's own position limit. The KV cache budget also lowers the effective ceiling for a long prompt."
-    }
-}
-
 /// Identity of the backend the Max Output Tokens ceiling must be recomputed for.
 ///
 /// `task(id:)` re-runs whenever this changes, so it carries exactly the inputs
@@ -667,15 +579,13 @@ struct SettingsSheetView: View {
 
     /// The recorded-window inputs for one cloud address, or nil when it is not
     /// a cloud address at all.
+    ///
+    /// The parsing lives on `CloudContextPolicy` so it takes an injectable
+    /// `defaults:` like `setOverride` and `globalWindow` do: this is the one
+    /// input to the ceiling that a `task(id:)` watches, and reading the process
+    /// domain from a view left that invalidation path untestable.
     private func cloudWindowFacts(for address: String?) -> String? {
-        guard let address,
-              let parsed = CloudModelAddress.parseModelId(address)
-                ?? CloudModelAddress.parsePath(address) else { return nil }
-        let defaults = UserDefaults.standard
-        return [
-            defaults.string(forKey: CloudContextPolicy.defaultsKey(for: parsed.provider.id)) ?? "",
-            CloudContextPolicy.globalWindow(defaults: defaults).map(String.init) ?? ""
-        ].joined(separator: "|")
+        CloudContextPolicy.windowFacts(forAddress: address)
     }
 
     private var activeCeilingKey: ActiveCeilingKey {
@@ -2997,11 +2907,26 @@ struct SettingsSheetView: View {
         }
         let isCurrentActive = (activeModelPath != nil && (activeModelPath == model.snapshotPath || activeModelPath == model.weightsEntryPath || (summary != nil && (modelConfig?.modelType ?? "").localizedCaseInsensitiveContains(model.displayName))))
         if isCurrentActive && type == activeProfile {
-            applyDraftToActiveSession()
+            // Every field EXCEPT the system prompt. Reset's job is to put the
+            // session back on the profile it just restored — leaving the old
+            // budget live while the button said "Reset to Defaults" was the bug
+            // this write fixes. The prompt is a different surface: the composer
+            // has its own Reset/Save as Default controls and its own persisted
+            // default (`ModelConfig.getUserDefaultSystemPrompt`), so a user who
+            // had just edited it there would have it replaced by a button that
+            // says nothing about prompts. "Apply to Session" still writes all of
+            // it, because that is what it is for.
+            applyDraftToActiveSession(includingSystemPrompt: false)
         }
     }
 
-    private func applyDraftToActiveSession() {
+    /// Writes the draft into the live session's generation settings.
+    ///
+    /// `includingSystemPrompt` exists because two callers mean two different
+    /// things: Apply to Session copies the profile wholesale, while Reset to
+    /// Defaults must not silently replace a prompt the user typed in the
+    /// composer.
+    private func applyDraftToActiveSession(includingSystemPrompt: Bool = true) {
         temperature = editingDraft.temperature
         topP = editingDraft.topP
         minP = editingDraft.minP
@@ -3009,7 +2934,9 @@ struct SettingsSheetView: View {
         repetitionPenalty = editingDraft.repetitionPenalty
         presencePenalty = editingDraft.presencePenalty
         maxNewTokens = editingDraft.maxNewTokens
-        systemPrompt = editingDraft.systemPrompt
+        if includingSystemPrompt {
+            systemPrompt = editingDraft.systemPrompt
+        }
         jetSpecEnabled = editingDraft.jetSpecEnabled
         jetSpecMaxDepth = editingDraft.jetSpecMaxDepth
         jetSpecBranchingFactor = editingDraft.jetSpecBranchingFactor
@@ -3232,6 +3159,34 @@ struct SettingsSheetView: View {
                             }
                         }
                     } else {
+                        // No known ceiling, so no slider: a range would have to
+                        // be guessed, and a guessed upper bound silently
+                        // rewrites the number the moment it is touched. A FIELD
+                        // stays, because withholding the control as well left
+                        // the setting uneditable with only "rescan" as advice —
+                        // the old flat slider always offered a way to type a
+                        // number, and losing that is a worse failure than
+                        // offering an unbounded one.
+                        HStack(spacing: 6) {
+                            TextField(
+                                "tokens",
+                                value: Binding(
+                                    get: { editingDraft.maxNewTokens },
+                                    set: { editingDraft.maxNewTokens = max(maxTokenSliderFloor, $0) }
+                                ),
+                                format: .number
+                            )
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 11, design: .monospaced))
+                            .multilineTextAlignment(.trailing)
+                            .frame(width: 90)
+                            .accessibilityLabel("Max Output Tokens")
+
+                            Text("tokens")
+                                .font(.system(size: 9))
+                                .foregroundStyle(.secondary)
+                        }
+
                         Text("This model's Max Output Tokens ceiling is unknown — rescan to identify it. The saved value is used as-is; the backend lowers an allocation it cannot hold.")
                             .font(.system(size: 9))
                             .foregroundStyle(.secondary)

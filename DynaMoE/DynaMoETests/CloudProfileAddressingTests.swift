@@ -230,22 +230,25 @@ final class CloudProfileAddressingTests: XCTestCase {
 
     // MARK: - The window writer is a true no-op when nothing changes
 
-    /// `setOverride`'s return answers "does the store hold the requested value",
-    /// so a clear of a model that was never there reports false and writes
-    /// nothing — the previous `true` claimed a save that had not happened.
-    func testClearingAnAbsentWindowReportsNoChangeAndWritesNothing() {
+    /// A write that changes nothing must not rewrite the key: churning defaults
+    /// notifies every observer of the domain for a value nobody changed. Both
+    /// no-op shapes are covered — a save of the value already stored, and a clear
+    /// of a model that was never there — and both report success, because the
+    /// store does hold what was asked for.
+    ///
+    /// The RETURN meaning is pinned separately by
+    /// `testSetOverrideReportsWhetherTheRequestedStateHolds`.
+    func testAWindowWriteThatChangesNothingDoesNotTouchTheStore() {
         let suite = "CloudProfileAddressingTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
 
-        XCTAssertFalse(
+        XCTAssertTrue(
             CloudContextPolicy.setOverride(model: "absent", window: nil, providerId: "p", defaults: defaults)
         )
         XCTAssertNil(defaults.string(forKey: CloudContextPolicy.defaultsKey(for: "p")),
                      "a no-op clear must not create an empty key")
 
-        // A save of the value already stored is also a no-op, reported as the
-        // success it is: the store does hold the requested value.
         XCTAssertTrue(
             CloudContextPolicy.setOverride(model: "m", window: 128_000, providerId: "p", defaults: defaults)
         )
@@ -265,13 +268,16 @@ final class CloudProfileAddressingTests: XCTestCase {
     /// The presets feed `ForEach(_:id: \.self)`, so they must stay unique, never
     /// exceed the ceiling, and never offer a button below the slider's own floor
     /// — which would set a value the control immediately clamps back up.
+    ///
+    /// The uniqueness and ceiling properties are pinned by
+    /// `CloudProviderLogicTests.testMaxTokenPresetsRespectTheCeilingAndStayUnique`;
+    /// this covers the part that is about the FLOOR, which that test does not
+    /// touch.
     func testMaxTokenPresetsRespectTheSliderFloor() {
         for ceiling in [16_384, 32_768, 40_000, 262_144] {
             let presets = maxTokenPresets(upTo: ceiling)
-            XCTAssertEqual(presets, Array(Set(presets)).sorted(), "unique and ascending at \(ceiling)")
-            XCTAssertTrue(presets.allSatisfy { $0 <= ceiling }, "no preset above the ceiling at \(ceiling)")
-            XCTAssertEqual(presets.filter { $0 == ceiling }.count, 1, "the ceiling is offered once at \(ceiling)")
             XCTAssertTrue(presets.allSatisfy { $0 >= maxTokenSliderFloor }, "no preset below the floor")
+            XCTAssertEqual(presets.last, ceiling, "the ceiling is the top rung at \(ceiling)")
         }
 
         // A ceiling under the floor is a backend that does not exist today. It
@@ -319,10 +325,122 @@ final class CloudProfileAddressingTests: XCTestCase {
     }
 
     func testUneditedContextWindowSavePreservesStoredValue() {
-        XCTAssertEqual(CloudProvidersSettingsView.effectiveWindowInput(draft: nil, stored: 128_000), "128000")
+        XCTAssertEqual(CloudProvidersSettingsView.effectiveWindowInput(draft: nil, stored: "128000"), "128000")
         XCTAssertEqual(CloudProvidersSettingsView.effectiveWindowInput(draft: nil, stored: nil), "")
-        XCTAssertEqual(CloudProvidersSettingsView.effectiveWindowInput(draft: "", stored: 128_000), "")
-        XCTAssertEqual(CloudProvidersSettingsView.effectiveWindowInput(draft: "200000", stored: 128_000), "200000")
+        XCTAssertEqual(CloudProvidersSettingsView.effectiveWindowInput(draft: "", stored: "128000"), "")
+        XCTAssertEqual(CloudProvidersSettingsView.effectiveWindowInput(draft: "200000", stored: "128000"), "200000")
+
+        // An entry this build cannot parse is still the stored value. Handing
+        // this the PARSE view meant a stored `12k` arrived as nil, so an
+        // unedited Save resolved to "" and took the clear branch — deleting the
+        // operator's typo through a button that had shown an empty field for it.
+        XCTAssertEqual(
+            CloudProvidersSettingsView.effectiveWindowInput(draft: nil, stored: "12k"),
+            "12k",
+            "an unreadable stored entry must be re-submitted, not resolved to a clear"
+        )
+    }
+
+    /// The raw view is what the editor shows and what a Save re-submits; the
+    /// parse view is what the send path uses. They must disagree about exactly
+    /// one thing — whether an unreadable entry exists — and agree on the rest.
+    func testRawOverridesKeepUnreadableEntriesTheParseViewDrops() {
+        let suite = "CloudProfileAddressingTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        defaults.set("good=128000; typo=12k; tiny=512", forKey: CloudContextPolicy.defaultsKey(for: "p"))
+
+        XCTAssertEqual(
+            CloudContextPolicy.overrides(for: "p", defaults: defaults),
+            ["good": 128_000],
+            "the parse view reports only what it can read"
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.rawOverrides(for: "p", defaults: defaults),
+            ["good": "128000", "typo": "12k", "tiny": "512"],
+            "the raw view reports what is stored, including what it cannot read"
+        )
+
+        // Last entry wins in both views, so a row can never show one value and
+        // save against another.
+        defaults.set("m=1000; m=2000", forKey: CloudContextPolicy.defaultsKey(for: "q"))
+        XCTAssertEqual(CloudContextPolicy.rawOverrides(for: "q", defaults: defaults)["m"], "2000")
+        XCTAssertEqual(CloudContextPolicy.overrides(for: "q", defaults: defaults)["m"], 2_000)
+    }
+
+    /// `setOverride`'s return answers ONE question: does the store now hold the
+    /// requested value. A clear of an absent model satisfies that request, so it
+    /// reports true — the same way a save of the value already stored does.
+    /// `false` is reserved for a request that could not be honoured at all.
+    func testSetOverrideReportsWhetherTheRequestedStateHolds() {
+        let suite = "CloudProfileAddressingTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let key = CloudContextPolicy.defaultsKey(for: "p")
+
+        // A clear of a model that was never there: the requested state (absent)
+        // is what the store holds, so true — and nothing is written.
+        XCTAssertTrue(
+            CloudContextPolicy.setOverride(model: "absent", window: nil, providerId: "p", defaults: defaults)
+        )
+        XCTAssertNil(defaults.string(forKey: key), "a satisfied clear must not create an empty key")
+
+        // Requests that cannot be honoured are the only false answers.
+        XCTAssertFalse(
+            CloudContextPolicy.setOverride(model: "", window: 128_000, providerId: "p", defaults: defaults)
+        )
+        XCTAssertFalse(
+            CloudContextPolicy.setOverride(model: "m", window: 512, providerId: "p", defaults: defaults),
+            "a sub-plausible window would be dropped by the reader and read back as absent"
+        )
+        XCTAssertNil(defaults.string(forKey: key))
+
+        // A real save, then a real clear, both report true.
+        XCTAssertTrue(
+            CloudContextPolicy.setOverride(model: "m", window: 128_000, providerId: "p", defaults: defaults)
+        )
+        XCTAssertTrue(
+            CloudContextPolicy.setOverride(model: "m", window: nil, providerId: "p", defaults: defaults)
+        )
+        XCTAssertNil(defaults.string(forKey: key))
+    }
+
+    /// The ceiling's `task(id:)` watches this string, so it has to move when a
+    /// window is recorded and stay put when nothing relevant changed. It takes
+    /// an injectable `defaults:` for the same reason `setOverride` does: reading
+    /// the process domain from the view left this path untestable.
+    func testWindowFactsTrackTheProviderEntriesAndTheGlobalFallback() {
+        let suite = "CloudProfileAddressingTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let address = "cloud://synthetic/unregistered-model"
+        let empty = CloudContextPolicy.windowFacts(forAddress: address, defaults: defaults)
+        XCTAssertNotNil(empty, "a cloud address always has facts, even when nothing is recorded")
+
+        // A per-model window changes the facts.
+        CloudContextPolicy.setOverride(
+            model: "unregistered-model",
+            window: 200_000,
+            providerId: "synthetic",
+            defaults: defaults
+        )
+        let withWindow = CloudContextPolicy.windowFacts(forAddress: address, defaults: defaults)
+        XCTAssertNotEqual(withWindow, empty, "recording a window must invalidate the ceiling")
+
+        // So does the global fallback, which is the other input to the answer.
+        defaults.set(64_000, forKey: CloudContextPolicy.globalWindowKey)
+        XCTAssertNotEqual(
+            CloudContextPolicy.windowFacts(forAddress: address, defaults: defaults),
+            withWindow,
+            "the global fallback must invalidate the ceiling too"
+        )
+
+        // A non-cloud address has no such facts, which is what tells the view
+        // to price it from its checkpoint instead.
+        XCTAssertNil(CloudContextPolicy.windowFacts(forAddress: "/tmp/local-model", defaults: defaults))
+        XCTAssertNil(CloudContextPolicy.windowFacts(forAddress: nil, defaults: defaults))
     }
 
     func testFallbackAddressResolvesCloudAndOnDeviceCeilingsWhenModelIsNil() {

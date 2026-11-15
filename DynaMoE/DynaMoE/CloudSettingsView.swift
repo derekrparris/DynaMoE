@@ -479,8 +479,20 @@ struct CloudProvidersSettingsView: View {
     private struct ContextWindowEntry: Identifiable {
         var provider: CloudProvider
         var spec: CloudModelSpec
-        /// The window recorded for THIS model, or nil when it has none.
+        /// The window recorded for THIS model, or nil when it has none this
+        /// build can read.
         var recorded: Int?
+        /// The entry as it is STORED, unparsed — `"128000"` or `"12k"` or nil.
+        ///
+        /// Kept beside `recorded` because the two answer different questions and
+        /// the row needs both. `recorded` is what the send path will use;
+        /// `rawRecorded` is what the operator typed. A row that showed only the
+        /// parse view rendered a stored `zen-model=12k` as an EMPTY field, so the
+        /// typo was invisible and the next Save — reading "no stored value" from
+        /// that empty field — took the clear branch and deleted it. The invariant
+        /// that a typo is the operator's to fix, not this button's to erase, has
+        /// to hold for this row too, not just its neighbours.
+        var rawRecorded: String?
         /// The window the send path resolves: the model's own, else the single
         /// global fallback. The reply budget is derived from this one, because
         /// this is the one the turn is priced and clamped against.
@@ -488,9 +500,15 @@ struct CloudProvidersSettingsView: View {
 
         var id: String { "\(provider.id)/\(spec.providerModelId)" }
         /// What the field shows when the user has not typed into it: the stored
-        /// value, so a window recorded out of band (or by a Sync that arrived
-        /// after this pane opened) can never sit beside an empty field.
-        var recordedText: String { recorded.map(String.init) ?? "" }
+        /// TEXT, so a window recorded out of band (or by a Sync that arrived
+        /// after this pane opened) can never sit beside an empty field — and so a
+        /// value this build cannot parse is visible and correctable instead of
+        /// silently absent.
+        var recordedText: String { rawRecorded ?? "" }
+        /// Whether the stored entry exists but is not a window this build can
+        /// read. Drives the subtitle, which must not claim "no window recorded"
+        /// for a model that plainly has one.
+        var hasUnreadableRecord: Bool { rawRecorded != nil && recorded == nil }
         var budget: Int {
             CloudContextPolicy.maximumOutputTokens(window: resolvedWindow)
         }
@@ -507,7 +525,11 @@ struct CloudProvidersSettingsView: View {
     private func contextWindowEntries() -> [ContextWindowEntry] {
         let globalWindow = CloudContextPolicy.globalWindow(defaults: .standard)
         return providerStore.providers.flatMap { provider -> [ContextWindowEntry] in
+            // Both views of the same key, read once: the parse view decides the
+            // budget, the raw view decides what the field shows and whether a
+            // Save may clear it.
             let recordedWindows = CloudContextPolicy.overrides(for: provider.id)
+            let rawWindows = CloudContextPolicy.rawOverrides(for: provider.id)
             return registeredSpecs(for: provider).map { spec in
                 // `overrides(for:)` already drops anything below
                 // `minimumPlausibleWindow`, so a value it returned is capacity
@@ -517,6 +539,7 @@ struct CloudProvidersSettingsView: View {
                     provider: provider,
                     spec: spec,
                     recorded: recorded,
+                    rawRecorded: rawWindows[spec.providerModelId],
                     resolvedWindow: recorded ?? globalWindow
                 )
             }
@@ -540,8 +563,13 @@ struct CloudProvidersSettingsView: View {
         SettingsRow(
             title: spec.displayName,
             subtitle: entry.recorded.map { "\($0.formatted()) tokens — reply budget \(budget.formatted())." }
-                ?? (entry.resolvedWindow.map { "No window of its own — the global \($0.formatted()) applies, reply budget \(budget.formatted())." }
-                    ?? "No window recorded — reply budget \(budget.formatted()).")
+                ?? (entry.hasUnreadableRecord
+                    // A stored entry this build cannot read is NOT "no window
+                    // recorded": saying so beside a field holding `12k` is the
+                    // contradiction that made the typo look like an empty row.
+                    ? "Stored value “\(entry.recordedText)” is not a usable window — fix it or clear the field. Reply budget \(budget.formatted())."
+                    : (entry.resolvedWindow.map { "No window of its own — the global \($0.formatted()) applies, reply budget \(budget.formatted())." }
+                        ?? "No window recorded — reply budget \(budget.formatted())."))
         ) {
             VStack(alignment: .trailing, spacing: 3) {
                 HStack(spacing: 6) {
@@ -600,6 +628,21 @@ struct CloudProvidersSettingsView: View {
         windowFeedback = [:]
     }
 
+    /// Resolves the string a Save click should persist: an explicit edit draft
+    /// wins (including an empty draft that intentionally clears the stored
+    /// value), whereas `nil` means the field was never edited and keeps the
+    /// stored window it is displaying.
+    ///
+    /// `stored` is the RAW stored text, not the parsed window. Handing this the
+    /// parse view meant a stored `12k` arrived as `nil`, the field having shown
+    /// nothing for it, so an unedited Save resolved to `""` and cleared the typo
+    /// the operator was supposed to fix. With the raw text, an unedited Save
+    /// re-submits `12k` and the validation below refuses it — which is the
+    /// behaviour the neighbouring-row invariant already promised.
+    static func effectiveWindowInput(draft: String?, stored: String?) -> String {
+        draft ?? stored ?? ""
+    }
+
     /// Stores one model's context window, or removes it when the field is empty
     /// (empty means "no recorded window", which is a real state: the reply
     /// budget and the compaction pre-flight both treat it differently).
@@ -611,18 +654,10 @@ struct CloudProvidersSettingsView: View {
     ///
     /// Only the saved model's draft is replaced. Refreshing the whole provider's
     /// drafts would discard an in-progress edit on a sibling row.
-    /// Resolves the string a Save click should persist: an explicit edit draft
-    /// wins (including an empty draft that intentionally clears the stored
-    /// value), whereas `nil` means the field was never edited and keeps the
-    /// stored window it is displaying.
-    static func effectiveWindowInput(draft: String?, stored: Int?) -> String {
-        draft ?? stored.map(String.init) ?? ""
-    }
-
     private func saveWindow(for provider: CloudProvider, modelId: String) {
         let rawInput = Self.effectiveWindowInput(
             draft: windowDrafts[provider.id]?[modelId],
-            stored: CloudContextPolicy.overrides(for: provider.id)[modelId]
+            stored: CloudContextPolicy.rawOverrides(for: provider.id)[modelId]
         )
         let typed = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
         let feedbackKey = "\(provider.id)/\(modelId)"

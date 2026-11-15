@@ -4968,7 +4968,17 @@ final class DynaMoETests: XCTestCase {
         // The same id through the manager, which is the path the app actually
         // takes: steps 1-3 still honour a profile saved against an exact cloud
         // key, but the SUBSTRING family match must not fire for a cloud address.
-        let manager = ModelProfileManager.shared
+        //
+        // A manager over its own suite rather than `.shared`: the app's domain is
+        // shared with this test host, and `ModelProfileManager.shared` seeds it on
+        // init. This test only reads, so it would not corrupt anything — but a
+        // scratch store is what `CloudProfileAddressingTests` opens with a
+        // paragraph about, and a read that depends on the developer's own saved
+        // profiles is a test that can pass or fail for reasons outside the code.
+        let suite = "DynaMoETests-generic-profile-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let manager = ModelProfileManager(defaults: defaults)
         let qwenCloudAssistant = manager.getProfile(
             for: "cloud-model-zen-qwen3-coder",
             type: .assistant

@@ -416,20 +416,46 @@ public nonisolated enum CloudContextPolicy {
         "dynamoe_cloud_\(providerId)_context"
     }
 
+    /// Every entry for one provider EXACTLY as typed, keyed by model id —
+    /// including values this build cannot read as a window.
+    ///
+    /// `overrides(for:)` is the PARSE view: it drops what it cannot read, which
+    /// is right for the send path and wrong for the editor. A row that read only
+    /// the parse view rendered a stored `zen-model=12k` as an empty field, so the
+    /// typo was invisible AND the next Save — resolving "no stored value" from
+    /// that empty field — took the clear branch and deleted it. The editor needs
+    /// the text to show, and the save path needs it to refuse.
+    ///
+    /// Last entry wins for a duplicated model id, matching the parse view, so a
+    /// caller can never show one value and save against another.
+    public static func rawOverrides(
+        for providerId: String,
+        defaults: UserDefaults = .standard
+    ) -> [String: String] {
+        let raw = defaults.string(forKey: defaultsKey(for: providerId)) ?? ""
+        var result: [String: String] = [:]
+        for entry in splitOverrideEntries(raw) {
+            guard let parts = splitEntry(entry) else { continue }
+            result[parts.model] = parts.value
+        }
+        return result
+    }
+
     /// One provider's per-model windows, parsed from `model=window` entries
     /// separated by `;`, `,` or newline. Tolerates `model@window`, grouped
     /// integers (`1,048,576`), and bare integers.
+    ///
+    /// Reads through `rawOverrides(for:)` so the two views of the same key
+    /// cannot disagree about which entry is the model's.
     public static func overrides(
         for providerId: String,
         defaults: UserDefaults = .standard
     ) -> [String: Int] {
-        let raw = defaults.string(forKey: defaultsKey(for: providerId)) ?? ""
         var result: [String: Int] = [:]
-        for entry in splitOverrideEntries(raw) {
-            guard let parts = splitEntry(entry) else { continue }
-            let window = parseWindowValue(parts.value) ?? 0
-            guard window >= minimumPlausibleWindow else { continue }
-            result[parts.model] = window
+        for (model, value) in rawOverrides(for: providerId, defaults: defaults) {
+            guard let window = parseWindowValue(value),
+                  window >= minimumPlausibleWindow else { continue }
+            result[model] = window
         }
         return result
     }
@@ -496,11 +522,17 @@ public nonisolated enum CloudContextPolicy {
     /// operator's typo AND every valid neighbour the same pass could not
     /// represent. Saving one row must not erase another.
     ///
-    /// Returns false when nothing was written: a sub-plausible window (which the
-    /// reader would drop and therefore read back as absent), an empty model id,
-    /// or a clear of a model that had no entry — a write that changes nothing is
-    /// reported as such rather than as a save. Callers validate the typed value
-    /// first; this is the last line of defence.
+    /// The return answers ONE question — does the store now hold the requested
+    /// value — and both directions read it the same way. A save of the value
+    /// already stored is `true` (nothing to write, but the request is satisfied),
+    /// and so is a clear of a model that had no entry (the requested state,
+    /// absent, is what the store holds). `false` therefore means only that the
+    /// request could not be honoured at all: an empty model id, or a
+    /// sub-plausible window the reader would drop and so read back as absent.
+    ///
+    /// `removeOverride` keeps its own narrower meaning — did the bytes change —
+    /// because it is also used to prune, where "nothing changed" is the useful
+    /// answer. Callers that ask "did my save land" want this one.
     @discardableResult
     public static func setOverride(
         model: String,
@@ -510,7 +542,12 @@ public nonisolated enum CloudContextPolicy {
     ) -> Bool {
         guard !model.isEmpty else { return false }
         guard let window else {
-            return removeOverride(model: model, providerId: providerId, defaults: defaults)
+            // A clear is satisfied by the entry already being absent. The write
+            // is still skipped when there is nothing to remove, which is what
+            // `removeOverride` reports and what keeps an empty key from being
+            // created.
+            removeOverride(model: model, providerId: providerId, defaults: defaults)
+            return true
         }
         guard window >= minimumPlausibleWindow else { return false }
 
@@ -665,6 +702,31 @@ public nonisolated enum CloudContextPolicy {
             return parsed
         }
         return nil
+    }
+
+    /// The raw window facts for one cloud address, as one comparable string.
+    ///
+    /// This is the identity a SwiftUI `task(id:)` needs to re-resolve a ceiling
+    /// when a window is edited in a different pane of the same window: the
+    /// provider's stored entries (unparsed, so a typo that changes nothing about
+    /// the resolved window still changes nothing here) plus the global fallback.
+    /// Nil for a non-cloud address, which has no such facts.
+    ///
+    /// `defaults` is injectable for the same reason `setOverride` and
+    /// `globalWindow` take one: this is the only part of the ceiling logic that
+    /// otherwise reads the process domain directly, and an untestable branch is
+    /// the one that rots.
+    public static func windowFacts(
+        forAddress address: String?,
+        defaults: UserDefaults = .standard
+    ) -> String? {
+        guard let address,
+              let parsed = CloudModelAddress.parseModelId(address)
+                ?? CloudModelAddress.parsePath(address) else { return nil }
+        return [
+            defaults.string(forKey: defaultsKey(for: parsed.provider.id)) ?? "",
+            globalWindow(defaults: defaults).map(String.init) ?? ""
+        ].joined(separator: "|")
     }
 
     private static func resolvedWindow(recorded: Int?, defaults: UserDefaults) -> Int? {
@@ -848,6 +910,107 @@ public nonisolated enum CloudContextPolicy {
         let room = Double(window) * 0.25
         guard room.isFinite, room < Double(Int.max) else { return proportion }
         return min(proportion, Int(room))
+    }
+}
+
+// MARK: - Max Output Tokens ceiling
+
+/// Which backend's limit governs the Max Output Tokens slider for one model.
+///
+/// A single flat number was wrong for every backend: a local checkpoint's
+/// ceiling is its KV policy, a cloud model's is a fraction of the context window
+/// its provider records, and the on-device model has a fixed response limit of
+/// its own. The slider has to show whichever one binds, or it either advertises
+/// a budget the launch path lowers or invites one no provider will accept.
+///
+/// This lives beside `maximumOutputTokens` rather than in the Settings view
+/// because it is pure policy over recorded facts: it reads `UserDefaults` and a
+/// `DiscoveredModel`, never a view's state, and it is what the tests exercise.
+enum MaxOutputCeilingBackend {
+    case cloud(window: Int?)
+    case appleFoundationModel
+    case local
+
+    static func classify(
+        model: DiscoveredModel?,
+        fallbackAddress: String?,
+        defaults: UserDefaults = .standard
+    ) -> MaxOutputCeilingBackend {
+        if let model {
+            if let parsed = CloudModelAddress.parseModelId(model.id)
+                ?? CloudModelAddress.parsePath(model.snapshotPath) {
+                return .cloud(window: CloudContextPolicy.window(
+                    forModelId: parsed.providerModelId,
+                    providerId: parsed.provider.id,
+                    defaults: defaults
+                ))
+            }
+            if CloudModelAddress.isCloudModelId(model.id) || CloudModelAddress.isCloudPath(model.snapshotPath) {
+                return .cloud(window: CloudContextPolicy.globalWindow(defaults: defaults))
+            }
+            if model.isAppleFoundationModel {
+                return .appleFoundationModel
+            }
+            return .local
+        }
+        guard let address = fallbackAddress, !address.isEmpty else {
+            return .local
+        }
+        if address == AppleFoundationModelService.modelPath
+            || address == AppleFoundationModelService.modelId {
+            return .appleFoundationModel
+        }
+        if let parsed = CloudModelAddress.parseModelId(address)
+            ?? CloudModelAddress.parsePath(address) {
+            return .cloud(window: CloudContextPolicy.window(
+                forModelId: parsed.providerModelId,
+                providerId: parsed.provider.id,
+                defaults: defaults
+            ))
+        }
+        if CloudModelAddress.isCloudModelId(address) || CloudModelAddress.isCloudPath(address) {
+            return .cloud(window: CloudContextPolicy.globalWindow(defaults: defaults))
+        }
+        return .local
+    }
+}
+
+/// Resolves the Max Output Tokens ceiling for a non-local backend (cloud or
+/// Apple Foundation Model), returning nil when the backend is a local checkpoint
+/// whose `config.json` position limit governs instead.
+func resolveNonLocalMaxOutputCeiling(
+    model: DiscoveredModel?,
+    fallbackAddress: String?,
+    defaults: UserDefaults = .standard
+) -> Int? {
+    switch MaxOutputCeilingBackend.classify(model: model, fallbackAddress: fallbackAddress, defaults: defaults) {
+    case .cloud(let window):
+        return CloudContextPolicy.maximumOutputTokens(window: window)
+    case .appleFoundationModel:
+        return AppleFoundationModelService.maxResponseTokenCeiling
+    case .local:
+        return nil
+    }
+}
+
+/// Explains why the Max Output Tokens ceiling sits where it does, handling both
+/// discovered entries and fallback addresses (e.g., an ad-hoc cloud model or
+/// the on-device model before a scan completes).
+func maxOutputCeilingExplanation(
+    for model: DiscoveredModel?,
+    fallbackAddress: String?,
+    defaults: UserDefaults = .standard
+) -> String {
+    switch MaxOutputCeilingBackend.classify(model: model, fallbackAddress: fallbackAddress, defaults: defaults) {
+    case .cloud(let recorded):
+        if let recorded {
+            return "Capped by 20% of this model's \(recorded.formatted())-token context window — a reply budget larger than that cannot share the window with any prompt. Record a larger window on the Cloud tab to raise it."
+        }
+        return "No context window is recorded for this model, so the reply budget is held to \(CloudContextPolicy.unknownWindowReplyCeiling.formatted()) tokens. Record its window on the Cloud tab to raise the ceiling to 20% of it."
+    case .appleFoundationModel:
+        return "Capped by the on-device model's own response limit (\(AppleFoundationModelService.maxResponseTokenCeiling.formatted()) tokens); a larger value is clamped before the framework sees it."
+    case .local:
+        return "Capped by this checkpoint's own position limit. The KV cache budget also lowers the effective ceiling for a long prompt."
     }
 }
 
