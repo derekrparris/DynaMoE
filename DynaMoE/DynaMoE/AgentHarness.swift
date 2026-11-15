@@ -680,7 +680,7 @@ public final class FindFilesTool: AgentTool {
 public final class GrepSearchTool: AgentTool {
     public let definition = ToolDefinition(
         name: "grep_search",
-        description: "Searches for text or regular expression patterns across files in a directory using ripgrep (rg) or grep.",
+        description: "Searches a directory (or one file) for a regular expression, using ripgrep when available and grep otherwise. Git-ignored files are searched; hidden files and directories are skipped.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
@@ -716,27 +716,114 @@ public final class GrepSearchTool: AgentTool {
             baseDir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         }
 
-        let caseInsensitive = (arguments["case_insensitive"] as? Bool) ?? true
-        let escapedQuery = query.replacingOccurrences(of: "'", with: "\\'")
-        let flag = caseInsensitive ? "-i" : ""
-        let cmd = "if command -v rg >/dev/null 2>&1; then rg \(flag) -n --max-count 50 -- '\(escapedQuery)' .; else grep -rn \(flag) --max-count=50 --exclude-dir=.* -- '\(escapedQuery)' .; fi"
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: baseDir.path, isDirectory: &isDirectory) else {
+            let err = "Error: search path does not exist: \(baseDir.path)"
+            return (AgentHarness.toolErrorJSON(tool: "grep_search", error: err), nil, err, false)
+        }
 
-        let (_, stdout, _) = try await AgentHarness.runProcess(
-            executableURL: URL(fileURLWithPath: "/bin/zsh"),
-            arguments: ["-c", cmd],
-            currentDirectory: baseDir,
+        let caseInsensitive = (arguments["case_insensitive"] as? Bool) ?? true
+        let ripgrep = Self.ripgrepExecutable()
+
+        let searchDirectory: URL
+        let searchTargets: [String]
+
+        if isDirectory.boolValue {
+            searchDirectory = baseDir
+            if ripgrep != nil {
+                searchTargets = ["."]
+            } else {
+                let children = (try? FileManager.default.contentsOfDirectory(atPath: baseDir.path)) ?? []
+                searchTargets = children
+                    .filter { !$0.hasPrefix(".") }
+                    .sorted()
+                    .map { "./\($0)" }
+            }
+        } else {
+            searchDirectory = baseDir.deletingLastPathComponent()
+            searchTargets = ["./\(baseDir.lastPathComponent)"]
+        }
+
+        guard !searchTargets.isEmpty else {
+            return Self.emptySearchResult(query: query, searchPath: baseDir.path)
+        }
+
+        let executable: URL
+        var searchArguments: [String]
+        if let ripgrep {
+            executable = ripgrep
+            searchArguments = ["-u", "-n", "--max-count=50"]
+        } else {
+            executable = URL(fileURLWithPath: "/usr/bin/grep")
+            searchArguments = ["-E", "-r", "-n", "-I", "--max-count=50"]
+        }
+        if caseInsensitive {
+            searchArguments.append("-i")
+        }
+        searchArguments += ["--", query]
+        searchArguments += searchTargets
+
+        let (exitCode, stdout, stderr) = try await AgentHarness.runProcess(
+            executableURL: executable,
+            arguments: searchArguments,
+            currentDirectory: searchDirectory,
             timeoutSeconds: 30
         )
+
+        if exitCode > 1 {
+            let trimmedError = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            let err: String
+            if exitCode == 124 {
+                err = "Error: search timed out after 30 seconds. Narrow the path or pattern."
+            } else if trimmedError.isEmpty {
+                err = "Error: search command failed with status \(exitCode)"
+            } else {
+                err = "Error: search failed: \(AgentHarness.truncateText(trimmedError, limit: 1_000))"
+            }
+            return (AgentHarness.toolErrorJSON(tool: "grep_search", error: err), nil, err, false)
+        }
 
         let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(stdout.trimmingCharacters(in: .whitespacesAndNewlines)), limit: maxOutputLength)
         let lines = cleanOut.components(separatedBy: "\n").filter { !$0.isEmpty }
 
         let res = AgentHarness.toolSuccessJSON(tool: "grep_search", data: [
             "query": query,
+            "search_path": baseDir.path,
             "count": lines.count,
             "results": lines
         ])
         return (res, cleanOut, nil, false)
+    }
+
+    private static func emptySearchResult(query: String, searchPath: String) -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        let res = AgentHarness.toolSuccessJSON(tool: "grep_search", data: [
+            "query": query,
+            "search_path": searchPath,
+            "count": 0,
+            "results": [String]()
+        ])
+        return (res, "", nil, false)
+    }
+
+    /// Resolved without a shell so the search never depends on zsh quoting or
+    /// globbing. launchd hands the app a minimal PATH, so the install locations
+    /// are checked before the curated PATH from `toolEnvironment()`.
+    private static func ripgrepExecutable() -> URL? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        var candidates = [
+            "/opt/homebrew/bin/rg",
+            "/usr/local/bin/rg",
+            "\(home)/.cargo/bin/rg",
+            "/usr/bin/rg"
+        ]
+        let pathCandidates = (ControlledProcessRunner.toolEnvironment()["PATH"] ?? "")
+            .split(separator: ":")
+            .map { "\($0)/rg" }
+        candidates += pathCandidates
+        guard let match = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+            return nil
+        }
+        return URL(fileURLWithPath: match)
     }
 }
 
@@ -5723,7 +5810,10 @@ public final class AgentHarness {
                         }
                     } catch {
                         state.cancelTimer()
-                        cleanupPipes()
+                        stdoutPipe.fileHandleForReading.readabilityHandler = nil
+                        stderrPipe.fileHandleForReading.readabilityHandler = nil
+                        try? stdoutPipe.fileHandleForWriting.close()
+                        try? stderrPipe.fileHandleForWriting.close()
 
                         state.lock.lock()
                         state.isFinished = true
