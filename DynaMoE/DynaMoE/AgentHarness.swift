@@ -703,13 +703,13 @@ public final class GrepSearchTool: AgentTool {
 
     public let definition = ToolDefinition(
         name: "grep_search",
-        description: "Searches a directory (or one file) for a regular expression, using ripgrep when available and grep otherwise. Git-ignored files are searched; hidden files and directories are skipped.",
+        description: "Searches a directory (or one file) for a regular expression, using ripgrep when available and grep otherwise. A query that is not a valid regular expression is searched as literal text. Git-ignored files are searched; hidden and binary files are skipped.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
                 "query": [
                     "type": "string",
-                    "description": "Text or regex pattern to search for."
+                    "description": "Regex pattern to search for. A pattern that does not compile is searched as literal text."
                 ],
                 "path": [
                     "type": "string",
@@ -748,64 +748,68 @@ public final class GrepSearchTool: AgentTool {
         let caseInsensitive = (arguments["case_insensitive"] as? Bool) ?? true
         let backend = backendOverride ?? Self.resolvedBackend()
 
+        // A directory is searched as "." rather than as its list of children:
+        // the exclude rules already skip hidden entries at every depth, one
+        // target keeps both backends on one code path, and a child list costs
+        // a second failure mode plus an argv size limit on a large flat root.
         let searchDirectory: URL
         let searchTargets: [String]
-
         if isDirectory.boolValue {
             searchDirectory = baseDir
-            if backend.isRipgrep {
-                searchTargets = ["."]
-            } else {
-                let children: [String]
-                do {
-                    children = try FileManager.default.contentsOfDirectory(atPath: baseDir.path)
-                } catch {
-                    let err = "Error: cannot list search directory \(baseDir.path): \(error.localizedDescription)"
-                    return (AgentHarness.toolErrorJSON(tool: "grep_search", error: err), nil, err, false)
-                }
-                searchTargets = children
-                    .filter { !$0.hasPrefix(".") }
-                    .sorted()
-                    .map { "./\($0)" }
-            }
+            searchTargets = ["."]
         } else {
             searchDirectory = baseDir.deletingLastPathComponent()
             searchTargets = ["./\(baseDir.lastPathComponent)"]
         }
 
-        guard !searchTargets.isEmpty else {
-            return Self.emptySearchResult(query: query, searchPath: baseDir.path)
+        func runSearch(literal: Bool) async throws -> (exitCode: Int32, stdout: String, stderr: String) {
+            try await AgentHarness.runProcess(
+                executableURL: backend.executable,
+                arguments: Self.searchArguments(
+                    backend: backend,
+                    isDirectory: isDirectory.boolValue,
+                    caseInsensitive: caseInsensitive,
+                    literal: literal,
+                    query: query,
+                    targets: searchTargets
+                ),
+                currentDirectory: searchDirectory,
+                timeoutSeconds: 30
+            )
         }
 
-        var searchArguments: [String]
-        if backend.isRipgrep {
-            searchArguments = ["-u", "-n", "--max-count=50", "--with-filename"]
-        } else {
-            searchArguments = ["-E", "-r", "-n", "-I", "-H", "--max-count=50"]
-            if isDirectory.boolValue {
-                searchArguments += ["--exclude-dir=*/.*", "--exclude=*/.*"]
+        var attempt = try await runSearch(literal: false)
+        var searchedLiterally = false
+
+        // A pattern that does not compile (an unbalanced "(", a trailing
+        // backslash) exits non-zero with nothing on stdout, which reads as
+        // "0 results" once the status is dropped. Retry it as literal text so a
+        // code fragment pasted verbatim still finds its match. The retry keys
+        // on the SHAPE of the failure rather than the message: grep and
+        // ripgrep word a pattern error differently and every wording moves
+        // between releases.
+        if attempt.exitCode > 1,
+           attempt.exitCode != 124,  // timed out: a retry only waits again
+           attempt.exitCode != 130,  // cancelled: no second search after a cancel
+           attempt.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let literal = try await runSearch(literal: true)
+            if literal.exitCode <= 1 {
+                attempt = literal
+                searchedLiterally = true
             }
         }
-        if caseInsensitive {
-            searchArguments.append("-i")
-        }
-        searchArguments += ["--", query]
-        searchArguments += searchTargets
 
-        let (exitCode, stdout, stderr) = try await AgentHarness.runProcess(
-            executableURL: backend.executable,
-            arguments: searchArguments,
-            currentDirectory: searchDirectory,
-            timeoutSeconds: 30
-        )
-
-        let trimmedError = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        let exitCode = attempt.exitCode
+        let stdout = attempt.stdout
+        let trimmedError = attempt.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
         let hasMatches = !stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
 
         if exitCode > 1 && !hasMatches {
             let err: String
             if exitCode == 124 {
                 err = "Error: search timed out after 30 seconds. Narrow the path or pattern."
+            } else if exitCode == 130 {
+                err = "Error: search was cancelled before it finished."
             } else if trimmedError.isEmpty {
                 err = "Error: search command failed with status \(exitCode)"
             } else {
@@ -830,28 +834,63 @@ public final class GrepSearchTool: AgentTool {
         if wasTruncated {
             data["truncated"] = true
         }
+        var warnings: [String] = []
+        if searchedLiterally {
+            warnings.append("the query is not a valid regular expression; it was searched as literal text")
+        }
         if exitCode > 1 {
             if exitCode == 124 {
-                data["warning"] = "search timed out after 30 seconds; results are partial"
+                warnings.append("search timed out after 30 seconds; results are partial")
+            } else if exitCode == 130 {
+                warnings.append("search was cancelled; results are partial")
             } else if trimmedError.isEmpty {
-                data["warning"] = "search exited with status \(exitCode); results may be incomplete"
+                warnings.append("search exited with status \(exitCode); results may be incomplete")
             } else {
-                data["warning"] = "search exited with status \(exitCode); results may be incomplete: \(AgentHarness.truncateText(trimmedError, limit: 1_000))"
+                warnings.append("search exited with status \(exitCode); results may be incomplete: \(AgentHarness.truncateText(trimmedError, limit: 1_000))")
             }
+        }
+        if !warnings.isEmpty {
+            data["warning"] = warnings.joined(separator: "; ")
         }
 
         let res = AgentHarness.toolSuccessJSON(tool: "grep_search", data: data)
         return (res, cleanOut, nil, false)
     }
 
-    private static func emptySearchResult(query: String, searchPath: String) -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
-        let res = AgentHarness.toolSuccessJSON(tool: "grep_search", data: [
-            "query": query,
-            "search_path": searchPath,
-            "count": 0,
-            "results": [String]()
-        ])
-        return (res, "", nil, false)
+    /// Both backends' flags in one place, so the contract test can pin them.
+    ///
+    /// Parity is the point: each side searches git-ignored files and skips
+    /// hidden entries and binary files. ripgrep skips hidden entries by
+    /// default, and `-u` only turns off ignore-file filtering. grep needs the
+    /// two exclude globs, and they must be path-globbed (`*/.*`): BSD grep
+    /// matches `--exclude*` against the WHOLE path, so a bare `.*` excludes
+    /// every path under the search root and `--exclude-dir='.*'` silently
+    /// skipped the entire tree. `--max-count` is per file in both.
+    static func searchArguments(
+        backend: SearchBackend,
+        isDirectory: Bool,
+        caseInsensitive: Bool,
+        literal: Bool,
+        query: String,
+        targets: [String]
+    ) -> [String] {
+        var arguments: [String] = []
+        if backend.isRipgrep {
+            if literal { arguments.append("-F") }
+            arguments += ["-u", "-n", "--max-count=50", "--with-filename"]
+        } else {
+            arguments.append(literal ? "-F" : "-E")
+            arguments += ["-r", "-n", "-I", "-H", "--max-count=50"]
+            if isDirectory {
+                arguments += ["--exclude-dir=*/.*", "--exclude=*/.*"]
+            }
+        }
+        if caseInsensitive {
+            arguments.append("-i")
+        }
+        arguments += ["--", query]
+        arguments += targets
+        return arguments
     }
 
     private static func resolvedBackend() -> SearchBackend {
@@ -863,8 +902,10 @@ public final class GrepSearchTool: AgentTool {
 
     /// Resolved without a shell so the search never depends on zsh quoting or
     /// globbing. launchd hands the app a minimal PATH, so the install locations
-    /// are checked before the curated PATH from `toolEnvironment()`.
-    private static func ripgrepExecutable() -> URL? {
+    /// are checked before the curated PATH from `toolEnvironment()`. Internal
+    /// so a test can exercise the ripgrep path through the same resolution
+    /// instead of growing a second ladder.
+    static func ripgrepExecutable() -> URL? {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         var candidates = [
             "/opt/homebrew/bin/rg",

@@ -47,23 +47,69 @@ final class GrepSearchToolTests: XCTestCase {
         return url
     }
 
+    private static let grepBackend = GrepSearchTool.SearchBackend.grep(URL(fileURLWithPath: "/usr/bin/grep"))
+
+    /// Every backend this machine can run. `nil` is the tool's own resolution,
+    /// so a machine with ripgrep covers both real backends and one without it
+    /// covers grep twice instead of skipping the contract.
+    private func backends() -> [GrepSearchTool.SearchBackend?] {
+        var available: [GrepSearchTool.SearchBackend?] = [nil, Self.grepBackend]
+        if let ripgrep = Self.ripgrepBinary() {
+            available.append(.ripgrep(ripgrep))
+        }
+        return available
+    }
+
+    private func label(_ backend: GrepSearchTool.SearchBackend?) -> String {
+        guard let backend else {
+            return "auto(\(Self.ripgrepBinary() == nil ? "grep" : "ripgrep"))"
+        }
+        return backend.isRipgrep ? "ripgrep" : "grep"
+    }
+
     @MainActor
     private func runTool(
         _ arguments: [String: Any],
         maxOutputLength: Int = 4_000,
-        forceGrepFallback: Bool = false
+        backend: GrepSearchTool.SearchBackend? = nil
     ) async throws -> (json: String, stdout: String?) {
-        let tool = GrepSearchTool(
-            backendOverride: forceGrepFallback
-                ? .grep(URL(fileURLWithPath: "/usr/bin/grep"))
-                : nil
-        )
+        let tool = GrepSearchTool(backendOverride: backend)
         let result = try await tool.execute(
             arguments: arguments,
             workingDirectory: root,
             maxOutputLength: maxOutputLength
         )
         return (json: result.resultJSON, stdout: result.stdout)
+    }
+
+    private func gitInit() throws {
+        let git = "/usr/bin/git"
+        try XCTSkipUnless(FileManager.default.isExecutableFile(atPath: git), "git is unavailable")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: git)
+        process.arguments = ["init", "-q"]
+        process.currentDirectoryURL = root
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0)
+    }
+
+    /// ripgrep when this machine has it, else a binary named by a marker file.
+    /// `xcodebuild` does not forward the shell environment into an app-hosted
+    /// test, so a variable cannot carry the path; the marker file is the seam
+    /// the DeepSeek measurement cases already use.
+    private static func ripgrepBinary() -> URL? {
+        let marker = "/tmp/dynamoe_grep_rg_path"
+        if let data = FileManager.default.contents(atPath: marker),
+           let text = String(data: data, encoding: .utf8) {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty, FileManager.default.isExecutableFile(atPath: trimmed) {
+                return URL(fileURLWithPath: trimmed)
+            }
+        }
+        return GrepSearchTool.ripgrepExecutable()
     }
 
     private func object(in json: String) throws -> [String: Any] {
@@ -83,13 +129,15 @@ final class GrepSearchToolTests: XCTestCase {
 
     private func assertToolError(
         _ json: String,
+        context: String = "",
         file: StaticString = #filePath,
         line: UInt = #line
     ) throws {
+        let suffix = context.isEmpty ? "" : " [\(context)]"
         let obj = try object(in: json)
-        XCTAssertEqual(obj["status"] as? String, "error", "expected a tool error, got: \(json)", file: file, line: line)
+        XCTAssertEqual(obj["status"] as? String, "error", "expected a tool error\(suffix), got: \(json)", file: file, line: line)
         let error = try XCTUnwrap(obj["error"] as? String, file: file, line: line)
-        XCTAssertFalse(error.isEmpty, "error message must name the failure", file: file, line: line)
+        XCTAssertFalse(error.isEmpty, "error message must name the failure\(suffix)", file: file, line: line)
     }
 
     // MARK: - Matches
@@ -156,15 +204,42 @@ final class GrepSearchToolTests: XCTestCase {
         XCTAssertEqual(try resultObject(in: json)["count"] as? Int, 0)
     }
 
-    /// An invalid pattern makes both grep and ripgrep exit 2 with nothing on
-    /// stdout. Discarding the exit code turned that into "0 results", which is
-    /// indistinguishable from a real empty result.
-    func testInvalidPatternIsReportedAsAnError() async throws {
-        try writeFile("foo(bar\n", to: "a.swift")
+    /// `foo(bar` is an unterminated group, so both backends exit 2 with
+    /// nothing on stdout. Discarding the status turned that into "0 results",
+    /// and refusing the query outright would drop a literal code fragment an
+    /// agent pasted verbatim (`-E` is stricter than the old BRE fallback, which
+    /// matched `foo(` as text). The query is retried as literal text instead,
+    /// and the payload says so rather than silently changing the dialect.
+    func testAMetacharacterQueryFallsBackToALiteralSearch() async throws {
+        try writeFile("if (foo(bar)) {\n", to: "a.swift")
 
-        let (json, _) = try await runTool(["query": "foo("])
+        for backend in backends() {
+            let (json, _) = try await runTool(["query": "foo(bar"], backend: backend)
 
-        try assertToolError(json)
+            let result = try resultObject(in: json)
+            XCTAssertEqual(result["count"] as? Int, 1, "\(label(backend)) lost a literal match: \(json)")
+            XCTAssertTrue(
+                try XCTUnwrap(try resultLines(in: json).first).contains("a.swift"),
+                "\(label(backend)) must name the file it matched"
+            )
+            let warning = try XCTUnwrap(
+                result["warning"] as? String,
+                "\(label(backend)) must say the pattern was not a regex: \(json)"
+            )
+            XCTAssertTrue(warning.contains("literal"), "\(label(backend)) said: \(warning)")
+        }
+    }
+
+    /// A literal retry that finds nothing too is a real empty result, not an
+    /// error, and the payload still explains which reading it used.
+    func testALiteralRetryWithNoMatchIsAnEmptySuccess() async throws {
+        try writeFile("alpha beta\n", to: "a.swift")
+
+        let (json, _) = try await runTool(["query": "foo("], backend: Self.grepBackend)
+
+        let result = try resultObject(in: json)
+        XCTAssertEqual(result["count"] as? Int, 0)
+        XCTAssertNotNil(result["warning"] as? String, "the payload must still name the literal reading")
     }
 
     func testMissingPathIsReportedAsAnError() async throws {
@@ -185,16 +260,16 @@ final class GrepSearchToolTests: XCTestCase {
         try writeFile("needle in this file\n", to: "chosen.swift")
         try writeFile("needle in another file\n", to: "other.swift")
 
-        for forceGrep in [false, true] {
+        for backend in backends() {
             let (json, _) = try await runTool([
                 "query": "needle",
                 "path": root.appendingPathComponent("chosen.swift").path
-            ], forceGrepFallback: forceGrep)
+            ], backend: backend)
 
             let lines = try resultLines(in: json)
-            XCTAssertEqual(lines.count, 1, "a file path must search that file only (grep=\(forceGrep)): \(lines)")
+            XCTAssertEqual(lines.count, 1, "\(label(backend)) must search that file only: \(lines)")
             let line = try XCTUnwrap(lines.first)
-            XCTAssertTrue(line.hasPrefix("./chosen.swift:1:"), "grep=\(forceGrep) printed: \(line)")
+            XCTAssertTrue(line.hasPrefix("./chosen.swift:1:"), "\(label(backend)) printed: \(line)")
         }
     }
 
@@ -216,32 +291,20 @@ final class GrepSearchToolTests: XCTestCase {
     /// Ignored is not absent. Local docs and instruction files are commonly
     /// gitignored, and an agent that searched them used to get a silent zero.
     func testGitIgnoredFileIsSearchedOnEitherBackend() async throws {
-        let git = "/usr/bin/git"
-        try XCTSkipUnless(FileManager.default.isExecutableFile(atPath: git), "git is unavailable")
-
         try writeFile("NOTES.md\n", to: ".gitignore")
         try writeFile("the ignored instruction\n", to: "NOTES.md")
+        try gitInit()
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: git)
-        process.arguments = ["init", "-q"]
-        process.currentDirectoryURL = root
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try process.run()
-        process.waitUntilExit()
-        XCTAssertEqual(process.terminationStatus, 0)
-
-        for forceGrep in [false, true] {
+        for backend in backends() {
             let (json, _) = try await runTool(
                 ["query": "ignored instruction"],
-                forceGrepFallback: forceGrep
+                backend: backend
             )
 
             XCTAssertEqual(
                 try resultObject(in: json)["count"] as? Int,
                 1,
-                "grep=\(forceGrep) skipped a git-ignored file"
+                "\(label(backend)) skipped a git-ignored file"
             )
         }
     }
@@ -252,11 +315,11 @@ final class GrepSearchToolTests: XCTestCase {
         try writeFile("needle in a hidden directory\n", to: "Sub/.hidden/x.txt")
         try writeFile("needle in a visible file\n", to: "Sub/visible.txt")
 
-        for forceGrep in [false, true] {
-            let (json, _) = try await runTool(["query": "needle"], forceGrepFallback: forceGrep)
+        for backend in backends() {
+            let (json, _) = try await runTool(["query": "needle"], backend: backend)
 
             let lines = try resultLines(in: json)
-            XCTAssertEqual(lines.count, 1, "grep=\(forceGrep) searched a hidden entry: \(lines)")
+            XCTAssertEqual(lines.count, 1, "\(label(backend)) searched a hidden entry: \(lines)")
             XCTAssertTrue(try XCTUnwrap(lines.first).contains("visible.txt"))
         }
     }
@@ -283,7 +346,7 @@ final class GrepSearchToolTests: XCTestCase {
     func testTheGrepFallbackFindsMatches() async throws {
         try writeFile("let answer = 42\n", to: "Sources/a.swift")
 
-        let (json, _) = try await runTool(["query": "let answer = 42"], forceGrepFallback: true)
+        let (json, _) = try await runTool(["query": "let answer = 42"], backend: Self.grepBackend)
 
         let result = try resultObject(in: json)
         XCTAssertEqual(result["count"] as? Int, 1)
@@ -310,7 +373,7 @@ final class GrepSearchToolTests: XCTestCase {
             )
         }
 
-        let (json, _) = try await runTool(["query": "needle"], forceGrepFallback: true)
+        let (json, _) = try await runTool(["query": "needle"], backend: Self.grepBackend)
 
         let result = try resultObject(in: json)
         XCTAssertEqual(result["count"] as? Int, 1, "a soft error must not discard the matches: \(result)")
@@ -318,8 +381,10 @@ final class GrepSearchToolTests: XCTestCase {
         XCTAssertNotNil(result["warning"] as? String, "the payload must say the search was incomplete")
     }
 
-    /// An unlistable search root used to turn into `count: 0` with a success
-    /// status because the directory listing was read with `try?`.
+    /// An unlistable search root must not read as "0 results". It used to be a
+    /// silent success (the root's children were listed with `try?`); now the
+    /// backend itself reports the permission failure and the exit code carries
+    /// it.
     func testAnUnlistableSearchRootIsReportedAsAnError() async throws {
         try XCTSkipIf(geteuid() == 0, "root can list a chmod 111 directory")
 
@@ -337,14 +402,147 @@ final class GrepSearchToolTests: XCTestCase {
             )
         }
 
-        for forceGrep in [false, true] {
+        for backend in backends() {
             let (json, _) = try await runTool([
                 "query": "needle",
                 "path": locked.path
-            ], forceGrepFallback: forceGrep)
+            ], backend: backend)
 
-            try assertToolError(json)
+            try assertToolError(json, context: label(backend))
         }
+    }
+
+    // MARK: - The command line is one contract
+
+    /// Both backends' argv, pinned flag for flag: hidden and binary handling,
+    /// the exclude globs, the case toggle, the `--` guard, and exactly one
+    /// search target. `rg` is absent on many machines, so this case is the only
+    /// one that always exercises its flags.
+    func testBothBackendsBuildTheirDocumentedCommandLine() throws {
+        let ripgrep = GrepSearchTool.SearchBackend.ripgrep(URL(fileURLWithPath: "/nonexistent/rg"))
+
+        XCTAssertEqual(
+            GrepSearchTool.searchArguments(
+                backend: ripgrep,
+                isDirectory: true,
+                caseInsensitive: true,
+                literal: false,
+                query: "-needle",
+                targets: ["."]
+            ),
+            ["-u", "-n", "--max-count=50", "--with-filename", "-i", "--", "-needle", "."]
+        )
+
+        XCTAssertEqual(
+            GrepSearchTool.searchArguments(
+                backend: Self.grepBackend,
+                isDirectory: true,
+                caseInsensitive: false,
+                literal: false,
+                query: "needle",
+                targets: ["."]
+            ),
+            [
+                "-E", "-r", "-n", "-I", "-H", "--max-count=50",
+                "--exclude-dir=*/.*", "--exclude=*/.*",
+                "--", "needle", "."
+            ]
+        )
+
+        // A single file target needs no exclude rules, and the literal retry
+        // swaps the pattern dialect rather than adding a second one.
+        XCTAssertEqual(
+            GrepSearchTool.searchArguments(
+                backend: Self.grepBackend,
+                isDirectory: false,
+                caseInsensitive: true,
+                literal: true,
+                query: "foo(",
+                targets: ["./a.swift"]
+            ),
+            ["-F", "-r", "-n", "-I", "-H", "--max-count=50", "-i", "--", "foo(", "./a.swift"]
+        )
+
+        XCTAssertEqual(
+            GrepSearchTool.searchArguments(
+                backend: ripgrep,
+                isDirectory: false,
+                caseInsensitive: true,
+                literal: true,
+                query: "foo(",
+                targets: ["./a.swift"]
+            ),
+            ["-F", "-u", "-n", "--max-count=50", "--with-filename", "-i", "--", "foo(", "./a.swift"]
+        )
+    }
+
+    // MARK: - ripgrep
+
+    /// The primary backend, exercised for real when it is installed. Every
+    /// other "either backend" loop here degrades to grep on a machine without
+    /// rg, so without this case a search could mean two different things
+    /// depending on what a machine happens to have installed.
+    func testTheRipgrepBackendHonoursTheSameContract() async throws {
+        guard let ripgrep = Self.ripgrepBinary() else {
+            throw XCTSkip("ripgrep is not installed; name a binary in /tmp/dynamoe_grep_rg_path to run this case")
+        }
+        let backend = GrepSearchTool.SearchBackend.ripgrep(ripgrep)
+
+        try writeFile("needle in this file\n", to: "chosen.swift")
+        try writeFile("needle in another file\n", to: "other.swift")
+        try writeFile("needle in a nested dotfile\n", to: "Sub/.nested.txt")
+        try writeFile("needle in a hidden directory\n", to: "Sub/.hidden/x.txt")
+        try writeFile("needle in a visible file\n", to: "Sub/visible.txt")
+        try writeFile("NOTES.md\n", to: ".gitignore")
+        try writeFile("the ignored instruction\n", to: "NOTES.md")
+        try gitInit()
+
+        let single = try await runTool([
+            "query": "needle",
+            "path": root.appendingPathComponent("chosen.swift").path
+        ], backend: backend)
+        let singleLines = try resultLines(in: single.json)
+        XCTAssertEqual(singleLines.count, 1, "a file path must search that file only: \(singleLines)")
+        XCTAssertTrue(
+            try XCTUnwrap(singleLines.first).hasPrefix("./chosen.swift:1:"),
+            "ripgrep printed: \(singleLines)"
+        )
+
+        let directory = try await runTool(["query": "needle"], backend: backend)
+        let directoryLines = try resultLines(in: directory.json)
+        XCTAssertEqual(directoryLines.count, 3, "ripgrep must find only the visible files: \(directoryLines)")
+        XCTAssertFalse(
+            directoryLines.contains { $0.contains("/.") },
+            "ripgrep searched a hidden entry: \(directoryLines)"
+        )
+
+        let ignored = try await runTool(["query": "ignored instruction"], backend: backend)
+        XCTAssertEqual(
+            try resultObject(in: ignored.json)["count"] as? Int,
+            1,
+            "ripgrep skipped a git-ignored file: \(ignored.json)"
+        )
+    }
+
+    /// The tool reports a cancelled search as a cancellation rather than a
+    /// failure, keyed on the exit code this produces (a cancelled process
+    /// reports 130, never the backend's own 2).
+    func testACancelledProcessReportsCancellationRatherThanFailure() async throws {
+        let start = Date()
+        let task = Task {
+            try await AgentHarness.runProcess(
+                executableURL: URL(fileURLWithPath: "/bin/sleep"),
+                arguments: ["30"],
+                currentDirectory: root,
+                timeoutSeconds: 30
+            )
+        }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        task.cancel()
+
+        let result = try await task.value
+        XCTAssertEqual(result.exitCode, 130)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 10, "a cancelled process must not run to its own exit")
     }
 
     /// A process that cannot even be launched must fail, not block. The old
