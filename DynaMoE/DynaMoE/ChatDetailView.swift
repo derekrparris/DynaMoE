@@ -223,6 +223,10 @@ struct ChatDetailView: View {
     @State private var floatingLayerHeight: CGFloat = 0
     /// The same reservation at the top, for the standing history warning.
     @State private var historyWarningHeight: CGFloat = 0
+    /// Height the composer's text view reports for its content, measured by the
+    /// AppKit editor and clamped to the composer's floor and cap. Zero until the
+    /// editor's first measurement, when the floor stands in.
+    @State private var composerEditorHeight: CGFloat = 0
 
     /// Distance-from-bottom bookkeeping for the pin/detach logic.
     private struct ScrollSnapshot: Equatable {
@@ -305,15 +309,41 @@ struct ChatDetailView: View {
         compactionProgressMessageId != nil
     }
 
+    /// The composer editor's font, kept as one definition so the editor, the
+    /// one-line floor, and the growth cap can never disagree about the zoom.
+    private var composerFont: NSFont {
+        NSFont.systemFont(ofSize: max(10, 13.5 * zoomManager.zoomScale))
+    }
+
+    /// Height of one line of composer text, from the real font metrics.
+    private var composerLineHeight: CGFloat {
+        ceil(composerFont.ascender - composerFont.descender + composerFont.leading)
+    }
+
     /// Minimum height of the composer's text view that still fits exactly one
     /// line: the editor font's line height plus its top and bottom insets.
     /// Deriving this from the real font metrics keeps the first line and the
     /// placeholder from being clipped when the composer is collapsed, while the
     /// surrounding spacing is trimmed instead to keep the box compact.
     private var composerMinHeight: CGFloat {
-        let font = NSFont.systemFont(ofSize: max(10, 13.5 * zoomManager.zoomScale))
-        let lineHeight = ceil(font.ascender - font.descender + font.leading)
-        return lineHeight + MacTextEditor.textContainerInsetHeight * 2
+        composerLineHeight + MacTextEditor.textContainerInsetHeight * 2
+    }
+
+    /// How tall the composer text view may grow before it scrolls internally.
+    /// Twelve lines of the live font, absolutely capped so a large zoom cannot
+    /// hand the composer most of the window. Past this the editor keeps its
+    /// height and its own scroll view takes over, which is what makes a pasted
+    /// prompt reachable without the transcript shrinking to nothing.
+    private var composerMaxHeight: CGFloat {
+        min(max(composerMinHeight, composerLineHeight * 12), 320)
+    }
+
+    /// Visible height of the composer text view: what the editor measured, held
+    /// between the one-line floor and the growth cap. The floor stands in until
+    /// the editor's first measurement arrives.
+    private var composerTextEditorHeight: CGFloat {
+        let measured = composerEditorHeight > 0 ? composerEditorHeight : composerMinHeight
+        return min(max(measured, composerMinHeight), composerMaxHeight)
     }
 
     /// Cache for `cloudContextWindow`. Reference type because the body
@@ -800,6 +830,9 @@ struct ChatDetailView: View {
                                ? "Describe what you want built — DynaMoE will plan it first..."
                                : "Ask DynaMoE anything... (Enter to send, Shift+Enter for newline)"),
                         zoomScale: zoomManager.zoomScale,
+                        minHeight: composerMinHeight,
+                        maxHeight: composerMaxHeight,
+                        onContentHeightChange: { composerEditorHeight = $0 },
                         onCommit: {
                             let trimmed = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !trimmed.isEmpty || !pendingImages.isEmpty else {
@@ -824,7 +857,7 @@ struct ChatDetailView: View {
                         },
                         onPasteImage: { handlePasteboardImage() }
                     )
-                    .frame(minHeight: composerMinHeight, maxHeight: max(100, 140 * zoomManager.zoomScale))
+                    .frame(height: composerTextEditorHeight)
                     .padding(.horizontal, 4)
                     .padding(.top, 1)
                     
@@ -2097,6 +2130,43 @@ struct ChatDetailView: View {
     }
 }
 
+// MARK: - Composer Layout Policy
+/// Pure geometry for the composer editor: how tall its text view should be for
+/// a given amount of laid-out content.
+///
+/// Kept apart from the AppKit plumbing so the clamp rules can be tested without
+/// a window, and so the one-line floor, the growth cap, and the measurement
+/// short-circuit cannot disagree about which bound wins.
+nonisolated enum ComposerLayoutPolicy {
+    /// UTF-8 bytes beyond which the text cannot fit inside any legal composer
+    /// height, so the editor is pinned at the cap without laying the whole paste
+    /// out.
+    ///
+    /// Twelve lines at the widest composer hold roughly a thousand characters,
+    /// and even four-byte characters cannot make eight thousand bytes fit, so
+    /// this is a wide margin. It is measured in bytes because that count is
+    /// O(1); a grapheme count would walk the whole paste on every update pass.
+    static let measurementByteLimit = 8_000
+
+    /// True when the text is certainly taller than any composer cap, so the
+    /// caller can skip measuring it.
+    static func isCertainlyOversized(_ text: String) -> Bool {
+        text.utf8.count > measurementByteLimit
+    }
+
+    /// The editor height for `contentHeight` points of laid-out text, clamped to
+    /// the one-line floor and the growth cap. A cap at or below the floor means
+    /// there is no room to grow, so the floor wins.
+    static func editorHeight(
+        contentHeight: CGFloat,
+        minHeight: CGFloat,
+        maxHeight: CGFloat
+    ) -> CGFloat {
+        guard maxHeight > minHeight else { return minHeight }
+        return min(max(contentHeight.rounded(.up), minHeight), maxHeight)
+    }
+}
+
 // MARK: - Custom Mac NSTextView Subclass
 final class ComposerTextView: NSTextView {
     var onCommit: (() -> Void)?
@@ -2104,10 +2174,22 @@ final class ComposerTextView: NSTextView {
     /// Consumes an image paste before the text view inserts anything. Returning
     /// true means the pasteboard held an image and was handled.
     var onPasteImage: (() -> Bool)?
+    /// Fires when the view's WIDTH changes, which is what re-wraps the text and
+    /// therefore changes how tall the composer has to be. Height changes are the
+    /// text system's own growth and are deliberately not reported: publishing a
+    /// height because the height changed is a feedback loop.
+    var onLayoutWidthChange: ((CGFloat) -> Void)?
 
     override func paste(_ sender: Any?) {
         if let onPasteImage, onPasteImage() { return }
         super.paste(sender)
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        let previousWidth = frame.width
+        super.setFrameSize(newSize)
+        guard abs(previousWidth - newSize.width) > 0.5 else { return }
+        onLayoutWidthChange?(newSize.width)
     }
 
     override func keyDown(with event: NSEvent) {
@@ -2141,6 +2223,14 @@ struct MacTextEditor: NSViewRepresentable {
     @Binding var text: String
     var placeholder: String
     var zoomScale: CGFloat = 1.0
+    /// One-line floor and growth cap for the editor's height. Past the cap the
+    /// editor keeps this height and scrolls its own content.
+    var minHeight: CGFloat = 0
+    var maxHeight: CGFloat = .greatestFiniteMagnitude
+    /// Reports the height the content needs, already clamped to the bounds
+    /// above. Called from text and layout events, never during SwiftUI's own
+    /// update pass.
+    var onContentHeightChange: (CGFloat) -> Void = { _ in }
     var onCommit: () -> Void
     var onCommitImmediate: (() -> Void)? = nil
     var onPasteImage: (() -> Bool)? = nil
@@ -2152,22 +2242,54 @@ struct MacTextEditor: NSViewRepresentable {
     func makeNSView(context: Context) -> NSScrollView {
         let scrollView = NSScrollView()
         scrollView.drawsBackground = false
-        scrollView.hasVerticalScroller = false
+        scrollView.borderType = .noBorder
+        // The composer caps its height, so anything past the cap has to scroll.
+        // An overlay scroller is what makes that discoverable without the
+        // scroller's width re-wrapping the text every time it appears.
+        scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
         scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
+        scrollView.horizontalScrollElasticity = .none
 
         let textStorage = NSTextStorage()
         let layoutManager = NSLayoutManager()
+        // Long pastes only ever need the laid-out lines that fit the cap, so
+        // let the text system lay out lazily instead of in one pass.
+        layoutManager.allowsNonContiguousLayout = true
         textStorage.addLayoutManager(layoutManager)
-        let textContainer = NSTextContainer()
+        let textContainer = NSTextContainer(
+            size: NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
+        )
         textContainer.widthTracksTextView = true
+        textContainer.heightTracksTextView = false
         layoutManager.addTextContainer(textContainer)
 
-        let textView = ComposerTextView(frame: .zero, textContainer: textContainer)
+        let textView = ComposerTextView(
+            frame: NSRect(x: 0, y: 0, width: 0, height: max(minHeight, 0)),
+            textContainer: textContainer
+        )
+        // Without an explicit unbounded maxSize the text view's self-sizing path
+        // is clamped to the frame it was created with, which is why a tall paste
+        // used to be clipped and unreachable instead of scrollable.
+        textView.minSize = NSSize(width: 0, height: 0)
+        textView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
         textView.delegate = context.coordinator
         textView.onCommit = onCommit
         textView.onCommitImmediate = onCommitImmediate
         textView.onPasteImage = onPasteImage
+        textView.onLayoutWidthChange = { [weak textView] _ in
+            guard let textView, let scrollView = textView.enclosingScrollView else { return }
+            DispatchQueue.main.async {
+                context.coordinator.measureAndPublishHeight(
+                    for: textView,
+                    in: scrollView
+                )
+            }
+        }
         textView.font = .systemFont(ofSize: max(10, 13.5 * zoomScale))
         textView.isRichText = false
         textView.drawsBackground = false
@@ -2182,33 +2304,150 @@ struct MacTextEditor: NSViewRepresentable {
         textView.isAutomaticDashSubstitutionEnabled = false
 
         scrollView.documentView = textView
+
+        // The scroll view has no width until SwiftUI lays it out, so the first
+        // measurement has to wait for that pass.
+        DispatchQueue.main.async { [weak textView, weak scrollView] in
+            guard let textView, let scrollView else { return }
+            context.coordinator.measureAndPublishHeight(for: textView, in: scrollView)
+        }
         return scrollView
     }
 
     func updateNSView(_ nsView: NSScrollView, context: Context) {
         guard let textView = nsView.documentView as? ComposerTextView else { return }
+        context.coordinator.parent = self
         textView.onCommit = onCommit
         textView.onCommitImmediate = onCommitImmediate
         textView.onPasteImage = onPasteImage
-        if textView.string != text {
-            textView.string = text
-        }
+
         let targetFont = NSFont.systemFont(ofSize: max(10, 13.5 * zoomScale))
-        if abs((textView.font?.pointSize ?? 13.5) - targetFont.pointSize) > 0.1 {
+        let fontChanged = abs((textView.font?.pointSize ?? 13.5) - targetFont.pointSize) > 0.1
+        if fontChanged {
             textView.font = targetFont
+        }
+
+        // Keep the document at the scroll view's width. The autoresizing mask
+        // covers a live window resize, but SwiftUI sizes the scroll view without
+        // resizing a document view it did not create.
+        let contentWidth = nsView.contentSize.width
+        if contentWidth > 0, abs(textView.frame.width - contentWidth) > 0.5 {
+            textView.setFrameSize(
+                NSSize(width: contentWidth, height: max(textView.frame.height, minHeight))
+            )
+        }
+
+        if textView.string != text {
+            // Assigning `.string` does not fire `textDidChange`, and it drops
+            // the insertion point. Keep the caret where it was (clamped to the
+            // new length) and remeasure once the update pass has finished.
+            let previousSelection = textView.selectedRange()
+            textView.string = text
+            let length = (text as NSString).length
+            textView.setSelectedRange(
+                NSRange(location: min(previousSelection.location, length), length: 0)
+            )
+        }
+
+        // Remeasure after every update pass, not only after a text change: the
+        // first pass is when the scroll view receives the width the text wraps
+        // at, and a zoom change alters both the font and the height bounds. The
+        // coordinator publishes only real changes, so this cannot loop.
+        scheduleRemeasure(textView: textView, scrollView: nsView, context: context)
+    }
+
+    /// Measures after the current update pass, because publishing a height is a
+    /// SwiftUI state write and must not happen during `updateNSView`.
+    private func scheduleRemeasure(
+        textView: ComposerTextView,
+        scrollView: NSScrollView,
+        context: Context
+    ) {
+        DispatchQueue.main.async { [weak textView, weak scrollView] in
+            guard let textView, let scrollView else { return }
+            context.coordinator.measureAndPublishHeight(for: textView, in: scrollView)
         }
     }
 
     class Coordinator: NSObject, NSTextViewDelegate {
         var parent: MacTextEditor
+        /// Last height handed to SwiftUI, so the layout pass cannot publish the
+        /// same value twice and bounce the composer's frame.
+        private var publishedHeight: CGFloat?
 
         init(_ parent: MacTextEditor) {
             self.parent = parent
         }
 
+        /// The height the text needs at the editor's current width, clamped to
+        /// the composer's floor and cap.
+        func measureAndPublishHeight(for textView: NSTextView, in scrollView: NSScrollView) {
+            // A zero-width text view wraps every word onto its own line and
+            // would report a height no width needs; wait for real layout.
+            guard textView.frame.width > 0, scrollView.contentSize.width > 0 else { return }
+            let height = Self.desiredHeight(
+                for: textView,
+                minHeight: parent.minHeight,
+                maxHeight: parent.maxHeight
+            )
+            guard publishedHeight.map({ abs($0 - height) > 0.5 }) ?? true else { return }
+            publishedHeight = height
+            parent.onContentHeightChange(height)
+            // Growing or shrinking the visible area moves the fold under a caret
+            // that was already in view; reveal it once the new frame is laid out.
+            DispatchQueue.main.async { [weak textView] in
+                guard let textView, !textView.hasMarkedText() else { return }
+                textView.scrollRangeToVisible(textView.selectedRange())
+            }
+        }
+
+        /// Measures laid-out content without touching the view hierarchy.
+        static func desiredHeight(
+            for textView: NSTextView,
+            minHeight: CGFloat,
+            maxHeight: CGFloat
+        ) -> CGFloat {
+            // A paste this large cannot fit any legal cap, and laying it all out
+            // to prove that would stall the keystroke that pasted it.
+            if ComposerLayoutPolicy.isCertainlyOversized(textView.string) {
+                return ComposerLayoutPolicy.editorHeight(
+                    contentHeight: maxHeight,
+                    minHeight: minHeight,
+                    maxHeight: maxHeight
+                )
+            }
+            guard let layoutManager = textView.layoutManager,
+                  let textContainer = textView.textContainer else {
+                return max(minHeight, 0)
+            }
+            layoutManager.ensureLayout(for: textContainer)
+            let contentHeight = layoutManager.usedRect(for: textContainer).height
+                + textView.textContainerInset.height * 2
+            return ComposerLayoutPolicy.editorHeight(
+                contentHeight: contentHeight,
+                minHeight: minHeight,
+                maxHeight: maxHeight
+            )
+        }
+
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
             self.parent.text = textView.string
+            if let scrollView = textView.enclosingScrollView {
+                measureAndPublishHeight(for: textView, in: scrollView)
+            }
+        }
+
+        /// Reveals the insertion point whenever the selection moves. AppKit does
+        /// this itself for a stock text view, but this one is sized by SwiftUI
+        /// and its scroll view is ours, so arrow-key movement after a long paste
+        /// would otherwise walk the caret onto lines that are not visible.
+        func textViewDidChangeSelection(_ notification: Notification) {
+            guard let textView = notification.object as? NSTextView,
+                  !textView.hasMarkedText(),
+                  textView.window?.firstResponder === textView,
+                  textView.enclosingScrollView != nil else { return }
+            textView.scrollRangeToVisible(textView.selectedRange())
         }
     }
 }
