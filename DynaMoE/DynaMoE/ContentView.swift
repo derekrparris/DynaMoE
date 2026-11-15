@@ -4731,17 +4731,25 @@ struct ContentView: View {
             providerId: provider.id
         )
         // The reply budget the request actually carries. Left at the app's
-        // setting it can be larger than a small model's whole window (the
-        // default is 8,192 tokens against models that register 1,024-8,192),
-        // which makes the request impossible no matter how short the prompt
-        // is and, before the pre-flight knew better, paid for a summarizer
-        // pass on every send without ever clearing the wall. Clamped to the
-        // room the compaction threshold leaves, so a prompt under 80% of the
-        // window plus this reply always fits.
-        let replyBudget = CloudContextPolicy.replyBudget(
-            requested: maxNewTokens,
-            window: contextWindow
+        // setting it can be larger than a small model's whole window, which
+        // makes the request impossible no matter how short the prompt is and,
+        // before the pre-flight knew better, paid for a summarizer pass on every
+        // send without ever clearing the wall. Clamped to the room the
+        // compaction threshold leaves, so a prompt under 80% of the window plus
+        // this reply always fits, and to the model's own published output limit
+        // when its catalog declares one. The resolution also carries WHY the
+        // number is what it is, so a truncated turn's notice can name the control
+        // that can actually raise it.
+        let observedLimits = CloudContextPolicy.observedLimit(
+            forModelId: providerModelId,
+            providerId: provider.id
         )
+        let budgetResolution = CloudContextPolicy.replyBudgetResolution(
+            requested: maxNewTokens,
+            window: contextWindow,
+            outputLimit: observedLimits?.maxOutput
+        )
+        let replyBudget = budgetResolution.effective
         let params = CloudChatGenerationParams(
             temperature: Double(temperature),
             topP: Double(topP),
@@ -5712,7 +5720,7 @@ struct ContentView: View {
                 let truncatedAtLimit = CloudFinishDisposition(finishReason: finishReason) == .outputLimit
                 let truncationNotice: String?
                 if truncatedAtLimit {
-                    truncationNotice = "⚠️ This answer stopped at the Max Output Tokens limit and may be truncated. Raise it in Settings ▸ Sampling for a longer reply."
+                    truncationNotice = CloudContextPolicy.outputLimitNotice(budgetResolution)
                 } else if endedWithoutTerminal {
                     // Naming the refused calls matters: the assistant message
                     // shows none of them (a call record is only written when it
@@ -5753,7 +5761,7 @@ struct ContentView: View {
                     : String(format: "%.0f ms", finalElapsed * 1000.0)
                 self.showStatus(
                     "☁️ \(provider.displayName) — \(turnCost.statusSuffix) · \(durationText) · \(String(format: "%.1f", finalTokPerSec)) tok/s"
-                        + (truncatedAtLimit ? " — truncated at the Max Output Tokens limit." : "")
+                        + (truncatedAtLimit ? " · truncated at \(budgetResolution.effective.formatted()) tokens." : "")
                         + (truncationNotice != nil && !truncatedAtLimit ? " — stream ended early." : "")
                 )
                 self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)

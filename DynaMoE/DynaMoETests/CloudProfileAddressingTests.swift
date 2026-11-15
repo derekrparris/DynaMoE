@@ -858,6 +858,302 @@ final class CloudProfileAddressingTests: XCTestCase {
         XCTAssertEqual(CloudContextPolicy.window(forModelId: "m", providerId: "p", defaults: defaults), 32_768)
     }
 
+    // MARK: - Capacity the provider published
+
+    /// The catalog's own window ranks above the global fallback (it is a fact
+    /// about THIS model) and below a hand-recorded value (that is the
+    /// operator's correction). The budget must follow the same order, or the
+    /// row and the send path disagree about one model.
+    func testAnObservedWindowOutranksTheFallbackAndYieldsToAHandRecordedOne() {
+        let suite = "CloudProfileAddressingTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        defaults.set(200_000, forKey: CloudContextPolicy.globalWindowKey)
+        CloudContextPolicy.setObservedLimits(
+            ["m": .init(contextWindow: 1_000_000, maxOutput: 384_000)],
+            forProviderId: "p",
+            defaults: defaults
+        )
+
+        XCTAssertEqual(
+            CloudContextPolicy.windowSource(forModelId: "m", providerId: "p", defaults: defaults),
+            .observed(1_000_000)
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.window(forModelId: "m", providerId: "p", defaults: defaults),
+            1_000_000,
+            "the source and the resolved window must agree"
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.maximumOutputTokens(
+                window: 1_000_000,
+                outputLimit: 384_000
+            ),
+            200_000,
+            "20% of the published window is smaller than the published output cap"
+        )
+
+        XCTAssertTrue(
+            CloudContextPolicy.setOverride(model: "m", window: 32_768, providerId: "p", defaults: defaults)
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.windowSource(forModelId: "m", providerId: "p", defaults: defaults),
+            .model(32_768),
+            "a hand-recorded correction outranks the catalog"
+        )
+    }
+
+    /// A published output cap smaller than the window fraction binds first. The
+    /// app must not invite a reply the model itself refuses, and the Settings
+    /// ceiling must be the same number the send path enforces.
+    func testThePublishedOutputLimitBindsBeforeTheWindowFraction() {
+        let suite = "CloudProfileAddressingTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        CloudContextPolicy.setObservedLimits(
+            ["published-model": .init(contextWindow: 200_000, maxOutput: 32_000)],
+            forProviderId: "synthetic",
+            defaults: defaults
+        )
+
+        XCTAssertEqual(
+            CloudContextPolicy.maximumOutputTokens(window: 200_000, outputLimit: 32_000),
+            32_000
+        )
+        let resolution = CloudContextPolicy.replyBudgetResolution(
+            requested: 131_072,
+            window: 200_000,
+            outputLimit: 32_000
+        )
+        XCTAssertEqual(resolution.effective, 32_000)
+        XCTAssertEqual(resolution.binding, .outputLimit)
+        XCTAssertTrue(
+            maxOutputCeilingExplanation(
+                for: nil,
+                fallbackAddress: "cloud://synthetic/published-model",
+                defaults: defaults
+            ).contains("published 32,000-token output limit")
+        )
+    }
+
+    /// The generic cloud profile is only a fallback for an unrecorded model.
+    /// Once the catalog publishes capacity, the fallback budget must rise to
+    /// the ceiling the slider advertises, or Plan Mode starts every fresh
+    /// model pinned at 16,384 and truncates long deliverables. A profile the
+    /// user saved stays exactly where they put it.
+    func testTheGenericCloudBudgetFollowsObservedCapacityButASavedProfileWins() {
+        let (manager, defaults, suite) = scratchManager()
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let sentinel = "cloud://synthetic/deepseek-v4.1-flash"
+        let registryID = "cloud-model-synthetic-deepseek-v4.1-flash"
+        let generic = GenerationProfileSettings.defaultFor(type: .coder)
+
+        XCTAssertEqual(
+            manager.getProfile(for: sentinel, type: .coder).maxNewTokens,
+            generic.maxNewTokens,
+            "nothing published yet: the unrecorded-window default"
+        )
+        XCTAssertEqual(
+            manager.getProfile(for: sentinel, type: .assistant).maxNewTokens,
+            GenerationProfileSettings.defaultFor(type: .assistant).maxNewTokens,
+            "no capacity means no seeding, including the Assistant ratio"
+        )
+
+        CloudContextPolicy.setObservedLimits(
+            ["deepseek-v4.1-flash": .init(contextWindow: 1_000_000, maxOutput: 384_000)],
+            forProviderId: "synthetic",
+            defaults: defaults
+        )
+        XCTAssertEqual(
+            manager.getProfile(for: sentinel, type: .coder).maxNewTokens,
+            200_000,
+            "both address forms resolve to the model's own ceiling"
+        )
+        XCTAssertEqual(
+            manager.getProfile(for: registryID, type: .coder).maxNewTokens,
+            200_000
+        )
+        // The seeded number is the number the turn actually sends, not a value
+        // the ceiling then lowers behind the setting's back.
+        let resolution = CloudContextPolicy.replyBudgetResolution(
+            requested: manager.getProfile(for: sentinel, type: .coder).maxNewTokens,
+            window: CloudContextPolicy.window(
+                forModelId: "deepseek-v4.1-flash",
+                providerId: "synthetic",
+                defaults: defaults
+            ),
+            outputLimit: CloudContextPolicy.observedLimit(
+                forModelId: "deepseek-v4.1-flash",
+                providerId: "synthetic",
+                defaults: defaults
+            )?.maxOutput
+        )
+        XCTAssertEqual(resolution.effective, 200_000)
+        XCTAssertEqual(
+            resolution.binding,
+            .windowFraction,
+            "at the ceiling a tie belongs to the constraint, not the setting"
+        )
+
+        var saved = generic
+        saved.maxNewTokens = 16_384
+        manager.saveProfile(for: sentinel, type: .coder, settings: saved)
+        XCTAssertEqual(
+            manager.getProfile(for: sentinel, type: .coder).maxNewTokens,
+            16_384,
+            "a saved profile is the user's choice, not a default to improve"
+        )
+    }
+
+    // MARK: - What the truncation notice is allowed to claim
+
+    /// A hand-recorded window is capacity too, and it is the fallback when a
+    /// provider's catalog publishes nothing. Seeding only from the catalog
+    /// would leave the operator typing a window and then having to raise the
+    /// budget by hand as well.
+    func testAHandRecordedWindowAlsoSeedsTheGenericBudget() {
+        let (manager, defaults, suite) = scratchManager()
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let sentinel = "cloud://synthetic/hand-recorded-model"
+        XCTAssertTrue(
+            CloudContextPolicy.setOverride(
+                model: "hand-recorded-model",
+                window: 200_000,
+                providerId: "synthetic",
+                defaults: defaults
+            )
+        )
+        XCTAssertEqual(
+            manager.getProfile(for: sentinel, type: .coder).maxNewTokens,
+            40_000,
+            "the generic budget follows a known window's ceiling"
+        )
+    }
+
+    /// A tie belongs to the CONSTRAINT: when the setting already equals the
+    /// ceiling, raising the setting cannot move the number, so the notice must
+    /// not name that control.
+    func testTheReplyBudgetNamesTheBindingConstraint() {
+        let unknown = CloudContextPolicy.replyBudgetResolution(
+            requested: CloudContextPolicy.unknownWindowReplyCeiling,
+            window: nil
+        )
+        XCTAssertEqual(unknown.effective, CloudContextPolicy.unknownWindowReplyCeiling)
+        XCTAssertEqual(unknown.binding, .unrecordedWindow)
+
+        let setting = CloudContextPolicy.replyBudgetResolution(requested: 8_192, window: 1_000_000)
+        XCTAssertEqual(setting.effective, 8_192)
+        XCTAssertEqual(setting.binding, .setting)
+
+        let tie = CloudContextPolicy.replyBudgetResolution(requested: 200_000, window: 1_000_000)
+        XCTAssertEqual(tie.effective, 200_000)
+        XCTAssertEqual(tie.binding, .windowFraction)
+
+        let capped = CloudContextPolicy.replyBudgetResolution(
+            requested: 200_000,
+            window: 200_000,
+            outputLimit: 32_000
+        )
+        XCTAssertEqual(capped.effective, 32_000)
+        XCTAssertEqual(capped.binding, .outputLimit)
+
+        let none = CloudContextPolicy.replyBudgetResolution(requested: 0, window: nil)
+        XCTAssertEqual(none.effective, 0)
+        XCTAssertEqual(none.binding, .setting)
+    }
+
+    func testTheTruncationNoticeNamesTheControlThatCanChangeTheCap() {
+        let unknown = CloudContextPolicy.replyBudgetResolution(
+            requested: CloudContextPolicy.unknownWindowReplyCeiling,
+            window: nil
+        )
+        let unknownNotice = CloudContextPolicy.outputLimitNotice(unknown)
+        XCTAssertTrue(unknownNotice.contains("No context window is recorded"), unknownNotice)
+        XCTAssertTrue(unknownNotice.contains("Test & Sync Models"), unknownNotice)
+        XCTAssertFalse(
+            unknownNotice.contains("Raise Max Output Tokens in Settings ▸ Sampling"),
+            "a setting already at the clamp is not the control that can raise it"
+        )
+
+        let setting = CloudContextPolicy.replyBudgetResolution(requested: 16_384, window: 1_000_000)
+        let settingNotice = CloudContextPolicy.outputLimitNotice(setting)
+        XCTAssertTrue(settingNotice.contains("Raise Max Output Tokens in Settings ▸ Sampling"), settingNotice)
+        XCTAssertTrue(settingNotice.contains("200,000"), settingNotice)
+
+        let fraction = CloudContextPolicy.replyBudgetResolution(requested: 200_000, window: 1_000_000)
+        let fractionNotice = CloudContextPolicy.outputLimitNotice(fraction)
+        XCTAssertTrue(
+            fractionNotice.contains("cannot go higher"),
+            "a window-fraction cap cannot be raised from the setting"
+        )
+
+        let output = CloudContextPolicy.replyBudgetResolution(
+            requested: 200_000,
+            window: 1_000_000,
+            outputLimit: 32_000
+        )
+        let outputNotice = CloudContextPolicy.outputLimitNotice(output)
+        XCTAssertTrue(outputNotice.contains("published 32,000-token output limit"), outputNotice)
+
+        for notice in [unknownNotice, settingNotice, fractionNotice, outputNotice] {
+            XCTAssertTrue(
+                notice.contains("Reasoning counts toward the same budget"),
+                "every notice must say why a long thinking block spends the answer's budget: \(notice)"
+            )
+        }
+    }
+
+    /// A sync REPLACES the observed map, and losing the endpoint takes the map
+    /// with it: those facts describe a catalog, not a model the operator typed.
+    func testObservedLimitsAreReplacedByASyncAndDroppedWithTheEndpoint() {
+        let suite = "CloudProfileAddressingTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let provider = CloudProviderRegistry.synthetic
+        CloudContextPolicy.setObservedLimits(
+            ["old": .init(contextWindow: 100_000), "kept": .init(contextWindow: 200_000)],
+            forProviderId: provider.id,
+            defaults: defaults
+        )
+        CloudContextPolicy.setObservedLimits(
+            ["kept": .init(contextWindow: 400_000, maxOutput: 64_000)],
+            forProviderId: provider.id,
+            defaults: defaults
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.observedLimits(forProviderId: provider.id, defaults: defaults).keys.sorted(),
+            ["kept"]
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.observedLimit(forModelId: "kept", providerId: provider.id, defaults: defaults),
+            .init(contextWindow: 400_000, maxOutput: 64_000)
+        )
+
+        // The identity a Settings `task(id:)` watches must move with them.
+        let address = "cloud://synthetic/kept"
+        let before = CloudContextPolicy.windowFacts(forAddress: address, defaults: defaults)
+        CloudContextPolicy.setObservedLimits(
+            ["kept": .init(contextWindow: 800_000)],
+            forProviderId: provider.id,
+            defaults: defaults
+        )
+        XCTAssertNotEqual(
+            CloudContextPolicy.windowFacts(forAddress: address, defaults: defaults),
+            before,
+            "a refreshed catalog window has to re-resolve the ceiling"
+        )
+
+        CloudModelRegistry.clearEndpointState(for: provider, defaults: defaults)
+        XCTAssertTrue(
+            CloudContextPolicy.observedLimits(forProviderId: provider.id, defaults: defaults).isEmpty,
+            "catalog facts describe the endpoint that published them"
+        )
+    }
+
     /// The Generation tab's ceiling line and the Cloud tab's row have to agree
     /// about the same model: one is not allowed to say "this model's window"
     /// when the other already says "no window of its own".

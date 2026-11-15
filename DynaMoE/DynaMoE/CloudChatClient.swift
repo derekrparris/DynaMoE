@@ -18,6 +18,7 @@
 //
 
 import Foundation
+import CoreFoundation
 
 // MARK: - Connection Test
 
@@ -27,6 +28,31 @@ public nonisolated enum CloudConnectionTestResult: Equatable, Sendable {
 }
 
 // MARK: - Service Protocol
+
+/// One entry from a provider's `GET /models` catalog, with the capacity facts
+/// some endpoints publish beside the id.
+///
+/// The id alone is enough to register a model, which is why this started as a
+/// string array. It is not enough to price a turn: a provider that publishes
+/// `limit.context`/`limit.output` is stating the model's own capacity, and
+/// discarding it left every such model on the conservative unrecorded-window
+/// budget. Both facts are optional because a catalog is free to publish only
+/// an id, and a missing fact must stay missing rather than becoming a guess.
+public nonisolated struct CloudModelCatalogEntry: Equatable, Sendable {
+    public let id: String
+    public let contextWindowTokens: Int?
+    public let maxOutputTokens: Int?
+
+    public init(
+        id: String,
+        contextWindowTokens: Int? = nil,
+        maxOutputTokens: Int? = nil
+    ) {
+        self.id = id
+        self.contextWindowTokens = contextWindowTokens
+        self.maxOutputTokens = maxOutputTokens
+    }
+}
 
 nonisolated protocol CloudChatServicing: Sendable {
     /// Streams one turn and records its terminal classification in `receipt`.
@@ -45,8 +71,19 @@ nonisolated protocol CloudChatServicing: Sendable {
     ) -> AsyncStream<CloudTurnEvent>
 
     /// GET the provider's model listing. Used by the Settings connection test
-    /// (and by the future model-registration branch).
+    /// and by the model-registration sync.
     func fetchModelIds() async throws -> [String]
+
+    /// The same listing with every capacity fact it publishes. A service that
+    /// only knows how to read ids inherits the default below and reports no
+    /// limits, which keeps the registration behaviour it already had.
+    func fetchModelCatalog() async throws -> [CloudModelCatalogEntry]
+}
+
+extension CloudChatServicing {
+    func fetchModelCatalog() async throws -> [CloudModelCatalogEntry] {
+        try await fetchModelIds().map { CloudModelCatalogEntry(id: $0) }
+    }
 }
 
 // MARK: - Session Cache
@@ -914,15 +951,24 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
     /// because a provider added in Settings may publish a bare array, a
     /// string array, or a `models` key, and failing a connection test over an
     /// envelope difference helps nobody.
-    nonisolated static func decodeModelIds(from data: Data) -> [String] {
+    ///
+    /// Capacity rides in the same payload on providers that publish it
+    /// (OpenCode: `limit.context` / `limit.output`; vLLM and others:
+    /// `max_model_len` / `max_output_tokens`). Those facts are read here and
+    /// nowhere else, so every caller sees the same catalog.
+    nonisolated static func decodeModelCatalog(from data: Data) -> [CloudModelCatalogEntry] {
         guard let object = try? JSONSerialization.jsonObject(with: data) else { return [] }
 
-        var ids: [String] = []
+        var entries: [CloudModelCatalogEntry] = []
         func append(_ value: Any?) {
             if let id = value as? String {
-                ids.append(id)
+                entries.append(CloudModelCatalogEntry(id: id))
             } else if let entry = value as? [String: Any], let id = entry["id"] as? String {
-                ids.append(id)
+                entries.append(CloudModelCatalogEntry(
+                    id: id,
+                    contextWindowTokens: contextWindowTokens(in: entry),
+                    maxOutputTokens: maxOutputTokens(in: entry)
+                ))
             }
         }
 
@@ -937,12 +983,88 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
         }
 
         var seen = Set<String>()
-        return ids
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty && seen.insert($0).inserted }
+        return entries.compactMap { entry in
+            let id = entry.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty, seen.insert(id).inserted else { return nil }
+            return CloudModelCatalogEntry(
+                id: id,
+                contextWindowTokens: entry.contextWindowTokens,
+                maxOutputTokens: entry.maxOutputTokens
+            )
+        }
+    }
+
+    /// The id-only view of the same payload, kept for callers and tests that
+    /// only need the registration list.
+    nonisolated static func decodeModelIds(from data: Data) -> [String] {
+        decodeModelCatalog(from: data).map(\.id)
+    }
+
+    private nonisolated static func contextWindowTokens(in entry: [String: Any]) -> Int? {
+        let limit = entry["limit"] as? [String: Any]
+        let candidates: [Any?] = [
+            limit?["context"],
+            entry["context_length"],
+            entry["max_model_len"],
+            entry["context_window"],
+            entry["max_context_tokens"]
+        ]
+        for candidate in candidates {
+            if let window = positiveInt(candidate),
+               window >= CloudContextPolicy.minimumPlausibleWindow {
+                return window
+            }
+        }
+        return nil
+    }
+
+    private nonisolated static func maxOutputTokens(in entry: [String: Any]) -> Int? {
+        let limit = entry["limit"] as? [String: Any]
+        let candidates: [Any?] = [
+            limit?["output"],
+            entry["max_output_tokens"],
+            entry["max_completion_tokens"]
+        ]
+        for candidate in candidates {
+            if let maxOutput = positiveInt(candidate), maxOutput >= 1 {
+                return maxOutput
+            }
+        }
+        return nil
+    }
+
+    /// Reads a catalog number without inventing one. JSON bridges booleans as
+    /// `NSNumber`, so the boolean check has to come first; a non-finite or
+    /// oversized value is a units mistake, not capacity.
+    private nonisolated static func positiveInt(_ value: Any?) -> Int? {
+        switch value {
+        case let string as String:
+            return Int(string.trimmingCharacters(in: .whitespacesAndNewlines))
+        case let number as NSNumber:
+            guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+            let double = number.doubleValue
+            // A fractional token count is not capacity, and truncating it would
+            // price a turn against a number the catalog never published.
+            guard double.isFinite,
+                  double >= 1,
+                  double < Double(Int.max),
+                  double == double.rounded(.towardZero) else { return nil }
+            return Int(double)
+        default:
+            return nil
+        }
+    }
+
+    func fetchModelCatalog() async throws -> [CloudModelCatalogEntry] {
+        let data = try await fetchModelData()
+        return Self.decodeModelCatalog(from: data)
     }
 
     func fetchModelIds() async throws -> [String] {
+        try await fetchModelCatalog().map(\.id)
+    }
+
+    private func fetchModelData() async throws -> Data {
         var request = URLRequest(url: modelsURL)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -960,7 +1082,7 @@ nonisolated final class OpenAICloudChatService: CloudChatServicing, @unchecked S
                     summary: MCPHTTPTransport.summarizeErrorBody(body)
                 )
             }
-            return Self.decodeModelIds(from: data)
+            return data
         } catch let failure as CloudTurnFailure {
             throw failure
         } catch {
@@ -1248,16 +1370,26 @@ public nonisolated final class CloudChatClient: @unchecked Sendable {
     }
 
     /// The provider's live model catalog, used by the Settings "Sync Models"
-    /// action to register the provider's chat models (callers filter the
-    /// non-chat entries).
-    public func fetchModelIds() async -> Result<[String], CloudTurnFailure> {
+    /// action to register the provider's chat models and record the capacity
+    /// facts the catalog publishes (callers filter the non-chat entries).
+    public func fetchModelCatalog() async -> Result<[CloudModelCatalogEntry], CloudTurnFailure> {
         do {
-            return .success(try await service.fetchModelIds())
+            return .success(try await service.fetchModelCatalog())
         } catch let failure as CloudTurnFailure {
             return .failure(failure)
         } catch {
             // Same rule as the connection test: a catalog read is not billed.
             return .failure(CloudTurnFailure.transportFailure(error, requestWasSent: false))
+        }
+    }
+
+    /// The id-only view of the same catalog.
+    public func fetchModelIds() async -> Result<[String], CloudTurnFailure> {
+        switch await fetchModelCatalog() {
+        case .success(let catalog):
+            return .success(catalog.map(\.id))
+        case .failure(let failure):
+            return .failure(failure)
         }
     }
 }

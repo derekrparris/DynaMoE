@@ -534,7 +534,58 @@ public final class ModelProfileManager: ObservableObject {
         }
 
         // 5. Fallback to model-specific default
-        return GenerationProfileSettings.defaultFor(type: type, modelName: modelId)
+        return seedingKnownCapacity(
+            GenerationProfileSettings.defaultFor(type: type, modelName: modelId),
+            modelId: modelId
+        )
+    }
+
+    /// The generic cloud default, raised to the capacity the app knows.
+    ///
+    /// The generic cloud budget is `unknownWindowReplyCeiling` (16,384) because
+    /// that is all the app may assume about a model whose window nobody recorded.
+    /// Once a window or an output cap is known, from the provider's `/models`
+    /// payload or a hand-recorded value, that assumption is no longer the best
+    /// fact available: leaving the default at 16,384 pins a capable model below
+    /// its own ceiling, so a long Plan Mode turn hits the truncation notice
+    /// before the model is anywhere near its limit (`#95` review, then the live
+    /// plan session that reproduced it).
+    ///
+    /// Only the GENERIC profile is seeded. A saved profile is returned by steps
+    /// 1-4 above and is the user's own choice, so an explicit 16k stays 16k. The
+    /// seed is the same number the Settings slider advertises as the ceiling,
+    /// because a default the send path silently lowers reads as the app ignoring
+    /// its own setting.
+    ///
+    /// No known capacity means no seeding: an unknown model keeps the shipped
+    /// defaults, including the Assistant's half-of-Coder ratio. The seed is a
+    /// response to evidence, not a blanket increase.
+    private func seedingKnownCapacity(
+        _ settings: GenerationProfileSettings,
+        modelId: String?
+    ) -> GenerationProfileSettings {
+        guard let modelId,
+              let parsed = CloudModelAddress.parseModelId(modelId)
+                ?? CloudModelAddress.parsePath(modelId) else { return settings }
+        let limits = CloudContextPolicy.observedLimit(
+            forModelId: parsed.providerModelId,
+            providerId: parsed.provider.id,
+            defaults: defaults
+        )
+        let window = CloudContextPolicy.window(
+            forModelId: parsed.providerModelId,
+            providerId: parsed.provider.id,
+            defaults: defaults
+        )
+        guard window != nil || limits?.maxOutput != nil else { return settings }
+        let ceiling = CloudContextPolicy.maximumOutputTokens(
+            window: window,
+            outputLimit: limits?.maxOutput
+        )
+        guard ceiling > settings.maxNewTokens else { return settings }
+        var seeded = settings
+        seeded.maxNewTokens = ceiling
+        return seeded
     }
 
     public func saveProfile(for modelId: String?, type: ModelProfileType, settings: GenerationProfileSettings) {

@@ -724,6 +724,17 @@ final class CloudProviderStoreTests: XCTestCase {
             for: provider.id,
             defaults: harness.defaults
         )
+        // A catalog-derived fact is a third kind of registration data. It was
+        // learned from this endpoint, so removing the model must take it too;
+        // otherwise re-adding the id inherits a window nothing publishes.
+        CloudContextPolicy.setObservedLimits(
+            [
+                "gpt-5.1-codex": .init(contextWindow: 400_000, maxOutput: 128_000),
+                "qwen3-coder": .init(contextWindow: 262_144)
+            ],
+            forProviderId: provider.id,
+            defaults: harness.defaults
+        )
 
         CloudModelRegistry.removeRegisteredModel(
             "gpt-5.1-codex",
@@ -748,6 +759,11 @@ final class CloudProviderStoreTests: XCTestCase {
         XCTAssertEqual(
             Array(CloudPricingStore.pricing(for: provider.id, defaults: harness.defaults).keys),
             ["qwen3-coder"]
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.observedLimits(forProviderId: provider.id, defaults: harness.defaults).keys.sorted(),
+            ["qwen3-coder"],
+            "unregistering a model drops the limits its endpoint published"
         )
         XCTAssertEqual(
             harness.defaults.string(forKey: CloudModelRegistry.debugModelDefaultsKey),
@@ -1017,5 +1033,99 @@ final class CloudModelListDecodingTests: XCTestCase {
         XCTAssertTrue(ids("not json").isEmpty)
         XCTAssertTrue(ids("{}").isEmpty)
         XCTAssertTrue(ids(#"{"data":null}"#).isEmpty)
+    }
+
+    // MARK: - Capacity facts in the same payload
+
+    /// OpenCode publishes `limit.context` and `limit.output` beside the id, and
+    /// the sync used to throw both away. They are the difference between a
+    /// capable model priced at its own ceiling and one held at the conservative
+    /// unrecorded-window budget, so the decoder has to read them.
+    func testOpenCodeStyleContextAndOutputLimitsAreDecoded() {
+        let catalog = OpenAICloudChatService.decodeModelCatalog(from: Data("""
+        {"object":"list","data":[
+          {"id":"deepseek-v4.1-flash","object":"model","limit":{"context":1000000,"output":384000}},
+          {"id":"glm-5.3","limit":{"context":1000000,"output":131072}}
+        ]}
+        """.utf8))
+
+        XCTAssertEqual(catalog.count, 2)
+        XCTAssertEqual(catalog[0].id, "deepseek-v4.1-flash")
+        XCTAssertEqual(catalog[0].contextWindowTokens, 1_000_000)
+        XCTAssertEqual(catalog[0].maxOutputTokens, 384_000)
+        XCTAssertEqual(catalog[1].contextWindowTokens, 1_000_000)
+        XCTAssertEqual(catalog[1].maxOutputTokens, 131_072)
+        XCTAssertEqual(catalog.map(\.id), ids("""
+        {"object":"list","data":[
+          {"id":"deepseek-v4.1-flash"},
+          {"id":"glm-5.3"}
+        ]}
+        """))
+    }
+
+    /// Other OpenAI-compatible servers spell the same facts differently, and a
+    /// budget parser that only knew one spelling would leave those providers on
+    /// the unrecorded-window clamp.
+    func testCommonCapacityAliasesAndStringNumbersAreDecoded() {
+        let catalog = OpenAICloudChatService.decodeModelCatalog(from: Data("""
+        {"data":[
+          {"id":"vllm-model","max_model_len":131072,"max_output_tokens":8192},
+          {"id":"string-model","context_length":"200000","max_completion_tokens":"16384"},
+          {"id":"simple-model","context_window":32768}
+        ]}
+        """.utf8))
+
+        XCTAssertEqual(catalog[0].contextWindowTokens, 131_072)
+        XCTAssertEqual(catalog[0].maxOutputTokens, 8_192)
+        XCTAssertEqual(catalog[1].contextWindowTokens, 200_000)
+        XCTAssertEqual(catalog[1].maxOutputTokens, 16_384)
+        XCTAssertEqual(catalog[2].contextWindowTokens, 32_768)
+        XCTAssertNil(catalog[2].maxOutputTokens)
+    }
+
+    /// A missing, zero, negative, boolean, or sub-plausible value is not
+    /// capacity. Each must stay absent rather than becoming a guess: a bogus
+    /// window would price every turn against a number the model does not have.
+    func testMissingInvalidAndBooleanLimitsStayAbsent() {
+        let catalog = OpenAICloudChatService.decodeModelCatalog(from: Data("""
+        {"data":[
+          {"id":"no-limits"},
+          {"id":"zero","limit":{"context":0,"output":0}},
+          {"id":"negative","limit":{"context":-1,"output":-5}},
+          {"id":"boolean","limit":{"context":true,"output":true}},
+          {"id":"tiny","limit":{"context":512,"output":1}},
+          {"id":"fraction","limit":{"context":2000.5,"output":2.5}}
+        ]}
+        """.utf8))
+
+        XCTAssertNil(catalog[0].contextWindowTokens)
+        XCTAssertNil(catalog[0].maxOutputTokens)
+        XCTAssertNil(catalog[1].contextWindowTokens)
+        XCTAssertNil(catalog[1].maxOutputTokens)
+        XCTAssertNil(catalog[2].contextWindowTokens)
+        XCTAssertNil(catalog[2].maxOutputTokens)
+        XCTAssertNil(catalog[3].contextWindowTokens)
+        XCTAssertNil(catalog[3].maxOutputTokens)
+        XCTAssertNil(catalog[4].contextWindowTokens)
+        XCTAssertEqual(catalog[4].maxOutputTokens, 1)
+        XCTAssertNil(catalog[5].contextWindowTokens, "a fractional window is not a fact")
+        XCTAssertNil(catalog[5].maxOutputTokens)
+    }
+
+    /// The first entry wins for a duplicated id, and its limits travel with it.
+    /// A catalog that repeats an id with a different window must not answer two
+    /// numbers for one model depending on which duplicate is read.
+    func testDuplicateIdsKeepTheFirstEntryAndItsLimits() {
+        let catalog = OpenAICloudChatService.decodeModelCatalog(from: Data("""
+        {"data":[
+          {"id":"a","limit":{"context":200000,"output":32000}},
+          {"id":" a ","limit":{"context":1000000,"output":128000}}
+        ]}
+        """.utf8))
+
+        XCTAssertEqual(catalog.count, 1)
+        XCTAssertEqual(catalog[0].id, "a")
+        XCTAssertEqual(catalog[0].contextWindowTokens, 200_000)
+        XCTAssertEqual(catalog[0].maxOutputTokens, 32_000)
     }
 }
