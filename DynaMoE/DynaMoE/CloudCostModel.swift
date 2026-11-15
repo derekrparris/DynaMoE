@@ -476,6 +476,14 @@ public nonisolated enum CloudContextPolicy {
         return result
     }
 
+    /// Writes a provider's entire window map in one call.
+    ///
+    /// TEST-ONLY. It is the bulk form of `setOverride`, so it rewrites the key
+    /// from a parsed map and therefore cannot preserve an entry this build
+    /// cannot read — the exact data loss `setOverride` and `removeOverride`
+    /// exist to avoid. Production has no caller and must not gain one: a save
+    /// goes through `setOverride`, a removal through `removeOverride`. It stays
+    /// so a test can set up a known map in one line.
     public static func setOverrides(
         _ overrides: [String: Int],
         for providerId: String,
@@ -699,6 +707,10 @@ public nonisolated enum CloudContextPolicy {
     /// The window this model is believed to have, or nil when nobody recorded
     /// one. The per-model value wins over the global fallback.
     ///
+    /// An entry point to `windowSource(recorded:defaults:)`, not a second rule:
+    /// a spec already carries the recorded value, so it skips the storage read,
+    /// and the resolution under it is the one every other reader shares.
+    ///
     /// The fallback is a SINGLE global key, so it answers for every provider.
     /// A default recorded for one provider's large-window model therefore also
     /// describes a smaller-window model elsewhere, and under-compacting that
@@ -709,7 +721,7 @@ public nonisolated enum CloudContextPolicy {
         for spec: CloudModelSpec?,
         defaults: UserDefaults = .standard
     ) -> Int? {
-        resolvedWindow(recorded: spec?.contextWindowTokens, defaults: defaults)
+        windowSource(recorded: spec?.contextWindowTokens, defaults: defaults).window
     }
 
     /// The window recorded for one model id, resolved without building the
@@ -756,19 +768,49 @@ public nonisolated enum CloudContextPolicy {
     /// One model's window together with where it came from.
     ///
     /// Written against the same two reads `window(forModelId:providerId:)` makes,
-    /// and the number it carries is that function's answer: the two cannot
-    /// disagree about which window applies, only about how to describe it.
+    /// and the number it carries is that function's answer because
+    /// `window(forModelId:)` delegates here: the two cannot disagree about which
+    /// window applies, only about how to describe it.
     public static func windowSource(
         forModelId modelId: String,
         providerId: String,
         defaults: UserDefaults = .standard
     ) -> WindowSource {
-        if let recorded = overrides(for: providerId, defaults: defaults)[modelId],
-           recorded >= minimumPlausibleWindow {
+        windowSource(
+            recorded: overrides(for: providerId, defaults: defaults)[modelId],
+            defaults: defaults
+        )
+    }
+
+    /// The ONE rule every window reader shares: a recorded per-model value wins
+    /// when this build can read it, else the single global fallback answers,
+    /// else there is no window.
+    ///
+    /// `window(for:)` (a spec already in hand) and
+    /// `windowSource(forModelId:providerId:)` (a model id read from storage) are
+    /// two ways IN to this function, not two resolutions expected to agree. They
+    /// used to be two copies of this rule, which is how a display reader drifts
+    /// from the send path it is meant to report.
+    public static func windowSource(
+        recorded: Int?,
+        defaults: UserDefaults = .standard
+    ) -> WindowSource {
+        windowSource(recorded: recorded, fallback: globalWindow(defaults: defaults))
+    }
+
+    /// The same rule with the global fallback already read, for a caller that
+    /// resolves many models in one pass (the settings list) and must not
+    /// re-parse the same default per row. `fallback` is taken as the caller
+    /// read it, which `globalWindow` already filters for plausibility.
+    public static func windowSource(
+        recorded: Int?,
+        fallback: Int?
+    ) -> WindowSource {
+        if let recorded, recorded >= minimumPlausibleWindow {
             return .model(recorded)
         }
-        if let global = globalWindow(defaults: defaults) {
-            return .global(global)
+        if let fallback {
+            return .global(fallback)
         }
         return .none
     }
@@ -817,13 +859,6 @@ public nonisolated enum CloudContextPolicy {
             defaults.string(forKey: defaultsKey(for: parsed.provider.id)) ?? "",
             globalWindow(defaults: defaults).map(String.init) ?? ""
         ].joined(separator: "|")
-    }
-
-    private static func resolvedWindow(recorded: Int?, defaults: UserDefaults) -> Int? {
-        if let recorded, recorded >= minimumPlausibleWindow {
-            return recorded
-        }
-        return globalWindow(defaults: defaults)
     }
 
     /// Whether a send of `promptTokens` should compact first.

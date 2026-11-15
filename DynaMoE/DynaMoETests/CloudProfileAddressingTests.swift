@@ -339,6 +339,55 @@ final class CloudProfileAddressingTests: XCTestCase {
         )
     }
 
+    /// Every family key `seedOfficialProfiles` writes must hold that FAMILY's
+    /// profile, not the generic branch's.
+    ///
+    /// The seed names its families as literals while `defaultFor` decides which
+    /// profile answers — and the seed takes every value FROM `defaultFor`, so
+    /// the two agreeing today is what keeps the stored numbers the official
+    /// ones. If the matching drifted, a fresh install would silently store the
+    /// generic (cloud/ungated-local) budget and sampling pair under the Ornith,
+    /// Qwen and Nanbeige keys, with no error and no visible difference until a
+    /// turn misbehaved. Iterating `ModelProfileType.allCases` covers both
+    /// profiles each key is seeded with.
+    func testEverySeededFamilyKeyHoldsItsFamilyProfileNotTheGenericOne() {
+        let (manager, defaults, suite) = scratchManager()
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let seededKeys: [(key: String, familyName: String)] = [
+            ("mlx-community/ornith-1.5-9b-optiq-4bit", "ornith"),
+            ("ornith-1.5-9b-optiq-4bit", "ornith"),
+            ("ornith", "ornith"),
+            ("qwen/qwen3.8-flash-next-fp8", "qwen"),
+            ("qwen3.8-flash-next-fp8", "qwen"),
+            ("qwen", "qwen"),
+            ("nanbeige/nanbeige4.3-33b", "nanbeige"),
+            ("nanbeige4.3-33b", "nanbeige"),
+            ("nanbeige", "nanbeige")
+        ]
+
+        for (key, familyName) in seededKeys {
+            for type in ModelProfileType.allCases {
+                let stored = manager.getProfile(for: key, type: type)
+                let family = GenerationProfileSettings.defaultFor(
+                    type: type,
+                    modelName: familyName
+                )
+                let generic = GenerationProfileSettings.defaultFor(type: type)
+                XCTAssertEqual(
+                    stored,
+                    family,
+                    "\(key) must be seeded with the \(familyName) \(type.rawValue) profile"
+                )
+                XCTAssertNotEqual(
+                    stored,
+                    generic,
+                    "\(key) must not be seeded with the generic \(type.rawValue) profile"
+                )
+            }
+        }
+    }
+
     /// The raw view is what the editor shows and what a Save re-submits; the
     /// parse view is what the send path uses. They disagree about what they
     /// cannot read — which is the point — and agree on everything else.

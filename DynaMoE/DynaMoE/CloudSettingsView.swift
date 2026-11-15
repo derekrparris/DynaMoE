@@ -479,13 +479,10 @@ struct CloudProvidersSettingsView: View {
     private struct ContextWindowEntry: Identifiable {
         var provider: CloudProvider
         var spec: CloudModelSpec
-        /// The window recorded for THIS model, or nil when it has none this
-        /// build can read.
-        var recorded: Int?
         /// The entry as it is STORED, unparsed — `"128000"` or `"12k"` or nil.
         ///
-        /// Kept beside `recorded` because the two answer different questions and
-        /// the row needs both. `recorded` is what the send path will use;
+        /// Kept beside `windowSource` because the two answer different questions
+        /// and the row needs both. `windowSource` is what the send path will use;
         /// `rawRecorded` is what the operator typed. A row that showed only the
         /// parse view rendered a stored `zen-model=12k` as an EMPTY field, so the
         /// typo was invisible and the next Save — reading "no stored value" from
@@ -493,10 +490,15 @@ struct CloudProvidersSettingsView: View {
         /// that a typo is the operator's to fix, not this button's to erase, has
         /// to hold for this row too, not just its neighbours.
         var rawRecorded: String?
-        /// The window the send path resolves: the model's own, else the single
-        /// global fallback. The reply budget is derived from this one, because
-        /// this is the one the turn is priced and clamped against.
-        var resolvedWindow: Int?
+        /// The window the send path resolves, together with WHERE it came from.
+        ///
+        /// Resolved through `CloudContextPolicy.windowSource(recorded:fallback:)`
+        /// — the same rule `windowSource(forModelId:providerId:)` applies on the
+        /// send path — so this row cannot report a different number than the turn
+        /// is priced against. The source is carried, not only the number, because
+        /// "no window of its own" and "no window at all" are two different
+        /// budgets and one must not be printed as the other.
+        var windowSource: CloudContextPolicy.WindowSource
 
         var id: String { "\(provider.id)/\(spec.providerModelId)" }
         /// What the field shows when the user has not typed into it: the stored
@@ -507,7 +509,7 @@ struct CloudProvidersSettingsView: View {
         var recordedText: String { rawRecorded ?? "" }
         /// Whether the text the FIELD shows is a value this build cannot read.
         ///
-        /// Asked of the raw text alone, not of `recorded == nil`. A duplicated
+        /// Asked of the raw text alone, not of `windowSource`. A duplicated
         /// model id whose later entry is junk (`a=200000; a=12k`) stores a field
         /// reading `12k` while the parse view — which takes the last READABLE
         /// entry — reports 200,000; deriving this from the parse view said the
@@ -519,7 +521,25 @@ struct CloudProvidersSettingsView: View {
             rawRecorded != nil && !CloudContextPolicy.isUsableWindow(rawRecorded)
         }
         var budget: Int {
-            CloudContextPolicy.maximumOutputTokens(window: resolvedWindow)
+            CloudContextPolicy.maximumOutputTokens(window: windowSource.window)
+        }
+        /// What the row says about the window and the budget it yields.
+        ///
+        /// Exhaustive over `WindowSource`: a window the model recorded and one
+        /// the global fallback supplied are different facts and get different
+        /// sentences, and "nothing recorded" is a third budget.
+        var subtitle: String {
+            if hasUnreadableRecord {
+                return "Stored value “\(recordedText)” is not a usable window — fix it or clear the field. Reply budget \(budget.formatted())."
+            }
+            switch windowSource {
+            case .model(let window):
+                return "\(window.formatted()) tokens — reply budget \(budget.formatted())."
+            case .global(let window):
+                return "No window of its own — the global \(window.formatted()) applies, reply budget \(budget.formatted())."
+            case .none:
+                return "No window recorded — reply budget \(budget.formatted())."
+            }
         }
     }
 
@@ -547,9 +567,11 @@ struct CloudProvidersSettingsView: View {
                 return ContextWindowEntry(
                     provider: provider,
                     spec: spec,
-                    recorded: recorded,
                     rawRecorded: rawWindows[spec.providerModelId],
-                    resolvedWindow: recorded ?? globalWindow
+                    windowSource: CloudContextPolicy.windowSource(
+                        recorded: recorded,
+                        fallback: globalWindow
+                    )
                 )
             }
         }
@@ -564,11 +586,11 @@ struct CloudProvidersSettingsView: View {
     private func contextWindowRow(_ entry: ContextWindowEntry) -> some View {
         let provider = entry.provider
         let spec = entry.spec
-        let budget = entry.budget
-        // The per-model override, NOT the value this save would store: the row
-        // reports what the turn will actually send with, and the global fallback
-        // is named rather than implied, because "no window of its own" and "no
-        // window at all" are two different budgets.
+        // The window the TURN uses (the model's own, else the global fallback),
+        // not the value this save would store: the row reports what will actually
+        // be sent with, and names the fallback rather than implying it, because
+        // "no window of its own" and "no window at all" are two different
+        // budgets.
         SettingsRow(
             title: spec.displayName,
             // The unreadable case comes FIRST and names the budget the turn
@@ -576,11 +598,7 @@ struct CloudProvidersSettingsView: View {
             // typo while a valid entry for the same model is what prices the
             // send. Saying "no window recorded" beside a field holding `12k` is
             // the contradiction that made the typo look like an empty row.
-            subtitle: entry.hasUnreadableRecord
-                ? "Stored value “\(entry.recordedText)” is not a usable window — fix it or clear the field. Reply budget \(budget.formatted())."
-                : (entry.recorded.map { "\($0.formatted()) tokens — reply budget \(budget.formatted())." }
-                    ?? (entry.resolvedWindow.map { "No window of its own — the global \($0.formatted()) applies, reply budget \(budget.formatted())." }
-                        ?? "No window recorded — reply budget \(budget.formatted())."))
+            subtitle: entry.subtitle
         ) {
             VStack(alignment: .trailing, spacing: 3) {
                 HStack(spacing: 6) {
@@ -702,11 +720,14 @@ struct CloudProvidersSettingsView: View {
         // which resolves the per-model window AND the global fallback. Asking
         // the override alone advertised 16,384 for a model the turn would send
         // 40,000 to, and disagreed with the same model's row in Settings.
-        let resolvedWindow = CloudContextPolicy.window(
+        // `windowSource` carries WHERE the value came from as well, so the
+        // cleared-with-a-fallback line below names the fallback from the source
+        // itself rather than re-deriving it and force-unwrapping a non-nil one.
+        let windowSource = CloudContextPolicy.windowSource(
             forModelId: modelId,
             providerId: provider.id
         )
-        let budget = CloudContextPolicy.maximumOutputTokens(window: resolvedWindow)
+        let budget = CloudContextPolicy.maximumOutputTokens(window: windowSource.window)
 
         // Only this model's draft, and it is REMOVED rather than written back:
         // the field reads storage when it has no draft, so the row now shows
@@ -718,11 +739,12 @@ struct CloudProvidersSettingsView: View {
         // A save with no window of its own lands on the global fallback, and a
         // budget line that did not say so would read as if this row's clearing
         // chose the number.
-        let bindsGlobal = stored == nil && resolvedWindow != nil
         if typed.isEmpty {
-            windowFeedback[feedbackKey] = bindsGlobal
-                ? "Cleared — the global \(resolvedWindow!.formatted()) applies, reply budget \(budget.formatted())."
-                : "Cleared — reply budget now \(budget.formatted())."
+            if case .global(let global) = windowSource, stored == nil {
+                windowFeedback[feedbackKey] = "Cleared — the global \(global.formatted()) applies, reply budget \(budget.formatted())."
+            } else {
+                windowFeedback[feedbackKey] = "Cleared — reply budget now \(budget.formatted())."
+            }
         } else {
             windowFeedback[feedbackKey] = "Saved — reply budget up to \(budget.formatted())."
         }
