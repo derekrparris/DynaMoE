@@ -431,10 +431,39 @@ final class CloudProfileAddressingTests: XCTestCase {
 
         // So does the global fallback, which is the other input to the answer.
         defaults.set(64_000, forKey: CloudContextPolicy.globalWindowKey)
+        let withFallback = CloudContextPolicy.windowFacts(forAddress: address, defaults: defaults)
         XCTAssertNotEqual(
-            CloudContextPolicy.windowFacts(forAddress: address, defaults: defaults),
+            withFallback,
             withWindow,
             "the global fallback must invalidate the ceiling too"
+        )
+
+        // An unreadable entry also moves the facts, even though it cannot move
+        // the number: the string carries the raw text, so correcting a typo
+        // re-runs a resolution that lands where it already was. That is a
+        // wasted lookup and not a wrong answer — a parse-view identity would
+        // instead hide the edit, and the row would keep showing a ceiling the
+        // stored bytes no longer describe.
+        CloudContextPolicy.setOverride(
+            model: "unregistered-model",
+            window: nil,
+            providerId: "synthetic",
+            defaults: defaults
+        )
+        defaults.set("unregistered-model=12k", forKey: CloudContextPolicy.defaultsKey(for: "synthetic"))
+        XCTAssertNotEqual(
+            CloudContextPolicy.windowFacts(forAddress: address, defaults: defaults),
+            withFallback,
+            "an edit the reader cannot parse still has to re-resolve"
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.windowSource(
+                forModelId: "unregistered-model",
+                providerId: "synthetic",
+                defaults: defaults
+            ),
+            .global(64_000),
+            "and the resolution it re-runs still lands on the fallback"
         )
 
         // A non-cloud address has no such facts, which is what tells the view
@@ -465,9 +494,23 @@ final class CloudProfileAddressingTests: XCTestCase {
             resolveNonLocalMaxOutputCeiling(model: nil, fallbackAddress: adHocCloud, defaults: defaults),
             40_000
         )
+        // The explanation must name the FALLBACK, not claim the model recorded a
+        // 200,000-token window of its own. The number alone cannot tell the two
+        // apart, which is why the backend carries the window's origin; the Cloud
+        // tab's own row already says "No window of its own — the global …
+        // applies", so a pane saying otherwise contradicts it about one model.
+        let globalExplanation = maxOutputCeilingExplanation(
+            for: nil,
+            fallbackAddress: adHocCloud,
+            defaults: defaults
+        )
         XCTAssertTrue(
-            maxOutputCeilingExplanation(for: nil, fallbackAddress: adHocCloud, defaults: defaults)
-                .contains("200,000-token context window")
+            globalExplanation.contains("global 200,000-token fallback"),
+            "expected the fallback to be named, got: \(globalExplanation)"
+        )
+        XCTAssertFalse(
+            globalExplanation.contains("this model's 200,000-token context window"),
+            "a fallback value is not this model's own recorded window"
         )
 
         // Apple Foundation Model fallback before discovery scan finishes.
@@ -489,6 +532,155 @@ final class CloudProfileAddressingTests: XCTestCase {
         XCTAssertTrue(
             maxOutputCeilingExplanation(for: nil, fallbackAddress: "/tmp/local-model", defaults: defaults)
                 .contains("checkpoint's own position limit")
+        )
+    }
+
+    // MARK: - Which window the ceiling was priced against
+
+    /// `windowSource` is what lets an explanation name the right fact: a
+    /// per-model record belongs to the model, the single global fallback does
+    /// not. The NUMBER must stay the one `window(forModelId:providerId:)`
+    /// answers — the two are the same read expressed twice.
+    func testTheWindowSourceNamesWhereTheResolvedWindowCameFrom() {
+        let suite = "CloudProfileAddressingTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        // Nothing recorded anywhere.
+        XCTAssertEqual(
+            CloudContextPolicy.windowSource(forModelId: "m", providerId: "p", defaults: defaults),
+            .none
+        )
+        XCTAssertNil(CloudContextPolicy.window(forModelId: "m", providerId: "p", defaults: defaults))
+
+        // Only the fallback: it supplies the number but is NOT the model's own.
+        defaults.set(200_000, forKey: CloudContextPolicy.globalWindowKey)
+        XCTAssertEqual(
+            CloudContextPolicy.windowSource(forModelId: "m", providerId: "p", defaults: defaults),
+            .global(200_000)
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.window(forModelId: "m", providerId: "p", defaults: defaults),
+            200_000,
+            "the source and the resolved window must agree"
+        )
+
+        // A per-model record wins over the fallback, and says so.
+        XCTAssertTrue(
+            CloudContextPolicy.setOverride(model: "m", window: 32_768, providerId: "p", defaults: defaults)
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.windowSource(forModelId: "m", providerId: "p", defaults: defaults),
+            .model(32_768)
+        )
+        XCTAssertEqual(CloudContextPolicy.window(forModelId: "m", providerId: "p", defaults: defaults), 32_768)
+    }
+
+    /// The Generation tab's ceiling line and the Cloud tab's row have to agree
+    /// about the same model: one is not allowed to say "this model's window"
+    /// when the other already says "no window of its own".
+    func testTheCeilingExplanationNamesAModelsOwnWindowWhenItHasOne() {
+        let suite = "CloudProfileAddressingTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let address = "cloud://synthetic/registered-model"
+        XCTAssertTrue(
+            CloudContextPolicy.setOverride(
+                model: "registered-model",
+                window: 128_000,
+                providerId: "synthetic",
+                defaults: defaults
+            )
+        )
+        let explanation = maxOutputCeilingExplanation(
+            for: nil,
+            fallbackAddress: address,
+            defaults: defaults
+        )
+        XCTAssertTrue(
+            explanation.contains("this model's 128,000-token context window"),
+            "a recorded window is the model's own fact, got: \(explanation)"
+        )
+        XCTAssertFalse(explanation.contains("fallback"))
+    }
+
+    /// A stored value above the ceiling is KEPT on every backend, but no
+    /// backend sends it: the cloud route clamps through `replyBudget`, a local
+    /// turn's allocation is lowered by `turnFit`, and the on-device turn is
+    /// clamped before the framework sees it. The note has to say which one,
+    /// because "the engine still honours it" was false on all three.
+    func testTheOverCeilingNoteNamesWhatEachBackendDoesWithTheSavedValue() {
+        let suite = "CloudProfileAddressingTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        defaults.set(200_000, forKey: CloudContextPolicy.globalWindowKey)
+        let cloudCeiling = resolveNonLocalMaxOutputCeiling(
+            model: nil,
+            fallbackAddress: "cloud://synthetic/unregistered-model",
+            defaults: defaults
+        )!
+        let cloud = maxOutputOverCeilingExplanation(
+            savedTokens: 262_144,
+            ceiling: cloudCeiling,
+            for: nil,
+            fallbackAddress: "cloud://synthetic/unregistered-model",
+            defaults: defaults
+        )
+        XCTAssertTrue(cloud.contains("262,144"), "the saved value is named, got: \(cloud)")
+        XCTAssertTrue(cloud.contains("\(cloudCeiling.formatted())-token ceiling"), "the ceiling is named")
+        XCTAssertTrue(cloud.contains("cloud turn lowers the reply budget"), cloud)
+        XCTAssertFalse(cloud.contains("still honours"), "the send path does lower it: \(cloud)")
+
+        let onDevice = maxOutputOverCeilingExplanation(
+            savedTokens: 262_144,
+            ceiling: AppleFoundationModelService.maxResponseTokenCeiling,
+            for: nil,
+            fallbackAddress: AppleFoundationModelService.modelPath,
+            defaults: defaults
+        )
+        XCTAssertTrue(onDevice.contains("on-device turn clamps it"), onDevice)
+
+        let local = maxOutputOverCeilingExplanation(
+            savedTokens: 262_144,
+            ceiling: KVCacheProvisioning.localMaxOutputTokens(config: nil),
+            for: nil,
+            fallbackAddress: "/tmp/local-model",
+            defaults: defaults
+        )
+        XCTAssertTrue(local.contains("local turn lowers the allocation"), local)
+        XCTAssertTrue(local.contains("KV budget"), local)
+    }
+
+    /// The Cloud tab's Save button validates with the reader's own parser now.
+    /// A second parser is how the validator and the reader drift: the button
+    /// would accept a value the parser drops, store it, and the row would then
+    /// read it back as absent while the ceiling never moved.
+    func testTheSavePathValidatesWithTheReadersParser() {
+        let suite = "CloudProfileAddressingTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        // Both separator spellings the reader tolerates are accepted…
+        XCTAssertEqual(CloudContextPolicy.parseWindowValue("1,048,576"), 1_048_576)
+        XCTAssertEqual(CloudContextPolicy.parseWindowValue("1_048_576"), 1_048_576)
+        XCTAssertEqual(CloudContextPolicy.parseWindowValue("  65536  "), 65_536)
+        // …and what it refuses can never be stored by the save either, because
+        // the button now asks this function.
+        XCTAssertNil(CloudContextPolicy.parseWindowValue("12k"))
+        XCTAssertNil(CloudContextPolicy.parseWindowValue(""))
+        XCTAssertNil(CloudContextPolicy.parseWindowValue("1,04,576"))
+
+        // Round trip: what the parser accepts is what the store holds.
+        let parsed = CloudContextPolicy.parseWindowValue("1,048,576")!
+        XCTAssertTrue(
+            CloudContextPolicy.setOverride(model: "m", window: parsed, providerId: "p", defaults: defaults)
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.overrides(for: "p", defaults: defaults)["m"],
+            1_048_576,
+            "a value the parser accepted must read back as the same window"
         )
     }
 

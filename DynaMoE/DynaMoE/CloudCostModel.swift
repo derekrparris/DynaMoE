@@ -610,7 +610,13 @@ public nonisolated enum CloudContextPolicy {
 
     /// Parses a positive integer window, tolerating ASCII thousands separators
     /// (`1,048,576` or `1_048_576`).
-    private static func parseWindowValue(_ raw: String) -> Int? {
+    ///
+    /// Public so the Cloud tab's Save button validates with the READER's parser
+    /// instead of a second one. A view that worked the number out for itself
+    /// accepted values this reader drops, which stored a window that then read
+    /// back as absent — the save looked like it landed and the ceiling never
+    /// moved.
+    public static func parseWindowValue(_ raw: String) -> Int? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if let direct = Int(trimmed) {
             return direct
@@ -682,10 +688,52 @@ public nonisolated enum CloudContextPolicy {
         providerId: String,
         defaults: UserDefaults = .standard
     ) -> Int? {
-        resolvedWindow(
-            recorded: overrides(for: providerId, defaults: defaults)[modelId],
-            defaults: defaults
-        )
+        windowSource(forModelId: modelId, providerId: providerId, defaults: defaults).window
+    }
+
+    /// Where a model's resolved window came from.
+    ///
+    /// The number alone cannot say it, and the difference is not cosmetic: a
+    /// window the model RECORDED is a fact about that model, while a window the
+    /// single global fallback supplied belongs to whichever model the operator
+    /// had in mind when they set it. `maximumOutputTokens` prices both the same
+    /// way, but a row that explains the ceiling has to name the right one or it
+    /// asserts a fact the store does not hold (`#95` review).
+    public enum WindowSource: Equatable, Sendable {
+        /// The model's own recorded window.
+        case model(Int)
+        /// No per-model value; the global fallback supplied this one.
+        case global(Int)
+        /// Nobody recorded anything, so there is no window to price against.
+        case none
+
+        /// The window the send path will actually use, if any.
+        public var window: Int? {
+            switch self {
+            case .model(let window), .global(let window): return window
+            case .none: return nil
+            }
+        }
+    }
+
+    /// One model's window together with where it came from.
+    ///
+    /// Written against the same two reads `window(forModelId:providerId:)` makes,
+    /// and the number it carries is that function's answer: the two cannot
+    /// disagree about which window applies, only about how to describe it.
+    public static func windowSource(
+        forModelId modelId: String,
+        providerId: String,
+        defaults: UserDefaults = .standard
+    ) -> WindowSource {
+        if let recorded = overrides(for: providerId, defaults: defaults)[modelId],
+           recorded >= minimumPlausibleWindow {
+            return .model(recorded)
+        }
+        if let global = globalWindow(defaults: defaults) {
+            return .global(global)
+        }
+        return .none
     }
 
     /// The single global fallback value, or nil when none is set. Exposed so a
@@ -708,9 +756,14 @@ public nonisolated enum CloudContextPolicy {
     ///
     /// This is the identity a SwiftUI `task(id:)` needs to re-resolve a ceiling
     /// when a window is edited in a different pane of the same window: the
-    /// provider's stored entries (unparsed, so a typo that changes nothing about
-    /// the resolved window still changes nothing here) plus the global fallback.
-    /// Nil for a non-cloud address, which has no such facts.
+    /// provider's stored entries EXACTLY as typed plus the global fallback.
+    ///
+    /// It carries the raw text rather than the parsed values on purpose, so a
+    /// change the reader cannot parse still moves the identity. Correcting a typo
+    /// therefore re-runs a resolution that lands on the same number — a wasted
+    /// lookup, not a wrong answer — where the parse view would have made the
+    /// correction invisible to a ceiling the next send already prices
+    /// differently. Nil for a non-cloud address, which has no such facts.
     ///
     /// `defaults` is injectable for the same reason `setOverride` and
     /// `globalWindow` take one: this is the only part of the ceiling logic that
@@ -927,7 +980,11 @@ public nonisolated enum CloudContextPolicy {
 /// because it is pure policy over recorded facts: it reads `UserDefaults` and a
 /// `DiscoveredModel`, never a view's state, and it is what the tests exercise.
 enum MaxOutputCeilingBackend {
-    case cloud(window: Int?)
+    /// A cloud turn, carrying where its window came from: the model's own
+    /// recorded value, the single global fallback, or neither. The ceiling is
+    /// the same 20% either way, but an explanation that called a fallback value
+    /// "this model's context window" would name a fact the store does not hold.
+    case cloud(window: CloudContextPolicy.WindowSource)
     case appleFoundationModel
     case local
 
@@ -939,14 +996,14 @@ enum MaxOutputCeilingBackend {
         if let model {
             if let parsed = CloudModelAddress.parseModelId(model.id)
                 ?? CloudModelAddress.parsePath(model.snapshotPath) {
-                return .cloud(window: CloudContextPolicy.window(
+                return .cloud(window: CloudContextPolicy.windowSource(
                     forModelId: parsed.providerModelId,
                     providerId: parsed.provider.id,
                     defaults: defaults
                 ))
             }
             if CloudModelAddress.isCloudModelId(model.id) || CloudModelAddress.isCloudPath(model.snapshotPath) {
-                return .cloud(window: CloudContextPolicy.globalWindow(defaults: defaults))
+                return .cloud(window: globalWindowSource(defaults: defaults))
             }
             if model.isAppleFoundationModel {
                 return .appleFoundationModel
@@ -962,16 +1019,28 @@ enum MaxOutputCeilingBackend {
         }
         if let parsed = CloudModelAddress.parseModelId(address)
             ?? CloudModelAddress.parsePath(address) {
-            return .cloud(window: CloudContextPolicy.window(
+            return .cloud(window: CloudContextPolicy.windowSource(
                 forModelId: parsed.providerModelId,
                 providerId: parsed.provider.id,
                 defaults: defaults
             ))
         }
         if CloudModelAddress.isCloudModelId(address) || CloudModelAddress.isCloudPath(address) {
-            return .cloud(window: CloudContextPolicy.globalWindow(defaults: defaults))
+            return .cloud(window: globalWindowSource(defaults: defaults))
         }
         return .local
+    }
+
+    /// A cloud id this build cannot parse into (provider, model) still has a
+    /// window only if the global fallback supplies one, and it is exactly that:
+    /// a fallback, never the model's own record.
+    private static func globalWindowSource(
+        defaults: UserDefaults
+    ) -> CloudContextPolicy.WindowSource {
+        guard let global = CloudContextPolicy.globalWindow(defaults: defaults) else {
+            return CloudContextPolicy.WindowSource.none
+        }
+        return .global(global)
     }
 }
 
@@ -984,8 +1053,8 @@ func resolveNonLocalMaxOutputCeiling(
     defaults: UserDefaults = .standard
 ) -> Int? {
     switch MaxOutputCeilingBackend.classify(model: model, fallbackAddress: fallbackAddress, defaults: defaults) {
-    case .cloud(let window):
-        return CloudContextPolicy.maximumOutputTokens(window: window)
+    case .cloud(let source):
+        return CloudContextPolicy.maximumOutputTokens(window: source.window)
     case .appleFoundationModel:
         return AppleFoundationModelService.maxResponseTokenCeiling
     case .local:
@@ -1002,15 +1071,48 @@ func maxOutputCeilingExplanation(
     defaults: UserDefaults = .standard
 ) -> String {
     switch MaxOutputCeilingBackend.classify(model: model, fallbackAddress: fallbackAddress, defaults: defaults) {
-    case .cloud(let recorded):
-        if let recorded {
-            return "Capped by 20% of this model's \(recorded.formatted())-token context window — a reply budget larger than that cannot share the window with any prompt. Record a larger window on the Cloud tab to raise it."
-        }
+    case .cloud(.model(let recorded)):
+        return "Capped by 20% of this model's \(recorded.formatted())-token context window — a reply budget larger than that cannot share the window with any prompt. Record a larger window on the Cloud tab to raise it."
+    case .cloud(.global(let fallback)):
+        return "No window of its own is recorded for this model, so the global \(fallback.formatted())-token fallback applies and caps the reply at 20% of it. Record a window for this model on the Cloud tab to price it against its own context."
+    case .cloud(.none):
         return "No context window is recorded for this model, so the reply budget is held to \(CloudContextPolicy.unknownWindowReplyCeiling.formatted()) tokens. Record its window on the Cloud tab to raise the ceiling to 20% of it."
     case .appleFoundationModel:
         return "Capped by the on-device model's own response limit (\(AppleFoundationModelService.maxResponseTokenCeiling.formatted()) tokens); a larger value is clamped before the framework sees it."
     case .local:
         return "Capped by this checkpoint's own position limit. The KV cache budget also lowers the effective ceiling for a long prompt."
+    }
+}
+
+/// Explains a STORED Max Output Tokens value that sits above the ceiling shown
+/// for its model, and what a turn will actually do with it.
+///
+/// Every backend keeps the saved number and lowers the turn, so the note must
+/// not promise that the value is sent: a cloud turn's `max_tokens` goes through
+/// `CloudContextPolicy.replyBudget`, a local turn's allocation is lowered by
+/// `KVCacheProvisioning.turnFit` (which logs `.maxTokensReduced`), and the
+/// on-device turn is clamped before the framework sees it. Only the stored value
+/// survives intact, which is why the note explains the number instead of the
+/// view silently rewriting it — a profile is per model, so a value saved against
+/// a wider model (or a cloud window since lowered) can legitimately sit here.
+///
+/// The sentence is shared by the Generation tab and the profile editor on
+/// purpose: unpinned, the two panes said opposite things about the same model.
+func maxOutputOverCeilingExplanation(
+    savedTokens: Int,
+    ceiling: Int,
+    for model: DiscoveredModel?,
+    fallbackAddress: String?,
+    defaults: UserDefaults = .standard
+) -> String {
+    let saved = "Saved value \(savedTokens.formatted()) exceeds this model's \(ceiling.formatted())-token ceiling. It is kept; "
+    switch MaxOutputCeilingBackend.classify(model: model, fallbackAddress: fallbackAddress, defaults: defaults) {
+    case .cloud:
+        return saved + "a cloud turn lowers the reply budget to the ceiling rather than sending more."
+    case .appleFoundationModel:
+        return saved + "an on-device turn clamps it before the framework sees it."
+    case .local:
+        return saved + "a local turn lowers the allocation to what the KV budget affords rather than generating the full number."
     }
 }
 

@@ -669,8 +669,7 @@ struct CloudProvidersSettingsView: View {
                 window: nil,
                 providerId: provider.id
             )
-        } else if let window = Int(typed.replacingOccurrences(of: ",", with: "")
-            .replacingOccurrences(of: "_", with: "")),
+        } else if let window = CloudContextPolicy.parseWindowValue(typed),
             window >= CloudContextPolicy.minimumPlausibleWindow {
             guard CloudContextPolicy.setOverride(
                 model: modelId,

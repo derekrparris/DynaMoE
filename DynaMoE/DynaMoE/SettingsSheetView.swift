@@ -568,6 +568,27 @@ struct SettingsSheetView: View {
         return localModelManager.discoveredModels.first(where: { $0.id == id })
     }
 
+    /// Whether `model` is the one the engine has installed, so a write meant for
+    /// the live session targets the right entry.
+    ///
+    /// Identity is the installed path (or the row's id) and nothing else. Four
+    /// copies of this predicate used to append
+    /// `modelConfig.modelType.localizedCaseInsensitiveContains(displayName)`,
+    /// which is true for an UNRELATED checkpoint whose folder name happens to be
+    /// a substring of the loaded family — a directory called `llama` matched any
+    /// Llama checkpoint — so "Reset to Defaults" could write into the live
+    /// session for a model that was not active, and this branch now has real
+    /// effect. The clause bought nothing: every activation path (local weights,
+    /// cloud, on-device) assigns `activeModelPath` from the row's own
+    /// `snapshotPath`, and a custom entry's `weightsEntryPath` covers a
+    /// selection pinned to a file inside the snapshot.
+    private func isActiveGenerationModel(_ model: DiscoveredModel) -> Bool {
+        guard let path = activeModelPath, !path.isEmpty else { return false }
+        return path == model.snapshotPath
+            || path == model.weightsEntryPath
+            || path == model.id
+    }
+
     /// The raw window facts for the active model's provider, so `task(id:)` can
     /// re-resolve the ceiling when a window is recorded or cleared in the Cloud
     /// pane of this same window. Nil for a non-cloud backend, which has no such
@@ -771,7 +792,7 @@ struct SettingsSheetView: View {
                 VStack(spacing: 10) {
                     ForEach(localModelManager.discoveredModels) { model in
                         let isDefault = localModelManager.defaultModelId == model.id || localModelManager.defaultModelId == model.repoId
-                        let isCurrentActive = (activeModelPath != nil && (activeModelPath == model.snapshotPath || activeModelPath == model.weightsEntryPath || (summary != nil && (modelConfig?.modelType ?? "").localizedCaseInsensitiveContains(model.displayName))))
+                        let isCurrentActive = isActiveGenerationModel(model)
                         // Virtual (cloud / on-device) entries have no snapshot on
                         // disk, so probing their sentinel path for packed experts
                         // is meaningless and hits the filesystem every render.
@@ -1160,16 +1181,19 @@ struct SettingsSheetView: View {
                 if let ceiling {
                     // The stored value can legitimately exceed the ceiling being
                     // shown: a profile is per-model and a cloud window can be
-                    // lowered after a value was saved against it. The engine
-                    // still honours the stored number, so explain it rather than
-                    // silently rewriting it — the same treatment the profile
-                    // editor gives the same case.
+                    // lowered after a value was saved against it. No backend
+                    // SENDS the stored number once it is above the ceiling — a
+                    // cloud turn's budget goes through `replyBudget` and a local
+                    // turn's allocation is lowered by `turnFit` — so the note
+                    // explains which of the two happens rather than promising
+                    // the value is honoured, which is the same treatment the
+                    // profile editor gives the same case.
                     if maxNewTokens > ceiling {
                         HStack(alignment: .top, spacing: 6) {
                             Image(systemName: "exclamationmark.triangle.fill")
                                 .font(.system(size: 9))
                                 .foregroundColor(.orange)
-                            Text("This setting (\(maxNewTokens.formatted())) exceeds the \(ceiling.formatted())-token ceiling for the selected model. It is still sent; a backend that cannot hold it lowers the allocation for that turn. Editing this control rewrites it.")
+                            Text("\(maxOutputOverCeilingExplanation(savedTokens: maxNewTokens, ceiling: ceiling, for: activeGenerationModel(), fallbackAddress: activeGenerationAddress)) Editing this control rewrites the saved value.")
                                 .font(.system(size: 9))
                                 .foregroundColor(.orange)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -2878,7 +2902,7 @@ struct SettingsSheetView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
             profileFeedbackText = nil
         }
-        let isCurrentActive = (activeModelPath != nil && (activeModelPath == model.snapshotPath || activeModelPath == model.weightsEntryPath || (summary != nil && (modelConfig?.modelType ?? "").localizedCaseInsensitiveContains(model.displayName))))
+        let isCurrentActive = isActiveGenerationModel(model)
         if isCurrentActive && type == activeProfile {
             applyDraftToActiveSession()
         }
@@ -2905,7 +2929,7 @@ struct SettingsSheetView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
             profileFeedbackText = nil
         }
-        let isCurrentActive = (activeModelPath != nil && (activeModelPath == model.snapshotPath || activeModelPath == model.weightsEntryPath || (summary != nil && (modelConfig?.modelType ?? "").localizedCaseInsensitiveContains(model.displayName))))
+        let isCurrentActive = isActiveGenerationModel(model)
         if isCurrentActive && type == activeProfile {
             // Every field EXCEPT the system prompt. Reset's job is to put the
             // session back on the profile it just restored — leaving the old
@@ -2967,7 +2991,7 @@ struct SettingsSheetView: View {
 
     @ViewBuilder
     private func modelProfileEditorSection(for model: DiscoveredModel) -> some View {
-        let isCurrentActive = (activeModelPath != nil && (activeModelPath == model.snapshotPath || activeModelPath == model.weightsEntryPath || (summary != nil && (modelConfig?.modelType ?? "").localizedCaseInsensitiveContains(model.displayName))))
+        let isCurrentActive = isActiveGenerationModel(model)
 
         VStack(alignment: .leading, spacing: 14) {
             Divider()
@@ -3131,11 +3155,12 @@ struct SettingsSheetView: View {
                         // Shown only when the draft sits above this model's
                         // ceiling: a profile is per-model, so a value saved
                         // against a wider model (or a cloud window since
-                        // lowered) can legitimately exceed the slider. The
-                        // engine still honours it, so this explains the number
-                        // instead of silently rewriting it.
+                        // lowered) can legitimately exceed the slider. No
+                        // backend sends it anyway — the launch path lowers the
+                        // turn — so this explains the number instead of
+                        // silently rewriting it.
                         if editingDraft.maxNewTokens > ceiling {
-                            Text("Saved value exceeds this model's ceiling of \(ceiling); the engine still honours it. Editing the slider lowers it.")
+                            Text("\(maxOutputOverCeilingExplanation(savedTokens: editingDraft.maxNewTokens, ceiling: ceiling, for: model, fallbackAddress: nil)) Editing the slider lowers the draft; Save stores it.")
                                 .font(.system(size: 9))
                                 .foregroundColor(.orange)
                                 .fixedSize(horizontal: false, vertical: true)

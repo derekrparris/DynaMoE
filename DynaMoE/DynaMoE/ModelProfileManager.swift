@@ -293,8 +293,18 @@ public struct GenerationProfileSettings: Codable, Equatable, Hashable {
         // Spark, DeepSeek), which is why these numbers cannot be cloud-only
         // reasoning: a local turn resolves them as its reply budget too, and
         // `turnFit` lowers the allocation rather than refusing the turn when the
-        // KV budget cannot hold `prompt + this`. On the 16 GB reference machine
-        // a long local prompt therefore clamps more often than it did at 8,192.
+        // KV budget cannot hold `prompt + this`.
+        //
+        // What a local turn pays for that is a RESERVATION, not a shorter reply.
+        // On the 16 GB reference machine the request reserves up to 8,192 more KV
+        // rows whenever the budget affords them, so `turnFit`'s effective budget
+        // (`provisioned - prompt - slack`) is equal to or larger than the old
+        // default's, never smaller; when the budget cannot afford the larger
+        // reservation the same arithmetic settles on the same floor, and it
+        // reports `.maxTokensReduced` (one `[KVCACHE] clamping max_tokens` line)
+        // a little more often. "A long prompt now clamps to a smaller reply" was
+        // the earlier wording here and is unreachable: `provisioned` only grows
+        // with the request.
         //
         // They were 8,192 / 4,096, a budget sized for a local checkpoint's KV
         // appetite, which crippled a capable remote model's ability to use the
