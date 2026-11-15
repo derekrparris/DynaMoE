@@ -2117,7 +2117,7 @@ struct SettingsSheetView: View {
                     toolSummaryCard(name: "file_write", icon: "doc.badge.plus", desc: "Creates or overwrites files with automatic parent directory creation and compiler feedback.")
                     toolSummaryCard(name: "file_edit", icon: "square.and.pencil", desc: "Performs precise anchor string search-and-replace edits with self-healing compiler diagnostics.")
                     toolSummaryCard(name: "find_files", icon: "folder.badge.gearshape", desc: "Discovers files and directories using glob matching and max depth.")
-                    toolSummaryCard(name: "grep_search", icon: "magnifyingglass", desc: "Fast regex and literal text pattern search across files using ripgrep or grep.")
+                    toolSummaryCard(name: "grep_search", icon: "magnifyingglass", desc: "Fast regex search across files using ripgrep or grep. Git-ignored files are searched; hidden and binary entries are skipped.")
                     toolSummaryCard(name: "codebase_search", icon: "sparkle.magnifyingglass", desc: "Metal GPU vector search & BM25 hybrid retrieval across indexed codebase AST chunks.")
                     toolSummaryCard(name: "spawn_subagent", icon: "person.2.badge.gearshape", desc: "Spawns isolated background subagents with dedicated roles (Codebase Researcher, Test Runner, Shader Optimizer).")
                     toolSummaryCard(name: "get_subagent_status", icon: "clock.arrow.2.circlepath", desc: "Queries live execution status, transcript steps, and completed summary of a subagent.")
