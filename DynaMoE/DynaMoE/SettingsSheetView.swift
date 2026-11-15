@@ -260,6 +260,19 @@ struct SettingsSheetView: View {
     private struct ResolvedCeiling: Equatable {
         var key: ActiveCeilingKey
         var rows: Int
+        /// The declared position limit the rows were priced against, when the
+        /// backend is a local checkpoint. Carried rather than re-read from
+        /// `modelConfig` when the explanation renders: the local ceiling is
+        /// `max(32_768, min(declared, 262_144))`, so the sentence has to name
+        /// whichever of the three binds, and the fact has to come from the same
+        /// read as the number or the two can describe different checkpoints.
+        var declaredMaxPositionEmbeddings: Int?
+    }
+
+    /// One ceiling together with what it was resolved from.
+    private struct ResolvedCeilingRows {
+        var rows: Int
+        var declaredMaxPositionEmbeddings: Int?
     }
 
     // Model & Tokenizer bindings
@@ -378,7 +391,10 @@ struct SettingsSheetView: View {
                         // shown, and again whenever the active model or its
                         // backend changes. Both are actions, not `body` work: a
                         // cloud ceiling rebuilds the provider registry and a
-                        // local one may read `config.json`.
+                        // local one may read `config.json`. (`.task` inherits
+                        // `MainActor`, so the read is off `body` rather than off
+                        // the main thread — the files are small and it is once
+                        // per key change, which is why that is enough.)
                         //
                         // The resolved key is stored WITH the number, so the
                         // panel can tell "this ceiling is the one for the model
@@ -388,8 +404,12 @@ struct SettingsSheetView: View {
                         // rather than a placeholder number.
                         .task(id: activeCeilingKey) {
                             let key = activeCeilingKey
-                            let rows = resolveActiveModelCeiling()
-                            activeCeiling = ResolvedCeiling(key: key, rows: rows)
+                            let resolved = resolveActiveModelCeiling()
+                            activeCeiling = ResolvedCeiling(
+                                key: key,
+                                rows: resolved.rows,
+                                declaredMaxPositionEmbeddings: resolved.declaredMaxPositionEmbeddings
+                            )
                         }
                 case .memory:
                     memorySettingsSection
@@ -594,6 +614,11 @@ struct SettingsSheetView: View {
     /// pane of this same window. Nil for a non-cloud backend, which has no such
     /// facts. Two reads of a defaults key, cheap enough for a body pass, and one
     /// string that already exists in the domain rather than a copy of its parse.
+    ///
+    /// There is no publisher behind this: the invalidation is that switching
+    /// tabs re-evaluates this view's `body`, which recomputes the key. A window
+    /// edited in the Cloud pane therefore re-resolves the ceiling on the way
+    /// back, not the instant it is saved.
     private var activeCloudWindowFacts: String? {
         cloudWindowFacts(for: activeGenerationAddress)
     }
@@ -630,6 +655,18 @@ struct SettingsSheetView: View {
         return activeCeiling.rows
     }
 
+    /// The declared position limit `activeModelCeilingRows` was resolved from,
+    /// for the sentence beneath it.
+    ///
+    /// Nil when there is no ceiling for the model on screen yet, which is a real
+    /// state and not "the checkpoint declared nothing": the explanation then
+    /// says the config is not loaded rather than asserting a position limit from
+    /// the model this pane was previously showing.
+    private var activeDeclaredMaxPositionEmbeddings: Int? {
+        guard let activeCeiling, activeCeiling.key == activeCeilingKey else { return nil }
+        return activeCeiling.declaredMaxPositionEmbeddings
+    }
+
     /// The Max Output Tokens ceiling for the ACTIVE model.
     ///
     /// Two backends answer to different limits, and a single flat number was
@@ -640,23 +677,32 @@ struct SettingsSheetView: View {
     ///
     /// Called from `.task(id:)` rather than `body`: the fallback path (no
     /// discovered row) reads the checkpoint `config.json`.
-    private func resolveActiveModelCeiling() -> Int {
+    private func resolveActiveModelCeiling() -> ResolvedCeilingRows {
         guard let model = activeGenerationModel() else {
             if let nonLocal = resolveNonLocalMaxOutputCeiling(
                 model: nil,
                 fallbackAddress: activeGenerationAddress
             ) {
-                return nonLocal
+                return ResolvedCeilingRows(rows: nonLocal, declaredMaxPositionEmbeddings: nil)
             }
             // `modelConfig` is nil while a local load is in flight, and
             // `activeModelPath` is assigned BEFORE the detached load begins, so
             // a checkpoint that is still loading would otherwise advertise the
             // policy floor rather than its own position limit.
-            return KVCacheProvisioning.localMaxOutputTokens(
-                config: localConfig(atPath: activeModelPath) ?? modelConfig
+            let config = localConfig(atPath: activeModelPath) ?? modelConfig
+            return ResolvedCeilingRows(
+                rows: KVCacheProvisioning.localMaxOutputTokens(config: config),
+                declaredMaxPositionEmbeddings: config?.declaredMaxPositionEmbeddings
             )
         }
-        return ceilingRows(for: model)
+        if let nonLocal = resolveNonLocalMaxOutputCeiling(model: model, fallbackAddress: nil) {
+            return ResolvedCeilingRows(rows: nonLocal, declaredMaxPositionEmbeddings: nil)
+        }
+        let config = localConfig(for: model)
+        return ResolvedCeilingRows(
+            rows: KVCacheProvisioning.localMaxOutputTokens(config: config),
+            declaredMaxPositionEmbeddings: config?.declaredMaxPositionEmbeddings
+        )
     }
 
     /// The inputs the profile editor's ceiling depends on, as a value the
@@ -686,11 +732,17 @@ struct SettingsSheetView: View {
         if let nonLocal = resolveNonLocalMaxOutputCeiling(model: model, fallbackAddress: nil) {
             return nonLocal
         }
+        return KVCacheProvisioning.localMaxOutputTokens(config: localConfig(for: model))
+    }
+
+    /// The checkpoint `config.json` a LOCAL registry row prices its ceiling
+    /// against: the one on disk, falling back to the engine's own config only
+    /// when the row IS the loaded model.
+    private func localConfig(for model: DiscoveredModel) -> ModelConfig? {
         let isActive = activeModelPath != nil
             && (activeModelPath == model.snapshotPath || activeModelPath == model.weightsEntryPath)
-        let config = localConfig(atPath: model.snapshotPath)
+        return localConfig(atPath: model.snapshotPath)
             ?? (isActive ? modelConfig : nil)
-        return KVCacheProvisioning.localMaxOutputTokens(config: config)
     }
 
     /// The `config.json` for a LOCAL address, read from disk.
@@ -718,7 +770,11 @@ struct SettingsSheetView: View {
     /// recorded window" for a model that has none would name a fact that does
     /// not exist.
     private func ceilingExplanation(for model: DiscoveredModel?) -> String {
-        maxOutputCeilingExplanation(for: model, fallbackAddress: activeGenerationAddress)
+        maxOutputCeilingExplanation(
+            for: model,
+            fallbackAddress: activeGenerationAddress,
+            declaredMaxPositionEmbeddings: activeDeclaredMaxPositionEmbeddings
+        )
     }
 
     /// Label-left settings row carrying a slider-plus-field numeric control,

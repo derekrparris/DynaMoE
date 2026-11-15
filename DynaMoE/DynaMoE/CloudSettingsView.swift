@@ -505,10 +505,19 @@ struct CloudProvidersSettingsView: View {
         /// value this build cannot parse is visible and correctable instead of
         /// silently absent.
         var recordedText: String { rawRecorded ?? "" }
-        /// Whether the stored entry exists but is not a window this build can
-        /// read. Drives the subtitle, which must not claim "no window recorded"
-        /// for a model that plainly has one.
-        var hasUnreadableRecord: Bool { rawRecorded != nil && recorded == nil }
+        /// Whether the text the FIELD shows is a value this build cannot read.
+        ///
+        /// Asked of the raw text alone, not of `recorded == nil`. A duplicated
+        /// model id whose later entry is junk (`a=200000; a=12k`) stores a field
+        /// reading `12k` while the parse view — which takes the last READABLE
+        /// entry — reports 200,000; deriving this from the parse view said the
+        /// row was healthy and printed "200,000 tokens" beside a field holding
+        /// `12k`. Both facts are true and the subtitle now states both: the
+        /// field's text is unusable, and the budget comes from the entry that is:
+        /// the subtitle names the rejected text first, then that budget.
+        var hasUnreadableRecord: Bool {
+            rawRecorded != nil && !CloudContextPolicy.isUsableWindow(rawRecorded)
+        }
         var budget: Int {
             CloudContextPolicy.maximumOutputTokens(window: resolvedWindow)
         }
@@ -562,13 +571,15 @@ struct CloudProvidersSettingsView: View {
         // window at all" are two different budgets.
         SettingsRow(
             title: spec.displayName,
-            subtitle: entry.recorded.map { "\($0.formatted()) tokens — reply budget \(budget.formatted())." }
-                ?? (entry.hasUnreadableRecord
-                    // A stored entry this build cannot read is NOT "no window
-                    // recorded": saying so beside a field holding `12k` is the
-                    // contradiction that made the typo look like an empty row.
-                    ? "Stored value “\(entry.recordedText)” is not a usable window — fix it or clear the field. Reply budget \(budget.formatted())."
-                    : (entry.resolvedWindow.map { "No window of its own — the global \($0.formatted()) applies, reply budget \(budget.formatted())." }
+            // The unreadable case comes FIRST and names the budget the turn
+            // will really use, because the two can differ: the field may hold a
+            // typo while a valid entry for the same model is what prices the
+            // send. Saying "no window recorded" beside a field holding `12k` is
+            // the contradiction that made the typo look like an empty row.
+            subtitle: entry.hasUnreadableRecord
+                ? "Stored value “\(entry.recordedText)” is not a usable window — fix it or clear the field. Reply budget \(budget.formatted())."
+                : (entry.recorded.map { "\($0.formatted()) tokens — reply budget \(budget.formatted())." }
+                    ?? (entry.resolvedWindow.map { "No window of its own — the global \($0.formatted()) applies, reply budget \(budget.formatted())." }
                         ?? "No window recorded — reply budget \(budget.formatted())."))
         ) {
             VStack(alignment: .trailing, spacing: 3) {
@@ -669,8 +680,8 @@ struct CloudProvidersSettingsView: View {
                 window: nil,
                 providerId: provider.id
             )
-        } else if let window = CloudContextPolicy.parseWindowValue(typed),
-            window >= CloudContextPolicy.minimumPlausibleWindow {
+        } else if CloudContextPolicy.isUsableWindow(typed),
+            let window = CloudContextPolicy.parseWindowValue(typed) {
             guard CloudContextPolicy.setOverride(
                 model: modelId,
                 window: window,

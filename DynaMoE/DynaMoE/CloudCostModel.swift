@@ -426,8 +426,10 @@ public nonisolated enum CloudContextPolicy {
     /// that empty field — took the clear branch and deleted it. The editor needs
     /// the text to show, and the save path needs it to refuse.
     ///
-    /// Last entry wins for a duplicated model id, matching the parse view, so a
-    /// caller can never show one value and save against another.
+    /// Last entry wins for a duplicated model id, and that is deliberately the
+    /// LAST ENTRY rather than the last readable one: this is the view the editor
+    /// shows and re-submits, so it has to be the text the operator's file ends
+    /// with. `overrides(for:)` picks differently on purpose — see its note.
     public static func rawOverrides(
         for providerId: String,
         defaults: UserDefaults = .standard
@@ -445,17 +447,31 @@ public nonisolated enum CloudContextPolicy {
     /// separated by `;`, `,` or newline. Tolerates `model@window`, grouped
     /// integers (`1,048,576`), and bare integers.
     ///
-    /// Reads through `rawOverrides(for:)` so the two views of the same key
-    /// cannot disagree about which entry is the model's.
+    /// Scans EVERY entry and keeps the last one this build can READ, which is
+    /// not the same entry `rawOverrides(for:)` shows when a duplicated model id
+    /// ends in junk (`a=200000; a=12k`): the raw view reports `12k` because that
+    /// is what the file ends with and the editor has to show it, while this view
+    /// reports 200,000 because that is the only capacity anyone recorded. Parsing
+    /// the raw view's pick instead would have dropped the model entirely and, on
+    /// the send path, silently swapped a known window for the unrecorded-window
+    /// ceiling — the under-compaction failure `window(for:providerId:)` warns
+    /// about. The two views therefore differ on which DUPLICATE they pick and on
+    /// nothing else.
+    ///
+    /// Only `setOverride` writes this key in the app (it dedupes), so a duplicate
+    /// only reaches here from an out-of-band `defaults write` or a hand-edited
+    /// sync. It is cheap to read either way.
     public static func overrides(
         for providerId: String,
         defaults: UserDefaults = .standard
     ) -> [String: Int] {
+        let raw = defaults.string(forKey: defaultsKey(for: providerId)) ?? ""
         var result: [String: Int] = [:]
-        for (model, value) in rawOverrides(for: providerId, defaults: defaults) {
-            guard let window = parseWindowValue(value),
+        for entry in splitOverrideEntries(raw) {
+            guard let parts = splitEntry(entry),
+                  let window = parseWindowValue(parts.value),
                   window >= minimumPlausibleWindow else { continue }
-            result[model] = window
+            result[parts.model] = window
         }
         return result
     }
@@ -540,6 +556,12 @@ public nonisolated enum CloudContextPolicy {
         providerId: String,
         defaults: UserDefaults = .standard
     ) -> Bool {
+        // The model id is trimmed the way `splitEntry` trims a stored entry's
+        // model, and then used in its trimmed form. An untrimmed `" a "` passed
+        // the emptiness check, then compared unequal to the `a` the split had
+        // trimmed, so a save appended a duplicate instead of replacing in place —
+        // the very duplicate this writer exists to collapse.
+        let model = model.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !model.isEmpty else { return false }
         guard let window else {
             // A clear is satisfied by the entry already being absent. The write
@@ -638,6 +660,21 @@ public nonisolated enum CloudContextPolicy {
             }
         }
         return nil
+    }
+
+    /// Whether `raw` is a window this build can READ — the exact rule
+    /// `overrides(for:)` applies, exposed so a UI that reports on stored text uses
+    /// the reader's own test instead of a second copy of it.
+    ///
+    /// The Save button already validated with `parseWindowValue` + a comparison
+    /// against `minimumPlausibleWindow`, and the Cloud tab's row was about to
+    /// grow a third copy to decide whether the field's text was usable. Three
+    /// statements of "readable" is how the validator and the reader drift: a
+    /// button that accepts a value the reader drops stores a window that reads
+    /// back as absent, while the ceiling never moves.
+    public static func isUsableWindow(_ raw: String?) -> Bool {
+        guard let raw, let window = parseWindowValue(raw) else { return false }
+        return window >= minimumPlausibleWindow
     }
 
     /// Splits one `model=window` (or `model@window`) entry at its LAST
@@ -986,13 +1023,31 @@ enum MaxOutputCeilingBackend {
     /// "this model's context window" would name a fact the store does not hold.
     case cloud(window: CloudContextPolicy.WindowSource)
     case appleFoundationModel
-    case local
+    /// A local checkpoint, carrying what actually binds its ceiling. The number
+    /// is `max(32_768, min(declared, 262_144))`, so it is NOT always the
+    /// checkpoint's own limit: an 8k checkpoint is capped by the policy floor,
+    /// 24,576 rows below what it declares. An explanation has to name the case
+    /// it is in for the same reason the cloud branch carries its `WindowSource`.
+    case local(basis: KVCacheProvisioning.LocalCeilingBasis)
 
+    /// `declaredMaxPositionEmbeddings` is asked about only for the LOCAL branch,
+    /// which is why it is optional and defaulted: the cloud and on-device
+    /// branches have no checkpoint to read it from, and their callers do not
+    /// have one either. The Settings pane passes the DECLARED limit as a value
+    /// so this stays pure — the ceiling itself was resolved in an action, and a
+    /// second `config.json` read here would be both a disk hit in `body` and a
+    /// chance for the sentence and the number to describe different checkpoints.
     static func classify(
         model: DiscoveredModel?,
         fallbackAddress: String?,
+        declaredMaxPositionEmbeddings: Int? = nil,
         defaults: UserDefaults = .standard
     ) -> MaxOutputCeilingBackend {
+        let local = MaxOutputCeilingBackend.local(
+            basis: KVCacheProvisioning.localCeilingBasis(
+                declaredMaxPositionEmbeddings: declaredMaxPositionEmbeddings
+            )
+        )
         if let model {
             if let parsed = CloudModelAddress.parseModelId(model.id)
                 ?? CloudModelAddress.parsePath(model.snapshotPath) {
@@ -1008,10 +1063,10 @@ enum MaxOutputCeilingBackend {
             if model.isAppleFoundationModel {
                 return .appleFoundationModel
             }
-            return .local
+            return local
         }
         guard let address = fallbackAddress, !address.isEmpty else {
-            return .local
+            return local
         }
         if address == AppleFoundationModelService.modelPath
             || address == AppleFoundationModelService.modelId {
@@ -1028,7 +1083,7 @@ enum MaxOutputCeilingBackend {
         if CloudModelAddress.isCloudModelId(address) || CloudModelAddress.isCloudPath(address) {
             return .cloud(window: globalWindowSource(defaults: defaults))
         }
-        return .local
+        return local
     }
 
     /// A cloud id this build cannot parse into (provider, model) still has a
@@ -1065,12 +1120,26 @@ func resolveNonLocalMaxOutputCeiling(
 /// Explains why the Max Output Tokens ceiling sits where it does, handling both
 /// discovered entries and fallback addresses (e.g., an ad-hoc cloud model or
 /// the on-device model before a scan completes).
+///
+/// `declaredMaxPositionEmbeddings` is the DECLARED limit of whatever checkpoint
+/// the row is about, for the same reason `classify` takes it: the local ceiling
+/// is `max(32_768, min(declared, 262_144))`, so a checkpoint under the floor is
+/// capped by the POLICY, not by its own positions, and the two cases need
+/// different sentences. Saying "capped by this checkpoint's own position limit"
+/// beside a 32,768 slider told every 8k model the opposite of what was binding
+/// it (`#95` review).
 func maxOutputCeilingExplanation(
     for model: DiscoveredModel?,
     fallbackAddress: String?,
+    declaredMaxPositionEmbeddings: Int? = nil,
     defaults: UserDefaults = .standard
 ) -> String {
-    switch MaxOutputCeilingBackend.classify(model: model, fallbackAddress: fallbackAddress, defaults: defaults) {
+    switch MaxOutputCeilingBackend.classify(
+        model: model,
+        fallbackAddress: fallbackAddress,
+        declaredMaxPositionEmbeddings: declaredMaxPositionEmbeddings,
+        defaults: defaults
+    ) {
     case .cloud(.model(let recorded)):
         return "Capped by 20% of this model's \(recorded.formatted())-token context window — a reply budget larger than that cannot share the window with any prompt. Record a larger window on the Cloud tab to raise it."
     case .cloud(.global(let fallback)):
@@ -1079,8 +1148,32 @@ func maxOutputCeilingExplanation(
         return "No context window is recorded for this model, so the reply budget is held to \(CloudContextPolicy.unknownWindowReplyCeiling.formatted()) tokens. Record its window on the Cloud tab to raise the ceiling to 20% of it."
     case .appleFoundationModel:
         return "Capped by the on-device model's own response limit (\(AppleFoundationModelService.maxResponseTokenCeiling.formatted()) tokens); a larger value is clamped before the framework sees it."
-    case .local:
-        return "Capped by this checkpoint's own position limit. The KV cache budget also lowers the effective ceiling for a long prompt."
+    case .local(let basis):
+        return localCeilingExplanation(basis)
+    }
+}
+
+/// The local branch's sentence, split out so each case is written once and the
+/// text cannot drift from `KVCacheProvisioning.localCeilingBasis`'s switch.
+private func localCeilingExplanation(_ basis: KVCacheProvisioning.LocalCeilingBasis) -> String {
+    let budget = "The KV cache budget also lowers the effective ceiling for a long prompt."
+    switch basis {
+    case .policyFloor(let declared):
+        // The number shown is the floor, which is LARGER than the checkpoint's
+        // own limit. Both facts are stated, because "held to 32,768" reads as a
+        // cap the checkpoint asked for otherwise.
+        return "This checkpoint declares \(declared.formatted()) positions, below the \(KVCacheProvisioning.maxProvisionedRows.formatted())-token policy floor every local model is provisioned at, so the floor is what sets the ceiling. \(budget)"
+    case .checkpointPositions(let declared):
+        return "Capped by this checkpoint's own \(declared.formatted())-position limit. \(budget)"
+    case .policyMaximum(let declared):
+        return "This checkpoint declares \(declared.formatted()) positions, above the \(KVCacheProvisioning.absoluteMaxProvisionedRows.formatted())-row maximum this app will provision for a local model, so that maximum is what sets the ceiling. \(budget)"
+    case .unknown:
+        // No declared limit was read, which is two situations in one sentence:
+        // a local model whose `config.json` has not landed yet, and a fallback
+        // address with no checkpoint behind it at all. Both are provisioned at
+        // the floor, so the sentence states that rather than claiming a
+        // position limit either of them does not have.
+        return "This checkpoint's position limit has not been read, so the \(KVCacheProvisioning.maxProvisionedRows.formatted())-token local policy floor is what a turn is provisioned at until it is. \(budget)"
     }
 }
 

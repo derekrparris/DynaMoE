@@ -372,7 +372,14 @@ struct HelpAndSettingsGuideView: View {
                         Text("Coder")
                             .font(.headline).bold()
                     }
-                    Text("• Temperature: 0.60\n• Top-P: 0.95 | Top-K: 20\n• Min-P: 0.00\n• Repetition Penalty: 1.00\n• Presence Penalty: 0.00\n• Max Tokens: 16,384\n• JetSpec: Enabled")
+                    // The budget is READ from the profile it describes, not
+                    // typed again. It used to be a literal directly under the
+                    // comment in `ModelProfileManager` arguing that a literal
+                    // there would be "a second copy of a number whose whole job
+                    // is to be the budget an unrecorded-window turn is clamped
+                    // to" — and this pane is code, not a doc file, so nothing
+                    // would have caught the two drifting apart.
+                    Text("• Temperature: 0.60\n• Top-P: 0.95 | Top-K: 20\n• Min-P: 0.00\n• Repetition Penalty: 1.00\n• Presence Penalty: 0.00\n• Max Tokens: \(genericCloudCoderBudget.formatted())\n• JetSpec: Enabled")
                         .font(.system(size: 12, design: .monospaced))
                         .lineSpacing(4)
                 }
@@ -388,7 +395,7 @@ struct HelpAndSettingsGuideView: View {
                         Text("Assistant")
                             .font(.headline).bold()
                     }
-                    Text("• Temperature: 0.70\n• Top-P: 0.90 | Top-K: 50\n• Min-P: 0.05\n• Repetition Penalty: 1.10\n• Presence Penalty: 0.00\n• Max Tokens: 8,192\n• JetSpec: Enabled")
+                    Text("• Temperature: 0.70\n• Top-P: 0.90 | Top-K: 50\n• Min-P: 0.05\n• Repetition Penalty: 1.10\n• Presence Penalty: 0.00\n• Max Tokens: \(genericCloudAssistantBudget.formatted())\n• JetSpec: Enabled")
                         .font(.system(size: 12, design: .monospaced))
                         .lineSpacing(4)
                 }
@@ -615,12 +622,32 @@ struct HelpAndSettingsGuideView: View {
 
             faqCard(
                 "How do I reset my settings to default?",
-                "Open Settings (⌘,) -> Models, choose 'Configure Profiles…' from your active model's ellipsis menu, and click 'Reset to Defaults'. This restores factory-tuned parameters for the profile you are currently editing (Coder or Assistant), not both at once; repeat for the other profile if needed. The running session keeps its current values until you click 'Apply to Session'."
+                "Open Settings (⌘,) -> Models, choose 'Configure Profiles…' from your active model's ellipsis menu, and click 'Reset to Defaults'. This restores factory-tuned parameters for the profile you are currently editing (Coder or Assistant), not both at once; repeat for the other profile if needed. If that model is the one currently loaded, the running session's sampling settings and Max Output Tokens follow immediately (the system prompt does not — it has its own Reset in the composer). For any other model the session is unchanged until you click 'Apply to Session'."
             )
         }
     }
 
+    // MARK: - Budgets quoted from the profiles themselves
+
+    /// The generic (cloud) profile's two budgets, as the Help pane quotes them.
+    ///
+    /// Read through `GenerationProfileSettings.defaultFor(type:)` rather than
+    /// restated: that is the profile every cloud model — and every ungated local
+    /// checkpoint — actually runs on, and its coder budget IS
+    /// `CloudContextPolicy.unknownWindowReplyCeiling`. A hand-typed copy here was
+    /// the same second-copy-of-a-load-bearing-number problem the profile default
+    /// was written to avoid, and nothing checked it: the Help coverage test
+    /// counts topic names, not figures.
+    private var genericCloudCoderBudget: Int {
+        GenerationProfileSettings.defaultFor(type: .coder).maxNewTokens
+    }
+
+    private var genericCloudAssistantBudget: Int {
+        GenerationProfileSettings.defaultFor(type: .assistant).maxNewTokens
+    }
+
     // MARK: - Helper Views & Components
+
     private func headerBadge(_ text: String, color: Color) -> some View {
         Text(text)
             .font(.system(size: 11, weight: .bold))

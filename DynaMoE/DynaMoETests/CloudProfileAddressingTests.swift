@@ -265,20 +265,18 @@ final class CloudProfileAddressingTests: XCTestCase {
         XCTAssertNil(defaults.string(forKey: CloudContextPolicy.defaultsKey(for: "p")))
     }
 
-    /// The presets feed `ForEach(_:id: \.self)`, so they must stay unique, never
-    /// exceed the ceiling, and never offer a button below the slider's own floor
-    /// — which would set a value the control immediately clamps back up.
+    /// The presets feed `ForEach(_:id: \.self)`, so they must never offer a
+    /// button below the slider's own floor — which would set a value the control
+    /// immediately clamps back up — and the ceiling must still be the top rung.
     ///
-    /// The uniqueness and ceiling properties are pinned by
-    /// `CloudProviderLogicTests.testMaxTokenPresetsRespectTheCeilingAndStayUnique`;
-    /// this covers the part that is about the FLOOR, which that test does not
-    /// touch.
+    /// Uniqueness and the ceiling bound are pinned by
+    /// `CloudProviderLogicTests.testMaxTokenPresetsRespectTheCeilingAndStayUnique`,
+    /// which iterates the same ceilings; this covers only the part that is about
+    /// the FLOOR, which that test does not touch. The ceiling loop here was a
+    /// duplicate of it and has been dropped.
     func testMaxTokenPresetsRespectTheSliderFloor() {
-        for ceiling in [16_384, 32_768, 40_000, 262_144] {
-            let presets = maxTokenPresets(upTo: ceiling)
-            XCTAssertTrue(presets.allSatisfy { $0 >= maxTokenSliderFloor }, "no preset below the floor")
-            XCTAssertEqual(presets.last, ceiling, "the ceiling is the top rung at \(ceiling)")
-        }
+        XCTAssertTrue(maxTokenPresets(upTo: 40_000).allSatisfy { $0 >= maxTokenSliderFloor })
+        XCTAssertTrue(maxTokenPresets(upTo: 262_144).allSatisfy { $0 >= maxTokenSliderFloor })
 
         // A ceiling under the floor is a backend that does not exist today. It
         // must still produce a usable control rather than a button below the
@@ -342,8 +340,8 @@ final class CloudProfileAddressingTests: XCTestCase {
     }
 
     /// The raw view is what the editor shows and what a Save re-submits; the
-    /// parse view is what the send path uses. They must disagree about exactly
-    /// one thing — whether an unreadable entry exists — and agree on the rest.
+    /// parse view is what the send path uses. They disagree about what they
+    /// cannot read — which is the point — and agree on everything else.
     func testRawOverridesKeepUnreadableEntriesTheParseViewDrops() {
         let suite = "CloudProfileAddressingTests-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
@@ -362,11 +360,153 @@ final class CloudProfileAddressingTests: XCTestCase {
             "the raw view reports what is stored, including what it cannot read"
         )
 
-        // Last entry wins in both views, so a row can never show one value and
-        // save against another.
+        // Last entry wins in both views when both are readable.
         defaults.set("m=1000; m=2000", forKey: CloudContextPolicy.defaultsKey(for: "q"))
         XCTAssertEqual(CloudContextPolicy.rawOverrides(for: "q", defaults: defaults)["m"], "2000")
         XCTAssertEqual(CloudContextPolicy.overrides(for: "q", defaults: defaults)["m"], 2_000)
+    }
+
+    /// A duplicated model id whose LAST entry is unreadable must not take the
+    /// whole model down with it.
+    ///
+    /// The parse view used to be derived from the raw view, so a top-level
+    /// last-one-wins merge handed it `12k`, its parse dropped the entry, and the
+    /// model vanished from the parse view entirely — on the SEND path, where
+    /// `window(forModelId:providerId:)` feeds `replyBudget` and `shouldCompact`.
+    /// A hand-written `defaults write` with a duplicate therefore swapped a known
+    /// window for the unrecorded-window fallback and silently disabled the
+    /// pre-flight compaction check: the under-compaction failure `window()`'s own
+    /// documentation warns about.
+    ///
+    /// The two views now differ deliberately — the raw view reports what the file
+    /// ends with because that is what the editor must show and re-submit, the
+    /// parse view reports the last entry anyone could READ — so this pins both
+    /// halves of the disagreement.
+    func testADuplicateUnreadableEntryDoesNotHideTheReadableOne() {
+        let suite = "CloudProfileAddressingTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let key = CloudContextPolicy.defaultsKey(for: "p")
+
+        // Junk last: the editor shows the junk, the send path keeps the window.
+        defaults.set("a=200000; a=12k", forKey: key)
+        XCTAssertEqual(
+            CloudContextPolicy.rawOverrides(for: "p", defaults: defaults)["a"],
+            "12k",
+            "the editor shows the text the file ends with, so the typo is fixable"
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.overrides(for: "p", defaults: defaults)["a"],
+            200_000,
+            "the send path keeps the last READABLE window rather than losing the model"
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.window(forModelId: "a", providerId: "p", defaults: defaults),
+            200_000,
+            "the resolved window follows the parse view, so the ceiling does too"
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.windowSource(forModelId: "a", providerId: "p", defaults: defaults),
+            .model(200_000)
+        )
+
+        // A sub-plausible last entry is dropped by the reader exactly the way an
+        // unreadable one is, and must resolve the same way.
+        defaults.set("b=200000; b=512", forKey: key)
+        XCTAssertEqual(CloudContextPolicy.overrides(for: "p", defaults: defaults)["b"], 200_000)
+        XCTAssertEqual(CloudContextPolicy.rawOverrides(for: "p", defaults: defaults)["b"], "512")
+
+        // Nothing readable at all is still absent, not a guess.
+        defaults.set("c=12k; c=oops", forKey: key)
+        XCTAssertNil(CloudContextPolicy.overrides(for: "p", defaults: defaults)["c"])
+        XCTAssertNil(CloudContextPolicy.window(forModelId: "c", providerId: "p", defaults: defaults))
+    }
+
+    /// `setOverride` trims the model id the way the reader trims a stored entry's.
+    ///
+    /// An untrimmed `" a "` passed the emptiness check and then compared unequal
+    /// to the `a` `splitEntry` had trimmed, so saving it APPENDED a duplicate
+    /// instead of replacing in place — reaching the duplicate case above through
+    /// the API rather than through `defaults write`.
+    func testSetOverrideTreatsAnUntrimmedModelIdAsTheSameModel() {
+        let suite = "CloudProfileAddressingTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let key = CloudContextPolicy.defaultsKey(for: "p")
+
+        XCTAssertTrue(
+            CloudContextPolicy.setOverride(model: "a", window: 128_000, providerId: "p", defaults: defaults)
+        )
+        XCTAssertTrue(
+            CloudContextPolicy.setOverride(
+                model: "  a\n",
+                window: 200_000,
+                providerId: "p",
+                defaults: defaults
+            )
+        )
+        XCTAssertEqual(
+            defaults.string(forKey: key),
+            "a=200000",
+            "the padded id replaces the stored entry instead of appending a second one"
+        )
+
+        // Whitespace-only is not a model id at all, and still reports false.
+        XCTAssertFalse(
+            CloudContextPolicy.setOverride(model: "   ", window: 128_000, providerId: "p", defaults: defaults)
+        )
+        XCTAssertEqual(defaults.string(forKey: key), "a=200000")
+    }
+
+    /// "Is this text a window the app can read" is asked in three places — the
+    /// Save button, the Cloud tab's unreadable-record note, and the reader
+    /// itself — so it lives in ONE place and this pins the three together.
+    ///
+    /// The Save button's validation and the reader are the pair that matters: a
+    /// button that accepts a value the reader drops stores a window that then
+    /// reads back as absent while the ceiling never moves.
+    func testTheUsableWindowTestIsTheReadersOwnRule() {
+        let suite = "CloudProfileAddressingTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let key = CloudContextPolicy.defaultsKey(for: "p")
+
+        for text in ["128000", "1,048,576", "1_048_576", " 8192 "] {
+            XCTAssertTrue(CloudContextPolicy.isUsableWindow(text), text)
+            defaults.set("m=\(text)", forKey: key)
+            XCTAssertEqual(
+                CloudContextPolicy.overrides(for: "p", defaults: defaults)["m"],
+                CloudContextPolicy.parseWindowValue(text),
+                "the button and the reader accept exactly the same text: \(text)"
+            )
+        }
+        for text in [nil, "", "12k", "0", "512", "abc", "1,2,3"] {
+            XCTAssertFalse(CloudContextPolicy.isUsableWindow(text), String(describing: text))
+            defaults.set("m=\(text ?? "")", forKey: key)
+            XCTAssertNil(
+                CloudContextPolicy.overrides(for: "p", defaults: defaults)["m"],
+                "the button and the reader reject exactly the same text: \(String(describing: text))"
+            )
+        }
+    }
+
+    /// The Help pane quotes the generic profile's budgets, so it has to read
+    /// them from that profile. The two figures it printed were literals under a
+    /// comment in `ModelProfileManager` arguing against exactly that, and the
+    /// Help coverage test counts topic names, not numbers.
+    func testTheHelpPaneQuotesTheGenericProfilesOwnBudgets() {
+        let coder = GenerationProfileSettings.defaultFor(type: .coder)
+        let assistant = GenerationProfileSettings.defaultFor(type: .assistant)
+
+        // The coder budget IS the unrecorded-window ceiling; the Help pane shows
+        // whatever this resolves to, so pinning the identity pins the text.
+        XCTAssertEqual(coder.maxNewTokens, CloudContextPolicy.unknownWindowReplyCeiling)
+        XCTAssertEqual(assistant.maxNewTokens, coder.maxNewTokens / 2)
+
+        // The formatted strings the pane renders, so a change to either budget
+        // shows up as a change here rather than as a silently stale sentence.
+        XCTAssertEqual(coder.maxNewTokens.formatted(), "16,384")
+        XCTAssertEqual(assistant.maxNewTokens.formatted(), "8,192")
     }
 
     /// `setOverride`'s return answers ONE question: does the store now hold the
@@ -525,14 +665,107 @@ final class CloudProfileAddressingTests: XCTestCase {
             )
         }
 
-        // Local fallback defers to KVCacheProvisioning and local checkpoint explanation.
+        // Local fallback defers to KVCacheProvisioning. Its sentence names the
+        // POLICY FLOOR rather than a position limit, because no config was read
+        // and the number shown (32,768) is not derived from one.
         XCTAssertNil(
             resolveNonLocalMaxOutputCeiling(model: nil, fallbackAddress: "/tmp/local-model", defaults: defaults)
         )
-        XCTAssertTrue(
-            maxOutputCeilingExplanation(for: nil, fallbackAddress: "/tmp/local-model", defaults: defaults)
-                .contains("checkpoint's own position limit")
+        let localExplanation = maxOutputCeilingExplanation(
+            for: nil,
+            fallbackAddress: "/tmp/local-model",
+            defaults: defaults
         )
+        XCTAssertTrue(localExplanation.contains("policy floor"), localExplanation)
+        XCTAssertFalse(
+            localExplanation.contains("checkpoint's own"),
+            "a 32,768 floor is not the checkpoint's own limit: \(localExplanation)"
+        )
+    }
+
+    /// A sub-32k checkpoint is capped by the POLICY FLOOR, not by its own
+    /// positions, and the sentence beside the slider has to say so. Every 8k
+    /// Qwen and older Llama is in this case: the ceiling shown is 32,768 — 24,576
+    /// rows ABOVE what the checkpoint declares — so "capped by this checkpoint's
+    /// own position limit" told them the opposite of what was binding.
+    func testTheLocalCeilingExplanationNamesTheFloorRatherThanASmallCheckpointsLimit() throws {
+        let suite = "CloudProfileAddressingTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let floor = KVCacheProvisioning.maxProvisionedRows
+
+        // An 8k checkpoint: the floor binds, and the sentence says so instead of
+        // claiming 8,192 positions are the ceiling.
+        let small = 8_192
+        XCTAssertEqual(KVCacheProvisioning.localMaxOutputTokens(config: nil), floor)
+        XCTAssertEqual(
+            KVCacheProvisioning.localCeilingBasis(declaredMaxPositionEmbeddings: small),
+            .policyFloor(declared: small)
+        )
+        let smallExplanation = maxOutputCeilingExplanation(
+            for: nil,
+            fallbackAddress: "/tmp/local-model",
+            declaredMaxPositionEmbeddings: small,
+            defaults: defaults
+        )
+        XCTAssertTrue(smallExplanation.contains("8,192 positions"), smallExplanation)
+        XCTAssertTrue(smallExplanation.contains("policy floor"), smallExplanation)
+        XCTAssertFalse(smallExplanation.contains("checkpoint's own"), smallExplanation)
+
+        // A checkpoint between the floor and the absolute maximum: its own
+        // declared limit IS the ceiling, and the sentence says that.
+        let wide = 131_072
+        XCTAssertEqual(
+            KVCacheProvisioning.localCeilingBasis(declaredMaxPositionEmbeddings: wide),
+            .checkpointPositions(wide)
+        )
+        let wideExplanation = maxOutputCeilingExplanation(
+            for: nil,
+            fallbackAddress: "/tmp/local-model",
+            declaredMaxPositionEmbeddings: wide,
+            defaults: defaults
+        )
+        XCTAssertTrue(wideExplanation.contains("131,072"), wideExplanation)
+        XCTAssertTrue(wideExplanation.contains("checkpoint's own"), wideExplanation)
+        XCTAssertFalse(wideExplanation.contains("policy floor"), wideExplanation)
+
+        // A checkpoint claiming more positions than this app will provision is
+        // capped by the policy MAXIMUM, which is a third fact again: 524,288
+        // positions do not make a 524,288-token ceiling.
+        let huge = 524_288
+        XCTAssertEqual(
+            KVCacheProvisioning.localCeilingBasis(declaredMaxPositionEmbeddings: huge),
+            .policyMaximum(declared: huge)
+        )
+        let hugeExplanation = maxOutputCeilingExplanation(
+            for: nil,
+            fallbackAddress: "/tmp/local-model",
+            declaredMaxPositionEmbeddings: huge,
+            defaults: defaults
+        )
+        XCTAssertTrue(hugeExplanation.contains("524,288 positions"), hugeExplanation)
+        XCTAssertTrue(
+            hugeExplanation.contains(KVCacheProvisioning.absoluteMaxProvisionedRows.formatted()),
+            hugeExplanation
+        )
+
+        // And the three cases agree with the ceiling that is actually shown, so
+        // the sentence can never explain a number the slider is not offering.
+        for declared in [small, wide, huge] {
+            let config = try JSONDecoder().decode(
+                ModelConfig.self,
+                from: Data("{\"model_type\":\"llama\",\"max_position_embeddings\":\(declared)}".utf8)
+            )
+            XCTAssertEqual(
+                KVCacheProvisioning.localCeilingBasis(config: config),
+                KVCacheProvisioning.localCeilingBasis(declaredMaxPositionEmbeddings: declared)
+            )
+            XCTAssertEqual(
+                KVCacheProvisioning.localMaxOutputTokens(config: config),
+                KVCacheProvisioning.policyMaxRows(config: config)
+            )
+        }
     }
 
     // MARK: - Which window the ceiling was priced against

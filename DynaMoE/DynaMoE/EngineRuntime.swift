@@ -924,6 +924,48 @@ enum KVCacheProvisioning {
         policyMaxRows(config: config)
     }
 
+    /// What actually BINDS the number `localMaxOutputTokens` returns.
+    ///
+    /// The ceiling is `max(32_768, min(declared, 262_144))`, so a row that
+    /// explains it cannot name one cause: for a checkpoint declaring 8,192
+    /// positions (an 8k Qwen, an older Llama) the value shown is 32,768 and the
+    /// POLICY FLOOR binds — the checkpoint's own limit is 24,576 rows smaller.
+    /// A single sentence saying "capped by this checkpoint's own position limit"
+    /// therefore told every sub-32k model the opposite of what was clamping it.
+    ///
+    /// This is the local counterpart of `CloudContextPolicy.WindowSource`: an
+    /// explanation that cannot name its own cause has to report which case it is
+    /// in, or it asserts a fact the store does not hold (`#95` review).
+    enum LocalCeilingBasis: Equatable {
+        /// No checkpoint config was available, so no position limit is known.
+        /// The floor is what answers, and it must not be described as the
+        /// checkpoint having declared a small window.
+        case unknown
+        /// The policy floor answers: the checkpoint declares fewer positions
+        /// than `maxProvisionedRows`, so the floor is what binds.
+        case policyFloor(declared: Int)
+        /// The checkpoint's own declared limit answers.
+        case checkpointPositions(Int)
+        /// The policy's absolute maximum answers, because the checkpoint claims
+        /// more positions than this app will ever provision.
+        case policyMaximum(declared: Int)
+    }
+
+    static func localCeilingBasis(config: ModelConfig?) -> LocalCeilingBasis {
+        localCeilingBasis(declaredMaxPositionEmbeddings: config?.declaredMaxPositionEmbeddings)
+    }
+
+    /// Split out from the config-taking overload because the Settings pane
+    /// resolves the ceiling from a `ModelConfig` it may not have loaded yet: it
+    /// carries the DECLARED limit as a value (`ActiveCeilingKey`), and the
+    /// explanation it renders has to be about the same fact.
+    static func localCeilingBasis(declaredMaxPositionEmbeddings declared: Int?) -> LocalCeilingBasis {
+        guard let declared, declared > 0 else { return .unknown }
+        if declared < maxProvisionedRows { return .policyFloor(declared: declared) }
+        if declared > absoluteMaxProvisionedRows { return .policyMaximum(declared: declared) }
+        return .checkpointPositions(declared)
+    }
+
     /// The reserve this turn asks for. `configured` is the persisted
     /// `dynamoe_agent_session_floor` value (nil when unset) and only applies to
     /// agent sessions; it is clamped to the row ceiling, so the key can only
