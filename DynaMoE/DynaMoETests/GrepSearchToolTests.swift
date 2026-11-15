@@ -8,8 +8,8 @@
 //  would receive.
 //
 //  A quiet failure is the defect these cases exist for. `rg` is absent on many
-//  machines, the tool falls back to `grep` through zsh, and a search that never
-//  ran must never be reported as "0 results".
+//  machines, the tool falls back to `grep`, and a search that never ran must
+//  never be reported as "0 results".
 //
 
 import XCTest
@@ -50,9 +50,14 @@ final class GrepSearchToolTests: XCTestCase {
     @MainActor
     private func runTool(
         _ arguments: [String: Any],
-        maxOutputLength: Int = 4_000
+        maxOutputLength: Int = 4_000,
+        forceGrepFallback: Bool = false
     ) async throws -> (json: String, stdout: String?) {
-        let tool = GrepSearchTool()
+        let tool = GrepSearchTool(
+            backendOverride: forceGrepFallback
+                ? .grep(URL(fileURLWithPath: "/usr/bin/grep"))
+                : nil
+        )
         let result = try await tool.execute(
             arguments: arguments,
             workingDirectory: root,
@@ -173,19 +178,24 @@ final class GrepSearchToolTests: XCTestCase {
 
     // MARK: - Path handling
 
-    func testSearchesASingleFilePath() async throws {
+    /// `grep -r` prints the filename for a single file operand, but ripgrep
+    /// defaults to `--no-filename` when explicitly given one file. Pin the
+    /// `path:line:text` contract on both backends.
+    func testSearchesASingleFilePathOnEitherBackend() async throws {
         try writeFile("needle in this file\n", to: "chosen.swift")
         try writeFile("needle in another file\n", to: "other.swift")
 
-        let (json, _) = try await runTool([
-            "query": "needle",
-            "path": root.appendingPathComponent("chosen.swift").path
-        ])
+        for forceGrep in [false, true] {
+            let (json, _) = try await runTool([
+                "query": "needle",
+                "path": root.appendingPathComponent("chosen.swift").path
+            ], forceGrepFallback: forceGrep)
 
-        let lines = try resultLines(in: json)
-        XCTAssertEqual(lines.count, 1, "a file path must search that file only: \(lines)")
-        let line = try XCTUnwrap(lines.first)
-        XCTAssertTrue(line.contains("chosen.swift"))
+            let lines = try resultLines(in: json)
+            XCTAssertEqual(lines.count, 1, "a file path must search that file only (grep=\(forceGrep)): \(lines)")
+            let line = try XCTUnwrap(lines.first)
+            XCTAssertTrue(line.hasPrefix("./chosen.swift:1:"), "grep=\(forceGrep) printed: \(line)")
+        }
     }
 
     func testSearchesASubdirectoryPath() async throws {
@@ -205,7 +215,7 @@ final class GrepSearchToolTests: XCTestCase {
 
     /// Ignored is not absent. Local docs and instruction files are commonly
     /// gitignored, and an agent that searched them used to get a silent zero.
-    func testGitIgnoredFileIsSearched() async throws {
+    func testGitIgnoredFileIsSearchedOnEitherBackend() async throws {
         let git = "/usr/bin/git"
         try XCTSkipUnless(FileManager.default.isExecutableFile(atPath: git), "git is unavailable")
 
@@ -222,18 +232,33 @@ final class GrepSearchToolTests: XCTestCase {
         process.waitUntilExit()
         XCTAssertEqual(process.terminationStatus, 0)
 
-        let (json, _) = try await runTool(["query": "ignored instruction"])
+        for forceGrep in [false, true] {
+            let (json, _) = try await runTool(
+                ["query": "ignored instruction"],
+                forceGrepFallback: forceGrep
+            )
 
-        XCTAssertEqual(try resultObject(in: json)["count"] as? Int, 1)
+            XCTAssertEqual(
+                try resultObject(in: json)["count"] as? Int,
+                1,
+                "grep=\(forceGrep) skipped a git-ignored file"
+            )
+        }
     }
 
-    func testHiddenFileIsNotSearched() async throws {
+    func testHiddenEntriesAreNotSearchedOnEitherBackend() async throws {
         try writeFile("needle only in a dotfile\n", to: ".hidden.txt")
-        try writeFile("unrelated\n", to: "visible.txt")
+        try writeFile("needle in a nested dotfile\n", to: "Sub/.nested.txt")
+        try writeFile("needle in a hidden directory\n", to: "Sub/.hidden/x.txt")
+        try writeFile("needle in a visible file\n", to: "Sub/visible.txt")
 
-        let (json, _) = try await runTool(["query": "needle only in a dotfile"])
+        for forceGrep in [false, true] {
+            let (json, _) = try await runTool(["query": "needle"], forceGrepFallback: forceGrep)
 
-        XCTAssertEqual(try resultObject(in: json)["count"] as? Int, 0)
+            let lines = try resultLines(in: json)
+            XCTAssertEqual(lines.count, 1, "grep=\(forceGrep) searched a hidden entry: \(lines)")
+            XCTAssertTrue(try XCTUnwrap(lines.first).contains("visible.txt"))
+        }
     }
 
     func testTruncationStillReportsSuccess() async throws {
@@ -243,7 +268,83 @@ final class GrepSearchToolTests: XCTestCase {
         let (json, _) = try await runTool(["query": "needle line"], maxOutputLength: 400)
 
         let result = try resultObject(in: json)
-        XCTAssertGreaterThanOrEqual(result["count"] as? Int ?? 0, 1)
+        XCTAssertEqual(result["truncated"] as? Bool, true)
+        let reported = try resultLines(in: json)
+        XCTAssertGreaterThan(reported.count, 0)
+        XCTAssertFalse(
+            reported.contains { $0.contains("<<<TRUNCATED:") },
+            "the truncation marker is metadata, not a match: \(reported)"
+        )
+        XCTAssertEqual(result["count"] as? Int, reported.count)
+    }
+
+    // MARK: - grep fallback
+
+    func testTheGrepFallbackFindsMatches() async throws {
+        try writeFile("let answer = 42\n", to: "Sources/a.swift")
+
+        let (json, _) = try await runTool(["query": "let answer = 42"], forceGrepFallback: true)
+
+        let result = try resultObject(in: json)
+        XCTAssertEqual(result["count"] as? Int, 1)
+        XCTAssertTrue(try XCTUnwrap(try resultLines(in: json).first).hasPrefix("./Sources/a.swift:1:"))
+    }
+
+    /// grep and ripgrep exit 2 for a soft error (an unreadable subdirectory).
+    /// Matches printed before it are real, so the tool must warn instead of
+    /// replacing them with an error.
+    func testMatchesFoundBeforeASoftErrorAreReturned() async throws {
+        try XCTSkipIf(geteuid() == 0, "root can read a chmod 000 directory")
+
+        try writeFile("needle readable\n", to: "readable.txt")
+        let locked = try writeFile("needle locked\n", to: "locked/secret.txt")
+            .deletingLastPathComponent()
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o000],
+            ofItemAtPath: locked.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: locked.path
+            )
+        }
+
+        let (json, _) = try await runTool(["query": "needle"], forceGrepFallback: true)
+
+        let result = try resultObject(in: json)
+        XCTAssertEqual(result["count"] as? Int, 1, "a soft error must not discard the matches: \(result)")
+        XCTAssertTrue(try XCTUnwrap(try resultLines(in: json).first).contains("readable.txt"))
+        XCTAssertNotNil(result["warning"] as? String, "the payload must say the search was incomplete")
+    }
+
+    /// An unlistable search root used to turn into `count: 0` with a success
+    /// status because the directory listing was read with `try?`.
+    func testAnUnlistableSearchRootIsReportedAsAnError() async throws {
+        try XCTSkipIf(geteuid() == 0, "root can list a chmod 111 directory")
+
+        let locked = root.appendingPathComponent("locked", isDirectory: true)
+        try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+        try writeFile("needle\n", to: "locked/a.txt")
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o111],
+            ofItemAtPath: locked.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o755],
+                ofItemAtPath: locked.path
+            )
+        }
+
+        for forceGrep in [false, true] {
+            let (json, _) = try await runTool([
+                "query": "needle",
+                "path": locked.path
+            ], forceGrepFallback: forceGrep)
+
+            try assertToolError(json)
+        }
     }
 
     /// A process that cannot even be launched must fail, not block. The old

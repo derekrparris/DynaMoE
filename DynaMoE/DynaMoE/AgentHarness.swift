@@ -676,8 +676,31 @@ public final class FindFilesTool: AgentTool {
     }
 }
 
-/// Tool 6: grep_search — Fast regex and literal pattern search using ripgrep or grep
+/// Tool 6: grep_search — Fast regex pattern search using ripgrep or grep
 public final class GrepSearchTool: AgentTool {
+    enum SearchBackend {
+        case ripgrep(URL)
+        case grep(URL)
+
+        var executable: URL {
+            switch self {
+            case .ripgrep(let url): return url
+            case .grep(let url): return url
+            }
+        }
+
+        var isRipgrep: Bool {
+            if case .ripgrep = self { return true }
+            return false
+        }
+    }
+
+    private let backendOverride: SearchBackend?
+
+    init(backendOverride: SearchBackend? = nil) {
+        self.backendOverride = backendOverride
+    }
+
     public let definition = ToolDefinition(
         name: "grep_search",
         description: "Searches a directory (or one file) for a regular expression, using ripgrep when available and grep otherwise. Git-ignored files are searched; hidden files and directories are skipped.",
@@ -723,17 +746,23 @@ public final class GrepSearchTool: AgentTool {
         }
 
         let caseInsensitive = (arguments["case_insensitive"] as? Bool) ?? true
-        let ripgrep = Self.ripgrepExecutable()
+        let backend = backendOverride ?? Self.resolvedBackend()
 
         let searchDirectory: URL
         let searchTargets: [String]
 
         if isDirectory.boolValue {
             searchDirectory = baseDir
-            if ripgrep != nil {
+            if backend.isRipgrep {
                 searchTargets = ["."]
             } else {
-                let children = (try? FileManager.default.contentsOfDirectory(atPath: baseDir.path)) ?? []
+                let children: [String]
+                do {
+                    children = try FileManager.default.contentsOfDirectory(atPath: baseDir.path)
+                } catch {
+                    let err = "Error: cannot list search directory \(baseDir.path): \(error.localizedDescription)"
+                    return (AgentHarness.toolErrorJSON(tool: "grep_search", error: err), nil, err, false)
+                }
                 searchTargets = children
                     .filter { !$0.hasPrefix(".") }
                     .sorted()
@@ -748,14 +777,14 @@ public final class GrepSearchTool: AgentTool {
             return Self.emptySearchResult(query: query, searchPath: baseDir.path)
         }
 
-        let executable: URL
         var searchArguments: [String]
-        if let ripgrep {
-            executable = ripgrep
-            searchArguments = ["-u", "-n", "--max-count=50"]
+        if backend.isRipgrep {
+            searchArguments = ["-u", "-n", "--max-count=50", "--with-filename"]
         } else {
-            executable = URL(fileURLWithPath: "/usr/bin/grep")
-            searchArguments = ["-E", "-r", "-n", "-I", "--max-count=50"]
+            searchArguments = ["-E", "-r", "-n", "-I", "-H", "--max-count=50"]
+            if isDirectory.boolValue {
+                searchArguments += ["--exclude-dir=*/.*", "--exclude=*/.*"]
+            }
         }
         if caseInsensitive {
             searchArguments.append("-i")
@@ -764,14 +793,16 @@ public final class GrepSearchTool: AgentTool {
         searchArguments += searchTargets
 
         let (exitCode, stdout, stderr) = try await AgentHarness.runProcess(
-            executableURL: executable,
+            executableURL: backend.executable,
             arguments: searchArguments,
             currentDirectory: searchDirectory,
             timeoutSeconds: 30
         )
 
-        if exitCode > 1 {
-            let trimmedError = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedError = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasMatches = !stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+
+        if exitCode > 1 && !hasMatches {
             let err: String
             if exitCode == 124 {
                 err = "Error: search timed out after 30 seconds. Narrow the path or pattern."
@@ -783,15 +814,33 @@ public final class GrepSearchTool: AgentTool {
             return (AgentHarness.toolErrorJSON(tool: "grep_search", error: err), nil, err, false)
         }
 
-        let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(stdout.trimmingCharacters(in: .whitespacesAndNewlines)), limit: maxOutputLength)
-        let lines = cleanOut.components(separatedBy: "\n").filter { !$0.isEmpty }
+        let sanitized = AgentHarness.sanitizeText(stdout.trimmingCharacters(in: .whitespacesAndNewlines))
+        let cleanOut = AgentHarness.truncateText(sanitized, limit: maxOutputLength)
+        let wasTruncated = cleanOut != sanitized
+        let lines = cleanOut
+            .components(separatedBy: "\n")
+            .filter { !$0.isEmpty && !(wasTruncated && $0.hasPrefix("<<<TRUNCATED:")) }
 
-        let res = AgentHarness.toolSuccessJSON(tool: "grep_search", data: [
+        var data: [String: Any] = [
             "query": query,
             "search_path": baseDir.path,
             "count": lines.count,
             "results": lines
-        ])
+        ]
+        if wasTruncated {
+            data["truncated"] = true
+        }
+        if exitCode > 1 {
+            if exitCode == 124 {
+                data["warning"] = "search timed out after 30 seconds; results are partial"
+            } else if trimmedError.isEmpty {
+                data["warning"] = "search exited with status \(exitCode); results may be incomplete"
+            } else {
+                data["warning"] = "search exited with status \(exitCode); results may be incomplete: \(AgentHarness.truncateText(trimmedError, limit: 1_000))"
+            }
+        }
+
+        let res = AgentHarness.toolSuccessJSON(tool: "grep_search", data: data)
         return (res, cleanOut, nil, false)
     }
 
@@ -803,6 +852,13 @@ public final class GrepSearchTool: AgentTool {
             "results": [String]()
         ])
         return (res, "", nil, false)
+    }
+
+    private static func resolvedBackend() -> SearchBackend {
+        if let ripgrep = ripgrepExecutable() {
+            return .ripgrep(ripgrep)
+        }
+        return .grep(URL(fileURLWithPath: "/usr/bin/grep"))
     }
 
     /// Resolved without a shell so the search never depends on zsh quoting or
