@@ -925,7 +925,19 @@ struct ChatDetailView: View {
                         .menuStyle(.borderlessButton)
                         .fixedSize()
 
-                        let currentProfileModel = session?.selectedModelName ?? modelName
+                        // The session's own selection is checked as well as the
+                        // installed backend: `selectedModelName` is a DISPLAY
+                        // name ("qwen3-coder (Zen)"), not a cloud address, so a
+                        // moment where `isCloudModelActive` is still false (an
+                        // activation in flight, a background turn that swapped
+                        // `installedModelPath`) would let `profileDisplayName`
+                        // classify it as the local Qwen family.
+                        let sessionIsCloud = isCloudModelActive
+                            || CloudModelAddress.isCloudModelId(session?.selectedModelId)
+                            || CloudModelAddress.isCloudPath(session?.selectedModelPath)
+                        let currentProfileModel = sessionIsCloud
+                            ? nil
+                            : (session?.selectedModelName ?? modelName)
                         // Profile Selector Menu (Coder / Assistant)
                         Menu {
                             Section("Generation Profile") {

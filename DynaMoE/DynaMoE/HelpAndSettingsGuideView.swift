@@ -359,6 +359,56 @@ struct HelpAndSettingsGuideView: View {
                 .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.green.opacity(0.3), lineWidth: 1))
             }
 
+            // Generic / cloud profiles
+            Text("Generic Profile (Every Cloud Model)")
+                .font(.headline)
+                .padding(.top, 4)
+
+            HStack(alignment: .top, spacing: 16) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Image(systemName: "cloud.fill")
+                            .foregroundColor(.cyan)
+                        Text("Coder")
+                            .font(.headline).bold()
+                    }
+                    // The budget is READ from the profile it describes, not
+                    // typed again. It used to be a literal directly under the
+                    // comment in `ModelProfileManager` arguing that a literal
+                    // there would be "a second copy of a number whose whole job
+                    // is to be the budget an unrecorded-window turn is clamped
+                    // to" — and this pane is code, not a doc file, so nothing
+                    // would have caught the two drifting apart.
+                    Text("• Temperature: 0.60\n• Top-P: 0.95 | Top-K: 20\n• Min-P: 0.00\n• Repetition Penalty: 1.00\n• Presence Penalty: 0.00\n• Max Tokens: \(genericCloudCoderBudget.formatted())\n• JetSpec: Enabled")
+                        .font(.system(size: 12, design: .monospaced))
+                        .lineSpacing(4)
+                }
+                .padding(14)
+                .background(Color(NSColor.controlBackgroundColor).opacity(0.4))
+                .cornerRadius(10)
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.cyan.opacity(0.3), lineWidth: 1))
+
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Image(systemName: "cloud.fill")
+                            .foregroundColor(.teal)
+                        Text("Assistant")
+                            .font(.headline).bold()
+                    }
+                    Text("• Temperature: 0.70\n• Top-P: 0.90 | Top-K: 50\n• Min-P: 0.05\n• Repetition Penalty: 1.10\n• Presence Penalty: 0.00\n• Max Tokens: \(genericCloudAssistantBudget.formatted())\n• JetSpec: Enabled")
+                        .font(.system(size: 12, design: .monospaced))
+                        .lineSpacing(4)
+                }
+                .padding(14)
+                .background(Color(NSColor.controlBackgroundColor).opacity(0.4))
+                .cornerRadius(10)
+                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.teal.opacity(0.3), lineWidth: 1))
+            }
+
+            Text("Every cloud model uses this profile, even when the provider's model id names a local family (`qwen3-coder` on Zen, `hf:Qwen/...` on Synthetic): a remote id describes someone else's checkpoint, so it gets neither a local family's token budget nor its sampling tuning. An ungated local checkpoint (Llama, Gemma, Spark, DeepSeek) uses these budgets too.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+
             infoBox(title: "Why Repetition Penalty is 1.00 for Coding", icon: "exclamationmark.triangle.fill") {
                 Text("Programming languages require repetitive keywords, variable names, indentation, and structural syntax (e.g. braces). Setting repetition penalty > 1.0 causes the model to invent erroneous synonyms for identifiers and omit closing brackets. For code, keep repetition penalty at 1.00.")
                     .font(.system(size: 12))
@@ -572,12 +622,32 @@ struct HelpAndSettingsGuideView: View {
 
             faqCard(
                 "How do I reset my settings to default?",
-                "Open Settings (⌘,) -> Models, choose 'Configure Profiles…' from your active model's ellipsis menu, and click 'Reset to Defaults'. This restores factory-tuned parameters for the profile you are currently editing (Coder or Assistant), not both at once; repeat for the other profile if needed. The running session keeps its current values until you click 'Apply to Session'."
+                "Open Settings (⌘,) -> Models, choose 'Configure Profiles…' from your active model's ellipsis menu, and click 'Reset to Defaults'. This restores factory-tuned parameters for the profile you are currently editing (Coder or Assistant), not both at once; repeat for the other profile if needed. If that model is the one currently loaded, the running session's sampling settings and Max Output Tokens follow immediately (the system prompt does not — it has its own Reset in the composer). For any other model the session is unchanged until you click 'Apply to Session'."
             )
         }
     }
 
+    // MARK: - Budgets quoted from the profiles themselves
+
+    /// The generic (cloud) profile's two budgets, as the Help pane quotes them.
+    ///
+    /// Read through `GenerationProfileSettings.defaultFor(type:)` rather than
+    /// restated: that is the profile every cloud model — and every ungated local
+    /// checkpoint — actually runs on, and its coder budget IS
+    /// `CloudContextPolicy.unknownWindowReplyCeiling`. A hand-typed copy here was
+    /// the same second-copy-of-a-load-bearing-number problem the profile default
+    /// was written to avoid, and nothing checked it: the Help coverage test
+    /// counts topic names, not figures.
+    private var genericCloudCoderBudget: Int {
+        GenerationProfileSettings.defaultFor(type: .coder).maxNewTokens
+    }
+
+    private var genericCloudAssistantBudget: Int {
+        GenerationProfileSettings.defaultFor(type: .assistant).maxNewTokens
+    }
+
     // MARK: - Helper Views & Components
+
     private func headerBadge(_ text: String, color: Color) -> some View {
         Text(text)
             .font(.system(size: 11, weight: .bold))

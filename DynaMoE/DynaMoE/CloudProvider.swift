@@ -575,6 +575,34 @@ public nonisolated enum CloudModelAddress {
         return nil
     }
 
+    /// The key a cloud model stores its generation profile under, or nil when
+    /// the address is cloud-shaped but no provider claims it.
+    ///
+    /// Both address forms collapse to ONE key, because a saved profile has to be
+    /// readable through whichever form the caller happens to hold. That matters
+    /// because the two forms genuinely reach the profile manager at different
+    /// moments: `switchModel` passes the registry id, while
+    /// `ContentView.applyProfile` is handed the `cloud://` sentinel
+    /// (`activeLoadedModelPath`) after every cloud activation, and Settings ▸
+    /// Generation ▸ Save writes the sentinel too. Keyed by the sentinel's last
+    /// path component — which is what the generic `normalizeKey` path rules
+    /// produce — a cloud save landed on the LOCAL `qwen3.8-flash-next-fp8`
+    /// profile, and a cloud read was answered by it.
+    ///
+    /// Lowercased to match the rest of `ModelProfileManager`'s keys, so a
+    /// provider that spells a model id with different capitalisation in two
+    /// catalogs still resolves to one profile.
+    public static func profileKey(
+        _ address: String,
+        providers: [CloudProvider] = CloudProviderRegistry.all
+    ) -> String? {
+        let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let parsed = parseModelId(trimmed, providers: providers)
+            ?? parsePath(trimmed, providers: providers) else { return nil }
+        return modelId(providerId: parsed.provider.id, providerModelId: parsed.providerModelId)
+            .lowercased()
+    }
+
     private static func longestFirst(_ providers: [CloudProvider]) -> [CloudProvider] {
         providers.sorted { $0.id.count > $1.id.count }
     }
