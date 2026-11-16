@@ -1336,14 +1336,22 @@ struct ContentView: View {
         // recovers.
         guard hasAttemptedInitialLoad else { return }
         hasPendingSessionPersist = true
-        sessionPersistTask?.cancel()
+        // A burst of mutations shares ONE debounce rather than restarting it.
+        // Streaming-mutated state arrives several times a second, so cancelling
+        // and re-creating the task on every call both churned an allocation per
+        // chunk and kept pushing the deadline out: a turn that mutated faster
+        // than the interval never persisted at all until it settled.
+        guard sessionPersistTask == nil else { return }
         sessionPersistTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 800_000_000)
+            // A cancelled task was replaced by `flushSessionPersist`, which
+            // clears the field itself; it must not clear a newer task here.
             guard !Task.isCancelled else { return }
             self.hasPendingSessionPersist = false
             // Orphan cleanup is only safe once the load has populated
             // `managedIds`; before that it would delete not-yet-loaded files.
             ChatSessionStore.shared.saveAll(self.sessions, cleanOrphans: self.hasLoadedPersistedSessions)
+            self.sessionPersistTask = nil
         }
     }
 
@@ -1355,6 +1363,7 @@ struct ContentView: View {
     /// conversations whose bytes are already durable, so re-enqueuing is cheap.
     private func flushSessionPersist() {
         sessionPersistTask?.cancel()
+        sessionPersistTask = nil
         hasPendingSessionPersist = false
         // Before the load has populated `managedIds`, skip orphan cleanup: it
         // would treat the not-yet-merged files on disk as deleted conversations

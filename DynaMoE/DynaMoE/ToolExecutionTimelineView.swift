@@ -15,6 +15,9 @@ public struct ToolExecutionTimelineView: View {
     public var onApproveCall: ((UUID) -> Void)? = nil
     public var onRejectCall: ((UUID) -> Void)? = nil
 
+    /// Calls the summary strip shows before it collapses to a `+N more` chip.
+    static let badgeLimit = 8
+
     public init(
         toolCalls: [ToolCallRecord],
         onApproveCall: ((UUID) -> Void)? = nil,
@@ -27,24 +30,36 @@ public struct ToolExecutionTimelineView: View {
 
     public var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            // Horizontal Step Nodes Flow
+            // Step nodes. The strip is a SUMMARY, not the record — the cards
+            // below it are the record — so it shows the first few calls and
+            // counts the rest. It also used to be a horizontal `ScrollView`,
+            // which meant every multi-call turn allocated another layer inside
+            // the transcript row; a long agent turn accumulated dozens of them.
             if toolCalls.count > 1 {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(Array(toolCalls.enumerated()), id: \.element.id) { index, call in
-                            HStack(spacing: 6) {
-                                StepNodeBadge(stepIndex: index + 1, call: call)
-                                if index < toolCalls.count - 1 {
-                                    Image(systemName: "arrow.right")
-                                        .font(.system(size: 8, weight: .bold))
-                                        .foregroundColor(.secondary.opacity(0.4))
-                                }
+                HStack(spacing: 6) {
+                    ForEach(Array(toolCalls.prefix(Self.badgeLimit).enumerated()), id: \.element.id) { index, call in
+                        HStack(spacing: 6) {
+                            StepNodeBadge(stepIndex: index + 1, call: call)
+                            if index < min(toolCalls.count, Self.badgeLimit) - 1 {
+                                Image(systemName: "arrow.right")
+                                    .font(.system(size: 8, weight: .bold))
+                                    .foregroundColor(.secondary.opacity(0.4))
                             }
                         }
                     }
-                    .padding(.horizontal, 2)
-                    .padding(.vertical, 4)
+                    if toolCalls.count > Self.badgeLimit {
+                        Text("+\(toolCalls.count - Self.badgeLimit) more")
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(Color.secondary.opacity(0.08))
+                            .cornerRadius(6)
+                            .help("\(toolCalls.count) tool calls in this turn; the cards below list them all")
+                    }
                 }
+                .padding(.horizontal, 2)
+                .padding(.vertical, 4)
             }
 
             // Detailed Cards for Each Step
@@ -112,6 +127,10 @@ struct TimelineStepCardView: View {
     let call: ToolCallRecord
     var onApprove: (() -> Void)? = nil
     var onReject: (() -> Void)? = nil
+
+    /// Height cap for the expanded output. A tool result can be a whole file;
+    /// the card is an inspection view, not the transcript.
+    static let maxOutputHeight: CGFloat = 240
 
     @State private var isExpanded: Bool = false
     @State private var isCopied: Bool = false
@@ -358,12 +377,20 @@ struct TimelineStepCardView: View {
                                 .buttonStyle(.plain)
                             }
 
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                Text(out)
+                            // Bounded, and bounded twice: `ChunkedText` keeps
+                            // any one text view small enough to paint, and the
+                            // frame caps the card so a `file_read` of a 200 KB
+                            // file cannot put an enormous view in the
+                            // transcript. The full output is still reachable
+                            // through the copy button and by expanding.
+                            ScrollView(.vertical, showsIndicators: true) {
+                                ChunkedText(text: out, lineSpacing: 2)
                                     .font(.system(size: 11, design: .monospaced))
                                     .foregroundColor(.primary)
                                     .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
                             }
+                            .frame(maxHeight: Self.maxOutputHeight)
                             .padding(8)
                             .background(Color.secondary.opacity(0.04))
                             .cornerRadius(6)

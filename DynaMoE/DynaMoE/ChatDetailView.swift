@@ -126,19 +126,77 @@ struct ChatDetailView: View {
     /// point at a plan the conversation has already moved past. A follow-up that
     /// itself produces a plan is a NEWER ready message, so this search finds it.
     private var readyPlanMessage: ChatMessage? {
+        // Short-circuit before any history scan: outside plan mode the answer is
+        // always nil, and this property is read by the body on every streamed
+        // chunk of every turn.
         guard isPlanMode, !isGenerating, let session else { return nil }
-        guard let planIndex = session.messages.lastIndex(where: {
-            $0.role == .assistant
-                && PlanMarkers.anyMarkerMentioned(in: $0.content)
-                && PlanMarkers.readyPresent(in: $0.content)
-        }) else { return nil }
-        if let lastUserIndex = session.messages.lastIndex(where: { $0.role == .user }),
-           lastUserIndex > planIndex {
-            return nil
+        return readyPlanMemo.value(
+            messages: session.messages,
+            dismissedPlanMessageId: dismissedPlanMessageId
+        )
+    }
+
+    /// Memoizes the ready-plan search.
+    ///
+    /// The search runs `lastIndex(where:)` over every message and executes
+    /// `PlanMarkers.anyMarkerMentioned` + `readyPresent` on each assistant
+    /// message's FULL content. At 50–60k tokens that is tens of kilobytes of
+    /// marker scanning per message, on every frame of a streaming turn. The key
+    /// is the tuple that can change the answer: message count, the last
+    /// message's identity and length (the only message that grows mid-turn),
+    /// and the dismissed plan.
+    final class ReadyPlanMemo {
+        private var key: Key?
+        private var cached: ChatMessage?
+
+        struct Key: Equatable {
+            var messageCount: Int
+            var lastMessageId: UUID?
+            var lastMessageLength: Int
+            var lastMessageRole: MessageRole?
+            var dismissedPlanMessageId: UUID?
         }
-        let message = session.messages[planIndex]
-        guard dismissedPlanMessageId != message.id else { return nil }
-        return message
+
+        func value(messages: [ChatMessage], dismissedPlanMessageId: UUID?) -> ChatMessage? {
+            let last = messages.last
+            let newKey = Key(
+                messageCount: messages.count,
+                lastMessageId: last?.id,
+                lastMessageLength: (last?.content.count ?? 0) + (last?.thinkingContent?.count ?? 0),
+                lastMessageRole: last?.role,
+                dismissedPlanMessageId: dismissedPlanMessageId
+            )
+            if key == newKey { return cached }
+
+            let found = Self.search(
+                messages: messages,
+                dismissedPlanMessageId: dismissedPlanMessageId
+            )
+            key = newKey
+            cached = found
+            return found
+        }
+
+        /// The search itself, split out so it can be tested without a view.
+        ///
+        /// A plan is only current until the next user turn: once a follow-up has
+        /// been sent, an older plan's handoff must not come back when the reply
+        /// carries no markers. A follow-up that produces a plan of its own is a
+        /// newer ready message, so this search finds it.
+        static func search(
+            messages: [ChatMessage],
+            dismissedPlanMessageId: UUID?
+        ) -> ChatMessage? {
+            guard let planIndex = messages.lastIndex(where: {
+                $0.role == .assistant
+                    && PlanMarkers.anyMarkerMentioned(in: $0.content)
+                    && PlanMarkers.readyPresent(in: $0.content)
+            }) else { return nil }
+            let lastUserIndex = messages.lastIndex(where: { $0.role == .user })
+            if let lastUserIndex, lastUserIndex > planIndex { return nil }
+            let message = messages[planIndex]
+            return dismissedPlanMessageId == message.id ? nil : message
+        }
     }
     var onSendMessage: (String, [PreparedImage]) -> Bool
     var onStopGeneration: () -> Void
@@ -174,9 +232,22 @@ struct ChatDetailView: View {
     /// to be remembered; being view state, it resets on relaunch and a dismissed
     /// plan comes back rather than disappearing for good.
     @State private var dismissedPlanMessageId: UUID? = nil
+    /// Memoizes the ready-plan search, which otherwise scans every message's
+    /// full content on every streamed frame.
+    @State private var readyPlanMemo = ReadyPlanMemo()
     @State private var promptTokenCount: Int = 0
     @State private var tokenCountTask: Task<Void, Never>? = nil
     @State private var isPinnedToBottom: Bool = true
+    /// Set while a `scrollTo` this view issued is in flight. Content growth must
+    /// never unpin the follow, and an animated programmatic scroll transiently
+    /// reads as "scrolled away from the bottom" — which is what made the pin
+    /// state flip mid-stream and the follow stop. Only a user drag may unpin.
+    @State private var isProgrammaticScrollInFlight: Bool = false
+    /// The per-message parse and segmentation, shared by every row of a
+    /// message so segmentation does not multiply parse cost.
+    @State private var presentationCache = TranscriptPresentationCache()
+    /// Geometry and row-height instrumentation for the whiteout threshold.
+    @State private var transcriptDiagnostics = TranscriptDiagnostics()
     /// Memoizes the cloud context-window lookup the header pill uses. The body
     /// runs on every streamed frame and the policy re-parses the provider's
     /// `model=window` string on each call; the key includes the raw recorded
@@ -241,21 +312,144 @@ struct ChatDetailView: View {
     @AppStorage("dynamoe_agent_turbo_mode") private var isTurboModeEnabled: Bool = false
     @ObservedObject private var subagentManager = SubagentManager.shared
 
-    /// Characters of streamed output that make up one follow-scroll bucket,
-    /// roughly one line. This is the knob that controls how often the
-    /// transcript scrolls while a turn streams: smaller follows more often.
-    private static let streamedFollowBucketCharacters = 120
+    // MARK: - Transcript rows
 
-    /// Coarse progress marker for the newest message (content or thinking
-    /// grows — a chat turn, or the /compact progress bubble typing out a
-    /// summary). The follow handler keys off buckets of roughly a line of
-    /// output instead of the exact length: a per-token value made the handler
-    /// run several times per frame, and every run had to invalidate layout to
-    /// scroll, which a long transcript cannot absorb.
-    private var streamedContentBucket: Int {
-        guard let last = session?.messages.last else { return 0 }
-        return (last.content.count + (last.thinkingContent?.count ?? 0))
-            / Self.streamedFollowBucketCharacters
+    /// The flattened rows the transcript draws: one per message in the common
+    /// case, several for a message too tall to paint as one lazy child.
+    ///
+    /// The parse and the segmentation are memoized per message by
+    /// `presentationCache`, so this is O(messages) on a body pass that changes
+    /// nothing and O(1) parses per changed message while a turn streams.
+    private func transcriptRows(for session: ChatSession) -> [TranscriptEntry] {
+        var rows: [TranscriptEntry] = []
+        rows.reserveCapacity(session.messages.count)
+        let streamingId = isGenerating ? session.messages.last?.id : nil
+
+        for message in session.messages {
+            if message.isCompactionSummary == true {
+                // A digest card is chrome, not a turn: it is never split, and
+                // its own card already bounds the summary's height.
+                rows.append(TranscriptEntry(
+                    row: TranscriptRow(
+                        messageId: message.id,
+                        kind: .compactionSummary,
+                        segmentIndex: 0,
+                        segmentCount: 1,
+                        segment: TranscriptSegment(blocks: [])
+                    ),
+                    message: message
+                ))
+                continue
+            }
+            if message.role == .assistant,
+               PlanMarkers.anyMarkerMentioned(in: message.content),
+               PlanMarkers.startPresent(in: message.content) {
+                rows.append(TranscriptEntry(
+                    row: TranscriptRow(
+                        messageId: message.id,
+                        kind: .planCard,
+                        segmentIndex: 0,
+                        segmentCount: 1,
+                        segment: TranscriptSegment(blocks: [])
+                    ),
+                    message: message
+                ))
+                continue
+            }
+            let segments: [TranscriptSegment]
+            if message.role == .user {
+                segments = TranscriptSegmenter.plainTextSegments(for: message.content)
+            } else {
+                segments = presentationCache.presentation(
+                    for: message,
+                    isGemmaDialect: isGemmaDialect,
+                    isStreaming: message.id == streamingId
+                ).segments
+            }
+            rows.append(contentsOf: TranscriptSegmenter.rows(
+                for: message.id,
+                kind: .message,
+                segments: segments
+            ).map { TranscriptEntry(row: $0, message: message) })
+        }
+        return rows
+    }
+
+    /// One transcript row. Split out of the `ForEach` so the body stays
+    /// readable and so the compaction/plan/message choice lives in one place.
+    @ViewBuilder
+    private func transcriptRowView(_ entry: TranscriptEntry, in session: ChatSession) -> some View {
+        let row = entry.row
+        let message = entry.message
+        switch row.kind {
+            case .compactionSummary:
+                CompactionSummaryCard(
+                    message: message,
+                    isExpanded: Binding(
+                        get: { isCompactionSummaryExpanded[message.id] ?? true },
+                        set: { isCompactionSummaryExpanded[message.id] = $0 }
+                    )
+                )
+            case .planCard:
+                PlanCard(
+                    content: PlanMarkers.strip(message.content),
+                    thinkingContent: message.thinkingContent,
+                    isReady: PlanMarkers.readyPresent(in: message.content),
+                    isStreaming: isGenerating && message.id == session.messages.last?.id,
+                    isReasoningExpanded: Binding(
+                        get: { isReasoningExpanded[message.id] ?? reasoningExpandedByDefault },
+                        set: { isReasoningExpanded[message.id] = $0 }
+                    )
+                )
+            case .message:
+                ChatMessageView(
+                    message: message,
+                    row: row,
+                    displayContent: presentationCache.presentation(
+                        for: message,
+                        isGemmaDialect: isGemmaDialect,
+                        isStreaming: isGenerating && message.id == session.messages.last?.id
+                    ).displayContent,
+                    zoomScale: zoomManager.zoomScale,
+                    isGenerating: isGenerating && message.id == session.messages.last?.id,
+                    isStreamingOffDisk: isStreamingOffDisk,
+                    isCompactingConversation: message.id == compactionProgressMessageId,
+                    isGemmaDialect: isGemmaDialect,
+                    isExpanded: Binding(
+                        get: { isReasoningExpanded[message.id] ?? reasoningExpandedByDefault },
+                        set: { isReasoningExpanded[message.id] = $0 }
+                    )
+                )
+                // Every realized row is re-evaluated when the transcript's body
+                // runs, which happens on each streamed chunk. `ChatMessageView`
+                // compares its render fingerprint, so an unchanged row is
+                // skipped here instead of re-running its body over the whole
+                // message.
+                .equatable()
+        }
+    }
+
+    /// Emits the transcript's geometry once for `session`, tagged with `suffix`
+    /// so the settle report and the restored-conversation report are separate
+    /// lines rather than one suppressing the other.
+    ///
+    /// The segments are recomputed here with repairs enabled, which is what the
+    /// settled message renders: it is the realized shape the diagnostic reports
+    /// on, not the throttled streaming one.
+    private func reportTranscriptGeometry(for session: ChatSession, suffix: String) {
+        var segmentsByMessage: [UUID: [TranscriptSegment]] = [:]
+        for message in session.messages {
+            segmentsByMessage[message.id] = presentationCache.presentation(
+                for: message,
+                isGemmaDialect: isGemmaDialect,
+                isStreaming: false
+            ).segments
+        }
+        transcriptDiagnostics.reportIfNeeded(
+            turnKey: "\(session.id.uuidString.prefix(8))-\(suffix)",
+            messages: session.messages,
+            segmentsByMessage: segmentsByMessage
+        )
     }
 
     /// Scrolls the transcript to its newest line. Callers are throttled by
@@ -267,6 +461,7 @@ struct ChatDetailView: View {
     /// faster than it completes. Discrete transitions (a message landing, a
     /// turn starting or ending) animate, as they did before the throttle.
     private func followBottom(_ proxy: ScrollViewProxy, animated: Bool = false) {
+        isProgrammaticScrollInFlight = true
         DispatchQueue.main.async {
             if animated {
                 withAnimation(.easeOut(duration: 0.2)) {
@@ -274,6 +469,13 @@ struct ChatDetailView: View {
                 }
             } else {
                 proxy.scrollTo(Self.scrollBottomAnchorID, anchor: .bottom)
+            }
+            // The geometry handler runs before this clears, so the offset
+            // change this scroll causes is never read as a user drag. The delay
+            // covers the animation: an animated scroll reports intermediate
+            // offsets for its duration, and any of them would otherwise unpin.
+            DispatchQueue.main.asyncAfter(deadline: .now() + (animated ? 0.25 : 0.05)) {
+                isProgrammaticScrollInFlight = false
             }
         }
     }
@@ -294,9 +496,16 @@ struct ChatDetailView: View {
         guard let first = session?.messages.first,
               first.isCompactionSummary == true,
               session?.messages.count == 2 else { return false }
+        isProgrammaticScrollInFlight = true
         DispatchQueue.main.async {
             withAnimation(.easeOut(duration: 0.2)) {
-                proxy.scrollTo(first.id, anchor: .top)
+                // The card is a message, and a message's own id no longer names
+                // a row: every message is drawn as at least one segment, so the
+                // scroll target is the first segment's id.
+                proxy.scrollTo(TranscriptRow.firstSegmentId(for: first.id), anchor: .top)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                isProgrammaticScrollInFlight = false
             }
         }
         return true
@@ -699,45 +908,40 @@ struct ChatDetailView: View {
                 ScrollView {
                     VStack(spacing: 0) {
                         if let session = session, !session.messages.isEmpty {
-                            LazyVStack(spacing: 24) {
-                                ForEach(session.messages) { message in
-                                    Group {
-                                        if message.isCompactionSummary == true {
-                                            CompactionSummaryCard(
-                                                message: message,
-                                                isExpanded: Binding(
-                                                    get: { isCompactionSummaryExpanded[message.id] ?? true },
-                                                    set: { isCompactionSummaryExpanded[message.id] = $0 }
-                                                )
-                                            )
-                                        } else if message.role == .assistant,
-                                                  PlanMarkers.anyMarkerMentioned(in: message.content),
-                                                  PlanMarkers.startPresent(in: message.content) {
-                                            PlanCard(
-                                                content: PlanMarkers.strip(message.content),
-                                                thinkingContent: message.thinkingContent,
-                                                isReady: PlanMarkers.readyPresent(in: message.content),
-                                                isStreaming: isGenerating && message.id == session.messages.last?.id,
-                                                isReasoningExpanded: Binding(
-                                                    get: { isReasoningExpanded[message.id] ?? reasoningExpandedByDefault },
-                                                    set: { isReasoningExpanded[message.id] = $0 }
-                                                )
-                                            )
-                                        } else {
-                                            ChatMessageView(
-                                                message: message,
-                                                isGenerating: isGenerating && message.id == session.messages.last?.id,
-                                                isStreamingOffDisk: isStreamingOffDisk,
-                                                isCompactingConversation: message.id == compactionProgressMessageId,
-                                                isGemmaDialect: isGemmaDialect,
-                                                isExpanded: Binding(
-                                                    get: { isReasoningExpanded[message.id] ?? reasoningExpandedByDefault },
-                                                    set: { isReasoningExpanded[message.id] = $0 }
-                                                )
+                            // One lazy child per SEGMENT, not per message: a
+                            // single assistant turn of 50–60k tokens laid out to
+                            // 15,000–20,000 pt in one row, which crosses the
+                            // compositor's maximum layer and paints blank. A
+                            // message that fits the budget still yields exactly
+                            // one row, so nothing about a normal conversation
+                            // changes.
+                            LazyVStack(spacing: 0) {
+                                ForEach(transcriptRows(for: session)) { entry in
+                                    transcriptRowView(entry, in: session)
+                                        .id(entry.row.id)
+                                        // The row's own height is the number the
+                                        // whiteout hypothesis is about: a lazy
+                                        // child taller than the compositor's
+                                        // ceiling is realized but never painted.
+                                        .onGeometryChange(for: CGFloat.self) { proxy in
+                                            proxy.size.height
+                                        } action: { height in
+                                            transcriptDiagnostics.record(
+                                                rowId: entry.row.id,
+                                                height: height
                                             )
                                         }
-                                    }
-                                    .id(message.id)
+                                        // The gap belongs between MESSAGES, not
+                                        // between rows: rows of one message sit
+                                        // flush so a paragraph or a code block
+                                        // that was split to fit the budget reads
+                                        // continuously instead of breaking at
+                                        // every row boundary. For a message that
+                                        // was not split this is the same 24 pt
+                                        // gap the stack used to apply. The
+                                        // padding sits OUTSIDE the measurement,
+                                        // so the recorded height is the row's.
+                                        .padding(.top, entry.row.isFirst ? 24 : 0)
                                 }
                             }
                             .padding(.top, 24)
@@ -766,6 +970,12 @@ struct ChatDetailView: View {
                     // still be reachable under it.
                     .padding(.top, historyWarningHeight)
                 }
+                // The scroll view owns the follow. On macOS 26 this keeps the
+                // bottom edge anchored as content grows, so a streaming turn
+                // needs no `scrollTo` per bucket — and a per-bucket scroll was
+                // the layout-invalidation storm that made the follow
+                // inconsistent in the first place.
+                .defaultScrollAnchor(.bottom)
                 .onChange(of: session?.id) { _ in
                     isPinnedToBottom = true
                     guard !landOnCompactedSummary(proxy) else { return }
@@ -776,19 +986,37 @@ struct ChatDetailView: View {
                     guard isPinnedToBottom else { return }
                     followBottom(proxy, animated: true)
                 }
-                .onChange(of: streamedContentBucket) { _ in
-                    guard isPinnedToBottom, isGenerating || isCompactingConversation else { return }
-                    followBottom(proxy)
-                }
                 .onChange(of: isGenerating) { generating in
                     if generating {
                         // A new turn is starting (user sent or a queued prompt fired):
                         // re-pin and jump to the newest message.
                         isPinnedToBottom = true
+                        transcriptDiagnostics.beginTurn()
                         followBottom(proxy, animated: true)
                     } else if isPinnedToBottom {
                         followBottom(proxy, animated: true)
                     }
+                }
+                // The turn settled: emit its numbers once. This is what makes
+                // the whiteout threshold falsifiable — if no row and no content
+                // height crosses the compositor ceiling, the hypothesis is
+                // wrong and segmentation is not the fix.
+                .onChange(of: isGenerating) { generating in
+                    guard !generating, let session else { return }
+                    reportTranscriptGeometry(for: session, suffix: "\(session.messages.count)")
+                    presentationCache.prune(keeping: Set(session.messages.map(\.id)))
+                }
+                // A conversation restored from disk is the OTHER reproduction of
+                // the whiteout: nothing is generating, so the turn-settle report
+                // above never fires, and yet this is the case that was reported
+                // (a long agent conversation opens blank until something changes
+                // the content height). Report once per session, after the lazy
+                // rows have had time to realize and publish their heights.
+                .task(id: session?.id) {
+                    guard let session, !session.messages.isEmpty else { return }
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    guard !Task.isCancelled, !isGenerating else { return }
+                    reportTranscriptGeometry(for: session, suffix: "restored")
                 }
                 .onScrollGeometryChange(for: ScrollSnapshot.self) { geometry in
                     ScrollSnapshot(
@@ -797,13 +1025,25 @@ struct ChatDetailView: View {
                         containerHeight: geometry.containerSize.height
                     )
                 } action: { old, new in
-                    if new.contentHeight != old.contentHeight && new.offset == old.offset {
-                        // Content grew under us (streaming output) — not a user
-                        // scroll. Keep the current pin state; the bucket handler
-                        // will follow if pinned. Otherwise growing content would
-                        // read as "scrolled away from bottom" and unpin itself.
-                        return
-                    }
+                    // Report the geometry the diagnostic needs to prove (or
+                    // disprove) the compositor-ceiling hypothesis.
+                    transcriptDiagnostics.record(
+                        contentHeight: new.contentHeight,
+                        viewportHeight: new.containerHeight
+                    )
+
+                    // Content grew under us (streaming output). That is not a
+                    // user scroll, so it must never unpin — the old
+                    // `offset == old.offset` heuristic tried to say this and
+                    // mis-read an animated scroll, which is what made the
+                    // follow stop mid-turn. The scroll view keeps the tail
+                    // visible on its own via `defaultScrollAnchor(.bottom)`.
+                    if new.contentHeight > old.contentHeight { return }
+
+                    // A programmatic scroll in flight reports intermediate
+                    // offsets for its duration; none of them is a user drag.
+                    guard !isProgrammaticScrollInFlight else { return }
+
                     // Only write on a real change: this action runs on every
                     // geometry update, and an unconditional write invalidated
                     // the view several times per frame while a turn streamed.
@@ -3020,7 +3260,12 @@ struct PlanCard: View {
                     .help(isReasoningExpanded ? "Hide the plan's reasoning" : "Show the plan's reasoning")
 
                     if isReasoningExpanded {
-                        Text(thinking)
+                        // A plan turn's reasoning runs to tens of thousands of
+                        // tokens. One `Text` of that height is never painted
+                        // (the whiteout), and this card replaced the only path
+                        // that had been chunked — so it was the one place a
+                        // long reasoning block could still blank the row.
+                        ChunkedText(text: thinking, lineSpacing: 3)
                             .font(.system(size: max(9.5, 11.5 * zoomManager.zoomScale)))
                             .foregroundColor(.secondary)
                             .textSelection(.enabled)
@@ -3052,9 +3297,25 @@ struct PlanCard: View {
     }
 }
 
-struct ChatMessageView: View {
+struct ChatMessageView: View, Equatable {
     @EnvironmentObject private var zoomManager: AppZoomManager
     let message: ChatMessage
+    /// The slice of `message` this row draws. A message that fits the
+    /// transcript's row budget has exactly one row, so this is the whole
+    /// message and its rendering is unchanged; only a message that would lay
+    /// out taller than the compositor's ceiling is split across several rows.
+    let row: TranscriptRow
+    /// The message's display text (tool-call markup stripped). Derived once per
+    /// content change by `TranscriptPresentationCache` and shared by every row
+    /// of the message, rather than re-derived per row.
+    let displayContent: String
+    /// Mirrors `zoomManager.zoomScale` into the render fingerprint.
+    ///
+    /// This view is compared with `.equatable()`, and an equal view is not
+    /// re-rendered even when the environment changed. Every font size here is
+    /// scaled by the app-wide zoom, so it has to be part of the compared value
+    /// or a zoom change would leave the transcript at the old type scale.
+    var zoomScale: CGFloat = 1
     var isGenerating: Bool = false
     var isStreamingOffDisk: Bool = false
     var isCompactingConversation: Bool = false
@@ -3064,30 +3325,6 @@ struct ChatMessageView: View {
     @Binding var isExpanded: Bool
     @State private var isCopied = false
     @State private var isThinkingCopied = false
-
-    /// Memoizes the display-cleanup pass for this message. It strips tool-call
-    /// markup with two regex scans plus three opener searches, and the
-    /// transcript re-renders on every streamed chunk; without the memo every
-    /// visible message repeated that work per frame. Reference type so the body
-    /// can refresh it in place without scheduling another update.
-    private final class DisplayMemo {
-        var content: String?
-        var gemmaDialect = false
-        var display = ""
-    }
-
-    @State private var displayMemo = DisplayMemo()
-
-    private var displayContent: String {
-        if displayMemo.content == message.content, displayMemo.gemmaDialect == isGemmaDialect {
-            return displayMemo.display
-        }
-        let cleaned = Self.responseDisplayContent(message.content, isGemmaDialect: isGemmaDialect)
-        displayMemo.content = message.content
-        displayMemo.gemmaDialect = isGemmaDialect
-        displayMemo.display = cleaned
-        return cleaned
-    }
 
     /// True when the footer has any telemetry to show. Kept separate from the
     /// display-content check so tool-only assistant turns (which clean down to
@@ -3205,6 +3442,78 @@ struct ChatMessageView: View {
         return isStreamingToolCall
     }
 
+    /// Everything this row draws, reduced to comparable values.
+    ///
+    /// `ChatMessageView` is not `Equatable` by default because `message` is a
+    /// large value and the transcript re-renders on every streamed chunk: every
+    /// realized row re-ran its body per chunk, which is O(history) work per
+    /// frame. This fingerprint is what `==` compares, and it deliberately
+    /// includes EVERY field the body reads — a field omitted here freezes that
+    /// part of the row mid-stream, which is a far worse failure than the cost
+    /// it saves.
+    struct RenderFingerprint: Equatable {
+        var messageId: UUID
+        var contentLength: Int
+        var thinkingLength: Int
+        var isThinking: Bool
+        var prefillStatus: String?
+        var tokenCount: Int
+        var tokensPerSec: Double
+        var timeToFirstTokenSeconds: Double?
+        var thinkingTimeSeconds: Double?
+        var jetSpecTau: Double?
+        var toolCallFingerprint: [ToolCallRecord]
+        var attachmentCount: Int
+        var isCompactionSummary: Bool
+
+        var rowId: String
+        var segmentIndex: Int
+        var segmentCount: Int
+        var segmentBlocks: [MarkdownBlock]
+        var segmentPlainText: String?
+
+        var displayContent: String
+        var zoomScale: CGFloat
+        var isGenerating: Bool
+        var isStreamingOffDisk: Bool
+        var isCompactingConversation: Bool
+        var isGemmaDialect: Bool
+        var isExpanded: Bool
+    }
+
+    private var renderFingerprint: RenderFingerprint {
+        RenderFingerprint(
+            messageId: message.id,
+            contentLength: message.content.count,
+            thinkingLength: message.thinkingContent?.count ?? 0,
+            isThinking: message.isThinking,
+            prefillStatus: message.prefillStatus,
+            tokenCount: message.tokenCount,
+            tokensPerSec: message.tokensPerSec,
+            timeToFirstTokenSeconds: message.timeToFirstTokenSeconds,
+            thinkingTimeSeconds: message.thinkingTimeSeconds,
+            jetSpecTau: message.jetSpecTau,
+            // The records themselves: a call's status, output, and error all
+            // change visibly while the turn runs, so comparing only the count
+            // would freeze a card mid-execution.
+            toolCallFingerprint: message.toolCalls ?? [],
+            attachmentCount: message.attachments?.count ?? 0,
+            isCompactionSummary: message.isCompactionSummary ?? false,
+            rowId: row.id,
+            segmentIndex: row.segmentIndex,
+            segmentCount: row.segmentCount,
+            segmentBlocks: row.segment.blocks,
+            segmentPlainText: row.segment.plainText,
+            displayContent: displayContent,
+            zoomScale: zoomScale,
+            isGenerating: isGenerating,
+            isStreamingOffDisk: isStreamingOffDisk,
+            isCompactingConversation: isCompactingConversation,
+            isGemmaDialect: isGemmaDialect,
+            isExpanded: isExpanded
+        )
+    }
+
     /// Strips tool-call markup from assistant text for display, truncating at the
     /// earliest marker that survived the block strip. The marker table is shared with
     /// the working-pill predicate, so a dialect cannot be readable in one and invisible
@@ -3232,7 +3541,7 @@ struct ChatMessageView: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 14) {
-            if message.role == .assistant {
+            if message.role == .assistant, row.isFirst {
                 // Assistant Avatar
                 Image(systemName: "circle.hexagongrid.fill")
                     .font(.system(size: 15))
@@ -3247,6 +3556,12 @@ struct ChatMessageView: View {
                     .background(Color.purple.opacity(0.12))
                     .clipShape(Circle())
                     .padding(.top, 2)
+            } else if message.role == .assistant {
+                // A continuation row draws no avatar, but reserves its width so
+                // the text column is unbroken across the split. The avatar is
+                // 28 pt wide and the stack spaces children by 14.
+                Color.clear
+                    .frame(width: 28, height: 0)
             }
 
             VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 8) {
@@ -3255,14 +3570,16 @@ struct ChatMessageView: View {
                     HStack {
                         Spacer(minLength: 40)
                         VStack(alignment: .trailing, spacing: 6) {
-                            if let attachments = message.attachments, !attachments.isEmpty {
+                            if row.isFirst, let attachments = message.attachments, !attachments.isEmpty {
                                 TranscriptAttachmentStrip(attachments: attachments)
                             }
                             // An image-only turn has no text bubble at all; an
                             // empty padded bubble under the pictures reads as a
-                            // rendering bug.
-                            if !message.content.isEmpty {
-                                ChunkedText(text: message.content, lineSpacing: 3)
+                            // rendering bug. A long user turn is split across
+                            // rows like any other message, so the bubble draws
+                            // this row's slice of the text.
+                            if let slice = row.segment.plainText, !slice.isEmpty {
+                                ChunkedText(text: slice, lineSpacing: 3)
                                     .font(.system(size: max(9, 14 * zoomManager.zoomScale)))
                                     .padding(.horizontal, 16)
                                     .padding(.vertical, 10)
@@ -3275,9 +3592,11 @@ struct ChatMessageView: View {
                         }
                     }
                 } else {
-                    // Assistant Thinking / Reasoning Accordion (Osaurus Style)
+                    // Assistant Thinking / Reasoning Accordion (Osaurus Style).
+                    // It belongs to the message, not to a slice of it, so only
+                    // the first row draws it.
                     let hasThinkingContent = message.thinkingContent != nil && !message.thinkingContent!.isEmpty
-                    if (message.isThinking && isGenerating) || hasThinkingContent {
+                    if row.isFirst, (message.isThinking && isGenerating) || hasThinkingContent {
                         let thinking = message.thinkingContent ?? ""
                         VStack(alignment: .leading, spacing: 8) {
                             HStack(spacing: 6) {
@@ -3431,7 +3750,9 @@ struct ChatMessageView: View {
 
                     // Tool Calls Execution Cards & Sequential Timeline (if any tool calls were issued)
                     // Gesture calls keep a record for history reconstruction but are hidden here.
-                    if let toolCalls = message.toolCalls {
+                    // The timeline summarises the whole turn, so it rides the
+                    // first row rather than being repeated per slice.
+                    if row.isFirst, let toolCalls = message.toolCalls {
                         let visibleToolCalls = toolCalls.filter { !$0.isGesture }
                         if !visibleToolCalls.isEmpty {
                             ToolExecutionTimelineView(toolCalls: visibleToolCalls)
@@ -3441,21 +3762,23 @@ struct ChatMessageView: View {
                     // Inline agent-work indicator: shown while the model streams a
                     // tool call's arguments or the harness executes a running call,
                     // so slow calls (e.g. writing a script) still read as active work.
-                    if isAgentWorkingOnToolCall {
+                    if row.isLast, isAgentWorkingOnToolCall {
                         AgentWorkingIndicatorView()
                             .padding(.top, 2)
                     }
 
                     // Main Response Text rendered via Rich Markdown Engine.
                     // Raw call markup is suppressed for tool-only turns, both while
-                    // streaming and after the call has parsed.
-                    if !displayContent.isEmpty {
+                    // streaming and after the call has parsed. Only this row's
+                    // slice of the parse is drawn; the parse itself is shared.
+                    if !displayContent.isEmpty, !row.segment.isEmpty {
                         MarkdownMessageView(
                             content: displayContent,
                             isStreaming: (isGenerating || isCompactingConversation) && message.isThinking == false,
-                            isStreamingOffDisk: isStreamingOffDisk
+                            isStreamingOffDisk: isStreamingOffDisk,
+                            preparsedBlocks: row.segment.blocks
                         )
-                    } else if (isGenerating || isCompactingConversation) && !message.isThinking && !hasThinkingContent && (message.toolCalls == nil || message.toolCalls!.isEmpty) && !isStreamingToolCall {
+                    } else if row.isLast, (isGenerating || isCompactingConversation) && !message.isThinking && !hasThinkingContent && (message.toolCalls == nil || message.toolCalls!.isEmpty) && !isStreamingToolCall {
                         // Only for non-thinking models during initial prefill / generation,
                         // or the /compact progress bubble before its first summary text
                         if let prefill = message.prefillStatus {
@@ -3481,8 +3804,10 @@ struct ChatMessageView: View {
                         }
                     }
 
-                    // Action & Metrics Footer (Osaurus Style Telemetry & Actions)
-                    if (!message.isThinking || !isGenerating) && (hasTelemetry || !displayContent.isEmpty) {
+                    // Action & Metrics Footer (Osaurus Style Telemetry & Actions).
+                    // Telemetry describes the whole turn, so it closes the last
+                    // row rather than repeating under every slice.
+                    if row.isLast, (!message.isThinking || !isGenerating) && (hasTelemetry || !displayContent.isEmpty) {
                         HStack(spacing: 12) {
                             // Telemetry
                             HStack(spacing: 6) {
@@ -3588,6 +3913,12 @@ struct ChatMessageView: View {
             .frame(maxWidth: .infinity, alignment: message.role == .user ? .trailing : .leading)
         }
     }
+
+    /// Equality is the render fingerprint, not the message: only the row whose
+    /// visible content changed re-renders when a turn streams.
+    static func == (lhs: ChatMessageView, rhs: ChatMessageView) -> Bool {
+        lhs.renderFingerprint == rhs.renderFingerprint
+    }
 }
 
 // MARK: - Welcome / Empty State View
@@ -3635,7 +3966,7 @@ struct EmptyWelcomeView: View {
 
 // MARK: - Markdown Table & Typography Models
 
-public enum TextAlignmentType {
+nonisolated public enum TextAlignmentType {
     case leading
     case center
     case trailing
@@ -3657,7 +3988,7 @@ public enum TextAlignmentType {
     }
 }
 
-public struct MarkdownTableData: Identifiable, Equatable {
+nonisolated public struct MarkdownTableData: Identifiable, Equatable {
     public let id: String
     public let headers: [String]
     public let alignments: [TextAlignmentType]
@@ -3696,6 +4027,12 @@ struct MarkdownMessageView: View {
     let content: String
     var isStreaming: Bool = false
     var isStreamingOffDisk: Bool = false
+    /// A slice of an already-parsed message, when the transcript is rendering
+    /// one segment of a message it has split. Supplying blocks here is what
+    /// keeps segmentation from multiplying parse cost: the full text is parsed
+    /// once by `TranscriptPresentationCache` and each row renders its own slice,
+    /// instead of every row re-parsing the whole message on realization.
+    var preparsedBlocks: [MarkdownBlock]? = nil
 
     /// Memoizes this message's block parse. Parsing runs ~20 regex passes over
     /// the whole text (measured at ~30 ms per 40 KB and ~85 ms per 120 KB), and
@@ -3708,11 +4045,17 @@ struct MarkdownMessageView: View {
         var content: String?
         var repairs = true
         var blocks: [MarkdownBlock] = []
+        /// The derived `IdentifiableMarkdownBlock` array, kept beside the parse
+        /// it came from. Rebuilding it re-derived every block id on every body
+        /// pass, which is O(blocks) work per frame on a message that had not
+        /// changed at all. Invalidated with `blocks`, so the two cannot drift.
+        var identifiable: [IdentifiableMarkdownBlock] = []
     }
 
     @State private var memo = BlockMemo()
 
     private var parsedBlocks: [MarkdownBlock] {
+        if let preparsedBlocks { return preparsedBlocks }
         // While the answer streams, skip the malformed-markdown repair passes:
         // they cost more than the rest of the parse together and the growing
         // text is re-parsed on every UI update. The settled message re-parses
@@ -3723,12 +4066,28 @@ struct MarkdownMessageView: View {
         memo.content = content
         memo.repairs = wantsRepairs
         memo.blocks = parsed
+        memo.identifiable = []
         return parsed
     }
 
     private var identifiableBlocks: [IdentifiableMarkdownBlock] {
         let rawBlocks = parsedBlocks
-        return rawBlocks.enumerated().map { index, block in
+        if preparsedBlocks == nil, !memo.identifiable.isEmpty,
+           memo.identifiable.count == rawBlocks.count {
+            return memo.identifiable
+        }
+        let derived = Self.identifiableBlocks(from: rawBlocks, isStreaming: isStreaming)
+        if preparsedBlocks == nil { memo.identifiable = derived }
+        return derived
+    }
+
+    /// Derives the render list for a block array. Split out so the memoized
+    /// path and the segment path build ids with the same rules.
+    static func identifiableBlocks(
+        from rawBlocks: [MarkdownBlock],
+        isStreaming: Bool
+    ) -> [IdentifiableMarkdownBlock] {
+        rawBlocks.enumerated().map { index, block in
             let isLast = isStreaming && (index == rawBlocks.count - 1)
             let blockId: String
             switch block {
@@ -3745,30 +4104,38 @@ struct MarkdownMessageView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            ForEach(identifiableBlocks) { item in
-                switch item.block {
-                case .heading(let level, let text):
-                    renderHeading(level: level, text: text, isLast: item.isLast)
-                case .paragraph(let text):
-                    renderParagraph(text: text, isLast: item.isLast)
-                case .table(let table):
-                    MarkdownTableView(table: table, isLast: item.isLast, isStreamingOffDisk: isStreamingOffDisk)
-                case .codeBlock(let language, let code):
-                    CodeBlockCard(
-                        language: language,
-                        code: code,
-                        isStreaming: item.isLast,
-                        isStreamingOffDisk: isStreamingOffDisk
-                    )
-                case .blockquote(let text):
-                    renderBlockquote(text: text, isLast: item.isLast)
-                case .listItem(let number, let text):
-                    renderListItem(number: number, text: text, isLast: item.isLast)
-                case .horizontalRule:
-                    Divider()
-                        .padding(.vertical, 6)
+        // Spacing is applied as per-child top padding rather than as the stack's
+        // `spacing`, so the first block of a row sits flush against the row
+        // above it: a message split to fit the budget draws continuously rather
+        // than gaining a paragraph break at every row boundary. For a message
+        // that fits one row this is pixel-identical to `VStack(spacing: 10)`.
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(identifiableBlocks.enumerated()), id: \.element.id) { index, item in
+                Group {
+                    switch item.block {
+                    case .heading(let level, let text):
+                        renderHeading(level: level, text: text, isLast: item.isLast)
+                    case .paragraph(let text):
+                        renderParagraph(text: text, isLast: item.isLast)
+                    case .table(let table):
+                        MarkdownTableView(table: table, isLast: item.isLast, isStreamingOffDisk: isStreamingOffDisk)
+                    case .codeBlock(let language, let code):
+                        CodeBlockCard(
+                            language: language,
+                            code: code,
+                            isStreaming: item.isLast,
+                            isStreamingOffDisk: isStreamingOffDisk
+                        )
+                    case .blockquote(let text):
+                        renderBlockquote(text: text, isLast: item.isLast)
+                    case .listItem(let number, let text):
+                        renderListItem(number: number, text: text, isLast: item.isLast)
+                    case .horizontalRule:
+                        Divider()
+                            .padding(.vertical, 6)
+                    }
                 }
+                .padding(.top, index == 0 ? 0 : 10)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -3962,7 +4329,10 @@ struct MarkdownTableView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            ScrollView(.horizontal, showsIndicators: true) {
+            // The `Grid` already sizes to its content; the horizontal scroll
+            // view around it was the only thing allocating a layer, and a
+            // transcript row can carry dozens of tables. Cells wrap instead.
+            Group {
                 Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
                     // Header Row
                     GridRow {
@@ -3977,6 +4347,7 @@ struct MarkdownTableView: View {
                                     .padding(.horizontal, 14)
                                     .padding(.vertical, 9)
                                     .frame(minWidth: 90, alignment: align.alignment)
+                                    .fixedSize(horizontal: false, vertical: true)
                                     .textSelection(.enabled)
 
                                 if colIdx < table.headers.count - 1 {
@@ -4009,6 +4380,7 @@ struct MarkdownTableView: View {
                                         .padding(.horizontal, 14)
                                         .padding(.vertical, 8)
                                         .frame(minWidth: 90, alignment: align.alignment)
+                                        .fixedSize(horizontal: false, vertical: true)
                                         .textSelection(.enabled)
 
                                     if colIdx < table.headers.count - 1 {
@@ -4284,18 +4656,23 @@ struct CodeBlockCard: View {
             // highlighting ~11 KB costs ~23 ms and used to rerun on every
             // streamed chunk, which is most of a frame budget spent on a block
             // whose tail is still changing. It highlights once it settles.
-            ScrollView(.horizontal, showsIndicators: true) {
-                VStack(alignment: .leading, spacing: 3) {
-                    ForEach(chunks.indices, id: \.self) { index in
-                        Text(text(forChunk: index))
-                            .lineSpacing(3)
-                    }
+            // No horizontal `ScrollView` here. Every code block used to wrap
+            // itself in one, so a long agent turn accumulated 30–100 nested
+            // scroll views inside a single lazy row, each allocating a layer —
+            // and the row that could not paint was the one carrying them. Long
+            // lines wrap instead, so a block contributes one layer.
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(chunks.indices, id: \.self) { index in
+                    Text(text(forChunk: index))
+                        .lineSpacing(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .font(.system(size: max(8.5, 12.5 * zoomManager.zoomScale), design: .monospaced))
-                .textSelection(.enabled)
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .font(.system(size: max(8.5, 12.5 * zoomManager.zoomScale), design: .monospaced))
+            .textSelection(.enabled)
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color(NSColor.textBackgroundColor))
         }
         .cornerRadius(8)
