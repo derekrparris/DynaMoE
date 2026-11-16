@@ -104,6 +104,38 @@ nonisolated enum TranscriptSegmenter {
     /// Height above which the diagnostic warns about a single row.
     static let rowHeightWarning: CGFloat = 8_000
 
+    /// Height cap for a region of INSPECTION content that rides a row and cannot
+    /// be segmented: the reasoning accordion, a plan document, a compaction
+    /// summary, the tool-call card list.
+    ///
+    /// These are the last unbounded things a transcript row can carry. A
+    /// reasoning trace of 60k characters laid out inline is ~16,000 pt of views
+    /// inside ONE lazy child, which is exactly what the compositor refuses to
+    /// paint, so each such region is drawn inside a scroll area no taller than
+    /// this instead. The content stays reachable; the row stays bounded.
+    static let inspectionHeightCeiling: CGFloat = 420
+
+    /// Chrome a row adds around its content: avatar, header, working indicator,
+    /// telemetry footer, attachment strip.
+    static let rowChromeHeight: CGFloat = 420
+
+    /// A message's first row can carry two capped sections before its own
+    /// blocks: the reasoning accordion and the tool-call card list.
+    static var rowRiderHeightCeiling: CGFloat { inspectionHeightCeiling * 2 }
+
+    /// Tallest a row can get: its segmented blocks plus everything that rides
+    /// the row and cannot be split, plus the row's own chrome. Segmentation is
+    /// only doing its job while this stays under the compositor's ceiling.
+    static func worstCaseRowHeight(of segment: TranscriptSegment) -> CGFloat {
+        estimatedHeight(of: segment) + rowRiderHeightCeiling + rowChromeHeight
+    }
+
+    /// True when `text` would lay out taller than an inspection region may be,
+    /// so it has to be drawn inside a capped scroll area rather than inline.
+    static func exceedsInspectionHeight(_ text: String) -> Bool {
+        LongTextChunker.isOversized(text, maxLines: 24, maxCharacters: 2_400)
+    }
+
     // MARK: - Rows
 
     /// One row per segment, always at least one: a tool-only assistant turn has

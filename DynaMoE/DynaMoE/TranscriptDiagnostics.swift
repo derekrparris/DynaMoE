@@ -27,8 +27,16 @@ import Foundation
 final class TranscriptDiagnostics {
     static let category = "transcript"
 
+    /// One realized row's measurement, with the label that says what it is. A
+    /// bare height cannot be acted on: whether the tall row is an answer, a
+    /// reasoning accordion or a tool-call list decides where the fix belongs.
+    struct RowMeasurement {
+        var height: CGFloat
+        var label: String
+    }
+
     /// Rows measured in the current turn, keyed by row id.
-    private var rowHeights: [String: CGFloat] = [:]
+    private var rowHeights: [String: RowMeasurement] = [:]
     private var contentHeight: CGFloat = 0
     private var viewportHeight: CGFloat = 0
     private var lastReportedTurnKey: String?
@@ -37,8 +45,8 @@ final class TranscriptDiagnostics {
 
     /// Records one realized row's height. Called from the row's own geometry
     /// callback, so it only ever sees rows the lazy stack actually built.
-    func record(rowId: String, height: CGFloat) {
-        rowHeights[rowId] = height
+    func record(rowId: String, label: String, height: CGFloat) {
+        rowHeights[rowId] = RowMeasurement(height: height, label: label)
     }
 
     /// Records the scroll view's own geometry.
@@ -69,7 +77,9 @@ final class TranscriptDiagnostics {
         guard turnKey != lastReportedTurnKey else { return }
         lastReportedTurnKey = turnKey
 
-        let tallest = rowHeights.values.max() ?? 0
+        let tallest = rowHeights.values.max { $0.height < $1.height }
+        let tallestHeight = tallest?.height ?? 0
+        let tallestLabel = tallest?.label ?? "none"
         let realized = rowHeights.count
         var blockCount = 0
         var nestedScrollViews = 0
@@ -89,17 +99,18 @@ final class TranscriptDiagnostics {
             Self.category,
             "turn=\(turnKey) contentHeight=\(Int(contentHeight))pt "
                 + "viewport=\(Int(viewportHeight))pt realizedRows=\(realized) "
-                + "tallestRow=\(Int(tallest))pt rows=\(segmentCount) "
+                + "tallestRow=\(Int(tallestHeight))pt tallestRowKind=\(tallestLabel) "
+                + "rows=\(segmentCount) "
                 + "blocks=\(blockCount) nestedScrollViews=\(nestedScrollViews) "
                 + "characters=\(characters) messages=\(messages.count)"
         )
 
-        if tallest > TranscriptSegmenter.rowHeightWarning, !warnedRowHeight {
+        if tallestHeight > TranscriptSegmenter.rowHeightWarning, !warnedRowHeight {
             warnedRowHeight = true
             DiagLog.warning(
                 Self.category,
                 "row exceeds \(Int(TranscriptSegmenter.rowHeightWarning))pt: "
-                    + "tallestRow=\(Int(tallest))pt turn=\(turnKey) — "
+                    + "tallestRow=\(Int(tallestHeight))pt kind=\(tallestLabel) turn=\(turnKey) "
                     + "a row this tall is at risk of the compositor ceiling "
                     + "(\(Int(TranscriptSegmenter.compositorHeightCeiling))pt)"
             )

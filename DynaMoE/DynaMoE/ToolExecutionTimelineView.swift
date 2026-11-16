@@ -18,6 +18,15 @@ public struct ToolExecutionTimelineView: View {
     /// Calls the summary strip shows before it collapses to a `+N more` chip.
     static let badgeLimit = 8
 
+    /// Cards drawn inline before the list becomes a scroll area. Every card is
+    /// another view inside the same transcript row, and an agent loop can issue
+    /// dozens of calls in one turn, so an unbounded list is a row that grows
+    /// without limit, which is what the compositor refuses to paint.
+    static let inlineCardLimit = 5
+
+    /// Height cap for the card list once it scrolls.
+    static var cardListHeightCeiling: CGFloat { TranscriptSegmenter.inspectionHeightCeiling }
+
     public init(
         toolCalls: [ToolCallRecord],
         onApproveCall: ((UUID) -> Void)? = nil,
@@ -62,18 +71,34 @@ public struct ToolExecutionTimelineView: View {
                 .padding(.vertical, 4)
             }
 
-            // Detailed Cards for Each Step
-            VStack(alignment: .leading, spacing: 8) {
-                ForEach(toolCalls) { call in
-                    TimelineStepCardView(
-                        call: call,
-                        onApprove: { onApproveCall?(call.id) },
-                        onReject: { onRejectCall?(call.id) }
-                    )
+            // Detailed Cards for Each Step. Bounded past a handful of calls: a
+            // long agent turn can issue dozens, and the list rides one
+            // transcript row. Scrolling keeps every card reachable, which is why
+            // the whole list is not truncated the way the badge strip is.
+            if toolCalls.count > Self.inlineCardLimit {
+                ScrollView(.vertical, showsIndicators: true) {
+                    cardList(toolCalls)
                 }
+                .frame(maxHeight: Self.cardListHeightCeiling)
+            } else {
+                cardList(toolCalls)
             }
         }
         .padding(.vertical, 2)
+    }
+
+    /// The per-call detail cards, in call order.
+    @ViewBuilder
+    private func cardList(_ calls: [ToolCallRecord]) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(calls) { call in
+                TimelineStepCardView(
+                    call: call,
+                    onApprove: { onApproveCall?(call.id) },
+                    onReject: { onRejectCall?(call.id) }
+                )
+            }
+        }
     }
 }
 

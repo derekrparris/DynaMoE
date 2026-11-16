@@ -294,6 +294,40 @@ final class TranscriptSegmenterTests: XCTestCase {
         XCTAssertEqual(TranscriptSegmenter.nestedScrollViewCount(of: segment), 3)
     }
 
+    // MARK: - What rides a row
+
+    func testARowWithEverythingThatRidesItStaysUnderTheCeiling() {
+        // A row is not only its blocks. The reasoning accordion and the tool-call
+        // card list ride the message's first row and cannot be split, so they are
+        // capped; the worst case has to fit anyway, or segmentation alone would
+        // still leave a row the compositor refuses to paint.
+        let segment = TranscriptSegment(blocks: parseMarkdownBlocks(longParagraph(lines: 150)))
+        XCTAssertLessThanOrEqual(
+            TranscriptSegmenter.worstCaseRowHeight(of: segment),
+            TranscriptSegmenter.compositorHeightCeiling
+        )
+        XCTAssertLessThan(
+            TranscriptSegmenter.rowRiderHeightCeiling + TranscriptSegmenter.rowChromeHeight,
+            TranscriptSegmenter.compositorHeightCeiling
+        )
+    }
+
+    func testInspectionHeightRuleMatchesTheCap() {
+        // Short reading stays inline; anything that would lay out past the cap
+        // goes inside the scroll area. The threshold is below the cap so a region
+        // is never taller than the space it is given.
+        XCTAssertFalse(TranscriptSegmenter.exceedsInspectionHeight("a short thought"))
+        XCTAssertTrue(TranscriptSegmenter.exceedsInspectionHeight(longParagraph(lines: 1_200)))
+        XCTAssertTrue(TranscriptSegmenter.exceedsInspectionHeight(String(repeating: "x", count: 2_401)))
+        XCTAssertFalse(TranscriptSegmenter.exceedsInspectionHeight(String(repeating: "x", count: 2_400)))
+
+        // The cap has to be small enough to be a real bound on a row.
+        XCTAssertLessThan(
+            TranscriptSegmenter.inspectionHeightCeiling,
+            TranscriptSegmenter.compositorHeightCeiling / 8
+        )
+    }
+
     func testLaidOutLineCountWrapsLongLines() {
         XCTAssertEqual(TranscriptSegmenter.laidOutLineCount(of: .paragraph(text: "short")), 1)
         XCTAssertEqual(

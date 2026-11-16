@@ -312,6 +312,19 @@ struct ChatDetailView: View {
     @AppStorage("dynamoe_agent_turbo_mode") private var isTurboModeEnabled: Bool = false
     @ObservedObject private var subagentManager = SubagentManager.shared
 
+    /// Characters of streamed output that make up one follow bucket, roughly one
+    /// line. The follow keys off this rather than the exact length so a turn
+    /// scrolls a few times a second instead of once per streamed chunk.
+    private static let streamFollowBucketCharacters = 120
+
+    /// Coarse progress marker for the newest message, so the transcript follows
+    /// a streamed answer without a `scrollTo` per chunk.
+    private var streamFollowBucket: Int {
+        guard let last = session?.messages.last else { return 0 }
+        return (last.content.count + (last.thinkingContent?.count ?? 0))
+            / Self.streamFollowBucketCharacters
+    }
+
     // MARK: - Transcript rows
 
     /// The flattened rows the transcript draws: one per message in the common
@@ -429,6 +442,19 @@ struct ChatDetailView: View {
         }
     }
 
+    /// What kind of row this is, for the geometry diagnostic. A bare height
+    /// cannot be acted on: whether the row that crosses the ceiling is an
+    /// answer, a plan card or a compaction digest decides where the fix goes.
+    private static func diagnosticLabel(for row: TranscriptRow) -> String {
+        let kind: String
+        switch row.kind {
+        case .compactionSummary: kind = "compaction"
+        case .planCard: kind = "plan"
+        case .message: kind = "message"
+        }
+        return "\(kind)#\(row.segmentIndex)/\(row.segmentCount)"
+    }
+
     /// Emits the transcript's geometry once for `session`, tagged with `suffix`
     /// so the settle report and the restored-conversation report are separate
     /// lines rather than one suppressing the other.
@@ -461,7 +487,13 @@ struct ChatDetailView: View {
     /// faster than it completes. Discrete transitions (a message landing, a
     /// turn starting or ending) animate, as they did before the throttle.
     private func followBottom(_ proxy: ScrollViewProxy, animated: Bool = false) {
-        isProgrammaticScrollInFlight = true
+        // Only an ANIMATED follow needs the suppression window: it reports
+        // intermediate offsets for its whole duration. An instantaneous jump
+        // lands on the bottom within the same frame, so it cannot be misread as
+        // a drag. Claiming the window for it (a streaming turn follows
+        // several times a second) left the pin permanently immune to the user
+        // scrolling away.
+        if animated { isProgrammaticScrollInFlight = true }
         DispatchQueue.main.async {
             if animated {
                 withAnimation(.easeOut(duration: 0.2)) {
@@ -470,11 +502,8 @@ struct ChatDetailView: View {
             } else {
                 proxy.scrollTo(Self.scrollBottomAnchorID, anchor: .bottom)
             }
-            // The geometry handler runs before this clears, so the offset
-            // change this scroll causes is never read as a user drag. The delay
-            // covers the animation: an animated scroll reports intermediate
-            // offsets for its duration, and any of them would otherwise unpin.
-            DispatchQueue.main.asyncAfter(deadline: .now() + (animated ? 0.25 : 0.05)) {
+            guard animated else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                 isProgrammaticScrollInFlight = false
             }
         }
@@ -928,6 +957,7 @@ struct ChatDetailView: View {
                                         } action: { height in
                                             transcriptDiagnostics.record(
                                                 rowId: entry.row.id,
+                                                label: Self.diagnosticLabel(for: entry.row),
                                                 height: height
                                             )
                                         }
@@ -1018,6 +1048,15 @@ struct ChatDetailView: View {
                     guard !Task.isCancelled, !isGenerating else { return }
                     reportTranscriptGeometry(for: session, suffix: "restored")
                 }
+                // The scroll view's own bottom anchor does not hold the tail
+                // while a streamed answer grows: rows are re-segmented, heights
+                // change, and the view drifts off the newest output. The follow
+                // is therefore explicit, off a coarse bucket (about a line) so a
+                // turn jumps a few times a second instead of once per chunk.
+                .onChange(of: streamFollowBucket) { _ in
+                    guard isGenerating, isPinnedToBottom else { return }
+                    followBottom(proxy)
+                }
                 .onScrollGeometryChange(for: ScrollSnapshot.self) { geometry in
                     ScrollSnapshot(
                         offset: geometry.contentOffset.y,
@@ -1032,24 +1071,26 @@ struct ChatDetailView: View {
                         viewportHeight: new.containerHeight
                     )
 
-                    // Content grew under us (streaming output). That is not a
-                    // user scroll, so it must never unpin — the old
-                    // `offset == old.offset` heuristic tried to say this and
-                    // mis-read an animated scroll, which is what made the
-                    // follow stop mid-turn. The scroll view keeps the tail
-                    // visible on its own via `defaultScrollAnchor(.bottom)`.
-                    if new.contentHeight > old.contentHeight { return }
-
                     // A programmatic scroll in flight reports intermediate
                     // offsets for its duration; none of them is a user drag.
                     guard !isProgrammaticScrollInFlight else { return }
 
+                    // Only a drag UP may unpin. Content growing under the user
+                    // pushes the offset DOWN the document, and the follow jumps
+                    // it further down; neither is the user leaving the tail. The
+                    // old rule asked whether the offset changed at all, which
+                    // read both of those as a drag, so the follow stopped
+                    // mid-turn.
+                    if new.offset < old.offset - 1 {
+                        if isPinnedToBottom { isPinnedToBottom = false }
+                        return
+                    }
+
                     // Only write on a real change: this action runs on every
                     // geometry update, and an unconditional write invalidated
                     // the view several times per frame while a turn streamed.
-                    let pinned = new.distanceFromBottom <= 48
-                    if pinned != isPinnedToBottom {
-                        isPinnedToBottom = pinned
+                    if new.distanceFromBottom <= 48, !isPinnedToBottom {
+                        isPinnedToBottom = true
                     }
                 }
                 // Everything the chat column says without moving anything: the
@@ -3156,7 +3197,11 @@ struct CompactionSummaryCard: View {
             }
 
             if isExpanded {
-                MarkdownMessageView(content: message.content)
+                // A digest of a 60k-token conversation is long enough to be its
+                // own row's ceiling problem, and this card is a single row.
+                BoundedInspection(isTall: TranscriptSegmenter.exceedsInspectionHeight(message.content)) {
+                    MarkdownMessageView(content: message.content)
+                }
             }
         }
         .padding(14)
@@ -3261,24 +3306,33 @@ struct PlanCard: View {
 
                     if isReasoningExpanded {
                         // A plan turn's reasoning runs to tens of thousands of
-                        // tokens. One `Text` of that height is never painted
-                        // (the whiteout), and this card replaced the only path
-                        // that had been chunked — so it was the one place a
-                        // long reasoning block could still blank the row.
-                        ChunkedText(text: thinking, lineSpacing: 3)
-                            .font(.system(size: max(9.5, 11.5 * zoomManager.zoomScale)))
-                            .foregroundColor(.secondary)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .padding(8)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Color.secondary.opacity(0.05))
-                            .cornerRadius(6)
+                        // tokens. Chunking bounds any ONE text view but not the
+                        // stack of them, so the trace is capped as well: a plan
+                        // card is one row, and a row taller than the
+                        // compositor's ceiling is never painted.
+                        BoundedInspection(isTall: TranscriptSegmenter.exceedsInspectionHeight(thinking)) {
+                            ChunkedText(text: thinking, lineSpacing: 3)
+                                .font(.system(size: max(9.5, 11.5 * zoomManager.zoomScale)))
+                                .foregroundColor(.secondary)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.secondary.opacity(0.05))
+                        .cornerRadius(6)
                     }
                 }
             }
 
-            MarkdownMessageView(content: content, isStreaming: isStreaming && !isReady)
+            // The plan itself is a document of arbitrary length, and this card is
+            // a single transcript row: it is bounded here for the same reason the
+            // message rows are split. A plan short enough to read inline is
+            // unchanged.
+            BoundedInspection(isTall: TranscriptSegmenter.exceedsInspectionHeight(content)) {
+                MarkdownMessageView(content: content, isStreaming: isStreaming && !isReady)
+            }
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -3709,23 +3763,28 @@ struct ChatMessageView: View, Equatable {
 
                                     if !thinking.isEmpty {
                                         // Reasoning can run to tens of thousands of
-                                        // tokens; one Text of that height is
-                                        // never painted (the whiteout), so it is
-                                        // drawn as bounded chunks instead.
-                                        ChunkedText(text: thinking, lineSpacing: 3)
-                                            .font(.system(size: max(8, 12 * zoomManager.zoomScale), design: .monospaced))
-                                            .foregroundColor(.secondary)
-                                            .padding(.horizontal, 14)
-                                            .padding(.vertical, 10)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                            .background(Color.secondary.opacity(0.035))
-                                            .cornerRadius(8)
-                                            .overlay(
-                                                RoundedRectangle(cornerRadius: 8)
-                                                    .stroke(Color.primary.opacity(0.05), lineWidth: 1)
-                                            )
-                                            .textSelection(.enabled)
+                                        // tokens. `ChunkedText` bounds any ONE text
+                                        // view, but the chunks stack, so a whole
+                                        // trace of 60k characters is still ~16,000
+                                        // pt of views in this single row, which is
+                                        // the whiteout. It is capped, not chunked
+                                        // alone: chunks inside a scroll area.
+                                        BoundedInspection(isTall: TranscriptSegmenter.exceedsInspectionHeight(thinking)) {
+                                            ChunkedText(text: thinking, lineSpacing: 3)
+                                                .font(.system(size: max(8, 12 * zoomManager.zoomScale), design: .monospaced))
+                                                .foregroundColor(.secondary)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                .fixedSize(horizontal: false, vertical: true)
+                                                .textSelection(.enabled)
+                                        }
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 10)
+                                        .background(Color.secondary.opacity(0.035))
+                                        .cornerRadius(8)
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 8)
+                                                .stroke(Color.primary.opacity(0.05), lineWidth: 1)
+                                        )
                                     } else if message.isThinking && isGenerating && message.prefillStatus == nil {
                                         HStack(spacing: 8) {
                                             StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
@@ -3918,6 +3977,34 @@ struct ChatMessageView: View, Equatable {
     /// visible content changed re-renders when a turn streams.
     static func == (lhs: ChatMessageView, rhs: ChatMessageView) -> Bool {
         lhs.renderFingerprint == rhs.renderFingerprint
+    }
+}
+
+/// Draws long content inside a capped scroll area so it cannot grow its row past
+/// the compositor's maximum layer height. Short content is drawn inline, exactly
+/// as before, so the common case looks unchanged and allocates nothing extra.
+///
+/// This is the counterpart to row segmentation: a transcript row's markdown
+/// blocks are split across rows, but reasoning traces, plan documents, compaction
+/// summaries and tool-call lists ride a single row and cannot be split, so they
+/// are bounded instead.
+struct BoundedInspection<Content: View>: View {
+    /// Whether the content would lay out taller than `maxHeight`. Passed in
+    /// rather than measured so the caller decides with the same rule the
+    /// segmenter uses, and so a short trace never pays for a scroll view.
+    let isTall: Bool
+    var maxHeight: CGFloat = TranscriptSegmenter.inspectionHeightCeiling
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        if isTall {
+            ScrollView(.vertical, showsIndicators: true) {
+                content
+            }
+            .frame(maxHeight: maxHeight)
+        } else {
+            content
+        }
     }
 }
 
