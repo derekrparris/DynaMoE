@@ -62,6 +62,10 @@ public struct PendingActionConfirmation: Identifiable, Equatable {
     public let toolName: String
     public let arguments: [String: String]
     public let targetSummary: String
+    /// Where the call actually sends data (origin and, for an upload, the file
+    /// names). The card used to name only the tool, so a call redirected to a
+    /// custom host looked identical to the official one.
+    public let destinationSummary: String?
     public let diffPreview: String?
     public let commandPreview: String?
 
@@ -70,6 +74,7 @@ public struct PendingActionConfirmation: Identifiable, Equatable {
         toolName: String,
         arguments: [String: String],
         targetSummary: String,
+        destinationSummary: String? = nil,
         diffPreview: String? = nil,
         commandPreview: String? = nil
     ) {
@@ -77,6 +82,7 @@ public struct PendingActionConfirmation: Identifiable, Equatable {
         self.toolName = toolName
         self.arguments = arguments
         self.targetSummary = targetSummary
+        self.destinationSummary = destinationSummary
         self.diffPreview = diffPreview
         self.commandPreview = commandPreview
     }
@@ -138,6 +144,23 @@ public struct ActionConfirmationView: View {
                     .foregroundColor(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+            }
+
+            // Destination (a third-party upload, a custom endpoint)
+            if let destination = confirmation.destinationSummary, !destination.isEmpty {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "arrow.up.forward.square")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.orange)
+                    Text(destination)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.primary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(7)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.orange.opacity(0.08))
+                .cornerRadius(5)
             }
 
             // Diff or Command Preview

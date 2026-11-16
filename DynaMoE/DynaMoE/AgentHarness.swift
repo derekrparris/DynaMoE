@@ -3751,26 +3751,42 @@ public final class AgentHarness {
     public static func requiresApproval(
         toolName: String,
         arguments: [String: Any],
-        mode: AgentMode
+        mode: AgentMode,
+        subQEndpoint: URL? = nil
     ) -> Bool {
         if isStateChanging(toolName: toolName) {
             return !PlanModePolicy.withholds(toolName, in: mode)
         }
         if toolName == "subq_decide" {
-            return subqDecideRequiresApproval(arguments: arguments)
+            return subqDecideRequiresApproval(
+                arguments: arguments,
+                endpoint: subQEndpoint ?? SubQDecisionSettings.endpoint()
+            )
         }
         return false
     }
 
     /// True when a `subq_decide` call sends local file bytes or would send the
-    /// state to a host other than SubQ's own.
+    /// state to an origin other than SubQ's own.
+    public static func subqDecideRequiresApproval(
+        arguments: [String: Any],
+        endpoint: URL
+    ) -> Bool {
+        if let images = arguments["images"] as? [Any], !images.isEmpty { return true }
+        // Origin, not host: `https://api.subq.ai:8443` is a different service
+        // and must not ride in on the official host's approval.
+        return SubQDecisionSettings.origin(endpoint) != SubQDecisionSettings.officialOrigin
+    }
+
+    /// The defaults-driven form, kept for the Settings and test call sites.
     public static func subqDecideRequiresApproval(
         arguments: [String: Any],
         defaults: UserDefaults = .standard
     ) -> Bool {
-        if let images = arguments["images"] as? [Any], !images.isEmpty { return true }
-        let officialHost = URL(string: SubQDecisionSettings.defaultEndpoint)?.host?.lowercased()
-        return SubQDecisionSettings.endpoint(defaults: defaults).host?.lowercased() != officialHost
+        subqDecideRequiresApproval(
+            arguments: arguments,
+            endpoint: SubQDecisionSettings.endpoint(defaults: defaults)
+        )
     }
 
     /// The mode of the turn whose tool is executing, bound by `executeTool`.
@@ -4921,18 +4937,24 @@ public final class AgentHarness {
     /// `mode` is the TURN's mode. Callers that know it pass it by value, because
     /// `activeMode` is process-global and another turn can move it; a nil value
     /// keeps the historical behaviour of reading the active mode.
-    public func executeTool(call: ParsedToolCall, workingDirectory: URL? = nil, maxOutputLength: Int? = nil, mode: AgentMode? = nil) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool) {
+    public func executeTool(call: ParsedToolCall, workingDirectory: URL? = nil, maxOutputLength: Int? = nil, mode: AgentMode? = nil, approvedSubQEndpoint: URL? = nil) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool) {
         let effectiveMode = mode ?? activeMode
         // Bound for the whole call so a tool that takes no `mode:` parameter
         // (`tools_discover`, `tools_load`) answers for THIS turn rather than for
         // whatever `activeMode` holds when its own `await` resumes.
+        //
+        // The SubQ endpoint is bound for the same reason: the approval card
+        // displays a destination, and the call must use THAT one rather than
+        // re-read `UserDefaults` after the operator approved a different host.
         return await AgentHarness.$executingTurnMode.withValue(effectiveMode) {
-            await self.runToolInTurn(
-                call: call,
-                workingDirectory: workingDirectory,
-                maxOutputLength: maxOutputLength,
-                effectiveMode: effectiveMode
-            )
+            await SubQDecideTool.$pinnedEndpoint.withValue(approvedSubQEndpoint) {
+                await self.runToolInTurn(
+                    call: call,
+                    workingDirectory: workingDirectory,
+                    maxOutputLength: maxOutputLength,
+                    effectiveMode: effectiveMode
+                )
+            }
         }
     }
 
@@ -5673,19 +5695,41 @@ public final class AgentHarness {
     }
 
     public static func toolErrorJSON(tool: String, error: String, extra: [String: Any]? = nil) -> String {
+        // Every error path funnels here: a tool's own `localizedDescription`, a
+        // server's 500 body, a parser's quoted line. Those are untrusted text,
+        // and an unsanitized one could close the tool-response span and forge a
+        // turn. Sanitizing centrally is what keeps a new tool from reopening
+        // the hole its success path already closed.
+        let safeError = sanitizeText(error)
         var dict: [String: Any] = [
             "status": "error",
             "tool": tool,
-            "error": error
+            "error": safeError
         ]
         if let extra = extra {
-            for (k, v) in extra { dict[k] = v }
+            for (k, v) in extra {
+                dict[k] = sanitizeErrorValue(v)
+            }
         }
         if let jsonBytes = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted]),
            let str = String(data: jsonBytes, encoding: .utf8) {
             return str
         }
-        return "{\"status\": \"error\", \"tool\": \"\(tool)\", \"error\": \"\(error)\"}"
+        return "{\"status\": \"error\", \"tool\": \"\(tool)\", \"error\": \"\(safeError)\"}"
+    }
+
+    /// Recursively sanitizes the string values of an error payload.
+    private static func sanitizeErrorValue(_ value: Any) -> Any {
+        switch value {
+        case let text as String:
+            return sanitizeText(text)
+        case let array as [Any]:
+            return array.map(sanitizeErrorValue)
+        case let map as [String: Any]:
+            return map.mapValues(sanitizeErrorValue)
+        default:
+            return value
+        }
     }
 
     // MARK: - Tool Result Rendering (model-facing observations)
@@ -5778,7 +5822,9 @@ public final class AgentHarness {
         guard let data = resultJSON.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let toolName = obj["tool"] as? String, !toolName.isEmpty else {
-            return resultJSON
+            // Already-rendered text still crosses into a tool turn, so the
+            // marker pass runs on it too (it is idempotent).
+            return sanitizeText(resultJSON)
         }
         let status = (obj["status"] as? String) ?? "success"
         var lines: [String] = []
@@ -5792,7 +5838,7 @@ public final class AgentHarness {
             for (k, v) in obj.sorted(by: { $0.key < $1.key }) where k != "status" && k != "tool" && k != "error" {
                 Self.appendRendered(key: k, value: v, indent: 0, to: &lines)
             }
-            return lines.joined(separator: "\n")
+            return sanitizeText(lines.joined(separator: "\n"))
         }
 
         if status == "error" {
@@ -5812,7 +5858,7 @@ public final class AgentHarness {
             lines.append("--- \(k) ---")
             Self.appendLongBody(value: v, indent: 0, to: &lines)
         }
-        return lines.joined(separator: "\n")
+        return sanitizeText(lines.joined(separator: "\n"))
     }
 
     private static func isLongTextValue(_ value: Any?) -> Bool {

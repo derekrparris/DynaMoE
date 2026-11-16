@@ -570,8 +570,15 @@ struct SkillsSettingsSection: View {
     }
 
     private func runTest() {
-        guard let key = SubQDecisionKeySource.resolve() else {
-            testState = .failure("No SubQ API key is configured.")
+        let key: (key: String, label: String)
+        switch SubQDecisionKeySource.resolveDetail() {
+        case .found(let value, let label):
+            key = (value, label)
+        case .missing:
+            testState = .failure(SubQDecisionError.missingKey.localizedDescription)
+            return
+        case .unreadable(let status):
+            testState = .failure(SubQDecisionError.keyUnreadable(status: status).localizedDescription)
             return
         }
         testState = .running
@@ -599,27 +606,29 @@ struct SkillsSettingsSection: View {
     }
 
     private func installStarter() {
-        switch registry.installSubQDecisionsStarter() {
-        case .success(let url):
-            let installedDirectory = url.deletingLastPathComponent().standardizedFileURL.path
-            var message = "Installed at \(installedDirectory)."
-            // The app folder is scanned LAST among the built-in roots, so an
-            // installed starter wins an older ~/.agents or ~/.claude copy. Only
-            // an extraRoot scans after it, and that is the single case where the
-            // copy just installed is the shadowed one. Say which path matters
-            // instead of guessing from a message.
-            if let shadow = registry.shadows.first(where: {
-                $0.winner.directory.standardizedFileURL.path == installedDirectory
-            }) {
-                message += " The copy at \(shadow.loser.directory.path) is shadowed by this one and will not be used."
-            } else if let shadow = registry.shadows.first(where: {
-                $0.loser.directory.standardizedFileURL.path == installedDirectory
-            }) {
-                message += " A copy at \(shadow.winner.directory.path) is scanned later (an extraRoot) and shadows this one. Remove or rename that copy to use this one."
+        Task {
+            switch await registry.installSubQDecisionsStarter() {
+            case .success(let url):
+                let installedDirectory = url.deletingLastPathComponent().standardizedFileURL.path
+                var message = "Installed at \(installedDirectory)."
+                // The app folder is scanned LAST among the built-in roots, so an
+                // installed starter wins an older ~/.agents or ~/.claude copy. Only
+                // an extraRoot scans after it, and that is the single case where the
+                // copy just installed is the shadowed one. Say which path matters
+                // instead of guessing from a message.
+                if let shadow = registry.shadows.first(where: {
+                    $0.winner.directory.standardizedFileURL.path == installedDirectory
+                }) {
+                    message += " The copy at \(shadow.loser.directory.path) is shadowed by this one and will not be used."
+                } else if let shadow = registry.shadows.first(where: {
+                    $0.loser.directory.standardizedFileURL.path == installedDirectory
+                }) {
+                    message += " A copy at \(shadow.winner.directory.path) is scanned later (an extraRoot) and shadows this one. Remove or rename that copy to use this one."
+                }
+                installMessage = message
+            case .failure(let error):
+                installMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             }
-            installMessage = message
-        case .failure(let error):
-            installMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
 

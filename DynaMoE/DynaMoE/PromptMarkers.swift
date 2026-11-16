@@ -30,9 +30,32 @@ public nonisolated enum PromptMarkers {
         ("</tool_call>", "[/tool_call]"),
         ("<tool_response>", "[tool_response]"),
         ("</tool_response>", "[/tool_response]"),
-        // Gemma turn boundaries.
+        // Gemma turn boundaries and reasoning channel.
         ("<|turn>", "[turn]"),
         ("<turn|>", "[end_turn]"),
+        (ChatPromptFormatter.gemmaChannelOpen, "[channel]"),
+        (ChatPromptFormatter.gemmaReasoningClose, "[end_channel]"),
+        (ChatPromptFormatter.gemmaThinkMarker, "[think]"),
+        ("<bos>", "[bos]"),
+        ("<|tool_response>", "[tool_response]"),
+        ("<tool_response|>", "[/tool_response]"),
+        ("<|tool_call>", "[tool_call]"),
+        ("<tool_call|>", "[/tool_call]"),
+        ("<|\"|>", "[quote]"),
+        // Ling/Bailing 3.0 role spans. Both halves are control syntax: the
+        // assistant turn boundary is `<role>ASSISTANT</role>`.
+        (ChatPromptFormatter.lingRoleOpen, "[role]"),
+        (ChatPromptFormatter.lingRoleClose, "[/role]"),
+        (ChatPromptFormatter.lingRoleEnd, "[role_end]"),
+        // Spark 2.5's framing (ASCII role markers plus fullwidth sentence
+        // markers). Taken from the formatter's constants for the same reason
+        // as DeepSeek's below.
+        (ChatPromptFormatter.sparkStartOfSentence, "[start_of_sentence]"),
+        (ChatPromptFormatter.sparkEndOfSentence, "[end_of_sentence]"),
+        (ChatPromptFormatter.sparkSystemMarker, "[System]"),
+        (ChatPromptFormatter.sparkUserMarker, "[User]"),
+        (ChatPromptFormatter.sparkBotMarker, "[Bot]"),
+        (ChatPromptFormatter.sparkToolMarker, "[Tool]"),
         // Llama 3 headers and text boundaries.
         ("<|start_header_id|>", "[start_header_id]"),
         ("<|end_header_id|>", "[end_header_id]"),

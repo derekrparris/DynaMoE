@@ -285,6 +285,12 @@ struct TimelineStepCardView: View {
                         toolName: call.name,
                         arguments: call.arguments,
                         targetSummary: primarySummary,
+                        destinationSummary: call.name == "subq_decide"
+                            ? SubQDecideTool.approvalDetail(
+                                rawArguments: call.rawArguments,
+                                endpointString: call.arguments["endpoint"]
+                            )
+                            : nil,
                         diffPreview: call.arguments["diff"] ?? call.arguments["content"],
                         commandPreview: call.arguments["command"]
                     ),

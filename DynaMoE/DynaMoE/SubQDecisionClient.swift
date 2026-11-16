@@ -20,11 +20,16 @@
 //
 
 import Foundation
+import Security
 
 // MARK: - Errors
 
 public nonisolated enum SubQDecisionError: LocalizedError, Equatable {
     case missingKey
+    /// A credential exists but this build may not read it (a dismissed
+    /// Keychain dialog, a locked keychain, a legacy-only item). Reporting that
+    /// as "no key configured" sent the operator to add a second one.
+    case keyUnreadable(status: OSStatus)
     case badRequest(String)
     case unauthorized(String)
     case paymentRequired(String)
@@ -40,6 +45,8 @@ public nonisolated enum SubQDecisionError: LocalizedError, Equatable {
         switch self {
         case .missingKey:
             return "No SubQ API key is configured. Add one in Settings → Agent & Tools → Skills (SubQ Decisions), or add a Cloud Provider with base URL https://api.subq.ai/v1 and a key. Create a key at console.subq.ai."
+        case .keyUnreadable(let status):
+            return "A SubQ API key is stored, but this build could not read it (Keychain error \(status)). If macOS showed an access prompt, allow it and retry; otherwise import the credential from Settings → Stored Credentials."
         case .badRequest(let detail):
             return "subq_decide could not build a request: \(detail)"
         case .unauthorized(let detail):
@@ -109,14 +116,38 @@ public nonisolated enum SubQDecisionSettings {
             || lowered == "[::1]"
     }
 
-    /// Non-nil when the configured endpoint is not SubQ's own host. The request
-    /// carries the API key as a Bearer token, so a custom URL sends that secret
-    /// wherever it points; the Settings card shows this before a test does.
+    /// Canonical origin: `scheme://host:port`, with the scheme's default port
+    /// made explicit. A HOST is not an origin: `https://api.subq.ai` and
+    /// `https://api.subq.ai:8443` are different destinations for a Bearer
+    /// token, and comparing hosts treated the second as SubQ's own.
+    public static func origin(_ url: URL?) -> String? {
+        guard let url,
+              let scheme = url.scheme?.lowercased(), !scheme.isEmpty,
+              let host = url.host?.lowercased(), !host.isEmpty else { return nil }
+        return "\(scheme)://\(host):\(effectivePort(url))"
+    }
+
+    /// The port a URL actually reaches, with the scheme's default made
+    /// explicit. `url.port` is nil for `https://host`, which is 443.
+    public static func effectivePort(_ url: URL) -> Int {
+        let scheme = url.scheme?.lowercased()
+        return url.port ?? (scheme == "https" ? 443 : (scheme == "http" ? 80 : -1))
+    }
+
+    /// The origin this build treats as SubQ's own. Everything else is a custom
+    /// destination that needs explicit approval.
+    public static var officialOrigin: String? {
+        origin(URL(string: defaultEndpoint))
+    }
+
+    /// Non-nil when the configured endpoint is not SubQ's own origin. The
+    /// request carries the API key as a Bearer token, so a custom URL sends
+    /// that secret wherever it points; Settings shows this before a test does
+    /// and the approval card names it before a call runs.
     public static func customEndpointWarning(defaults: UserDefaults = .standard) -> String? {
         let configured = endpoint(defaults: defaults)
-        let officialHost = URL(string: defaultEndpoint)?.host?.lowercased()
-        guard configured.host?.lowercased() != officialHost else { return nil }
-        let destination = configured.host ?? configured.absoluteString
+        guard origin(configured) != officialOrigin else { return nil }
+        let destination = origin(configured) ?? configured.absoluteString
         return "This endpoint is not api.subq.ai. The API key is sent as a Bearer token to \(destination); use a custom endpoint only with a server you trust."
     }
 
@@ -161,27 +192,60 @@ public nonisolated enum SubQDecisionKeySource {
         }
     }
 
+    /// What a call can do with the credentials this build can see.
+    public enum Resolution: Sendable, Equatable {
+        case found(key: String, label: String)
+        case missing
+        /// A credential is stored but the read was refused or the keychain was
+        /// unavailable. A turn must say that rather than "add a key".
+        case unreadable(OSStatus)
+    }
+
     /// The key and where it came from, for the Settings readout and the tool's
     /// error text. Ordered so the user's existing Cloud Provider setup wins.
-    public static func resolve(defaults: UserDefaults = .standard) -> (key: String, label: String)? {
+    ///
+    /// Distinguishes "not stored" from "could not read it": `get` folds both
+    /// into nil, which reported a denied Keychain read as a missing key.
+    public static func resolveDetail(defaults: UserDefaults = .standard) -> Resolution {
         #if DEBUG
-        if let override = resolutionOverrideForTesting { return override() }
+        if let override = resolutionOverrideForTesting {
+            guard let resolved = override() else { return .missing }
+            return .found(key: resolved.key, label: resolved.label)
+        }
         #endif
+        var unreadable: OSStatus?
         for provider in matchingProviders(defaults: defaults) {
-            if let key = CloudSecretStore.shared.get(providerId: provider.id),
-               !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return (key, "Cloud Provider '\(provider.displayName)'")
+            switch CloudSecretStore.shared.read(providerId: provider.id) {
+            case .found(let key) where !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
+                return .found(key: key, label: "Cloud Provider '\(provider.displayName)'")
+            case .accessDenied(let status), .unavailable(let status):
+                unreadable = unreadable ?? status
+            default:
+                break
             }
         }
-        if let key = SkillsSecretStore.shared.get(account: account),
-           !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return (key, "Skills Keychain")
+        switch SkillsSecretStore.shared.read(account: account) {
+        case .found(let key) where !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty:
+            return .found(key: key, label: "Skills Keychain")
+        case .accessDenied(let status), .unavailable(let status):
+            unreadable = unreadable ?? status
+        default:
+            break
         }
         if let key = ProcessInfo.processInfo.environment[environmentName],
            !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return (key, "\(environmentName) environment variable")
+            return .found(key: key, label: "\(environmentName) environment variable")
         }
-        return nil
+        if let unreadable { return .unreadable(unreadable) }
+        return .missing
+    }
+
+    /// The key alone, for callers that only need a value. Prefer
+    /// `resolveDetail` where the difference between missing and unreadable
+    /// changes what the user is told.
+    public static func resolve(defaults: UserDefaults = .standard) -> (key: String, label: String)? {
+        guard case .found(let key, let label) = resolveDetail(defaults: defaults) else { return nil }
+        return (key, label)
     }
 
     /// Attributes only where possible, so this is safe on the prompt-seeding
@@ -285,8 +349,11 @@ public nonisolated enum SubQDecisionAnswer: Equatable, Sendable {
             return parts.joined(separator: " · ")
         case .score(let score, let legend, let probabilities, let confidence):
             var parts = ["score \(Self.number(score))"]
-            let level = String(Int(score.rounded()))
-            if let name = legend[level] { parts.append("= \(name)") }
+            // `Int(exactly:)` rather than `Int(...)`: a hostile endpoint's
+            // `1e300` trapped the app here, before any validation ran.
+            if let level = Int(exactly: score.rounded()), let name = legend[String(level)] {
+                parts.append("= \(name)")
+            }
             if let confidence { parts.append("confidence \(Self.number(confidence))") }
             let top = probabilities.sorted { $0.value > $1.value }.prefix(3)
                 .map { entry in
@@ -320,7 +387,7 @@ extension SubQDecisionAnswer: Decodable {
             // strongest possible "no", and report `status: success`. Schema
             // drift throws so the tool refuses instead of answering a
             // distribution the API never produced.
-            let probability = try container.decode(Double.self, forKey: .noul)
+            let probability = try Self.unit(container, .noul)
             self = .noul(probability: probability)
         case "choice":
             // A choice with no chosen label used to render as `choice "none"`
@@ -329,22 +396,87 @@ extension SubQDecisionAnswer: Decodable {
             let choice = try container.decode(String.self, forKey: .choice)
             self = .choice(
                 choice: choice,
-                probabilities: (try? container.decode([String: Double].self, forKey: .probabilities)) ?? [:],
-                confidence: try? container.decodeIfPresent(Double.self, forKey: .confidence)
+                probabilities: try Self.probabilities(container),
+                confidence: try Self.confidence(container)
             )
         case "score":
             // Same rule: a missing score printed `score 0.00`, the strongest
             // possible low answer, as a success.
-            let score = try container.decode(Double.self, forKey: .score)
+            let score = try Self.finite(container, .score)
             self = .score(
                 score: score,
                 legend: (try? container.decode([String: String].self, forKey: .legend)) ?? [:],
-                probabilities: (try? container.decode([String: Double].self, forKey: .probabilities)) ?? [:],
-                confidence: try? container.decodeIfPresent(Double.self, forKey: .confidence)
+                probabilities: try Self.probabilities(container),
+                confidence: try Self.confidence(container)
             )
         default:
             self = .other(type: type)
         }
+    }
+
+    /// A number this client can print. `1e300` used to reach
+    /// `Int(score.rounded())` and trap the app; NaN would compare false
+    /// against every threshold without saying so.
+    private static func finite(
+        _ container: KeyedDecodingContainer<CodingKeys>,
+        _ key: CodingKeys
+    ) throws -> Double {
+        let value = try container.decode(Double.self, forKey: key)
+        guard value.isFinite else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) is not a finite number"
+            )
+        }
+        return value
+    }
+
+    private static func unit(
+        _ container: KeyedDecodingContainer<CodingKeys>,
+        _ key: CodingKeys
+    ) throws -> Double {
+        let value = try finite(container, key)
+        guard (-1e-9)...(1.0 + 1e-9) ~= value else {
+            throw DecodingError.dataCorruptedError(
+                forKey: key,
+                in: container,
+                debugDescription: "\(key.stringValue) is \(value), outside 0...1"
+            )
+        }
+        return min(max(value, 0), 1)
+    }
+
+    private static func probabilities(
+        _ container: KeyedDecodingContainer<CodingKeys>
+    ) throws -> [String: Double] {
+        guard let map = try container.decodeIfPresent([String: Double].self, forKey: .probabilities) else {
+            return [:]
+        }
+        for (name, value) in map {
+            guard value.isFinite, (-1e-9)...(1.0 + 1e-9) ~= value else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .probabilities,
+                    in: container,
+                    debugDescription: "probability for '\(name)' is \(value), outside 0...1"
+                )
+            }
+        }
+        return map.mapValues { min(max($0, 0), 1) }
+    }
+
+    private static func confidence(
+        _ container: KeyedDecodingContainer<CodingKeys>
+    ) throws -> Double? {
+        guard let value = try container.decodeIfPresent(Double.self, forKey: .confidence) else { return nil }
+        guard value.isFinite, (-1e-9)...(1.0 + 1e-9) ~= value else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .confidence,
+                in: container,
+                debugDescription: "confidence is \(value), outside 0...1"
+            )
+        }
+        return min(max(value, 0), 1)
     }
 }
 
@@ -352,6 +484,26 @@ public nonisolated struct SubQDecisionResponse: Decodable, Equatable, Sendable {
     public let model: String?
     public let answers: [String: SubQDecisionAnswer]
     public let usage: SubQDecisionUsage?
+
+    private enum CodingKeys: String, CodingKey {
+        case model, answers, usage
+    }
+
+    /// An empty `answers` map used to render "No answers were returned" and
+    /// report `status: success`, i.e. a missing decision presented as one.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        model = try container.decodeIfPresent(String.self, forKey: .model)
+        answers = try container.decode([String: SubQDecisionAnswer].self, forKey: .answers)
+        usage = try container.decodeIfPresent(SubQDecisionUsage.self, forKey: .usage)
+        guard !answers.isEmpty else {
+            throw DecodingError.dataCorruptedError(
+                forKey: .answers,
+                in: container,
+                debugDescription: "the response carried no answers"
+            )
+        }
+    }
 
     public var readableSummary: String {
         guard !answers.isEmpty else { return "No answers were returned." }
@@ -387,7 +539,13 @@ public nonisolated struct SubQImage: Sendable {
     /// both opens a local file and POSTs it to a third party, so a path outside
     /// the turn's workspace is refused rather than uploaded — `web_fetch` has
     /// no equivalent capability.
-    public static func load(path: String, workingDirectory: URL? = nil) throws -> SubQImage {
+    public static let supportedMediaTypes: Set<String> = ["image/png", "image/jpeg", "image/webp"]
+
+    public static func load(
+        path: String,
+        workingDirectory: URL? = nil,
+        mediaTypeOverride: String? = nil
+    ) throws -> SubQImage {
         let expanded = (path as NSString).expandingTildeInPath
         let candidate: URL
         if expanded.hasPrefix("/") {
@@ -412,14 +570,28 @@ public nonisolated struct SubQImage: Sendable {
         }
         let data = try readBytes(at: url, maximumBytes: maximumBytes)
         let mediaType: String
-        switch url.pathExtension.lowercased() {
-        case "png": mediaType = "image/png"
-        case "jpg", "jpeg": mediaType = "image/jpeg"
-        case "webp": mediaType = "image/webp"
-        default:
-            throw SubQDecisionError.badRequest(
-                "image \(url.lastPathComponent) is not a supported format; use PNG, JPEG or WebP."
-            )
+        // An explicit `media_type` is honoured rather than silently dropped:
+        // the schema advertises it, and ignoring it uploaded a different type
+        // than the caller declared. It is still validated against the API's
+        // accepted set.
+        if let requested = mediaTypeOverride?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           !requested.isEmpty {
+            guard supportedMediaTypes.contains(requested) else {
+                throw SubQDecisionError.badRequest(
+                    "image \(url.lastPathComponent) declares media_type '\(requested)'; use image/png, image/jpeg or image/webp."
+                )
+            }
+            mediaType = requested
+        } else {
+            switch url.pathExtension.lowercased() {
+            case "png": mediaType = "image/png"
+            case "jpg", "jpeg": mediaType = "image/jpeg"
+            case "webp": mediaType = "image/webp"
+            default:
+                throw SubQDecisionError.badRequest(
+                    "image \(url.lastPathComponent) is not a supported format; use PNG, JPEG or WebP."
+                )
+            }
         }
         return SubQImage(mediaType: mediaType, base64: data.base64EncodedString())
     }
@@ -490,15 +662,21 @@ nonisolated final class SubQRedirectGuard: NSObject, URLSessionTaskDelegate {
     }
 
     static func isAllowedRedirect(from origin: URL?, to destination: URL?) -> Bool {
-        guard let originHost = origin?.host?.lowercased(), !originHost.isEmpty,
-              let destinationHost = destination?.host?.lowercased(), !destinationHost.isEmpty else {
+        guard let origin, let destination,
+              let originHost = origin.host?.lowercased(), !originHost.isEmpty,
+              let destinationHost = destination.host?.lowercased(), !destinationHost.isEmpty else {
             return false
         }
         guard originHost == destinationHost else { return false }
+        // Host alone was not the origin: the same host on another PORT is a
+        // different service, and the Bearer token would go with it.
+        guard SubQDecisionSettings.effectivePort(origin) == SubQDecisionSettings.effectivePort(destination) else {
+            return false
+        }
         // A same-host redirect is still a downgrade when it drops TLS: the
         // Bearer token would leave in clear on the second hop. Refuse it.
-        let originScheme = origin?.scheme?.lowercased()
-        let destinationScheme = destination?.scheme?.lowercased()
+        let originScheme = origin.scheme?.lowercased()
+        let destinationScheme = destination.scheme?.lowercased()
         if originScheme == "https", destinationScheme != "https" { return false }
         return true
     }
@@ -634,7 +812,9 @@ public nonisolated struct SubQDecisionClient: Sendable {
                 switch error {
                 case .rateLimited, .unavailable:
                     if attempt == 0 {
-                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        // `try?` swallowed cancellation and slept through it, so
+                        // the retry ran after the turn had been cancelled.
+                        try await Task.sleep(nanoseconds: 1_000_000_000)
                         continue
                     }
                     throw error
@@ -666,17 +846,33 @@ public nonisolated struct SubQDecisionClient: Sendable {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.httpBody = payload
 
+        // Streamed rather than buffered: `session.data(for:)` materialises the
+        // whole body before the ceiling is consulted, so a hostile endpoint
+        // could exhaust memory first. The cap is now enforced as bytes arrive.
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await session.data(for: request)
+            let (bytes, urlResponse) = try await session.bytes(for: request)
+            var collected = Data()
+            collected.reserveCapacity(16 * 1024)
+            for try await byte in bytes {
+                collected.append(byte)
+                if collected.count > Self.maximumResponseBytes {
+                    throw SubQDecisionError.decoding(
+                        "the response exceeded \(Self.maximumResponseBytes) bytes; this client reads at most that."
+                    )
+                }
+            }
+            data = collected
+            response = urlResponse
+        } catch is CancellationError {
+            // A cancelled turn is not a transport failure; reporting it as one
+            // made an interrupted generation look like a network problem.
+            throw CancellationError()
+        } catch let error as SubQDecisionError {
+            throw error
         } catch {
             throw SubQDecisionError.transport(error.localizedDescription)
-        }
-        guard data.count <= Self.maximumResponseBytes else {
-            throw SubQDecisionError.decoding(
-                "the response was \(data.count) bytes; this client reads at most \(Self.maximumResponseBytes)."
-            )
         }
 
         guard let http = response as? HTTPURLResponse else {
@@ -703,7 +899,7 @@ public nonisolated struct SubQDecisionClient: Sendable {
 public final class SubQDecideTool: AgentTool {
     public let definition = ToolDefinition(
         name: "subq_decide",
-        description: "Asks SubQ's decisions-only model (subq-snap-preview) one to three typed questions about a state and returns probabilities plus confidence. Use it for yes/no gates, routing or classification, triage and ordered scoring. Do NOT use it for open-ended analysis, drafting, summarizing, or extracting fields — use a chat model for those. Load the subq-decisions skill first for framing rules and thresholds. The state and questions are sent to SubQ's API; never put secrets or credentials in the state.",
+        description: "Asks SubQ's decisions-only model (subq-snap-preview) one to three typed questions about a state and returns probabilities plus confidence. Use it for yes/no gates, routing or classification, triage and ordered scoring. Do NOT use it for open-ended analysis, drafting, summarizing, or extracting fields — use a chat model for those. Load the subq-decisions skill first for framing rules and thresholds. The state and questions are sent to SubQ's API (or the endpoint configured in Settings); never put secrets or credentials in the state. A call that uploads images or targets a non-SubQ endpoint asks for approval first, and a subagent is refused because it cannot ask.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
@@ -718,7 +914,7 @@ public final class SubQDecideTool: AgentTool {
                 ],
                 "images": [
                     "type": "array",
-                    "description": "Optional up to 4 images to judge alongside the state. Each entry is {path: 'shot.png'} — PNG, JPEG or WebP under 4 MiB, resolved against this turn's working directory. The file must be inside that folder; the tool refuses an image outside it because the bytes are uploaded to SubQ, and a call with images asks for approval first.",
+                    "description": "Optional up to 4 images to judge alongside the state. Each entry is {path: 'shot.png', media_type: 'image/png'} — PNG, JPEG or WebP under 4 MiB, resolved against this turn's working directory. The file must be inside that folder; the tool refuses an image outside it because the bytes are uploaded. A call with images asks for approval first and is refused inside a subagent.",
                     "items": [
                         "type": "object",
                         "properties": [
@@ -745,69 +941,114 @@ public final class SubQDecideTool: AgentTool {
     /// Lets a test answer `execute` without the network. The redirect guard,
     /// status mapping and sanitizing are pinned through it.
     nonisolated(unsafe) public static var clientFactoryForTesting: ((String) -> SubQDecisionClient)?
+    /// Observes the endpoint `execute` resolved, so a test can prove the
+    /// APPROVED url is used rather than the stored setting.
+    nonisolated(unsafe) public static var endpointObserverForTesting: ((URL) -> Void)?
     #endif
 
+    public static let maximumLabels = 64
+    public static let maximumLabelCharacters = 256
+
+    /// The endpoint the operator approved for THIS call. Bound by
+    /// `AgentHarness.executeTool` from the value the approval card displayed,
+    /// because re-reading `UserDefaults` here let a `defaults write` between
+    /// the card and the call retarget the key to a host nobody approved.
+    @TaskLocal public static var pinnedEndpoint: URL?
+
+    private func failure(_ message: String) -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        (AgentHarness.toolErrorJSON(tool: "subq_decide", error: message), nil, message, false)
+    }
+
     public func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
-        guard let key = SubQDecisionKeySource.resolve() else {
+        let key: (key: String, label: String)
+        switch SubQDecisionKeySource.resolveDetail() {
+        case .found(let value, let label):
+            key = (value, label)
+        case .missing:
             let error = SubQDecisionError.missingKey
-            return (AgentHarness.toolErrorJSON(tool: "subq_decide", error: error.localizedDescription), nil, error.localizedDescription, false)
+            return failure(error.localizedDescription)
+        case .unreadable(let status):
+            let error = SubQDecisionError.keyUnreadable(status: status)
+            return failure(error.localizedDescription)
         }
 
         guard let rawState = arguments["state"] else {
-            let message = "Missing 'state' in subq_decide: it must carry the facts the questions judge."
-            return (AgentHarness.toolErrorJSON(tool: "subq_decide", error: message), nil, message, false)
+            return failure("Missing 'state' in subq_decide: it must carry the facts the questions judge.")
         }
         let state = AnyCodable(rawState)
         if let problem = Self.stateProblem(state) {
-            let message = "subq_decide could not send this state: \(problem)"
-            return (AgentHarness.toolErrorJSON(tool: "subq_decide", error: message), nil, message, false)
+            return failure("subq_decide could not send this state: \(problem)")
         }
 
         guard let rawQuestions = arguments["questions"] as? [String: Any], !rawQuestions.isEmpty else {
-            let message = "Missing or empty 'questions' in subq_decide. Send one to three named questions, for example {\"needs_human\": {\"type\": \"noul\", \"instructions\": \"…\", \"criteria\": {\"true\": \"…\", \"false\": \"…\"}}}."
-            return (AgentHarness.toolErrorJSON(tool: "subq_decide", error: message), nil, message, false)
+            return failure("Missing or empty 'questions' in subq_decide. Send one to three named questions, for example {\"needs_human\": {\"type\": \"noul\", \"instructions\": \"…\", \"criteria\": {\"true\": \"…\", \"false\": \"…\"}}}.")
         }
 
         if let problem = Self.questionProblem(rawQuestions) {
-            let message = "subq_decide could not use these questions: \(problem)"
-            return (AgentHarness.toolErrorJSON(tool: "subq_decide", error: message), nil, message, false)
+            return failure("subq_decide could not use these questions: \(problem)")
         }
 
         var images: [SubQImage] = []
-        if let rawImages = arguments["images"] as? [Any], !rawImages.isEmpty {
-            // Without a working directory an absolute path could name any file
-            // on this Mac, and the bytes leave the machine. A turn with no
-            // workspace therefore gets no image upload.
-            guard let workingDirectory else {
-                let message = "subq_decide can only read images inside this turn's working directory, and none is set. Send the state as text, or run the call from a workspace."
-                return (AgentHarness.toolErrorJSON(tool: "subq_decide", error: message), nil, message, false)
+        if let value = arguments["images"], !(value is NSNull) {
+            guard let rawImages = value as? [Any] else {
+                return failure("'images' must be an array of {path: ...} objects.")
             }
-            for entry in rawImages.prefix(SubQImage.maximumImages) {
-                guard let dict = entry as? [String: Any],
-                      let path = dict["path"] as? String else { continue }
-                // Up to 4 MiB per image is read off the main actor: the tool
-                // itself is MainActor-bound and this is a local file read.
-                let outcome = await Task.detached(priority: .userInitiated) { () -> (image: SubQImage?, error: String?) in
-                    do {
-                        return (try SubQImage.load(path: path, workingDirectory: workingDirectory), nil)
-                    } catch {
-                        return (nil, (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+            if !rawImages.isEmpty {
+                // Without a working directory an absolute path could name any
+                // file on this Mac, and the bytes leave the machine. A turn
+                // with no workspace therefore gets no image upload.
+                guard let workingDirectory else {
+                    return failure("subq_decide can only read images inside this turn's working directory, and none is set. Send the state as text, or run the call from a workspace.")
+                }
+                // Silently ignoring the fifth image (or a malformed entry)
+                // answered a different request than the caller made.
+                guard rawImages.count <= SubQImage.maximumImages else {
+                    return failure("\(rawImages.count) images were sent; subq_decide accepts at most \(SubQImage.maximumImages). Split the call.")
+                }
+                for entry in rawImages {
+                    guard let dict = entry as? [String: Any],
+                          let path = dict["path"] as? String,
+                          !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        let described = AgentHarness.truncateText(
+                            AgentHarness.sanitizeText(String(describing: entry)),
+                            limit: 120
+                        )
+                        return failure("Every image entry must be an object with a non-empty 'path'. One entry was: \(described)")
                     }
-                }.value
-                if let image = outcome.image {
-                    images.append(image)
-                } else {
-                    let message = outcome.error ?? "the image could not be read."
-                    return (AgentHarness.toolErrorJSON(tool: "subq_decide", error: message), nil, message, false)
+                    let mediaType = dict["media_type"] as? String
+                    // Up to 4 MiB per image is read off the main actor: the
+                    // tool itself is MainActor-bound and this is a local file
+                    // read.
+                    let outcome = await Task.detached(priority: .userInitiated) { () -> (image: SubQImage?, error: String?) in
+                        do {
+                            return (try SubQImage.load(
+                                path: path,
+                                workingDirectory: workingDirectory,
+                                mediaTypeOverride: mediaType
+                            ), nil)
+                        } catch {
+                            return (nil, (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+                        }
+                    }.value
+                    if let image = outcome.image {
+                        images.append(image)
+                    } else {
+                        return failure(outcome.error ?? "the image could not be read.")
+                    }
                 }
             }
         }
 
+        let endpoint = Self.pinnedEndpoint ?? SubQDecisionSettings.endpoint()
+        #if DEBUG
+        Self.endpointObserverForTesting?(endpoint)
+        #endif
         let client: SubQDecisionClient
         #if DEBUG
-        client = Self.clientFactoryForTesting?(key.key) ?? SubQDecisionClient(apiKey: key.key)
+        client = Self.clientFactoryForTesting?(key.key)
+            ?? SubQDecisionClient(endpoint: endpoint, apiKey: key.key)
         #else
-        client = SubQDecisionClient(apiKey: key.key)
+        client = SubQDecisionClient(endpoint: endpoint, apiKey: key.key)
         #endif
         do {
             let response = try await client.decide(
@@ -816,25 +1057,32 @@ public final class SubQDecideTool: AgentTool {
                 images: images
             )
 
+            if let problem = Self.answerProblem(response, questions: rawQuestions) {
+                return failure("subq_decide answered in a shape this call cannot use: \(problem)")
+            }
+
             var answersJSON: [String: Any] = [:]
             for (name, answer) in response.answers {
-                answersJSON[AgentHarness.sanitizeText(name)] = Self.jsonObject(answer)
+                answersJSON[Self.label(name)] = Self.jsonObject(answer)
             }
 
             // The answer's labels (choice names, legend rows) are echoed text,
             // so they go through the same marker pass as every other tool
             // result before they reach the transcript. `jsonObject` sanitizes
             // the structured copy; this covers the readable one.
-            let summary = AgentHarness.sanitizeText(response.readableSummary)
-            let servedModel = AgentHarness.sanitizeText(response.model ?? client.model)
+            let summary = AgentHarness.truncateText(
+                AgentHarness.sanitizeText(response.readableSummary),
+                limit: max(0, maxOutputLength)
+            )
+            let servedModel = Self.label(response.model ?? client.model)
             // A Cloud Provider's display name is operator text, but it lands in
             // the transcript like any other label, so it gets the same pass.
-            let keyLabel = AgentHarness.sanitizeText(key.label)
-            let readable = """
+            let keyLabel = Self.label(key.label)
+            let readable = AgentHarness.truncateText("""
             SubQ decision (\(servedModel), key: \(keyLabel))
             \(summary)
             \(response.usageLine)
-            """
+            """, limit: max(0, maxOutputLength))
 
             var data: [String: Any] = [
                 "model": servedModel,
@@ -850,12 +1098,12 @@ public final class SubQDecideTool: AgentTool {
             }
             let res = AgentHarness.toolSuccessJSON(tool: "subq_decide", data: data)
             return (res, readable, nil, false)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as SubQDecisionError {
-            let message = error.localizedDescription
-            return (AgentHarness.toolErrorJSON(tool: "subq_decide", error: message), nil, message, false)
+            return failure(error.localizedDescription)
         } catch {
-            let message = "subq_decide failed: \(error.localizedDescription)"
-            return (AgentHarness.toolErrorJSON(tool: "subq_decide", error: message), nil, message, false)
+            return failure("subq_decide failed: \(error.localizedDescription)")
         }
     }
 
@@ -921,6 +1169,91 @@ public final class SubQDecideTool: AgentTool {
         return nil
     }
 
+    /// The API is the authority on criteria semantics, but an answer about a
+    /// label that was never offered is not an answer to the question asked, and
+    /// a missing answer is not a decision. Both used to report success.
+    static func answerProblem(_ response: SubQDecisionResponse, questions: [String: Any]) -> String? {
+        for (name, answer) in response.answers.sorted(by: { $0.key < $1.key }) {
+            guard let raw = questions[name], let question = raw as? [String: Any] else {
+                return "it answered '\(name)', which was not one of the questions."
+            }
+            switch answer {
+            case .noul(let probability):
+                guard probability.isFinite, (0.0...1.0).contains(probability) else {
+                    return "'\(name)' returned probability \(probability), outside 0...1."
+                }
+            case .choice(let choice, let probabilities, let confidence):
+                if let criteria = question["criteria"] as? [String: Any],
+                   !criteria.keys.contains(choice) {
+                    return "'\(name)' chose '\(choice)', which is not one of the offered options (\(criteria.keys.sorted().joined(separator: ", ")))."
+                }
+                for (key, value) in probabilities where !value.isFinite || !(0.0...1.0).contains(value) {
+                    return "'\(name)' returned probability \(value) for '\(key)', outside 0...1."
+                }
+                if let confidence, !confidence.isFinite || !(0.0...1.0).contains(confidence) {
+                    return "'\(name)' returned confidence \(confidence), outside 0...1."
+                }
+            case .score(let score, let legend, let probabilities, let confidence):
+                guard score.isFinite else {
+                    return "'\(name)' returned a non-finite score."
+                }
+                let level = Int(score.rounded(.toNearestOrAwayFromZero))
+                if !legend.isEmpty {
+                    guard level >= 0, legend[String(level)] != nil else {
+                        return "'\(name)' scored \(score), which is not a level its legend offers (\(legend.keys.sorted().joined(separator: ", ")))."
+                    }
+                } else if let criteria = question["criteria"] as? [Any], !criteria.isEmpty {
+                    guard level >= 0, level < criteria.count else {
+                        return "'\(name)' scored \(score), outside 0..<\(criteria.count)."
+                    }
+                }
+                for (key, value) in probabilities where !value.isFinite || !(0.0...1.0).contains(value) {
+                    return "'\(name)' returned probability \(value) for '\(key)', outside 0...1."
+                }
+                if let confidence, !confidence.isFinite || !(0.0...1.0).contains(confidence) {
+                    return "'\(name)' returned confidence \(confidence), outside 0...1."
+                }
+            case .other(let type):
+                return "'\(name)' answered with an unrecognised shape '\(type)'."
+            }
+        }
+        if let missing = questions.keys.sorted().first(where: { response.answers[$0] == nil }) {
+            return "no answer was returned for '\(missing)'."
+        }
+        return nil
+    }
+
+    /// Bounded, sanitized label. A hostile endpoint controls every string it
+    /// echoes back, and the response ceiling alone still allows megabytes of
+    /// labels in the transcript.
+    static func label(_ text: String) -> String {
+        let safe = AgentHarness.sanitizeText(text)
+        guard safe.count > maximumLabelCharacters else { return safe }
+        return String(safe.prefix(maximumLabelCharacters)) + "…"
+    }
+
+    /// What the approval card must show: the ORIGIN the state (and any image
+    /// bytes) go to, plus the files themselves. `endpointString` is the
+    /// destination the turn loop pinned beside the record, which is what the
+    /// call will actually use.
+    public static func approvalDetail(rawArguments: String?, endpointString: String?) -> String {
+        let endpoint = endpointString.flatMap(URL.init(string:)) ?? SubQDecisionSettings.endpoint()
+        let origin = SubQDecisionSettings.origin(endpoint) ?? endpoint.absoluteString
+        var names: [String] = []
+        // The state can be 200 KB; only pay to parse when an upload is possible.
+        if let rawArguments, rawArguments.contains("\"images\""),
+           let data = rawArguments.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let images = object["images"] as? [Any] {
+            names = images.compactMap { entry in
+                guard let path = (entry as? [String: Any])?["path"] as? String, !path.isEmpty else { return nil }
+                return (path as NSString).lastPathComponent
+            }
+        }
+        guard !names.isEmpty else { return "Sends the state to \(origin)." }
+        return "Sends the state and \(names.count) image(s) to \(origin): \(names.joined(separator: ", "))"
+    }
+
     static func jsonObject(_ answer: SubQDecisionAnswer) -> [String: Any] {
         switch answer {
         case .noul(let probability):
@@ -943,7 +1276,7 @@ public final class SubQDecideTool: AgentTool {
             if let confidence { object["confidence"] = confidence }
             return object
         case .other(let type):
-            return ["type": type.isEmpty ? "unknown" : AgentHarness.sanitizeText(type)]
+            return ["type": type.isEmpty ? "unknown" : label(type)]
         }
     }
 
@@ -952,14 +1285,14 @@ public final class SubQDecideTool: AgentTool {
     /// here (not only the human-readable summary) is what keeps a forged
     /// `<|im_start|>system` key out of the `resultJSON` the model is shown.
     static func sanitized(_ probabilities: [String: Double]) -> [String: Double] {
-        probabilities.reduce(into: [:]) { result, entry in
-            result[AgentHarness.sanitizeText(entry.key)] = entry.value
+        probabilities.sorted { $0.key < $1.key }.prefix(maximumLabels).reduce(into: [:]) { result, entry in
+            result[label(entry.key)] = entry.value
         }
     }
 
     static func sanitized(_ legend: [String: String]) -> [String: String] {
-        legend.reduce(into: [:]) { result, entry in
-            result[AgentHarness.sanitizeText(entry.key)] = AgentHarness.sanitizeText(entry.value)
+        legend.sorted { $0.key < $1.key }.prefix(maximumLabels).reduce(into: [:]) { result, entry in
+            result[label(entry.key)] = label(entry.value)
         }
     }
 }

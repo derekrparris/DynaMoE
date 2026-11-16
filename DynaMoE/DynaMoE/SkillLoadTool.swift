@@ -175,6 +175,16 @@ public final class SkillLoadTool: AgentTool {
                 return (AgentHarness.toolErrorJSON(tool: "skill_load", error: err), nil, err, false)
             }
 
+            // The registry listed this skill under its folder name. A manifest
+            // edited to declare a DIFFERENT name would otherwise be loaded as
+            // the advertised skill, i.e. the model would follow a procedure
+            // that no longer belongs to the name it asked for.
+            guard SkillValidation.normalizedName(document.frontmatter.name) == skill.id else {
+                let declared = AgentHarness.sanitizeText(document.frontmatter.name)
+                let err = "SKILL.md for '\(skill.name)' now declares name '\(declared)'. The advertised name and the manifest must match; rename the folder or restore the frontmatter name."
+                return (AgentHarness.toolErrorJSON(tool: "skill_load", error: err), nil, err, false)
+            }
+
             let files = (await Task.detached(priority: .userInitiated) {
                 Self.supportFiles(in: skill.directory)
             }.value).map(AgentHarness.sanitizeText)

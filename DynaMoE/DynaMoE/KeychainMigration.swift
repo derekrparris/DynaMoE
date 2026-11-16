@@ -62,7 +62,9 @@ public nonisolated struct PendingCredential: Sendable, Hashable, Identifiable {
             guard let separator = remainder.firstIndex(of: ".") else { return "Skill · \(remainder)" }
             let skill = String(remainder[remainder.startIndex..<separator])
             let field = String(remainder[remainder.index(after: separator)...])
-            let name = skill == SubQDecisionKeySource.skillName ? "SubQ Decisions" : Self.humanized(skill)
+            // The skills service is not SubQ's service: any installed skill can
+            // store a credential. SubQ is the one name with a product spelling.
+            let name = Self.skillDisplayName(skill)
             if field == "apikey" {
                 return "\(name) API key"
             }
@@ -74,6 +76,17 @@ public nonisolated struct PendingCredential: Sendable, Hashable, Identifiable {
     private static func humanized(_ token: String) -> String {
         guard !token.isEmpty else { return token }
         return token.prefix(1).uppercased() + token.dropFirst()
+    }
+
+    /// `subq-decisions` -> "SubQ Decisions", `my-skill` -> "My Skill". A
+    /// credential card must name the skill it belongs to, not assume the only
+    /// skill is the starter.
+    private static func skillDisplayName(_ token: String) -> String {
+        if token == SubQDecisionKeySource.skillName { return "SubQ Decisions" }
+        let words = token
+            .split(whereSeparator: { $0 == "-" || $0 == "_" })
+            .map { $0.prefix(1).uppercased() + $0.dropFirst() }
+        return words.isEmpty ? Self.humanized(token) : words.joined(separator: " ")
     }
 }
 
@@ -329,7 +342,7 @@ public nonisolated enum KeychainMigration {
         case CloudSecretStore.defaultService:
             return "Cloud inference provider credential"
         case SkillsSecretStore.defaultService:
-            return "Skill credential (SubQ Decisions)"
+            return "Skill credential for an installed agent skill"
         default:
             return "MCP server credential"
         }

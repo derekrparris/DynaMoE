@@ -42,7 +42,10 @@ public nonisolated enum SkillParseError: LocalizedError, Equatable {
         case .unclosedFrontmatter:
             return "SKILL.md frontmatter is never closed. Add the closing '---' line before the procedure text."
         case .malformedLine(let line, let text):
-            return "SKILL.md frontmatter line \(line) is not 'key: value': \(text)"
+            // The quoted line is untrusted file content and this text reaches a
+            // tool result, so it is bounded rather than echoed whole.
+            let quoted = text.count > 160 ? String(text.prefix(160)) + "…" : text
+            return "SKILL.md frontmatter line \(line) is not 'key: value': \(quoted)"
         case .missingName:
             return "SKILL.md frontmatter has no 'name'. The name must match the skill's folder name."
         case .missingDescription:
@@ -131,7 +134,10 @@ public nonisolated enum SkillFrontmatterParser {
         var closing: Int?
         var scan = firstFieldLine
         while scan < lines.count {
-            if lines[scan].trimmingCharacters(in: .whitespaces) == "---" {
+            // A closing delimiter is at column 0. Trimming the line first meant
+            // an INDENTED `---` inside a block scalar closed the frontmatter
+            // early, truncating the fields and mis-framing the body.
+            if isFrontmatterDelimiter(lines[scan]) {
                 closing = scan
                 break
             }
@@ -373,10 +379,25 @@ public nonisolated enum SkillFrontmatterParser {
         return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// A file saved by an editor with a UTF-8 BOM otherwise began with
+    /// U+FEFF and failed as "no frontmatter", which is a framing bug, not a
+    /// user error.
     private static func normalizedLines(_ text: String) -> [String] {
-        text.replacingOccurrences(of: "\r\n", with: "\n")
+        var normalized = text
+        if normalized.hasPrefix("\u{FEFF}") {
+            normalized.removeFirst()
+        }
+        return normalized
+            .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
             .components(separatedBy: "\n")
+    }
+
+    /// The closing `---` must start the line. Trailing whitespace is tolerated;
+    /// leading indentation means the line belongs to a block scalar.
+    private static func isFrontmatterDelimiter(_ line: String) -> Bool {
+        guard line.hasPrefix("---") else { return false }
+        return line.dropFirst(3).allSatisfy { $0 == " " || $0 == "\t" }
     }
 }
 
@@ -601,6 +622,11 @@ public nonisolated enum SkillDiscovery {
     }
 
     public static let skillFileName = "SKILL.md"
+    /// Bounds on one scan. `skillFileURL` falls back to a directory listing for
+    /// a case-variant manifest, so an `extraRoot` pointed at a large workspace
+    /// would otherwise turn every watcher event into one listing per folder.
+    public static let maximumRootEntries = 512
+    public static let maximumSkills = 256
 
     public static func scan(roots: [SkillRoot]) -> ScanResult {
         var result = ScanResult(scannedRoots: roots)
@@ -612,7 +638,7 @@ public nonisolated enum SkillDiscovery {
         // folders with the same name are a shadowing (which is reported).
         var seenRealDirectories: Set<String> = []
 
-        for (rootIndex, root) in roots.enumerated() {
+        scanRoots: for (rootIndex, root) in roots.enumerated() {
             // A root that is itself a symlink (a dotfiles checkout linking
             // ~/.agents/skills elsewhere) must be resolved BEFORE listing: the
             // file manager refuses `contentsOfDirectory` on the link and the
@@ -640,7 +666,21 @@ public nonisolated enum SkillDiscovery {
                 ))
                 continue
             }
-            for entry in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            if entries.count > Self.maximumRootEntries {
+                result.issues.append(SkillIssue(
+                    severity: .warning,
+                    path: root.url.path,
+                    message: "holds \(entries.count) entries; only the first \(Self.maximumRootEntries) are scanned. Point the root at a folder of skill folders, not at a large workspace."
+                ))
+            }
+            for entry in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }).prefix(Self.maximumRootEntries) {
+                if winners.count >= Self.maximumSkills {
+                    result.issues.append(SkillIssue(
+                        severity: .warning,
+                        message: "more than \(Self.maximumSkills) skills were found; the rest are not listed. Remove or disable skills you do not use."
+                    ))
+                    break scanRoots
+                }
                 var entryIsDirectory: ObjCBool = false
                 guard FileManager.default.fileExists(atPath: entry.path, isDirectory: &entryIsDirectory),
                       entryIsDirectory.boolValue else { continue }
@@ -678,6 +718,11 @@ public nonisolated enum SkillDiscovery {
                             message: warning
                         ))
                     }
+                    // A symlinked manifest is resolved (so `skill_load` reads the
+                    // file it actually classified), which is why it may live
+                    // outside the folder. Support files are confined to the
+                    // folder instead; a manifest is the one path discovery
+                    // already chose from inside it.
                     let skill = Skill(
                         name: document.frontmatter.name,
                         description: document.frontmatter.description,
@@ -1083,11 +1128,23 @@ public nonisolated enum SkillsConfigValidator {
             }
         }
 
-        let duplicateNames = Dictionary(grouping: config.disabledSkills.map(SkillValidation.normalizedName)) { $0 }
-            .filter { !$0.value.isEmpty && $0.key.isEmpty }
-            .count
-        if duplicateNames > 0 {
-            issues.append(SkillIssue(severity: .warning, message: "A disabled skill entry is empty and is ignored."))
+        var disabledSeen: Set<String> = []
+        var reportedEmptyDisabled = false
+        for raw in config.disabledSkills {
+            let normalized = SkillValidation.normalizedName(raw)
+            if normalized.isEmpty {
+                if !reportedEmptyDisabled {
+                    issues.append(SkillIssue(severity: .warning, message: "A disabled skill entry is empty and is ignored."))
+                    reportedEmptyDisabled = true
+                }
+                continue
+            }
+            if !disabledSeen.insert(normalized).inserted {
+                issues.append(SkillIssue(
+                    severity: .warning,
+                    message: "'\(normalized)' is listed more than once in disabledSkills; the duplicate is ignored."
+                ))
+            }
         }
         return issues
     }
@@ -1124,7 +1181,10 @@ public nonisolated enum SkillsPromptRenderer {
         // why there is none: the validator clamps the value into a range where
         // the header still leaves room for at least a clipped line.
         var budget = max(0, advertisedCharacters - lines.reduce(0) { $0 + $1.count + 1 })
-        var listed = 0
+        // `maxAdvertised` bounds what the whole section lists. Always-on rules
+        // are the first entries, so they count against it instead of being
+        // added on top of it.
+        var listed = alwaysOn.count
         var omitted = 0
 
         if !alwaysOn.isEmpty {
@@ -1167,6 +1227,7 @@ public nonisolated enum SkillsPromptRenderer {
                     availableLines.append(clipped)
                     budget -= clipped.count + 1
                     listed += 1
+                    continue
                 }
                 omitted += 1
                 continue

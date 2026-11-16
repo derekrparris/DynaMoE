@@ -846,6 +846,18 @@ final class SubagentToolExecutor {
             return (AgentHarness.toolErrorJSON(tool: name, error: err), err)
         }
 
+        // A subagent runs without a human in the loop, so a call the harness
+        // would gate on approval cannot be honoured here. `subq_decide` is the
+        // one tool whose documentation promises that gate (it uploads local
+        // image bytes), so it is refused rather than run unapproved. Turbo Mode
+        // is the operator's documented bypass and still applies.
+        if name == "subq_decide",
+           AgentHarness.requiresApproval(toolName: name, arguments: arguments, mode: parentMode),
+           !UserDefaults.standard.bool(forKey: "dynamoe_agent_turbo_mode") {
+            let err = "Tool '\(name)' needs the user's approval before it uploads the state or local image bytes. A subagent cannot ask for it; return the finding to the coordinator and let the main agent make that call."
+            return (AgentHarness.toolErrorJSON(tool: name, error: err), err)
+        }
+
         let strArgs = arguments.mapValues { String(describing: $0) }
         let rawArgs = (try? JSONSerialization.data(withJSONObject: strArgs, options: [.prettyPrinted]))
             .flatMap { String(data: $0, encoding: .utf8) } ?? ""

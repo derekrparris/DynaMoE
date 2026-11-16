@@ -5949,11 +5949,23 @@ struct ContentView: View {
             agent.recordToolCallValidity(true)
 
             let isTurbo = UserDefaults.standard.bool(forKey: "dynamoe_agent_turbo_mode")
+            // The destination the approval card displays is pinned here and
+            // handed to the call below, so a `defaults write` between approval
+            // and execution cannot send the key somewhere else.
+            let subQEndpoint = call.name == "subq_decide" ? SubQDecisionSettings.endpoint() : nil
             // A tool plan mode withholds is refused by `executeTool` without
             // running, so asking the user first offered them a write the mode had
             // already denied.
-            if AgentHarness.requiresApproval(toolName: call.name, arguments: parsedCall.arguments, mode: mode), !isTurbo {
-                updateRecord(record.id) { rec in rec.status = .awaitingApproval }
+            if AgentHarness.requiresApproval(
+                toolName: call.name,
+                arguments: parsedCall.arguments,
+                mode: mode,
+                subQEndpoint: subQEndpoint
+            ), !isTurbo {
+                updateRecord(record.id) { rec in
+                    rec.status = .awaitingApproval
+                    if let subQEndpoint { rec.arguments["endpoint"] = subQEndpoint.absoluteString }
+                }
                 showStatus("🛡️ Action requires confirmation: \(call.name)")
                 let approved = await ActionApprovalManager.shared.waitForApproval(id: record.id)
                 if !approved {
@@ -5976,7 +5988,8 @@ struct ContentView: View {
                 call: parsedCall,
                 workingDirectory: baseWorkingDirectory,
                 maxOutputLength: maxToolOutputLength,
-                mode: mode
+                mode: mode,
+                approvedSubQEndpoint: subQEndpoint
             )
             agent.recordToolCallOutcome(
                 toolName: call.name,
@@ -6928,13 +6941,17 @@ struct ContentView: View {
 
                         // Human-In-The-Loop (HITL) Safety & Turbo Mode
                         let isTurbo = UserDefaults.standard.bool(forKey: "dynamoe_agent_turbo_mode")
-                        // See the cloud path: a call plan mode withholds is
-                        // refused by `executeTool` without running, so it must not
-                        // raise an approval prompt first.
+                        // See the local path: the destination the card shows is
+                        // pinned here and used by the call, not re-read later.
+                        let subQEndpoint = call.name == "subq_decide" ? SubQDecisionSettings.endpoint() : nil
+                        // A call plan mode withholds is refused by `executeTool`
+                        // without running, so it must not raise an approval
+                        // prompt first.
                         let isDestructive = AgentHarness.requiresApproval(
                             toolName: call.name,
                             arguments: call.arguments,
-                            mode: turnMode
+                            mode: turnMode,
+                            subQEndpoint: subQEndpoint
                         )
 
                         if isDestructive && !isTurbo {
@@ -6945,6 +6962,7 @@ struct ContentView: View {
                                    var currentCalls = self.sessions[sIdx].messages[mIdx].toolCalls,
                                    let callIdx = currentCalls.firstIndex(where: { $0.id == recordId }) {
                                     currentCalls[callIdx].status = .awaitingApproval
+                                    if let subQEndpoint { currentCalls[callIdx].arguments["endpoint"] = subQEndpoint.absoluteString }
                                     self.sessions[sIdx].messages[mIdx].toolCalls = currentCalls
                                     self.showStatus("🛡️ Action requires confirmation: \(call.name)")
                                 }
@@ -6982,7 +7000,8 @@ struct ContentView: View {
                             call: call,
                             workingDirectory: baseWdURL,
                             maxOutputLength: self.maxToolOutputLength,
-                            mode: turnMode
+                            mode: turnMode,
+                            approvedSubQEndpoint: subQEndpoint
                         )
                         responseSlots[actionableCallIndices[idx]] = execResult.resultJSON
                         AgentHarness.shared.recordToolCallOutcome(

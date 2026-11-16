@@ -225,7 +225,18 @@ public final class SkillsRegistry: ObservableObject {
         #endif
     }
 
+    /// A settings save, the Reload button, a starter install and the deferred
+    /// poll all arrive here. The scan reads every root and up to 512 KB per
+    /// manifest, so it runs off the MainActor with no debounce delay instead of
+    /// freezing the UI for the duration of a large `extraRoot`.
     public func reload(reason: String) {
+        scheduleExternalReload(reason: reason, delayNanoseconds: 0)
+    }
+
+    /// The synchronous form. Only the deferred poll (which has already waited
+    /// for the turn to end) and the test seam use it; every user-visible path
+    /// goes through `reload` so the scan stays off the MainActor.
+    private func reloadNow(reason: String) {
         // A synchronous reload supersedes any debounced scan: a settings save
         // must not be overwritten by a watcher event that started earlier.
         reloadDebounceTask?.cancel()
@@ -265,6 +276,27 @@ public final class SkillsRegistry: ObservableObject {
             self.reloadDebounceTask = nil
             self.apply(snapshot: snapshot, reason: reason)
         }
+    }
+
+    /// Scans off the MainActor and applies the result before returning. Used by
+    /// the one caller whose next statement reads the new state.
+    private func reloadAwaitingScan(reason: String) async {
+        reloadDebounceTask?.cancel()
+        reloadDebounceTask = nil
+        reloadTicket += 1
+        let ticket = reloadTicket
+        let configURL = configURL
+        let rootsOverride = rootOverride
+        let fallbackConfig = config
+        let snapshot = await Task.detached(priority: .utility) {
+            SkillsRegistry.makeSnapshot(
+                configURL: configURL,
+                rootsOverride: rootsOverride,
+                fallbackConfig: fallbackConfig
+            )
+        }.value
+        guard ticket == reloadTicket else { return }
+        apply(snapshot: snapshot, reason: reason)
     }
 
     private func apply(snapshot: ReloadSnapshot, reason: String) {
@@ -396,6 +428,7 @@ public final class SkillsRegistry: ObservableObject {
                         self.pendingReload = false
                         self.reload(reason: "external edit")
                     }
+
                     self.deferredTask = nil
                     return
                 }
@@ -546,8 +579,13 @@ public final class SkillsRegistry: ObservableObject {
     // MARK: Starter skill
 
     /// Writes the bundled `subq-decisions` starter into the app skills folder.
+    ///
+    /// Async because the scan runs off the MainActor, and the caller reports
+    /// which copy won a name collision from that scan's result; it therefore
+    /// awaits the scan instead of returning a state the reload has not reached
+    /// yet.
     @discardableResult
-    public func installSubQDecisionsStarter() -> Result<URL, Error> {
+    public func installSubQDecisionsStarter() async -> Result<URL, Error> {
         guard let directory = SkillsConfigStore.skillsDirectoryURL else {
             return .failure(SkillsConfigError.applicationSupportUnavailable("the skills folder could not be resolved"))
         }
@@ -556,7 +594,7 @@ public final class SkillsRegistry: ObservableObject {
             if isBusy {
                 deferPendingReload(summary: "Starter installed; it appears when the current turn finishes.")
             } else {
-                reload(reason: "installed starter skill")
+                await reloadAwaitingScan(reason: "installed starter skill")
             }
             return .success(url)
         } catch {
@@ -613,6 +651,11 @@ public final class SkillsRegistry: ObservableObject {
 
     private func startConfigWatcher() {
         configWatcher?.stop()
+        // A failed re-arm must leave `configWatcher` NIL. Keeping the stopped
+        // object meant the `configWatcher == nil` recovery in `apply` could
+        // never fire, so one transient `open` failure disabled external-edit
+        // detection until the next launch.
+        configWatcher = nil
         guard let url = configURL else { return }
         let watcher = SkillPathWatcher(path: url.path) { [weak self] in
             guard let self else { return }
@@ -639,7 +682,15 @@ public final class SkillsRegistry: ObservableObject {
             guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
                   isDirectory.boolValue else { continue }
             let watcher = SkillPathWatcher(path: path) { [weak self] in
-                self?.reloadAfterExternalChange()
+                guard let self else { return }
+                // A directory replace (a `git checkout`, an installer replacing
+                // the folder) kills this source under an unchanged path. Forget
+                // it FIRST so the reload below can create one against the new
+                // inode, the same stop-and-recreate the manifest watcher does.
+                if let existing = self.rootWatchers.removeValue(forKey: path) {
+                    existing.stop()
+                }
+                self.reloadAfterExternalChange()
             }
             if watcher.start() {
                 rootWatchers[path] = watcher
@@ -736,7 +787,15 @@ public final class SkillsRegistry: ObservableObject {
         reloadDebounceTask = nil
         guard pendingReload else { return }
         pendingReload = false
-        reload(reason: "external edit")
+        reloadNow(reason: "external edit")
+    }
+
+    /// Applies a reload synchronously, for a test that asserts immediately
+    /// afterwards. Production never calls this: a settings save, the Reload
+    /// button, a starter install and a watcher event all scan off the
+    /// MainActor through `reload`.
+    public func reloadForTesting(reason: String) {
+        reloadNow(reason: reason)
     }
 
     /// Installs a registry state without touching the user's real folders.
