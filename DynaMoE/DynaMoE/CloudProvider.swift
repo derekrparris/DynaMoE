@@ -611,9 +611,9 @@ public nonisolated enum CloudModelAddress {
 // MARK: - Registered Cloud Models
 
 /// One chat model a provider can be asked to run. This is a registration
-/// record, not provider metadata: capabilities (thinking, context) are
-/// editable here because the provider's `/models` listing is only consulted
-/// opportunistically.
+/// record, not provider metadata: capabilities and the hand-typed window are
+/// editable here, while facts a provider's `/models` listing publishes are
+/// recorded separately by the sync and yield to the hand-typed value.
 public nonisolated struct CloudModelSpec: Equatable, Sendable {
     public let providerId: String
     /// Upstream model id exactly as the API expects it ("hf:deepseek-ai/…").
@@ -631,12 +631,13 @@ public nonisolated struct CloudModelSpec: Equatable, Sendable {
     /// left off the vision list is treated as text-only: the composer disables
     /// attachment and a rejected image turn retries once without it.
     public let supportsVision: Bool
-    /// What this model's context window is believed to be, or nil when nobody
-    /// recorded one for THIS model. A registration fact, not provider truth:
-    /// the catalog publishes no window, and a wrong guess would compact at the
-    /// wrong time. Nil falls back to the global
-    /// `dynamoe_cloud_context_window_tokens` default; only when that is unset
-    /// too is auto-compaction off for the model.
+    /// What this model's context window is or was HAND-RECORDED to be, or nil
+    /// when nobody typed one for THIS model. A registration fact, not provider
+    /// truth: a catalog that publishes a window is read into a separate
+    /// observed store (`CloudContextPolicy.observedLimit`), and this field is
+    /// the override that wins over it. Nil falls back to that observed value,
+    /// then to the global `dynamoe_cloud_context_window_tokens` default; only
+    /// when none of the three exists is auto-compaction off for the model.
     public let contextWindowTokens: Int?
 
     public init(
@@ -803,17 +804,20 @@ public nonisolated enum CloudModelRegistry {
     }
 
     /// Drops every registration fact about the SERVER at the provider's base
-    /// URL: the model list, the no-tools list and the vision marks. Used when
-    /// the base URL changes, where the old ids and capability marks describe an
+    /// URL: the model list, the no-tools list, the vision marks and the
+    /// capacity facts learned from its catalog. Used when the base URL changes,
+    /// where the old ids, capability marks and published windows describe an
     /// endpoint that is no longer being talked to.
     ///
-    /// Prices and context windows deliberately survive, because they describe
-    /// the MODEL rather than the endpoint. They are typed by hand from the
-    /// provider's own price sheet, neither has a Settings control to retype
-    /// one, and re-pointing a provider (a proxy, a regional host, a corrected
-    /// path) says nothing about what its models cost or how much context they
-    /// hold. Deleting them silently also deleted the spend figure and the
-    /// auto-compaction ceiling for every model on it.
+    /// Prices and HAND-RECORDED context windows deliberately survive, because
+    /// they describe the MODEL rather than the endpoint. They are typed by hand
+    /// from the provider's own price sheet, neither has a Settings control to
+    /// retype one, and re-pointing a provider (a proxy, a regional host, a
+    /// corrected path) says nothing about what its models cost or how much
+    /// context they hold. Deleting them silently also deleted the spend figure
+    /// and the auto-compaction ceiling for every model on it. Observed limits are
+    /// the opposite: they came from the old endpoint's `/models` payload and a
+    /// different server must not inherit them.
     public static func clearEndpointState(
         for provider: CloudProvider,
         defaults: UserDefaults = .standard
@@ -821,6 +825,7 @@ public nonisolated enum CloudModelRegistry {
         defaults.removeObject(forKey: modelsDefaultsKey(for: provider.id))
         defaults.removeObject(forKey: noToolsDefaultsKey(for: provider.id))
         defaults.removeObject(forKey: visionDefaultsKey(for: provider.id))
+        defaults.removeObject(forKey: CloudContextPolicy.observedLimitsKey(for: provider.id))
     }
 
     /// Drops every per-provider registration fact: the model list, the
@@ -863,6 +868,11 @@ public nonisolated enum CloudModelRegistry {
             setModelIdsWithVisionSupport(withVision, for: provider, defaults: defaults)
         }
         CloudContextPolicy.removeOverride(
+            model: providerModelId,
+            providerId: provider.id,
+            defaults: defaults
+        )
+        CloudContextPolicy.removeObservedLimit(
             model: providerModelId,
             providerId: provider.id,
             defaults: defaults

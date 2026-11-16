@@ -153,7 +153,9 @@ final class CloudProviderStore: ObservableObject {
         // facts about the server at the old base URL rather than about this
         // identifier, so keeping them would offer model ids the new endpoint
         // never listed and fail with that endpoint's own error on the send.
-        // Prices and windows are facts about the MODEL and are kept.
+        // Prices and hand-typed windows are facts about the MODEL and are
+        // kept. Capacity facts learned from the old catalog are not: they
+        // describe the server that published them.
         if updated.openAIBaseURL != previousBaseURL {
             CloudModelRegistry.clearEndpointState(for: updated, defaults: defaults)
         }

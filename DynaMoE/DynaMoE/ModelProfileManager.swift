@@ -319,7 +319,9 @@ public struct GenerationProfileSettings: Codable, Equatable, Hashable {
         // literal here would be a second copy of a number whose whole job is to
         // be the budget an unrecorded-window turn is clamped to, and the two
         // could drift apart with nothing to notice. The assistant budget is half
-        // of it, the 2:1 coder:assistant ratio the shipped profiles keep.
+        // of it, the 2:1 coder:assistant ratio the shipped profiles keep WHILE
+        // capacity is unknown; a published ceiling seeds both types (see
+        // `seedingKnownCapacity`).
         let cloudReplyCeiling = CloudContextPolicy.unknownWindowReplyCeiling
         switch type {
         case .coder:
@@ -534,7 +536,89 @@ public final class ModelProfileManager: ObservableObject {
         }
 
         // 5. Fallback to model-specific default
-        return GenerationProfileSettings.defaultFor(type: type, modelName: modelId)
+        return seedingKnownCapacity(
+            GenerationProfileSettings.defaultFor(type: type, modelName: modelId),
+            modelId: modelId
+        )
+    }
+
+    /// The generic cloud default, raised to the capacity the app knows.
+    ///
+    /// The generic cloud budget is `unknownWindowReplyCeiling` (16,384) because
+    /// that is all the app may assume about a model whose window nobody recorded.
+    /// Once a window or an output cap is known, from the provider's `/models`
+    /// payload or a hand-recorded value, that assumption is no longer the best
+    /// fact available: leaving the default at 16,384 pins a capable model below
+    /// its own ceiling, so a long Plan Mode turn hits the truncation notice
+    /// before the model is anywhere near its limit (`#95` review, then the live
+    /// plan session that reproduced it).
+    ///
+    /// Only the GENERIC profile is seeded. A saved profile is returned by steps
+    /// 1-4 above and is the user's own choice, so an explicit 16k stays 16k. The
+    /// seed is the same number the Settings slider advertises as the ceiling,
+    /// because a default the send path silently lowers reads as the app ignoring
+    /// its own setting.
+    ///
+    /// No known capacity means no seeding: an unknown model keeps the shipped
+    /// defaults, including the Assistant's half-of-Coder ratio. The seed is a
+    /// response to evidence, not a blanket increase.
+    ///
+    /// Seeding applies to BOTH generic types, so once capacity is known the
+    /// Assistant profile also rises to the ceiling and the shipped 2:1
+    /// Coder:Assistant ratio stops applying. That collapse is deliberate: the
+    /// ratio is how the app is conservative when nothing is known, not a
+    /// product promise that an assistant reply must be half as long. A known
+    /// ceiling is evidence about the model, and a user who prefers the old
+    /// number can save a profile.
+    ///
+    /// A seeded budget is a CEILING, not spend: the provider stops when the
+    /// answer ends, so a larger `max_tokens` cannot cost more tokens than the
+    /// reply produces. It only keeps a legitimate long answer from being cut,
+    /// which is why the default is the ceiling rather than a fraction of it.
+    /// A provider that refuses the number without ever publishing its own cap
+    /// is handled once at the turn, and the cap it names is recorded as
+    /// observed capacity (`CloudContextPolicy.replyBudgetRecovery`).
+    ///
+    /// The evidence has to be about THIS model. The single global fallback
+    /// (`dynamoe_cloud_context_window_tokens`) is not: it is one number the
+    /// operator set with some other model in mind, and `window(forModelId:)`
+    /// would answer it for every cloud model on every provider. Treating it as
+    /// capacity would raise the default budget of a model whose window nobody
+    /// knows — from 16,384 to 20% of whatever the operator typed elsewhere —
+    /// which is exactly the un-evidenced `max_tokens` the unrecorded ceiling
+    /// exists to prevent. Only a recorded or catalog-published window counts.
+    private func seedingKnownCapacity(
+        _ settings: GenerationProfileSettings,
+        modelId: String?
+    ) -> GenerationProfileSettings {
+        guard let modelId,
+              let parsed = CloudModelAddress.parseModelId(modelId)
+                ?? CloudModelAddress.parsePath(modelId) else { return settings }
+        let limits = CloudContextPolicy.observedLimit(
+            forModelId: parsed.providerModelId,
+            providerId: parsed.provider.id,
+            defaults: defaults
+        )
+        let windowSource = CloudContextPolicy.windowSource(
+            forModelId: parsed.providerModelId,
+            providerId: parsed.provider.id,
+            defaults: defaults
+        )
+        // `.global` is a fallback for the READER, not a fact about the model.
+        let perModelWindow: Int?
+        switch windowSource {
+        case .model(let window), .observed(let window): perModelWindow = window
+        case .global, .none: perModelWindow = nil
+        }
+        guard perModelWindow != nil || limits?.maxOutput != nil else { return settings }
+        let ceiling = CloudContextPolicy.maximumOutputTokens(
+            window: perModelWindow,
+            outputLimit: limits?.maxOutput
+        )
+        guard ceiling > settings.maxNewTokens else { return settings }
+        var seeded = settings
+        seeded.maxNewTokens = ceiling
+        return seeded
     }
 
     public func saveProfile(for modelId: String?, type: ModelProfileType, settings: GenerationProfileSettings) {

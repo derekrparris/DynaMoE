@@ -83,7 +83,7 @@ struct CloudProvidersSettingsView: View {
                 // context windows are lost with it, and they are typed by hand
                 // from the provider's own price sheet with no other control to
                 // retype them.
-                return "\(provider.displayName) is removed together with its Keychain API key, its registered model list, its no-tools list, its vision marks, and every model price and context window recorded for it. Conversations pinned to its models will ask you to reselect a model."
+                return "\(provider.displayName) is removed together with its Keychain API key, its registered model list, its no-tools list, its vision marks, and every model price and context window recorded or detected for it. Conversations pinned to its models will ask you to reselect a model."
             case .apiKey(let provider):
                 return "The API key for \(provider.displayName) is deleted from the login Keychain. Its registered models stay in the picker but cannot answer until a new key is saved."
             }
@@ -168,7 +168,7 @@ struct CloudProvidersSettingsView: View {
 
             SettingsRow(
                 title: "Context Window",
-                subtitle: "A model's window sets both when the turn compacts and how large a reply it may ask for (20% of the window). Record it per model below. A model with no recorded window is held to a \(CloudContextPolicy.unknownWindowReplyCeiling.formatted())-token reply budget and compacts only after the provider refuses a request.",
+                subtitle: "A model's window sets both when the turn compacts and how large a reply it may ask for (20% of the window). Test & Sync Models records the window and output limit when the provider publishes them; type a value below to override one. A model with no recorded or published window is held to a \(CloudContextPolicy.unknownWindowReplyCeiling.formatted())-token reply budget and compacts only after the provider refuses a request.",
                 icon: "ruler.fill",
                 iconTint: .cyan
             ) { EmptyView() }
@@ -490,9 +490,14 @@ struct CloudProvidersSettingsView: View {
         /// that a typo is the operator's to fix, not this button's to erase, has
         /// to hold for this row too, not just its neighbours.
         var rawRecorded: String?
+        /// What the provider's `/models` catalog last said about this model,
+        /// when a sync recorded an answer. A hand-recorded window outranks it;
+        /// this is what makes the row and the ceiling work without the operator
+        /// having to find and type a number the provider already publishes.
+        var observed: CloudContextPolicy.ModelLimits?
         /// The window the send path resolves, together with WHERE it came from.
         ///
-        /// Resolved through `CloudContextPolicy.windowSource(recorded:fallback:)`
+        /// Resolved through `CloudContextPolicy.windowSource(recorded:observed:fallback:)`
         /// — the same rule `windowSource(forModelId:providerId:)` applies on the
         /// send path — so this row cannot report a different number than the turn
         /// is priced against. The source is carried, not only the number, because
@@ -521,23 +526,52 @@ struct CloudProvidersSettingsView: View {
             rawRecorded != nil && !CloudContextPolicy.isUsableWindow(rawRecorded)
         }
         var budget: Int {
-            CloudContextPolicy.maximumOutputTokens(window: windowSource.window)
+            CloudContextPolicy.maximumOutputTokens(
+                window: windowSource.window,
+                outputLimit: observed?.maxOutput
+            )
+        }
+        /// What the empty field says. Only a window the provider actually
+        /// published earns "detected": an output-limit-only entry is capacity
+        /// evidence, but it is not a window, and saying "detected" beside an
+        /// empty field implied one had been.
+        var placeholder: String {
+            guard let observedWindow = observed?.contextWindow,
+                  observedWindow >= CloudContextPolicy.minimumPlausibleWindow else {
+                return "none"
+            }
+            return "detected"
         }
         /// What the row says about the window and the budget it yields.
         ///
-        /// Exhaustive over `WindowSource`: a window the model recorded and one
-        /// the global fallback supplied are different facts and get different
-        /// sentences, and "nothing recorded" is a third budget.
+        /// Exhaustive over `WindowSource`: a window the model recorded, one the
+        /// provider published and one the global fallback supplied are different
+        /// facts and get different sentences, and "nothing recorded" is a
+        /// fourth budget.
         var subtitle: String {
             if hasUnreadableRecord {
                 return "Stored value “\(recordedText)” is not a usable window — fix it or clear the field. Reply budget \(budget.formatted())."
             }
             switch windowSource {
             case .model(let window):
+                if let maxOutput = observed?.maxOutput, budget == maxOutput {
+                    return "\(window.formatted()) tokens, but the provider publishes a \(maxOutput.formatted())-token output limit; reply budget \(budget.formatted())."
+                }
                 return "\(window.formatted()) tokens — reply budget \(budget.formatted())."
+            case .observed(let window):
+                if let maxOutput = observed?.maxOutput, budget == maxOutput {
+                    return "\(window.formatted()) tokens detected from the provider, whose \(maxOutput.formatted())-token output limit caps the reply budget at \(budget.formatted()). Enter a value to override."
+                }
+                return "\(window.formatted()) tokens detected from the provider's catalog, reply budget \(budget.formatted()). Enter a value to override."
             case .global(let window):
+                if let maxOutput = observed?.maxOutput, budget == maxOutput {
+                    return "No window of its own — the global \(window.formatted()) applies, but the provider publishes a \(maxOutput.formatted())-token output limit; reply budget \(budget.formatted())."
+                }
                 return "No window of its own — the global \(window.formatted()) applies, reply budget \(budget.formatted())."
             case .none:
+                if let maxOutput = observed?.maxOutput, budget == maxOutput {
+                    return "No window recorded, but the provider publishes a \(maxOutput.formatted())-token output limit; reply budget \(budget.formatted())."
+                }
                 return "No window recorded — reply budget \(budget.formatted())."
             }
         }
@@ -559,17 +593,21 @@ struct CloudProvidersSettingsView: View {
             // Save may clear it.
             let recordedWindows = CloudContextPolicy.overrides(for: provider.id)
             let rawWindows = CloudContextPolicy.rawOverrides(for: provider.id)
+            let observedLimits = CloudContextPolicy.observedLimits(forProviderId: provider.id)
             return registeredSpecs(for: provider).map { spec in
                 // `overrides(for:)` already drops anything below
                 // `minimumPlausibleWindow`, so a value it returned is capacity
                 // and the fallback only applies when the model has none.
                 let recorded = recordedWindows[spec.providerModelId]
+                let observed = observedLimits[spec.providerModelId]
                 return ContextWindowEntry(
                     provider: provider,
                     spec: spec,
                     rawRecorded: rawWindows[spec.providerModelId],
+                    observed: observed,
                     windowSource: CloudContextPolicy.windowSource(
                         recorded: recorded,
+                        observed: observed?.contextWindow,
                         fallback: globalWindow
                     )
                 )
@@ -603,7 +641,7 @@ struct CloudProvidersSettingsView: View {
             VStack(alignment: .trailing, spacing: 3) {
                 HStack(spacing: 6) {
                     TextField(
-                        "none",
+                        entry.placeholder,
                         text: Binding(
                             get: {
                                 // A draft is an EDIT. With none, the field reads
@@ -727,7 +765,14 @@ struct CloudProvidersSettingsView: View {
             forModelId: modelId,
             providerId: provider.id
         )
-        let budget = CloudContextPolicy.maximumOutputTokens(window: windowSource.window)
+        let observed = CloudContextPolicy.observedLimit(
+            forModelId: modelId,
+            providerId: provider.id
+        )
+        let budget = CloudContextPolicy.maximumOutputTokens(
+            window: windowSource.window,
+            outputLimit: observed?.maxOutput
+        )
 
         // Only this model's draft, and it is REMOVED rather than written back:
         // the field reads storage when it has no draft, so the row now shows
@@ -740,7 +785,9 @@ struct CloudProvidersSettingsView: View {
         // budget line that did not say so would read as if this row's clearing
         // chose the number.
         if typed.isEmpty {
-            if case .global(let global) = windowSource, stored == nil {
+            if case .observed(let window) = windowSource, stored == nil {
+                windowFeedback[feedbackKey] = "Cleared; the provider's \(window.formatted())-token window applies, reply budget \(budget.formatted())."
+            } else if case .global(let global) = windowSource, stored == nil {
                 windowFeedback[feedbackKey] = "Cleared — the global \(global.formatted()) applies, reply budget \(budget.formatted())."
             } else {
                 windowFeedback[feedbackKey] = "Cleared — reply budget now \(budget.formatted())."
@@ -789,7 +836,7 @@ struct CloudProvidersSettingsView: View {
         }
         testStates[provider.id] = .testing
         Task {
-            let result = await client.fetchModelIds()
+            let result = await client.fetchModelCatalog()
             // The request can outlive the provider: the card is only disabled
             // while testing, but Settings can be closed, storage reloaded, or
             // the record replaced. Writing the catalog for a record that is
@@ -810,15 +857,30 @@ struct CloudProvidersSettingsView: View {
                 return
             }
             switch result {
-            case .success(let ids):
-                guard !ids.isEmpty else {
+            case .success(let catalog):
+                guard !catalog.isEmpty else {
                     testStates[provider.id] = .failure("The provider returned an empty model list.")
                     return
                 }
                 // The catalog also lists embeddings, rerankers, speech, and
                 // image generators; registering those makes them pickable chat
                 // models that fail on the first send.
+                let ids = catalog.map(\.id)
                 let chatIds = CloudModelRegistry.chatModelIds(from: ids)
+                // Record what the catalog publishes about the models that are
+                // being registered BEFORE the model list lands, so the composer's
+                // scan and the ceiling resolve against the same facts. A hand
+                // recorded window is a separate store and wins over these.
+                let chatIdSet = Set(chatIds)
+                var observed: [String: CloudContextPolicy.ModelLimits] = [:]
+                for entry in catalog where chatIdSet.contains(entry.id) {
+                    let limits = CloudContextPolicy.ModelLimits(
+                        contextWindow: entry.contextWindowTokens,
+                        maxOutput: entry.maxOutputTokens
+                    )
+                    if !limits.isEmpty { observed[entry.id] = limits }
+                }
+                CloudContextPolicy.setObservedLimits(observed, forProviderId: provider.id)
                 CloudModelRegistry.setRegisteredModelIds(chatIds, for: provider)
                 // Re-scan so the composer's "Cloud Models" section reflects
                 // the new list without a relaunch.

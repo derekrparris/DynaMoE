@@ -395,6 +395,14 @@ public nonisolated enum CloudContextPolicy {
     /// Below this a "window" is a units mistake, not a context size.
     public static let minimumPlausibleWindow = 1_024
 
+    /// Below this a published `max output` is a units mistake or a mis-keyed
+    /// field, not a reply limit. The window has a floor for the same reason: a
+    /// catalog is machine-written, and one bad number must not silently become
+    /// the app's policy. Nothing real publishes a cap this small — the smallest
+    /// chat limits in the wild are in the hundreds — while a `limit.output` of
+    /// `1` would truncate every answer to a single token.
+    public static let minimumPlausibleOutputLimit = 64
+
     /// The reply budget a cloud model is held to when it records NO window.
     ///
     /// An unrecorded window used to mean "no cap": `replyBudget` passed the
@@ -705,11 +713,13 @@ public nonisolated enum CloudContextPolicy {
     }
 
     /// The window this model is believed to have, or nil when nobody recorded
-    /// one. The per-model value wins over the global fallback.
+    /// or published one. The spec's hand-recorded value wins over the
+    /// catalog-observed one, which wins over the global fallback.
     ///
-    /// An entry point to `windowSource(recorded:defaults:)`, not a second rule:
-    /// a spec already carries the recorded value, so it skips the storage read,
-    /// and the resolution under it is the one every other reader shares.
+    /// An entry point to `windowSource(recorded:observed:fallback:)`, not a
+    /// second rule: a spec already carries the recorded value, so that read is
+    /// skipped, and the resolution under it is the one every other reader
+    /// shares.
     ///
     /// The fallback is a SINGLE global key, so it answers for every provider.
     /// A default recorded for one provider's large-window model therefore also
@@ -721,7 +731,18 @@ public nonisolated enum CloudContextPolicy {
         for spec: CloudModelSpec?,
         defaults: UserDefaults = .standard
     ) -> Int? {
-        windowSource(recorded: spec?.contextWindowTokens, defaults: defaults).window
+        guard let spec else {
+            return windowSource(recorded: nil, defaults: defaults).window
+        }
+        return windowSource(
+            recorded: spec.contextWindowTokens,
+            observed: observedLimit(
+                forModelId: spec.providerModelId,
+                providerId: spec.providerId,
+                defaults: defaults
+            )?.contextWindow,
+            defaults: defaults
+        ).window
     }
 
     /// The window recorded for one model id, resolved without building the
@@ -740,26 +761,152 @@ public nonisolated enum CloudContextPolicy {
         windowSource(forModelId: modelId, providerId: providerId, defaults: defaults).window
     }
 
+    /// What one model's entry in a provider's `/models` catalog said about its
+    /// capacity.
+    ///
+    /// Kept apart from the hand-recorded window on purpose. A recorded window is
+    /// an operator's fact about the model and outranks this; these values are
+    /// what the provider publishes and a sync may refresh them. Merging the two
+    /// would make a re-sync either overwrite an operator's correction or leave a
+    /// stale number indistinguishable from a hand-typed one (`#95` review's
+    /// "a re-sync must not delete a hand-typed window").
+    public struct ModelLimits: Codable, Equatable, Sendable {
+        /// The model's total context window, when the catalog publishes one.
+        public let contextWindow: Int?
+        /// The model's own maximum output, when the catalog publishes one. It
+        /// binds before the window fraction on models whose output cap is a
+        /// smaller share of the window than this app reserves.
+        public let maxOutput: Int?
+
+        public init(contextWindow: Int? = nil, maxOutput: Int? = nil) {
+            self.contextWindow = contextWindow
+            self.maxOutput = maxOutput
+        }
+
+        public var isEmpty: Bool { contextWindow == nil && maxOutput == nil }
+    }
+
+    /// The UserDefaults key holding one provider's observed catalog limits,
+    /// keyed by upstream model id.
+    ///
+    /// JSON rather than the `model=window` text the hand-recorded store uses:
+    /// model ids may contain `=`, `;` and `,`, and a separator format would have
+    /// to invent escaping for them.
+    public static func observedLimitsKey(for providerId: String) -> String {
+        "dynamoe_cloud_\(providerId)_model_limits"
+    }
+
+    /// Every observed limit one provider's last sync recorded. A corrupt or
+    /// foreign payload answers an empty map rather than failing a turn.
+    public static func observedLimits(
+        forProviderId providerId: String,
+        defaults: UserDefaults = .standard
+    ) -> [String: ModelLimits] {
+        guard let data = defaults.data(forKey: observedLimitsKey(for: providerId)) else { return [:] }
+        return (try? JSONDecoder().decode([String: ModelLimits].self, from: data)) ?? [:]
+    }
+
+    /// Replaces one provider's observed limits. A sync passes only the models it
+    /// registered, so a model the catalog stopped serving loses its observed
+    /// facts with the registration. Never touches the hand-recorded windows.
+    public static func setObservedLimits(
+        _ limits: [String: ModelLimits],
+        forProviderId providerId: String,
+        defaults: UserDefaults = .standard
+    ) {
+        let cleaned = limits.filter { !$0.key.isEmpty && !$0.value.isEmpty }
+        guard !cleaned.isEmpty else {
+            defaults.removeObject(forKey: observedLimitsKey(for: providerId))
+            return
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(cleaned) else { return }
+        guard data != defaults.data(forKey: observedLimitsKey(for: providerId)) else { return }
+        defaults.set(data, forKey: observedLimitsKey(for: providerId))
+    }
+
+    /// Records an output cap a provider's own refusal named, merging it into
+    /// the provider's observed limits.
+    ///
+    /// A catalog may publish a window without an output cap, so the first time
+    /// the app learns that cap can be a 400 on a budget derived from that
+    /// window. That is capacity evidence about this model from the provider
+    /// itself, and keeping it only for the retry would send the same rejected
+    /// number on the next turn. An existing smaller cap is kept: the point is
+    /// to stop asking for too much, not to talk the provider up.
+    ///
+    /// A sub-plausible value is ignored rather than recorded, because that is
+    /// the same units-mistake rule the catalog path applies. Returns whether
+    /// the stored map changed.
+    @discardableResult
+    public static func recordObservedOutputLimit(
+        _ limit: Int,
+        forModelId modelId: String,
+        providerId: String,
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        guard limit >= minimumPlausibleOutputLimit else { return false }
+        var all = observedLimits(forProviderId: providerId, defaults: defaults)
+        let existing = all[modelId]
+        let merged = min(existing?.maxOutput ?? limit, limit)
+        guard existing?.maxOutput != merged else { return false }
+        all[modelId] = ModelLimits(
+            contextWindow: existing?.contextWindow,
+            maxOutput: merged
+        )
+        setObservedLimits(all, forProviderId: providerId, defaults: defaults)
+        return true
+    }
+
+    /// One model's observed limits, or nil when the provider's catalog has
+    /// published none. The upstream model id is matched exactly.
+    public static func observedLimit(
+        forModelId modelId: String,
+        providerId: String,
+        defaults: UserDefaults = .standard
+    ) -> ModelLimits? {
+        observedLimits(forProviderId: providerId, defaults: defaults)[modelId]
+    }
+
+    /// Removes one model's observed limits, leaving every other entry. Used
+    /// when a model is unregistered so a later re-add cannot inherit facts the
+    /// endpoint no longer published.
+    public static func removeObservedLimit(
+        model: String,
+        providerId: String,
+        defaults: UserDefaults = .standard
+    ) {
+        var all = observedLimits(forProviderId: providerId, defaults: defaults)
+        guard all.removeValue(forKey: model) != nil else { return }
+        setObservedLimits(all, forProviderId: providerId, defaults: defaults)
+    }
+
     /// Where a model's resolved window came from.
     ///
     /// The number alone cannot say it, and the difference is not cosmetic: a
-    /// window the model RECORDED is a fact about that model, while a window the
-    /// single global fallback supplied belongs to whichever model the operator
-    /// had in mind when they set it. `maximumOutputTokens` prices both the same
-    /// way, but a row that explains the ceiling has to name the right one or it
-    /// asserts a fact the store does not hold (`#95` review).
+    /// window the model RECORDED is a fact about that model, a window its
+    /// provider PUBLISHED is a fact about that provider's catalog, and a window
+    /// the single global fallback supplied belongs to whichever model the
+    /// operator had in mind when they set it. `maximumOutputTokens` prices all
+    /// three the same way, but a row that explains the ceiling has to name the
+    /// right one or it asserts a fact the store does not hold (`#95` review).
     public enum WindowSource: Equatable, Sendable {
         /// The model's own recorded window.
         case model(Int)
+        /// The provider's catalog published this window. A sync refreshes it; a
+        /// hand-recorded value outranks it.
+        case observed(Int)
         /// No per-model value; the global fallback supplied this one.
         case global(Int)
-        /// Nobody recorded anything, so there is no window to price against.
+        /// Nobody recorded or published anything, so there is no window to price
+        /// against.
         case none
 
         /// The window the send path will actually use, if any.
         public var window: Int? {
             switch self {
-            case .model(let window), .global(let window): return window
+            case .model(let window), .observed(let window), .global(let window): return window
             case .none: return nil
             }
         }
@@ -778,13 +925,14 @@ public nonisolated enum CloudContextPolicy {
     ) -> WindowSource {
         windowSource(
             recorded: overrides(for: providerId, defaults: defaults)[modelId],
+            observed: observedLimit(forModelId: modelId, providerId: providerId, defaults: defaults)?.contextWindow,
             defaults: defaults
         )
     }
 
     /// The ONE rule every window reader shares: a recorded per-model value wins
-    /// when this build can read it, else the single global fallback answers,
-    /// else there is no window.
+    /// when this build can read it, else the provider's own published window,
+    /// else the single global fallback, else there is no window.
     ///
     /// `window(for:)` (a spec already in hand) and
     /// `windowSource(forModelId:providerId:)` (a model id read from storage) are
@@ -793,9 +941,14 @@ public nonisolated enum CloudContextPolicy {
     /// from the send path it is meant to report.
     public static func windowSource(
         recorded: Int?,
+        observed: Int? = nil,
         defaults: UserDefaults = .standard
     ) -> WindowSource {
-        windowSource(recorded: recorded, fallback: globalWindow(defaults: defaults))
+        windowSource(
+            recorded: recorded,
+            observed: observed,
+            fallback: globalWindow(defaults: defaults)
+        )
     }
 
     /// The same rule with the global fallback already read, for a caller that
@@ -804,10 +957,14 @@ public nonisolated enum CloudContextPolicy {
     /// read it, which `globalWindow` already filters for plausibility.
     public static func windowSource(
         recorded: Int?,
+        observed: Int? = nil,
         fallback: Int?
     ) -> WindowSource {
         if let recorded, recorded >= minimumPlausibleWindow {
             return .model(recorded)
+        }
+        if let observed, observed >= minimumPlausibleWindow {
+            return .observed(observed)
         }
         if let fallback {
             return .global(fallback)
@@ -855,8 +1012,14 @@ public nonisolated enum CloudContextPolicy {
         guard let address,
               let parsed = CloudModelAddress.parseModelId(address)
                 ?? CloudModelAddress.parsePath(address) else { return nil }
+        // The observed limits are stored as JSON DATA, not as a string: reading
+        // them through `string(forKey:)` answered nil and left this identity
+        // blind to a sync that had just moved the ceiling.
+        let observed = defaults.data(forKey: observedLimitsKey(for: parsed.provider.id))
+            .map { String(decoding: $0, as: UTF8.self) } ?? ""
         return [
             defaults.string(forKey: defaultsKey(for: parsed.provider.id)) ?? "",
+            observed,
             globalWindow(defaults: defaults).map(String.init) ?? ""
         ].joined(separator: "|")
     }
@@ -895,36 +1058,238 @@ public nonisolated enum CloudContextPolicy {
         return prompt + reserve > Double(window)
     }
 
+    /// Why a reply budget is the number it is.
+    ///
+    /// The number alone cannot explain a truncation: `16,384` can be the user's
+    /// setting, the unrecorded-window clamp, 20% of a small window, or a model's
+    /// published output cap, and only one of those can be raised from Settings.
+    /// The old notice named that one control unconditionally, so a model whose
+    /// cap came from an unrecorded window was told to raise a setting already at
+    /// its maximum. Carrying the binding lets the notice name the control that
+    /// can actually move the number.
+    public struct ReplyBudget: Equatable, Sendable {
+        public enum Binding: Equatable, Sendable {
+            /// The caller's own Max Output Tokens setting is the smallest cap.
+            case setting
+            /// No context window is recorded, so the conservative clamp applies.
+            case unrecordedWindow
+            /// 20% of the model's context window is the smallest cap.
+            case windowFraction
+            /// The catalog publishes a max output that binds: it is either
+            /// smaller than the window room, or (with no usable window) the
+            /// only capacity fact the app has.
+            case outputLimit
+            /// The provider refused a larger reply budget without naming a
+            /// number. This turn was lowered; the saved setting was not, so
+            /// the Settings control cannot move the number the provider
+            /// already rejected.
+            case providerRefused
+        }
+
+        public let requested: Int
+        public let window: Int?
+        public let outputLimit: Int?
+        public let effective: Int
+        public let binding: Binding
+    }
+
     /// The reply budget a request may carry and still share the window with a
     /// prompt this app would send.
     ///
     /// `max_tokens` is a ceiling, so lowering it never breaks a turn that would
     /// otherwise have fitted; leaving it above the window guarantees the
     /// request is refused (or truncated) no matter how short the prompt is.
-    /// The cap is the room the auto-compaction threshold leaves — 20% of the
-    /// window — so the two rules agree: once the prompt is under 80%, the
+    /// The cap is the room the auto-compaction threshold leaves, 20% of the
+    /// window, so the two rules agree: once the prompt is under 80%, the
     /// prompt plus this reply fits, and the pre-flight is only triggered by a
     /// prompt compaction can actually shrink.
     ///
-    /// A model with NO recorded window is capped at `unknownWindowReplyCeiling`
-    /// rather than passed through. The pass-through was safe only while the
-    /// settings slider topped out at a budget most providers accept; it let the
-    /// app send an arbitrary `max_tokens` to a provider whose capacity nobody had
-    /// written down, which is a 400 (or an expensive success) with no local
-    /// evidence behind it. The ceiling is the same number
-    /// `maximumOutputTokens(window:)` advertises, so the slider and this clamp
-    /// cannot disagree. A caller that asked for no budget (`nil`/`0`) is still
-    /// left alone.
-    public static func replyBudget(requested: Int, window: Int?) -> Int {
-        guard requested > 0 else { return max(0, requested) }
-        guard let window, window >= minimumPlausibleWindow else {
-            return min(requested, unknownWindowReplyCeiling)
+    /// A model with NO recorded or published window is capped at
+    /// `unknownWindowReplyCeiling` rather than passed through. The pass-through
+    /// was safe only while the settings slider topped out at a budget most
+    /// providers accept; it let the app send an arbitrary `max_tokens` to a
+    /// provider whose capacity nobody had written down, which is a 400 (or an
+    /// expensive success) with no local evidence behind it. The ceiling is the
+    /// same number `maximumOutputTokens(window:)` advertises, so the slider and
+    /// this clamp cannot disagree.
+    ///
+    /// A model whose catalog publishes its own `max output` is capped by that
+    /// too: the window fraction is this app's reserve, not a promise the model
+    /// will accept a reply longer than its own published limit.
+    ///
+    /// With no usable window, a published output limit stands IN for the
+    /// missing window rather than being clamped by `unknownWindowReplyCeiling`.
+    /// That ceiling exists for the ABSENCE of evidence — it stops the app
+    /// sending an arbitrary `max_tokens` to a provider whose capacity nobody
+    /// recorded — and a published output limit is evidence about this model.
+    /// Clamping it to the ceiling made the catalog's one useful number change
+    /// nothing for an endpoint that publishes output caps without context
+    /// windows. A sub-plausible published value is treated as absent, because
+    /// that is a units mistake and not capacity.
+    ///
+    /// A caller that asked for no budget (`nil`/`0`) is still left alone.
+    public static func replyBudgetResolution(
+        requested: Int,
+        window: Int?,
+        outputLimit: Int? = nil
+    ) -> ReplyBudget {
+        guard requested > 0 else {
+            return ReplyBudget(
+                requested: requested,
+                window: window,
+                outputLimit: outputLimit,
+                effective: max(0, requested),
+                binding: .setting
+            )
         }
-        let room = (Double(window) * (1 - autoCompactFraction)).rounded()
-        guard room.isFinite, room >= 1, room < Double(Int.max) else {
-            return min(requested, unknownWindowReplyCeiling)
+
+        // Constraints are evaluated before the setting, and a TIE keeps the
+        // constraint: when the setting equals the ceiling, raising the setting
+        // cannot move the effective number, so naming it would repeat the dead
+        // end this type exists to remove.
+        var effective = unknownWindowReplyCeiling
+        var binding = ReplyBudget.Binding.unrecordedWindow
+        var windowBinds = false
+        if let window, window >= minimumPlausibleWindow {
+            let room = (Double(window) * (1 - autoCompactFraction)).rounded()
+            if room.isFinite, room >= 1, room < Double(Int.max) {
+                effective = Int(room)
+                binding = .windowFraction
+                windowBinds = true
+            }
         }
-        return min(requested, Int(room))
+        if let outputLimit, outputLimit >= minimumPlausibleOutputLimit {
+            if !windowBinds || outputLimit < effective {
+                effective = outputLimit
+                binding = .outputLimit
+            }
+        }
+        if requested < effective {
+            effective = requested
+            binding = .setting
+        }
+        return ReplyBudget(
+            requested: requested,
+            window: window,
+            outputLimit: outputLimit,
+            effective: effective,
+            binding: binding
+        )
+    }
+
+    /// The plain budget, for callers that do not need the explanation.
+    public static func replyBudget(
+        requested: Int,
+        window: Int?,
+        outputLimit: Int? = nil
+    ) -> Int {
+        replyBudgetResolution(
+            requested: requested,
+            window: window,
+            outputLimit: outputLimit
+        ).effective
+    }
+
+    /// A lower reply budget a provider's own rejection just made necessary.
+    public struct ReplyBudgetRecovery: Equatable, Sendable {
+        /// The budget the retry should carry, with its binding recomputed.
+        public let budget: ReplyBudget
+        /// The output cap the provider named, when the body stated one. This
+        /// is capacity evidence about the model and may be recorded.
+        public let publishedLimit: Int?
+
+        public init(budget: ReplyBudget, publishedLimit: Int?) {
+            self.budget = budget
+            self.publishedLimit = publishedLimit
+        }
+    }
+
+    /// The smaller budget one provider rejection justifies, or nil when the
+    /// body is not about the reply budget or no smaller number is available.
+    ///
+    /// One retry only: this never walks a provider's limit down in steps. A
+    /// body that names the limit is used exactly; one that only says "too
+    /// large" halves the budget, floored by the unrecorded-window ceiling, so
+    /// a rejected 200,000 falls back to the conservative number the app used
+    /// before capacity was known rather than to an arbitrary fraction of it.
+    ///
+    /// The returned `ReplyBudget` is rebuilt through
+    /// `replyBudgetResolution` rather than constructed by hand, so the window
+    /// and output-limit arithmetic is the send path's own. A rejection that
+    /// names no number is marked `.providerRefused`: the turn was lowered, not
+    /// the saved setting, and the notice must not send the reader to a control
+    /// that already holds the rejected number.
+    public static func replyBudgetRecovery(
+        afterRejectionOf current: ReplyBudget,
+        body: String
+    ) -> ReplyBudgetRecovery? {
+        guard CloudTurnFailure.indicatesOutputBudgetRejection(body),
+              current.effective > 1 else { return nil }
+        let named = publishedOutputLimit(in: body).flatMap {
+            $0 < current.effective ? $0 : nil
+        }
+        let fallback = min(current.effective / 2, unknownWindowReplyCeiling)
+        let requested = max(1, min(named ?? fallback, current.effective - 1))
+        guard requested < current.effective else { return nil }
+        let limits = [current.outputLimit, named].compactMap { $0 }
+        let resolved = replyBudgetResolution(
+            requested: requested,
+            window: current.window,
+            outputLimit: limits.min()
+        )
+        guard resolved.effective < current.effective else { return nil }
+        let budget = named == nil
+            ? ReplyBudget(
+                requested: resolved.requested,
+                window: resolved.window,
+                outputLimit: resolved.outputLimit,
+                effective: resolved.effective,
+                binding: .providerRefused
+            )
+            : resolved
+        return ReplyBudgetRecovery(budget: budget, publishedLimit: named)
+    }
+
+    /// The output-token cap a provider's rejection names, if it names one.
+    ///
+    /// Only called after `CloudTurnFailure.indicatesOutputBudgetRejection`
+    /// says the body is about the reply budget, so each pattern can assume
+    /// that context. The spellings covered are the ones the app has seen and
+    /// the ones the OpenAI/Anthropic/OpenRouter/Groq families produce:
+    /// `max_tokens: 200000 > 64000`, `at most 4096`, `must be less than or
+    /// equal to 32768`, `valid range … [1, 16384]`, and `cannot exceed 8192`.
+    ///
+    /// A number from a model name is never taken: every pattern requires its
+    /// own cue word or comparison immediately before the digits, and the
+    /// plausibility floor rejects the small numbers that a model name leaks
+    /// (`claude-sonnet-4-6`, `gpt-4o`). Returning nil is not a failure — the
+    /// caller halves the budget instead.
+    public static func publishedOutputLimit(in summary: String) -> Int? {
+        let patterns = [
+            #"(?:max_tokens|max_completion_tokens)[^\n]{0,80}>\s*(\d[\d,]*)"#,
+            #"(?:at most|up to|cannot exceed|not exceed|exceed(?:s|ing)?|less than(?: or equal to)?|<=|≤)\s*(\d[\d,]*)"#,
+            #"(?:valid range[^0-9]{0,40}?\[\s*\d[\d,]*\s*,\s*)(\d[\d,]*)"#,
+            #"(?:maximum|max)\s+(?:allowed\s+)?(?:number\s+of\s+)?(?:output\s+)?tokens?[^0-9]{0,40}?(\d[\d,]*)"#,
+            #"(?:output\s+token\s+limit|output\s+limit|max(?:imum)?\s+output(?:\s+tokens?)?)[^0-9]{0,40}?(\d[\d,]*)"#
+        ]
+        let range = NSRange(summary.startIndex..., in: summary)
+        var found: [Int] = []
+        for pattern in patterns {
+            guard let expression = try? NSRegularExpression(
+                pattern: pattern,
+                options: [.caseInsensitive]
+            ) else { continue }
+            for match in expression.matches(in: summary, options: [], range: range) {
+                guard match.numberOfRanges > 1,
+                      let captured = Range(match.range(at: 1), in: summary) else { continue }
+                let digits = String(summary[captured])
+                    .replacingOccurrences(of: ",", with: "")
+                guard let value = Int(digits),
+                      (minimumPlausibleOutputLimit...10_000_000).contains(value) else { continue }
+                found.append(value)
+            }
+        }
+        return found.min()
     }
 
     /// The Max Output Tokens ceiling Settings should advertise for a cloud
@@ -935,8 +1300,48 @@ public nonisolated enum CloudContextPolicy {
     /// send path silently lowers, which reads as the app ignoring a setting.
     /// An unrecorded (or sub-plausible) window answers with
     /// `unknownWindowReplyCeiling`, exactly as the clamp does.
-    public static func maximumOutputTokens(window: Int?) -> Int {
-        replyBudget(requested: Int.max, window: window)
+    public static func maximumOutputTokens(window: Int?, outputLimit: Int? = nil) -> Int {
+        replyBudget(requested: Int.max, window: window, outputLimit: outputLimit)
+    }
+
+    /// The transcript notice for a turn the provider stopped at `length`.
+    ///
+    /// Each binding gets the sentence that can actually change it, and the
+    /// reasoning note names why a long thinking block can spend the budget
+    /// before the visible answer starts. Plan Mode is the mode that made this
+    /// concrete: its deliverable is one long message and its reasoning shares
+    /// the same output budget, so a 16k cap cut the plan mid-sentence.
+    public static func outputLimitNotice(_ budget: ReplyBudget) -> String {
+        let head = "⚠️ This answer stopped at the Max Output Tokens limit (\(budget.effective.formatted()) tokens) and may be truncated. "
+        let tail = " Reasoning counts toward the same budget, so a long thinking block can use it before the answer starts."
+        let ceiling = maximumOutputTokens(
+            window: budget.window,
+            outputLimit: budget.outputLimit
+        )
+        switch budget.binding {
+        case .setting:
+            return head
+                + "This model allows up to \(ceiling.formatted()). Raise Max Output Tokens in Settings ▸ Sampling for a longer reply."
+                + tail
+        case .unrecordedWindow:
+            return head
+                + "No context window is recorded for this model, so its reply budget is held to \(budget.effective.formatted()). Run Test & Sync Models on Settings ▸ Cloud (or record its window) to price it against the provider's own capacity, then raise Max Output Tokens."
+                + tail
+        case .windowFraction:
+            let windowText = budget.window.map { "this model's \($0.formatted())-token context window" } ?? "this model's context window"
+            return head
+                + "That is the room \(windowText) leaves for a reply, so raising Max Output Tokens cannot go higher. Record a larger window on Settings ▸ Cloud if the provider publishes one."
+                + tail
+        case .outputLimit:
+            let limitText = budget.outputLimit.map { "this model's published \($0.formatted())-token output limit" } ?? "this model's published output limit"
+            return head
+                + "That is \(limitText), so raising Max Output Tokens cannot go higher. Choose a model with a larger output limit for a longer reply."
+                + tail
+        case .providerRefused:
+            return head
+                + "The provider refused a larger reply budget for this model, so this turn continued at \(budget.effective.formatted()). Your Max Output Tokens setting was not lowered; record the model's real output limit on Settings ▸ Cloud so a later turn is not refused again."
+                + tail
+        }
     }
 
     /// The share of the window a prompt occupies, for a status line.
@@ -1053,10 +1458,12 @@ public nonisolated enum CloudContextPolicy {
 /// `DiscoveredModel`, never a view's state, and it is what the tests exercise.
 enum MaxOutputCeilingBackend {
     /// A cloud turn, carrying where its window came from: the model's own
-    /// recorded value, the single global fallback, or neither. The ceiling is
-    /// the same 20% either way, but an explanation that called a fallback value
-    /// "this model's context window" would name a fact the store does not hold.
-    case cloud(window: CloudContextPolicy.WindowSource)
+    /// recorded value, the provider's published window, the single global
+    /// fallback, or neither; plus the catalog's own output cap when it
+    /// published one. The ceiling is 20% of the window either way, but an
+    /// explanation that called a fallback value "this model's context window"
+    /// would name a fact the store does not hold.
+    case cloud(window: CloudContextPolicy.WindowSource, outputLimit: Int?)
     case appleFoundationModel
     /// A local checkpoint, carrying what actually binds its ceiling. The number
     /// is `max(32_768, min(declared, 262_144))`, so it is NOT always the
@@ -1086,14 +1493,22 @@ enum MaxOutputCeilingBackend {
         if let model {
             if let parsed = CloudModelAddress.parseModelId(model.id)
                 ?? CloudModelAddress.parsePath(model.snapshotPath) {
-                return .cloud(window: CloudContextPolicy.windowSource(
+                let limits = CloudContextPolicy.observedLimit(
                     forModelId: parsed.providerModelId,
                     providerId: parsed.provider.id,
                     defaults: defaults
-                ))
+                )
+                return .cloud(
+                    window: CloudContextPolicy.windowSource(
+                        forModelId: parsed.providerModelId,
+                        providerId: parsed.provider.id,
+                        defaults: defaults
+                    ),
+                    outputLimit: limits?.maxOutput
+                )
             }
             if CloudModelAddress.isCloudModelId(model.id) || CloudModelAddress.isCloudPath(model.snapshotPath) {
-                return .cloud(window: globalWindowSource(defaults: defaults))
+                return .cloud(window: globalWindowSource(defaults: defaults), outputLimit: nil)
             }
             if model.isAppleFoundationModel {
                 return .appleFoundationModel
@@ -1109,14 +1524,22 @@ enum MaxOutputCeilingBackend {
         }
         if let parsed = CloudModelAddress.parseModelId(address)
             ?? CloudModelAddress.parsePath(address) {
-            return .cloud(window: CloudContextPolicy.windowSource(
+            let limits = CloudContextPolicy.observedLimit(
                 forModelId: parsed.providerModelId,
                 providerId: parsed.provider.id,
                 defaults: defaults
-            ))
+            )
+            return .cloud(
+                window: CloudContextPolicy.windowSource(
+                    forModelId: parsed.providerModelId,
+                    providerId: parsed.provider.id,
+                    defaults: defaults
+                ),
+                outputLimit: limits?.maxOutput
+            )
         }
         if CloudModelAddress.isCloudModelId(address) || CloudModelAddress.isCloudPath(address) {
-            return .cloud(window: globalWindowSource(defaults: defaults))
+            return .cloud(window: globalWindowSource(defaults: defaults), outputLimit: nil)
         }
         return local
     }
@@ -1143,8 +1566,11 @@ func resolveNonLocalMaxOutputCeiling(
     defaults: UserDefaults = .standard
 ) -> Int? {
     switch MaxOutputCeilingBackend.classify(model: model, fallbackAddress: fallbackAddress, defaults: defaults) {
-    case .cloud(let source):
-        return CloudContextPolicy.maximumOutputTokens(window: source.window)
+    case .cloud(let source, let outputLimit):
+        return CloudContextPolicy.maximumOutputTokens(
+            window: source.window,
+            outputLimit: outputLimit
+        )
     case .appleFoundationModel:
         return AppleFoundationModelService.maxResponseTokenCeiling
     case .local:
@@ -1175,16 +1601,41 @@ func maxOutputCeilingExplanation(
         declaredMaxPositionEmbeddings: declaredMaxPositionEmbeddings,
         defaults: defaults
     ) {
-    case .cloud(.model(let recorded)):
-        return "Capped by 20% of this model's \(recorded.formatted())-token context window — a reply budget larger than that cannot share the window with any prompt. Record a larger window on the Cloud tab to raise it."
-    case .cloud(.global(let fallback)):
-        return "No window of its own is recorded for this model, so the global \(fallback.formatted())-token fallback applies and caps the reply at 20% of it. Record a window for this model on the Cloud tab to price it against its own context."
-    case .cloud(.none):
-        return "No context window is recorded for this model, so the reply budget is held to \(CloudContextPolicy.unknownWindowReplyCeiling.formatted()) tokens. Record its window on the Cloud tab to raise the ceiling to 20% of it."
+    case .cloud(let source, let outputLimit):
+        return cloudCeilingExplanation(source: source, outputLimit: outputLimit)
     case .appleFoundationModel:
         return "Capped by the on-device model's own response limit (\(AppleFoundationModelService.maxResponseTokenCeiling.formatted()) tokens); a larger value is clamped before the framework sees it."
     case .local(let basis):
         return localCeilingExplanation(basis)
+    }
+}
+
+/// The cloud branch's sentence, naming whichever fact actually binds.
+///
+/// The output cap is checked first because it can be smaller than the window
+/// fraction: a model with a 200k window and a 32k published output limit is
+/// capped at 32k, and a sentence that said `20% of the window` beside a 32k
+/// slider would name a limit the model does not have.
+private func cloudCeilingExplanation(
+    source: CloudContextPolicy.WindowSource,
+    outputLimit: Int?
+) -> String {
+    let ceiling = CloudContextPolicy.maximumOutputTokens(
+        window: source.window,
+        outputLimit: outputLimit
+    )
+    if let outputLimit, ceiling == outputLimit {
+        return "Capped by this model's published \(outputLimit.formatted())-token output limit. That limit binds before the 20% window reserve, so raising the window alone cannot move it."
+    }
+    switch source {
+    case .model(let recorded):
+        return "Capped by 20% of this model's \(recorded.formatted())-token context window. A reply budget larger than that cannot share the window with any prompt. Record a larger window on the Cloud tab to raise it."
+    case .observed(let recorded):
+        return "Detected from the provider's model catalog: a \(recorded.formatted())-token context window, which caps a reply at \(ceiling.formatted()). Record a window on the Cloud tab to override it."
+    case .global(let fallback):
+        return "No window of its own is recorded for this model, so the global \(fallback.formatted())-token fallback applies and caps the reply at 20% of it. Record a window for this model on the Cloud tab to price it against its own context."
+    case .none:
+        return "No context window is recorded for this model, so the reply budget is held to \(CloudContextPolicy.unknownWindowReplyCeiling.formatted()) tokens. Run Test & Sync Models on the Cloud tab (or record its window) to raise the ceiling to 20% of its context."
     }
 }
 
