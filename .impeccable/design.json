@@ -1,0 +1,198 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-13T00:00:00Z",
+  "title": "Design System: DynaMoE",
+  "extensions": {
+    "colorMeta": {
+      "signal-violet": {
+        "role": "primary",
+        "displayName": "Signal Violet",
+        "canonical": "#AF52DE",
+        "tonalRamp": ["#2A0F3A", "#3E1754", "#552070", "#6D2A8F", "#8A3CB0", "#AF52DE", "#C98BEA", "#E9CDF6"]
+      },
+      "signal-indigo": {
+        "role": "primary",
+        "displayName": "Signal Indigo",
+        "canonical": "#5856D6",
+        "tonalRamp": ["#0F1236", "#171C4F", "#212869", "#2C3488", "#3A44AB", "#5856D6", "#8C8BE6", "#D2D2F7"]
+      },
+      "signal-cyan": {
+        "role": "tertiary",
+        "displayName": "Signal Cyan",
+        "canonical": "#32ADE6",
+        "tonalRamp": ["#062B3A", "#0A4060", "#0D5680", "#106DA3", "#1689C4", "#32ADE6", "#7FCDF0", "#CFEBFA"]
+      },
+      "status-green": {
+        "role": "secondary",
+        "displayName": "Success Green",
+        "canonical": "#34C759",
+        "tonalRamp": ["#06301A", "#0A4A28", "#0D6436", "#118045", "#18A257", "#34C759", "#7FDF9A", "#CFF5D9"]
+      },
+      "status-orange": {
+        "role": "secondary",
+        "displayName": "Caution Orange",
+        "canonical": "#FF9500",
+        "tonalRamp": ["#3A2200", "#5C3600", "#7F4C00", "#A36200", "#CC7C00", "#FF9500", "#FFC166", "#FFE6BF"]
+      },
+      "status-red": {
+        "role": "secondary",
+        "displayName": "Failure Red",
+        "canonical": "#FF3B30",
+        "tonalRamp": ["#3A0A08", "#5C1210", "#7F1A17", "#A3241F", "#CC322B", "#FF3B30", "#FF8F86", "#FFD3CE"]
+      },
+      "action-blue": {
+        "role": "primary",
+        "displayName": "Action Blue",
+        "canonical": "#007AFF",
+        "tonalRamp": ["#00264D", "#003A73", "#004E99", "#0062BF", "#007AFF", "#4FA3FF", "#99C9FF", "#D6EBFF"]
+      },
+      "settings-pane": {
+        "role": "neutral",
+        "displayName": "Settings Pane",
+        "canonical": "#FFFFFF",
+        "tonalRamp": ["#1E1E1E", "#2C2C2C", "#3B3B3B", "#5A5A5A", "#8A8A8A", "#C2C2C2", "#E8E8E8", "#FFFFFF"]
+      },
+      "settings-card": {
+        "role": "neutral",
+        "displayName": "Settings Card",
+        "canonical": "#F8F8F8",
+        "tonalRamp": ["#1E1E1E", "#2A2A2A", "#383838", "#585858", "#8C8C8C", "#C7C7C7", "#E9E9E9", "#F8F8F8"]
+      }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Display", "purpose": "One per surface: the welcome greeting or About mark." },
+      "headline": { "displayName": "Headline", "purpose": "Markdown H1 inside an answer." },
+      "title": { "displayName": "Title", "purpose": "Markdown H2 and pane titles." },
+      "body": { "displayName": "Body", "purpose": "Assistant answers and user bubbles." },
+      "supporting": { "displayName": "Supporting", "purpose": "Descriptions, status lines, secondary labels." },
+      "label": { "displayName": "Label", "purpose": "Telemetry, chips, badges, code-block headers." },
+      "mono": { "displayName": "Mono", "purpose": "Every measured number, tool name, and identifier." }
+    },
+    "shadows": [
+      { "name": "floating-surface", "value": "0 4px 10px rgba(0, 0, 0, 0.14)", "purpose": "Composer and cards that sit above the transcript." },
+      { "name": "transient-notice", "value": "0 3px 8px rgba(0, 0, 0, 0.12)", "purpose": "Status notices and toasts." },
+      { "name": "soft-lift", "value": "0 4px 12px rgba(0, 0, 0, 0.08)", "purpose": "Secondary floating panels." },
+      { "name": "whisper", "value": "0 4px 10px rgba(0, 0, 0, 0.06)", "purpose": "The transcript's floating bottom fade layer." },
+      { "name": "signal-glow", "value": "0 4px 8px rgba(175, 82, 222, 0.35)", "purpose": "The About window's identity mark only." }
+    ],
+    "motion": [
+      { "name": "state-fast", "value": "0.15s ease-in-out", "purpose": "Tool-card expansion and small state changes." },
+      { "name": "state-emphasis", "value": "0.18s ease-in-out", "purpose": "Selected-segment and mode changes." },
+      { "name": "state-standard", "value": "0.2s ease-in-out", "purpose": "Thinking accordion and disclosure toggles." },
+      { "name": "pace-pulse", "value": "0.85s ease-in-out infinite", "purpose": "Streaming pace indicator only." }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "composer",
+      "description": "Bordered prominent action for the one affirmative control in a pane.",
+      "html": "<button class=\"ds-btn-primary\">Load Model</button>",
+      "css": ".ds-btn-primary { appearance: none; border: none; border-radius: 8px; background: #007AFF; color: #FFFFFF; font: 600 13px -apple-system, 'SF Pro', sans-serif; padding: 6px 14px; cursor: pointer; transition: background 0.15s ease-in-out; } .ds-btn-primary:hover { background: #0066D6; } .ds-btn-primary:focus-visible { outline: 2px solid rgba(0, 122, 255, 0.45); outline-offset: 2px; }"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "description": "Bordered default action used across Settings.",
+      "html": "<button class=\"ds-btn-secondary\">Restart Server</button>",
+      "css": ".ds-btn-secondary { appearance: none; border: 1px solid rgba(0, 0, 0, 0.14); border-radius: 8px; background: #FFFFFF; color: #1D1D1F; font: 500 13px -apple-system, 'SF Pro', sans-serif; padding: 5px 12px; cursor: pointer; transition: background 0.15s ease-in-out; } .ds-btn-secondary:hover { background: #F2F2F2; } .ds-btn-secondary:focus-visible { outline: 2px solid rgba(0, 0, 0, 0.2); outline-offset: 2px; }"
+    },
+    {
+      "name": "Ghost Row Button",
+      "kind": "button",
+      "description": "The app's default chrome button: borderless, 6% hover fill, 6 px radius.",
+      "html": "<button class=\"ds-btn-ghost\"><span class=\"ds-btn-ghost-glyph\">+</span> New Chat</button>",
+      "css": ".ds-btn-ghost { appearance: none; border: none; border-radius: 6px; background: transparent; color: #1D1D1F; font: 500 13px -apple-system, 'SF Pro', sans-serif; padding: 7px 10px; text-align: left; width: 100%; cursor: pointer; display: flex; align-items: center; gap: 8px; transition: background 0.15s ease-in-out; } .ds-btn-ghost:hover { background: rgba(0, 0, 0, 0.06); } .ds-btn-ghost:focus-visible { outline: 2px solid rgba(0, 0, 0, 0.2); outline-offset: 2px; } .ds-btn-ghost-glyph { font-size: 13px; opacity: 0.8; }"
+    },
+    {
+      "name": "Composer Field",
+      "kind": "input",
+      "refersTo": "composer",
+      "description": "Floating 18 pt card on the control surface with a shadow and no border.",
+      "html": "<div class=\"ds-composer\"><div class=\"ds-composer-placeholder\">Ask DynaMoE anything... (Enter to send)</div></div>",
+      "css": ".ds-composer { background: #FFFFFF; border-radius: 18px; box-shadow: 0 4px 10px rgba(0, 0, 0, 0.14); padding: 12px 14px; min-height: 44px; } .ds-composer-placeholder { color: #8E8E93; font: 400 14px -apple-system, 'SF Pro', sans-serif; }"
+    },
+    {
+      "name": "User Message Bubble",
+      "kind": "card",
+      "refersTo": "message-user",
+      "description": "Violet wash at 18% over the window surface, 14 pt radius, right-aligned.",
+      "html": "<div class=\"ds-bubble-wrap\"><div class=\"ds-bubble-user\">The capital of France is</div></div>",
+      "css": ".ds-bubble-wrap { display: flex; justify-content: flex-end; } .ds-bubble-user { background: rgba(175, 82, 222, 0.18); color: #1D1D1F; font: 400 14px/20px -apple-system, 'SF Pro', sans-serif; border-radius: 14px; padding: 10px 16px; max-width: 60ch; }"
+    },
+    {
+      "name": "Sidebar Session Row",
+      "kind": "nav",
+      "description": "Flat row; selected state is a 12% violet fill, hover 6% primary.",
+      "html": "<div class=\"ds-nav-row ds-nav-row-selected\">Named the launch plan</div><div class=\"ds-nav-row\">Qwen repack notes</div>",
+      "css": ".ds-nav-row { border-radius: 6px; padding: 6px 8px; color: #1D1D1F; font: 500 12px -apple-system, 'SF Pro', sans-serif; cursor: pointer; transition: background 0.15s ease-in-out; } .ds-nav-row + .ds-nav-row { margin-top: 2px; } .ds-nav-row:hover { background: rgba(0, 0, 0, 0.06); } .ds-nav-row-selected { background: rgba(175, 82, 222, 0.12); }"
+    },
+    {
+      "name": "Status Badge",
+      "kind": "chip",
+      "refersTo": "status-badge",
+      "description": "Capsule badge whose tint is the state: green success, indigo running, orange approval, red error.",
+      "html": "<span class=\"ds-badge ds-badge-success\">Loaded</span><span class=\"ds-badge ds-badge-running\">Running</span>",
+      "css": ".ds-badge { display: inline-block; border-radius: 999px; padding: 2px 6px; font: 700 9.5px -apple-system, 'SF Pro', sans-serif; letter-spacing: 0.02em; text-transform: uppercase; } .ds-badge-success { color: #34C759; background: rgba(52, 199, 89, 0.12); } .ds-badge-running { color: #5856D6; background: rgba(88, 86, 214, 0.12); }"
+    },
+    {
+      "name": "Settings Card",
+      "kind": "card",
+      "refersTo": "settings-card",
+      "description": "System-Settings-style grouped inset card: no border, faint fill, continuous 10 pt corners.",
+      "html": "<section class=\"ds-settings-card\"><h4 class=\"ds-settings-card-header\">Server</h4><div class=\"ds-settings-row\"><span class=\"ds-settings-row-title\">Enable local server</span><span class=\"ds-settings-row-value\">127.0.0.1:8787</span></div></section>",
+      "css": ".ds-settings-card { background: #F8F8F8; border-radius: 10px; padding: 6px 14px; } .ds-settings-card-header { margin: 0 0 6px 8px; color: #1D1D1F; font: 600 12.5px -apple-system, 'SF Pro', sans-serif; } .ds-settings-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-top: 1px solid rgba(0, 0, 0, 0.06); } .ds-settings-row:first-of-type { border-top: none; } .ds-settings-row-title { color: #1D1D1F; font: 400 13px -apple-system, 'SF Pro', sans-serif; } .ds-settings-row-value { color: #6E6E73; font: 400 12px 'SF Mono', ui-monospace, monospace; }"
+    },
+    {
+      "name": "Code Block",
+      "kind": "custom",
+      "refersTo": "code-block",
+      "description": "8 pt card with a header bar, divider, and a monospaced canvas on the text surface.",
+      "html": "<div class=\"ds-code\"><div class=\"ds-code-header\"><span class=\"ds-code-lang\">SWIFT</span><span class=\"ds-code-copy\">Copy</span></div><pre class=\"ds-code-body\">launchTurn(request)</pre></div>",
+      "css": ".ds-code { border: 1px solid rgba(0, 0, 0, 0.08); border-radius: 8px; overflow: hidden; background: #FFFFFF; } .ds-code-header { display: flex; justify-content: space-between; align-items: center; padding: 7px 12px; background: #FFFFFF; border-bottom: 1px solid rgba(0, 0, 0, 0.08); } .ds-code-lang { color: #6E6E73; font: 700 11px 'SF Mono', ui-monospace, monospace; } .ds-code-copy { color: #6E6E73; font: 500 10px -apple-system, 'SF Pro', sans-serif; padding: 3px 8px; border-radius: 4px; background: rgba(0, 0, 0, 0.08); } .ds-code-body { margin: 0; padding: 12px; color: #1D1D1F; font: 400 12.5px/17px 'SF Mono', ui-monospace, monospace; }"
+    },
+    {
+      "name": "Tool Step Badge",
+      "kind": "custom",
+      "description": "Timeline step: 6 pt status dot, mono step label, tinted pill with matching stroke.",
+      "html": "<span class=\"ds-step\"><span class=\"ds-step-dot\"></span>3. grep_search 0.42s</span>",
+      "css": ".ds-step { display: inline-flex; align-items: center; gap: 4px; border-radius: 6px; padding: 4px 8px; color: #1D1D1F; font: 600 10.5px 'SF Mono', ui-monospace, monospace; background: rgba(52, 199, 89, 0.08); border: 1px solid rgba(52, 199, 89, 0.2); } .ds-step-dot { width: 6px; height: 6px; border-radius: 50%; background: #34C759; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Telemetry Deck",
+    "overview": "DynaMoE looks like equipment that is running something: dense rows of small type, live numbers in monospaced figures, and a status light that changes color while the machine works. The interface is not a stage for the model; it is the panel you watch the model through. Density is the aesthetic, and restraint is how it stays readable - panels, hairlines, and system surfaces carry the structure, while one violet signal marks identity and activity.",
+    "keyCharacteristics": [
+      "Small type (9-13 pt) at almost every size, with a single 22 pt display moment.",
+      "Flat system surfaces separated by 1 px translucent strokes, not shadows.",
+      "One violet-to-indigo signal gradient, reserved for identity marks.",
+      "State colors (green, orange, red, indigo, violet) that always mean something.",
+      "Radii that step with containment: 18 floating, 14 bubble, 10 card, 8 control, 6 row."
+    ],
+    "rules": [
+      { "name": "The Provisional Palette Rule", "body": "The palette is scheduled for replacement from the DRP and DynaMoE websites. Do not mint new colors from it or extend violet into a new component; use the existing tier that already means what you need, or use a system semantic color.", "section": "colors" },
+      { "name": "The Signal-Not-Decoration Rule", "body": "Violet identifies DynaMoE or marks that it is working. It is never a background wash for a section, a heading color, or a hover state on neutral chrome.", "section": "colors" },
+      { "name": "The Status Vocabulary Rule", "body": "Green means success or generating, orange means warning, attention, or Turbo Mode, red means failure, indigo means running, violet means withheld or idle. A status color always carries a state; a decorative accent never borrows one.", "section": "colors" },
+      { "name": "The Small-Type Rule", "body": "UI chrome lives between 9 and 13 pt. Nothing above 16.5 pt appears more than once per surface, and only as a display moment.", "section": "typography" },
+      { "name": "The Zoom-Not-Dynamic-Type Rule", "body": "Type scales through the app zoom (0.6-2.5 in 0.15 steps, persisted), never through per-view size variants. Every custom size is written as max(floor, base * zoomScale) so text never falls below its legibility floor; new text must do the same.", "section": "typography" },
+      { "name": "The Mono-Means-Measured Rule", "body": "Any number the user might compare (tok/s, TTFT, GB, tokens, tau, durations) is monospaced. Prose numbers are not.", "section": "typography" },
+      { "name": "The Hairline Rule", "body": "Separation is a stroke, not a shadow. Inside the window, use primary.opacity(0.06-0.2) at 1 px; reserve every shadow for elements that leave the surface plane.", "section": "elevation" }
+    ],
+    "dos": [
+      "Do draw surfaces from AppKit semantic colors first; the only literal neutrals are the two Settings fills.",
+      "Do write custom type as max(floor, base * zoomScale) so the 0.6 zoom floor never clips.",
+      "Do use the status vocabulary for status and nothing else.",
+      "Do keep the composer, cards, and code blocks inside the 6/8/10/14/18 radius ladder.",
+      "Do prefer a 1 px stroke or a tonal fill over a shadow for separation.",
+      "Do lean on stock macOS chrome - bordered buttons, menus, pickers - for new settings surfaces; the restrained direction wins ties."
+    ],
+    "donts": [
+      "Don't introduce new hues, gradients, or violet opacity tiers; the palette is provisional and awaiting the site-derived rebrand.",
+      "Don't put the violet-to-indigo gradient on chrome; it belongs to identity marks (avatar, welcome mark, blockquote rail, agent indicator).",
+      "Don't animate longer than 0.2 s for state changes; 0.85 s is reserved for the streaming pace pulse.",
+      "Don't use Dynamic Type APIs or hardcoded point sizes that ignore the zoom manager.",
+      "Don't use SF Symbols larger than 30 pt outside the single display moment."
+    ]
+  }
+}

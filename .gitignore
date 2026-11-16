@@ -92,9 +92,20 @@ build/
 DynaMoE Architectural Overview.md
 AGENTS.md
 .codex
-Product.md
-Design.md
-.impeccable
+
+# ==========================================
+# Impeccable design context
+# ==========================================
+# Durable design context is tracked so teammates and other worktrees share it.
+# A blanket `.impeccable` ignore, plus case-insensitive `Product.md`/`Design.md`
+# rules on macOS, hid all of it, which is how PRODUCT.md got lost.
+.impeccable/*
+!.impeccable/config.json
+!.impeccable/design.json
+!.impeccable/live/
+!.impeccable/surfaces/
+!.impeccable/critique/
+.impeccable/config.local.json
 
 # Compiled streaming benchmark binary (built from Benchmarks/dynamoe_stream_bench.swift)
 Benchmarks/dynamoe_stream_bench
