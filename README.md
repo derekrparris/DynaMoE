@@ -174,6 +174,13 @@ flowchart TD
 * **No keychain prompts at launch**: a credential is read only when something actually needs it, and "is one stored?" is answered from item attributes, which macOS returns without a dialog. Shipped builds keep their credentials in the data protection keychain, where access is granted by the app's code-signing identity, so a new version never asks for permission again. Credentials written by an older version are copied across once from the **Stored Credentials** card, which appears in Settings on both **Cloud Providers** and **Agent & Tools** while something is still waiting to be imported.
 * **Gated by Default**: Every MCP tool call asks for human approval unless Turbo Mode is on, because a remote server can do anything and its own `readOnlyHint` annotation is a claim rather than a guarantee.
 
+### 6. Skills & Decision Models
+* **Agent Skills, Loaded on Demand**: A skill is a folder with a `SKILL.md`. The system prompt advertises only its name and a one-line description; the model reads the procedure with the `skill_load` tool (and any `scripts/`, `reference/` or `assets/` files beside it) when the description matches. An unused skill costs a line of prompt instead of its whole body.
+* **Shared Folders, Personal Overrides**: Skills are discovered in `~/Library/Application Support/DynaMoE/skills`, `~/.agents/skills` and `~/.claude/skills`, plus any `extraRoots` in `skills.json`. A later folder wins a name collision, so an installed starter or a project folder overrides a shared copy; a shadowed skill is reported with the path to remove rather than silently dropped.
+* **Always-On Rules**: `always: true` renders a "route this kind of work through me" rule into every prompt, which is how a judgment skill like `subq-decisions` becomes the default without editing each model profile's system prompt.
+* **SubQ Decisions as a Native Tool**: `subq_decide` calls SubQ's decisions-only `subq-snap-preview` model (`POST /v1/systemone`) for yes/no gates, routing, triage, classification and ordered scoring, returning probabilities and confidence. The key lives in the Keychain (or is reused from a SubQ Cloud Provider) and never enters a prompt, a log line, or the model's shell environment.
+* **Design Work with `impeccable`**: Because skills are shell-backed, a design skill's own tooling (an audit detector, a context loader) runs through `shell_run` with the same curated PATH and approval rules as any other command.
+
 ---
 
 ## Key Highlights & Capabilities

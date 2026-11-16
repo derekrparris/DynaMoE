@@ -126,6 +126,8 @@ struct TimelineStepCardView: View {
         case "grep_search": return "magnifyingglass"
         case "web_search": return "globe"
         case "web_fetch": return "arrow.down.doc.fill"
+        case "skill_load": return "book.closed.fill"
+        case "subq_decide": return "arrow.triangle.branch"
         case "complete": return "checkmark.seal.fill"
         default: return "wrench.and.screwdriver.fill"
         }

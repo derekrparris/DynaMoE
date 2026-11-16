@@ -160,7 +160,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .memory:
             return ["memory", "ram", "budget", "kv cache", "precision", "fp8", "fp16", "prefetch", "ssd", "paging", "diagnostics", "cache", "lookahead depth", "execution mode", "working set budget"]
         case .agent:
-            return ["agent", "tools", "turbo", "grammar", "workspace", "directory", "search", "brave", "chrome", "index", "rag", "subagent", "git", "lint", "dogfood", "benchmark", "max multi-step agent iterations", "no limit", "unlimited", "max tool output", "working directory", "mcp", "model context protocol", "keychain", "mcp.json", "stdio", "streamable http", "external tools", "import", "stored credentials", "authorize", "login keychain"]
+            return ["agent", "tools", "turbo", "grammar", "workspace", "directory", "search", "brave", "chrome", "index", "rag", "subagent", "git", "lint", "dogfood", "benchmark", "max multi-step agent iterations", "no limit", "unlimited", "max tool output", "working directory", "mcp", "model context protocol", "keychain", "mcp.json", "stdio", "streamable http", "external tools", "import", "stored credentials", "authorize", "login keychain", "skills", "skill", "skill.md", "skill_load", "subq", "subquadratic", "snap", "decisions", "subq_decide", "skills.json", "procedures", "playbook"]
         case .cloud:
             return ["cloud", "provider", "synthetic", "synthetic.new", "remote", "api key", "connected provider", "deepseek", "cloud models", "keychain", "import", "stored credentials", "authorize", "login keychain", "add provider", "base url", "openai-compatible", "opencode", "opencode zen", "zen", "endpoint"]
         case .server:
@@ -1952,6 +1952,10 @@ struct SettingsSheetView: View {
                 }
             }
 
+            // Skills: user-authored procedure documents (SKILL.md) advertised
+            // by name and loaded on demand.
+            SkillsSettingsSection()
+
             // Model Context Protocol servers (external tool integrations)
             MCPSettingsSection()
 
@@ -2129,6 +2133,8 @@ struct SettingsSheetView: View {
                     toolSummaryCard(name: "find_symbol_definition", icon: "character.textbox", desc: "Locates symbol definitions (class, struct, func, kernel) with exact file coordinates.")
                     toolSummaryCard(name: "find_references", icon: "arrow.triangle.swap", desc: "Locates all call sites, references, and usages of a symbol across project files.")
                     toolSummaryCard(name: "lint_diagnostics", icon: "stethoscope", desc: "Runs native swiftc/metal/clang compiler checks for instant self-healing error reporting.")
+                    toolSummaryCard(name: "skill_load", icon: "book.closed.fill", desc: "Reads an installed skill's SKILL.md and support files by name; no arguments lists every installed skill.")
+                    toolSummaryCard(name: "subq_decide", icon: "arrow.triangle.branch", desc: "Asks SubQ's decisions-only model for probabilities and confidence on yes/no, choice and score questions.")
                     toolSummaryCard(name: "web_search", icon: "globe", desc: "Live web search via Headless Chrome / Brave. Returns titles, URLs, and real-time snippets.")
                     toolSummaryCard(name: "web_fetch", icon: "arrow.down.doc.fill", desc: "Fetches and reads web pages with automatic HTML stripping and markdown extraction.")
                     toolSummaryCard(name: "complete", icon: "checkmark.seal.fill", desc: "Signals task completion with final structured summary.")

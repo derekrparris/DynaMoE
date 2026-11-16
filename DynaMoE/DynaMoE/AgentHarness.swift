@@ -139,6 +139,7 @@ public extension AgentTool {
         case "git_status", "git_diff", "git_commit": return "git"
         case "spawn_subagent", "get_subagent_status", "send_subagent_message", "list_subagents": return "subagents"
         case "lint_diagnostics": return "quality"
+        case "subq_decide": return "decisions"
         default: return "core"
         }
     }
@@ -1953,7 +1954,7 @@ public final class ToolDiscoverTool: AgentTool {
             "properties": AnyCodable([
                 "category": [
                     "type": "string",
-                    "enum": ["search", "analysis", "web", "git", "subagents", "quality", "mcp"],
+                    "enum": ["search", "analysis", "web", "git", "subagents", "quality", "decisions", "mcp"],
                     "description": "Optional category filter; omit to list all groups."
                 ],
                 "query": [
@@ -1990,7 +1991,7 @@ public final class ToolDiscoverTool: AgentTool {
             ])
         }
 
-        let order = ["search", "analysis", "web", "git", "subagents", "quality", "mcp", "core"]
+        let order = ["search", "analysis", "web", "git", "subagents", "quality", "decisions", "mcp", "core"]
         var lines: [String] = []
         var total = 0
         for cat in order {
@@ -2015,6 +2016,14 @@ public final class ToolDiscoverTool: AgentTool {
 
         var groupsJSON: [[String: Any]] = []
         for cat in order {
+            if let items = groups[cat], !items.isEmpty {
+                groupsJSON.append(["category": cat, "tools": items])
+            }
+        }
+        // A category that somehow missed the display order must not vanish
+        // from the structured payload: tools_discover is how the model learns
+        // what a feature added later can do.
+        for cat in groups.keys.sorted() where !order.contains(cat) {
             if let items = groups[cat], !items.isEmpty {
                 groupsJSON.append(["category": cat, "tools": items])
             }
@@ -3474,13 +3483,14 @@ public final class AgentHarness {
     public static let coreLoadedToolNames: Set<String> = [
         "shell_run", "complete",
         "tools_discover", "tools_load", "tools_unload",
-        "web_fetch"
+        "web_fetch", "skill_load"
     ]
 
     /// Tools the model may never unload through `tools_unload`.
     public static let nonUnloadableToolNames: Set<String> = [
         "shell_run", "complete",
-        "tools_discover", "tools_load", "tools_unload"
+        "tools_discover", "tools_load", "tools_unload",
+        "skill_load"
     ]
 
     private init() {
@@ -3511,10 +3521,20 @@ public final class AgentHarness {
         registerTool(ToolDiscoverTool())
         registerTool(ToolLoadTool())
         registerTool(ToolUnloadTool())
+        registerTool(SkillLoadTool())
+        registerTool(SubQDecideTool())
 
         // Seed the fundamental core set into the active prompt/grammar.
         for name in Self.coreLoadedToolNames where tools[name] != nil {
             loadedTools[name] = tools[name]
+        }
+        // The decisions tool is seeded only when a key resolves. Without one
+        // its schema would be paid for on every turn of every conversation and
+        // every call would fail; with one, requiring a discovery turn before a
+        // cheap judgment makes the skill too expensive to use. The check is
+        // attribute-only, so it never raises a Keychain dialog at launch.
+        if SubQDecisionKeySource.hasAnyKey(), let decision = tools["subq_decide"] {
+            loadedTools["subq_decide"] = decision
         }
         syncGrammar()
     }
@@ -3652,6 +3672,12 @@ public final class AgentHarness {
         for name in Self.coreLoadedToolNames where tools[name] != nil {
             loadedTools[name] = tools[name]
         }
+        // Mirrors `registerDefaultTools`: a configured decisions key keeps
+        // `subq_decide` armed, because the skill that teaches it expects to
+        // call it without a discovery step first.
+        if SubQDecisionKeySource.hasAnyKey(), let decision = tools["subq_decide"] {
+            loadedTools["subq_decide"] = decision
+        }
         syncGrammar()
     }
 
@@ -3783,6 +3809,28 @@ public final class AgentHarness {
         return prompt
     }
 
+    /// The "# Skills" section: installed skill names and one-line descriptions,
+    /// plus an explicit rule for skills that declare themselves always-on.
+    ///
+    /// Rendered from the registry snapshot at turn start, deliberately. A
+    /// section that changed between steps would silently rewrite what the
+    /// model was told it could do (the weights path never rebuilds the system
+    /// block mid-run) and would invalidate a cloud provider's prompt cache on
+    /// every step.
+    ///
+    /// The body of a skill is NOT here — `skill_load` carries it. The registry
+    /// caps the list (`maxAdvertised`) and the total characters
+    /// (`advertisedCharacters`) because this block is paid on every turn.
+    public func buildSkillsSection() -> String {
+        let registry = SkillsRegistry.shared
+        guard registry.config.enabled else { return "" }
+        return SkillsPromptRenderer.section(
+            skills: registry.enabledSkills,
+            maxAdvertised: registry.config.maxAdvertised,
+            advertisedCharacters: registry.config.advertisedCharacters
+        )
+    }
+
     /// Agent-mode instructions for a remote provider that calls tools through
     /// the API's native function-calling interface. Deliberately not
     /// `buildSystemPrompt`: that prompt teaches the local `<tool_call>` /
@@ -3827,6 +3875,10 @@ public final class AgentHarness {
 
             - \(unloadedCount) additional tool(s) are installed but not loaded. Call `tools_discover` to list them by category, then `tools_load` with a `names` array to add the schemas you need (one batched call) before using them.
             """
+        }
+        let skillsSection = buildSkillsSection()
+        if !skillsSection.isEmpty {
+            prompt += "\n\n" + skillsSection
         }
         if mode == .plan {
             prompt += """
@@ -3937,6 +3989,15 @@ public final class AgentHarness {
         - Use `get_subagent_status` with `wait: true` to block until a background subagent finishes, then present its results. Use `send_subagent_message` to redirect a subagent that has drifted from its goal.
         - When you relay a subagent's results, always end with a final answer to the user. Do not end your turn after spawning, checking, or acknowledging a subagent — the task is only done when the user has received the outcome.
         """
+
+        // Skills sit AFTER this block on purpose. `refreshingLoadedToolsSection`
+        // rewrites everything between `# Tools` and this heading, so a section
+        // placed earlier would be deleted on the next tools_load; sitting just
+        // past it also keeps the "refreshed == freshly built" invariant true.
+        let skillsSection = buildSkillsSection()
+        if !skillsSection.isEmpty {
+            prompt += "\n\n" + skillsSection
+        }
 
         // The local prompt is assembled here rather than by
         // `buildCloudToolGuidance`, so its "ending your turn" rule has to be
