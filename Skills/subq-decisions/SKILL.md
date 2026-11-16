@@ -101,9 +101,11 @@ mid-band, the evidence is genuinely ambiguous — gather more evidence instead.
 
 ## Images
 
-`images` accepts up to four PNG/JPEG/WebP files under 4 MiB each, by absolute
-path. Use them for visual judgments (is this screenshot broken? does this
-layout overflow?) and keep the question about the image concrete.
+`images` accepts up to four PNG/JPEG/WebP files under 4 MiB each. Pass a path
+inside this turn's working directory: the tool uploads the bytes, so anything
+outside that folder is refused. Use them for visual judgments (is this
+screenshot broken? does this layout overflow?) and keep the question about the
+image concrete.
 
 ## When SubQ is unavailable
 

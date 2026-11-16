@@ -613,14 +613,33 @@ public nonisolated enum SkillDiscovery {
         var seenRealDirectories: Set<String> = []
 
         for (rootIndex, root) in roots.enumerated() {
+            // A root that is itself a symlink (a dotfiles checkout linking
+            // ~/.agents/skills elsewhere) must be resolved BEFORE listing: the
+            // file manager refuses `contentsOfDirectory` on the link and the
+            // old `?? []` turned that into "this root has no skills" with no
+            // diagnostic.
+            let resolvedRoot = root.url.resolvingSymlinksInPath().standardizedFileURL
             var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: root.url.path, isDirectory: &isDirectory),
+            // An absent built-in root is normal (`~/.agents/skills` on a fresh
+            // machine), so it is a silent skip; a folder that EXISTS and
+            // cannot be listed is the case that must not read as "no skills".
+            guard FileManager.default.fileExists(atPath: resolvedRoot.path, isDirectory: &isDirectory),
                   isDirectory.boolValue else { continue }
-            let entries = (try? FileManager.default.contentsOfDirectory(
-                at: root.url,
-                includingPropertiesForKeys: [.isDirectoryKey],
-                options: [.skipsHiddenFiles]
-            )) ?? []
+            let entries: [URL]
+            do {
+                entries = try FileManager.default.contentsOfDirectory(
+                    at: resolvedRoot,
+                    includingPropertiesForKeys: [.isDirectoryKey],
+                    options: [.skipsHiddenFiles]
+                )
+            } catch {
+                result.issues.append(SkillIssue(
+                    severity: .warning,
+                    path: root.url.path,
+                    message: "could not be listed, so nothing is scanned here: \(error.localizedDescription)"
+                ))
+                continue
+            }
             for entry in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
                 var entryIsDirectory: ObjCBool = false
                 guard FileManager.default.fileExists(atPath: entry.path, isDirectory: &entryIsDirectory),
@@ -710,37 +729,67 @@ public nonisolated enum SkillDiscovery {
 
     /// A manifest is a hand-written text file. The cap is generous enough for
     /// any real SKILL.md and small enough that a symlink to a large file (or a
-    /// FIFO) cannot hang or exhaust the app: this read runs on the MainActor,
-    /// once per skill, at launch and on every watcher event.
+    /// FIFO) cannot hang or exhaust the app: this read runs at launch, on a
+    /// watcher event, and on every `skill_load`.
     public static let maximumManifestBytes = 512 * 1024
 
     static func readText(_ url: URL) throws -> String {
-        let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
-        guard values?.isRegularFile != false else {
+        try readTextCapped(url, maximumBytes: maximumManifestBytes)
+    }
+
+    /// Reads a text file without trusting a check-then-open.
+    ///
+    /// The earlier version asked `resourceValues(.isRegularFileKey)` and then
+    /// opened the path, which fails open when the attribute read throws and
+    /// blocks forever on a FIFO (the open waits for a writer). Here the path is
+    /// resolved once, opened `O_NONBLOCK` so a FIFO cannot stall the caller,
+    /// and classified with `fstat` on the descriptor that is actually read.
+    /// A symlinked `SKILL.md` is still supported: it is resolved first, which
+    /// is also what stops the discovery-then-rejection mismatch.
+    static func readTextCapped(_ url: URL, maximumBytes: Int) throws -> String {
+        let resolved = url.resolvingSymlinksInPath().standardizedFileURL
+        let descriptor = open(resolved.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            throw SkillParseError.unreadable(
+                "\(url.path) could not be opened: \(String(cString: strerror(errno)))"
+            )
+        }
+        defer { close(descriptor) }
+
+        var info = stat()
+        guard fstat(descriptor, &info) == 0 else {
+            throw SkillParseError.unreadable(
+                "\(url.path) could not be inspected: \(String(cString: strerror(errno)))"
+            )
+        }
+        guard (info.st_mode & S_IFMT) == S_IFREG else {
             throw SkillParseError.unreadable("\(url.path) is not a regular file")
         }
-        if let size = values?.fileSize, size > maximumManifestBytes {
+        if info.st_size > maximumBytes {
             throw SkillParseError.unreadable(
-                "\(url.path) is \(size) bytes; a SKILL.md may be at most \(maximumManifestBytes)."
+                "\(url.path) is \(info.st_size) bytes; a text file here may be at most \(maximumBytes)."
             )
         }
-        let handle: FileHandle
-        do {
-            handle = try FileHandle(forReadingFrom: url)
-        } catch {
-            throw SkillParseError.unreadable("\(url.path) could not be opened: \(error.localizedDescription)")
-        }
-        defer { try? handle.close() }
-        let data: Data
-        do {
-            data = try handle.read(upToCount: maximumManifestBytes + 1) ?? Data()
-        } catch {
-            throw SkillParseError.unreadable("\(url.path) could not be read: \(error.localizedDescription)")
-        }
-        guard data.count <= maximumManifestBytes else {
-            throw SkillParseError.unreadable(
-                "\(url.path) is larger than \(maximumManifestBytes) bytes; a SKILL.md must be a short procedure."
-            )
+
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { raw in
+                read(descriptor, raw.baseAddress, raw.count)
+            }
+            if count == 0 { break }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw SkillParseError.unreadable(
+                    "\(url.path) could not be read: \(String(cString: strerror(errno)))"
+                )
+            }
+            data.append(contentsOf: buffer[0..<count])
+            if data.count > maximumBytes {
+                throw SkillParseError.unreadable(
+                    "\(url.path) is larger than \(maximumBytes) bytes; a SKILL.md must be a short procedure."
+                )
+            }
         }
         if let text = String(data: data, encoding: .utf8) { return text }
         if let text = String(data: data, encoding: .isoLatin1) { return text }

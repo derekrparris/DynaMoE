@@ -132,6 +132,11 @@ struct KeychainMigrationSettingsSection: View {
             // models are complete, so both consumers re-read their state.
             MCPManager.shared.restartAll()
             LocalModelManager.shared.scanLocalModels()
+            // A skill key imported here is read by `subq_decide`; without this
+            // the tool stayed unloaded and the Skills card still said "No Key"
+            // about a credential that had just become usable.
+            AgentHarness.shared.syncSubQDecideAvailability()
+            SkillsRegistry.shared.requestReload()
         }
     }
 }

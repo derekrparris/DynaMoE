@@ -515,7 +515,7 @@ Additional folders (a workspace's `.agents/skills`, for example) go in `extraRoo
 │  Enable Skills: [ON]                                                   │
 │  ~/Library/Application Support/DynaMoE/skills.json                     │
 │  [Open Config File] [Reveal] [Reload] [Edit as JSON]                   │
-│  3 folders scanned · 2 skills found · 2 enabled                        │
+│  3 folder(s) scanned · 2 skill(s) found · 2 enabled                    │
 │                                                                        │
 │  Installed Skills (2)                                                  │
 │  * subq-decisions   [ALWAYS]  Application Support  [eye] [folder] [ON] │
@@ -605,14 +605,14 @@ The first skill that needs a real capability. SubQ's `subq-snap-preview` is a **
 
 Two ways to give it a key, tried in this order:
 
-1. **A Cloud Provider for SubQ.** Add a provider with base URL `https://api.subq.ai/v1` and a key; register `subq-preview` if you also want chat. `subq_decide` reuses that key.
+1. **A Cloud Provider for SubQ.** Add a provider with base URL `https://api.subq.ai/v1` and a key. `subq_decide` reuses that key; no chat model has to be registered for it. (The same provider serves chat if SubQ publishes a chat model.)
 2. **The key field in this card**, stored in the Keychain under the service `DRP.DynaMoE.skills` with account `dynamoe.skill.subq-decisions.apikey`. Nothing is written to `skills.json`.
 
 Create a key at [console.subq.ai](https://console.subq.ai). Pricing is $0.05 per 1M input tokens; output is free. Use **Test** to spend one tiny decision and confirm the key works.
 
 The **Install subq-decisions Starter** button writes the canonical skill into the app skills folder. An existing copy is never overwritten.
 
-`subq_decide` is seeded into the prompt only when a key resolves, so a machine without a key pays zero tokens for it. Adding a SubQ Cloud Provider or saving a key arms it immediately; no relaunch is needed. When the key is missing, rejected (401), out of credit (402), rate-limited (429) or SubQ is down (503), the tool refuses with the fix rather than falling back silently, and the skill tells the model to decide itself and say the decision was not SubQ-verified.
+`subq_decide` is seeded into the prompt only when a key resolves, so a machine without a key pays zero tokens for it. Adding a SubQ Cloud Provider or saving a key arms it immediately; no relaunch is needed. The endpoint must be `https://` unless it is a loopback host (a local proxy), because the key is sent as a Bearer token, and a redirect that would drop TLS is refused rather than followed. A call that uploads local images, or that talks to a host other than `api.subq.ai`, asks for approval first. When the key is missing, rejected (401), out of credit (402), rate-limited (429) or SubQ is down (503), the tool refuses with the fix rather than falling back silently, and the skill tells the model to decide itself and say the decision was not SubQ-verified.
 
 #### Shell-Backed Design Skills
 
@@ -629,7 +629,7 @@ Skills are otherwise runtime-agnostic: whatever the `SKILL.md` tells the model t
 
 #### Troubleshooting
 
-- **A skill I edited is not listed**: check the folder's immediate contents have a `SKILL.md`, that `name` matches the folder exactly, and that the root is one of the three built-in paths or in `extraRoots`. The card shows the reason for anything it refused.
+- **A skill I edited is not listed**: check the folder's immediate contents have a `SKILL.md`, that `name` matches the folder exactly, and that the root is one of the three built-in paths or in `extraRoots`. The card shows the reason for each refused item (the first ten, then a count; the rest are still enforced).
 - **The model never loads a skill**: confirm **Enable Skills** is on and the skill is enabled; ask for the task the description covers. The prompt tells the model to call `skill_load` before acting on a matching description.
 - **My edit had no effect**: two folders may define the same name. The later root wins and the card reports the shadowed copy with both paths.
 - **A skill is silently ignored**: `name` that does not match its folder is an error, and the skill is not loaded at all. The card says which folder it expected.

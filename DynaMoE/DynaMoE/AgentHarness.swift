@@ -3741,7 +3741,36 @@ public final class AgentHarness {
     /// prompting for it asked the user to approve a write the mode had already
     /// denied, and the approved call then came back withheld.
     public static func requiresApproval(toolName: String, mode: AgentMode) -> Bool {
-        isStateChanging(toolName: toolName) && !PlanModePolicy.withholds(toolName, in: mode)
+        requiresApproval(toolName: toolName, arguments: [:], mode: mode)
+    }
+
+    /// The same decision for a parsed call. `subq_decide` needs the arguments:
+    /// it uploads local image bytes and, against a custom endpoint, the state
+    /// itself to a host the operator chose. Every MCP tool gates on approval
+    /// for far less, so this one does when either risk is present.
+    public static func requiresApproval(
+        toolName: String,
+        arguments: [String: Any],
+        mode: AgentMode
+    ) -> Bool {
+        if isStateChanging(toolName: toolName) {
+            return !PlanModePolicy.withholds(toolName, in: mode)
+        }
+        if toolName == "subq_decide" {
+            return subqDecideRequiresApproval(arguments: arguments)
+        }
+        return false
+    }
+
+    /// True when a `subq_decide` call sends local file bytes or would send the
+    /// state to a host other than SubQ's own.
+    public static func subqDecideRequiresApproval(
+        arguments: [String: Any],
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        if let images = arguments["images"] as? [Any], !images.isEmpty { return true }
+        let officialHost = URL(string: SubQDecisionSettings.defaultEndpoint)?.host?.lowercased()
+        return SubQDecisionSettings.endpoint(defaults: defaults).host?.lowercased() != officialHost
     }
 
     /// The mode of the turn whose tool is executing, bound by `executeTool`.

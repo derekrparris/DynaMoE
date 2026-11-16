@@ -62,6 +62,20 @@ struct SkillsSettingsSection: View {
             Text("subq_decide will stop working until a key is stored here again or a SubQ Cloud Provider provides one.")
         }
         .onAppear { refreshKeyStatus() }
+        .onChange(of: registry.generation) { _, _ in
+            // An import from Stored Credentials, a Cloud Provider mutation or
+            // an external edit can make a key resolvable without this card
+            // appearing again.
+            refreshKeyStatus()
+        }
+        .onChange(of: endpoint) { _, _ in
+            // The test result belonged to the previous destination.
+            testState = .idle
+            keyError = nil
+        }
+        .onChange(of: model) { _, _ in
+            testState = .idle
+        }
     }
 
     private func refreshKeyStatus() {
@@ -261,11 +275,24 @@ struct SkillsSettingsSection: View {
                         .font(.system(size: 10.5, weight: .medium))
                         .foregroundColor(.secondary)
                     ForEach(registry.scannedRoots) { root in
-                        Text("· \(root.label)")
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundColor(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
+                        HStack(spacing: 6) {
+                            Text("· \(root.label)")
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            if isExtraRoot(root) {
+                                Button {
+                                    registry.removeRoot(root.url.standardizedFileURL.path)
+                                } label: {
+                                    Image(systemName: "minus.circle")
+                                        .font(.system(size: 10, weight: .medium))
+                                }
+                                .buttonStyle(.borderless)
+                                .help("Remove \(root.label) from the scanned folders")
+                            }
+                            Spacer(minLength: 0)
+                        }
                     }
                 }
                 .padding(.vertical, 2)
@@ -293,7 +320,7 @@ struct SkillsSettingsSection: View {
                                         .font(.system(size: 10, weight: .medium))
                                 }
                                 .buttonStyle(.borderless)
-                                .help("Reveal \\(path) in Finder")
+                                .help("Reveal \(path) in Finder")
                             }
                         }
                     }
@@ -305,6 +332,14 @@ struct SkillsSettingsSection: View {
                 }
                 .padding(.vertical, 2)
             }
+        }
+    }
+
+    private func isExtraRoot(_ root: SkillRoot) -> Bool {
+        let path = root.url.standardizedFileURL.path
+        return registry.config.extraRoots.contains { raw in
+            URL(fileURLWithPath: (raw as NSString).expandingTildeInPath, isDirectory: true)
+                .standardizedFileURL.path == path
         }
     }
 
@@ -483,6 +518,12 @@ struct SkillsSettingsSection: View {
                     .foregroundColor(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if let rejection = SubQDecisionSettings.endpointRejection() {
+                Text(rejection)
+                    .font(.system(size: 10.5))
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             HStack(spacing: 10) {
                 Text("Model")
@@ -505,6 +546,7 @@ struct SkillsSettingsSection: View {
             try SkillsSecretStore.set(trimmed, account: SubQDecisionKeySource.account)
             keyDraft = ""
             keyError = nil
+            testState = .idle
             keyRefresh += 1
             // A configured key is the whole reason subq_decide is seeded into
             // the prompt. Arm it immediately so the next turn can use it
@@ -520,6 +562,7 @@ struct SkillsSettingsSection: View {
         SkillsSecretStore.delete(account: SubQDecisionKeySource.account)
         keyRefresh += 1
         keyError = nil
+        testState = .idle
         refreshKeyStatus()
         if !keyConfigured {
             _ = try? AgentHarness.shared.unloadTool(named: "subq_decide")

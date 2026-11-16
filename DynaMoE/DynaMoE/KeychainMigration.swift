@@ -55,6 +55,19 @@ public nonisolated struct PendingCredential: Sendable, Hashable, Identifiable {
             let field = String(remainder[remainder.index(after: separator)...])
             return "MCP · \(Self.humanized(server)) · \(field)"
         }
+        if service == SkillsSecretStore.defaultService {
+            let prefix = "dynamoe.skill."
+            guard account.hasPrefix(prefix) else { return "Skill credential" }
+            let remainder = account.dropFirst(prefix.count)
+            guard let separator = remainder.firstIndex(of: ".") else { return "Skill · \(remainder)" }
+            let skill = String(remainder[remainder.startIndex..<separator])
+            let field = String(remainder[remainder.index(after: separator)...])
+            let name = skill == SubQDecisionKeySource.skillName ? "SubQ Decisions" : Self.humanized(skill)
+            if field == "apikey" {
+                return "\(name) API key"
+            }
+            return "Skill · \(name) · \(field)"
+        }
         return account
     }
 
@@ -301,14 +314,24 @@ public nonisolated enum KeychainMigration {
     }
 
     private static func label(for service: String) -> String {
-        service == CloudSecretStore.defaultService
-            ? "DynaMoE cloud provider API key"
-            : "DynaMoE MCP secret"
+        switch service {
+        case CloudSecretStore.defaultService:
+            return "DynaMoE cloud provider API key"
+        case SkillsSecretStore.defaultService:
+            return "DynaMoE skill secret"
+        default:
+            return "DynaMoE MCP secret"
+        }
     }
 
     private static func description(for service: String) -> String {
-        service == CloudSecretStore.defaultService
-            ? "Cloud inference provider credential"
-            : "MCP server credential"
+        switch service {
+        case CloudSecretStore.defaultService:
+            return "Cloud inference provider credential"
+        case SkillsSecretStore.defaultService:
+            return "Skill credential (SubQ Decisions)"
+        default:
+            return "MCP server credential"
+        }
     }
 }

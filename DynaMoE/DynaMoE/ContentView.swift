@@ -5952,7 +5952,7 @@ struct ContentView: View {
             // A tool plan mode withholds is refused by `executeTool` without
             // running, so asking the user first offered them a write the mode had
             // already denied.
-            if AgentHarness.requiresApproval(toolName: call.name, mode: mode), !isTurbo {
+            if AgentHarness.requiresApproval(toolName: call.name, arguments: parsedCall.arguments, mode: mode), !isTurbo {
                 updateRecord(record.id) { rec in rec.status = .awaitingApproval }
                 showStatus("🛡️ Action requires confirmation: \(call.name)")
                 let approved = await ActionApprovalManager.shared.waitForApproval(id: record.id)
@@ -6931,7 +6931,11 @@ struct ContentView: View {
                         // See the cloud path: a call plan mode withholds is
                         // refused by `executeTool` without running, so it must not
                         // raise an approval prompt first.
-                        let isDestructive = AgentHarness.requiresApproval(toolName: call.name, mode: turnMode)
+                        let isDestructive = AgentHarness.requiresApproval(
+                            toolName: call.name,
+                            arguments: call.arguments,
+                            mode: turnMode
+                        )
 
                         if isDestructive && !isTurbo {
                             await MainActor.run {

@@ -92,14 +92,14 @@ public final class SkillLoadTool: AgentTool {
 
         let relativeFile = Self.string(arguments["file"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !relativeFile.isEmpty {
-            return loadSupportFile(
+            return await loadSupportFile(
                 skill: skill,
                 relativePath: relativeFile,
                 offset: offset,
                 budget: budget
             )
         }
-        return loadBody(skill: skill, offset: offset, budget: budget)
+        return await loadBody(skill: skill, offset: offset, budget: budget)
     }
 
     // MARK: List mode
@@ -108,7 +108,7 @@ public final class SkillLoadTool: AgentTool {
         let skills = registry.enabledSkills
         guard !skills.isEmpty else {
             let message = registry.allSkills.isEmpty
-                ? "No skills are installed. Scanned: \(registry.scannedRoots.map(\.url.path).joined(separator: ", ")). Add a folder to skills.json or install the starter skill in Settings."
+                ? "No skills are installed. Scanned: \(registry.scannedRoots.map { AgentHarness.sanitizeText($0.url.path) }.joined(separator: ", ")). Add a folder to skills.json or install the starter skill in Settings."
                 : "All installed skills are disabled in Settings (Agent & Tools → Skills)."
             return (AgentHarness.toolSuccessJSON(tool: "skill_load", data: [
                 "skills": [],
@@ -120,21 +120,24 @@ public final class SkillLoadTool: AgentTool {
         var payload: [[String: Any]] = []
         var lines: [String] = ["Installed skills (\(skills.count)):", ""]
         for skill in skills {
-            // A description is untrusted frontmatter: the same pass every other
-            // tool result gets, so a stored marker cannot forge a boundary in
-            // the transcript either.
+            // A description is untrusted frontmatter, and a folder or root
+            // label is a directory name somebody else may have chosen: both go
+            // through the same marker pass as every other tool result, so a
+            // stored marker cannot forge a boundary in the transcript either.
             let description = AgentHarness.sanitizeText(skill.description)
+            let baseDirectory = AgentHarness.sanitizeText(skill.directory.path)
+            let source = AgentHarness.sanitizeText(skill.rootLabel)
             payload.append([
                 "name": skill.name,
                 "description": description,
-                "base_dir": skill.directory.path,
+                "base_dir": baseDirectory,
                 "always_on": skill.always,
-                "source": skill.rootLabel
+                "source": source
             ])
             var line = "- \(skill.name) — \(description)"
             if skill.always { line += " [always invoked]" }
             lines.append(line)
-            lines.append("  base_dir: \(skill.directory.path)")
+            lines.append("  base_dir: \(baseDirectory)")
         }
         lines.append("")
         lines.append("Call skill_load with {\"name\": \"<name>\"} to read one, or add a \"file\" to read a support file.")
@@ -154,14 +157,16 @@ public final class SkillLoadTool: AgentTool {
         skill: Skill,
         offset: Int,
         budget: Int
-    ) -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+    ) async -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
         let skillFile = skill.skillFile
         guard FileManager.default.fileExists(atPath: skillFile.path) else {
-            let err = "Skill '\(skill.name)' has no readable SKILL.md at \(skillFile.path)."
+            let err = "Skill '\(skill.name)' has no readable SKILL.md at \(AgentHarness.sanitizeText(skillFile.path))."
             return (AgentHarness.toolErrorJSON(tool: "skill_load", error: err), nil, err, false)
         }
         do {
-            let text = try SkillDiscovery.readText(skillFile)
+            // The read runs off the main actor: this tool is MainActor-bound,
+            // and a 512 KB manifest plus a stat per entry must not stall the UI.
+            let text = try await Self.readOffMain(skillFile, maximumBytes: SkillDiscovery.maximumManifestBytes)
             let document: SkillFrontmatterParser.Document
             do {
                 document = try SkillFrontmatterParser.parse(text)
@@ -170,13 +175,18 @@ public final class SkillLoadTool: AgentTool {
                 return (AgentHarness.toolErrorJSON(tool: "skill_load", error: err), nil, err, false)
             }
 
-            let files = Self.supportFiles(in: skill.directory)
+            let files = (await Task.detached(priority: .userInitiated) {
+                Self.supportFiles(in: skill.directory)
+            }.value).map(AgentHarness.sanitizeText)
             let safeBody = AgentHarness.sanitizeText(document.body)
             let page = Self.page(safeBody, offset: offset, maxCharacters: budget)
             let safeDescription = AgentHarness.sanitizeText(document.frontmatter.description)
+            let baseDirectory = AgentHarness.sanitizeText(skill.directory.path)
+            let manifestPath = AgentHarness.sanitizeText(skillFile.path)
+            let source = AgentHarness.sanitizeText(skill.rootLabel)
 
             var header = "[skill] \(skill.name) — \(safeDescription)\n"
-            header += "Base directory: \(skill.directory.path)\n"
+            header += "Base directory: \(baseDirectory)\n"
             header += "Support files: \(files.isEmpty ? "none" : files.joined(separator: ", "))\n"
             if document.frontmatter.always {
                 header += "This skill is declared always-on: apply it whenever its description matches, without being asked.\n"
@@ -194,9 +204,9 @@ public final class SkillLoadTool: AgentTool {
             var data: [String: Any] = [
                 "name": skill.name,
                 "description": safeDescription,
-                "base_dir": skill.directory.path,
-                "skill_file": skillFile.path,
-                "source": skill.rootLabel,
+                "base_dir": baseDirectory,
+                "skill_file": manifestPath,
+                "source": source,
                 "always_on": document.frontmatter.always,
                 "files": files,
                 "total_lines": page.totalLines,
@@ -220,41 +230,47 @@ public final class SkillLoadTool: AgentTool {
         relativePath: String,
         offset: Int,
         budget: Int
-    ) -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+    ) async -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
         guard let url = Self.resolve(relativePath: relativePath, in: skill.directory) else {
-            let err = "'\(relativePath)' is not a readable path inside the '\(skill.name)' skill folder. Use a path relative to \(skill.directory.path) with no '..' segments."
+            let safePath = AgentHarness.sanitizeText(relativePath)
+            let err = "'\(safePath)' is not a readable path inside the '\(skill.name)' skill folder. Use a path relative to \(AgentHarness.sanitizeText(skill.directory.path)) with no '..' segments."
             return (AgentHarness.toolErrorJSON(tool: "skill_load", error: err), nil, err, false)
         }
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
-            let files = Self.supportFiles(in: skill.directory)
-            let err = "'\(relativePath)' does not exist in '\(skill.name)'. Available: \(files.joined(separator: ", "))."
+            let files = Self.supportFiles(in: skill.directory).map(AgentHarness.sanitizeText)
+            let err = "'\(AgentHarness.sanitizeText(relativePath))' does not exist in '\(skill.name)'. Available: \(files.joined(separator: ", "))."
             return (AgentHarness.toolErrorJSON(tool: "skill_load", error: err, extra: [
                 "files": files
             ]), nil, err, false)
         }
         guard !isDirectory.boolValue else {
-            let err = "'\(relativePath)' is a folder. Ask for a file inside it, for example '\(relativePath)/file.md'."
+            let safePath = AgentHarness.sanitizeText(relativePath)
+            let err = "'\(safePath)' is a folder. Ask for a file inside it, for example '\(safePath)/file.md'."
             return (AgentHarness.toolErrorJSON(tool: "skill_load", error: err), nil, err, false)
         }
         // A FIFO named like a support file would block the read forever, and a
-        // device node is not a document. Refuse both before opening anything.
-        let values = try? url.resourceValues(forKeys: [.isRegularFileKey])
-        guard values?.isRegularFile != false else {
-            let err = "'\(relativePath)' is not a regular file, so skill_load will not read it."
+        // device node is not a document. The shared reader resolves symlinks,
+        // opens with O_NONBLOCK and classifies the opened descriptor, so this
+        // no longer trusts a check-then-open.
+        if let urlValues = try? url.resourceValues(forKeys: [.isRegularFileKey]),
+           urlValues.isRegularFile == false {
+            let err = "'\(AgentHarness.sanitizeText(relativePath))' is not a regular file, so skill_load will not read it."
             return (AgentHarness.toolErrorJSON(tool: "skill_load", error: err), nil, err, false)
         }
         if let fileKind = AgentHarness.binaryFileKind(at: url) {
-            let err = "'\(relativePath)' is binary content (detected: \(fileKind)); skill_load returns text only."
+            let err = "'\(AgentHarness.sanitizeText(relativePath))' is binary content (detected: \(fileKind)); skill_load returns text only."
             return (AgentHarness.toolErrorJSON(tool: "skill_load", error: err, extra: [
                 "file_kind": fileKind
             ]), nil, err, false)
         }
         do {
-            let text = AgentHarness.sanitizeText(try Self.readTextCapped(url, maximumBytes: 1_048_576))
+            let safeRelativePath = AgentHarness.sanitizeText(relativePath)
+            let rawText = try await Self.readOffMain(url, maximumBytes: 1_048_576)
+            let text = AgentHarness.sanitizeText(rawText)
             let page = Self.page(text, offset: offset, maxCharacters: budget)
-            var observation = "[skill file] \(skill.name)/\(relativePath)\n"
-            observation += "Base directory: \(skill.directory.path)\n\n"
+            var observation = "[skill file] \(skill.name)/\(safeRelativePath)\n"
+            observation += "Base directory: \(AgentHarness.sanitizeText(skill.directory.path))\n\n"
             observation += "--- content (lines \(page.firstLine + 1)-\(page.lastLine) of \(page.totalLines)) ---\n"
             observation += page.content
             if let hint = page.continuationHint {
@@ -262,9 +278,9 @@ public final class SkillLoadTool: AgentTool {
             }
             var data: [String: Any] = [
                 "name": skill.name,
-                "file": relativePath,
-                "path": url.path,
-                "base_dir": skill.directory.path,
+                "file": safeRelativePath,
+                "path": AgentHarness.sanitizeText(url.path),
+                "base_dir": AgentHarness.sanitizeText(skill.directory.path),
                 "total_lines": page.totalLines,
                 "offset": page.firstLine,
                 "content": page.content
@@ -276,7 +292,7 @@ public final class SkillLoadTool: AgentTool {
             let res = AgentHarness.toolSuccessJSON(tool: "skill_load", data: data)
             return (res, observation, nil, false)
         } catch {
-            let err = "Could not read '\(relativePath)' from '\(skill.name)': \(error.localizedDescription)"
+            let err = "Could not read '\(AgentHarness.sanitizeText(relativePath))' from '\(skill.name)': \(error.localizedDescription)"
             return (AgentHarness.toolErrorJSON(tool: "skill_load", error: err), nil, err, false)
         }
     }
@@ -353,7 +369,7 @@ public final class SkillLoadTool: AgentTool {
     /// Top-level entries plus the contents of the conventional support
     /// folders. Capped so a skill with a large reference tree cannot flood the
     /// result; the model can still ask for a named file.
-    static func supportFiles(in directory: URL) -> [String] {
+    nonisolated static func supportFiles(in directory: URL) -> [String] {
         let fileManager = FileManager.default
         let entries = (try? fileManager.contentsOfDirectory(
             at: directory,
@@ -389,13 +405,18 @@ public final class SkillLoadTool: AgentTool {
         return names
     }
 
-    private static func readTextCapped(_ url: URL, maximumBytes: Int) throws -> String {
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        let data = try handle.read(upToCount: maximumBytes) ?? Data()
-        if let text = String(data: data, encoding: .utf8) { return text }
-        if let text = String(data: data, encoding: .isoLatin1) { return text }
-        throw SkillParseError.malformedLine(line: 0, text: "file is not UTF-8 or Latin-1 text")
+    /// Reads on a background task and rethrows on the caller's actor, so the
+    /// tool's file access never runs on the MainActor.
+    private static func readOffMain(_ url: URL, maximumBytes: Int) async throws -> String {
+        let outcome = await Task.detached(priority: .userInitiated) { () -> (text: String?, error: String?) in
+            do {
+                return (try SkillDiscovery.readTextCapped(url, maximumBytes: maximumBytes), nil)
+            } catch {
+                return (nil, error.localizedDescription)
+            }
+        }.value
+        if let text = outcome.text { return text }
+        throw SkillParseError.unreadable(outcome.error ?? "\(url.path) could not be read")
     }
 
     // MARK: Argument coercion

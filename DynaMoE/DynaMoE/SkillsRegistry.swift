@@ -135,6 +135,11 @@ public final class SkillsRegistry: ObservableObject {
     private var manifestWatchers: [String: SkillPathWatcher] = [:]
     private var pendingReload = false
     private var deferredTask: Task<Void, Never>?
+    private var reloadDebounceTask: Task<Void, Never>?
+    /// Monotonic ticket so an in-flight background scan cannot publish over a
+    /// newer synchronous reload (a settings save can land while a debounced
+    /// watcher scan is still running).
+    private var reloadTicket = 0
     private var lastRenderedSection: String?
 
     private var isBusy: Bool {
@@ -152,13 +157,6 @@ public final class SkillsRegistry: ObservableObject {
         #endif
     }
 
-    private func rootsForReload(_ config: SkillsConfig) -> [SkillRoot] {
-        #if DEBUG
-        if let override = rootOverrideForTesting { return override }
-        #endif
-        return resolveRoots(config)
-    }
-
     private init() {}
 
     // MARK: Lifecycle
@@ -167,8 +165,12 @@ public final class SkillsRegistry: ObservableObject {
         guard !hasBootstrapped else { return }
         hasBootstrapped = true
         ensureSkillsDirectory()
-        reload(reason: "launch")
         startConfigWatcher()
+        // The initial scan reads up to 512 KB per manifest plus a stat and a
+        // realpath per entry; doing it in `App.init` blocked launch. The first
+        // turn cannot start before a model is loaded, so an immediate
+        // background scan is ready well before the prompt is built.
+        scheduleExternalReload(reason: "launch", delayNanoseconds: 0)
     }
 
     /// Creates the app-managed skills folder so a user has an obvious place to
@@ -181,26 +183,114 @@ public final class SkillsRegistry: ObservableObject {
 
     // MARK: Reload
 
+    /// One load of the config, the roots and the scan, as a value.
+    /// `nonisolated` so the watcher path can build it on a background task;
+    /// it reads no registry state.
+    private nonisolated struct ReloadSnapshot: Sendable {
+        var configURL: URL?
+        /// The decoded file, before clamping. Nil when the load failed.
+        var loadedConfig: SkillsConfig?
+        /// Issues from the RAW file, so an out-of-range budget is reported
+        /// instead of being silently repaired by `clamped()`.
+        var configIssues: [SkillIssue] = []
+        var configError: String?
+        var roots: [SkillRoot] = []
+        var scan: SkillDiscovery.ScanResult = .init()
+    }
+
+    private nonisolated static func makeSnapshot(
+        configURL: URL?,
+        rootsOverride: [SkillRoot]?,
+        fallbackConfig: SkillsConfig
+    ) -> ReloadSnapshot {
+        var snapshot = ReloadSnapshot(configURL: configURL)
+        do {
+            let raw = try SkillsConfigStore.loadOrSeed(at: configURL)
+            snapshot.loadedConfig = raw
+            snapshot.configIssues = SkillsConfigValidator.validate(raw)
+        } catch {
+            snapshot.configError = error.localizedDescription
+        }
+        let rootsConfig = snapshot.loadedConfig ?? fallbackConfig
+        snapshot.roots = rootsOverride ?? SkillsRegistry.resolveRoots(rootsConfig)
+        snapshot.scan = SkillDiscovery.scan(roots: snapshot.roots)
+        return snapshot
+    }
+
+    private var rootOverride: [SkillRoot]? {
+        #if DEBUG
+        rootOverrideForTesting
+        #else
+        nil
+        #endif
+    }
+
     public func reload(reason: String) {
-        configPath = configURL?.path ?? SkillsConfigStore.defaultPathDescription
+        // A synchronous reload supersedes any debounced scan: a settings save
+        // must not be overwritten by a watcher event that started earlier.
+        reloadDebounceTask?.cancel()
+        reloadDebounceTask = nil
+        reloadTicket += 1
+        let snapshot = Self.makeSnapshot(
+            configURL: configURL,
+            rootsOverride: rootOverride,
+            fallbackConfig: config
+        )
+        apply(snapshot: snapshot, reason: reason)
+    }
+
+    /// Coalesces a burst of filesystem events (a `git checkout` touching N
+    /// manifests) into one scan and runs it off the main actor. The section is
+    /// still applied on the MainActor, and only when no turn owns the prompt.
+    private func scheduleExternalReload(reason: String, delayNanoseconds: UInt64 = 350_000_000) {
+        reloadDebounceTask?.cancel()
+        reloadTicket += 1
+        let ticket = reloadTicket
+        let configURL = configURL
+        let rootsOverride = rootOverride
+        let fallbackConfig = config
+        reloadDebounceTask = Task { [weak self] in
+            if delayNanoseconds > 0 {
+                try? await Task.sleep(nanoseconds: delayNanoseconds)
+            }
+            guard !Task.isCancelled else { return }
+            let snapshot = await Task.detached(priority: .utility) {
+                SkillsRegistry.makeSnapshot(
+                    configURL: configURL,
+                    rootsOverride: rootsOverride,
+                    fallbackConfig: fallbackConfig
+                )
+            }.value
+            guard let self, !Task.isCancelled, ticket == self.reloadTicket else { return }
+            self.reloadDebounceTask = nil
+            self.apply(snapshot: snapshot, reason: reason)
+        }
+    }
+
+    private func apply(snapshot: ReloadSnapshot, reason: String) {
+        guard !isBusy else {
+            deferPendingReload(summary: "Change detected; it applies when the current turn finishes.")
+            return
+        }
+        configPath = snapshot.configURL?.path ?? SkillsConfigStore.defaultPathDescription
 
         var configIssues: [SkillIssue] = []
-        do {
-            // Clamp after decoding: the validator REPORTS an out-of-range
-            // budget, but the section must not then spend a value the
-            // operator's file did not mean.
-            config = try SkillsConfigStore.loadOrSeed(at: configURL).clamped()
+        if let loaded = snapshot.loadedConfig {
+            config = loaded.clamped()
             lastError = nil
-        } catch {
+            // Validate the file as written. The previous order clamped first,
+            // which made the validator's range errors unreachable on reload.
+            configIssues = snapshot.configIssues
+        } else {
             // Keep the last good config: a malformed external edit must not
             // hide every skill while the user fixes the file.
-            lastError = error.localizedDescription
-            DiagLog.error("skills", "config load failed: \(error.localizedDescription)")
+            lastError = snapshot.configError
+            DiagLog.error("skills", "config load failed: \(snapshot.configError ?? "unknown error")")
+            configIssues = SkillsConfigValidator.validate(config)
         }
-        configIssues = SkillsConfigValidator.validate(config)
 
-        let roots = rootsForReload(config)
-        let scan = SkillDiscovery.scan(roots: roots)
+        let roots = snapshot.roots
+        let scan = snapshot.scan
         scannedRoots = roots
         allSkills = scan.skills
         shadows = scan.shadowed.map { SkillShadow(loser: $0.skill, winner: $0.winner) }
@@ -248,9 +338,21 @@ public final class SkillsRegistry: ObservableObject {
         DiagLog.info("skills", "reload (\(reason)): \(lastReloadSummary ?? "")")
         restartRootWatchers(roots: roots)
         restartManifestWatchers(skills: scan.skills)
+        // The launch scan seeds a missing skills.json, so the config watcher
+        // can only be armed once that file exists. Every later reload leaves
+        // an armed watcher alone.
+        if configWatcher == nil {
+            startConfigWatcher()
+        }
         // The tool's schema is paid on every turn, so it should not be in the
         // prompt while the feature is off. The harness owns the loaded set.
         AgentHarness.shared.applySkillsAvailability(enabled: config.enabled)
+    }
+
+    private func deferPendingReload(summary: String) {
+        pendingReload = true
+        lastReloadSummary = summary
+        scheduleDeferredReload()
     }
 
     /// Invalidates the pinned prefix only when no turn owns the engine. While
@@ -266,11 +368,10 @@ public final class SkillsRegistry: ObservableObject {
 
     public func reloadAfterExternalChange() {
         guard !isBusy else {
-            pendingReload = true
-            scheduleDeferredReload()
+            deferPendingReload(summary: "Change detected; it applies when the current turn finishes.")
             return
         }
-        reload(reason: "external edit")
+        scheduleExternalReload(reason: "external edit")
     }
 
     /// The Settings Reload button. Deferred for the same reason an external
@@ -278,9 +379,7 @@ public final class SkillsRegistry: ObservableObject {
     /// desynchronises `skill_load` from what the model was told.
     public func requestReload() {
         guard !isBusy else {
-            pendingReload = true
-            lastReloadSummary = "Reload queued; it applies when the current turn finishes."
-            scheduleDeferredReload()
+            deferPendingReload(summary: "Reload queued; it applies when the current turn finishes.")
             return
         }
         reload(reason: "manual reload")
@@ -315,6 +414,13 @@ public final class SkillsRegistry: ObservableObject {
     /// folder (which is exactly the migration case for `subq-decisions`).
     /// `extraRoots` stay last so a project can still override the app copy.
     public func resolveRoots(_ config: SkillsConfig) -> [SkillRoot] {
+        if let override = rootOverride { return override }
+        return Self.resolveRoots(config)
+    }
+
+    /// The root list as a pure function of the config, so the background scan
+    /// can resolve it without touching registry state.
+    public nonisolated static func resolveRoots(_ config: SkillsConfig) -> [SkillRoot] {
         var roots: [SkillRoot] = []
         let home = FileManager.default.homeDirectoryForCurrentUser
         roots.append(SkillRoot(
@@ -431,9 +537,7 @@ public final class SkillsRegistry: ObservableObject {
     private func applySaved(reason: String) {
         lastError = nil
         guard !isBusy else {
-            pendingReload = true
-            lastReloadSummary = "Change saved; it applies when the current turn finishes."
-            scheduleDeferredReload()
+            deferPendingReload(summary: "Change saved; it applies when the current turn finishes.")
             return
         }
         reload(reason: reason)
@@ -450,15 +554,21 @@ public final class SkillsRegistry: ObservableObject {
         do {
             let url = try StarterSkills.installSubQDecisions(in: directory)
             if isBusy {
-                pendingReload = true
-                lastReloadSummary = "Starter installed; it appears when the current turn finishes."
-                scheduleDeferredReload()
+                deferPendingReload(summary: "Starter installed; it appears when the current turn finishes.")
             } else {
                 reload(reason: "installed starter skill")
             }
             return .success(url)
         } catch {
-            lastError = error.localizedDescription
+            // "Already installed" is a benign no-op: it is reported by the
+            // caller as an install message, but it must not paint the master
+            // card red as though the feature were broken.
+            if let starterError = error as? StarterSkillError,
+               case .alreadyInstalled = starterError {
+                lastError = nil
+            } else {
+                lastError = error.localizedDescription
+            }
             return .failure(error)
         }
     }
@@ -524,7 +634,7 @@ public final class SkillsRegistry: ObservableObject {
             watcher.stop()
             rootWatchers.removeValue(forKey: path)
         }
-        for (path, _) in wanted where rootWatchers[path] == nil {
+        for (path, _) in wanted.sorted(by: { $0.key < $1.key }) where rootWatchers[path] == nil {
             var isDirectory: ObjCBool = false
             guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
                   isDirectory.boolValue else { continue }
@@ -533,9 +643,18 @@ public final class SkillsRegistry: ObservableObject {
             }
             if watcher.start() {
                 rootWatchers[path] = watcher
+            } else {
+                DiagLog.warning("skills", "could not watch skill root \(path); additions there need a manual reload")
             }
         }
     }
+
+    /// More watched manifests than this crowd the process's descriptor soft
+    /// limit (a `DispatchSource` holds one fd each) and the failure lands on
+    /// some unrelated later `open()`. Past the cap, root-directory watching
+    /// still notices skills appearing and disappearing; edits inside existing
+    /// manifests then need the Reload button.
+    private static let maximumManifestWatchers = 128
 
     /// Watches each manifest, not just its folder. A root directory's watcher
     /// fires when an entry is added or removed; editing `description:` or
@@ -553,17 +672,33 @@ public final class SkillsRegistry: ObservableObject {
             watcher.stop()
             manifestWatchers.removeValue(forKey: path)
         }
-        for (path, _) in wanted where manifestWatchers[path] == nil {
+        for (path, _) in wanted.sorted(by: { $0.key < $1.key }) where manifestWatchers[path] == nil {
+            guard manifestWatchers.count < Self.maximumManifestWatchers else {
+                DiagLog.warning(
+                    "skills",
+                    "not watching \(wanted.count) manifests individually (cap \(Self.maximumManifestWatchers)); edits inside them need a manual reload"
+                )
+                break
+            }
             let watcher = SkillPathWatcher(path: path) { [weak self] in
                 guard let self else { return }
+                // An atomic save (or an editor's write-and-rename) replaces the
+                // inode: this source is dead after the `.delete`/`.rename` it
+                // reports, and the path string is unchanged, so a plain
+                // "create if absent" could never replace it. Forget this
+                // watcher FIRST; the reload below re-creates it against the
+                // new file. This is the same stop-and-recreate the config
+                // watcher does, made explicit because the dictionary key does
+                // not change.
+                if let existing = self.manifestWatchers.removeValue(forKey: path) {
+                    existing.stop()
+                }
                 self.reloadAfterExternalChange()
-                // An atomic save (or an editor's write-and-rename) replaces
-                // the inode, so re-arm on the new file exactly as the config
-                // watcher does.
-                self.restartManifestWatchers(skills: self.allSkills)
             }
             if watcher.start() {
                 manifestWatchers[path] = watcher
+            } else {
+                DiagLog.warning("skills", "could not watch \(path); in-place edits to it need a manual reload")
             }
         }
     }
@@ -597,6 +732,8 @@ public final class SkillsRegistry: ObservableObject {
     public func flushDeferredReloadForTesting() {
         deferredTask?.cancel()
         deferredTask = nil
+        reloadDebounceTask?.cancel()
+        reloadDebounceTask = nil
         guard pendingReload else { return }
         pendingReload = false
         reload(reason: "external edit")
@@ -631,6 +768,9 @@ public final class SkillsRegistry: ObservableObject {
         pendingReload = false
         deferredTask?.cancel()
         deferredTask = nil
+        reloadDebounceTask?.cancel()
+        reloadDebounceTask = nil
+        reloadTicket = 0
         configURLForTesting = nil
         rootOverrideForTesting = nil
         busyOverrideForTesting = nil

@@ -92,11 +92,21 @@ public nonisolated enum SubQDecisionSettings {
         let raw = (defaults.string(forKey: endpointKey) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         let fallback = URL(string: defaultEndpoint)!
         guard !raw.isEmpty, let url = URL(string: raw),
-              let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http",
-              let host = url.host, !host.isEmpty else {
+              let scheme = url.scheme?.lowercased(), let host = url.host, !host.isEmpty,
+              scheme == "https" || (scheme == "http" && isLoopback(host)) else {
             return fallback
         }
         return url
+    }
+
+    /// The API key travels as a Bearer token, so plaintext HTTP is allowed only
+    /// for a loopback endpoint (a local proxy), matching the MCP client's
+    /// posture. Any other `http://` value is refused and the official endpoint
+    /// is used instead; the Settings card explains why.
+    public static func isLoopback(_ host: String) -> Bool {
+        let lowered = host.lowercased()
+        return lowered == "localhost" || lowered == "127.0.0.1" || lowered == "::1"
+            || lowered == "[::1]"
     }
 
     /// Non-nil when the configured endpoint is not SubQ's own host. The request
@@ -108,6 +118,21 @@ public nonisolated enum SubQDecisionSettings {
         guard configured.host?.lowercased() != officialHost else { return nil }
         let destination = configured.host ?? configured.absoluteString
         return "This endpoint is not api.subq.ai. The API key is sent as a Bearer token to \(destination); use a custom endpoint only with a server you trust."
+    }
+
+    /// Non-nil when the raw endpoint value was rejected rather than used, so
+    /// Settings can show the reason instead of silently substituting the
+    /// official one.
+    public static func endpointRejection(defaults: UserDefaults = .standard) -> String? {
+        let raw = (defaults.string(forKey: endpointKey) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else { return nil }
+        guard let url = URL(string: raw), let scheme = url.scheme?.lowercased(),
+              let host = url.host, !host.isEmpty else {
+            return "'\(raw)' is not an http(s) URL with a host; the official endpoint is used instead."
+        }
+        if scheme == "https" { return nil }
+        if scheme == "http" && isLoopback(host) { return nil }
+        return "'\(raw)' would send the API key over plaintext to \(host). Use https://, or a loopback host for a local proxy; the official endpoint is used instead."
     }
 
     public static func model(defaults: UserDefaults = .standard) -> String {
@@ -139,6 +164,9 @@ public nonisolated enum SubQDecisionKeySource {
     /// The key and where it came from, for the Settings readout and the tool's
     /// error text. Ordered so the user's existing Cloud Provider setup wins.
     public static func resolve(defaults: UserDefaults = .standard) -> (key: String, label: String)? {
+        #if DEBUG
+        if let override = resolutionOverrideForTesting { return override() }
+        #endif
         for provider in matchingProviders(defaults: defaults) {
             if let key = CloudSecretStore.shared.get(providerId: provider.id),
                !key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -164,6 +192,9 @@ public nonisolated enum SubQDecisionKeySource {
     /// would report "Ready" while every call failed with a missing key until
     /// the Stored Credentials import ran.
     public static func hasAnyKey(defaults: UserDefaults = .standard) -> Bool {
+        #if DEBUG
+        if let override = hasAnyKeyOverrideForTesting { return override }
+        #endif
         for provider in matchingProviders(defaults: defaults) where CloudSecretStore.shared.hasCurrentCredential(providerId: provider.id) {
             return true
         }
@@ -171,6 +202,14 @@ public nonisolated enum SubQDecisionKeySource {
         if let key = ProcessInfo.processInfo.environment[environmentName], !key.isEmpty { return true }
         return false
     }
+
+    /// Test seams for `resolve` and `hasAnyKey`: without them a case that
+    /// exercises the tool would read (and depend on) the developer's real
+    /// Keychain or shell environment.
+    #if DEBUG
+    nonisolated(unsafe) public static var resolutionOverrideForTesting: (() -> (key: String, label: String)?)?
+    nonisolated(unsafe) public static var hasAnyKeyOverrideForTesting: Bool?
+    #endif
 
     /// True when a key exists only in the keychain an earlier version wrote.
     /// The Settings card uses it to point at the Stored Credentials import
@@ -189,6 +228,10 @@ public nonisolated enum SubQDecisionKeySource {
     /// renders this on every body evaluation, and a read is the one Keychain
     /// call that can prompt for access on the legacy backend.
     public static func describeWithoutPrompt(defaults: UserDefaults = .standard) -> String {
+        #if DEBUG
+        if hasAnyKeyOverrideForTesting == true { return "Using a test key." }
+        if hasAnyKeyOverrideForTesting == false { return "No test key." }
+        #endif
         let providers = matchingProviders(defaults: defaults)
         if let provider = providers.first(where: { CloudSecretStore.shared.hasCurrentCredential(providerId: $0.id) }) {
             return "Using the key stored for Cloud Provider '\(provider.displayName)'."
@@ -223,8 +266,8 @@ public nonisolated struct SubQDecisionUsage: Decodable, Equatable, Sendable {
 
 public nonisolated enum SubQDecisionAnswer: Equatable, Sendable {
     case noul(probability: Double)
-    case choice(choice: String?, probabilities: [String: Double], confidence: Double?)
-    case score(score: Double?, legend: [String: String], probabilities: [String: Double], confidence: Double?)
+    case choice(choice: String, probabilities: [String: Double], confidence: Double?)
+    case score(score: Double, legend: [String: String], probabilities: [String: Double], confidence: Double?)
     case other(type: String)
 
     /// One-line, model-facing reading. Numbers only: the thresholds that turn
@@ -234,18 +277,16 @@ public nonisolated enum SubQDecisionAnswer: Equatable, Sendable {
         case .noul(let probability):
             return "noul \(Self.number(probability)) (probability of yes)"
         case .choice(let choice, let probabilities, let confidence):
-            var parts = ["choice \"\(choice ?? "none")\""]
+            var parts = ["choice \"\(choice)\""]
             if let confidence { parts.append("confidence \(Self.number(confidence))") }
             let top = probabilities.sorted { $0.value > $1.value }.prefix(3)
                 .map { "\($0.key) \(Self.number($0.value))" }
             if !top.isEmpty { parts.append(top.joined(separator: ", ")) }
             return parts.joined(separator: " · ")
         case .score(let score, let legend, let probabilities, let confidence):
-            var parts = ["score \(Self.number(score ?? 0))"]
-            if let score {
-                let level = String(Int(score.rounded()))
-                if let name = legend[level] { parts.append("= \(name)") }
-            }
+            var parts = ["score \(Self.number(score))"]
+            let level = String(Int(score.rounded()))
+            if let name = legend[level] { parts.append("= \(name)") }
             if let confidence { parts.append("confidence \(Self.number(confidence))") }
             let top = probabilities.sorted { $0.value > $1.value }.prefix(3)
                 .map { entry in
@@ -282,14 +323,21 @@ extension SubQDecisionAnswer: Decodable {
             let probability = try container.decode(Double.self, forKey: .noul)
             self = .noul(probability: probability)
         case "choice":
+            // A choice with no chosen label used to render as `choice "none"`
+            // and report success. That is a missing answer, not the option
+            // named "none", so schema drift throws like the noul gate above.
+            let choice = try container.decode(String.self, forKey: .choice)
             self = .choice(
-                choice: try? container.decodeIfPresent(String.self, forKey: .choice),
+                choice: choice,
                 probabilities: (try? container.decode([String: Double].self, forKey: .probabilities)) ?? [:],
                 confidence: try? container.decodeIfPresent(Double.self, forKey: .confidence)
             )
         case "score":
+            // Same rule: a missing score printed `score 0.00`, the strongest
+            // possible low answer, as a success.
+            let score = try container.decode(Double.self, forKey: .score)
             self = .score(
-                score: try? container.decodeIfPresent(Double.self, forKey: .score),
+                score: score,
                 legend: (try? container.decode([String: String].self, forKey: .legend)) ?? [:],
                 probabilities: (try? container.decode([String: Double].self, forKey: .probabilities)) ?? [:],
                 confidence: try? container.decodeIfPresent(Double.self, forKey: .confidence)
@@ -359,20 +407,10 @@ public nonisolated struct SubQImage: Sendable {
                 )
             }
         }
-        let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
-        guard values?.isRegularFile != false else {
-            throw SubQDecisionError.badRequest("image is not a regular file at \(url.path)")
-        }
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw SubQDecisionError.badRequest("image not found at \(url.path)")
         }
-        let size = values?.fileSize ?? 0
-        guard size <= maximumBytes else {
-            throw SubQDecisionError.badRequest(
-                "image \(url.lastPathComponent) is \(size) bytes; the API accepts at most \(maximumBytes) decoded bytes per image."
-            )
-        }
-        let data = try Data(contentsOf: url)
+        let data = try readBytes(at: url, maximumBytes: maximumBytes)
         let mediaType: String
         switch url.pathExtension.lowercased() {
         case "png": mediaType = "image/png"
@@ -384,6 +422,54 @@ public nonisolated struct SubQImage: Sendable {
             )
         }
         return SubQImage(mediaType: mediaType, base64: data.base64EncodedString())
+    }
+
+    /// The same discipline as `SkillDiscovery.readTextCapped`: classify the
+    /// descriptor that is actually read, not a path checked a moment earlier.
+    /// `O_NONBLOCK` means a FIFO renamed into place cannot stall the caller.
+    private static func readBytes(at url: URL, maximumBytes: Int) throws -> Data {
+        let descriptor = open(url.path, O_RDONLY | O_NONBLOCK | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            throw SubQDecisionError.badRequest(
+                "image could not be opened at \(url.path): \(String(cString: strerror(errno)))"
+            )
+        }
+        defer { close(descriptor) }
+        var info = stat()
+        guard fstat(descriptor, &info) == 0 else {
+            throw SubQDecisionError.badRequest(
+                "image could not be inspected at \(url.path): \(String(cString: strerror(errno)))"
+            )
+        }
+        guard (info.st_mode & S_IFMT) == S_IFREG else {
+            throw SubQDecisionError.badRequest("image is not a regular file at \(url.path)")
+        }
+        guard info.st_size <= maximumBytes else {
+            throw SubQDecisionError.badRequest(
+                "image \(url.lastPathComponent) is \(info.st_size) bytes; the API accepts at most \(maximumBytes) decoded bytes per image."
+            )
+        }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { raw in
+                read(descriptor, raw.baseAddress, raw.count)
+            }
+            if count == 0 { break }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw SubQDecisionError.badRequest(
+                    "image could not be read at \(url.path): \(String(cString: strerror(errno)))"
+                )
+            }
+            data.append(contentsOf: buffer[0..<count])
+            if data.count > maximumBytes {
+                throw SubQDecisionError.badRequest(
+                    "image \(url.lastPathComponent) grew past \(maximumBytes) bytes; the API accepts at most \(maximumBytes) decoded bytes per image."
+                )
+            }
+        }
+        return data
     }
 }
 
@@ -408,7 +494,13 @@ nonisolated final class SubQRedirectGuard: NSObject, URLSessionTaskDelegate {
               let destinationHost = destination?.host?.lowercased(), !destinationHost.isEmpty else {
             return false
         }
-        return originHost == destinationHost
+        guard originHost == destinationHost else { return false }
+        // A same-host redirect is still a downgrade when it drops TLS: the
+        // Bearer token would leave in clear on the second hop. Refuse it.
+        let originScheme = origin?.scheme?.lowercased()
+        let destinationScheme = destination?.scheme?.lowercased()
+        if originScheme == "https", destinationScheme != "https" { return false }
+        return true
     }
 }
 
@@ -555,10 +647,15 @@ public nonisolated struct SubQDecisionClient: Sendable {
     }
 
     private func send(payload: Data) async throws -> SubQDecisionResponse {
-        guard let scheme = endpoint.scheme?.lowercased(), scheme == "https" || scheme == "http",
+        guard let scheme = endpoint.scheme?.lowercased(),
               endpoint.host?.isEmpty == false else {
             throw SubQDecisionError.badRequest(
                 "the configured endpoint \(endpoint.absoluteString) is not an http(s) URL with a host."
+            )
+        }
+        guard scheme == "https" || (scheme == "http" && SubQDecisionSettings.isLoopback(endpoint.host ?? "")) else {
+            throw SubQDecisionError.badRequest(
+                "the configured endpoint \(endpoint.absoluteString) would send the API key over plaintext. Use https://, or a loopback host for a local proxy."
             )
         }
         var request = URLRequest(url: endpoint)
@@ -621,13 +718,13 @@ public final class SubQDecideTool: AgentTool {
                 ],
                 "images": [
                     "type": "array",
-                    "description": "Optional up to 4 images to judge alongside the state. Each entry is {path: '/absolute/file.png'} — PNG, JPEG or WebP under 4 MiB. The file must be inside this turn's working directory; the tool refuses an image outside it because the bytes are uploaded to SubQ.",
+                    "description": "Optional up to 4 images to judge alongside the state. Each entry is {path: 'shot.png'} — PNG, JPEG or WebP under 4 MiB, resolved against this turn's working directory. The file must be inside that folder; the tool refuses an image outside it because the bytes are uploaded to SubQ, and a call with images asks for approval first.",
                     "items": [
                         "type": "object",
                         "properties": [
                             "path": [
                                 "type": "string",
-                                "description": "Absolute path to the image file."
+                                "description": "Path to the image file, relative to this turn's working directory (or an absolute path that resolves inside it)."
                             ],
                             "media_type": [
                                 "type": "string",
@@ -643,6 +740,12 @@ public final class SubQDecideTool: AgentTool {
     )
 
     public init() {}
+
+    #if DEBUG
+    /// Lets a test answer `execute` without the network. The redirect guard,
+    /// status mapping and sanitizing are pinned through it.
+    nonisolated(unsafe) public static var clientFactoryForTesting: ((String) -> SubQDecisionClient)?
+    #endif
 
     public func execute(arguments: [String: Any], workingDirectory: URL?, maxOutputLength: Int) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
         guard let key = SubQDecisionKeySource.resolve() else {
@@ -671,20 +774,41 @@ public final class SubQDecideTool: AgentTool {
         }
 
         var images: [SubQImage] = []
-        if let rawImages = arguments["images"] as? [Any] {
+        if let rawImages = arguments["images"] as? [Any], !rawImages.isEmpty {
+            // Without a working directory an absolute path could name any file
+            // on this Mac, and the bytes leave the machine. A turn with no
+            // workspace therefore gets no image upload.
+            guard let workingDirectory else {
+                let message = "subq_decide can only read images inside this turn's working directory, and none is set. Send the state as text, or run the call from a workspace."
+                return (AgentHarness.toolErrorJSON(tool: "subq_decide", error: message), nil, message, false)
+            }
             for entry in rawImages.prefix(SubQImage.maximumImages) {
                 guard let dict = entry as? [String: Any],
                       let path = dict["path"] as? String else { continue }
-                do {
-                    images.append(try SubQImage.load(path: path, workingDirectory: workingDirectory))
-                } catch {
-                    let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                // Up to 4 MiB per image is read off the main actor: the tool
+                // itself is MainActor-bound and this is a local file read.
+                let outcome = await Task.detached(priority: .userInitiated) { () -> (image: SubQImage?, error: String?) in
+                    do {
+                        return (try SubQImage.load(path: path, workingDirectory: workingDirectory), nil)
+                    } catch {
+                        return (nil, (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+                    }
+                }.value
+                if let image = outcome.image {
+                    images.append(image)
+                } else {
+                    let message = outcome.error ?? "the image could not be read."
                     return (AgentHarness.toolErrorJSON(tool: "subq_decide", error: message), nil, message, false)
                 }
             }
         }
 
-        let client = SubQDecisionClient(apiKey: key.key)
+        let client: SubQDecisionClient
+        #if DEBUG
+        client = Self.clientFactoryForTesting?(key.key) ?? SubQDecisionClient(apiKey: key.key)
+        #else
+        client = SubQDecisionClient(apiKey: key.key)
+        #endif
         do {
             let response = try await client.decide(
                 state: state,
@@ -694,24 +818,29 @@ public final class SubQDecideTool: AgentTool {
 
             var answersJSON: [String: Any] = [:]
             for (name, answer) in response.answers {
-                answersJSON[name] = Self.jsonObject(answer)
+                answersJSON[AgentHarness.sanitizeText(name)] = Self.jsonObject(answer)
             }
 
             // The answer's labels (choice names, legend rows) are echoed text,
             // so they go through the same marker pass as every other tool
-            // result before they reach the transcript.
+            // result before they reach the transcript. `jsonObject` sanitizes
+            // the structured copy; this covers the readable one.
             let summary = AgentHarness.sanitizeText(response.readableSummary)
+            let servedModel = AgentHarness.sanitizeText(response.model ?? client.model)
+            // A Cloud Provider's display name is operator text, but it lands in
+            // the transcript like any other label, so it gets the same pass.
+            let keyLabel = AgentHarness.sanitizeText(key.label)
             let readable = """
-            SubQ decision (\(response.model ?? client.model), key: \(key.label))
+            SubQ decision (\(servedModel), key: \(keyLabel))
             \(summary)
             \(response.usageLine)
             """
 
             var data: [String: Any] = [
-                "model": response.model ?? client.model,
+                "model": servedModel,
                 "answers": answersJSON,
                 "readable": summary,
-                "key_source": key.label
+                "key_source": keyLabel
             ]
             if let usage = response.usage {
                 var usageJSON: [String: Any] = [:]
@@ -797,17 +926,40 @@ public final class SubQDecideTool: AgentTool {
         case .noul(let probability):
             return ["type": "noul", "probability": probability]
         case .choice(let choice, let probabilities, let confidence):
-            var object: [String: Any] = ["type": "choice", "probabilities": probabilities]
-            if let choice { object["choice"] = choice }
+            var object: [String: Any] = [
+                "type": "choice",
+                "choice": AgentHarness.sanitizeText(choice),
+                "probabilities": sanitized(probabilities)
+            ]
             if let confidence { object["confidence"] = confidence }
             return object
         case .score(let score, let legend, let probabilities, let confidence):
-            var object: [String: Any] = ["type": "score", "legend": legend, "probabilities": probabilities]
-            if let score { object["score"] = score }
+            var object: [String: Any] = [
+                "type": "score",
+                "score": score,
+                "legend": sanitized(legend),
+                "probabilities": sanitized(probabilities)
+            ]
             if let confidence { object["confidence"] = confidence }
             return object
         case .other(let type):
-            return ["type": type.isEmpty ? "unknown" : type]
+            return ["type": type.isEmpty ? "unknown" : AgentHarness.sanitizeText(type)]
+        }
+    }
+
+    /// A hostile endpoint controls every label it echoes back, so the choice
+    /// names, legend rows and question keys are untrusted text. Sanitizing them
+    /// here (not only the human-readable summary) is what keeps a forged
+    /// `<|im_start|>system` key out of the `resultJSON` the model is shown.
+    static func sanitized(_ probabilities: [String: Double]) -> [String: Double] {
+        probabilities.reduce(into: [:]) { result, entry in
+            result[AgentHarness.sanitizeText(entry.key)] = entry.value
+        }
+    }
+
+    static func sanitized(_ legend: [String: String]) -> [String: String] {
+        legend.reduce(into: [:]) { result, entry in
+            result[AgentHarness.sanitizeText(entry.key)] = AgentHarness.sanitizeText(entry.value)
         }
     }
 }
