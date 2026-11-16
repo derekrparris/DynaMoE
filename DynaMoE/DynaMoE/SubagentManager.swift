@@ -849,11 +849,29 @@ final class SubagentToolExecutor {
         // A subagent runs without a human in the loop, so a call the harness
         // would gate on approval cannot be honoured here. `subq_decide` is the
         // one tool whose documentation promises that gate (it uploads local
-        // image bytes), so it is refused rather than run unapproved. Turbo Mode
-        // is the operator's documented bypass and still applies.
+        // image bytes), so it is refused rather than run unapproved.
+        //
+        // The destination is pinned ONCE, here, and handed to both the gate and
+        // the call. Reading `UserDefaults` twice let a `defaults write` land
+        // between them, and reading the raw turbo flag let Turbo Mode skip the
+        // one prompt that guards the credential — the exact bypass
+        // `testTurboModeCannotBypassACustomSubQEndpoint` forbids in the main
+        // loop, so the subagent path must ask the same question the same way.
+        let subQEndpoint = name == "subq_decide" ? SubQDecisionSettings.endpoint() : nil
         if name == "subq_decide",
-           AgentHarness.requiresApproval(toolName: name, arguments: arguments, mode: parentMode),
-           !UserDefaults.standard.bool(forKey: "dynamoe_agent_turbo_mode") {
+           AgentHarness.requiresApproval(
+               toolName: name,
+               arguments: arguments,
+               mode: parentMode,
+               subQEndpoint: subQEndpoint
+           ),
+           !(UserDefaults.standard.bool(forKey: "dynamoe_agent_turbo_mode")
+             && AgentHarness.turboModeMayBypassApproval(
+                 toolName: name,
+                 arguments: arguments,
+                 mode: parentMode,
+                 subQEndpoint: subQEndpoint
+             )) {
             let err = "Tool '\(name)' needs the user's approval before it uploads the state or local image bytes. A subagent cannot ask for it; return the finding to the coordinator and let the main agent make that call."
             return (AgentHarness.toolErrorJSON(tool: name, error: err), err)
         }
@@ -867,7 +885,8 @@ final class SubagentToolExecutor {
             call: call,
             workingDirectory: workingDirectory,
             maxOutputLength: stepOutputLimit,
-            mode: parentMode
+            mode: parentMode,
+            approvedSubQEndpoint: subQEndpoint
         )
 
         let readable = exec.record.output ?? exec.record.error ?? exec.resultJSON

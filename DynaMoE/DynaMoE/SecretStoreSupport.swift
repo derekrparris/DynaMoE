@@ -81,8 +81,19 @@ public nonisolated enum SecretAccessResult: Sendable, Equatable {
 }
 
 /// What an attribute-only credential lookup established.
+///
+/// `found` and `legacyOnly` are separate cases because they answer different
+/// questions. `read()` consults only the resolved backend, so an item that
+/// lives in the legacy keychain alone cannot be read by this build: reporting
+/// it as `found` made the Settings card say "Ready" while every call failed
+/// with a missing key, which is the exact bug `hasCurrentCredential` was added
+/// to fix. A caller that only wants "is something stored?" asks `exists`.
 public nonisolated enum CredentialStatus: Sendable, Equatable {
+    /// Present in the keychain this build reads, so a call can succeed now.
     case found
+    /// Present only in the legacy keychain. The Stored Credentials import
+    /// makes it usable; until then a read returns nothing.
+    case legacyOnly
     case missing
     /// The Keychain refused the lookup itself (a dismissed dialog, a locked
     /// keychain, a missing entitlement).
@@ -588,7 +599,9 @@ public nonisolated struct KeychainSecretStore: Sendable {
             SecretStoreQuery.existence(service: service, account: account, backend: .legacy)
         ).status
         switch legacy {
-        case errSecSuccess: return .found
+        // NOT `.found`: this build reads only `backend`, so an item here is
+        // pending an import, not ready to use.
+        case errSecSuccess: return .legacyOnly
         case errSecItemNotFound: return .missing
         default: return .unreadable(legacy)
         }

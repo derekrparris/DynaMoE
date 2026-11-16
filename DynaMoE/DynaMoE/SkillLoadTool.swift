@@ -44,12 +44,16 @@ public final class SkillLoadTool: AgentTool {
                 ],
                 "max_chars": [
                     "type": "integer",
-                    "description": "Optional character budget for this read. Clamped to the harness output budget."
+                    "description": "Optional character budget for this read, in characters. Clamped to the harness output budget; a smaller value is raised to a \(SkillLoadTool.minimumPageCharacters)-character minimum so the page is worth reading."
                 ]
             ]),
             "required": AnyCodable([])
         ]
     )
+
+    /// Smallest page worth returning: below this a paged read costs a step and
+    /// answers with a fragment. Never allowed to exceed the harness budget.
+    static let minimumPageCharacters = 1_000
 
     public init() {}
 
@@ -64,7 +68,12 @@ public final class SkillLoadTool: AgentTool {
         let name = Self.string(arguments["name"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let offset = Self.integer(arguments["offset"]) ?? 0
         let requestedBudget = Self.integer(arguments["max_chars"]) ?? maxOutputLength
-        let budget = max(1_000, min(requestedBudget, max(4_000, maxOutputLength)))
+        // The harness budget is a CEILING, not a suggestion: a 100-token budget
+        // arrives here as 600 characters, and the old `max(1_000, …)` floor
+        // spent 400 more than the caller allowed. The floor is a minimum useful
+        // page, so it is clamped by the ceiling rather than applied over it.
+        let ceiling = max(0, maxOutputLength)
+        let budget = min(ceiling, max(Self.minimumPageCharacters, requestedBudget))
 
         if name.isEmpty {
             return list(registry: registry)

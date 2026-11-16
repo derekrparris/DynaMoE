@@ -2772,3 +2772,360 @@ final class SkillsReviewFollowUpTests: XCTestCase {
         XCTAssertEqual(onDisk.disabledSkills, ["alpha"])
     }
 }
+
+// MARK: - Second review pass
+
+/// The findings from the follow-up review of PR #99. Each case drives the site
+/// that was wrong rather than a helper beside it: the first review's
+/// `testAnExtremeScoreCannotTrapOrInventALegendRow` only exercised
+/// `readableSummary`, which is why the sibling trap in `answerProblem` survived.
+@MainActor
+final class SkillsSecondReviewTests: XCTestCase {
+    private var directory: URL!
+    private var session: URLSession!
+
+    override func setUpWithError() throws {
+        directory = try SkillFixture.makeRoot()
+        SubQMockURLProtocol.attempts = 0
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [SubQMockURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        self.session = session
+        SubQDecisionKeySource.resolutionOverrideForTesting = { ("test-key", "test") }
+        SubQDecisionKeySource.hasAnyKeyOverrideForTesting = true
+        // Built from the endpoint the tool HANDS the factory, so a call that
+        // re-read `UserDefaults` instead of using the pinned destination would
+        // be visible to the mock rather than silently corrected here.
+        SubQDecideTool.clientFactoryForTesting = { key in
+            SubQDecisionClient(
+                endpoint: SubQDecideTool.pinnedEndpointForTesting
+                    ?? URL(string: SubQDecisionSettings.defaultEndpoint)!,
+                apiKey: key,
+                model: "subq-snap-preview",
+                timeout: 2,
+                session: session
+            )
+        }
+    }
+
+    override func tearDown() {
+        SubQMockURLProtocol.handler = nil
+        SubQDecisionKeySource.resolutionOverrideForTesting = nil
+        SubQDecisionKeySource.hasAnyKeyOverrideForTesting = nil
+        SubQDecideTool.clientFactoryForTesting = nil
+        session?.invalidateAndCancel()
+        session = nil
+        if let directory { SkillFixture.cleanUp(directory) }
+        super.tearDown()
+    }
+
+    private func decode(_ json: String) throws -> SubQDecisionResponse {
+        try JSONDecoder().decode(SubQDecisionResponse.self, from: Data(json.utf8))
+    }
+
+    // MARK: Finding 1 — a finite-but-huge score trapped inside `answerProblem`
+
+    func testAnExtremeScoreIsRefusedRatherThanTrappingTheCall() throws {
+        // `isFinite` passes 1e300, and `Int(score.rounded())` then traps. The
+        // sibling site in `readableDescription` was already fixed with
+        // `Int(exactly:)`; this one runs inside `execute`, after the network
+        // call, so the trap took the app down instead of failing one result.
+        let response = try decode("""
+        { "answers": { "q": { "type": "score", "score": 1e300, "legend": { "0": "low", "1": "high" } } } }
+        """)
+        let problem = SubQDecideTool.answerProblem(
+            response,
+            questions: ["q": ["type": "score", "instructions": "Rate it.", "criteria": ["low", "high"]]]
+        )
+        let message = try XCTUnwrap(problem, "a score no legend can name is not an answer")
+        XCTAssertFalse(message.contains("= low"), message)
+        XCTAssertTrue(message.contains("not a level"), message)
+    }
+
+    func testAnExtremeScoreFailsTheToolCallInsteadOfCrashingTheApp() async throws {
+        // The end-to-end form: the same body a buggy or hostile endpoint can
+        // return, driven through `execute` rather than through the validator.
+        SubQMockURLProtocol.handler = { request in
+            let body = """
+            {"model":"subq-snap-preview","answers":{"q":{"type":"score","score":1e300,"legend":{"0":"low","1":"high"}}}}
+            """.data(using: .utf8)!
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil
+            )!
+            return (response, body)
+        }
+
+        let result = try await SubQDecideTool().execute(
+            arguments: [
+                "state": "x",
+                "questions": ["q": ["type": "score", "instructions": "Rate it.", "criteria": ["low", "high"]]]
+            ],
+            workingDirectory: nil,
+            maxOutputLength: 20_000
+        )
+        XCTAssertFalse(result.isCompleted)
+        XCTAssertNotNil(result.stderr, "an unusable answer must fail the call, not succeed")
+        XCTAssertTrue(
+            result.resultJSON.contains("cannot use") || result.resultJSON.contains("not a level"),
+            result.resultJSON
+        )
+    }
+
+    func testAnOrdinaryScoreStillValidatesAgainstItsLegend() throws {
+        // The guard must not turn every score into a refusal.
+        let response = try decode("""
+        { "answers": { "q": { "type": "score", "score": 1.0, "legend": { "0": "low", "1": "high" } } } }
+        """)
+        XCTAssertNil(SubQDecideTool.answerProblem(
+            response,
+            questions: ["q": ["type": "score", "instructions": "Rate it.", "criteria": ["low", "high"]]]
+        ))
+    }
+
+    // MARK: Finding 2 — a legacy-only key must not read as "Ready"
+
+    func testALegacyOnlyCredentialIsNotReportedAsReady() {
+        // `credentialStatus` fell through to the legacy backend and returned
+        // `.found`, while `read()` consults only the current one — so the card
+        // said "Ready" and every call failed with a missing key. That is the
+        // bug `hasCurrentCredential`'s own doc comment says was fixed.
+        let items = FakeKeychainItemAccess()
+        let service = "DRP.DynaMoE.tests.legacy.\(UUID().uuidString)"
+        let store = KeychainSecretStore(
+            service: service,
+            items: items,
+            backend: .dataProtection(accessGroup: "RMY84Y8G7M.DRP.DynaMoE")
+        )
+        items.seed(service: service, account: "acct", secret: "sk-old", dataProtection: false)
+
+        XCTAssertEqual(store.credentialStatus(account: "acct"), .legacyOnly)
+        XCTAssertNotEqual(store.credentialStatus(account: "acct"), .found)
+        XCTAssertNil(store.read(account: "acct").value, "the current backend has nothing to read")
+        // The same question the launch-path gate asks, answered the same way:
+        // the current backend holds nothing, so no call can succeed yet.
+        XCTAssertFalse(store.exists(account: "acct", backend: store.backend))
+        // The question `exists` answers is unchanged: something IS stored.
+        XCTAssertTrue(store.exists(account: "acct"))
+    }
+
+    func testACurrentCredentialIsStillReportedAsFound() throws {
+        let items = FakeKeychainItemAccess()
+        let service = "DRP.DynaMoE.tests.current.\(UUID().uuidString)"
+        let store = KeychainSecretStore(
+            service: service,
+            items: items,
+            backend: .dataProtection(accessGroup: "RMY84Y8G7M.DRP.DynaMoE")
+        )
+        try store.set("sk-new", account: "acct", label: "l", description: "d")
+
+        XCTAssertEqual(store.credentialStatus(account: "acct"), .found)
+        XCTAssertEqual(store.read(account: "acct"), .found("sk-new"))
+    }
+
+    func testAnUnentitledBuildStillReportsItsOwnKeychainAsFound() {
+        // With no data protection backend, the legacy keychain IS the current
+        // one, so an item there is readable and must not be called pending.
+        let items = FakeKeychainItemAccess()
+        let service = "DRP.DynaMoE.tests.plain.\(UUID().uuidString)"
+        let store = KeychainSecretStore(service: service, items: items, backend: .legacy)
+        items.seed(service: service, account: "acct", secret: "sk", dataProtection: false)
+
+        XCTAssertEqual(store.credentialStatus(account: "acct"), .found)
+        XCTAssertEqual(store.credentialStatus(account: "absent"), .missing)
+    }
+
+    // MARK: Finding 3 — the subagent path must ask the same approval question
+
+    func testASubagentCannotReachACustomEndpointEvenInTurboMode() {
+        // The subagent executor read the raw turbo flag, so Turbo Mode skipped
+        // the one prompt that guards the credential — the exact bypass
+        // `testTurboModeCannotBypassACustomSubQEndpoint` forbids in the main
+        // loop. The rule is asserted through the same two calls the executor
+        // now makes, so an edit that reverts to the raw flag fails here.
+        let custom = URL(string: "https://attacker.example/v1/systemone")!
+        let arguments: [String: Any] = ["state": "x", "questions": [String: Any]()]
+
+        XCTAssertTrue(AgentHarness.requiresApproval(
+            toolName: "subq_decide",
+            arguments: arguments,
+            mode: .code,
+            subQEndpoint: custom
+        ))
+        XCTAssertFalse(
+            AgentHarness.turboModeMayBypassApproval(
+                toolName: "subq_decide",
+                arguments: arguments,
+                mode: .code,
+                subQEndpoint: custom
+            ),
+            "Turbo Mode must not skip the SubQ prompt for a custom endpoint"
+        )
+
+        // The official origin keeps the documented bypass.
+        let official = URL(string: SubQDecisionSettings.defaultEndpoint)!
+        XCTAssertTrue(AgentHarness.turboModeMayBypassApproval(
+            toolName: "subq_decide",
+            arguments: arguments,
+            mode: .code,
+            subQEndpoint: official
+        ))
+    }
+
+    /// Runs `subq_decide` through the subagent executor with Turbo Mode on and
+    /// the endpoint aimed at `endpoint`, returning what the executor answered.
+    private func runSubagentDecision(
+        endpoint: String,
+        images: [[String: String]] = []
+    ) async throws -> String {
+        let defaults = UserDefaults.standard
+        let previousEndpoint = defaults.object(forKey: SubQDecisionSettings.endpointKey)
+        let previousTurbo = defaults.object(forKey: "dynamoe_agent_turbo_mode")
+        defaults.set(endpoint, forKey: SubQDecisionSettings.endpointKey)
+        defaults.set(true, forKey: "dynamoe_agent_turbo_mode")
+        defer {
+            if let previousEndpoint {
+                defaults.set(previousEndpoint, forKey: SubQDecisionSettings.endpointKey)
+            } else {
+                defaults.removeObject(forKey: SubQDecisionSettings.endpointKey)
+            }
+            if let previousTurbo {
+                defaults.set(previousTurbo, forKey: "dynamoe_agent_turbo_mode")
+            } else {
+                defaults.removeObject(forKey: "dynamoe_agent_turbo_mode")
+            }
+        }
+
+        let owner = SubagentInstance(
+            role: "reviewer",
+            taskDescription: "Decide something.",
+            allowedTools: ["subq_decide"],
+            parentMode: .code,
+            workingDirectory: directory
+        )
+        let executor = SubagentToolExecutor(owner: owner, workingDirectory: directory)
+        var arguments: [String: Any] = [
+            "state": "x",
+            "questions": ["q": ["type": "noul", "instructions": "?"]]
+        ]
+        if !images.isEmpty { arguments["images"] = images }
+        let result = await executor.runTool(named: "subq_decide", arguments: arguments)
+        return result.readable
+    }
+
+    func testASubagentRefusesACustomEndpointEvenInTurboMode() async throws {
+        // The executor read the raw turbo flag, so Turbo Mode skipped the one
+        // prompt that guards the credential and a subagent could send the key
+        // to an arbitrary host. It must now ask the same question the main loop
+        // asks, which never bypasses a non-SubQ origin.
+        SubQMockURLProtocol.handler = { request in
+            let body = #"{"answers":{"q":{"type":"noul","noul":0.5}}}"#.data(using: .utf8)!
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, body)
+        }
+        let readable = try await runSubagentDecision(
+            endpoint: "https://attacker.example/v1/systemone"
+        )
+        XCTAssertTrue(readable.contains("needs the user's approval"), readable)
+        XCTAssertEqual(SubQMockURLProtocol.attempts, 0, "nothing may be uploaded to a custom host")
+    }
+
+    func testASubagentStillRunsAgainstTheOfficialEndpointInTurboMode() async throws {
+        // The documented bypass must survive the fix: Turbo Mode against SubQ's
+        // own origin is the operator's own choice, and the main loop allows it.
+        SubQMockURLProtocol.handler = { request in
+            let body = #"{"answers":{"q":{"type":"noul","noul":0.5}}}"#.data(using: .utf8)!
+            return (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, body)
+        }
+        let readable = try await runSubagentDecision(
+            endpoint: SubQDecisionSettings.defaultEndpoint
+        )
+        XCTAssertFalse(readable.contains("needs the user's approval"), readable)
+    }
+
+    // MARK: Finding 4 — the budget floor must not exceed the harness budget
+
+    private func pageContent(_ resultJSON: String) throws -> String {
+        let object = try JSONSerialization.jsonObject(with: Data(resultJSON.utf8)) as? [String: Any]
+        let result = try XCTUnwrap(object?["result"] as? [String: Any], resultJSON)
+        return try XCTUnwrap(result["content"] as? String, resultJSON)
+    }
+
+    private func installLongSkill() throws {
+        let body = (1...400).map { "Line \($0) of the procedure." }.joined(separator: "\n")
+        let skillDirectory = try SkillFixture.writeSkill(
+            in: directory,
+            folder: "long",
+            frontmatter: "name: long\ndescription: Long skill.",
+            body: body
+        )
+        SkillsRegistry.shared.installForTesting(
+            skills: [SkillFixture.skill(name: "long", directory: skillDirectory)],
+            config: SkillsConfig()
+        )
+    }
+
+    func testASmallHarnessBudgetIsNotExceededByThePageFloor() async throws {
+        // A 100-token budget arrives as 600 characters; the old
+        // `max(1_000, …)` floor spent 400 more than the caller allowed.
+        defer { SkillsRegistry.shared.resetForTesting() }
+        try installLongSkill()
+
+        let harnessBudget = AgentHarness.charBudget(forTokenBudget: 100)
+        XCTAssertEqual(harnessBudget, 600)
+        let result = try await SkillLoadTool().execute(
+            arguments: ["name": "long"],
+            workingDirectory: nil,
+            maxOutputLength: harnessBudget
+        )
+        let page = try pageContent(result.resultJSON)
+        XCTAssertLessThanOrEqual(page.count, harnessBudget, "the harness budget is a ceiling")
+        XCTAssertFalse(page.isEmpty)
+    }
+
+    func testThePageFloorStillAppliesWhenTheBudgetAllowsIt() async throws {
+        defer { SkillsRegistry.shared.resetForTesting() }
+        try installLongSkill()
+
+        // A tiny explicit request is raised to the floor, because a fragment
+        // costs a step and answers nothing.
+        let result = try await SkillLoadTool().execute(
+            arguments: ["name": "long", "max_chars": 10],
+            workingDirectory: nil,
+            maxOutputLength: 20_000
+        )
+        let page = try pageContent(result.resultJSON)
+        XCTAssertGreaterThan(page.count, 10)
+        XCTAssertLessThanOrEqual(page.count, SkillLoadTool.minimumPageCharacters)
+    }
+
+    // MARK: Finding 5 — the settings path the message names
+
+    func testTheUnavailableMessageNamesARealSettingsLocation() {
+        let registry = SkillsRegistry.shared
+        defer { registry.resetForTesting() }
+        registry.installForTesting(skills: [], config: SkillsConfig(enabled: false))
+        SubQDecisionKeySource.hasAnyKeyOverrideForTesting = false
+        defer { SubQDecisionKeySource.hasAnyKeyOverrideForTesting = true }
+
+        // There is no "Decisions" tab: the SubQ card lives under
+        // Agent & Tools → Skills, which is what every other message says.
+        let reason = AgentHarness.toolUnavailableReason("subq_decide")
+        let message = reason ?? ""
+        XCTAssertTrue(message.contains("Agent & Tools → Skills"), message)
+        XCTAssertFalse(message.contains("Agent & Tools → Decisions"), message)
+    }
+
+    // MARK: Finding 7 — no force-unwrap on hostile input
+
+    func testAReadableSummaryIsBuiltWithoutForceUnwrapping() throws {
+        let response = try decode("""
+        { "answers": {
+            "a": { "type": "noul", "noul": 0.5 },
+            "b": { "type": "choice", "choice": "x", "probabilities": { "x": 0.7, "y": 0.3 } }
+        } }
+        """)
+        let summary = response.readableSummary
+        XCTAssertTrue(summary.contains("- a: noul 0.50"), summary)
+        XCTAssertTrue(summary.contains("- b: choice \"x\""), summary)
+        XCTAssertEqual(summary.components(separatedBy: "\n").count, 2)
+    }
+}

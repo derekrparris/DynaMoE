@@ -3662,7 +3662,7 @@ public final class AgentHarness {
             return "Skills are turned off in Settings (Agent & Tools → Skills)."
         case "subq_decide":
             guard !SubQDecisionKeySource.hasAnyKey() else { return nil }
-            return "no SubQ decisions key is configured (Settings → Agent & Tools → Decisions)."
+            return "no SubQ decisions key is configured (Settings → Agent & Tools → Skills, under SubQ Decisions)."
         default:
             return nil
         }

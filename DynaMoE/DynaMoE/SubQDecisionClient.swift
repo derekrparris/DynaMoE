@@ -315,10 +315,17 @@ public nonisolated enum SubQDecisionKeySource {
         #endif
         let providers = matchingProviders(defaults: defaults)
         var unreadable: OSStatus?
+        // A legacy-only item is NOT `.ready`: `read()` consults only the
+        // resolved backend, so the card would promise a key every call then
+        // fails to find. It falls through to `.legacyPending` below, which is
+        // the answer that points at the Stored Credentials import.
+        var legacyPending = false
         for provider in providers {
             switch CloudSecretStore.shared.credentialStatus(providerId: provider.id) {
             case .found:
                 return .ready(source: "Cloud Provider '\(provider.displayName)'")
+            case .legacyOnly:
+                legacyPending = true
             case .unreadable(let status):
                 unreadable = unreadable ?? status
             case .missing:
@@ -328,6 +335,8 @@ public nonisolated enum SubQDecisionKeySource {
         switch SkillsSecretStore.shared.credentialStatus(account: account) {
         case .found:
             return .ready(source: "this card")
+        case .legacyOnly:
+            legacyPending = true
         case .unreadable(let status):
             unreadable = unreadable ?? status
         case .missing:
@@ -337,7 +346,9 @@ public nonisolated enum SubQDecisionKeySource {
             return .ready(source: environmentName)
         }
         if let unreadable { return .unreadable(unreadable) }
-        if legacyKeyPending(defaults: defaults) { return .legacyPending }
+        // `credentialStatus` already established this; the second probe is
+        // only for the case where a provider list was empty.
+        if legacyPending || legacyKeyPending(defaults: defaults) { return .legacyPending }
         return .missing
     }
 
@@ -552,8 +563,11 @@ public nonisolated struct SubQDecisionResponse: Decodable, Equatable, Sendable {
 
     public var readableSummary: String {
         guard !answers.isEmpty else { return "No answers were returned." }
-        return answers.keys.sorted().map { name in
-            "- \(name): \(answers[name]!.readableDescription)"
+        // `compactMap` rather than `answers[name]!`: the subscript is safe today
+        // only because the keys come from the same dictionary, and this file
+        // otherwise treats every input as hostile.
+        return answers.keys.sorted().compactMap { name in
+            answers[name].map { "- \(name): \($0.readableDescription)" }
         }.joined(separator: "\n")
     }
 
@@ -1283,7 +1297,14 @@ public final class SubQDecideTool: AgentTool {
                 guard score.isFinite else {
                     return "'\(name)' returned a non-finite score."
                 }
-                let level = Int(score.rounded(.toNearestOrAwayFromZero))
+                // `isFinite` is not enough: 1e300 passes it and then traps in
+                // `Int(_:)`, the same crash `readableDescription` already fixed
+                // with `Int(exactly:)`. This site runs inside `execute`, after
+                // the network call, so the trap takes the app down instead of
+                // failing one tool result.
+                guard let level = Int(exactly: score.rounded(.toNearestOrAwayFromZero)) else {
+                    return "'\(name)' scored \(score), which is not a level any legend or criteria list can name."
+                }
                 if !legend.isEmpty {
                     guard level >= 0, legend[String(level)] != nil else {
                         return "'\(name)' scored \(score), which is not a level its legend offers (\(legend.keys.sorted().joined(separator: ", ")))."

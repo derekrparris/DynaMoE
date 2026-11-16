@@ -81,18 +81,24 @@ struct SkillsSettingsSection: View {
 
     private var keyBadgeText: String {
         if keyConfigured { return "Ready" }
+        // A key that exists only in the legacy keychain is not "No Key": it is
+        // sitting right there, and this build cannot read it until it is
+        // imported. Saying "No Key" invites the user to delete it.
+        if case .legacyPending = keyStatus { return "Import" }
         if case .unreadable = keyStatus { return "Unreadable" }
         return "No Key"
     }
 
     private var keyBadgeImage: String {
         if keyConfigured { return "checkmark.circle.fill" }
+        if case .legacyPending = keyStatus { return "arrow.down.circle.fill" }
         if case .unreadable = keyStatus { return "exclamationmark.triangle.fill" }
         return "key.slash"
     }
 
     private var keyBadgeTint: Color {
         if keyConfigured { return .green }
+        if case .legacyPending = keyStatus { return .blue }
         if case .unreadable = keyStatus { return .orange }
         return .secondary
     }
