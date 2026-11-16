@@ -55,12 +55,38 @@ public nonisolated struct PendingCredential: Sendable, Hashable, Identifiable {
             let field = String(remainder[remainder.index(after: separator)...])
             return "MCP · \(Self.humanized(server)) · \(field)"
         }
+        if service == SkillsSecretStore.defaultService {
+            let prefix = "dynamoe.skill."
+            guard account.hasPrefix(prefix) else { return "Skill credential" }
+            let remainder = account.dropFirst(prefix.count)
+            guard let separator = remainder.firstIndex(of: ".") else { return "Skill · \(remainder)" }
+            let skill = String(remainder[remainder.startIndex..<separator])
+            let field = String(remainder[remainder.index(after: separator)...])
+            // The skills service is not SubQ's service: any installed skill can
+            // store a credential. SubQ is the one name with a product spelling.
+            let name = Self.skillDisplayName(skill)
+            if field == "apikey" {
+                return "\(name) API key"
+            }
+            return "Skill · \(name) · \(field)"
+        }
         return account
     }
 
     private static func humanized(_ token: String) -> String {
         guard !token.isEmpty else { return token }
         return token.prefix(1).uppercased() + token.dropFirst()
+    }
+
+    /// `subq-decisions` -> "SubQ Decisions", `my-skill` -> "My Skill". A
+    /// credential card must name the skill it belongs to, not assume the only
+    /// skill is the starter.
+    private static func skillDisplayName(_ token: String) -> String {
+        if token == SubQDecisionKeySource.skillName { return "SubQ Decisions" }
+        let words = token
+            .split(whereSeparator: { $0 == "-" || $0 == "_" })
+            .map { $0.prefix(1).uppercased() + $0.dropFirst() }
+        return words.isEmpty ? Self.humanized(token) : words.joined(separator: " ")
     }
 }
 
@@ -156,7 +182,9 @@ public nonisolated enum KeychainImportOutcome: Sendable, Equatable {
 
 public nonisolated enum KeychainMigration {
     public static var services: [String] {
-        [MCPSecretStore.defaultService, CloudSecretStore.defaultService]
+        // Skills credentials are read by `subq_decide`, so a key written by an
+        // older build needs the same one-time import the other two services get.
+        [MCPSecretStore.defaultService, CloudSecretStore.defaultService, SkillsSecretStore.defaultService]
     }
 
     /// Credentials still sitting in the legacy keychain. Attribute-only queries,
@@ -299,14 +327,24 @@ public nonisolated enum KeychainMigration {
     }
 
     private static func label(for service: String) -> String {
-        service == CloudSecretStore.defaultService
-            ? "DynaMoE cloud provider API key"
-            : "DynaMoE MCP secret"
+        switch service {
+        case CloudSecretStore.defaultService:
+            return "DynaMoE cloud provider API key"
+        case SkillsSecretStore.defaultService:
+            return "DynaMoE skill secret"
+        default:
+            return "DynaMoE MCP secret"
+        }
     }
 
     private static func description(for service: String) -> String {
-        service == CloudSecretStore.defaultService
-            ? "Cloud inference provider credential"
-            : "MCP server credential"
+        switch service {
+        case CloudSecretStore.defaultService:
+            return "Cloud inference provider credential"
+        case SkillsSecretStore.defaultService:
+            return "Skill credential for an installed agent skill"
+        default:
+            return "MCP server credential"
+        }
     }
 }

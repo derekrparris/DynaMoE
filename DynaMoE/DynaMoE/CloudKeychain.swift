@@ -106,6 +106,11 @@ public nonisolated struct CloudSecretStore: Sendable {
         core.exists(account: Self.account(providerId: providerId), backend: core.backend)
     }
 
+    /// Attribute-only, so it never prompts. See `CredentialStatus`.
+    public func credentialStatus(providerId: String) -> CredentialStatus {
+        core.credentialStatus(account: Self.account(providerId: providerId))
+    }
+
     public func delete(providerId: String) {
         core.delete(account: Self.account(providerId: providerId))
     }

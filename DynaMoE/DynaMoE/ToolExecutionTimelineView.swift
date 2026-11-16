@@ -126,6 +126,8 @@ struct TimelineStepCardView: View {
         case "grep_search": return "magnifyingglass"
         case "web_search": return "globe"
         case "web_fetch": return "arrow.down.doc.fill"
+        case "skill_load": return "book.closed.fill"
+        case "subq_decide": return "arrow.triangle.branch"
         case "complete": return "checkmark.seal.fill"
         default: return "wrench.and.screwdriver.fill"
         }
@@ -160,6 +162,16 @@ struct TimelineStepCardView: View {
                 return (URL(string: url)?.host ?? url)
             }
             return call.rawArguments
+        case "skill_load":
+            if let name = call.arguments["name"] {
+                let file = call.arguments["file"].map { " · \($0)" } ?? ""
+                return name + file
+            }
+            return "Installed skills"
+        case "subq_decide":
+            let names = SubQDecideTool.questionNames(from: call.arguments["questions"])
+            guard let first = names.first else { return "Decision" }
+            return names.count == 1 ? first : "\(first) +\(names.count - 1)"
         case "complete":
             return call.arguments["summary"] ?? "Completed"
         default:
@@ -273,6 +285,12 @@ struct TimelineStepCardView: View {
                         toolName: call.name,
                         arguments: call.arguments,
                         targetSummary: primarySummary,
+                        destinationSummary: call.name == "subq_decide"
+                            ? SubQDecideTool.approvalDetail(
+                                rawArguments: call.rawArguments,
+                                endpointString: call.pinnedEndpoint
+                            )
+                            : nil,
                         diffPreview: call.arguments["diff"] ?? call.arguments["content"],
                         commandPreview: call.arguments["command"]
                     ),

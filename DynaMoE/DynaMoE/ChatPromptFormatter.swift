@@ -54,18 +54,21 @@ public enum ChatPromptFormatter {
                 )
             }
         } else if isLing {
-            if prompt.contains("<role>") {
+            if prompt.contains(Self.lingRoleOpen) {
                 formattedPrompt = prompt
             } else {
                 let lingThinking = thinkingEnabled ? "detailed thinking on" : "detailed thinking off"
                 let sysPart = cleanSystem.isEmpty ? lingThinking : "\(cleanSystem)\n\(lingThinking)"
                 let thinkTag = thinkingEnabled ? "\n<think>" : "\n<think></think>"
-                formattedPrompt = "<role>SYSTEM</role>\(sysPart)<|role_end|><role>HUMAN</role>\(prompt)<|role_end|><role>ASSISTANT</role>\(thinkTag)"
+                formattedPrompt = Self.lingRoleOpen + "SYSTEM" + Self.lingRoleClose + sysPart
+                    + Self.lingRoleEnd + Self.lingRoleOpen + "HUMAN" + Self.lingRoleClose + prompt
+                    + Self.lingRoleEnd + Self.lingRoleOpen + "ASSISTANT" + Self.lingRoleClose + thinkTag
             }
         } else if modelConfig?.isSparkModel == true {
             // Spark 2.5 DeepSeek-style dialect; X2.6 adds the effort line to the
             // System block (never when thinking is off, per the template).
-            if prompt.contains("<|Bot|>") || prompt.contains("<|User|>") || prompt.contains("<|System|>") {
+            if prompt.contains(Self.sparkBotMarker) || prompt.contains(Self.sparkUserMarker)
+                || prompt.contains(Self.sparkSystemMarker) {
                 formattedPrompt = prompt
             } else {
                 let systemBody = Self.sparkSystemBody(
@@ -73,10 +76,10 @@ public enum ChatPromptFormatter {
                     thinkingEnabled: thinkingEnabled,
                     thinkingEffort: thinkingEffort
                 )
-                var p = "<｜start▁of▁sentence｜><|System|>\n" + systemBody + "<｜end▁of▁sentence｜>"
-                p += "<｜start▁of▁sentence｜><|User|>\(prompt)<｜end▁of▁sentence｜>"
+                var p = Self.sparkStartOfSentence + Self.sparkSystemMarker + "\n" + systemBody + Self.sparkEndOfSentence
+                p += Self.sparkStartOfSentence + Self.sparkUserMarker + prompt + Self.sparkEndOfSentence
                 let sparkThink = thinkingEnabled ? "<think>" : "<think></think>"
-                p += "<｜start▁of▁sentence｜><|Bot|>\(sparkThink)"
+                p += Self.sparkStartOfSentence + Self.sparkBotMarker + sparkThink
                 formattedPrompt = p
             }
         } else if modelConfig?.isGemma4Model == true {
@@ -124,6 +127,21 @@ public enum ChatPromptFormatter {
     /// escapes so a renderer can never mangle the fullwidth bars / block
     /// underscores (AGENTS.md: "Reading files safely").
     public static let sparkEndOfSentence = "<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>"
+
+    /// Spark 2.5's remaining turn framing. `nonisolated` because
+    /// `PromptMarkers` sanitizes them from a nonisolated context, and named
+    /// here so the sanitizer and the renderer cannot disagree byte for byte.
+    public nonisolated static let sparkStartOfSentence = "<\u{FF5C}start\u{2581}of\u{2581}sentence\u{FF5C}>"
+    public nonisolated static let sparkSystemMarker = "<|System|>"
+    public nonisolated static let sparkUserMarker = "<|User|>"
+    public nonisolated static let sparkBotMarker = "<|Bot|>"
+    public nonisolated static let sparkToolMarker = "<|Tool|>"
+
+    /// Ling/Bailing 3.0's role spans. The assistant turn boundary is
+    /// `<role>ASSISTANT</role>`, so both halves of the span are control syntax.
+    public nonisolated static let lingRoleOpen = "<role>"
+    public nonisolated static let lingRoleClose = "</role>"
+    public nonisolated static let lingRoleEnd = "<|role_end|>"
 
     /// Spark X2.6's thinking-level instruction, appended to the System block
     /// when the model's chat template exposes `reasoning_effort` (levels:
@@ -225,8 +243,11 @@ public enum ChatPromptFormatter {
     /// echoed reasoning must be re-wrapped in them: the canonical
     /// ` thinking`/`</think>` markers the adapters fold in are the *other*
     /// families' tags and would not reproduce the pinned generation.
-    static let gemmaReasoningOpen = "<|channel>thought\n"
-    static let gemmaReasoningClose = "<channel|>"
+    nonisolated static let gemmaChannelOpen = "<|channel>"
+    nonisolated static let gemmaChannelClose = "<channel|>"
+    nonisolated static let gemmaThinkMarker = "<|think|>"
+    nonisolated static let gemmaReasoningOpen = gemmaChannelOpen + "thought\n"
+    nonisolated static let gemmaReasoningClose = gemmaChannelClose
 
     /// Prefixes the protocol adapters use to re-render an assistant tool-call
     /// turn out of a client's echoed `tool_calls` / `tool_use` structure. A
@@ -383,17 +404,17 @@ public enum ChatPromptFormatter {
             let sysPart = cleanSystem.isEmpty ? lingThinking : "\(cleanSystem)\n\(lingThinking)"
             // The Ling assistant prefix with its reasoning block open, and with
             // it empty (a completed turn that carried no reasoning).
-            let openPrefix = "<role>ASSISTANT</role>" + "\n" + TurnTextSplitter.canonicalReasoningOpenTag
+            let openPrefix = Self.lingRoleOpen + "ASSISTANT" + Self.lingRoleClose + "\n" + TurnTextSplitter.canonicalReasoningOpenTag
             let emptyPrefix = openPrefix + TurnTextSplitter.canonicalReasoningCloseTag
-            var p = "<role>SYSTEM</role>" + sysPart + "<|role_end|>"
+            var p = Self.lingRoleOpen + "SYSTEM" + Self.lingRoleClose + sysPart + Self.lingRoleEnd
             for turn in turns {
                 if turn.role == .user {
-                    p += "<role>HUMAN</role>" + turn.text + "<|role_end|>"
+                    p += Self.lingRoleOpen + "HUMAN" + Self.lingRoleClose + turn.text + Self.lingRoleEnd
                 } else {
                     let opens = thinkingEnabled || TurnTextSplitter.containsReasoningClose(turn.text)
                     p += (opens ? openPrefix : emptyPrefix)
                         + Self.completedAssistantBody(prefixOpensReasoning: opens, text: turn.text)
-                        + "<|role_end|>"
+                        + Self.lingRoleEnd
                 }
             }
             p += (thinkingEnabled ? openPrefix : emptyPrefix)
@@ -406,12 +427,12 @@ public enum ChatPromptFormatter {
                 thinkingEnabled: thinkingEnabled,
                 thinkingEffort: thinkingEffort
             )
-            let openPrefix = "<｜start▁of▁sentence｜><|Bot|>" + TurnTextSplitter.canonicalReasoningOpenTag
+            let openPrefix = Self.sparkStartOfSentence + Self.sparkBotMarker + TurnTextSplitter.canonicalReasoningOpenTag
             let emptyPrefix = openPrefix + TurnTextSplitter.canonicalReasoningCloseTag
-            var p = "<｜start▁of▁sentence｜><|System|>\n" + sysLine + "<｜end▁of▁sentence｜>"
+            var p = Self.sparkStartOfSentence + Self.sparkSystemMarker + "\n" + sysLine + Self.sparkEndOfSentence
             for turn in turns {
                 if turn.role == .user {
-                    p += "<｜start▁of▁sentence｜><|User|>" + turn.text + "<｜end▁of▁sentence｜>"
+                    p += Self.sparkStartOfSentence + Self.sparkUserMarker + turn.text + Self.sparkEndOfSentence
                 } else {
                     let opens = thinkingEnabled || TurnTextSplitter.containsReasoningClose(turn.text)
                     p += (opens ? openPrefix : emptyPrefix)
@@ -525,7 +546,7 @@ public enum ChatPromptFormatter {
         promptDialect: DeepSeekV41PromptDialect = DeepSeekV41PromptDialect()
     ) -> String? {
         if modelConfig?.isDeepSeekV41Model == true { return promptDialect.markers.endOfSentence }
-        if modelConfig?.isLingModel == true { return "<|role_end|>" }
+        if modelConfig?.isLingModel == true { return lingRoleEnd }
         if modelConfig?.isSparkModel == true { return nil }
         if modelConfig?.isGemma4Model == true { return "<turn|>" }
         return "<|im_end|>"

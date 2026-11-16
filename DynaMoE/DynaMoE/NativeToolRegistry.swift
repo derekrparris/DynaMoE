@@ -173,6 +173,11 @@ public final class ControlledProcessRunner {
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["NONINTERACTIVE"] = "1"
         env["DEBIAN_FRONTEND"] = "noninteractive"
+        // `subq_decide` accepts a key from the app's environment as a developer
+        // convenience, so the same variable must not reach a process the model
+        // can ask to `printenv`. The app process keeps its own copy; a child
+        // environment is a place the model can read.
+        env.removeValue(forKey: "SUBQ_API_KEY")
         return env
     }
 
@@ -189,7 +194,7 @@ public final class ControlledProcessRunner {
             process.currentDirectoryURL = wd.resolvingSymlinksInPath()
         }
 
-        var env = Self.toolEnvironment()
+        let env = Self.toolEnvironment()
         process.environment = env
 
         let outPipe = Pipe()

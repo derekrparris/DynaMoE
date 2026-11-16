@@ -4988,6 +4988,8 @@ struct ToolCallCardView: View {
         case "find_symbol_definition": return "character.textbox"
         case "find_references": return "arrow.triangle.swap"
         case "lint_diagnostics": return "stethoscope"
+        case "skill_load": return "book.closed.fill"
+        case "subq_decide": return "arrow.triangle.branch"
         case "complete": return "checkmark.seal.fill"
         default: return "wrench.and.screwdriver.fill"
         }
@@ -5015,6 +5017,16 @@ struct ToolCallCardView: View {
             return call.rawArguments
         case "codebase_search":
             return "\"\(call.arguments["query"] ?? "")\""
+        case "skill_load":
+            if let name = call.arguments["name"] {
+                let file = call.arguments["file"].map { " · \($0)" } ?? ""
+                return name + file
+            }
+            return "Installed skills"
+        case "subq_decide":
+            let names = SubQDecideTool.questionNames(from: call.arguments["questions"])
+            guard let first = names.first else { return "Decision" }
+            return names.count == 1 ? first : "\(first) +\(names.count - 1)"
         case "spawn_subagent":
             let role = call.arguments["role"] ?? "Subagent"
             let task = call.arguments["task_description"] ?? ""

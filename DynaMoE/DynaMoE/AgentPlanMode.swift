@@ -183,7 +183,12 @@ nonisolated public enum PlanModePolicy {
         "find_symbol_definition", "find_references", "lint_diagnostics",
         "web_search", "web_fetch", "git_status", "git_diff",
         "spawn_subagent", "get_subagent_status", "send_subagent_message", "list_subagents",
-        "tools_discover", "tools_load", "tools_unload"
+        "tools_discover", "tools_load", "tools_unload",
+        // Skills are read-only procedure documents, and the decisions API is a
+        // read-only network call like web_search/fetch, so a plan turn may use
+        // both. A skill whose procedure needs shell or writes is still
+        // constrained: its SCRIPT cannot run, because shell_run stays withheld.
+        "skill_load", "subq_decide"
     ]
 
     /// A coder tool plan mode takes away, and what it is for.

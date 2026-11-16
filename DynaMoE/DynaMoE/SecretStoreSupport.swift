@@ -80,6 +80,26 @@ public nonisolated enum SecretAccessResult: Sendable, Equatable {
     }
 }
 
+/// What an attribute-only credential lookup established.
+///
+/// `found` and `legacyOnly` are separate cases because they answer different
+/// questions. `read()` consults only the resolved backend, so an item that
+/// lives in the legacy keychain alone cannot be read by this build: reporting
+/// it as `found` made the Settings card say "Ready" while every call failed
+/// with a missing key, which is the exact bug `hasCurrentCredential` was added
+/// to fix. A caller that only wants "is something stored?" asks `exists`.
+public nonisolated enum CredentialStatus: Sendable, Equatable {
+    /// Present in the keychain this build reads, so a call can succeed now.
+    case found
+    /// Present only in the legacy keychain. The Stored Credentials import
+    /// makes it usable; until then a read returns nothing.
+    case legacyOnly
+    case missing
+    /// The Keychain refused the lookup itself (a dismissed dialog, a locked
+    /// keychain, a missing entitlement).
+    case unreadable(OSStatus)
+}
+
 public nonisolated enum SecretAccessClassifier {
     /// Statuses macOS reports when the ACL (or a locked keychain) refused the
     /// read, as opposed to the item not existing.
@@ -550,6 +570,41 @@ public nonisolated struct KeychainSecretStore: Sendable {
         items.copyMatching(
             SecretStoreQuery.existence(service: service, account: account, backend: backend)
         ).status == errSecSuccess
+    }
+
+    /// What an ATTRIBUTE-ONLY lookup established, so a caller can tell "not
+    /// stored" from "stored but this build may not look at it".
+    ///
+    /// `exists` collapses both into false, which is right for a launch-path
+    /// gate and wrong for the Settings card: it is the screen a user consults
+    /// before deleting a credential, and "No Key" about a key that is sitting
+    /// there invites exactly the wrong action. Still attribute-only, so this
+    /// never raises a dialog.
+    public func credentialStatus(account: String) -> CredentialStatus {
+        let current = items.copyMatching(
+            SecretStoreQuery.existence(service: service, account: account, backend: backend)
+        ).status
+        switch current {
+        case errSecSuccess:
+            return .found
+        case errSecItemNotFound:
+            break
+        default:
+            // A denied or locked keychain says nothing about whether a legacy
+            // copy exists, so report the refusal rather than guessing.
+            return .unreadable(current)
+        }
+        guard backend.usesDataProtection else { return .missing }
+        let legacy = items.copyMatching(
+            SecretStoreQuery.existence(service: service, account: account, backend: .legacy)
+        ).status
+        switch legacy {
+        // NOT `.found`: this build reads only `backend`, so an item here is
+        // pending an import, not ready to use.
+        case errSecSuccess: return .legacyOnly
+        case errSecItemNotFound: return .missing
+        default: return .unreadable(legacy)
+        }
     }
 
     /// Removes the credential from both keychains, so a deleted integration

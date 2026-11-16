@@ -132,6 +132,13 @@ struct DynaMoEApp: App {
         if !isTesting {
             MCPManager.shared.bootstrap()
         }
+
+        // Skills (Phase 8): load skills.json, scan the skill folders, and watch
+        // them for additions. The prompt advertises names and descriptions
+        // only; the model reads a SKILL.md on demand with `skill_load`.
+        if !isTesting {
+            SkillsRegistry.shared.bootstrap()
+        }
     }
 
     var sharedModelContainer: ModelContainer = {
