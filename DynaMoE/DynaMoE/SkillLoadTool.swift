@@ -26,7 +26,7 @@ import Foundation
 public final class SkillLoadTool: AgentTool {
     public let definition = ToolDefinition(
         name: "skill_load",
-        description: "Reads an installed skill's SKILL.md by name, or one of its support files. Call with no arguments to list every installed skill. The # Skills prompt section lists only names and descriptions; the procedure lives in SKILL.md, so load a skill before following it. Long bodies are paged: the result reports next_offset when more remains.",
+        description: "Reads an installed skill's SKILL.md by name, or one of its support files. Call with no arguments to list every enabled skill. The # Skills prompt section lists only names and descriptions; the procedure lives in SKILL.md, so load a skill before following it. Long bodies are paged: the result reports next_offset when more remains.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
@@ -85,6 +85,11 @@ public final class SkillLoadTool: AgentTool {
             return (AgentHarness.toolErrorJSON(tool: "skill_load", error: err), nil, err, false)
         }
 
+        guard skill.modelInvocable else {
+            let err = "Skill '\(skill.name)' sets disable-model-invocation: true, so the model must not load it. Continue without it."
+            return (AgentHarness.toolErrorJSON(tool: "skill_load", error: err), nil, err, false)
+        }
+
         let relativeFile = Self.string(arguments["file"])?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !relativeFile.isEmpty {
             return loadSupportFile(
@@ -115,14 +120,18 @@ public final class SkillLoadTool: AgentTool {
         var payload: [[String: Any]] = []
         var lines: [String] = ["Installed skills (\(skills.count)):", ""]
         for skill in skills {
+            // A description is untrusted frontmatter: the same pass every other
+            // tool result gets, so a stored marker cannot forge a boundary in
+            // the transcript either.
+            let description = AgentHarness.sanitizeText(skill.description)
             payload.append([
                 "name": skill.name,
-                "description": skill.description,
+                "description": description,
                 "base_dir": skill.directory.path,
                 "always_on": skill.always,
                 "source": skill.rootLabel
             ])
-            var line = "- \(skill.name) — \(skill.description)"
+            var line = "- \(skill.name) — \(description)"
             if skill.always { line += " [always invoked]" }
             lines.append(line)
             lines.append("  base_dir: \(skill.directory.path)")
@@ -162,9 +171,11 @@ public final class SkillLoadTool: AgentTool {
             }
 
             let files = Self.supportFiles(in: skill.directory)
-            let page = Self.page(document.body, offset: offset, maxCharacters: budget)
+            let safeBody = AgentHarness.sanitizeText(document.body)
+            let page = Self.page(safeBody, offset: offset, maxCharacters: budget)
+            let safeDescription = AgentHarness.sanitizeText(document.frontmatter.description)
 
-            var header = "[skill] \(skill.name) — \(document.frontmatter.description)\n"
+            var header = "[skill] \(skill.name) — \(safeDescription)\n"
             header += "Base directory: \(skill.directory.path)\n"
             header += "Support files: \(files.isEmpty ? "none" : files.joined(separator: ", "))\n"
             if document.frontmatter.always {
@@ -182,7 +193,7 @@ public final class SkillLoadTool: AgentTool {
 
             var data: [String: Any] = [
                 "name": skill.name,
-                "description": document.frontmatter.description,
+                "description": safeDescription,
                 "base_dir": skill.directory.path,
                 "skill_file": skillFile.path,
                 "source": skill.rootLabel,
@@ -226,8 +237,21 @@ public final class SkillLoadTool: AgentTool {
             let err = "'\(relativePath)' is a folder. Ask for a file inside it, for example '\(relativePath)/file.md'."
             return (AgentHarness.toolErrorJSON(tool: "skill_load", error: err), nil, err, false)
         }
+        // A FIFO named like a support file would block the read forever, and a
+        // device node is not a document. Refuse both before opening anything.
+        let values = try? url.resourceValues(forKeys: [.isRegularFileKey])
+        guard values?.isRegularFile != false else {
+            let err = "'\(relativePath)' is not a regular file, so skill_load will not read it."
+            return (AgentHarness.toolErrorJSON(tool: "skill_load", error: err), nil, err, false)
+        }
+        if let fileKind = AgentHarness.binaryFileKind(at: url) {
+            let err = "'\(relativePath)' is binary content (detected: \(fileKind)); skill_load returns text only."
+            return (AgentHarness.toolErrorJSON(tool: "skill_load", error: err, extra: [
+                "file_kind": fileKind
+            ]), nil, err, false)
+        }
         do {
-            let text = try Self.readTextCapped(url, maximumBytes: 1_048_576)
+            let text = AgentHarness.sanitizeText(try Self.readTextCapped(url, maximumBytes: 1_048_576))
             let page = Self.page(text, offset: offset, maxCharacters: budget)
             var observation = "[skill file] \(skill.name)/\(relativePath)\n"
             observation += "Base directory: \(skill.directory.path)\n\n"

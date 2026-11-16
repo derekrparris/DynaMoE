@@ -98,6 +98,14 @@ public nonisolated struct SkillsSecretStore: Sendable {
         core.exists(account: account)
     }
 
+    /// True only when the keychain this build actually READS holds the key,
+    /// i.e. a call can succeed without importing anything first. `exists`
+    /// covers the legacy keychain too, and those two questions had different
+    /// answers: a legacy-only item reported "Ready" while `get` returned nil.
+    public func hasCurrentCredential(account: String) -> Bool {
+        core.exists(account: account, backend: core.backend)
+    }
+
     public func delete(account: String) {
         core.delete(account: account)
     }
@@ -125,6 +133,10 @@ public extension SkillsSecretStore {
 
     static func exists(account: String) -> Bool {
         shared.exists(account: account)
+    }
+
+    static func hasCurrentCredential(account: String) -> Bool {
+        shared.hasCurrentCredential(account: account)
     }
 
     static func delete(account: String) {

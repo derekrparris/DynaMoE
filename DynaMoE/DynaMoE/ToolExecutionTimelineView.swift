@@ -162,6 +162,16 @@ struct TimelineStepCardView: View {
                 return (URL(string: url)?.host ?? url)
             }
             return call.rawArguments
+        case "skill_load":
+            if let name = call.arguments["name"] {
+                let file = call.arguments["file"].map { " · \($0)" } ?? ""
+                return name + file
+            }
+            return "Installed skills"
+        case "subq_decide":
+            let names = SubQDecideTool.questionNames(from: call.arguments["questions"])
+            guard let first = names.first else { return "Decision" }
+            return names.count == 1 ? first : "\(first) +\(names.count - 1)"
         case "complete":
             return call.arguments["summary"] ?? "Completed"
         default:

@@ -520,11 +520,12 @@ Additional folders (a workspace's `.agents/skills`, for example) go in `extraRoo
 │  Installed Skills (2)                                                  │
 │  * subq-decisions   [ALWAYS]  Application Support  [eye] [folder] [ON] │
 │      Use when a judgment reduces to a structured question …            │
-│  * impeccable       ~/.agents/skills              [eye] [folder] [ON]  │
-│      Use when the user wants to design, redesign, shape, critique …    │
+│  * pdf-tools        ~/.agents/skills              [eye] [folder] [ON]  │
+│      Use when the task needs forms, extraction or page rendering …     │
 │  [Install Starter] [Add Root Folder…] [App Skills Folder]              │
 └────────────────────────────────────────────────────────────────────────┘
 ```
+(An example list: `subq-decisions` is the one bundled starter; other skills are installed by you.)
 
 #### The SKILL.md Format
 
@@ -547,9 +548,10 @@ The procedure. Any supporting files sit beside this file in `scripts/`,
 | Field | Required | Meaning |
 |---|---|---|
 | `name` | yes | The skill's address. Letters, digits and single dashes, at most 64 characters, and it **must match the folder name**. |
-| `description` | yes | What tells the model **when** the skill applies. Clipped to 240 characters in the prompt. Write it as a trigger, not a summary of the procedure. |
+| `description` | yes | What tells the model **when** the skill applies. Clipped to 320 characters in the prompt, so keep the trigger inside that budget. Write it as a trigger, not a summary of the procedure. |
 | `always` | no | Renders an "Always invoke" rule into every prompt. At most three skills may use it; a fourth is reported in the card instead of silently bloating the prompt. |
-| `user-invocable` | no | Reserved for the `/skill` composer command. |
+| `user-invocable` | no | Accepted for parity with other Agent Skills hosts. DynaMoE has no user-invocation command yet, so it has no effect. |
+| `disable-model-invocation` | no | `true` means the author forbids the model from invoking the skill on its own. Because this build's only invocation surface is the model's, such a skill is not advertised and `skill_load` refuses it. |
 | `metadata` | no | Free-form map for other hosts. DynaMoE reads nothing from it. |
 
 Values may be plain, single-quoted, double-quoted, or block scalars (`|` and `>` with chomping indicators). CRLF line endings are accepted. An unknown field is reported as a warning rather than silently ignored, because a field another host honours (for example `allowed-tools`) is *not* enforced here.
@@ -569,16 +571,16 @@ Values may be plain, single-quoted, double-quoted, or block scalars (`|` and `>`
 }
 ```
 
-- **`extraRoots`** — whole folders whose immediate subfolders are skills. `~` and relative-looking paths are expanded; a missing folder is a warning, not an error.
+- **`extraRoots`** — whole folders whose immediate subfolders are skills. `~` is expanded and every entry must be an absolute path; a relative path is ignored with a warning (the app has no working directory to resolve it against). A missing folder is a warning, not an error.
 - **`disabledSkills`** — names hidden from the prompt and refused by `skill_load`. A disabled skill stays visible in the card so it can be re-enabled.
 - **`maxAdvertised`** / **`advertisedCharacters`** — the prompt budget for the section. When the list is trimmed the model is told how many skills were omitted and that `skill_load` with no arguments lists them all.
 
 #### How a Skill Reaches the Model
 
-`skill_load` is a core tool, present from the first turn:
+`skill_load` is a core tool, present from the first turn (it is unloaded while the master switch is off, so its schema is not paid for):
 
-1. **`skill_load` with no arguments** lists every installed skill with its base directory. This is how the model recovers the list after `/compact` truncates older tool results.
-2. **`skill_load` with a `name`** returns the `SKILL.md` body, the skill's absolute base directory, and a listing of its support files. The base directory matters: a skill like impeccable resolves its own launcher as `<base-dir>/scripts/impeccable`.
+1. **`skill_load` with no arguments** lists every enabled skill with its base directory. This is how the model recovers the list after `/compact` truncates older tool results.
+2. **`skill_load` with a `name`** returns the `SKILL.md` body, the skill's absolute base directory, and a listing of its support files. The base directory matters: a shell-backed skill resolves its own launcher relative to `<base-dir>`.
 3. **`skill_load` with `name` and `file`** reads one support file. Paths are relative to the skill folder; anything that escapes it (`..`, an absolute path, a symlink pointing outside) is refused.
 
 Long bodies are paged exactly like `file_read`: the result reports `next_offset` and a continuation hint, and passing `offset` returns the next slice.
@@ -604,24 +606,24 @@ The first skill that needs a real capability. SubQ's `subq-snap-preview` is a **
 Two ways to give it a key, tried in this order:
 
 1. **A Cloud Provider for SubQ.** Add a provider with base URL `https://api.subq.ai/v1` and a key; register `subq-preview` if you also want chat. `subq_decide` reuses that key.
-2. **The key field in this card**, stored in the Keychain under `dynamoe.skill.subq-decisions.apikey`. Nothing is written to `skills.json`.
+2. **The key field in this card**, stored in the Keychain under the service `DRP.DynaMoE.skills` with account `dynamoe.skill.subq-decisions.apikey`. Nothing is written to `skills.json`.
 
 Create a key at [console.subq.ai](https://console.subq.ai). Pricing is $0.05 per 1M input tokens; output is free. Use **Test** to spend one tiny decision and confirm the key works.
 
 The **Install subq-decisions Starter** button writes the canonical skill into the app skills folder. An existing copy is never overwritten.
 
-`subq_decide` is seeded into the prompt only when a key resolves, so a machine without a key pays zero tokens for it. When the key is missing, rejected (401), out of credit (402), rate-limited (429) or SubQ is down (503), the tool refuses with the fix rather than falling back silently, and the skill tells the model to decide itself and say the decision was not SubQ-verified.
+`subq_decide` is seeded into the prompt only when a key resolves, so a machine without a key pays zero tokens for it. Adding a SubQ Cloud Provider or saving a key arms it immediately; no relaunch is needed. When the key is missing, rejected (401), out of credit (402), rate-limited (429) or SubQ is down (503), the tool refuses with the fix rather than falling back silently, and the skill tells the model to decide itself and say the decision was not SubQ-verified.
 
-#### Impeccable and Other Design Skills
+#### Shell-Backed Design Skills
 
-The `impeccable` skill in `~/.agents/skills` is discovered automatically. It is a **shell-backed** skill: its workflow runs `<base-dir>/scripts/impeccable context` and `<base-dir>/scripts/impeccable detect <path>`, so it needs `shell_run`. Plan Mode withholds `shell_run`, so a plan turn can read the skill but cannot run its detector — switch to Code Mode before using it.
+DynaMoE ships exactly one skill, the `subq-decisions` starter; everything else is installed by you. A shell-backed design skill (the external `impeccable` skill is one example) keeps its workflow in `<base-dir>/scripts/`, so it needs `shell_run`. Plan Mode withholds `shell_run`, so a plan turn can read the skill but cannot run its detector; switch to Code Mode before using it.
 
 Skills are otherwise runtime-agnostic: whatever the `SKILL.md` tells the model to run goes through `shell_run`, with the curated PATH (Homebrew, cargo, `~/.local/bin`) and the same approval rules as any other command.
 
 #### Safety Model
 
 - **A skill is text.** Loading one executes nothing. Its scripts run only when the model calls `shell_run`, which is approval-gated unless Turbo Mode is on.
-- **Credentials stay in the Keychain.** A skill may instruct the model to use a tool that needs a secret (`subq_decide`), but no secret is written to `skills.json`, a prompt, or a log line.
+- **Credentials stay in the Keychain.** A skill may instruct the model to use a tool that needs a secret (`subq_decide`), but no secret is written to `skills.json`, a prompt, or a log line. `SUBQ_API_KEY` is also removed from every process `shell_run` spawns, so `printenv` cannot read the environment fallback.
 - **Skills are scanned from three fixed locations plus the folders you list.** Adding a root is deliberate; there is no implicit workspace scan.
 - **Skill files are readable without approval, like any other file.** A skill can point the model at commands; review third-party skills before installing them, the same way you would review an MCP server.
 

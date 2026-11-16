@@ -25,14 +25,20 @@ import Foundation
 
 // MARK: - File Watcher
 
-/// One `DispatchSource` on one path, re-armable. Kept private: the registry
-/// owns the policy (when to reload, when to defer) and this only reports
-/// "something happened at this path".
-private final class SkillPathWatcher {
+/// One `DispatchSource` on one path, re-armable. Internal so a test can prove
+/// `stop()` closes the descriptor; the registry owns the policy (when to
+/// reload, when to defer) and this only reports "something happened here".
+final class SkillPathWatcher {
     private let path: String
     private let onChange: () -> Void
     private var source: DispatchSourceFileSystemObject?
-    private var descriptor: Int32 = -1
+    /// The descriptor this watcher opened last, kept after `stop()` so a test
+    /// can prove the cancel handler closed it (the fd must report EBADF). The
+    /// close itself captures the number BY VALUE: it used to live on `self` and
+    /// be closed from a `[weak self]` handler, which had no owner by the time
+    /// the cancel ran, so every stopped watcher leaked its descriptor —
+    /// re-arming `skills.json` on each external edit leaked one fd per edit.
+    private(set) var descriptorForTesting: Int32 = -1
 
     init(path: String, onChange: @escaping () -> Void) {
         self.path = path
@@ -52,15 +58,11 @@ private final class SkillPathWatcher {
         source.setEventHandler { [weak self] in
             self?.onChange()
         }
-        source.setCancelHandler { [weak self] in
-            guard let self else { return }
-            if self.descriptor >= 0 {
-                close(self.descriptor)
-                self.descriptor = -1
-            }
+        source.setCancelHandler {
+            close(descriptor)
         }
         self.source = source
-        self.descriptor = descriptor
+        self.descriptorForTesting = descriptor
         source.resume()
         return true
     }
@@ -84,6 +86,10 @@ public final class SkillsRegistry: ObservableObject {
     /// Every discovered skill, including ones the config disables.
     @Published public private(set) var allSkills: [Skill] = []
     @Published public private(set) var issues: [SkillIssue] = []
+    /// Name collisions as data, in addition to the readable issues: the
+    /// starter installer has to know which copy WON before it can tell the user
+    /// which one to remove.
+    @Published public private(set) var shadows: [SkillShadow] = []
     @Published public private(set) var scannedRoots: [SkillRoot] = []
     @Published public private(set) var configPath = SkillsConfigStore.defaultPathDescription
     @Published public private(set) var lastReloadSummary: String?
@@ -94,10 +100,13 @@ public final class SkillsRegistry: ObservableObject {
 
     // MARK: Derived state
 
-    /// What the prompt and the loader are allowed to see right now.
+    /// What the prompt and the loader are allowed to see right now. A skill
+    /// that opts out of model invocation is not in here: this build has no
+    /// other invocation surface, so advertising it would produce exactly the
+    /// auto-invocation the author forbade.
     public var enabledSkills: [Skill] {
         guard config.enabled else { return [] }
-        return allSkills.filter { config.isEnabled($0) }
+        return allSkills.filter { config.isEnabled($0) && $0.modelInvocable }
     }
 
     public var alwaysOnSkills: [Skill] {
@@ -120,12 +129,34 @@ public final class SkillsRegistry: ObservableObject {
     private var hasBootstrapped = false
     private var configWatcher: SkillPathWatcher?
     private var rootWatchers: [String: SkillPathWatcher] = [:]
+    /// One watcher per skill MANIFEST. Watching only the root directories sees
+    /// folders appear and disappear but not a `description:` or `always:`
+    /// edited in place, which is the most common change of all.
+    private var manifestWatchers: [String: SkillPathWatcher] = [:]
     private var pendingReload = false
     private var deferredTask: Task<Void, Never>?
     private var lastRenderedSection: String?
 
     private var isBusy: Bool {
-        CompletionEngine.shared.isActive || AgentActivity.shared.isBusy
+        #if DEBUG
+        if let override = busyOverrideForTesting { return override }
+        #endif
+        return CompletionEngine.shared.isActive || AgentActivity.shared.isBusy
+    }
+
+    private var configURL: URL? {
+        #if DEBUG
+        configURLForTesting ?? SkillsConfigStore.defaultURL
+        #else
+        SkillsConfigStore.defaultURL
+        #endif
+    }
+
+    private func rootsForReload(_ config: SkillsConfig) -> [SkillRoot] {
+        #if DEBUG
+        if let override = rootOverrideForTesting { return override }
+        #endif
+        return resolveRoots(config)
     }
 
     private init() {}
@@ -151,11 +182,14 @@ public final class SkillsRegistry: ObservableObject {
     // MARK: Reload
 
     public func reload(reason: String) {
-        configPath = SkillsConfigStore.defaultPathDescription
+        configPath = configURL?.path ?? SkillsConfigStore.defaultPathDescription
 
         var configIssues: [SkillIssue] = []
         do {
-            config = try SkillsConfigStore.loadOrSeed()
+            // Clamp after decoding: the validator REPORTS an out-of-range
+            // budget, but the section must not then spend a value the
+            // operator's file did not mean.
+            config = try SkillsConfigStore.loadOrSeed(at: configURL).clamped()
             lastError = nil
         } catch {
             // Keep the last good config: a malformed external edit must not
@@ -165,10 +199,11 @@ public final class SkillsRegistry: ObservableObject {
         }
         configIssues = SkillsConfigValidator.validate(config)
 
-        let roots = resolveRoots(config)
+        let roots = rootsForReload(config)
         let scan = SkillDiscovery.scan(roots: roots)
         scannedRoots = roots
         allSkills = scan.skills
+        shadows = scan.shadowed.map { SkillShadow(loser: $0.skill, winner: $0.winner) }
 
         var issues = configIssues + scan.issues
         for pair in scan.shadowed {
@@ -181,11 +216,13 @@ public final class SkillsRegistry: ObservableObject {
                 message: "is shadowed by \(pair.winner.rootLabel): \(pair.winner.directory.path). The later-scanned folder wins; remove or rename that copy to use \(pair.skill.directory.path)."
             ))
         }
-        let alwaysSkills = allSkills.filter(\.always)
+        // Count only what could actually render: a disabled skill's `always`
+        // costs nothing, so warning about it pointed at the wrong file.
+        let alwaysSkills = enabledSkills.filter(\.always)
         if alwaysSkills.count > SkillValidation.maximumAlwaysOnSkills {
             issues.append(SkillIssue(
                 severity: .warning,
-                message: "\(alwaysSkills.count) skills declare always: true, but only the first \(SkillValidation.maximumAlwaysOnSkills) by name render an always-invoke rule. Remove 'always' from the ones that should not be mandatory."
+                message: "\(alwaysSkills.count) enabled skills declare always: true, but only the first \(SkillValidation.maximumAlwaysOnSkills) by name render an always-invoke rule. Remove 'always' from the ones that should not be mandatory."
             ))
         }
         issues.sort {
@@ -210,6 +247,10 @@ public final class SkillsRegistry: ObservableObject {
         generation += 1
         DiagLog.info("skills", "reload (\(reason)): \(lastReloadSummary ?? "")")
         restartRootWatchers(roots: roots)
+        restartManifestWatchers(skills: scan.skills)
+        // The tool's schema is paid on every turn, so it should not be in the
+        // prompt while the feature is off. The harness owns the loaded set.
+        AgentHarness.shared.applySkillsAvailability(enabled: config.enabled)
     }
 
     /// Invalidates the pinned prefix only when no turn owns the engine. While
@@ -217,6 +258,9 @@ public final class SkillsRegistry: ObservableObject {
     /// snapshot at turn start either way.
     private func invalidatePrefixIfIdle() {
         guard !isBusy else { return }
+        #if DEBUG
+        prefixInvalidationCount += 1
+        #endif
         PrefixCacheManager.shared.invalidate()
     }
 
@@ -227,6 +271,19 @@ public final class SkillsRegistry: ObservableObject {
             return
         }
         reload(reason: "external edit")
+    }
+
+    /// The Settings Reload button. Deferred for the same reason an external
+    /// edit is: applying a new skill list while a turn's prompt is frozen
+    /// desynchronises `skill_load` from what the model was told.
+    public func requestReload() {
+        guard !isBusy else {
+            pendingReload = true
+            lastReloadSummary = "Reload queued; it applies when the current turn finishes."
+            scheduleDeferredReload()
+            return
+        }
+        reload(reason: "manual reload")
     }
 
     private func scheduleDeferredReload() {
@@ -275,6 +332,10 @@ public final class SkillsRegistry: ObservableObject {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
             let expanded = (trimmed as NSString).expandingTildeInPath
+            // A relative path would resolve against the process's working
+            // directory, which is `/` for the app. Skipping it is what the
+            // validator warns about, so config and scanner agree.
+            guard expanded.hasPrefix("/") else { continue }
             let url = URL(fileURLWithPath: expanded, isDirectory: true).standardizedFileURL
             guard !roots.contains(where: { $0.url.standardizedFileURL.path == url.path }) else { continue }
             roots.append(SkillRoot(url: url, label: url.path))
@@ -306,6 +367,10 @@ public final class SkillsRegistry: ObservableObject {
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let expanded = (trimmed as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else {
+            lastError = "\(expanded) is not an absolute path. Choose the folder again; a relative path has no working directory to resolve against."
+            return
+        }
         let standardized = URL(fileURLWithPath: expanded, isDirectory: true).standardizedFileURL.path
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: standardized, isDirectory: &isDirectory),
@@ -343,21 +408,35 @@ public final class SkillsRegistry: ObservableObject {
     }
 
     public func saveRawJSON(_ text: String) throws {
-        let updated = try SkillsConfigStore.saveRawJSON(text)
-        config = updated
-        reload(reason: "raw JSON edit")
+        _ = try SkillsConfigStore.saveRawJSON(text, to: configURL)
+        applySaved(reason: "raw JSON edit")
     }
 
     private func persist(_ updated: SkillsConfig, reason: String) {
         do {
-            try SkillsConfigStore.save(updated)
-            config = updated
-            lastError = nil
-            reload(reason: reason)
+            try SkillsConfigStore.save(updated, to: configURL)
+            applySaved(reason: reason)
         } catch {
             lastError = error.localizedDescription
             DiagLog.error("skills", "config save failed: \(error.localizedDescription)")
         }
+    }
+
+    /// A settings write lands on disk immediately but is APPLIED through the
+    /// same deferral the external watcher uses. Applying it mid-turn while the
+    /// prompt is frozen desynchronised `skill_load` from what the model had
+    /// been told: a skill could disappear from the loader while its description
+    /// was still in the system block. `config` therefore keeps its previous
+    /// value until the reload actually runs.
+    private func applySaved(reason: String) {
+        lastError = nil
+        guard !isBusy else {
+            pendingReload = true
+            lastReloadSummary = "Change saved; it applies when the current turn finishes."
+            scheduleDeferredReload()
+            return
+        }
+        reload(reason: reason)
     }
 
     // MARK: Starter skill
@@ -370,7 +449,13 @@ public final class SkillsRegistry: ObservableObject {
         }
         do {
             let url = try StarterSkills.installSubQDecisions(in: directory)
-            reload(reason: "installed starter skill")
+            if isBusy {
+                pendingReload = true
+                lastReloadSummary = "Starter installed; it appears when the current turn finishes."
+                scheduleDeferredReload()
+            } else {
+                reload(reason: "installed starter skill")
+            }
             return .success(url)
         } catch {
             lastError = error.localizedDescription
@@ -381,10 +466,10 @@ public final class SkillsRegistry: ObservableObject {
     // MARK: Config file affordances (Settings)
 
     public func openConfigInEditor() {
-        guard let url = SkillsConfigStore.defaultURL else { return }
+        guard let url = configURL else { return }
         if !FileManager.default.fileExists(atPath: url.path) {
             do {
-                try SkillsConfigStore.save(config)
+                try SkillsConfigStore.save(config, to: url)
             } catch {
                 lastError = error.localizedDescription
                 return
@@ -394,7 +479,7 @@ public final class SkillsRegistry: ObservableObject {
     }
 
     public func revealConfigInFinder() {
-        guard let url = SkillsConfigStore.defaultURL else { return }
+        guard let url = configURL else { return }
         if FileManager.default.fileExists(atPath: url.path) {
             NSWorkspace.shared.activateFileViewerSelecting([url])
         } else {
@@ -418,7 +503,7 @@ public final class SkillsRegistry: ObservableObject {
 
     private func startConfigWatcher() {
         configWatcher?.stop()
-        guard let url = SkillsConfigStore.defaultURL else { return }
+        guard let url = configURL else { return }
         let watcher = SkillPathWatcher(path: url.path) { [weak self] in
             guard let self else { return }
             self.reloadAfterExternalChange()
@@ -452,9 +537,71 @@ public final class SkillsRegistry: ObservableObject {
         }
     }
 
+    /// Watches each manifest, not just its folder. A root directory's watcher
+    /// fires when an entry is added or removed; editing `description:` or
+    /// `always:` inside an EXISTING SKILL.md changes no parent metadata, so
+    /// that edit was invisible until the next launch. The body needs no
+    /// watcher: `skill_load` re-reads the file every call.
+    private func restartManifestWatchers(skills: [Skill]) {
+        var wanted: [String: URL] = [:]
+        for skill in skills {
+            let url = skill.skillFile
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            wanted[url.path] = url
+        }
+        for (path, watcher) in manifestWatchers where wanted[path] == nil {
+            watcher.stop()
+            manifestWatchers.removeValue(forKey: path)
+        }
+        for (path, _) in wanted where manifestWatchers[path] == nil {
+            let watcher = SkillPathWatcher(path: path) { [weak self] in
+                guard let self else { return }
+                self.reloadAfterExternalChange()
+                // An atomic save (or an editor's write-and-rename) replaces
+                // the inode, so re-arm on the new file exactly as the config
+                // watcher does.
+                self.restartManifestWatchers(skills: self.allSkills)
+            }
+            if watcher.start() {
+                manifestWatchers[path] = watcher
+            }
+        }
+    }
+
     // MARK: Testing seams
 
     #if DEBUG
+    /// Replaces the real `skills.json` location and root list so a test can
+    /// exercise reload/watchers without touching the developer's home folder.
+    var configURLForTesting: URL?
+    var rootOverrideForTesting: [SkillRoot]?
+    /// Overrides the engine/agent "a turn is running" answer so deferral is
+    /// testable with no model and no server.
+    var busyOverrideForTesting: Bool?
+    /// Counts prefix invalidations, i.e. the "the rendered block changed"
+    /// decision, without touching KV state.
+    public private(set) var prefixInvalidationCount = 0
+    public var isReloadPendingForTesting: Bool { pendingReload }
+    public var manifestWatcherCountForTesting: Int { manifestWatchers.count }
+
+    public func setTestingOverrides(configURL: URL?, roots: [SkillRoot]?) {
+        configURLForTesting = configURL
+        rootOverrideForTesting = roots
+    }
+
+    public func setBusyOverrideForTesting(_ busy: Bool?) {
+        busyOverrideForTesting = busy
+    }
+
+    /// Applies a deferred reload now instead of after the poll interval.
+    public func flushDeferredReloadForTesting() {
+        deferredTask?.cancel()
+        deferredTask = nil
+        guard pendingReload else { return }
+        pendingReload = false
+        reload(reason: "external edit")
+    }
+
     /// Installs a registry state without touching the user's real folders.
     /// Registry watchers are not started, so a test cannot trip over the
     /// developer's `~/.claude/skills` mid-run.
@@ -462,6 +609,7 @@ public final class SkillsRegistry: ObservableObject {
         hasBootstrapped = true
         self.config = config
         self.allSkills = skills
+        self.shadows = []
         self.scannedRoots = []
         self.issues = SkillsConfigValidator.validate(config)
         self.lastError = nil
@@ -473,11 +621,26 @@ public final class SkillsRegistry: ObservableObject {
         hasBootstrapped = false
         config = SkillsConfig()
         allSkills = []
+        shadows = []
         issues = []
         scannedRoots = []
         lastError = nil
         lastReloadSummary = nil
         lastRenderedSection = nil
+        generation = 0
+        pendingReload = false
+        deferredTask?.cancel()
+        deferredTask = nil
+        configURLForTesting = nil
+        rootOverrideForTesting = nil
+        busyOverrideForTesting = nil
+        prefixInvalidationCount = 0
+        for (_, watcher) in rootWatchers { watcher.stop() }
+        rootWatchers.removeAll()
+        for (_, watcher) in manifestWatchers { watcher.stop() }
+        manifestWatchers.removeAll()
+        configWatcher?.stop()
+        configWatcher = nil
     }
     #endif
 }

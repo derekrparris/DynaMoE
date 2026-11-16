@@ -5024,10 +5024,9 @@ struct ToolCallCardView: View {
             }
             return "Installed skills"
         case "subq_decide":
-            if let questions = call.arguments["questions"] as? String {
-                return questions
-            }
-            return "Decision"
+            let names = SubQDecideTool.questionNames(from: call.arguments["questions"])
+            guard let first = names.first else { return "Decision" }
+            return names.count == 1 ? first : "\(first) +\(names.count - 1)"
         case "spawn_subagent":
             let role = call.arguments["role"] ?? "Subagent"
             let task = call.arguments["task_description"] ?? ""

@@ -25,6 +25,7 @@ struct SkillsSettingsSection: View {
     @State private var keyError: String?
     @State private var testState: SubQTestState = .idle
     @State private var keyRefresh = 0
+    @State private var confirmRemoveKey = false
     // Read once per appearance / mutation instead of in the view body: these
     // are Keychain attribute queries, and a body evaluation runs on every
     // keystroke in the SecureField.
@@ -54,6 +55,12 @@ struct SkillsSettingsSection: View {
         .sheet(item: $previewSkill) { skill in
             SkillsPreviewSheet(skill: skill)
         }
+        .alert("Remove the SubQ API key?", isPresented: $confirmRemoveKey) {
+            Button("Remove", role: .destructive) { removeKey() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("subq_decide will stop working until a key is stored here again or a SubQ Cloud Provider provides one.")
+        }
         .onAppear { refreshKeyStatus() }
     }
 
@@ -61,6 +68,10 @@ struct SkillsSettingsSection: View {
         keyConfigured = SubQDecisionKeySource.hasAnyKey()
         skillKeyStored = SkillsSecretStore.exists(account: SubQDecisionKeySource.account)
         keyDescription = SubQDecisionKeySource.describeWithoutPrompt()
+        // The key can become resolvable without a relaunch (a Cloud Provider
+        // added for api.subq.ai, or an import from the legacy keychain), so
+        // re-arm the tool whenever this card reads the state.
+        AgentHarness.shared.syncSubQDecideAvailability()
     }
 
     // MARK: Master card
@@ -120,7 +131,7 @@ struct SkillsSettingsSection: View {
                     .buttonStyle(.bordered)
 
                     Button {
-                        registry.reload(reason: "manual reload")
+                        registry.requestReload()
                     } label: {
                         Label("Reload", systemImage: "arrow.clockwise")
                             .font(.system(size: 11, weight: .medium))
@@ -409,7 +420,7 @@ struct SkillsSettingsSection: View {
                     .disabled(keyDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
                     Button {
-                        removeKey()
+                        confirmRemoveKey = true
                     } label: {
                         Label("Remove", systemImage: "trash")
                             .font(.system(size: 11, weight: .medium))
@@ -464,6 +475,13 @@ struct SkillsSettingsSection: View {
                 TextField(SubQDecisionSettings.defaultEndpoint, text: $endpoint)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 10.5, design: .monospaced))
+            }
+
+            if let warning = SubQDecisionSettings.customEndpointWarning() {
+                Text(warning)
+                    .font(.system(size: 10.5))
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             HStack(spacing: 10) {
@@ -540,15 +558,21 @@ struct SkillsSettingsSection: View {
     private func installStarter() {
         switch registry.installSubQDecisionsStarter() {
         case .success(let url):
-            var message = "Installed at \(url.deletingLastPathComponent().path)."
-            // The app folder is the LOWEST-precedence root on purpose (a
-            // personal copy wins), so an existing skill of the same name in
-            // ~/.agents or ~/.claude silently takes over. Say so with the path
-            // to remove instead of letting the button look like it did nothing.
-            if let shadow = registry.issues.first(where: {
-                $0.skillName == StarterSkills.subqDecisionsName && $0.message.contains("shadowed by")
+            let installedDirectory = url.deletingLastPathComponent().standardizedFileURL.path
+            var message = "Installed at \(installedDirectory)."
+            // The app folder is scanned LAST among the built-in roots, so an
+            // installed starter wins an older ~/.agents or ~/.claude copy. Only
+            // an extraRoot scans after it, and that is the single case where the
+            // copy just installed is the shadowed one. Say which path matters
+            // instead of guessing from a message.
+            if let shadow = registry.shadows.first(where: {
+                $0.winner.directory.standardizedFileURL.path == installedDirectory
             }) {
-                message += " " + shadow.displayMessage + " Remove or rename that copy to use this one."
+                message += " The copy at \(shadow.loser.directory.path) is shadowed by this one and will not be used."
+            } else if let shadow = registry.shadows.first(where: {
+                $0.loser.directory.standardizedFileURL.path == installedDirectory
+            }) {
+                message += " A copy at \(shadow.winner.directory.path) is scanned later (an extraRoot) and shadows this one. Remove or rename that copy to use this one."
             }
             installMessage = message
         case .failure(let error):
@@ -577,11 +601,11 @@ struct SkillsPreviewSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     private var content: String {
-        guard let data = try? Data(contentsOf: skill.skillFile),
-              let text = String(data: data, encoding: .utf8) else {
-            return "Could not read \(skill.skillFile.path)"
+        do {
+            return try SkillDiscovery.readText(skill.skillFile)
+        } catch {
+            return "Could not read \(skill.skillFile.path): \(error.localizedDescription)"
         }
-        return text
     }
 
     var body: some View {

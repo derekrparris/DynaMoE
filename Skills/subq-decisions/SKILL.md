@@ -1,6 +1,6 @@
 ---
 name: subq-decisions
-description: "Use when a judgment reduces to a structured question — a yes/no gate, routing or queueing, triage, classification, a guardrail check, or ordered scoring — using SubQ's decisions-only model (subq-snap-preview) through the subq_decide tool. Also use when the task mentions 'subq', 'subquadratic', 'snap', or wants many cheap judgments over a batch of items. Do NOT use for open-ended analysis, drafting, summarizing, or field extraction — those need a chat model."
+description: "Use when a judgment reduces to a structured question (a yes/no gate, routing, triage, classification, a guardrail, or ordered scoring) through the subq_decide tool, SubQ's decisions-only model. Also for 'subq', 'snap', or many cheap batch judgments. Not for drafting, summarizing or extraction."
 always: true
 user-invocable: true
 metadata:

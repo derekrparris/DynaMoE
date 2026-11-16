@@ -33,6 +33,7 @@ public nonisolated enum SkillParseError: LocalizedError, Equatable {
     case malformedLine(line: Int, text: String)
     case missingName
     case missingDescription
+    case unreadable(String)
 
     public var errorDescription: String? {
         switch self {
@@ -46,6 +47,8 @@ public nonisolated enum SkillParseError: LocalizedError, Equatable {
             return "SKILL.md frontmatter has no 'name'. The name must match the skill's folder name."
         case .missingDescription:
             return "SKILL.md frontmatter has no 'description'. The description is what tells the model when to load the skill."
+        case .unreadable(let detail):
+            return detail
         }
     }
 }
@@ -62,9 +65,14 @@ public nonisolated struct SkillFrontmatter: Equatable, Sendable {
     /// subq-decisions"), maintained by the skill rather than by a system
     /// prompt per model profile.
     public var always: Bool
-    /// Accepted for parity with other Agent Skills hosts. Reserved for the
-    /// `/skill <name>` composer command; nothing reads it yet.
+    /// Accepted for parity with other Agent Skills hosts. Reserved for a future
+    /// user-invocation command; no composer command reads it yet.
     public var userInvocable: Bool
+    /// `disable-model-invocation: true` is an author saying the model must NOT
+    /// pick this skill up on its own. This build's only invocation surface is
+    /// the model's, so such a skill is not advertised and `skill_load` refuses
+    /// it — the opposite of silently auto-invoking it.
+    public var modelInvocable: Bool
     public var compatibility: String?
     public var license: String?
     public var metadata: [String: String]
@@ -78,6 +86,7 @@ public nonisolated struct SkillFrontmatter: Equatable, Sendable {
         description: String,
         always: Bool = false,
         userInvocable: Bool = false,
+        modelInvocable: Bool = true,
         compatibility: String? = nil,
         license: String? = nil,
         metadata: [String: String] = [:],
@@ -87,6 +96,7 @@ public nonisolated struct SkillFrontmatter: Equatable, Sendable {
         self.description = description
         self.always = always
         self.userInvocable = userInvocable
+        self.modelInvocable = modelInvocable
         self.compatibility = compatibility
         self.license = license
         self.metadata = metadata
@@ -105,7 +115,7 @@ public nonisolated enum SkillFrontmatterParser {
 
     private static let knownKeys: Set<String> = [
         "name", "description", "always", "always-on", "user-invocable",
-        "license", "compatibility", "metadata"
+        "disable-model-invocation", "license", "compatibility", "metadata"
     ]
 
     public static func parse(_ text: String) throws -> Document {
@@ -139,12 +149,16 @@ public nonisolated enum SkillFrontmatterParser {
 
         let alwaysValue = fields.scalars["always"] ?? fields.scalars["always-on"]
         let userInvocable = decodeBoolean(fields.scalars["user-invocable"]) ?? false
+        // Absent means the model MAY invoke it; only an explicit truthy value
+        // opts out.
+        let modelInvocable = !(decodeBoolean(fields.scalars["disable-model-invocation"]) ?? false)
 
         let frontmatter = SkillFrontmatter(
             name: name,
             description: description,
             always: decodeBoolean(alwaysValue) ?? false,
             userInvocable: userInvocable,
+            modelInvocable: modelInvocable,
             compatibility: fields.scalars["compatibility"].flatMap { $0.isEmpty ? nil : $0 },
             license: fields.scalars["license"].flatMap { $0.isEmpty ? nil : $0 },
             metadata: fields.metadata,
@@ -413,13 +427,23 @@ public nonisolated enum SkillValidation {
     /// which refuses to load the skill at all.
     public static func warnings(for frontmatter: SkillFrontmatter) -> [String] {
         var warnings: [String] = []
+        if frontmatter.description.count > advertisedDescriptionLength {
+            warnings.append(
+                "description is \(frontmatter.description.count) characters; the prompt clips it to \(advertisedDescriptionLength), so a trailing trigger may never reach the model."
+            )
+        }
         if frontmatter.description.count > maximumDescriptionLength {
             warnings.append(
-                "description is \(frontmatter.description.count) characters; the advertised copy is clipped to \(advertisedDescriptionLength) and other hosts may reject it past \(maximumDescriptionLength)."
+                "other Agent Skills hosts may reject a description past \(maximumDescriptionLength) characters."
             )
         }
         if let compatibility = frontmatter.compatibility, compatibility.count > maximumCompatibilityLength {
             warnings.append("compatibility is longer than \(maximumCompatibilityLength) characters and is ignored.")
+        }
+        if !frontmatter.modelInvocable {
+            warnings.append(
+                "disable-model-invocation is true. This build has no user-invocation command, so the skill is not advertised and skill_load refuses it; remove the field to let the model use it."
+            )
         }
         for key in frontmatter.unknownKeys {
             warnings.append("unknown frontmatter field '\(key)' is ignored — it does not take effect in DynaMoE.")
@@ -472,6 +496,21 @@ public nonisolated struct SkillIssue: Identifiable, Equatable, Sendable {
 
 // MARK: - Skill
 
+/// One name collision between two scanned roots. Published separately from the
+/// human-readable issue so a caller (the starter installer, in particular) can
+/// tell which copy won instead of parsing a message.
+public nonisolated struct SkillShadow: Identifiable, Equatable, Sendable {
+    public let loser: Skill
+    public let winner: Skill
+
+    public var id: String { "\(loser.id)|\(loser.directory.path)|\(winner.directory.path)" }
+
+    public init(loser: Skill, winner: Skill) {
+        self.loser = loser
+        self.winner = winner
+    }
+}
+
 /// One installed skill. Metadata only: the body is re-read from disk on every
 /// `skill_load`, so editing a SKILL.md takes effect without a rescan.
 public nonisolated struct Skill: Identifiable, Equatable, Sendable {
@@ -481,14 +520,21 @@ public nonisolated struct Skill: Identifiable, Equatable, Sendable {
     public let description: String
     public let always: Bool
     public let userInvocable: Bool
+    /// False when the frontmatter says `disable-model-invocation: true`.
+    public let modelInvocable: Bool
     public let directory: URL
     public let rootLabel: String
     /// Precedence order of the root it came from; a later root wins a name
     /// collision, which is how a personal override shadows a checked-in copy.
     public let rootIndex: Int
+    /// The manifest the scanner actually read. Discovery is case-insensitive,
+    /// so a checkout whose file is `skill.md` must be loadable too; falling
+    /// back to a hardcoded `SKILL.md` would list it and then fail on a
+    /// case-sensitive volume.
+    public let manifestURL: URL?
 
     public var skillFile: URL {
-        directory.appendingPathComponent("SKILL.md", isDirectory: false)
+        manifestURL ?? directory.appendingPathComponent(SkillDiscovery.skillFileName, isDirectory: false)
     }
 
     public init(
@@ -498,16 +544,20 @@ public nonisolated struct Skill: Identifiable, Equatable, Sendable {
         userInvocable: Bool,
         directory: URL,
         rootLabel: String,
-        rootIndex: Int
+        rootIndex: Int,
+        modelInvocable: Bool = true,
+        manifestURL: URL? = nil
     ) {
         self.name = name
         self.id = SkillValidation.normalizedName(name)
         self.description = description
         self.always = always
         self.userInvocable = userInvocable
+        self.modelInvocable = modelInvocable
         self.directory = directory
         self.rootLabel = rootLabel
         self.rootIndex = rootIndex
+        self.manifestURL = manifestURL
     }
 }
 
@@ -616,7 +666,9 @@ public nonisolated enum SkillDiscovery {
                         userInvocable: document.frontmatter.userInvocable,
                         directory: realDirectory,
                         rootLabel: root.label,
-                        rootIndex: rootIndex
+                        rootIndex: rootIndex,
+                        modelInvocable: document.frontmatter.modelInvocable,
+                        manifestURL: skillFile.resolvingSymlinksInPath()
                     )
                     if let previous = winners[skill.id] {
                         result.shadowed.append((skill: previous, winner: skill))
@@ -656,11 +708,43 @@ public nonisolated enum SkillDiscovery {
         return entries.first { $0.lastPathComponent.lowercased() == skillFileName.lowercased() }
     }
 
+    /// A manifest is a hand-written text file. The cap is generous enough for
+    /// any real SKILL.md and small enough that a symlink to a large file (or a
+    /// FIFO) cannot hang or exhaust the app: this read runs on the MainActor,
+    /// once per skill, at launch and on every watcher event.
+    public static let maximumManifestBytes = 512 * 1024
+
     static func readText(_ url: URL) throws -> String {
-        let data = try Data(contentsOf: url)
+        let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard values?.isRegularFile != false else {
+            throw SkillParseError.unreadable("\(url.path) is not a regular file")
+        }
+        if let size = values?.fileSize, size > maximumManifestBytes {
+            throw SkillParseError.unreadable(
+                "\(url.path) is \(size) bytes; a SKILL.md may be at most \(maximumManifestBytes)."
+            )
+        }
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forReadingFrom: url)
+        } catch {
+            throw SkillParseError.unreadable("\(url.path) could not be opened: \(error.localizedDescription)")
+        }
+        defer { try? handle.close() }
+        let data: Data
+        do {
+            data = try handle.read(upToCount: maximumManifestBytes + 1) ?? Data()
+        } catch {
+            throw SkillParseError.unreadable("\(url.path) could not be read: \(error.localizedDescription)")
+        }
+        guard data.count <= maximumManifestBytes else {
+            throw SkillParseError.unreadable(
+                "\(url.path) is larger than \(maximumManifestBytes) bytes; a SKILL.md must be a short procedure."
+            )
+        }
         if let text = String(data: data, encoding: .utf8) { return text }
         if let text = String(data: data, encoding: .isoLatin1) { return text }
-        throw SkillParseError.malformedLine(line: 0, text: "file is not UTF-8 or Latin-1 text")
+        throw SkillParseError.unreadable("\(url.path) is not UTF-8 or Latin-1 text")
     }
 }
 
@@ -718,6 +802,23 @@ public nonisolated struct SkillsConfig: Codable, Equatable, Sendable {
     public func isEnabled(_ skill: Skill) -> Bool {
         let disabled = Set(disabledSkills.map(SkillValidation.normalizedName))
         return !disabled.contains(skill.id)
+    }
+
+    /// The documented bounds are ranges, not suggestions. A hand-edited file
+    /// with `advertisedCharacters: 0` used to render a section that ignored
+    /// the setting; validation reports the problem, and this makes the running
+    /// config obey the same bounds either way.
+    public func clamped() -> SkillsConfig {
+        var copy = self
+        copy.maxAdvertised = min(
+            max(maxAdvertised, 1),
+            SkillsConfigValidator.maximumAdvertised
+        )
+        copy.advertisedCharacters = min(
+            max(advertisedCharacters, 500),
+            SkillsConfigValidator.maximumAdvertisedCharacters
+        )
+        return copy
     }
 }
 
@@ -903,6 +1004,17 @@ public nonisolated enum SkillsConfigValidator {
                 continue
             }
             let expanded = (trimmed as NSString).expandingTildeInPath
+            guard expanded.hasPrefix("/") else {
+                // URL(fileURLWithPath:) resolves a relative path against the
+                // process's working directory, which for the app is `/`. That
+                // is never what a person means by `my-project/.agents/skills`.
+                issues.append(SkillIssue(
+                    severity: .warning,
+                    path: expanded,
+                    message: "This root is not an absolute path and is ignored. Use / or ~/…; relative paths are not resolved against a working directory."
+                ))
+                continue
+            }
             let standardized = URL(fileURLWithPath: expanded, isDirectory: true).standardizedFileURL.path
             if !seen.insert(standardized).inserted {
                 issues.append(SkillIssue(
@@ -959,22 +1071,39 @@ public nonisolated enum SkillsPromptRenderer {
         )
 
         // The header is paid too, so it comes out of the configured budget.
-        var budget = max(300, advertisedCharacters - lines.reduce(0) { $0 + $1.count + 1 })
+        // A floor would silently spend more than the operator allowed, which is
+        // why there is none: the validator clamps the value into a range where
+        // the header still leaves room for at least a clipped line.
+        var budget = max(0, advertisedCharacters - lines.reduce(0) { $0 + $1.count + 1 })
         var listed = 0
+        var omitted = 0
 
         if !alwaysOn.isEmpty {
-            lines.append("")
-            lines.append("## Always invoke")
-            lines.append("")
+            var alwaysLines: [String] = []
             for skill in alwaysOn {
                 let line = entry(skill)
-                lines.append(line)
-                budget -= line.count + 1
+                if budget - (line.count + 1) >= 0 {
+                    alwaysLines.append(line)
+                    budget -= line.count + 1
+                } else if budget >= 120 {
+                    // Keep the rule the author asked for rather than dropping
+                    // it, but clip the part that does not fit.
+                    let clipped = entry(skill, descriptionLimit: max(40, budget - 40))
+                    alwaysLines.append(clipped)
+                    budget -= clipped.count + 1
+                } else {
+                    omitted += 1
+                }
+            }
+            if !alwaysLines.isEmpty {
+                lines.append("")
+                lines.append("## Always invoke")
+                lines.append("")
+                lines.append(contentsOf: alwaysLines)
             }
         }
 
         var availableLines: [String] = []
-        var omitted = 0
         for skill in remaining {
             if listed >= max(1, maxAdvertised) {
                 omitted += 1
@@ -1022,6 +1151,12 @@ public nonisolated enum SkillsPromptRenderer {
         if description.count > descriptionLimit {
             description = String(description.prefix(max(0, descriptionLimit - 1))).trimmingCharacters(in: .whitespaces) + "…"
         }
-        return "- \(skill.name): \(description)"
+        // A description is pasted into the system block, so a chat-template
+        // marker in it would close the system turn and forge another. The
+        // name is validated, but it goes through the same pass because a
+        // future rule change must not reopen the hole.
+        let name = PromptMarkers.sanitizeControlMarkers(skill.name)
+        let safeDescription = PromptMarkers.sanitizeControlMarkers(description)
+        return "- \(name): \(safeDescription)"
     }
 }

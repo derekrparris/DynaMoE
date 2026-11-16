@@ -3526,6 +3526,10 @@ public final class AgentHarness {
 
         // Seed the fundamental core set into the active prompt/grammar.
         for name in Self.coreLoadedToolNames where tools[name] != nil {
+            // The skills tool is core only while the feature is on. When the
+            // harness is created AFTER `SkillsRegistry.bootstrap`, this reads
+            // the persisted switch; a later toggle is applied by `reload`.
+            if name == "skill_load", !SkillsRegistry.shared.config.enabled { continue }
             loadedTools[name] = tools[name]
         }
         // The decisions tool is seeded only when a key resolves. Without one
@@ -3670,6 +3674,9 @@ public final class AgentHarness {
         loadedTools.removeAll()
         armedByPlanMode.removeAll()
         for name in Self.coreLoadedToolNames where tools[name] != nil {
+            // `skill_load` is core only while the feature is on: its schema is
+            // paid on every turn, and a disabled feature should not be billed.
+            if name == "skill_load", !SkillsRegistry.shared.config.enabled { continue }
             loadedTools[name] = tools[name]
         }
         // Mirrors `registerDefaultTools`: a configured decisions key keeps
@@ -3677,6 +3684,39 @@ public final class AgentHarness {
         // call it without a discovery step first.
         if SubQDecisionKeySource.hasAnyKey(), let decision = tools["subq_decide"] {
             loadedTools["subq_decide"] = decision
+        }
+        syncGrammar()
+    }
+
+    /// Loads or unloads `skill_load` to match the Skills master switch. Called
+    /// by the registry after a reload, so turning skills off also stops paying
+    /// for the tool schema on every turn.
+    public func applySkillsAvailability(enabled: Bool) {
+        guard let tool = tools["skill_load"] else { return }
+        if enabled {
+            guard loadedTools["skill_load"] == nil else { return }
+            loadedTools["skill_load"] = tool
+        } else {
+            guard loadedTools.removeValue(forKey: "skill_load") != nil else { return }
+        }
+        syncGrammar()
+    }
+
+    /// Arms `subq_decide` when a key resolves, and withdraws it when none does.
+    ///
+    /// Registration seeds it once at launch, which left the documented
+    /// Cloud-Provider path needing a relaunch: adding a provider for
+    /// `api.subq.ai` (or importing a key from the legacy keychain) made the key
+    /// resolvable while the tool stayed unloaded. Settings and the cloud
+    /// provider store call this after a mutation; the check is attribute-only,
+    /// so it never raises a Keychain dialog.
+    public func syncSubQDecideAvailability() {
+        guard let tool = tools["subq_decide"] else { return }
+        if SubQDecisionKeySource.hasAnyKey() {
+            guard loadedTools["subq_decide"] == nil else { return }
+            loadedTools["subq_decide"] = tool
+        } else {
+            guard loadedTools.removeValue(forKey: "subq_decide") != nil else { return }
         }
         syncGrammar()
     }
@@ -5359,13 +5399,10 @@ public final class AgentHarness {
     }()
 
     public static func sanitizeText(_ text: String) -> String {
-        var s = text
-        s = s.replacingOccurrences(of: "<|im_start|>", with: "[im_start]")
-        s = s.replacingOccurrences(of: "<|im_end|>", with: "[im_end]")
-        s = s.replacingOccurrences(of: "<tool_call>", with: "[tool_call]")
-        s = s.replacingOccurrences(of: "</tool_call>", with: "[/tool_call]")
-        s = s.replacingOccurrences(of: "<tool_response>", with: "[tool_response]")
-        s = s.replacingOccurrences(of: "</tool_response>", with: "[/tool_response]")
+        // Every family's control markers, not just ChatML: a tool result or a
+        // skill description carrying `<|turn>` or a fullwidth role marker
+        // forges a boundary just as well.
+        var s = PromptMarkers.sanitizeControlMarkers(text)
         // Scrub inline base64 (data URIs first, then any remaining standalone run)
         // so binary payloads become compact placeholders instead of garbling context.
         if let re = Self.inlineBase64Regex {

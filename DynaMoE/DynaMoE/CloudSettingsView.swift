@@ -808,6 +808,9 @@ struct CloudProvidersSettingsView: View {
             // Models only surface once a credential exists; re-scan so a key
             // saved after a sync makes the composer's list appear immediately.
             LocalModelManager.shared.scanLocalModels()
+            // A key for api.subq.ai also unlocks subq_decide; arm it now rather
+            // than requiring a relaunch.
+            AgentHarness.shared.syncSubQDecideAvailability()
         } catch {
             testStates[provider.id] = .failure(error.localizedDescription)
         }
@@ -820,6 +823,7 @@ struct CloudProvidersSettingsView: View {
         testStates[provider.id] = .untested
         // Drop this provider's entries from the composer immediately.
         LocalModelManager.shared.scanLocalModels()
+        AgentHarness.shared.syncSubQDecideAvailability()
     }
 
     /// Validates the key and registers the provider's live model catalog in

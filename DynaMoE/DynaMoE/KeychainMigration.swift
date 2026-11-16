@@ -156,7 +156,9 @@ public nonisolated enum KeychainImportOutcome: Sendable, Equatable {
 
 public nonisolated enum KeychainMigration {
     public static var services: [String] {
-        [MCPSecretStore.defaultService, CloudSecretStore.defaultService]
+        // Skills credentials are read by `subq_decide`, so a key written by an
+        // older build needs the same one-time import the other two services get.
+        [MCPSecretStore.defaultService, CloudSecretStore.defaultService, SkillsSecretStore.defaultService]
     }
 
     /// Credentials still sitting in the legacy keychain. Attribute-only queries,

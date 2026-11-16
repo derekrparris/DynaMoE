@@ -176,10 +176,10 @@ flowchart TD
 
 ### 6. Skills & Decision Models
 * **Agent Skills, Loaded on Demand**: A skill is a folder with a `SKILL.md`. The system prompt advertises only its name and a one-line description; the model reads the procedure with the `skill_load` tool (and any `scripts/`, `reference/` or `assets/` files beside it) when the description matches. An unused skill costs a line of prompt instead of its whole body.
-* **Shared Folders, Personal Overrides**: Skills are discovered in `~/Library/Application Support/DynaMoE/skills`, `~/.agents/skills` and `~/.claude/skills`, plus any `extraRoots` in `skills.json`. A later folder wins a name collision, so an installed starter or a project folder overrides a shared copy; a shadowed skill is reported with the path to remove rather than silently dropped.
+* **Shared Folders, Personal Overrides**: Skills are discovered in `~/.agents/skills`, `~/.claude/skills` and `~/Library/Application Support/DynaMoE/skills` (in that order), plus any `extraRoots` in `skills.json`. A later folder wins a name collision, so an installed starter or a project folder overrides a shared copy; a shadowed skill is reported with the path to remove rather than silently dropped.
 * **Always-On Rules**: `always: true` renders a "route this kind of work through me" rule into every prompt, which is how a judgment skill like `subq-decisions` becomes the default without editing each model profile's system prompt.
-* **SubQ Decisions as a Native Tool**: `subq_decide` calls SubQ's decisions-only `subq-snap-preview` model (`POST /v1/systemone`) for yes/no gates, routing, triage, classification and ordered scoring, returning probabilities and confidence. The key lives in the Keychain (or is reused from a SubQ Cloud Provider) and never enters a prompt, a log line, or the model's shell environment.
-* **Design Work with `impeccable`**: Because skills are shell-backed, a design skill's own tooling (an audit detector, a context loader) runs through `shell_run` with the same curated PATH and approval rules as any other command.
+* **SubQ Decisions as a Native Tool**: `subq_decide` calls SubQ's decisions-only `subq-snap-preview` model (`POST /v1/systemone`) for yes/no gates, routing, triage, classification and ordered scoring, returning probabilities and confidence. The key lives in the Keychain (or is reused from a SubQ Cloud Provider), never enters a prompt or a log line, and `SUBQ_API_KEY` is stripped from every process `shell_run` spawns.
+* **Design Skills Are Shell-Backed, Not Bundled**: a design skill you install yourself (for example the external `impeccable` skill) runs its own tooling (an audit detector, a context loader) through `shell_run` with the same curated PATH and approval rules as any other command.
 
 ---
 

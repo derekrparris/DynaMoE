@@ -231,6 +231,10 @@ final class CloudProviderStore: ObservableObject {
     private func publish() {
         if updatesSharedRuntime {
             CloudProviderRuntime.shared.refresh(defaults: defaults)
+            // A provider for api.subq.ai is one of the two ways `subq_decide`
+            // gets a key, so a new or removed one must arm or withdraw the tool
+            // without waiting for a relaunch. Attribute-only, so no dialog.
+            AgentHarness.shared.syncSubQDecideAvailability()
         }
         publish(providers: CloudProviderCatalog.all(defaults: defaults))
         if rescansModels {

@@ -8,10 +8,10 @@
 //  (`subq-snap-preview`). It is NOT a chat model — it answers typed questions
 //  about a `state` over `POST https://api.subq.ai/v1/systemone` — so it cannot
 //  be registered as a Cloud Provider model. `subq_decide` is the native tool
-//  that stands in for the Python helper a shell-based agent would run, which
-//  also keeps the API key out of the model's reach: DynaMoE's `shell_run` does
-//  not inherit the user's shell environment, and a secret in a process
-//  environment is a secret the model can print.
+//  that stands in for the Python helper a shell-based agent would run, and the
+//  key never enters a prompt or a log line. `ControlledProcessRunner` strips
+//  `SUBQ_API_KEY` from every spawned tool process, because the environment
+//  fallback below is live exactly when `shell_run` could otherwise print it.
 //
 //  The wire contract is documented in the companion skill. This file owns the
 //  request shape, the three answer types, the error mapping, and the key
@@ -90,7 +90,24 @@ public nonisolated enum SubQDecisionSettings {
 
     public static func endpoint(defaults: UserDefaults = .standard) -> URL {
         let raw = (defaults.string(forKey: endpointKey) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        return URL(string: raw.isEmpty ? defaultEndpoint : raw) ?? URL(string: defaultEndpoint)!
+        let fallback = URL(string: defaultEndpoint)!
+        guard !raw.isEmpty, let url = URL(string: raw),
+              let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http",
+              let host = url.host, !host.isEmpty else {
+            return fallback
+        }
+        return url
+    }
+
+    /// Non-nil when the configured endpoint is not SubQ's own host. The request
+    /// carries the API key as a Bearer token, so a custom URL sends that secret
+    /// wherever it points; the Settings card shows this before a test does.
+    public static func customEndpointWarning(defaults: UserDefaults = .standard) -> String? {
+        let configured = endpoint(defaults: defaults)
+        let officialHost = URL(string: defaultEndpoint)?.host?.lowercased()
+        guard configured.host?.lowercased() != officialHost else { return nil }
+        let destination = configured.host ?? configured.absoluteString
+        return "This endpoint is not api.subq.ai. The API key is sent as a Bearer token to \(destination); use a custom endpoint only with a server you trust."
     }
 
     public static func model(defaults: UserDefaults = .standard) -> String {
@@ -141,13 +158,31 @@ public nonisolated enum SubQDecisionKeySource {
 
     /// Attributes only where possible, so this is safe on the prompt-seeding
     /// path: no query here can raise a Keychain dialog.
+    ///
+    /// It answers the SAME question `resolve` does: a credential the build
+    /// actually reads. `exists` covers both keychains, so a legacy-only item
+    /// would report "Ready" while every call failed with a missing key until
+    /// the Stored Credentials import ran.
     public static func hasAnyKey(defaults: UserDefaults = .standard) -> Bool {
-        for provider in matchingProviders(defaults: defaults) where CloudSecretStore.shared.exists(providerId: provider.id) {
+        for provider in matchingProviders(defaults: defaults) where CloudSecretStore.shared.hasCurrentCredential(providerId: provider.id) {
             return true
         }
-        if SkillsSecretStore.shared.exists(account: account) { return true }
+        if SkillsSecretStore.shared.hasCurrentCredential(account: account) { return true }
         if let key = ProcessInfo.processInfo.environment[environmentName], !key.isEmpty { return true }
         return false
+    }
+
+    /// True when a key exists only in the keychain an earlier version wrote.
+    /// The Settings card uses it to point at the Stored Credentials import
+    /// rather than saying "No Key" about a key that is sitting right there.
+    public static func legacyKeyPending(defaults: UserDefaults = .standard) -> Bool {
+        for provider in matchingProviders(defaults: defaults)
+        where CloudSecretStore.shared.exists(providerId: provider.id)
+            && !CloudSecretStore.shared.hasCurrentCredential(providerId: provider.id) {
+            return true
+        }
+        return SkillsSecretStore.shared.exists(account: account)
+            && !SkillsSecretStore.shared.hasCurrentCredential(account: account)
     }
 
     /// Same answer as `resolve`, without reading a secret. The Settings card
@@ -155,14 +190,17 @@ public nonisolated enum SubQDecisionKeySource {
     /// call that can prompt for access on the legacy backend.
     public static func describeWithoutPrompt(defaults: UserDefaults = .standard) -> String {
         let providers = matchingProviders(defaults: defaults)
-        if let provider = providers.first(where: { CloudSecretStore.shared.exists(providerId: $0.id) }) {
+        if let provider = providers.first(where: { CloudSecretStore.shared.hasCurrentCredential(providerId: $0.id) }) {
             return "Using the key stored for Cloud Provider '\(provider.displayName)'."
         }
-        if SkillsSecretStore.shared.exists(account: account) {
+        if SkillsSecretStore.shared.hasCurrentCredential(account: account) {
             return "Using the key stored in this card."
         }
         if let key = ProcessInfo.processInfo.environment[environmentName], !key.isEmpty {
             return "Using \(environmentName) from the app environment."
+        }
+        if legacyKeyPending(defaults: defaults) {
+            return "A SubQ key is stored in the legacy keychain. Import it from Settings → Stored Credentials; this build cannot read it until then."
         }
         if let provider = providers.first {
             return "Cloud Provider '\(provider.displayName)' exists but has no stored key."
@@ -236,7 +274,12 @@ extension SubQDecisionAnswer: Decodable {
         let type = (try? container.decode(String.self, forKey: .type)) ?? ""
         switch type {
         case "noul":
-            let probability = (try? container.decode(Double.self, forKey: .noul)) ?? 0
+            // A gate whose whole output is one number must not invent it: a
+            // missing/renamed/string field used to decode as 0.0, i.e. the
+            // strongest possible "no", and report `status: success`. Schema
+            // drift throws so the tool refuses instead of answering a
+            // distribution the API never produced.
+            let probability = try container.decode(Double.self, forKey: .noul)
             self = .noul(probability: probability)
         case "choice":
             self = .choice(
@@ -289,15 +332,41 @@ public nonisolated struct SubQImage: Sendable {
     public static let maximumImages = 4
 
     /// Loads one image from disk, refusing anything the API would reject:
-    /// over 4 MiB decoded, or a format it does not accept.
-    public static func load(path: String) throws -> SubQImage {
+    /// over 4 MiB decoded, a format it does not accept, or anything that is
+    /// not a regular file.
+    ///
+    /// `workingDirectory` confines the read. This is the one native tool that
+    /// both opens a local file and POSTs it to a third party, so a path outside
+    /// the turn's workspace is refused rather than uploaded — `web_fetch` has
+    /// no equivalent capability.
+    public static func load(path: String, workingDirectory: URL? = nil) throws -> SubQImage {
         let expanded = (path as NSString).expandingTildeInPath
-        let url = URL(fileURLWithPath: expanded)
+        let candidate: URL
+        if expanded.hasPrefix("/") {
+            candidate = URL(fileURLWithPath: expanded)
+        } else if let workingDirectory {
+            candidate = workingDirectory.appendingPathComponent(expanded)
+        } else {
+            candidate = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent(expanded)
+        }
+        let url = candidate.resolvingSymlinksInPath().standardizedFileURL
+        if let workingDirectory {
+            let base = workingDirectory.resolvingSymlinksInPath().standardizedFileURL.path
+            guard url.path == base || url.path.hasPrefix(base + "/") else {
+                throw SubQDecisionError.badRequest(
+                    "image \(path) is outside the working directory \(base). Pass a path inside the folder this turn is working in."
+                )
+            }
+        }
+        let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+        guard values?.isRegularFile != false else {
+            throw SubQDecisionError.badRequest("image is not a regular file at \(url.path)")
+        }
         guard FileManager.default.fileExists(atPath: url.path) else {
             throw SubQDecisionError.badRequest("image not found at \(url.path)")
         }
-        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
-        let size = (attributes?[.size] as? NSNumber)?.intValue ?? 0
+        let size = values?.fileSize ?? 0
         guard size <= maximumBytes else {
             throw SubQDecisionError.badRequest(
                 "image \(url.lastPathComponent) is \(size) bytes; the API accepts at most \(maximumBytes) decoded bytes per image."
@@ -318,29 +387,79 @@ public nonisolated struct SubQImage: Sendable {
     }
 }
 
+// MARK: - Redirects
+
+/// Refuses a redirect to a different host. The request carries the API key as a
+/// Bearer token, so following a 3xx to somebody else's host would hand them the
+/// secret. A refused redirect is reported as the 3xx status it was.
+nonisolated final class SubQRedirectGuard: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(Self.isAllowedRedirect(from: response.url, to: request.url) ? request : nil)
+    }
+
+    static func isAllowedRedirect(from origin: URL?, to destination: URL?) -> Bool {
+        guard let originHost = origin?.host?.lowercased(), !originHost.isEmpty,
+              let destinationHost = destination?.host?.lowercased(), !destinationHost.isEmpty else {
+            return false
+        }
+        return originHost == destinationHost
+    }
+}
+
 // MARK: - Client
 
 public nonisolated struct SubQDecisionClient: Sendable {
     public static let maximumQuestions = 3
     public static let maximumStateCharacters = 200_000
+    /// A decision response is a handful of numbers. A server that streams
+    /// megabytes at us is a misconfigured endpoint (or worse), not an answer.
+    public static let maximumResponseBytes = 2 * 1024 * 1024
     public static let defaultTimeout: TimeInterval = 30
 
     public let endpoint: URL
     public let apiKey: String
     public let model: String
     public let timeout: TimeInterval
+    /// Injectable so an HTTP-path test can answer without the network. The
+    /// default session has a resource ceiling and a same-host redirect guard.
+    public let session: URLSession
 
     public init(
         endpoint: URL = SubQDecisionSettings.endpoint(),
         apiKey: String,
         model: String = SubQDecisionSettings.model(),
-        timeout: TimeInterval = SubQDecisionClient.defaultTimeout
+        timeout: TimeInterval = SubQDecisionClient.defaultTimeout,
+        session: URLSession = SubQDecisionClient.defaultSession
     ) {
         self.endpoint = endpoint
         self.apiKey = apiKey
         self.model = model
         self.timeout = timeout
+        self.session = session
     }
+
+    /// `timeoutIntervalForRequest` is per request (see `send`), but a resource
+    /// ceiling cannot be, so it is set here. Three default timeouts lets the
+    /// retry below finish inside one call.
+    public static let defaultSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = SubQDecisionClient.defaultTimeout
+        configuration.timeoutIntervalForResource = SubQDecisionClient.defaultTimeout * 3
+        configuration.httpMaximumConnectionsPerHost = 2
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.urlCache = nil
+        return URLSession(
+            configuration: configuration,
+            delegate: SubQRedirectGuard(),
+            delegateQueue: nil
+        )
+    }()
 
     private struct RequestBody: Encodable {
         let model: String
@@ -436,6 +555,12 @@ public nonisolated struct SubQDecisionClient: Sendable {
     }
 
     private func send(payload: Data) async throws -> SubQDecisionResponse {
+        guard let scheme = endpoint.scheme?.lowercased(), scheme == "https" || scheme == "http",
+              endpoint.host?.isEmpty == false else {
+            throw SubQDecisionError.badRequest(
+                "the configured endpoint \(endpoint.absoluteString) is not an http(s) URL with a host."
+            )
+        }
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
         request.timeoutInterval = timeout
@@ -447,9 +572,14 @@ public nonisolated struct SubQDecisionClient: Sendable {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await URLSession.shared.data(for: request)
+            (data, response) = try await session.data(for: request)
         } catch {
             throw SubQDecisionError.transport(error.localizedDescription)
+        }
+        guard data.count <= Self.maximumResponseBytes else {
+            throw SubQDecisionError.decoding(
+                "the response was \(data.count) bytes; this client reads at most \(Self.maximumResponseBytes)."
+            )
         }
 
         guard let http = response as? HTTPURLResponse else {
@@ -476,7 +606,7 @@ public nonisolated struct SubQDecisionClient: Sendable {
 public final class SubQDecideTool: AgentTool {
     public let definition = ToolDefinition(
         name: "subq_decide",
-        description: "Asks SubQ's decisions-only model (subq-snap-preview) one to three typed questions about a state and returns probabilities plus confidence. Use it for yes/no gates, routing or classification, triage and ordered scoring. Do NOT use it for open-ended analysis, drafting, summarizing, or extracting fields — use a chat model for those. Load the subq-decisions skill first for framing rules and thresholds.",
+        description: "Asks SubQ's decisions-only model (subq-snap-preview) one to three typed questions about a state and returns probabilities plus confidence. Use it for yes/no gates, routing or classification, triage and ordered scoring. Do NOT use it for open-ended analysis, drafting, summarizing, or extracting fields — use a chat model for those. Load the subq-decisions skill first for framing rules and thresholds. The state and questions are sent to SubQ's API; never put secrets or credentials in the state.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
@@ -491,7 +621,7 @@ public final class SubQDecideTool: AgentTool {
                 ],
                 "images": [
                     "type": "array",
-                    "description": "Optional up to 4 images to judge alongside the state. Each entry is {path: '/absolute/file.png'} — PNG, JPEG or WebP under 4 MiB.",
+                    "description": "Optional up to 4 images to judge alongside the state. Each entry is {path: '/absolute/file.png'} — PNG, JPEG or WebP under 4 MiB. The file must be inside this turn's working directory; the tool refuses an image outside it because the bytes are uploaded to SubQ.",
                     "items": [
                         "type": "object",
                         "properties": [
@@ -525,6 +655,10 @@ public final class SubQDecideTool: AgentTool {
             return (AgentHarness.toolErrorJSON(tool: "subq_decide", error: message), nil, message, false)
         }
         let state = AnyCodable(rawState)
+        if let problem = Self.stateProblem(state) {
+            let message = "subq_decide could not send this state: \(problem)"
+            return (AgentHarness.toolErrorJSON(tool: "subq_decide", error: message), nil, message, false)
+        }
 
         guard let rawQuestions = arguments["questions"] as? [String: Any], !rawQuestions.isEmpty else {
             let message = "Missing or empty 'questions' in subq_decide. Send one to three named questions, for example {\"needs_human\": {\"type\": \"noul\", \"instructions\": \"…\", \"criteria\": {\"true\": \"…\", \"false\": \"…\"}}}."
@@ -542,7 +676,7 @@ public final class SubQDecideTool: AgentTool {
                 guard let dict = entry as? [String: Any],
                       let path = dict["path"] as? String else { continue }
                 do {
-                    images.append(try SubQImage.load(path: path))
+                    images.append(try SubQImage.load(path: path, workingDirectory: workingDirectory))
                 } catch {
                     let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                     return (AgentHarness.toolErrorJSON(tool: "subq_decide", error: message), nil, message, false)
@@ -563,16 +697,20 @@ public final class SubQDecideTool: AgentTool {
                 answersJSON[name] = Self.jsonObject(answer)
             }
 
+            // The answer's labels (choice names, legend rows) are echoed text,
+            // so they go through the same marker pass as every other tool
+            // result before they reach the transcript.
+            let summary = AgentHarness.sanitizeText(response.readableSummary)
             let readable = """
             SubQ decision (\(response.model ?? client.model), key: \(key.label))
-            \(response.readableSummary)
+            \(summary)
             \(response.usageLine)
             """
 
             var data: [String: Any] = [
                 "model": response.model ?? client.model,
                 "answers": answersJSON,
-                "readable": response.readableSummary,
+                "readable": summary,
                 "key_source": key.label
             ]
             if let usage = response.usage {
@@ -593,6 +731,30 @@ public final class SubQDecideTool: AgentTool {
     }
 
     // MARK: Validation
+
+    /// Question names from the raw `questions` argument, for a tool card's
+    /// title. The card used to print the entire JSON blob as the summary line.
+    static func questionNames(from raw: String?) -> [String] {
+        guard let raw, let data = raw.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return []
+        }
+        return object.keys.sorted()
+    }
+
+    /// `maximumStateCharacters` was documented and never enforced, so `state`
+    /// was effectively uncapped. Measuring the encoded body is the same number
+    /// the request will spend on the wire.
+    static func stateProblem(_ state: AnyCodable) -> String? {
+        let encoder = JSONEncoder()
+        guard let data = try? encoder.encode(state) else {
+            return "the state is not JSON-encodable."
+        }
+        guard data.count <= SubQDecisionClient.maximumStateCharacters else {
+            return "the state is \(data.count) bytes; the limit is \(SubQDecisionClient.maximumStateCharacters). Split the batch into smaller calls."
+        }
+        return nil
+    }
 
     /// Catches the request the API would reject with a 422 before the round
     /// trip, with text that says how to fix it. Deliberately light: the API is
