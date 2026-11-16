@@ -39,7 +39,10 @@ final class TranscriptDiagnostics {
     private var rowHeights: [String: RowMeasurement] = [:]
     private var contentHeight: CGFloat = 0
     private var viewportHeight: CGFloat = 0
-    private var lastReportedTurnKey: String?
+    /// The last turn whose numbers were emitted. Cleared when a turn begins so a
+    /// later turn whose key collides with it is still reported; the key is built
+    /// from the message count, which repeats across conversations of one length.
+    private(set) var lastReportedTurnKey: String?
     private var warnedRowHeight = false
     private var warnedContentHeight = false
 
@@ -59,6 +62,7 @@ final class TranscriptDiagnostics {
     /// report describes the turn that is running rather than the whole session.
     func beginTurn() {
         rowHeights.removeAll(keepingCapacity: true)
+        lastReportedTurnKey = nil
         warnedRowHeight = false
         warnedContentHeight = false
     }
@@ -82,7 +86,6 @@ final class TranscriptDiagnostics {
         let tallestLabel = tallest?.label ?? "none"
         let realized = rowHeights.count
         var blockCount = 0
-        var nestedScrollViews = 0
         var characters = 0
         var segmentCount = 0
         for message in messages {
@@ -90,7 +93,6 @@ final class TranscriptDiagnostics {
             segmentCount += segments.count
             for segment in segments {
                 blockCount += segment.blocks.count
-                nestedScrollViews += TranscriptSegmenter.nestedScrollViewCount(of: segment)
             }
             characters += message.content.count + (message.thinkingContent?.count ?? 0)
         }
@@ -101,7 +103,7 @@ final class TranscriptDiagnostics {
                 + "viewport=\(Int(viewportHeight))pt realizedRows=\(realized) "
                 + "tallestRow=\(Int(tallestHeight))pt tallestRowKind=\(tallestLabel) "
                 + "rows=\(segmentCount) "
-                + "blocks=\(blockCount) nestedScrollViews=\(nestedScrollViews) "
+                + "blocks=\(blockCount) "
                 + "characters=\(characters) messages=\(messages.count)"
         )
 

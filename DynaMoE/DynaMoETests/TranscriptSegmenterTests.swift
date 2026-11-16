@@ -282,16 +282,49 @@ final class TranscriptSegmenterTests: XCTestCase {
         XCTAssertEqual(tables.flatMap(\.rows), table.rows)
     }
 
-    func testNestedScrollViewCountCountsCodeBlocksAndTables() {
-        let table = MarkdownTableData(headers: ["h"], alignments: [.leading], rows: [["c"]])
-        let segment = TranscriptSegment(blocks: [
-            .paragraph(text: "intro"),
-            .codeBlock(language: "swift", code: "let x = 1"),
-            .codeBlock(language: "rust", code: "let x = 1;"),
-            .table(table),
-            .heading(level: 2, text: "done"),
-        ])
-        XCTAssertEqual(TranscriptSegmenter.nestedScrollViewCount(of: segment), 3)
+    func testTableWithWideCellsSplitsByWrappedLinesNotRowCount() {
+        // The transcript dropped the horizontal scroll view, so a cell wraps
+        // inside its column. One line per row was right only for narrow cells: a
+        // 60-row table of wide cells lays out several times taller, which is the
+        // row the compositor refuses to paint.
+        let wideCell = String(repeating: "x", count: 240)
+        let table = MarkdownTableData(
+            headers: ["a", "b", "c"],
+            alignments: [.leading, .leading, .leading],
+            rows: (0..<60).map { _ in [wideCell, wideCell, wideCell] }
+        )
+
+        // A 3-column table gives each cell a third of a line's characters, so one
+        // row is many lines and the whole table is far past the line budget.
+        XCTAssertGreaterThan(TranscriptSegmenter.laidOutLineCount(of: .table(table)), 150)
+
+        let segments = TranscriptSegmenter.segments(for: [.table(table)])
+        let tables = segments.flatMap(\.blocks).compactMap { block -> MarkdownTableData? in
+            if case .table(let value) = block { return value }
+            return nil
+        }
+        XCTAssertGreaterThan(tables.count, 1)
+        // Every piece fits the budget it was split for, which is what bounds the
+        // row rather than the block count.
+        for piece in tables {
+            XCTAssertLessThanOrEqual(TranscriptSegmenter.laidOutLineCount(of: .table(piece)), 150)
+            XCTAssertEqual(piece.headers, table.headers)
+        }
+        XCTAssertEqual(tables.flatMap(\.rows), table.rows)
+    }
+
+    func testAShortTableStaysOneBlock() {
+        // The estimate must not split what it does not have to: a narrow, short
+        // table is one block and one row, exactly as before.
+        let table = MarkdownTableData(
+            headers: ["name", "value"],
+            alignments: [.leading, .leading],
+            rows: (0..<10).map { ["name\($0)", "value\($0)"] }
+        )
+        XCTAssertEqual(TranscriptSegmenter.laidOutLineCount(of: .table(table)), 12)
+        let segments = TranscriptSegmenter.segments(for: [.table(table)])
+        XCTAssertEqual(segments.count, 1)
+        XCTAssertEqual(segments[0].blocks.count, 1)
     }
 
     // MARK: - What rides a row
@@ -470,6 +503,61 @@ final class TranscriptSegmenterTests: XCTestCase {
         XCTAssertEqual(presentation.segments.count, 1)
     }
 
+    func testPlanMarkerClassificationRidesTheCacheRatherThanTheRowLoop() {
+        // The row loop runs on every body pass, i.e. on every streamed chunk. The
+        // probe reads every character of the answer (two substring scans, plus a
+        // line split when they hit), so the classification is cached with the
+        // parse instead. A plan card also skips the parse: it would be thrown
+        // away, and a plan is the longest message in a conversation.
+        let cache = TranscriptPresentationCache()
+        let plan = makeMessage(.assistant, planBody)
+
+        let first = cache.presentation(for: plan, isGemmaDialect: false, isStreaming: true)
+        XCTAssertTrue(first.isPlanCard)
+        XCTAssertTrue(first.segments.isEmpty, "a plan card renders its own text, not blocks")
+
+        // A cache hit still answers the same thing, without re-scanning.
+        let second = cache.presentation(for: plan, isGemmaDialect: false, isStreaming: true)
+        XCTAssertTrue(second.isPlanCard)
+
+        // An ordinary answer is not a card.
+        let answer = cache.presentation(
+            for: makeMessage(.assistant, "just prose"),
+            isGemmaDialect: false,
+            isStreaming: false
+        )
+        XCTAssertFalse(answer.isPlanCard)
+        XCTAssertEqual(answer.segments.count, 1)
+
+        // A middle-of-prose mention is not a plan: the fence-aware confirm still
+        // decides, exactly as it did when the row loop asked.
+        let mention = cache.presentation(
+            for: makeMessage(.assistant, "the marker is `\(PlanMarkers.start)` in prose"),
+            isGemmaDialect: false,
+            isStreaming: false
+        )
+        XCTAssertFalse(mention.isPlanCard)
+
+        // A user turn is never a card even when it quotes the markers.
+        let user = cache.presentation(for: makeMessage(.user, planBody), isGemmaDialect: false, isStreaming: false)
+        XCTAssertFalse(user.isPlanCard)
+    }
+
+    func testASplitListItemKeepsItsOwnNumber() {
+        // Splitting a single item's text into pieces continues that ONE item, so
+        // every piece carries the item's number rather than counting up. A list
+        // of many items is many blocks and is grouped, never split, so its
+        // numbering is untouched.
+        let item = (0..<400).map { "line \($0)" }.joined(separator: "\n")
+        let segments = TranscriptSegmenter.segments(for: [.listItem(number: 7, text: item)])
+        let numbers = segments.flatMap(\.blocks).compactMap { block -> Int? in
+            if case .listItem(let number, _) = block { return number }
+            return nil
+        }
+        XCTAssertGreaterThan(numbers.count, 1)
+        XCTAssertTrue(numbers.allSatisfy { $0 == 7 })
+    }
+
     // MARK: - Block slices
 
     func testARowSliceBuildsIdsFromItsOwnBlocks() {
@@ -538,5 +626,25 @@ final class TranscriptSegmenterTests: XCTestCase {
         var withFollowUp = messages
         withFollowUp.append(makeMessage(.user, "implement the plan"))
         XCTAssertNil(memo.value(messages: withFollowUp, dismissedPlanMessageId: nil))
+    }
+
+    // MARK: - Diagnostics
+
+    func testANewTurnReArmsTheOneShotReport() {
+        // The report keys on the message count, which repeats across conversations
+        // of one length. Without clearing the key when a turn begins, a later turn
+        // that lands on the same one reports nothing at all, so the instrumentation
+        // goes quiet in exactly the case it exists to describe.
+        let diagnostics = TranscriptDiagnostics()
+        let messages = [makeMessage(.user, "hi")]
+
+        diagnostics.reportIfNeeded(turnKey: "abc-2", messages: messages, segmentsByMessage: [:])
+        XCTAssertEqual(diagnostics.lastReportedTurnKey, "abc-2")
+
+        diagnostics.beginTurn()
+        XCTAssertNil(diagnostics.lastReportedTurnKey)
+
+        diagnostics.reportIfNeeded(turnKey: "abc-2", messages: messages, segmentsByMessage: [:])
+        XCTAssertEqual(diagnostics.lastReportedTurnKey, "abc-2")
     }
 }

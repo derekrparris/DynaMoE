@@ -19,6 +19,16 @@ final class TranscriptPresentationCache {
     struct Presentation {
         var displayContent: String
         var segments: [TranscriptSegment]
+        /// True when the message is a plan-mode deliverable, which the transcript
+        /// draws as `PlanCard` instead of `ChatMessageView`.
+        ///
+        /// Classified here, once per content change, rather than in the row loop:
+        /// the loop runs on every body pass, and the probe is two substring scans
+        /// of the whole answer plus a line split of it when they hit. On a long
+        /// conversation that was tens of milliseconds per frame, on the main
+        /// actor, during a turn. A plan card is also the longest message in a
+        /// conversation, so it skips the markdown parse entirely.
+        var isPlanCard: Bool = false
     }
 
     private struct Entry {
@@ -51,6 +61,26 @@ final class TranscriptPresentationCache {
            entry.isGemmaDialect == isGemmaDialect,
            entry.repairs == repairs {
             return entry.presentation
+        }
+
+        // A plan card is classified before the parse and skips it: the card
+        // renders the message's own text through `PlanMarkers.strip`, so a
+        // segment list for it would be thrown away.
+        if message.role == .assistant,
+           PlanMarkers.anyMarkerMentioned(in: message.content),
+           PlanMarkers.startPresent(in: message.content) {
+            let presentation = Presentation(
+                displayContent: message.content,
+                segments: [],
+                isPlanCard: true
+            )
+            entries[message.id] = Entry(
+                content: message.content,
+                isGemmaDialect: isGemmaDialect,
+                repairs: repairs,
+                presentation: presentation
+            )
+            return presentation
         }
 
         let display = ChatMessageView.responseDisplayContent(

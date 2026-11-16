@@ -93,8 +93,10 @@ nonisolated enum TranscriptSegmenter {
     /// padding, so this bounds the row's layer count as well as its height.
     static let maxRowBlocks = 24
 
-    /// Rows one table block may carry before it is split into several tables.
-    /// A table's height is driven by its row count, not its character count.
+    /// Hard ceiling on the rows one table block may carry, on top of the row's
+    /// line budget. A table's height is driven by its rows rather than by its
+    /// character count and a cell wraps per column, so the line budget usually
+    /// splits it first; this bounds the block count too.
     static let maxTableRows = 60
 
     /// The compositor's layer ceiling this segmentation exists to stay under,
@@ -245,26 +247,65 @@ nonisolated enum TranscriptSegmenter {
         case .horizontalRule:
             return 1
         case .table(let table):
-            // One line per row plus the header. A cell that wraps adds a line
-            // the estimate cannot see, which is what the height margin covers.
-            return table.rows.count + 1
+            // A table's height is line count too, and its cells WRAP: the
+            // transcript dropped the horizontal scroll view, so a wide cell
+            // occupies as many lines as its column is narrow. Counting one line
+            // per row let a 60-row table of wide cells lay out several times
+            // taller than the budget predicted.
+            let columns = max(1, table.headers.count)
+            // The header plus the divider grid row beneath it.
+            var lines = tableRowLineCount(table.headers, columns: columns) + 1
+            for row in table.rows {
+                lines += tableRowLineCount(row, columns: columns)
+            }
+            return lines
         }
     }
 
+    /// Characters a full-width line holds at the transcript's type scale: 14 pt
+    /// type sets roughly 80.
+    static let wrappedLineWidth = 80
+
+    /// Lines one table row occupies once its cells wrap inside their columns.
+    ///
+    /// A cell's available width is the full line split across the columns, so a
+    /// two-column table gives each cell half a line's characters. This is an
+    /// estimate on the same terms as `wrappedLineCount`, kept in characters
+    /// rather than points on purpose: the segmenter runs without a window and
+    /// cannot measure text.
+    static func tableRowLineCount(_ cells: [String], columns: Int) -> Int {
+        let perLine = tableColumnCharacters(columns: columns)
+        var lines = 1
+        for cell in cells {
+            lines = max(lines, wrappedLineCount(cell, charactersPerLine: perLine))
+        }
+        return lines
+    }
+
+    /// Characters one table cell fits per line, given a table's column count.
+    private static func tableColumnCharacters(columns: Int) -> Int {
+        guard columns > 0 else { return wrappedLineWidth }
+        return max(8, wrappedLineWidth / columns)
+    }
+
     /// Lines `text` occupies at the transcript's width, where a long line wraps
-    /// rather than scrolling: 14 pt type sets roughly 80 characters per line.
-    private static func wrappedLineCount(_ text: String) -> Int {
+    /// rather than scrolling.
+    private static func wrappedLineCount(
+        _ text: String,
+        charactersPerLine: Int = TranscriptSegmenter.wrappedLineWidth
+    ) -> Int {
+        let perLine = max(1, charactersPerLine)
         var total = 0
         var current = 0
         for character in text {
             if character == "\n" {
-                total += max(1, (current + 79) / 80)
+                total += max(1, (current + perLine - 1) / perLine)
                 current = 0
             } else {
                 current += 1
             }
         }
-        total += max(1, (current + 79) / 80)
+        total += max(1, (current + perLine - 1) / perLine)
         return total
     }
 
@@ -278,17 +319,6 @@ nonisolated enum TranscriptSegmenter {
             points += CGFloat(laidOutLineCount(of: block)) * 17 + 24
         }
         return points
-    }
-
-    /// Nested scroll views a segment allocates: one per code block and one per
-    /// table. This is the per-row layer count the diagnostic reports.
-    static func nestedScrollViewCount(of segment: TranscriptSegment) -> Int {
-        segment.blocks.reduce(0) { total, block in
-            switch block {
-            case .codeBlock, .table: return total + 1
-            default: return total
-            }
-        }
     }
 
     // MARK: - Splitting one oversized block
@@ -342,11 +372,34 @@ nonisolated enum TranscriptSegmenter {
     }
 
     private static func splitTable(_ table: MarkdownTableData) -> [MarkdownTableData] {
-        guard table.rows.count > maxTableRows else { return [table] }
+        let columns = max(1, table.headers.count)
+        // Every piece repeats the header and its divider, so both come out of
+        // the row's line budget before any data row is placed.
+        let headerLines = tableRowLineCount(table.headers, columns: columns) + 1
+        let rowLineBudget = max(1, maxRowLines - headerLines)
+
+        var totalLines = headerLines
+        for row in table.rows {
+            totalLines += tableRowLineCount(row, columns: columns)
+        }
+        guard table.rows.count > maxTableRows || totalLines > maxRowLines else {
+            return [table]
+        }
+
         var pieces: [MarkdownTableData] = []
         var start = 0
         while start < table.rows.count {
-            let end = min(start + maxTableRows, table.rows.count)
+            var end = start
+            var pieceLines = 0
+            while end < table.rows.count, end - start < maxTableRows {
+                let rowLines = tableRowLineCount(table.rows[end], columns: columns)
+                // A single row taller than the whole budget still needs a piece
+                // of its own, or the split would never terminate.
+                if end > start, pieceLines + rowLines > rowLineBudget { break }
+                pieceLines += rowLines
+                end += 1
+            }
+            if end == start { end = start + 1 }
             pieces.append(
                 MarkdownTableData(
                     headers: table.headers,
@@ -357,6 +410,6 @@ nonisolated enum TranscriptSegmenter {
             )
             start = end
         }
-        return pieces
+        return pieces.isEmpty ? [table] : pieces
     }
 }

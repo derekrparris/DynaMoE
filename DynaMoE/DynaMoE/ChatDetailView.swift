@@ -238,11 +238,18 @@ struct ChatDetailView: View {
     @State private var promptTokenCount: Int = 0
     @State private var tokenCountTask: Task<Void, Never>? = nil
     @State private var isPinnedToBottom: Bool = true
-    /// Set while a `scrollTo` this view issued is in flight. Content growth must
-    /// never unpin the follow, and an animated programmatic scroll transiently
-    /// reads as "scrolled away from the bottom" — which is what made the pin
-    /// state flip mid-stream and the follow stop. Only a user drag may unpin.
+    /// Set while a `scrollTo` this view issued is still settling. Content growth
+    /// must never unpin the follow, and an animated programmatic scroll
+    /// transiently reads as "scrolled away from the bottom", which is what made
+    /// the pin state flip mid-stream and the follow stop. Only a user drag may
+    /// unpin.
     @State private var isProgrammaticScrollInFlight: Bool = false
+    /// The suppression window above, held as a cancellable work item rather than
+    /// a bare `asyncAfter`: a drag revokes it the moment it happens (otherwise a
+    /// reader who grabbed the transcript during the 200 ms follow animation could
+    /// not scroll away at all), and a disappearing view cancels it instead of
+    /// running it against a released one.
+    @State private var scrollSuppressionWork: DispatchWorkItem? = nil
     /// The per-message parse and segmentation, shared by every row of a
     /// message so segmentation does not multiply parse cost.
     @State private var presentationCache = TranscriptPresentationCache()
@@ -354,9 +361,23 @@ struct ChatDetailView: View {
                 ))
                 continue
             }
-            if message.role == .assistant,
-               PlanMarkers.anyMarkerMentioned(in: message.content),
-               PlanMarkers.startPresent(in: message.content) {
+            if message.role == .user {
+                rows.append(contentsOf: TranscriptSegmenter.rows(
+                    for: message.id,
+                    kind: .message,
+                    segments: TranscriptSegmenter.plainTextSegments(for: message.content)
+                ).map { TranscriptEntry(row: $0, message: message) })
+                continue
+            }
+            // The plan-marker classification rides the cache: the probe reads
+            // every character of the answer, and this loop runs on every body
+            // pass, i.e. on every streamed chunk.
+            let presentation = presentationCache.presentation(
+                for: message,
+                isGemmaDialect: isGemmaDialect,
+                isStreaming: message.id == streamingId
+            )
+            if presentation.isPlanCard {
                 rows.append(TranscriptEntry(
                     row: TranscriptRow(
                         messageId: message.id,
@@ -369,20 +390,10 @@ struct ChatDetailView: View {
                 ))
                 continue
             }
-            let segments: [TranscriptSegment]
-            if message.role == .user {
-                segments = TranscriptSegmenter.plainTextSegments(for: message.content)
-            } else {
-                segments = presentationCache.presentation(
-                    for: message,
-                    isGemmaDialect: isGemmaDialect,
-                    isStreaming: message.id == streamingId
-                ).segments
-            }
             rows.append(contentsOf: TranscriptSegmenter.rows(
                 for: message.id,
                 kind: .message,
-                segments: segments
+                segments: presentation.segments
             ).map { TranscriptEntry(row: $0, message: message) })
         }
         return rows
@@ -478,6 +489,23 @@ struct ChatDetailView: View {
         )
     }
 
+    /// Opens the window in which a programmatic scroll's own offsets are not read
+    /// as a drag, and closes it after the longest animation this view runs.
+    private func beginScrollSuppression() {
+        isProgrammaticScrollInFlight = true
+        scrollSuppressionWork?.cancel()
+        let work = DispatchWorkItem { isProgrammaticScrollInFlight = false }
+        scrollSuppressionWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+    }
+
+    /// Ends the window early: the reader is driving the scroll now.
+    private func endScrollSuppression() {
+        scrollSuppressionWork?.cancel()
+        scrollSuppressionWork = nil
+        isProgrammaticScrollInFlight = false
+    }
+
     /// Scrolls the transcript to its newest line. Callers are throttled by
     /// buckets, message counts, and turn boundaries, never by per-token
     /// updates, and the jump is deferred so the frame carrying the growth is
@@ -493,7 +521,7 @@ struct ChatDetailView: View {
         // a drag. Claiming the window for it (a streaming turn follows
         // several times a second) left the pin permanently immune to the user
         // scrolling away.
-        if animated { isProgrammaticScrollInFlight = true }
+        if animated { beginScrollSuppression() }
         DispatchQueue.main.async {
             if animated {
                 withAnimation(.easeOut(duration: 0.2)) {
@@ -502,10 +530,22 @@ struct ChatDetailView: View {
             } else {
                 proxy.scrollTo(Self.scrollBottomAnchorID, anchor: .bottom)
             }
-            guard animated else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                isProgrammaticScrollInFlight = false
-            }
+        }
+    }
+
+    /// Lands the transcript on its newest line when the view first appears, which
+    /// is what the removed `defaultScrollAnchor(.bottom)` used to provide.
+    ///
+    /// The jump is attempted twice: the first normally resolves the tail row
+    /// directly, but a long conversation restored from disk may not have realized
+    /// it on the first pass, and the second attempt is a no-op when the first one
+    /// landed.
+    private func followBottomOnFirstAppearance(_ proxy: ScrollViewProxy) {
+        guard isPinnedToBottom else { return }
+        followBottom(proxy)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            guard isPinnedToBottom else { return }
+            proxy.scrollTo(Self.scrollBottomAnchorID, anchor: .bottom)
         }
     }
 
@@ -525,16 +565,13 @@ struct ChatDetailView: View {
         guard let first = session?.messages.first,
               first.isCompactionSummary == true,
               session?.messages.count == 2 else { return false }
-        isProgrammaticScrollInFlight = true
+        beginScrollSuppression()
         DispatchQueue.main.async {
             withAnimation(.easeOut(duration: 0.2)) {
                 // The card is a message, and a message's own id no longer names
                 // a row: every message is drawn as at least one segment, so the
                 // scroll target is the first segment's id.
                 proxy.scrollTo(TranscriptRow.firstSegmentId(for: first.id), anchor: .top)
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                isProgrammaticScrollInFlight = false
             }
         }
         return true
@@ -974,7 +1011,9 @@ struct ChatDetailView: View {
                                         .padding(.top, entry.row.isFirst ? 24 : 0)
                                 }
                             }
-                            .padding(.top, 24)
+                            // No top padding here: the first row carries the
+                            // 24 pt gap itself, and applying it in both places
+                            // gave the opening message 48.
                             .padding(.bottom, 24)
                         } else {
                             EmptyWelcomeView(
@@ -1000,12 +1039,25 @@ struct ChatDetailView: View {
                     // still be reachable under it.
                     .padding(.top, historyWarningHeight)
                 }
-                // The scroll view owns the follow. On macOS 26 this keeps the
-                // bottom edge anchored as content grows, so a streaming turn
-                // needs no `scrollTo` per bucket — and a per-bucket scroll was
-                // the layout-invalidation storm that made the follow
-                // inconsistent in the first place.
-                .defaultScrollAnchor(.bottom)
+                // The follow has ONE owner: the explicit `followBottom` below.
+                // `defaultScrollAnchor(.bottom)` used to sit here as well and the
+                // two disagreed. It also re-applies whenever the scroll view is
+                // created or resized, so switching sessions with the reader
+                // scrolled back snapped them to the bottom. Placement on first
+                // appearance is handled by the `onAppear` follow instead.
+                .onAppear {
+                    followBottomOnFirstAppearance(proxy)
+                }
+                .onDisappear {
+                    scrollSuppressionWork?.cancel()
+                }
+                // A user gesture always wins: it ends any suppression window a
+                // follow opened, so a drag during the 200 ms animated follow can
+                // still scroll the reader away. A programmatic follow reports
+                // `.animating`, never `.interacting`.
+                .onScrollPhaseChange { _, newPhase in
+                    if newPhase == .interacting { endScrollSuppression() }
+                }
                 .onChange(of: session?.id) { _ in
                     isPinnedToBottom = true
                     guard !landOnCompactedSummary(proxy) else { return }
@@ -1023,18 +1075,20 @@ struct ChatDetailView: View {
                         isPinnedToBottom = true
                         transcriptDiagnostics.beginTurn()
                         followBottom(proxy, animated: true)
-                    } else if isPinnedToBottom {
-                        followBottom(proxy, animated: true)
+                    } else {
+                        // The turn settled: emit its numbers once. This is what
+                        // makes the whiteout threshold falsifiable. If no row and
+                        // no content height crosses the compositor ceiling, the
+                        // hypothesis is wrong and segmentation is not the fix.
+                        if isPinnedToBottom { followBottom(proxy, animated: true) }
+                        if let session {
+                            reportTranscriptGeometry(
+                                for: session,
+                                suffix: "\(session.messages.count)"
+                            )
+                            presentationCache.prune(keeping: Set(session.messages.map(\.id)))
+                        }
                     }
-                }
-                // The turn settled: emit its numbers once. This is what makes
-                // the whiteout threshold falsifiable — if no row and no content
-                // height crosses the compositor ceiling, the hypothesis is
-                // wrong and segmentation is not the fix.
-                .onChange(of: isGenerating) { generating in
-                    guard !generating, let session else { return }
-                    reportTranscriptGeometry(for: session, suffix: "\(session.messages.count)")
-                    presentationCache.prune(keeping: Set(session.messages.map(\.id)))
                 }
                 // A conversation restored from disk is the OTHER reproduction of
                 // the whiteout: nothing is generating, so the turn-settle report
@@ -1048,13 +1102,17 @@ struct ChatDetailView: View {
                     guard !Task.isCancelled, !isGenerating else { return }
                     reportTranscriptGeometry(for: session, suffix: "restored")
                 }
-                // The scroll view's own bottom anchor does not hold the tail
-                // while a streamed answer grows: rows are re-segmented, heights
-                // change, and the view drifts off the newest output. The follow
-                // is therefore explicit, off a coarse bucket (about a line) so a
-                // turn jumps a few times a second instead of once per chunk.
+                // The follow is explicit, off a coarse bucket (about a line) so a
+                // turn jumps a few times a second instead of once per chunk:
+                // rows are re-segmented as an answer grows, heights change, and
+                // nothing else holds the tail. A compaction pass streams into its
+                // progress bubble without ever setting `isGenerating`, so it
+                // counts as a running turn here too, or it scrolls the first
+                // bucket and then stops following.
                 .onChange(of: streamFollowBucket) { _ in
-                    guard isGenerating, isPinnedToBottom else { return }
+                    guard isGenerating || isCompactingConversation, isPinnedToBottom else {
+                        return
+                    }
                     followBottom(proxy)
                 }
                 .onScrollGeometryChange(for: ScrollSnapshot.self) { geometry in
@@ -3310,7 +3368,11 @@ struct PlanCard: View {
                         // stack of them, so the trace is capped as well: a plan
                         // card is one row, and a row taller than the
                         // compositor's ceiling is never painted.
-                        BoundedInspection(isTall: TranscriptSegmenter.exceedsInspectionHeight(thinking)) {
+                        BoundedInspection(
+                            isTall: TranscriptSegmenter.exceedsInspectionHeight(thinking),
+                            followsTail: isStreaming,
+                            tailKey: thinking.count
+                        ) {
                             ChunkedText(text: thinking, lineSpacing: 3)
                                 .font(.system(size: max(9.5, 11.5 * zoomManager.zoomScale)))
                                 .foregroundColor(.secondary)
@@ -3330,7 +3392,11 @@ struct PlanCard: View {
             // a single transcript row: it is bounded here for the same reason the
             // message rows are split. A plan short enough to read inline is
             // unchanged.
-            BoundedInspection(isTall: TranscriptSegmenter.exceedsInspectionHeight(content)) {
+            BoundedInspection(
+                isTall: TranscriptSegmenter.exceedsInspectionHeight(content),
+                followsTail: isStreaming,
+                tailKey: content.count
+            ) {
                 MarkdownMessageView(content: content, isStreaming: isStreaming && !isReady)
             }
         }
@@ -3769,7 +3835,11 @@ struct ChatMessageView: View, Equatable {
                                         // pt of views in this single row, which is
                                         // the whiteout. It is capped, not chunked
                                         // alone: chunks inside a scroll area.
-                                        BoundedInspection(isTall: TranscriptSegmenter.exceedsInspectionHeight(thinking)) {
+                                        BoundedInspection(
+                                            isTall: TranscriptSegmenter.exceedsInspectionHeight(thinking),
+                                            followsTail: isGenerating || isCompactingConversation,
+                                            tailKey: thinking.count
+                                        ) {
                                             ChunkedText(text: thinking, lineSpacing: 3)
                                                 .font(.system(size: max(8, 12 * zoomManager.zoomScale), design: .monospaced))
                                                 .foregroundColor(.secondary)
@@ -3980,6 +4050,27 @@ struct ChatMessageView: View, Equatable {
     }
 }
 
+/// Identity of the invisible marker at the end of an inspection region. Constant
+/// per scroll area rather than per update: an id that changed with the content
+/// would re-lay out the region on every chunk.
+private let boundedInspectionTailAnchorID = "bounded-inspection-tail-anchor"
+
+/// Characters of new content that make up one follow bucket for an inspection
+/// region, about one line. The transcript throttles its own follow the same way.
+private let boundedInspectionFollowBucketCharacters = 120
+
+/// The geometry an inspection region's pin decision needs, reduced to values
+/// that compare cheaply so the scroll callback runs only on a real change.
+private struct InspectionScrollSnapshot: Equatable {
+    var offset: CGFloat
+    var contentHeight: CGFloat
+    var containerHeight: CGFloat
+
+    var distanceFromBottom: CGFloat {
+        contentHeight - (offset + containerHeight)
+    }
+}
+
 /// Draws long content inside a capped scroll area so it cannot grow its row past
 /// the compositor's maximum layer height. Short content is drawn inline, exactly
 /// as before, so the common case looks unchanged and allocates nothing extra.
@@ -3988,22 +4079,90 @@ struct ChatMessageView: View, Equatable {
 /// blocks are split across rows, but reasoning traces, plan documents, compaction
 /// summaries and tool-call lists ride a single row and cannot be split, so they
 /// are bounded instead.
+///
+/// A LIVE region follows its own newest line. Once a trace is taller than the cap
+/// the row stops growing, so the transcript's own bottom pin lands on the box and
+/// shows its TOP while the newest reasoning is appended below the visible area.
+/// Following the tail inside the box is what makes a long reasoning trace read as
+/// progress rather than as a frozen block.
 struct BoundedInspection<Content: View>: View {
     /// Whether the content would lay out taller than `maxHeight`. Passed in
     /// rather than measured so the caller decides with the same rule the
     /// segmenter uses, and so a short trace never pays for a scroll view.
     let isTall: Bool
     var maxHeight: CGFloat = TranscriptSegmenter.inspectionHeightCeiling
+    /// True while this region's content is still arriving. A settled region opens
+    /// at its start on purpose: reading a finished trace in order is the point of
+    /// a trace, and following the tail of one the reader has not scrolled yet
+    /// would hide how it began.
+    var followsTail: Bool = false
+    /// A coarse length of `content`, in characters, for the follow. Bucketed
+    /// rather than exact because a chunk arrives several times a second and each
+    /// jump costs a layout pass.
+    var tailKey: Int = 0
     @ViewBuilder var content: Content
+
+    @State private var isPinnedToTail = true
 
     var body: some View {
         if isTall {
-            ScrollView(.vertical, showsIndicators: true) {
-                content
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: true) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        content
+                        // The scroll target, inside the content rather than on
+                        // `content` itself so the id cannot change what the
+                        // content is.
+                        Color.clear
+                            .frame(height: 1)
+                            .id(boundedInspectionTailAnchorID)
+                    }
+                }
+                .frame(maxHeight: maxHeight)
+                .onAppear {
+                    // The region became tall mid-stream: land on the newest line
+                    // rather than opening at its beginning.
+                    guard followsTail, isPinnedToTail else { return }
+                    followTail(proxy)
+                }
+                .onChange(of: tailFollowBucket) {
+                    guard followsTail, isPinnedToTail else { return }
+                    followTail(proxy)
+                }
+                .onScrollGeometryChange(for: InspectionScrollSnapshot.self) { geometry in
+                    InspectionScrollSnapshot(
+                        offset: geometry.contentOffset.y,
+                        contentHeight: geometry.contentSize.height,
+                        containerHeight: geometry.containerSize.height
+                    )
+                } action: { old, new in
+                    // Only a drag UP unpins, the same rule the transcript uses.
+                    // Growth and the follow both move the view down the document,
+                    // and neither is the reader leaving the tail.
+                    if new.offset < old.offset - 1 {
+                        if isPinnedToTail { isPinnedToTail = false }
+                        return
+                    }
+                    if new.distanceFromBottom <= 8, !isPinnedToTail {
+                        isPinnedToTail = true
+                    }
+                }
             }
-            .frame(maxHeight: maxHeight)
         } else {
             content
+        }
+    }
+
+    /// The follow's throttle: the region jumps once per ~line of new content.
+    private var tailFollowBucket: Int {
+        tailKey / boundedInspectionFollowBucketCharacters
+    }
+
+    private func followTail(_ proxy: ScrollViewProxy) {
+        // Deferred, so the frame carrying the growth is laid out before the
+        // target is resolved; an immediate jump lands a chunk short.
+        DispatchQueue.main.async {
+            proxy.scrollTo(boundedInspectionTailAnchorID, anchor: .bottom)
         }
     }
 }
