@@ -319,7 +319,9 @@ public struct GenerationProfileSettings: Codable, Equatable, Hashable {
         // literal here would be a second copy of a number whose whole job is to
         // be the budget an unrecorded-window turn is clamped to, and the two
         // could drift apart with nothing to notice. The assistant budget is half
-        // of it, the 2:1 coder:assistant ratio the shipped profiles keep.
+        // of it, the 2:1 coder:assistant ratio the shipped profiles keep WHILE
+        // capacity is unknown; a published ceiling seeds both types (see
+        // `seedingKnownCapacity`).
         let cloudReplyCeiling = CloudContextPolicy.unknownWindowReplyCeiling
         switch type {
         case .coder:
@@ -560,6 +562,22 @@ public final class ModelProfileManager: ObservableObject {
     /// No known capacity means no seeding: an unknown model keeps the shipped
     /// defaults, including the Assistant's half-of-Coder ratio. The seed is a
     /// response to evidence, not a blanket increase.
+    ///
+    /// Seeding applies to BOTH generic types, so once capacity is known the
+    /// Assistant profile also rises to the ceiling and the shipped 2:1
+    /// Coder:Assistant ratio stops applying. That collapse is deliberate: the
+    /// ratio is how the app is conservative when nothing is known, not a
+    /// product promise that an assistant reply must be half as long. A known
+    /// ceiling is evidence about the model, and a user who prefers the old
+    /// number can save a profile.
+    ///
+    /// A seeded budget is a CEILING, not spend: the provider stops when the
+    /// answer ends, so a larger `max_tokens` cannot cost more tokens than the
+    /// reply produces. It only keeps a legitimate long answer from being cut,
+    /// which is why the default is the ceiling rather than a fraction of it.
+    /// A provider that refuses the number without ever publishing its own cap
+    /// is handled once at the turn, and the cap it names is recorded as
+    /// observed capacity (`CloudContextPolicy.replyBudgetRecovery`).
     ///
     /// The evidence has to be about THIS model. The single global fallback
     /// (`dynamoe_cloud_context_window_tokens`) is not: it is one number the

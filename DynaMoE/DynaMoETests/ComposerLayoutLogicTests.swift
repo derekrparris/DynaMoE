@@ -81,25 +81,26 @@ final class ComposerLayoutLogicTests: XCTestCase {
     }
 
     func testPastesThatStayMeasurableAndPastesThatCannotFit() {
-        XCTAssertFalse(ComposerLayoutPolicy.isCertainlyOversized(""))
+        XCTAssertFalse(ComposerLayoutPolicy.isBeyondMeasurementLimit(""))
         XCTAssertFalse(
-            ComposerLayoutPolicy.isCertainlyOversized(
+            ComposerLayoutPolicy.isBeyondMeasurementLimit(
                 String(repeating: "x", count: ComposerLayoutPolicy.measurementByteLimit)
             )
         )
         XCTAssertTrue(
-            ComposerLayoutPolicy.isCertainlyOversized(
+            ComposerLayoutPolicy.isBeyondMeasurementLimit(
                 String(repeating: "x", count: ComposerLayoutPolicy.measurementByteLimit + 1)
             )
         )
 
         let paste = (0..<500).map { "line \($0) of a pasted prompt" }.joined(separator: "\n")
-        XCTAssertTrue(ComposerLayoutPolicy.isCertainlyOversized(paste))
+        XCTAssertTrue(ComposerLayoutPolicy.isBeyondMeasurementLimit(paste))
 
         // The limit is counted in UTF-8 bytes, so four-byte scalars reach it
-        // sooner: 2,001 of them is 8,004 bytes and cannot fit any composer cap.
+        // sooner: 2,001 of them is 8,004 bytes, past the short-circuit's
+        // limit. The limit is an approximation, not a proof about the text.
         XCTAssertTrue(
-            ComposerLayoutPolicy.isCertainlyOversized(String(repeating: "😀", count: 2_001))
+            ComposerLayoutPolicy.isBeyondMeasurementLimit(String(repeating: "😀", count: 2_001))
         )
     }
 

@@ -958,6 +958,51 @@ public nonisolated enum CloudTurnFailure: Equatable, Sendable, LocalizedError {
         return markers.contains { lower.contains($0) }
     }
 
+    /// Whether a provider's 400/422 body is refusing the size of the REPLY
+    /// budget rather than the prompt.
+    ///
+    /// `max_tokens` is a ceiling, so a provider that publishes no output cap
+    /// can still refuse a number this app derived from the model's window:
+    /// 20% of a 128k window is 25,600, while the model's real cap may be
+    /// 16,384. Compacting the history cannot answer that (the prompt may be
+    /// tiny), and the cache-field retry deliberately refuses it (the body
+    /// names a sampling parameter), so without this predicate the turn simply
+    /// fails.
+    ///
+    /// Deliberately narrow: the body has to name the reply-budget field or the
+    /// model's output limit AND carry an over-limit marker. A plain
+    /// "max_tokens must be a positive integer" has no marker and is not a
+    /// number a retry can recover by guessing lower.
+    ///
+    /// A context refusal that also names `max_tokens` ("max_tokens is too
+    /// large: 200000. This model's maximum context length is 128000 tokens")
+    /// counts here rather than as an overflow: lowering the reply budget is
+    /// what can make it fit, and a prompt that is genuinely too long will
+    /// still be over the window on the retry, where the overflow path gets
+    /// its turn.
+    public nonisolated static func indicatesOutputBudgetRejection(_ summary: String) -> Bool {
+        let lower = summary.lowercased()
+        let namesBudget = lower.contains("max_tokens")
+            || lower.contains("max_completion_tokens")
+            || lower.contains("max output token")
+            || lower.contains("output token limit")
+            || lower.contains("output limit")
+            || lower.contains("completion token limit")
+        guard namesBudget else { return false }
+        let namesOutputCap = lower.contains("output token")
+            || lower.contains("output limit")
+            || lower.contains("max output")
+            || lower.contains("maximum output")
+        let namesField = lower.contains("max_tokens") || lower.contains("max_completion_tokens")
+        if indicatesContextOverflow(lower), !namesOutputCap, !namesField { return false }
+        let overLimitMarkers = [
+            "too large", "too long", "too high", "exceed", "greater than",
+            "less than", "at most", "up to", "valid range", "maximum", "max ",
+            "limit", "≤", "<=", ">"
+        ]
+        return overLimitMarkers.contains { lower.contains($0) }
+    }
+
     /// Whether a provider's 400/422 body is complaining about the image content
     /// parts rather than about tools, schemas, or the context window. Registration
     /// of vision capability is an editorial fact (no catalog publishes

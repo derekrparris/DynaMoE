@@ -2154,19 +2154,24 @@ struct ChatDetailView: View {
 /// a window, and so the one-line floor, the growth cap, and the measurement
 /// short-circuit cannot disagree about which bound wins.
 nonisolated enum ComposerLayoutPolicy {
-    /// UTF-8 bytes beyond which the text cannot fit inside any legal composer
-    /// height, so the editor is pinned at the cap without laying the whole paste
-    /// out.
+    /// UTF-8 bytes past which the editor is pinned at the cap without laying
+    /// the whole paste out.
     ///
-    /// Twelve lines at the widest composer hold roughly a thousand characters,
-    /// and even four-byte characters cannot make eight thousand bytes fit, so
-    /// this is a wide margin. It is measured in bytes because that count is
-    /// O(1); a grapheme count would walk the whole paste on every update pass.
+    /// The true bound is not a byte count: it depends on the composer's width,
+    /// and a wide enough window can fit 2,000 four-byte scalars in twelve
+    /// lines. This is a deliberate approximation rather than a proof — a paste
+    /// this large is treated as oversized so the keystroke that pasted it does
+    /// not wait for a full TextKit layout. Pinning slightly early only means
+    /// the editor scrolls at a size it might just have fitted; measuring a
+    /// megabyte-long paste on every update pass is the cost it avoids. Bytes
+    /// are used because that count is O(1); a grapheme count would walk the
+    /// whole paste.
     static let measurementByteLimit = 8_000
 
-    /// True when the text is certainly taller than any composer cap, so the
-    /// caller can skip measuring it.
-    static func isCertainlyOversized(_ text: String) -> Bool {
+    /// True when the text is far enough past `measurementByteLimit` that the
+    /// editor is pinned at its cap without measuring. The name says what the
+    /// caller does, not a proof about the text: see the limit's note.
+    static func isBeyondMeasurementLimit(_ text: String) -> Bool {
         text.utf8.count > measurementByteLimit
     }
 
@@ -2260,6 +2265,22 @@ final class ComposerTextView: NSTextView {
     }
 }
 
+/// A scroll view that reports every layout pass, so the composer's right-hand
+/// gutter can be re-applied during a live window resize.
+///
+/// SwiftUI's update pass is not the only thing that changes the document width:
+/// the text view's autoresizing mask restores the full content width first, so
+/// waiting for the next `updateNSView` leaves the last glyphs under the overlay
+/// scroller for that frame.
+final class ComposerScrollView: NSScrollView {
+    var onLayout: (() -> Void)?
+
+    override func layout() {
+        super.layout()
+        onLayout?()
+    }
+}
+
 // MARK: - Custom Mac NSTextView Wrapper
 struct MacTextEditor: NSViewRepresentable {
     /// Vertical padding above and below the text inside the editor. Shared with
@@ -2292,7 +2313,7 @@ struct MacTextEditor: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView()
+        let scrollView = ComposerScrollView()
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
         // The composer caps its height, so anything past the cap has to scroll.
@@ -2356,6 +2377,14 @@ struct MacTextEditor: NSViewRepresentable {
         textView.isAutomaticDashSubstitutionEnabled = false
 
         scrollView.documentView = textView
+        // Re-apply the gutter on the scroll view's own layout pass as well as
+        // SwiftUI's. A live window resize moves the document back to the full
+        // content width through the autoresizing mask, and waiting for the next
+        // `updateNSView` leaves that frame's text under the overlay scroller.
+        scrollView.onLayout = { [weak textView, weak scrollView, weak coordinator = context.coordinator] in
+            guard let textView, let scrollView, let coordinator else { return }
+            coordinator.applyGutter(to: textView, in: scrollView)
+        }
 
         // The scroll view has no width until SwiftUI lays it out, so the first
         // measurement has to wait for that pass.
@@ -2388,15 +2417,7 @@ struct MacTextEditor: NSViewRepresentable {
         // last glyphs of a wrapped line. The gutter follows the OVERFLOW state
         // rather than the scroller's visibility: an overlay scroller that fades
         // in while the user scrolls must not re-wrap the text under them.
-        let contentWidth = nsView.contentSize.width
-        let contentHeight = nsView.contentSize.height
-        let overflowing = contentHeight > 0 && textView.frame.height > contentHeight + 0.5
-        let targetWidth = overflowing ? max(1, contentWidth - Self.scrollerGutter) : contentWidth
-        if contentWidth > 0, abs(textView.frame.width - targetWidth) > 0.5 {
-            textView.setFrameSize(
-                NSSize(width: targetWidth, height: max(textView.frame.height, minHeight))
-            )
-        }
+        context.coordinator.applyGutter(to: textView, in: nsView)
 
         var textWasAssigned = false
         if textView.string != text {
@@ -2457,6 +2478,30 @@ struct MacTextEditor: NSViewRepresentable {
             self.parent = parent
         }
 
+        /// Keeps the document at the scroll view's width, less the scroller
+        /// gutter when the editor is scrolling.
+        ///
+        /// Called from SwiftUI's update pass and from the scroll view's own
+        /// `layout()`. The second caller is what keeps a live window resize
+        /// from leaving text under the overlay scroller: the autoresizing mask
+        /// restores the full content width before SwiftUI updates again.
+        func applyGutter(
+            to textView: NSTextView,
+            in scrollView: NSScrollView
+        ) {
+            let contentWidth = scrollView.contentSize.width
+            guard contentWidth > 0 else { return }
+            let contentHeight = scrollView.contentSize.height
+            let overflowing = contentHeight > 0 && textView.frame.height > contentHeight + 0.5
+            let targetWidth = overflowing
+                ? max(1, contentWidth - MacTextEditor.scrollerGutter)
+                : contentWidth
+            guard abs(textView.frame.width - targetWidth) > 0.5 else { return }
+            textView.setFrameSize(
+                NSSize(width: targetWidth, height: max(textView.frame.height, parent.minHeight))
+            )
+        }
+
         /// The height the text needs at the editor's current width, clamped to
         /// the composer's floor and cap.
         func measureAndPublishHeight(
@@ -2503,9 +2548,10 @@ struct MacTextEditor: NSViewRepresentable {
             minHeight: CGFloat,
             maxHeight: CGFloat
         ) -> CGFloat {
-            // A paste this large cannot fit any legal cap, and laying it all out
-            // to prove that would stall the keystroke that pasted it.
-            if ComposerLayoutPolicy.isCertainlyOversized(textView.string) {
+            // A paste past the measurement budget is treated as taller than the
+            // cap; laying it all out to find out would stall the keystroke that
+            // pasted it.
+            if ComposerLayoutPolicy.isBeyondMeasurementLimit(textView.string) {
                 return ComposerLayoutPolicy.editorHeight(
                     contentHeight: maxHeight,
                     minHeight: minHeight,

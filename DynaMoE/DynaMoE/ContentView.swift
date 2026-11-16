@@ -4825,6 +4825,14 @@ struct ContentView: View {
             // every later step then carries the metadata-only notice instead.
             var imagesAllowed = visionCapable
             var didRetryWithoutImages = false
+            // The reply budget the request carries can move DURING the run. A
+            // provider may refuse a number derived from the model's window
+            // without publishing its own output cap; the retry below lowers it
+            // for the rest of the turn. The saved profile and the app's setting
+            // stay untouched: this is this turn's ceiling, not a new preference.
+            var activeBudget = budgetResolution
+            var requestParams = params
+            var didRetryWithSmallerOutputBudget = false
             // The tool schemas a step would carry, resolved by ONE rule that
             // both the pre-flight projection and the post-compaction estimate
             // consult: a relay or synthesis turn is a final-answer pass and
@@ -4949,7 +4957,10 @@ struct ContentView: View {
                     if CloudContextPolicy.shouldCompact(
                         promptTokens: projected,
                         window: window,
-                        reservedTokens: replyBudget
+                        // The budget a retry already lowered is the one this
+                        // step will send; reserving the original would compact
+                        // for room no reply needs.
+                        reservedTokens: activeBudget.effective
                     ),
                        compactionAttempts.shouldAttemptPreflight(projectedTokens: projected) {
                         compactionAttempts.beginPreflight()
@@ -5215,7 +5226,7 @@ struct ContentView: View {
                 for await event in client.streamTurn(
                     model: providerModelId,
                     messages: outbound,
-                    params: params,
+                    params: requestParams,
                     tools: tools,
                     receipt: stepReceipt
                 ) {
@@ -5345,6 +5356,63 @@ struct ContentView: View {
                     )
                     // The retry is the SAME step: its directive (a subagent
                     // relay or the synthesis instruction) has to ride it again.
+                    carriedStepDirective = stepDirective
+                    continue
+                }
+
+                // An over-large `max_tokens` is recoverable too, and it is NOT
+                // an overflow: a catalog can publish a window without an output
+                // cap, so 20% of that window can be a number the model refuses
+                // while the prompt itself is short. Compacting would pay for a
+                // summary and change nothing. Lower the reply budget once, keep
+                // the new number for the rest of the run, and record the cap
+                // when the provider names it — that is capacity evidence about
+                // this model, so the next turn does not ask again.
+                if !didRetryWithSmallerOutputBudget,
+                   let failure = serviceFailure,
+                   case .httpStatus(let code, let summary) = failure,
+                   code == 400 || code == 422,
+                   let recovery = CloudContextPolicy.replyBudgetRecovery(
+                       afterRejectionOf: activeBudget,
+                       body: summary
+                   ) {
+                    didRetryWithSmallerOutputBudget = true
+                    let previousBudget = activeBudget.effective
+                    activeBudget = recovery.budget
+                    requestParams.maxTokens = activeBudget.effective > 0
+                        ? activeBudget.effective
+                        : nil
+                    if let published = recovery.publishedLimit {
+                        CloudContextPolicy.recordObservedOutputLimit(
+                            published,
+                            forModelId: providerModelId,
+                            providerId: provider.id
+                        )
+                    }
+                    let reason = recovery.publishedLimit == nil
+                        ? "refused the requested reply budget"
+                        : "caps this model's reply"
+                    self.showStatus(
+                        "⚠️ \(provider.displayName) \(reason) — retrying this step with \(activeBudget.effective.formatted()) tokens."
+                    )
+                    if let liveIdx = self.sessions.firstIndex(where: { $0.id == sessionId }) {
+                        self.sessions[liveIdx].messages.append(ChatMessage(
+                            role: .system,
+                            content: "⚠️ \(provider.displayName) \(reason) at \(previousBudget.formatted()) tokens for \(CloudModelRegistry.defaultDisplayName(provider: provider, providerModelId: providerModelId)). Retrying this step with \(activeBudget.effective.formatted())."
+                        ))
+                    }
+                    turnLog.recordChatTurn(
+                        status: 400,
+                        errorMessage: "Reply budget rejected by the provider; retrying with \(activeBudget.effective) tokens.",
+                        outputTokens: 0,
+                        finishReason: nil,
+                        thinking: latestThinking,
+                        response: latestText,
+                        toolCalls: []
+                    )
+                    // Same step, same directive, for the same reason the image
+                    // retry keeps it: the report or instruction this attempt
+                    // carried was already marked delivered.
                     carriedStepDirective = stepDirective
                     continue
                 }
@@ -5720,7 +5788,7 @@ struct ContentView: View {
                 let truncatedAtLimit = CloudFinishDisposition(finishReason: finishReason) == .outputLimit
                 let truncationNotice: String?
                 if truncatedAtLimit {
-                    truncationNotice = CloudContextPolicy.outputLimitNotice(budgetResolution)
+                    truncationNotice = CloudContextPolicy.outputLimitNotice(activeBudget)
                 } else if endedWithoutTerminal {
                     // Naming the refused calls matters: the assistant message
                     // shows none of them (a call record is only written when it
@@ -5761,7 +5829,7 @@ struct ContentView: View {
                     : String(format: "%.0f ms", finalElapsed * 1000.0)
                 self.showStatus(
                     "☁️ \(provider.displayName) — \(turnCost.statusSuffix) · \(durationText) · \(String(format: "%.1f", finalTokPerSec)) tok/s"
-                        + (truncatedAtLimit ? " · truncated at \(budgetResolution.effective.formatted()) tokens." : "")
+                        + (truncatedAtLimit ? " · truncated at \(activeBudget.effective.formatted()) tokens." : "")
                         + (truncationNotice != nil && !truncatedAtLimit ? " — stream ended early." : "")
                 )
                 self.dequeueAndRunNextPromptIfNeeded(sessionId: sessionId)

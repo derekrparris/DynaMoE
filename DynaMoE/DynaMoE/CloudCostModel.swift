@@ -826,6 +826,39 @@ public nonisolated enum CloudContextPolicy {
         defaults.set(data, forKey: observedLimitsKey(for: providerId))
     }
 
+    /// Records an output cap a provider's own refusal named, merging it into
+    /// the provider's observed limits.
+    ///
+    /// A catalog may publish a window without an output cap, so the first time
+    /// the app learns that cap can be a 400 on a budget derived from that
+    /// window. That is capacity evidence about this model from the provider
+    /// itself, and keeping it only for the retry would send the same rejected
+    /// number on the next turn. An existing smaller cap is kept: the point is
+    /// to stop asking for too much, not to talk the provider up.
+    ///
+    /// A sub-plausible value is ignored rather than recorded, because that is
+    /// the same units-mistake rule the catalog path applies. Returns whether
+    /// the stored map changed.
+    @discardableResult
+    public static func recordObservedOutputLimit(
+        _ limit: Int,
+        forModelId modelId: String,
+        providerId: String,
+        defaults: UserDefaults = .standard
+    ) -> Bool {
+        guard limit >= minimumPlausibleOutputLimit else { return false }
+        var all = observedLimits(forProviderId: providerId, defaults: defaults)
+        let existing = all[modelId]
+        let merged = min(existing?.maxOutput ?? limit, limit)
+        guard existing?.maxOutput != merged else { return false }
+        all[modelId] = ModelLimits(
+            contextWindow: existing?.contextWindow,
+            maxOutput: merged
+        )
+        setObservedLimits(all, forProviderId: providerId, defaults: defaults)
+        return true
+    }
+
     /// One model's observed limits, or nil when the provider's catalog has
     /// published none. The upstream model id is matched exactly.
     public static func observedLimit(
@@ -1046,6 +1079,11 @@ public nonisolated enum CloudContextPolicy {
             /// smaller than the window room, or (with no usable window) the
             /// only capacity fact the app has.
             case outputLimit
+            /// The provider refused a larger reply budget without naming a
+            /// number. This turn was lowered; the saved setting was not, so
+            /// the Settings control cannot move the number the provider
+            /// already rejected.
+            case providerRefused
         }
 
         public let requested: Int
@@ -1152,6 +1190,108 @@ public nonisolated enum CloudContextPolicy {
         ).effective
     }
 
+    /// A lower reply budget a provider's own rejection just made necessary.
+    public struct ReplyBudgetRecovery: Equatable, Sendable {
+        /// The budget the retry should carry, with its binding recomputed.
+        public let budget: ReplyBudget
+        /// The output cap the provider named, when the body stated one. This
+        /// is capacity evidence about the model and may be recorded.
+        public let publishedLimit: Int?
+
+        public init(budget: ReplyBudget, publishedLimit: Int?) {
+            self.budget = budget
+            self.publishedLimit = publishedLimit
+        }
+    }
+
+    /// The smaller budget one provider rejection justifies, or nil when the
+    /// body is not about the reply budget or no smaller number is available.
+    ///
+    /// One retry only: this never walks a provider's limit down in steps. A
+    /// body that names the limit is used exactly; one that only says "too
+    /// large" halves the budget, floored by the unrecorded-window ceiling, so
+    /// a rejected 200,000 falls back to the conservative number the app used
+    /// before capacity was known rather than to an arbitrary fraction of it.
+    ///
+    /// The returned `ReplyBudget` is rebuilt through
+    /// `replyBudgetResolution` rather than constructed by hand, so the window
+    /// and output-limit arithmetic is the send path's own. A rejection that
+    /// names no number is marked `.providerRefused`: the turn was lowered, not
+    /// the saved setting, and the notice must not send the reader to a control
+    /// that already holds the rejected number.
+    public static func replyBudgetRecovery(
+        afterRejectionOf current: ReplyBudget,
+        body: String
+    ) -> ReplyBudgetRecovery? {
+        guard CloudTurnFailure.indicatesOutputBudgetRejection(body),
+              current.effective > 1 else { return nil }
+        let named = publishedOutputLimit(in: body).flatMap {
+            $0 < current.effective ? $0 : nil
+        }
+        let fallback = min(current.effective / 2, unknownWindowReplyCeiling)
+        let requested = max(1, min(named ?? fallback, current.effective - 1))
+        guard requested < current.effective else { return nil }
+        let limits = [current.outputLimit, named].compactMap { $0 }
+        let resolved = replyBudgetResolution(
+            requested: requested,
+            window: current.window,
+            outputLimit: limits.min()
+        )
+        guard resolved.effective < current.effective else { return nil }
+        let budget = named == nil
+            ? ReplyBudget(
+                requested: resolved.requested,
+                window: resolved.window,
+                outputLimit: resolved.outputLimit,
+                effective: resolved.effective,
+                binding: .providerRefused
+            )
+            : resolved
+        return ReplyBudgetRecovery(budget: budget, publishedLimit: named)
+    }
+
+    /// The output-token cap a provider's rejection names, if it names one.
+    ///
+    /// Only called after `CloudTurnFailure.indicatesOutputBudgetRejection`
+    /// says the body is about the reply budget, so each pattern can assume
+    /// that context. The spellings covered are the ones the app has seen and
+    /// the ones the OpenAI/Anthropic/OpenRouter/Groq families produce:
+    /// `max_tokens: 200000 > 64000`, `at most 4096`, `must be less than or
+    /// equal to 32768`, `valid range … [1, 16384]`, and `cannot exceed 8192`.
+    ///
+    /// A number from a model name is never taken: every pattern requires its
+    /// own cue word or comparison immediately before the digits, and the
+    /// plausibility floor rejects the small numbers that a model name leaks
+    /// (`claude-sonnet-4-6`, `gpt-4o`). Returning nil is not a failure — the
+    /// caller halves the budget instead.
+    public static func publishedOutputLimit(in summary: String) -> Int? {
+        let patterns = [
+            #"(?:max_tokens|max_completion_tokens)[^\n]{0,80}>\s*(\d[\d,]*)"#,
+            #"(?:at most|up to|cannot exceed|not exceed|exceed(?:s|ing)?|less than(?: or equal to)?|<=|≤)\s*(\d[\d,]*)"#,
+            #"(?:valid range[^0-9]{0,40}?\[\s*\d[\d,]*\s*,\s*)(\d[\d,]*)"#,
+            #"(?:maximum|max)\s+(?:allowed\s+)?(?:number\s+of\s+)?(?:output\s+)?tokens?[^0-9]{0,40}?(\d[\d,]*)"#,
+            #"(?:output\s+token\s+limit|output\s+limit|max(?:imum)?\s+output(?:\s+tokens?)?)[^0-9]{0,40}?(\d[\d,]*)"#
+        ]
+        let range = NSRange(summary.startIndex..., in: summary)
+        var found: [Int] = []
+        for pattern in patterns {
+            guard let expression = try? NSRegularExpression(
+                pattern: pattern,
+                options: [.caseInsensitive]
+            ) else { continue }
+            for match in expression.matches(in: summary, options: [], range: range) {
+                guard match.numberOfRanges > 1,
+                      let captured = Range(match.range(at: 1), in: summary) else { continue }
+                let digits = String(summary[captured])
+                    .replacingOccurrences(of: ",", with: "")
+                guard let value = Int(digits),
+                      (minimumPlausibleOutputLimit...10_000_000).contains(value) else { continue }
+                found.append(value)
+            }
+        }
+        return found.min()
+    }
+
     /// The Max Output Tokens ceiling Settings should advertise for a cloud
     /// model — the same number `replyBudget` enforces for it.
     ///
@@ -1196,6 +1336,10 @@ public nonisolated enum CloudContextPolicy {
             let limitText = budget.outputLimit.map { "this model's published \($0.formatted())-token output limit" } ?? "this model's published output limit"
             return head
                 + "That is \(limitText), so raising Max Output Tokens cannot go higher. Choose a model with a larger output limit for a longer reply."
+                + tail
+        case .providerRefused:
+            return head
+                + "The provider refused a larger reply budget for this model, so this turn continued at \(budget.effective.formatted()). Your Max Output Tokens setting was not lowered; record the model's real output limit on Settings ▸ Cloud so a later turn is not refused again."
                 + tail
         }
     }

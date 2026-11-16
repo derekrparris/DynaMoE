@@ -531,6 +531,17 @@ struct CloudProvidersSettingsView: View {
                 outputLimit: observed?.maxOutput
             )
         }
+        /// What the empty field says. Only a window the provider actually
+        /// published earns "detected": an output-limit-only entry is capacity
+        /// evidence, but it is not a window, and saying "detected" beside an
+        /// empty field implied one had been.
+        var placeholder: String {
+            guard let observedWindow = observed?.contextWindow,
+                  observedWindow >= CloudContextPolicy.minimumPlausibleWindow else {
+                return "none"
+            }
+            return "detected"
+        }
         /// What the row says about the window and the budget it yields.
         ///
         /// Exhaustive over `WindowSource`: a window the model recorded, one the
@@ -630,7 +641,7 @@ struct CloudProvidersSettingsView: View {
             VStack(alignment: .trailing, spacing: 3) {
                 HStack(spacing: 6) {
                     TextField(
-                        entry.observed.map { _ in "detected" } ?? "none",
+                        entry.placeholder,
                         text: Binding(
                             get: {
                                 // A draft is an EDIT. With none, the field reads

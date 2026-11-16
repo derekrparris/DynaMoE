@@ -975,6 +975,11 @@ final class CloudProfileAddressingTests: XCTestCase {
             manager.getProfile(for: registryID, type: .coder).maxNewTokens,
             200_000
         )
+        XCTAssertEqual(
+            manager.getProfile(for: sentinel, type: .assistant).maxNewTokens,
+            200_000,
+            "known capacity seeds both generic types; the 2:1 ratio is only the unknown-capacity fallback"
+        )
         // The seeded number is the number the turn actually sends, not a value
         // the ceiling then lowers behind the setting's back.
         let resolution = CloudContextPolicy.replyBudgetResolution(
@@ -1108,6 +1113,130 @@ final class CloudProfileAddressingTests: XCTestCase {
         XCTAssertEqual(
             manager.getProfile(for: "cloud://synthetic/output-only", type: .coder).maxNewTokens,
             65_536
+        )
+    }
+
+    /// A provider that names its own output cap must be believed twice: the
+    /// retry carries it, and the cap is recorded so the next turn does not ask
+    /// for a number the model already refused.
+    func testAProviderOutputCapRejectionYieldsALowerBudgetAndRecordsTheCap() {
+        let (_, defaults, suite) = scratchManager()
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        CloudContextPolicy.setObservedLimits(
+            ["capped": .init(contextWindow: 1_000_000)],
+            forProviderId: "synthetic",
+            defaults: defaults
+        )
+        let current = CloudContextPolicy.replyBudgetResolution(
+            requested: 200_000,
+            window: 1_000_000
+        )
+        let body = "max_tokens: 200000 > 64000, which is the maximum allowed number of output tokens for claude-sonnet-4-6"
+        let recovery = CloudContextPolicy.replyBudgetRecovery(
+            afterRejectionOf: current,
+            body: body
+        )
+        XCTAssertEqual(recovery?.publishedLimit, 64_000)
+        XCTAssertEqual(recovery?.budget.effective, 64_000)
+        XCTAssertEqual(recovery?.budget.binding, .outputLimit)
+        XCTAssertEqual(
+            CloudContextPolicy.publishedOutputLimit(
+                in: "max_tokens too large: 200000 > 64000"
+            ),
+            64_000,
+            "a bare comparison still belongs to the reply budget"
+        )
+        XCTAssertNil(
+            CloudContextPolicy.publishedOutputLimit(
+                in: "maximum context length is 128000 tokens"
+            ),
+            "a context window is not an output cap"
+        )
+
+        XCTAssertTrue(
+            CloudContextPolicy.recordObservedOutputLimit(
+                64_000,
+                forModelId: "capped",
+                providerId: "synthetic",
+                defaults: defaults
+            )
+        )
+        XCTAssertEqual(
+            CloudContextPolicy.observedLimit(
+                forModelId: "capped",
+                providerId: "synthetic",
+                defaults: defaults
+            ),
+            .init(contextWindow: 1_000_000, maxOutput: 64_000),
+            "recording a discovered cap must keep the window the catalog published"
+        )
+        XCTAssertFalse(
+            CloudContextPolicy.recordObservedOutputLimit(
+                64_000,
+                forModelId: "capped",
+                providerId: "synthetic",
+                defaults: defaults
+            ),
+            "the same cap twice is not a change"
+        )
+    }
+
+    /// A rejection that names no number still yields one retry, at the
+    /// conservative ceiling the app used before capacity was known, and the
+    /// notice says the saved setting was not the thing that moved.
+    func testAProviderRejectionWithoutANumberFallsBackToTheConservativeCeiling() {
+        let current = CloudContextPolicy.replyBudgetResolution(
+            requested: 200_000,
+            window: 1_000_000
+        )
+        let recovery = CloudContextPolicy.replyBudgetRecovery(
+            afterRejectionOf: current,
+            body: "Invalid 'max_tokens': integer too large"
+        )
+        XCTAssertEqual(recovery?.publishedLimit, nil)
+        XCTAssertEqual(recovery?.budget.effective, CloudContextPolicy.unknownWindowReplyCeiling)
+        XCTAssertEqual(recovery?.budget.binding, .providerRefused)
+        let notice = CloudContextPolicy.outputLimitNotice(recovery!.budget)
+        XCTAssertTrue(notice.contains("provider refused a larger reply budget"), notice)
+        XCTAssertFalse(
+            notice.contains("Raise Max Output Tokens"),
+            "the saved setting is not the control that can move a number the provider refused"
+        )
+    }
+
+    /// The classifier must not turn an unrelated sampling or schema complaint
+    /// into a second upload of the whole prompt.
+    func testOnlyAnOutputCapComplaintEarnsABudgetRetry() {
+        let current = CloudContextPolicy.replyBudgetResolution(
+            requested: 200_000,
+            window: 1_000_000
+        )
+        for body in [
+            "temperature must be between 0 and 2",
+            "tools are unsupported for this model",
+            "max_tokens must be a positive integer",
+            "This model's maximum context length is 128000 tokens. Please reduce the length of the messages.",
+            "image_url is not supported"
+        ] {
+            XCTAssertFalse(
+                CloudTurnFailure.indicatesOutputBudgetRejection(body),
+                body
+            )
+            XCTAssertNil(
+                CloudContextPolicy.replyBudgetRecovery(
+                    afterRejectionOf: current,
+                    body: body
+                ),
+                body
+            )
+        }
+        // The OpenAI spelling that mentions BOTH the field and the context
+        // window is still about max_tokens: lowering it is what fits.
+        XCTAssertTrue(
+            CloudTurnFailure.indicatesOutputBudgetRejection(
+                "max_tokens is too large: 200000. This model's maximum context length is 128000 tokens."
+            )
         )
     }
 
