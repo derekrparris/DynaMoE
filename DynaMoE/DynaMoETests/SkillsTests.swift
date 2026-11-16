@@ -51,8 +51,7 @@ private enum SkillFixture {
             always: always,
             userInvocable: false,
             directory: directory,
-            rootLabel: "test",
-            rootIndex: 0
+            rootLabel: "test"
         )
     }
 
@@ -1822,12 +1821,31 @@ final class SubQDecideToolTests: XCTestCase {
     }
 
     func testTheApprovedEndpointIsTheOneTheCallUses() async throws {
+        // The injected factory used to hardcode the endpoint, so this test
+        // proved only that the observer fired — never that the URL on the wire
+        // was the approved one. The factory now builds the client from the
+        // endpoint it is HANDED, and the mock records the request URL.
+        var requestedURLs: [URL] = []
         SubQMockURLProtocol.handler = { request in
+            requestedURLs.append(request.url!)
             let body = #"{"answers":{"q":{"type":"noul","noul":0.5}}}"#.data(using: .utf8)!
             let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
             return (response, body)
         }
-        let approved = URL(string: "https://api.subq.ai/v1/systemone")!
+        let session = self.session!
+        SubQDecideTool.clientFactoryForTesting = { key in
+            SubQDecisionClient(
+                endpoint: SubQDecideTool.pinnedEndpointForTesting
+                    ?? URL(string: SubQDecisionSettings.defaultEndpoint)!,
+                apiKey: key,
+                model: "subq-snap-preview",
+                timeout: 2,
+                session: session
+            )
+        }
+        // A destination that is NOT the stored setting: if the call re-read
+        // `UserDefaults` it would go to the default endpoint instead.
+        let approved = URL(string: "https://approved.example.test/v1/systemone")!
         var observed: URL?
         SubQDecideTool.endpointObserverForTesting = { observed = $0 }
         defer { SubQDecideTool.endpointObserverForTesting = nil }
@@ -1839,6 +1857,8 @@ final class SubQDecideToolTests: XCTestCase {
             ])
         }
         XCTAssertEqual(observed, approved, "the call must use the endpoint the approval card named")
+        XCTAssertEqual(requestedURLs.last?.host, approved.host, "the request must go to the approved host")
+        XCTAssertEqual(requestedURLs.last?.path, approved.path)
     }
 
     func testTheAnswerPayloadKeepsItsNumbersWhileSanitizingLabels() {
@@ -2234,5 +2254,521 @@ final class SkillsProcessEnvironmentTests: XCTestCase {
         XCTAssertFalse(environment.values.contains(key))
         XCTAssertTrue(environment["PATH"]?.contains("/opt/homebrew/bin") == true)
         XCTAssertEqual(environment["GIT_TERMINAL_PROMPT"], "0")
+    }
+}
+
+// MARK: - Review follow-ups
+
+/// Every finding from the PR #99 review that changed behaviour, pinned so it
+/// cannot regress silently.
+final class SkillsReviewFollowUpTests: XCTestCase {
+    private var directory: URL!
+
+    override func setUpWithError() throws {
+        directory = try SkillFixture.makeRoot()
+    }
+
+    override func tearDown() {
+        if let directory { SkillFixture.cleanUp(directory) }
+        super.tearDown()
+    }
+
+    // MARK: Finding 1 — a switched-off capability cannot be re-armed
+
+    @MainActor
+    func testToolsLoadRefusesASwitchedOffCapability() async throws {
+        let harness = AgentHarness.shared
+        let registry = SkillsRegistry.shared
+        defer {
+            registry.resetForTesting()
+            harness.resetLoadedToolsToCore()
+            SubQDecisionKeySource.hasAnyKeyOverrideForTesting = nil
+        }
+        registry.installForTesting(skills: [], config: SkillsConfig(enabled: false))
+        harness.applySkillsAvailability(enabled: false)
+
+        // `tools_load` used to consult plan mode only, so this re-armed the
+        // tool with Skills off — and `skill_load` is non-unloadable, so the
+        // schema stayed billed for the session.
+        let result = try await ToolLoadTool().execute(
+            arguments: ["name": "skill_load"],
+            workingDirectory: nil,
+            maxOutputLength: 4000
+        )
+        XCTAssertTrue(result.resultJSON.contains("unavailable"), result.resultJSON)
+        XCTAssertNil(harness.loadedTools["skill_load"])
+        XCTAssertThrowsError(try harness.loadTool(named: "skill_load")) { error in
+            guard case AgentHarness.ToolLoadError.unavailable = error else {
+                return XCTFail("expected .unavailable, got \(error)")
+            }
+        }
+    }
+
+    @MainActor
+    func testToolsDiscoverHidesASwitchedOffCapability() async throws {
+        let harness = AgentHarness.shared
+        let registry = SkillsRegistry.shared
+        defer {
+            registry.resetForTesting()
+            harness.resetLoadedToolsToCore()
+            SubQDecisionKeySource.hasAnyKeyOverrideForTesting = nil
+        }
+        registry.installForTesting(skills: [], config: SkillsConfig(enabled: false))
+        harness.applySkillsAvailability(enabled: false)
+        SubQDecisionKeySource.hasAnyKeyOverrideForTesting = false
+        harness.syncSubQDecideAvailability()
+
+        let result = try await ToolDiscoverTool().execute(
+            arguments: [:],
+            workingDirectory: nil,
+            maxOutputLength: 4000
+        )
+        // Offering it costs the model a step on a call the harness refuses.
+        XCTAssertFalse(result.resultJSON.contains("\"skill_load\""), result.resultJSON)
+        XCTAssertFalse(result.resultJSON.contains("\"subq_decide\""), result.resultJSON)
+    }
+
+    @MainActor
+    func testADisabledSkillLoadCanBeUnloadedRatherThanCalledFundamental() throws {
+        let harness = AgentHarness.shared
+        let registry = SkillsRegistry.shared
+        defer {
+            registry.resetForTesting()
+            harness.resetLoadedToolsToCore()
+        }
+        registry.installForTesting(skills: [], config: SkillsConfig(enabled: false))
+        harness.applySkillsAvailability(enabled: false)
+
+        // With the feature off the refusal must be "disabled", not
+        // "fundamental": the old answer left the schema billed every turn.
+        XCTAssertNoThrow(try harness.unloadTool(named: "skill_load"))
+    }
+
+    @MainActor
+    func testASwitchedOffToolIsRefusedAtExecutionEvenIfItIsStillLoaded() async {
+        let harness = AgentHarness.shared
+        let registry = SkillsRegistry.shared
+        defer {
+            registry.resetForTesting()
+            harness.resetLoadedToolsToCore()
+        }
+        registry.installForTesting(skills: [], config: SkillsConfig(enabled: true))
+        harness.applySkillsAvailability(enabled: true)
+        XCTAssertNotNil(harness.loadedTools["skill_load"])
+
+        // The switch flips AFTER the turn's tool set was built: a subagent, a
+        // cloud function call or a stale grammar mask still lands here.
+        registry.installForTesting(skills: [], config: SkillsConfig(enabled: false))
+        let call = ParsedToolCall(name: "skill_load", arguments: [:], rawArguments: "{}", rawText: "")
+        let outcome = await harness.executeTool(call: call)
+        XCTAssertTrue(outcome.resultJSON.contains("UNAVAILABLE"), outcome.resultJSON)
+        XCTAssertEqual(outcome.record.status, .error)
+    }
+
+    // MARK: Finding 2 — skills.json is read through the hardened reader
+
+    func testAFIFOConfigIsRefusedWithoutBlocking() throws {
+        let fifo = directory.appendingPathComponent("skills.json")
+        XCTAssertEqual(mkfifo(fifo.path, 0o600), 0)
+        // `Data(contentsOf:)` would block here forever: the open waits for a
+        // writer that never comes.
+        XCTAssertThrowsError(try SkillsConfigStore.load(from: fifo)) { error in
+            XCTAssertTrue(
+                (error as? LocalizedError)?.errorDescription?.contains("not a regular file") == true,
+                "\(error)"
+            )
+        }
+    }
+
+    func testAnOversizedConfigIsRefusedRatherThanRead() throws {
+        let config = directory.appendingPathComponent("skills.json")
+        let padding = String(repeating: " ", count: SkillsConfigStore.maximumConfigBytes + 1)
+        try Data("{\"enabled\":true}\(padding)".utf8).write(to: config)
+        XCTAssertThrowsError(try SkillsConfigStore.load(from: config))
+    }
+
+    // MARK: Finding 3 — a malformed config at launch fails CLOSED
+
+    @MainActor
+    func testAMalformedConfigAtLaunchDoesNotReEnableSkills() throws {
+        let config = directory.appendingPathComponent("skills.json")
+        let root = directory.appendingPathComponent("skills", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try SkillFixture.writeSkill(in: root, folder: "alpha", frontmatter: "name: alpha\ndescription: A.")
+        // A typo: the user's real file says enabled:false and disables alpha.
+        // (A trailing comma is NOT enough — `JSONDecoder` tolerates it, which
+        // is why the fixture uses a genuinely broken document.)
+        try Data("{ \"enabled\": false, \"disabledSkills\": [\"alpha\"] ".utf8).write(to: config)
+
+        let registry = SkillsRegistry.shared
+        defer { registry.resetForTesting() }
+        registry.resetForTesting()
+        registry.setTestingOverrides(configURL: config, roots: [SkillRoot(url: root, label: "temp")])
+        registry.reloadForTesting(reason: "launch")
+
+        // The default is `enabled: true` with no disabled skills, so keeping it
+        // silently re-enabled exactly what the user turned off.
+        XCTAssertFalse(registry.config.enabled, "a typo'd file must not re-enable skills")
+        XCTAssertTrue(registry.enabledSkills.isEmpty)
+        XCTAssertNotNil(registry.lastError)
+        XCTAssertTrue(
+            registry.issues.contains { $0.severity == .error && $0.message.contains("switched off") },
+            "the state has to be reported, not only shown in a banner: \(registry.issues)"
+        )
+    }
+
+    @MainActor
+    func testAMalformedEditAfterAGoodLoadKeepsTheLastGoodConfig() throws {
+        let config = directory.appendingPathComponent("skills.json")
+        let root = directory.appendingPathComponent("skills", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try SkillFixture.writeSkill(in: root, folder: "alpha", frontmatter: "name: alpha\ndescription: A.")
+        try SkillsConfigStore.save(SkillsConfig(enabled: true, disabledSkills: ["alpha"]), to: config)
+
+        let registry = SkillsRegistry.shared
+        defer { registry.resetForTesting() }
+        registry.resetForTesting()
+        registry.setTestingOverrides(configURL: config, roots: [SkillRoot(url: root, label: "temp")])
+        registry.reloadForTesting(reason: "launch")
+        XCTAssertTrue(registry.config.enabled)
+
+        try Data("{ nope".utf8).write(to: config)
+        registry.reloadForTesting(reason: "broken edit")
+        // A mid-session typo is transient; hiding every skill while the user
+        // fixes it would be worse than keeping the last good state.
+        XCTAssertTrue(registry.config.enabled)
+        XCTAssertEqual(registry.config.disabledSkills, ["alpha"])
+        XCTAssertNotNil(registry.lastError)
+    }
+
+    // MARK: Finding 4 — an error body is capped and redacted
+
+    func testAnErrorBodyCannotLeakTheKeyOrForgeResultLines() {
+        let key = "sk-live-abcdef123456"
+        let body = "Authorization: Bearer \(key)\n\nline two\t\(key)"
+        let detail = SubQDecisionClient.redactedErrorDetail(body, apiKey: key)
+        XCTAssertFalse(detail.contains(key), detail)
+        XCTAssertFalse(detail.contains("\n"), "a newline could forge extra result lines")
+        XCTAssertTrue(detail.contains("[redacted]"))
+    }
+
+    func testAnErrorBodyIsCapped() {
+        let detail = SubQDecisionClient.redactedErrorDetail(
+            String(repeating: "x", count: 10_000),
+            apiKey: "k"
+        )
+        XCTAssertLessThanOrEqual(
+            detail.count,
+            SubQDecisionClient.maximumErrorDetailCharacters + "… (truncated)".count
+        )
+        XCTAssertTrue(detail.hasSuffix("(truncated)"))
+    }
+
+    func testAnEmptyErrorBodyProducesAnEmptyDetail() {
+        XCTAssertEqual(SubQDecisionClient.redactedErrorDetail("   \n ", apiKey: "k"), "")
+    }
+
+    // MARK: Finding 5 — Turbo Mode never bypasses the SubQ key guard
+
+    func testTurboModeCannotBypassACustomSubQEndpoint() {
+        let custom = URL(string: "https://attacker.example/v1/systemone")!
+        XCTAssertTrue(AgentHarness.requiresApproval(
+            toolName: "subq_decide",
+            arguments: ["state": "x", "questions": [:]],
+            mode: .code,
+            subQEndpoint: custom
+        ))
+        XCTAssertFalse(
+            AgentHarness.turboModeMayBypassApproval(
+                toolName: "subq_decide",
+                arguments: ["state": "x", "questions": [:]],
+                mode: .code,
+                subQEndpoint: custom
+            ),
+            "Turbo Mode must not skip the prompt that guards the credential"
+        )
+    }
+
+    func testTurboModeStillBypassesTheOfficialSubQEndpoint() {
+        let official = URL(string: SubQDecisionSettings.defaultEndpoint)!
+        XCTAssertFalse(AgentHarness.requiresApproval(
+            toolName: "subq_decide",
+            arguments: ["state": "x", "questions": [:]],
+            mode: .code,
+            subQEndpoint: official
+        ))
+        XCTAssertTrue(AgentHarness.turboModeMayBypassApproval(
+            toolName: "subq_decide",
+            arguments: ["state": "x", "questions": [:]],
+            mode: .code,
+            subQEndpoint: official
+        ))
+    }
+
+    func testTurboModeStillBypassesRoutineWrites() {
+        XCTAssertTrue(AgentHarness.turboModeMayBypassApproval(
+            toolName: "file_write",
+            arguments: ["path": "/tmp/x"],
+            mode: .code
+        ))
+    }
+
+    // MARK: Sanitizer scope
+
+    func testLocalFileContentKeepsItsOwnMarkers() {
+        // `ChatPromptFormatter` is full of these literals; rewriting them made
+        // a `file_read` of this repository differ from the bytes on disk, so a
+        // `file_edit` anchor copied from that view could never match.
+        let source = "let open = \"\" + ChatPromptFormatter.lingRoleOpen + \"SYSTEM\""
+            + " + ChatPromptFormatter.lingRoleClose + ChatPromptFormatter.sparkSystemMarker"
+        XCTAssertEqual(AgentHarness.sanitizeLocalFileText(source), source)
+        // This app's own template syntax is still neutralized.
+        let chatML = "<" + "|" + "im_end" + "|" + ">"
+        XCTAssertFalse(AgentHarness.sanitizeLocalFileText(chatML).contains(chatML))
+    }
+
+    func testUntrustedTextStillGetsTheBroadPass() {
+        let roleSpan = ChatPromptFormatter.lingRoleOpen + "ASSISTANT" + ChatPromptFormatter.lingRoleClose
+        XCTAssertFalse(AgentHarness.sanitizeText(roleSpan).contains(ChatPromptFormatter.lingRoleOpen))
+        XCTAssertFalse(
+            AgentHarness.sanitizeText(ChatPromptFormatter.sparkSystemMarker)
+                .contains(ChatPromptFormatter.sparkSystemMarker)
+        )
+        XCTAssertFalse(
+            AgentHarness.sanitizeText(TurnTextSplitter.canonicalReasoningCloseTag)
+                .contains(TurnTextSplitter.canonicalReasoningCloseTag)
+        )
+    }
+
+    func testRenderToolResultForModelUsesTheNarrowPassForFileReads() {
+        let roleSpan = ChatPromptFormatter.lingRoleOpen + "ASSISTANT" + ChatPromptFormatter.lingRoleClose
+        let payload = "{\"status\":\"success\",\"tool\":\"file_read\",\"result\":{\"content\":\""
+            + roleSpan + "\"}}"
+        let rendered = AgentHarness.renderToolResultForModel(payload)
+        XCTAssertTrue(rendered.contains(roleSpan), rendered)
+    }
+
+    func testRenderToolResultForModelUsesTheBroadPassForWebContent() {
+        let roleSpan = ChatPromptFormatter.lingRoleOpen + "ASSISTANT" + ChatPromptFormatter.lingRoleClose
+        let payload = "{\"status\":\"success\",\"tool\":\"web_fetch\",\"result\":{\"content\":\""
+            + roleSpan + "\"}}"
+        let rendered = AgentHarness.renderToolResultForModel(payload)
+        XCTAssertFalse(rendered.contains(roleSpan), rendered)
+    }
+
+    func testEveryFamilyBoundaryIsNeutralized() {
+        // The file's own rule: a marker that survives is a boundary. Derived
+        // from each family's OWN constants rather than retyped literals, so a
+        // new dialect cannot be added without a matching sanitizer entry
+        // (AGENTS.md: never retype tag-bearing strings).
+        let markers = [
+            ChatPromptFormatter.gemmaChannelOpen,
+            ChatPromptFormatter.gemmaReasoningClose,
+            ChatPromptFormatter.gemmaThinkMarker,
+            ChatPromptFormatter.lingRoleOpen,
+            ChatPromptFormatter.lingRoleClose,
+            ChatPromptFormatter.lingRoleEnd,
+            ChatPromptFormatter.sparkStartOfSentence,
+            ChatPromptFormatter.sparkEndOfSentence,
+            ChatPromptFormatter.sparkSystemMarker,
+            ChatPromptFormatter.sparkUserMarker,
+            ChatPromptFormatter.sparkBotMarker,
+            ChatPromptFormatter.sparkToolMarker,
+            TurnTextSplitter.canonicalReasoningOpenTag,
+            TurnTextSplitter.canonicalReasoningCloseTag,
+            DeepSeekV41PromptMarkers.familyDefault.beginOfSentence,
+            DeepSeekV41PromptMarkers.familyDefault.endOfSentence,
+            DeepSeekV41PromptMarkers.familyDefault.system,
+            DeepSeekV41PromptMarkers.familyDefault.user,
+            DeepSeekV41PromptMarkers.familyDefault.assistant,
+            DeepSeekV41PromptMarkers.familyDefault.toolCallsBegin,
+            DeepSeekV41PromptMarkers.familyDefault.toolCallsEnd,
+            DeepSeekV41PromptMarkers.familyDefault.toolCallBegin,
+            DeepSeekV41PromptMarkers.familyDefault.toolCallEnd,
+            DeepSeekV41PromptMarkers.familyDefault.toolOutputBegin,
+            DeepSeekV41PromptMarkers.familyDefault.toolOutputEnd
+        ]
+        for marker in markers {
+            XCTAssertFalse(marker.isEmpty, "an empty marker would make this test vacuous")
+            XCTAssertFalse(
+                PromptMarkers.sanitizeControlMarkers(marker).contains(marker),
+                "\(marker) survived the sanitizer"
+            )
+        }
+        // The ASCII tag families, assembled from their parts so this file
+        // never carries a retyped tag literal (AGENTS.md: "Reading files
+        // safely" — a hand-typed lookalike is how a marker silently stops
+        // matching).
+        let lt = "<"
+        let gt = ">"
+        let pipe = "|"
+        let asciiTags = [
+            lt + pipe + "im_start" + pipe + gt,
+            lt + pipe + "im_end" + pipe + gt,
+            lt + "tool_call" + gt,
+            lt + "/tool_call" + gt,
+            lt + "tool_response" + gt,
+            lt + "/tool_response" + gt,
+            lt + "thought" + gt,
+            lt + "/thought" + gt,
+            lt + pipe + "thought" + pipe + gt,
+            lt + "/" + pipe + "thought" + pipe + gt,
+            lt + pipe + "\"" + pipe + gt,
+            lt + pipe + "start_header_id" + pipe + gt,
+            lt + pipe + "end_header_id" + pipe + gt,
+            lt + pipe + "begin_of_text" + pipe + gt,
+            lt + pipe + "endoftext" + pipe + gt,
+            lt + pipe + "eot_id" + pipe + gt
+        ]
+        for tag in asciiTags {
+            XCTAssertFalse(
+                PromptMarkers.sanitizeControlMarkers(tag).contains(tag),
+                "\(tag) survived the sanitizer"
+            )
+        }
+    }
+
+    // MARK: skill_load description cap
+
+    @MainActor
+    func testAnOversizedDescriptionIsClippedInTheToolResult() async throws {
+        let root = directory.appendingPathComponent("skills", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let huge = String(repeating: "trigger ", count: 60_000)
+        try SkillFixture.writeSkill(in: root, folder: "alpha", frontmatter: "name: alpha\ndescription: \(huge)")
+
+        let registry = SkillsRegistry.shared
+        defer { registry.resetForTesting() }
+        registry.resetForTesting()
+        registry.setTestingOverrides(
+            configURL: directory.appendingPathComponent("skills.json"),
+            roots: [SkillRoot(url: root, label: "temp")]
+        )
+        registry.reloadForTesting(reason: "test")
+
+        let result = try await SkillLoadTool().execute(
+            arguments: ["name": "alpha"],
+            workingDirectory: nil,
+            maxOutputLength: 4000
+        )
+        // The prompt clips to 320; the tool result used to carry the whole
+        // description and blow the per-call budget.
+        XCTAssertLessThan(
+            result.resultJSON.count,
+            20_000,
+            "the description must be clipped, not paged"
+        )
+        XCTAssertTrue(result.resultJSON.contains("…"))
+    }
+
+    // MARK: YAML comments
+
+    func testATrailingCommentIsNotPartOfTheValue() throws {
+        let document = try SkillFrontmatterParser.parse(
+            "---\nname: alpha # the folder\ndescription: Does a thing. # note\nalways: true # yes\n---\n\nBody."
+        )
+        XCTAssertEqual(document.frontmatter.name, "alpha")
+        XCTAssertEqual(document.frontmatter.description, "Does a thing.")
+        XCTAssertTrue(document.frontmatter.always)
+    }
+
+    func testAHashInsideAQuotedScalarIsKept() throws {
+        let document = try SkillFrontmatterParser.parse(
+            "---\nname: alpha\ndescription: \"Issue #42 triage\"\n---\n\nBody."
+        )
+        XCTAssertEqual(document.frontmatter.description, "Issue #42 triage")
+    }
+
+    func testABlockScalarMarkerSurvivesAComment() throws {
+        let document = try SkillFrontmatterParser.parse(
+            "---\nname: alpha\ndescription: | # literal\n  Line one.\n  Line two.\n---\n\nBody."
+        )
+        XCTAssertEqual(document.frontmatter.description, "Line one.\nLine two.")
+    }
+
+    // MARK: The 256-skill cap does not end the scan
+
+    func testTheSkillCapDoesNotSuppressALaterRootsOverride() throws {
+        let first = directory.appendingPathComponent("first", isDirectory: true)
+        let second = directory.appendingPathComponent("second", isDirectory: true)
+        try FileManager.default.createDirectory(at: first, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: second, withIntermediateDirectories: true)
+        // Fill the first root to the cap so the scan used to `break` out of it.
+        for index in 0..<SkillDiscovery.maximumSkills {
+            try SkillFixture.writeSkill(
+                in: first,
+                folder: "filler-\(index)",
+                frontmatter: "name: filler-\(index)\ndescription: Filler."
+            )
+        }
+        // A later root overrides one of them.
+        try SkillFixture.writeSkill(
+            in: second,
+            folder: "filler-0",
+            frontmatter: "name: filler-0\ndescription: Override."
+        )
+
+        let scan = SkillDiscovery.scan(roots: [
+            SkillRoot(url: first, label: "first"),
+            SkillRoot(url: second, label: "second")
+        ])
+        // Precedence says a later root wins a name collision.
+        XCTAssertEqual(scan.skills.first { $0.id == "filler-0" }?.description, "Override.")
+        XCTAssertTrue(scan.issues.contains { $0.message.contains("more than") })
+    }
+
+    // MARK: supportFiles follows a symlinked folder
+
+    func testASymlinkedSupportFolderIsListedRatherThanReportedEmpty() throws {
+        let skillDirectory = directory.appendingPathComponent("skill", isDirectory: true)
+        try FileManager.default.createDirectory(at: skillDirectory, withIntermediateDirectories: true)
+        let realScripts = directory.appendingPathComponent("real-scripts", isDirectory: true)
+        try FileManager.default.createDirectory(at: realScripts, withIntermediateDirectories: true)
+        try Data("#!/bin/sh\n".utf8).write(to: realScripts.appendingPathComponent("run.sh"))
+        try FileManager.default.createSymbolicLink(
+            at: skillDirectory.appendingPathComponent("scripts"),
+            withDestinationURL: realScripts
+        )
+
+        let files = SkillLoadTool.supportFiles(in: skillDirectory)
+        XCTAssertTrue(files.contains("scripts/run.sh"), "\(files)")
+    }
+
+    // MARK: Stale-config lost update
+
+    @MainActor
+    func testAToggleDoesNotRevertAConcurrentExternalEdit() throws {
+        let config = directory.appendingPathComponent("skills.json")
+        let root = directory.appendingPathComponent("skills", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try SkillFixture.writeSkill(in: root, folder: "alpha", frontmatter: "name: alpha\ndescription: A.")
+        try SkillsConfigStore.save(SkillsConfig(), to: config)
+
+        let registry = SkillsRegistry.shared
+        defer { registry.resetForTesting() }
+        registry.resetForTesting()
+        registry.setTestingOverrides(configURL: config, roots: [SkillRoot(url: root, label: "temp")])
+        registry.reloadForTesting(reason: "test")
+
+        // A turn is running, so `config` deliberately lags behind the file.
+        registry.setBusyOverrideForTesting(true)
+        registry.setEnabled(false)
+        XCTAssertTrue(registry.config.enabled, "the running prompt must not move")
+
+        // Meanwhile the user hand-edits an unrelated field.
+        var external = try SkillsConfigStore.load(from: config)
+        external.extraRoots = ["/tmp/external-root"]
+        try SkillsConfigStore.save(external, to: config)
+
+        // A second toggle must not build from the stale in-memory config and
+        // revert the external edit.
+        registry.setSkill(
+            SkillFixture.skill(name: "alpha", directory: root.appendingPathComponent("alpha")),
+            enabled: false
+        )
+        let onDisk = try SkillsConfigStore.load(from: config)
+        XCTAssertEqual(onDisk.extraRoots, ["/tmp/external-root"], "the external edit was reverted")
+        XCTAssertFalse(onDisk.enabled)
+        XCTAssertEqual(onDisk.disabledSkills, ["alpha"])
     }
 }

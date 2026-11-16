@@ -124,7 +124,9 @@ public final class SkillLoadTool: AgentTool {
             // label is a directory name somebody else may have chosen: both go
             // through the same marker pass as every other tool result, so a
             // stored marker cannot forge a boundary in the transcript either.
-            let description = AgentHarness.sanitizeText(skill.description)
+            let description = AgentHarness.sanitizeText(
+                SkillValidation.clippedDescription(skill.description)
+            )
             let baseDirectory = AgentHarness.sanitizeText(skill.directory.path)
             let source = AgentHarness.sanitizeText(skill.rootLabel)
             payload.append([
@@ -190,7 +192,12 @@ public final class SkillLoadTool: AgentTool {
             }.value).map(AgentHarness.sanitizeText)
             let safeBody = AgentHarness.sanitizeText(document.body)
             let page = Self.page(safeBody, offset: offset, maxCharacters: budget)
-            let safeDescription = AgentHarness.sanitizeText(document.frontmatter.description)
+            // Clipped like the prompt clips it: this is a per-call budget, and
+            // the description is a trigger to read the file, not a summary of
+            // it. The body below is what gets paged.
+            let safeDescription = AgentHarness.sanitizeText(
+                SkillValidation.clippedDescription(document.frontmatter.description)
+            )
             let baseDirectory = AgentHarness.sanitizeText(skill.directory.path)
             let manifestPath = AgentHarness.sanitizeText(skillFile.path)
             let source = AgentHarness.sanitizeText(skill.rootLabel)
@@ -248,7 +255,11 @@ public final class SkillLoadTool: AgentTool {
         }
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
-            let files = Self.supportFiles(in: skill.directory).map(AgentHarness.sanitizeText)
+            // Off the caller's actor: this is a stat per entry across every
+            // support folder, and the tool is MainActor-bound.
+            let files = (await Task.detached(priority: .userInitiated) {
+                Self.supportFiles(in: skill.directory)
+            }.value).map(AgentHarness.sanitizeText)
             let err = "'\(AgentHarness.sanitizeText(relativePath))' does not exist in '\(skill.name)'. Available: \(files.joined(separator: ", "))."
             return (AgentHarness.toolErrorJSON(tool: "skill_load", error: err, extra: [
                 "files": files
@@ -381,8 +392,13 @@ public final class SkillLoadTool: AgentTool {
     /// result; the model can still ask for a named file.
     nonisolated static func supportFiles(in directory: URL) -> [String] {
         let fileManager = FileManager.default
+        // Resolve first: `contentsOfDirectory` refuses a symlinked folder and
+        // the old `?? []` turned that into "this skill has no support files",
+        // which is the exact hazard AGENTS.md records. A skill checked out
+        // through a dotfiles link is a normal layout, not an empty one.
+        let resolved = directory.resolvingSymlinksInPath().standardizedFileURL
         let entries = (try? fileManager.contentsOfDirectory(
-            at: directory,
+            at: resolved,
             includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles]
         )) ?? []
@@ -393,12 +409,15 @@ public final class SkillLoadTool: AgentTool {
             names.append(isDirectory.boolValue ? entry.lastPathComponent + "/" : entry.lastPathComponent)
         }
         for folder in ["scripts", "reference", "references", "assets", "examples"] {
-            let folderURL = directory.appendingPathComponent(folder, isDirectory: true)
+            let folderURL = resolved.appendingPathComponent(folder, isDirectory: true)
+            // `fileExists` follows a link, so a symlinked `scripts/` passes
+            // here; listing the RESOLVED path is what makes it list anything.
             var isDirectory: ObjCBool = false
             guard fileManager.fileExists(atPath: folderURL.path, isDirectory: &isDirectory),
                   isDirectory.boolValue else { continue }
+            let resolvedFolder = folderURL.resolvingSymlinksInPath().standardizedFileURL
             let children = (try? fileManager.contentsOfDirectory(
-                at: folderURL,
+                at: resolvedFolder,
                 includingPropertiesForKeys: [.isDirectoryKey],
                 options: [.skipsHiddenFiles]
             )) ?? []

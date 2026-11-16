@@ -5956,15 +5956,24 @@ struct ContentView: View {
             // A tool plan mode withholds is refused by `executeTool` without
             // running, so asking the user first offered them a write the mode had
             // already denied.
+            // Turbo Mode may skip a routine write, never the prompt that
+            // guards the SubQ key: a `defaults write` earlier in the same
+            // assistant message could otherwise aim `subq_decide` off-host
+            // with no card shown at all.
             if AgentHarness.requiresApproval(
                 toolName: call.name,
                 arguments: parsedCall.arguments,
                 mode: mode,
                 subQEndpoint: subQEndpoint
-            ), !isTurbo {
+            ), !(isTurbo && AgentHarness.turboModeMayBypassApproval(
+                toolName: call.name,
+                arguments: parsedCall.arguments,
+                mode: mode,
+                subQEndpoint: subQEndpoint
+            )) {
                 updateRecord(record.id) { rec in
                     rec.status = .awaitingApproval
-                    if let subQEndpoint { rec.arguments["endpoint"] = subQEndpoint.absoluteString }
+                    if let subQEndpoint { rec.pinnedEndpoint = subQEndpoint.absoluteString }
                 }
                 showStatus("🛡️ Action requires confirmation: \(call.name)")
                 let approved = await ActionApprovalManager.shared.waitForApproval(id: record.id)
@@ -6954,7 +6963,15 @@ struct ContentView: View {
                             subQEndpoint: subQEndpoint
                         )
 
-                        if isDestructive && !isTurbo {
+                        // Same rule as the local path: Turbo Mode never
+                        // bypasses the approval that guards the SubQ key.
+                        let turboBypasses = isTurbo && AgentHarness.turboModeMayBypassApproval(
+                            toolName: call.name,
+                            arguments: call.arguments,
+                            mode: turnMode,
+                            subQEndpoint: subQEndpoint
+                        )
+                        if isDestructive && !turboBypasses {
                             await MainActor.run {
                                 if let sId = sessionId, let mId = messageId,
                                    let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
@@ -6962,7 +6979,7 @@ struct ContentView: View {
                                    var currentCalls = self.sessions[sIdx].messages[mIdx].toolCalls,
                                    let callIdx = currentCalls.firstIndex(where: { $0.id == recordId }) {
                                     currentCalls[callIdx].status = .awaitingApproval
-                                    if let subQEndpoint { currentCalls[callIdx].arguments["endpoint"] = subQEndpoint.absoluteString }
+                                    if let subQEndpoint { currentCalls[callIdx].pinnedEndpoint = subQEndpoint.absoluteString }
                                     self.sessions[sIdx].messages[mIdx].toolCalls = currentCalls
                                     self.showStatus("🛡️ Action requires confirmation: \(call.name)")
                                 }

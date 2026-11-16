@@ -45,10 +45,29 @@ final class SkillPathWatcher {
         self.onChange = onChange
     }
 
+    /// Opens the descriptor this watcher needs, WITHOUT arming it.
+    ///
+    /// `open(O_EVTONLY)` blocks, so the registry calls this from a detached
+    /// task and hands the result to `start(descriptor:)` on the MainActor. A
+    /// caller that does not care can use `start()`, which does both.
+    nonisolated static func openDescriptor(path: String) -> Int32 {
+        open(path, O_EVTONLY)
+    }
+
     @discardableResult
     func start() -> Bool {
-        guard source == nil else { return true }
-        let descriptor = open(path, O_EVTONLY)
+        start(descriptor: Self.openDescriptor(path: path))
+    }
+
+    /// Arms the source against an already-open descriptor. Takes ownership of
+    /// it: the cancel handler closes it.
+    @discardableResult
+    func start(descriptor: Int32) -> Bool {
+        guard source == nil else {
+            // Already armed; the caller's descriptor has no owner.
+            close(descriptor)
+            return true
+        }
         guard descriptor >= 0 else { return false }
         let source = DispatchSource.makeFileSystemObjectSource(
             fileDescriptor: descriptor,
@@ -141,6 +160,10 @@ public final class SkillsRegistry: ObservableObject {
     /// watcher scan is still running).
     private var reloadTicket = 0
     private var lastRenderedSection: String?
+    /// Whether a config has ever been read successfully. It decides what a
+    /// FAILED read falls back to: the last good config once there is one, and
+    /// a closed switch before there is.
+    private var hasLoadedConfig = false
 
     private var isBusy: Bool {
         #if DEBUG
@@ -247,7 +270,7 @@ public final class SkillsRegistry: ObservableObject {
             rootsOverride: rootOverride,
             fallbackConfig: config
         )
-        apply(snapshot: snapshot, reason: reason)
+        apply(snapshot: snapshot, reason: reason, armWatchersSynchronously: true)
     }
 
     /// Coalesces a burst of filesystem events (a `git checkout` touching N
@@ -299,7 +322,15 @@ public final class SkillsRegistry: ObservableObject {
         apply(snapshot: snapshot, reason: reason)
     }
 
-    private func apply(snapshot: ReloadSnapshot, reason: String) {
+    /// `armWatchersSynchronously` exists for the test seams only: production
+    /// arms off the MainActor (see `restartWatchers`), and a test that asserts
+    /// `manifestWatcherCountForTesting` immediately after a synchronous reload
+    /// would otherwise race the detached task.
+    private func apply(
+        snapshot: ReloadSnapshot,
+        reason: String,
+        armWatchersSynchronously: Bool = false
+    ) {
         guard !isBusy else {
             deferPendingReload(summary: "Change detected; it applies when the current turn finishes.")
             return
@@ -309,16 +340,32 @@ public final class SkillsRegistry: ObservableObject {
         var configIssues: [SkillIssue] = []
         if let loaded = snapshot.loadedConfig {
             config = loaded.clamped()
+            hasLoadedConfig = true
             lastError = nil
             // Validate the file as written. The previous order clamped first,
             // which made the validator's range errors unreachable on reload.
             configIssues = snapshot.configIssues
-        } else {
+        } else if hasLoadedConfig {
             // Keep the last good config: a malformed external edit must not
             // hide every skill while the user fixes the file.
             lastError = snapshot.configError
             DiagLog.error("skills", "config load failed: \(snapshot.configError ?? "unknown error")")
             configIssues = SkillsConfigValidator.validate(config)
+        } else {
+            // Nothing has ever loaded, so there is no last good config to keep
+            // and the default is `enabled: true` with no disabled skills. Fail
+            // CLOSED instead: a typo'd file must not silently re-enable the
+            // skills the user turned off and restore default budgets. The
+            // error is reported as an issue, not only in the Settings banner,
+            // because this is the state a user has to be told about.
+            lastError = snapshot.configError
+            DiagLog.error("skills", "config load failed at launch: \(snapshot.configError ?? "unknown error")")
+            config = SkillsConfig(enabled: false)
+            configIssues = [SkillIssue(
+                severity: .error,
+                path: snapshot.configURL?.path,
+                message: "could not be read, so skills are switched off until it is fixed. Nothing is advertised or loadable meanwhile."
+            )]
         }
 
         let roots = snapshot.roots
@@ -368,8 +415,7 @@ public final class SkillsRegistry: ObservableObject {
 
         generation += 1
         DiagLog.info("skills", "reload (\(reason)): \(lastReloadSummary ?? "")")
-        restartRootWatchers(roots: roots)
-        restartManifestWatchers(skills: scan.skills)
+        restartWatchers(roots: roots, skills: scan.skills, synchronously: armWatchersSynchronously)
         // The launch scan seeds a missing skills.json, so the config watcher
         // can only be armed once that file exists. Every later reload leaves
         // an armed watcher alone.
@@ -485,21 +531,23 @@ public final class SkillsRegistry: ObservableObject {
     // MARK: Settings operations
 
     public func setEnabled(_ enabled: Bool) {
-        var updated = config
-        updated.enabled = enabled
-        persist(updated, reason: "master toggle")
+        mutate(reason: "master toggle") { updated in
+            updated.enabled = enabled
+            return true
+        }
     }
 
     public func setSkill(_ skill: Skill, enabled: Bool) {
-        var updated = config
-        var disabled = Set(updated.disabledSkills.map(SkillValidation.normalizedName))
-        if enabled {
-            disabled.remove(skill.id)
-        } else {
-            disabled.insert(skill.id)
+        mutate(reason: enabled ? "enabled \(skill.name)" : "disabled \(skill.name)") { updated in
+            var disabled = Set(updated.disabledSkills.map(SkillValidation.normalizedName))
+            if enabled {
+                disabled.remove(skill.id)
+            } else {
+                disabled.insert(skill.id)
+            }
+            updated.disabledSkills = disabled.sorted()
+            return true
         }
-        updated.disabledSkills = disabled.sorted()
-        persist(updated, reason: enabled ? "enabled \(skill.name)" : "disabled \(skill.name)")
     }
 
     public func addRoot(_ path: String) {
@@ -517,23 +565,50 @@ public final class SkillsRegistry: ObservableObject {
             lastError = "\(standardized) is not a folder."
             return
         }
-        var updated = config
-        guard !updated.extraRoots.contains(where: { ($0 as NSString).expandingTildeInPath == expanded }) else { return }
-        updated.extraRoots.append(standardized)
-        persist(updated, reason: "added root \(standardized)")
+        mutate(reason: "added root \(standardized)") { updated in
+            guard !updated.extraRoots.contains(where: { ($0 as NSString).expandingTildeInPath == expanded }) else {
+                return false
+            }
+            updated.extraRoots.append(standardized)
+            return true
+        }
     }
 
     public func removeRoot(_ path: String) {
-        var updated = config
-        updated.extraRoots.removeAll { raw in
-            URL(fileURLWithPath: (raw as NSString).expandingTildeInPath, isDirectory: true)
-                .standardizedFileURL.path == path
+        mutate(reason: "removed root \(path)") { updated in
+            let before = updated.extraRoots.count
+            updated.extraRoots.removeAll { raw in
+                URL(fileURLWithPath: (raw as NSString).expandingTildeInPath, isDirectory: true)
+                    .standardizedFileURL.path == path
+            }
+            return updated.extraRoots.count != before
         }
-        persist(updated, reason: "removed root \(path)")
     }
 
+    /// Replaces the whole document. This is the Settings FORM, which shows
+    /// every field, so it is a deliberate overwrite rather than a partial
+    /// edit; `mutate` is for the controls that change one field.
     public func save(_ updated: SkillsConfig) {
         persist(updated, reason: "settings")
+    }
+
+    /// Applies a one-field change to the file as it is ON DISK, then saves.
+    ///
+    /// `config` deliberately lags: a toggle during a turn is written
+    /// immediately but not applied until the turn ends, so building the new
+    /// document from `config` reverted any external edit made in the meantime
+    /// (a hand-edited `extraRoots`, a skill disabled in another window). The
+    /// base here is the current file, and `config` is only the fallback when it
+    /// cannot be read.
+    /// The closure returns `false` to abandon the write (a duplicate root, say),
+    /// so a no-op control does not rewrite the file and trigger a reload.
+    private func mutate(reason: String, _ change: (inout SkillsConfig) -> Bool) {
+        var base = config
+        if let url = configURL, let onDisk = try? SkillsConfigStore.load(from: url) {
+            base = onDisk
+        }
+        guard change(&base) else { return }
+        persist(base, reason: reason)
     }
 
     public func rawJSONText() -> String {
@@ -657,45 +732,32 @@ public final class SkillsRegistry: ObservableObject {
         // detection until the next launch.
         configWatcher = nil
         guard let url = configURL else { return }
-        let watcher = SkillPathWatcher(path: url.path) { [weak self] in
-            guard let self else { return }
-            self.reloadAfterExternalChange()
-            // An atomic save replaces the inode; re-arm on the new file.
-            self.startConfigWatcher()
-        }
-        if watcher.start() {
-            configWatcher = watcher
-        } else {
-            DiagLog.warning("skills", "could not watch skills.json; external edits need a manual reload")
-        }
-    }
-
-    private func restartRootWatchers(roots: [SkillRoot]) {
-        var wanted: [String: SkillRoot] = [:]
-        for root in roots { wanted[root.url.path] = root }
-        for (path, watcher) in rootWatchers where wanted[path] == nil {
-            watcher.stop()
-            rootWatchers.removeValue(forKey: path)
-        }
-        for (path, _) in wanted.sorted(by: { $0.key < $1.key }) where rootWatchers[path] == nil {
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
-                  isDirectory.boolValue else { continue }
+        let path = url.path
+        // The `open` happens off the MainActor for the same reason the root and
+        // manifest watchers do: it is a filesystem call that blocks.
+        Task { [weak self] in
+            let descriptor = await Task.detached(priority: .utility) {
+                SkillPathWatcher.openDescriptor(path: path)
+            }.value
+            guard let self else {
+                if descriptor >= 0 { close(descriptor) }
+                return
+            }
+            guard self.configWatcher == nil else {
+                // A reload armed one while this was in flight.
+                if descriptor >= 0 { close(descriptor) }
+                return
+            }
             let watcher = SkillPathWatcher(path: path) { [weak self] in
                 guard let self else { return }
-                // A directory replace (a `git checkout`, an installer replacing
-                // the folder) kills this source under an unchanged path. Forget
-                // it FIRST so the reload below can create one against the new
-                // inode, the same stop-and-recreate the manifest watcher does.
-                if let existing = self.rootWatchers.removeValue(forKey: path) {
-                    existing.stop()
-                }
                 self.reloadAfterExternalChange()
+                // An atomic save replaces the inode; re-arm on the new file.
+                self.startConfigWatcher()
             }
-            if watcher.start() {
-                rootWatchers[path] = watcher
+            if watcher.start(descriptor: descriptor) {
+                self.configWatcher = watcher
             } else {
-                DiagLog.warning("skills", "could not watch skill root \(path); additions there need a manual reload")
+                DiagLog.warning("skills", "could not watch skills.json; external edits need a manual reload")
             }
         }
     }
@@ -707,50 +769,166 @@ public final class SkillsRegistry: ObservableObject {
     /// manifests then need the Reload button.
     private static let maximumManifestWatchers = 128
 
-    /// Watches each manifest, not just its folder. A root directory's watcher
-    /// fires when an entry is added or removed; editing `description:` or
-    /// `always:` inside an EXISTING SKILL.md changes no parent metadata, so
-    /// that edit was invisible until the next launch. The body needs no
-    /// watcher: `skill_load` re-reads the file every call.
-    private func restartManifestWatchers(skills: [Skill]) {
-        var wanted: [String: URL] = [:]
-        for skill in skills {
-            let url = skill.skillFile
-            guard FileManager.default.fileExists(atPath: url.path) else { continue }
-            wanted[url.path] = url
+    /// One watcher to arm, resolved off the MainActor.
+    private nonisolated struct WatcherPlan: Sendable {
+        enum Kind: Sendable { case root, manifest }
+        var path: String
+        var kind: Kind
+        /// Opened off the MainActor; `start(descriptor:)` takes ownership.
+        var descriptor: Int32
+    }
+
+    /// Arms the root and manifest watchers for a completed scan.
+    ///
+    /// `open(O_EVTONLY)` blocks, and this ran on the MainActor for every root
+    /// plus up to `maximumManifestWatchers` manifests on each reload: one
+    /// `extraRoot` on an unresponsive SMB mount froze the UI for the duration
+    /// of the mount timeout. The `stat` and the `open` therefore happen on a
+    /// detached task, and only the finished watchers are installed here.
+    ///
+    /// A watcher that is already armed for an unchanged path is left alone, so
+    /// a reload does not churn descriptors.
+    private func restartWatchers(
+        roots: [SkillRoot],
+        skills: [Skill],
+        synchronously: Bool = false
+    ) {
+        var rootPaths: [String] = []
+        var seenRoots = Set<String>()
+        for root in roots.sorted(by: { $0.url.path < $1.url.path }) where seenRoots.insert(root.url.path).inserted {
+            rootPaths.append(root.url.path)
         }
-        for (path, watcher) in manifestWatchers where wanted[path] == nil {
+        var manifestPaths: [String] = []
+        var seenManifests = Set<String>()
+        for skill in skills.sorted(by: { $0.skillFile.path < $1.skillFile.path }) {
+            let path = skill.skillFile.path
+            guard seenManifests.insert(path).inserted else { continue }
+            manifestPaths.append(path)
+        }
+        if manifestPaths.count > Self.maximumManifestWatchers {
+            DiagLog.warning(
+                "skills",
+                "not watching \(manifestPaths.count) manifests individually (cap \(Self.maximumManifestWatchers)); edits inside them need a manual reload"
+            )
+            manifestPaths = Array(manifestPaths.prefix(Self.maximumManifestWatchers))
+        }
+
+        let wantedRoots = Set(rootPaths)
+        let wantedManifests = Set(manifestPaths)
+        // Stop what is no longer wanted FIRST, on the MainActor: the cancel
+        // handler closes the descriptor and must not race the arm below.
+        for (path, watcher) in rootWatchers where !wantedRoots.contains(path) {
+            watcher.stop()
+            rootWatchers.removeValue(forKey: path)
+        }
+        for (path, watcher) in manifestWatchers where !wantedManifests.contains(path) {
             watcher.stop()
             manifestWatchers.removeValue(forKey: path)
         }
-        for (path, _) in wanted.sorted(by: { $0.key < $1.key }) where manifestWatchers[path] == nil {
-            guard manifestWatchers.count < Self.maximumManifestWatchers else {
-                DiagLog.warning(
-                    "skills",
-                    "not watching \(wanted.count) manifests individually (cap \(Self.maximumManifestWatchers)); edits inside them need a manual reload"
-                )
-                break
+        let armedRoots = Set(rootWatchers.keys)
+        let armedManifests = Set(manifestWatchers.keys)
+        let rootsToArm = rootPaths.filter { !armedRoots.contains($0) }
+        let manifestsToArm = manifestPaths.filter { !armedManifests.contains($0) }
+        guard !rootsToArm.isEmpty || !manifestsToArm.isEmpty else { return }
+
+        if synchronously {
+            let plans = Self.resolveWatcherPlans(roots: rootsToArm, manifests: manifestsToArm)
+            install(plans: plans)
+            return
+        }
+        Task { [weak self] in
+            let plans = await Task.detached(priority: .utility) {
+                Self.resolveWatcherPlans(roots: rootsToArm, manifests: manifestsToArm)
+            }.value
+            guard let self else {
+                for plan in plans where plan.descriptor >= 0 { close(plan.descriptor) }
+                return
             }
-            let watcher = SkillPathWatcher(path: path) { [weak self] in
-                guard let self else { return }
-                // An atomic save (or an editor's write-and-rename) replaces the
-                // inode: this source is dead after the `.delete`/`.rename` it
-                // reports, and the path string is unchanged, so a plain
-                // "create if absent" could never replace it. Forget this
-                // watcher FIRST; the reload below re-creates it against the
-                // new file. This is the same stop-and-recreate the config
-                // watcher does, made explicit because the dictionary key does
-                // not change.
-                if let existing = self.manifestWatchers.removeValue(forKey: path) {
-                    existing.stop()
-                }
-                self.reloadAfterExternalChange()
+            self.install(plans: plans)
+        }
+    }
+
+    private func install(plans: [WatcherPlan]) {
+        for plan in plans {
+            switch plan.kind {
+            case .root: armRootWatcher(path: plan.path, descriptor: plan.descriptor)
+            case .manifest: armManifestWatcher(path: plan.path, descriptor: plan.descriptor)
             }
-            if watcher.start() {
-                manifestWatchers[path] = watcher
-            } else {
-                DiagLog.warning("skills", "could not watch \(path); in-place edits to it need a manual reload")
+        }
+    }
+
+    /// `stat` + `open` for each candidate, off the MainActor. A path that does
+    /// not exist yet is dropped: the parent's watcher reports it appearing.
+    private nonisolated static func resolveWatcherPlans(
+        roots: [String],
+        manifests: [String]
+    ) -> [WatcherPlan] {
+        var plans: [WatcherPlan] = []
+        for path in roots {
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+                  isDirectory.boolValue else { continue }
+            plans.append(WatcherPlan(
+                path: path,
+                kind: .root,
+                descriptor: SkillPathWatcher.openDescriptor(path: path)
+            ))
+        }
+        for path in manifests {
+            guard FileManager.default.fileExists(atPath: path) else { continue }
+            plans.append(WatcherPlan(
+                path: path,
+                kind: .manifest,
+                descriptor: SkillPathWatcher.openDescriptor(path: path)
+            ))
+        }
+        return plans
+    }
+
+    private func armRootWatcher(path: String, descriptor: Int32) {
+        guard rootWatchers[path] == nil else {
+            if descriptor >= 0 { close(descriptor) }
+            return
+        }
+        let watcher = SkillPathWatcher(path: path) { [weak self] in
+            guard let self else { return }
+            // A directory replace (a `git checkout`, an installer replacing the
+            // folder) kills this source under an unchanged path. Forget it
+            // FIRST so the reload below can create one against the new inode,
+            // the same stop-and-recreate the manifest watcher does.
+            if let existing = self.rootWatchers.removeValue(forKey: path) {
+                existing.stop()
             }
+            self.reloadAfterExternalChange()
+        }
+        if watcher.start(descriptor: descriptor) {
+            rootWatchers[path] = watcher
+        } else {
+            DiagLog.warning("skills", "could not watch skill root \(path); additions there need a manual reload")
+        }
+    }
+
+    private func armManifestWatcher(path: String, descriptor: Int32) {
+        guard manifestWatchers[path] == nil else {
+            if descriptor >= 0 { close(descriptor) }
+            return
+        }
+        let watcher = SkillPathWatcher(path: path) { [weak self] in
+            guard let self else { return }
+            // An atomic save (or an editor's write-and-rename) replaces the
+            // inode: this source is dead after the `.delete`/`.rename` it
+            // reports, and the path string is unchanged, so a plain
+            // "create if absent" could never replace it. Forget this watcher
+            // FIRST; the reload below re-creates it against the new file.
+            if let existing = self.manifestWatchers.removeValue(forKey: path) {
+                existing.stop()
+            }
+            self.reloadAfterExternalChange()
+        }
+        if watcher.start(descriptor: descriptor) {
+            manifestWatchers[path] = watcher
+        } else {
+            DiagLog.warning("skills", "could not watch \(path); in-place edits to it need a manual reload")
         }
     }
 
@@ -834,6 +1012,7 @@ public final class SkillsRegistry: ObservableObject {
         rootOverrideForTesting = nil
         busyOverrideForTesting = nil
         prefixInvalidationCount = 0
+        hasLoadedConfig = false
         for (_, watcher) in rootWatchers { watcher.stop() }
         rootWatchers.removeAll()
         for (_, watcher) in manifestWatchers { watcher.stop() }

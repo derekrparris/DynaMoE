@@ -37,10 +37,6 @@ public nonisolated enum PromptMarkers {
         (ChatPromptFormatter.gemmaReasoningClose, "[end_channel]"),
         (ChatPromptFormatter.gemmaThinkMarker, "[think]"),
         ("<bos>", "[bos]"),
-        ("<|tool_response>", "[tool_response]"),
-        ("<tool_response|>", "[/tool_response]"),
-        ("<|tool_call>", "[tool_call]"),
-        ("<tool_call|>", "[/tool_call]"),
         ("<|\"|>", "[quote]"),
         // Ling/Bailing 3.0 role spans. Both halves are control syntax: the
         // assistant turn boundary is `<role>ASSISTANT</role>`.
@@ -62,6 +58,26 @@ public nonisolated enum PromptMarkers {
         ("<|begin_of_text|>", "[begin_of_text]"),
         ("<|endoftext|>", "[endoftext]"),
         ("<|eot_id|>", "[eot_id]"),
+        // The canonical reasoning pair. These are the tags the adapters fold
+        // into a rendered assistant turn, so text carrying them can close the
+        // reasoning block it landed in and go on speaking outside it. Taken
+        // from `TurnTextSplitter` so the sanitizer never retypes a tag literal
+        // (AGENTS.md: "Reading files safely").
+        (TurnTextSplitter.canonicalReasoningOpenTag, "[think]"),
+        (TurnTextSplitter.canonicalReasoningCloseTag, "[/think]"),
+        // Ornith's reasoning span, which `TurnTextSplitter` already treats as a
+        // boundary when it splits a turn.
+        ("<thought>", "[think]"),
+        ("</thought>", "[/think]"),
+        ("<|thought|>", "[think]"),
+        ("</|thought|>", "[/think]"),
+        // Hermes / Qwen function-calling framing: some templates emit these
+        // instead of the in-app tool tags, and they are control syntax either
+        // way.
+        ("<tool_call>", "[tool_call]"),
+        ("</tool_call>", "[/tool_call]"),
+        ("<tool_response>", "[tool_response]"),
+        ("</tool_response>", "[/tool_response]"),
         // DeepSeek V4.1 spells its special tokens with FULLWIDTH vertical bars
         // (U+FF5C) and BLOCK LOW LINE (U+2581). Taken from the dialect's own
         // constants so a source edit cannot silently ASCII-ize them.
@@ -78,11 +94,44 @@ public nonisolated enum PromptMarkers {
         (DeepSeekV41PromptMarkers.familyDefault.toolOutputEnd, "[/tool_output]"),
     ]
 
+    /// The subset that is control syntax for THIS app's own templates: the
+    /// ChatML pair and the in-app tool tags. Everything else in
+    /// `substitutions` belongs to a model family whose markers are inert
+    /// unless that family is the one rendering.
+    ///
+    /// Local file content gets this pass and not the broad one. A file the
+    /// model is asked to edit must come back byte-faithful: `ChatPromptFormatter`
+    /// is full of role-span and system-marker literals, and rewriting them
+    /// meant a `file_read` of this repository returned different text than the
+    /// file holds, so a `file_edit` anchor copied from that view could never
+    /// match. The broad pass stays on text whose author is not the operator.
+    private static let localFileSubstitutions: [(String, String)] = [
+        ("<|im_start|>", "[im_start]"),
+        ("<|im_end|>", "[im_end]"),
+        ("<tool_call>", "[tool_call]"),
+        ("</tool_call>", "[/tool_call]"),
+        ("<tool_response>", "[tool_response]"),
+        ("</tool_response>", "[/tool_response]"),
+    ]
+
     /// Replaces any chat-template control marker so interpolated text cannot
     /// open, close or forge a turn.
+    ///
+    /// For text written by somebody other than the operator: a web page, an
+    /// MCP server's result, a skill body, a subagent's report, an error body.
     public static func sanitizeControlMarkers(_ text: String) -> String {
+        applying(substitutions, to: text)
+    }
+
+    /// The narrow pass for content the operator owns and may be editing.
+    /// See `localFileSubstitutions`.
+    public static func sanitizeLocalFileMarkers(_ text: String) -> String {
+        applying(localFileSubstitutions, to: text)
+    }
+
+    private static func applying(_ table: [(String, String)], to text: String) -> String {
         var sanitized = text
-        for (marker, replacement) in substitutions {
+        for (marker, replacement) in table {
             sanitized = sanitized.replacingOccurrences(of: marker, with: replacement)
         }
         return sanitized

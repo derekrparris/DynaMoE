@@ -102,9 +102,14 @@ AGENTS.md
 .impeccable/*
 !.impeccable/config.json
 !.impeccable/design.json
-!.impeccable/live/
 !.impeccable/surfaces/
 !.impeccable/critique/
+# `live/` is runtime state, not project source: `roots.json`, the session
+# journal and `inject-journal.json` are rewritten by every live session. Only
+# the project config beside them is worth committing.
+!.impeccable/live/
+.impeccable/live/*
+!.impeccable/live/config.json
 .impeccable/config.local.json
 
 # Compiled streaming benchmark binary (built from Benchmarks/dynamoe_stream_bench.swift)

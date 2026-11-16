@@ -503,7 +503,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         }
 
         let (exitCode, stdout, stderr, cmdDuration) = await runShell(testCmd ?? "swift test 2>&1 | tail -n 30")
-        let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeText(stdout), limit: 3000)
+        let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeLocalFileText(stdout), limit: 3000)
         let isSuccess = (exitCode == 0)
 
         var report = "## Test Runner Report: \(role)\n\n"

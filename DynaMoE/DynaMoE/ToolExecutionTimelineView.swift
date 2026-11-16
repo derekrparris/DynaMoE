@@ -288,7 +288,7 @@ struct TimelineStepCardView: View {
                         destinationSummary: call.name == "subq_decide"
                             ? SubQDecideTool.approvalDetail(
                                 rawArguments: call.rawArguments,
-                                endpointString: call.arguments["endpoint"]
+                                endpointString: call.pinnedEndpoint
                             )
                             : nil,
                         diffPreview: call.arguments["diff"] ?? call.arguments["content"],

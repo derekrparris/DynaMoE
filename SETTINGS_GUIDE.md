@@ -549,7 +549,7 @@ The procedure. Any supporting files sit beside this file in `scripts/`,
 |---|---|---|
 | `name` | yes | The skill's address. Letters, digits and single dashes, at most 64 characters, and it **must match the folder name**. |
 | `description` | yes | What tells the model **when** the skill applies. Clipped to 320 characters in the prompt, so keep the trigger inside that budget. Write it as a trigger, not a summary of the procedure. |
-| `always` | no | Renders an "Always invoke" rule into every prompt. At most three skills may use it; a fourth is reported in the card instead of silently bloating the prompt. |
+| `always` | no | Renders an "Always invoke" rule into every **agent** prompt (the local agent turn and the cloud tool-calling turn). A plain chat with Agent Tools off has no skills section and no `skill_load`, so the rule has no effect there. At most three skills may use it; a fourth is reported in the card instead of silently bloating the prompt. |
 | `user-invocable` | no | Accepted for parity with other Agent Skills hosts. DynaMoE has no user-invocation command yet, so it has no effect. |
 | `disable-model-invocation` | no | `true` means the author forbids the model from invoking the skill on its own. Because this build's only invocation surface is the model's, such a skill is not advertised and `skill_load` refuses it. |
 | `metadata` | no | Free-form map for other hosts. DynaMoE reads nothing from it. |

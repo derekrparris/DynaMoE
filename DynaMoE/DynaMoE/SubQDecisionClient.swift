@@ -288,31 +288,76 @@ public nonisolated enum SubQDecisionKeySource {
             && !SkillsSecretStore.shared.hasCurrentCredential(account: account)
     }
 
+    /// What the Settings card can say about the credential WITHOUT reading it.
+    ///
+    /// `describeWithoutPrompt` folded "denied" into "no key", which is the one
+    /// screen a user consults before deleting a good credential: a dismissed
+    /// Keychain dialog read as "No Key" and invited them to delete the item
+    /// that was actually there. The distinction is attribute-only, so it still
+    /// raises no dialog.
+    public enum KeyStatus: Sendable, Equatable {
+        /// A key resolves from a provider, this card, or the environment.
+        case ready(source: String)
+        /// Nothing is stored anywhere this build can see.
+        case missing
+        /// An item exists but the Keychain refused the attribute read (a
+        /// dismissed dialog, a locked keychain). The advice is "authorize",
+        /// not "add a key".
+        case unreadable(OSStatus)
+        /// A pre-import credential is in the legacy keychain only.
+        case legacyPending
+    }
+
+    public static func keyStatus(defaults: UserDefaults = .standard) -> KeyStatus {
+        #if DEBUG
+        if hasAnyKeyOverrideForTesting == true { return .ready(source: "a test key") }
+        if hasAnyKeyOverrideForTesting == false { return .missing }
+        #endif
+        let providers = matchingProviders(defaults: defaults)
+        var unreadable: OSStatus?
+        for provider in providers {
+            switch CloudSecretStore.shared.credentialStatus(providerId: provider.id) {
+            case .found:
+                return .ready(source: "Cloud Provider '\(provider.displayName)'")
+            case .unreadable(let status):
+                unreadable = unreadable ?? status
+            case .missing:
+                break
+            }
+        }
+        switch SkillsSecretStore.shared.credentialStatus(account: account) {
+        case .found:
+            return .ready(source: "this card")
+        case .unreadable(let status):
+            unreadable = unreadable ?? status
+        case .missing:
+            break
+        }
+        if let key = ProcessInfo.processInfo.environment[environmentName], !key.isEmpty {
+            return .ready(source: environmentName)
+        }
+        if let unreadable { return .unreadable(unreadable) }
+        if legacyKeyPending(defaults: defaults) { return .legacyPending }
+        return .missing
+    }
+
     /// Same answer as `resolve`, without reading a secret. The Settings card
     /// renders this on every body evaluation, and a read is the one Keychain
     /// call that can prompt for access on the legacy backend.
     public static func describeWithoutPrompt(defaults: UserDefaults = .standard) -> String {
-        #if DEBUG
-        if hasAnyKeyOverrideForTesting == true { return "Using a test key." }
-        if hasAnyKeyOverrideForTesting == false { return "No test key." }
-        #endif
-        let providers = matchingProviders(defaults: defaults)
-        if let provider = providers.first(where: { CloudSecretStore.shared.hasCurrentCredential(providerId: $0.id) }) {
-            return "Using the key stored for Cloud Provider '\(provider.displayName)'."
-        }
-        if SkillsSecretStore.shared.hasCurrentCredential(account: account) {
-            return "Using the key stored in this card."
-        }
-        if let key = ProcessInfo.processInfo.environment[environmentName], !key.isEmpty {
-            return "Using \(environmentName) from the app environment."
-        }
-        if legacyKeyPending(defaults: defaults) {
+        switch keyStatus(defaults: defaults) {
+        case .ready(let source):
+            return "Using the key from \(source)."
+        case .unreadable(let status):
+            return "A SubQ key is stored, but the Keychain refused the lookup (\(status)). If macOS showed an access prompt, allow it and reopen this card; otherwise import the credential from Settings → Stored Credentials. Do not delete the key first — it is probably still there."
+        case .legacyPending:
             return "A SubQ key is stored in the legacy keychain. Import it from Settings → Stored Credentials; this build cannot read it until then."
+        case .missing:
+            if let provider = matchingProviders(defaults: defaults).first {
+                return "Cloud Provider '\(provider.displayName)' exists but has no stored key."
+            }
+            return "No SubQ API key. Add one here, or add a Cloud Provider for api.subq.ai."
         }
-        if let provider = providers.first {
-            return "Cloud Provider '\(provider.displayName)' exists but has no stored key."
-        }
-        return "No SubQ API key. Add one here, or add a Cloud Provider for api.subq.ai."
     }
 }
 
@@ -826,6 +871,33 @@ public nonisolated struct SubQDecisionClient: Sendable {
         throw lastError ?? SubQDecisionError.transport("no response")
     }
 
+    /// What one error body is allowed to contribute to a message.
+    ///
+    /// The body is written by a remote server and reaches the transcript
+    /// verbatim: it is persisted in the session store and re-sent in every
+    /// later prompt. A proxy that echoes the `Authorization` header back in a
+    /// 401, or a gateway that dumps a page of HTML, therefore used to write the
+    /// operator's key to disk. Errors carry a capped, redacted, single-line
+    /// excerpt instead, and the raw body only reaches `DiagLog` redacted.
+    public static let maximumErrorDetailCharacters = 240
+
+    /// Redacts the credential, collapses whitespace/newlines (so one body
+    /// cannot forge extra `key: value` result lines) and caps the length.
+    static func redactedErrorDetail(_ raw: String, apiKey: String) -> String {
+        var text = raw
+        if !apiKey.isEmpty {
+            for secret in [apiKey, "Bearer \(apiKey)"] where !secret.isEmpty {
+                text = text.replacingOccurrences(of: secret, with: "[redacted]")
+            }
+        }
+        text = text.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.count > maximumErrorDetailCharacters {
+            text = String(text.prefix(maximumErrorDetailCharacters)) + "… (truncated)"
+        }
+        return text
+    }
+
     private func send(payload: Data) async throws -> SubQDecisionResponse {
         guard let scheme = endpoint.scheme?.lowercased(),
               endpoint.host?.isEmpty == false else {
@@ -880,11 +952,21 @@ public nonisolated struct SubQDecisionClient: Sendable {
         }
         guard (200...299).contains(http.statusCode) else {
             let summary = (try? JSONDecoder().decode(ErrorEnvelope.self, from: data))?.summary ?? ""
-            let fallback = String(data: data.prefix(400), encoding: .utf8) ?? ""
-            throw SubQDecisionError.forStatus(
-                http.statusCode,
-                detail: summary.isEmpty ? fallback.trimmingCharacters(in: .whitespacesAndNewlines) : summary
+            // Read a bounded prefix BEFORE decoding as text: `data` can be the
+            // whole 2 MiB ceiling, and an error body is not worth that.
+            let fallback = String(decoding: data.prefix(2048), as: UTF8.self)
+            let detail = Self.redactedErrorDetail(
+                summary.isEmpty ? fallback : summary,
+                apiKey: apiKey
             )
+            // The structure (status → actionable case) is what the skill
+            // promises; the body only fills in the detail, and only after it
+            // has been made safe to persist.
+            DiagLog.warning(
+                "subq",
+                "HTTP \(http.statusCode) from \(endpoint.host ?? "endpoint"): \(detail)"
+            )
+            throw SubQDecisionError.forStatus(http.statusCode, detail: detail)
         }
         do {
             return try JSONDecoder().decode(SubQDecisionResponse.self, from: data)
@@ -944,6 +1026,10 @@ public final class SubQDecideTool: AgentTool {
     /// Observes the endpoint `execute` resolved, so a test can prove the
     /// APPROVED url is used rather than the stored setting.
     nonisolated(unsafe) public static var endpointObserverForTesting: ((URL) -> Void)?
+    /// The pinned endpoint, readable by a test's injected client factory so it
+    /// can build a client aimed at the APPROVED destination instead of
+    /// hardcoding one (which made the URL assertion vacuous).
+    public static var pinnedEndpointForTesting: URL? { pinnedEndpoint }
     #endif
 
     public static let maximumLabels = 64

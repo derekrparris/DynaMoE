@@ -80,6 +80,15 @@ public nonisolated enum SecretAccessResult: Sendable, Equatable {
     }
 }
 
+/// What an attribute-only credential lookup established.
+public nonisolated enum CredentialStatus: Sendable, Equatable {
+    case found
+    case missing
+    /// The Keychain refused the lookup itself (a dismissed dialog, a locked
+    /// keychain, a missing entitlement).
+    case unreadable(OSStatus)
+}
+
 public nonisolated enum SecretAccessClassifier {
     /// Statuses macOS reports when the ACL (or a locked keychain) refused the
     /// read, as opposed to the item not existing.
@@ -550,6 +559,39 @@ public nonisolated struct KeychainSecretStore: Sendable {
         items.copyMatching(
             SecretStoreQuery.existence(service: service, account: account, backend: backend)
         ).status == errSecSuccess
+    }
+
+    /// What an ATTRIBUTE-ONLY lookup established, so a caller can tell "not
+    /// stored" from "stored but this build may not look at it".
+    ///
+    /// `exists` collapses both into false, which is right for a launch-path
+    /// gate and wrong for the Settings card: it is the screen a user consults
+    /// before deleting a credential, and "No Key" about a key that is sitting
+    /// there invites exactly the wrong action. Still attribute-only, so this
+    /// never raises a dialog.
+    public func credentialStatus(account: String) -> CredentialStatus {
+        let current = items.copyMatching(
+            SecretStoreQuery.existence(service: service, account: account, backend: backend)
+        ).status
+        switch current {
+        case errSecSuccess:
+            return .found
+        case errSecItemNotFound:
+            break
+        default:
+            // A denied or locked keychain says nothing about whether a legacy
+            // copy exists, so report the refusal rather than guessing.
+            return .unreadable(current)
+        }
+        guard backend.usesDataProtection else { return .missing }
+        let legacy = items.copyMatching(
+            SecretStoreQuery.existence(service: service, account: account, backend: .legacy)
+        ).status
+        switch legacy {
+        case errSecSuccess: return .found
+        case errSecItemNotFound: return .missing
+        default: return .unreadable(legacy)
+        }
     }
 
     /// Removes the credential from both keychains, so a deleted integration

@@ -30,6 +30,7 @@ struct SkillsSettingsSection: View {
     // are Keychain attribute queries, and a body evaluation runs on every
     // keystroke in the SecureField.
     @State private var keyConfigured = false
+    @State private var keyStatus: SubQDecisionKeySource.KeyStatus = .missing
     @State private var skillKeyStored = false
     @State private var keyDescription = "Checking for a SubQ key…"
 
@@ -78,7 +79,26 @@ struct SkillsSettingsSection: View {
         }
     }
 
+    private var keyBadgeText: String {
+        if keyConfigured { return "Ready" }
+        if case .unreadable = keyStatus { return "Unreadable" }
+        return "No Key"
+    }
+
+    private var keyBadgeImage: String {
+        if keyConfigured { return "checkmark.circle.fill" }
+        if case .unreadable = keyStatus { return "exclamationmark.triangle.fill" }
+        return "key.slash"
+    }
+
+    private var keyBadgeTint: Color {
+        if keyConfigured { return .green }
+        if case .unreadable = keyStatus { return .orange }
+        return .secondary
+    }
+
     private func refreshKeyStatus() {
+        keyStatus = SubQDecisionKeySource.keyStatus()
         keyConfigured = SubQDecisionKeySource.hasAnyKey()
         skillKeyStored = SkillsSecretStore.exists(account: SubQDecisionKeySource.account)
         keyDescription = SubQDecisionKeySource.describeWithoutPrompt()
@@ -423,10 +443,13 @@ struct SkillsSettingsSection: View {
                 icon: "arrow.triangle.branch",
                 iconTint: .indigo
             ) {
+                // "Unreadable" is its own badge: a dismissed Keychain dialog
+                // used to read as "No Key" on the one screen a user consults
+                // before deleting a credential that is probably still there.
                 SettingsStatusBadge(
-                    text: keyConfigured ? "Ready" : "No Key",
-                    systemImage: keyConfigured ? "checkmark.circle.fill" : "key.slash",
-                    tint: keyConfigured ? .green : .secondary
+                    text: keyBadgeText,
+                    systemImage: keyBadgeImage,
+                    tint: keyBadgeTint
                 )
                 .id(keyRefresh)
             }
@@ -582,6 +605,12 @@ struct SkillsSettingsSection: View {
             return
         }
         testState = .running
+        // The endpoint and model are read HERE, at the start, and stamped onto
+        // the result: a test that finishes after the user changed either one
+        // used to report the old destination's verdict against the new
+        // settings, which reads as "the new endpoint works".
+        let testedEndpoint = endpoint
+        let testedModel = model
         let client = SubQDecisionClient(apiKey: key.key)
         Task {
             do {
@@ -598,8 +627,16 @@ struct SkillsSettingsSection: View {
                         ])
                     ]
                 )
+                guard testedEndpoint == endpoint, testedModel == model else {
+                    testState = .idle
+                    return
+                }
                 testState = .success("Connected (\(key.label)). \(response.readableSummary) · \(response.usageLine)")
             } catch {
+                guard testedEndpoint == endpoint, testedModel == model else {
+                    testState = .idle
+                    return
+                }
                 testState = .failure((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
             }
         }
@@ -652,12 +689,23 @@ struct SkillsPreviewSheet: View {
     let skill: Skill
     @Environment(\.dismiss) private var dismiss
 
-    private var content: String {
-        do {
-            return try SkillDiscovery.readText(skill.skillFile)
-        } catch {
-            return "Could not read \(skill.skillFile.path): \(error.localizedDescription)"
-        }
+    /// Read ONCE, off the MainActor, into state.
+    ///
+    /// This used to be a computed property, so `body` re-read up to 512 KB from
+    /// disk on every evaluation — and a body re-evaluates on hover, on resize
+    /// and on any observed change. A preview is a one-shot read.
+    @State private var content = "Reading…"
+
+    private func load() async {
+        let url = skill.skillFile
+        let text = await Task.detached(priority: .userInitiated) { () -> String in
+            do {
+                return try SkillDiscovery.readText(url)
+            } catch {
+                return "Could not read \(url.path): \(error.localizedDescription)"
+            }
+        }.value
+        content = text
     }
 
     var body: some View {
@@ -688,6 +736,7 @@ struct SkillsPreviewSheet: View {
         }
         .padding(18)
         .frame(minWidth: 720, minHeight: 560)
+        .task { await load() }
     }
 }
 

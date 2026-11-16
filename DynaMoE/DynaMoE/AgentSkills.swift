@@ -204,8 +204,12 @@ public nonisolated enum SkillFrontmatterParser {
             guard !key.isEmpty, key.unicodeScalars.allSatisfy({ isValidKeyScalar($0) }) else {
                 throw SkillParseError.malformedLine(line: firstAbsoluteLine + index, text: trimmed)
             }
-            var value = String(trimmed[trimmed.index(after: colon)...])
-                .trimmingCharacters(in: .whitespaces)
+            // A trailing `# note` is a YAML comment, not part of the value.
+            // Stripped here so the block-scalar marker check below sees `|`
+            // rather than `| # note` too.
+            var value = strippingTrailingComment(
+                String(trimmed[trimmed.index(after: colon)...])
+            )
             index += 1
 
             if isBlockScalarMarker(value) {
@@ -292,8 +296,31 @@ public nonisolated enum SkillFrontmatterParser {
 
     // MARK: Scalar decoding
 
-    static func decodeScalar(_ raw: String) -> String {
+    /// Strips a trailing YAML comment from an UNQUOTED scalar.
+    ///
+    /// `always: true # note` used to decode as the string `true # note`, which
+    /// `decodeBoolean` rejects, so the flag silently became false; `name: alpha
+    /// # note` failed name validation with an error that pointed at the wrong
+    /// thing. A `#` only starts a comment at the start of the value or after
+    /// whitespace, and never inside a quoted scalar, which is why this runs
+    /// before quote handling rather than after.
+    static func strippingTrailingComment(_ raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.hasPrefix("\""), !trimmed.hasPrefix("'") else { return trimmed }
+        var previousWasWhitespace = true
+        for index in trimmed.indices {
+            let character = trimmed[index]
+            if character == "#", previousWasWhitespace {
+                return String(trimmed[trimmed.startIndex..<index])
+                    .trimmingCharacters(in: .whitespaces)
+            }
+            previousWasWhitespace = character == " " || character == "\t"
+        }
+        return trimmed
+    }
+
+    static func decodeScalar(_ raw: String) -> String {
+        let trimmed = strippingTrailingComment(raw)
         if trimmed.hasPrefix("\"") {
             guard trimmed.hasSuffix("\""), trimmed.count >= 2 else {
                 return String(trimmed.dropFirst())
@@ -414,6 +441,19 @@ public nonisolated enum SkillValidation {
     /// Per-description clip in the prompt section. Long descriptions are a
     /// trigger to read the file, not a summary of it.
     public static let advertisedDescriptionLength = 320
+
+    /// Clips a description for a TOOL RESULT, which is a per-call budget rather
+    /// than a per-turn one. The prompt already clips to
+    /// `advertisedDescriptionLength`; `skill_load` did not, so a manifest with
+    /// a 500 KB `description:` blew the call's output budget on text the model
+    /// had already been told was clipped.
+    public static func clippedDescription(
+        _ description: String,
+        limit: Int = advertisedDescriptionLength
+    ) -> String {
+        guard description.count > limit else { return description }
+        return String(description.prefix(limit)) + "…"
+    }
 
     /// The same shape other Agent Skills hosts validate: letters, digits and
     /// single dashes. Case is accepted (some folders are capitalised) but
@@ -545,9 +585,6 @@ public nonisolated struct Skill: Identifiable, Equatable, Sendable {
     public let modelInvocable: Bool
     public let directory: URL
     public let rootLabel: String
-    /// Precedence order of the root it came from; a later root wins a name
-    /// collision, which is how a personal override shadows a checked-in copy.
-    public let rootIndex: Int
     /// The manifest the scanner actually read. Discovery is case-insensitive,
     /// so a checkout whose file is `skill.md` must be loadable too; falling
     /// back to a hardcoded `SKILL.md` would list it and then fail on a
@@ -565,7 +602,6 @@ public nonisolated struct Skill: Identifiable, Equatable, Sendable {
         userInvocable: Bool,
         directory: URL,
         rootLabel: String,
-        rootIndex: Int,
         modelInvocable: Bool = true,
         manifestURL: URL? = nil
     ) {
@@ -577,7 +613,6 @@ public nonisolated struct Skill: Identifiable, Equatable, Sendable {
         self.modelInvocable = modelInvocable
         self.directory = directory
         self.rootLabel = rootLabel
-        self.rootIndex = rootIndex
         self.manifestURL = manifestURL
     }
 }
@@ -638,7 +673,7 @@ public nonisolated enum SkillDiscovery {
         // folders with the same name are a shadowing (which is reported).
         var seenRealDirectories: Set<String> = []
 
-        scanRoots: for (rootIndex, root) in roots.enumerated() {
+        for root in roots {
             // A root that is itself a symlink (a dotfiles checkout linking
             // ~/.agents/skills elsewhere) must be resolved BEFORE listing: the
             // file manager refuses `contentsOfDirectory` on the link and the
@@ -674,13 +709,15 @@ public nonisolated enum SkillDiscovery {
                 ))
             }
             for entry in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }).prefix(Self.maximumRootEntries) {
-                if winners.count >= Self.maximumSkills {
-                    result.issues.append(SkillIssue(
-                        severity: .warning,
-                        message: "more than \(Self.maximumSkills) skills were found; the rest are not listed. Remove or disable skills you do not use."
-                    ))
-                    break scanRoots
-                }
+                // The cap bounds how many skills are LISTED; it must not end the
+                // scan. `break scanRoots` here meant a first root with 256
+                // entries suppressed the app-managed starter and every
+                // `extraRoots` override, inverting the documented precedence
+                // (a later root wins a name collision). Reaching the cap
+                // therefore only stops NEW names being added; a later root may
+                // still shadow one that is already listed, which is exactly the
+                // override the precedence promises.
+                let atCapacity = winners.count >= Self.maximumSkills
                 var entryIsDirectory: ObjCBool = false
                 guard FileManager.default.fileExists(atPath: entry.path, isDirectory: &entryIsDirectory),
                       entryIsDirectory.boolValue else { continue }
@@ -691,10 +728,16 @@ public nonisolated enum SkillDiscovery {
                 let realDirectory = entry.resolvingSymlinksInPath().standardizedFileURL
                 guard seenRealDirectories.insert(realDirectory.path).inserted else { continue }
                 guard let skillFile = skillFileURL(in: entry) else { continue }
+                let folderName = entry.lastPathComponent
+                if atCapacity, winners[SkillValidation.normalizedName(folderName)] == nil {
+                    // Nothing this root adds can be listed, and parsing it
+                    // would only cost a read. A name already listed is still
+                    // worth parsing: this root may be the override for it.
+                    continue
+                }
                 do {
                     let text = try readText(skillFile)
                     let document = try SkillFrontmatterParser.parse(text)
-                    let folderName = entry.lastPathComponent
                     var fatal: String?
                     if !SkillValidation.isValidName(document.frontmatter.name) {
                         fatal = "name '\(document.frontmatter.name)' is not a valid skill name (letters, digits and single dashes, at most \(SkillValidation.maximumNameLength) characters)."
@@ -730,7 +773,6 @@ public nonisolated enum SkillDiscovery {
                         userInvocable: document.frontmatter.userInvocable,
                         directory: realDirectory,
                         rootLabel: root.label,
-                        rootIndex: rootIndex,
                         modelInvocable: document.frontmatter.modelInvocable,
                         manifestURL: skillFile.resolvingSymlinksInPath()
                     )
@@ -750,6 +792,12 @@ public nonisolated enum SkillDiscovery {
             }
         }
 
+        if winners.count >= Self.maximumSkills {
+            result.issues.append(SkillIssue(
+                severity: .warning,
+                message: "more than \(Self.maximumSkills) skills were found; the rest are not listed. Remove or disable skills you do not use."
+            ))
+        }
         result.skills = order.compactMap { winners[$0] }.sorted { $0.id < $1.id }
         result.issues.sort {
             if $0.severity != $1.severity { return $0.severity > $1.severity }
@@ -974,15 +1022,26 @@ public nonisolated enum SkillsConfigStore {
 
     """
 
+    /// A config file is small by construction; the cap only has to be large
+    /// enough for a hand-edited document with a long `extraRoots` list.
+    public static let maximumConfigBytes = 256 * 1024
+
+    /// Reads `skills.json` through the same hardened reader as a manifest.
+    ///
+    /// `Data(contentsOf:)` trusts a check-then-open: a FIFO at this path blocks
+    /// the read forever (there is no writer, and the open waits for one), and a
+    /// symlink to a multi-gigabyte file is read in full before anything can
+    /// reject it. This runs at launch, on every watcher event and on every
+    /// deferred poll, so a wedge here stops the feature reloading at all.
     public static func load(from url: URL) throws -> SkillsConfig {
-        let data: Data
+        let text: String
         do {
-            data = try Data(contentsOf: url)
+            text = try SkillDiscovery.readTextCapped(url, maximumBytes: maximumConfigBytes)
         } catch {
             throw SkillsConfigError.unreadable(path: url.path, reason: error.localizedDescription)
         }
         do {
-            return try JSONDecoder().decode(SkillsConfig.self, from: data)
+            return try JSONDecoder().decode(SkillsConfig.self, from: Data(text.utf8))
         } catch {
             throw SkillsConfigError.malformed(path: url.path, reason: error.localizedDescription)
         }
@@ -1038,14 +1097,6 @@ public nonisolated enum SkillsConfigStore {
               ),
               let string = String(data: pretty, encoding: .utf8) else { return nil }
         return string + "\n"
-    }
-
-    public static func modificationToken(at url: URL? = nil) -> String? {
-        guard let target = url ?? defaultURL,
-              let attributes = try? FileManager.default.attributesOfItem(atPath: target.path) else { return nil }
-        let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
-        let size = (attributes[.size] as? NSNumber)?.intValue ?? 0
-        return "\(modified)-\(size)"
     }
 
     private static func writeAtomically(_ data: Data, to target: URL) throws {

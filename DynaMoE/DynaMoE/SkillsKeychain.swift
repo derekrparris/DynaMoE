@@ -106,6 +106,11 @@ public nonisolated struct SkillsSecretStore: Sendable {
         core.exists(account: account, backend: core.backend)
     }
 
+    /// Attribute-only, so it never prompts. See `CredentialStatus`.
+    public func credentialStatus(account: String) -> CredentialStatus {
+        core.credentialStatus(account: account)
+    }
+
     public func delete(account: String) {
         core.delete(account: account)
     }

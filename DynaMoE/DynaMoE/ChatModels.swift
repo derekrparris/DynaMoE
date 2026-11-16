@@ -60,6 +60,15 @@ nonisolated public struct ToolCallRecord: Identifiable, Codable, Equatable, Send
     /// record is kept so reconstructed history has a matching result for the call
     /// the assistant emitted, but it is hidden from the tool timeline UI.
     public var isGesture: Bool
+    /// The destination the approval card showed and the call actually used,
+    /// for a tool whose target is a setting rather than an argument.
+    ///
+    /// This used to be written into `arguments["endpoint"]`, which put a
+    /// parameter the model never sent into the record: the timeline's expanded
+    /// details listed it as though the model had asked for it, and a
+    /// reconstructed history replayed an argument the call never carried. A
+    /// separate field keeps `arguments` exactly what the model emitted.
+    public var pinnedEndpoint: String?
 
     public init(
         id: UUID = UUID(),
@@ -71,7 +80,8 @@ nonisolated public struct ToolCallRecord: Identifiable, Codable, Equatable, Send
         error: String? = nil,
         executionDurationSeconds: Double? = nil,
         timestamp: Date = Date(),
-        isGesture: Bool = false
+        isGesture: Bool = false,
+        pinnedEndpoint: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -83,13 +93,14 @@ nonisolated public struct ToolCallRecord: Identifiable, Codable, Equatable, Send
         self.executionDurationSeconds = executionDurationSeconds
         self.timestamp = timestamp
         self.isGesture = isGesture
+        self.pinnedEndpoint = pinnedEndpoint
     }
 
     // MARK: - Codable
 
     private enum CodingKeys: String, CodingKey {
         case id, name, arguments, rawArguments, status, output, error
-        case executionDurationSeconds, timestamp, isGesture
+        case executionDurationSeconds, timestamp, isGesture, pinnedEndpoint
         /// Written beside a withheld `status` and read back as the real meaning.
         /// See `encode(to:)`.
         case withheldInPlanMode
@@ -116,6 +127,7 @@ nonisolated public struct ToolCallRecord: Identifiable, Codable, Equatable, Send
         )
         timestamp = try container.decode(Date.self, forKey: .timestamp)
         isGesture = try container.decodeIfPresent(Bool.self, forKey: .isGesture) ?? false
+        pinnedEndpoint = try container.decodeIfPresent(String.self, forKey: .pinnedEndpoint)
         let recorded = try container.decode(ToolExecutionStatus.self, forKey: .status)
         let flagged = try container.decodeIfPresent(Bool.self, forKey: .withheldInPlanMode) ?? false
         status = (flagged || recorded == .withheld) ? .withheld : recorded
@@ -132,6 +144,7 @@ nonisolated public struct ToolCallRecord: Identifiable, Codable, Equatable, Send
         try container.encodeIfPresent(executionDurationSeconds, forKey: .executionDurationSeconds)
         try container.encode(timestamp, forKey: .timestamp)
         try container.encode(isGesture, forKey: .isGesture)
+        try container.encodeIfPresent(pinnedEndpoint, forKey: .pinnedEndpoint)
         // `.withheld` did not exist before plan mode, and an unknown raw value
         // fails the decode of the WHOLE record and with it the session file. It
         // is therefore persisted as the closest status an older build knows, with
