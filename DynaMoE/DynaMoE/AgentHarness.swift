@@ -137,7 +137,8 @@ public extension AgentTool {
         case "find_symbol_definition", "find_references": return "analysis"
         case "web_search", "web_fetch": return "web"
         case "git_status", "git_diff", "git_commit": return "git"
-        case "spawn_subagent", "get_subagent_status", "send_subagent_message", "list_subagents": return "subagents"
+        case "spawn_subagent", "get_subagent_status", "send_subagent_message", "list_subagents",
+             "apply_subagent_changes": return "subagents"
         case "lint_diagnostics": return "quality"
         case "subq_decide": return "decisions"
         default: return "core"
@@ -2407,7 +2408,7 @@ public final class SpawnSubagentTool: AgentTool {
                 "isolation": [
                     "type": "string",
                     "enum": ["none", "worktree"],
-                    "description": "Workspace isolation. 'none' runs in the coordinator's directory with per-call approval; 'worktree' is reserved for writers and is refused until it ships."
+                    "description": "Workspace isolation. Use 'worktree' for any writer in a git repository: it gets its own worktree and branch, asks once at spawn, and leaves the work for apply_subagent_changes. 'none' runs in the coordinator's directory with per-call approval; a read-only run or a non-git workspace cannot use a worktree."
                 ],
                 "thinking": [
                     "type": "boolean",
@@ -2467,7 +2468,7 @@ public final class SpawnSubagentTool: AgentTool {
             )
             let runId = UUID()
             do {
-                let plan = try AgentSpawnResolver.resolve(
+                let plan = try await AgentSpawnResolver.resolve(
                     request,
                     runId: runId,
                     sessionId: runId
@@ -2507,7 +2508,7 @@ public final class SpawnSubagentTool: AgentTool {
                 var overridden = request
                 overridden.operatorOverride = true
                 do {
-                    let plan = try AgentSpawnResolver.resolve(
+                    let plan = try await AgentSpawnResolver.resolve(
                         overridden,
                         runId: runId,
                         sessionId: runId
@@ -2556,8 +2557,12 @@ public final class SpawnSubagentTool: AgentTool {
         // not, and only the background run should ask for attention when it
         // ends.
         subagent.notifiesOnFinish = runInBackground
+        let worktree = AgentHarness.worktreeDescription(of: subagent)
         if runInBackground {
-            let msg = "Subagent [\(subagent.role)] spawned in background (ID: \(subagent.id.uuidString)). You are responsible for its outcome: when you need its results, call get_subagent_status with wait=true, then present the report to the user in your reply. The user never contacts the subagent directly."
+            var msg = "Subagent [\(subagent.role)] spawned in background (ID: \(subagent.id.uuidString)). You are responsible for its outcome: when you need its results, call get_subagent_status with wait=true, then present the report to the user in your reply. The user never contacts the subagent directly."
+            if let worktree {
+                msg += " It works in an isolated worktree on branch \(worktree.branch); when it finishes, call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to land its changes on the main tree (the operator approves the apply), unless the user asked to keep the work isolated."
+            }
             var data: [String: Any] = [
                 "subagent_id": subagent.id.uuidString,
                 "role": subagent.role,
@@ -2565,6 +2570,11 @@ public final class SpawnSubagentTool: AgentTool {
                 "run_in_background": true,
                 "message": msg
             ]
+            if let worktree {
+                data["isolation"] = "worktree"
+                data["worktree"] = worktree.path
+                data["branch"] = worktree.branch
+            }
             if let backend = subagent.backendDescriptor {
                 data["backend"] = backend.displayName
             }
@@ -2581,8 +2591,15 @@ public final class SpawnSubagentTool: AgentTool {
             "status": subagent.status.rawValue,
             "duration_seconds": subagent.executionDurationSeconds,
             "summary": cleanSummary,
-            "directive": "Present this report to the user now, then answer their original question with it."
+            "directive": worktree == nil
+                ? "Present this report to the user now, then answer their original question with it."
+                : "Present this report to the user now, then answer their original question with it. Its changes are isolated on branch \(worktree!.branch); call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to land them on the working tree (the operator approves the apply), unless the user asked to keep them isolated."
         ]
+        if let worktree {
+            data["isolation"] = "worktree"
+            data["worktree"] = worktree.path
+            data["branch"] = worktree.branch
+        }
         if let backend = subagent.backendDescriptor {
             data["backend"] = backend.displayName
             data["usage"] = [
@@ -2654,8 +2671,9 @@ public final class SpawnSubagentTool: AgentTool {
         guard let value = (raw as? String)?.lowercased(), value == "worktree" else {
             return .none
         }
-        // The resolver refuses this by name; spelling it as a worktree here is
-        // what makes the refusal specific instead of "unknown option".
+        // The empty path and branch are the request's intent. The resolver
+        // replaces them with the worktree it creates, so the plan (and every
+        // record written from it) carries the real location.
         return .worktree(path: "", branch: "")
     }
 }
@@ -2745,6 +2763,13 @@ public final class GetSubagentStatusTool: AgentTool {
             "duration_seconds": subagent.executionDurationSeconds
         ]
         if isTerminal {
+            if let worktree = AgentHarness.worktreeDescription(of: subagent) {
+                data["isolation"] = "worktree"
+                data["worktree"] = worktree.path
+                data["branch"] = worktree.branch
+                data["apply_directive"] = "This run's changes are isolated on branch \(worktree.branch). Call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to land them on the main tree (the operator approves the apply), unless the user asked to keep them isolated."
+                readable += "\nChanges: isolated worktree on \(worktree.branch). Call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to apply them.\n"
+            }
             data["directive"] = "Present this report to the user in your reply, then answer their original question with it. Do not end your turn without delivering these results."
         }
 
@@ -3037,6 +3062,69 @@ public final class GitCommitTool: AgentTool {
         } catch {
             let err = error.localizedDescription
             return (AgentHarness.toolErrorJSON(tool: "git_commit", error: err), nil, err, false)
+        }
+    }
+}
+
+/// Tool: apply_subagent_changes — lands an isolated run's worktree diff on the
+/// current working tree, behind the same approval card as any other write.
+public final class ApplySubagentChangesTool: AgentTool {
+    public let definition = ToolDefinition(
+        name: "apply_subagent_changes",
+        description: "Applies the changes an isolated writer subagent made in its git worktree onto the current working tree, then removes the worktree. The run must have been spawned with isolation 'worktree'. Changes are left unstaged so you can review and commit them yourself.",
+        parameters: [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "subagent_id": [
+                    "type": "string",
+                    "description": "The run id returned by spawn_subagent."
+                ],
+                "run_id": [
+                    "type": "string",
+                    "description": "Alias for subagent_id."
+                ]
+            ])
+        ]
+    )
+
+    public func execute(
+        arguments: [String: Any],
+        workingDirectory: URL?,
+        maxOutputLength: Int
+    ) async throws -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        let raw = (arguments["subagent_id"] as? String) ?? (arguments["run_id"] as? String)
+        guard let raw,
+              let runId = UUID(uuidString: raw.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            let err = "Error: missing or invalid 'subagent_id' parameter in apply_subagent_changes"
+            return (AgentHarness.toolErrorJSON(tool: "apply_subagent_changes", error: err), nil, err, false)
+        }
+
+        do {
+            let outcome = try await SubagentApplyService.apply(runId: runId)
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            let message: String
+            if outcome.alreadyApplied {
+                message = "These changes were already applied on \(formatter.string(from: outcome.appliedAt)). Nothing was applied twice."
+            } else if outcome.changedFiles.isEmpty {
+                message = "The run had no changes to apply. Its worktree has been removed."
+            } else {
+                let count = outcome.changedFiles.count
+                message = "Applied \(count) file\(count == 1 ? "" : "s") from \(outcome.branch) onto the working tree. The changes are unstaged; review them and commit when ready. The worktree has been removed."
+            }
+            let json = AgentHarness.toolSuccessJSON(tool: "apply_subagent_changes", data: [
+                "subagent_id": outcome.runId.uuidString,
+                "role": outcome.role,
+                "branch": outcome.branch,
+                "applied_files": outcome.changedFiles,
+                "already_applied": outcome.alreadyApplied,
+                "applied_at": formatter.string(from: outcome.appliedAt),
+                "message": message
+            ])
+            return (json, message, nil, false)
+        } catch {
+            let err = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return (AgentHarness.toolErrorJSON(tool: "apply_subagent_changes", error: err), nil, err, false)
         }
     }
 }
@@ -3736,7 +3824,7 @@ public final class AgentHarness {
     /// own tool registry or would let a run delegate again. Delegation is one
     /// level, so a child has no subagent surface at all.
     public static let runScopedForbiddenToolNames: Set<String> = [
-        "tools_discover", "tools_load", "tools_unload", "spawn_subagent"
+        "tools_discover", "tools_load", "tools_unload", "spawn_subagent", "apply_subagent_changes"
     ]
 
     public private(set) var runId: UUID?
@@ -3798,6 +3886,7 @@ public final class AgentHarness {
         registerTool(WebFetchTool())
         registerTool(CodebaseSearchTool())
         registerTool(SpawnSubagentTool())
+        registerTool(ApplySubagentChangesTool())
         registerTool(GetSubagentStatusTool())
         registerTool(SendSubagentMessageTool())
         registerTool(ListSubagentsTool())
@@ -4056,13 +4145,24 @@ public final class AgentHarness {
         GrammarConstrainedSampler.shared.registerTools(availableToolDefinitions(mode: activeMode))
     }
 
+    /// The run's worktree when it has one. A spawn's result and the status
+    /// tool both name it so the coordinator knows the work is not in the main
+    /// tree yet and which tool lands it.
+    static func worktreeDescription(of subagent: SubagentInstance) -> (path: String, branch: String)? {
+        guard let plan = subagent.modelPlan,
+              case .worktree(let path, let branch) = plan.isolation,
+              !path.isEmpty else { return nil }
+        return (path, branch)
+    }
+
     /// MCP tools are treated as state-changing unconditionally. A remote server
     /// can do anything, including write files and spend money, and its own
     /// read-only annotations are a claim rather than a guarantee, so every MCP
     /// call gates on HITL approval (Turbo Mode still bypasses it).
     public static func isStateChanging(toolName: String) -> Bool {
         if toolName.hasPrefix(MCPToolBridge.namePrefix) { return true }
-        return toolName == "file_write" || toolName == "file_edit" || toolName == "shell_run" || toolName == "git_commit"
+        return toolName == "file_write" || toolName == "file_edit" || toolName == "shell_run"
+            || toolName == "git_commit" || toolName == "apply_subagent_changes"
     }
 
     /// Whether a call must ask the user before it runs.

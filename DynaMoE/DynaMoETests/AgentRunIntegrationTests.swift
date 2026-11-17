@@ -128,9 +128,9 @@ final class AgentRunIntegrationTests: XCTestCase {
         XCTAssertFalse(summary.isEmpty)
     }
 
-    func testASpawnWithAForbiddenToolNeverReachesABackend() {
-        XCTAssertThrowsError(
-            try AgentSpawnResolver.resolve(
+    func testASpawnWithAForbiddenToolNeverReachesABackend() async {
+        do {
+            _ = try await AgentSpawnResolver.resolve(
                 AgentSpawnRequest(
                     role: "Custom",
                     taskDescription: "delegate again",
@@ -140,6 +140,9 @@ final class AgentRunIntegrationTests: XCTestCase {
                 runId: UUID(),
                 sessionId: UUID()
             )
-        )
+            XCTFail("a forbidden tool must be refused before a backend is resolved")
+        } catch {
+            XCTAssertEqual(error as? AgentSpawnError, .forbiddenTool("spawn_subagent"))
+        }
     }
 }

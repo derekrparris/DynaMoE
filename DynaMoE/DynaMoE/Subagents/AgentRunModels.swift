@@ -268,6 +268,10 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
     var error: String?
     var depth: Int
     var summaryRelayed: Bool
+    /// When an isolated run's changes were applied to the main tree, if they
+    /// were. Optional and additive: records written before Phase 4 decode with
+    /// no value, and a newer build's field is never rewritten by an older one.
+    var appliedAt: Date?
     var schemaVersion: Int
 
     static let currentSchemaVersion = 1
@@ -296,6 +300,7 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
         error: String? = nil,
         depth: Int = 0,
         summaryRelayed: Bool = false,
+        appliedAt: Date? = nil,
         schemaVersion: Int = AgentRunRecord.currentSchemaVersion
     ) {
         self.id = id
@@ -321,6 +326,7 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
         self.error = error
         self.depth = depth
         self.summaryRelayed = summaryRelayed
+        self.appliedAt = appliedAt
         self.schemaVersion = schemaVersion
     }
 }

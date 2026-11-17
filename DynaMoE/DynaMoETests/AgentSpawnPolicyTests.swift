@@ -160,26 +160,28 @@ final class AgentSpawnPolicyTests: XCTestCase {
 
     // MARK: - Resolver refusals
 
-    func testEmptyTaskIsRefused() {
-        XCTAssertThrowsError(
-            try AgentSpawnResolver.resolve(
+    func testEmptyTaskIsRefused() async {
+        do {
+            _ = try await AgentSpawnResolver.resolve(
                 request(task: "   "),
                 runId: UUID(),
                 sessionId: UUID()
             )
-        ) { error in
+            XCTFail("an empty task must be refused")
+        } catch {
             XCTAssertEqual(error as? AgentSpawnError, .emptyTask)
         }
     }
 
-    func testWorktreeIsolationIsRefusedByName() {
-        XCTAssertThrowsError(
-            try AgentSpawnResolver.resolve(
+    func testWorktreeIsolationIsRefusedForAReadOnlyRun() async {
+        do {
+            _ = try await AgentSpawnResolver.resolve(
                 request(isolation: .worktree(path: "", branch: "")),
                 runId: UUID(),
                 sessionId: UUID()
             )
-        ) { error in
+            XCTFail("a read-only run must not get a worktree")
+        } catch {
             guard case .unsupportedIsolation(let detail)? = error as? AgentSpawnError else {
                 return XCTFail("expected an isolation refusal, got \(error)")
             }
@@ -187,26 +189,65 @@ final class AgentSpawnPolicyTests: XCTestCase {
         }
     }
 
-    func testForbiddenToolsAreRefused() {
-        XCTAssertThrowsError(
-            try AgentSpawnResolver.resolve(
+    func testForbiddenToolsAreRefused() async {
+        do {
+            _ = try await AgentSpawnResolver.resolve(
                 request(tools: ["file_read", "spawn_subagent"]),
                 runId: UUID(),
                 sessionId: UUID()
             )
-        ) { error in
+            XCTFail("a forbidden tool must be refused")
+        } catch {
             XCTAssertEqual(error as? AgentSpawnError, .forbiddenTool("spawn_subagent"))
         }
     }
 
-    func testUnknownToolsAreRefusedByName() {
-        XCTAssertThrowsError(
-            try AgentSpawnResolver.resolve(
+    func testWorktreeIsolationRefusesANonGitWriterWorkspace() async {
+        do {
+            _ = try await AgentSpawnResolver.resolve(
+                request(tools: ["file_write"], isolation: .worktree(path: "", branch: "")),
+                runId: UUID(),
+                sessionId: UUID()
+            )
+            XCTFail("a writer on a non-git workspace must not get a worktree")
+        } catch {
+            guard case .unsupportedIsolation(let detail)? = error as? AgentSpawnError else {
+                return XCTFail("expected an isolation refusal, got \(error)")
+            }
+            XCTAssertTrue(detail.lowercased().contains("git"), detail)
+        }
+    }
+
+    func testIsolatedWritersApproveAtSpawnOnly() {
+        let implementer = AgentRolePresetCatalog.definition(for: .implementer)
+        XCTAssertEqual(
+            AgentRolePresetCatalog.approvalPolicy(preset: implementer, mode: .code, isolated: true),
+            .spawnOnly
+        )
+        XCTAssertEqual(
+            AgentRolePresetCatalog.approvalPolicy(preset: implementer, mode: .code, isolated: false),
+            .everyStateChange
+        )
+        let explore = AgentRolePresetCatalog.definition(for: .explore)
+        XCTAssertEqual(
+            AgentRolePresetCatalog.approvalPolicy(preset: explore, mode: .code, isolated: false),
+            .auto
+        )
+        XCTAssertEqual(
+            AgentRolePresetCatalog.approvalPolicy(preset: implementer, mode: .plan, isolated: true),
+            .deny
+        )
+    }
+
+    func testUnknownToolsAreRefusedByName() async {
+        do {
+            _ = try await AgentSpawnResolver.resolve(
                 request(tools: ["file_read", "definitely_not_a_tool"]),
                 runId: UUID(),
                 sessionId: UUID()
             )
-        ) { error in
+            XCTFail("an unknown tool must be refused")
+        } catch {
             XCTAssertEqual(error as? AgentSpawnError, .unknownTool("definitely_not_a_tool"))
         }
     }

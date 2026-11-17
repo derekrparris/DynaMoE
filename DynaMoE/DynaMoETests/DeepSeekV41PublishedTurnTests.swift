@@ -5303,7 +5303,7 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
             operatorOverride: true,
             sampling: AgentSampling(temperature: 0, topP: 1, maxTokens: 48)
         )
-        let plan = try AgentSpawnResolver.resolve(request, runId: runId, sessionId: runId)
+        let plan = try await AgentSpawnResolver.resolve(request, runId: runId, sessionId: runId)
         XCTAssertEqual(plan.backendDescriptor.kind, .local)
         XCTAssertEqual(plan.schedulingClass, .local)
         XCTAssertEqual(plan.approvalPolicy, .auto, "the explore preset is read-only")

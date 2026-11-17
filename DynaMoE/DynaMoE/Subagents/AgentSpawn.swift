@@ -128,18 +128,34 @@ enum AgentSpawnResolver {
         runId: UUID,
         sessionId: UUID,
         defaults: UserDefaults = .standard
-    ) throws -> AgentSpawnPlan {
+    ) async throws -> AgentSpawnPlan {
         let task = request.taskDescription.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !task.isEmpty else { throw AgentSpawnError.emptyTask }
-        if case .worktree = request.isolation {
-            throw AgentSpawnError.unsupportedIsolation("worktree isolation ships with the writers phase.")
-        }
 
         let preset = AgentRolePresetCatalog.preset(named: request.presetName, role: request.role)
         let definition = AgentRolePresetCatalog.definition(for: preset)
         let toolNames = try resolveTools(request, definition: definition)
         let budget = AgentRolePresetCatalog.budget(for: definition, overrides: request.budgetOverrides)
-        let approvalPolicy = AgentRolePresetCatalog.approvalPolicy(preset: definition, mode: request.parentMode)
+
+        // Isolation is validated BEFORE the backend is resolved, so a spawn that
+        // cannot have a worktree is refused for that reason rather than for
+        // "no model loaded". The worktree itself is created after the backend
+        // resolves: a local cost refusal re-resolves the request, and a worktree
+        // created before it would be left behind.
+        var worktreeRepository: URL?
+        if request.isolation.isIsolated {
+            guard !Set(toolNames).isDisjoint(with: AgentToolSurface.writeCapable) else {
+                throw AgentSpawnError.unsupportedIsolation(
+                    "this run's tools cannot change the workspace, so a worktree would be an empty copy. Use isolation \"none\" for a read-only run."
+                )
+            }
+            guard let repositoryRoot = await WorkspaceIsolation.repositoryRoot(for: request.workingDirectory) else {
+                throw AgentSpawnError.unsupportedIsolation(
+                    "'\(request.workingDirectory.path)' is not inside a git repository. A writer on a non-git workspace must use isolation \"none\" and approve each change."
+                )
+            }
+            worktreeRepository = repositoryRoot
+        }
 
         let (backend, schedulingClass, descriptor) = try resolveBackend(
             request,
@@ -147,6 +163,28 @@ enum AgentSpawnResolver {
             runId: runId,
             sessionId: sessionId,
             defaults: defaults
+        )
+
+        var isolation = AgentIsolation.none
+        var workingDirectory = request.workingDirectory
+        if let repositoryRoot = worktreeRepository {
+            do {
+                let worktree = try await WorkspaceIsolation.createWorktree(
+                    repositoryRoot: repositoryRoot,
+                    runId: runId
+                )
+                isolation = worktree.isolation
+                workingDirectory = worktree.path
+            } catch {
+                let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                throw AgentSpawnError.unsupportedIsolation(detail)
+            }
+        }
+
+        let approvalPolicy = AgentRolePresetCatalog.approvalPolicy(
+            preset: definition,
+            mode: request.parentMode,
+            isolated: isolation.isIsolated
         )
 
         return AgentSpawnPlan(
@@ -160,13 +198,13 @@ enum AgentSpawnResolver {
             toolNames: toolNames,
             budget: budget,
             approvalPolicy: approvalPolicy,
-            isolation: request.isolation,
+            isolation: isolation,
             thinking: request.thinking,
             sampling: request.sampling,
             priority: request.priority,
             parentSessionId: request.parentSessionId,
             parentTurnId: request.parentTurnId,
-            workingDirectory: request.workingDirectory
+            workingDirectory: workingDirectory
         )
     }
 

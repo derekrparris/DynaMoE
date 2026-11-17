@@ -143,11 +143,17 @@ nonisolated enum AgentRolePresetCatalog {
         return budget
     }
 
-    /// Read-only runs may be automatic; a run that can write goes through the
-    /// operator unless it is isolated, and plan mode denies writes outright.
-    static func approvalPolicy(preset definition: AgentPresetDefinition, mode: AgentMode) -> AgentApprovalPolicy {
+    /// Read-only runs may be automatic; a run that can write on the main tree
+    /// asks before every change, one that writes inside its own worktree asks
+    /// once at spawn, and plan mode denies writes outright.
+    static func approvalPolicy(
+        preset definition: AgentPresetDefinition,
+        mode: AgentMode,
+        isolated: Bool = false
+    ) -> AgentApprovalPolicy {
         if mode == .plan { return .deny }
-        return definition.canMutate ? .everyStateChange : .auto
+        guard definition.canMutate else { return .auto }
+        return isolated ? .spawnOnly : .everyStateChange
     }
 }
 

@@ -215,6 +215,9 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// The loop's own transcript once the run finishes. Until then the live
     /// view is `transcript` (tool steps) plus the streaming text below.
     private(set) var runTranscript: [AgentTranscriptEntry] = []
+    /// When an isolated run's worktree changes were applied to the main tree.
+    /// Part of the record so a restored run still knows it was applied.
+    private(set) var appliedAt: Date? = nil
     /// The step currently streaming. The loop mints one delta id pair per step,
     /// so a new id is the boundary that clears the previous step's text.
     @Published public private(set) var liveAssistantText: String = ""
@@ -380,8 +383,21 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             },
             error: status == .failed ? finalSummary : nil,
             depth: 0,
-            summaryRelayed: isSummaryRelayed
+            summaryRelayed: isSummaryRelayed,
+            appliedAt: appliedAt
         )
+    }
+
+    /// Records that this run's worktree landed on the main tree. The store is
+    /// written synchronously by the apply path, so a crash immediately after
+    /// the patch cannot leave a record that would try to apply it twice.
+    func markApplied(at date: Date, files: [String]) {
+        appliedAt = date
+        if var report, !files.isEmpty {
+            report.changedFiles = files
+            self.report = report
+        }
+        AgentRunStore.shared.saveImmediately(snapshotRecord())
     }
 
     /// Writes the current state. Safe to call on every boundary: the store
@@ -534,6 +550,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             )
         } catch {
             await scheduler.finish(runId: id)
+            await discardWorktree(for: plan.isolation)
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             let cancelled = (error as? AgentSchedulerError) == .cancelled || Task.isCancelled
             finishRun(
@@ -571,6 +588,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                 }
             )
         } catch {
+            await discardWorktree(for: plan.isolation)
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             finishRun(
                 summary: message,
@@ -621,7 +639,12 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         await eventPump.value
 
         let duration = CFAbsoluteTimeGetCurrent() - startTime
-        report = outcome.report
+        // An isolated writer's worktree is read back here, not by the loop: the
+        // loop runs inside the worktree and has no business knowing where its
+        // bytes are. A cancelled run's worktree is discarded (SUBAGENTS.md §7);
+        // anything terminal keeps it until `apply_subagent_changes` lands it.
+        let finalReport = await finalizeWorktree(plan: plan, outcome: outcome)
+        report = finalReport
         usage = outcome.usage
         // The loop's transcript is authoritative: it records thinking, text and
         // every tool result in emission order, including a withheld call the
@@ -657,6 +680,47 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         let liveStatus = outcome.error
             ?? String(format: "Completed in %.2fs", duration)
         finishRun(summary: summary, status: finalStatus, duration: duration, liveStatus: liveStatus)
+    }
+
+    /// Reads an isolated run's worktree into its report, or discards it on
+    /// cancellation. A worktree that cannot be opened leaves the run's report
+    /// intact and adds an open question naming why: the loop's transcript is
+    /// still a truthful record of what happened.
+    private func finalizeWorktree(plan: AgentSpawnPlan, outcome: AgentLoopOutcome) async -> AgentReport? {
+        guard case .worktree(let path, let branch) = plan.isolation else {
+            return outcome.report
+        }
+        if outcome.status == .cancelled || Task.isCancelled {
+            if let worktree = try? await WorkspaceIsolation.open(path: path, branch: branch) {
+                await WorkspaceIsolation.cleanup(worktree)
+            }
+            return outcome.report
+        }
+        guard var report = outcome.report else { return nil }
+        do {
+            let worktree = try await WorkspaceIsolation.open(path: path, branch: branch)
+            let changes = try await WorkspaceIsolation.snapshot(worktree)
+            report.changedFiles = changes.changedFiles
+            report.diff = changes.diff.isEmpty ? nil : changes.diff
+            if changes.diffWasTruncated {
+                report.openQuestions.append(
+                    "The worktree diff was too large to store in full. apply_subagent_changes still applies the complete patch."
+                )
+            }
+        } catch {
+            let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            report.openQuestions.append("The run's worktree could not be read back: \(detail)")
+        }
+        return report
+    }
+
+    /// A run that never reached its loop still owns a worktree. Called from the
+    /// scheduler/context failure paths so a refused run does not leave a branch
+    /// and a directory behind.
+    private func discardWorktree(for isolation: AgentIsolation) async {
+        guard case .worktree(let path, let branch) = isolation,
+              let worktree = try? await WorkspaceIsolation.open(path: path, branch: branch) else { return }
+        await WorkspaceIsolation.cleanup(worktree)
     }
 
     /// The loop's events, applied to the drawer's own state.
@@ -1489,6 +1553,12 @@ public final class SubagentManager: ObservableObject {
     private var subagentsById: [UUID: SubagentInstance] = [:]
     private var spawnsSincePrune = 0
     private var subagentsOrder: [SubagentInstance] = []
+    /// Live instances are ObservableObjects on their own, but the inspector
+    /// observes the MANAGER. Forwarding their changes keeps the list, the live
+    /// stream and the new usage strip refreshing together; without it a
+    /// `@Published` mutation on a run would not redraw anything that holds a
+    /// value snapshot of it.
+    private var instanceObservers: [UUID: AnyCancellable] = [:]
     private let lock = NSLock()
 
     public var activeSubagentsCount: Int {
@@ -1517,10 +1587,13 @@ public final class SubagentManager: ObservableObject {
         // Retention runs once per process rather than on a timer: the store can
         // only grow while the app is running, and a launch sweep is the moment
         // a slow disk should be paid for. Off the main actor, because startup
-        // must not parse a few hundred records before the first frame.
+        // must not parse a few hundred records before the first frame. Orphaned
+        // worktrees are swept with the same sweep: a run that was interrupted
+        // between creating one and applying it has no other owner.
         let policy = AgentRunStore.configuredPolicy()
         Task.detached(priority: .utility) {
             AgentRunStore.shared.prune(policy: policy)
+            await WorkspaceIsolation.pruneStaleWorktrees()
         }
     }
 
@@ -1583,6 +1656,15 @@ public final class SubagentManager: ObservableObject {
         lock.lock()
         subagentsById[instance.id] = instance
         subagentsOrder.insert(instance, at: 0)
+        lock.unlock()
+
+        let observer = instance.objectWillChange
+            .throttle(for: .milliseconds(80), scheduler: RunLoop.main, latest: true)
+            .sink { [weak self] _ in
+                Task { @MainActor in self?.objectWillChange.send() }
+            }
+        lock.lock()
+        instanceObservers[instance.id] = observer
         lock.unlock()
 
         if Thread.isMainThread {
@@ -1657,6 +1739,7 @@ public final class SubagentManager: ObservableObject {
         subagentsOrder.removeAll(where: { clearedIds.contains($0.id) })
         for id in clearedIds {
             subagentsById.removeValue(forKey: id)
+            instanceObservers.removeValue(forKey: id)
         }
         lock.unlock()
 

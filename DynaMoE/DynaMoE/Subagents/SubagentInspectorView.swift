@@ -57,6 +57,9 @@ struct SubagentInspectorView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            if !allRecords.isEmpty {
+                usageStrip
+            }
             Divider()
             if selectedRunId == nil, !approvalCenter.pending.isEmpty {
                 approvalStack
@@ -137,6 +140,76 @@ struct SubagentInspectorView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
         .background(Color(NSColor.controlBackgroundColor))
+    }
+
+    /// The conversation's cost and usage at a glance. A run's cost is only
+    /// meaningful in aggregate (one web search costs less than a reviewer's
+    /// forty steps), so this is the dashboard the design doc asks for without a
+    /// second window to keep in sync with the list.
+    private var usageStrip: some View {
+        let totals = sessionTotals
+        return HStack(spacing: 16) {
+            if totals.active > 0 {
+                usageStat("\(totals.active)", "active", tint: .blue)
+            }
+            usageStat("\(totals.runs)", totals.runs == 1 ? "run" : "runs")
+            if totals.tokens > 0 {
+                usageStat(compactTokens(totals.tokens), "tokens")
+            }
+            if totals.cost > 0 {
+                usageStat(String(format: "$%.4f", totals.cost), "spend")
+            }
+            if totals.seconds > 0 {
+                usageStat(compactDuration(totals.seconds), "time")
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Color(NSColor.controlBackgroundColor).opacity(0.55))
+    }
+
+    private func usageStat(_ value: String, _ label: String, tint: Color = .secondary) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(value)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundColor(tint == .secondary ? .primary : tint)
+            Text(label)
+                .font(.system(size: 8.5, weight: .medium))
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private var sessionTotals: (runs: Int, active: Int, tokens: Int, cost: Double, seconds: Double) {
+        var runs = 0
+        var active = 0
+        var tokens = 0
+        var cost = 0.0
+        var seconds = 0.0
+        for record in allRecords {
+            runs += 1
+            if !record.status.isTerminal { active += 1 }
+            tokens += record.usage.totalTokens
+            cost += record.usage.costUSD
+            if record.usage.wallClockSeconds > 0 {
+                seconds += record.usage.wallClockSeconds
+            } else if let completed = record.completedAt, let started = record.startedAt {
+                seconds += completed.timeIntervalSince(started)
+            }
+        }
+        return (runs, active, tokens, cost, seconds)
+    }
+
+    private func compactTokens(_ count: Int) -> String {
+        if count >= 1_000_000 { return String(format: "%.1fM", Double(count) / 1_000_000) }
+        if count >= 1_000 { return String(format: "%.1fk", Double(count) / 1_000) }
+        return "\(count)"
+    }
+
+    private func compactDuration(_ seconds: Double) -> String {
+        if seconds >= 3_600 { return String(format: "%.1fh", seconds / 3_600) }
+        if seconds >= 60 { return String(format: "%.1fm", seconds / 60) }
+        return String(format: "%.1fs", seconds)
     }
 
     private var approvalStack: some View {
@@ -525,6 +598,41 @@ private struct SubagentRunDetailView: View {
                 .buttonStyle(.plain)
                 .help("Reveal in Finder")
                 Spacer(minLength: 0)
+            }
+            if case .worktree(let worktreePath, let branch) = record.isolation {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Text("Worktree")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.secondary)
+                        .frame(width: 96, alignment: .leading)
+                    Text(worktreePath)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .textSelection(.enabled)
+                    if FileManager.default.fileExists(atPath: worktreePath) {
+                        Button(action: {
+                            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: worktreePath)])
+                        }) {
+                            Image(systemName: "folder")
+                                .font(.system(size: 9))
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Reveal the run's worktree in Finder")
+                    }
+                    Spacer(minLength: 0)
+                }
+                metaRow("Branch", branch)
+                if let appliedAt = record.appliedAt {
+                    metaRow("Applied", Self.dateFormatter.string(from: appliedAt))
+                } else if record.status.isTerminal, FileManager.default.fileExists(atPath: worktreePath) {
+                    Text("Isolated changes are waiting. The coordinator applies them with apply_subagent_changes, or you can review the worktree directly.")
+                        .font(.system(size: 9.5))
+                        .foregroundColor(.secondary)
+                        .padding(.leading, 102)
+                }
             }
             if let started = record.startedAt {
                 metaRow("Started", Self.dateFormatter.string(from: started))

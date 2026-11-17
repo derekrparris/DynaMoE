@@ -50,6 +50,10 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         static let thinking = 16_384
         static let status = 2_048
         static let task = 16_384
+        /// A worktree diff is the report's most useful artifact, so it gets a
+        /// larger budget than a single tool output. Applying never reads this
+        /// copy: the live worktree supplies the full patch.
+        static let reportDiff = 65_536
     }
 
     /// What retention keeps: the newest `keepNewest` runs, plus anything younger
@@ -349,7 +353,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         }
         if var report = bounded.report {
             report.summary = truncate(report.summary, to: TranscriptBudget.assistantText)
-            report.diff = report.diff.map { truncate($0, to: TranscriptBudget.toolOutput) }
+            report.diff = report.diff.map { truncate($0, to: TranscriptBudget.reportDiff) }
             bounded.report = report
         }
         return bounded
