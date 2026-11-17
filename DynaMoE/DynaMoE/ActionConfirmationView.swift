@@ -41,7 +41,16 @@ public nonisolated final class ActionApprovalManager: @unchecked Sendable {
         // A pending prompt is part of a running agent operation even though
         // the engine is idle, so a config reload must wait for the decision.
         AgentActivity.shared.begin(.approval)
-        defer { AgentActivity.shared.end(.approval) }
+        defer {
+            AgentActivity.shared.end(.approval)
+            // A cancellation that lands AFTER `decide` resumed this id inserts
+            // it below with nobody left to consume it. The handler cannot run
+            // once `withTaskCancellationHandler` returns, so dropping the id
+            // here is what keeps this set bounded.
+            lock.lock()
+            cancelledWaits.remove(id)
+            lock.unlock()
+        }
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 lock.lock()
@@ -82,13 +91,6 @@ public nonisolated final class ActionApprovalManager: @unchecked Sendable {
         decide(id: id, approved: false)
     }
 
-    /// Whether a call is still waiting on this id, for the card to render.
-    public func isWaiting(id: UUID) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return pendingContinuations[id] != nil
-    }
-
     public func cancelAll() {
         lock.lock()
         let all = pendingContinuations
@@ -115,11 +117,14 @@ public nonisolated final class ActionApprovalManager: @unchecked Sendable {
         // No waiter yet. Remember the answer so a late registration resolves
         // instead of parking forever; a cancel for this id is now moot.
         cancelledWaits.remove(id)
-        pendingDecisions[id] = approved
-        pendingDecisionOrder.append(id)
-        if pendingDecisionOrder.count > Self.rememberedDecisionLimit {
-            let oldest = pendingDecisionOrder.removeFirst()
-            pendingDecisions.removeValue(forKey: oldest)
+        if pendingDecisions.updateValue(approved, forKey: id) == nil {
+            // A second click on one id replaces the answer rather than adding
+            // a second order entry that would evict an unrelated decision.
+            pendingDecisionOrder.append(id)
+            if pendingDecisionOrder.count > Self.rememberedDecisionLimit {
+                let oldest = pendingDecisionOrder.removeFirst()
+                pendingDecisions.removeValue(forKey: oldest)
+            }
         }
         lock.unlock()
         return true
@@ -214,7 +219,7 @@ public struct ActionConfirmationView: View {
                         .cornerRadius(5)
                     }
                     .buttonStyle(.plain)
-                    .help("Turn Turbo Mode on so this and later file writes and commands run without a per-call confirmation. This control cannot turn Turbo off.")
+                    .help("Turn Turbo Mode on so later file writes and commands run without a per-call confirmation. This pending action still needs its own approval, and this control cannot turn Turbo off.")
                 }
             }
 

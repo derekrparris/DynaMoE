@@ -2423,11 +2423,13 @@ struct ContentView: View {
         }
     }
 
-    /// Announces a Turbo flip made from the composer pill.
+    /// Announces a Turbo flip, whatever its writer.
     ///
-    /// Extracted from the `ChatDetailView` call site on purpose: a ternary that
-    /// builds two messages inside that view expression is enough to push the
-    /// type-checker past its time budget.
+    /// Called by the `turboModeForNotice` observer below: the UI's `@AppStorage`
+    /// bindings write straight to defaults, so the composer pill, Settings and
+    /// the approval card all land there rather than in this view. Kept out of
+    /// the view expression because a ternary that builds two messages inside it
+    /// is enough to push the type-checker past its time budget.
     private func showTurboModeNotice(_ enabled: Bool) {
         showStatus(enabled
             ? "⚡ Turbo Mode on — file writes and commands run without a per-call approval."
@@ -6917,6 +6919,32 @@ struct ContentView: View {
                     var anyCompleted = false
                     var ranCompleteTool = false
 
+                    // A Stop can land before a call starts, or while its
+                    // approval is being consumed. Both end the turn the same
+                    // way, and neither may leave a card whose continuation has
+                    // already resolved.
+                    func markCallsCancelled(from index: Int) async {
+                        await MainActor.run {
+                            guard self.ownsGeneration(myGenerationId) else { return }
+                            self.isGeneratingText = false
+                            self.generationTask = nil
+                            self.showStatus("⏹ Tool execution stopped by user.")
+                            if let sId = sessionId, let mId = messageId,
+                               let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                               let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }),
+                               var currentCalls = self.sessions[sIdx].messages[mIdx].toolCalls {
+                                for i in index..<currentCalls.count {
+                                    if currentCalls[i].status == .running
+                                        || currentCalls[i].status == .awaitingApproval {
+                                        currentCalls[i].status = .error
+                                        currentCalls[i].error = "Cancelled by user."
+                                    }
+                                }
+                                self.sessions[sIdx].messages[mIdx].toolCalls = currentCalls
+                            }
+                        }
+                    }
+
                     // A call and the approval that authorizes it are one
                     // operation. `executeTool` raises the same counter, but the
                     // approval wait ends before it starts, and a deferred MCP
@@ -6927,25 +6955,7 @@ struct ContentView: View {
                         defer { AgentActivity.shared.end(.toolCall) }
 
                         if Task.isCancelled {
-                            await MainActor.run {
-                                guard self.ownsGeneration(myGenerationId) else { return }
-                                self.isGeneratingText = false
-                                self.generationTask = nil
-                                self.showStatus("⏹ Tool execution stopped by user.")
-                                if let sId = sessionId, let mId = messageId,
-                                   let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
-                                   let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }),
-                                   var currentCalls = self.sessions[sIdx].messages[mIdx].toolCalls {
-                                    for i in idx..<currentCalls.count {
-                                        if currentCalls[i].status == .running
-                                            || currentCalls[i].status == .awaitingApproval {
-                                            currentCalls[i].status = .error
-                                            currentCalls[i].error = "Cancelled by user."
-                                        }
-                                    }
-                                    self.sessions[sIdx].messages[mIdx].toolCalls = currentCalls
-                                }
-                            }
+                            await markCallsCancelled(from: idx)
                             return
                         }
 
@@ -7055,6 +7065,14 @@ struct ContentView: View {
                                 }
                                 continue
                             }
+                        }
+
+                        // The approval above has been consumed. A Stop that
+                        // landed while it was pending must not let the call it
+                        // authorized run, and must not leave the card behind.
+                        if Task.isCancelled {
+                            await markCallsCancelled(from: idx)
+                            return
                         }
 
                         let execResult = await AgentHarness.shared.executeTool(

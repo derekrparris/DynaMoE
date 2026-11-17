@@ -3887,6 +3887,12 @@ public final class AgentHarness {
     /// legitimate agent work, so only a command that both names this bundle and
     /// mutates is refused. `killall cfprefsd` is included because it discards
     /// unflushed writes for every application on the machine, not just this one.
+    ///
+    /// This is a substring heuristic, not a shell parser: a domain held in a
+    /// variable, an escaped dot, or a scripted plist write gets past it, and MCP
+    /// tools are not inspected at all. It exists to stop the ordinary case (an
+    /// agent composing a `defaults write`), which is what the Turbo self-revert
+    /// was, and is not a sandbox.
     static func shellCommandWritesApplicationPreferences(_ command: String) -> Bool {
         let lowered = command.lowercased()
         if lowered.contains("cfprefsd"),

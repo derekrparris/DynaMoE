@@ -202,15 +202,6 @@ final class TurboModeGuardTests: XCTestCase {
         let approved = await waiter.value
         XCTAssertFalse(approved)
     }
-
-    func testApprovingAnUnknownIdIsRecordedAndWaitingIsFalse() {
-        let id = UUID()
-        XCTAssertFalse(ActionApprovalManager.shared.isWaiting(id: id))
-        XCTAssertTrue(ActionApprovalManager.shared.approve(id: id))
-        // Still not "waiting": no call has parked on it. The recorded decision
-        // is what a late waiter consumes.
-        XCTAssertFalse(ActionApprovalManager.shared.isWaiting(id: id))
-    }
 }
 
 /// Argument-dictionary shorthands. The gate takes `[String: Any]`, so a test

@@ -72,14 +72,14 @@ public struct DogfoodBenchmarkReport: Sendable {
 
 /// Why a benchmark run was refused before it touched engine state.
 public enum DogfoodBenchmarkError: LocalizedError {
-    /// The benchmark flips a global preference and reads the shared engine's
-    /// resident model, so it cannot share the process with a live turn.
-    case generationInProgress
+    /// The benchmark flips an app-wide preference and mutates a workspace, so
+    /// it cannot share the process with a live turn, tool call, or approval.
+    case operationInProgress
 
     public var errorDescription: String? {
         switch self {
-        case .generationInProgress:
-            return "A generation is in progress. Stop or finish it before running the dogfood benchmark."
+        case .operationInProgress:
+            return "A turn, tool call, or approval is still in progress. Stop or finish it before running the dogfood benchmark."
         }
     }
 }
@@ -181,11 +181,12 @@ public final class ModelDogfoodBenchmarkRunner: ObservableObject {
         modelName: String = "Ornith-1.5-35B-A3B-FP8",
         modelSnapshotPath: String = ""
     ) async throws -> DogfoodBenchmarkReport {
-        // The run flips Turbo for its self-healing turn and reads the shared
-        // engine, so starting it during a turn would change another operation's
-        // safety setting and observe a model mid-generation.
+        // The run arms Turbo for its self-healing turn. That preference is
+        // app-wide, and a live turn is deciding approvals against it, so a
+        // benchmark starting mid-turn would change another operation's safety
+        // policy underneath it (and share the machine with a running tool call).
         guard !CompletionEngine.shared.isActive, !AgentActivity.shared.isBusy else {
-            throw DogfoodBenchmarkError.generationInProgress
+            throw DogfoodBenchmarkError.operationInProgress
         }
         isRunning = true
         currentTurn = 0
