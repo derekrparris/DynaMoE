@@ -4,7 +4,9 @@ Design and working document for the model-backed subagent system. This file is
 the reference for a multi-session build: read it first, check the phase
 checklist, then continue at the first unchecked item.
 
-Status: **Phase 0 complete; `CloudAgentBackend` drafted ahead of Phase 1.**
+Status: **Phase 1 complete (both backends, the local cost refusal and the
+opt-in real turns); Phase 2 is next.** Only the cloud provider/model default
+(§16) is still an open product question.
 
 ---
 
@@ -338,7 +340,10 @@ struct AgentBackendTurn {
   calls and `generatedTokenIds` for history.
 - Holds the **engine lease** for the whole run, not per step, so the run's own
   prefix stays pinned between steps. Interleaving another run or a coordinator
-  turn would force a full re-prefill on its next step.
+  turn would force a full re-prefill on its next step. *(Phase 1 ships the
+  claim per step, because `launchTurn` consumes a claim as soon as it mints the
+  generation task and the ledger holds one; the lifetime lease is
+  `AgentScheduler`'s, §8.)*
 - **Cost estimate + refusal:** before the first step, compute the coordinator's
   re-prefill cost from the pinned prefix length and the recent prefill rate.
   If the estimate exceeds `dynamoe_subagent_local_cost_limit` (default 120 s),
@@ -552,9 +557,8 @@ Implemented beyond the checklist, deliberately early:
   `tools_load`, `tools_unload` and `spawn_subagent` at `configureRunScope`
   (`AgentRunScopeError.forbiddenTool`), so invariant 3 is enforced where the run
   scope is built rather than left to the spawn path.
-- `CloudAgentBackend.swift` is written against `CloudChatClient` and builds, but
-  it has no logic tests, no spawn path and no UI; treat it as a draft until
-  Phase 1's exit criteria are met.
+- `CloudAgentBackend.swift` is written against `CloudChatClient` and builds; its
+  logic tests landed in Phase 1. It still has no spawn path and no UI.
 
 Naming drift from §4/§6 as implemented: `AgentBackendTurn.calls` (not
 `toolCalls`), `AgentBudget.maxCompletionTokens` (not `maxTokens`), and
@@ -562,14 +566,61 @@ Naming drift from §4/§6 as implemented: `AgentBackendTurn.calls` (not
 
 ### Phase 1 — Real backends
 
-- [ ] `CloudAgentBackend`: provider/model resolution, streaming, native tool
+- [x] `CloudAgentBackend`: provider/model resolution, streaming, native tool
       calls, usage/cost
-- [ ] `LocalAgentBackend`: family formatting, tool mask, parser, engine lease
-- [ ] Cost estimate + refusal for local in-turn
-- [ ] Backend logic tests; one opt-in real turn per backend
+- [x] `LocalAgentBackend`: family formatting, tool mask, parser, engine lease
+- [x] Cost estimate + refusal for local in-turn
+- [x] Backend logic tests; one opt-in real turn per backend
+      (`CloudAgentBackendLogicTests`, 18 cases incl. the opt-in real turn;
+      `LocalAgentBackendLogicTests`, 22 cases; the real-turn cases in
+      `DeepSeekV41PublishedTurnTests` and `CloudAgentBackendLogicTests`).
 
 **Exit criteria:** the same loop runs a real cloud turn and a real local turn,
 producing identical transcript/report shapes.
+
+Measured on the reference machine (2026-11-17):
+
+- real LOCAL turn on `DeepSeek-V4.1-Flash-1017`: 28 prompt / 7 generated tokens,
+  `finish eos`, 7 deltas, 17.2 s including the runtime build, answer "The
+  capital of France is Paris.";
+- real CLOUD turn on Syn Large Text (Synthetic): 50 prompt / 24 generated,
+  0.76 s, same answer shape. Both return the same `AgentBackendTurn` fields
+  (`text`, `thinking`, `calls`, `finishReason`, `usage`), which is what the exit
+  criterion asks for.
+
+Implemented in Phase 1, with the reasoning recorded:
+
+- **The engine slot is claimed per STEP, not per run.** `launchTurn` consumes the
+  `TurnSlotClaim` it is handed as soon as it mints the generation task, and the
+  ledger holds exactly one claim, so a claim cannot be carried across steps
+  without changing the mechanism the server queue and the chat send path depend
+  on. Claiming per step was the chosen risk profile (~0.91); the cost is stated
+  in the code rather than hidden: a coordinator turn landing between two steps
+  takes the engine, moves the global prefix pin to its own session, and the
+  run's next step re-prefills. `AgentScheduler` (§8) owns the lifetime lease.
+- **The cost refusal lives in `LocalAgentBackend`.** `make` prices the spawn and
+  calls `admission(hasLoadedModel:estimate:operatorOverride:)`, so no caller can
+  start a local run without consulting it; `operatorOverride` is the spawn
+  card's permission and the only thing that turns a refusal into an admission
+  (invariant 10). The estimate is the coordinator's DISPLACED prefix (the pin is
+  only priced when another session owns it) divided by the last measured prefill
+  rate, which the engine now records from its own progress line
+  (`PrefillThroughput`); an unmeasured process prices with a deliberately
+  pessimistic 5 tok/s floor.
+- **A step re-renders the whole conversation** through
+  `ChatPromptFormatter.formatConversation` (the stateless server path's shape),
+  rather than splicing token ids forward like the in-app chat loop. The
+  conversation-turn mapping mirrors `OpenAIAdapter.splitMessages`: a tool result
+  is a `.toolResult` turn, an assistant turn keeps its reasoning closed, and a
+  call whose markup is not in the text is echoed with the server's plain-text
+  call record.
+- **The tool mask is one implementation.** `GrammarConstrainedSampler.withTurnToolMask`
+  now owns the snapshot/install/restore that `ServerController` used privately,
+  and the local backend uses the same call for its turn.
+- A test caught a real defect in `maskSchemas`: encoding the parameters
+  dictionary inside a second `AnyCodable` has no encoding of its own, so every
+  schema decoded as `{}` and the mask constrained nothing. It now encodes the
+  dictionary itself.
 
 ### Phase 2 — Manager, scheduling, approval
 
@@ -639,6 +690,8 @@ Append one line per session so the next session knows where work stopped.
 | Date | Session | Result |
 |---|---|---|
 | 2026-11-17 | design | Architecture approved; decisions recorded; doc created; Phase 0 started |
+| 2026-11-17 | phase 1 exit check | Both opt-in real turns ran and passed (local DSV4.1: 28 prompt / 7 generated, eos, 17.2 s; cloud Syn Large Text: 50 / 24, 0.76 s), so Phase 1's exit criteria are met. The cloud case walks the spawn's candidates and treats a provider's HTTP 4xx as "this model cannot serve the run" rather than a defect. Markers removed afterwards. |
+| 2026-11-17 | phase 1 backends | `CloudAgentBackendLogicTests` (18, one opt-in) and `LocalAgentBackendLogicTests` (22) landed; `LocalAgentBackend` added (per-step engine claim, family rendering through `formatConversation`, shared tool mask, result/usage mapping); `LocalSubagentCostEstimate` + `PrefillThroughput` added and wired into `LocalAgentBackend.make` and the engine's prefill meter; `AgentRunContext.workerSystemPrompt` gained the family flags. 70 tests green (new suites + `SubagentLoopTests`, `TurnToolMaskTests`, `AgentStepBudgetTests`), `ServerControllerSmokeTests` 30 green in isolation. Next: one opt-in real turn per backend, then Phase 2. |
 | 2026-11-17 | phase 0 build | Models, backend protocol + scripted backend, run context, run-scoped harness/prompt, loop and 14 tests landed; app + test targets build; `SubagentLoopTests` green. Session ended looping on compile/lock/isolation errors; picked up, fixed and closed out. Next: Phase 1 (CloudAgentBackend tests + LocalAgentBackend). |
 
 ---

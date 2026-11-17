@@ -5206,6 +5206,92 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         )
     }
 
+    /// One real LOCAL subagent turn, through `LocalAgentBackend`.
+    ///
+    /// This is the only case that runs the backend's own path against the real
+    /// engine: prompt rendering through the family formatter, the tool mask
+    /// install/restore, `launchTurn`, the stream's frame deltas and the result
+    /// mapping. Everything above it is pure logic, so a mistake in the wiring
+    /// (a prompt the V4.1 template re-wraps, a session id the prefix pin
+    /// rejects, a finish reason that never arrives) can only be seen here.
+    ///
+    /// Opt-in through the class's own gate (`/tmp/dynamoe_dsv41_real_turn`).
+    func testALocalSubagentTurnRunsOnThePublishedCheckpoint() async throws {
+        let snapshot = try snapshotDirectory()
+        let engine = try loadPublishedCheckpointIntoTheSharedEngine(snapshot)
+        defer {
+            unloadSharedEngine()
+            withExtendedLifetime(engine) {}
+        }
+
+        let runSession = UUID()
+        // The run is admitted explicitly: the cost estimate prices the
+        // coordinator's displaced prefix, which this harness cannot know.
+        let backend = try await MainActor.run {
+            try LocalAgentBackend.make(
+                runId: UUID(),
+                sessionId: runSession,
+                thinking: false,
+                promptTokenEstimate: 64,
+                operatorOverride: true
+            )
+        }
+        XCTAssertEqual(backend.descriptor.kind, .local)
+
+        let deltas = DeltaCollector()
+        let request = AgentBackendRequest(
+            systemPrompt: "You are a subagent working for a coordinator. Answer in one short sentence.",
+            messages: [.user("What is the capital of France?")],
+            tools: [],
+            sampling: AgentSampling(temperature: 0, topP: 1, maxTokens: 48),
+            maxTokens: 48,
+            stopSequences: [],
+            thinking: false,
+            sessionId: runSession,
+            onDelta: { text, thinking in deltas.add(text, thinking) }
+        )
+        let turn = try await backend.runTurn(request)
+
+        XCTAssertFalse(turn.text.isEmpty, "a real local turn must produce text")
+        XCTAssertGreaterThan(turn.usage.promptTokens, 0)
+        XCTAssertGreaterThan(turn.usage.completionTokens, 0)
+        XCTAssertEqual(turn.calls.count, 0, "a tool-less run must not report calls")
+        XCTAssertGreaterThan(deltas.count, 0, "the stream must reach the run's delta sink")
+        print(
+            "🔎 [dsv41 real] local subagent turn: \(turn.usage.promptTokens) prompt / "
+                + "\(turn.usage.completionTokens) generated, finish \(turn.finishReason), "
+                + "\(deltas.count) delta(s)/\(deltas.characters) character(s), "
+                + "text: \(turn.text.prefix(160))"
+        )
+    }
+
+    /// Deltas arrive on the run's own task, so the collector is locked rather
+    /// than main-actor state.
+    private final class DeltaCollector: @unchecked Sendable {
+        private let lock = NSLock()
+        private var deltaCount = 0
+        private var deltaCharacters = 0
+
+        func add(_ text: String, _ thinking: Bool) {
+            lock.lock()
+            deltaCount += 1
+            deltaCharacters += text.count
+            lock.unlock()
+        }
+
+        var count: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return deltaCount
+        }
+
+        var characters: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return deltaCharacters
+        }
+    }
+
     /// The chat UI's history, at the checkpoint's own tokenizer.
     ///
     /// `DeepSeekV41ChatPromptFormatterTests` pins the rendered SHAPE. This pins the

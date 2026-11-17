@@ -193,6 +193,17 @@ nonisolated public final class PrefixCacheManager: @unchecked Sendable {
         return pinnedTokenIds.count
     }
 
+    /// The session that owns the pin, i.e. whose next turn can reuse it.
+    ///
+    /// The pin is global and single: a caller that records a different session
+    /// displaces it, so a spawn has to know WHOSE prefix it is about to cost
+    /// (SUBAGENTS.md invariant 10). Nil before anything has been pinned.
+    public var currentPinnedSession: UUID? {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeSessionId
+    }
+
     /// Resets/invalidates the pinned prefix (e.g. on new chat or context clearance).
     public func invalidate(sessionId: UUID? = nil) {
         lock.lock()

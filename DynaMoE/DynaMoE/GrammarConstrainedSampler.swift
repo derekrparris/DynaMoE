@@ -265,6 +265,27 @@ nonisolated public final class GrammarConstrainedSampler {
         applyRegistry(names: registry.names, parameterKeys: registry.parameterKeys, requiredKeys: registry.requiredKeys)
     }
 
+    /// Runs `body` with exactly these tool schemas installed, restoring the
+    /// previous registry afterwards.
+    ///
+    /// The registry is process-global, so every turn that carries its own tool
+    /// vocabulary (an API client's tools, a subagent run's tools) has to install
+    /// it around the turn and put back what was live before. One implementation
+    /// for both callers, because restoring the wrong registry rewrites the
+    /// in-app tool names for every later turn. An empty schema list leaves the
+    /// registry alone rather than clearing it: a turn with no tools must not
+    /// unregister the app's own.
+    nonisolated public static func withTurnToolMask<T>(
+        _ schemas: [GrammarToolSchema],
+        _ body: () async throws -> T
+    ) async rethrows -> T {
+        guard !schemas.isEmpty else { return try await body() }
+        let previous = shared.snapshotRegistry()
+        shared.registerToolSchemas(schemas)
+        defer { shared.restoreRegistry(previous) }
+        return try await body()
+    }
+
     private func applyRegistry(names: Set<String>, parameterKeys: [String: Set<String>], requiredKeys: [String: Set<String>]) {
         registrationLock.lock()
         registeredToolNames = names

@@ -69,8 +69,21 @@ final class AgentRunContext {
         harness.availableToolDefinitions(mode: mode)
     }
 
-    func workerSystemPrompt(role: String, baseSystem: String) -> String {
-        harness.buildWorkerSystemPrompt(baseSystem: baseSystem, role: role, mode: mode)
+    func workerSystemPrompt(
+        role: String,
+        baseSystem: String,
+        isLingModel: Bool = false,
+        isGemma4Model: Bool = false,
+        isDeepSeekV41Model: Bool = false
+    ) -> String {
+        harness.buildWorkerSystemPrompt(
+            baseSystem: baseSystem,
+            role: role,
+            mode: mode,
+            isLingModel: isLingModel,
+            isGemma4Model: isGemma4Model,
+            isDeepSeekV41Model: isDeepSeekV41Model
+        )
     }
 
     func execute(_ call: AgentToolCall) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool) {

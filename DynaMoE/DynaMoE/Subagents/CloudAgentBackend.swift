@@ -145,7 +145,7 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
         )
     }
 
-    private static func usage(from usage: CloudUsage?, pricing: CloudPricing?) -> AgentUsage {
+    static func usage(from usage: CloudUsage?, pricing: CloudPricing?) -> AgentUsage {
         var result = AgentUsage()
         guard let usage else { return result }
         result.promptTokens = usage.promptTokens ?? 0
@@ -157,7 +157,7 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
         return result
     }
 
-    private static func isRetryable(_ failure: CloudTurnFailure) -> Bool {
+    static func isRetryable(_ failure: CloudTurnFailure) -> Bool {
         switch failure {
         case .transport(_, let billed):
             return billed
@@ -170,7 +170,7 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
         }
     }
 
-    private static func wireMessages(systemPrompt: String, messages: [AgentBackendMessage]) -> [CloudChatMessage] {
+    static func wireMessages(systemPrompt: String, messages: [AgentBackendMessage]) -> [CloudChatMessage] {
         var wire: [CloudChatMessage] = [
             CloudChatMessage(role: "system", content: systemPrompt)
         ]
@@ -198,7 +198,7 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
         return wire
     }
 
-    private static func argumentsJSON(_ arguments: [String: Any]) -> String {
+    static func argumentsJSON(_ arguments: [String: Any]) -> String {
         guard JSONSerialization.isValidJSONObject(arguments),
               let data = try? JSONSerialization.data(withJSONObject: arguments, options: [.sortedKeys]),
               let text = String(data: data, encoding: .utf8) else {
@@ -207,7 +207,7 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
         return text
     }
 
-    private static func arguments(from json: String) -> [String: Any] {
+    static func arguments(from json: String) -> [String: Any] {
         guard let data = json.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return ["_raw_arguments": json]

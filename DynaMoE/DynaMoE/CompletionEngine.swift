@@ -11078,6 +11078,11 @@ if layer.attnGateProjTensor != nil,
                                 let prefillStr = "Ingesting prompt: Token \(idx + 1)/\(totalTokens) (\(pct)%) • \(speedStr) tok/s"
                                 let currentRss = WorkingSetManager.shared.effectiveResidentMemoryGB
 
+                                // The measured rate, kept for the local subagent
+                                // spawn's re-prefill estimate: a run has to price
+                                // the coordinator's next turn before it starts, and
+                                // the only honest input is what this machine did.
+                                PrefillThroughput.note(tokensPerSecond: promptSpeed)
                                 emit(.prefillProgress(status: prefillStr, speed: promptSpeed, rssGB: currentRss))
                             }
                         }
