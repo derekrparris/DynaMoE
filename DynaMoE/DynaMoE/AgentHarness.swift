@@ -3505,8 +3505,64 @@ public final class AgentHarness {
         "skill_load"
     ]
 
+    /// True for a harness created for one subagent run. A run-scoped harness
+    /// owns its loaded tools, guards, mode and approval policy, and must never
+    /// rebuild the process-global grammar registry.
+    private let isRunScoped: Bool
+
+    /// Tools a subagent run may never be given: they reach the coordinator's
+    /// own tool registry or would let a run delegate again. Delegation is one
+    /// level, so a child has no subagent surface at all.
+    public static let runScopedForbiddenToolNames: Set<String> = [
+        "tools_discover", "tools_load", "tools_unload", "spawn_subagent"
+    ]
+
+    public private(set) var runId: UUID?
+    public private(set) var runApprovalPolicy: AgentApprovalPolicy = .auto
+    public private(set) var isWorkspaceIsolated: Bool = false
+    public var runApprovalHandler: (@Sendable (AgentApprovalRequest) async -> Bool)?
+
     private init() {
+        self.isRunScoped = false
         registerDefaultTools()
+    }
+
+    private init(runScoped: Bool) {
+        self.isRunScoped = runScoped
+        registerDefaultTools()
+    }
+
+    /// An independent harness for one subagent run. It shares the installed
+    /// tool catalog but none of the coordinator's run state.
+    public static func makeRunScoped() -> AgentHarness {
+        AgentHarness(runScoped: true)
+    }
+
+    public func configureRunScope(
+        runId: UUID,
+        toolNames: [String],
+        workingDirectory: URL,
+        mode: AgentMode,
+        approvalPolicy: AgentApprovalPolicy,
+        workspaceIsolated: Bool,
+        approvalHandler: (@Sendable (AgentApprovalRequest) async -> Bool)?
+    ) throws {
+        guard isRunScoped else { throw AgentRunScopeError.notRunScoped }
+        var selected: [String: AgentTool] = [:]
+        for name in Set(toolNames).sorted() {
+            guard !Self.runScopedForbiddenToolNames.contains(name) else {
+                throw AgentRunScopeError.forbiddenTool(name)
+            }
+            guard let tool = tools[name] else { throw AgentRunScopeError.unknownTool(name) }
+            selected[name] = tool
+        }
+        self.runId = runId
+        self.loadedTools = selected
+        self.defaultWorkingDirectory = workingDirectory
+        self.activeMode = mode
+        self.runApprovalPolicy = approvalPolicy
+        self.isWorkspaceIsolated = workspaceIsolated
+        self.runApprovalHandler = approvalHandler
     }
 
     public func registerDefaultTools() {
@@ -3774,6 +3830,7 @@ public final class AgentHarness {
     }
 
     private func syncGrammar() {
+        guard !isRunScoped else { return }
         GrammarConstrainedSampler.shared.registerTools(availableToolDefinitions(mode: activeMode))
     }
 
@@ -4012,7 +4069,7 @@ public final class AgentHarness {
                 && !PlanModePolicy.withholds(name, in: mode)
                 && Self.toolUnavailableReason(name) == nil
         }.count
-        if unloadedCount > 0 {
+        if unloadedCount > 0 && !isRunScoped {
             prompt += """
             NOTE: \(unloadedCount) additional tool(s) are installed but NOT loaded, so their schemas are not shown above and they cannot currently be called.
 
@@ -4047,7 +4104,7 @@ public final class AgentHarness {
         // web_search query after query trying to obtain page content until the
         // search budget guardrail force-disabled web_search mid-task. Tell it
         // exactly how to gain fetch capability instead.
-        if loadedTools["web_search"] != nil && loadedTools["web_fetch"] == nil && mode == .code {
+        if loadedTools["web_search"] != nil && loadedTools["web_fetch"] == nil && mode == .code && !isRunScoped {
             prompt += """
             Web research readiness: `web_fetch` (full page content) is NOT loaded yet, so you cannot read pages. Before you need page content, call `tools_load` with `{\"names\": [\"web_fetch\"]}` and then fetch the exact URLs `web_search` returned. Do NOT keep issuing `web_search` queries to obtain page content — search snippets are all web_search can give you.
 
@@ -4119,7 +4176,7 @@ public final class AgentHarness {
             - The withheld tools are not declared in this request's `tools` array, so the provider will not offer them. Investigate with the declared tools above, then write the plan.
             """
         }
-        if unloadedCount > 0 {
+        if unloadedCount > 0 && !isRunScoped {
             prompt += """
 
             - \(unloadedCount) additional tool(s) are installed but not loaded. Call `tools_discover` to list them by category, then `tools_load` with a `names` array to add the schemas you need (one batched call) before using them.
@@ -4202,6 +4259,164 @@ public final class AgentHarness {
         - Timezone: \(tzName)\(tzAbbr.isEmpty ? "" : " (\(tzAbbr))")
         - Temporal Context: Today's reference date is \(readableDateTime). When conducting web research (`web_search`), fetching web pages (`web_fetch`), synthesizing recent developments, or reasoning about relative dates ("today", "yesterday", "recent", "this year"), always use \(year) and this reference timestamp.
         """
+    }
+
+    /// The system prompt for a model-backed subagent run.
+    ///
+    /// Deliberately separate from `buildSystemPrompt`: a worker is not the
+    /// coordinator, so it must not be given the coordinator's subagent-delivery
+    /// policy, nor told to present results to the user. It is told to do its
+    /// assigned task with its tools, cite real evidence, and finish with
+    /// `complete`.
+    public func buildWorkerSystemPrompt(
+        baseSystem: String,
+        role: String,
+        mode: AgentMode,
+        isLingModel: Bool = false,
+        isGemma4Model: Bool = false,
+        isDeepSeekV41Model: Bool = false,
+        currentDate: Date = Date()
+    ) -> String {
+        var prompt = AgentHarness.formattedDateTimeContext(date: currentDate) + "\n\n"
+        let cleanBase = baseSystem.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanBase.isEmpty {
+            prompt += cleanBase + "\n\n"
+        }
+        prompt += """
+        # Subagent Role
+
+        You are a subagent working on behalf of a coordinator agent inside DynaMoE. Your role is: \(role).
+
+        The coordinator owns the conversation with the user; you do not. Work only on the task you were given, with the tools listed below, and return a report the coordinator can use. Do not ask the user questions and do not wait for approval you cannot receive.
+
+        """
+        prompt += buildToolsSection(mode: mode)
+        prompt += Self.workerToolCallSyntaxSection(
+            isLingModel: isLingModel,
+            isGemma4Model: isGemma4Model,
+            isDeepSeekV41Model: isDeepSeekV41Model
+        )
+        prompt += """
+
+        # Tool Results
+
+        Tool results arrive as plain text: a `[tool_name] status` header, `key: value` metadata lines, then one or more `--- field ---` sections. Read `--- content ---` as the actual file or page text. `<<<TRUNCATED: …>>>` and `next_start_line` are harness annotations: page through with `start_line` rather than assuming the document is broken.
+
+        # Subagent Rules
+
+        - Read real files and run real commands. Never describe code or output you have not actually inspected with a tool in this run.
+        - Every finding you report must cite its evidence: a file and line, a URL, or the command whose output produced it.
+        - Prefer a small number of targeted tool calls over broad exploration. You have a bounded step and token budget.
+        - Do not attempt to spawn another subagent. Delegation is one level.
+        - Do not call `tools_discover` or `tools_load`; your tool set is fixed for this run.
+        - When the task is complete, call `complete` with a summary that states what you found or changed, and what you could not verify. If you cannot complete the task, still call `complete` and say why, with the evidence you gathered.
+        - If a tool is refused by policy, do not retry it. Continue with the tools you have and report the limitation.
+
+        """
+        return prompt
+    }
+
+    private static func workerToolCallSyntaxSection(
+        isLingModel: Bool,
+        isGemma4Model: Bool,
+        isDeepSeekV41Model: Bool
+    ) -> String {
+        if isDeepSeekV41Model {
+            return "\n\n" + DeepSeekV41ToolDialect.instructions() + "\n\n"
+        }
+        if isLingModel {
+            return """
+
+
+            # Tool Calls
+
+            To call a function, reply only in this native format with no suffix:
+
+            <tool_call>example_function_name
+            <arg_key>example_parameter_1</arg_key>
+            <arg_value>value_1</arg_value>
+            </tool_call>
+
+            The function name follows <tool_call> directly, then one <arg_key>/<arg_value> pair per argument. Required parameters must be present. Any reasoning for the call goes BEFORE it, never after.
+
+            """
+        }
+        if isGemma4Model {
+            return """
+
+
+            # Tool Calls
+
+            To call a function, reply only in this native format with no suffix:
+
+            <|tool_call>call:example_function_name{example_parameter_1:<|"|>value_1<|"|>}<tool_call|>
+
+            String values are wrapped in <|"|> quotes; numbers, booleans and nested objects are written bare. Required parameters must be present. Any reasoning for the call goes BEFORE it, never after.
+
+            """
+        }
+        return """
+
+
+        # Tool Calls
+
+        To call a function, reply only in this format with no suffix:
+
+        <tool_call>
+        <function=example_function_name>
+        <parameter=example_parameter_1>
+        value_1
+        </parameter>
+        </function>
+        </tool_call>
+
+        The <function=...></function> block must be nested inside <tool_call></tool_call>. Required parameters must be present. Any reasoning for the call goes BEFORE it, never after.
+
+        """
+    }
+
+    public func buildCloudWorkerSystemPrompt(
+        baseSystem: String,
+        role: String,
+        mode: AgentMode,
+        currentDate: Date = Date()
+    ) -> String {
+        var prompt = AgentHarness.formattedDateTimeContext(date: currentDate) + "\n\n"
+        let cleanBase = baseSystem.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanBase.isEmpty {
+            prompt += cleanBase + "\n\n"
+        }
+        prompt += """
+        # Subagent Role
+
+        You are a subagent working on behalf of a coordinator agent inside DynaMoE. Your role is: \(role).
+
+        The coordinator owns the conversation with the user; you do not. Work only on the task you were given and return a report the coordinator can use. Do not ask the user questions.
+
+        """
+        if mode == .plan {
+            prompt += PlanModePolicy.directive(toolNames: availableToolDefinitions(mode: mode).map { $0.function.name }) + "\n\n"
+        }
+        prompt += """
+
+        # Tools
+
+        Call tools through the provider's native function-calling interface, using the functions declared in this request. Never emit XML or prose instead of a call. Only the declared functions are callable; do not try to load or discover others.
+
+        - Issue the call rather than narrating it.
+        - Read every result before deciding the next step, and never repeat an identical call hoping for a different answer.
+        - Use absolute paths.
+        - A refused tool is final for this run: continue with what you have and report the limitation.
+
+        # Subagent Rules
+
+        - Every finding must cite its evidence: a file and line, a URL, or the command whose output produced it.
+        - Keep the tool calls targeted; you have a bounded step and token budget.
+        - Do not attempt to spawn another subagent.
+        - Finish by calling `complete` with a summary of what you found or changed and what you could not verify. If the task cannot be completed, still call `complete` and say why.
+
+        """
+        return prompt
     }
 
     public func buildSystemPrompt(baseSystem: String, modelName: String? = nil, currentDate: Date = Date(), isLingModel: Bool = false, isGemma4Model: Bool = false, isDeepSeekV41Model: Bool = false, mode: AgentMode = .code) -> String {
@@ -5122,6 +5337,53 @@ public final class AgentHarness {
         }
     }
 
+    private enum RunScopeDecision {
+        case allow
+        case deny(String)
+        case ask(AgentApprovalRequest)
+    }
+
+    private func runScopeDecision(for call: ParsedToolCall, workingDirectory: URL?) -> RunScopeDecision {
+        guard isRunScoped else { return .allow }
+        let stateChanging = Self.isStateChanging(toolName: call.name)
+        let appPreferences = Self.targetsApplicationPreferences(toolName: call.name, arguments: call.arguments)
+        let subQNeedsApproval = call.name == "subq_decide" && Self.requiresApproval(
+            toolName: call.name,
+            arguments: call.arguments,
+            mode: activeMode,
+            subQEndpoint: SubQDecisionSettings.endpoint()
+        )
+        let strArgs = call.arguments.mapValues { String(describing: $0) }
+        func ask(_ reason: String) -> RunScopeDecision {
+            .ask(AgentApprovalRequest(
+                runId: runId ?? UUID(),
+                toolName: call.name,
+                arguments: strArgs,
+                workingDirectory: workingDirectory?.path,
+                reason: reason
+            ))
+        }
+        switch runApprovalPolicy {
+        case .deny, .auto:
+            if stateChanging { return .deny("this run has no write capability") }
+            if appPreferences { return .deny("it would rewrite DynaMoE's own preferences") }
+            if subQNeedsApproval { return ask("it uploads the state or local image bytes") }
+            return .allow
+        case .spawnOnly:
+            if appPreferences { return ask("it would rewrite DynaMoE's own preferences") }
+            if subQNeedsApproval { return ask("it uploads the state or local image bytes") }
+            if stateChanging && !isWorkspaceIsolated {
+                return ask("it changes state outside an isolated workspace")
+            }
+            return .allow
+        case .everyStateChange:
+            if stateChanging { return ask("it changes files, the repository or the system") }
+            if appPreferences { return ask("it would rewrite DynaMoE's own preferences") }
+            if subQNeedsApproval { return ask("it uploads the state or local image bytes") }
+            return .allow
+        }
+    }
+
     private func runToolInTurn(call: ParsedToolCall, workingDirectory: URL?, maxOutputLength: Int?, effectiveMode: AgentMode) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool) {
         let startTime = CFAbsoluteTimeGetCurrent()
         // The engine is idle while a tool runs, but the agent operation is not
@@ -5193,6 +5455,39 @@ public final class AgentHarness {
                 executionDurationSeconds: CFAbsoluteTimeGetCurrent() - startTime
             )
             return (json, rec, false)
+        }
+        switch runScopeDecision(for: call, workingDirectory: wd) {
+        case .allow:
+            break
+        case .deny(let reason):
+            let err = "SUBAGENT POLICY: '\(call.name)' is not permitted in this run (\(reason)) and was not executed. Do not retry it; continue with the tools you have, or report what you could not do."
+            let json = AgentHarness.toolErrorJSON(tool: call.name, error: err)
+            let rec = ToolCallRecord(
+                name: call.name,
+                arguments: strArgs,
+                rawArguments: call.rawArguments,
+                status: .withheld,
+                output: AgentHarness.renderToolResultForModel(json),
+                error: err,
+                executionDurationSeconds: CFAbsoluteTimeGetCurrent() - startTime
+            )
+            return (json, rec, false)
+        case .ask(let request):
+            let approved = await (runApprovalHandler?(request) ?? false)
+            guard approved else {
+                let err = "Action rejected: the operator declined '\(call.name)' in this subagent run. Do not retry it; continue with another approach or report what you could not do."
+                let json = AgentHarness.toolErrorJSON(tool: call.name, error: err)
+                let rec = ToolCallRecord(
+                    name: call.name,
+                    arguments: strArgs,
+                    rawArguments: call.rawArguments,
+                    status: .rejected,
+                    output: AgentHarness.renderToolResultForModel(json),
+                    error: err,
+                    executionDurationSeconds: CFAbsoluteTimeGetCurrent() - startTime
+                )
+                return (json, rec, false)
+            }
         }
         // maxOutputLength (and maxToolOutputLength) is a TOKEN budget; tools work in
         // characters, so convert with a conservative chars-per-token estimate.
@@ -5622,13 +5917,13 @@ public final class AgentHarness {
     }
 
     /// Matches inline `data:...;base64,...` payloads of 256+ base64 characters.
-    private static let inlineBase64Regex: NSRegularExpression? = {
+    private nonisolated static let inlineBase64Regex: NSRegularExpression? = {
         try? NSRegularExpression(pattern: "data:[a-zA-Z0-9.+/-]{1,64};base64,([A-Za-z0-9+/=]{256,})", options: [])
     }()
 
     /// Matches standalone base64 runs of 768+ characters (embedded binary blobs that
     /// no model can read and that otherwise flood the truncation tail with gibberish).
-    private static let longBase64Regex: NSRegularExpression? = {
+    private nonisolated static let longBase64Regex: NSRegularExpression? = {
         try? NSRegularExpression(pattern: "[A-Za-z0-9+/=]{768,}", options: [])
     }()
 
@@ -5641,7 +5936,7 @@ public final class AgentHarness {
     /// output made a file the model was asked to edit come back different from
     /// the bytes on disk, and a `file_edit` anchor copied from that view could
     /// never match.
-    public static func sanitizeText(_ text: String) -> String {
+    nonisolated public static func sanitizeText(_ text: String) -> String {
         sanitize(text, markers: PromptMarkers.sanitizeControlMarkers)
     }
 
@@ -5653,7 +5948,7 @@ public final class AgentHarness {
         sanitize(text, markers: PromptMarkers.sanitizeLocalFileMarkers)
     }
 
-    private static func sanitize(_ text: String, markers: (String) -> String) -> String {
+    private nonisolated static func sanitize(_ text: String, markers: (String) -> String) -> String {
         // Every family's control markers, not just ChatML: a tool result or a
         // skill description carrying a turn marker or a fullwidth role marker
         // forges a boundary just as well.
@@ -5811,7 +6106,7 @@ public final class AgentHarness {
     /// budget allows (cut at a line boundary when possible), a short tail preserves
     /// the end of the output, and the splice is wrapped in an unambiguous marker that
     /// cannot be mistaken for file content.
-    public static func truncateText(_ text: String, limit: Int) -> String {
+    nonisolated public static func truncateText(_ text: String, limit: Int) -> String {
         let byteLimit = max(200, limit)
         guard text.utf8.count > byteLimit else { return text }
 
@@ -5885,7 +6180,7 @@ public final class AgentHarness {
         return WebFetchTool.extractStructuredSections(from: markdown)
     }
 
-    public static func toolSuccessJSON(tool: String, data: [String: Any]) -> String {
+    nonisolated public static func toolSuccessJSON(tool: String, data: [String: Any]) -> String {
         let dict: [String: Any] = [
             "status": "success",
             "tool": tool,
@@ -5898,7 +6193,7 @@ public final class AgentHarness {
         return "{\"status\": \"success\", \"tool\": \"\(tool)\"}"
     }
 
-    public static func toolErrorJSON(tool: String, error: String, extra: [String: Any]? = nil) -> String {
+    nonisolated public static func toolErrorJSON(tool: String, error: String, extra: [String: Any]? = nil) -> String {
         // Every error path funnels here: a tool's own `localizedDescription`, a
         // server's 500 body, a parser's quoted line. Those are untrusted text,
         // and an unsanitized one could close the tool-response span and forge a
@@ -5923,7 +6218,7 @@ public final class AgentHarness {
     }
 
     /// Recursively sanitizes the string values of an error payload.
-    private static func sanitizeErrorValue(_ value: Any) -> Any {
+    private nonisolated static func sanitizeErrorValue(_ value: Any) -> Any {
         switch value {
         case let text as String:
             return sanitizeText(text)
@@ -6023,7 +6318,7 @@ public final class AgentHarness {
     /// `renderToolResultForModel` re-sanitizes whatever the tool already
     /// sanitized, so this list is what keeps that second pass from undoing the
     /// first.
-    static let localFileContentToolNames: Set<String> = [
+    nonisolated static let localFileContentToolNames: Set<String> = [
         "shell_run", "file_read", "file_write", "file_edit", "find_files",
         "grep_search", "codebase_search", "git_status", "git_diff",
         "find_symbol_definition", "find_references", "lint_diagnostics"
@@ -6036,7 +6331,7 @@ public final class AgentHarness {
     ///
     /// Idempotent: input that is not a tool-result JSON object (already-rendered text,
     /// plain prose) is returned unchanged, so results can be stored rendered and re-embedded.
-    public static func renderToolResultForModel(_ resultJSON: String) -> String {
+    nonisolated public static func renderToolResultForModel(_ resultJSON: String) -> String {
         guard let data = resultJSON.data(using: .utf8),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let toolName = obj["tool"] as? String, !toolName.isEmpty else {
@@ -6088,12 +6383,12 @@ public final class AgentHarness {
         return sanitize(lines.joined(separator: "\n"), markers: markers)
     }
 
-    private static func isLongTextValue(_ value: Any?) -> Bool {
+    private nonisolated static func isLongTextValue(_ value: Any?) -> Bool {
         guard let s = value as? String else { return false }
         return s.contains("\n") || s.count > 240
     }
 
-    private static func appendRendered(
+    private nonisolated static func appendRendered(
         key: String,
         value: Any?,
         indent: Int,
@@ -6144,7 +6439,7 @@ public final class AgentHarness {
         }
     }
 
-    private static func appendLongBody(
+    private nonisolated static func appendLongBody(
         value: Any,
         indent: Int,
         to lines: inout [String],
@@ -6163,11 +6458,11 @@ public final class AgentHarness {
         }
     }
 
-    private static func isCompactScalar(_ value: Any) -> Bool {
+    private nonisolated static func isCompactScalar(_ value: Any) -> Bool {
         value is String || value is NSNumber
     }
 
-    private static func renderCompact(_ value: Any) -> String {
+    private nonisolated static func renderCompact(_ value: Any) -> String {
         switch value {
         case let s as String:
             return s
