@@ -153,6 +153,10 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             usage.backendRequests += 1
             usage.steps += 1
             usage.merge(turn.usage)
+            // A step's prompt size is the run's "last ingested prompt" for the
+            // context count; `merge` cannot infer it because backends report
+            // only the billed sum, and the sum is not what the drawer shows.
+            usage.latestPromptTokens = turn.usage.promptTokens
             usage.wallClockSeconds = CFAbsoluteTimeGetCurrent() - start
 
             if !turn.thinking.isEmpty {

@@ -224,6 +224,18 @@ struct SettingsSheetView: View {
         AgentStepBudget.resolvedCap(unlimited: isMaxAgentStepsUnlimited, configured: maxAgentSteps)
     }
 
+    /// Parse-level validation for the free-text Cloud model field. A stored
+    /// value that names no configured cloud model is refused at spawn time
+    /// (never silently replaced with the default), so it is surfaced here,
+    /// where it is typed, instead of being discovered from a failed run.
+    private var subagentCloudModelWarning: String? {
+        let trimmed = subagentCloudModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              CloudModelAddress.parseModelId(trimmed) == nil,
+              CloudModelAddress.parsePath(trimmed) == nil else { return nil }
+        return "'\(trimmed)' is not a configured cloud model. Subagent runs that need the cloud will refuse until it is fixed or cleared; leave it empty to use the provider default."
+    }
+
     // MARK: - Delegated run controls
 
     /// Every control here is read at use time (resolver, scheduler, store), so a
@@ -249,6 +261,13 @@ struct SettingsSheetView: View {
                 Text("Upstream model id")
                     .font(.system(size: 10))
                     .foregroundColor(.secondary)
+            }
+
+            if let cloudModelWarning = subagentCloudModelWarning {
+                Text(cloudModelWarning)
+                    .font(.system(size: 10))
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             subagentSettingRow("Local cost limit") {

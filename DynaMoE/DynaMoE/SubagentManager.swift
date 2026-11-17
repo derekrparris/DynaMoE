@@ -453,17 +453,27 @@ public final class SubagentInstance: Identifiable, ObservableObject {
 
     /// Waits asynchronously until this subagent reaches a terminal state.
     public func waitForCompletion() async -> String {
+        await withCheckedContinuation { continuation in
+            registerCompletionWaiter(continuation)
+        }
+    }
+
+    /// Synchronous on purpose, called from the continuation body before it
+    /// returns: `NSLock` may not be touched from an async context (an error
+    /// in Swift 6 mode), so the finished-check and the waiter registration
+    /// are one decision in a single lock hold here. Keeping them together is
+    /// what stops a run that finishes in between from resuming nobody and
+    /// stranding the waiter.
+    private func registerCompletionWaiter(_ continuation: CheckedContinuation<String, Never>) {
         lock.lock()
         if isFinished {
             let summary = finalSummary
             lock.unlock()
-            return summary
+            continuation.resume(returning: summary)
+            return
         }
-
-        return await withCheckedContinuation { continuation in
-            completionContinuations.append(continuation)
-            lock.unlock()
-        }
+        completionContinuations.append(continuation)
+        lock.unlock()
     }
 
     // MARK: - Execution Lifecycle
@@ -1004,12 +1014,13 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             return (exitCode, stdout, stderr, duration)
         }
 
-        let (exitCode, stdout, stderr, cmdDuration) = await runShell(testCmd ?? "swift test 2>&1 | tail -n 30")
+        let resolvedCommand = testCmd ?? "swift test 2>&1 | tail -n 30"
+        let (exitCode, stdout, stderr, cmdDuration) = await runShell(resolvedCommand)
         let cleanOut = AgentHarness.truncateText(AgentHarness.sanitizeLocalFileText(stdout), limit: 3000)
         let isSuccess = (exitCode == 0)
 
         var report = "## Test Runner Report: \(role)\n\n"
-        report += "**Command Executed**: `\(testCmd)`\n"
+        report += "**Command Executed**: `\(resolvedCommand)`\n"
         report += "**Status**: \(isSuccess ? "✅ Passed (Exit Code 0)" : "❌ Failed (Exit Code \(exitCode))")\n"
         report += "**Duration**: \(String(format: "%.2f", cmdDuration))s\n\n"
         report += "### Output:\n```\n\(cleanOut.isEmpty ? stderr : cleanOut)\n```\n"

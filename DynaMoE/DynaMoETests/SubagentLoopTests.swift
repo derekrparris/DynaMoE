@@ -107,6 +107,43 @@ final class SubagentLoopTests: XCTestCase {
         XCTAssertEqual(outcome.usage.toolCalls, 0)
     }
 
+    /// Every step reports the FULL prompt it was sent, so a multi-step run's
+    /// summed prompt tokens grow with the square of the step count while its
+    /// context only grows with the conversation. The usage the drawer reads
+    /// must be the last request's size, not the billed sum.
+    func testTheRunsContextCountIsTheLastRequestsSizeNotTheStepSum() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let file = workspace.appendingPathComponent("Tokens.txt")
+        try "context".write(to: file, atomically: true, encoding: .utf8)
+
+        var first = AgentUsage()
+        first.promptTokens = 100
+        first.completionTokens = 5
+        var second = AgentUsage()
+        second.promptTokens = 120
+        second.completionTokens = 7
+        let backend = ScriptedBackend(turns: [
+            .init(text: "one", calls: [readCall(file.path)], usage: first),
+            .init(text: "Done.", calls: [completeCall("done")], usage: second)
+        ])
+        let context = try makeContext(workspace: workspace, tools: ["file_read", "complete"])
+
+        let outcome = await HeadlessAgentLoop().run(
+            input: input(),
+            backend: backend,
+            context: context,
+            emit: { _ in }
+        )
+
+        XCTAssertEqual(outcome.status, .completed)
+        // Billed: both steps' full prompts, summed.
+        XCTAssertEqual(outcome.usage.promptTokens, 220)
+        // Context: the LAST request's size plus everything generated.
+        XCTAssertEqual(outcome.usage.latestPromptTokens, 120)
+        XCTAssertEqual(outcome.usage.contextTokens, 132)
+    }
+
     func testStepBudgetIsEnforced() async throws {
         let workspace = try makeWorkspace()
         defer { try? FileManager.default.removeItem(at: workspace) }

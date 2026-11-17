@@ -148,6 +148,17 @@ nonisolated struct AgentUsage: Codable, Equatable, Sendable {
     var wallClockSeconds: Double = 0
     var toolCalls: Int = 0
     var backendRequests: Int = 0
+    /// The prompt size of the LAST request this usage folded in. Every backend
+    /// reports the FULL prompt each step was sent (correct for billing, and the
+    /// spend column prices it), so `promptTokens` summed over steps grows with
+    /// the square of the step count while the run's context only grows with the
+    /// conversation. This field is what the UI's "tokens" number is made of
+    /// (see `contextTokens`); it is never summed by `merge`.
+    var latestPromptTokens: Int = 0
+
+    /// Present because `init(from:)` below displaces the memberwise init, and
+    /// every call site builds a usage as `AgentUsage()` then sets fields.
+    init() {}
 
     mutating func merge(_ other: AgentUsage) {
         steps += other.steps
@@ -158,9 +169,38 @@ nonisolated struct AgentUsage: Codable, Equatable, Sendable {
         wallClockSeconds += other.wallClockSeconds
         toolCalls += other.toolCalls
         backendRequests += other.backendRequests
+        latestPromptTokens = max(latestPromptTokens, other.latestPromptTokens)
     }
 
+    /// The billed token total: every step's full prompt plus everything
+    /// generated. This is what the requests cost, not what the conversation
+    /// carries.
     var totalTokens: Int { promptTokens + completionTokens }
+
+    /// The context footprint the UI shows — the same doctrine as the chat
+    /// header's token chip: "the prompt the model last ingested plus the tokens
+    /// it generated", not a running total of what each step billed. A record
+    /// that predates `latestPromptTokens` falls back to its recorded sum, the
+    /// only number it holds.
+    var contextTokens: Int {
+        (latestPromptTokens > 0 ? latestPromptTokens : promptTokens) + completionTokens
+    }
+
+    /// Defaults-tolerant on purpose: the store's decode-failure path is "the
+    /// record is lost", so a stored usage that predates a field must still
+    /// decode with that field's default rather than failing the whole record.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        steps = try container.decodeIfPresent(Int.self, forKey: .steps) ?? 0
+        promptTokens = try container.decodeIfPresent(Int.self, forKey: .promptTokens) ?? 0
+        completionTokens = try container.decodeIfPresent(Int.self, forKey: .completionTokens) ?? 0
+        cachedTokens = try container.decodeIfPresent(Int.self, forKey: .cachedTokens) ?? 0
+        costUSD = try container.decodeIfPresent(Double.self, forKey: .costUSD) ?? 0
+        wallClockSeconds = try container.decodeIfPresent(Double.self, forKey: .wallClockSeconds) ?? 0
+        toolCalls = try container.decodeIfPresent(Int.self, forKey: .toolCalls) ?? 0
+        backendRequests = try container.decodeIfPresent(Int.self, forKey: .backendRequests) ?? 0
+        latestPromptTokens = try container.decodeIfPresent(Int.self, forKey: .latestPromptTokens) ?? 0
+    }
 }
 
 nonisolated struct AgentFinding: Codable, Equatable, Sendable {

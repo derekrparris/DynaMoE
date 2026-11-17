@@ -85,4 +85,29 @@ final class SubagentRecordProjectionTests: XCTestCase {
         XCTAssertEqual(record.status, .cancelled)
         XCTAssertNotNil(record.completedAt)
     }
+
+    func testTheUsageTokenCountIsContextNotTheBilledSum() throws {
+        var usage = AgentUsage()
+        usage.steps = 2
+        usage.promptTokens = 220
+        usage.latestPromptTokens = 120
+        usage.completionTokens = 12
+        // The drawer's number: the last request's size plus everything
+        // generated, not 220 + 12.
+        XCTAssertEqual(usage.contextTokens, 132)
+        // The billed total stays available for anything that prices it.
+        XCTAssertEqual(usage.totalTokens, 232)
+        XCTAssertTrue(usage.compactDescription.contains("132 tok"))
+
+        // A legacy record never stored the last request's size, so its
+        // recorded sum is the only honest number it can show.
+        var legacy = AgentUsage()
+        legacy.promptTokens = 1_352_593
+        legacy.completionTokens = 7_478
+        XCTAssertEqual(legacy.contextTokens, 1_360_071)
+
+        // The new field survives a coding round trip.
+        let decoded = try JSONDecoder().decode(AgentUsage.self, from: JSONEncoder().encode(usage))
+        XCTAssertEqual(decoded, usage)
+    }
 }

@@ -249,7 +249,7 @@ enum AgentSpawnResolver {
     ) throws -> (any AgentModelBackend, AgentSchedulingClass, AgentBackendDescriptor) {
         let engine = CompletionEngine.shared
         let hasLocalModel = engine.loadedModelInfo != nil && engine.promptModelConfig != nil
-        let cloudAddress = SubagentBackendSettings.preferredCloudModel(coordinateModelId: nil, defaults: defaults)
+        let cloudPreference = SubagentBackendSettings.preferredCloudModel(coordinateModelId: nil, defaults: defaults)
 
         func makeLocal() throws -> (any AgentModelBackend, AgentSchedulingClass, AgentBackendDescriptor) {
             let estimate = max(1, (task.count + (request.contextSummary?.count ?? 0)) / 4 + 600)
@@ -265,17 +265,27 @@ enum AgentSpawnResolver {
         }
 
         func makeCloud() throws -> (any AgentModelBackend, AgentSchedulingClass, AgentBackendDescriptor) {
-            guard let cloudAddress else {
+            switch cloudPreference {
+            case .configured(let cloudAddress):
+                switch CloudAgentBackend.make(address: cloudAddress) {
+                case .success(let backend):
+                    let providerId = backend.descriptor.providerId ?? "cloud"
+                    return (backend, .cloud(providerId: providerId), backend.descriptor)
+                case .failure(let failure):
+                    // A stored preference that parses but cannot run (for
+                    // example a provider with no stored key) refuses with
+                    // the provider named; it is never swapped for the default.
+                    throw failure
+                }
+            case .unresolvable(let stored):
+                throw AgentSpawnError.noBackend(
+                    "The subagent Cloud model setting names '\(stored)', which is not a configured cloud model. "
+                        + "Fix or clear it in Settings under Agent & Tools, or load a local checkpoint."
+                )
+            case .noneConfigured:
                 throw AgentSpawnError.noBackend(
                     "No cloud model is configured for subagents. Add a provider and a model in Settings, or load a local checkpoint."
                 )
-            }
-            switch CloudAgentBackend.make(address: cloudAddress) {
-            case .success(let backend):
-                let providerId = backend.descriptor.providerId ?? "cloud"
-                return (backend, .cloud(providerId: providerId), backend.descriptor)
-            case .failure(let failure):
-                throw failure
             }
         }
 

@@ -1003,12 +1003,27 @@ public final class HeadlessChromeSearchEngine: @unchecked Sendable {
         process.standardError = FileHandle.nullDevice
 
         return try await withCheckedThrowingContinuation { continuation in
-            var isResumed = false
+            // The timer handler, the termination handler and the run-failure
+            // path all race to resume exactly once. A plain captured `var`
+            // would be a data race here (an error in Swift 6 mode), so the
+            // once-claim is lock-guarded and the type is nonisolated so its
+            // members stay mutable from every handler.
+            nonisolated final class ResumeOnce: @unchecked Sendable {
+                private let lock = NSLock()
+                private var claimed = false
+                func claim() -> Bool {
+                    lock.lock()
+                    defer { lock.unlock() }
+                    if claimed { return false }
+                    claimed = true
+                    return true
+                }
+            }
+            let resume = ResumeOnce()
             let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
             timer.schedule(deadline: .now() + timeoutSeconds)
             timer.setEventHandler {
-                if !isResumed {
-                    isResumed = true
+                if resume.claim() {
                     process.terminate()
                     try? fileHandle.close()
                     try? FileManager.default.removeItem(at: tmpFile)
@@ -1021,8 +1036,7 @@ public final class HeadlessChromeSearchEngine: @unchecked Sendable {
 
             process.terminationHandler = { proc in
                 timer.cancel()
-                if !isResumed {
-                    isResumed = true
+                if resume.claim() {
                     try? fileHandle.close()
                     do {
                         let html = try String(contentsOf: tmpFile, encoding: .utf8)
@@ -1039,8 +1053,7 @@ public final class HeadlessChromeSearchEngine: @unchecked Sendable {
                 try process.run()
             } catch {
                 timer.cancel()
-                if !isResumed {
-                    isResumed = true
+                if resume.claim() {
                     try? fileHandle.close()
                     try? FileManager.default.removeItem(at: tmpFile)
                     continuation.resume(throwing: error)
@@ -6862,7 +6875,12 @@ public final class AgentHarness {
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
-        final class ProcessState: @unchecked Sendable {
+        // Nonisolated on purpose: a type declared inside this MainActor-isolated
+        // function inherits the default isolation, which makes every member
+        // main-actor-isolated and every mutation from the pipe readers, the
+        // timer, the process-wait closure and the cancellation handler a
+        // Swift 6 error. The NSLock below is the real guard.
+        nonisolated final class ProcessState: @unchecked Sendable {
             let lock = NSLock()
             var stdoutData = Data()
             var stderrData = Data()

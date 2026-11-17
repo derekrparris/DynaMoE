@@ -30,7 +30,7 @@ extension AgentUsage {
     var compactDescription: String {
         var parts: [String] = []
         if steps > 0 { parts.append("\(steps) step\(steps == 1 ? "" : "s")") }
-        if totalTokens > 0 { parts.append("\(totalTokens) tok") }
+        if contextTokens > 0 { parts.append("\(contextTokens) tok") }
         if toolCalls > 0 { parts.append("\(toolCalls) tool\(toolCalls == 1 ? "" : "s")") }
         if costUSD > 0 { parts.append(String(format: "$%.4f", costUSD)) }
         return parts.isEmpty ? "No usage recorded" : parts.joined(separator: " · ")
@@ -156,6 +156,7 @@ struct SubagentInspectorView: View {
             usageStat("\(totals.runs)", totals.runs == 1 ? "run" : "runs")
             if totals.tokens > 0 {
                 usageStat(compactTokens(totals.tokens), "tokens")
+                    .help("Context this conversation's runs are carrying: each run's last request size plus the tokens it generated, summed over runs. Every backend counts the full prompt a request carried, so this is not a running total of what each step billed; spend prices those.")
             }
             if totals.cost > 0 {
                 usageStat(String(format: "$%.4f", totals.cost), "spend")
@@ -190,7 +191,7 @@ struct SubagentInspectorView: View {
         for record in allRecords {
             runs += 1
             if !record.status.isTerminal { active += 1 }
-            tokens += record.usage.totalTokens
+            tokens += record.usage.contextTokens
             cost += record.usage.costUSD
             if record.usage.wallClockSeconds > 0 {
                 seconds += record.usage.wallClockSeconds

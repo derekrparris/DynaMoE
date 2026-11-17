@@ -364,6 +364,75 @@ final class CloudAgentBackendLogicTests: XCTestCase {
         XCTAssertEqual(recorder.count, 1)
     }
 
+    // MARK: - Preferred-model resolution
+
+    private static func freshDefaults(_ name: String) -> UserDefaults {
+        UserDefaults.standard.removePersistentDomain(forName: name)
+        return UserDefaults(suiteName: name)!
+    }
+
+    func testAnEmptyCloudModelSettingResolvesNothingStored() {
+        // no stored setting, no providers: nothing resolves, and the caller
+        // refuses with the "no cloud model is configured" message.
+        let defaults = Self.freshDefaults("dynamoe-tests-cloud-empty")
+        XCTAssertEqual(
+            SubagentBackendSettings.preferredCloudModel(
+                coordinateModelId: nil, defaults: defaults, providers: []
+            ),
+            .noneConfigured
+        )
+    }
+
+    func testAStoredCloudModelThatParsesIsThePreference() {
+        let defaults = Self.freshDefaults("dynamoe-tests-cloud-parses")
+        let address = CloudModelAddress.modelId(providerId: "test-provider", providerModelId: "test-model")
+        defaults.set(address, forKey: SubagentBackendSettings.cloudModelKey)
+        XCTAssertEqual(
+            SubagentBackendSettings.preferredCloudModel(
+                coordinateModelId: nil, defaults: defaults, providers: [Self.provider]
+            ),
+            .configured(address)
+        )
+    }
+
+    func testAStoredCloudModelThatDoesNotParseIsRefusedByName() {
+        // The old behavior silently substituted the provider default here,
+        // billing runs on a model the operator never chose.
+        let defaults = Self.freshDefaults("dynamoe-tests-cloud-broken")
+        defaults.set("not-a-cloud-model", forKey: SubagentBackendSettings.cloudModelKey)
+        XCTAssertEqual(
+            SubagentBackendSettings.preferredCloudModel(
+                coordinateModelId: nil, defaults: defaults, providers: [Self.provider]
+            ),
+            .unresolvable("not-a-cloud-model")
+        )
+    }
+
+    func testASpawnRefusesAnUnresolvableStoredCloudModelInsteadOfSubstituting() async {
+        let defaults = Self.freshDefaults("dynamoe-tests-cloud-spawn-broken")
+        defaults.set("not-a-cloud-model", forKey: SubagentBackendSettings.cloudModelKey)
+        do {
+            _ = try await AgentSpawnResolver.resolve(
+                AgentSpawnRequest(
+                    role: "Codebase Researcher",
+                    taskDescription: "Find the scheduler.",
+                    backendPreference: .cloud,
+                    explicitToolNames: ["file_read"],
+                    workingDirectory: FileManager.default.temporaryDirectory
+                ),
+                runId: UUID(),
+                sessionId: UUID(),
+                defaults: defaults
+            )
+            XCTFail("a spawn must refuse an unresolvable stored cloud model")
+        } catch {
+            guard case .noBackend(let message)? = error as? AgentSpawnError else {
+                return XCTFail("expected a noBackend refusal, got \(error)")
+            }
+            XCTAssertTrue(message.contains("not-a-cloud-model"), message)
+        }
+    }
+
     // MARK: - Opt-in real turn
 
     /// One real cloud turn, on the first configured model that will serve it.
@@ -382,7 +451,7 @@ final class CloudAgentBackendLogicTests: XCTestCase {
             "opt-in: touch /tmp/dynamoe_subagent_cloud_turn"
         )
         var candidates: [String] = []
-        if let preferred = SubagentBackendSettings.preferredCloudModel(coordinateModelId: nil) {
+        if case .configured(let preferred) = SubagentBackendSettings.preferredCloudModel(coordinateModelId: nil) {
             candidates.append(preferred)
         }
         for model in CloudModelRegistry.makeDiscoveredModels() where !model.id.lowercased().contains("infinite") {
@@ -449,7 +518,7 @@ final class CloudAgentBackendLogicTests: XCTestCase {
             "opt-in: touch /tmp/dynamoe_subagent_cloud_run"
         )
         var candidates: [String] = []
-        if let preferred = SubagentBackendSettings.preferredCloudModel(coordinateModelId: nil) {
+        if case .configured(let preferred) = SubagentBackendSettings.preferredCloudModel(coordinateModelId: nil) {
             candidates.append(preferred)
         }
         for model in CloudModelRegistry.makeDiscoveredModels() where !model.id.lowercased().contains("infinite") {
@@ -497,7 +566,12 @@ final class CloudAgentBackendLogicTests: XCTestCase {
                 approvalPolicy: .auto,
                 isolation: .none,
                 thinking: false,
-                sampling: AgentSampling(temperature: 0, topP: 1, maxTokens: 96),
+                // 256, not the 96 the first cut used: a small model on the
+                // real worker prompt can spend a hundred tokens before its
+                // first visible word, and a step cut at its own cap is a
+                // finished answer to the loop (finishReason is advisory
+                // there), so the cap has to leave room for one sentence.
+                sampling: AgentSampling(temperature: 0, topP: 1, maxTokens: 256),
                 priority: .userRequested,
                 parentSessionId: nil,
                 parentTurnId: nil,

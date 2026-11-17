@@ -78,7 +78,6 @@ final class AgentRunStoreTests: XCTestCase {
         let store = makeStore()
         let saved = record(sessionId: nil)
         store.saveImmediately(saved)
-
         XCTAssertEqual(store.load(sessionId: nil).first?.id, saved.id)
         XCTAssertEqual(store.loadAll().first?.id, saved.id)
     }
@@ -95,6 +94,44 @@ final class AgentRunStoreTests: XCTestCase {
         try data.write(to: store.fileURL(runId: future.id, sessionId: sessionId))
 
         XCTAssertTrue(store.load(sessionId: sessionId).isEmpty)
+    }
+
+    /// A stored usage that predates the context field must still decode: the
+    /// store's decode-failure path is "the record is lost", so a missing field
+    /// in one nested struct may never cost the operator the whole run.
+    func testAUsageThatPredatesTheContextFieldStillDecodes() throws {
+        let store = makeStore()
+        let sessionId = UUID()
+        let directory = store.directory(for: sessionId)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        var saved = record(sessionId: sessionId)
+        var usage = AgentUsage()
+        usage.steps = 2
+        usage.promptTokens = 220
+        usage.latestPromptTokens = 120
+        usage.completionTokens = 12
+        saved.usage = usage
+        try JSONEncoder().encode(saved).write(to: store.fileURL(runId: saved.id, sessionId: sessionId))
+
+        // Rewrite the stored JSON the way an older build wrote it: the usage
+        // block carries no `latestPromptTokens` key at all.
+        let url = store.fileURL(runId: saved.id, sessionId: sessionId)
+        let object = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
+        var legacy = try XCTUnwrap(object)
+        var legacyUsage = try XCTUnwrap(legacy["usage"] as? [String: Any])
+        legacyUsage.removeValue(forKey: "latestPromptTokens")
+        legacy["usage"] = legacyUsage
+        try JSONSerialization.data(withJSONObject: legacy).write(to: url)
+
+        let restored = try XCTUnwrap(store.load(sessionId: sessionId).first)
+        XCTAssertEqual(restored.usage.steps, 2)
+        XCTAssertEqual(restored.usage.promptTokens, 220)
+        XCTAssertEqual(restored.usage.completionTokens, 12)
+        XCTAssertEqual(restored.usage.latestPromptTokens, 0)
+        // The legacy fallback: with no last-request size stored, the recorded
+        // sum is the only number the record can honestly show.
+        XCTAssertEqual(restored.usage.contextTokens, 232)
     }
 
     func testTranscriptToolOutputIsTruncatedBeforeWriting() throws {

@@ -220,12 +220,44 @@ nonisolated enum SubagentBackendSettings {
     static let cloudModelKey = "dynamoe_subagent_cloud_model"
     static let backendKey = "dynamoe_subagent_backend"
 
-    static func preferredCloudModel(coordinateModelId: String?, defaults: UserDefaults = .standard) -> String? {
+    /// The outcome of resolving the subagent Cloud model setting.
+    ///
+    /// A stored value that does not name a configured cloud model is
+    /// REFUSED by name rather than silently replaced with the default: a
+    /// run would otherwise be billed on a provider the operator never chose
+    /// (the same rule as `CloudModelAddress.selectionIsUnresolved` for the
+    /// chat model picker). Resolution is PARSE-level on purpose so this stays
+    /// pure; a stored address whose provider has no stored key still reaches
+    /// `CloudAgentBackend.make` one step later and refuses there with the
+    /// provider named, so no path falls through to the default either.
+    enum PreferredCloudModel: Equatable {
+        /// Nothing is stored and no default resolves, so a cloud spawn is
+        /// refused with the "no cloud model is configured" message.
+        case noneConfigured
+        /// A usable address: the stored setting when it parses, otherwise the
+        /// coordinator's model or the first registered tool-capable one.
+        case configured(String)
+        /// The stored setting does not name a configured cloud model. The
+        /// payload is the stored text so the refusal can name it.
+        case unresolvable(String)
+    }
+
+    static func preferredCloudModel(
+        coordinateModelId: String?,
+        defaults: UserDefaults = .standard,
+        providers: [CloudProvider] = CloudProviderRegistry.all
+    ) -> PreferredCloudModel {
         if let stored = defaults.string(forKey: cloudModelKey)?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !stored.isEmpty,
-           case .success = CloudAgentBackend.make(address: stored) {
-            return stored
+           !stored.isEmpty {
+            guard CloudModelAddress.parseModelId(stored, providers: providers) != nil
+                || CloudModelAddress.parsePath(stored, providers: providers) != nil else {
+                return .unresolvable(stored)
+            }
+            return .configured(stored)
         }
-        return CloudAgentBackend.resolveDefault(coordinateModelId: coordinateModelId)
+        if let fallback = CloudAgentBackend.resolveDefault(coordinateModelId: coordinateModelId, providers: providers) {
+            return .configured(fallback)
+        }
+        return .noneConfigured
     }
 }
