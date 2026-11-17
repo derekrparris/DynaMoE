@@ -647,4 +647,126 @@ final class TranscriptSegmenterTests: XCTestCase {
         diagnostics.reportIfNeeded(turnKey: "abc-2", messages: messages, segmentsByMessage: [:])
         XCTAssertEqual(diagnostics.lastReportedTurnKey, "abc-2")
     }
+
+    // MARK: - Pin / follow policy
+
+    private func snapshot(
+        offset: CGFloat,
+        contentHeight: CGFloat,
+        containerHeight: CGFloat = 600
+    ) -> TranscriptFollowPolicy.Snapshot {
+        TranscriptFollowPolicy.Snapshot(
+            offset: offset,
+            contentHeight: contentHeight,
+            containerHeight: containerHeight
+        )
+    }
+
+    private func decide(
+        _ old: TranscriptFollowPolicy.Snapshot,
+        _ new: TranscriptFollowPolicy.Snapshot,
+        isPinned: Bool = true,
+        isReaderScrolling: Bool = false,
+        isFollowInFlight: Bool = false
+    ) -> TranscriptFollowPolicy.Outcome {
+        TranscriptFollowPolicy.decide(
+            from: old,
+            to: new,
+            isPinned: isPinned,
+            isReaderScrolling: isReaderScrolling,
+            isFollowInFlight: isFollowInFlight
+        )
+    }
+
+    func testContentGrowthUnderAPinnedReaderIsFollowed() {
+        // A tool card landing after a capped reasoning trace: the transcript is
+        // a card taller, no text streamed, and the pin has to reach it.
+        let old = snapshot(offset: 1_400, contentHeight: 2_000)
+        let new = snapshot(offset: 1_400, contentHeight: 2_400)
+
+        let outcome = decide(old, new)
+        XCTAssertEqual(outcome.follow, true)
+        XCTAssertNil(outcome.pin, "growth never moves the pin")
+    }
+
+    func testGrowthBelowOneFollowStepIsNotFollowed() {
+        // The follow is throttled by height steps so a streamed chunk does not
+        // buy a layout pass each; the character bucket drives that case.
+        let old = snapshot(offset: 1_400, contentHeight: 2_000)
+        let new = snapshot(offset: 1_400, contentHeight: 2_020)
+
+        XCTAssertEqual(decide(old, new).follow, false)
+    }
+
+    func testGrowthDoesNotFollowAReaderWhoLeftTheTail() {
+        // The reader scrolled up: growth is theirs to catch up on, not the
+        // view's to yank them out of.
+        let old = snapshot(offset: 400, contentHeight: 2_000)
+        let new = snapshot(offset: 400, contentHeight: 2_400)
+
+        let outcome = decide(old, new, isPinned: false)
+        XCTAssertEqual(outcome.follow, false)
+        XCTAssertNil(outcome.pin)
+    }
+
+    func testAQuietOffsetShiftDoesNotUnpin() {
+        // The defect: a lazy stack re-estimating an unrealized row, or a follow
+        // landing a point short, slides the offset up with nobody scrolling.
+        // Reading that as a drag dropped the pin for the rest of the turn.
+        let old = snapshot(offset: 1_400, contentHeight: 2_000)
+        let new = snapshot(offset: 1_180, contentHeight: 2_000)
+
+        let outcome = decide(old, new)
+        XCTAssertNil(outcome.pin)
+        XCTAssertEqual(outcome.follow, false)
+    }
+
+    func testContentShrinkWhilePinnedKeepsThePin() {
+        // A shrink clamps the offset to the new maximum: the scroll view moved
+        // the tail into view, it did not leave it.
+        let old = snapshot(offset: 1_400, contentHeight: 2_000)
+        let new = snapshot(offset: 1_100, contentHeight: 1_700)
+
+        let outcome = decide(old, new)
+        XCTAssertNil(outcome.pin, "the view is still at the tail")
+        XCTAssertEqual(outcome.follow, false)
+    }
+
+    func testOnlyTheReaderUnpins() {
+        let old = snapshot(offset: 1_400, contentHeight: 2_000)
+        let new = snapshot(offset: 1_100, contentHeight: 2_000)
+
+        let outcome = decide(old, new, isReaderScrolling: true)
+        XCTAssertEqual(outcome.pin, false)
+        XCTAssertEqual(outcome.follow, false)
+    }
+
+    func testTheReaderReturningToTheTailReattachesThePin() {
+        let old = snapshot(offset: 1_100, contentHeight: 2_000)
+        let new = snapshot(offset: 1_395, contentHeight: 2_000)
+
+        let outcome = decide(old, new, isPinned: false, isReaderScrolling: true)
+        XCTAssertEqual(outcome.pin, true)
+    }
+
+    func testAFollowInFlightIsNeverReadAsADrag() {
+        let old = snapshot(offset: 1_400, contentHeight: 2_000)
+        let new = snapshot(offset: 900, contentHeight: 2_000)
+
+        let outcome = decide(old, new, isReaderScrolling: true, isFollowInFlight: true)
+        XCTAssertNil(outcome.pin)
+        XCTAssertEqual(outcome.follow, false)
+    }
+
+    func testAReattachedReaderAlsoFollowsGrowthInTheSameUpdate() {
+        // The pin and the follow are decided together: answering "near the
+        // bottom, pin again" without following the growth that arrives in the
+        // same update would leave the view pinned and a card short.
+        let old = snapshot(offset: 1_000, contentHeight: 2_300)
+        let new = snapshot(offset: 1_760, contentHeight: 2_360)
+
+        let outcome = decide(old, new, isPinned: false, isReaderScrolling: true)
+        XCTAssertEqual(outcome.pin, true)
+        XCTAssertEqual(outcome.follow, true)
+    }
 }

@@ -306,16 +306,11 @@ struct ChatDetailView: View {
     /// editor's first measurement, when the floor stands in.
     @State private var composerEditorHeight: CGFloat = 0
 
-    /// Distance-from-bottom bookkeeping for the pin/detach logic.
-    private struct ScrollSnapshot: Equatable {
-        var offset: CGFloat
-        var contentHeight: CGFloat
-        var containerHeight: CGFloat
-
-        var distanceFromBottom: CGFloat {
-            contentHeight - (offset + containerHeight)
-        }
-    }
+    /// True while the scroll view reports that the reader is driving it, i.e. a
+    /// trackpad or wheel gesture. The pin may only be dropped by the reader; a
+    /// follow, a lazy row re-estimate and a clamp after a shrink all move the
+    /// offset without anyone touching it.
+    @State private var isReaderScrolling: Bool = false
     @AppStorage("dynamoe_agent_turbo_mode") private var isTurboModeEnabled: Bool = false
     @ObservedObject private var subagentManager = SubagentManager.shared
 
@@ -546,6 +541,22 @@ struct ChatDetailView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
             guard isPinnedToBottom else { return }
             proxy.scrollTo(Self.scrollBottomAnchorID, anchor: .bottom)
+        }
+    }
+
+    /// Follows a transcript that grew without streaming any text: a tool-call
+    /// card landing under a capped reasoning trace, a status line, a row
+    /// re-segmenting.
+    ///
+    /// The bottom anchor's position is the lazy stack's own layout, so a jump
+    /// issued while rows are still being realized can land short of the tail.
+    /// One re-check a moment later covers that, and only one: the second jump is
+    /// a no-op when the first landed, so this cannot chase the anchor.
+    private func followGrowth(_ proxy: ScrollViewProxy) {
+        followBottom(proxy)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            guard isPinnedToBottom, !isReaderScrolling else { return }
+            followBottom(proxy)
         }
     }
 
@@ -1056,10 +1067,17 @@ struct ChatDetailView: View {
                 // still scroll the reader away. A programmatic follow reports
                 // `.animating`, never `.interacting`.
                 .onScrollPhaseChange { _, newPhase in
-                    if newPhase == .interacting { endScrollSuppression() }
+                    // The scroll view is the only authority on who is driving.
+                    // `.tracking` is a gesture that has not moved yet, and it is
+                    // still the reader.
+                    isReaderScrolling = (newPhase == .tracking || newPhase == .interacting)
+                    if newPhase == .tracking || newPhase == .interacting {
+                        endScrollSuppression()
+                    }
                 }
                 .onChange(of: session?.id) { _ in
                     isPinnedToBottom = true
+                    isReaderScrolling = false
                     guard !landOnCompactedSummary(proxy) else { return }
                     followBottom(proxy)
                 }
@@ -1115,8 +1133,8 @@ struct ChatDetailView: View {
                     }
                     followBottom(proxy)
                 }
-                .onScrollGeometryChange(for: ScrollSnapshot.self) { geometry in
-                    ScrollSnapshot(
+                .onScrollGeometryChange(for: TranscriptFollowPolicy.Snapshot.self) { geometry in
+                    TranscriptFollowPolicy.Snapshot(
                         offset: geometry.contentOffset.y,
                         contentHeight: geometry.contentSize.height,
                         containerHeight: geometry.containerSize.height
@@ -1129,26 +1147,27 @@ struct ChatDetailView: View {
                         viewportHeight: new.containerHeight
                     )
 
-                    // A programmatic scroll in flight reports intermediate
-                    // offsets for its duration; none of them is a user drag.
-                    guard !isProgrammaticScrollInFlight else { return }
-
-                    // Only a drag UP may unpin. Content growing under the user
-                    // pushes the offset DOWN the document, and the follow jumps
-                    // it further down; neither is the user leaving the tail. The
-                    // old rule asked whether the offset changed at all, which
-                    // read both of those as a drag, so the follow stopped
-                    // mid-turn.
-                    if new.offset < old.offset - 1 {
-                        if isPinnedToBottom { isPinnedToBottom = false }
-                        return
+                    let outcome = TranscriptFollowPolicy.decide(
+                        from: old,
+                        to: new,
+                        isPinned: isPinnedToBottom,
+                        isReaderScrolling: isReaderScrolling,
+                        isFollowInFlight: isProgrammaticScrollInFlight
+                    )
+                    if let pin = outcome.pin, pin != isPinnedToBottom {
+                        isPinnedToBottom = pin
                     }
-
-                    // Only write on a real change: this action runs on every
-                    // geometry update, and an unconditional write invalidated
-                    // the view several times per frame while a turn streamed.
-                    if new.distanceFromBottom <= 48, !isPinnedToBottom {
-                        isPinnedToBottom = true
+                    // Growth the streamed-text bucket cannot see has to be
+                    // followed too: a tool-call card landing under a capped
+                    // reasoning trace grows the transcript with no new output,
+                    // and the trace has stopped growing, so nothing else would
+                    // ever bring the card into view. Only a live turn follows
+                    // this way: an idle transcript grows because the reader
+                    // opened something, and yanking them to the tail for that
+                    // would scroll away what they just asked to see.
+                    if outcome.follow, isPinnedToBottom,
+                       isGenerating || isCompactingConversation {
+                        followGrowth(proxy)
                     }
                 }
                 // Everything the chat column says without moving anything: the
