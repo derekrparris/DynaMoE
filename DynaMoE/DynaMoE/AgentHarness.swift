@@ -3840,9 +3840,85 @@ public final class AgentHarness {
             mode: mode,
             subQEndpoint: subQEndpoint
         ) else { return true }
+        // A call that rewrites THIS app's preferences is the one class of state
+        // change Turbo must never wave through: the switch itself lives in the
+        // same defaults domain `shell_run` can edit, so a bypassed
+        // `defaults write DRP.DynaMoE dynamoe_agent_turbo_mode -bool NO` would
+        // turn off the very guard that approved it. The card is the point — the
+        // operator still sees the command and may say yes.
+        if targetsApplicationPreferences(toolName: toolName, arguments: arguments) { return false }
         guard toolName == "subq_decide" else { return true }
         let endpoint = subQEndpoint ?? SubQDecisionSettings.endpoint()
         return SubQDecisionSettings.origin(endpoint) == SubQDecisionSettings.officialOrigin
+    }
+
+    // MARK: - App-preference protection
+
+    /// True when a call would write this application's own preferences.
+    ///
+    /// Turbo Mode is a guard the operator sets, and `shell_run` runs as the same
+    /// user with the same defaults domain (`DRP.DynaMoE`) as the app. That made
+    /// a `defaults write` on the Turbo key a command that switches off the guard
+    /// which permitted it, with no approval card ever shown. Calls in this class
+    /// are never auto-approved.
+    static func targetsApplicationPreferences(
+        toolName: String,
+        arguments: [String: Any]
+    ) -> Bool {
+        switch toolName {
+        case "shell_run":
+            guard let command = arguments["command"] as? String else { return false }
+            return shellCommandWritesApplicationPreferences(command)
+        case "file_write", "file_edit":
+            guard let path = arguments["path"] as? String else { return false }
+            return pathWritesApplicationPreferences(path)
+        default:
+            return false
+        }
+    }
+
+    /// The bundle id, lowercased: it is both the `defaults` domain and the
+    /// preference plist's own file name.
+    private static let applicationPreferencesDomain = "drp.dynamoe"
+
+    /// True for a shell command that would rewrite this app's preferences.
+    ///
+    /// Deliberately narrow. Editing ANOTHER application's preferences is
+    /// legitimate agent work, so only a command that both names this bundle and
+    /// mutates is refused. `killall cfprefsd` is included because it discards
+    /// unflushed writes for every application on the machine, not just this one.
+    ///
+    /// This is a substring heuristic, not a shell parser: a domain held in a
+    /// variable, an escaped dot, or a scripted plist write gets past it, and MCP
+    /// tools are not inspected at all. It exists to stop the ordinary case (an
+    /// agent composing a `defaults write`), which is what the Turbo self-revert
+    /// was, and is not a sandbox.
+    static func shellCommandWritesApplicationPreferences(_ command: String) -> Bool {
+        let lowered = command.lowercased()
+        if lowered.contains("cfprefsd"),
+           lowered.contains("killall") || lowered.contains("pkill") {
+            return true
+        }
+        guard lowered.contains(applicationPreferencesDomain) else { return false }
+        if lowered.contains("defaults") {
+            let mutating = ["write", "delete", "remove", "import", "rename"]
+            return mutating.contains { lowered.contains($0) }
+        }
+        if lowered.contains("plutil") {
+            let mutating = ["-replace", "-insert", "-remove", "-set"]
+            return mutating.contains { lowered.contains($0) }
+        }
+        // Any other route to the plist itself: a copy, a move, a truncation, an
+        // in-place edit, or a redirect. Reading the domain is still allowed.
+        let fileMutations = ["rm ", "mv ", "cp ", "tee ", "truncate", "sed -i", "perl -pi", ">"]
+        return fileMutations.contains { lowered.contains($0) }
+    }
+
+    /// True when a file tool would write the app's preference plist directly.
+    static func pathWritesApplicationPreferences(_ path: String) -> Bool {
+        let lowered = path.lowercased()
+        guard lowered.contains(applicationPreferencesDomain) else { return false }
+        return lowered.contains("preferences") && lowered.hasSuffix(".plist")
     }
 
     /// True when a `subq_decide` call sends local file bytes or would send the

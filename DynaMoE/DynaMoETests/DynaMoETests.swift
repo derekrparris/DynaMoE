@@ -12592,7 +12592,12 @@ final class ModelDogfoodAndPrefixCacheTests: XCTestCase {
 
     override func tearDown() {
         PrefixCacheManager.shared.invalidate()
-        UserDefaults.standard.removeObject(forKey: "dynamoe_agent_turbo_mode")
+        // No `UserDefaults.standard` cleanup here, deliberately. Tests are
+        // hosted INSIDE DynaMoE.app (`TEST_HOST`), so `UserDefaults.standard`
+        // is the operator's real `DRP.DynaMoE` domain: deleting the Turbo key
+        // in tearDown turned a running app's Turbo Mode off mid-turn, which
+        // reads as the app demoting itself to Safe Mode. A test that needs the
+        // switch set must pass its own suite and leave this domain alone.
         super.tearDown()
     }
 

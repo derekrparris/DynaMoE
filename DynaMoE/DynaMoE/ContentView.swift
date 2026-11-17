@@ -409,6 +409,10 @@ struct ContentView: View {
     @AppStorage("dynamoe_agent_tools_enabled") private var defaultAgentToolsEnabled: Bool = false
     @AppStorage("dynamoe_agent_working_directory") private var agentWorkingDirectory: String = ""
     @AppStorage("dynamoe_max_tool_output_length") private var maxToolOutputLength: Int = 4000
+    /// Observed only so a Turbo flip is announced and logged wherever it came
+    /// from: the composer pill, Settings, the approval card, or the plan
+    /// handoff. Read as an app-wide fact, not as this view's own setting.
+    @AppStorage("dynamoe_agent_turbo_mode") private var turboModeForNotice: Bool = false
     /// Whether a cloud turn re-sends every picture in the conversation on every
     /// request. On by default, because a model that forgets the picture mid-run
     /// answers about nothing; off sends only the newest user turn's pictures
@@ -1814,6 +1818,13 @@ struct ContentView: View {
                 }
             }
         }
+        .onChange(of: turboModeForNotice) { previous, current in
+            // The UI's `@AppStorage` bindings write straight to defaults, so a
+            // human-made flip never passes through `TurboModeSettings.set`;
+            // this observer is what puts it in the unified log and announces it.
+            TurboModeSettings.logObservedChange(from: previous, to: current)
+            showTurboModeNotice(current)
+        }
         .onChange(of: scenePhase) { phase in
             if phase == .active {
                 // Retry a history load that failed or never ran, so a transient
@@ -2380,6 +2391,11 @@ struct ContentView: View {
     /// messages the refused send had already appended, because "Try again"
     /// re-sends the continuation: leaving the first copy in the transcript
     /// would duplicate the user turn on the retry.
+    ///
+    /// Turbo is deliberately NOT unwound. It is a preference the operator just
+    /// expressed, not turn state; reverting it to the value from before the
+    /// click is how "Code with Turbo" turned Turbo back off whenever its send
+    /// was refused, which reads as the app demoting itself to Safe Mode.
     private func approvePlanAndImplement(sessionId: UUID, withTurbo: Bool) {
         guard !isModeChangeLocked else {
             showStatus("⏳ The current turn is still running — approve the plan once it finishes.", kind: .warning)
@@ -2387,7 +2403,6 @@ struct ContentView: View {
         }
         guard let idx = sessions.firstIndex(where: { $0.id == sessionId }) else { return }
         let previousMode = sessions[idx].agentMode ?? .code
-        let turboWasEnabled = UserDefaults.standard.bool(forKey: "dynamoe_agent_turbo_mode")
         // The send appends its user turn and assistant placeholder BEFORE the
         // launch can be refused, so remember where the transcript ended. A
         // refusal that happened earlier (another turn running, a model load in
@@ -2396,17 +2411,29 @@ struct ContentView: View {
         let messageCountBeforeSend = sessions[idx].messages.count
         guard applyPlanMode(false, sessionId: sessionId) else { return }
         if withTurbo {
-            UserDefaults.standard.set(true, forKey: "dynamoe_agent_turbo_mode")
+            TurboModeSettings.set(true, from: "approvePlanAndImplement")
         }
         guard handleSendMessage("Implement the plan.", sessionId: sessionId) else {
             if sessions[idx].messages.count > messageCountBeforeSend {
                 sessions[idx].messages.removeLast(sessions[idx].messages.count - messageCountBeforeSend)
             }
-            UserDefaults.standard.set(turboWasEnabled, forKey: "dynamoe_agent_turbo_mode")
             _ = applyPlanMode(previousMode == .plan, sessionId: sessionId)
-            showStatus("⚠️ Could not start the implementation turn — the conversation is still in Plan Mode. Try again.", kind: .warning)
+            showStatus("⚠️ Could not start the implementation turn — the conversation is still in Plan Mode. Retry when the running turn or model load finishes.", kind: .warning)
             return
         }
+    }
+
+    /// Announces a Turbo flip, whatever its writer.
+    ///
+    /// Called by the `turboModeForNotice` observer below: the UI's `@AppStorage`
+    /// bindings write straight to defaults, so the composer pill, Settings and
+    /// the approval card all land there rather than in this view. Kept out of
+    /// the view expression because a ternary that builds two messages inside it
+    /// is enough to push the type-checker past its time budget.
+    private func showTurboModeNotice(_ enabled: Bool) {
+        showStatus(enabled
+            ? "⚡ Turbo Mode on — file writes and commands run without a per-call approval."
+            : "🛡️ Safe Mode — actions require confirmation before they run.")
     }
 
     /// Manual compaction via /compact. The Apple Foundation Model folds the
@@ -5662,7 +5689,8 @@ struct ContentView: View {
                         if let sIdx = self.sessions.firstIndex(where: { $0.id == sessionId }),
                            let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == stepMessageId }),
                            var current = self.sessions[sIdx].messages[mIdx].toolCalls {
-                            for i in current.indices where current[i].status == .running {
+                            for i in current.indices
+                                where current[i].status == .running || current[i].status == .awaitingApproval {
                                 current[i].status = .error
                                 current[i].error = "Cancelled by user."
                             }
@@ -5957,7 +5985,7 @@ struct ContentView: View {
             }
             agent.recordToolCallValidity(true)
 
-            let isTurbo = UserDefaults.standard.bool(forKey: "dynamoe_agent_turbo_mode")
+            let isTurbo = TurboModeSettings.isEnabled
             // The destination the approval card displays is pinned here and
             // handed to the call below, so a `defaults write` between approval
             // and execution cannot send the key somewhere else.
@@ -5999,6 +6027,14 @@ struct ContentView: View {
             }
 
             if Task.isCancelled || !ownsGeneration(myGenerationId) {
+                // The approval above has been consumed but this call will never
+                // run. Leaving the record at `.awaitingApproval` keeps an
+                // interactive card on screen with no continuation behind it,
+                // so a later click would resolve nothing.
+                updateRecord(record.id) { rec in
+                    rec.status = .error
+                    rec.error = "Cancelled by user."
+                }
                 return (true, ranComplete, false)
             }
 
@@ -6883,6 +6919,32 @@ struct ContentView: View {
                     var anyCompleted = false
                     var ranCompleteTool = false
 
+                    // A Stop can land before a call starts, or while its
+                    // approval is being consumed. Both end the turn the same
+                    // way, and neither may leave a card whose continuation has
+                    // already resolved.
+                    func markCallsCancelled(from index: Int) async {
+                        await MainActor.run {
+                            guard self.ownsGeneration(myGenerationId) else { return }
+                            self.isGeneratingText = false
+                            self.generationTask = nil
+                            self.showStatus("⏹ Tool execution stopped by user.")
+                            if let sId = sessionId, let mId = messageId,
+                               let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
+                               let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }),
+                               var currentCalls = self.sessions[sIdx].messages[mIdx].toolCalls {
+                                for i in index..<currentCalls.count {
+                                    if currentCalls[i].status == .running
+                                        || currentCalls[i].status == .awaitingApproval {
+                                        currentCalls[i].status = .error
+                                        currentCalls[i].error = "Cancelled by user."
+                                    }
+                                }
+                                self.sessions[sIdx].messages[mIdx].toolCalls = currentCalls
+                            }
+                        }
+                    }
+
                     // A call and the approval that authorizes it are one
                     // operation. `executeTool` raises the same counter, but the
                     // approval wait ends before it starts, and a deferred MCP
@@ -6893,24 +6955,7 @@ struct ContentView: View {
                         defer { AgentActivity.shared.end(.toolCall) }
 
                         if Task.isCancelled {
-                            await MainActor.run {
-                                guard self.ownsGeneration(myGenerationId) else { return }
-                                self.isGeneratingText = false
-                                self.generationTask = nil
-                                self.showStatus("⏹ Tool execution stopped by user.")
-                                if let sId = sessionId, let mId = messageId,
-                                   let sIdx = self.sessions.firstIndex(where: { $0.id == sId }),
-                                   let mIdx = self.sessions[sIdx].messages.firstIndex(where: { $0.id == mId }),
-                                   var currentCalls = self.sessions[sIdx].messages[mIdx].toolCalls {
-                                    for i in idx..<currentCalls.count {
-                                        if currentCalls[i].status == .running {
-                                            currentCalls[i].status = .error
-                                            currentCalls[i].error = "Cancelled by user."
-                                        }
-                                    }
-                                    self.sessions[sIdx].messages[mIdx].toolCalls = currentCalls
-                                }
-                            }
+                            await markCallsCancelled(from: idx)
                             return
                         }
 
@@ -6958,7 +7003,7 @@ struct ContentView: View {
                         AgentHarness.shared.recordToolCallValidity(true)
 
                         // Human-In-The-Loop (HITL) Safety & Turbo Mode
-                        let isTurbo = UserDefaults.standard.bool(forKey: "dynamoe_agent_turbo_mode")
+                        let isTurbo = TurboModeSettings.isEnabled
                         // See the local path: the destination the card shows is
                         // pinned here and used by the call, not re-read later.
                         let subQEndpoint = call.name == "subq_decide" ? SubQDecisionSettings.endpoint() : nil
@@ -7020,6 +7065,14 @@ struct ContentView: View {
                                 }
                                 continue
                             }
+                        }
+
+                        // The approval above has been consumed. A Stop that
+                        // landed while it was pending must not let the call it
+                        // authorized run, and must not leave the card behind.
+                        if Task.isCancelled {
+                            await markCallsCancelled(from: idx)
+                            return
                         }
 
                         let execResult = await AgentHarness.shared.executeTool(

@@ -200,6 +200,10 @@ struct SettingsSheetView: View {
     @ObservedObject private var dogfoodRunner = ModelDogfoodBenchmarkRunner.shared
     @ObservedObject private var updaterViewModel = UpdaterViewModel.shared
     @State private var showDogfoodReportModal: Bool = false
+    /// A refused benchmark run has a reason the operator can act on (a live
+    /// turn or a pending approval), so discarding it would make the only
+    /// control that starts the run look broken.
+    @State private var dogfoodErrorMessage: String? = nil
 
     /// The step cap as the agent loops resolve it, so this tab's value label
     /// reads the same number the run enforces.
@@ -2018,7 +2022,12 @@ struct SettingsSheetView: View {
                     Button(action: {
                         Task {
                             let modelName = localModelManager.discoveredModels.first(where: { $0.snapshotPath == activeModelPath })?.displayName ?? "Ornith-1.5-35B-A3B-FP8"
-                            _ = try? await dogfoodRunner.runBenchmark(modelName: modelName)
+                            dogfoodErrorMessage = nil
+                            do {
+                                _ = try await dogfoodRunner.runBenchmark(modelName: modelName)
+                            } catch {
+                                dogfoodErrorMessage = error.localizedDescription
+                            }
                         }
                     }) {
                         HStack(spacing: 6) {
@@ -2049,6 +2058,13 @@ struct SettingsSheetView: View {
                         }
                         .buttonStyle(.bordered)
                     }
+                }
+
+                if let dogfoodErrorMessage {
+                    Text(dogfoodErrorMessage)
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundColor(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 if let report = dogfoodRunner.latestReport {
