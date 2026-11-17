@@ -14,16 +14,17 @@ import Foundation
 /// templating, prefix pinning, tool masking and mid-stream tool-call freezing are
 /// the app's own behaviour rather than a second implementation.
 ///
-/// **The engine slot is taken per step, not per run.** `launchTurn` consumes the
-/// `TurnSlotClaim` it is handed as soon as it has minted the generation task, and
-/// the ledger holds one claim, so a claim cannot be carried across steps without
-/// changing the mechanism the server queue and the chat send path depend on.
-/// Phase 1 therefore claims, launches and releases per step. The consequence is
-/// stated plainly rather than hidden: a coordinator turn that lands between two
-/// steps takes the engine and moves the global prefix pin to its own session, so
-/// the run's next step re-prefills. Holding the engine for a whole run is
-/// `AgentScheduler`'s job (SUBAGENTS.md §8), which generalizes the ledger instead
-/// of adding a second one.
+/// **The engine slot is taken per step, not per run, and Phase 2 kept it that
+/// way.** `launchTurn` consumes the `TurnSlotClaim` it is handed as soon as it
+/// has minted the generation task, and the ledger holds one claim, so a claim
+/// cannot be carried across steps without changing the mechanism the server
+/// queue and the chat send path depend on. A lifetime lease was measured and
+/// rejected (§8), because holding the only slot for a whole run blocks every
+/// chat turn. The consequence is stated plainly rather than hidden: a
+/// coordinator turn that lands between two steps moves the global prefix pin to
+/// its own session, so the run's next step re-prefills. `AgentScheduler` owns
+/// admission and cancellation; the turn is `.background`, so an operator's send
+/// can preempt it.
 nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendable {
     let descriptor: AgentBackendDescriptor
 
@@ -196,7 +197,8 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
             stopSequences: request.stopSequences,
             asOfDate: nil,
             images: [],
-            imageSpans: []
+            imageSpans: [],
+            turnPriority: .background
         )
         return Prepared(turn: turn, claim: claim, maskSchemas: maskSchemas(for: request.tools))
     }

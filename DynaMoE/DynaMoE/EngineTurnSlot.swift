@@ -8,6 +8,16 @@
 
 import Foundation
 
+/// Why a turn wants the engine.
+///
+/// There is one slot, so a background turn (a subagent's step) must be able to
+/// yield it: an operator who sends a message outranks work they are waiting on,
+/// and a run can resume its next step afterwards. Interactive turns never yield.
+nonisolated enum TurnPriority: Sendable, Equatable {
+    case interactive
+    case background
+}
+
 /// A claim on the engine's single-flight generation slot.
 ///
 /// Asking whether the slot is free and then taking it are two steps, and a turn

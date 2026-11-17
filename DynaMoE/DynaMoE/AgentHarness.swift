@@ -2347,7 +2347,7 @@ public final class CodebaseSearchTool: AgentTool {
 public final class SpawnSubagentTool: AgentTool {
     public let definition = ToolDefinition(
         name: "spawn_subagent",
-        description: "Spawns an isolated background subagent with a dedicated role (e.g. Codebase Researcher, Test Runner, Shader Optimizer) to handle focused multi-step tasks without filling your primary context window.",
+        description: "Spawns an isolated subagent with a dedicated role (e.g. Codebase Researcher, Test Runner, Shader Optimizer) to handle focused multi-step tasks without filling your primary context window. Set backend to 'local' or 'cloud' for a run where another model actually works the task; leave it unset for the built-in role pipelines.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
@@ -2362,7 +2362,7 @@ public final class SpawnSubagentTool: AgentTool {
                 "allowed_tools": [
                     "type": "array",
                     "items": ["type": "string"],
-                    "description": "List of tools the subagent is permitted to call (optional). Defaults to safe read & research tools."
+                    "description": "List of tools the subagent is permitted to call (optional). Defaults to the preset's tool set."
                 ],
                 "context_summary": [
                     "type": "string",
@@ -2371,6 +2371,47 @@ public final class SpawnSubagentTool: AgentTool {
                 "run_in_background": [
                     "type": "boolean",
                     "description": "Set true to execute asynchronously in the background task manager; set false (default) to wait for the subagent to complete and return its synthesized report."
+                ],
+                "backend": [
+                    "type": "string",
+                    "enum": ["auto", "local", "cloud", "legacy"],
+                    "description": "Which model works the run: 'local' (the loaded checkpoint), 'cloud' (the configured subagent model), 'auto' (the backend chosen in Settings), or 'legacy' (the built-in role pipelines). Omit for the Settings default."
+                ],
+                "preset": [
+                    "type": "string",
+                    "enum": ["explore", "implementer", "verifier", "reviewer", "general", "custom"],
+                    "description": "Capability preset for a model-backed run: which tools it may use and its default budget. Inferred from the role when omitted."
+                ],
+                "budget": [
+                    "type": "object",
+                    "description": "Optional budget overrides for a model-backed run.",
+                    "properties": [
+                        "max_steps": [
+                            "type": "integer",
+                            "description": "Maximum model turns before the run stops."
+                        ],
+                        "max_completion_tokens": [
+                            "type": "integer",
+                            "description": "Completion tokens across the whole run."
+                        ],
+                        "max_wall_clock_seconds": [
+                            "type": "integer",
+                            "description": "Wall-clock seconds across the whole run."
+                        ],
+                        "max_cost_usd": [
+                            "type": "number",
+                            "description": "Cloud spend ceiling, in US dollars."
+                        ]
+                    ]
+                ],
+                "isolation": [
+                    "type": "string",
+                    "enum": ["none", "worktree"],
+                    "description": "Workspace isolation. 'none' runs in the coordinator's directory with per-call approval; 'worktree' is reserved for writers and is refused until it ships."
+                ],
+                "thinking": [
+                    "type": "boolean",
+                    "description": "Ask a local model to reason before answering. Ignored by cloud providers that decide this themselves."
                 ]
             ]),
             "required": AnyCodable(["role", "task_description"])
@@ -2397,44 +2438,221 @@ public final class SpawnSubagentTool: AgentTool {
         }
         let contextSummary = arguments["context_summary"] as? String
         let runInBackground = (arguments["run_in_background"] as? Bool) ?? false
+        // The turn's mode, not the process-global one: another turn can move
+        // `activeMode`, and a plan turn's child must inherit plan mode.
+        let parentMode = AgentHarness.executingTurnMode ?? AgentHarness.shared.activeMode
+        let sessionsWorkingDirectory = URL(
+            fileURLWithPath: FileManager.default.currentDirectoryPath
+        )
+        let spawnDirectory = workingDirectory ?? sessionsWorkingDirectory
+
+        let backendSelection = Self.backendSelection(from: arguments)
+        if backendSelection.error == nil, backendSelection.modelBacked {
+            let request = AgentSpawnRequest(
+                role: role,
+                taskDescription: taskDesc,
+                contextSummary: contextSummary,
+                presetName: arguments["preset"] as? String,
+                backendPreference: backendSelection.preference,
+                explicitToolNames: allowedTools.isEmpty ? nil : allowedTools,
+                budgetOverrides: Self.budgetOverrides(from: arguments["budget"]),
+                isolation: Self.isolation(from: arguments["isolation"]),
+                workingDirectory: spawnDirectory,
+                parentSessionId: AgentHarness.shared.currentSessionId,
+                parentTurnId: nil,
+                parentMode: parentMode,
+                thinking: (arguments["thinking"] as? Bool) ?? false,
+                operatorOverride: false,
+                priority: .userRequested
+            )
+            let runId = UUID()
+            do {
+                let plan = try AgentSpawnResolver.resolve(
+                    request,
+                    runId: runId,
+                    sessionId: runId
+                )
+                let subagent = SubagentManager.shared.spawnModelBacked(plan, id: runId)
+                return await Self.respond(
+                    subagent: subagent,
+                    runInBackground: runInBackground,
+                    maxOutputLength: maxOutputLength
+                )
+            } catch let error as AgentBackendError {
+                // The local cost refusal is the spawn card's decision, not a dead
+                // end: show the estimate and, only if the operator approves it,
+                // re-resolve with the override (invariant 10). Turbo Mode must not
+                // make this choice, because the point of the setting is that the
+                // run can displace the coordinator's prefix for minutes.
+                guard case .refused(let message) = error else {
+                    let text = error.errorDescription ?? "The spawn was refused."
+                    return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: text), nil, text, false)
+                }
+                let approval = AgentApprovalRequest(
+                    runId: runId,
+                    toolName: "spawn_subagent",
+                    arguments: [
+                        "role": role,
+                        "task_description": taskDesc,
+                        "backend": backendSelection.preference.rawValue,
+                        "estimated_cost": message
+                    ],
+                    workingDirectory: spawnDirectory.path,
+                    reason: message
+                )
+                guard await SubagentApprovalCenter.shared.request(approval, honorsTurbo: false) else {
+                    let declined = "The operator declined this local run's estimated re-prefill cost. Send the task to a cloud backend, raise dynamoe_subagent_local_cost_limit in Settings, or give it a smaller task."
+                    return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: declined), nil, declined, false)
+                }
+                var overridden = request
+                overridden.operatorOverride = true
+                do {
+                    let plan = try AgentSpawnResolver.resolve(
+                        overridden,
+                        runId: runId,
+                        sessionId: runId
+                    )
+                    let subagent = SubagentManager.shared.spawnModelBacked(plan, id: runId)
+                    return await Self.respond(
+                        subagent: subagent,
+                        runInBackground: runInBackground,
+                        maxOutputLength: maxOutputLength
+                    )
+                } catch {
+                    let text = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: text), nil, text, false)
+                }
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: message), nil, message, false)
+            }
+        }
+        if let error = backendSelection.error {
+            return (AgentHarness.toolErrorJSON(tool: "spawn_subagent", error: error), nil, error, false)
+        }
 
         let subagent = SubagentManager.shared.spawn(
             role: role,
             taskDescription: taskDesc,
             allowedTools: allowedTools,
-            // The turn's mode, not the process-global one: another turn can move
-            // `activeMode`, and a plan turn's child must inherit plan mode.
-            parentMode: AgentHarness.executingTurnMode ?? AgentHarness.shared.activeMode,
+            parentMode: parentMode,
             contextSummary: contextSummary,
             parentSessionId: AgentHarness.shared.currentSessionId,
             workingDirectory: workingDirectory
         )
+        return await Self.respond(
+            subagent: subagent,
+            runInBackground: runInBackground,
+            maxOutputLength: maxOutputLength
+        )
+    }
 
+    private static func respond(
+        subagent: SubagentInstance,
+        runInBackground: Bool,
+        maxOutputLength: Int
+    ) async -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
         if runInBackground {
-            let msg = "Subagent [\(role)] spawned in background (ID: \(subagent.id.uuidString)). You are responsible for its outcome: when you need its results, call get_subagent_status with wait=true, then present the report to the user in your reply. The user never contacts the subagent directly."
-            let res = AgentHarness.toolSuccessJSON(tool: "spawn_subagent", data: [
+            let msg = "Subagent [\(subagent.role)] spawned in background (ID: \(subagent.id.uuidString)). You are responsible for its outcome: when you need its results, call get_subagent_status with wait=true, then present the report to the user in your reply. The user never contacts the subagent directly."
+            var data: [String: Any] = [
                 "subagent_id": subagent.id.uuidString,
                 "role": subagent.role,
                 "status": "running",
                 "run_in_background": true,
                 "message": msg
-            ])
+            ]
+            if let backend = subagent.backendDescriptor {
+                data["backend"] = backend.displayName
+            }
+            let res = AgentHarness.toolSuccessJSON(tool: "spawn_subagent", data: data)
             return (res, msg, nil, false)
-        } else {
-            // Synchronous delegation: wait for subagent to finish
-            let summary = await subagent.waitForCompletion()
-            await MainActor.run { subagent.isSummaryRelayed = true }
-            let cleanSummary = AgentHarness.truncateText(AgentHarness.sanitizeText(summary), limit: maxOutputLength)
-            let res = AgentHarness.toolSuccessJSON(tool: "spawn_subagent", data: [
-                "subagent_id": subagent.id.uuidString,
-                "role": subagent.role,
-                "status": subagent.status.rawValue,
-                "duration_seconds": subagent.executionDurationSeconds,
-                "summary": cleanSummary,
-                "directive": "Present this report to the user now, then answer their original question with it."
-            ])
-            return (res, cleanSummary, nil, false)
         }
+        // Synchronous delegation: wait for subagent to finish
+        let summary = await subagent.waitForCompletion()
+        await MainActor.run { subagent.isSummaryRelayed = true }
+        let cleanSummary = AgentHarness.truncateText(AgentHarness.sanitizeText(summary), limit: maxOutputLength)
+        var data: [String: Any] = [
+            "subagent_id": subagent.id.uuidString,
+            "role": subagent.role,
+            "status": subagent.status.rawValue,
+            "duration_seconds": subagent.executionDurationSeconds,
+            "summary": cleanSummary,
+            "directive": "Present this report to the user now, then answer their original question with it."
+        ]
+        if let backend = subagent.backendDescriptor {
+            data["backend"] = backend.displayName
+            data["usage"] = [
+                "steps": subagent.usage.steps,
+                "prompt_tokens": subagent.usage.promptTokens,
+                "completion_tokens": subagent.usage.completionTokens,
+                "tool_calls": subagent.usage.toolCalls
+            ]
+        }
+        let res = AgentHarness.toolSuccessJSON(tool: "spawn_subagent", data: data)
+        return (res, cleanSummary, nil, false)
+    }
+
+    // MARK: - Argument decoding
+
+    /// Which backend this spawn asked for, and whether that is a model-backed
+    /// run at all.
+    ///
+    /// `auto` reads the operator's Settings choice; with none stored it keeps
+    /// the legacy role pipelines. Sending work to a model (and, for cloud,
+    /// off-device) is a deliberate choice, not something an omitted argument
+    /// should make on the operator's behalf.
+    private static func backendSelection(
+        from arguments: [String: Any]
+    ) -> (preference: AgentBackendPreference, modelBacked: Bool, error: String?) {
+        let raw = (arguments["backend"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch raw {
+        case nil, "", "auto":
+            let stored = UserDefaults.standard
+                .string(forKey: SubagentBackendSettings.backendKey)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            switch stored {
+            case "local": return (.local, true, nil)
+            case "cloud": return (.cloud, true, nil)
+            default: return (.auto, false, nil)
+            }
+        case "local": return (.local, true, nil)
+        case "cloud": return (.cloud, true, nil)
+        case "legacy": return (.auto, false, nil)
+        default:
+            return (.auto, false, "The 'backend' argument must be one of auto, local, cloud or legacy.")
+        }
+    }
+
+    private static func budgetOverrides(from raw: Any?) -> AgentBudgetOverrides? {
+        guard let object = raw as? [String: Any] else { return nil }
+        func int(_ key: String) -> Int? {
+            if let value = object[key] as? Int { return value }
+            if let value = object[key] as? NSNumber { return value.intValue }
+            return nil
+        }
+        func double(_ key: String) -> Double? {
+            if let value = object[key] as? Double { return value }
+            if let value = object[key] as? NSNumber { return value.doubleValue }
+            return nil
+        }
+        let overrides = AgentBudgetOverrides(
+            maxSteps: int("max_steps"),
+            maxCompletionTokens: int("max_completion_tokens"),
+            maxWallClockSeconds: int("max_wall_clock_seconds"),
+            maxCostUSD: double("max_cost_usd")
+        )
+        if overrides == AgentBudgetOverrides() { return nil }
+        return overrides
+    }
+
+    private static func isolation(from raw: Any?) -> AgentIsolation {
+        guard let value = (raw as? String)?.lowercased(), value == "worktree" else {
+            return .none
+        }
+        // The resolver refuses this by name; spelling it as a worktree here is
+        // what makes the refusal specific instead of "unknown option".
+        return .worktree(path: "", branch: "")
     }
 }
 
@@ -3866,6 +4084,9 @@ public final class AgentHarness {
         if isStateChanging(toolName: toolName) {
             return !PlanModePolicy.withholds(toolName, in: mode)
         }
+        if toolName == "spawn_subagent" {
+            return spawnSubagentRequiresApproval(arguments: arguments, mode: mode)
+        }
         if toolName == "subq_decide" {
             return subqDecideRequiresApproval(
                 arguments: arguments,
@@ -3873,6 +4094,23 @@ public final class AgentHarness {
             )
         }
         return false
+    }
+
+    /// Delegation is the primary card: a spawn that can write is a decision the
+    /// operator makes once, with the role, backend and tool set in front of
+    /// them, rather than a stream of per-call cards they cannot attribute to a
+    /// background run. A read-only spawn, and any spawn in plan mode (whose
+    /// tools are withheld anyway), runs without a card.
+    static func spawnSubagentRequiresApproval(arguments: [String: Any], mode: AgentMode) -> Bool {
+        guard mode != .plan else { return false }
+        let preset = AgentRolePresetCatalog.preset(
+            named: arguments["preset"] as? String,
+            role: arguments["role"] as? String ?? ""
+        )
+        let definition = AgentRolePresetCatalog.definition(for: preset)
+        let explicit = (arguments["allowed_tools"] as? [String]) ?? []
+        let intended = explicit.isEmpty ? definition.toolNames : explicit
+        return !Set(intended).isDisjoint(with: AgentToolSurface.writeCapable)
     }
 
     /// Whether Turbo Mode may skip the approval prompt for this call.

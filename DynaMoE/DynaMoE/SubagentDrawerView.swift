@@ -13,6 +13,7 @@ import SwiftUI
 
 public struct SubagentDrawerView: View {
     @ObservedObject var subagentManager = SubagentManager.shared
+    @ObservedObject private var approvalCenter = SubagentApprovalCenter.shared
     public var onClose: () -> Void
 
     @State private var expandedSubagentIds: Set<UUID> = []
@@ -98,6 +99,15 @@ public struct SubagentDrawerView: View {
             } else {
                 ScrollView {
                     LazyVStack(spacing: 10) {
+                        if !approvalCenter.pending.isEmpty {
+                            ForEach(approvalCenter.pending) { entry in
+                                ActionConfirmationView(
+                                    confirmation: SubagentApprovalCenter.confirmation(for: entry.request),
+                                    onApprove: { approvalCenter.approve(entry.id) },
+                                    onReject: { approvalCenter.reject(entry.id) }
+                                )
+                            }
+                        }
                         ForEach(subagentManager.subagents) { subagent in
                             SubagentCardView(
                                 subagent: subagent,

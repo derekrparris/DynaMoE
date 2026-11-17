@@ -45,6 +45,11 @@ public enum SubagentStatus: String, Codable, CaseIterable {
         }
     }
 
+    /// True once the run can no longer change state on its own.
+    public var isTerminal: Bool {
+        self == .completed || self == .failed || self == .cancelled
+    }
+
     public var color: Color {
         switch self {
         case .pending: return .secondary
@@ -145,6 +150,25 @@ public struct SubagentMessage: Identifiable, Codable, Equatable {
 
 // MARK: - Subagent Instance
 
+/// Hands the scheduler a way to stop a run without retaining it.
+///
+/// A registry entry must not keep a finished run alive, and the closure it holds
+/// is `@Sendable`; a weak box is how the two requirements meet.
+nonisolated final class InstanceCancellationBox: @unchecked Sendable {
+    private weak var instance: SubagentInstance?
+
+    init(_ instance: SubagentInstance) {
+        self.instance = instance
+    }
+
+    func cancel(_ reason: String) {
+        let instance = instance
+        Task { @MainActor in
+            instance?.cancel(reason: reason)
+        }
+    }
+}
+
 public final class SubagentInstance: Identifiable, ObservableObject {
     public let id: UUID
     public let role: String
@@ -164,6 +188,10 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     public let contextSummary: String?
     public let parentSessionId: UUID?
     public let workingDirectory: URL?
+    /// The model-backed plan, when this instance is a real agent run rather than
+    /// one of the legacy canned pipelines. The manager sets it through the
+    /// internal initializer below.
+    let modelPlan: AgentSpawnPlan?
 
     @Published public var status: SubagentStatus = .pending
     @Published public var liveStatusText: String = "Initializing..."
@@ -176,6 +204,10 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     @Published public var isSummaryRelayed: Bool = false
     @Published public var executionDurationSeconds: Double = 0.0
     @Published public var currentStepIndex: Int = 0
+    /// The run's structured report and usage, when a model ran it.
+    private(set) var report: AgentReport? = nil
+    private(set) var usage: AgentUsage = AgentUsage()
+    private(set) var backendDescriptor: AgentBackendDescriptor? = nil
 
     public let createdAt: Date
     public private(set) var completedAt: Date? = nil
@@ -208,6 +240,25 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         self.contextSummary = contextSummary
         self.parentSessionId = parentSessionId
         self.workingDirectory = workingDirectory
+        self.modelPlan = nil
+        self.createdAt = Date()
+    }
+
+    /// A model-backed run. Internal because `AgentSpawnPlan` is an
+    /// implementation type: the public surface stays the legacy initializer the
+    /// tests and the drawer already use.
+    init(id: UUID, plan: AgentSpawnPlan) {
+        self.id = id
+        self.role = plan.role
+        self.archetype = SubagentRoleArchetype.match(from: plan.role)
+        self.taskDescription = plan.taskDescription
+        self.allowedTools = plan.toolNames
+        self.parentMode = plan.approvalPolicy == .deny ? .plan : .code
+        self.contextSummary = plan.contextSummary
+        self.parentSessionId = plan.parentSessionId
+        self.workingDirectory = plan.workingDirectory
+        self.modelPlan = plan
+        self.backendDescriptor = plan.backendDescriptor
         self.createdAt = Date()
     }
 
@@ -215,6 +266,12 @@ public final class SubagentInstance: Identifiable, ObservableObject {
 
     /// Cancels this subagent's execution.
     public func cancel() {
+        cancel(reason: "Cancelled by user or coordinator.")
+    }
+
+    /// Stops the run with a reason it can report. The scheduler's cancellation
+    /// tree, the Stop button and the run's own preemption all land here.
+    public func cancel(reason: String) {
         lock.lock()
         executionTask?.cancel()
         executionTask = nil
@@ -223,15 +280,15 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         completionContinuations.removeAll()
         lock.unlock()
 
-        Task { @MainActor in
-            self.status = .cancelled
-            self.liveStatusText = "Cancelled by user or coordinator."
-            self.completedAt = Date()
-            self.finalSummary = "Subagent was cancelled before completion."
-        }
+        // Synchronous, not dispatched: a caller that cancels and then asks for
+        // the summary must not observe `isFinished` with an empty report.
+        status = .cancelled
+        liveStatusText = reason
+        completedAt = Date()
+        finalSummary = reason
 
         for c in continuations {
-            c.resume(returning: "Subagent was cancelled.")
+            c.resume(returning: reason)
         }
     }
 
@@ -278,9 +335,14 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         guard status == .pending else { return }
 
         lock.lock()
+        let plan = modelPlan
         executionTask = Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
-            await self.runAutonomousPipeline()
+            if let plan {
+                await self.runModelBackedExecution(plan)
+            } else {
+                await self.runAutonomousPipeline()
+            }
         }
         lock.unlock()
     }
@@ -311,23 +373,247 @@ public final class SubagentInstance: Identifiable, ObservableObject {
 
         let duration = CFAbsoluteTimeGetCurrent() - startTime
         let finalStatus: SubagentStatus = Task.isCancelled ? .cancelled : .completed
+        finishRun(
+            summary: accumulatedSummary,
+            status: finalStatus,
+            duration: duration,
+            liveStatus: String(format: "Completed in %.2fs", duration)
+        )
+    }
 
-        await MainActor.run {
-            self.status = finalStatus
-            self.completedAt = Date()
-            self.executionDurationSeconds = duration
-            self.finalSummary = accumulatedSummary
-            self.liveStatusText = "Completed in \(String(format: "%.2f", duration))s"
+    /// Runs the real agent loop on one backend.
+    ///
+    /// The loop is off the main actor (invariant 6); this method is the run's
+    /// main-actor bookkeeping and its lifetime ends with the loop. Admission,
+    /// the cancellation tree and the backend boundary all belong to the
+    /// scheduler — a local run still claims the engine per step, which is the
+    /// slot the server queue and the chat send path share.
+    private func runModelBackedExecution(_ plan: AgentSpawnPlan) async {
+        let startTime = CFAbsoluteTimeGetCurrent()
+        liveStatusText = "Preparing \(plan.role)…"
+
+        let scheduler = AgentScheduler.shared
+        let cancellation = InstanceCancellationBox(self)
+        await scheduler.register(
+            runId: id,
+            parentRunId: nil,
+            parentSessionId: parentSessionId,
+            schedulingClass: plan.schedulingClass,
+            priority: plan.priority,
+            cancel: { reason in cancellation.cancel(reason) }
+        )
+
+        let ticket: UUID
+        do {
+            ticket = try await scheduler.acquire(
+                plan.schedulingClass,
+                priority: plan.priority,
+                runId: id
+            )
+        } catch {
+            await scheduler.finish(runId: id)
+            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            let cancelled = (error as? AgentSchedulerError) == .cancelled || Task.isCancelled
+            finishRun(
+                summary: message,
+                status: cancelled ? .cancelled : .failed,
+                duration: CFAbsoluteTimeGetCurrent() - startTime,
+                liveStatus: message
+            )
+            return
+        }
+        defer {
+            Task {
+                await scheduler.release(ticket)
+                await scheduler.finish(runId: id)
+            }
         }
 
+        status = .running
+        liveStatusText = "Working on \(plan.role)…"
+
+        let workingDirectoryURL = workingDirectory
+            ?? URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        let context: AgentRunContext
+        do {
+            context = try AgentRunContext.make(
+                runId: id,
+                sessionId: id,
+                toolNames: plan.toolNames,
+                workingDirectory: workingDirectoryURL,
+                mode: parentMode,
+                approvalPolicy: plan.approvalPolicy,
+                workspaceIsolated: plan.isolation.isIsolated,
+                approvalHandler: { request in
+                    await SubagentApprovalCenter.shared.request(request)
+                }
+            )
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            finishRun(
+                summary: message,
+                status: .failed,
+                duration: CFAbsoluteTimeGetCurrent() - startTime,
+                liveStatus: message
+            )
+            return
+        }
+
+        let systemPrompt = LocalAgentBackend.workerSystemPrompt(
+            role: plan.role,
+            baseSystem: "",
+            mode: parentMode,
+            harness: context.harness,
+            config: CompletionEngine.shared.promptModelConfig
+        )
+        let input = AgentLoopInput(
+            role: plan.role,
+            task: plan.taskDescription,
+            contextSummary: plan.contextSummary,
+            systemPrompt: systemPrompt,
+            budget: plan.budget,
+            sampling: plan.sampling,
+            sessionId: id,
+            thinking: plan.thinking,
+            stopSequences: []
+        )
+
+        // Events are applied through ONE serial stream. A Task per event let a
+        // late `.running` land after `finishRun`, so the drawer (and a test)
+        // could read a completed run as still running. Finishing the stream and
+        // awaiting the pump before the terminal bookkeeping keeps the order the
+        // loop emitted them in.
+        let (events, eventSink) = AsyncStream<AgentRunEvent>.makeStream()
+        let eventPump = Task { @MainActor [weak self] in
+            for await event in events {
+                self?.apply(event)
+            }
+        }
+        let outcome = await HeadlessAgentLoop().run(
+            input: input,
+            backend: plan.backend,
+            context: context,
+            emit: { eventSink.yield($0) }
+        )
+        eventSink.finish()
+        await eventPump.value
+
+        let duration = CFAbsoluteTimeGetCurrent() - startTime
+        report = outcome.report
+        usage = outcome.usage
+        var summary = outcome.report?.summary ?? ""
+        // A failed run's report carries no summary; the failure reason is the
+        // report. Falling back only when the report is ABSENT hid every failure
+        // behind "finished without a report".
+        if summary.isEmpty { summary = outcome.error ?? "" }
+        if summary.isEmpty {
+            summary = "The run finished without a report."
+        }
+        summary += "\n\n—\nBackend: \(plan.backendDescriptor.displayName) · "
+            + "\(outcome.usage.steps) step(s) · \(outcome.usage.completionTokens) completion token(s)"
+        if !summary.isEmpty, outcome.status == .completed {
+            appendTranscriptStep(
+                actionName: "assistant",
+                arguments: [:],
+                output: outcome.report?.summary ?? "",
+                duration: 0,
+                isError: false
+            )
+        }
+
+        let finalStatus: SubagentStatus
+        switch outcome.status {
+        case .completed: finalStatus = .completed
+        case .cancelled: finalStatus = .cancelled
+        default: finalStatus = .failed
+        }
+        let liveStatus = outcome.error
+            ?? String(format: "Completed in %.2fs", duration)
+        finishRun(summary: summary, status: finalStatus, duration: duration, liveStatus: liveStatus)
+    }
+
+    /// The loop's events, applied to the drawer's own state.
+    @MainActor
+    private func apply(_ event: AgentRunEvent) {
+        switch event {
+        case .status(let status, let detail):
+            liveStatusText = detail
+            switch status {
+            case .running:
+                self.status = .running
+            case .waitingForApproval:
+                self.status = .waitingForApproval
+            case .cancelled:
+                self.status = .cancelled
+            case .failed, .blocked:
+                self.status = .failed
+            default:
+                break
+            }
+        case .assistantDelta:
+            break
+        case .toolStarted(let record):
+            liveStatusText = "Running \(record.name)…"
+        case .toolFinished(let record):
+            appendTranscriptStep(
+                actionName: record.name,
+                arguments: record.arguments,
+                output: record.output ?? record.error ?? "",
+                duration: record.executionDurationSeconds ?? 0,
+                isError: record.status == .error || record.status == .rejected || record.status == .withheld
+            )
+        case .usage(let usage):
+            self.usage = usage
+        case .completed(let report):
+            self.report = report
+        }
+    }
+
+    private func appendTranscriptStep(
+        actionName: String,
+        arguments: [String: String],
+        output: String,
+        duration: Double,
+        isError: Bool
+    ) {
+        let nextIndex = currentStepIndex + 1
+        let step = SubagentStepRecord(
+            stepIndex: nextIndex,
+            timestamp: Date(),
+            actionName: actionName,
+            arguments: arguments,
+            output: output,
+            durationSeconds: duration,
+            isError: isError
+        )
+        currentStepIndex = nextIndex
+        transcript.append(step)
+        liveStatusText = "Executed \(actionName) [Step \(nextIndex)]"
+    }
+
+    /// Terminal bookkeeping shared by both execution paths. Resumes every
+    /// waiter exactly once, so a coordinator that spawned this run synchronously
+    /// always receives a report (invariant 11).
+    private func finishRun(
+        summary: String,
+        status: SubagentStatus,
+        duration: Double,
+        liveStatus: String
+    ) {
+        self.status = status
+        completedAt = Date()
+        executionDurationSeconds = duration
+        finalSummary = summary
+        liveStatusText = liveStatus
+
         lock.lock()
-        self.isFinished = true
+        isFinished = true
         let continuations = completionContinuations
         completionContinuations.removeAll()
         lock.unlock()
 
-        for c in continuations {
-            c.resume(returning: accumulatedSummary)
+        for continuation in continuations {
+            continuation.resume(returning: summary)
         }
     }
 
@@ -1101,6 +1387,26 @@ public final class SubagentManager: ObservableObject {
             workingDirectory: workingDirectory
         )
 
+        register(instance)
+        instance.startExecution()
+        return instance
+    }
+
+    /// Spawns a run the model actually works, on the backend the plan resolved.
+    ///
+    /// The legacy `spawn` above stays for the canned pipelines (and for the
+    /// tests that pin them). This path is what `spawn_subagent` uses when a
+    /// backend is available: same manager, same drawer, same status tools, but
+    /// the work is a real agent loop.
+    @discardableResult
+    func spawnModelBacked(_ plan: AgentSpawnPlan, id: UUID = UUID()) -> SubagentInstance {
+        let instance = SubagentInstance(id: id, plan: plan)
+        register(instance)
+        instance.startExecution()
+        return instance
+    }
+
+    private func register(_ instance: SubagentInstance) {
         lock.lock()
         subagentsById[instance.id] = instance
         subagentsOrder.insert(instance, at: 0)
@@ -1119,9 +1425,6 @@ public final class SubagentManager: ObservableObject {
                 }
             }
         }
-
-        instance.startExecution()
-        return instance
     }
 
     // MARK: - Lookup & Management
@@ -1145,6 +1448,22 @@ public final class SubagentManager: ObservableObject {
         for s in list {
             s.cancel()
         }
+        Task { await AgentScheduler.shared.cancelAll(reason: "All subagent runs were cancelled.") }
+    }
+
+    /// Stops every run spawned by one coordinator session.
+    ///
+    /// A Stop is the operator abandoning the turn, not just its current step:
+    /// leaving a child working on it would spend tokens on work nobody asked
+    /// for and could let it write after the conversation moved on.
+    public func cancelSession(sessionId: UUID, reason: String = "The coordinator turn was stopped.") {
+        let children = allSubagents.filter {
+            $0.parentSessionId == sessionId && !$0.status.isTerminal
+        }
+        for child in children {
+            child.cancel(reason: reason)
+        }
+        Task { await AgentScheduler.shared.cancelRuns(parentSessionId: sessionId, reason: reason) }
     }
 
     public func clearCompleted() {

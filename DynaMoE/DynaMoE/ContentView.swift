@@ -1839,6 +1839,10 @@ struct ContentView: View {
             // flushSessionPersist only enqueues the write; block until the
             // utility queue drains so the process cannot exit first.
             ChatSessionStore.shared.flushPendingIO()
+            // No subagent outlives the app: a child's cloud stream, local step or
+            // pending approval card would otherwise be cut off without a report.
+            SubagentManager.shared.cancelAll()
+            ActionApprovalManager.shared.cancelAll()
         }
         .task {
             await loadPersistedSessionsIfNeeded()
@@ -4304,6 +4308,12 @@ struct ContentView: View {
         // must not inherit its mode. The next send resolves a fresh one at step 0.
         activeTurnMode = nil
         ActionApprovalManager.shared.cancelAll()
+        // Delegation is part of the turn: a Stop must not leave a child working
+        // on work the operator has abandoned. This covers both the runs this
+        // turn spawned and anything they queued behind the scheduler.
+        if let generatingSessionId {
+            SubagentManager.shared.cancelSession(sessionId: generatingSessionId)
+        }
         showStatus("⏹ Generation stopped by user.")
     }
 
@@ -6182,7 +6192,7 @@ struct ContentView: View {
     /// it, because a launch refused AFTER the messages were appended (lost slot,
     /// engine not ready) is otherwise reported to the caller as accepted work.
     @discardableResult
-    private func startAutoregressiveGeneration(customPrompt: String? = nil, promptTokens: [UInt32]? = nil, images: [TurnImage] = [], carriedImageSpans: [TurnImageSpan] = [], sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false) -> Bool {
+    private func startAutoregressiveGeneration(customPrompt: String? = nil, promptTokens: [UInt32]? = nil, images: [TurnImage] = [], carriedImageSpans: [TurnImageSpan] = [], sessionId: UUID? = nil, messageId: UUID? = nil, agentStep: Int = 0, isInThinkingContinuation: Bool = false, forceSynthesis: Bool = false, preemptionRetry: Bool = false) -> Bool {
         guard let summary = summary,
               let tokenizer = tokenizer else {
             let err = "❌ Metal or Tokenizer not ready for text generation. Please load model and tokenizer in Settings."
@@ -6212,11 +6222,38 @@ struct ContentView: View {
             return false
         }
 
+        // An operator's send outranks a subagent's step. The engine is
+        // single-flight, so the background turn is stopped rather than raced:
+        // cancel it at its next boundary, wait for it to drain, then run this
+        // send once. `preemptionRetry` bounds the retry to one attempt, and the
+        // "accepted" answer is honest — the work is queued behind a cancellation
+        // measured in milliseconds, not refused.
+        if !preemptionRetry, CompletionEngine.shared.hasActiveBackgroundTurn {
+            showStatus("⏸ Pausing a background subagent so this turn can run…")
+            Task { @MainActor in
+                await AgentScheduler.shared.preemptLocalRuns()
+                CompletionEngine.shared.cancelBackgroundTurn()
+                await CompletionEngine.shared.awaitIdle()
+                _ = self.startAutoregressiveGeneration(
+                    customPrompt: customPrompt,
+                    promptTokens: promptTokens,
+                    images: images,
+                    carriedImageSpans: carriedImageSpans,
+                    sessionId: sessionId,
+                    messageId: messageId,
+                    agentStep: agentStep,
+                    isInThinkingContinuation: isInThinkingContinuation,
+                    forceSynthesis: forceSynthesis,
+                    preemptionRetry: true
+                )
+            }
+            return true
+        }
+
         // Derive model/thinking from the session this generation belongs to, not
         // the current selection, so an async send that resumed after a selection
         // change still formats with the conversation's own model.
-        let generationSession = sessionId.flatMap { id in sessions.first(where: { $0.id == id }) }
-        // The turn's agent surface, resolved ONCE and carried by value for the
+        let generationSession = sessionId.flatMap { id in sessions.first(where: { $0.id == id }) }        // The turn's agent surface, resolved ONCE and carried by value for the
         // rest of the turn. `AgentHarness.activeMode` is process-global, so
         // reading it at each tool call meant a mode flip while the turn ran
         // could hand a plan turn a write tool. Every tool execution and every

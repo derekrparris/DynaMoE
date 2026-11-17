@@ -281,6 +281,11 @@ public final class CompletionEngine: @unchecked Sendable {
     /// interrupt path awaits the outgoing task, a replacement send would sit behind
     /// the whole chunk. Set by `cancelActiveTurn`, cleared when a turn is minted.
     private var activeTurnCancelled = false
+    /// Whether the active turn may be preempted. A subagent step is background:
+    /// an operator's send cancels it and the run reports what it lost, rather
+    /// than the send failing with "another caller is holding the generation
+    /// slot" and leaving the operator to retry.
+    private var activeTurnPriority: TurnPriority = .interactive
 
     /// Ownership of the single-flight slot while a turn is being PREPARED, i.e.
     /// after a caller has been told the slot is free and before `launchTurn` mints
@@ -830,6 +835,7 @@ public final class CompletionEngine: @unchecked Sendable {
                 let myGenerationId = generationCounter
                 currentGenerationId = myGenerationId
                 activeTurnCancelled = false
+                activeTurnPriority = request.turnPriority
                 stateLock.unlock()
 
                 // The pin proposes how much of this prompt a previous turn may have
@@ -2496,6 +2502,7 @@ public final class CompletionEngine: @unchecked Sendable {
         let myGenerationId = generationCounter
         currentGenerationId = myGenerationId
         activeTurnCancelled = false
+        activeTurnPriority = request.turnPriority
         stateLock.unlock()
 
         let prep = TurnPrepInfo(
@@ -11594,6 +11601,30 @@ if layer.attnGateProjTensor != nil,
         stateLock.unlock()
     }
 
+    /// True while the turn holding the engine is one an operator's send may
+    /// preempt, i.e. a subagent step.
+    public var hasActiveBackgroundTurn: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return currentGenerationTask != nil && activeTurnPriority == .background
+    }
+
+    /// Cancels the active turn only when it is background.
+    ///
+    /// Returns false when the turn belongs to chat, the API server or a model
+    /// load, so an interactive retry can never stop a turn that outranks it.
+    /// Cancellation is cooperative, so the caller must follow this with
+    /// `awaitIdle()` before launching its own turn.
+    @discardableResult
+    public func cancelBackgroundTurn() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard currentGenerationTask != nil, activeTurnPriority == .background else { return false }
+        currentGenerationTask?.cancel()
+        activeTurnCancelled = true
+        return true
+    }
+
     /// Suspends until no turn is active (model switch/load safety).
     ///
     /// "Active" is `isActive`, not just the registered task. A turn is UNREGISTERED
@@ -11633,6 +11664,7 @@ if layer.attnGateProjTensor != nil,
         defer { stateLock.unlock() }
         if currentGenerationId == id {
             currentGenerationTask = nil
+            activeTurnPriority = .interactive
         }
     }
 

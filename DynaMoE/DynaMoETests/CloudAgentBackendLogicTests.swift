@@ -438,6 +438,97 @@ final class CloudAgentBackendLogicTests: XCTestCase {
         throw XCTSkip("every configured cloud model refused this turn: \(refusals.suffix(2).joined(separator: " | "))")
     }
 
+    /// One real CLOUD subagent RUN through `SubagentManager`.
+    ///
+    /// The turn test above pins the wire; this pins the manager, the loop, the
+    /// run-scoped harness and the cloud scheduler class around it. Kept on its
+    /// own marker so the turn test can be used without spending a run.
+    func testARealCloudSubagentRunAnswersThroughTheManager() async throws {
+        try XCTSkipUnless(
+            FileManager.default.fileExists(atPath: "/tmp/dynamoe_subagent_cloud_run"),
+            "opt-in: touch /tmp/dynamoe_subagent_cloud_run"
+        )
+        var candidates: [String] = []
+        if let preferred = SubagentBackendSettings.preferredCloudModel(coordinateModelId: nil) {
+            candidates.append(preferred)
+        }
+        for model in CloudModelRegistry.makeDiscoveredModels() where !model.id.lowercased().contains("infinite") {
+            if !candidates.contains(model.id) { candidates.append(model.id) }
+        }
+        guard !candidates.isEmpty else {
+            throw XCTSkip("no configured cloud model with tool support")
+        }
+
+        let workingDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SubagentCloudRun_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: workingDirectory, withIntermediateDirectories: true)
+        defer {
+            SubagentManager.shared.cancelAll()
+            try? FileManager.default.removeItem(at: workingDirectory)
+        }
+
+        var refusals: [String] = []
+        for address in candidates {
+            let backend: CloudAgentBackend
+            switch CloudAgentBackend.make(address: address) {
+            case .success(let made): backend = made
+            case .failure: continue
+            }
+            let providerId = backend.descriptor.providerId ?? "cloud"
+            let runId = UUID()
+            let plan = AgentSpawnPlan(
+                role: "Codebase Researcher",
+                taskDescription: "In one short sentence, what is the capital of France?",
+                contextSummary: nil,
+                preset: .explore,
+                backendDescriptor: backend.descriptor,
+                schedulingClass: .cloud(providerId: providerId),
+                backend: backend,
+                // No tools on purpose: this case prices the manager/loop/wire
+                // seam, and a tool-less turn is the shortest one a provider
+                // answers with text.
+                toolNames: [],
+                budget: AgentBudget(
+                    maxSteps: 2,
+                    maxCompletionTokens: 400,
+                    maxWallClockSeconds: 60,
+                    maxCostUSD: nil
+                ),
+                approvalPolicy: .auto,
+                isolation: .none,
+                thinking: false,
+                sampling: AgentSampling(temperature: 0, topP: 1, maxTokens: 96),
+                priority: .userRequested,
+                parentSessionId: nil,
+                parentTurnId: nil,
+                workingDirectory: workingDirectory
+            )
+            let subagent = SubagentManager.shared.spawnModelBacked(plan, id: runId)
+            let summary = await subagent.waitForCompletion()
+            if subagent.status == .completed {
+                XCTAssertTrue(summary.lowercased().contains("paris"), "summary: \(summary)")
+                XCTAssertEqual(subagent.report?.backend, backend.descriptor)
+                print(
+                    "🔎 [subagent real] cloud run on \(backend.descriptor.displayName): "
+                        + "\(subagent.usage.promptTokens) prompt / \(subagent.usage.completionTokens) generated, "
+                        + "cost \(String(format: "%.6f", subagent.usage.costUSD)) USD, "
+                        + "summary: \(summary.prefix(160))"
+                )
+                return
+            }
+            // `runTurn` wraps every provider failure as a transport error, so the
+            // HTTP status only survives in the message. A 4xx is the provider
+            // declining this model; anything else is a real failure.
+            if summary.contains("HTTP 4") {
+                refusals.append("\(backend.descriptor.displayName): \(summary)")
+                continue
+            }
+            XCTFail("cloud run failed: \(summary)")
+            return
+        }
+        throw XCTSkip("every configured cloud model refused this run: \(refusals.suffix(2).joined(separator: " | "))")
+    }
+
     func testTheDescriptorCarriesTheModelIdentityAndKind() {
         let (backend, _) = Self.backend { _, continuation in
             continuation.finish()

@@ -1,0 +1,259 @@
+//
+//  AgentSpawn.swift
+//  DynaMoE
+//
+//  What a `spawn_subagent` call turns into: a preset, a backend, a tool set and
+//  a budget. See SUBAGENTS.md §7, §8 and §9.
+//
+
+import Foundation
+
+nonisolated enum AgentBackendPreference: String, Sendable, CaseIterable {
+    case auto
+    case local
+    case cloud
+}
+
+nonisolated enum AgentSpawnError: LocalizedError, Equatable {
+    case emptyTask
+    case unsupportedIsolation(String)
+    case noBackend(String)
+    case forbiddenTool(String)
+    case unknownTool(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .emptyTask:
+            return "A subagent needs a task to work on."
+        case .unsupportedIsolation(let detail):
+            return "Isolated subagent workspaces are not available yet: \(detail) The run was not started. Use isolation \"none\" and approve each change."
+        case .noBackend(let message):
+            return message
+        case .forbiddenTool(let name):
+            return "Tool '\(name)' may never be given to a subagent run."
+        case .unknownTool(let name):
+            return "Tool '\(name)' is not installed, so it cannot be given to a subagent run."
+        }
+    }
+}
+
+/// Everything one spawn needs. The tool fills this from its arguments; the
+/// manager resolves it into a run.
+nonisolated struct AgentSpawnRequest: Sendable {
+    var role: String
+    var taskDescription: String
+    var contextSummary: String?
+    var presetName: String?
+    var backendPreference: AgentBackendPreference
+    var explicitToolNames: [String]?
+    var budgetOverrides: AgentBudgetOverrides?
+    var isolation: AgentIsolation
+    var workingDirectory: URL
+    var parentSessionId: UUID?
+    var parentTurnId: UUID?
+    var parentMode: AgentMode
+    var thinking: Bool
+    var operatorOverride: Bool
+    var priority: AgentSchedulingPriority
+    var sampling: AgentSampling
+
+    init(
+        role: String,
+        taskDescription: String,
+        contextSummary: String? = nil,
+        presetName: String? = nil,
+        backendPreference: AgentBackendPreference = .auto,
+        explicitToolNames: [String]? = nil,
+        budgetOverrides: AgentBudgetOverrides? = nil,
+        isolation: AgentIsolation = .none,
+        workingDirectory: URL,
+        parentSessionId: UUID? = nil,
+        parentTurnId: UUID? = nil,
+        parentMode: AgentMode = .code,
+        thinking: Bool = false,
+        operatorOverride: Bool = false,
+        priority: AgentSchedulingPriority = .userRequested,
+        sampling: AgentSampling = .default
+    ) {
+        self.role = role
+        self.taskDescription = taskDescription
+        self.contextSummary = contextSummary
+        self.presetName = presetName
+        self.backendPreference = backendPreference
+        self.explicitToolNames = explicitToolNames
+        self.budgetOverrides = budgetOverrides
+        self.isolation = isolation
+        self.workingDirectory = workingDirectory
+        self.parentSessionId = parentSessionId
+        self.parentTurnId = parentTurnId
+        self.parentMode = parentMode
+        self.thinking = thinking
+        self.operatorOverride = operatorOverride
+        self.priority = priority
+        self.sampling = sampling
+    }
+}
+
+/// A resolved spawn: the run's identity, scope and model boundary.
+nonisolated struct AgentSpawnPlan: @unchecked Sendable {
+    var role: String
+    var taskDescription: String
+    var contextSummary: String?
+    var preset: AgentRolePreset
+    var backendDescriptor: AgentBackendDescriptor
+    var schedulingClass: AgentSchedulingClass
+    var backend: any AgentModelBackend
+    var toolNames: [String]
+    var budget: AgentBudget
+    var approvalPolicy: AgentApprovalPolicy
+    var isolation: AgentIsolation
+    var thinking: Bool
+    var sampling: AgentSampling
+    var priority: AgentSchedulingPriority
+    var parentSessionId: UUID?
+    var parentTurnId: UUID?
+    var workingDirectory: URL
+}
+
+/// Turns a request into a plan, or refuses by name.
+///
+/// Backend selection is the only part that reads app state: a local run needs a
+/// loaded checkpoint and its cost admitted, a cloud run needs a configured
+/// provider and a stored key. Everything else is pure, so a spawn card can price
+/// a run before it starts.
+@MainActor
+enum AgentSpawnResolver {
+    static func resolve(
+        _ request: AgentSpawnRequest,
+        runId: UUID,
+        sessionId: UUID,
+        defaults: UserDefaults = .standard
+    ) throws -> AgentSpawnPlan {
+        let task = request.taskDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !task.isEmpty else { throw AgentSpawnError.emptyTask }
+        if case .worktree = request.isolation {
+            throw AgentSpawnError.unsupportedIsolation("worktree isolation ships with the writers phase.")
+        }
+
+        let preset = AgentRolePresetCatalog.preset(named: request.presetName, role: request.role)
+        let definition = AgentRolePresetCatalog.definition(for: preset)
+        let toolNames = try resolveTools(request, definition: definition)
+        let budget = AgentRolePresetCatalog.budget(for: definition, overrides: request.budgetOverrides)
+        let approvalPolicy = AgentRolePresetCatalog.approvalPolicy(preset: definition, mode: request.parentMode)
+
+        let (backend, schedulingClass, descriptor) = try resolveBackend(
+            request,
+            task: task,
+            runId: runId,
+            sessionId: sessionId,
+            defaults: defaults
+        )
+
+        return AgentSpawnPlan(
+            role: request.role,
+            taskDescription: task,
+            contextSummary: request.contextSummary,
+            preset: preset,
+            backendDescriptor: descriptor,
+            schedulingClass: schedulingClass,
+            backend: backend,
+            toolNames: toolNames,
+            budget: budget,
+            approvalPolicy: approvalPolicy,
+            isolation: request.isolation,
+            thinking: request.thinking,
+            sampling: request.sampling,
+            priority: request.priority,
+            parentSessionId: request.parentSessionId,
+            parentTurnId: request.parentTurnId,
+            workingDirectory: request.workingDirectory
+        )
+    }
+
+    static func resolveTools(
+        _ request: AgentSpawnRequest,
+        definition: AgentPresetDefinition
+    ) throws -> [String] {
+        let catalog = AgentHarness.shared.tools
+        let requested = request.explicitToolNames?.isEmpty == false
+            ? request.explicitToolNames!
+            : definition.toolNames
+        var seen = Set<String>()
+        var resolved: [String] = []
+        for raw in requested {
+            let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty else { continue }
+            if AgentHarness.runScopedForbiddenToolNames.contains(name) {
+                throw AgentSpawnError.forbiddenTool(name)
+            }
+            guard catalog[name] != nil else {
+                throw AgentSpawnError.unknownTool(name)
+            }
+            // Plan mode's promise covers the work it delegates: advertise only
+            // what the run's execution path would actually allow.
+            if PlanModePolicy.withholds(name, in: request.parentMode) { continue }
+            if seen.insert(name).inserted {
+                resolved.append(name)
+            }
+        }
+        guard !resolved.isEmpty else {
+            throw AgentSpawnError.noBackend("Every tool this run asked for is withheld in the current mode, so there is nothing it could do.")
+        }
+        return resolved.sorted()
+    }
+
+    static func resolveBackend(
+        _ request: AgentSpawnRequest,
+        task: String,
+        runId: UUID,
+        sessionId: UUID,
+        defaults: UserDefaults
+    ) throws -> (any AgentModelBackend, AgentSchedulingClass, AgentBackendDescriptor) {
+        let engine = CompletionEngine.shared
+        let hasLocalModel = engine.loadedModelInfo != nil && engine.promptModelConfig != nil
+        let cloudAddress = SubagentBackendSettings.preferredCloudModel(coordinateModelId: nil, defaults: defaults)
+
+        func makeLocal() throws -> (any AgentModelBackend, AgentSchedulingClass, AgentBackendDescriptor) {
+            let estimate = max(1, (task.count + (request.contextSummary?.count ?? 0)) / 4 + 600)
+            let backend = try LocalAgentBackend.make(
+                runId: runId,
+                sessionId: sessionId,
+                thinking: request.thinking,
+                promptTokenEstimate: estimate,
+                operatorOverride: request.operatorOverride,
+                defaults: defaults
+            )
+            return (backend, .local, backend.descriptor)
+        }
+
+        func makeCloud() throws -> (any AgentModelBackend, AgentSchedulingClass, AgentBackendDescriptor) {
+            guard let cloudAddress else {
+                throw AgentSpawnError.noBackend(
+                    "No cloud model is configured for subagents. Add a provider and a model in Settings, or load a local checkpoint."
+                )
+            }
+            switch CloudAgentBackend.make(address: cloudAddress) {
+            case .success(let backend):
+                let providerId = backend.descriptor.providerId ?? "cloud"
+                return (backend, .cloud(providerId: providerId), backend.descriptor)
+            case .failure(let failure):
+                throw failure
+            }
+        }
+
+        switch request.backendPreference {
+        case .local:
+            guard hasLocalModel else {
+                throw AgentSpawnError.noBackend("This spawn asked for the local model, but no checkpoint is loaded.")
+            }
+            return try makeLocal()
+        case .cloud:
+            return try makeCloud()
+        case .auto:
+            if hasLocalModel {
+                return try makeLocal()
+            }
+            return try makeCloud()
+        }
+    }
+}

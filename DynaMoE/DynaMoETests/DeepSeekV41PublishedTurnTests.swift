@@ -5265,6 +5265,68 @@ final class DeepSeekV41PublishedTurnTests: XCTestCase {
         )
     }
 
+    /// One real LOCAL subagent RUN, through `SubagentManager` and the loop.
+    ///
+    /// `testALocalSubagentTurnRunsOnThePublishedCheckpoint` pins the backend;
+    /// this pins the wiring above it: the spawn resolver's local admission, the
+    /// run-scoped harness and its worker prompt, the scheduler's local class,
+    /// the loop's report, and the drawer-facing instance that receives it. A
+    /// mistake there (an empty tool set the resolver refuses, a scheduler
+    /// ticket never released, a report the manager drops) cannot be seen by any
+    /// pure-logic case.
+    ///
+    /// Opt-in through the class's own gate (`/tmp/dynamoe_dsv41_real_turn`).
+    @MainActor
+    func testARealLocalSubagentRunAnswersThroughTheManager() async throws {
+        let snapshot = try snapshotDirectory()
+        let engine = try loadPublishedCheckpointIntoTheSharedEngine(snapshot)
+        let workingDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("SubagentRealRun_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: workingDirectory, withIntermediateDirectories: true)
+        defer {
+            SubagentManager.shared.cancelAll()
+            unloadSharedEngine()
+            try? FileManager.default.removeItem(at: workingDirectory)
+            withExtendedLifetime(engine) {}
+        }
+
+        let runId = UUID()
+        let request = AgentSpawnRequest(
+            role: "Codebase Researcher",
+            taskDescription: "In one short sentence, what is the capital of France?",
+            presetName: "explore",
+            backendPreference: .local,
+            explicitToolNames: ["file_read"],
+            workingDirectory: workingDirectory,
+            parentMode: .code,
+            thinking: false,
+            operatorOverride: true,
+            sampling: AgentSampling(temperature: 0, topP: 1, maxTokens: 48)
+        )
+        let plan = try AgentSpawnResolver.resolve(request, runId: runId, sessionId: runId)
+        XCTAssertEqual(plan.backendDescriptor.kind, .local)
+        XCTAssertEqual(plan.schedulingClass, .local)
+        XCTAssertEqual(plan.approvalPolicy, .auto, "the explore preset is read-only")
+
+        let subagent = SubagentManager.shared.spawnModelBacked(plan, id: runId)
+        let summary = await subagent.waitForCompletion()
+
+        XCTAssertEqual(subagent.status, .completed, "summary: \(summary)")
+        XCTAssertTrue(
+            summary.lowercased().contains("paris"),
+            "a real local run must answer the task it was given: \(summary)"
+        )
+        XCTAssertTrue(summary.contains("Backend: \(plan.backendDescriptor.displayName)"))
+        XCTAssertEqual(subagent.report?.backend, plan.backendDescriptor)
+        XCTAssertGreaterThan(subagent.usage.completionTokens, 0)
+        XCTAssertGreaterThanOrEqual(subagent.usage.backendRequests, 1)
+        print(
+            "🔎 [dsv41 real] local subagent run: \(subagent.usage.steps) step(s), "
+                + "\(subagent.usage.promptTokens) prompt / \(subagent.usage.completionTokens) generated, "
+                + "summary: \(summary.prefix(200))"
+        )
+    }
+
     /// Deltas arrive on the run's own task, so the collector is locked rather
     /// than main-actor state.
     private final class DeltaCollector: @unchecked Sendable {

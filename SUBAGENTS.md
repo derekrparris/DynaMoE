@@ -4,9 +4,13 @@ Design and working document for the model-backed subagent system. This file is
 the reference for a multi-session build: read it first, check the phase
 checklist, then continue at the first unchecked item.
 
-Status: **Phase 1 complete (both backends, the local cost refusal and the
-opt-in real turns); Phase 2 is next.** Only the cloud provider/model default
-(§16) is still an open product question.
+Status: **Phases 0–2 complete.** Phase 1 landed both backends; Phase 2 landed
+`AgentScheduler` (capacity, priority, cancellation tree, queue timeouts), the
+real run path inside `SubagentManager`, the spawn approval gate, the extended
+`spawn_subagent` schema and a run-level opt-in test on each backend. Phase 3
+(persistence + inspector) is next. Still open: the cloud provider/model default
+and when a model-backed spawn becomes the default rather than a Settings opt-in
+(§16).
 
 ---
 
@@ -433,25 +437,48 @@ from a child is refused by name.
 
 ## 8. Scheduling, leases and budgets
 
-`AgentScheduler` is an actor.
+`AgentScheduler` is an actor (`Subagents/AgentScheduler.swift`).
 
-- **Local capacity: 1.** A local run acquires the engine lease before its first
-  turn and holds it until the run ends. Interactive coordinator turns have
-  priority: a queued coordinator turn that needs the engine cancels or pauses
-  the local run at its next step boundary (the run is resumable).
-- **Cloud capacity: N** (default 3 per provider, global fan-out 6).
-- **Apple FM: 1.**
+- **Local capacity: 1.** The scheduler admits one local run at a time. The
+  engine itself is claimed **per step**, through the existing `TurnSlotClaim` /
+  `TurnSlotLedger` the server queue and the chat send path share; a local turn
+  is launched with `TurnPriority.background` so it can yield.
+- **Interactive priority is cancel-and-report, not pause/resume.** An operator's
+  send that finds a background turn active cancels it (`cancelBackgroundTurn`),
+  waits for the engine to drain (`awaitIdle`) and runs the send once
+  (`preemptionRetry` in `startAutoregressiveGeneration`). The subagent's run is
+  cancelled at its next boundary and reports why; it is not resumed. SubQ chose
+  this over `pause_and_resume` (0.81 vs 0.10) because resumability needs a
+  paused status, a serializable loop state and store work that belongs with
+  Phase 3.
+- **Cloud capacity: N** (default 3 per provider, global fan-out 6, both
+  overridable through `dynamoe_subagent_cloud_per_provider` /
+  `dynamoe_subagent_cloud_global`).
+- **Apple FM: 1** (reserved; the backend ships in Phase 4).
 - **Queue:** FIFO within a priority class (interactive > user-requested >
-  speculative). A queued run can be cancelled while waiting.
-- **Cancellation tree:** stopping the coordinator turn cancels every descendant
-  run. Application termination cancels all runs and closes cloud streams.
+  speculative), and priority ordering is per CLASS, so one class's head cannot
+  starve a class that still has capacity. A queued run can be cancelled while
+  waiting, and the wait is bounded by `dynamoe_subagent_queue_timeout`
+  (default 120 s); a timeout is a refusal that names the class.
+- **Cancellation tree:** `register(runId:parentRunId:parentSessionId:cancel:)`
+  records how to stop a run. `cancel(runId:)` walks descendants,
+  `cancelRuns(parentSessionId:)` is what the Stop button and
+  `SubagentManager.cancelSession` call, and application termination cancels
+  every run and every pending approval.
 - **Budgets** are enforced by the loop, not the scheduler; the scheduler enforces
   concurrency and queue timeouts.
 
-Engine lease implementation: generalize the existing `TurnSlotClaim` /
-`TurnSlotLedger` rather than add a second mechanism. The server queue, the
-coordinator send path and the local backend all acquire the same claim. A local
-run holds a claim for its lifetime; `launchTurn` receives it per step.
+Engine lease: the doc's original "hold a claim for the run's lifetime" was
+implemented as **per-step claims** instead (SubQ: 0.012 for the lifetime lease).
+A run's step is a turn, and `launchTurn` releases the claim it is handed as soon
+as it mints the generation task, so a lifetime claim would mean generalizing the
+ledger that the server queue and the chat send path already depend on — and
+holding the only slot across a multi-minute run would block every chat turn. The
+safety property invariant 1 needs (a local run never launches a turn without
+holding the claim) holds unchanged. The cost is stated in `LocalAgentBackend`:
+a coordinator turn between two steps moves the global prefix pin and the run's
+next step re-prefills. Measuring that cost is a Phase 3 item; the scheduler is
+where a lifetime lease would land if it proves worth the mechanism.
 
 ---
 
@@ -597,7 +624,10 @@ Implemented in Phase 1, with the reasoning recorded:
   on. Claiming per step was the chosen risk profile (~0.91); the cost is stated
   in the code rather than hidden: a coordinator turn landing between two steps
   takes the engine, moves the global prefix pin to its own session, and the
-  run's next step re-prefills. `AgentScheduler` (§8) owns the lifetime lease.
+  run's next step re-prefills. Phase 2 kept this shape on purpose (§8): the
+  lifetime lease measured 0.012 with SubQ, and holding the only slot across a
+  run would block every chat turn. `AgentScheduler` (§8) owns admission,
+  priority and cancellation, not a run-lifetime claim.
 - **The cost refusal lives in `LocalAgentBackend`.** `make` prices the spawn and
   calls `admission(hasLoadedModel:estimate:operatorOverride:)`, so no caller can
   start a local run without consulting it; `operatorOverride` is the spawn
@@ -624,15 +654,63 @@ Implemented in Phase 1, with the reasoning recorded:
 
 ### Phase 2 — Manager, scheduling, approval
 
-- [ ] `AgentScheduler` with local/cloud capacity and cancellation tree
-- [ ] `SubagentManager` rewritten to spawn `AgentRun`s
-- [ ] Spawn approval card + per-call policy in `executeTool`
-- [ ] `spawn_subagent` schema: backend, preset, budget, isolation
-- [ ] Stop propagation; relay on a finished background run
+- [x] `AgentScheduler` with local/cloud capacity and cancellation tree
+- [x] `SubagentManager` rewritten to spawn `AgentRun`s
+- [x] Spawn approval card + per-call policy in `executeTool`
+- [x] `spawn_subagent` schema: backend, preset, budget, isolation
+- [x] Stop propagation; relay on a finished background run
 
 **Exit criteria:** the coordinator can delegate a real task on either backend
 and receives a report; a stopped turn cancels its children; no write reaches the
 main tree without approval.
+
+**Measured at the exit check:** the local run answered through the manager on
+the published checkpoint in 116.7 s total (`1 step(s), 906 prompt / 7
+generated`, "The capital of France is Paris."), and the cloud run answered
+through the manager on a discovered tool-capable model. `AgentSchedulerTests`
+(9) pins local capacity 1, per-class priority, per-provider and global cloud
+caps, the cancellation tree, session-scoped stop and both queue outcomes;
+`AgentRunIntegrationTests` (4) drives a real manager run with a scripted
+backend; `AgentSpawnPolicyTests` (14) pins the preset table, plan-mode filtering,
+the write-spawn approval rule and the tool schema. 153 related tests green
+(2 opt-in cloud cases skipped), zero failures.
+
+**Implemented in Phase 2, with the reasoning recorded:**
+
+- **`SubagentManager` grew a second execution path instead of a second
+  manager.** `SubagentInstance` now carries an `AgentSpawnPlan` and runs the
+  headless loop when it has one; the canned archetype pipelines stay for the
+  legacy path and for the tests that pin them (SubQ: extend the instance 0.94,
+  new manager 0.06). Both paths share the same published status, transcript,
+  messages, `waitForCompletion` and drawer, so the UI needed only an approval
+  section.
+- **Event application is serialized through one `AsyncStream`.** A Task per
+  event applied a late `.running` after the terminal bookkeeping, so a finished
+  run could read as running; the pump is drained before `finishRun`. Cancelling
+  now writes status and summary synchronously for the same reason.
+- **A model-backed spawn is opt-in until the Settings default flips.** The tool
+  reads `dynamoe_subagent_backend`; with none stored it keeps the legacy
+  pipelines. Sending work to a model (and, for cloud, off-device) is the
+  operator's choice, not something an omitted argument should make; tests that
+  pin the legacy pipelines also never touch a network or a checkpoint.
+- **Spawn approval reuses the existing card.** `requiresApproval` treats a
+  `spawn_subagent` that can write (its explicit tools, else its preset) as
+  state-changing, so the operator approves the delegation once with the role and
+  tool set in front of them; read-only spawns and plan-mode spawns need no card,
+  and Turbo still bypasses routine writes.
+- **Per-call approval in a run lives in the Task Manager.** A run's card cannot
+  ride the coordinator's tool timeline (the spawning step may already be over),
+  so `SubagentApprovalCenter` renders it in the drawer from the same
+  `ActionApprovalManager` continuations. Plan mode is `.deny`; a write-capable
+  run on the main tree is `.everyStateChange`; read-only is `.auto`.
+- **Cloud capacity is per provider AND global, and priority is per class.** A
+  global head-of-queue check let one provider's waiter starve another provider
+  that still had quota; the fix is in `isHeadWaiter` and is pinned by
+  `testCloudCapacityIsPerProvider`.
+- **`spawn_subagent` refuses what it cannot honour.** `worktree` isolation is
+  refused by name (Phase 4 ships it), forbidden and unknown tool names are
+  refused before any backend is resolved, and an empty tool set after plan-mode
+  filtering is refused rather than starting a run with nothing to do.
 
 ### Phase 3 — Persistence and UI
 
@@ -689,6 +767,7 @@ Append one line per session so the next session knows where work stopped.
 
 | Date | Session | Result |
 |---|---|---|
+| 2026-11-17 | phase 2 manager | `AgentScheduler` (capacity 1 local, 3/provider + 6 global cloud, per-class priority, cancellation tree, queue timeout), `AgentRolePresets`, `AgentSpawn` resolver, `SubagentApprovalCenter`, the model-backed path in `SubagentManager`/`SubagentInstance`, the extended `spawn_subagent` schema with a write-spawn approval gate, engine `TurnPriority` + chat preemption retry, Stop propagating to children and termination cancelling everything. New tests: `AgentSchedulerTests` 9, `AgentSpawnPolicyTests` 14, `AgentRunIntegrationTests` 4. Related suites 153 green, 0 failures (2 opt-in cloud skipped). Opt-in manager runs passed on both backends (local DSV4.1 906 prompt / 7 generated in 116.7 s; cloud Syn Large Text 668 prompt / 67 generated, 1.27 s), each answering the task it was given. Next: Phase 3 (`AgentRunStore`, inspector). |
 | 2026-11-17 | design | Architecture approved; decisions recorded; doc created; Phase 0 started |
 | 2026-11-17 | phase 1 exit check | Both opt-in real turns ran and passed (local DSV4.1: 28 prompt / 7 generated, eos, 17.2 s; cloud Syn Large Text: 50 / 24, 0.76 s), so Phase 1's exit criteria are met. The cloud case walks the spawn's candidates and treats a provider's HTTP 4xx as "this model cannot serve the run" rather than a defect. Markers removed afterwards. |
 | 2026-11-17 | phase 1 backends | `CloudAgentBackendLogicTests` (18, one opt-in) and `LocalAgentBackendLogicTests` (22) landed; `LocalAgentBackend` added (per-step engine claim, family rendering through `formatConversation`, shared tool mask, result/usage mapping); `LocalSubagentCostEstimate` + `PrefillThroughput` added and wired into `LocalAgentBackend.make` and the engine's prefill meter; `AgentRunContext.workerSystemPrompt` gained the family flags. 70 tests green (new suites + `SubagentLoopTests`, `TurnToolMaskTests`, `AgentStepBudgetTests`), `ServerControllerSmokeTests` 30 green in isolation. Next: one opt-in real turn per backend, then Phase 2. |
@@ -698,15 +777,26 @@ Append one line per session so the next session knows where work stopped.
 
 ## 16. Open questions
 
-- Cloud provider defaults: which profile/model should a subagent use when the
-  user has several? (Proposed: a dedicated "Subagent model" setting, defaulting
-  to the cheapest configured profile that reports tool support.)
+- Cloud provider defaults: `SubagentBackendSettings.preferredCloudModel` now
+  resolves the stored subagent model, else the coordinator's model when it
+  supports tools, else the first discovered tool-capable model. Still product
+  work for Phase 3: the dedicated "Subagent model" picker and whether the
+  cheapest tool-capable profile should be the default.
+- Model-backed default: `spawn_subagent` keeps the legacy pipelines unless
+  `dynamoe_subagent_backend` says `local` or `cloud` (or the call names a
+  backend). Decide in Phase 3, with the Settings default, whether a loaded
+  checkpoint makes local the default.
 - Worktree location: inside Application Support avoids polluting the repo, but
   some tools assume the repo root. Validate with the existing `find_files` and
-  `codebase_search` tools.
-- Local prefix preservation: a run holds the engine for its lifetime. Is that
-  acceptable for long runs, or should a run yield after N steps and accept a
-  re-prefill? (Proposed: hold, with a yield on interactive priority.)
+  `codebase_search` tools. Phase 2 refuses `worktree` isolation by name until
+  this ships (Phase 4).
+- Local prefix preservation: measured as a per-step claim, not a lifetime lease
+  (§8). What is still unmeasured is how often a coordinator turn lands between a
+  run's steps and forces a re-prefill. Instrument that before proposing a
+  lifetime lease again.
+- Interactive preemption loses the in-flight step: the run is cancelled with a
+  reason rather than paused. Phase 3's `AgentRunStore` is what makes a resumable
+  pause (paused status, serialized messages, step index) affordable.
 - AFM tool loop: the FoundationModels framework exposes a `Tool` protocol; a
   bridge is possible but unproven. Keep it optional.
 - Do subagent turns appear in `ServerRequestLog`? (Proposed: no, a dedicated
