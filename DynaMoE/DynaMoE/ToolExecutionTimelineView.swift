@@ -128,11 +128,21 @@ struct StepNodeBadge: View {
             Text("\(stepIndex). \(call.name)")
                 .font(.system(size: 10.5, weight: .semibold, design: .monospaced))
                 .foregroundColor(.primary)
+                // Names like `mcp__<server>__<tool>` are long, and up to
+                // `badgeLimit` of them share one line of a transcript row that
+                // must not grow: without a line limit the strip wraps and makes
+                // the row taller at narrow widths. Middle truncation keeps both
+                // ends readable, which is the half that identifies the tool.
+                .lineLimit(1)
+                .truncationMode(.middle)
 
             if let dur = call.executionDurationSeconds {
                 Text(String(format: "%.2fs", dur))
                     .font(.system(size: 9.5, design: .monospaced))
                     .foregroundColor(.secondary)
+                    // The shortest text in the badge: a truncated name must not
+                    // push the duration out.
+                    .layoutPriority(1)
             }
         }
         .padding(.horizontal, 8)

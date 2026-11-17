@@ -141,10 +141,13 @@ struct ChatDetailView: View {
     /// The search runs `lastIndex(where:)` over every message and executes
     /// `PlanMarkers.anyMarkerMentioned` + `readyPresent` on each assistant
     /// message's FULL content. At 50–60k tokens that is tens of kilobytes of
-    /// marker scanning per message, on every frame of a streaming turn. The key
-    /// is the tuple that can change the answer: message count, the last
-    /// message's identity and length (the only message that grows mid-turn),
-    /// and the dismissed plan.
+    /// marker scanning per assistant message. A streaming turn does not pay it:
+    /// `readyPlanMessage` is gated on `!isGenerating`, so the search never runs
+    /// mid-stream. What re-runs it is every other body pass of an idle plan
+    /// conversation (typing in the composer, a resize, a status notice), and
+    /// the memo answers each of those without the scan. The key is the tuple
+    /// that can change the answer: message count, the last message's identity
+    /// and length (the only message that can grow), and the dismissed plan.
     final class ReadyPlanMemo {
         private var key: Key?
         private var cached: ChatMessage?
@@ -338,7 +341,6 @@ struct ChatDetailView: View {
     private func transcriptRows(for session: ChatSession) -> [TranscriptEntry] {
         var rows: [TranscriptEntry] = []
         rows.reserveCapacity(session.messages.count)
-        let streamingId = isGenerating ? session.messages.last?.id : nil
 
         for message in session.messages {
             if message.isCompactionSummary == true {
@@ -370,7 +372,7 @@ struct ChatDetailView: View {
             let presentation = presentationCache.presentation(
                 for: message,
                 isGemmaDialect: isGemmaDialect,
-                isStreaming: message.id == streamingId
+                isStreaming: isStreamingMessage(message, in: session)
             )
             if presentation.isPlanCard {
                 rows.append(TranscriptEntry(
@@ -392,6 +394,22 @@ struct ChatDetailView: View {
             ).map { TranscriptEntry(row: $0, message: message) })
         }
         return rows
+    }
+
+    /// True for the one message whose text is still arriving: the transcript's
+    /// last message during a turn, or the `/compact` pass's progress bubble.
+    ///
+    /// The parse the presentation cache holds differs by this flag, so every
+    /// caller has to ask the same question. Two answers for one message would
+    /// make the cache re-parse it with the repair passes and then without on
+    /// every body pass, which is the cost the cache exists to avoid, on the main
+    /// actor, while the text grows.
+    private func isStreamingMessage(_ message: ChatMessage, in session: ChatSession) -> Bool {
+        if isGenerating, message.id == session.messages.last?.id { return true }
+        // A compaction pass streams into its progress bubble without ever
+        // setting `isGenerating`, so keying on the turn alone left that bubble
+        // re-parsing with repairs enabled on every chunk.
+        return isCompactingConversation && message.id == compactionProgressMessageId
     }
 
     /// One transcript row. Split out of the `ForEach` so the body stays
@@ -427,7 +445,7 @@ struct ChatDetailView: View {
                     displayContent: presentationCache.presentation(
                         for: message,
                         isGemmaDialect: isGemmaDialect,
-                        isStreaming: isGenerating && message.id == session.messages.last?.id
+                        isStreaming: isStreamingMessage(message, in: session)
                     ).displayContent,
                     zoomScale: zoomManager.zoomScale,
                     isGenerating: isGenerating && message.id == session.messages.last?.id,
@@ -1068,10 +1086,10 @@ struct ChatDetailView: View {
                 // `.animating`, never `.interacting`.
                 .onScrollPhaseChange { _, newPhase in
                     // The scroll view is the only authority on who is driving.
-                    // `.tracking` is a gesture that has not moved yet, and it is
-                    // still the reader.
-                    isReaderScrolling = (newPhase == .tracking || newPhase == .interacting)
-                    if newPhase == .tracking || newPhase == .interacting {
+                    isReaderScrolling = TranscriptFollowPolicy.isReaderDriven(newPhase)
+                    if isReaderScrolling {
+                        // A gesture, or the momentum of one, always wins over
+                        // the suppression window a follow opened.
                         endScrollSuppression()
                     }
                 }
@@ -3586,12 +3604,18 @@ struct ChatMessageView: View, Equatable {
     /// `ChatMessageView` is not `Equatable` by default because `message` is a
     /// large value and the transcript re-renders on every streamed chunk: every
     /// realized row re-ran its body per chunk, which is O(history) work per
-    /// frame. This fingerprint is what `==` compares, and it deliberately
-    /// includes EVERY field the body reads — a field omitted here freezes that
-    /// part of the row mid-stream, which is a far worse failure than the cost
-    /// it saves.
+    /// frame. This fingerprint is what `==` compares. It includes every field
+    /// the body READS, not the whole message: a field omitted here freezes that
+    /// part of the row mid-stream, which is a far worse failure than the cost it
+    /// saves, while a field the body never reads only makes the comparison
+    /// cheaper to leave out.
+    ///
+    /// Text is reduced to its UTF-8 length rather than `String.count`, which is
+    /// O(n) in characters: `utf8.count` is stored on a native string, and this
+    /// runs twice per realized row per frame (once per operand of `==`).
     struct RenderFingerprint: Equatable {
         var messageId: UUID
+        var role: MessageRole
         var contentLength: Int
         var thinkingLength: Int
         var isThinking: Bool
@@ -3602,7 +3626,10 @@ struct ChatMessageView: View, Equatable {
         var thinkingTimeSeconds: Double?
         var jetSpecTau: Double?
         var toolCallFingerprint: [ToolCallRecord]
-        var attachmentCount: Int
+        /// The records, not a count: the strip reads each attachment's own file
+        /// name, size and hash to load its thumbnail, so a replacement with the
+        /// same count still has to repaint.
+        var attachments: [ImageAttachmentRef]
         var isCompactionSummary: Bool
 
         var rowId: String
@@ -3623,8 +3650,9 @@ struct ChatMessageView: View, Equatable {
     private var renderFingerprint: RenderFingerprint {
         RenderFingerprint(
             messageId: message.id,
-            contentLength: message.content.count,
-            thinkingLength: message.thinkingContent?.count ?? 0,
+            role: message.role,
+            contentLength: message.content.utf8.count,
+            thinkingLength: message.thinkingContent?.utf8.count ?? 0,
             isThinking: message.isThinking,
             prefillStatus: message.prefillStatus,
             tokenCount: message.tokenCount,
@@ -3636,7 +3664,7 @@ struct ChatMessageView: View, Equatable {
             // change visibly while the turn runs, so comparing only the count
             // would freeze a card mid-execution.
             toolCallFingerprint: message.toolCalls ?? [],
-            attachmentCount: message.attachments?.count ?? 0,
+            attachments: message.attachments ?? [],
             isCompactionSummary: message.isCompactionSummary ?? false,
             rowId: row.id,
             segmentIndex: row.segmentIndex,
@@ -3922,7 +3950,14 @@ struct ChatMessageView: View, Equatable {
                     if !displayContent.isEmpty, !row.segment.isEmpty {
                         MarkdownMessageView(
                             content: displayContent,
-                            isStreaming: (isGenerating || isCompactingConversation) && message.isThinking == false,
+                            // Only the row this message ENDS on may draw the
+                            // streaming cursor: `isStreaming` marks that row's
+                            // last block, so passing it for every slice drew a
+                            // hare (and, for an oversized block, a pace
+                            // indicator) once per segment of a split answer.
+                            isStreaming: (isGenerating || isCompactingConversation)
+                                && message.isThinking == false
+                                && row.isLast,
                             isStreamingOffDisk: isStreamingOffDisk,
                             preparsedBlocks: row.segment.blocks
                         )
@@ -4078,18 +4113,6 @@ private let boundedInspectionTailAnchorID = "bounded-inspection-tail-anchor"
 /// region, about one line. The transcript throttles its own follow the same way.
 private let boundedInspectionFollowBucketCharacters = 120
 
-/// The geometry an inspection region's pin decision needs, reduced to values
-/// that compare cheaply so the scroll callback runs only on a real change.
-private struct InspectionScrollSnapshot: Equatable {
-    var offset: CGFloat
-    var contentHeight: CGFloat
-    var containerHeight: CGFloat
-
-    var distanceFromBottom: CGFloat {
-        contentHeight - (offset + containerHeight)
-    }
-}
-
 /// Draws long content inside a capped scroll area so it cannot grow its row past
 /// the compositor's maximum layer height. Short content is drawn inline, exactly
 /// as before, so the common case looks unchanged and allocates nothing extra.
@@ -4122,6 +4145,10 @@ struct BoundedInspection<Content: View>: View {
     @ViewBuilder var content: Content
 
     @State private var isPinnedToTail = true
+    /// Whether the READER is driving this scroll area. The region's pin rule is
+    /// the transcript's (`TranscriptFollowPolicy`): only a reader's scroll may
+    /// unpin it.
+    @State private var isReaderScrolling = false
 
     var body: some View {
         if isTall {
@@ -4148,22 +4175,32 @@ struct BoundedInspection<Content: View>: View {
                     guard followsTail, isPinnedToTail else { return }
                     followTail(proxy)
                 }
-                .onScrollGeometryChange(for: InspectionScrollSnapshot.self) { geometry in
-                    InspectionScrollSnapshot(
+                .onScrollPhaseChange { _, newPhase in
+                    isReaderScrolling = TranscriptFollowPolicy.isReaderDriven(newPhase)
+                }
+                .onScrollGeometryChange(for: TranscriptFollowPolicy.Snapshot.self) { geometry in
+                    TranscriptFollowPolicy.Snapshot(
                         offset: geometry.contentOffset.y,
                         contentHeight: geometry.contentSize.height,
                         containerHeight: geometry.containerSize.height
                     )
                 } action: { old, new in
-                    // Only a drag UP unpins, the same rule the transcript uses.
-                    // Growth and the follow both move the view down the document,
-                    // and neither is the reader leaving the tail.
-                    if new.offset < old.offset - 1 {
-                        if isPinnedToTail { isPinnedToTail = false }
-                        return
-                    }
-                    if new.distanceFromBottom <= 8, !isPinnedToTail {
-                        isPinnedToTail = true
+                    // The transcript's own rule, shared rather than restated. A
+                    // bare "any upward move unpins" read the clamp that follows
+                    // a content shrink, and a re-measure while the box is laid
+                    // out, as the reader leaving the tail, which is the defect
+                    // `TranscriptFollowPolicy` was split out to stop repeating.
+                    // This region's follow is bucket-driven, so only the pin half
+                    // of the decision applies.
+                    let outcome = TranscriptFollowPolicy.decide(
+                        from: old,
+                        to: new,
+                        isPinned: isPinnedToTail,
+                        isReaderScrolling: isReaderScrolling,
+                        isFollowInFlight: false
+                    )
+                    if let pin = outcome.pin, pin != isPinnedToTail {
+                        isPinnedToTail = pin
                     }
                 }
             }
@@ -4594,74 +4631,81 @@ struct MarkdownTableView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            // The `Grid` already sizes to its content; the horizontal scroll
-            // view around it was the only thing allocating a layer, and a
-            // transcript row can carry dozens of tables. Cells wrap instead.
+            // A cell keeps a `minWidth` so a table reads as columns rather than
+            // as ragged text, which means ~10 columns have an intrinsic minimum
+            // wider than a narrow transcript column. Cells wrap, so the table
+            // shrinks horizontally only until that minimum, and the transcript's
+            // own vertical scroll view cannot pan: without a horizontal scroll
+            // view the right-hand columns are simply unreachable. This is the
+            // one nested scroll area that earns its own layer, because the
+            // alternative is losing content.
             Group {
-                Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
-                    // Header Row
-                    GridRow {
-                        ForEach(0..<table.headers.count, id: \.self) { colIdx in
-                            let header = table.headers[colIdx]
-                            let align = table.alignments.indices.contains(colIdx) ? table.alignments[colIdx] : .leading
-                            HStack(spacing: 0) {
-                                Text(LocalizedStringKey(header))
-                                    .font(.system(size: max(8.5, 13 * zoomManager.zoomScale), weight: .bold))
-                                    .foregroundColor(.secondary)
-                                    .multilineTextAlignment(align.textAlignment)
-                                    .padding(.horizontal, 14)
-                                    .padding(.vertical, 9)
-                                    .frame(minWidth: 90, alignment: align.alignment)
-                                    .fixedSize(horizontal: false, vertical: true)
-                                    .textSelection(.enabled)
-
-                                if colIdx < table.headers.count - 1 {
-                                    Divider()
-                                        .opacity(0.35)
-                                }
-                            }
-                        }
-                    }
-                    .background(Color.secondary.opacity(0.08))
-
-                    // Header Divider
-                    GridRow {
-                        Divider()
-                            .gridCellColumns(max(1, table.headers.count))
-                    }
-
-                    // Data Rows
-                    ForEach(0..<table.rows.count, id: \.self) { rowIdx in
-                        let row = table.rows[rowIdx]
+                ScrollView(.horizontal, showsIndicators: true) {
+                    Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
+                        // Header Row
                         GridRow {
                             ForEach(0..<table.headers.count, id: \.self) { colIdx in
-                                let cell = colIdx < row.count ? row[colIdx] : ""
+                                let header = table.headers[colIdx]
                                 let align = table.alignments.indices.contains(colIdx) ? table.alignments[colIdx] : .leading
                                 HStack(spacing: 0) {
-                                    Text(LocalizedStringKey(cell))
-                                        .font(.system(size: max(8.5, 13 * zoomManager.zoomScale)))
-                                        .foregroundColor(.primary)
+                                    Text(LocalizedStringKey(header))
+                                        .font(.system(size: max(8.5, 13 * zoomManager.zoomScale), weight: .bold))
+                                        .foregroundColor(.secondary)
                                         .multilineTextAlignment(align.textAlignment)
                                         .padding(.horizontal, 14)
-                                        .padding(.vertical, 8)
+                                        .padding(.vertical, 9)
                                         .frame(minWidth: 90, alignment: align.alignment)
                                         .fixedSize(horizontal: false, vertical: true)
                                         .textSelection(.enabled)
 
                                     if colIdx < table.headers.count - 1 {
                                         Divider()
-                                            .opacity(0.25)
+                                            .opacity(0.35)
                                     }
                                 }
                             }
                         }
-                        .background(rowIdx % 2 == 1 ? Color.secondary.opacity(0.03) : Color.clear)
+                        .background(Color.secondary.opacity(0.08))
 
-                        if rowIdx < table.rows.count - 1 {
+                        // Header Divider
+                        GridRow {
+                            Divider()
+                                .gridCellColumns(max(1, table.headers.count))
+                        }
+
+                        // Data Rows
+                        ForEach(0..<table.rows.count, id: \.self) { rowIdx in
+                            let row = table.rows[rowIdx]
                             GridRow {
-                                Divider()
-                                    .opacity(0.25)
-                                    .gridCellColumns(max(1, table.headers.count))
+                                ForEach(0..<table.headers.count, id: \.self) { colIdx in
+                                    let cell = colIdx < row.count ? row[colIdx] : ""
+                                    let align = table.alignments.indices.contains(colIdx) ? table.alignments[colIdx] : .leading
+                                    HStack(spacing: 0) {
+                                        Text(LocalizedStringKey(cell))
+                                            .font(.system(size: max(8.5, 13 * zoomManager.zoomScale)))
+                                            .foregroundColor(.primary)
+                                            .multilineTextAlignment(align.textAlignment)
+                                            .padding(.horizontal, 14)
+                                            .padding(.vertical, 8)
+                                            .frame(minWidth: 90, alignment: align.alignment)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                            .textSelection(.enabled)
+
+                                        if colIdx < table.headers.count - 1 {
+                                            Divider()
+                                                .opacity(0.25)
+                                        }
+                                    }
+                                }
+                            }
+                            .background(rowIdx % 2 == 1 ? Color.secondary.opacity(0.03) : Color.clear)
+
+                            if rowIdx < table.rows.count - 1 {
+                                GridRow {
+                                    Divider()
+                                        .opacity(0.25)
+                                        .gridCellColumns(max(1, table.headers.count))
+                                }
                             }
                         }
                     }

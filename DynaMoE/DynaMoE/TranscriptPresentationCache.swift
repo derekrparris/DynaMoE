@@ -108,8 +108,18 @@ final class TranscriptPresentationCache {
 
     /// Drops entries for messages that are no longer in the transcript, so a
     /// long-lived window does not accumulate every message ever shown.
+    ///
+    /// Always filters. A previous `entries.count > ids.count` short-circuit
+    /// skipped the prune whenever the cache held exactly one entry per message in
+    /// the current transcript, which is precisely what switching to a session of
+    /// the SAME length leaves: every entry belonged to the other session, the
+    /// counts matched, and nothing was dropped until some later turn happened to
+    /// change them.
     func prune(keeping ids: Set<UUID>) {
-        guard entries.count > ids.count else { return }
         entries = entries.filter { ids.contains($0.key) }
     }
+
+    /// How many messages' parses are resident. Exposed so the prune above is
+    /// observable in a test; nothing in the view reads it.
+    var cachedMessageCount: Int { entries.count }
 }

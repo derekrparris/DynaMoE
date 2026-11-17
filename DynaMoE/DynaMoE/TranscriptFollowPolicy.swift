@@ -23,8 +23,34 @@
 //
 
 import CoreGraphics
+import SwiftUI
 
 nonisolated enum TranscriptFollowPolicy {
+    /// The scroll phases in which the READER is driving.
+    ///
+    /// `.tracking` is a gesture that has not moved yet, `.interacting` is a live
+    /// drag, wheel or scroller knob, and `.decelerating` is the momentum left by
+    /// one, so all three are the reader. `.animating` is a programmatic follow
+    /// (the animated `scrollTo` this view issues, which reports intermediate
+    /// offsets for its whole duration) and `.idle` is nobody. Kept in one place
+    /// because the transcript and the capped inspection regions inside it both
+    /// decide their pin from it, and a phase counted by one and not the other
+    /// would make the two disagree about what counts as a drag.
+    ///
+    /// Counting `.decelerating` is what keeps a wheel or trackpad flick able to
+    /// unpin after the finger has left: reporting `.interacting` only while the
+    /// gesture is live would hand control back to the follow mid-flick.
+    static func isReaderDriven(_ phase: ScrollPhase) -> Bool {
+        switch phase {
+        case .tracking, .interacting, .decelerating:
+            return true
+        case .idle, .animating:
+            return false
+        @unknown default:
+            return false
+        }
+    }
+
     /// The geometry one scroll update is decided from.
     struct Snapshot: Equatable {
         var offset: CGFloat

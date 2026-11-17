@@ -15,6 +15,7 @@
 //
 
 import XCTest
+import SwiftUI
 @testable import DynaMoE
 
 @MainActor
@@ -451,6 +452,37 @@ final class TranscriptSegmenterTests: XCTestCase {
         XCTAssertEqual(updated.segments[0].blocks.count, 3)
     }
 
+    func testPruneDropsEntriesFromASessionOfTheSameLength() {
+        // A switch to a session with the SAME number of messages used to skip the
+        // prune entirely: the `entries.count > ids.count` short-circuit compared
+        // sizes, and every size matched while every id belonged to the other
+        // conversation. The stale parses then stayed resident until some later
+        // turn happened to change the counts.
+        let cache = TranscriptPresentationCache()
+        let firstSession = [
+            makeMessage(.user, "one"),
+            makeMessage(.assistant, "two"),
+        ]
+        for message in firstSession {
+            _ = cache.presentation(for: message, isGemmaDialect: false, isStreaming: false)
+        }
+        XCTAssertEqual(cache.cachedMessageCount, 2)
+
+        let secondSession = [
+            makeMessage(.user, "three"),
+            makeMessage(.assistant, "four"),
+        ]
+        cache.prune(keeping: Set(secondSession.map(\.id)))
+        XCTAssertEqual(cache.cachedMessageCount, 0, "a same-length session still prunes")
+
+        for message in secondSession {
+            _ = cache.presentation(for: message, isGemmaDialect: false, isStreaming: false)
+        }
+        XCTAssertEqual(cache.cachedMessageCount, 2)
+        cache.prune(keeping: Set(secondSession.map(\.id)))
+        XCTAssertEqual(cache.cachedMessageCount, 2, "the live session's parses are kept")
+    }
+
     func testALongAnswerNeverRendersAsAnEmptyRow() {
         // The failure state this guards: a non-empty answer that ended up with
         // zero renderable blocks drew a blank row, which is indistinguishable
@@ -707,6 +739,19 @@ final class TranscriptSegmenterTests: XCTestCase {
         let outcome = decide(old, new, isPinned: false)
         XCTAssertEqual(outcome.follow, false)
         XCTAssertNil(outcome.pin)
+    }
+
+    func testOnlyAReaderDrivenScrollPhaseCanUnpin() {
+        // The pin rule is only ever as good as the phase it is handed: if a
+        // scroll the reader performed reports a phase this denies, the reader
+        // cannot leave the tail mid-turn at all. Momentum counts as the reader
+        // (a wheel or trackpad flick after the finger left), while a
+        // programmatic follow reports `.animating` and must never unpin.
+        XCTAssertTrue(TranscriptFollowPolicy.isReaderDriven(.tracking))
+        XCTAssertTrue(TranscriptFollowPolicy.isReaderDriven(.interacting))
+        XCTAssertTrue(TranscriptFollowPolicy.isReaderDriven(.decelerating))
+        XCTAssertFalse(TranscriptFollowPolicy.isReaderDriven(.animating))
+        XCTAssertFalse(TranscriptFollowPolicy.isReaderDriven(.idle))
     }
 
     func testAQuietOffsetShiftDoesNotUnpin() {

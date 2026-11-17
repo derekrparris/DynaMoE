@@ -9,8 +9,15 @@
 //  fix addressed one of them without confirming which one crosses the limit.
 //  This emits the numbers that make the hypothesis falsifiable: the scroll
 //  content height, the viewport height, and the height of the tallest realized
-//  row, with a one-shot warning the first time either crosses the compositor's
+//  row, with a one-shot warning the first time a row crosses the compositor's
 //  ceiling.
+//
+//  The content height is reported and deliberately NOT warned on. It is the
+//  scroll view's total, which a lazy stack never paints as one layer: a
+//  conversation about twenty viewports tall crosses 16,384 pt routinely and
+//  paints fine, so a warning there fires on ordinary history and says nothing
+//  about the defect. The ceiling applies to a REALIZED row, which is what the
+//  row warning measures.
 //
 //  Metadata only, per `DiagLog`'s contract: counts and heights, never message
 //  content.
@@ -44,7 +51,6 @@ final class TranscriptDiagnostics {
     /// from the message count, which repeats across conversations of one length.
     private(set) var lastReportedTurnKey: String?
     private var warnedRowHeight = false
-    private var warnedContentHeight = false
 
     /// Records one realized row's height. Called from the row's own geometry
     /// callback, so it only ever sees rows the lazy stack actually built.
@@ -64,7 +70,6 @@ final class TranscriptDiagnostics {
         rowHeights.removeAll(keepingCapacity: true)
         lastReportedTurnKey = nil
         warnedRowHeight = false
-        warnedContentHeight = false
     }
 
     /// Emits the turn's numbers once, when the turn settles.
@@ -115,14 +120,6 @@ final class TranscriptDiagnostics {
                     + "tallestRow=\(Int(tallestHeight))pt kind=\(tallestLabel) turn=\(turnKey) "
                     + "a row this tall is at risk of the compositor ceiling "
                     + "(\(Int(TranscriptSegmenter.compositorHeightCeiling))pt)"
-            )
-        }
-        if contentHeight > TranscriptSegmenter.compositorHeightCeiling, !warnedContentHeight {
-            warnedContentHeight = true
-            DiagLog.warning(
-                Self.category,
-                "scroll content exceeds the compositor ceiling: "
-                    + "contentHeight=\(Int(contentHeight))pt turn=\(turnKey)"
             )
         }
     }
