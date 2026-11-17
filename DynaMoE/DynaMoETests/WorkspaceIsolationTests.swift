@@ -371,6 +371,17 @@ final class WorkspaceIsolationTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: repository.appendingPathComponent("from_agent.txt").path))
         XCTAssertNotNil(subagent.appliedAt)
         XCTAssertFalse(FileManager.default.fileExists(atPath: worktree.path.path))
+
+        let status = try await GetSubagentStatusTool().execute(
+            arguments: ["subagent_id": runId.uuidString],
+            workingDirectory: repository,
+            maxOutputLength: 4_000
+        )
+        XCTAssertTrue(
+            status.stdout?.contains("already been applied") ?? false,
+            "a coordinator that asks after the apply must not be told to apply again: \(status.resultJSON)"
+        )
+        XCTAssertFalse(status.resultJSON.contains("apply_directive"), status.resultJSON)
     }
 
     func testApplyIsStateChangingAndForbiddenToRuns() {
@@ -449,6 +460,153 @@ final class WorkspaceIsolationTests: XCTestCase {
             maxOutputLength: 1_000
         )
         XCTAssertTrue(result.resultJSON.contains("did not run in an isolated worktree"), result.resultJSON)
+    }
+
+    // MARK: - The operator's path
+
+    func testTheOperatorPathOnlyOffersApplyForAStoppedUnappliedIsolatedRun() async throws {
+        let runId = UUID()
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: runId,
+            root: worktreeRoot
+        )
+
+        var record = AgentRunRecord(
+            id: runId,
+            role: "Implementer",
+            preset: .implementer,
+            task: "Add a file.",
+            backend: .scripted,
+            workingDirectory: worktree.path.path,
+            isolation: worktree.isolation,
+            allowedTools: ["file_write"],
+            status: .completed
+        )
+
+        XCTAssertTrue(SubagentApplyControl.canApply(record))
+        let request = SubagentApplyControl.applyRequest(for: record)
+        XCTAssertEqual(request?.runId, runId)
+        XCTAssertEqual(request?.toolName, "apply_subagent_changes")
+        XCTAssertEqual(request?.arguments["subagent_id"], runId.uuidString)
+        XCTAssertEqual(request?.arguments["branch"], worktree.branch)
+        XCTAssertTrue(request?.reason.contains(worktree.branch) ?? false)
+        XCTAssertNil(request?.workingDirectory, "the card resolves the main tree only when the caller has it")
+
+        record.status = .running
+        XCTAssertFalse(SubagentApplyControl.canApply(record))
+        XCTAssertNil(SubagentApplyControl.applyRequest(for: record))
+
+        record.status = .completed
+        record.appliedAt = Date()
+        XCTAssertFalse(SubagentApplyControl.canApply(record))
+        XCTAssertNil(SubagentApplyControl.applyRequest(for: record))
+
+        record.appliedAt = nil
+        record.isolation = .none
+        XCTAssertFalse(SubagentApplyControl.canApply(record))
+
+        record.isolation = worktree.isolation
+        await WorkspaceIsolation.cleanup(worktree)
+        XCTAssertFalse(SubagentApplyControl.canApply(record), "a missing worktree offers nothing to apply")
+    }
+
+    func testTheOperatorPathDeclinedApprovalLeavesTheWorktreeAndRecordUntouched() async throws {
+        let runId = UUID()
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: runId,
+            root: worktreeRoot
+        )
+        try "declined\n".write(
+            to: worktree.path.appendingPathComponent("declined.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let record = AgentRunRecord(
+            id: runId,
+            role: "Implementer",
+            preset: .implementer,
+            task: "Add a file.",
+            backend: .scripted,
+            workingDirectory: worktree.path.path,
+            isolation: worktree.isolation,
+            allowedTools: ["file_write"],
+            status: .completed
+        )
+        AgentRunStore.shared.saveImmediately(record)
+        defer { AgentRunStore.shared.delete(runId: runId, sessionId: nil) }
+
+        do {
+            _ = try await SubagentApplyControl.apply(runId: runId, requestApproval: { _ in false })
+            XCTFail("a declined card must not apply")
+        } catch let error as SubagentApplyControlError {
+            XCTAssertEqual(error, .approvalDenied)
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: repository.appendingPathComponent("declined.txt").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: worktree.path.path))
+        XCTAssertNil(AgentRunStore.shared.loadAny(runId: runId)?.appliedAt)
+        _ = await WorkspaceIsolation.cleanup(worktree)
+    }
+
+    func testTheOperatorPathAppliesAfterApprovalAndThenOffersNothing() async throws {
+        let runId = UUID()
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: runId,
+            root: worktreeRoot
+        )
+        try "operator applied\n".write(
+            to: worktree.path.appendingPathComponent("operator.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let record = AgentRunRecord(
+            id: runId,
+            role: "Implementer",
+            preset: .implementer,
+            task: "Add a file.",
+            backend: .scripted,
+            workingDirectory: worktree.path.path,
+            isolation: worktree.isolation,
+            allowedTools: ["file_write"],
+            status: .completed
+        )
+        AgentRunStore.shared.saveImmediately(record)
+        defer { AgentRunStore.shared.delete(runId: runId, sessionId: nil) }
+
+        let asked = expectation(description: "the operator is asked once")
+        let directory = repository.resolvingSymlinksInPath().standardizedFileURL.path
+        let outcome = try await SubagentApplyControl.apply(runId: runId) { request in
+            XCTAssertEqual(request.runId, runId)
+            XCTAssertEqual(request.toolName, "apply_subagent_changes")
+            XCTAssertEqual(request.arguments["branch"], worktree.branch)
+            XCTAssertEqual(
+                URL(fileURLWithPath: request.workingDirectory ?? "")
+                    .resolvingSymlinksInPath().standardizedFileURL.path,
+                directory,
+                "the card names the tree the patch lands in"
+            )
+            asked.fulfill()
+            return true
+        }
+        await fulfillment(of: [asked], timeout: 2)
+
+        XCTAssertFalse(outcome.alreadyApplied)
+        XCTAssertEqual(outcome.changedFiles, ["operator.txt"])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: repository.appendingPathComponent("operator.txt").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: worktree.path.path))
+        XCTAssertNotNil(AgentRunStore.shared.loadAny(runId: runId)?.appliedAt)
+
+        do {
+            _ = try await SubagentApplyControl.apply(runId: runId, requestApproval: { _ in true })
+            XCTFail("an applied run must not offer a second apply")
+        } catch let error as SubagentApplyControlError {
+            guard case .nothingToApply = error else {
+                return XCTFail("expected nothingToApply, got \(error)")
+            }
+        }
     }
 
     // MARK: - Helpers

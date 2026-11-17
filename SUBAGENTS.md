@@ -4,7 +4,7 @@ Design and working document for the model-backed subagent system. This file is
 the reference for a multi-session build: read it first, check the phase
 checklist, then continue at the first unchecked item.
 
-Status: **Phases 0–4 complete for writers.** Phase 1 landed both backends;
+Status: **Phases 0–5 complete for writers.** Phase 1 landed both backends;
 Phase 2 landed `AgentScheduler` (capacity, priority, cancellation tree, queue
 timeouts), the real run path inside `SubagentManager`, the spawn approval gate
 and the extended `spawn_subagent` schema. Phase 3 landed `AgentRunStore` (one
@@ -16,10 +16,14 @@ and notifications. Phase 4 landed `WorkspaceIsolation` (a git worktree per
 writer, diffed against the commit it branched from), the approved
 `apply_subagent_changes` tool, the inspector's worktree controls and
 conversation cost strip, and the spawn-result hints that make the worktree
-discoverable to the coordinator. The optional AFM backend and the performance
-pass remain deferred (§16). Still open: the cheapest-capable cloud model as the
-default, and when a model-backed spawn becomes the default rather than a
-Settings opt-in (§16).
+discoverable to the coordinator. Phase 5 adds the operator's own Apply Changes
+control in the inspector, which lands an isolated run's work through the same
+approval card and apply service the coordinator's tool uses, makes the apply
+single-flight per run, and proves the path with a real local writer run (3
+steps, applied `hello_from_subagent.txt`). The optional AFM backend and the
+performance pass remain deferred (§16). Still open: the cheapest-capable cloud
+model as the default, and when a model-backed spawn becomes the default rather
+than a Settings opt-in (§16).
 
 ---
 
@@ -129,7 +133,7 @@ SubagentManager                      coordinator-facing API + registry + relays
 | `Subagents/AgentRunStore.swift` | Persistence, retention, corrupt-file handling |
 | `Subagents/AgentRolePresets.swift` | Role presets: prompt, tools, budgets, isolation |
 | `Subagents/WorkspaceIsolation.swift` | Git worktree lifecycle, base-commit snapshots, `git apply`, cleanup and stale sweep |
-| `Subagents/SubagentApply.swift` | The approved path that lands a run's worktree diff (used by `apply_subagent_changes`) |
+| `Subagents/SubagentApply.swift` | The approved path that lands a run's worktree diff, used by both `apply_subagent_changes` and the inspector's Apply Changes (`SubagentApplyControl`, single-flight per run) |
 | `Subagents/SubagentManager.swift` | Rewritten coordinator API (`spawn`, status, message, cancel, relays) plus the live→record projection |
 | `Subagents/SubagentInspectorView.swift` | Inspector UI (replaces the drawer), worktree controls, conversation cost strip |
 | `AgentHarness.swift` | Tool implementations, including `spawn_subagent`, status/message/list and `apply_subagent_changes` |
@@ -540,7 +544,10 @@ it.
   conversation strip (active/runs/tokens/spend/time) over the same merged list;
   a detail pane with live streamed text/thinking, tool timeline, artifacts,
   diff, report, Reveal Worktree, the applied date and controls (stop, steer,
-  approve).
+  approve, Apply Changes). Apply Changes is the operator's own path to land a
+  stopped isolated run: it raises the ordinary approval card and then calls the
+  same `SubagentApplyService` the coordinator's `apply_subagent_changes` tool
+  uses.
 - **Inline spawn card** in the transcript: role, backend, live status, short
   summary, link to the inspector.
 - **Notifications** for a finished background run; unread reports are injected
@@ -565,8 +572,8 @@ Pure-logic and fake-backend tests are the default; real-model tests are opt-in.
 | `AgentRunStoreTests` | round trip, retention, corrupt file, unknown schema |
 | `CloudAgentBackendLogicTests` | event mapping, fragmented tool-call assembly, retry rules |
 | `LocalAgentBackendLogicTests` | prompt rendering, mask install/restore, cost estimate and refusal |
-| `WorkspaceIsolationTests` | worktree create/snapshot/apply/cleanup, committed work included, conflicts refused, non-git refusal, the apply tool and a scripted isolated run end to end |
-| Opt-in | one real local turn, one real cloud turn |
+| `WorkspaceIsolationTests` | worktree create/snapshot/apply/cleanup, committed work included, conflicts refused, non-git refusal, the apply tool and a scripted isolated run end to end, and the operator's Apply Changes path (offer gate, one approval request, declined card, applied-then-nothing) |
+| Opt-in | one real local turn, one real cloud turn, one real local writer run + operator apply |
 
 Headless invocation (from `AGENTS.md`):
 
@@ -870,6 +877,73 @@ Implemented, with the decisions worth carrying:
   build decode with no value, and the store's schema gate never rewrites a
   newer build's fields. The inspector shows the apply date when it exists.
 
+### Phase 5 — Operator control
+
+- [x] Inspector Apply Changes, behind `SubagentApprovalCenter` and
+      `SubagentApplyService`
+- [x] One apply in flight per run, so the coordinator's tool and the
+      inspector's button cannot race
+- [x] Opt-in real-model writer + operator apply case
+      (`DeepSeekV41PublishedTurnTests.testARealLocalWriterLandsItsWorkFromTheWorktree`)
+- [ ] Discard Worktree control (not built: the 14-day sweep and Reveal
+      Worktree cover cleanup for now, §16)
+
+**Exit criteria met at the logic seam:** a stopped isolated run can be landed
+from the inspector without terminal git, and the card it raises is the same
+approval the coordinator's tool raises. The button itself has not had a
+rendered UI pass yet: `WorkspaceIsolationTests` proves the control's gate,
+request and apply outcomes, not the pixels.
+
+Implemented, with the decisions worth carrying:
+
+- **The button is a second caller, not a second apply path.**
+  `SubagentApplyControl` asks `SubagentApprovalCenter` for the same
+  `AgentApprovalRequest` shape a tool call uses, then delegates to
+  `SubagentApplyService`. Patch validation, record writes and worktree removal
+  are not duplicated. The apply card carries `apply_subagent_changes` as its
+  tool name and the run id in its arguments, so the generic card and the
+  inspector's inline stack render it exactly as they render any other
+  approval.
+- **The card names the main tree, not the worktree.** `applyRequest(for:)` is
+  pure and testable; `apply` resolves the owning repository from the worktree
+  (`git rev-parse --git-common-dir`) so the destination is where the patch
+  actually lands. A worktree that is gone offers nothing: `canApply` requires
+  the path to exist.
+- **Apply is offered only for a terminal, unapplied, isolated run.** A running
+  run cannot be applied; an applied run shows its date instead of a dead
+  button; a non-git/non-worktree run was never isolated. The control re-reads
+  the record from the manager or the store rather than trusting the pane's
+  snapshot, so a stale view cannot apply a live run.
+- **One apply per run at a time.** The durable guard is `appliedAt`, but it is
+  written only after the patch lands; with two callers both could pass the
+  guard before either wrote it. `SubagentApplyService` now takes an in-flight
+  set keyed by run id before the first `await` and refuses a concurrent
+  request with a named error.
+- **`SubagentInstance.appliedAt` is `@Published`.** The inspector renders a
+  value snapshot and the manager forwards each instance's `objectWillChange`;
+  without publishing, the pane that offered the button would keep showing it
+  after a successful apply. Stored (non-live) records are refreshed through
+  `onRecordChanged` to `reloadStored`.
+- **A declined card changes nothing.** `SubagentApplyControl.apply` throws
+  `.approvalDenied` before touching the worktree, so the record, the branch and
+  the main tree are all left as they were.
+- **The coordinator is told when the work is already landed.**
+  `get_subagent_status` and a synchronous spawn result check `appliedAt`. They
+  report `applied: true` and say the changes are already in the main tree,
+  instead of naming `apply_subagent_changes`; telling the coordinator to apply
+  work the operator just landed would produce a second, confusing card.
+
+**Measured (2026-11-17):** the opt-in
+`testARealLocalWriterLandsItsWorkFromTheWorktree` ran the published checkpoint
+through this whole path with a model rather than `ScriptedBackend`: 3 steps,
+8,403 prompt / 227 generated, 1,035 s including checkpoint load and a
+2,636-position first prefill. The implementer wrote
+`hello_from_subagent.txt` in its own worktree on branch
+`dynamoe/agent/<short>`; the main tree had no such file while it ran; and the
+operator path applied exactly `["hello_from_subagent.txt"]`, set
+`appliedAt`, and removed the worktree. That closes the ScriptedBackend-only
+gap Phase 4 recorded.
+
 ---
 
 ## 14. Invariants (do not break)
@@ -904,6 +978,7 @@ Append one line per session so the next session knows where work stopped.
 
 | Date | Session | Result |
 |---|---|---|
+| 2026-11-17 | phase 5 operator apply | `SubagentApplyControl` is the inspector's Apply Changes path: it offers apply only for a terminal, unapplied, isolated run whose worktree still exists, raises the ordinary `SubagentApprovalCenter` card with the main tree as its destination, and delegates to the existing `SubagentApplyService` (no second apply implementation). `SubagentApplyService` takes a per-run in-flight guard before its first `await`, because the coordinator's tool and the button can snapshot together; `SubagentInstance.appliedAt` is now `@Published` so a live run's pane redraws, and stored records refresh through `onRecordChanged` → `reloadStored`. `get_subagent_status` and a synchronous spawn now report `applied: true` instead of telling the coordinator to apply work the operator landed. The worktree note names the button. Tests: `WorkspaceIsolationTests` 18 (gate, request shape, declined card leaves everything untouched, approved apply then offers nothing, status after apply), and the opt-in `DeepSeekV41PublishedTurnTests.testARealLocalWriterLandsItsWorkFromTheWorktree` passed with a real model (3 steps, 8,403 prompt / 227 generated, 1,035 s; wrote and applied `hello_from_subagent.txt`). Related subagent suites 69 green. Build + test build green. Next: rendered UI pass, or the §16 measurements. |
 | 2026-11-17 | phase 4 worktrees + apply | `WorkspaceIsolation` (worktree at Application Support/worktrees/<runId> on `dynamoe/agent/<short>`, base-commit snapshots so committed work is included, bounded display diff, `git apply` landing, merge/rebase refusal, cancel/apply cleanup, 14-day launch sweep) with 12 pure git cases; spawn resolver is asynchronous and creates a worktree only for a writable run in a git workspace, after the backend resolves; `.spawnOnly` approval for isolated writers; `apply_subagent_changes` tool + `SubagentApplyService` (idempotent via `appliedAt`, live diff, synchronous record write, worktree removal) and its state-changing card; spawn/status results name the worktree, branch and apply tool; inspector gains Reveal Worktree, applied date, and a conversation cost/usage strip; `AgentRunRecord.appliedAt` additive field, report diff budget 64 KB. Tests: `WorkspaceIsolationTests` 15, `AgentSpawnPolicyTests` new isolation/policy cases. Build + test build green. Next: Phase 5 candidates (§16). |
 | 2026-11-17 | phase 3 store + inspector | `AgentRunStore` (schema gate, atomic digest-skipped writes, transcript bounds, retention) with 8 pure cases; `SubagentInstance.snapshotRecord()` + persistence on start/tool boundary/finish/cancel/relay; `SubagentInspectorView` (list/detail, live stream, timeline, report, approvals, steering) replacing `SubagentDrawerView`; inline `spawn_subagent` card linked by the result's run id; `SubagentNotifier` (Dock bounce + opt-in banner, silent under XCTest); start-of-turn unread relay on both backends (cloud trailing directive, local prompt-only turn); Settings for backend, cloud model, cost limit, concurrency, retention and notifications; `AgentScheduler.shared` now reads `configured()` limits. New logic cases: `AgentRunStoreTests` 8, `SubagentRunLinkTests` 4, `LocalSubagentRelayTests` 2, `SubagentRecordProjectionTests` 2. Build + test build green; Phase 2 suites 35/35. Next: Phase 4 (worktrees, writers). |
 | 2026-11-17 | phase 2 manager | `AgentScheduler` (capacity 1 local, 3/provider + 6 global cloud, per-class priority, cancellation tree, queue timeout), `AgentRolePresets`, `AgentSpawn` resolver, `SubagentApprovalCenter`, the model-backed path in `SubagentManager`/`SubagentInstance`, the extended `spawn_subagent` schema with a write-spawn approval gate, engine `TurnPriority` + chat preemption retry, Stop propagating to children and termination cancelling everything. New tests: `AgentSchedulerTests` 9, `AgentSpawnPolicyTests` 14, `AgentRunIntegrationTests` 4. Related suites 153 green, 0 failures (2 opt-in cloud skipped). Opt-in manager runs passed on both backends (local DSV4.1 906 prompt / 7 generated in 116.7 s; cloud Syn Large Text 668 prompt / 67 generated, 1.27 s), each answering the task it was given. Next: Phase 3 (`AgentRunStore`, inspector). |
@@ -931,8 +1006,9 @@ Append one line per session so the next session knows where work stopped.
   DynaMoE/worktrees/<runId>`, with the run's own tools rooted at that directory.
   A `codebase_search` index is keyed by workspace, so a large repository pays
   for a second index on its first worktree run; measure that before treating it
-  as a cost. The inspector offers Reveal Worktree rather than an Apply button:
-  landing changes stays the coordinator's approved tool.
+  as a cost. The inspector offers Reveal Worktree AND Apply Changes (Phase 5);
+  the button is a second caller of the same approval card and apply service,
+  not a bypass.
 - Local prefix preservation: measured as a per-step claim, not a lifetime lease
   (§8). What is still unmeasured is how often a coordinator turn lands between a
   run's steps and forces a re-prefill. Instrument that before proposing a
@@ -945,6 +1021,9 @@ Append one line per session so the next session knows where work stopped.
   not need it.
 - Do subagent turns appear in `ServerRequestLog`? (Proposed: no, a dedicated
   run store is the record; the log is for the model-serving wire.)
-- Operator-initiated apply: the inspector can reveal a worktree but cannot land
-  it. If that is wanted, it should reuse `SubagentApprovalCenter` and the same
-  `SubagentApplyService`, not grow a second apply path.
+- Operator-initiated apply: decided and shipped in Phase 5. The inspector's
+  Apply Changes button raises the same `SubagentApprovalCenter` request a tool
+  call would and delegates to `SubagentApplyService`. Deliberately NOT built:
+  an inspector Discard Worktree control. The 14-day sweep and Reveal Worktree
+  cover cleanup for now, and a discard would need its own recorded outcome so
+  the inspector could distinguish "thrown away" from "never existed".

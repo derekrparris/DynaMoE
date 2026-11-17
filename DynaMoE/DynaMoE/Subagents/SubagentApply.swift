@@ -3,12 +3,15 @@
 //  DynaMoE
 //
 //  Moves an isolated run's work onto the main tree. See SUBAGENTS.md §7 and §13
-//  (Phase 4). The coordinator reaches this through apply_subagent_changes.
+//  (Phases 4 and 5). The coordinator reaches this through
+//  `apply_subagent_changes`; the inspector's Apply Changes button reaches the
+//  same service through `SubagentApplyControl`, behind the same approval store.
 //
 //  Applying is a separate, approved step rather than the end of a run: a writer
 //  working in its own worktree cannot disturb the operator's tree, and the
-//  coordinator decides when (and whether) the diff lands. Changes are applied
-//  unstaged, so the coordinator's own commit tooling stays in charge of history.
+//  coordinator (or the operator) decides when the diff lands. Changes are
+//  applied unstaged, so the coordinator's own commit tooling stays in charge of
+//  history.
 //
 
 import Foundation
@@ -17,6 +20,7 @@ nonisolated enum SubagentApplyError: LocalizedError, Equatable {
     case runNotFound(UUID)
     case notIsolated(String)
     case stillRunning(String)
+    case alreadyApplying(String)
     case worktreeGone(String)
 
     var errorDescription: String? {
@@ -27,6 +31,8 @@ nonisolated enum SubagentApplyError: LocalizedError, Equatable {
             return "'\(role)' did not run in an isolated worktree, so its changes are either already in the working tree or there are none. Only a run spawned with isolation \"worktree\" can be applied."
         case .stillRunning(let role):
             return "'\(role)' is still running. Wait for it to finish, then apply its changes."
+        case .alreadyApplying(let role):
+            return "'\(role)' is already being applied. Wait for that apply to finish."
         case .worktreeGone(let detail):
             return detail
         }
@@ -44,7 +50,21 @@ nonisolated struct SubagentApplyOutcome: Sendable {
 
 @MainActor
 enum SubagentApplyService {
+    /// One apply per run at a time. The `appliedAt` check below is the durable
+    /// guard, but it is written only after the patch lands; the coordinator's
+    /// tool and the inspector's button can otherwise reach `snapshot` together
+    /// and both try to write the same patch. Two writers race here, so the
+    /// guard has to exist before the first `await`, not after it.
+    private static var inFlight: Set<UUID> = []
+
     static func apply(runId: UUID) async throws -> SubagentApplyOutcome {
+        guard !inFlight.contains(runId) else {
+            let role = SubagentManager.shared.getSubagent(byId: runId)?.role ?? "This run"
+            throw SubagentApplyError.alreadyApplying(role)
+        }
+        inFlight.insert(runId)
+        defer { inFlight.remove(runId) }
+
         let live = SubagentManager.shared.getSubagent(byId: runId)
         if let live, !live.status.isTerminal {
             throw SubagentApplyError.stillRunning(live.role)
@@ -104,5 +124,100 @@ enum SubagentApplyService {
             appliedAt: appliedAt,
             alreadyApplied: false
         )
+    }
+}
+
+// MARK: - The operator's path
+
+nonisolated enum SubagentApplyControlError: LocalizedError, Equatable {
+    case runNotFound(UUID)
+    case nothingToApply(String)
+    case approvalDenied
+
+    var errorDescription: String? {
+        switch self {
+        case .runNotFound(let id):
+            return "No subagent run with id \(id.uuidString) was found."
+        case .nothingToApply(let role):
+            return "'\(role)' has no isolated worktree waiting to be applied."
+        case .approvalDenied:
+            return "The changes were not applied because the request was declined."
+        }
+    }
+}
+
+/// The inspector's Apply Changes button, which is the operator's own way to
+/// finish a run the coordinator never landed. It raises the same approval
+/// request shape as a tool call, through `SubagentApprovalCenter`, and hands
+/// the work to `SubagentApplyService`; there is deliberately no second apply
+/// implementation here, only a second caller.
+@MainActor
+enum SubagentApplyControl {
+    typealias ApprovalHandler = (AgentApprovalRequest) async -> Bool
+
+    /// Whether the detail pane should offer Apply at all: an isolated run that
+    /// has stopped, has not landed yet, and still has its worktree on disk.
+    static func canApply(_ record: AgentRunRecord) -> Bool {
+        guard case .worktree(let path, _) = record.isolation else { return false }
+        guard record.status.isTerminal, record.appliedAt == nil else { return false }
+        return FileManager.default.fileExists(atPath: path)
+    }
+
+    /// The card the operator sees. `destination` is the main working tree the
+    /// patch lands in, resolved by `apply` when the worktree still names it.
+    static func applyRequest(
+        for record: AgentRunRecord,
+        destination: String? = nil
+    ) -> AgentApprovalRequest? {
+        guard canApply(record),
+              case .worktree(let path, let branch) = record.isolation else { return nil }
+        let changed = record.report?.changedFiles.count ?? 0
+        let summary: String
+        switch changed {
+        case 0: summary = "this run's worktree changes"
+        case 1: summary = "1 changed file"
+        default: summary = "\(changed) changed files"
+        }
+        return AgentApprovalRequest(
+            runId: record.id,
+            toolName: "apply_subagent_changes",
+            arguments: [
+                "subagent_id": record.id.uuidString,
+                "branch": branch,
+                "worktree": path
+            ],
+            workingDirectory: destination,
+            reason: "Apply \(summary) from \(branch) to the main working tree. Changes land unstaged."
+        )
+    }
+
+    /// Raises the card, then applies. `requestApproval` is injectable so the
+    /// tests can approve or deny without a window; production uses
+    /// `SubagentApprovalCenter`, the same store every run-scoped approval goes
+    /// through.
+    static func apply(
+        runId: UUID,
+        requestApproval: ApprovalHandler? = nil
+    ) async throws -> SubagentApplyOutcome {
+        let live = SubagentManager.shared.getSubagent(byId: runId)
+        guard let record = live?.snapshotRecord() ?? AgentRunStore.shared.loadAny(runId: runId) else {
+            throw SubagentApplyControlError.runNotFound(runId)
+        }
+        guard canApply(record),
+              case .worktree(let path, _) = record.isolation else {
+            throw SubagentApplyControlError.nothingToApply(record.role)
+        }
+
+        var destination: String? = nil
+        if let repository = await WorkspaceIsolation.owningRepository(for: URL(fileURLWithPath: path)) {
+            destination = repository.path
+        }
+        guard let request = applyRequest(for: record, destination: destination) else {
+            throw SubagentApplyControlError.nothingToApply(record.role)
+        }
+
+        let ask = requestApproval ?? { await SubagentApprovalCenter.shared.request($0) }
+        guard await ask(request) else { throw SubagentApplyControlError.approvalDenied }
+        return try await SubagentApplyService.apply(runId: runId)
     }
 }

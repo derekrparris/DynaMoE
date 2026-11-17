@@ -2584,6 +2584,10 @@ public final class SpawnSubagentTool: AgentTool {
         // Synchronous delegation: wait for subagent to finish
         let summary = await subagent.waitForCompletion()
         await MainActor.run { subagent.isSummaryRelayed = true }
+        // The operator can land an isolated run from the inspector while this
+        // call is waiting; the result must not tell the coordinator to apply
+        // work that is already in the main tree.
+        let alreadyApplied = subagent.appliedAt != nil
         let cleanSummary = AgentHarness.truncateText(AgentHarness.sanitizeText(summary), limit: maxOutputLength)
         var data: [String: Any] = [
             "subagent_id": subagent.id.uuidString,
@@ -2593,12 +2597,17 @@ public final class SpawnSubagentTool: AgentTool {
             "summary": cleanSummary,
             "directive": worktree == nil
                 ? "Present this report to the user now, then answer their original question with it."
-                : "Present this report to the user now, then answer their original question with it. Its changes are isolated on branch \(worktree!.branch); call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to land them on the working tree (the operator approves the apply), unless the user asked to keep them isolated."
+                : alreadyApplied
+                    ? "Present this report to the user now, then answer their original question with it. Its isolated changes have already been applied to the working tree; do not call apply_subagent_changes."
+                    : "Present this report to the user now, then answer their original question with it. Its changes are isolated on branch \(worktree!.branch); call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to land them on the working tree (the operator approves the apply), unless the user asked to keep them isolated."
         ]
-        if let worktree {
+        if let worktree, !alreadyApplied {
             data["isolation"] = "worktree"
             data["worktree"] = worktree.path
             data["branch"] = worktree.branch
+        }
+        if alreadyApplied {
+            data["applied"] = true
         }
         if let backend = subagent.backendDescriptor {
             data["backend"] = backend.displayName
@@ -2764,11 +2773,19 @@ public final class GetSubagentStatusTool: AgentTool {
         ]
         if isTerminal {
             if let worktree = AgentHarness.worktreeDescription(of: subagent) {
-                data["isolation"] = "worktree"
-                data["worktree"] = worktree.path
-                data["branch"] = worktree.branch
-                data["apply_directive"] = "This run's changes are isolated on branch \(worktree.branch). Call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to land them on the main tree (the operator approves the apply), unless the user asked to keep them isolated."
-                readable += "\nChanges: isolated worktree on \(worktree.branch). Call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to apply them.\n"
+                if subagent.appliedAt != nil {
+                    // The worktree and its branch are gone; naming a path that
+                    // no longer exists would send the coordinator looking for it.
+                    data["isolation"] = "worktree"
+                    data["applied"] = true
+                    readable += "\nChanges: this run's isolated changes have already been applied to the main tree; the worktree has been removed.\n"
+                } else {
+                    data["isolation"] = "worktree"
+                    data["worktree"] = worktree.path
+                    data["branch"] = worktree.branch
+                    data["apply_directive"] = "This run's changes are isolated on branch \(worktree.branch). Call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to land them on the main tree (the operator approves the apply), unless the user asked to keep them isolated."
+                    readable += "\nChanges: isolated worktree on \(worktree.branch). Call apply_subagent_changes with subagent_id \(subagent.id.uuidString) to apply them.\n"
+                }
             }
             data["directive"] = "Present this report to the user in your reply, then answer their original question with it. Do not end your turn without delivering these results."
         }

@@ -73,7 +73,8 @@ struct SubagentInspectorView: View {
                     onApprove: { approvalCenter.approve($0) },
                     onReject: { approvalCenter.reject($0) },
                     onBack: { withAnimation(.easeInOut(duration: 0.15)) { self.selectedRunId = nil } },
-                    onClose: onClose
+                    onClose: onClose,
+                    onRecordChanged: reloadStored
                 )
                 .transition(.opacity)
             } else {
@@ -482,9 +483,24 @@ private struct SubagentRunDetailView: View {
     var onReject: (UUID) -> Void
     var onBack: () -> Void
     var onClose: () -> Void
+    /// Reloading the stored list is what makes a non-live record show the
+    /// apply it just completed; a live run publishes its own `appliedAt`.
+    var onRecordChanged: () -> Void
 
     @State private var messageDraft = ""
     @State private var showThinking = true
+    @State private var isApplying = false
+    @State private var applyError: String?
+    @State private var appliedHereAt: Date?
+
+    /// The record is a value snapshot, so an apply performed from this pane is
+    /// shown from local state until the parent reloads; the two are the same
+    /// date once it does.
+    private var appliedAt: Date? { appliedHereAt ?? record.appliedAt }
+
+    private var canApplyChanges: Bool {
+        appliedHereAt == nil && SubagentApplyControl.canApply(record)
+    }
 
     var body: some View {
         ScrollView {
@@ -625,10 +641,10 @@ private struct SubagentRunDetailView: View {
                     Spacer(minLength: 0)
                 }
                 metaRow("Branch", branch)
-                if let appliedAt = record.appliedAt {
+                if let appliedAt {
                     metaRow("Applied", Self.dateFormatter.string(from: appliedAt))
                 } else if record.status.isTerminal, FileManager.default.fileExists(atPath: worktreePath) {
-                    Text("Isolated changes are waiting. The coordinator applies them with apply_subagent_changes, or you can review the worktree directly.")
+                    Text("Isolated changes are waiting. Apply them below, or let the coordinator land them with apply_subagent_changes.")
                         .font(.system(size: 9.5))
                         .foregroundColor(.secondary)
                         .padding(.leading, 102)
@@ -924,43 +940,79 @@ private struct SubagentRunDetailView: View {
     }
 
     private var controls: some View {
-        HStack(spacing: 10) {
-            if let live, !record.status.isTerminal {
-                Button(role: .destructive) {
-                    live.cancel()
-                } label: {
-                    Label("Stop Run", systemImage: "stop.circle")
-                        .font(.system(size: 10, weight: .medium))
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                if let live, !record.status.isTerminal {
+                    Button(role: .destructive) {
+                        live.cancel()
+                    } label: {
+                        Label("Stop Run", systemImage: "stop.circle")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.red)
                 }
-                .buttonStyle(.bordered)
-                .tint(.red)
+
+                if canApplyChanges {
+                    Button(action: applyChanges) {
+                        Label(isApplying ? "Applying…" : "Apply Changes", systemImage: "arrow.down.doc")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.purple)
+                    .disabled(isApplying)
+                    .help("Land this run's worktree changes on the main working tree, unstaged. You will be asked to confirm first.")
+                }
+
+                if let report = record.report, !report.summary.isEmpty {
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(report.summary, forType: .string)
+                    } label: {
+                        Label("Copy Report", systemImage: "doc.on.doc")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                Spacer()
+
+                if !record.status.isTerminal {
+                    Button {
+                        // The coordinator keeps the conversation; closing the panel
+                        // while a run works is a view change, not a cancellation.
+                        onClose()
+                    } label: {
+                        Text("Hide")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(.secondary)
+                }
             }
 
-            if let report = record.report, !report.summary.isEmpty {
-                Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(report.summary, forType: .string)
-                } label: {
-                    Label("Copy Report", systemImage: "doc.on.doc")
-                        .font(.system(size: 10, weight: .medium))
-                }
-                .buttonStyle(.bordered)
+            if let applyError {
+                Text(applyError)
+                    .font(.system(size: 10))
+                    .foregroundColor(.red)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+        }
+    }
 
-            Spacer()
-
-            if !record.status.isTerminal {
-                Button {
-                    // The coordinator keeps the conversation; closing the panel
-                    // while a run works is a view change, not a cancellation.
-                    onClose()
-                } label: {
-                    Text("Hide")
-                        .font(.system(size: 10, weight: .medium))
-                }
-                .buttonStyle(.plain)
-                .foregroundColor(.secondary)
+    private func applyChanges() {
+        guard !isApplying else { return }
+        isApplying = true
+        applyError = nil
+        Task {
+            do {
+                let outcome = try await SubagentApplyControl.apply(runId: record.id)
+                appliedHereAt = outcome.appliedAt
+                onRecordChanged()
+            } catch {
+                applyError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             }
+            isApplying = false
         }
     }
 

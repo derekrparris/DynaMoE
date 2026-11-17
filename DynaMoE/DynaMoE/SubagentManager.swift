@@ -216,8 +216,10 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// view is `transcript` (tool steps) plus the streaming text below.
     private(set) var runTranscript: [AgentTranscriptEntry] = []
     /// When an isolated run's worktree changes were applied to the main tree.
-    /// Part of the record so a restored run still knows it was applied.
-    private(set) var appliedAt: Date? = nil
+    /// Part of the record so a restored run still knows it was applied. Published
+    /// because the inspector reads it through a value snapshot: without this, the
+    /// apply service's write would not redraw the pane that offered the button.
+    @Published private(set) var appliedAt: Date? = nil
     /// The step currently streaming. The loop mints one delta id pair per step,
     /// so a new id is the boundary that clears the previous step's text.
     @Published public private(set) var liveAssistantText: String = ""
