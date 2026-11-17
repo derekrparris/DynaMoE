@@ -117,7 +117,23 @@ nonisolated enum TranscriptFollowPolicy {
         return outcome
     }
 
+    /// Largest step a geometry may report, so the `Int` conversion cannot trap.
+    ///
+    /// Content height is measured geometry, and the scroll view publishes
+    /// `.infinity` before it has laid out (the reason `TranscriptDiagnostics`
+    /// refuses to cast a height it has not checked). `step` reads that same
+    /// value, so it needs the same guard: a bucket count is only ever compared,
+    /// and a transcript past this many steps is not one any view could draw.
+    /// A finite height can overflow `Int` too, which is why the clamp is a
+    /// representable constant rather than `CGFloat(Int.max)`.
+    private static let maximumStep = CGFloat(1 << 40)
+
     private static func step(of snapshot: Snapshot) -> Int {
-        Int(max(0, snapshot.contentHeight) / followHeightStep)
+        let height = snapshot.contentHeight
+        // NaN has no order, so it maps to no step. +infinity is the
+        // unlaid-out value and clamps to the same ceiling any other huge
+        // growth does.
+        guard !height.isNaN else { return 0 }
+        return Int(min(max(0, height), maximumStep) / followHeightStep)
     }
 }

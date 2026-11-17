@@ -262,6 +262,42 @@ struct TimelineStepCardView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    /// One expanded field's text, bounded the way `output` is: chunked so no
+    /// single text view is oversized, and scroll-capped when this card owns the
+    /// scroll area. An argument or an error is as unbounded as output (a
+    /// whole-file write payload, a wall of stderr), so it takes the same rule.
+    @ViewBuilder
+    private func boundedField(_ text: String, fontSize: CGFloat, color: Color) -> some View {
+        let chunked = ChunkedText(text: text, lineSpacing: 2)
+            .font(.system(size: fontSize, design: .monospaced))
+            .foregroundColor(color)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        if scrollsOutput {
+            ScrollView(.vertical, showsIndicators: true) { chunked }
+                .frame(maxHeight: Self.maxOutputHeight)
+        } else {
+            chunked
+        }
+    }
+
+    /// The expanded arguments. Each value is chunked rather than drawn as one
+    /// `Text`: a write payload is one argument and can be a whole file.
+    private var argumentRows: some View {
+        ForEach(call.arguments.sorted(by: { $0.key < $1.key }), id: \.key) { k, v in
+            HStack(alignment: .top, spacing: 4) {
+                Text("\(k):")
+                    .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                    .foregroundColor(.secondary)
+                ChunkedText(text: v, lineSpacing: 2)
+                    .font(.system(size: 10.5, design: .monospaced))
+                    .foregroundColor(.primary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Button(action: {
@@ -397,15 +433,17 @@ struct TimelineStepCardView: View {
                             Text("Arguments:")
                                 .font(.system(size: 10, weight: .semibold))
                                 .foregroundColor(.secondary)
-                            ForEach(call.arguments.sorted(by: { $0.key < $1.key }), id: \.key) { k, v in
-                                HStack(alignment: .top, spacing: 4) {
-                                    Text("\(k):")
-                                        .font(.system(size: 10.5, weight: .medium, design: .monospaced))
-                                        .foregroundColor(.secondary)
-                                    Text(v)
-                                        .font(.system(size: 10.5, design: .monospaced))
-                                        .foregroundColor(.primary)
-                                        .textSelection(.enabled)
+                            // Same bound as output, and the same single scroll:
+                            // an argument can be a whole file, and exactly one of
+                            // this card or the list around it scrolls.
+                            Group {
+                                if scrollsOutput {
+                                    ScrollView(.vertical, showsIndicators: true) {
+                                        argumentRows
+                                    }
+                                    .frame(maxHeight: Self.maxOutputHeight)
+                                } else {
+                                    argumentRows
                                 }
                             }
                         }
@@ -469,10 +507,7 @@ struct TimelineStepCardView: View {
                             Text("Error:")
                                 .font(.system(size: 10, weight: .semibold))
                                 .foregroundColor(.red)
-                            Text(err)
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundColor(.red)
-                                .textSelection(.enabled)
+                            boundedField(err, fontSize: 11, color: .red)
                                 .padding(8)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .background(Color.red.opacity(0.06))

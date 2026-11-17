@@ -277,7 +277,8 @@ final class TranscriptSegmenterTests: XCTestCase {
         assertWithinBudget(segments)
     }
 
-    func testSplitRowsReproduceTheOriginalText() {        // Every piece splits at a line boundary, so the pieces of the message
+    func testSplitRowsReproduceTheOriginalText() {
+        // Every piece splits at a line boundary, so the pieces of the message
         // join back to exactly what the model wrote: selection and the copy
         // action cannot tell that the answer was drawn as several rows.
         let text = longParagraph(lines: 800)
@@ -845,6 +846,44 @@ final class TranscriptSegmenterTests: XCTestCase {
         XCTAssertEqual(diagnostics.warnedTurnKey, "abc-2")
     }
 
+    func testAHugeFiniteHeightCannotCrashTheReport() {
+        // The non-finite guard is not enough on its own: the cap the cast relies
+        // on has to be REPRESENTABLE. `CGFloat(Int.max - 1)` is not, so it
+        // rounded up to 2^63, one past `Int.max`, and a large finite height
+        // trapped exactly as `.infinity` did.
+        let diagnostics = TranscriptDiagnostics()
+        diagnostics.record(
+            rowId: "row#0/1",
+            label: "message#0/1",
+            height: .greatestFiniteMagnitude
+        )
+        diagnostics.record(
+            contentHeight: .greatestFiniteMagnitude,
+            viewportHeight: .greatestFiniteMagnitude
+        )
+
+        diagnostics.reportIfNeeded(
+            turnKey: "abc-huge",
+            messages: [makeMessage(.user, "hi")],
+            segmentsByMessage: [:]
+        )
+        XCTAssertEqual(diagnostics.lastReportedTurnKey, "abc-huge")
+        XCTAssertEqual(diagnostics.warnedTurnKey, "abc-huge")
+    }
+
+    func testASessionSwitchForgetsThePreviousConversationsRows() {
+        // One diagnostics object serves every conversation the transcript view
+        // shows, and `beginTurn()` only runs when a turn starts, not when a
+        // restored conversation is opened. A report must describe the rows it
+        // actually built, not the ones still remembered from the chat before.
+        let diagnostics = TranscriptDiagnostics()
+        diagnostics.record(rowId: "old#0/1", label: "message#0/1", height: 120)
+        XCTAssertEqual(diagnostics.realizedRowCount, 1)
+
+        diagnostics.beginSession()
+        XCTAssertEqual(diagnostics.realizedRowCount, 0)
+    }
+
     func testTheRowWarningReArmsForARestoredConversation() {
         // `beginTurn()` only runs on the generating transition, so a conversation
         // restored from disk reports without one. A bare warn-once flag meant the
@@ -999,5 +1038,24 @@ final class TranscriptSegmenterTests: XCTestCase {
         let outcome = decide(old, new, isPinned: false, isReaderScrolling: true)
         XCTAssertEqual(outcome.pin, true)
         XCTAssertEqual(outcome.follow, true)
+    }
+
+    func testANonFiniteContentHeightCannotCrashTheFollow() {
+        // `Int(CGFloat)` traps on `.infinity`, and an unlaid-out scroll view
+        // publishes exactly that, the value that once killed the diagnostic.
+        // The follow reads the same geometry, so a pinned transcript whose
+        // height arrives as `.infinity` must grow-or-not, never crash.
+        let old = snapshot(offset: 1_400, contentHeight: 2_000)
+
+        let infinite = snapshot(offset: 1_400, contentHeight: .infinity)
+        XCTAssertEqual(decide(old, infinite).follow, true)
+
+        // A huge FINITE height overflows the conversion just as hard.
+        let huge = snapshot(offset: 1_400, contentHeight: 1e300)
+        XCTAssertEqual(decide(old, huge).follow, true)
+
+        // NaN is not growth, and must not be read as any.
+        let nan = snapshot(offset: 1_400, contentHeight: .nan)
+        XCTAssertEqual(decide(old, nan).follow, false)
     }
 }

@@ -1191,6 +1191,12 @@ struct ChatDetailView: View {
                 // (a long agent conversation opens blank until something changes
                 // the content height). Report once per session, after the lazy
                 // rows have had time to realize and publish their heights.
+                .onChange(of: session?.id) {
+                    // One diagnostics object serves every conversation this view
+                    // shows, so rows built for the previous one must not ride
+                    // into this conversation's report.
+                    transcriptDiagnostics.beginSession()
+                }
                 .task(id: session?.id) {
                     guard let session, !session.messages.isEmpty else { return }
                     try? await Task.sleep(nanoseconds: 1_500_000_000)
@@ -3080,15 +3086,22 @@ enum LongTextChunker {
         return chunks.isEmpty ? [text] : chunks
     }
 
-    /// True when `chunks(of:)` would return more than one piece, i.e. when a
-    /// single text view would be too tall to paint reliably. Renderers use it
-    /// to choose `ChunkedText` without splitting the block itself.
+    /// True when `text` is too tall to draw as one piece, i.e. when it has to be
+    /// split by `chunks(of:)` or drawn inside a capped scroll area.
+    ///
+    /// The character budget is applied to UTF-8 bytes, an upper bound on the
+    /// character count rather than an estimate: non-ASCII text is reported
+    /// oversized a little earlier than its grapheme count would, which is the
+    /// safe direction for a compositor ceiling.
     nonisolated static func isOversized(
         _ text: String,
         maxLines: Int = 120,
         maxCharacters: Int = 8000
     ) -> Bool {
-        if text.count > maxCharacters { return true }
+        // UTF-8 bytes rather than graphemes: renderers ask this on every body
+        // pass, and `String.count` walks the whole string. The line walk below
+        // already reads the string's bytes.
+        if text.utf8.count > maxCharacters { return true }
         var newlines = 0
         for byte in text.utf8 where byte == 0x0A {
             newlines += 1
@@ -3467,7 +3480,7 @@ struct PlanCard: View {
                         BoundedInspection(
                             isTall: TranscriptSegmenter.exceedsInspectionHeight(thinking),
                             followsTail: isStreaming,
-                            tailKey: thinking.count
+                            tailKey: thinking.utf8.count
                         ) {
                             ChunkedText(text: thinking, lineSpacing: 3)
                                 .font(.system(size: max(9.5, 11.5 * zoomManager.zoomScale)))
@@ -3491,7 +3504,7 @@ struct PlanCard: View {
             BoundedInspection(
                 isTall: TranscriptSegmenter.exceedsInspectionHeight(content),
                 followsTail: isStreaming,
-                tailKey: content.count
+                tailKey: content.utf8.count
             ) {
                 MarkdownMessageView(content: content, isStreaming: isStreaming && !isReady)
             }
@@ -3714,6 +3727,13 @@ struct ChatMessageView: View, Equatable {
         /// message reads the raw text (it derives the display form itself), and a
         /// same-length edit still has to repaint.
         var content: String
+        /// The reasoning trace, reduced to its byte length.
+        ///
+        /// That is only enough because the trace is APPEND-ONLY while a turn
+        /// streams; a future in-place rewrite would keep this number and freeze
+        /// the accordion, so it would have to fingerprint the text itself. Bytes
+        /// rather than `count` because this runs per realized row per frame and
+        /// counting graphemes is O(n).
         var thinkingLength: Int
         var isThinking: Bool
         var prefillStatus: String?
@@ -3983,7 +4003,7 @@ struct ChatMessageView: View, Equatable {
                                         BoundedInspection(
                                             isTall: TranscriptSegmenter.exceedsInspectionHeight(thinking),
                                             followsTail: isGenerating || isCompactingConversation,
-                                            tailKey: thinking.count
+                                            tailKey: thinking.utf8.count
                                         ) {
                                             ChunkedText(text: thinking, lineSpacing: 3)
                                                 .font(.system(size: max(8, 12 * zoomManager.zoomScale), design: .monospaced))

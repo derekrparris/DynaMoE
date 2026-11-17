@@ -59,6 +59,11 @@ final class TranscriptDiagnostics {
     /// instrumentation exists for.
     private(set) var warnedTurnKey: String?
 
+    /// Rows measured since the turn or conversation began. Read by the report
+    /// and by the tests, so a session switch that failed to forget the previous
+    /// conversation's rows is visible rather than merely logged.
+    var realizedRowCount: Int { rowHeights.count }
+
     /// Records one realized row's height. Called from the row's own geometry
     /// callback, so it only ever sees rows the lazy stack actually built.
     func record(rowId: String, label: String, height: CGFloat) {
@@ -77,6 +82,19 @@ final class TranscriptDiagnostics {
         rowHeights.removeAll(keepingCapacity: true)
         lastReportedTurnKey = nil
         warnedTurnKey = nil
+    }
+
+    /// Forgets the rows measured for a previous conversation.
+    ///
+    /// The transcript view keeps ONE diagnostics object across a session
+    /// switch, and `beginTurn()` only runs when a turn starts. A conversation
+    /// restored from disk therefore reported without one, and its row count and
+    /// tallest-row kind were whatever the view had built for the conversation
+    /// before it, a report about a transcript that was never on screen. The
+    /// geometry itself is overwritten by the next scroll update, so only the
+    /// per-row measurements need clearing.
+    func beginSession() {
+        rowHeights.removeAll(keepingCapacity: true)
     }
 
     /// Emits the turn's numbers once, when the turn settles.
@@ -141,8 +159,13 @@ final class TranscriptDiagnostics {
     private static func points(_ value: CGFloat) -> String {
         guard value.isFinite else { return "unknown" }
         // Clamped before the cast for the same reason: a finite value too large
-        // for `Int` traps exactly as hard.
-        let clamped = min(max(value, 0), CGFloat(Int.max - 1))
+        // for `Int` traps exactly as hard. The cap has to be representable in a
+        // `CGFloat`, which `Int.max - 1` is not: it rounds up to 2^63, one past
+        // `Int.max`, so the cast still trapped for large finite values. 2^53 is
+        // the largest integer a `Double` holds exactly, and no height is close.
+        let clamped = min(max(value, 0), maximumFormattableHeight)
         return String(Int(clamped.rounded()))
     }
+
+    private static let maximumFormattableHeight: CGFloat = 9_007_199_254_740_992
 }

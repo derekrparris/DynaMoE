@@ -137,6 +137,19 @@ final class LongTextChunkerTests: XCTestCase {
         }
     }
 
+    func testOversizeDetectionCountsBytesRatherThanGraphemes() {
+        // Renderers ask this on every body pass, so it must not walk graphemes.
+        // Bytes are an upper bound on the character count: non-ASCII text is
+        // reported oversized a little earlier, which is the safe direction for a
+        // compositor ceiling.
+        let text = String(repeating: "字", count: 1_000)
+        XCTAssertEqual(text.count, 1_000)
+        XCTAssertEqual(text.utf8.count, 3_000)
+
+        XCTAssertFalse(LongTextChunker.isOversized(text, maxLines: 24, maxCharacters: 4_000))
+        XCTAssertTrue(LongTextChunker.isOversized(text, maxLines: 24, maxCharacters: 2_000))
+    }
+
     func testShortParagraphStaysOneBlock() {
         let text = "a single\nshort paragraph"
 
