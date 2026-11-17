@@ -70,6 +70,20 @@ public struct DogfoodBenchmarkReport: Sendable {
 
 // MARK: - Benchmark Runner
 
+/// Why a benchmark run was refused before it touched engine state.
+public enum DogfoodBenchmarkError: LocalizedError {
+    /// The benchmark flips a global preference and reads the shared engine's
+    /// resident model, so it cannot share the process with a live turn.
+    case generationInProgress
+
+    public var errorDescription: String? {
+        switch self {
+        case .generationInProgress:
+            return "A generation is in progress. Stop or finish it before running the dogfood benchmark."
+        }
+    }
+}
+
 @MainActor
 public final class ModelDogfoodBenchmarkRunner: ObservableObject {
     public static let shared = ModelDogfoodBenchmarkRunner()
@@ -167,18 +181,33 @@ public final class ModelDogfoodBenchmarkRunner: ObservableObject {
         modelName: String = "Ornith-1.5-35B-A3B-FP8",
         modelSnapshotPath: String = ""
     ) async throws -> DogfoodBenchmarkReport {
+        // The run flips Turbo for its self-healing turn and reads the shared
+        // engine, so starting it during a turn would change another operation's
+        // safety setting and observe a model mid-generation.
+        guard !CompletionEngine.shared.isActive, !AgentActivity.shared.isBusy else {
+            throw DogfoodBenchmarkError.generationInProgress
+        }
         isRunning = true
         currentTurn = 0
         progressMessage = "Preparing isolated test workspace..."
 
         let startTime = CFAbsoluteTimeGetCurrent()
 
+        // The benchmark arms Turbo for its self-healing turn, which is engine
+        // state the operator also owns. Capture what it actually was and put
+        // that back: removing the key dropped every operator who had Turbo on
+        // into Safe Mode the moment a benchmark finished. Registered before the
+        // workspace is set up, so a setup throw cannot leave `isRunning` stuck.
+        let previousTurbo = TurboModeSettings.rawValue
+        defer {
+            TurboModeSettings.restore(previousTurbo, from: "ModelDogfoodBenchmarkRunner.runBenchmark")
+            // A throw used to leave the runner stuck at `isRunning = true`,
+            // disabling the only control that can start it again.
+            isRunning = false
+        }
+
         // 1. Setup isolated repo
         try setupDogfoodTestEnvironment()
-        defer {
-            // Restore default turbo mode state
-            UserDefaults.standard.removeObject(forKey: "dynamoe_agent_turbo_mode")
-        }
 
         var turns: [DogfoodTurnResult] = []
         let sessionId = UUID()
@@ -272,8 +301,8 @@ public final class ModelDogfoodBenchmarkRunner: ObservableObject {
         progressMessage = "Turn 3: Turbo Mode autonomous file editing & self-healing compiler feedback..."
 
         // Enable Turbo Mode
-        UserDefaults.standard.set(true, forKey: "dynamoe_agent_turbo_mode")
-        let isTurboActive = UserDefaults.standard.bool(forKey: "dynamoe_agent_turbo_mode")
+        TurboModeSettings.set(true, from: "ModelDogfoodBenchmarkRunner.runBenchmark")
+        let isTurboActive = TurboModeSettings.isEnabled
 
         // 3a. Introduce a flawed edit
         let flawedSwiftCode = """

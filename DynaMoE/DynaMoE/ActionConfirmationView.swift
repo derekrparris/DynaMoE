@@ -12,11 +12,28 @@ import SwiftUI
 
 // MARK: - Action Approval Continuation Manager
 
-public final class ActionApprovalManager: @unchecked Sendable {
+/// The one place a human-in-the-loop decision is parked.
+///
+/// `nonisolated` because a waiter is resumed from the tool loop, from a Stop,
+/// and from task cancellation, none of which share an executor. All state is
+/// behind `lock`; nothing resumes a continuation while holding it.
+public nonisolated final class ActionApprovalManager: @unchecked Sendable {
     public static let shared = ActionApprovalManager()
 
     private let lock = NSLock()
     private var pendingContinuations: [UUID: CheckedContinuation<Bool, Never>] = [:]
+    /// Ids cancelled BEFORE their waiter registered. Without this the cancel
+    /// races registration: `onCancel` finds nothing to resume, the waiter then
+    /// parks on a continuation nobody will ever resume, and the call stalls for
+    /// the rest of the process's life.
+    private var cancelledWaits: Set<UUID> = []
+    /// Decisions that arrived BEFORE their waiter registered (a fast click on a
+    /// freshly rendered card). The waiter consumes its entry on arrival, so a
+    /// click can never be lost to that window. Bounded: ids are single-use, so
+    /// the oldest entries are dead weight rather than a leak that grows.
+    private var pendingDecisions: [UUID: Bool] = [:]
+    private var pendingDecisionOrder: [UUID] = []
+    private static let rememberedDecisionLimit = 8
 
     private init() {}
 
@@ -25,35 +42,87 @@ public final class ActionApprovalManager: @unchecked Sendable {
         // the engine is idle, so a config reload must wait for the decision.
         AgentActivity.shared.begin(.approval)
         defer { AgentActivity.shared.end(.approval) }
-        return await withCheckedContinuation { continuation in
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                lock.lock()
+                if cancelledWaits.remove(id) != nil {
+                    lock.unlock()
+                    // A stopped turn must not leave a call awaiting a decision
+                    // the transcript no longer offers.
+                    continuation.resume(returning: false)
+                } else if let decided = pendingDecisions.removeValue(forKey: id) {
+                    lock.unlock()
+                    continuation.resume(returning: decided)
+                } else {
+                    pendingContinuations[id] = continuation
+                    lock.unlock()
+                }
+            }
+        } onCancel: {
             lock.lock()
-            pendingContinuations[id] = continuation
-            lock.unlock()
+            if let continuation = pendingContinuations.removeValue(forKey: id) {
+                lock.unlock()
+                continuation.resume(returning: false)
+            } else {
+                cancelledWaits.insert(id)
+                lock.unlock()
+            }
         }
     }
 
-    public func approve(id: UUID) {
-        lock.lock()
-        let continuation = pendingContinuations.removeValue(forKey: id)
-        lock.unlock()
-        continuation?.resume(returning: true)
+    /// Records a decision. True when it resolved a waiter or was remembered for
+    /// one that has not registered yet.
+    @discardableResult
+    public func approve(id: UUID) -> Bool {
+        decide(id: id, approved: true)
     }
 
-    public func reject(id: UUID) {
+    @discardableResult
+    public func reject(id: UUID) -> Bool {
+        decide(id: id, approved: false)
+    }
+
+    /// Whether a call is still waiting on this id, for the card to render.
+    public func isWaiting(id: UUID) -> Bool {
         lock.lock()
-        let continuation = pendingContinuations.removeValue(forKey: id)
-        lock.unlock()
-        continuation?.resume(returning: false)
+        defer { lock.unlock() }
+        return pendingContinuations[id] != nil
     }
 
     public func cancelAll() {
         lock.lock()
         let all = pendingContinuations
         pendingContinuations.removeAll()
+        // A decision recorded for a waiter that never registered belongs to the
+        // turn being stopped: cancelling wins over a click that arrived first,
+        // or a stopped turn would execute the call it was stopped for.
+        cancelledWaits.formUnion(pendingDecisions.keys)
+        pendingDecisions.removeAll()
+        pendingDecisionOrder.removeAll()
         lock.unlock()
         for (_, cont) in all {
             cont.resume(returning: false)
         }
+    }
+
+    private func decide(id: UUID, approved: Bool) -> Bool {
+        lock.lock()
+        if let continuation = pendingContinuations.removeValue(forKey: id) {
+            lock.unlock()
+            continuation.resume(returning: approved)
+            return true
+        }
+        // No waiter yet. Remember the answer so a late registration resolves
+        // instead of parking forever; a cancel for this id is now moot.
+        cancelledWaits.remove(id)
+        pendingDecisions[id] = approved
+        pendingDecisionOrder.append(id)
+        if pendingDecisionOrder.count > Self.rememberedDecisionLimit {
+            let oldest = pendingDecisionOrder.removeFirst()
+            pendingDecisions.removeValue(forKey: oldest)
+        }
+        lock.unlock()
+        return true
     }
 }
 
@@ -109,24 +178,44 @@ public struct ActionConfirmationView: View {
 
                 Spacer()
 
-                // Turbo Mode indicator
-                Button(action: {
-                    isTurboModeEnabled.toggle()
-                }) {
+                // Turbo Mode indicator. It may ENABLE Turbo and never disable it.
+                // This used to be a blind toggle drawn as a status badge, and it
+                // is the first control in the header: clicking it to turn Turbo
+                // on while Turbo was already on turned it OFF. Disabling belongs
+                // to the composer pill and Settings, where the state being
+                // changed is the thing under the pointer.
+                if isTurboModeEnabled {
                     HStack(spacing: 4) {
-                        Image(systemName: isTurboModeEnabled ? "bolt.fill" : "bolt.slash")
+                        Image(systemName: "bolt.fill")
                             .font(.system(size: 10))
-                        Text(isTurboModeEnabled ? "Turbo ON" : "Turbo OFF")
+                        Text("Turbo ON")
                             .font(.system(size: 10, weight: .semibold, design: .monospaced))
                     }
                     .padding(.horizontal, 6)
                     .padding(.vertical, 3)
-                    .background(isTurboModeEnabled ? Color.orange.opacity(0.18) : Color.secondary.opacity(0.1))
-                    .foregroundColor(isTurboModeEnabled ? .orange : .secondary)
+                    .background(Color.orange.opacity(0.18))
+                    .foregroundColor(.orange)
                     .cornerRadius(5)
+                    .help("Turbo Mode is on. Turn it off from the composer's Turbo pill or Settings.")
+                } else {
+                    Button(action: {
+                        TurboModeSettings.set(true, from: "ActionConfirmationView")
+                    }) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "bolt.slash")
+                                .font(.system(size: 10))
+                            Text("Enable Turbo")
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(Color.secondary.opacity(0.1))
+                        .foregroundColor(.secondary)
+                        .cornerRadius(5)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Turn Turbo Mode on so this and later file writes and commands run without a per-call confirmation. This control cannot turn Turbo off.")
                 }
-                .buttonStyle(.plain)
-                .help("When Turbo Mode is ON, file writes and commands execute automatically without individual confirmation.")
             }
 
             // Summary of Target / Action

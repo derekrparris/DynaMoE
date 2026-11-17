@@ -865,7 +865,7 @@ final class SubagentToolExecutor {
                mode: parentMode,
                subQEndpoint: subQEndpoint
            ),
-           !(UserDefaults.standard.bool(forKey: "dynamoe_agent_turbo_mode")
+           !(TurboModeSettings.isEnabled
              && AgentHarness.turboModeMayBypassApproval(
                  toolName: name,
                  arguments: arguments,
