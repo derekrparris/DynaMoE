@@ -126,19 +126,80 @@ struct ChatDetailView: View {
     /// point at a plan the conversation has already moved past. A follow-up that
     /// itself produces a plan is a NEWER ready message, so this search finds it.
     private var readyPlanMessage: ChatMessage? {
+        // Short-circuit before any history scan: outside plan mode the answer is
+        // always nil, and this property is read by the body on every streamed
+        // chunk of every turn.
         guard isPlanMode, !isGenerating, let session else { return nil }
-        guard let planIndex = session.messages.lastIndex(where: {
-            $0.role == .assistant
-                && PlanMarkers.anyMarkerMentioned(in: $0.content)
-                && PlanMarkers.readyPresent(in: $0.content)
-        }) else { return nil }
-        if let lastUserIndex = session.messages.lastIndex(where: { $0.role == .user }),
-           lastUserIndex > planIndex {
-            return nil
+        return readyPlanMemo.value(
+            messages: session.messages,
+            dismissedPlanMessageId: dismissedPlanMessageId
+        )
+    }
+
+    /// Memoizes the ready-plan search.
+    ///
+    /// The search runs `lastIndex(where:)` over every message and executes
+    /// `PlanMarkers.anyMarkerMentioned` + `readyPresent` on each assistant
+    /// message's FULL content. At 50–60k tokens that is tens of kilobytes of
+    /// marker scanning per assistant message. A streaming turn does not pay it:
+    /// `readyPlanMessage` is gated on `!isGenerating`, so the search never runs
+    /// mid-stream. What re-runs it is every other body pass of an idle plan
+    /// conversation (typing in the composer, a resize, a status notice), and
+    /// the memo answers each of those without the scan. The key is the tuple
+    /// that can change the answer: message count, the last message's identity
+    /// and length (the only message that can grow), and the dismissed plan.
+    final class ReadyPlanMemo {
+        private var key: Key?
+        private var cached: ChatMessage?
+
+        struct Key: Equatable {
+            var messageCount: Int
+            var lastMessageId: UUID?
+            var lastMessageLength: Int
+            var lastMessageRole: MessageRole?
+            var dismissedPlanMessageId: UUID?
         }
-        let message = session.messages[planIndex]
-        guard dismissedPlanMessageId != message.id else { return nil }
-        return message
+
+        func value(messages: [ChatMessage], dismissedPlanMessageId: UUID?) -> ChatMessage? {
+            let last = messages.last
+            let newKey = Key(
+                messageCount: messages.count,
+                lastMessageId: last?.id,
+                lastMessageLength: (last?.content.count ?? 0) + (last?.thinkingContent?.count ?? 0),
+                lastMessageRole: last?.role,
+                dismissedPlanMessageId: dismissedPlanMessageId
+            )
+            if key == newKey { return cached }
+
+            let found = Self.search(
+                messages: messages,
+                dismissedPlanMessageId: dismissedPlanMessageId
+            )
+            key = newKey
+            cached = found
+            return found
+        }
+
+        /// The search itself, split out so it can be tested without a view.
+        ///
+        /// A plan is only current until the next user turn: once a follow-up has
+        /// been sent, an older plan's handoff must not come back when the reply
+        /// carries no markers. A follow-up that produces a plan of its own is a
+        /// newer ready message, so this search finds it.
+        static func search(
+            messages: [ChatMessage],
+            dismissedPlanMessageId: UUID?
+        ) -> ChatMessage? {
+            guard let planIndex = messages.lastIndex(where: {
+                $0.role == .assistant
+                    && PlanMarkers.anyMarkerMentioned(in: $0.content)
+                    && PlanMarkers.readyPresent(in: $0.content)
+            }) else { return nil }
+            let lastUserIndex = messages.lastIndex(where: { $0.role == .user })
+            if let lastUserIndex, lastUserIndex > planIndex { return nil }
+            let message = messages[planIndex]
+            return dismissedPlanMessageId == message.id ? nil : message
+        }
     }
     var onSendMessage: (String, [PreparedImage]) -> Bool
     var onStopGeneration: () -> Void
@@ -174,9 +235,29 @@ struct ChatDetailView: View {
     /// to be remembered; being view state, it resets on relaunch and a dismissed
     /// plan comes back rather than disappearing for good.
     @State private var dismissedPlanMessageId: UUID? = nil
+    /// Memoizes the ready-plan search, which otherwise scans every message's
+    /// full content on every streamed frame.
+    @State private var readyPlanMemo = ReadyPlanMemo()
     @State private var promptTokenCount: Int = 0
     @State private var tokenCountTask: Task<Void, Never>? = nil
     @State private var isPinnedToBottom: Bool = true
+    /// Set while a `scrollTo` this view issued is still settling. Content growth
+    /// must never unpin the follow, and an animated programmatic scroll
+    /// transiently reads as "scrolled away from the bottom", which is what made
+    /// the pin state flip mid-stream and the follow stop. Only a user drag may
+    /// unpin.
+    @State private var isProgrammaticScrollInFlight: Bool = false
+    /// The suppression window above, held as a cancellable work item rather than
+    /// a bare `asyncAfter`: a drag revokes it the moment it happens (otherwise a
+    /// reader who grabbed the transcript during the 200 ms follow animation could
+    /// not scroll away at all), and a disappearing view cancels it instead of
+    /// running it against a released one.
+    @State private var scrollSuppressionWork: DispatchWorkItem? = nil
+    /// The per-message parse and segmentation, shared by every row of a
+    /// message so segmentation does not multiply parse cost.
+    @State private var presentationCache = TranscriptPresentationCache()
+    /// Geometry and row-height instrumentation for the whiteout threshold.
+    @State private var transcriptDiagnostics = TranscriptDiagnostics()
     /// Memoizes the cloud context-window lookup the header pill uses. The body
     /// runs on every streamed frame and the policy re-parses the provider's
     /// `model=window` string on each call; the key includes the raw recorded
@@ -228,34 +309,265 @@ struct ChatDetailView: View {
     /// editor's first measurement, when the floor stands in.
     @State private var composerEditorHeight: CGFloat = 0
 
-    /// Distance-from-bottom bookkeeping for the pin/detach logic.
-    private struct ScrollSnapshot: Equatable {
-        var offset: CGFloat
-        var contentHeight: CGFloat
-        var containerHeight: CGFloat
-
-        var distanceFromBottom: CGFloat {
-            contentHeight - (offset + containerHeight)
-        }
-    }
+    /// True while the scroll view reports that the reader is driving it, i.e. a
+    /// trackpad or wheel gesture. The pin may only be dropped by the reader; a
+    /// follow, a lazy row re-estimate and a clamp after a shrink all move the
+    /// offset without anyone touching it.
+    @State private var isReaderScrolling: Bool = false
     @AppStorage("dynamoe_agent_turbo_mode") private var isTurboModeEnabled: Bool = false
     @ObservedObject private var subagentManager = SubagentManager.shared
 
-    /// Characters of streamed output that make up one follow-scroll bucket,
-    /// roughly one line. This is the knob that controls how often the
-    /// transcript scrolls while a turn streams: smaller follows more often.
-    private static let streamedFollowBucketCharacters = 120
+    /// Characters of streamed output that make up one follow bucket, roughly one
+    /// line. The follow keys off this rather than the exact length so a turn
+    /// scrolls a few times a second instead of once per streamed chunk.
+    private static let streamFollowBucketCharacters = 120
 
-    /// Coarse progress marker for the newest message (content or thinking
-    /// grows — a chat turn, or the /compact progress bubble typing out a
-    /// summary). The follow handler keys off buckets of roughly a line of
-    /// output instead of the exact length: a per-token value made the handler
-    /// run several times per frame, and every run had to invalidate layout to
-    /// scroll, which a long transcript cannot absorb.
-    private var streamedContentBucket: Int {
+    /// Coarse progress marker for the newest message, so the transcript follows
+    /// a streamed answer without a `scrollTo` per chunk.
+    private var streamFollowBucket: Int {
         guard let last = session?.messages.last else { return 0 }
         return (last.content.count + (last.thinkingContent?.count ?? 0))
-            / Self.streamedFollowBucketCharacters
+            / Self.streamFollowBucketCharacters
+    }
+
+    // MARK: - Transcript rows
+
+    /// The flattened rows the transcript draws: one per message in the common
+    /// case, several for a message too tall to paint as one lazy child.
+    ///
+    /// Parsing is the expensive half of this and happens only where the rows
+    /// need it. This loop runs over EVERY message on the first body pass, so
+    /// parsing each one here made opening a long conversation a main-actor stall
+    /// — 0.43 s for 30 turns of 57 KB, 1.42 s for 100 — on exactly the case the
+    /// diagnostic below was added to instrument. A message that cannot exceed a
+    /// row's budget is therefore emitted as one row with no parse, and the row
+    /// parses itself when the lazy stack realizes it.
+    private func transcriptRows(for session: ChatSession) -> [TranscriptEntry] {
+        var rows: [TranscriptEntry] = []
+        rows.reserveCapacity(session.messages.count)
+
+        for message in session.messages {
+            if message.isCompactionSummary == true {
+                // A digest card is chrome, not a turn: it is never split, and
+                // its own card already bounds the summary's height.
+                rows.append(TranscriptEntry(
+                    row: TranscriptRow(
+                        messageId: message.id,
+                        kind: .compactionSummary,
+                        segmentIndex: 0,
+                        segmentCount: 1,
+                        segment: TranscriptSegment()
+                    ),
+                    message: message,
+                    displayContent: nil
+                ))
+                continue
+            }
+            if message.role == .user {
+                // Chunked through the cache too: the chunker is O(characters),
+                // and this runs on every body pass, i.e. on every streamed
+                // chunk, for every pasted turn in the conversation.
+                rows.append(contentsOf: TranscriptSegmenter.rows(
+                    for: message.id,
+                    kind: .message,
+                    segments: presentationCache.plainTextSegments(for: message)
+                ).map { TranscriptEntry(row: $0, message: message, displayContent: nil) })
+                continue
+            }
+            // The plan-marker classification rides the cache: the probe reads
+            // every character of the answer, and this loop runs on every body
+            // pass, i.e. on every streamed chunk.
+            if presentationCache.isPlanCard(for: message) {
+                rows.append(TranscriptEntry(
+                    row: TranscriptRow(
+                        messageId: message.id,
+                        kind: .planCard,
+                        segmentIndex: 0,
+                        segmentCount: 1,
+                        segment: TranscriptSegment()
+                    ),
+                    message: message,
+                    displayContent: nil
+                ))
+                continue
+            }
+            if TranscriptSegmenter.isCertainlyOneRow(message.content) {
+                // One row, and that row does the parsing when it is built.
+                rows.append(TranscriptEntry(
+                    row: TranscriptRow(
+                        messageId: message.id,
+                        kind: .message,
+                        segmentIndex: 0,
+                        segmentCount: 1,
+                        segment: TranscriptSegment(isWholeMessage: true)
+                    ),
+                    message: message,
+                    displayContent: nil
+                ))
+                continue
+            }
+            let presentation = presentationCache.presentation(
+                for: message,
+                isGemmaDialect: isGemmaDialect,
+                isStreaming: isStreamingMessage(message, in: session)
+            )
+            rows.append(contentsOf: TranscriptSegmenter.rows(
+                for: message.id,
+                kind: .message,
+                segments: presentation.segments
+            ).map {
+                TranscriptEntry(
+                    row: $0,
+                    message: message,
+                    displayContent: presentation.displayContent
+                )
+            })
+        }
+        return rows
+    }
+
+    /// True for the one message whose text is still arriving: the transcript's
+    /// last message during a turn, or the `/compact` pass's progress bubble.
+    ///
+    /// The parse the presentation cache holds differs by this flag, so every
+    /// caller has to ask the same question. Two answers for one message would
+    /// make the cache re-parse it with the repair passes and then without on
+    /// every body pass, which is the cost the cache exists to avoid, on the main
+    /// actor, while the text grows.
+    private func isStreamingMessage(_ message: ChatMessage, in session: ChatSession) -> Bool {
+        if isGenerating, message.id == session.messages.last?.id { return true }
+        // A compaction pass streams into its progress bubble without ever
+        // setting `isGenerating`, so keying on the turn alone left that bubble
+        // re-parsing with repairs enabled on every chunk.
+        return isCompactingConversation && message.id == compactionProgressMessageId
+    }
+
+    /// One transcript row. Split out of the `ForEach` so the body stays
+    /// readable and so the compaction/plan/message choice lives in one place.
+    @ViewBuilder
+    private func transcriptRowView(_ entry: TranscriptEntry, in session: ChatSession) -> some View {
+        let row = entry.row
+        let message = entry.message
+        switch row.kind {
+            case .compactionSummary:
+                CompactionSummaryCard(
+                    message: message,
+                    isExpanded: Binding(
+                        get: { isCompactionSummaryExpanded[message.id] ?? true },
+                        set: { isCompactionSummaryExpanded[message.id] = $0 }
+                    )
+                )
+            case .planCard:
+                PlanCard(
+                    content: PlanMarkers.strip(message.content),
+                    thinkingContent: message.thinkingContent,
+                    isReady: PlanMarkers.readyPresent(in: message.content),
+                    isStreaming: isGenerating && message.id == session.messages.last?.id,
+                    isReasoningExpanded: Binding(
+                        get: { isReasoningExpanded[message.id] ?? reasoningExpandedByDefault },
+                        set: { isReasoningExpanded[message.id] = $0 }
+                    )
+                )
+            case .message:
+                ChatMessageView(
+                    message: message,
+                    row: row,
+                    displayContent: entry.displayContent,
+                    zoomScale: zoomManager.zoomScale,
+                    isGenerating: isGenerating && message.id == session.messages.last?.id,
+                    isStreamingOffDisk: isStreamingOffDisk,
+                    isCompactingConversation: message.id == compactionProgressMessageId,
+                    isGemmaDialect: isGemmaDialect,
+                    isExpanded: Binding(
+                        get: { isReasoningExpanded[message.id] ?? reasoningExpandedByDefault },
+                        set: { isReasoningExpanded[message.id] = $0 }
+                    )
+                )
+                // Every realized row is re-evaluated when the transcript's body
+                // runs, which happens on each streamed chunk. `ChatMessageView`
+                // compares its render fingerprint, so an unchanged row is
+                // skipped here instead of re-running its body over the whole
+                // message.
+                .equatable()
+        }
+    }
+
+    /// What kind of row this is, for the geometry diagnostic. A bare height
+    /// cannot be acted on: whether the row that crosses the ceiling is an
+    /// answer, a plan card or a compaction digest decides where the fix goes.
+    private static func diagnosticLabel(for row: TranscriptRow) -> String {
+        let kind: String
+        switch row.kind {
+        case .compactionSummary: kind = "compaction"
+        case .planCard: kind = "plan"
+        case .message: kind = "message"
+        }
+        return "\(kind)#\(row.segmentIndex)/\(row.segmentCount)"
+    }
+
+    /// Emits the transcript's geometry once for `session`, tagged with `suffix`
+    /// so the settle report and the restored-conversation report are separate
+    /// lines rather than one suppressing the other.
+    ///
+    /// The segments come from the same cheap rule the rows use, rather than from
+    /// a fresh eager parse of every message. The restored-conversation report
+    /// fires 1.5 s after a long history is opened — precisely the moment the
+    /// eager parse was making the transcript blank — so re-parsing the whole
+    /// conversation for a diagnostic would put the defect back.
+    private func reportTranscriptGeometry(for session: ChatSession, suffix: String) {
+        var segmentsByMessage: [UUID: [TranscriptSegment]] = [:]
+        for message in session.messages {
+            segmentsByMessage[message.id] = segmentsForDiagnostic(for: message)
+        }
+        transcriptDiagnostics.reportIfNeeded(
+            turnKey: "\(session.id.uuidString.prefix(8))-\(suffix)",
+            messages: session.messages,
+            segmentsByMessage: segmentsByMessage
+        )
+    }
+
+    /// What the transcript draws for `message`, at the granularity that is
+    /// actually realized: one lazy row for a message that cannot split, the
+    /// cached segmentation for one that can.
+    ///
+    /// Nothing here may PARSE. The report fires once at settle, when the turn's
+    /// own messages have already been parsed, and once 1.5 s after a restored
+    /// conversation opens, when nothing has — and that second case is the one
+    /// where parsing the whole history would put the blank-transcript stall
+    /// back. A message with no cached shape reports as one row until its row
+    /// list parses it.
+    private func segmentsForDiagnostic(for message: ChatMessage) -> [TranscriptSegment] {
+        if message.isCompactionSummary == true {
+            return []
+        }
+        if message.role == .user {
+            return presentationCache.plainTextSegments(for: message)
+        }
+        if presentationCache.isPlanCard(for: message)
+            || TranscriptSegmenter.isCertainlyOneRow(message.content) {
+            return [TranscriptSegment(isWholeMessage: true)]
+        }
+        return presentationCache.cachedPresentation(
+            for: message,
+            isGemmaDialect: isGemmaDialect
+        )?.segments ?? [TranscriptSegment(isWholeMessage: true)]
+    }
+
+    /// Opens the window in which a programmatic scroll's own offsets are not read
+    /// as a drag, and closes it after the longest animation this view runs.
+    private func beginScrollSuppression() {
+        isProgrammaticScrollInFlight = true
+        scrollSuppressionWork?.cancel()
+        let work = DispatchWorkItem { isProgrammaticScrollInFlight = false }
+        scrollSuppressionWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+    }
+
+    /// Ends the window early: the reader is driving the scroll now.
+    private func endScrollSuppression() {
+        scrollSuppressionWork?.cancel()
+        scrollSuppressionWork = nil
+        isProgrammaticScrollInFlight = false
     }
 
     /// Scrolls the transcript to its newest line. Callers are throttled by
@@ -267,6 +579,13 @@ struct ChatDetailView: View {
     /// faster than it completes. Discrete transitions (a message landing, a
     /// turn starting or ending) animate, as they did before the throttle.
     private func followBottom(_ proxy: ScrollViewProxy, animated: Bool = false) {
+        // Only an ANIMATED follow needs the suppression window: it reports
+        // intermediate offsets for its whole duration. An instantaneous jump
+        // lands on the bottom within the same frame, so it cannot be misread as
+        // a drag. Claiming the window for it (a streaming turn follows
+        // several times a second) left the pin permanently immune to the user
+        // scrolling away.
+        if animated { beginScrollSuppression() }
         DispatchQueue.main.async {
             if animated {
                 withAnimation(.easeOut(duration: 0.2)) {
@@ -275,6 +594,38 @@ struct ChatDetailView: View {
             } else {
                 proxy.scrollTo(Self.scrollBottomAnchorID, anchor: .bottom)
             }
+        }
+    }
+
+    /// Lands the transcript on its newest line when the view first appears, which
+    /// is what the removed `defaultScrollAnchor(.bottom)` used to provide.
+    ///
+    /// The jump is attempted twice: the first normally resolves the tail row
+    /// directly, but a long conversation restored from disk may not have realized
+    /// it on the first pass, and the second attempt is a no-op when the first one
+    /// landed.
+    private func followBottomOnFirstAppearance(_ proxy: ScrollViewProxy) {
+        guard isPinnedToBottom else { return }
+        followBottom(proxy)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            guard isPinnedToBottom else { return }
+            proxy.scrollTo(Self.scrollBottomAnchorID, anchor: .bottom)
+        }
+    }
+
+    /// Follows a transcript that grew without streaming any text: a tool-call
+    /// card landing under a capped reasoning trace, a status line, a row
+    /// re-segmenting.
+    ///
+    /// The bottom anchor's position is the lazy stack's own layout, so a jump
+    /// issued while rows are still being realized can land short of the tail.
+    /// One re-check a moment later covers that, and only one: the second jump is
+    /// a no-op when the first landed, so this cannot chase the anchor.
+    private func followGrowth(_ proxy: ScrollViewProxy) {
+        followBottom(proxy)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            guard isPinnedToBottom, !isReaderScrolling else { return }
+            followBottom(proxy)
         }
     }
 
@@ -294,9 +645,13 @@ struct ChatDetailView: View {
         guard let first = session?.messages.first,
               first.isCompactionSummary == true,
               session?.messages.count == 2 else { return false }
+        beginScrollSuppression()
         DispatchQueue.main.async {
             withAnimation(.easeOut(duration: 0.2)) {
-                proxy.scrollTo(first.id, anchor: .top)
+                // The card is a message, and a message's own id no longer names
+                // a row: every message is drawn as at least one segment, so the
+                // scroll target is the first segment's id.
+                proxy.scrollTo(TranscriptRow.firstSegmentId(for: first.id), anchor: .top)
             }
         }
         return true
@@ -699,48 +1054,46 @@ struct ChatDetailView: View {
                 ScrollView {
                     VStack(spacing: 0) {
                         if let session = session, !session.messages.isEmpty {
-                            LazyVStack(spacing: 24) {
-                                ForEach(session.messages) { message in
-                                    Group {
-                                        if message.isCompactionSummary == true {
-                                            CompactionSummaryCard(
-                                                message: message,
-                                                isExpanded: Binding(
-                                                    get: { isCompactionSummaryExpanded[message.id] ?? true },
-                                                    set: { isCompactionSummaryExpanded[message.id] = $0 }
-                                                )
-                                            )
-                                        } else if message.role == .assistant,
-                                                  PlanMarkers.anyMarkerMentioned(in: message.content),
-                                                  PlanMarkers.startPresent(in: message.content) {
-                                            PlanCard(
-                                                content: PlanMarkers.strip(message.content),
-                                                thinkingContent: message.thinkingContent,
-                                                isReady: PlanMarkers.readyPresent(in: message.content),
-                                                isStreaming: isGenerating && message.id == session.messages.last?.id,
-                                                isReasoningExpanded: Binding(
-                                                    get: { isReasoningExpanded[message.id] ?? reasoningExpandedByDefault },
-                                                    set: { isReasoningExpanded[message.id] = $0 }
-                                                )
-                                            )
-                                        } else {
-                                            ChatMessageView(
-                                                message: message,
-                                                isGenerating: isGenerating && message.id == session.messages.last?.id,
-                                                isStreamingOffDisk: isStreamingOffDisk,
-                                                isCompactingConversation: message.id == compactionProgressMessageId,
-                                                isGemmaDialect: isGemmaDialect,
-                                                isExpanded: Binding(
-                                                    get: { isReasoningExpanded[message.id] ?? reasoningExpandedByDefault },
-                                                    set: { isReasoningExpanded[message.id] = $0 }
-                                                )
+                            // One lazy child per SEGMENT, not per message: a
+                            // single assistant turn of 50–60k tokens laid out to
+                            // 15,000–20,000 pt in one row, which crosses the
+                            // compositor's maximum layer and paints blank. A
+                            // message that fits the budget still yields exactly
+                            // one row, so nothing about a normal conversation
+                            // changes.
+                            LazyVStack(spacing: 0) {
+                                ForEach(transcriptRows(for: session)) { entry in
+                                    transcriptRowView(entry, in: session)
+                                        .id(entry.row.id)
+                                        // The row's own height is the number the
+                                        // whiteout hypothesis is about: a lazy
+                                        // child taller than the compositor's
+                                        // ceiling is realized but never painted.
+                                        .onGeometryChange(for: CGFloat.self) { proxy in
+                                            proxy.size.height
+                                        } action: { height in
+                                            transcriptDiagnostics.record(
+                                                rowId: entry.row.id,
+                                                label: Self.diagnosticLabel(for: entry.row),
+                                                height: height
                                             )
                                         }
-                                    }
-                                    .id(message.id)
+                                        // The gap belongs between MESSAGES, not
+                                        // between rows: rows of one message sit
+                                        // flush so a paragraph or a code block
+                                        // that was split to fit the budget reads
+                                        // continuously instead of breaking at
+                                        // every row boundary. For a message that
+                                        // was not split this is the same 24 pt
+                                        // gap the stack used to apply. The
+                                        // padding sits OUTSIDE the measurement,
+                                        // so the recorded height is the row's.
+                                        .padding(.top, entry.row.isFirst ? 24 : 0)
                                 }
                             }
-                            .padding(.top, 24)
+                            // No top padding here: the first row carries the
+                            // 24 pt gap itself, and applying it in both places
+                            // gave the opening message 48.
                             .padding(.bottom, 24)
                         } else {
                             EmptyWelcomeView(
@@ -766,8 +1119,42 @@ struct ChatDetailView: View {
                     // still be reachable under it.
                     .padding(.top, historyWarningHeight)
                 }
+                // The follow has ONE owner: the explicit `followBottom` below.
+                // `defaultScrollAnchor(.bottom)` used to sit here as well and the
+                // two disagreed. It also re-applies whenever the scroll view is
+                // created or resized, so switching sessions with the reader
+                // scrolled back snapped them to the bottom. Placement on first
+                // appearance is handled by the `onAppear` follow instead.
+                .onAppear {
+                    followBottomOnFirstAppearance(proxy)
+                }
+                .onDisappear {
+                    scrollSuppressionWork?.cancel()
+                }
+                // A user gesture always wins: it ends any suppression window a
+                // follow opened, so a drag during the 200 ms animated follow can
+                // still scroll the reader away. A programmatic follow reports
+                // `.animating`, never `.interacting`.
+                .onScrollPhaseChange { _, newPhase in
+                    // The scroll view is the only authority on who is driving.
+                    isReaderScrolling = TranscriptFollowPolicy.isReaderDriven(newPhase)
+                    if isReaderScrolling {
+                        // A gesture, or the momentum of one, always wins over
+                        // the suppression window a follow opened.
+                        endScrollSuppression()
+                    }
+                }
                 .onChange(of: session?.id) { _ in
                     isPinnedToBottom = true
+                    isReaderScrolling = false
+                    // Switching conversations is the one moment the cache is
+                    // certain to hold a previous conversation's parses: nothing
+                    // settles, so the turn hook below never fires, and reading
+                    // five chats without generating retained five conversations'
+                    // worth of parses until one did.
+                    if let session {
+                        presentationCache.prune(keeping: Set(session.messages.map(\.id)))
+                    }
                     guard !landOnCompactedSummary(proxy) else { return }
                     followBottom(proxy)
                 }
@@ -776,40 +1163,94 @@ struct ChatDetailView: View {
                     guard isPinnedToBottom else { return }
                     followBottom(proxy, animated: true)
                 }
-                .onChange(of: streamedContentBucket) { _ in
-                    guard isPinnedToBottom, isGenerating || isCompactingConversation else { return }
-                    followBottom(proxy)
-                }
                 .onChange(of: isGenerating) { generating in
                     if generating {
                         // A new turn is starting (user sent or a queued prompt fired):
                         // re-pin and jump to the newest message.
                         isPinnedToBottom = true
+                        transcriptDiagnostics.beginTurn()
                         followBottom(proxy, animated: true)
-                    } else if isPinnedToBottom {
-                        followBottom(proxy, animated: true)
+                    } else {
+                        // The turn settled: emit its numbers once. This is what
+                        // makes the whiteout threshold falsifiable. If no row and
+                        // no content height crosses the compositor ceiling, the
+                        // hypothesis is wrong and segmentation is not the fix.
+                        if isPinnedToBottom { followBottom(proxy, animated: true) }
+                        if let session {
+                            reportTranscriptGeometry(
+                                for: session,
+                                suffix: "\(session.messages.count)"
+                            )
+                            presentationCache.prune(keeping: Set(session.messages.map(\.id)))
+                        }
                     }
                 }
-                .onScrollGeometryChange(for: ScrollSnapshot.self) { geometry in
-                    ScrollSnapshot(
+                // A conversation restored from disk is the OTHER reproduction of
+                // the whiteout: nothing is generating, so the turn-settle report
+                // above never fires, and yet this is the case that was reported
+                // (a long agent conversation opens blank until something changes
+                // the content height). Report once per session, after the lazy
+                // rows have had time to realize and publish their heights.
+                .onChange(of: session?.id) {
+                    // One diagnostics object serves every conversation this view
+                    // shows, so rows built for the previous one must not ride
+                    // into this conversation's report.
+                    transcriptDiagnostics.beginSession()
+                }
+                .task(id: session?.id) {
+                    guard let session, !session.messages.isEmpty else { return }
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    guard !Task.isCancelled, !isGenerating else { return }
+                    reportTranscriptGeometry(for: session, suffix: "restored")
+                }
+                // The follow is explicit, off a coarse bucket (about a line) so a
+                // turn jumps a few times a second instead of once per chunk:
+                // rows are re-segmented as an answer grows, heights change, and
+                // nothing else holds the tail. A compaction pass streams into its
+                // progress bubble without ever setting `isGenerating`, so it
+                // counts as a running turn here too, or it scrolls the first
+                // bucket and then stops following.
+                .onChange(of: streamFollowBucket) { _ in
+                    guard isGenerating || isCompactingConversation, isPinnedToBottom else {
+                        return
+                    }
+                    followBottom(proxy)
+                }
+                .onScrollGeometryChange(for: TranscriptFollowPolicy.Snapshot.self) { geometry in
+                    TranscriptFollowPolicy.Snapshot(
                         offset: geometry.contentOffset.y,
                         contentHeight: geometry.contentSize.height,
                         containerHeight: geometry.containerSize.height
                     )
                 } action: { old, new in
-                    if new.contentHeight != old.contentHeight && new.offset == old.offset {
-                        // Content grew under us (streaming output) — not a user
-                        // scroll. Keep the current pin state; the bucket handler
-                        // will follow if pinned. Otherwise growing content would
-                        // read as "scrolled away from bottom" and unpin itself.
-                        return
+                    // Report the geometry the diagnostic needs to prove (or
+                    // disprove) the compositor-ceiling hypothesis.
+                    transcriptDiagnostics.record(
+                        contentHeight: new.contentHeight,
+                        viewportHeight: new.containerHeight
+                    )
+
+                    let outcome = TranscriptFollowPolicy.decide(
+                        from: old,
+                        to: new,
+                        isPinned: isPinnedToBottom,
+                        isReaderScrolling: isReaderScrolling,
+                        isFollowInFlight: isProgrammaticScrollInFlight
+                    )
+                    if let pin = outcome.pin, pin != isPinnedToBottom {
+                        isPinnedToBottom = pin
                     }
-                    // Only write on a real change: this action runs on every
-                    // geometry update, and an unconditional write invalidated
-                    // the view several times per frame while a turn streamed.
-                    let pinned = new.distanceFromBottom <= 48
-                    if pinned != isPinnedToBottom {
-                        isPinnedToBottom = pinned
+                    // Growth the streamed-text bucket cannot see has to be
+                    // followed too: a tool-call card landing under a capped
+                    // reasoning trace grows the transcript with no new output,
+                    // and the trace has stopped growing, so nothing else would
+                    // ever bring the card into view. Only a live turn follows
+                    // this way: an idle transcript grows because the reader
+                    // opened something, and yanking them to the tail for that
+                    // would scroll away what they just asked to see.
+                    if outcome.follow, isPinnedToBottom,
+                       isGenerating || isCompactingConversation {
+                        followGrowth(proxy)
                     }
                 }
                 // Everything the chat column says without moving anything: the
@@ -2645,15 +3086,22 @@ enum LongTextChunker {
         return chunks.isEmpty ? [text] : chunks
     }
 
-    /// True when `chunks(of:)` would return more than one piece, i.e. when a
-    /// single text view would be too tall to paint reliably. Renderers use it
-    /// to choose `ChunkedText` without splitting the block itself.
+    /// True when `text` is too tall to draw as one piece, i.e. when it has to be
+    /// split by `chunks(of:)` or drawn inside a capped scroll area.
+    ///
+    /// The character budget is applied to UTF-8 bytes, an upper bound on the
+    /// character count rather than an estimate: non-ASCII text is reported
+    /// oversized a little earlier than its grapheme count would, which is the
+    /// safe direction for a compositor ceiling.
     nonisolated static func isOversized(
         _ text: String,
         maxLines: Int = 120,
         maxCharacters: Int = 8000
     ) -> Bool {
-        if text.count > maxCharacters { return true }
+        // UTF-8 bytes rather than graphemes: renderers ask this on every body
+        // pass, and `String.count` walks the whole string. The line walk below
+        // already reads the string's bytes.
+        if text.utf8.count > maxCharacters { return true }
         var newlines = 0
         for byte in text.utf8 where byte == 0x0A {
             newlines += 1
@@ -2916,7 +3364,11 @@ struct CompactionSummaryCard: View {
             }
 
             if isExpanded {
-                MarkdownMessageView(content: message.content)
+                // A digest of a 60k-token conversation is long enough to be its
+                // own row's ceiling problem, and this card is a single row.
+                BoundedInspection(isTall: TranscriptSegmenter.exceedsInspectionHeight(message.content)) {
+                    MarkdownMessageView(content: message.content)
+                }
             }
         }
         .padding(14)
@@ -3020,20 +3472,42 @@ struct PlanCard: View {
                     .help(isReasoningExpanded ? "Hide the plan's reasoning" : "Show the plan's reasoning")
 
                     if isReasoningExpanded {
-                        Text(thinking)
-                            .font(.system(size: max(9.5, 11.5 * zoomManager.zoomScale)))
-                            .foregroundColor(.secondary)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .padding(8)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Color.secondary.opacity(0.05))
-                            .cornerRadius(6)
+                        // A plan turn's reasoning runs to tens of thousands of
+                        // tokens. Chunking bounds any ONE text view but not the
+                        // stack of them, so the trace is capped as well: a plan
+                        // card is one row, and a row taller than the
+                        // compositor's ceiling is never painted.
+                        BoundedInspection(
+                            isTall: TranscriptSegmenter.exceedsInspectionHeight(thinking),
+                            followsTail: isStreaming,
+                            tailKey: thinking.utf8.count
+                        ) {
+                            ChunkedText(text: thinking, lineSpacing: 3)
+                                .font(.system(size: max(9.5, 11.5 * zoomManager.zoomScale)))
+                                .foregroundColor(.secondary)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.secondary.opacity(0.05))
+                        .cornerRadius(6)
                     }
                 }
             }
 
-            MarkdownMessageView(content: content, isStreaming: isStreaming && !isReady)
+            // The plan itself is a document of arbitrary length, and this card is
+            // a single transcript row: it is bounded here for the same reason the
+            // message rows are split. A plan short enough to read inline is
+            // unchanged.
+            BoundedInspection(
+                isTall: TranscriptSegmenter.exceedsInspectionHeight(content),
+                followsTail: isStreaming,
+                tailKey: content.utf8.count
+            ) {
+                MarkdownMessageView(content: content, isStreaming: isStreaming && !isReady)
+            }
         }
         .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -3052,9 +3526,30 @@ struct PlanCard: View {
     }
 }
 
-struct ChatMessageView: View {
+struct ChatMessageView: View, Equatable {
     @EnvironmentObject private var zoomManager: AppZoomManager
     let message: ChatMessage
+    /// The slice of `message` this row draws. A message that fits the
+    /// transcript's row budget has exactly one row, so this is the whole
+    /// message and its rendering is unchanged; only a message that would lay
+    /// out taller than the compositor's ceiling is split across several rows.
+    let row: TranscriptRow
+    /// The message's display text (tool-call markup stripped), when the
+    /// transcript already derived it to segment this message. Nil means this row
+    /// derives it below, once per content change.
+    ///
+    /// The transcript supplies it only where it had to parse the message anyway.
+    /// Deriving it for every message up front was a markdown strip over the
+    /// whole conversation on the first body pass, over the messages the lazy
+    /// stack may never build.
+    let displayContent: String?
+    /// Mirrors `zoomManager.zoomScale` into the render fingerprint.
+    ///
+    /// This view is compared with `.equatable()`, and an equal view is not
+    /// re-rendered even when the environment changed. Every font size here is
+    /// scaled by the app-wide zoom, so it has to be part of the compared value
+    /// or a zoom change would leave the transcript at the old type scale.
+    var zoomScale: CGFloat = 1
     var isGenerating: Bool = false
     var isStreamingOffDisk: Bool = false
     var isCompactingConversation: Bool = false
@@ -3064,29 +3559,34 @@ struct ChatMessageView: View {
     @Binding var isExpanded: Bool
     @State private var isCopied = false
     @State private var isThinkingCopied = false
+    @State private var displayMemo = DisplayMemo()
 
-    /// Memoizes the display-cleanup pass for this message. It strips tool-call
-    /// markup with two regex scans plus three opener searches, and the
-    /// transcript re-renders on every streamed chunk; without the memo every
-    /// visible message repeated that work per frame. Reference type so the body
-    /// can refresh it in place without scheduling another update.
+    /// Memoizes the display derivation for a row the transcript did not parse.
+    /// A reference type so the body can refresh it in place without scheduling
+    /// an update, the same shape `MarkdownMessageView.BlockMemo` uses.
     private final class DisplayMemo {
         var content: String?
-        var gemmaDialect = false
+        var isGemmaDialect = false
         var display = ""
     }
 
-    @State private var displayMemo = DisplayMemo()
-
-    private var displayContent: String {
-        if displayMemo.content == message.content, displayMemo.gemmaDialect == isGemmaDialect {
+    /// What this row draws as text.
+    ///
+    /// Either the value the transcript already derived to segment the message,
+    /// or — for a message that fits one row — derived here, which is what keeps
+    /// an unrealized row free. Memoized on the content, because a streaming turn
+    /// re-runs this body on every chunk.
+    private var resolvedDisplayContent: String {
+        if let displayContent { return displayContent }
+        if displayMemo.content == message.content,
+           displayMemo.isGemmaDialect == isGemmaDialect {
             return displayMemo.display
         }
-        let cleaned = Self.responseDisplayContent(message.content, isGemmaDialect: isGemmaDialect)
+        let derived = Self.responseDisplayContent(message.content, isGemmaDialect: isGemmaDialect)
         displayMemo.content = message.content
-        displayMemo.gemmaDialect = isGemmaDialect
-        displayMemo.display = cleaned
-        return cleaned
+        displayMemo.isGemmaDialect = isGemmaDialect
+        displayMemo.display = derived
+        return derived
     }
 
     /// True when the footer has any telemetry to show. Kept separate from the
@@ -3205,6 +3705,97 @@ struct ChatMessageView: View {
         return isStreamingToolCall
     }
 
+    /// Everything this row draws, reduced to comparable values.
+    ///
+    /// `ChatMessageView` is not `Equatable` by default because `message` is a
+    /// large value and the transcript re-renders on every streamed chunk: every
+    /// realized row re-ran its body per chunk, which is O(history) work per
+    /// frame. This fingerprint is what `==` compares. It includes every field
+    /// the body READS, not the whole message: a field omitted here freezes that
+    /// part of the row mid-stream, which is a far worse failure than the cost it
+    /// saves, while a field the body never reads only makes the comparison
+    /// cheaper to leave out.
+    ///
+    /// Every value here is cheap to compare: a scalar, or a string that shares
+    /// its buffer with the message's own, so `==` is a pointer check in the
+    /// common case. That matters because this runs twice per realized row per
+    /// frame (once per operand of `==`).
+    struct RenderFingerprint: Equatable {
+        var messageId: UUID
+        var role: MessageRole
+        /// The raw content, not the display text: the row that draws an unparsed
+        /// message reads the raw text (it derives the display form itself), and a
+        /// same-length edit still has to repaint.
+        var content: String
+        /// The reasoning trace, reduced to its byte length.
+        ///
+        /// That is only enough because the trace is APPEND-ONLY while a turn
+        /// streams; a future in-place rewrite would keep this number and freeze
+        /// the accordion, so it would have to fingerprint the text itself. Bytes
+        /// rather than `count` because this runs per realized row per frame and
+        /// counting graphemes is O(n).
+        var thinkingLength: Int
+        var isThinking: Bool
+        var prefillStatus: String?
+        var tokenCount: Int
+        var tokensPerSec: Double
+        var timeToFirstTokenSeconds: Double?
+        var thinkingTimeSeconds: Double?
+        var jetSpecTau: Double?
+        var toolCallFingerprint: [ToolCallRecord]
+        /// The records, not a count: the strip reads each attachment's own file
+        /// name, size and hash to load its thumbnail, so a replacement with the
+        /// same count still has to repaint.
+        var attachments: [ImageAttachmentRef]
+        var isCompactionSummary: Bool
+
+        var rowId: String
+        var segmentIndex: Int
+        var segmentCount: Int
+        var segmentBlocks: [MarkdownBlock]
+        var segmentPlainText: String?
+
+        var zoomScale: CGFloat
+        var isGenerating: Bool
+        var isStreamingOffDisk: Bool
+        var isCompactingConversation: Bool
+        var isGemmaDialect: Bool
+        var isExpanded: Bool
+    }
+
+    private var renderFingerprint: RenderFingerprint {
+        RenderFingerprint(
+            messageId: message.id,
+            role: message.role,
+            content: message.content,
+            thinkingLength: message.thinkingContent?.utf8.count ?? 0,
+            isThinking: message.isThinking,
+            prefillStatus: message.prefillStatus,
+            tokenCount: message.tokenCount,
+            tokensPerSec: message.tokensPerSec,
+            timeToFirstTokenSeconds: message.timeToFirstTokenSeconds,
+            thinkingTimeSeconds: message.thinkingTimeSeconds,
+            jetSpecTau: message.jetSpecTau,
+            // The records themselves: a call's status, output, and error all
+            // change visibly while the turn runs, so comparing only the count
+            // would freeze a card mid-execution.
+            toolCallFingerprint: message.toolCalls ?? [],
+            attachments: message.attachments ?? [],
+            isCompactionSummary: message.isCompactionSummary ?? false,
+            rowId: row.id,
+            segmentIndex: row.segmentIndex,
+            segmentCount: row.segmentCount,
+            segmentBlocks: row.segment.blocks,
+            segmentPlainText: row.segment.plainText,
+            zoomScale: zoomScale,
+            isGenerating: isGenerating,
+            isStreamingOffDisk: isStreamingOffDisk,
+            isCompactingConversation: isCompactingConversation,
+            isGemmaDialect: isGemmaDialect,
+            isExpanded: isExpanded
+        )
+    }
+
     /// Strips tool-call markup from assistant text for display, truncating at the
     /// earliest marker that survived the block strip. The marker table is shared with
     /// the working-pill predicate, so a dialect cannot be readable in one and invisible
@@ -3232,7 +3823,7 @@ struct ChatMessageView: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 14) {
-            if message.role == .assistant {
+            if message.role == .assistant, row.isFirst {
                 // Assistant Avatar
                 Image(systemName: "circle.hexagongrid.fill")
                     .font(.system(size: 15))
@@ -3247,6 +3838,12 @@ struct ChatMessageView: View {
                     .background(Color.purple.opacity(0.12))
                     .clipShape(Circle())
                     .padding(.top, 2)
+            } else if message.role == .assistant {
+                // A continuation row draws no avatar, but reserves its width so
+                // the text column is unbroken across the split. The avatar is
+                // 28 pt wide and the stack spaces children by 14.
+                Color.clear
+                    .frame(width: 28, height: 0)
             }
 
             VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 8) {
@@ -3255,14 +3852,16 @@ struct ChatMessageView: View {
                     HStack {
                         Spacer(minLength: 40)
                         VStack(alignment: .trailing, spacing: 6) {
-                            if let attachments = message.attachments, !attachments.isEmpty {
+                            if row.isFirst, let attachments = message.attachments, !attachments.isEmpty {
                                 TranscriptAttachmentStrip(attachments: attachments)
                             }
                             // An image-only turn has no text bubble at all; an
                             // empty padded bubble under the pictures reads as a
-                            // rendering bug.
-                            if !message.content.isEmpty {
-                                ChunkedText(text: message.content, lineSpacing: 3)
+                            // rendering bug. A long user turn is split across
+                            // rows like any other message, so the bubble draws
+                            // this row's slice of the text.
+                            if let slice = row.segment.plainText, !slice.isEmpty {
+                                ChunkedText(text: slice, lineSpacing: 3)
                                     .font(.system(size: max(9, 14 * zoomManager.zoomScale)))
                                     .padding(.horizontal, 16)
                                     .padding(.vertical, 10)
@@ -3275,9 +3874,14 @@ struct ChatMessageView: View {
                         }
                     }
                 } else {
-                    // Assistant Thinking / Reasoning Accordion (Osaurus Style)
+                    // Derived once for the whole branch: the markdown body, the
+                    // footer's visibility and the speak action all read it.
+                    let display = resolvedDisplayContent
+                    // Assistant Thinking / Reasoning Accordion (Osaurus Style).
+                    // It belongs to the message, not to a slice of it, so only
+                    // the first row draws it.
                     let hasThinkingContent = message.thinkingContent != nil && !message.thinkingContent!.isEmpty
-                    if (message.isThinking && isGenerating) || hasThinkingContent {
+                    if row.isFirst, (message.isThinking && isGenerating) || hasThinkingContent {
                         let thinking = message.thinkingContent ?? ""
                         VStack(alignment: .leading, spacing: 8) {
                             HStack(spacing: 6) {
@@ -3390,23 +3994,32 @@ struct ChatMessageView: View {
 
                                     if !thinking.isEmpty {
                                         // Reasoning can run to tens of thousands of
-                                        // tokens; one Text of that height is
-                                        // never painted (the whiteout), so it is
-                                        // drawn as bounded chunks instead.
-                                        ChunkedText(text: thinking, lineSpacing: 3)
-                                            .font(.system(size: max(8, 12 * zoomManager.zoomScale), design: .monospaced))
-                                            .foregroundColor(.secondary)
-                                            .padding(.horizontal, 14)
-                                            .padding(.vertical, 10)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                            .background(Color.secondary.opacity(0.035))
-                                            .cornerRadius(8)
-                                            .overlay(
-                                                RoundedRectangle(cornerRadius: 8)
-                                                    .stroke(Color.primary.opacity(0.05), lineWidth: 1)
-                                            )
-                                            .textSelection(.enabled)
+                                        // tokens. `ChunkedText` bounds any ONE text
+                                        // view, but the chunks stack, so a whole
+                                        // trace of 60k characters is still ~16,000
+                                        // pt of views in this single row, which is
+                                        // the whiteout. It is capped, not chunked
+                                        // alone: chunks inside a scroll area.
+                                        BoundedInspection(
+                                            isTall: TranscriptSegmenter.exceedsInspectionHeight(thinking),
+                                            followsTail: isGenerating || isCompactingConversation,
+                                            tailKey: thinking.utf8.count
+                                        ) {
+                                            ChunkedText(text: thinking, lineSpacing: 3)
+                                                .font(.system(size: max(8, 12 * zoomManager.zoomScale), design: .monospaced))
+                                                .foregroundColor(.secondary)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                .fixedSize(horizontal: false, vertical: true)
+                                                .textSelection(.enabled)
+                                        }
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 10)
+                                        .background(Color.secondary.opacity(0.035))
+                                        .cornerRadius(8)
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 8)
+                                                .stroke(Color.primary.opacity(0.05), lineWidth: 1)
+                                        )
                                     } else if message.isThinking && isGenerating && message.prefillStatus == nil {
                                         HStack(spacing: 8) {
                                             StreamingPaceIndicatorView(isOffDisk: isStreamingOffDisk)
@@ -3431,7 +4044,9 @@ struct ChatMessageView: View {
 
                     // Tool Calls Execution Cards & Sequential Timeline (if any tool calls were issued)
                     // Gesture calls keep a record for history reconstruction but are hidden here.
-                    if let toolCalls = message.toolCalls {
+                    // The timeline summarises the whole turn, so it rides the
+                    // first row rather than being repeated per slice.
+                    if row.isFirst, let toolCalls = message.toolCalls {
                         let visibleToolCalls = toolCalls.filter { !$0.isGesture }
                         if !visibleToolCalls.isEmpty {
                             ToolExecutionTimelineView(toolCalls: visibleToolCalls)
@@ -3441,21 +4056,33 @@ struct ChatMessageView: View {
                     // Inline agent-work indicator: shown while the model streams a
                     // tool call's arguments or the harness executes a running call,
                     // so slow calls (e.g. writing a script) still read as active work.
-                    if isAgentWorkingOnToolCall {
+                    if row.isLast, isAgentWorkingOnToolCall {
                         AgentWorkingIndicatorView()
                             .padding(.top, 2)
                     }
 
                     // Main Response Text rendered via Rich Markdown Engine.
                     // Raw call markup is suppressed for tool-only turns, both while
-                    // streaming and after the call has parsed.
-                    if !displayContent.isEmpty {
+                    // streaming and after the call has parsed. Only this row's
+                    // slice of the parse is drawn; the parse itself is shared.
+                    //
+                    // A whole-message row passes NO blocks on purpose: its parse
+                    // is the one `MarkdownMessageView` runs, on realization.
+                    if !display.isEmpty, !row.segment.isEmpty {
                         MarkdownMessageView(
-                            content: displayContent,
-                            isStreaming: (isGenerating || isCompactingConversation) && message.isThinking == false,
-                            isStreamingOffDisk: isStreamingOffDisk
+                            content: display,
+                            // Only the row this message ENDS on may draw the
+                            // streaming cursor: `isStreaming` marks that row's
+                            // last block, so passing it for every slice drew a
+                            // hare (and, for an oversized block, a pace
+                            // indicator) once per segment of a split answer.
+                            isStreaming: (isGenerating || isCompactingConversation)
+                                && message.isThinking == false
+                                && row.isLast,
+                            isStreamingOffDisk: isStreamingOffDisk,
+                            preparsedBlocks: row.segment.isWholeMessage ? nil : row.segment.blocks
                         )
-                    } else if (isGenerating || isCompactingConversation) && !message.isThinking && !hasThinkingContent && (message.toolCalls == nil || message.toolCalls!.isEmpty) && !isStreamingToolCall {
+                    } else if row.isLast, (isGenerating || isCompactingConversation) && !message.isThinking && !hasThinkingContent && (message.toolCalls == nil || message.toolCalls!.isEmpty) && !isStreamingToolCall {
                         // Only for non-thinking models during initial prefill / generation,
                         // or the /compact progress bubble before its first summary text
                         if let prefill = message.prefillStatus {
@@ -3481,8 +4108,10 @@ struct ChatMessageView: View {
                         }
                     }
 
-                    // Action & Metrics Footer (Osaurus Style Telemetry & Actions)
-                    if (!message.isThinking || !isGenerating) && (hasTelemetry || !displayContent.isEmpty) {
+                    // Action & Metrics Footer (Osaurus Style Telemetry & Actions).
+                    // Telemetry describes the whole turn, so it closes the last
+                    // row rather than repeating under every slice.
+                    if row.isLast, (!message.isThinking || !isGenerating) && (hasTelemetry || !display.isEmpty) {
                         HStack(spacing: 12) {
                             // Telemetry
                             HStack(spacing: 6) {
@@ -3535,7 +4164,7 @@ struct ChatMessageView: View {
                             Spacer()
 
                             // Action Buttons (only when there is visible text to act on)
-                            if !displayContent.isEmpty {
+                            if !display.isEmpty {
                                 HStack(spacing: 8) {
                                     // Copy button
                                     Button(action: {
@@ -3566,7 +4195,7 @@ struct ChatMessageView: View {
                                     // Audio speak (model replies only)
                                     if message.role == .assistant {
                                         Button(action: {
-                                            NSSpeechSynthesizer().startSpeaking(displayContent)
+                                            NSSpeechSynthesizer().startSpeaking(display)
                                         }) {
                                             Image(systemName: "speaker.wave.2")
                                                 .font(.system(size: max(8.5, 11 * zoomManager.zoomScale)))
@@ -3586,6 +4215,131 @@ struct ChatMessageView: View {
                 }
             }
             .frame(maxWidth: .infinity, alignment: message.role == .user ? .trailing : .leading)
+        }
+    }
+
+    /// Equality is the render fingerprint, not the message: only the row whose
+    /// visible content changed re-renders when a turn streams.
+    static func == (lhs: ChatMessageView, rhs: ChatMessageView) -> Bool {
+        lhs.renderFingerprint == rhs.renderFingerprint
+    }
+}
+
+/// Identity of the invisible marker at the end of an inspection region. Constant
+/// per scroll area rather than per update: an id that changed with the content
+/// would re-lay out the region on every chunk.
+private let boundedInspectionTailAnchorID = "bounded-inspection-tail-anchor"
+
+/// Characters of new content that make up one follow bucket for an inspection
+/// region, about one line. The transcript throttles its own follow the same way.
+private let boundedInspectionFollowBucketCharacters = 120
+
+/// Draws long content inside a capped scroll area so it cannot grow its row past
+/// the compositor's maximum layer height. Short content is drawn inline, exactly
+/// as before, so the common case looks unchanged and allocates nothing extra.
+///
+/// This is the counterpart to row segmentation: a transcript row's markdown
+/// blocks are split across rows, but reasoning traces, plan documents, compaction
+/// summaries and tool-call lists ride a single row and cannot be split, so they
+/// are bounded instead.
+///
+/// A LIVE region follows its own newest line. Once a trace is taller than the cap
+/// the row stops growing, so the transcript's own bottom pin lands on the box and
+/// shows its TOP while the newest reasoning is appended below the visible area.
+/// Following the tail inside the box is what makes a long reasoning trace read as
+/// progress rather than as a frozen block.
+struct BoundedInspection<Content: View>: View {
+    /// Whether the content would lay out taller than `maxHeight`. Passed in
+    /// rather than measured so the caller decides with the same rule the
+    /// segmenter uses, and so a short trace never pays for a scroll view.
+    let isTall: Bool
+    var maxHeight: CGFloat = TranscriptSegmenter.inspectionHeightCeiling
+    /// True while this region's content is still arriving. A settled region opens
+    /// at its start on purpose: reading a finished trace in order is the point of
+    /// a trace, and following the tail of one the reader has not scrolled yet
+    /// would hide how it began.
+    var followsTail: Bool = false
+    /// A coarse length of `content`, in characters, for the follow. Bucketed
+    /// rather than exact because a chunk arrives several times a second and each
+    /// jump costs a layout pass.
+    var tailKey: Int = 0
+    @ViewBuilder var content: Content
+
+    @State private var isPinnedToTail = true
+    /// Whether the READER is driving this scroll area. The region's pin rule is
+    /// the transcript's (`TranscriptFollowPolicy`): only a reader's scroll may
+    /// unpin it.
+    @State private var isReaderScrolling = false
+
+    var body: some View {
+        if isTall {
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: true) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        content
+                        // The scroll target, inside the content rather than on
+                        // `content` itself so the id cannot change what the
+                        // content is.
+                        Color.clear
+                            .frame(height: 1)
+                            .id(boundedInspectionTailAnchorID)
+                    }
+                }
+                .frame(maxHeight: maxHeight)
+                .onAppear {
+                    // The region became tall mid-stream: land on the newest line
+                    // rather than opening at its beginning.
+                    guard followsTail, isPinnedToTail else { return }
+                    followTail(proxy)
+                }
+                .onChange(of: tailFollowBucket) {
+                    guard followsTail, isPinnedToTail else { return }
+                    followTail(proxy)
+                }
+                .onScrollPhaseChange { _, newPhase in
+                    isReaderScrolling = TranscriptFollowPolicy.isReaderDriven(newPhase)
+                }
+                .onScrollGeometryChange(for: TranscriptFollowPolicy.Snapshot.self) { geometry in
+                    TranscriptFollowPolicy.Snapshot(
+                        offset: geometry.contentOffset.y,
+                        contentHeight: geometry.contentSize.height,
+                        containerHeight: geometry.containerSize.height
+                    )
+                } action: { old, new in
+                    // The transcript's own rule, shared rather than restated. A
+                    // bare "any upward move unpins" read the clamp that follows
+                    // a content shrink, and a re-measure while the box is laid
+                    // out, as the reader leaving the tail, which is the defect
+                    // `TranscriptFollowPolicy` was split out to stop repeating.
+                    // This region's follow is bucket-driven, so only the pin half
+                    // of the decision applies.
+                    let outcome = TranscriptFollowPolicy.decide(
+                        from: old,
+                        to: new,
+                        isPinned: isPinnedToTail,
+                        isReaderScrolling: isReaderScrolling,
+                        isFollowInFlight: false
+                    )
+                    if let pin = outcome.pin, pin != isPinnedToTail {
+                        isPinnedToTail = pin
+                    }
+                }
+            }
+        } else {
+            content
+        }
+    }
+
+    /// The follow's throttle: the region jumps once per ~line of new content.
+    private var tailFollowBucket: Int {
+        tailKey / boundedInspectionFollowBucketCharacters
+    }
+
+    private func followTail(_ proxy: ScrollViewProxy) {
+        // Deferred, so the frame carrying the growth is laid out before the
+        // target is resolved; an immediate jump lands a chunk short.
+        DispatchQueue.main.async {
+            proxy.scrollTo(boundedInspectionTailAnchorID, anchor: .bottom)
         }
     }
 }
@@ -3635,7 +4389,7 @@ struct EmptyWelcomeView: View {
 
 // MARK: - Markdown Table & Typography Models
 
-public enum TextAlignmentType {
+nonisolated public enum TextAlignmentType {
     case leading
     case center
     case trailing
@@ -3657,7 +4411,7 @@ public enum TextAlignmentType {
     }
 }
 
-public struct MarkdownTableData: Identifiable, Equatable {
+nonisolated public struct MarkdownTableData: Identifiable, Equatable {
     public let id: String
     public let headers: [String]
     public let alignments: [TextAlignmentType]
@@ -3696,6 +4450,12 @@ struct MarkdownMessageView: View {
     let content: String
     var isStreaming: Bool = false
     var isStreamingOffDisk: Bool = false
+    /// A slice of an already-parsed message, when the transcript is rendering
+    /// one segment of a message it has split. Supplying blocks here is what
+    /// keeps segmentation from multiplying parse cost: the full text is parsed
+    /// once by `TranscriptPresentationCache` and each row renders its own slice,
+    /// instead of every row re-parsing the whole message on realization.
+    var preparsedBlocks: [MarkdownBlock]? = nil
 
     /// Memoizes this message's block parse. Parsing runs ~20 regex passes over
     /// the whole text (measured at ~30 ms per 40 KB and ~85 ms per 120 KB), and
@@ -3708,11 +4468,17 @@ struct MarkdownMessageView: View {
         var content: String?
         var repairs = true
         var blocks: [MarkdownBlock] = []
+        /// The derived `IdentifiableMarkdownBlock` array, kept beside the parse
+        /// it came from. Rebuilding it re-derived every block id on every body
+        /// pass, which is O(blocks) work per frame on a message that had not
+        /// changed at all. Invalidated with `blocks`, so the two cannot drift.
+        var identifiable: [IdentifiableMarkdownBlock] = []
     }
 
     @State private var memo = BlockMemo()
 
     private var parsedBlocks: [MarkdownBlock] {
+        if let preparsedBlocks { return preparsedBlocks }
         // While the answer streams, skip the malformed-markdown repair passes:
         // they cost more than the rest of the parse together and the growing
         // text is re-parsed on every UI update. The settled message re-parses
@@ -3723,12 +4489,28 @@ struct MarkdownMessageView: View {
         memo.content = content
         memo.repairs = wantsRepairs
         memo.blocks = parsed
+        memo.identifiable = []
         return parsed
     }
 
     private var identifiableBlocks: [IdentifiableMarkdownBlock] {
         let rawBlocks = parsedBlocks
-        return rawBlocks.enumerated().map { index, block in
+        if preparsedBlocks == nil, !memo.identifiable.isEmpty,
+           memo.identifiable.count == rawBlocks.count {
+            return memo.identifiable
+        }
+        let derived = Self.identifiableBlocks(from: rawBlocks, isStreaming: isStreaming)
+        if preparsedBlocks == nil { memo.identifiable = derived }
+        return derived
+    }
+
+    /// Derives the render list for a block array. Split out so the memoized
+    /// path and the segment path build ids with the same rules.
+    static func identifiableBlocks(
+        from rawBlocks: [MarkdownBlock],
+        isStreaming: Bool
+    ) -> [IdentifiableMarkdownBlock] {
+        rawBlocks.enumerated().map { index, block in
             let isLast = isStreaming && (index == rawBlocks.count - 1)
             let blockId: String
             switch block {
@@ -3745,30 +4527,38 @@ struct MarkdownMessageView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            ForEach(identifiableBlocks) { item in
-                switch item.block {
-                case .heading(let level, let text):
-                    renderHeading(level: level, text: text, isLast: item.isLast)
-                case .paragraph(let text):
-                    renderParagraph(text: text, isLast: item.isLast)
-                case .table(let table):
-                    MarkdownTableView(table: table, isLast: item.isLast, isStreamingOffDisk: isStreamingOffDisk)
-                case .codeBlock(let language, let code):
-                    CodeBlockCard(
-                        language: language,
-                        code: code,
-                        isStreaming: item.isLast,
-                        isStreamingOffDisk: isStreamingOffDisk
-                    )
-                case .blockquote(let text):
-                    renderBlockquote(text: text, isLast: item.isLast)
-                case .listItem(let number, let text):
-                    renderListItem(number: number, text: text, isLast: item.isLast)
-                case .horizontalRule:
-                    Divider()
-                        .padding(.vertical, 6)
+        // Spacing is applied as per-child top padding rather than as the stack's
+        // `spacing`, so the first block of a row sits flush against the row
+        // above it: a message split to fit the budget draws continuously rather
+        // than gaining a paragraph break at every row boundary. For a message
+        // that fits one row this is pixel-identical to `VStack(spacing: 10)`.
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(identifiableBlocks.enumerated()), id: \.element.id) { index, item in
+                Group {
+                    switch item.block {
+                    case .heading(let level, let text):
+                        renderHeading(level: level, text: text, isLast: item.isLast)
+                    case .paragraph(let text):
+                        renderParagraph(text: text, isLast: item.isLast)
+                    case .table(let table):
+                        MarkdownTableView(table: table, isLast: item.isLast, isStreamingOffDisk: isStreamingOffDisk)
+                    case .codeBlock(let language, let code):
+                        CodeBlockCard(
+                            language: language,
+                            code: code,
+                            isStreaming: item.isLast,
+                            isStreamingOffDisk: isStreamingOffDisk
+                        )
+                    case .blockquote(let text):
+                        renderBlockquote(text: text, isLast: item.isLast)
+                    case .listItem(let number, let text):
+                        renderListItem(number: number, text: text, isLast: item.isLast)
+                    case .horizontalRule:
+                        Divider()
+                            .padding(.vertical, 6)
+                    }
                 }
+                .padding(.top, index == 0 ? 0 : 10)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -3954,6 +4744,49 @@ struct MarkdownMessageView: View {
 
 // MARK: - Native Markdown Table Card View (SwiftUI Grid)
 
+/// One table cell's text, drawn inside a capped region when it is too large to
+/// draw inline.
+///
+/// `TranscriptSegmenter.splitTable` splits a table by ROW, and a cell is
+/// atomic, so a tool result pasted into one cell produced a row that no split
+/// could bound: a 33,000-character cell in a three-column table measured as a
+/// single 51,000 pt segment. The cell is therefore bounded where it is DRAWN,
+/// and `drawnTableRowLineCount` prices the same cap so the estimate the
+/// segmenter reports matches the height the reader gets.
+private struct MarkdownTableCellText: View {
+    let text: String
+    let fontSize: CGFloat
+    var weight: Font.Weight = .regular
+    let alignment: TextAlignmentType
+
+    /// Height cap for one capped cell. The same ceiling the tool-call card puts
+    /// on its own output, because this is the same content in a different
+    /// container: a tool result, kept reachable but not given the row.
+    static let cappedHeight: CGFloat = 240
+
+    var body: some View {
+        if TranscriptSegmenter.tableCellNeedsCapping(text) {
+            ScrollView(.vertical, showsIndicators: true) {
+                ChunkedText(text: text, parsesMarkdown: true)
+                    .font(.system(size: fontSize, weight: weight))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+            // An exact height rather than a maximum: a scroll view reports no
+            // intrinsic height, so inside a `Grid` row the cell would otherwise
+            // be sized by the row it is itself sizing.
+            .frame(height: Self.cappedHeight)
+        } else {
+            Text(LocalizedStringKey(text))
+                .font(.system(size: fontSize, weight: weight))
+                .multilineTextAlignment(alignment.textAlignment)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        }
+    }
+}
+
 struct MarkdownTableView: View {
     @EnvironmentObject private var zoomManager: AppZoomManager
     let table: MarkdownTableData
@@ -3962,69 +4795,82 @@ struct MarkdownTableView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            ScrollView(.horizontal, showsIndicators: true) {
-                Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
-                    // Header Row
-                    GridRow {
-                        ForEach(0..<table.headers.count, id: \.self) { colIdx in
-                            let header = table.headers[colIdx]
-                            let align = table.alignments.indices.contains(colIdx) ? table.alignments[colIdx] : .leading
-                            HStack(spacing: 0) {
-                                Text(LocalizedStringKey(header))
-                                    .font(.system(size: max(8.5, 13 * zoomManager.zoomScale), weight: .bold))
+            // A cell keeps a `minWidth` so a table reads as columns rather than
+            // as ragged text, which means ~10 columns have an intrinsic minimum
+            // wider than a narrow transcript column. Cells wrap, so the table
+            // shrinks horizontally only until that minimum, and the transcript's
+            // own vertical scroll view cannot pan: without a horizontal scroll
+            // view the right-hand columns are simply unreachable. This is the
+            // one nested scroll area that earns its own layer, because the
+            // alternative is losing content.
+            Group {
+                ScrollView(.horizontal, showsIndicators: true) {
+                    Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
+                        // Header Row
+                        GridRow {
+                            ForEach(0..<table.headers.count, id: \.self) { colIdx in
+                                let header = table.headers[colIdx]
+                                let align = table.alignments.indices.contains(colIdx) ? table.alignments[colIdx] : .leading
+                                HStack(spacing: 0) {
+                                    MarkdownTableCellText(
+                                        text: header,
+                                        fontSize: max(8.5, 13 * zoomManager.zoomScale),
+                                        weight: .bold,
+                                        alignment: align
+                                    )
                                     .foregroundColor(.secondary)
-                                    .multilineTextAlignment(align.textAlignment)
                                     .padding(.horizontal, 14)
                                     .padding(.vertical, 9)
                                     .frame(minWidth: 90, alignment: align.alignment)
-                                    .textSelection(.enabled)
-
-                                if colIdx < table.headers.count - 1 {
-                                    Divider()
-                                        .opacity(0.35)
-                                }
-                            }
-                        }
-                    }
-                    .background(Color.secondary.opacity(0.08))
-
-                    // Header Divider
-                    GridRow {
-                        Divider()
-                            .gridCellColumns(max(1, table.headers.count))
-                    }
-
-                    // Data Rows
-                    ForEach(0..<table.rows.count, id: \.self) { rowIdx in
-                        let row = table.rows[rowIdx]
-                        GridRow {
-                            ForEach(0..<table.headers.count, id: \.self) { colIdx in
-                                let cell = colIdx < row.count ? row[colIdx] : ""
-                                let align = table.alignments.indices.contains(colIdx) ? table.alignments[colIdx] : .leading
-                                HStack(spacing: 0) {
-                                    Text(LocalizedStringKey(cell))
-                                        .font(.system(size: max(8.5, 13 * zoomManager.zoomScale)))
-                                        .foregroundColor(.primary)
-                                        .multilineTextAlignment(align.textAlignment)
-                                        .padding(.horizontal, 14)
-                                        .padding(.vertical, 8)
-                                        .frame(minWidth: 90, alignment: align.alignment)
-                                        .textSelection(.enabled)
 
                                     if colIdx < table.headers.count - 1 {
                                         Divider()
-                                            .opacity(0.25)
+                                            .opacity(0.35)
                                     }
                                 }
                             }
                         }
-                        .background(rowIdx % 2 == 1 ? Color.secondary.opacity(0.03) : Color.clear)
+                        .background(Color.secondary.opacity(0.08))
 
-                        if rowIdx < table.rows.count - 1 {
+                        // Header Divider
+                        GridRow {
+                            Divider()
+                                .gridCellColumns(max(1, table.headers.count))
+                        }
+
+                        // Data Rows
+                        ForEach(0..<table.rows.count, id: \.self) { rowIdx in
+                            let row = table.rows[rowIdx]
                             GridRow {
-                                Divider()
-                                    .opacity(0.25)
-                                    .gridCellColumns(max(1, table.headers.count))
+                                ForEach(0..<table.headers.count, id: \.self) { colIdx in
+                                    let cell = colIdx < row.count ? row[colIdx] : ""
+                                    let align = table.alignments.indices.contains(colIdx) ? table.alignments[colIdx] : .leading
+                                    HStack(spacing: 0) {
+                                        MarkdownTableCellText(
+                                            text: cell,
+                                            fontSize: max(8.5, 13 * zoomManager.zoomScale),
+                                            alignment: align
+                                        )
+                                        .foregroundColor(.primary)
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 8)
+                                        .frame(minWidth: 90, alignment: align.alignment)
+
+                                        if colIdx < table.headers.count - 1 {
+                                            Divider()
+                                                .opacity(0.25)
+                                        }
+                                    }
+                                }
+                            }
+                            .background(rowIdx % 2 == 1 ? Color.secondary.opacity(0.03) : Color.clear)
+
+                            if rowIdx < table.rows.count - 1 {
+                                GridRow {
+                                    Divider()
+                                        .opacity(0.25)
+                                        .gridCellColumns(max(1, table.headers.count))
+                                }
                             }
                         }
                     }
@@ -4284,18 +5130,23 @@ struct CodeBlockCard: View {
             // highlighting ~11 KB costs ~23 ms and used to rerun on every
             // streamed chunk, which is most of a frame budget spent on a block
             // whose tail is still changing. It highlights once it settles.
-            ScrollView(.horizontal, showsIndicators: true) {
-                VStack(alignment: .leading, spacing: 3) {
-                    ForEach(chunks.indices, id: \.self) { index in
-                        Text(text(forChunk: index))
-                            .lineSpacing(3)
-                    }
+            // No horizontal `ScrollView` here. Every code block used to wrap
+            // itself in one, so a long agent turn accumulated 30–100 nested
+            // scroll views inside a single lazy row, each allocating a layer —
+            // and the row that could not paint was the one carrying them. Long
+            // lines wrap instead, so a block contributes one layer.
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(chunks.indices, id: \.self) { index in
+                    Text(text(forChunk: index))
+                        .lineSpacing(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .font(.system(size: max(8.5, 12.5 * zoomManager.zoomScale), design: .monospaced))
-                .textSelection(.enabled)
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .font(.system(size: max(8.5, 12.5 * zoomManager.zoomScale), design: .monospaced))
+            .textSelection(.enabled)
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(Color(NSColor.textBackgroundColor))
         }
         .cornerRadius(8)
