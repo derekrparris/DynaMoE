@@ -17,6 +17,10 @@
 //  message that would lay out too tall is split into several rows, each small
 //  enough to draw, and laziness becomes meaningful again.
 //
+//  `isCertainlyOneRow` is the third case and the cheap one: a message that
+//  cannot come near the budget needs no parse here at all, because the single
+//  row it produces parses itself when the lazy stack realizes it.
+//
 //  Pure and view-free on purpose: the segmentation rules are the part that can
 //  be tested without a window, a model, or a snapshot.
 //
@@ -59,14 +63,22 @@ nonisolated struct TranscriptRow: Identifiable, Equatable {
 
 /// One row's worth of a message, ready to render.
 nonisolated struct TranscriptSegment: Equatable {
-    var blocks: [MarkdownBlock]
+    var blocks: [MarkdownBlock] = []
     /// Set for a user turn, whose bubble draws its text verbatim rather than
     /// through the markdown engine. Splitting it into blocks would change how
     /// it renders (a pasted `#` line would become a heading), so the slice is
     /// carried as text instead.
     var plainText: String? = nil
+    /// True for a row that draws the WHOLE message and lets the row's own
+    /// realization do the parse, because the message cannot exceed a row's
+    /// budget (see `isCertainlyOneRow`).
+    ///
+    /// The message's display text and blocks are derived by the row in this
+    /// case, so both are empty here while the row is not: this is the one state
+    /// in which "no blocks" does not mean "nothing to draw".
+    var isWholeMessage: Bool = false
 
-    var isEmpty: Bool { blocks.isEmpty && plainText == nil }
+    var isEmpty: Bool { blocks.isEmpty && plainText == nil && !isWholeMessage }
 }
 
 /// A row plus the message it came from, so the transcript's `ForEach` never
@@ -75,6 +87,14 @@ nonisolated struct TranscriptSegment: Equatable {
 nonisolated struct TranscriptEntry: Identifiable {
     let row: TranscriptRow
     let message: ChatMessage
+    /// The message's display text, already derived by the presentation cache,
+    /// for a row whose message was parsed eagerly to be segmented.
+    ///
+    /// Nil means the row derives it itself, which is what an unparsed message
+    /// and a user turn both want: a user turn draws `plainText` and never reads
+    /// this, so deriving it there was a full markdown strip per turn per body
+    /// pass, thrown away.
+    let displayContent: String?
 
     var id: String { row.id }
 }
@@ -93,11 +113,73 @@ nonisolated enum TranscriptSegmenter {
     /// padding, so this bounds the row's layer count as well as its height.
     static let maxRowBlocks = 24
 
+    /// Characters a message may carry and still be certain it needs no
+    /// segmentation at all.
+    ///
+    /// Deliberately far under `maxRowCharacters`, because this is checked on the
+    /// RAW text before the markdown cleanup and the parse, and only one pass
+    /// over it is affordable here. With the line ceiling beside it, even the
+    /// pathological case (every line long enough to wrap) stays around 135
+    /// laid-out lines against the budget's 150.
+    static let singleRowCharacterCeiling = maxRowCharacters / 2
+
+    /// Lines a message may carry and still be certain it needs no segmentation.
+    static let singleRowLineCeiling = 60
+
+    /// True when `text` cannot lay out anywhere near the compositor's ceiling,
+    /// so ONE row can draw it whole and the parse can wait until that row is
+    /// realized.
+    ///
+    /// This is what keeps opening a long conversation cheap. The transcript
+    /// builds a row list for every message on its first body pass, and parsing
+    /// each message there cost 0.43 s for 30 turns of 57 KB and 1.42 s for 100 —
+    /// which is the same blank-transcript symptom this segmentation exists for,
+    /// arriving from the fix. A message that passes this check is parsed by
+    /// `MarkdownMessageView`, whose own memo already bounds the work to the rows
+    /// the lazy stack builds.
+    ///
+    /// The test is on the raw text, which is safe rather than merely close: the
+    /// display cleanup only removes characters, removes lines, or truncates, so
+    /// raw text under both ceilings stays under them once displayed.
+    static func isCertainlyOneRow(_ text: String) -> Bool {
+        if text.utf8.count > singleRowCharacterCeiling { return false }
+        var newlines = 0
+        for byte in text.utf8 where byte == 0x0A {
+            newlines += 1
+            if newlines > singleRowLineCeiling { return false }
+        }
+        return true
+    }
+
     /// Hard ceiling on the rows one table block may carry, on top of the row's
     /// line budget. A table's height is driven by its rows rather than by its
     /// character count and a cell wraps per column, so the line budget usually
     /// splits it first; this bounds the block count too.
     static let maxTableRows = 60
+
+    /// Lines one table cell may occupy before it is drawn inside a capped
+    /// region rather than at its natural height.
+    ///
+    /// `splitTable` splits by ROW, and a cell is atomic: no split can shorten
+    /// one, so a tool result pasted into a single cell produced one segment
+    /// estimated at 51,000 pt that no guard in this file could see. The bound
+    /// therefore lives where the cell is DRAWN (`MarkdownTableView`), and the
+    /// estimate reads the same rule so the number reported and the number drawn
+    /// cannot disagree.
+    static let tableCellLineCeiling = 24
+
+    /// Characters one table cell may occupy before it is drawn inside a capped
+    /// region.
+    static let tableCellCharacterCeiling = 2_400
+
+    /// True when a table cell has to be drawn inside a capped region.
+    static func tableCellNeedsCapping(_ cell: String) -> Bool {
+        LongTextChunker.isOversized(
+            cell,
+            maxLines: tableCellLineCeiling,
+            maxCharacters: tableCellCharacterCeiling
+        )
+    }
 
     /// The compositor's layer ceiling this segmentation exists to stay under,
     /// in points. Reported by the diagnostic so a regression is visible.
@@ -247,16 +329,17 @@ nonisolated enum TranscriptSegmenter {
         case .horizontalRule:
             return 1
         case .table(let table):
-            // A table's height is line count too, and its cells WRAP: the
-            // transcript dropped the horizontal scroll view, so a wide cell
-            // occupies as many lines as its column is narrow. Counting one line
-            // per row let a 60-row table of wide cells lay out several times
-            // taller than the budget predicted.
+            // A table's height is line count too, and its cells WRAP. Counting
+            // one line per row let a 60-row table of wide cells lay out several
+            // times taller than the budget predicted. The table keeps its own
+            // horizontal scroll view (`MarkdownTableView`), which only makes
+            // this estimate conservative: a cell that holds its `minWidth`
+            // wraps less than the column split assumes.
             let columns = max(1, table.headers.count)
             // The header plus the divider grid row beneath it.
-            var lines = tableRowLineCount(table.headers, columns: columns) + 1
+            var lines = drawnTableRowLineCount(table.headers, columns: columns) + 1
             for row in table.rows {
-                lines += tableRowLineCount(row, columns: columns)
+                lines += drawnTableRowLineCount(row, columns: columns)
             }
             return lines
         }
@@ -286,6 +369,20 @@ nonisolated enum TranscriptSegmenter {
     private static func tableColumnCharacters(columns: Int) -> Int {
         guard columns > 0 else { return wrappedLineWidth }
         return max(8, wrappedLineWidth / columns)
+    }
+
+    /// Lines one table row occupies once DRAWN, which is fewer than it would
+    /// naturally occupy when one of its cells is capped.
+    ///
+    /// The cap is per cell and applies to the row as a whole, because a row's
+    /// height is the tallest cell in it: capping the tallest cell is capping the
+    /// row. Without this the estimate kept reporting the natural height of a
+    /// cell the view never draws at that height, which made `worstCaseRowHeight`
+    /// overstate a row that is in fact bounded.
+    static func drawnTableRowLineCount(_ cells: [String], columns: Int) -> Int {
+        let natural = tableRowLineCount(cells, columns: columns)
+        guard cells.contains(where: tableCellNeedsCapping) else { return natural }
+        return min(natural, tableCellLineCeiling)
     }
 
     /// Lines `text` occupies at the transcript's width, where a long line wraps
@@ -375,13 +472,17 @@ nonisolated enum TranscriptSegmenter {
         let columns = max(1, table.headers.count)
         // Every piece repeats the header and its divider, so both come out of
         // the row's line budget before any data row is placed.
-        let headerLines = tableRowLineCount(table.headers, columns: columns) + 1
+        let headerLines = drawnTableRowLineCount(table.headers, columns: columns) + 1
         let rowLineBudget = max(1, maxRowLines - headerLines)
 
         var totalLines = headerLines
         for row in table.rows {
-            totalLines += tableRowLineCount(row, columns: columns)
+            totalLines += drawnTableRowLineCount(row, columns: columns)
         }
+        // A cell is atomic, so a single row taller than the budget is NOT
+        // splittable here: it becomes a piece of its own and the cap in
+        // `MarkdownTableView` is what bounds it. That is why the counts above are
+        // the drawn ones rather than the natural ones.
         guard table.rows.count > maxTableRows || totalLines > maxRowLines else {
             return [table]
         }
@@ -392,7 +493,7 @@ nonisolated enum TranscriptSegmenter {
             var end = start
             var pieceLines = 0
             while end < table.rows.count, end - start < maxTableRows {
-                let rowLines = tableRowLineCount(table.rows[end], columns: columns)
+                let rowLines = drawnTableRowLineCount(table.rows[end], columns: columns)
                 // A single row taller than the whole budget still needs a piece
                 // of its own, or the split would never terminate.
                 if end > start, pieceLines + rowLines > rowLineBudget { break }

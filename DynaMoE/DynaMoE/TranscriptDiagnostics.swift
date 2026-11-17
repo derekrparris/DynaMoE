@@ -50,7 +50,14 @@ final class TranscriptDiagnostics {
     /// later turn whose key collides with it is still reported; the key is built
     /// from the message count, which repeats across conversations of one length.
     private(set) var lastReportedTurnKey: String?
-    private var warnedRowHeight = false
+    /// The last turn the row-height warning fired for.
+    ///
+    /// Keyed on the turn rather than a bare `Bool`, because `beginTurn()` only
+    /// runs on the generating transition: a conversation RESTORED from disk
+    /// reports without one, so a process that had warned once stayed silent for
+    /// every restored long conversation afterwards — the other reproduction this
+    /// instrumentation exists for.
+    private(set) var warnedTurnKey: String?
 
     /// Records one realized row's height. Called from the row's own geometry
     /// callback, so it only ever sees rows the lazy stack actually built.
@@ -69,7 +76,7 @@ final class TranscriptDiagnostics {
     func beginTurn() {
         rowHeights.removeAll(keepingCapacity: true)
         lastReportedTurnKey = nil
-        warnedRowHeight = false
+        warnedTurnKey = nil
     }
 
     /// Emits the turn's numbers once, when the turn settles.
@@ -104,23 +111,38 @@ final class TranscriptDiagnostics {
 
         DiagLog.info(
             Self.category,
-            "turn=\(turnKey) contentHeight=\(Int(contentHeight))pt "
-                + "viewport=\(Int(viewportHeight))pt realizedRows=\(realized) "
-                + "tallestRow=\(Int(tallestHeight))pt tallestRowKind=\(tallestLabel) "
+            "turn=\(turnKey) contentHeight=\(Self.points(contentHeight))pt "
+                + "viewport=\(Self.points(viewportHeight))pt realizedRows=\(realized) "
+                + "tallestRow=\(Self.points(tallestHeight))pt tallestRowKind=\(tallestLabel) "
                 + "rows=\(segmentCount) "
                 + "blocks=\(blockCount) "
                 + "characters=\(characters) messages=\(messages.count)"
         )
 
-        if tallestHeight > TranscriptSegmenter.rowHeightWarning, !warnedRowHeight {
-            warnedRowHeight = true
+        if tallestHeight > TranscriptSegmenter.rowHeightWarning, warnedTurnKey != turnKey {
+            warnedTurnKey = turnKey
             DiagLog.warning(
                 Self.category,
-                "row exceeds \(Int(TranscriptSegmenter.rowHeightWarning))pt: "
-                    + "tallestRow=\(Int(tallestHeight))pt kind=\(tallestLabel) turn=\(turnKey) "
+                "row exceeds \(Self.points(TranscriptSegmenter.rowHeightWarning))pt: "
+                    + "tallestRow=\(Self.points(tallestHeight))pt kind=\(tallestLabel) turn=\(turnKey) "
                     + "a row this tall is at risk of the compositor ceiling "
-                    + "(\(Int(TranscriptSegmenter.compositorHeightCeiling))pt)"
+                    + "(\(Self.points(TranscriptSegmenter.compositorHeightCeiling))pt)"
             )
         }
+    }
+
+    /// One height, formatted for a log line.
+    ///
+    /// `Int(CGFloat)` TRAPS on a non-finite value, and geometry can report one:
+    /// an unlaid-out scroll view publishes `.infinity`, which was enough to kill
+    /// the process from this instrumentation. Observing a rendering bug must
+    /// never become a worse bug, so a value that cannot be printed is printed as
+    /// `unknown` rather than converted.
+    private static func points(_ value: CGFloat) -> String {
+        guard value.isFinite else { return "unknown" }
+        // Clamped before the cast for the same reason: a finite value too large
+        // for `Int` traps exactly as hard.
+        let clamped = min(max(value, 0), CGFloat(Int.max - 1))
+        return String(Int(clamped.rounded()))
     }
 }

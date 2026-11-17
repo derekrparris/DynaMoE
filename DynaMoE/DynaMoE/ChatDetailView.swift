@@ -335,9 +335,13 @@ struct ChatDetailView: View {
     /// The flattened rows the transcript draws: one per message in the common
     /// case, several for a message too tall to paint as one lazy child.
     ///
-    /// The parse and the segmentation are memoized per message by
-    /// `presentationCache`, so this is O(messages) on a body pass that changes
-    /// nothing and O(1) parses per changed message while a turn streams.
+    /// Parsing is the expensive half of this and happens only where the rows
+    /// need it. This loop runs over EVERY message on the first body pass, so
+    /// parsing each one here made opening a long conversation a main-actor stall
+    /// — 0.43 s for 30 turns of 57 KB, 1.42 s for 100 — on exactly the case the
+    /// diagnostic below was added to instrument. A message that cannot exceed a
+    /// row's budget is therefore emitted as one row with no parse, and the row
+    /// parses itself when the lazy stack realizes it.
     private func transcriptRows(for session: ChatSession) -> [TranscriptEntry] {
         var rows: [TranscriptEntry] = []
         rows.reserveCapacity(session.messages.count)
@@ -352,46 +356,72 @@ struct ChatDetailView: View {
                         kind: .compactionSummary,
                         segmentIndex: 0,
                         segmentCount: 1,
-                        segment: TranscriptSegment(blocks: [])
+                        segment: TranscriptSegment()
                     ),
-                    message: message
+                    message: message,
+                    displayContent: nil
                 ))
                 continue
             }
             if message.role == .user {
+                // Chunked through the cache too: the chunker is O(characters),
+                // and this runs on every body pass, i.e. on every streamed
+                // chunk, for every pasted turn in the conversation.
                 rows.append(contentsOf: TranscriptSegmenter.rows(
                     for: message.id,
                     kind: .message,
-                    segments: TranscriptSegmenter.plainTextSegments(for: message.content)
-                ).map { TranscriptEntry(row: $0, message: message) })
+                    segments: presentationCache.plainTextSegments(for: message)
+                ).map { TranscriptEntry(row: $0, message: message, displayContent: nil) })
                 continue
             }
             // The plan-marker classification rides the cache: the probe reads
             // every character of the answer, and this loop runs on every body
             // pass, i.e. on every streamed chunk.
-            let presentation = presentationCache.presentation(
-                for: message,
-                isGemmaDialect: isGemmaDialect,
-                isStreaming: isStreamingMessage(message, in: session)
-            )
-            if presentation.isPlanCard {
+            if presentationCache.isPlanCard(for: message) {
                 rows.append(TranscriptEntry(
                     row: TranscriptRow(
                         messageId: message.id,
                         kind: .planCard,
                         segmentIndex: 0,
                         segmentCount: 1,
-                        segment: TranscriptSegment(blocks: [])
+                        segment: TranscriptSegment()
                     ),
-                    message: message
+                    message: message,
+                    displayContent: nil
                 ))
                 continue
             }
+            if TranscriptSegmenter.isCertainlyOneRow(message.content) {
+                // One row, and that row does the parsing when it is built.
+                rows.append(TranscriptEntry(
+                    row: TranscriptRow(
+                        messageId: message.id,
+                        kind: .message,
+                        segmentIndex: 0,
+                        segmentCount: 1,
+                        segment: TranscriptSegment(isWholeMessage: true)
+                    ),
+                    message: message,
+                    displayContent: nil
+                ))
+                continue
+            }
+            let presentation = presentationCache.presentation(
+                for: message,
+                isGemmaDialect: isGemmaDialect,
+                isStreaming: isStreamingMessage(message, in: session)
+            )
             rows.append(contentsOf: TranscriptSegmenter.rows(
                 for: message.id,
                 kind: .message,
                 segments: presentation.segments
-            ).map { TranscriptEntry(row: $0, message: message) })
+            ).map {
+                TranscriptEntry(
+                    row: $0,
+                    message: message,
+                    displayContent: presentation.displayContent
+                )
+            })
         }
         return rows
     }
@@ -442,11 +472,7 @@ struct ChatDetailView: View {
                 ChatMessageView(
                     message: message,
                     row: row,
-                    displayContent: presentationCache.presentation(
-                        for: message,
-                        isGemmaDialect: isGemmaDialect,
-                        isStreaming: isStreamingMessage(message, in: session)
-                    ).displayContent,
+                    displayContent: entry.displayContent,
                     zoomScale: zoomManager.zoomScale,
                     isGenerating: isGenerating && message.id == session.messages.last?.id,
                     isStreamingOffDisk: isStreamingOffDisk,
@@ -483,23 +509,48 @@ struct ChatDetailView: View {
     /// so the settle report and the restored-conversation report are separate
     /// lines rather than one suppressing the other.
     ///
-    /// The segments are recomputed here with repairs enabled, which is what the
-    /// settled message renders: it is the realized shape the diagnostic reports
-    /// on, not the throttled streaming one.
+    /// The segments come from the same cheap rule the rows use, rather than from
+    /// a fresh eager parse of every message. The restored-conversation report
+    /// fires 1.5 s after a long history is opened — precisely the moment the
+    /// eager parse was making the transcript blank — so re-parsing the whole
+    /// conversation for a diagnostic would put the defect back.
     private func reportTranscriptGeometry(for session: ChatSession, suffix: String) {
         var segmentsByMessage: [UUID: [TranscriptSegment]] = [:]
         for message in session.messages {
-            segmentsByMessage[message.id] = presentationCache.presentation(
-                for: message,
-                isGemmaDialect: isGemmaDialect,
-                isStreaming: false
-            ).segments
+            segmentsByMessage[message.id] = segmentsForDiagnostic(for: message)
         }
         transcriptDiagnostics.reportIfNeeded(
             turnKey: "\(session.id.uuidString.prefix(8))-\(suffix)",
             messages: session.messages,
             segmentsByMessage: segmentsByMessage
         )
+    }
+
+    /// What the transcript draws for `message`, at the granularity that is
+    /// actually realized: one lazy row for a message that cannot split, the
+    /// cached segmentation for one that can.
+    ///
+    /// Nothing here may PARSE. The report fires once at settle, when the turn's
+    /// own messages have already been parsed, and once 1.5 s after a restored
+    /// conversation opens, when nothing has — and that second case is the one
+    /// where parsing the whole history would put the blank-transcript stall
+    /// back. A message with no cached shape reports as one row until its row
+    /// list parses it.
+    private func segmentsForDiagnostic(for message: ChatMessage) -> [TranscriptSegment] {
+        if message.isCompactionSummary == true {
+            return []
+        }
+        if message.role == .user {
+            return presentationCache.plainTextSegments(for: message)
+        }
+        if presentationCache.isPlanCard(for: message)
+            || TranscriptSegmenter.isCertainlyOneRow(message.content) {
+            return [TranscriptSegment(isWholeMessage: true)]
+        }
+        return presentationCache.cachedPresentation(
+            for: message,
+            isGemmaDialect: isGemmaDialect
+        )?.segments ?? [TranscriptSegment(isWholeMessage: true)]
     }
 
     /// Opens the window in which a programmatic scroll's own offsets are not read
@@ -1096,6 +1147,14 @@ struct ChatDetailView: View {
                 .onChange(of: session?.id) { _ in
                     isPinnedToBottom = true
                     isReaderScrolling = false
+                    // Switching conversations is the one moment the cache is
+                    // certain to hold a previous conversation's parses: nothing
+                    // settles, so the turn hook below never fires, and reading
+                    // five chats without generating retained five conversations'
+                    // worth of parses until one did.
+                    if let session {
+                        presentationCache.prune(keeping: Set(session.messages.map(\.id)))
+                    }
                     guard !landOnCompactedSummary(proxy) else { return }
                     followBottom(proxy)
                 }
@@ -3462,10 +3521,15 @@ struct ChatMessageView: View, Equatable {
     /// message and its rendering is unchanged; only a message that would lay
     /// out taller than the compositor's ceiling is split across several rows.
     let row: TranscriptRow
-    /// The message's display text (tool-call markup stripped). Derived once per
-    /// content change by `TranscriptPresentationCache` and shared by every row
-    /// of the message, rather than re-derived per row.
-    let displayContent: String
+    /// The message's display text (tool-call markup stripped), when the
+    /// transcript already derived it to segment this message. Nil means this row
+    /// derives it below, once per content change.
+    ///
+    /// The transcript supplies it only where it had to parse the message anyway.
+    /// Deriving it for every message up front was a markdown strip over the
+    /// whole conversation on the first body pass, over the messages the lazy
+    /// stack may never build.
+    let displayContent: String?
     /// Mirrors `zoomManager.zoomScale` into the render fingerprint.
     ///
     /// This view is compared with `.equatable()`, and an equal view is not
@@ -3482,6 +3546,35 @@ struct ChatMessageView: View, Equatable {
     @Binding var isExpanded: Bool
     @State private var isCopied = false
     @State private var isThinkingCopied = false
+    @State private var displayMemo = DisplayMemo()
+
+    /// Memoizes the display derivation for a row the transcript did not parse.
+    /// A reference type so the body can refresh it in place without scheduling
+    /// an update, the same shape `MarkdownMessageView.BlockMemo` uses.
+    private final class DisplayMemo {
+        var content: String?
+        var isGemmaDialect = false
+        var display = ""
+    }
+
+    /// What this row draws as text.
+    ///
+    /// Either the value the transcript already derived to segment the message,
+    /// or — for a message that fits one row — derived here, which is what keeps
+    /// an unrealized row free. Memoized on the content, because a streaming turn
+    /// re-runs this body on every chunk.
+    private var resolvedDisplayContent: String {
+        if let displayContent { return displayContent }
+        if displayMemo.content == message.content,
+           displayMemo.isGemmaDialect == isGemmaDialect {
+            return displayMemo.display
+        }
+        let derived = Self.responseDisplayContent(message.content, isGemmaDialect: isGemmaDialect)
+        displayMemo.content = message.content
+        displayMemo.isGemmaDialect = isGemmaDialect
+        displayMemo.display = derived
+        return derived
+    }
 
     /// True when the footer has any telemetry to show. Kept separate from the
     /// display-content check so tool-only assistant turns (which clean down to
@@ -3610,13 +3703,17 @@ struct ChatMessageView: View, Equatable {
     /// saves, while a field the body never reads only makes the comparison
     /// cheaper to leave out.
     ///
-    /// Text is reduced to its UTF-8 length rather than `String.count`, which is
-    /// O(n) in characters: `utf8.count` is stored on a native string, and this
-    /// runs twice per realized row per frame (once per operand of `==`).
+    /// Every value here is cheap to compare: a scalar, or a string that shares
+    /// its buffer with the message's own, so `==` is a pointer check in the
+    /// common case. That matters because this runs twice per realized row per
+    /// frame (once per operand of `==`).
     struct RenderFingerprint: Equatable {
         var messageId: UUID
         var role: MessageRole
-        var contentLength: Int
+        /// The raw content, not the display text: the row that draws an unparsed
+        /// message reads the raw text (it derives the display form itself), and a
+        /// same-length edit still has to repaint.
+        var content: String
         var thinkingLength: Int
         var isThinking: Bool
         var prefillStatus: String?
@@ -3638,7 +3735,6 @@ struct ChatMessageView: View, Equatable {
         var segmentBlocks: [MarkdownBlock]
         var segmentPlainText: String?
 
-        var displayContent: String
         var zoomScale: CGFloat
         var isGenerating: Bool
         var isStreamingOffDisk: Bool
@@ -3651,7 +3747,7 @@ struct ChatMessageView: View, Equatable {
         RenderFingerprint(
             messageId: message.id,
             role: message.role,
-            contentLength: message.content.utf8.count,
+            content: message.content,
             thinkingLength: message.thinkingContent?.utf8.count ?? 0,
             isThinking: message.isThinking,
             prefillStatus: message.prefillStatus,
@@ -3671,7 +3767,6 @@ struct ChatMessageView: View, Equatable {
             segmentCount: row.segmentCount,
             segmentBlocks: row.segment.blocks,
             segmentPlainText: row.segment.plainText,
-            displayContent: displayContent,
             zoomScale: zoomScale,
             isGenerating: isGenerating,
             isStreamingOffDisk: isStreamingOffDisk,
@@ -3759,6 +3854,9 @@ struct ChatMessageView: View, Equatable {
                         }
                     }
                 } else {
+                    // Derived once for the whole branch: the markdown body, the
+                    // footer's visibility and the speak action all read it.
+                    let display = resolvedDisplayContent
                     // Assistant Thinking / Reasoning Accordion (Osaurus Style).
                     // It belongs to the message, not to a slice of it, so only
                     // the first row draws it.
@@ -3947,9 +4045,12 @@ struct ChatMessageView: View, Equatable {
                     // Raw call markup is suppressed for tool-only turns, both while
                     // streaming and after the call has parsed. Only this row's
                     // slice of the parse is drawn; the parse itself is shared.
-                    if !displayContent.isEmpty, !row.segment.isEmpty {
+                    //
+                    // A whole-message row passes NO blocks on purpose: its parse
+                    // is the one `MarkdownMessageView` runs, on realization.
+                    if !display.isEmpty, !row.segment.isEmpty {
                         MarkdownMessageView(
-                            content: displayContent,
+                            content: display,
                             // Only the row this message ENDS on may draw the
                             // streaming cursor: `isStreaming` marks that row's
                             // last block, so passing it for every slice drew a
@@ -3959,7 +4060,7 @@ struct ChatMessageView: View, Equatable {
                                 && message.isThinking == false
                                 && row.isLast,
                             isStreamingOffDisk: isStreamingOffDisk,
-                            preparsedBlocks: row.segment.blocks
+                            preparsedBlocks: row.segment.isWholeMessage ? nil : row.segment.blocks
                         )
                     } else if row.isLast, (isGenerating || isCompactingConversation) && !message.isThinking && !hasThinkingContent && (message.toolCalls == nil || message.toolCalls!.isEmpty) && !isStreamingToolCall {
                         // Only for non-thinking models during initial prefill / generation,
@@ -3990,7 +4091,7 @@ struct ChatMessageView: View, Equatable {
                     // Action & Metrics Footer (Osaurus Style Telemetry & Actions).
                     // Telemetry describes the whole turn, so it closes the last
                     // row rather than repeating under every slice.
-                    if row.isLast, (!message.isThinking || !isGenerating) && (hasTelemetry || !displayContent.isEmpty) {
+                    if row.isLast, (!message.isThinking || !isGenerating) && (hasTelemetry || !display.isEmpty) {
                         HStack(spacing: 12) {
                             // Telemetry
                             HStack(spacing: 6) {
@@ -4043,7 +4144,7 @@ struct ChatMessageView: View, Equatable {
                             Spacer()
 
                             // Action Buttons (only when there is visible text to act on)
-                            if !displayContent.isEmpty {
+                            if !display.isEmpty {
                                 HStack(spacing: 8) {
                                     // Copy button
                                     Button(action: {
@@ -4074,7 +4175,7 @@ struct ChatMessageView: View, Equatable {
                                     // Audio speak (model replies only)
                                     if message.role == .assistant {
                                         Button(action: {
-                                            NSSpeechSynthesizer().startSpeaking(displayContent)
+                                            NSSpeechSynthesizer().startSpeaking(display)
                                         }) {
                                             Image(systemName: "speaker.wave.2")
                                                 .font(.system(size: max(8.5, 11 * zoomManager.zoomScale)))
@@ -4623,6 +4724,49 @@ struct MarkdownMessageView: View {
 
 // MARK: - Native Markdown Table Card View (SwiftUI Grid)
 
+/// One table cell's text, drawn inside a capped region when it is too large to
+/// draw inline.
+///
+/// `TranscriptSegmenter.splitTable` splits a table by ROW, and a cell is
+/// atomic, so a tool result pasted into one cell produced a row that no split
+/// could bound: a 33,000-character cell in a three-column table measured as a
+/// single 51,000 pt segment. The cell is therefore bounded where it is DRAWN,
+/// and `drawnTableRowLineCount` prices the same cap so the estimate the
+/// segmenter reports matches the height the reader gets.
+private struct MarkdownTableCellText: View {
+    let text: String
+    let fontSize: CGFloat
+    var weight: Font.Weight = .regular
+    let alignment: TextAlignmentType
+
+    /// Height cap for one capped cell. The same ceiling the tool-call card puts
+    /// on its own output, because this is the same content in a different
+    /// container: a tool result, kept reachable but not given the row.
+    static let cappedHeight: CGFloat = 240
+
+    var body: some View {
+        if TranscriptSegmenter.tableCellNeedsCapping(text) {
+            ScrollView(.vertical, showsIndicators: true) {
+                ChunkedText(text: text, parsesMarkdown: true)
+                    .font(.system(size: fontSize, weight: weight))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+            // An exact height rather than a maximum: a scroll view reports no
+            // intrinsic height, so inside a `Grid` row the cell would otherwise
+            // be sized by the row it is itself sizing.
+            .frame(height: Self.cappedHeight)
+        } else {
+            Text(LocalizedStringKey(text))
+                .font(.system(size: fontSize, weight: weight))
+                .multilineTextAlignment(alignment.textAlignment)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        }
+    }
+}
+
 struct MarkdownTableView: View {
     @EnvironmentObject private var zoomManager: AppZoomManager
     let table: MarkdownTableData
@@ -4648,15 +4792,16 @@ struct MarkdownTableView: View {
                                 let header = table.headers[colIdx]
                                 let align = table.alignments.indices.contains(colIdx) ? table.alignments[colIdx] : .leading
                                 HStack(spacing: 0) {
-                                    Text(LocalizedStringKey(header))
-                                        .font(.system(size: max(8.5, 13 * zoomManager.zoomScale), weight: .bold))
-                                        .foregroundColor(.secondary)
-                                        .multilineTextAlignment(align.textAlignment)
-                                        .padding(.horizontal, 14)
-                                        .padding(.vertical, 9)
-                                        .frame(minWidth: 90, alignment: align.alignment)
-                                        .fixedSize(horizontal: false, vertical: true)
-                                        .textSelection(.enabled)
+                                    MarkdownTableCellText(
+                                        text: header,
+                                        fontSize: max(8.5, 13 * zoomManager.zoomScale),
+                                        weight: .bold,
+                                        alignment: align
+                                    )
+                                    .foregroundColor(.secondary)
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 9)
+                                    .frame(minWidth: 90, alignment: align.alignment)
 
                                     if colIdx < table.headers.count - 1 {
                                         Divider()
@@ -4681,15 +4826,15 @@ struct MarkdownTableView: View {
                                     let cell = colIdx < row.count ? row[colIdx] : ""
                                     let align = table.alignments.indices.contains(colIdx) ? table.alignments[colIdx] : .leading
                                     HStack(spacing: 0) {
-                                        Text(LocalizedStringKey(cell))
-                                            .font(.system(size: max(8.5, 13 * zoomManager.zoomScale)))
-                                            .foregroundColor(.primary)
-                                            .multilineTextAlignment(align.textAlignment)
-                                            .padding(.horizontal, 14)
-                                            .padding(.vertical, 8)
-                                            .frame(minWidth: 90, alignment: align.alignment)
-                                            .fixedSize(horizontal: false, vertical: true)
-                                            .textSelection(.enabled)
+                                        MarkdownTableCellText(
+                                            text: cell,
+                                            fontSize: max(8.5, 13 * zoomManager.zoomScale),
+                                            alignment: align
+                                        )
+                                        .foregroundColor(.primary)
+                                        .padding(.horizontal, 14)
+                                        .padding(.vertical, 8)
+                                        .frame(minWidth: 90, alignment: align.alignment)
 
                                         if colIdx < table.headers.count - 1 {
                                             Divider()

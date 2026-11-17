@@ -22,6 +22,10 @@ public struct ToolExecutionTimelineView: View {
     /// another view inside the same transcript row, and an agent loop can issue
     /// dozens of calls in one turn, so an unbounded list is a row that grows
     /// without limit, which is what the compositor refuses to paint.
+    ///
+    /// When the list does scroll it is the ONLY vertical scroll area in the
+    /// list: the cards then draw their output inline, so a transcript row never
+    /// contains nested vertical scrollers competing for the wheel.
     static let inlineCardLimit = 5
 
     /// Height cap for the card list once it scrolls.
@@ -75,7 +79,7 @@ public struct ToolExecutionTimelineView: View {
             // long agent turn can issue dozens, and the list rides one
             // transcript row. Scrolling keeps every card reachable, which is why
             // the whole list is not truncated the way the badge strip is.
-            if toolCalls.count > Self.inlineCardLimit {
+            if isCardListScrollable {
                 ScrollView(.vertical, showsIndicators: true) {
                     cardList(toolCalls)
                 }
@@ -94,12 +98,19 @@ public struct ToolExecutionTimelineView: View {
             ForEach(calls) { call in
                 TimelineStepCardView(
                     call: call,
+                    // One vertical scroll area per transcript row, never two
+                    // nested: when this list scrolls, the cards inside it do not.
+                    scrollsOutput: !isCardListScrollable,
                     onApprove: { onApproveCall?(call.id) },
                     onReject: { onRejectCall?(call.id) }
                 )
             }
         }
     }
+
+    /// True when the card list itself is a scroll area, i.e. when the cards
+    /// inside it may not add one of their own.
+    private var isCardListScrollable: Bool { toolCalls.count > Self.inlineCardLimit }
 }
 
 // MARK: - Mini Step Node Badge
@@ -160,6 +171,13 @@ struct StepNodeBadge: View {
 
 struct TimelineStepCardView: View {
     let call: ToolCallRecord
+    /// Whether this card owns the vertical scroll area that bounds its output.
+    ///
+    /// True for a short list, where the card is the only thing that can bound a
+    /// `file_read` of 200 KB. False inside a scrollable list, where the list
+    /// already bounds the row and a second nested vertical scroll would capture
+    /// the wheel and make the transcript feel stuck over a tool-heavy turn.
+    var scrollsOutput: Bool = true
     var onApprove: (() -> Void)? = nil
     var onReject: (() -> Void)? = nil
 
@@ -231,6 +249,17 @@ struct TimelineStepCardView: View {
         default:
             return call.rawArguments
         }
+    }
+
+    /// This card's output, drawn as bounded chunks so no single text view is
+    /// taller than a couple of thousand points. Whether it scrolls is the
+    /// caller's decision (see `scrollsOutput`).
+    private func outputText(_ out: String) -> some View {
+        ChunkedText(text: out, lineSpacing: 2)
+            .font(.system(size: 11, design: .monospaced))
+            .foregroundColor(.primary)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     var body: some View {
@@ -412,20 +441,23 @@ struct TimelineStepCardView: View {
                                 .buttonStyle(.plain)
                             }
 
-                            // Bounded, and bounded twice: `ChunkedText` keeps
-                            // any one text view small enough to paint, and the
-                            // frame caps the card so a `file_read` of a 200 KB
-                            // file cannot put an enormous view in the
-                            // transcript. The full output is still reachable
-                            // through the copy button and by expanding.
-                            ScrollView(.vertical, showsIndicators: true) {
-                                ChunkedText(text: out, lineSpacing: 2)
-                                    .font(.system(size: 11, design: .monospaced))
-                                    .foregroundColor(.primary)
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            // Bounded either way, but bounded ONCE: `ChunkedText`
+                            // keeps any one text view small enough to paint, and
+                            // exactly one of this card or the list around it
+                            // scrolls. When the list is a scroll area it already
+                            // bounds the row and keeps every output reachable, so
+                            // the card adds no second vertical scroll for the
+                            // wheel to get captured by.
+                            Group {
+                                if scrollsOutput {
+                                    ScrollView(.vertical, showsIndicators: true) {
+                                        outputText(out)
+                                    }
+                                    .frame(maxHeight: Self.maxOutputHeight)
+                                } else {
+                                    outputText(out)
+                                }
                             }
-                            .frame(maxHeight: Self.maxOutputHeight)
                             .padding(8)
                             .background(Color.secondary.opacity(0.04))
                             .cornerRadius(6)

@@ -150,6 +150,84 @@ final class TranscriptSegmenterTests: XCTestCase {
         XCTAssertEqual(rows[0].segmentCount, 1)
     }
 
+    // MARK: - Rows that need no parse
+
+    func testAMessageThatCannotSplitIsOneUnparsedRow() {
+        // A whole-message segment carries no blocks on purpose: the row parses
+        // when the lazy stack realizes it. `isEmpty` decides whether anything is
+        // drawn at all, so it must not read "not parsed yet" as "nothing to
+        // draw".
+        let segment = TranscriptSegment(isWholeMessage: true)
+        XCTAssertTrue(segment.blocks.isEmpty)
+        XCTAssertNil(segment.plainText)
+        XCTAssertFalse(segment.isEmpty)
+    }
+
+    func testTheCheapCeilingOnlyAcceptsMessagesThatFitOneRow() {
+        XCTAssertTrue(TranscriptSegmenter.isCertainlyOneRow("A short answer."))
+        XCTAssertTrue(TranscriptSegmenter.isCertainlyOneRow(longParagraph(lines: 40)))
+        // Over the line ceiling: a diff or a long list is parsed so its rows can
+        // be bounded.
+        XCTAssertFalse(TranscriptSegmenter.isCertainlyOneRow(manyShortLines(lines: 200)))
+        // Over the character ceiling on a single line.
+        XCTAssertFalse(
+            TranscriptSegmenter.isCertainlyOneRow(String(repeating: "x", count: 20_000))
+        )
+        // Both ceilings are far under the row budget, so what the lazy path
+        // accepts can never be a row that blanks the transcript.
+        XCTAssertLessThan(
+            TranscriptSegmenter.singleRowCharacterCeiling,
+            TranscriptSegmenter.maxRowCharacters
+        )
+        XCTAssertLessThan(
+            TranscriptSegmenter.singleRowLineCeiling,
+            TranscriptSegmenter.maxRowLines
+        )
+    }
+
+    func testTheWorstMessageTheLazyPathAcceptsStillFitsOneRow() {
+        // The boundary the cheap test admits: every line near its ceiling AND the
+        // character ceiling reached. The row riders and the chrome are included,
+        // because this row is drawn whole and unsplit.
+        let boundary = manyShortLines(
+            lines: TranscriptSegmenter.singleRowLineCeiling,
+            width: 99
+        )
+        XCTAssertTrue(TranscriptSegmenter.isCertainlyOneRow(boundary))
+        XCTAssertLessThanOrEqual(
+            TranscriptSegmenter.worstCaseRowHeight(
+                of: TranscriptSegment(blocks: parseMarkdownBlocks(boundary))
+            ),
+            TranscriptSegmenter.compositorHeightCeiling,
+            "a message the lazy path accepts must still fit one row"
+        )
+    }
+
+    func testDecidingARowNeedsNoParse() {
+        // The row loop's decision for a message that fits one row is
+        // `isPlanCard` + `isCertainlyOneRow` and nothing else. Parsing every
+        // message on the first body pass is what made a long conversation take
+        // seconds to open, so neither call may populate the parse cache — even
+        // across a whole conversation.
+        let cache = TranscriptPresentationCache()
+        var entries: [TranscriptEntry] = []
+        for index in 0..<100 {
+            let message = makeMessage(.assistant, "Answer \(index).")
+            XCTAssertFalse(cache.isPlanCard(for: message))
+            XCTAssertTrue(TranscriptSegmenter.isCertainlyOneRow(message.content))
+            entries.append(contentsOf: TranscriptSegmenter.rows(
+                for: message.id,
+                kind: .message,
+                segments: [TranscriptSegment(isWholeMessage: true)]
+            ).map { TranscriptEntry(row: $0, message: message, displayContent: nil) })
+        }
+        XCTAssertEqual(cache.cachedMessageCount, 0, "no message on the lazy path was parsed")
+        XCTAssertEqual(entries.count, 100)
+        XCTAssertEqual(Set(entries.map(\.id)).count, 100)
+        XCTAssertTrue(entries.allSatisfy { $0.row.segmentCount == 1 && $0.row.isFirst })
+        XCTAssertTrue(entries.allSatisfy { $0.displayContent == nil })
+    }
+
     // MARK: - Long messages are bounded
 
     func testLongMessageSplitsIntoRowsUnderTheBudget() {
@@ -284,10 +362,11 @@ final class TranscriptSegmenterTests: XCTestCase {
     }
 
     func testTableWithWideCellsSplitsByWrappedLinesNotRowCount() {
-        // The transcript dropped the horizontal scroll view, so a cell wraps
-        // inside its column. One line per row was right only for narrow cells: a
-        // 60-row table of wide cells lays out several times taller, which is the
-        // row the compositor refuses to paint.
+        // A cell wraps, and the table keeps its own horizontal scroll view, so
+        // the estimate assumes less width than a cell may actually get: one line
+        // per row was right only for narrow cells, and a 60-row table of wide
+        // ones lays out several times taller than that, which is the row the
+        // compositor refuses to paint.
         let wideCell = String(repeating: "x", count: 240)
         let table = MarkdownTableData(
             headers: ["a", "b", "c"],
@@ -312,6 +391,32 @@ final class TranscriptSegmenterTests: XCTestCase {
             XCTAssertEqual(piece.headers, table.headers)
         }
         XCTAssertEqual(tables.flatMap(\.rows), table.rows)
+    }
+
+    func testATableCellTooLargeToDrawIsCappedInsteadOfBlowingTheRow() {
+        // A table is split by ROW and a cell is atomic, so one tool result
+        // pasted into a cell produced a single 51,000 pt segment that no guard
+        // in the segmenter could see. The cell is therefore capped where it is
+        // DRAWN, and the estimate has to price the same cap or the reported
+        // height and the drawn height disagree.
+        let hugeCell = String(repeating: "x", count: 33_000)
+        let table = MarkdownTableData(
+            headers: ["a", "b", "c"],
+            alignments: [.leading, .leading, .leading],
+            rows: [["k", hugeCell, "v"]]
+        )
+
+        XCTAssertTrue(TranscriptSegmenter.tableCellNeedsCapping(hugeCell))
+        XCTAssertFalse(TranscriptSegmenter.tableCellNeedsCapping("value"))
+        XCTAssertLessThan(
+            TranscriptSegmenter.laidOutLineCount(of: .table(table)),
+            TranscriptSegmenter.maxRowLines,
+            "the capped cell must be priced as drawn, not at its natural height"
+        )
+
+        let segments = TranscriptSegmenter.segments(for: [.table(table)])
+        XCTAssertEqual(segments.count, 1, "a single row cannot be split")
+        assertWithinBudget(segments)
     }
 
     func testAShortTableStaysOneBlock() {
@@ -481,6 +586,48 @@ final class TranscriptSegmenterTests: XCTestCase {
         XCTAssertEqual(cache.cachedMessageCount, 2)
         cache.prune(keeping: Set(secondSession.map(\.id)))
         XCTAssertEqual(cache.cachedMessageCount, 2, "the live session's parses are kept")
+    }
+
+    func testUserTurnChunkingIsMemoizedRatherThanRepeated() {
+        // A user turn draws its text verbatim, so there is no parse to share —
+        // but the chunking is O(characters) and the row loop asks for it on
+        // every body pass. A conversation with a few pasted turns was
+        // re-chunking all of them per streamed chunk.
+        let cache = TranscriptPresentationCache()
+        let message = makeMessage(.user, longParagraph(lines: 400))
+
+        let first = cache.plainTextSegments(for: message)
+        XCTAssertGreaterThan(first.count, 1)
+        XCTAssertEqual(cache.cachedPlainTextCount, 1)
+        XCTAssertEqual(cache.plainTextSegments(for: message), first)
+        XCTAssertEqual(
+            cache.cachedMessageCount,
+            0,
+            "a user turn must never go through the markdown parse"
+        )
+
+        var grown = message
+        grown.content += "\n" + longParagraph(lines: 10)
+        XCTAssertNotEqual(cache.plainTextSegments(for: grown), first)
+
+        cache.prune(keeping: [])
+        XCTAssertEqual(cache.cachedPlainTextCount, 0)
+    }
+
+    func testPlanClassificationIsAnsweredWithoutParsing() {
+        let cache = TranscriptPresentationCache()
+        let plan = makeMessage(.assistant, planBody)
+
+        XCTAssertTrue(cache.isPlanCard(for: plan))
+        XCTAssertEqual(cache.cachedMessageCount, 0, "classifying a plan must not parse it")
+        XCTAssertEqual(cache.cachedPlanClassificationCount, 1)
+        XCTAssertTrue(cache.isPlanCard(for: plan))
+        XCTAssertFalse(cache.isPlanCard(for: makeMessage(.assistant, "just prose")))
+        // A user turn is never a plan card, whatever it contains.
+        XCTAssertFalse(cache.isPlanCard(for: makeMessage(.user, planBody)))
+
+        cache.prune(keeping: [])
+        XCTAssertEqual(cache.cachedPlanClassificationCount, 0)
     }
 
     func testALongAnswerNeverRendersAsAnEmptyRow() {
@@ -678,6 +825,45 @@ final class TranscriptSegmenterTests: XCTestCase {
 
         diagnostics.reportIfNeeded(turnKey: "abc-2", messages: messages, segmentsByMessage: [:])
         XCTAssertEqual(diagnostics.lastReportedTurnKey, "abc-2")
+    }
+
+    func testANonFiniteHeightCannotCrashTheReport() {
+        // `Int(CGFloat)` traps on `.infinity`, and an unlaid-out scroll view
+        // publishes exactly that: the instrumentation for an intermittent
+        // rendering bug killed the process when geometry handed it one.
+        let diagnostics = TranscriptDiagnostics()
+        diagnostics.record(rowId: "row#0/1", label: "message#0/1", height: .infinity)
+        diagnostics.record(contentHeight: .infinity, viewportHeight: .nan)
+
+        diagnostics.reportIfNeeded(
+            turnKey: "abc-2",
+            messages: [makeMessage(.user, "hi")],
+            segmentsByMessage: [:]
+        )
+        XCTAssertEqual(diagnostics.lastReportedTurnKey, "abc-2")
+        // An unbounded row is still a row worth warning about.
+        XCTAssertEqual(diagnostics.warnedTurnKey, "abc-2")
+    }
+
+    func testTheRowWarningReArmsForARestoredConversation() {
+        // `beginTurn()` only runs on the generating transition, so a conversation
+        // restored from disk reports without one. A bare warn-once flag meant the
+        // FIRST long conversation warned and every one opened afterwards logged
+        // silently — which is the reproduction this instrumentation exists for.
+        let diagnostics = TranscriptDiagnostics()
+        let tall = TranscriptSegmenter.rowHeightWarning + 100
+        diagnostics.record(rowId: "row#0/1", label: "message#0/1", height: tall)
+
+        diagnostics.reportIfNeeded(turnKey: "abc-restored", messages: [], segmentsByMessage: [:])
+        XCTAssertEqual(diagnostics.warnedTurnKey, "abc-restored")
+
+        diagnostics.record(rowId: "row2#0/1", label: "message#0/1", height: tall)
+        diagnostics.reportIfNeeded(turnKey: "def-restored", messages: [], segmentsByMessage: [:])
+        XCTAssertEqual(
+            diagnostics.warnedTurnKey,
+            "def-restored",
+            "a second restored conversation warns too"
+        )
     }
 
     // MARK: - Pin / follow policy
