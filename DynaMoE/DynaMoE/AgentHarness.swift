@@ -2414,14 +2414,14 @@ public final class SpawnSubagentTool: AgentTool {
                         ],
                         "max_cost_usd": [
                             "type": "number",
-                            "description": "Cloud spend ceiling, in US dollars."
+                            "description": "Cloud spend ceiling, in US dollars. The model must have input and output prices recorded in Settings, or the spawn is refused: an unpriced run reports $0 for every token and the ceiling could never bind."
                         ]
                     ]
                 ],
                 "isolation": [
                     "type": "string",
                     "enum": ["none", "worktree"],
-                    "description": "Workspace isolation. Use 'worktree' for any writer in a git repository: it gets its own worktree and branch, asks once at spawn, and leaves the work for apply_subagent_changes. 'none' runs in the coordinator's directory with per-call approval; a read-only run or a non-git workspace cannot use a worktree."
+                    "description": "Workspace isolation. Use 'worktree' for any writer in a git repository: it gets its own worktree and branch and its file writes stay there without a per-call card. A shell command can reach outside the worktree, so it still asks each call. Changes are left for apply_subagent_changes. 'none' runs in the coordinator's directory with per-call approval; a read-only run or a non-git workspace cannot use a worktree."
                 ],
                 "thinking": [
                     "type": "boolean",
@@ -2764,6 +2764,21 @@ public final class GetSubagentStatusTool: AgentTool {
         if !subagent.finalSummary.isEmpty {
             readable += "\nSummary:\n\(subagent.finalSummary)\n"
         }
+        if let report = subagent.report, !report.findings.isEmpty {
+            // The report's findings are what the run learned, stated in its own
+            // words with the step they came from. A coordinator that only sees
+            // the summary repeats a paragraph; these are what it can relay.
+            readable += "\nFindings:\n"
+            for finding in report.findings.prefix(8) {
+                readable += "- \(finding.claim) [\(finding.evidence)]\n"
+            }
+        }
+        if let report = subagent.report, !report.openQuestions.isEmpty {
+            readable += "\nOpen questions:\n"
+            for question in report.openQuestions.prefix(5) {
+                readable += "- \(question)\n"
+            }
+        }
         if isTerminal {
             if subagent.isSummaryRelayed {
                 readable += "\nThis report has already been delivered into the conversation; present it to the user and answer their question with it.\n"
@@ -2784,6 +2799,19 @@ public final class GetSubagentStatusTool: AgentTool {
             "summary": subagent.finalSummary,
             "duration_seconds": subagent.executionDurationSeconds
         ]
+        if let report = subagent.report {
+            if !report.findings.isEmpty {
+                data["findings"] = report.findings.map {
+                    ["claim": $0.claim, "evidence": $0.evidence, "confidence": $0.confidence]
+                }
+            }
+            if !report.openQuestions.isEmpty {
+                data["open_questions"] = report.openQuestions
+            }
+            if report.usage.costIsUnpriced {
+                data["cost_is_unpriced"] = true
+            }
+        }
         if isTerminal {
             if let worktree = AgentHarness.worktreeDescription(of: subagent) {
                 if subagent.appliedAt != nil {
@@ -5715,6 +5743,40 @@ public final class AgentHarness {
         case ask(AgentApprovalRequest)
     }
 
+    /// True when every write this call can perform is inside `workspace`.
+    ///
+    /// Only a tool whose whole write surface is a named path can be proved.
+    /// `file_write` / `file_edit` name their destination directly, and a
+    /// `git_commit` is scoped by git to the worktree it runs in. A shell
+    /// command is arbitrary code that also takes its own `cwd`, so it answers
+    /// false: the spawn-only policy may not call it safe, and the operator
+    /// gets the same per-change card a write on the main tree gets.
+    private static func writesStayInsideWorkspace(
+        _ call: ParsedToolCall,
+        workspace: URL,
+        workingDirectory: URL?
+    ) -> Bool {
+        switch call.name {
+        case "file_write", "file_edit":
+            guard let path = call.arguments["path"] as? String, !path.isEmpty else { return false }
+            return contains(resolvePath(path, workingDirectory: workingDirectory), in: workspace)
+        case "git_commit":
+            guard let workingDirectory else { return false }
+            return contains(workingDirectory, in: workspace)
+        default:
+            return false
+        }
+    }
+
+    /// Containment after standardising and resolving symlinks, so a path that
+    /// escapes with `..` or through a symlink is not read as inside.
+    private static func contains(_ url: URL, in workspace: URL) -> Bool {
+        let root = workspace.standardizedFileURL.resolvingSymlinksInPath().path
+        let resolved = url.standardizedFileURL.resolvingSymlinksInPath().path
+        guard !root.isEmpty else { return false }
+        return resolved == root || resolved.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+    }
+
     private func runScopeDecision(for call: ParsedToolCall, workingDirectory: URL?) -> RunScopeDecision {
         guard isRunScoped else { return .allow }
         let stateChanging = Self.isStateChanging(toolName: call.name)
@@ -5744,8 +5806,20 @@ public final class AgentHarness {
         case .spawnOnly:
             if appPreferences { return ask("it would rewrite DynaMoE's own preferences") }
             if subQNeedsApproval { return ask("it uploads the state or local image bytes") }
-            if stateChanging && !isWorkspaceIsolated {
-                return ask("it changes state outside an isolated workspace")
+            if stateChanging {
+                guard isWorkspaceIsolated else {
+                    return ask("it changes state outside an isolated workspace")
+                }
+                // Isolation is a promise about THIS CALL's destination, not the
+                // existence of a worktree. `resolvePath` returns an absolute
+                // path verbatim, so a `file_write` naming the operator's tree
+                // would otherwise edit it with no card — in the configuration
+                // presented as safe. Only a call whose writes are provably
+                // confined may skip the card.
+                guard let workspace = workingDirectory ?? defaultWorkingDirectory,
+                      Self.writesStayInsideWorkspace(call, workspace: workspace, workingDirectory: workingDirectory) else {
+                    return ask("it can change state outside the run's isolated workspace")
+                }
             }
             return .allow
         case .everyStateChange:

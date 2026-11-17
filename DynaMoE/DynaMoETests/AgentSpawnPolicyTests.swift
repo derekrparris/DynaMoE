@@ -262,6 +262,111 @@ final class AgentSpawnPolicyTests: XCTestCase {
         XCTAssertFalse(tools.contains("shell_run"))
     }
 
+    // MARK: - Ending a run
+
+    /// The worker prompt tells every run to finish with `complete`, and
+    /// `endsAgentRun` keys the completion on it. A resolved tool set that omits
+    /// it leaves a run with no way to declare it finished: it either stops
+    /// calling tools (reported as a completion it never made) or dies on its
+    /// step budget.
+    func testEveryPresetCanEndItsRunWithComplete() throws {
+        for preset in AgentRolePreset.allCases {
+            let definition = AgentRolePresetCatalog.definition(for: preset)
+            let tools = try AgentSpawnResolver.resolveTools(
+                request(preset: preset.rawValue),
+                definition: definition
+            )
+            XCTAssertTrue(tools.contains("complete"), "\(preset) must be able to call complete")
+        }
+    }
+
+    func testAnExplicitToolListStillGetsComplete() throws {
+        let tools = try AgentSpawnResolver.resolveTools(
+            request(tools: ["file_read"]),
+            definition: AgentRolePresetCatalog.definition(for: .implementer)
+        )
+        XCTAssertEqual(tools, ["complete", "file_read"])
+    }
+
+    func testPlanModeStillWithholdsComplete() throws {
+        // In plan mode the plain-text plan IS the deliverable, so `complete` is
+        // withheld by policy and must not be appended back.
+        let tools = try AgentSpawnResolver.resolveTools(
+            request(tools: ["file_read"], mode: .plan),
+            definition: AgentRolePresetCatalog.definition(for: .explore)
+        )
+        XCTAssertEqual(tools, ["file_read"])
+    }
+
+    // MARK: - Cost ceilings
+
+    /// A ceiling compared against an unpriced run can never trip: the backend
+    /// reports `costUSD` 0 for every token because it has no rate to apply.
+    /// The spawn refuses instead of pretending the limit binds.
+    func testACostCeilingWithoutAPriceIsRefused() {
+        let suiteName = "AgentSpawnPolicyTests-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let descriptor = AgentBackendDescriptor(
+            kind: .cloud,
+            providerId: "synthetic",
+            modelId: "syn:large:text",
+            displayName: "Syn Large"
+        )
+        let budget = AgentBudget(
+            maxSteps: 4,
+            maxCompletionTokens: 400,
+            maxWallClockSeconds: 60,
+            maxCostUSD: 0.25
+        )
+        XCTAssertEqual(
+            AgentSpawnResolver.costCeilingProblem(budget: budget, descriptor: descriptor, defaults: defaults),
+            .costCeilingWithoutPricing("Syn Large")
+        )
+
+        CloudPricingStore.setPricing(
+            ["syn:large:text": CloudPricing(input: 1, output: 2)],
+            for: "synthetic",
+            defaults: defaults
+        )
+        XCTAssertNil(
+            AgentSpawnResolver.costCeilingProblem(budget: budget, descriptor: descriptor, defaults: defaults)
+        )
+    }
+
+    func testACostCeilingOnALocalRunIsRefusedToo() {
+        let descriptor = AgentBackendDescriptor(
+            kind: .local,
+            providerId: nil,
+            modelId: nil,
+            displayName: "Local checkpoint"
+        )
+        let budget = AgentBudget(
+            maxSteps: 4,
+            maxCompletionTokens: 400,
+            maxWallClockSeconds: 60,
+            maxCostUSD: 1
+        )
+        XCTAssertEqual(
+            AgentSpawnResolver.costCeilingProblem(budget: budget, descriptor: descriptor),
+            .costCeilingWithoutPricing("Local checkpoint"),
+            "a local run's cost is engine time, not dollars, so a dollar ceiling cannot bind"
+        )
+    }
+
+    func testNoCeilingNeedsNoPrice() {
+        let descriptor = AgentBackendDescriptor(
+            kind: .cloud,
+            providerId: "synthetic",
+            modelId: "syn:large:text",
+            displayName: "Syn Large"
+        )
+        XCTAssertNil(
+            AgentSpawnResolver.costCeilingProblem(budget: .standard, descriptor: descriptor)
+        )
+    }
+
     // MARK: - Tool schema
 
     func testSpawnSchemaCarriesBackendPresetBudgetAndIsolation() throws {

@@ -145,6 +145,12 @@ nonisolated struct AgentUsage: Codable, Equatable, Sendable {
     var completionTokens: Int = 0
     var cachedTokens: Int = 0
     var costUSD: Double = 0
+    /// True when a backend reported token usage for a model with no recorded
+    /// price, so `costUSD` is a FLOOR rather than the bill. A cost ceiling that
+    /// compares against an unpriced run is inert — the tokens cost something
+    /// the app cannot name — so the loop refuses to run with a ceiling it
+    /// cannot enforce instead of reading this as "$0 spent".
+    var costIsUnpriced: Bool = false
     var wallClockSeconds: Double = 0
     var toolCalls: Int = 0
     var backendRequests: Int = 0
@@ -166,6 +172,7 @@ nonisolated struct AgentUsage: Codable, Equatable, Sendable {
         completionTokens += other.completionTokens
         cachedTokens += other.cachedTokens
         costUSD += other.costUSD
+        costIsUnpriced = costIsUnpriced || other.costIsUnpriced
         wallClockSeconds += other.wallClockSeconds
         toolCalls += other.toolCalls
         backendRequests += other.backendRequests
@@ -196,6 +203,7 @@ nonisolated struct AgentUsage: Codable, Equatable, Sendable {
         completionTokens = try container.decodeIfPresent(Int.self, forKey: .completionTokens) ?? 0
         cachedTokens = try container.decodeIfPresent(Int.self, forKey: .cachedTokens) ?? 0
         costUSD = try container.decodeIfPresent(Double.self, forKey: .costUSD) ?? 0
+        costIsUnpriced = try container.decodeIfPresent(Bool.self, forKey: .costIsUnpriced) ?? false
         wallClockSeconds = try container.decodeIfPresent(Double.self, forKey: .wallClockSeconds) ?? 0
         toolCalls = try container.decodeIfPresent(Int.self, forKey: .toolCalls) ?? 0
         backendRequests = try container.decodeIfPresent(Int.self, forKey: .backendRequests) ?? 0

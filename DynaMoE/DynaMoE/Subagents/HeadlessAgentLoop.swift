@@ -112,10 +112,17 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 failure = "The run exhausted its \(input.budget.maxCompletionTokens)-token completion budget."
                 break
             }
-            if let maxCost = input.budget.maxCostUSD, usage.costUSD >= maxCost {
-                status = .failed
-                failure = "The run exhausted its cost budget."
-                break
+            if let maxCost = input.budget.maxCostUSD {
+                if usage.costIsUnpriced {
+                    status = .failed
+                    failure = "The run has a \(Self.currency(maxCost)) cost ceiling, but no price is recorded for its model, so the ceiling cannot be enforced."
+                    break
+                }
+                if usage.costUSD >= maxCost {
+                    status = .failed
+                    failure = "The run exhausted its cost budget."
+                    break
+                }
             }
 
             let deltaTextId = UUID()
@@ -252,16 +259,31 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         }
 
         usage.wallClockSeconds = CFAbsoluteTimeGetCurrent() - start
-        let summary = Self.bounded(completionSummary ?? finalText, limit: 6000)
+        // Derive what the run actually said. A `complete` call's summary is the
+        // run's considered answer; without one, a completed run's final text is
+        // the answer and a failed run's LONGEST text is the partial result it
+        // managed to produce (its last text is usually a preamble). Findings and
+        // open questions come from the transcript either way, so a read-only
+        // run's report is not an empty shell around one paragraph.
+        let derivedSummary = AgentReportBuilder.bestEffortSummary(in: transcript)
+        let summaryText: String
+        if let completionSummary, !completionSummary.isEmpty {
+            summaryText = completionSummary
+        } else if status == .completed, !finalText.isEmpty {
+            summaryText = finalText
+        } else {
+            summaryText = derivedSummary ?? finalText
+        }
+        let summary = Self.bounded(summaryText, limit: 6000)
         let report = AgentReport(
             status: status,
             summary: summary,
-            findings: [],
+            findings: AgentReportBuilder.findings(from: transcript),
             changedFiles: Self.changedFiles(in: transcript),
             diff: nil,
             tests: Self.testOutcomes(in: transcript),
             risks: failure.map { [$0] } ?? [],
-            openQuestions: [],
+            openQuestions: AgentReportBuilder.openQuestions(from: transcript),
             usage: usage,
             backend: backend.descriptor
         )
@@ -289,6 +311,10 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
 
     private static func bounded(_ text: String, limit: Int) -> String {
         AgentHarness.truncateText(AgentHarness.sanitizeText(text), limit: limit)
+    }
+
+    private static func currency(_ amount: Double) -> String {
+        String(format: "$%.2f", amount)
     }
 
     private static func changedFiles(in transcript: [AgentTranscriptEntry]) -> [String] {

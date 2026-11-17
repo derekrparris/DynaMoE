@@ -32,7 +32,11 @@ extension AgentUsage {
         if steps > 0 { parts.append("\(steps) step\(steps == 1 ? "" : "s")") }
         if contextTokens > 0 { parts.append("\(contextTokens) tok") }
         if toolCalls > 0 { parts.append("\(toolCalls) tool\(toolCalls == 1 ? "" : "s")") }
-        if costUSD > 0 { parts.append(String(format: "$%.4f", costUSD)) }
+        if costUSD > 0 {
+            parts.append(String(format: "$%.4f", costUSD))
+        } else if costIsUnpriced {
+            parts.append("cost unpriced")
+        }
         return parts.isEmpty ? "No usage recorded" : parts.joined(separator: " · ")
     }
 }
@@ -160,6 +164,9 @@ struct SubagentInspectorView: View {
             }
             if totals.cost > 0 {
                 usageStat(String(format: "$%.4f", totals.cost), "spend")
+            } else if totals.unpriced {
+                usageStat("unpriced", "spend")
+                    .help("One or more runs billed tokens for a model with no recorded price, so their spend is unknown rather than zero. Record input and output prices under Cloud Providers to see it.")
             }
             if totals.seconds > 0 {
                 usageStat(compactDuration(totals.seconds), "time")
@@ -182,24 +189,26 @@ struct SubagentInspectorView: View {
         }
     }
 
-    private var sessionTotals: (runs: Int, active: Int, tokens: Int, cost: Double, seconds: Double) {
+    private var sessionTotals: (runs: Int, active: Int, tokens: Int, cost: Double, unpriced: Bool, seconds: Double) {
         var runs = 0
         var active = 0
         var tokens = 0
         var cost = 0.0
+        var unpriced = false
         var seconds = 0.0
         for record in allRecords {
             runs += 1
             if !record.status.isTerminal { active += 1 }
             tokens += record.usage.contextTokens
             cost += record.usage.costUSD
+            unpriced = unpriced || record.usage.costIsUnpriced
             if record.usage.wallClockSeconds > 0 {
                 seconds += record.usage.wallClockSeconds
             } else if let completed = record.completedAt, let started = record.startedAt {
                 seconds += completed.timeIntervalSince(started)
             }
         }
-        return (runs, active, tokens, cost, seconds)
+        return (runs, active, tokens, cost, unpriced, seconds)
     }
 
     private func compactTokens(_ count: Int) -> String {

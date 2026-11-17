@@ -211,6 +211,10 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// The run's structured report and usage, when a model ran it.
     private(set) var report: AgentReport? = nil
     private(set) var usage: AgentUsage = AgentUsage()
+    /// The loop's failure reason, kept apart from the summary: a budget-exhausted
+    /// run's summary is now the analysis it managed to write, and that is not
+    /// the error the record's red banner should name.
+    private(set) var lastError: String? = nil
     private(set) var backendDescriptor: AgentBackendDescriptor? = nil
     /// The loop's own transcript once the run finishes. Until then the live
     /// view is `transcript` (tool steps) plus the streaming text below.
@@ -383,7 +387,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                     timestamp: message.timestamp
                 )
             },
-            error: status == .failed ? finalSummary : nil,
+            error: status == .failed ? (lastError ?? finalSummary) : nil,
             depth: 0,
             summaryRelayed: isSummaryRelayed,
             appliedAt: appliedAt
@@ -611,13 +615,29 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             return
         }
 
-        let systemPrompt = LocalAgentBackend.workerSystemPrompt(
-            role: plan.role,
-            baseSystem: "",
-            mode: parentMode,
-            harness: context.harness,
-            config: CompletionEngine.shared.promptModelConfig
-        )
+        // The tool-call instructions have to match the backend. A cloud
+        // provider receives native function declarations and must be told to
+        // use them; the local renderer parses XML out of the text, so its
+        // prompt teaches that dialect instead. Sending the local prompt to a
+        // cloud model made it narrate `<tool_call>` XML in prose — no
+        // `parsedToolCalls`, no `complete`, and a run that looked finished
+        // after one paragraph.
+        let systemPrompt: String
+        if plan.backendDescriptor.kind == .cloud {
+            systemPrompt = context.harness.buildCloudWorkerSystemPrompt(
+                baseSystem: "",
+                role: plan.role,
+                mode: parentMode
+            )
+        } else {
+            systemPrompt = LocalAgentBackend.workerSystemPrompt(
+                role: plan.role,
+                baseSystem: "",
+                mode: parentMode,
+                harness: context.harness,
+                config: CompletionEngine.shared.promptModelConfig
+            )
+        }
         let input = AgentLoopInput(
             role: plan.role,
             task: plan.taskDescription,
@@ -658,6 +678,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         let finalReport = await finalizeWorktree(plan: plan, outcome: outcome)
         report = finalReport
         usage = outcome.usage
+        lastError = outcome.error
         // The loop's transcript is authoritative: it records thinking, text and
         // every tool result in emission order, including a withheld call the
         // step list never sees. The live stream is replaced by it at the

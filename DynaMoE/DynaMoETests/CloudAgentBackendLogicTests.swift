@@ -337,6 +337,25 @@ final class CloudAgentBackendLogicTests: XCTestCase {
         XCTAssertEqual(mapped.promptTokens, 10)
         XCTAssertEqual(mapped.completionTokens, 10)
         XCTAssertEqual(mapped.costUSD, 0)
+        XCTAssertTrue(mapped.costIsUnpriced, "a 0.00 spend on a billed token count is unknown, not free")
+    }
+
+    func testAPricedTurnIsNotMarkedUnpriced() {
+        let mapped = CloudAgentBackend.usage(
+            from: CloudUsage(promptTokens: 1_000, completionTokens: 500),
+            pricing: CloudPricing(input: 2.0, output: 8.0)
+        )
+        XCTAssertFalse(mapped.costIsUnpriced)
+        XCTAssertGreaterThan(mapped.costUSD, 0)
+    }
+
+    func testTheUnpricedFlagSurvivesAMerge() {
+        var first = AgentUsage()
+        first.costIsUnpriced = true
+        var merged = AgentUsage()
+        merged.merge(first)
+        merged.merge(AgentUsage())
+        XCTAssertTrue(merged.costIsUnpriced)
     }
 
     func testAUsageBlockWithoutCountsPricesNothing() {

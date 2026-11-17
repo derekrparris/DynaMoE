@@ -106,6 +106,29 @@ final class AgentRunIntegrationTests: XCTestCase {
         XCTAssertTrue(request.messages.count >= 1)
     }
 
+    /// A cloud provider gets native function declarations, so its worker prompt
+    /// must tell it to issue those calls. The local spawn prompt teaches an XML
+    /// dialect the local parser understands; sending that to a cloud model made
+    /// it narrate the XML in prose instead of calling anything.
+    func testACloudRunIsToldToUseNativeFunctionCalling() async throws {
+        let backend = ScriptedBackend(turns: [.init(text: "done")])
+        let session = UUID()
+        var cloudPlan = plan(backend: backend, sessionId: session)
+        cloudPlan.backendDescriptor = AgentBackendDescriptor(
+            kind: .cloud,
+            providerId: "synthetic",
+            modelId: "syn:large:text",
+            displayName: "Syn Large"
+        )
+        cloudPlan.schedulingClass = .cloud(providerId: "synthetic")
+        let subagent = SubagentManager.shared.spawnModelBacked(cloudPlan, id: UUID())
+        _ = await subagent.waitForCompletion()
+
+        let prompt = try XCTUnwrap(backend.requests.first?.systemPrompt)
+        XCTAssertTrue(prompt.contains("native function-calling"), prompt)
+        XCTAssertFalse(prompt.contains("<tool_call>"), "a cloud model must not be taught the local XML dialect")
+    }
+
     func testStoppingASessionCancelsItsRun() async throws {
         let backend = ScriptedBackend(turns: [
             .init(text: "late", delayNanoseconds: 3_000_000_000)

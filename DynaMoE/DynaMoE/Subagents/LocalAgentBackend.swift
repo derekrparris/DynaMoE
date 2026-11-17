@@ -24,7 +24,8 @@ import Foundation
 /// coordinator turn that lands between two steps moves the global prefix pin to
 /// its own session, so the run's next step re-prefills. `AgentScheduler` owns
 /// admission and cancellation; the turn is `.background`, so an operator's send
-/// can preempt it.
+/// CANCELS it at its next boundary and the run reports what it lost. It is not
+/// paused and not resumed.
 nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendable {
     let descriptor: AgentBackendDescriptor
 

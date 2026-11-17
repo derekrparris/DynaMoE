@@ -10,9 +10,13 @@ import Foundation
 
 /// Why a turn wants the engine.
 ///
-/// There is one slot, so a background turn (a subagent's step) must be able to
-/// yield it: an operator who sends a message outranks work they are waiting on,
-/// and a run can resume its next step afterwards. Interactive turns never yield.
+/// There is one slot, so a background turn (a subagent's step) must be the one
+/// that gives way: an operator who sends a message outranks work they are
+/// waiting on. Giving way is a CANCEL, not a pause. The background turn stops at
+/// its next layer boundary, the engine drains, and the run reports what it lost;
+/// nothing resumes it, because there is no paused status, no serialized loop
+/// state and no step index to restart from. Interactive turns are never
+/// cancelled to make room.
 nonisolated enum TurnPriority: Sendable, Equatable {
     case interactive
     case background

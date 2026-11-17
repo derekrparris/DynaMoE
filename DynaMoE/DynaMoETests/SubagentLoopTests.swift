@@ -9,6 +9,24 @@
 import XCTest
 @testable import DynaMoE
 
+/// Counts approval cards from inside the run's own `@Sendable` handlers.
+nonisolated private final class CallCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = 0
+
+    func increment() {
+        lock.lock()
+        value += 1
+        lock.unlock()
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 @MainActor
 final class SubagentLoopTests: XCTestCase {
 
@@ -440,5 +458,220 @@ final class SubagentLoopTests: XCTestCase {
         let data = try JSONEncoder().encode(record)
         let decoded = try JSONDecoder().decode(AgentRunRecord.self, from: data)
         XCTAssertEqual(decoded, record)
+    }
+
+    // MARK: - Report derivation
+
+    func testTheReportCarriesTheRunsFindingsAndOpenQuestions() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let file = workspace.appendingPathComponent("Notes.txt")
+        try "CONTENT".write(to: file, atomically: true, encoding: .utf8)
+
+        let claim = "The scheduler lives in AgentScheduler.swift, and every run is admitted through it."
+        let backend = ScriptedBackend(turns: [
+            .init(text: claim + "\nIs the server queue's claim the same one?", calls: [readCall(file.path)]),
+            .init(text: "Done.", calls: [completeCall("Read Notes.txt.")])
+        ])
+        let context = try makeContext(workspace: workspace, tools: ["file_read", "complete"])
+
+        let outcome = await HeadlessAgentLoop().run(
+            input: input(),
+            backend: backend,
+            context: context,
+            emit: { _ in }
+        )
+
+        XCTAssertEqual(outcome.status, .completed)
+        let findings = try XCTUnwrap(outcome.report?.findings)
+        XCTAssertEqual(findings.count, 1, "one claim was made, so the report carries one finding")
+        XCTAssertEqual(findings.first?.claim, claim)
+        XCTAssertTrue(findings.first?.evidence.contains("step 1") == true, findings.first?.evidence ?? "")
+        XCTAssertTrue(findings.first?.evidence.contains("file_read") == true, "evidence names the tool result in front of the claim")
+
+        XCTAssertEqual(outcome.report?.openQuestions.count, 1)
+        XCTAssertTrue(outcome.report?.openQuestions.first?.hasPrefix("Is the server queue") == true)
+    }
+
+    func testABudgetExhaustedRunKeepsTheAnalysisItAlreadyFinished() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let file = workspace.appendingPathComponent("Notes.txt")
+        try "CONTENT".write(to: file, atomically: true, encoding: .utf8)
+
+        let analysis = "The review is complete: the FIFO cannot admit two runs because the tail is written before any suspension."
+        let backend = ScriptedBackend(turns: [
+            .init(text: analysis, calls: [readCall(file.path)]),
+            .init(text: "Let me check one more file before I write the final report.", calls: [readCall(file.path)])
+        ])
+        var budget = AgentBudget.standard
+        budget.maxSteps = 2
+        let context = try makeContext(workspace: workspace, tools: ["file_read", "complete"])
+
+        let outcome = await HeadlessAgentLoop().run(
+            input: input(budget: budget),
+            backend: backend,
+            context: context,
+            emit: { _ in }
+        )
+
+        XCTAssertEqual(outcome.status, .failed)
+        XCTAssertTrue(outcome.error?.contains("step budget") == true, outcome.error ?? "")
+        XCTAssertTrue(
+            outcome.report?.summary.contains("the FIFO cannot admit two runs") == true,
+            "a budget-exhausted run must keep the analysis it wrote, not its last preamble: \(outcome.report?.summary ?? "")"
+        )
+        XCTAssertTrue(outcome.report?.risks.first?.contains("step budget") == true)
+        XCTAssertEqual(outcome.report?.findings.count, 2)
+    }
+
+    // MARK: - Isolation is about the call's destination
+
+    func testAnIsolatedWriterMayNotEditOutsideItsWorktreeWithoutACard() async throws {
+        let workspace = try makeWorkspace()
+        let outside = try makeWorkspace()
+        defer {
+            try? FileManager.default.removeItem(at: workspace)
+            try? FileManager.default.removeItem(at: outside)
+        }
+        let target = outside.appendingPathComponent("Operator.txt")
+
+        let counter = CallCounter()
+        let backend = ScriptedBackend(turns: [
+            .init(text: "writing", calls: [
+                AgentToolCall(name: "file_write", arguments: ["path": target.path, "content": "escaped"])
+            ]),
+            .init(text: "refused", calls: [completeCall("Could not write outside the worktree.")])
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["file_write", "complete"],
+            policy: .spawnOnly,
+            isolated: true,
+            handler: { request in
+                counter.increment()
+                XCTAssertTrue(request.reason.lowercased().contains("outside"), request.reason)
+                return false
+            }
+        )
+
+        let outcome = await HeadlessAgentLoop().run(
+            input: input(),
+            backend: backend,
+            context: context,
+            emit: { _ in }
+        )
+
+        XCTAssertEqual(counter.count, 1, "a path outside the worktree must produce a card")
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: target.path),
+            "a declined card must leave the operator's tree untouched"
+        )
+        XCTAssertTrue(outcome.transcript.contains {
+            $0.toolRecord?.name == "file_write" && $0.toolRecord?.status == .rejected
+        })
+    }
+
+    func testAnIsolatedWriterStillEditsInsideItsWorktreeWithoutACard() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let target = workspace.appendingPathComponent("Inside.txt")
+        let counter = CallCounter()
+
+        let backend = ScriptedBackend(turns: [
+            .init(text: "writing", calls: [
+                AgentToolCall(name: "file_write", arguments: ["path": target.path, "content": "inside"])
+            ]),
+            .init(text: "done", calls: [completeCall("Wrote Inside.txt.")])
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["file_write", "complete"],
+            policy: .spawnOnly,
+            isolated: true,
+            handler: { _ in
+                counter.increment()
+                return true
+            }
+        )
+
+        let outcome = await HeadlessAgentLoop().run(
+            input: input(),
+            backend: backend,
+            context: context,
+            emit: { _ in }
+        )
+
+        XCTAssertEqual(outcome.status, .completed)
+        XCTAssertEqual(counter.count, 0, "a write inside the worktree is what spawn-only approval is for")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: target.path))
+    }
+
+    /// A shell command executes arbitrary code (and takes its own `cwd`), so a
+    /// worktree that merely EXISTS cannot make it safe. The policy falls back
+    /// to the per-change card rather than treating isolation as proof.
+    func testAnIsolatedShellCommandStillGetsACard() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let counter = CallCounter()
+
+        let backend = ScriptedBackend(turns: [
+            .init(text: "running", calls: [AgentToolCall(name: "shell_run", arguments: ["command": "echo hello"])]),
+            .init(text: "done", calls: [completeCall("Ran echo.")])
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["shell_run", "complete"],
+            policy: .spawnOnly,
+            isolated: true,
+            handler: { request in
+                counter.increment()
+                XCTAssertTrue(request.reason.lowercased().contains("outside"), request.reason)
+                return true
+            }
+        )
+
+        let outcome = await HeadlessAgentLoop().run(
+            input: input(),
+            backend: backend,
+            context: context,
+            emit: { _ in }
+        )
+
+        XCTAssertEqual(outcome.status, .completed)
+        XCTAssertEqual(counter.count, 1)
+    }
+
+    // MARK: - Cost ceilings fail closed
+
+    func testACostCeilingTheBackendCannotPriceFailsClosed() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let file = workspace.appendingPathComponent("Notes.txt")
+        try "CONTENT".write(to: file, atomically: true, encoding: .utf8)
+
+        var firstUsage = AgentUsage()
+        firstUsage.promptTokens = 900_000
+        firstUsage.completionTokens = 100
+        firstUsage.costIsUnpriced = true
+
+        let backend = ScriptedBackend(turns: [
+            .init(text: "working", calls: [readCall(file.path)], usage: firstUsage),
+            .init(text: "should not run")
+        ])
+        var budget = AgentBudget.standard
+        budget.maxCostUSD = 1
+        let context = try makeContext(workspace: workspace, tools: ["file_read", "complete"])
+
+        let outcome = await HeadlessAgentLoop().run(
+            input: input(budget: budget),
+            backend: backend,
+            context: context,
+            emit: { _ in }
+        )
+
+        XCTAssertEqual(outcome.status, .failed)
+        XCTAssertTrue(outcome.error?.contains("no price is recorded") == true, outcome.error ?? "")
+        XCTAssertEqual(backend.requests.count, 1, "the ceiling stops the run instead of spending on")
     }
 }

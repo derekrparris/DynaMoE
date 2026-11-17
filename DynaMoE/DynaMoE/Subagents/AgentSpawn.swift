@@ -20,6 +20,7 @@ nonisolated enum AgentSpawnError: LocalizedError, Equatable {
     case noBackend(String)
     case forbiddenTool(String)
     case unknownTool(String)
+    case costCeilingWithoutPricing(String)
 
     var errorDescription: String? {
         switch self {
@@ -33,6 +34,8 @@ nonisolated enum AgentSpawnError: LocalizedError, Equatable {
             return "Tool '\(name)' may never be given to a subagent run."
         case .unknownTool(let name):
             return "Tool '\(name)' is not installed, so it cannot be given to a subagent run."
+        case .costCeilingWithoutPricing(let model):
+            return "This spawn sets a max_cost_usd ceiling, but no price is recorded for '\(model)', so the ceiling could never bind. Record the model's input and output prices in Settings under Cloud Providers, or clear the ceiling."
         }
     }
 }
@@ -165,6 +168,14 @@ enum AgentSpawnResolver {
             defaults: defaults
         )
 
+        // A cost ceiling is only a ceiling when the model has a recorded price.
+        // An unpriced cloud model reports `costUSD` 0 for every token it bills,
+        // so the ceiling would never trip and the run would spend an amount the
+        // spawn card could not name. Refuse before anything runs.
+        if let problem = Self.costCeilingProblem(budget: budget, descriptor: descriptor, defaults: defaults) {
+            throw problem
+        }
+
         var isolation = AgentIsolation.none
         var workingDirectory = request.workingDirectory
         if let repositoryRoot = worktreeRepository {
@@ -208,6 +219,18 @@ enum AgentSpawnResolver {
         )
     }
 
+    /// Tools every model-backed run carries on top of whatever its preset or
+    /// the caller asked for.
+    ///
+    /// `complete` is how a run ENDS: the worker prompt tells the model to call
+    /// it, and `endsAgentRun` keys the completion on it. A run whose tool set
+    /// omitted it could only stop calling tools (reported as a completion it
+    /// never declared) or die on its step budget, which is exactly what
+    /// happened while the preset surfaces alone decided the run's tools. Plan
+    /// mode still withholds it, because there a plain-text plan is the
+    /// deliverable.
+    static let alwaysAvailableToolNames: [String] = ["complete"]
+
     static func resolveTools(
         _ request: AgentSpawnRequest,
         definition: AgentPresetDefinition
@@ -237,7 +260,33 @@ enum AgentSpawnResolver {
         guard !resolved.isEmpty else {
             throw AgentSpawnError.noBackend("Every tool this run asked for is withheld in the current mode, so there is nothing it could do.")
         }
+        for name in alwaysAvailableToolNames where !seen.contains(name) {
+            guard catalog[name] != nil else { continue }
+            if PlanModePolicy.withholds(name, in: request.parentMode) { continue }
+            resolved.append(name)
+        }
         return resolved.sorted()
+    }
+
+    /// Why this spawn's cost ceiling cannot bind, or nil when it can.
+    ///
+    /// Pure so a test can price a run without a backend: a ceiling needs a cloud
+    /// model AND a recorded price for it. A local, scripted or unpriced backend
+    /// reports `costUSD` 0 no matter how many tokens it bills, which makes the
+    /// ceiling inert rather than strict.
+    static func costCeilingProblem(
+        budget: AgentBudget,
+        descriptor: AgentBackendDescriptor,
+        defaults: UserDefaults = .standard
+    ) -> AgentSpawnError? {
+        guard let ceiling = budget.maxCostUSD, ceiling >= 0 else { return nil }
+        guard descriptor.kind == .cloud,
+              let providerId = descriptor.providerId,
+              let modelId = descriptor.modelId,
+              CloudPricingStore.pricing(forModel: modelId, providerId: providerId, defaults: defaults) != nil else {
+            return .costCeilingWithoutPricing(descriptor.displayName)
+        }
+        return nil
     }
 
     static func resolveBackend(

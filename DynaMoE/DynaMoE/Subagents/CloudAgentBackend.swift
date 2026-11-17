@@ -153,6 +153,11 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
         result.cachedTokens = usage.cachedTokens ?? 0
         if let pricing, let cost = pricing.cost(for: usage) {
             result.costUSD = cost
+        } else if result.promptTokens + result.completionTokens > 0 {
+            // No price is recorded for this model, or the provider reported
+            // half a usage block, so the dollar figure is unknown rather than
+            // zero. A cost ceiling has to see that difference.
+            result.costIsUnpriced = true
         }
         return result
     }
