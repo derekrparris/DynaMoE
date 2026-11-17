@@ -19,7 +19,7 @@ nonisolated struct PendingSubagentApproval: Identifiable, Sendable {
 ///
 /// A run is a background object, so its approval cannot ride the coordinator's
 /// tool timeline: the coordinator may already have finished the step that
-/// spawned it. The Task Manager renders these instead, which keeps every write
+/// spawned it. The Subagent Inspector renders these instead, which keeps every write
 /// behind a card without inventing a second approval store.
 @MainActor
 final class SubagentApprovalCenter: ObservableObject {

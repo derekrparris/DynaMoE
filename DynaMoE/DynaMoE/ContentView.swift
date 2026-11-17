@@ -1270,6 +1270,11 @@ struct ContentView: View {
             }
             ChatSessionStore.shared.delete(sessionIds: removedIds)
             ImageAttachmentStore.shared.delete(sessionIds: removedIds)
+            // A deleted conversation's subagent runs are its work; §10 keeps
+            // them only as long as the conversation that spawned them exists.
+            for id in removedIds {
+                AgentRunStore.shared.deleteSession(id)
+            }
         }
         // Run the orphan pass on every retention sweep, not only when a
         // conversation was evicted: deleting a message or a queued prompt by hand
@@ -2182,6 +2187,31 @@ struct ContentView: View {
     }
 
     // MARK: - Subagent Result Auto-Relay
+
+    /// Writes this turn's unread subagent reports into the conversation as a
+    /// prompt-only directive, immediately before the user's message.
+    ///
+    /// This is the local-backend half of §11's "injected at the start of the
+    /// next coordinator turn". The cloud path rides its own trailing directive
+    /// because a leading turn would change the provider's cached prefix; a
+    /// locally rendered prompt has no such cost, and every family renders a
+    /// `.user` turn, so one hidden message reaches them all without touching a
+    /// template.
+    private func insertStartOfTurnSubagentRelay(sessionIdx: Int, sessionId: UUID) {
+        // A directive belongs to exactly one turn; a later send must not find
+        // the previous one still in history and re-read reports it already saw.
+        sessions[sessionIdx].messages.removeAll { $0.isPromptOnly == true }
+        let pending = gatherCompletedSubagentRelayResponses(forSession: sessionId)
+        guard !pending.isEmpty else { return }
+        markSubagentSummariesRelayed(pending)
+        sessions[sessionIdx].messages.append(
+            ChatMessage(
+                role: .user,
+                content: LocalSubagentRelay.directive(reports: pending),
+                isPromptOnly: true
+            )
+        )
+    }
 
     /// Collects final reports from this session's completed subagents that have not yet been
     /// surfaced into the conversation. The harness injects these as `[SUBAGENT_RESULT]` blocks
@@ -3514,6 +3544,17 @@ struct ContentView: View {
             return false
         }
         
+        // A background report that landed after the coordinator finished has no
+        // tool turn to ride. It becomes a prompt-only directive at the head of
+        // this turn so the report reaches the model the next time the user
+        // speaks, instead of staying unread forever. Cloud turns carry their
+        // reports as a trailing directive (`startCloudGeneration`), which keeps
+        // the provider's cached prefix intact; every other backend renders the
+        // transcript locally, so an extra hidden turn costs nothing.
+        if !sendSessionUsesCloud {
+            insertStartOfTurnSubagentRelay(sessionIdx: sessionIdx, sessionId: currentSessionId)
+        }
+
         let userMsg = ChatMessage(
             role: .user,
             content: text,
@@ -3525,7 +3566,7 @@ struct ContentView: View {
         // already named this conversation before sending (the rename controls
         // are available on an empty chat), in which case their name wins. An
         // image-only turn has no text to title from, so it seeds "Image".
-        if sessions[sessionIdx].messages.filter({ $0.role == .user }).count == 1 {
+        if sessions[sessionIdx].messages.filter({ $0.role == .user && $0.isPromptOnly != true }).count == 1 {
             if sessions[sessionIdx].titleOrigin != .user {
                 let titleSeed = text.isEmpty && !attachmentRefs.isEmpty ? "Image" : text
                 sessions[sessionIdx].title = ChatSession.autoTitle(forFirstMessage: titleSeed)
@@ -4956,6 +4997,12 @@ struct ContentView: View {
                 relayDirective = CloudSubagentRelay.directive(reports: pending)
                 return true
             }
+
+            // §11's start-of-turn injection. A report that landed after the
+            // previous run ended has no step to ride, so the FIRST step of this
+            // turn carries it. The directive is appended to the request, never
+            // merged into the cached system message.
+            _ = takeSubagentRelayDirective()
 
             while true {
                 // A superseded or stopped turn must not spend one more provider

@@ -2552,6 +2552,10 @@ public final class SpawnSubagentTool: AgentTool {
         runInBackground: Bool,
         maxOutputLength: Int
     ) async -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
+        // A synchronous caller is waiting on the tool card; a background one is
+        // not, and only the background run should ask for attention when it
+        // ends.
+        subagent.notifiesOnFinish = runInBackground
         if runInBackground {
             let msg = "Subagent [\(subagent.role)] spawned in background (ID: \(subagent.id.uuidString)). You are responsible for its outcome: when you need its results, call get_subagent_status with wait=true, then present the report to the user in your reply. The user never contacts the subagent directly."
             var data: [String: Any] = [

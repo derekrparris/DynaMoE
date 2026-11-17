@@ -201,13 +201,31 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// True once the subagent's final summary has been surfaced to the coordinator
     /// (via synchronous spawn, get_subagent_status, or an automatic relay) so the
     /// loop guard only injects unsalvaged reports back into the conversation.
-    @Published public var isSummaryRelayed: Bool = false
+    @Published public var isSummaryRelayed: Bool = false {
+        didSet {
+            if isSummaryRelayed != oldValue { persistRecord() }
+        }
+    }
     @Published public var executionDurationSeconds: Double = 0.0
     @Published public var currentStepIndex: Int = 0
     /// The run's structured report and usage, when a model ran it.
     private(set) var report: AgentReport? = nil
     private(set) var usage: AgentUsage = AgentUsage()
     private(set) var backendDescriptor: AgentBackendDescriptor? = nil
+    /// The loop's own transcript once the run finishes. Until then the live
+    /// view is `transcript` (tool steps) plus the streaming text below.
+    private(set) var runTranscript: [AgentTranscriptEntry] = []
+    /// The step currently streaming. The loop mints one delta id pair per step,
+    /// so a new id is the boundary that clears the previous step's text.
+    @Published public private(set) var liveAssistantText: String = ""
+    @Published public private(set) var liveThinkingText: String = ""
+    private(set) var startedAt: Date? = nil
+    /// Whether the finish notice may ask for attention. A synchronous spawn's
+    /// caller is already watching the tool card, so only a run left in the
+    /// background should bounce the Dock or post a banner.
+    var notifiesOnFinish = true
+    private var liveTextEntryId: UUID? = nil
+    private var liveThinkingEntryId: UUID? = nil
 
     public let createdAt: Date
     public private(set) var completedAt: Date? = nil
@@ -286,6 +304,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         liveStatusText = reason
         completedAt = Date()
         finalSummary = reason
+        persistRecord()
 
         for c in continuations {
             c.resume(returning: reason)
@@ -314,6 +333,106 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         return messageStore
     }
 
+    // MARK: - Durable Record
+
+    /// A snapshot of this run in the shape the store and the inspector use.
+    /// Live instances are projections of the same record the store keeps, so a
+    /// field added here must also survive the round trip on disk.
+    func snapshotRecord() -> AgentRunRecord {
+        let plan = modelPlan
+        let descriptor = backendDescriptor
+            ?? plan?.backendDescriptor
+            ?? AgentBackendDescriptor(
+                kind: .scripted,
+                providerId: nil,
+                modelId: nil,
+                displayName: "Coordinator pipeline"
+            )
+        let workingPath = workingDirectory?.path ?? FileManager.default.currentDirectoryPath
+        let entries = runTranscript.isEmpty ? legacyTranscriptEntries() : runTranscript
+        return AgentRunRecord(
+            id: id,
+            parentSessionId: parentSessionId,
+            parentTurnId: plan?.parentTurnId,
+            role: role,
+            preset: plan?.preset ?? AgentRolePresetCatalog.match(role: role),
+            task: taskDescription,
+            contextSummary: contextSummary,
+            backend: descriptor,
+            workingDirectory: workingPath,
+            isolation: plan?.isolation ?? .none,
+            allowedTools: allowedTools,
+            budget: plan?.budget ?? .standard,
+            status: Self.agentRunStatus(for: status),
+            createdAt: createdAt,
+            startedAt: startedAt,
+            completedAt: completedAt,
+            transcript: entries,
+            report: report,
+            usage: usage,
+            messages: recordedMessages.map { message in
+                AgentMessageRecord(
+                    id: message.id,
+                    sender: message.sender,
+                    content: message.content,
+                    timestamp: message.timestamp
+                )
+            },
+            error: status == .failed ? finalSummary : nil,
+            depth: 0,
+            summaryRelayed: isSummaryRelayed
+        )
+    }
+
+    /// Writes the current state. Safe to call on every boundary: the store
+    /// skips unchanged bytes and dispatches its own IO.
+    func persistRecord() {
+        AgentRunStore.shared.save(snapshotRecord())
+    }
+
+    private func legacyTranscriptEntries() -> [AgentTranscriptEntry] {
+        var entries: [AgentTranscriptEntry] = [
+            AgentTranscriptEntry(
+                index: 0,
+                stepIndex: 0,
+                timestamp: createdAt,
+                kind: .task,
+                text: taskDescription
+            )
+        ]
+        for (offset, step) in transcript.enumerated() {
+            let record = ToolCallRecord(
+                name: step.actionName,
+                arguments: step.arguments,
+                status: step.isError ? .error : .success,
+                output: step.output,
+                error: step.isError ? step.output : nil,
+                executionDurationSeconds: step.durationSeconds,
+                timestamp: step.timestamp
+            )
+            entries.append(AgentTranscriptEntry(
+                index: offset + 1,
+                stepIndex: step.stepIndex,
+                timestamp: step.timestamp,
+                kind: .toolResult,
+                text: step.output,
+                toolRecord: record
+            ))
+        }
+        return entries
+    }
+
+    private static func agentRunStatus(for status: SubagentStatus) -> AgentRunStatus {
+        switch status {
+        case .pending: return .pending
+        case .running: return .running
+        case .waitingForApproval: return .waitingForApproval
+        case .completed: return .completed
+        case .failed: return .failed
+        case .cancelled: return .cancelled
+        }
+    }
+
     /// Waits asynchronously until this subagent reaches a terminal state.
     public func waitForCompletion() async -> String {
         lock.lock()
@@ -333,6 +452,9 @@ public final class SubagentInstance: Identifiable, ObservableObject {
 
     public func startExecution() {
         guard status == .pending else { return }
+
+        startedAt = Date()
+        persistRecord()
 
         lock.lock()
         let plan = modelPlan
@@ -501,6 +623,11 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         let duration = CFAbsoluteTimeGetCurrent() - startTime
         report = outcome.report
         usage = outcome.usage
+        // The loop's transcript is authoritative: it records thinking, text and
+        // every tool result in emission order, including a withheld call the
+        // step list never sees. The live stream is replaced by it at the
+        // boundary so the persisted run and the drawer cannot disagree.
+        runTranscript = outcome.transcript
         var summary = outcome.report?.summary ?? ""
         // A failed run's report carries no summary; the failure reason is the
         // report. Falling back only when the report is ABSENT hid every failure
@@ -550,8 +677,20 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             default:
                 break
             }
-        case .assistantDelta:
-            break
+        case .assistantDelta(let entryId, let text, let isThinking):
+            if isThinking {
+                if liveThinkingEntryId != entryId {
+                    liveThinkingEntryId = entryId
+                    liveThinkingText = ""
+                }
+                liveThinkingText += text
+            } else {
+                if liveTextEntryId != entryId {
+                    liveTextEntryId = entryId
+                    liveAssistantText = ""
+                }
+                liveAssistantText += text
+            }
         case .toolStarted(let record):
             liveStatusText = "Running \(record.name)…"
         case .toolFinished(let record):
@@ -562,6 +701,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                 duration: record.executionDurationSeconds ?? 0,
                 isError: record.status == .error || record.status == .rejected || record.status == .withheld
             )
+            persistRecord()
         case .usage(let usage):
             self.usage = usage
         case .completed(let report):
@@ -614,6 +754,16 @@ public final class SubagentInstance: Identifiable, ObservableObject {
 
         for continuation in continuations {
             continuation.resume(returning: summary)
+        }
+        persistRecord()
+        if notifiesOnFinish {
+            SubagentNotifier.runFinished(
+                runId: id,
+                role: role,
+                status: status,
+                summary: summary,
+                parentSessionId: parentSessionId
+            )
         }
     }
 
@@ -1337,6 +1487,7 @@ public final class SubagentManager: ObservableObject {
     @Published public var isDrawerOpen: Bool = false
 
     private var subagentsById: [UUID: SubagentInstance] = [:]
+    private var spawnsSincePrune = 0
     private var subagentsOrder: [SubagentInstance] = []
     private let lock = NSLock()
 
@@ -1362,7 +1513,16 @@ public final class SubagentManager: ObservableObject {
         return subagentsOrder
     }
 
-    private init() {}
+    private init() {
+        // Retention runs once per process rather than on a timer: the store can
+        // only grow while the app is running, and a launch sweep is the moment
+        // a slow disk should be paid for. Off the main actor, because startup
+        // must not parse a few hundred records before the first frame.
+        let policy = AgentRunStore.configuredPolicy()
+        Task.detached(priority: .utility) {
+            AgentRunStore.shared.prune(policy: policy)
+        }
+    }
 
     // MARK: - Spawning API
 
@@ -1406,7 +1566,20 @@ public final class SubagentManager: ObservableObject {
         return instance
     }
 
+    /// A launched instance is also the moment growth is worth re-bounding: a
+    /// long session can spawn more runs than the launch sweep ever sees.
+    private func noteSpawnForRetention() {
+        spawnsSincePrune += 1
+        guard spawnsSincePrune >= 10 else { return }
+        spawnsSincePrune = 0
+        let policy = AgentRunStore.configuredPolicy()
+        Task.detached(priority: .utility) {
+            AgentRunStore.shared.prune(policy: policy)
+        }
+    }
+
     private func register(_ instance: SubagentInstance) {
+        noteSpawnForRetention()
         lock.lock()
         subagentsById[instance.id] = instance
         subagentsOrder.insert(instance, at: 0)
@@ -1466,18 +1639,33 @@ public final class SubagentManager: ObservableObject {
         Task { await AgentScheduler.shared.cancelRuns(parentSessionId: sessionId, reason: reason) }
     }
 
-    public func clearCompleted() {
+    /// Removes finished runs from the drawer.
+    ///
+    /// With a `sessionId` the matching durable records go too: the inspector
+    /// lists stored runs beside live ones, so clearing only the in-memory half
+    /// would leave a "cleared" list that immediately refills from disk. The
+    /// no-argument form keeps the old behaviour for callers that predate the
+    /// store.
+    public func clearCompleted(sessionId: UUID? = nil) {
+        let terminal: [SubagentInstance]
         lock.lock()
-        subagentsOrder.removeAll(where: { $0.status == .completed || $0.status == .cancelled })
-        for (k, v) in subagentsById {
-            if v.status == .completed || v.status == .cancelled {
-                subagentsById.removeValue(forKey: k)
-            }
+        terminal = subagentsOrder.filter {
+            ($0.status == .completed || $0.status == .cancelled)
+                && (sessionId == nil || $0.parentSessionId == sessionId)
+        }
+        let clearedIds = Set(terminal.map(\.id))
+        subagentsOrder.removeAll(where: { clearedIds.contains($0.id) })
+        for id in clearedIds {
+            subagentsById.removeValue(forKey: id)
         }
         lock.unlock()
 
+        for instance in terminal {
+            AgentRunStore.shared.delete(runId: instance.id, sessionId: instance.parentSessionId)
+        }
+
         DispatchQueue.main.async {
-            self.subagents.removeAll(where: { $0.status == .completed || $0.status == .cancelled })
+            self.subagents.removeAll(where: { clearedIds.contains($0.id) })
             if let sel = self.selectedSubagentId, !self.subagents.contains(where: { $0.id == sel }) {
                 self.selectedSubagentId = self.subagents.first?.id
             }

@@ -187,6 +187,19 @@ struct SettingsSheetView: View {
     @AppStorage("dynamoe_agent_turbo_mode") private var isTurboModeEnabled: Bool = false
     @AppStorage("dynamoe_agent_grammar_masking") private var isGrammarMaskingEnabled: Bool = true
     @AppStorage("dynamoe_agent_working_directory") private var agentWorkingDirectory: String = ""
+    // Delegated runs (SUBAGENTS.md §11). The backend key is the same one
+    // `spawn_subagent` reads when its argument says "auto"; an empty value
+    // keeps the legacy role pipelines, which is the only choice that sends no
+    // work to a model the operator did not pick.
+    @AppStorage(SubagentBackendSettings.backendKey) private var subagentBackend: String = ""
+    @AppStorage(SubagentBackendSettings.cloudModelKey) private var subagentCloudModel: String = ""
+    @AppStorage(LocalSubagentCostEstimate.limitDefaultsKey) private var subagentLocalCostLimit: Double = LocalSubagentCostEstimate.defaultLimitSeconds
+    @AppStorage("dynamoe_subagent_notifications") private var subagentNotifications: Bool = true
+    @AppStorage("dynamoe_subagent_local_capacity") private var subagentLocalCapacity: Int = 1
+    @AppStorage("dynamoe_subagent_cloud_per_provider") private var subagentCloudPerProvider: Int = 3
+    @AppStorage("dynamoe_subagent_cloud_global") private var subagentCloudGlobal: Int = 6
+    @AppStorage("dynamoe_subagent_retention_runs") private var subagentRetentionRuns: Int = 200
+    @AppStorage("dynamoe_subagent_retention_days") private var subagentRetentionDays: Int = 30
     @AppStorage("dynamoe_max_tool_output_length") private var maxToolOutputLength: Int = 4000
     @AppStorage(AgentStepBudget.finiteStepsDefaultsKey) private var maxAgentSteps: Int = AgentStepBudget.defaultFiniteSteps
     @AppStorage(AgentStepBudget.unlimitedDefaultsKey) private var isMaxAgentStepsUnlimited: Bool = false
@@ -209,6 +222,83 @@ struct SettingsSheetView: View {
     /// reads the same number the run enforces.
     private var agentStepCap: Int? {
         AgentStepBudget.resolvedCap(unlimited: isMaxAgentStepsUnlimited, configured: maxAgentSteps)
+    }
+
+    // MARK: - Delegated run controls
+
+    /// Every control here is read at use time (resolver, scheduler, store), so a
+    /// change applies to the next spawn rather than needing a relaunch.
+    private var subagentSettings: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            subagentSettingRow("Run backend") {
+                Picker("", selection: $subagentBackend) {
+                    Text("Role pipelines (no model)").tag("")
+                    Text("Local model").tag("local")
+                    Text("Cloud model").tag("cloud")
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .font(.system(size: 11))
+            }
+
+            subagentSettingRow("Cloud model") {
+                TextField("Provider default", text: $subagentCloudModel)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11))
+                    .frame(maxWidth: 260)
+                Text("Upstream model id")
+                    .font(.system(size: 10))
+                    .foregroundColor(.secondary)
+            }
+
+            subagentSettingRow("Local cost limit") {
+                Stepper(value: $subagentLocalCostLimit, in: 10...1800, step: 10) {
+                    Text(String(format: "%.0f s", subagentLocalCostLimit))
+                        .font(.system(size: 11, design: .monospaced))
+                }
+                .frame(maxWidth: 150)
+            }
+
+            subagentSettingRow("Concurrency") {
+                Stepper("Local \(subagentLocalCapacity)", value: $subagentLocalCapacity, in: 1...4)
+                    .font(.system(size: 11))
+                Stepper("Cloud/provider \(subagentCloudPerProvider)", value: $subagentCloudPerProvider, in: 1...8)
+                    .font(.system(size: 11))
+                Stepper("Cloud total \(subagentCloudGlobal)", value: $subagentCloudGlobal, in: 1...16)
+                    .font(.system(size: 11))
+            }
+
+            Toggle("Notify when a background run finishes", isOn: $subagentNotifications)
+                .font(.system(size: 11))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+
+            subagentSettingRow("Keep runs") {
+                Stepper("\(subagentRetentionRuns) runs", value: $subagentRetentionRuns, in: 20...2000, step: 20)
+                    .font(.system(size: 11))
+                Stepper("\(subagentRetentionDays) days", value: $subagentRetentionDays, in: 1...365)
+                    .font(.system(size: 11))
+            }
+
+            Text("A local run holds the engine one step at a time, so the coordinator re-prefills after it. The cost limit is how long that wait may be before the spawn card asks first. Runs are listed in the Subagent Inspector and survive relaunch; concurrency limits apply to the next launch.")
+                .font(.system(size: 10))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func subagentSettingRow<Content: View>(
+        _ label: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(.primary)
+                .frame(width: 120, alignment: .leading)
+            content()
+            Spacer(minLength: 0)
+        }
     }
 
     // Local Inference Server bindings & live dashboard state
@@ -1926,7 +2016,7 @@ struct SettingsSheetView: View {
                     }) {
                         HStack(spacing: 4) {
                             Image(systemName: "sidebar.trailing")
-                            Text(SubagentManager.shared.isDrawerOpen ? "Close Task Manager" : "Open Task Manager")
+                            Text(SubagentManager.shared.isDrawerOpen ? "Close Inspector" : "Open Inspector")
                         }
                         .font(.system(size: 11, weight: .medium))
                     }
@@ -1954,6 +2044,10 @@ struct SettingsSheetView: View {
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
                 }
+
+                Divider()
+
+                subagentSettings
             }
 
             // Skills: user-authored procedure documents (SKILL.md) advertised

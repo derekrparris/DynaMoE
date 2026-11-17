@@ -110,7 +110,7 @@ nonisolated struct AgentSchedulerSnapshot: Equatable, Sendable {
 /// mechanism the server queue and the chat send path share (`EngineTurnSlot.swift`).
 /// What this enforces is that only one local run is ever asking for that slot.
 actor AgentScheduler {
-    static let shared = AgentScheduler()
+    static let shared = AgentScheduler(limits: .configured())
 
     private struct Waiter {
         var ticket: UUID
@@ -250,7 +250,7 @@ actor AgentScheduler {
         return localRuns.count
     }
 
-    /// Stops every registered run. Application teardown and the Task Manager's
+    /// Stops every registered run. Application teardown and the inspector's
     /// "cancel all" both land here.
     func cancelAll(reason: String) {
         for runId in Array(registry.keys) {

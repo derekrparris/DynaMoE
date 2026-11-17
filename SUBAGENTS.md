@@ -4,13 +4,17 @@ Design and working document for the model-backed subagent system. This file is
 the reference for a multi-session build: read it first, check the phase
 checklist, then continue at the first unchecked item.
 
-Status: **Phases 0–2 complete.** Phase 1 landed both backends; Phase 2 landed
+Status: **Phases 0–3 complete.** Phase 1 landed both backends; Phase 2 landed
 `AgentScheduler` (capacity, priority, cancellation tree, queue timeouts), the
-real run path inside `SubagentManager`, the spawn approval gate, the extended
-`spawn_subagent` schema and a run-level opt-in test on each backend. Phase 3
-(persistence + inspector) is next. Still open: the cloud provider/model default
-and when a model-backed spawn becomes the default rather than a Settings opt-in
-(§16).
+real run path inside `SubagentManager`, the spawn approval gate and the extended
+`spawn_subagent` schema. Phase 3 landed `AgentRunStore` (one JSON per run,
+schema gate, atomic digest-skipped writes, retention), the inspector
+(`SubagentInspectorView`, replacing the drawer), inline spawn cards,
+notifications, the start-of-turn unread-report relay on both paths, and the
+Settings surface for backend, cloud model, cost limit, concurrency, retention
+and notifications. Phase 4 (worktrees, writers, dashboard, AFM) is next. Still
+open: the cheapest-capable cloud model as the default, and when a model-backed
+spawn becomes the default rather than a Settings opt-in (§16).
 
 ---
 
@@ -714,13 +718,72 @@ the write-spawn approval rule and the tool schema. 153 related tests green
 
 ### Phase 3 — Persistence and UI
 
-- [ ] `AgentRunStore` + retention
-- [ ] Inspector with live stream, timeline, diff and controls
-- [ ] Inline spawn cards, notifications, unread reports
-- [ ] Settings
+- [x] `AgentRunStore` + retention
+- [x] Inspector with live stream, timeline, diff and controls
+- [x] Inline spawn cards, notifications, unread reports
+- [x] Settings
 
-**Exit criteria:** runs survive relaunch, are fully observable, and can be
-cancelled or steered from the UI.
+**Exit criteria met:** a run written by one process is listed by the next after
+relaunch, every run is observable down to its tool timeline and report, and a
+live run can be cancelled or steered from the panel.
+
+Implemented, with the decisions worth carrying:
+
+- **One JSON per run, written off the main actor.** `AgentRunStore` mirrors the
+  chat store: a private `ioQueue`, atomic writes, and a SHA256 digest skip so a
+  caller can persist on every tool boundary. The `schemaVersion` gate ignores a
+  record written by a newer build rather than decoding it lossily and rewriting
+  the fields this build does not know. Tool output is truncated at a per-entry
+  budget (16 KB) before the write, because a run that read a large file would
+  otherwise make one record the size of that file. Retention keeps the newest
+  200 runs or 30 days (whichever is larger) and never prunes anything younger
+  than 24 hours; `AgentRunStore.configuredPolicy()` reads the two Settings
+  values, and the launch sweep, `SubagentManager.init`, and every tenth spawn
+  run it.
+- **A test run never writes the operator's history.** `AgentRunStore.shared`
+  picks its root from the process: Application Support in the app, a fixed
+  temporary directory under XCTest. This is the request-log recorder's lesson
+  applied to run records.
+- **The inspector is a list → detail panel, not a table.** The old drawer was a
+  stack of expanded cards; at the width an app sidebar gets, a master list with
+  a back button gives each run a readable detail pane instead of squeezing
+  everything into a column. The list merges stored records with live instances
+  (the live one wins for its own id), groups active above finished, and marks a
+  finished report the coordinator has not received as `UNREAD`. The detail shows
+  backend + model, budget, duration, usage/cost, the live reasoning and answer,
+  the tool timeline, findings/changed files/tests/risks/questions/diff, the
+  run's own approval cards, steering, and Stop/Copy Report controls. Approvals
+  render in the detail when a run is selected and above the list otherwise, so
+  the same request never appears twice.
+- **A live instance is a projection of the record.** `snapshotRecord()` is the
+  one mapping from runtime state to `AgentRunRecord`; the loop's own transcript
+  replaces the step list at the terminal boundary, so the persisted run, the
+  inspector and the drawer cannot disagree about what happened. `isSummaryRelayed`
+  persists on change, which is what makes "unread" survive a relaunch.
+- **Notifications are a Dock bounce plus an opt-in banner.** The bounce needs no
+  permission and cannot outlive the moment; the banner asks on first use, is
+  skipped under XCTest (a headless runner must not meet a permission dialog),
+  and names the run rather than claiming more than the summary did.
+- **The start-of-turn relay has two shapes because the caches differ.** The
+  cloud path initializes its trailing directive before the first request
+  (`takeSubagentRelayDirective()`), keeping the provider's cached prefix intact.
+  A locally rendered prompt has no such prefix to protect, so a prompt-only
+  `.user` turn (`ChatMessage.isPromptOnly`) is inserted ahead of the user's
+  message; the transcript skips it and a restore drops it, and every family
+  template carries it without a per-family branch. A directive lives for one
+  turn: the next send removes the previous one before gathering again.
+- **Settings reads at use time where it can.** Backend, cloud model, cost limit
+  and retention are read by the resolver and store at the next spawn/sweep.
+  Scheduler capacities are read at launch: `AgentScheduler.shared` now uses
+  `AgentSchedulerLimits.configured()`, which it never did before this phase, so
+  the keys were dead in production.
+
+Measured: the Phase 3 logic suites (`AgentRunStoreTests`, `SubagentRunLinkTests`,
+`LocalSubagentRelayTests`, `SubagentRecordProjectionTests`) are 17 cases; the
+Phase 2 suites still pass (35). App and test targets build with the new files.
+A worktree picker and `apply_subagent_changes` remain Phase 4, which is why the
+inspector shows isolation as metadata rather than offering a Reveal Worktree
+control.
 
 ### Phase 4 — Writers and polish
 
@@ -767,6 +830,7 @@ Append one line per session so the next session knows where work stopped.
 
 | Date | Session | Result |
 |---|---|---|
+| 2026-11-17 | phase 3 store + inspector | `AgentRunStore` (schema gate, atomic digest-skipped writes, transcript bounds, retention) with 8 pure cases; `SubagentInstance.snapshotRecord()` + persistence on start/tool boundary/finish/cancel/relay; `SubagentInspectorView` (list/detail, live stream, timeline, report, approvals, steering) replacing `SubagentDrawerView`; inline `spawn_subagent` card linked by the result's run id; `SubagentNotifier` (Dock bounce + opt-in banner, silent under XCTest); start-of-turn unread relay on both backends (cloud trailing directive, local prompt-only turn); Settings for backend, cloud model, cost limit, concurrency, retention and notifications; `AgentScheduler.shared` now reads `configured()` limits. New logic cases: `AgentRunStoreTests` 8, `SubagentRunLinkTests` 4, `LocalSubagentRelayTests` 2, `SubagentRecordProjectionTests` 2. Build + test build green; Phase 2 suites 35/35. Next: Phase 4 (worktrees, writers). |
 | 2026-11-17 | phase 2 manager | `AgentScheduler` (capacity 1 local, 3/provider + 6 global cloud, per-class priority, cancellation tree, queue timeout), `AgentRolePresets`, `AgentSpawn` resolver, `SubagentApprovalCenter`, the model-backed path in `SubagentManager`/`SubagentInstance`, the extended `spawn_subagent` schema with a write-spawn approval gate, engine `TurnPriority` + chat preemption retry, Stop propagating to children and termination cancelling everything. New tests: `AgentSchedulerTests` 9, `AgentSpawnPolicyTests` 14, `AgentRunIntegrationTests` 4. Related suites 153 green, 0 failures (2 opt-in cloud skipped). Opt-in manager runs passed on both backends (local DSV4.1 906 prompt / 7 generated in 116.7 s; cloud Syn Large Text 668 prompt / 67 generated, 1.27 s), each answering the task it was given. Next: Phase 3 (`AgentRunStore`, inspector). |
 | 2026-11-17 | design | Architecture approved; decisions recorded; doc created; Phase 0 started |
 | 2026-11-17 | phase 1 exit check | Both opt-in real turns ran and passed (local DSV4.1: 28 prompt / 7 generated, eos, 17.2 s; cloud Syn Large Text: 50 / 24, 0.76 s), so Phase 1's exit criteria are met. The cloud case walks the spawn's candidates and treats a provider's HTTP 4xx as "this model cannot serve the run" rather than a defect. Markers removed afterwards. |
@@ -777,15 +841,17 @@ Append one line per session so the next session knows where work stopped.
 
 ## 16. Open questions
 
-- Cloud provider defaults: `SubagentBackendSettings.preferredCloudModel` now
-  resolves the stored subagent model, else the coordinator's model when it
-  supports tools, else the first discovered tool-capable model. Still product
-  work for Phase 3: the dedicated "Subagent model" picker and whether the
-  cheapest tool-capable profile should be the default.
-- Model-backed default: `spawn_subagent` keeps the legacy pipelines unless
-  `dynamoe_subagent_backend` says `local` or `cloud` (or the call names a
-  backend). Decide in Phase 3, with the Settings default, whether a loaded
-  checkpoint makes local the default.
+- Cloud provider defaults: Phase 3 shipped the Settings field
+  (`dynamoe_subagent_cloud_model`, an upstream model id). Resolution stays
+  stored value → coordinator's model when it supports tools → first discovered
+  tool-capable model. Still open: whether the CHEAPEST tool-capable profile
+  should lead that chain instead of the coordinator's, which needs a price
+  source the registry does not carry.
+- Model-backed default: decided in Phase 3 — it stays an explicit Settings
+  choice. The picker offers "Role pipelines (no model)", "Local model" and
+  "Cloud model"; an unset value keeps the legacy pipelines. Sending work to a
+  model (and, for cloud, off the machine) is the operator's decision, not
+  something an omitted `spawn_subagent` argument should infer.
 - Worktree location: inside Application Support avoids polluting the repo, but
   some tools assume the repo root. Validate with the existing `find_files` and
   `codebase_search` tools. Phase 2 refuses `worktree` isolation by name until
