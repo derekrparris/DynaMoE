@@ -27,6 +27,52 @@ nonisolated private final class CallCounter: @unchecked Sendable {
     }
 }
 
+/// Yields exactly once, for a drain or a gate that must fire a single time
+/// from inside a `@Sendable` closure.
+nonisolated private final class OnceFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fired = false
+
+    /// True the first time only.
+    func take() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let was = !fired
+        fired = true
+        return was
+    }
+}
+
+/// Resumes exactly one waiter, so a test can park a task and release it only
+/// after it has been cancelled.
+nonisolated private final class Gate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var resumed = false
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if resumed {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            self.continuation = continuation
+            lock.unlock()
+        }
+    }
+
+    func resume() {
+        lock.lock()
+        let waiter = continuation
+        continuation = nil
+        resumed = true
+        lock.unlock()
+        waiter?.resume()
+    }
+}
+
 @MainActor
 final class SubagentLoopTests: XCTestCase {
 
@@ -238,6 +284,137 @@ final class SubagentLoopTests: XCTestCase {
         let outcome = await task.value
 
         XCTAssertEqual(outcome.status, .cancelled)
+    }
+
+    func testSteeringQueuedMidRunReachesTheNextStep() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let file = workspace.appendingPathComponent("Notes.txt")
+        try "QUANTUM_RELAY_SEQUENCE".write(to: file, atomically: true, encoding: .utf8)
+        // The first drain (step 0) sees nothing queued; the note arrives while
+        // the run is between steps and must ride the NEXT request, exactly once.
+        let stepZeroDrain = OnceFlag()
+        let note = OnceFlag()
+        var loopInput = input()
+        loopInput.drainSteering = {
+            guard stepZeroDrain.take() else {
+                return note.take() ? [("coordinator", "focus on the token budget")] : []
+            }
+            return []
+        }
+        let backend = ScriptedBackend(turns: [
+            .init(text: "Reading.", calls: [readCall(file.path)]),
+            .init(text: "Done.", calls: [completeCall("Steered onto the budget.")])
+        ])
+        let context = try makeContext(workspace: workspace, tools: ["file_read", "complete"])
+
+        let outcome = await HeadlessAgentLoop().run(
+            input: loopInput,
+            backend: backend,
+            context: context,
+            emit: { _ in }
+        )
+
+        XCTAssertEqual(outcome.status, .completed, outcome.error ?? "")
+        guard backend.requests.count == 2 else {
+            return XCTFail("the run must take two turns, took \(backend.requests.count)")
+        }
+        let secondRequest = backend.requests[1]
+        XCTAssertTrue(
+            secondRequest.messages.contains { message in
+                if case .user(let text) = message {
+                    return text.contains("[coordinator]")
+                        && text.contains("focus on the token budget")
+                }
+                return false
+            },
+            "a steering message reported delivered must reach the model, not just the record"
+        )
+        XCTAssertTrue(outcome.transcript.contains {
+            $0.kind == .status && $0.text?.contains("focus on the token budget") == true
+        })
+    }
+
+    func testAStopRacingAToolIsCancelledNotAWallClockFailureAndItsApprovalDoesNotExecute() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        // The marker proves the second half: an approval that resolves after
+        // the Stop must not execute the write it approved.
+        let marker = workspace.appendingPathComponent("post-stop-write.txt")
+        let backend = ScriptedBackend(turns: [
+            .init(text: "writing", calls: [
+                AgentToolCall(name: "shell_run", arguments: ["command": "touch \(marker.path)"])
+            ]),
+            .init(text: "unreachable")
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["shell_run", "complete"],
+            policy: .everyStateChange,
+            handler: { _ in
+                // The approval is decided "after" the Stop: the sleep is cut
+                // short by the cancellation and the handler still says yes.
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                return true
+            }
+        )
+
+        let task = Task {
+            await HeadlessAgentLoop().run(
+                input: input(budget: AgentBudget(
+                    maxSteps: 4,
+                    maxCompletionTokens: 2_000,
+                    maxWallClockSeconds: 600,
+                    maxCostUSD: nil
+                )),
+                backend: backend,
+                context: context,
+                emit: { _ in }
+            )
+        }
+        try await Task.sleep(nanoseconds: 400_000_000)
+        task.cancel()
+        let outcome = await task.value
+
+        XCTAssertEqual(outcome.status, .cancelled, outcome.error ?? "")
+        XCTAssertFalse(
+            outcome.error?.lowercased().contains("wall-clock") == true,
+            "a Stop racing a tool must not be reported as the run's budget running out"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: marker.path),
+            "a write approved after the Stop must not execute"
+        )
+    }
+
+    func testRunProcessRefusesToSpawnFromACancelledTask() async throws {
+        // A cancelled task must not spawn a child process: the cancellation
+        // handler fires before `process.run()` and `terminate()` on the
+        // never-launched task aborts the process. The gate guarantees the
+        // cancellation is delivered BEFORE `runProcess` is entered.
+        let gate = Gate()
+        let task = Task { () -> Int32 in
+            await gate.wait()
+            do {
+                let result = try await AgentHarness.runProcess(
+                    executableURL: URL(fileURLWithPath: "/bin/echo"),
+                    arguments: ["cancellation-guard"],
+                    currentDirectory: FileManager.default.temporaryDirectory,
+                    timeoutSeconds: 10
+                )
+                return result.exitCode
+            } catch {
+                return -1
+            }
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        task.cancel()
+        gate.resume()
+        let exit = await task.value
+        XCTAssertEqual(
+            exit, -1,
+            "a task cancelled before the spawn must refuse instead of launching a child"
+        )
     }
 
     func testDisallowedToolIsRefusedWithoutExecution() async throws {
@@ -536,7 +713,10 @@ final class SubagentLoopTests: XCTestCase {
         let claim = "The scheduler lives in AgentScheduler.swift, and every run is admitted through it."
         let backend = ScriptedBackend(turns: [
             .init(text: claim + "\nIs the server queue's claim the same one?", calls: [readCall(file.path)]),
-            .init(text: "Done.", calls: [completeCall("Read Notes.txt.")])
+            .init(
+                text: "CONTENT was found in Notes.txt, so the reader works.",
+                calls: [completeCall("Read Notes.txt.")]
+            )
         ])
         let context = try makeContext(workspace: workspace, tools: ["file_read", "complete"])
 
@@ -549,10 +729,23 @@ final class SubagentLoopTests: XCTestCase {
 
         XCTAssertEqual(outcome.status, .completed)
         let findings = try XCTUnwrap(outcome.report?.findings)
-        XCTAssertEqual(findings.count, 1, "one claim was made, so the report carries one finding")
+        XCTAssertEqual(findings.count, 2, "two claims were made, so the report carries two findings")
         XCTAssertEqual(findings.first?.claim, claim)
         XCTAssertTrue(findings.first?.evidence.contains("step 1") == true, findings.first?.evidence ?? "")
-        XCTAssertTrue(findings.first?.evidence.contains("file_read") == true, "evidence names the tool result in front of the claim")
+        // A step's own tools run AFTER its text: the scheduler claim was
+        // written before the read it asked for, so its evidence must not cite
+        // a result it had not seen. (It used to, which is what the review
+        // called out: evidence for a claim the claim could not have used.)
+        XCTAssertFalse(
+            findings.first?.evidence.contains("file_read") == true,
+            "a claim cannot cite a tool result that ran after it was written: \(findings.first?.evidence ?? "")"
+        )
+        // The second claim comes after the read completed, so it may.
+        let later = try XCTUnwrap(findings.last)
+        XCTAssertTrue(
+            later.evidence.contains("file_read") == true,
+            "a claim made after a read cites the read: \(later.evidence)"
+        )
 
         XCTAssertEqual(outcome.report?.openQuestions.count, 1)
         XCTAssertTrue(outcome.report?.openQuestions.first?.hasPrefix("Is the server queue") == true)

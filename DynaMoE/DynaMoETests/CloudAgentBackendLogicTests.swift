@@ -373,12 +373,32 @@ final class CloudAgentBackendLogicTests: XCTestCase {
         XCTAssertTrue(merged.costIsUnpriced)
     }
 
-    func testAUsageBlockWithoutCountsPricesNothing() {
-        let priced = CloudAgentBackend.usage(from: CloudUsage(), pricing: CloudPricing(input: 2.0, output: 8.0))
+    func testExplicitZeroCountsAreAMeasuredZero() {
+        // A block that reports literal zeros measured a zero-cost turn.
+        let priced = CloudAgentBackend.usage(
+            from: CloudUsage(promptTokens: 0, completionTokens: 0),
+            pricing: CloudPricing(input: 2.0, output: 8.0)
+        )
         XCTAssertEqual(priced.promptTokens, 0)
         XCTAssertEqual(priced.completionTokens, 0)
         XCTAssertEqual(priced.costUSD, 0)
         XCTAssertFalse(priced.costIsUnpriced, "a reported zero-count block IS a measured zero")
+    }
+
+    func testAPartialUsageBlockIsUnknownRatherThanFree() {
+        // A provider that reports only `total_tokens` bills a turn the app
+        // cannot price. Reading it as a measured zero made `max_cost_usd` see
+        // "$0 spent" forever, so the ceiling never bound.
+        let partial = CloudAgentBackend.usage(
+            from: CloudUsage(totalTokens: 1_500),
+            pricing: CloudPricing(input: 2.0, output: 8.0)
+        )
+        XCTAssertEqual(partial.costUSD, 0)
+        XCTAssertTrue(partial.costIsUnpriced, "half a usage block is an unpriced bill, not a free turn")
+
+        // An empty block is no measurement at all: the same answer.
+        let empty = CloudAgentBackend.usage(from: CloudUsage(), pricing: CloudPricing(input: 2.0, output: 8.0))
+        XCTAssertTrue(empty.costIsUnpriced, "a block without counts cannot prove a $0 turn either")
     }
 
     func testAMissingUsageBlockIsUnknownRatherThanFree() {

@@ -28,6 +28,11 @@ nonisolated struct AgentLoopInput: Sendable {
     var sessionId: UUID
     var thinking: Bool
     var stopSequences: [String]
+    /// Steering queued for a run while it works (coordinator directives,
+    /// operator notes from the inspector). Drained before each step so a
+    /// message the run was told it received actually reaches the model; a nil
+    /// drain keeps a context-free caller (and every test input) unchanged.
+    var drainSteering: (@Sendable () async -> [(sender: String, content: String)])? = nil
 
     init(
         role: String,
@@ -38,7 +43,8 @@ nonisolated struct AgentLoopInput: Sendable {
         sampling: AgentSampling = .default,
         sessionId: UUID,
         thinking: Bool = false,
-        stopSequences: [String] = []
+        stopSequences: [String] = [],
+        drainSteering: (@Sendable () async -> [(sender: String, content: String)])? = nil
     ) {
         self.role = role
         self.task = task
@@ -49,6 +55,7 @@ nonisolated struct AgentLoopInput: Sendable {
         self.sessionId = sessionId
         self.thinking = thinking
         self.stopSequences = stopSequences
+        self.drainSteering = drainSteering
     }
 }
 
@@ -137,6 +144,18 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                     status = .failed
                     failure = "The run exhausted its cost budget."
                     break
+                }
+            }
+
+            // Steering queued while the run worked: `send_subagent_message`
+            // and the inspector's message box are reported delivered, so the
+            // loop has to consume them or the sender is lied to. Each drained
+            // note rides as a user turn before this step's request.
+            if let drain = input.drainSteering {
+                let notes = await drain()
+                for note in notes {
+                    append(kind: .status, step: step, text: "Steering from \(note.sender): \(note.content)")
+                    messages.append(.user(Self.steeringText(sender: note.sender, content: note.content)))
                 }
             }
 
@@ -305,11 +324,34 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 // next top-of-loop check would then report.
                 let remainingBeforeTool = Double(input.budget.maxWallClockSeconds)
                     - (CFAbsoluteTimeGetCurrent() - start)
-                guard let execution = await Self.runTool(
+                let raced = await Self.runTool(
                     context,
                     call,
                     remainingSeconds: remainingBeforeTool
-                ) else {
+                )
+                // The deadline arm fires on CANCELLATION too (`Task.sleep`
+                // returns the moment the run's task is stopped), so a Stop
+                // racing the deadline otherwise reads as a wall-clock failure
+                // and drops the tool's record. Cancellation is the honest
+                // outcome, and a tool that managed to return before the Stop
+                // keeps its record in the transcript.
+                if Task.isCancelled {
+                    if let raced {
+                        var record = raced.record
+                        record.id = running.id
+                        usage.toolCalls += 1
+                        await context.noteToolOutcome(record, call: call)
+                        append(kind: .toolResult, step: step, record: record)
+                        emit(.toolFinished(record))
+                    } else {
+                        append(kind: .status, step: step, text: "The run was stopped while '\(call.name)' was running.")
+                    }
+                    status = .cancelled
+                    failure = "The run was cancelled."
+                    finishedRun = true
+                    break
+                }
+                guard let execution = raced else {
                     status = .failed
                     failure = "The run exceeded its \(input.budget.maxWallClockSeconds)-second wall-clock budget while '\(call.name)' was running."
                     append(kind: .status, step: step, text: failure)
@@ -417,7 +459,7 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             group.addTask { try await backend.runTurn(request) }
             group.addTask {
                 try await Task.sleep(
-                    nanoseconds: UInt64(max(0, remainingSeconds) * 1_000_000_000)
+                    nanoseconds: Self.deadlineNanoseconds(remainingSeconds)
                 )
                 throw AgentLoopError.wallClockExceeded
             }
@@ -427,6 +469,15 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             }
             return first
         }
+    }
+
+    /// A deadline converted to nanoseconds without trapping: a model-supplied
+    /// budget can name a `max_wall_clock_seconds` whose nanosecond form
+    /// overflows UInt64, and the conversion traps and kills the whole app.
+    /// Anything past a day is not a deadline a run can reach anyway.
+    private static func deadlineNanoseconds(_ seconds: TimeInterval) -> UInt64 {
+        let clamped = min(max(0, seconds), 86_400)
+        return UInt64(clamped * 1_000_000_000)
     }
 
     /// Runs one tool under whatever is left of the wall-clock budget. Nil means
@@ -444,7 +495,7 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             group.addTask { await context.execute(call) }
             group.addTask {
                 try? await Task.sleep(
-                    nanoseconds: UInt64(max(0, remainingSeconds) * 1_000_000_000)
+                    nanoseconds: Self.deadlineNanoseconds(remainingSeconds)
                 )
                 return nil
             }
@@ -495,6 +546,18 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         return task + "\n\nCoordinator context:\n" + AgentHarness.sanitizeText(context)
     }
 
+    /// A steering note rendered as a user turn the model cannot mistake for
+    /// its own task: the sender is named, the content is sanitised (it is
+    /// model- or operator-authored text landing in a prompt) and bounded.
+    static func steeringText(sender: String, content: String) -> String {
+        let bounded = AgentHarness.truncateText(
+            AgentHarness.sanitizeText(content),
+            limit: 2_000
+        )
+        let who = AgentHarness.sanitizeText(sender)
+        return "[\(who)] sent while this run was working: \(bounded)"
+    }
+
     private static func bounded(_ text: String, limit: Int) -> String {
         AgentHarness.truncateText(AgentHarness.sanitizeText(text), limit: limit)
     }
@@ -527,11 +590,13 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             guard let record = entry.toolRecord, record.name == "shell_run" else { continue }
             guard let command = record.arguments["command"] else { continue }
             let lowered = command.lowercased()
+            // The bare `contains("test")` matched "latest" and "contest";
+            // the generic arm is word-bounded now.
             let looksLikeTest = lowered.contains("xcodebuild test")
                 || lowered.contains("swift test")
                 || lowered.contains("pytest")
                 || lowered.contains("npm test")
-                || lowered.contains("test")
+                || Self.containsWord("test", in: lowered)
             guard looksLikeTest else { continue }
             let output = record.output ?? record.error ?? ""
             let exitCode: Int32 = record.status == .success ? 0 : 1
@@ -559,5 +624,14 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             total += Int(value) ?? 0
         }
         return total
+    }
+
+    /// Word-boundary match, so "the latest run" and "contest" do not count a
+    /// shell command as a test invocation.
+    private static func containsWord(_ word: String, in text: String) -> Bool {
+        let pattern = "(^|[^a-z0-9_])" + word + "([^a-z0-9_]|$)"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return false }
+        let range = NSRange(location: 0, length: (text as NSString).length)
+        return regex.firstMatch(in: text, options: [], range: range) != nil
     }
 }

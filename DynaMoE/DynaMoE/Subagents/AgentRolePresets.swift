@@ -127,7 +127,11 @@ nonisolated enum AgentRolePresetCatalog {
 
     /// The run's budget: the preset's defaults, with the caller's explicit
     /// numbers winning. A budget is enforcement, not a suggestion, so a value
-    /// the caller gave is never silently clamped to the preset.
+    /// the caller gave is never silently clamped to the preset — but the
+    /// values arrive from a MODEL's spawn arguments, so each is clamped to
+    /// `AgentBudget`'s own bounds: an inflated `max_wall_clock_seconds` would
+    /// trap the loop's nanosecond arithmetic and take the app down, and a
+    /// runaway `max_steps` would keep a run alive for days.
     static func budget(for definition: AgentPresetDefinition, overrides: AgentBudgetOverrides?) -> AgentBudget {
         var budget = AgentBudget(
             maxSteps: definition.maxSteps,
@@ -136,9 +140,15 @@ nonisolated enum AgentRolePresetCatalog {
             maxCostUSD: nil
         )
         guard let overrides else { return budget }
-        if let value = overrides.maxSteps { budget.maxSteps = max(1, value) }
-        if let value = overrides.maxCompletionTokens { budget.maxCompletionTokens = max(1, value) }
-        if let value = overrides.maxWallClockSeconds { budget.maxWallClockSeconds = max(1, value) }
+        if let value = overrides.maxSteps {
+            budget.maxSteps = min(max(1, value), AgentBudget.maximumSteps)
+        }
+        if let value = overrides.maxCompletionTokens {
+            budget.maxCompletionTokens = min(max(1, value), AgentBudget.maximumCompletionTokens)
+        }
+        if let value = overrides.maxWallClockSeconds {
+            budget.maxWallClockSeconds = min(max(1, value), AgentBudget.maximumWallClockSeconds)
+        }
         if let value = overrides.maxCostUSD { budget.maxCostUSD = max(0, value) }
         return budget
     }

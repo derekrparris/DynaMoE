@@ -144,6 +144,7 @@ actor AgentScheduler {
     private struct Registration {
         var parentRunId: UUID?
         var parentSessionId: UUID?
+        var parentTurnId: UUID?
         var schedulingClass: AgentSchedulingClass
         var priority: AgentSchedulingPriority
         var cancel: @Sendable (String) -> Void
@@ -222,6 +223,7 @@ actor AgentScheduler {
         runId: UUID,
         parentRunId: UUID?,
         parentSessionId: UUID?,
+        parentTurnId: UUID? = nil,
         schedulingClass: AgentSchedulingClass,
         priority: AgentSchedulingPriority,
         cancel: @escaping @Sendable (String) -> Void
@@ -230,6 +232,7 @@ actor AgentScheduler {
         registry[runId] = Registration(
             parentRunId: parentRunId,
             parentSessionId: parentSessionId,
+            parentTurnId: parentTurnId,
             schedulingClass: schedulingClass,
             priority: priority,
             cancel: cancel
@@ -254,6 +257,17 @@ actor AgentScheduler {
     /// child working on work the operator has abandoned.
     func cancelRuns(parentSessionId: UUID, reason: String = "The coordinator turn was stopped.") {
         let roots = registry.filter { $0.value.parentSessionId == parentSessionId }.map(\.key)
+        for runId in roots {
+            cancelSubtree(runId: runId, reason: reason)
+        }
+    }
+
+    /// Stops only the runs the given coordinator TURN spawned. The session-wide
+    /// form above reaches runs spawned by earlier turns of the same
+    /// conversation; a Stop scopes to the turn that owns the run, so background
+    /// work an earlier turn left running survives it.
+    func cancelRuns(parentTurnId: UUID, reason: String = "The coordinator turn was stopped.") {
+        let roots = registry.filter { $0.value.parentTurnId == parentTurnId }.map(\.key)
         for runId in roots {
             cancelSubtree(runId: runId, reason: reason)
         }

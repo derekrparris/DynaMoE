@@ -49,6 +49,13 @@ nonisolated struct SubagentApplyOutcome: Sendable {
     var changedFiles: [String]
     var appliedAt: Date
     var alreadyApplied: Bool
+    /// The branch the destination tree had checked out when the patch landed,
+    /// or nil for a detached HEAD.
+    var destinationBranch: String? = nil
+    /// Ignored files still in the kept worktree after the tracked patch
+    /// landed. A patch cannot carry them, so the tree stays until the
+    /// operator retrieves or clears it.
+    var keptIgnoredFiles: [String] = []
 }
 
 @MainActor
@@ -110,7 +117,11 @@ enum SubagentApplyService {
             throw SubagentApplyError.worktreeGone(detail)
         }
 
-        let repositoryKey = worktree.repositoryRoot.standardizedFileURL.path
+        // Symlinks resolved, so two spellings of one checkout (a repo reached
+        // through /tmp against /private/tmp) claim the SAME key instead of
+        // letting two applies interleave their writes in one tree.
+        let repositoryKey = worktree.repositoryRoot
+            .standardizedFileURL.resolvingSymlinksInPath().path
         guard !repositoriesInFlight.contains(repositoryKey) else {
             throw SubagentApplyError.repositoryBusy(record.role)
         }
@@ -118,6 +129,12 @@ enum SubagentApplyService {
         defer { repositoriesInFlight.remove(repositoryKey) }
 
         let changes = try await WorkspaceIsolation.snapshot(worktree, diffLimit: nil)
+        // Files a patch cannot carry (git-ignored, e.g. a `.env.local` the run
+        // wrote) are only ever in the worktree. When the run also changed
+        // tracked files, the patch lands below and the tree used to be deleted
+        // with them still in it — silently. They are named here and the
+        // worktree is KEPT so the operator can retrieve them.
+        var keptIgnoredFiles: [String] = []
         let files: [String]
         if changes.isEmpty {
             // An empty change set is not proof the tree is empty: a patch whose
@@ -143,21 +160,72 @@ enum SubagentApplyService {
         } else {
             let result = try await WorkspaceIsolation.apply(worktree, changeSet: changes)
             files = result.changedFiles
+            // The tracked patch does not remove the run's ignored files; check
+            // AFTER the apply so the names describe what is still in the tree.
+            let ignored = await WorkspaceIsolation.ignoredFiles(worktree)
+            if !ignored.isEmpty {
+                keptIgnoredFiles = Array(ignored.prefix(10))
+            }
         }
+
+        // An apply lands on whatever the destination has CHECKED OUT, and the
+        // record is the only place that answers "where did it go" afterwards.
+        let destinationBranch = await WorkspaceIsolation.currentBranch(of: worktree.repositoryRoot)
 
         let appliedAt = Date()
         if let live {
-            live.markApplied(at: appliedAt, files: files)
+            live.markApplied(at: appliedAt, files: files, appliedTo: destinationBranch)
         } else {
-            var updated = record
-            updated.appliedAt = appliedAt
-            if var report = updated.report, !files.isEmpty {
-                report.changedFiles = files
-                updated.report = report
+            // Mutated against the CURRENT record on the store's IO queue, not
+            // restored from the copy this apply loaded seconds ago: a
+            // `summaryRelayed` write landing mid-apply would otherwise be
+            // reverted here and the report injected a second time.
+            AgentRunStore.shared.mutate(runId: runId, sessionId: record.parentSessionId) { current in
+                current.appliedAt = appliedAt
+                current.appliedToBranch = destinationBranch
+                if var report = current.report, !files.isEmpty {
+                    report.changedFiles = files
+                    current.report = report
+                }
             }
-            AgentRunStore.shared.saveImmediately(updated)
         }
-        await WorkspaceIsolation.cleanup(worktree)
+        if keptIgnoredFiles.isEmpty {
+            await WorkspaceIsolation.cleanup(worktree)
+        } else {
+            let named = keptIgnoredFiles.joined(separator: ", ")
+            // The record must say why an applied run still has a worktree, or
+            // the inspector's Apply reads as unfinished business.
+            if let live {
+                live.noteKeptIgnoredFiles(keptIgnoredFiles)
+            } else {
+                AgentRunStore.shared.mutate(runId: runId, sessionId: record.parentSessionId) { current in
+                    current.appliedAt = appliedAt
+                    current.appliedToBranch = destinationBranch
+                    // A record without a report (an interrupted run, an older
+                    // schema) still deserves the kept-worktree explanation.
+                    if current.report == nil {
+                        current.report = AgentReport(
+                            status: current.status,
+                            summary: "",
+                            findings: [],
+                            changedFiles: files,
+                            diff: nil,
+                            tests: [],
+                            risks: [],
+                            openQuestions: [],
+                            usage: AgentUsage(),
+                            backend: current.backend
+                        )
+                    }
+                    if var report = current.report {
+                        report.openQuestions.append(
+                            "The tracked patch was applied, but the worktree was kept: it also holds files a patch cannot carry (\(named)). Retrieve them manually before clearing the run."
+                        )
+                        current.report = report
+                    }
+                }
+            }
+        }
 
         return SubagentApplyOutcome(
             runId: runId,
@@ -165,7 +233,9 @@ enum SubagentApplyService {
             branch: branch,
             changedFiles: files,
             appliedAt: appliedAt,
-            alreadyApplied: false
+            alreadyApplied: false,
+            destinationBranch: destinationBranch,
+            keptIgnoredFiles: keptIgnoredFiles
         )
     }
 }

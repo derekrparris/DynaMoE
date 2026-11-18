@@ -170,6 +170,25 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         ioQueue.sync {}
     }
 
+    /// Reads the CURRENT record from disk, applies the mutation and writes it
+    /// back — all on the store's IO queue, so a caller that loaded a record
+    /// seconds ago cannot revert fields other writers changed in between. The
+    /// apply path used to restore its stale copy and clobber a
+    /// `summaryRelayed` write landing mid-apply, which re-injected an already
+    /// relayed report at the next send. Returns the record as it stands after
+    /// the mutation, or nil when no decodable record exists.
+    @discardableResult
+    func mutate(runId: UUID, sessionId: UUID?, _ change: (inout AgentRunRecord) -> Void) -> AgentRunRecord? {
+        let url = fileURL(runId: runId, sessionId: sessionId)
+        return ioQueue.sync { [self] in
+            guard var current = decodeRecord(at: url) else { return nil }
+            change(&current)
+            let bounded = Self.bounded(current)
+            writeNow(bounded, to: url)
+            return bounded
+        }
+    }
+
     private func writeNow(_ record: AgentRunRecord, to url: URL) {
         signatureLock.lock()
         let wasDeleted = deletedRunIds.contains(record.id)
@@ -210,13 +229,14 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             return
         }
         do {
-            try data.write(to: url, options: .atomic)
             // A run's record carries the task, the conversation excerpt,
             // thinking and tool output. Application Support is user-readable by
-            // default, which is the wrong floor for that content; the file is
-            // owner-only from the moment it exists. The directory is set as
-            // well so the filename (a run id) is not world-listable.
-            try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            // default, which is the wrong floor for that content: the helper
+            // creates the file 0600 from its first byte (a plain `.atomic`
+            // write creates it 0644 and chmods afterwards, a window in which
+            // the record is world-readable) and fsyncs before the rename, so a
+            // crash cannot leave a truncated record either.
+            try Self.writeOwnerOnlyAtomically(data, to: url)
             try? fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
             signatureLock.lock()
             writtenSignatures[key] = signature
@@ -224,6 +244,52 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             noteRelayMembership(record)
         } catch {
             print("⚠️ [AgentRunStore] failed to write run \(record.id): \(error.localizedDescription)")
+        }
+    }
+
+    /// Atomic, owner-only, durable write. The temp file is created 0600 and
+    /// fsynced before the rename, so the record is never world-readable in
+    /// flight and never truncated on disk after the call returns.
+    private nonisolated static func writeOwnerOnlyAtomically(_ data: Data, to url: URL) throws {
+        let temporary = url.deletingLastPathComponent()
+            .appendingPathComponent(".\(url.lastPathComponent).new-\(UUID().uuidString)", isDirectory: false)
+        let descriptor = open(temporary.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard descriptor >= 0 else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno),
+                userInfo: [NSFilePathErrorKey: temporary.path]
+            )
+        }
+        var writeErrno: Int32 = 0
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return }
+            var offset = 0
+            while offset < raw.count {
+                let written = write(descriptor, base + offset, raw.count - offset)
+                if written > 0 {
+                    offset += written
+                    continue
+                }
+                if written != 0 { writeErrno = errno }
+                break
+            }
+        }
+        _ = fsync(descriptor)
+        close(descriptor)
+        if writeErrno != 0 {
+            try? FileManager.default.removeItem(at: temporary)
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(writeErrno),
+                userInfo: [NSFilePathErrorKey: temporary.path]
+            )
+        }
+        do {
+            _ = try FileManager.default.replaceItemAt(url, withItemAt: temporary)
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            throw error
         }
     }
 
@@ -238,12 +304,18 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         return unrelayedBySession[Self.relayBucket(sessionId)] ?? []
     }
 
-    /// Builds the index off the caller's thread. The manager's launch sweep
-    /// calls this so the first send does not pay for the scan.
+    /// Builds the index OFF the caller's thread. The scan decodes every record
+    /// in the store; it used to run synchronously wherever the caller happened
+    /// to be, so a first send's lookup could pay the whole scan on the main
+    /// thread under the relay lock before the first prompt rendered. The IO
+    /// queue is the write path's own queue, so a save landing mid-scan waits
+    /// for it rather than being missed by the scan's snapshot.
     func prepareRelayIndex() {
-        signatureLock.lock()
-        defer { signatureLock.unlock() }
-        ensureRelayIndexLocked()
+        ioQueue.async { [self] in
+            signatureLock.lock()
+            defer { signatureLock.unlock() }
+            ensureRelayIndexLocked()
+        }
     }
 
     private static func relayBucket(_ sessionId: UUID?) -> String {
@@ -367,14 +439,19 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// Stop and no way to clear it. Nothing can be in flight before the
     /// manager that owns runs exists, so at launch every non-terminal record
     /// older than `graceSeconds` is an orphan; it is rewritten as `.failed`
-    /// rather than left claiming to be working.
+    /// rather than left claiming to be working. The sweep is ASYNC, though:
+    /// a run the operator spawned while this scan was still walking the store
+    /// is live, and `isLive` is what keeps it from being rewritten as failed
+    /// underneath its own working instance.
     @discardableResult
     func reconcileInterruptedRuns(
         now: Date = Date(),
-        graceSeconds: TimeInterval = 60
+        graceSeconds: TimeInterval = 60,
+        isLive: (UUID) -> Bool = { _ in false }
     ) -> [UUID] {
         var reconciled: [UUID] = []
         for var record in loadAll() where !record.status.isTerminal {
+            if isLive(record.id) { continue }
             let started = record.startedAt ?? record.createdAt
             guard now.timeIntervalSince(started) >= graceSeconds else { continue }
             record.status = .failed
@@ -484,6 +561,13 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             // on a slow operator approval) would otherwise be deleted underneath
             // its own instance, which then rewrites it anyway.
             guard record.status.isTerminal else { continue }
+            // An unapplied isolated run's record is the only thing keeping its
+            // WORKTREE alive: the launch sweep protects a tree while a
+            // decodable record says unapplied, so pruning the record first
+            // means the very next sweep deletes the run's only copy of its
+            // work. Retention is for conversation history; unapplied work is
+            // the operator's to clear or apply, never the clock's.
+            if record.isolation.isIsolated, record.appliedAt == nil { continue }
             let url = fileURL(runId: record.id, sessionId: record.parentSessionId)
             if (try? fileManager.removeItem(at: url)) != nil {
                 noteDeletedRun(record.id)
@@ -563,8 +647,24 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
 
     private nonisolated static func truncate(_ text: String, to limit: Int) -> String {
         guard text.count > limit else { return text }
+        // Idempotent: a value that already carries this function's marker
+        // (from the previous save's bound) stays as it is. Re-truncating on
+        // every save stacked a new tail with a different character count,
+        // which also defeated the store's digest skip: an unchanged record
+        // was rewritten on every boundary.
+        if isTruncationMarker(text.dropFirst(limit)) { return text }
         let cut = text.prefix(limit)
         return cut + "\n… [truncated \(text.count - limit) characters]"
+    }
+
+    /// Recognises this store's own truncation marker, so a value read back off
+    /// disk is not truncated a second time.
+    private nonisolated static func isTruncationMarker(_ tail: Substring) -> Bool {
+        let head = "\n… [truncated "
+        let foot = " characters]"
+        guard tail.hasPrefix(head), tail.hasSuffix(foot) else { return false }
+        let digits = tail.dropFirst(head.count).dropLast(foot.count)
+        return !digits.isEmpty && digits.allSatisfy(\.isNumber)
     }
 
     private nonisolated static func sortDate(_ record: AgentRunRecord) -> Date {

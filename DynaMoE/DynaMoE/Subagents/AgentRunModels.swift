@@ -103,6 +103,15 @@ nonisolated struct AgentBudget: Codable, Equatable, Sendable {
         maxCostUSD: nil
     )
 
+    /// Model-supplied overrides are clamped into these bounds at resolution.
+    /// A huge `max_wall_clock_seconds` traps the loop's nanosecond conversion
+    /// and takes the app down; a runaway `max_steps` or token budget outlives
+    /// every real task. Clamping keeps the spawn's promise bounded without
+    /// refusing the spawn over a number the model inflated.
+    static let maximumSteps = 1_000
+    static let maximumCompletionTokens = 10_000_000
+    static let maximumWallClockSeconds = 86_400
+
     var isValid: Bool {
         maxSteps > 0 && maxCompletionTokens > 0 && maxWallClockSeconds > 0
     }
@@ -325,6 +334,10 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
     /// were. Optional and additive: records written before Phase 4 decode with
     /// no value, and a newer build's field is never rewritten by an older one.
     var appliedAt: Date?
+    /// The branch the main tree had CHECKED OUT when this run's work landed.
+    /// An apply lands on whatever is checked out, so the record is the only
+    /// place that answers "where did it go" after the fact.
+    var appliedToBranch: String?
     /// The main repository an isolated worktree was cut from. Optional and
     /// additive: a record written before this field falls back to deriving the
     /// root from git, which cannot name the main worktree of a submodule or a
@@ -363,6 +376,7 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
         depth: Int = 0,
         summaryRelayed: Bool = false,
         appliedAt: Date? = nil,
+        appliedToBranch: String? = nil,
         repositoryRoot: String? = nil,
         baseCommit: String? = nil,
         schemaVersion: Int = AgentRunRecord.currentSchemaVersion
@@ -391,6 +405,7 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
         self.depth = depth
         self.summaryRelayed = summaryRelayed
         self.appliedAt = appliedAt
+        self.appliedToBranch = appliedToBranch
         self.repositoryRoot = repositoryRoot
         self.baseCommit = baseCommit
         self.schemaVersion = schemaVersion

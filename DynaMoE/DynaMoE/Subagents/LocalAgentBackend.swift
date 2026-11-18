@@ -122,6 +122,15 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
 
     func runTurn(_ request: AgentBackendRequest) async throws -> AgentBackendTurn {
         let prepared = try await Self.prepare(request, thinkingEnabled: thinkingEnabled)
+        // A run cancelled while it prepared (rendering, tokenizing, waiting for
+        // the slot) must not burn a full turn nobody will process: a DeepSeek
+        // launch rebuilds the runtime (measured 17.2 s) and moves the global
+        // prefix pin on its way through. The claim is given back here, which
+        // is what keeps the refusal from wedging the single-flight slot.
+        if Task.isCancelled {
+            prepared.claim.release()
+            throw AgentBackendError.cancelled
+        }
         do {
             return try await GrammarConstrainedSampler.withTurnToolMask(prepared.maskSchemas) {
                 let launch = try await MainActor.run { () -> CompletionLaunch in
@@ -171,8 +180,8 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         // The engine has ONE generation slot and the chat UI and API server use
         // it directly. A background run's next step is not a reason to fail:
         // any chat turn running when that step starts would otherwise kill the
-        // run permanently. Wait, bounded by the same queue budget the server
-        // uses, instead of treating "busy" as "unavailable".
+        // run permanently. The run waits out the holder — its own wall-clock
+        // budget bounds the wait — instead of treating "busy" as "unavailable".
         let claim = try await waitForEngineSlot(engine)
         do {
             return try prepare(request, thinkingEnabled: thinkingEnabled, engine: engine, info: info, config: config, claim: claim)
@@ -184,18 +193,28 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
 
     /// Polls the single-flight ledger until a claim is granted. A claim, not a
     /// probe: the slot cannot be taken between the check and the launch.
+    ///
+    /// The wait is bounded only by the run's own cancellation and wall-clock
+    /// budget (the step runs inside `HeadlessAgentLoop`'s deadline). The old
+    /// 120 s queue-admission deadline reused the SERVER's timeout, and a
+    /// coordinator turn longer than that — routine for a local model — killed
+    /// the child permanently at its next step instead of letting it wait out
+    /// the turn that held the engine.
     @MainActor
     private static func waitForEngineSlot(_ engine: CompletionEngine) async throws -> TurnSlotClaim {
-        let timeout = AgentSchedulerLimits.configured().queueTimeoutSeconds
-        let deadline = Date().addingTimeInterval(timeout)
         while true {
-            if let claim = engine.reserveTurnSlot() { return claim }
-            if Task.isCancelled { throw AgentBackendError.cancelled }
-            if Date() >= deadline {
-                throw AgentBackendError.unavailable(
-                    "The local engine stayed busy for \(Int(timeout)) s, so this run could not take its next step. Send again when the current turn finishes."
-                )
+            if let claim = engine.reserveTurnSlot() {
+                // The claim is granted by the ledger, not by this run's state:
+                // check cancellation AFTER taking it, so a run stopped while
+                // it waited hands the slot straight back instead of launching
+                // a full turn nobody will process.
+                if Task.isCancelled {
+                    claim.release()
+                    throw AgentBackendError.cancelled
+                }
+                return claim
             }
+            if Task.isCancelled { throw AgentBackendError.cancelled }
             try? await Task.sleep(nanoseconds: 100_000_000)
         }
     }

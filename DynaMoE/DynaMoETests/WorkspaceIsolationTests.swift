@@ -472,6 +472,132 @@ final class WorkspaceIsolationTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: worktree.path.path))
     }
 
+    func testTheSweepKeepsACancelledUnappliedWorktree() async throws {
+        let runId = UUID()
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: runId,
+            root: worktreeRoot
+        )
+        // A cancelled run's record with no appliedAt: the worktree is the only
+        // full copy of whatever the run wrote before its Stop, and the sweep
+        // used to treat "cancelled" as cleanup's licence to delete it.
+        let store = AgentRunStore.shared
+        let cancelled = AgentRunRecord(
+            id: runId,
+            parentSessionId: nil,
+            role: "Implementer",
+            preset: .implementer,
+            task: "stopped mid-write",
+            backend: .scripted,
+            workingDirectory: worktree.path.path,
+            isolation: worktree.isolation,
+            allowedTools: ["file_write"],
+            status: .cancelled,
+            createdAt: Date(),
+            startedAt: Date(),
+            completedAt: Date()
+        )
+        store.saveImmediately(cancelled)
+        defer {
+            store.delete(runId: runId, sessionId: nil)
+            Task { await WorkspaceIsolation.cleanup(worktree) }
+        }
+
+        let removed = await WorkspaceIsolation.pruneStaleWorktrees(
+            root: worktreeRoot,
+            olderThan: -1
+        )
+        XCTAssertTrue(removed.isEmpty, "a cancelled unapplied worktree must not be swept")
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: worktree.path.path),
+            "the sweep must keep the only copy of a cancelled run's work"
+        )
+    }
+
+    func testStoppingAnIsolatedRunKeepsItsWorktreeAndTheWorkInIt() async throws {
+        let runId = UUID()
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: runId,
+            root: worktreeRoot
+        )
+        // Turn 1 writes real work inside the tree; turn 2 stalls so the Stop
+        // lands mid-run. The cancelled run must keep BOTH the worktree and
+        // the file, and its record must say cancelled — not crash the process
+        // on git spawned from a cancelled task, and not delete the tree.
+        let backend = ScriptedBackend(turns: [
+            ScriptedBackend.ScriptedTurn(
+                text: "",
+                calls: [
+                    AgentToolCall(
+                        name: "file_write",
+                        arguments: ["path": "half_done.txt", "content": "written before the Stop\n"]
+                    )
+                ]
+            ),
+            ScriptedBackend.ScriptedTurn(text: "still working", delayNanoseconds: 20_000_000_000)
+        ])
+        let plan = AgentSpawnPlan(
+            role: "Implementer",
+            taskDescription: "Write half of the work.",
+            contextSummary: nil,
+            preset: .implementer,
+            backendDescriptor: .scripted,
+            schedulingClass: .cloud(providerId: "scripted"),
+            backend: backend,
+            toolNames: ["file_write"],
+            budget: AgentBudget(maxSteps: 4, maxCompletionTokens: 4_000, maxWallClockSeconds: 60, maxCostUSD: nil),
+            approvalPolicy: .spawnOnly,
+            isolation: worktree.isolation,
+            thinking: false,
+            sampling: .default,
+            priority: .userRequested,
+            parentSessionId: nil,
+            parentTurnId: nil,
+            workingDirectory: worktree.path
+        )
+        let subagent = SubagentManager.shared.spawnModelBacked(plan, id: runId)
+        defer {
+            SubagentManager.shared.clearCompleted(sessionId: nil)
+            AgentRunStore.shared.delete(runId: runId, sessionId: nil)
+            Task { await WorkspaceIsolation.cleanup(worktree) }
+        }
+
+        // Wait until the run has actually produced its work before stopping it,
+        // so the tree provably holds something worth keeping.
+        let written = worktree.path.appendingPathComponent("half_done.txt")
+        let readyDeadline = Date().addingTimeInterval(15)
+        while Date() < readyDeadline,
+              !FileManager.default.fileExists(atPath: written.path) {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: written.path),
+            "the run must reach its write before the Stop"
+        )
+
+        subagent.cancel(reason: "The coordinator turn was stopped.")
+        _ = await subagent.waitForCompletion()
+
+        // The record is written by the run's own detached bookkeeping task; the
+        // worktree assertions are only honest once that has landed.
+        let settled = Date().addingTimeInterval(10)
+        while Date() < settled,
+              AgentRunStore.shared.loadAny(runId: runId)?.status != .cancelled {
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        XCTAssertEqual(AgentRunStore.shared.loadAny(runId: runId)?.status, .cancelled)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: worktree.path.path),
+            "a cancelled writer's worktree is the only copy of its work"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: written.path),
+            "the work the run completed before the Stop must survive it"
+        )
+    }
+
     // MARK: - The coordinator's tool
 
     func testAnIsolatedScriptedRunWritesInItsWorktreeAndTheCoordinatorAppliesIt() async throws {
@@ -606,6 +732,79 @@ final class WorkspaceIsolationTests: XCTestCase {
             maxOutputLength: 4_000
         )
         XCTAssertTrue(second.stdout?.contains("already applied") ?? false, second.resultJSON)
+    }
+
+    func testAnApplyWithIgnoredFilesBesideTrackedChangesKeepsTheWorktree() async throws {
+        let runId = UUID()
+        // The ignore rule must be IN the tree the worktree is cut from, so
+        // the run's `.local` file is invisible to the patch.
+        try "*.local\n".write(
+            to: repository.appendingPathComponent(".gitignore"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try await git(["add", "-A"], in: repository)
+        try await git(["commit", "-m", "ignore local files"], in: repository)
+
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: runId,
+            root: worktreeRoot
+        )
+        try "tracked change\n".write(
+            to: worktree.path.appendingPathComponent("from_agent.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "api key\n".write(
+            to: worktree.path.appendingPathComponent("secret.local"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let record = AgentRunRecord(
+            id: runId,
+            role: "Implementer",
+            preset: .implementer,
+            task: "Write the file.",
+            backend: .scripted,
+            workingDirectory: worktree.path.path,
+            isolation: worktree.isolation,
+            allowedTools: ["file_write"],
+            status: .completed
+        )
+        AgentRunStore.shared.saveImmediately(record)
+        defer {
+            AgentRunStore.shared.delete(runId: runId, sessionId: nil)
+            Task { await WorkspaceIsolation.cleanup(worktree) }
+            try? FileManager.default.removeItem(at: repository.appendingPathComponent("from_agent.txt"))
+        }
+
+        let tool = ApplySubagentChangesTool()
+        let applied = try await tool.execute(
+            arguments: ["subagent_id": runId.uuidString],
+            workingDirectory: repository,
+            maxOutputLength: 4_000
+        )
+        // The tracked patch lands; the ignored file cannot ride it, so the
+        // worktree is KEPT and the apply names what is still in it. The old
+        // behaviour deleted the tree with the run's only copy of the file.
+        XCTAssertTrue(applied.stdout?.contains("Applied") ?? false, applied.resultJSON)
+        XCTAssertTrue(applied.stdout?.contains("KEPT") ?? false, applied.resultJSON)
+        XCTAssertTrue(applied.stdout?.contains("secret.local") ?? false, applied.resultJSON)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: repository.appendingPathComponent("from_agent.txt").path),
+            "the tracked patch must land"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: worktree.path.appendingPathComponent("secret.local").path),
+            "the ignored file must survive in the kept worktree"
+        )
+        let stored = AgentRunStore.shared.loadAny(runId: runId)
+        XCTAssertNotNil(stored?.appliedAt)
+        XCTAssertTrue(
+            stored?.report?.openQuestions.contains { $0.contains("secret.local") } == true,
+            "the record must say why an applied run still has a worktree"
+        )
     }
 
     func testTheApplyToolRefusesARunThatWasNotIsolated() async throws {

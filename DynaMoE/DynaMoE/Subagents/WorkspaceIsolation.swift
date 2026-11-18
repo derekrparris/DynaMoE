@@ -822,11 +822,12 @@ nonisolated enum WorkspaceIsolation {
             // A worktree is the ONLY full copy of a run that has not been
             // applied. Age is not evidence that its work is safe to destroy:
             // the record keeps a bounded diff, not the files. Leave it alone
-            // until the operator applies or clears the run.
+            // until the operator applies or clears the run — including a
+            // CANCELLED run's tree, which a Stop must not turn into the one
+            // path that destroys work.
             if let runId = UUID(uuidString: name),
                let record = AgentRunStore.shared.loadAny(runId: runId),
-               record.appliedAt == nil,
-               record.status != .cancelled {
+               record.appliedAt == nil {
                 continue
             }
 
@@ -859,6 +860,18 @@ nonisolated enum WorkspaceIsolation {
     }
 
     // MARK: Process
+
+    /// The branch a repository has CHECKED OUT, so an apply can record where
+    /// the patch landed. Nil for a detached HEAD (which is itself an answer:
+    /// the apply landed on no branch) or when git cannot say.
+    static func currentBranch(of repositoryRoot: URL) async -> String? {
+        guard let (code, out, _) = try? await git(
+            ["rev-parse", "--abbrev-ref", "HEAD"],
+            in: repositoryRoot
+        ), code == 0 else { return nil }
+        let branch = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        return branch.isEmpty || branch == "HEAD" ? nil : branch
+    }
 
     private static func git(
         _ arguments: [String],

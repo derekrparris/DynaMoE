@@ -468,13 +468,19 @@ from a child is refused by name.
   it at its next boundary. That is a cancel, not a yield-and-resume: see the
   next bullet.
 - **Interactive priority is cancel-and-report, not pause/resume.** An operator's
-  send that finds a background turn active cancels it (`cancelBackgroundTurn`),
-  waits for the engine to drain (`awaitIdle`) and runs the send once
-  (`preemptionRetry` in `startAutoregressiveGeneration`). The subagent's run is
-  cancelled at its next boundary and reports why; it is not resumed. SubQ chose
-  this over `pause_and_resume` (0.81 vs 0.10) because resumability needs a
-  paused status, a serializable loop state and store work that belongs with
-  Phase 3.
+  FRESH send that finds a background turn active cancels it
+  (`cancelBackgroundTurn`), waits for the engine to drain (`awaitIdle`) and
+  runs the send once (`preemptionRetry` in `startAutoregressiveGeneration`).
+  The subagent's run is cancelled at its next boundary and reports why; it is
+  not resumed. SubQ chose this over `pause_and_resume` (0.81 vs 0.10) because
+  resumability needs a paused status, a serializable loop state and store work
+  that belongs with Phase 3. A CONTINUATION of the coordinator's own turn
+  never preempts: its next step waits, bounded, for the single-flight slot
+  (the holder is usually the turn's own background child between steps) and
+  only past the patience window does interactive rank cancel the child. A Stop
+  is scoped to the TURN that minted it (`cancelTurnRuns`): runs spawned by
+  earlier turns of the same conversation keep working and keep their
+  unapplied worktrees.
 - **Cloud capacity: N** (default 3 per provider, global fan-out 6, both
   overridable through `dynamoe_subagent_cloud_per_provider` /
   `dynamoe_subagent_cloud_global`).
@@ -861,17 +867,25 @@ Implemented, with the decisions worth carrying:
   decides what becomes a commit. A merge or rebase already in progress in the
   main tree is refused rather than interleaved with someone else's conflict
   resolution.
-- **Lifecycle: completed and failed runs keep their worktree; cancelled runs
-  lose it.** The record's diff is bounded (64 KB for a report, plus the
-  per-entry transcript budgets), so the worktree is the only copy that can
-  always be applied in full. `apply_subagent_changes` re-reads the LIVE diff,
-  applies it, writes `appliedAt` synchronously, then removes the worktree; a
-  second call is a no-op that says so. A launch sweep removes worktrees older
-  than 14 days, but NEVER one whose record has not been applied: the record
-  keeps only a bounded diff, so the worktree is the only full copy. A run whose
-  work is entirely in git-ignored files refuses to apply rather than reporting
-  "no changes" and deleting the tree. A launch sweep also closes records left
-  `.running` by a crash, so they are terminal and clearable.
+- **Lifecycle: every terminal run keeps its worktree until it is applied or
+  cleared — cancelled runs included.** The record's diff is bounded (64 KB for a
+  report, plus the per-entry transcript budgets), so the worktree is the only
+  copy that can always be applied in full. A cancelled writer's tree used to be
+  discarded on the Stop, which destroyed the only copy of work the operator
+  never saw; it is kept now, and the record still names it so the inspector
+  offers the same keep-or-clear decision a completed run gets.
+  `apply_subagent_changes` re-reads the LIVE diff, applies it, writes
+  `appliedAt` synchronously, then removes the worktree — unless the tree also
+  holds git-ignored files a patch cannot carry, in which case it stays and the
+  apply names them; a second call is a no-op that says so. A launch sweep
+  removes worktrees older than 14 days, but NEVER one whose record has not
+  been applied: the record keeps only a bounded diff, so the worktree is the
+  only full copy. A run whose work is entirely in git-ignored files refuses to
+  apply rather than reporting "no changes" and deleting the tree. A launch
+  sweep also closes records left `.running` by a crash, so they are terminal
+  and clearable. Retention never deletes an unapplied isolated run's record
+  either: the record is what keeps the sweep from treating that worktree as
+  orphaned.
 - **Approval moves to spawn for an isolated writer.** `.spawnOnly` means the
   operator approves the delegation once, with the worktree and branch in front
   of them, and the run's writes inside its own tree need no per-call card.
@@ -969,8 +983,9 @@ gap Phase 4 recorded.
 1. A local run never launches a turn without holding the engine lease.
 2. A run never mutates `AgentHarness.shared`, the shared grammar registry
    outside its turn, or the coordinator's loaded tools.
-3. `tools_load`, `tools_discover`, `tools_unload`, `spawn_subagent` and
-   `apply_subagent_changes` are never offered to a run.
+3. `tools_load`, `tools_discover`, `tools_unload`, `spawn_subagent`,
+   `apply_subagent_changes`, `get_subagent_status`, `send_subagent_message`
+   and `list_subagents` are never offered to a run.
 4. Every state-changing tool call passes through the run's approval policy,
    including `shell_run`, MCP and `subq_decide`.
 5. `targetsApplicationPreferences` is absolute: no card, Turbo, or run policy may

@@ -850,12 +850,15 @@ public final class CompletionEngine: @unchecked Sendable {
                     ),
                     promptTokenIds: expandedPromptIds.map { Int($0) }
                 )
-                // The runtime continues from `reusablePrefix`, i.e. everything
-                // above it is rewritten. A pin that claims more rows is stale
-                // from here on, and a cancelled turn (which never records a new
-                // one) would otherwise leave it for the owner's next turn to
-                // reuse over overwritten slots.
-                PrefixCacheManager.shared.invalidateIfNotPreserved(reusablePrefix)
+                // The runner's own resume rule decides what the cache ends up
+                // holding, not the executor's token-based answer alone: an
+                // image turn always starts from position 0 (the pin is keyed on
+                // TOKEN IDS, which cannot tell two pictures apart), so a pin
+                // that survives a token-match here would point at rows the
+                // runner is about to zero. Invalidate against the number the
+                // RUNNER will actually preserve.
+                let runnerReused = boundRows.isEmpty ? reusablePrefix : 0
+                PrefixCacheManager.shared.invalidateIfNotPreserved(runnerReused)
 
                 let prep = TurnPrepInfo(
                     prefixTokensReused: reusablePrefix,
@@ -2372,13 +2375,6 @@ public final class CompletionEngine: @unchecked Sendable {
             prefixTokensReused = 0
         }
 
-        // The reset below keeps only `prefixTokensReused` rows. If that is less
-        // than the pin claims, the old pin describes rows this turn overwrites
-        // (or a fresh allocation zeroed), so it must not be offered to its
-        // owner later. A cancelled turn never reaches recordTurn, which is what
-        // used to leave such a pin behind; see `invalidateIfNotPreserved`.
-        PrefixCacheManager.shared.invalidateIfNotPreserved(prefixTokensReused)
-
         // Prompt-dump diagnostic for the tool-call spiral bisection
         // (defaults write DRP.DynaMoE dynamoe_dump_prompts -bool YES).
         // Writes the EXACT decoded token stream the model attends over this turn
@@ -2499,6 +2495,20 @@ public final class CompletionEngine: @unchecked Sendable {
             print("⚠️ [KVCACHE] clamping provisioned seq len \(neededSeqLen) -> \(clampedSeqLen) (KV \(String(format: "%.2f", kvGB)) GB against a \(String(format: "%.2f", kvBudgetGB)) GB budget on a \(String(format: "%.1f", physicalGB)) GB machine; set the memory budget mode to raise it)")
             neededSeqLen = clampedSeqLen
         }
+
+        // The reset below keeps only `prefixTokensReused` rows. If that is
+        // less than the pin claims, the old pin describes rows this turn
+        // overwrites (or a fresh allocation zeroed), so it must not be offered
+        // to its owner later. A cancelled turn never reaches recordTurn, which
+        // is what used to leave such a pin behind; see
+        // `invalidateIfNotPreserved`.
+        //
+        // Placement matters: this runs AFTER every gate that can refuse the
+        // turn. The affordability checks above throw for a prompt this
+        // machine cannot hold, and a refused launch overwrites no rows —
+        // invalidating the pin on the way to a 400 dropped a still-valid pin
+        // for a refusal the operator could fix by lowering the prompt.
+        PrefixCacheManager.shared.invalidateIfNotPreserved(prefixTokensReused)
 
         KVCacheManager.shared.reset(
             device: device,

@@ -187,6 +187,9 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     public var canRunShellCommands: Bool { parentMode == .code }
     public let contextSummary: String?
     public let parentSessionId: UUID?
+    /// The coordinator TURN that spawned this run, so a Stop in a later turn
+    /// cannot cancel it: cancellation scopes to the turn that owns the run.
+    public let parentTurnId: UUID?
     public let workingDirectory: URL?
     /// The model-backed plan, when this instance is a real agent run rather than
     /// one of the legacy canned pipelines. The manager sets it through the
@@ -224,6 +227,9 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// because the inspector reads it through a value snapshot: without this, the
     /// apply service's write would not redraw the pane that offered the button.
     @Published private(set) var appliedAt: Date? = nil
+    /// The branch the destination tree had checked out when this run's work
+    /// landed, so the record answers "where did it go" after the fact.
+    @Published private(set) var appliedToBranch: String? = nil
     /// The step currently streaming. The loop mints one delta id pair per step,
     /// so a new id is the boundary that clears the previous step's text.
     @Published public private(set) var liveAssistantText: String = ""
@@ -254,6 +260,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         parentMode: AgentMode = .code,
         contextSummary: String? = nil,
         parentSessionId: UUID? = nil,
+        parentTurnId: UUID? = nil,
         workingDirectory: URL? = nil
     ) {
         self.id = id
@@ -266,6 +273,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         self.parentMode = parentMode
         self.contextSummary = contextSummary
         self.parentSessionId = parentSessionId
+        self.parentTurnId = parentTurnId
         self.workingDirectory = workingDirectory
         self.modelPlan = nil
         self.createdAt = Date()
@@ -283,6 +291,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         self.parentMode = plan.approvalPolicy == .deny ? .plan : .code
         self.contextSummary = plan.contextSummary
         self.parentSessionId = plan.parentSessionId
+        self.parentTurnId = plan.parentTurnId
         self.workingDirectory = plan.workingDirectory
         self.modelPlan = plan
         self.backendDescriptor = plan.backendDescriptor
@@ -398,6 +407,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             depth: 0,
             summaryRelayed: isSummaryRelayed,
             appliedAt: appliedAt,
+            appliedToBranch: appliedToBranch,
             repositoryRoot: plan?.repositoryRoot?.path,
             baseCommit: plan?.baseCommit
         )
@@ -406,13 +416,31 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// Records that this run's worktree landed on the main tree. The store is
     /// written synchronously by the apply path, so a crash immediately after
     /// the patch cannot leave a record that would try to apply it twice.
-    func markApplied(at date: Date, files: [String]) {
+    /// `appliedTo` is the branch the destination had CHECKED OUT: an apply
+    /// lands on whatever is checked out, and the record is the only place
+    /// that answers where the work went.
+    func markApplied(at date: Date, files: [String], appliedTo: String? = nil) {
         appliedAt = date
+        appliedToBranch = appliedTo
         if var report, !files.isEmpty {
             report.changedFiles = files
             self.report = report
         }
         AgentRunStore.shared.saveImmediately(snapshotRecord())
+    }
+
+    /// Records that this run's worktree was kept after an apply because it
+    /// holds ignored files a patch cannot carry, so the inspector's Apply
+    /// does not read as unfinished business without a reason.
+    func noteKeptIgnoredFiles(_ files: [String]) {
+        guard !files.isEmpty else { return }
+        if var current = report {
+            current.openQuestions.append(
+                "The tracked patch was applied, but the worktree was kept: it also holds files a patch cannot carry (\(files.joined(separator: ", "))). Retrieve them manually before clearing the run."
+            )
+            report = current
+        }
+        persistRecord()
     }
 
     /// Writes the current state. Safe to call on every boundary: the store
@@ -561,6 +589,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             runId: id,
             parentRunId: nil,
             parentSessionId: parentSessionId,
+            parentTurnId: parentTurnId,
             schedulingClass: plan.schedulingClass,
             priority: plan.priority,
             cancel: { reason in cancellation.cancel(reason) }
@@ -575,7 +604,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             )
         } catch {
             await scheduler.finish(runId: id)
-            await discardWorktree(for: plan.isolation)
+            await discardWorktree(plan: plan)
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             let cancelled = (error as? AgentSchedulerError) == .cancelled || Task.isCancelled
             finishRun(
@@ -613,7 +642,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                 }
             )
         } catch {
-            await discardWorktree(for: plan.isolation)
+            await discardWorktree(plan: plan)
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             finishRun(
                 summary: message,
@@ -656,7 +685,13 @@ public final class SubagentInstance: Identifiable, ObservableObject {
             sampling: plan.sampling,
             sessionId: id,
             thinking: plan.thinking,
-            stopSequences: []
+            stopSequences: [],
+            // Steering the coordinator or operator queued while the run works
+            // is drained before each step, so a message reported delivered
+            // actually reaches the model.
+            drainSteering: { [weak self] in
+                await self?.drainUnconsumedSteering() ?? []
+            }
         )
 
         // Events are applied through ONE serial stream. A Task per event let a
@@ -682,9 +717,16 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         let duration = CFAbsoluteTimeGetCurrent() - startTime
         // An isolated writer's worktree is read back here, not by the loop: the
         // loop runs inside the worktree and has no business knowing where its
-        // bytes are. A cancelled run's worktree is discarded (SUBAGENTS.md §7);
-        // anything terminal keeps it until `apply_subagent_changes` lands it.
-        let finalReport = await finalizeWorktree(plan: plan, outcome: outcome)
+        // bytes are. The readback runs on its OWN detached task so the Stop
+        // that cancelled the run (or one landing right now) cannot abort the
+        // bookkeeping, and git is never spawned from a cancelled task. A
+        // cancelled run's worktree is KEPT: it is the only full copy of
+        // whatever the run wrote before the Stop, and the record still names
+        // it so the operator gets the same keep-or-clear choice a completed
+        // run's tree gets.
+        let finalReport = await Task.detached(priority: .userInitiated) {
+            await self.finalizeWorktree(plan: plan, outcome: outcome)
+        }.value
         report = finalReport
         usage = outcome.usage
         lastError = outcome.error
@@ -724,23 +766,22 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         finishRun(summary: summary, status: finalStatus, duration: duration, liveStatus: liveStatus)
     }
 
-    /// Reads an isolated run's worktree into its report, or discards it on
-    /// cancellation. A worktree that cannot be opened leaves the run's report
-    /// intact and adds an open question naming why: the loop's transcript is
-    /// still a truthful record of what happened.
+    /// Reads an isolated run's worktree into its report. A worktree that
+    /// cannot be opened leaves the run's report intact and adds an open
+    /// question naming why: the loop's transcript is still a truthful record
+    /// of what happened. A CANCELLED run keeps its worktree (the readback's
+    /// own detached task means cancellation cannot reach this function, so
+    /// the status alone decides) — the operator clears it from the inspector
+    /// or a later apply lands whatever it holds.
     private func finalizeWorktree(plan: AgentSpawnPlan, outcome: AgentLoopOutcome) async -> AgentReport? {
         guard case .worktree(let path, let branch) = plan.isolation else {
             return outcome.report
         }
-        if outcome.status == .cancelled || Task.isCancelled {
-            if let worktree = try? await WorkspaceIsolation.open(
-                path: path,
-                branch: branch,
-                repositoryRoot: plan.repositoryRoot,
-                baseCommit: plan.baseCommit
-            ) {
-                await WorkspaceIsolation.cleanup(worktree)
-            }
+        if outcome.status == .cancelled {
+            // The worktree is the only full copy of the run's unapplied work.
+            // Deleting it here is what made a Stop destroy work the operator
+            // never saw; the record keeps naming the tree so the inspector
+            // can offer the operator the keep-or-clear decision.
             return outcome.report
         }
         guard var report = outcome.report else { return nil }
@@ -768,11 +809,22 @@ public final class SubagentInstance: Identifiable, ObservableObject {
 
     /// A run that never reached its loop still owns a worktree. Called from the
     /// scheduler/context failure paths so a refused run does not leave a branch
-    /// and a directory behind.
-    private func discardWorktree(for isolation: AgentIsolation) async {
-        guard case .worktree(let path, let branch) = isolation,
-              let worktree = try? await WorkspaceIsolation.open(path: path, branch: branch) else { return }
-        await WorkspaceIsolation.cleanup(worktree)
+    /// and a directory behind. The discard runs on its own task because the
+    /// failure path can be a CANCELLED run (stopped while it waited for
+    /// admission), and git must not be spawned from a cancelled task. The
+    /// repository root and base commit travel with the plan so a submodule or
+    /// `--separate-git-dir` checkout is still found.
+    private func discardWorktree(plan: AgentSpawnPlan) async {
+        await Task.detached(priority: .utility) {
+            guard case .worktree(let path, let branch) = plan.isolation,
+                  let worktree = try? await WorkspaceIsolation.open(
+                      path: path,
+                      branch: branch,
+                      repositoryRoot: plan.repositoryRoot,
+                      baseCommit: plan.baseCommit
+                  ) else { return }
+            await WorkspaceIsolation.cleanup(worktree)
+        }.value
     }
 
     /// The loop's events, applied to the drawer's own state.
@@ -1349,6 +1401,14 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         }
         return fresh
     }
+
+    /// The same drain for the model-backed loop, which runs outside this
+    /// instance's task: `send_subagent_message` and the inspector's message
+    /// box report delivery, and before this hook the loop never read the
+    /// queue, so a steering note was recorded and silently ignored.
+    func drainUnconsumedSteering() -> [(sender: String, content: String)] {
+        drainUnconsumedMessages().map { ($0.sender, $0.content) }
+    }
 }
 
 // MARK: - Subagent Tool Executor
@@ -1661,8 +1721,13 @@ public final class SubagentManager: ObservableObject {
         Task.detached(priority: .utility) {
             // A record left `.running` by a crash has no live instance to Stop
             // and no terminal status to clear. Nothing can be in flight before
-            // this owner exists, so the launch sweep closes those records first.
-            AgentRunStore.shared.reconcileInterruptedRuns()
+            // this owner exists, so the launch sweep closes those records
+            // first — but a run the operator already spawned while this sweep
+            // runs is live and must not be rewritten underneath its instance.
+            AgentRunStore.shared.reconcileInterruptedRuns(isLive: { runId in
+                SubagentManager.shared.getSubagent(byId: runId)?
+                    .status.isTerminal == false
+            })
             AgentRunStore.shared.prune(policy: policy)
             // The relay asks which restored records it still owes; building
             // that index here keeps the first send from paying for the scan.
@@ -1682,6 +1747,7 @@ public final class SubagentManager: ObservableObject {
         parentMode: AgentMode = .code,
         contextSummary: String? = nil,
         parentSessionId: UUID? = nil,
+        parentTurnId: UUID? = nil,
         workingDirectory: URL? = nil
     ) -> SubagentInstance {
         let instance = SubagentInstance(
@@ -1691,6 +1757,7 @@ public final class SubagentManager: ObservableObject {
             parentMode: parentMode,
             contextSummary: contextSummary,
             parentSessionId: parentSessionId,
+            parentTurnId: parentTurnId,
             workingDirectory: workingDirectory
         )
 
@@ -1704,10 +1771,18 @@ public final class SubagentManager: ObservableObject {
     /// The legacy `spawn` above stays for the canned pipelines (and for the
     /// tests that pin them). This path is what `spawn_subagent` uses when a
     /// backend is available: same manager, same drawer, same status tools, but
-    /// the work is a real agent loop.
+    /// the work is a real agent loop. `notifiesOnFinish` is decided HERE,
+    /// before execution starts: the caller used to set it after `start`,
+    /// and a run that finished inside that window posted its banner for a
+    /// synchronous spawn the operator was already watching.
     @discardableResult
-    func spawnModelBacked(_ plan: AgentSpawnPlan, id: UUID = UUID()) -> SubagentInstance {
+    func spawnModelBacked(
+        _ plan: AgentSpawnPlan,
+        id: UUID = UUID(),
+        notifiesOnFinish: Bool = true
+    ) -> SubagentInstance {
         let instance = SubagentInstance(id: id, plan: plan)
+        instance.notifiesOnFinish = notifiesOnFinish
         register(instance)
         instance.startExecution()
         return instance
@@ -1830,6 +1905,23 @@ public final class SubagentManager: ObservableObject {
             child.cancel(reason: reason)
         }
         Task { await AgentScheduler.shared.cancelRuns(parentSessionId: sessionId, reason: reason) }
+    }
+
+    /// Stops only the runs the given coordinator TURN spawned.
+    ///
+    /// The session-wide cancel above reaches runs spawned by EARLIER turns of
+    /// the same conversation, destroying background work the stopped turn never
+    /// owned — and a cancelled run's unapplied worktree is the only copy of
+    /// its work. The Stop button cancels by turn id so a background run
+    /// launched in an earlier turn survives a Stop and keeps its worktree.
+    public func cancelTurnRuns(parentTurnId: UUID, reason: String = "The coordinator turn was stopped.") {
+        let children = allSubagents.filter {
+            $0.parentTurnId == parentTurnId && !$0.status.isTerminal
+        }
+        for child in children {
+            child.cancel(reason: reason)
+        }
+        Task { await AgentScheduler.shared.cancelRuns(parentTurnId: parentTurnId, reason: reason) }
     }
 
     /// Removes finished runs from the drawer.

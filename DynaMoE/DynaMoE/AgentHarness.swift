@@ -2473,7 +2473,7 @@ public final class SpawnSubagentTool: AgentTool {
                 isolation: Self.isolation(from: arguments["isolation"]),
                 workingDirectory: spawnDirectory,
                 parentSessionId: AgentHarness.shared.currentSessionId,
-                parentTurnId: nil,
+                parentTurnId: AgentHarness.shared.currentTurnId,
                 parentMode: parentMode,
                 thinking: (arguments["thinking"] as? Bool) ?? false,
                 operatorOverride: false,
@@ -2486,7 +2486,11 @@ public final class SpawnSubagentTool: AgentTool {
                     runId: runId,
                     sessionId: runId
                 )
-                let subagent = SubagentManager.shared.spawnModelBacked(plan, id: runId)
+                let subagent = SubagentManager.shared.spawnModelBacked(
+                    plan,
+                    id: runId,
+                    notifiesOnFinish: runInBackground
+                )
                 return await Self.respond(
                     subagent: subagent,
                     runInBackground: runInBackground,
@@ -2526,7 +2530,11 @@ public final class SpawnSubagentTool: AgentTool {
                         runId: runId,
                         sessionId: runId
                     )
-                    let subagent = SubagentManager.shared.spawnModelBacked(plan, id: runId)
+                    let subagent = SubagentManager.shared.spawnModelBacked(
+                        plan,
+                        id: runId,
+                        notifiesOnFinish: runInBackground
+                    )
                     return await Self.respond(
                         subagent: subagent,
                         runInBackground: runInBackground,
@@ -2566,10 +2574,9 @@ public final class SpawnSubagentTool: AgentTool {
         runInBackground: Bool,
         maxOutputLength: Int
     ) async -> (resultJSON: String, stdout: String?, stderr: String?, isCompleted: Bool) {
-        // A synchronous caller is waiting on the tool card; a background one is
-        // not, and only the background run should ask for attention when it
-        // ends.
-        subagent.notifiesOnFinish = runInBackground
+        // The notification decision is made at spawn time (before execution
+        // starts); a synchronous caller is watching the tool card, and only a
+        // background run should ask for attention when it ends.
         let worktree = AgentHarness.worktreeDescription(of: subagent)
         if runInBackground {
             var msg = "Subagent [\(subagent.role)] spawned in background (ID: \(subagent.id.uuidString)). You are responsible for its outcome: when you need its results, call get_subagent_status with wait=true, then present the report to the user in your reply. The user never contacts the subagent directly."
@@ -3168,17 +3175,29 @@ public final class ApplySubagentChangesTool: AgentTool {
                 message = "The run had no changes to apply. Its worktree has been removed."
             } else {
                 let count = outcome.changedFiles.count
-                message = "Applied \(count) file\(count == 1 ? "" : "s") from \(outcome.branch) onto the working tree. The changes are unstaged; review them and commit when ready. The worktree has been removed."
+                let destination = outcome.destinationBranch.map { " branch '\($0)'" } ?? " the working tree"
+                var composed = "Applied \(count) file\(count == 1 ? "" : "s") from \(outcome.branch) onto\(destination). The changes are unstaged; review them and commit when ready."
+                if outcome.keptIgnoredFiles.isEmpty {
+                    composed += " The worktree has been removed."
+                } else {
+                    composed += " The worktree was KEPT: it also holds git-ignored files a patch cannot carry (\(outcome.keptIgnoredFiles.joined(separator: ", "))). Retrieve them manually before the run is cleared."
+                }
+                message = composed
             }
-            let json = AgentHarness.toolSuccessJSON(tool: "apply_subagent_changes", data: [
+            var jsonData: [String: Any] = [
                 "subagent_id": outcome.runId.uuidString,
                 "role": outcome.role,
                 "branch": outcome.branch,
                 "applied_files": outcome.changedFiles,
                 "already_applied": outcome.alreadyApplied,
                 "applied_at": formatter.string(from: outcome.appliedAt),
+                "kept_ignored_files": outcome.keptIgnoredFiles,
                 "message": message
-            ])
+            ]
+            if let destination = outcome.destinationBranch {
+                jsonData["destination_branch"] = destination
+            }
+            let json = AgentHarness.toolSuccessJSON(tool: "apply_subagent_changes", data: jsonData)
             return (json, message, nil, false)
         } catch {
             let err = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
@@ -3516,6 +3535,12 @@ public final class AgentHarness {
     public var maxToolOutputLength: Int = 4000
     /// Session that owns the in-flight agent run; stamped onto spawned subagents.
     public var currentSessionId: UUID? = nil
+    /// The coordinator TURN that owns the in-flight generation (one operator
+    /// send and its continuations; a fresh send replaces it, a continuation
+    /// keeps it). Stamped onto spawned runs so a Stop scopes cancellation to
+    /// the turn that spawned the run instead of every run the conversation
+    /// ever spawned.
+    public var currentTurnId: UUID? = nil
 
     // MARK: - Web Search Loop Guard
     // Termination for tool loops is structural, not a matter of model capability: `web_search`
@@ -3901,9 +3926,14 @@ public final class AgentHarness {
 
     /// Tools a subagent run may never be given: they reach the coordinator's
     /// own tool registry or would let a run delegate again. Delegation is one
-    /// level, so a child has no subagent surface at all.
+    /// level, so a child has no subagent surface at all — including the
+    /// read-only-looking status tools, which operate PROCESS-WIDE
+    /// (`get_subagent_status` answers any run's summary and marks it relayed,
+    /// which suppresses that run's own report) and are not write-capable, so
+    /// without this entry a read-only spawn needed no card to reach them.
     public static let runScopedForbiddenToolNames: Set<String> = [
-        "tools_discover", "tools_load", "tools_unload", "spawn_subagent", "apply_subagent_changes"
+        "tools_discover", "tools_load", "tools_unload", "spawn_subagent", "apply_subagent_changes",
+        "get_subagent_status", "send_subagent_message", "list_subagents"
     ]
 
     public private(set) var runId: UUID?
@@ -5997,6 +6027,25 @@ public final class AgentHarness {
                 )
                 return (json, rec, false)
             }
+            // The approval races a Stop: an Approve click that lands while the
+            // run's task is being cancelled must not execute the write it
+            // approved. The decision was made for a run the operator has
+            // already abandoned, so it is reported back as not executed rather
+            // than performed.
+            if Task.isCancelled {
+                let err = "Action not executed: this run was stopped while '\(call.name)' was awaiting approval. Do not retry it."
+                let json = AgentHarness.toolErrorJSON(tool: call.name, error: err)
+                let rec = ToolCallRecord(
+                    name: call.name,
+                    arguments: strArgs,
+                    rawArguments: call.rawArguments,
+                    status: .rejected,
+                    output: AgentHarness.renderToolResultForModel(json),
+                    error: err,
+                    executionDurationSeconds: CFAbsoluteTimeGetCurrent() - startTime
+                )
+                return (json, rec, false)
+            }
         }
         // maxOutputLength (and maxToolOutputLength) is a TOKEN budget; tools work in
         // characters, so convert with a conservative chars-per-token estimate.
@@ -6996,6 +7045,14 @@ public final class AgentHarness {
         currentDirectory: URL,
         timeoutSeconds: TimeInterval = 120
     ) async throws -> (exitCode: Int32, stdout: String, stderr: String) {
+        // A cancelled task must not spawn a child. `withTaskCancellationHandler`
+        // invokes its cancellation handler synchronously when the task is
+        // already cancelled, so spawning from here reached `killProcessTree`
+        // before `process.run()` and `terminate()` raised an uncatchable
+        // NSInvalidArgumentException on the never-launched task. The callers
+        // that land here from a cancellation path (`WorkspaceIsolation.git`)
+        // treat a thrown CancellationError as "stopped", which is the truth.
+        if Task.isCancelled { throw CancellationError() }
         let process = Process()
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -7025,10 +7082,27 @@ public final class AgentHarness {
             var isTimedOut = false
             var isCancelled = false
             var timerWorkItem: DispatchWorkItem?
+            /// True once `process.run()` returned. `terminate()` raises an
+            /// uncatchable ObjC exception on a process that never launched, so
+            /// every kill path has to know whether there is anything to kill.
+            var hasLaunched = false
+            /// True once a cancellation or timeout asked for the process tree's
+            /// death. Recorded even before launch so the run block can honour a
+            /// kill that raced its own `process.run()`.
+            var killRequested = false
 
             func cancelTimer() {
                 timerWorkItem?.cancel()
                 timerWorkItem = nil
+            }
+
+            /// Records the launch; returns whether a kill was requested while
+            /// the process was not yet running, so the run block can apply it.
+            func noteLaunched() -> Bool {
+                lock.lock()
+                defer { lock.unlock() }
+                hasLaunched = true
+                return killRequested
             }
         }
 
@@ -7067,6 +7141,15 @@ public final class AgentHarness {
         }
 
         let killProcessTree: @Sendable () -> Void = {
+            state.lock.lock()
+            state.killRequested = true
+            let hasLaunched = state.hasLaunched
+            state.lock.unlock()
+            // Nothing to signal before `process.run()` (terminate() aborts the
+            // process on a never-launched task) or after the process exited.
+            // The pre-launch case is honoured by the run block, which applies
+            // the kill the moment the launch succeeds.
+            guard hasLaunched, process.isRunning else { return }
             let pid = process.processIdentifier
             if pid > 0 {
                 kill(-pid, SIGTERM)
@@ -7103,6 +7186,12 @@ public final class AgentHarness {
                 DispatchQueue.global(qos: .userInitiated).async {
                     do {
                         try process.run()
+                        // A cancellation (or timeout) that landed between the
+                        // entry check and this launch is applied here: the
+                        // kill path could not act on a not-yet-launched task.
+                        if state.noteLaunched() {
+                            killProcessTree()
+                        }
                         process.waitUntilExit()
 
                         state.cancelTimer()

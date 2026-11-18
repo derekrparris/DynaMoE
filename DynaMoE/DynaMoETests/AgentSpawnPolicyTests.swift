@@ -102,6 +102,33 @@ final class AgentSpawnPolicyTests: XCTestCase {
         )
     }
 
+    func testModelSuppliedBudgetsAreClampedToBoundsTheAppCanSurvive() {
+        // The spawn's budget fields arrive from a MODEL's arguments. A huge
+        // `max_wall_clock_seconds` used to reach the loop's nanosecond
+        // conversion and trap, taking the whole app down; every field is now
+        // clamped to `AgentBudget`'s own bounds rather than merely floored.
+        let definition = AgentRolePresetCatalog.definition(for: .general)
+        let inflated = AgentRolePresetCatalog.budget(
+            for: definition,
+            overrides: AgentBudgetOverrides(
+                maxSteps: Int.max,
+                maxCompletionTokens: Int.max,
+                maxWallClockSeconds: Int.max
+            )
+        )
+        XCTAssertEqual(inflated.maxSteps, AgentBudget.maximumSteps)
+        XCTAssertEqual(inflated.maxCompletionTokens, AgentBudget.maximumCompletionTokens)
+        XCTAssertEqual(inflated.maxWallClockSeconds, AgentBudget.maximumWallClockSeconds)
+        // Within the bounds, the caller's number still wins exactly.
+        let honest = AgentRolePresetCatalog.budget(
+            for: definition,
+            overrides: AgentBudgetOverrides(maxSteps: 5, maxCompletionTokens: 900, maxWallClockSeconds: 90)
+        )
+        XCTAssertEqual(honest.maxSteps, 5)
+        XCTAssertEqual(honest.maxCompletionTokens, 900)
+        XCTAssertEqual(honest.maxWallClockSeconds, 90)
+    }
+
     func testApprovalPolicyIsDenyInPlanMode() {
         let implementer = AgentRolePresetCatalog.definition(for: .implementer)
         XCTAssertEqual(
@@ -231,6 +258,53 @@ final class AgentSpawnPolicyTests: XCTestCase {
         // set before the catalog, which is what keeps delegation one level.
         XCTAssertTrue(AgentHarness.runScopedForbiddenToolNames.contains("spawn_subagent"))
         XCTAssertTrue(AgentHarness.runScopedForbiddenToolNames.contains("apply_subagent_changes"))
+    }
+
+    func testTheSubagentStatusFamilyIsNeverGivenToARun() {
+        // `get_subagent_status`, `list_subagents` and `send_subagent_message`
+        // look read-only but operate PROCESS-WIDE: the status tool answers any
+        // run's summary and marks it relayed, which suppresses that run's own
+        // report — and none of the three is write-capable, so without this
+        // entry a read-only spawn needed no card to reach them.
+        for name in ["get_subagent_status", "send_subagent_message", "list_subagents"] {
+            XCTAssertTrue(
+                AgentHarness.runScopedForbiddenToolNames.contains(name),
+                "'\(name)' must be in the run-scoped forbidden set"
+            )
+        }
+        do {
+            _ = try AgentRunContext.make(
+                runId: UUID(),
+                sessionId: UUID(),
+                toolNames: ["file_read", "get_subagent_status"],
+                workingDirectory: FileManager.default.temporaryDirectory,
+                mode: .code,
+                approvalPolicy: .auto,
+                workspaceIsolated: false,
+                approvalHandler: nil
+            )
+            XCTFail("the status family must be refused at run-scope configuration")
+        } catch let error as AgentRunScopeError {
+            guard case .forbiddenTool("get_subagent_status") = error else {
+                return XCTFail("expected a get_subagent_status refusal, got \(error)")
+            }
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+        do {
+            let definition = AgentRolePresetCatalog.definition(for: .explore)
+            _ = try AgentSpawnResolver.resolveTools(
+                request(tools: ["file_read", "list_subagents", "send_subagent_message"]),
+                definition: definition
+            )
+            XCTFail("the status family must be refused at spawn resolution")
+        } catch let error as AgentSpawnError {
+            guard case .forbiddenTool = error else {
+                return XCTFail("expected a forbiddenTool refusal, got \(error)")
+            }
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
     }
 
     func testPlanModeNeverAsksForASpawn() {

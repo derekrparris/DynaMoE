@@ -93,8 +93,8 @@ struct SubagentInspectorView: View {
             reloadStored()
             consumeManagerSelection()
         }
-        .onChange(of: manager.subagents.count) { _ in reloadStored() }
-        .onChange(of: manager.activeSubagentsCount) { _ in reloadStored() }
+        .onChange(of: manager.subagents.count) { _, _ in reloadStored() }
+        .onChange(of: manager.activeSubagentsCount) { _, _ in reloadStored() }
         // A notification click sets the manager's selection; the pane keeps its
         // own selection state, so it has to take the value and clear it.
         .onChange(of: manager.selectedSubagentId) { _, _ in consumeManagerSelection() }
@@ -521,6 +521,7 @@ private struct SubagentRunDetailView: View {
     @State private var showThinking = true
     @State private var isApplying = false
     @State private var applyError: String?
+    @State private var applyNotice: String?
     @State private var appliedHereAt: Date?
 
     /// The record is a value snapshot, so an apply performed from this pane is
@@ -673,6 +674,12 @@ private struct SubagentRunDetailView: View {
                 metaRow("Branch", branch)
                 if let appliedAt {
                     metaRow("Applied", Self.dateFormatter.string(from: appliedAt))
+                    // The record answers "where did it go": an apply lands on
+                    // whatever was checked out, and the branch is recorded for
+                    // exactly that reason.
+                    if let destination = record.appliedToBranch {
+                        metaRow("Applied to", destination)
+                    }
                 } else if record.status.isTerminal, FileManager.default.fileExists(atPath: worktreePath) {
                     Text("Isolated changes are waiting. Apply them below, or let the coordinator land them with apply_subagent_changes.")
                         .font(.system(size: 9.5))
@@ -1027,6 +1034,12 @@ private struct SubagentRunDetailView: View {
                     .foregroundColor(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if let applyNotice {
+                Text(applyNotice)
+                    .font(.system(size: 10))
+                    .foregroundColor(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -1034,10 +1047,14 @@ private struct SubagentRunDetailView: View {
         guard !isApplying else { return }
         isApplying = true
         applyError = nil
+        applyNotice = nil
         Task {
             do {
                 let outcome = try await SubagentApplyControl.apply(runId: record.id)
                 appliedHereAt = outcome.appliedAt
+                if !outcome.keptIgnoredFiles.isEmpty {
+                    applyNotice = "Applied the tracked patch, but kept the worktree: it also holds git-ignored files a patch cannot carry (\(outcome.keptIgnoredFiles.joined(separator: ", "))). Retrieve them manually before clearing the run."
+                }
                 onRecordChanged()
             } catch {
                 applyError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription

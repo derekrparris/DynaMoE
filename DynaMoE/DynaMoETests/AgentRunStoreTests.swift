@@ -33,7 +33,9 @@ final class AgentRunStoreTests: XCTestCase {
         createdAt: Date = Date(),
         completedAt: Date? = nil,
         status: AgentRunStatus = .completed,
-        transcript: [AgentTranscriptEntry] = []
+        transcript: [AgentTranscriptEntry] = [],
+        isolation: AgentIsolation = .none,
+        appliedAt: Date? = nil
     ) -> AgentRunRecord {
         AgentRunRecord(
             id: id,
@@ -48,12 +50,14 @@ final class AgentRunStoreTests: XCTestCase {
                 displayName: "Local model"
             ),
             workingDirectory: "/tmp",
+            isolation: isolation,
             allowedTools: ["file_read"],
             status: status,
             createdAt: createdAt,
             startedAt: createdAt,
             completedAt: completedAt,
-            transcript: transcript
+            transcript: transcript,
+            appliedAt: appliedAt
         )
     }
 
@@ -238,6 +242,53 @@ final class AgentRunStoreTests: XCTestCase {
         )
         XCTAssertEqual(removed.count, 1)
         XCTAssertEqual(store.load(sessionId: sessionId).count, 1)
+    }
+
+    func testRetentionNeverDeletesAnUnappliedIsolatedRunsRecord() throws {
+        let store = makeStore()
+        let sessionId = UUID()
+        let now = Date()
+        let ancient = now.addingTimeInterval(-90 * 86_400)
+        // An unapplied isolated run's record is the only thing keeping the
+        // launch sweep from treating its worktree as orphaned: prune the record
+        // and the very next sweep deletes the only full copy of the work.
+        // Completed AND cancelled unapplied writers are both protected; an
+        // applied one prunes like any other terminal record.
+        let unapplied = record(
+            sessionId: sessionId,
+            createdAt: ancient,
+            completedAt: ancient,
+            isolation: .worktree(path: "/tmp/w/x", branch: "dynamoe/run-x"),
+            appliedAt: nil
+        )
+        let cancelledWriter = record(
+            sessionId: sessionId,
+            createdAt: ancient,
+            completedAt: ancient,
+            status: .cancelled,
+            isolation: .worktree(path: "/tmp/w/y", branch: "dynamoe/run-y"),
+            appliedAt: nil
+        )
+        let applied = record(
+            sessionId: sessionId,
+            createdAt: ancient,
+            completedAt: ancient,
+            isolation: .worktree(path: "/tmp/w/z", branch: "dynamoe/run-z"),
+            appliedAt: ancient
+        )
+        store.saveImmediately(unapplied)
+        store.saveImmediately(cancelledWriter)
+        store.saveImmediately(applied)
+
+        let removed = store.prune(
+            now: now,
+            policy: .init(keepNewest: 0, keepDays: 0, minimumAgeHours: 24)
+        )
+
+        XCTAssertEqual(removed, [applied.id])
+        XCTAssertEqual(store.loadAny(runId: unapplied.id)?.id, unapplied.id)
+        XCTAssertEqual(store.loadAny(runId: cancelledWriter.id)?.id, cancelledWriter.id)
+        XCTAssertNil(store.loadAny(runId: applied.id))
     }
 
     func testARunCanBeFoundWithoutKnowingItsSession() throws {

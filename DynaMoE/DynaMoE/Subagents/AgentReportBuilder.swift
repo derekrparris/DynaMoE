@@ -46,7 +46,11 @@ nonisolated enum AgentReportBuilder {
         var findings: [AgentFinding] = []
         var seen = Set<String>()
         for block in rankedTexts(in: transcript) {
-            let tools = toolNames(inStep: block.entry.stepIndex, transcript: transcript)
+            // Evidence must cite tools whose RESULTS the model had when it
+            // wrote the text — the steps BEFORE this one. The step's own tools
+            // run after the text is emitted, so citing them was evidence for
+            // a claim that could not have seen it.
+            let tools = toolNames(beforeStep: block.entry.stepIndex, transcript: transcript)
             for claim in claims(in: block.text) {
                 let key = normalized(claim)
                 guard seen.insert(key).inserted else { continue }
@@ -164,17 +168,28 @@ nonisolated enum AgentReportBuilder {
         for marker in ["- ", "* ", "• "] where line.hasPrefix(marker) {
             return String(line.dropFirst(marker.count)).trimmingCharacters(in: .whitespaces)
         }
-        let scalars = Array(line.prefix(4))
-        if scalars.count >= 2, scalars[0].isNumber, scalars[1] == "." || scalars[1] == ")" {
-            return String(line.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+        // An ordered marker is one or more DIGITS then "." or ")": the old
+        // form read exactly two scalars, so "10. claim" kept its marker and
+        // read as prose while "1. claim" did not.
+        let scalars = Array(line.prefix(6))
+        var digitCount = 0
+        while digitCount < scalars.count, scalars[digitCount].isNumber {
+            digitCount += 1
+        }
+        if digitCount >= 1, digitCount < scalars.count,
+           scalars[digitCount] == "." || scalars[digitCount] == ")" {
+            return String(line.dropFirst(digitCount + 1)).trimmingCharacters(in: .whitespaces)
         }
         return line
     }
 
-    private static func toolNames(inStep step: Int, transcript: [AgentTranscriptEntry]) -> [String] {
+    /// Tools whose RESULTS the model had before the given step: a step's own
+    /// tools run AFTER its text is emitted, so citing them was evidence for
+    /// a claim that could not have seen it.
+    private static func toolNames(beforeStep step: Int, transcript: [AgentTranscriptEntry]) -> [String] {
         var names: [String] = []
         var seen = Set<String>()
-        for entry in transcript where entry.kind == .toolResult && entry.stepIndex == step {
+        for entry in transcript where entry.kind == .toolResult && entry.stepIndex < step {
             guard let name = entry.toolRecord?.name, seen.insert(name).inserted else { continue }
             names.append(name)
         }

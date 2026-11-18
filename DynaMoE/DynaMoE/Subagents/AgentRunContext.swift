@@ -87,7 +87,24 @@ final class AgentRunContext {
     }
 
     func execute(_ call: AgentToolCall) async -> (resultJSON: String, record: ToolCallRecord, isCompleted: Bool) {
-        await harness.executeTool(
+        // A run stopped between the model's call and this execution must not
+        // perform it. The cancellation lands here as a cancelled task, and the
+        // honest answer is a refused call the transcript records — not work
+        // done for a run the operator has already abandoned.
+        if Task.isCancelled {
+            let error = "This run was stopped before '\(call.name)' could run."
+            let json = AgentHarness.toolErrorJSON(tool: call.name, error: error)
+            let record = ToolCallRecord(
+                name: call.name,
+                arguments: call.arguments.mapValues { String(describing: $0) },
+                rawArguments: call.rawArguments,
+                status: .rejected,
+                output: AgentHarness.renderToolResultForModel(json),
+                error: error
+            )
+            return (json, record, false)
+        }
+        return await harness.executeTool(
             call: call.parsedCall,
             workingDirectory: workingDirectory,
             maxOutputLength: nil,
