@@ -1510,6 +1510,49 @@ final class SubagentLoopTests: XCTestCase {
         )
     }
 
+    /// `complete` succeeds without its (schema-required) summary argument, and
+    /// a run whose only output is that call must still complete rather than
+    /// fail with "the backend produced no final answer". Calls the model emits
+    /// after it are recorded instead of vanishing at the break.
+    func testCompleteWithoutASummaryCompletesAndRecordsLaterCalls() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let backend = ScriptedBackend(turns: [
+            .init(text: "", calls: [
+                AgentToolCall(name: "complete", arguments: [:]),
+                AgentToolCall(name: "file_read", arguments: ["path": "never.txt"])
+            ])
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["complete", "file_read"],
+            policy: .everyStateChange,
+            handler: { _ in true }
+        )
+
+        let outcome = await HeadlessAgentLoop().run(
+            input: input(budget: AgentBudget(
+                maxSteps: 4,
+                maxCompletionTokens: 2_000,
+                maxWallClockSeconds: 600,
+                maxCostUSD: nil
+            )),
+            backend: backend,
+            context: context,
+            emit: { _ in }
+        )
+
+        XCTAssertEqual(outcome.status, .completed, outcome.error ?? "")
+        XCTAssertEqual(outcome.report?.summary, "Task completed.")
+        let abandoned = outcome.transcript.compactMap { entry -> ToolCallRecord? in
+            guard entry.kind == .toolResult,
+                  let record = entry.toolRecord,
+                  record.error?.contains("Not completed") == true else { return nil }
+            return record
+        }
+        XCTAssertEqual(abandoned.map(\.name), ["file_read"])
+    }
+
     // MARK: - Turbo cannot bypass the two reserved cards
 
     /// On case-insensitive APFS a not-yet-existing `.GIT` is the same directory
@@ -1588,6 +1631,57 @@ final class SubagentLoopTests: XCTestCase {
 
         _ = await HeadlessAgentLoop().run(input: input(), backend: backend, context: context, emit: { _ in })
         XCTAssertEqual(counter.count, 1)
+    }
+
+    /// The same rule for a write whose destination is outside the run's
+    /// workspace. `.spawnOnly` already marks it an escape; `.everyStateChange`
+    /// asked for a Turbo-bypassable card, so an unisolated run could write
+    /// anywhere with no approval at all.
+    func testAnOutOfWorkspaceWriteInEveryStateChangeIsACardTurboCannotBypass() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let outside = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dynamoe-escape-\(UUID().uuidString).txt")
+        defer { try? FileManager.default.removeItem(at: outside) }
+        let counter = CallCounter()
+
+        let backend = ScriptedBackend(turns: [
+            .init(text: "writing", calls: [
+                AgentToolCall(
+                    name: "file_write",
+                    arguments: ["path": outside.path, "content": "escaped"]
+                )
+            ]),
+            .init(text: "done", calls: [completeCall("Refused.")])
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["file_write", "complete"],
+            policy: .everyStateChange,
+            handler: { request in
+                counter.increment()
+                XCTAssertTrue(
+                    request.containmentEscape,
+                    "a write outside the workspace is a containment escape"
+                )
+                let bypassed = await MainActor.run {
+                    SubagentApprovalCenter.turboBypasses(
+                        request: request,
+                        honorsTurbo: true,
+                        turboEnabled: true
+                    )
+                }
+                XCTAssertFalse(bypassed)
+                return false
+            }
+        )
+
+        _ = await HeadlessAgentLoop().run(input: input(), backend: backend, context: context, emit: { _ in })
+        XCTAssertEqual(counter.count, 1)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: outside.path),
+            "a declined escape must not be written"
+        )
     }
 }
 

@@ -691,7 +691,16 @@ nonisolated enum WorkspaceIsolation {
         }
 
         let rollback = try stageRollback(changes.changedFiles, in: worktree.repositoryRoot)
-        defer { try? FileManager.default.removeItem(at: rollback.directory) }
+        // The snapshot exists for ONE failure: an apply that dies partway
+        // through. When the restore itself fails, deleting this directory was
+        // deleting the only recovery copy in exactly the state the snapshot
+        // was taken for. The error names the path instead.
+        var keepRollback = false
+        defer {
+            if !keepRollback {
+                try? FileManager.default.removeItem(at: rollback.directory)
+            }
+        }
 
         let (applyCode, _, applyErr) = try await git(
             ["apply", "--binary", "--whitespace=nowarn", patchURL.path],
@@ -706,8 +715,9 @@ nonisolated enum WorkspaceIsolation {
                     "the write failed partway through and was rolled back." + suffix
                 )
             }
+            keepRollback = true
             throw WorkspaceIsolationError.applyFailed(
-                "the write failed partway through and the rollback did NOT fully restore the tree; inspect it before retrying." + suffix
+                "the write failed partway through and the rollback did NOT fully restore the tree. The files captured before the apply are kept at '\(rollback.directory.path)'; inspect the tree and that snapshot before retrying." + suffix
             )
         }
         return WorkspaceApplyResult(
@@ -1002,16 +1012,24 @@ nonisolated enum WorkspaceIsolation {
             let created = values?.creationDate ?? values?.contentModificationDate ?? now
             guard now.timeIntervalSince(created) >= olderThan else { continue }
 
-            // A worktree is the ONLY full copy of a run that has not been
-            // applied. Age is not evidence that its work is safe to destroy:
-            // the record keeps a bounded diff, not the files. Leave it alone
-            // until the operator applies or clears the run — including a
-            // CANCELLED run's tree, which a Stop must not turn into the one
-            // path that destroys work.
-            if let runId = UUID(uuidString: name),
-               let record = AgentRunStore.shared.loadAny(runId: runId),
-               record.appliedAt == nil {
-                continue
+            // A worktree is the ONLY full copy of a run's work when the run
+            // was never applied, or was applied while keeping git-ignored
+            // files a patch could not carry. Age is not evidence that the
+            // work is safe to destroy: the record keeps a bounded diff, not
+            // the files. Leave it alone until the operator clears the run —
+            // including a CANCELLED run's tree, which a Stop must not turn
+            // into the one path that destroys work.
+            //
+            // A record this build CANNOT decode is not an absent record: the
+            // store deliberately keeps a newer-schema or corrupt file, and
+            // that file is the worktree's only index. Probe for the file
+            // itself before treating a UUID-named tree as orphaned.
+            if let runId = UUID(uuidString: name) {
+                if let record = AgentRunStore.shared.loadAny(runId: runId) {
+                    if record.holdsWorktreeWork { continue }
+                } else if AgentRunStore.shared.hasRecordFile(runId: runId) {
+                    continue
+                }
             }
 
             if let repositoryRoot = await owningRepository(for: path),
@@ -1056,15 +1074,47 @@ nonisolated enum WorkspaceIsolation {
         return branch.isEmpty || branch == "HEAD" ? nil : branch
     }
 
+    /// A best-effort `git diff --stat` for the approval card, bounded so a
+    /// change set with hundreds of files cannot turn the card into a wall of
+    /// text. Nil when git cannot say (the card then falls back to the recorded
+    /// file list).
+    static func diffStat(_ worktree: AgentWorktree, lineLimit: Int = 14) async -> String? {
+        _ = try? await git(["add", "-N", "."], in: worktree.path)
+        guard let (code, out, _) = try? await git(
+            ["diff", worktree.baseCommit, "--stat", "--stat-width=78", "--no-color"],
+            in: worktree.path
+        ), code == 0 else { return nil }
+        let lines = out
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        guard !lines.isEmpty else { return nil }
+        if lines.count <= lineLimit { return lines.joined(separator: "\n") }
+        let kept = lines.prefix(lineLimit).joined(separator: "\n")
+        return kept + "\n… and \(lines.count - lineLimit) more line(s)"
+    }
+
     private static func git(
         _ arguments: [String],
         in directory: URL
     ) async throws -> (Int32, String, String) {
-        try await AgentHarness.runProcess(
+        // An inherited `diff.noprefix=true` strips the `a/` and `b/` prefixes
+        // from every patch this file generates, and `git apply --check` then
+        // refuses it with "header lacks filename information". An inherited
+        // `GIT_DIR` / `GIT_WORK_TREE` can redirect the apply into another
+        // repository entirely, so the child gets neither.
+        var environment = ControlledProcessRunner.toolEnvironment()
+        for key in environment.keys where key.hasPrefix("GIT_") {
+            environment.removeValue(forKey: key)
+        }
+        var arguments = arguments
+        arguments.insert(contentsOf: ["-c", "diff.noprefix=false"], at: 0)
+        return try await AgentHarness.runProcess(
             executableURL: gitURL,
             arguments: arguments,
             currentDirectory: directory,
-            timeoutSeconds: 300
+            timeoutSeconds: 300,
+            environment: environment
         )
     }
 }

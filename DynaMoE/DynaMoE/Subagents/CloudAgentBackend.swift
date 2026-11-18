@@ -306,9 +306,14 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
     }
 
     static func arguments(from json: String) -> [String: Any] {
+        // An unparseable block answers with NO arguments, not a fabricated
+        // `_raw_arguments` key: the raw text already travels on the call's own
+        // `rawArguments` (and from there into the transcript), and a synthetic
+        // key turned a malformed call into one with a plausible-looking
+        // argument name that no tool declares.
         guard let data = json.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return ["_raw_arguments": json]
+            return [:]
         }
         return object
     }

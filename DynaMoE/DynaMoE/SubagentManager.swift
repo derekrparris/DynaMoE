@@ -230,6 +230,9 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     /// The branch the destination tree had checked out when this run's work
     /// landed, so the record answers "where did it go" after the fact.
     @Published private(set) var appliedToBranch: String? = nil
+    /// Files a patch could not carry that are still in the run's worktree, so
+    /// an APPLIED run can still keep its tree and the launch sweep protects it.
+    @Published private(set) var keptIgnoredFiles: [String] = []
     /// The step currently streaming. The loop mints one delta id pair per step,
     /// so a new id is the boundary that clears the previous step's text.
     @Published public private(set) var liveAssistantText: String = ""
@@ -329,6 +332,7 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         liveStatusText = reason
         completedAt = Date()
         finalSummary = reason
+        lastError = reason
         persistRecord()
 
         for c in continuations {
@@ -419,11 +423,12 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                     timestamp: message.timestamp
                 )
             },
-            error: status == .failed ? (lastError ?? finalSummary) : nil,
+            error: (status == .failed || status == .cancelled) ? (lastError ?? finalSummary) : nil,
             depth: 0,
             summaryRelayed: isSummaryRelayed,
             appliedAt: appliedAt,
             appliedToBranch: appliedToBranch,
+            keptIgnoredFiles: keptIgnoredFiles.isEmpty ? nil : keptIgnoredFiles,
             repositoryRoot: plan?.repositoryRoot?.path,
             baseCommit: plan?.baseCommit
         )
@@ -466,15 +471,18 @@ public final class SubagentInstance: Identifiable, ObservableObject {
 
     /// Records that this run's worktree was kept after an apply because it
     /// holds ignored files a patch cannot carry, so the inspector's Apply
-    /// does not read as unfinished business without a reason.
+    /// does not read as unfinished business without a reason — and so the
+    /// launch sweep keeps the tree instead of deleting the only copy of them.
     func noteKeptIgnoredFiles(_ files: [String]) {
         guard !files.isEmpty else { return }
+        keptIgnoredFiles = files
         let note = "The tracked patch was applied, but the worktree was kept: it also holds files a patch cannot carry (\(files.joined(separator: ", "))). Retrieve them manually before clearing the run."
         if var current = report {
             current.openQuestions.append(note)
             report = current
         }
         AgentRunStore.shared.mutate(runId: id, sessionId: parentSessionId) { current in
+            current.keptIgnoredFiles = files
             if var report = current.report {
                 report.openQuestions.append(note)
                 current.report = report
@@ -1018,6 +1026,31 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         executionDurationSeconds = duration
         finalSummary = summary
         liveStatusText = liveStatus
+
+        // A steering note can land after the loop's last drain and before this
+        // transition. `send_subagent_message` reported it delivered, so it must
+        // not vanish: record the fact that it arrived too late to be consumed.
+        for note in drainUnconsumedMessages() {
+            let text = "Steering from \(note.sender) arrived after the run's final step, too late to be incorporated: \(note.content)"
+            transcript.append(SubagentStepRecord(
+                stepIndex: currentStepIndex,
+                actionName: "steering",
+                arguments: ["sender": note.sender],
+                output: text,
+                isError: true
+            ))
+            // The model-backed record is persisted from `runTranscript`, not
+            // from the live step list, so the note belongs there too or the
+            // stored run would still read as if nothing had arrived.
+            if !runTranscript.isEmpty {
+                runTranscript.append(AgentTranscriptEntry(
+                    index: runTranscript.count,
+                    stepIndex: currentStepIndex,
+                    kind: .status,
+                    text: text
+                ))
+            }
+        }
 
         for continuation in continuations {
             continuation.resume(returning: summary)
@@ -1867,7 +1900,8 @@ public final class SubagentManager: ObservableObject {
         contextSummary: String? = nil,
         parentSessionId: UUID? = nil,
         parentTurnId: UUID? = nil,
-        workingDirectory: URL? = nil
+        workingDirectory: URL? = nil,
+        notifiesOnFinish: Bool = true
     ) -> SubagentInstance {
         let instance = SubagentInstance(
             role: role,
@@ -1879,6 +1913,7 @@ public final class SubagentManager: ObservableObject {
             parentTurnId: parentTurnId,
             workingDirectory: workingDirectory
         )
+        instance.notifiesOnFinish = notifiesOnFinish
 
         register(instance)
         instance.startExecution()
@@ -1967,7 +2002,7 @@ public final class SubagentManager: ObservableObject {
         }
         for id in removed {
             subagentsById.removeValue(forKey: id)
-            instanceObservers.removeValue(forKey: id)
+            instanceObservers.removeValue(forKey: id)?.cancel()
         }
         lock.unlock()
         guard !removed.isEmpty else { return }
@@ -2072,15 +2107,16 @@ public final class SubagentManager: ObservableObject {
         lock.lock()
         terminal = subagentsOrder.filter {
             $0.status.isTerminal
-                && (sessionId == nil || $0.parentSessionId == sessionId)
-                && !($0.modelPlan?.isolation.isIsolated == true && $0.appliedAt == nil)
+                && (sessionId == nil || $0.parentSessionId == sessionId || $0.parentSessionId == nil)
+                && !($0.modelPlan?.isolation.isIsolated == true
+                    && ($0.appliedAt == nil || !$0.keptIgnoredFiles.isEmpty))
         }
         let clearedIds = Set(terminal.map(\.id))
         let liveIds = Set(subagentsOrder.map(\.id))
         subagentsOrder.removeAll(where: { clearedIds.contains($0.id) })
         for id in clearedIds {
             subagentsById.removeValue(forKey: id)
-            instanceObservers.removeValue(forKey: id)
+            instanceObservers.removeValue(forKey: id)?.cancel()
         }
         lock.unlock()
 
@@ -2105,7 +2141,7 @@ public final class SubagentManager: ObservableObject {
         AgentRunStore.shared.deleteClearableRecords(sessionId: sessionId) { record in
             !clearedIds.contains(record.id)
                 && (record.status.isTerminal || !liveIds.contains(record.id))
-                && !(record.isolation.isIsolated && record.appliedAt == nil)
+                && !record.holdsWorktreeWork
         }
 
         // Synchronous: the manager is main-actor state, and a caller that
@@ -2133,14 +2169,23 @@ public final class SubagentManager: ObservableObject {
         // A live run is stopped, not discarded: deleting its record underneath
         // it would drop its terminal write and leave an unstoppable worker.
         guard instance == nil || instance?.status.isTerminal == true else { return }
+        // An apply owns the record and the worktree while it runs. Discarding
+        // mid-apply could delete the record after the patch landed (changes
+        // with nothing naming them) or race cleanup against git.
+        guard !SubagentApplyService.isRunInFlight(runId) else { return }
         guard let record = instance?.snapshotRecord()
             ?? AgentRunStore.shared.load(runId: runId, sessionId: sessionId)
             ?? AgentRunStore.shared.loadAny(runId: runId),
             record.status.isTerminal else { return }
+        // A discard is rare and a wrong race loses landed work, so while ANY
+        // checkout is mid-apply the answer is "not now": a record's stored
+        // `repositoryRoot` can be stale, which is exactly when a narrower check
+        // would miss the claim it was meant to find.
+        guard !SubagentApplyService.hasAnyRepositoryInFlight else { return }
 
         lock.lock()
         subagentsById.removeValue(forKey: runId)
-        instanceObservers.removeValue(forKey: runId)
+        instanceObservers.removeValue(forKey: runId)?.cancel()
         subagentsOrder.removeAll { $0.id == runId }
         lock.unlock()
         subagents.removeAll { $0.id == runId }
@@ -2153,7 +2198,7 @@ public final class SubagentManager: ObservableObject {
         // directory after the record is gone is only safe because this call
         // holds the path and branch from the record itself. Detached because
         // git must not run inside a cancelled/main-actor context.
-        if case .worktree(let path, let branch) = record.isolation, record.appliedAt == nil {
+        if case .worktree(let path, let branch) = record.isolation, record.holdsWorktreeWork {
             let repositoryRoot = record.repositoryRoot.map { URL(fileURLWithPath: $0) }
             let baseCommit = record.baseCommit ?? ""
             Task.detached(priority: .utility) {

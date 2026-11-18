@@ -222,6 +222,22 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         }
     }
 
+    /// Marks a report delivered: the relay index learns it NOW, the durable
+    /// write lands behind the queue.
+    ///
+    /// The fast path of `unrelayedRunIds` answers from the index without
+    /// waiting for the IO queue, so a `mutateLater` that only wrote the field
+    /// left one send's worth of window in which the same run was still listed
+    /// as owed and its report was injected twice.
+    func markRelayed(runId: UUID, sessionId: UUID?) {
+        signatureLock.lock()
+        removeRelayEverywhereLocked(runId: runId)
+        signatureLock.unlock()
+        mutateLater(runId: runId, sessionId: sessionId) { current in
+            current.summaryRelayed = true
+        }
+    }
+
     /// Applies a mutation on the store's IO queue WITHOUT waiting for it.
     ///
     /// For a caller that updates a field nobody reads back synchronously.
@@ -241,6 +257,26 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
             let bounded = Self.bounded(current)
             _ = writeNow(bounded, to: url)
         }
+    }
+
+    /// Whether ANY bucket still holds a file for this run, decodable or not.
+    ///
+    /// The launch sweep needs this distinction: `loadAny` returns nil for a
+    /// corrupt or newer-schema record, and the record is the only thing that
+    /// says a worktree belongs to unapplied work. Treating "cannot decode" as
+    /// "no record" handed the tree to the 14-day clock.
+    func hasRecordFile(runId: UUID) -> Bool {
+        let name = "\(runId.uuidString).json"
+        guard let directories = try? fileManager.contentsOfDirectory(atPath: rootURL.path) else {
+            return false
+        }
+        for directory in directories {
+            let candidate = rootURL
+                .appendingPathComponent(directory, isDirectory: true)
+                .appendingPathComponent(name, isDirectory: false)
+            if fileManager.fileExists(atPath: candidate.path) { return true }
+        }
+        return false
     }
 
     /// The record's actual file when the preferred bucket no longer holds it.
@@ -366,6 +402,15 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         }
         do {
             _ = try FileManager.default.replaceItemAt(url, withItemAt: temporary)
+            // `replaceItemAt` preserves the DESTINATION's metadata, so a record
+            // first written by an older build at 0644 would keep that mode
+            // through every rewrite. Re-assert the owner-only mode here; the
+            // directory is 0700, which is why this is a hardening step rather
+            // than a live exposure.
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: url.path
+            )
         } catch {
             try? FileManager.default.removeItem(at: temporary)
             throw error
@@ -445,6 +490,19 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         unrelayedBySession[bucket]?.remove(runId)
         if unrelayedBySession[bucket]?.isEmpty == true {
             unrelayedBySession.removeValue(forKey: bucket)
+        }
+    }
+
+    /// Drops a run from every bucket. A conversation delete can re-scope a
+    /// record between a caller reading its bucket and marking it relayed, and
+    /// a removal keyed on the old bucket then left the id in the index forever
+    /// (a duplicate report on every later send).
+    private func removeRelayEverywhereLocked(runId: UUID) {
+        for bucket in Array(unrelayedBySession.keys) {
+            unrelayedBySession[bucket]?.remove(runId)
+            if unrelayedBySession[bucket]?.isEmpty == true {
+                unrelayedBySession.removeValue(forKey: bucket)
+            }
         }
     }
 
@@ -605,11 +663,16 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     private func deleteLocked(runId: UUID, sessionId: UUID?) {
         let preferred = fileURL(runId: runId, sessionId: sessionId)
         let url = existingRecordURL(runId: runId, preferredSession: sessionId) ?? preferred
+        // Tombstone AFTER the removal succeeds. A tombstone written first is
+        // never lifted, so a removal that failed (permissions, a locked file)
+        // left a record on disk that every later write refused to update: an
+        // immortal, invisible run. The queue is serial, so a save enqueued
+        // after this still sees the tombstone before it writes.
+        guard (try? fileManager.removeItem(at: url)) != nil else { return }
         noteDeletedRun(runId)
-        try? fileManager.removeItem(at: url)
         signatureLock.lock()
         writtenSignatures[url.path] = nil
-        removeRelayLocked(runId: runId, sessionId: sessionId)
+        removeRelayEverywhereLocked(runId: runId)
         signatureLock.unlock()
     }
 
@@ -662,7 +725,8 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     func deleteSession(_ sessionId: UUID) {
         let url = directory(for: sessionId)
         ioQueue.async { [self] in
-            for var record in load(sessionId: sessionId) where record.isolation.isIsolated && record.appliedAt == nil {
+            var rescueFailed = false
+            for var record in load(sessionId: sessionId) where record.holdsWorktreeWork {
                 if !record.status.isTerminal {
                     record.status = .cancelled
                     record.completedAt = record.completedAt ?? Date()
@@ -674,18 +738,30 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                 record.summaryRelayed = true
                 // Write-new before remove-old: a crash between the two leaves a
                 // duplicate the sweep still protects, while the reverse order
-                // leaves the worktree unprotected. `saveImmediately` is safe
-                // from this thread because the store's synchronous entry points
-                // run inline when the caller already holds `ioQueue` (see
-                // `onQueue`); before that, this line `sync`-ed the queue it was
-                // executing on and libdispatch aborted the process.
-                saveImmediately(record)
+                // leaves the worktree unprotected. If the rescue write FAILS,
+                // the original is the only record and must stay: removing it
+                // would let the sweep dispose of work the operator never saw.
+                // `saveImmediately` is safe from this thread because the store's
+                // synchronous entry points run inline when the caller already
+                // holds `ioQueue` (see `onQueue`); before that, this line
+                // `sync`-ed the queue it was executing on and libdispatch
+                // aborted the process.
+                guard saveImmediately(record) else {
+                    // The rescue write failed, so the ORIGINAL is the only
+                    // record. Removing the directory or tombstoning the
+                    // session below would delete or hide it, which is exactly
+                    // the disposal this branch exists to prevent: leave the
+                    // whole conversation's files where they are.
+                    rescueFailed = true
+                    continue
+                }
                 let original = fileURL(runId: record.id, sessionId: sessionId)
                 try? fileManager.removeItem(at: original)
                 signatureLock.lock()
                 writtenSignatures[original.path] = nil
                 signatureLock.unlock()
             }
+            guard !rescueFailed else { return }
             noteDeletedSession(sessionId)
             try? fileManager.removeItem(at: url)
             signatureLock.lock()
@@ -727,12 +803,11 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     @discardableResult
     func prune(now: Date = Date(), policy: RetentionPolicy = .standard) -> [UUID] {
         // The whole pass runs on the store's IO queue, ordered after every
-        // write in flight. It used to delete then tombstone from an arbitrary
-        // thread, so a `save` that had already passed its `wasDeleted` check
-        // could land AFTER the `removeItem` — resurrecting a pruned record
-        // that the too-late tombstone then blocked from being rewritten: an
-        // immortal, invisible file. `delete(runId:)` already runs on the queue
-        // with the tombstone first; prune must answer the same way.
+        // write in flight. That ordering is what makes remove-then-tombstone
+        // safe: no save can interleave between the two, and a save enqueued
+        // after the pass sees the tombstone. Tombstoning first instead left a
+        // failed removal as an immortal, invisible file that no later write
+        // could update.
         onQueue { [self] in
             let all = loadAll()
             let sorted = all.sorted { Self.sortDate($0) > Self.sortDate($1) }
@@ -749,22 +824,23 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                 // on a slow operator approval) would otherwise be deleted underneath
                 // its own instance, which then rewrites it anyway.
                 guard record.status.isTerminal else { continue }
-                // An unapplied isolated run's record is the only thing keeping its
-                // WORKTREE alive: the launch sweep protects a tree while a
-                // decodable record says unapplied, so pruning the record first
-                // means the very next sweep deletes the run's only copy of its
-                // work. Retention is for conversation history; unapplied work is
-                // the operator's to clear or apply, never the clock's.
-                if record.isolation.isIsolated, record.appliedAt == nil { continue }
+                // An isolated run's record is the only thing keeping its
+                // WORKTREE alive: the launch sweep protects a tree while the
+                // record says unapplied OR names kept ignored files, so
+                // pruning the record first means the very next sweep deletes
+                // the run's only copy of its work. Retention is for
+                // conversation history; that work is the operator's to clear
+                // or apply, never the clock's.
+                if record.holdsWorktreeWork { continue }
                 let url = fileURL(runId: record.id, sessionId: record.parentSessionId)
+                // Tombstone only once the file is gone; see `deleteLocked`.
+                guard (try? fileManager.removeItem(at: url)) != nil else { continue }
                 noteDeletedRun(record.id)
-                if (try? fileManager.removeItem(at: url)) != nil {
-                    removed.append(record.id)
-                    signatureLock.lock()
-                    writtenSignatures[url.path] = nil
-                    removeRelayLocked(runId: record.id, sessionId: record.parentSessionId)
-                    signatureLock.unlock()
-                }
+                removed.append(record.id)
+                signatureLock.lock()
+                writtenSignatures[url.path] = nil
+                removeRelayEverywhereLocked(runId: record.id)
+                signatureLock.unlock()
             }
             return removed
         }

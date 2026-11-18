@@ -76,6 +76,17 @@ enum SubagentApplyService {
     private static var inFlight: Set<UUID> = []
     private static var repositoriesInFlight: Set<String> = []
 
+    /// Whether an apply currently owns a run or a checkout. `discard` consults
+    /// these: deleting the record mid-apply can leave landed changes nothing
+    /// names, or race the worktree's cleanup against its own git call.
+    static func isRunInFlight(_ runId: UUID) -> Bool {
+        inFlight.contains(runId)
+    }
+
+    static var hasAnyRepositoryInFlight: Bool {
+        !repositoriesInFlight.isEmpty
+    }
+
     /// The key one checkout is claimed under. Symlinks are resolved, so two
     /// spellings of it (a repo reached through /tmp against /private/tmp) claim
     /// the SAME entry instead of letting two applies interleave their writes in
@@ -241,6 +252,7 @@ enum SubagentApplyService {
                 AgentRunStore.shared.mutate(runId: runId, sessionId: record.parentSessionId) { current in
                     current.appliedAt = appliedAt
                     current.appliedToBranch = destinationBranch
+                    current.keptIgnoredFiles = keptIgnoredFiles
                     // A record without a report (an interrupted run, an older
                     // schema) still deserves the kept-worktree explanation.
                     if current.report == nil {
@@ -318,9 +330,12 @@ enum SubagentApplyControl {
 
     /// The card the operator sees. `destination` is the main working tree the
     /// patch lands in, resolved by `apply` when the worktree still names it.
+    /// `diffStat` is `git diff --stat` for the worktree, so the decision is
+    /// made against the files that will change rather than a count.
     static func applyRequest(
         for record: AgentRunRecord,
-        destination: String? = nil
+        destination: String? = nil,
+        diffStat: String? = nil
     ) -> AgentApprovalRequest? {
         guard canApply(record),
               case .worktree(let path, let branch) = record.isolation else { return nil }
@@ -331,6 +346,18 @@ enum SubagentApplyControl {
         case 1: summary = "1 changed file"
         default: summary = "\(changed) changed files"
         }
+        // `repositoryRoot` on a record can be stale (a moved checkout), and the
+        // service falls back to git's own answer. Naming the DESTINATION on the
+        // card keeps the approval attached to the tree the patch lands in.
+        let destinationText = destination ?? "the main working tree (resolved when the apply runs)"
+        var reason = "Apply \(summary) from \(branch) to \(destinationText). Changes land unstaged."
+        if let diffStat, !diffStat.isEmpty {
+            reason += "\n\n" + diffStat
+        } else if let files = record.report?.changedFiles, !files.isEmpty {
+            let named = files.prefix(10).joined(separator: "\n")
+            let more = files.count > 10 ? "\n… and \(files.count - 10) more" : ""
+            reason += "\n\n" + named + more
+        }
         return AgentApprovalRequest(
             runId: record.id,
             toolName: "apply_subagent_changes",
@@ -340,7 +367,7 @@ enum SubagentApplyControl {
                 "worktree": path
             ],
             workingDirectory: destination,
-            reason: "Apply \(summary) from \(branch) to the main working tree. Changes land unstaged."
+            reason: reason
         )
     }
 
@@ -357,16 +384,31 @@ enum SubagentApplyControl {
             throw SubagentApplyControlError.runNotFound(runId)
         }
         guard canApply(record),
-              case .worktree(let path, _) = record.isolation else {
+              case .worktree(let path, let branch) = record.isolation else {
             throw SubagentApplyControlError.nothingToApply(record.role)
         }
 
-        var destination: String? = record.repositoryRoot
-        if destination == nil,
-           let repository = await WorkspaceIsolation.owningRepository(for: URL(fileURLWithPath: path)) {
-            destination = repository.path
-        }
-        guard let request = applyRequest(for: record, destination: destination) else {
+        // Git's own answer about the worktree wins over the record's stored
+        // root: a checkout that MOVED leaves `repositoryRoot` stale, and the
+        // apply itself resolves the owning repository from the worktree. The
+        // card must name the tree the patch will actually land in.
+        var destination = await WorkspaceIsolation.owningRepository(
+            for: URL(fileURLWithPath: path, isDirectory: true)
+        )?.path
+        if destination == nil { destination = record.repositoryRoot }
+        // Read the stat from the worktree the apply reads, so the card lists
+        // the changes rather than a count that can be stale.
+        let stat = await WorkspaceIsolation.diffStat(
+            AgentWorktree(
+                runId: record.id,
+                repositoryRoot: destination.map { URL(fileURLWithPath: $0, isDirectory: true) }
+                    ?? URL(fileURLWithPath: path, isDirectory: true),
+                path: URL(fileURLWithPath: path, isDirectory: true),
+                branch: branch,
+                baseCommit: record.baseCommit ?? ""
+            )
+        )
+        guard let request = applyRequest(for: record, destination: destination, diffStat: stat) else {
             throw SubagentApplyControlError.nothingToApply(record.role)
         }
 

@@ -338,6 +338,12 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
     /// An apply lands on whatever is checked out, so the record is the only
     /// place that answers "where did it go" after the fact.
     var appliedToBranch: String?
+    /// Files a patch could not carry that are still in the run's worktree, so
+    /// an APPLIED run can still keep its tree. Optional and additive: a record
+    /// written before this field decodes with nil, which means no kept tree.
+    /// The launch sweep protects a worktree while this is non-empty, because
+    /// deleting it would destroy the only copy of those files.
+    var keptIgnoredFiles: [String]?
     /// The main repository an isolated worktree was cut from. Optional and
     /// additive: a record written before this field falls back to deriving the
     /// root from git, which cannot name the main worktree of a submodule or a
@@ -377,6 +383,7 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
         summaryRelayed: Bool = false,
         appliedAt: Date? = nil,
         appliedToBranch: String? = nil,
+        keptIgnoredFiles: [String]? = nil,
         repositoryRoot: String? = nil,
         baseCommit: String? = nil,
         schemaVersion: Int = AgentRunRecord.currentSchemaVersion
@@ -406,9 +413,20 @@ nonisolated struct AgentRunRecord: Identifiable, Codable, Equatable, Sendable {
         self.summaryRelayed = summaryRelayed
         self.appliedAt = appliedAt
         self.appliedToBranch = appliedToBranch
+        self.keptIgnoredFiles = keptIgnoredFiles
         self.repositoryRoot = repositoryRoot
         self.baseCommit = baseCommit
         self.schemaVersion = schemaVersion
+    }
+
+    /// Whether deleting this record would leave a worktree nothing protects.
+    ///
+    /// An unapplied isolated run's tree is the only full copy of its work; so
+    /// is an APPLIED run's tree kept because a patch could not carry its
+    /// git-ignored files. Both are the operator's to clear, never the clock's.
+    nonisolated var holdsWorktreeWork: Bool {
+        isolation.isIsolated
+            && (appliedAt == nil || !(keptIgnoredFiles?.isEmpty ?? true))
     }
 }
 

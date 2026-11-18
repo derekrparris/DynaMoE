@@ -115,8 +115,6 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         var status: AgentRunStatus = .completed
         var finished = false
 
-        let toolDefinitions = await context.toolDefinitions()
-
         for step in 0..<input.budget.maxSteps {
             if Task.isCancelled {
                 status = .cancelled
@@ -172,6 +170,12 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             // report keep everything — only what the MODEL re-reads each step
             // shrinks.
             messages = Self.compactContextIfNeeded(messages)
+
+            // Resolved EVERY step, not once per run: a `tools_load` inside the
+            // loop changes the loaded set, and a step that still advertised
+            // step 0's array never told the model the tool it had just asked
+            // for was available.
+            let toolDefinitions = await context.toolDefinitions()
 
             let deltaTextId = UUID()
             let deltaThinkingId = UUID()
@@ -427,7 +431,24 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 ))
 
                 if record.status.endsAgentRun(toolName: call.name, isCompleted: execution.isCompleted) {
-                    completionSummary = call.arguments["summary"] as? String
+                    let declared = (call.arguments["summary"] as? String)?
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let declared, !declared.isEmpty {
+                        completionSummary = declared
+                    } else if call.name == "complete" {
+                        // The tool itself succeeds without a summary, so a run
+                        // that called it must not fail for having omitted the
+                        // argument — the previous `as? String` left this nil
+                        // and the run ended "no final answer".
+                        completionSummary = "Task completed."
+                    }
+                    // Calls the model emitted after the terminal one are still
+                    // output it expects to see recorded. Breaking silently made
+                    // them vanish from the transcript.
+                    recordAbandoned(
+                        turn.calls[(offset + 1)...],
+                        reason: "the run ended at '\(call.name)' before this call could execute."
+                    )
                     finishedRun = true
                     break
                 }

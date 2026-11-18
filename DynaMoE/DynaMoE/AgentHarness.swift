@@ -2594,7 +2594,11 @@ public final class SpawnSubagentTool: AgentTool {
             contextSummary: contextSummary,
             parentSessionId: parentSessionId,
             parentTurnId: parentTurnId,
-            workingDirectory: workingDirectory
+            workingDirectory: workingDirectory,
+            // A synchronous caller is already watching the tool card; only a
+            // background run should ask for attention when it ends. The legacy
+            // pipelines were the one spawn path that never said so.
+            notifiesOnFinish: runInBackground
         )
         return await Self.respond(
             subagent: subagent,
@@ -4379,6 +4383,17 @@ public final class AgentHarness {
     private func flushDeferredGrammarSync() {
         guard grammarSyncDeferred, !isRunScoped else { return }
         guard !CompletionEngine.shared.isActive else { return }
+        rebuildGrammarRegistry()
+    }
+
+    /// Applies a deferred rebuild at a turn's start, where the caller HOLDS the
+    /// engine slot. `flushDeferredGrammarSync` refuses whenever the engine
+    /// reads active, and `isActive` counts the caller's own claim — so the one
+    /// moment a turn could safely heal a `tools_load` the engine refused to
+    /// apply was also the moment that check turned it away, and the next step
+    /// ran on the step-0 tool set.
+    public func flushDeferredGrammarSyncForTurn() {
+        guard grammarSyncDeferred, !isRunScoped else { return }
         rebuildGrammarRegistry()
     }
 
@@ -6245,10 +6260,12 @@ public final class AgentHarness {
             return .allow
         case .everyStateChange:
             if stateChanging {
-                // SUBAGENTS.md §7 reserves these two for a real card in EVERY
-                // policy: a shell is arbitrary code with its own cwd, and a
-                // `.git` rewrite can redirect every later git call. Turbo is a
-                // switch over routine writes, so neither is bypassable.
+                // SUBAGENTS.md §7 reserves these for a real card in EVERY
+                // policy: a shell is arbitrary code with its own cwd, a
+                // `.git` rewrite can redirect every later git call, and a
+                // write outside the run's workspace escapes the containment
+                // this policy promises. Turbo is a switch over routine writes,
+                // so none of them is bypassable.
                 if call.name == "shell_run" {
                     return ask("it runs an arbitrary shell command", containmentEscape: true)
                 }
@@ -6259,6 +6276,25 @@ public final class AgentHarness {
                         "it writes git metadata, which can redirect the run's commits into another repository",
                         containmentEscape: true
                     )
+                }
+                if call.name == "file_write" || call.name == "file_edit" || call.name == "git_commit" {
+                    // `.spawnOnly` already refuses to let an unprovable
+                    // destination ride a cardless approval. An UNSCOPED run
+                    // reached this branch instead, so the same write got a
+                    // CONTAINMENT ESCAPE card in the isolated case and a
+                    // Turbo-bypassable one here — the documented rule is that
+                    // an escape is never bypassed, whatever the run's shape.
+                    guard let workspace = workingDirectory ?? defaultWorkingDirectory,
+                          Self.writesStayInsideWorkspace(
+                            call,
+                            workspace: workspace,
+                            workingDirectory: workingDirectory
+                          ) else {
+                        return ask(
+                            "it can change state outside the run's workspace",
+                            containmentEscape: true
+                        )
+                    }
                 }
                 return ask("it changes files, the repository or the system")
             }
@@ -7421,7 +7457,8 @@ public final class AgentHarness {
         executableURL: URL,
         arguments: [String],
         currentDirectory: URL,
-        timeoutSeconds: TimeInterval = 120
+        timeoutSeconds: TimeInterval = 120,
+        environment: [String: String]? = nil
     ) async throws -> (exitCode: Int32, stdout: String, stderr: String) {
         // A cancelled task must not spawn a child. `withTaskCancellationHandler`
         // invokes its cancellation handler synchronously when the task is
@@ -7436,8 +7473,10 @@ public final class AgentHarness {
         let stderrPipe = Pipe()
 
         // 1. Curated environment shared with ControlledProcessRunner: GUI-app PATH
-        //    injection plus non-interactive flags (see toolEnvironment()).
-        let env = ControlledProcessRunner.toolEnvironment()
+        //    injection plus non-interactive flags (see toolEnvironment()). A
+        //    caller that needs a scrubbed child (git must not inherit GIT_DIR)
+        //    passes its own instead.
+        let env = environment ?? ControlledProcessRunner.toolEnvironment()
 
         process.environment = env
         process.executableURL = executableURL

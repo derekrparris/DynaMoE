@@ -515,6 +515,119 @@ final class WorkspaceIsolationTests: XCTestCase {
         )
     }
 
+    func testDiscardIsRefusedWhileAnApplyOwnsTheRun() async throws {
+        let runId = UUID()
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: runId,
+            root: worktreeRoot
+        )
+        let store = AgentRunStore.shared
+        let record = AgentRunRecord(
+            id: runId,
+            parentSessionId: nil,
+            role: "Implementer",
+            preset: .implementer,
+            task: "mid-apply",
+            backend: .scripted,
+            workingDirectory: worktree.path.path,
+            isolation: worktree.isolation,
+            allowedTools: ["file_write"],
+            status: .completed,
+            createdAt: Date(),
+            startedAt: Date(),
+            completedAt: Date()
+        )
+        XCTAssertTrue(store.saveImmediately(record))
+        defer {
+            SubagentApplyService.endApplyForTesting(runId)
+            store.delete(runId: runId, sessionId: nil)
+            Task { await WorkspaceIsolation.cleanup(worktree) }
+        }
+
+        SubagentApplyService.beginApplyForTesting(runId)
+        SubagentManager.shared.discard(runId: runId)
+
+        XCTAssertNotNil(
+            store.loadAny(runId: runId),
+            "a discard must not delete the record while an apply owns it"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: worktree.path.path),
+            "a discard must not remove the worktree while an apply is reading it"
+        )
+    }
+
+    func testTheSweepKeepsAWorktreeApplyKeptForItsIgnoredFiles() async throws {
+        let runId = UUID()
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: runId,
+            root: worktreeRoot
+        )
+        let store = AgentRunStore.shared
+        let applied = AgentRunRecord(
+            id: runId,
+            parentSessionId: nil,
+            role: "Implementer",
+            preset: .implementer,
+            task: "landed a tracked change and kept a .env",
+            backend: .scripted,
+            workingDirectory: worktree.path.path,
+            isolation: worktree.isolation,
+            allowedTools: ["file_write"],
+            status: .completed,
+            createdAt: Date(),
+            startedAt: Date(),
+            completedAt: Date(),
+            appliedAt: Date(),
+            appliedToBranch: "main",
+            keptIgnoredFiles: [".env.local"]
+        )
+        XCTAssertTrue(store.saveImmediately(applied))
+        defer {
+            store.delete(runId: runId, sessionId: nil)
+            Task { await WorkspaceIsolation.cleanup(worktree) }
+        }
+
+        let removed = await WorkspaceIsolation.pruneStaleWorktrees(
+            root: worktreeRoot,
+            olderThan: -1
+        )
+        XCTAssertTrue(removed.isEmpty, "an applied worktree kept for ignored files must not be swept")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: worktree.path.path))
+    }
+
+    func testTheSweepKeepsAWorktreeWhoseRecordThisBuildCannotDecode() async throws {
+        let runId = UUID()
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: runId,
+            root: worktreeRoot
+        )
+        // A newer-schema (or corrupt) record is KEPT by the store on purpose.
+        // Treating "cannot decode" as "no record" handed the tree — the only
+        // full copy of its work — to the 14-day clock.
+        let store = AgentRunStore.shared
+        let recordURL = store.fileURL(runId: runId, sessionId: nil)
+        try FileManager.default.createDirectory(
+            at: recordURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("not a run record".utf8).write(to: recordURL)
+        defer {
+            try? FileManager.default.removeItem(at: recordURL)
+            Task { await WorkspaceIsolation.cleanup(worktree) }
+        }
+
+        let removed = await WorkspaceIsolation.pruneStaleWorktrees(
+            root: worktreeRoot,
+            olderThan: -1
+        )
+        XCTAssertTrue(removed.isEmpty, "an undecodable record still names the worktree")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: worktree.path.path))
+    }
+
     func testStoppingAnIsolatedRunKeepsItsWorktreeAndTheWorkInIt() async throws {
         let runId = UUID()
         let worktree = try await WorkspaceIsolation.createWorktree(

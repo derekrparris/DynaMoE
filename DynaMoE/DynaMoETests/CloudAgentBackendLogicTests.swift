@@ -154,9 +154,12 @@ final class CloudAgentBackendLogicTests: XCTestCase {
     }
 
     func testAnUnparseableAssembledArgumentBlockIsReportedRatherThanGuessedAt() {
-        XCTAssertEqual(CloudAgentBackend.arguments(from: "{\"path\":").keys.first, "_raw_arguments")
-        XCTAssertEqual(CloudAgentBackend.arguments(from: "")["_raw_arguments"] as? String, "")
-        XCTAssertEqual(CloudAgentBackend.arguments(from: "[]").isEmpty, false)
+        // No synthetic argument: the tool sees the arguments it was given
+        // (none) and reports the missing required field by name, while the raw
+        // JSON stays on the call's `rawArguments` for the transcript.
+        XCTAssertTrue(CloudAgentBackend.arguments(from: "{\"path\":").isEmpty)
+        XCTAssertTrue(CloudAgentBackend.arguments(from: "").isEmpty)
+        XCTAssertTrue(CloudAgentBackend.arguments(from: "[]").isEmpty)
         XCTAssertEqual(CloudAgentBackend.arguments(from: "{\"a\":1}")["a"] as? Int, 1)
     }
 

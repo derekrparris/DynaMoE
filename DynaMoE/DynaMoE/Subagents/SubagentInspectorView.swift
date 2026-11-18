@@ -612,6 +612,8 @@ private struct SubagentRunDetailView: View {
         record.status.isTerminal
             && record.isolation.isIsolated
             && appliedAt == nil
+            && !isApplying
+            && !SubagentApplyService.isRunInFlight(record.id)
     }
 
     var body: some View {
@@ -641,6 +643,7 @@ private struct SubagentRunDetailView: View {
         }
         .alert("Discard this run?", isPresented: $confirmDiscard) {
             Button("Discard", role: .destructive) { onDiscard() }
+                .disabled(isApplying || SubagentApplyService.isRunInFlight(record.id))
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("The run's record and its unapplied worktree are deleted. Its branch is removed too. This cannot be undone; apply the run first if you want to keep the work.")
@@ -1108,6 +1111,7 @@ private struct SubagentRunDetailView: View {
                     }
                     .buttonStyle(.bordered)
                     .tint(.red)
+                    .disabled(isApplying || SubagentApplyService.isRunInFlight(record.id))
                     .help("Delete this run's record and its unapplied worktree. Apply it first to keep the work.")
                 }
 

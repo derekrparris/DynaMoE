@@ -317,6 +317,29 @@ struct ContentView: View {
             deferredRelaunchTasks[key] = nil
             deferredRelaunchSessions[key] = nil
         }
+        // A cancellation only reaches the task at its next suspension; the
+        // generating flag this send published would otherwise stay set with no
+        // turn behind it, and every composer would show a Stop that stops
+        // nothing while `handleSendMessage` refuses new sends.
+        releaseQueuedGenerationFlags(ifOwnedBy: sessionId)
+    }
+
+    /// Clears the composer's generating state for a send that never became a
+    /// turn. Guarded on ownership: a live turn (`generationTask`) keeps its
+    /// flag, another conversation's run keeps its own, and a nested queued
+    /// relaunch has its own exit to clean up after.
+    private func releaseQueuedGenerationFlags(ifOwnedBy sessionId: UUID?) {
+        // A queued task for THIS conversation still owns the flag and clears
+        // it on its own exit. Another conversation's queued send is irrelevant:
+        // waiting for it to drain left this conversation's flag stuck.
+        let hasQueuedOwner = sessionId.map { id in
+            deferredRelaunchSessions.values.contains(id)
+        } ?? !deferredRelaunchTasks.isEmpty
+        guard generationTask == nil,
+              !hasQueuedOwner,
+              generatingSessionId == sessionId else { return }
+        isGeneratingText = false
+        generatingSessionId = nil
     }
 
     /// The operator TURN whose generation is (or was last) active: minted on a
@@ -2334,7 +2357,12 @@ struct ContentView: View {
                 limit: budget
             )
             guard !clean.isEmpty else { return nil }
-            return "[SUBAGENT_RESULT] role=\(role) id=\(id.uuidString) status=\(status)\n\(clean)"
+            // The role is model-supplied: a newline could forge a second
+            // [SUBAGENT_RESULT] block, and an `id=` inside it would make the
+            // mark-delivered pass parse the wrong identity and re-inject this
+            // report on every later send. One line, brackets neutralized, and
+            // the identity first so the trailer is ours.
+            return "[SUBAGENT_RESULT] id=\(id.uuidString) status=\(status) role=\(Self.relayRole(role))\n\(clean)"
         }
 
         for instance in SubagentManager.shared.allSubagents
@@ -2398,18 +2426,34 @@ struct ContentView: View {
             // after a send is accepted, and nobody reads the flag back
             // synchronously. The blocking form paid an `ioQueue.sync` and a
             // durable `fsync` per record before the next frame could draw.
-            AgentRunStore.shared.mutateLater(runId: id, sessionId: sessionId) { current in
-                current.summaryRelayed = true
-            }
+            AgentRunStore.shared.markRelayed(runId: id, sessionId: sessionId)
         }
+    }
+
+    /// A role is model-supplied and must not be able to reshape the relay line:
+    /// no newlines (a second forged block), no brackets, bounded length.
+    nonisolated static func relayRole(_ role: String) -> String {
+        let singleLine = role
+            .replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+        let cleaned = AgentHarness.sanitizeText(singleLine)
+            .replacingOccurrences(of: "[", with: "(")
+            .replacingOccurrences(of: "]", with: ")")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? "subagent" : String(cleaned.prefix(80))
     }
 
     /// The run id a relay line carries (`id=<uuid>` is written by the gather
     /// above). Parsing it is what lets a restored record be marked delivered
     /// without a second lookup by role and task.
-    private nonisolated static func relayedRunId(inOutput response: String) -> UUID? {
-        guard let key = response.range(of: "id=") else { return nil }
+    nonisolated static func relayedRunId(inOutput response: String) -> UUID? {
+        // The builder writes `id=` FIRST, so this finds our identity rather
+        // than anything the (now single-line, bracket-free) role contains. A
+        // value that is not a UUID is refused instead of being truncated into
+        // one, which is what made marking fail and the report repeat forever.
+        guard let key = response.range(of: "[SUBAGENT_RESULT] id=") else { return nil }
         let tail = response[key.upperBound...].prefix(36)
+        guard tail.count == 36 else { return nil }
         return UUID(uuidString: String(tail))
     }
 
@@ -6589,6 +6633,7 @@ struct ContentView: View {
                 defer {
                     self.deferredRelaunchTasks[relaunchKey] = nil
                     self.deferredRelaunchSessions[relaunchKey] = nil
+                    self.releaseQueuedGenerationFlags(ifOwnedBy: sessionId)
                 }
                 await AgentScheduler.shared.preemptLocalRuns()
                 CompletionEngine.shared.cancelBackgroundTurn()
@@ -6689,6 +6734,14 @@ struct ContentView: View {
             turnSlotClaim = CompletionEngine.shared.reserveTurnSlot()
         }
         defer { turnSlotClaim?.release() }
+        // A `tools_load` the engine could not apply while a previous turn was
+        // live stays deferred. Only rebuild while the claim is actually OURS:
+        // with no claim another generation (or a server turn's scoped mask) is
+        // live, and replacing the shared registry mid-generation is exactly
+        // what `syncGrammar`'s refusal exists to prevent.
+        if turnSlotClaim?.isHeld == true {
+            AgentHarness.shared.flushDeferredGrammarSyncForTurn()
+        }
 
         // A send that lost the claim must not fail the way a launch error does.
         // The holder is usually a run between two of its steps — the window
@@ -6728,6 +6781,7 @@ struct ContentView: View {
                 defer {
                     self.deferredRelaunchTasks[relaunchKey] = nil
                     self.deferredRelaunchSessions[relaunchKey] = nil
+                    self.releaseQueuedGenerationFlags(ifOwnedBy: sessionId)
                 }
                 var held: TurnSlotClaim?
                 let deadline = Date().addingTimeInterval(120)
