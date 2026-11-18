@@ -1273,4 +1273,171 @@ final class WorkspaceIsolationTests: XCTestCase {
         let survivors = try await git(["rev-parse", "--verify", branch], in: repository)
         XCTAssertEqual(survivors.0, 0, "the failure path must not delete a branch it did not own")
     }
+
+    // MARK: - Applying into a busy tree
+
+    /// A new-file patch hand-carried through `WorkspaceIsolation.apply`, so
+    /// the mid-operation refusals below exercise the guard without first
+    /// needing a run, a snapshot, or a real change set.
+    private func newFileChangeSet(name: String) -> WorkspaceChangeSet {
+        WorkspaceChangeSet(
+            changedFiles: [name],
+            // git apply refuses a patch whose final line has no newline, so the
+            // hand-written diff carries one explicitly.
+            diff: """
+            diff --git a/\(name) b/\(name)
+            new file mode 100644
+            index 0000000..b5ba4d5
+            --- /dev/null
+            +++ b/\(name)
+            @@ -0,0 +1 @@
+            +landed by the apply
+            """ + "\n",
+            diffWasTruncated: false
+        )
+    }
+
+    /// Applying into a merge, cherry-pick, revert or bisect lands in the middle
+    /// of someone else's operation; each is refused by name, and the same patch
+    /// applies once the tree is settled (the control, run last because it
+    /// writes the file).
+    func testApplyIsRefusedWhileTheMainTreeIsMidOperation() async throws {
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: UUID(),
+            root: worktreeRoot
+        )
+        defer { _ = Task { await WorkspaceIsolation.cleanup(worktree) } }
+
+        // A side branch with a different README, so the merge stays pending
+        // under `--no-commit --no-ff`.
+        try await git(["checkout", "-q", "-b", "side"], in: repository)
+        try "side-version\n".write(
+            to: repository.appendingPathComponent("README.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try await git(["commit", "-aqm", "side change"], in: repository)
+        let sideCommit = try await git(["rev-parse", "HEAD"], in: repository)
+        try await git(["checkout", "-q", "main"], in: repository)
+        try "main-version\n".write(
+            to: repository.appendingPathComponent("README.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try await git(["commit", "-aqm", "main line"], in: repository)
+        let baseCommit = worktree.baseCommit
+
+        let refusals: [(label: String, begin: [String], abort: [String])] = [
+            (
+                "merge",
+                ["merge", "--no-commit", "--no-ff", "side"],
+                ["merge", "--abort"]
+            ),
+            (
+                "cherry-pick",
+                ["cherry-pick", sideCommit.1.trimmingCharacters(in: .whitespacesAndNewlines)],
+                ["cherry-pick", "--abort"]
+            ),
+            (
+                "revert",
+                ["revert", "--no-edit", baseCommit],
+                ["revert", "--abort"]
+            ),
+            (
+                "bisect",
+                ["bisect", "start"],
+                ["bisect", "reset"]
+            )
+        ]
+
+        for refusal in refusals {
+            _ = try? await git(refusal.begin, in: repository)
+            do {
+                _ = try await WorkspaceIsolation.apply(
+                    worktree,
+                    changeSet: newFileChangeSet(name: "\(refusal.label)-probe.txt")
+                )
+                XCTFail("an apply during a pending \(refusal.label) must be refused")
+            } catch let error as WorkspaceIsolationError {
+                guard case .applyFailed(let detail) = error else {
+                    return XCTFail("expected applyFailed during a \(refusal.label), got \(error)")
+                }
+                XCTAssertTrue(
+                    detail.contains(refusal.label),
+                    "the refusal must name the \(refusal.label), got: \(detail)"
+                )
+            }
+            _ = try await git(refusal.abort, in: repository)
+        }
+
+        // The control: with no operation pending, the same patch lands.
+        let settled = newFileChangeSet(name: "landed-by-control.txt")
+        let result = try await WorkspaceIsolation.apply(worktree, changeSet: settled)
+        XCTAssertEqual(result.changedFiles, settled.changedFiles)
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: repository.appendingPathComponent("landed-by-control.txt").path),
+            "the control patch must actually land once the tree is settled"
+        )
+    }
+
+    /// `snapshot` registers intent to add instead of staging content: a linked
+    /// worktree shares the main repository's object DB, and staging blobbed
+    /// every file the run touched into the operator's store just to read a
+    /// patch back. The content blob must not exist after a snapshot, while the
+    /// patch still carries the file.
+    func testASnapshotDoesNotBlobTheRunsFilesIntoTheSharedObjectStore() async throws {
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: UUID(),
+            root: worktreeRoot
+        )
+        defer { _ = Task { await WorkspaceIsolation.cleanup(worktree) } }
+
+        let big = String(repeating: "blob-bloat guard ", count: 6_400)
+        try big.write(
+            to: worktree.path.appendingPathComponent("big-new-file.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let changeSet = try await WorkspaceIsolation.snapshot(worktree, diffLimit: nil)
+
+        XCTAssertEqual(changeSet.changedFiles, ["big-new-file.txt"])
+        XCTAssertTrue(
+            changeSet.diff.contains("blob-bloat guard"),
+            "the patch carries the new file's content"
+        )
+
+        let hash = try await git(
+            ["hash-object", worktree.path.appendingPathComponent("big-new-file.txt").path],
+            in: repository
+        )
+        let blobId = hash.1.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lookup = try await git(["cat-file", "-e", blobId], in: repository)
+        XCTAssertNotEqual(
+            lookup.0, 0,
+            "the file's content must not be blobbed into the shared object store by a snapshot"
+        )
+    }
+
+    /// The apply single-flight: a second apply for the same run is refused
+    /// while the first is in flight. The in-flight window is the duration of
+    /// one git call, which no test can occupy deterministically, so the window
+    /// is opened by the testing seam instead.
+    func testASecondApplyForTheSameRunIsRefusedWhileTheFirstIsInFlight() async {
+        let runId = UUID()
+        SubagentApplyService.beginApplyForTesting(runId)
+        defer { SubagentApplyService.endApplyForTesting(runId) }
+
+        do {
+            _ = try await SubagentApplyService.apply(runId: runId)
+            XCTFail("an apply during an in-flight apply of the same run must be refused")
+        } catch let error as SubagentApplyError {
+            guard case .alreadyApplying = error else {
+                return XCTFail("expected alreadyApplying, got \(error)")
+            }
+        } catch {
+            XCTFail("unexpected error type: \(error)")
+        }
+    }
 }

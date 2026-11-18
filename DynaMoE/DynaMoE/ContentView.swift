@@ -1297,7 +1297,16 @@ struct ContentView: View {
             ImageAttachmentStore.shared.delete(sessionIds: removedIds)
             // A deleted conversation's subagent runs are its work; §10 keeps
             // them only as long as the conversation that spawned them exists.
+            // They are stopped BEFORE the records go — the protected set
+            // above should mean no run is still live here, but a run that
+            // turned live between the plan and this loop must not become
+            // invisible, unstoppable work whose terminal write the store's
+            // tombstone then drops.
             for id in removedIds {
+                SubagentManager.shared.cancelSession(
+                    sessionId: id,
+                    reason: "The conversation was removed by chat retention."
+                )
                 AgentRunStore.shared.deleteSession(id)
             }
         }
@@ -1332,9 +1341,11 @@ struct ContentView: View {
         return paths
     }
 
-    /// Sessions retention must never evict: the one the user is viewing and the
+    /// Sessions retention must never evict: the one the user is viewing, the
     /// one actively generating (which may differ after switching chats mid-turn,
-    /// since the generation loop still appends to its own session).
+    /// since the generation loop still appends to its own session), and every
+    /// session with a subagent run still working — evicting one of those deletes
+    /// the run's record underneath a run that is still executing.
     private var chatRetentionProtectedIds: Set<UUID> {
         var ids: Set<UUID> = []
         if let selected = selectedSessionId {
@@ -1346,6 +1357,7 @@ struct ContentView: View {
             ids.insert(generating)
         }
         ids.formUnion(retentionProtectionCounts.keys)
+        ids.formUnion(SubagentManager.shared.liveRunSessionIds)
         return ids
     }
 
@@ -1549,6 +1561,20 @@ struct ContentView: View {
                             run.task?.cancel()
                             manualCompactions.removeValue(forKey: id)
                         }
+                        // The conversation's runs are its work (§10): stop them
+                        // BEFORE the records go, or a run keeps executing tools
+                        // and billing while its record orphans on disk — and a
+                        // run whose record is deleted underneath it is
+                        // invisible, unstoppable, and its terminal write is
+                        // dropped by the store's tombstone. Unapplied isolated
+                        // survivors are re-scoped by the store rather than
+                        // destroyed, so their worktrees stay out of the 14-day
+                        // sweep's reach.
+                        SubagentManager.shared.cancelSession(
+                            sessionId: id,
+                            reason: "The conversation was deleted."
+                        )
+                        AgentRunStore.shared.deleteSession(id)
                         sessions.removeAll(where: { $0.id == id })
                         // The conversation JSON is cleaned by the next save pass's
                         // orphan sweep, but its asset directory is a separate tree.
@@ -6572,6 +6598,24 @@ struct ContentView: View {
         // background run, so it is cancelled and the send retries.
         if turnSlotClaim == nil, slotCarry == nil, !preemptionRetry {
             showStatus("⏳ Waiting for the engine so this turn can \(isFreshOperatorSend ? "run" : "continue")…")
+            // The send was ACCEPTED (this branch returns true), but nothing is
+            // generating yet, so the Stop button stayed invisible for the whole
+            // wait: the operator could not abort their own queued send for up
+            // to 120 s, and the preemption it eventually fires looked like an
+            // unexplained model stop. Publishing the generating state for the
+            // wait makes Stop visible — it cancels exactly the deferred
+            // relaunch below (`cancelDeferredRelaunches`), and the fresh turn
+            // identity minted above scopes its subagent cancellation to a turn
+            // that has spawned nothing yet. Guarded so a send queued behind
+            // ANOTHER session's live generation never repoints the state that
+            // Stop and retention read; a refused relaunch below clears the
+            // flag itself, and Stop clears it on the way in.
+            if !isGeneratingText {
+                isGeneratingText = true
+            }
+            if generatingSessionId == nil {
+                generatingSessionId = sessionId
+            }
             // Tracked so Stop can cancel it — see the preemption branch above.
             let relaunchKey = UUID()
             deferredRelaunchTasks[relaunchKey] = Task { @MainActor in
@@ -6605,6 +6649,10 @@ struct ContentView: View {
                         relayedReports: relayedReports
                     )
                 } else {
+                    // Same notice the immediate preemption shows: the runs about
+                    // to be stopped belong to a background agent, and a kill
+                    // with no explanation reads as a crash.
+                    self.showStatus("⏸ Stopping a background subagent so this turn can \(isFreshOperatorSend ? "run" : "continue")…")
                     await AgentScheduler.shared.preemptLocalRuns()
                     CompletionEngine.shared.cancelBackgroundTurn()
                     await CompletionEngine.shared.awaitIdle()

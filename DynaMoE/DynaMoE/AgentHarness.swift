@@ -2560,6 +2560,7 @@ public final class SpawnSubagentTool: AgentTool {
             parentMode: parentMode,
             contextSummary: contextSummary,
             parentSessionId: AgentHarness.shared.currentSessionId,
+            parentTurnId: AgentHarness.shared.currentTurnId,
             workingDirectory: workingDirectory
         )
         return await Self.respond(
@@ -2864,7 +2865,7 @@ public final class GetSubagentStatusTool: AgentTool {
 public final class SendSubagentMessageTool: AgentTool {
     public let definition = ToolDefinition(
         name: "send_subagent_message",
-        description: "Sends a follow-up directive, instruction, or clarification to a running or completed subagent. The subagent consumes directives between execution steps: file paths in a directive are read, shell commands in a directive are run, and the results are folded into its final report.",
+        description: "Sends a follow-up directive, instruction, or clarification to a RUNNING subagent. The subagent consumes directives between execution steps: file paths in a directive are read, shell commands in a directive are run, and the results are folded into its final report. A finished run cannot consume directives; spawn a new one instead.",
         parameters: [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
@@ -2897,6 +2898,14 @@ public final class SendSubagentMessageTool: AgentTool {
 
         guard let subagent = SubagentManager.shared.getSubagent(byId: uuid) else {
             let err = "Subagent with ID '\(idStr)' not found."
+            return (AgentHarness.toolErrorJSON(tool: "send_subagent_message", error: err), nil, err, false)
+        }
+
+        // A terminal run drains nothing: its channel is closed. Reporting a
+        // message "delivered" there was a promise the run could never keep —
+        // the note was queued into an object nobody reads again.
+        if subagent.status.isTerminal {
+            let err = "Subagent [\(subagent.role)] (ID: \(idStr)) has already finished; it cannot consume new directives. Spawn a new run instead."
             return (AgentHarness.toolErrorJSON(tool: "send_subagent_message", error: err), nil, err, false)
         }
 

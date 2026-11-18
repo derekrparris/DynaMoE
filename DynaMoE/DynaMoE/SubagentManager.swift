@@ -732,6 +732,15 @@ public final class SubagentInstance: Identifiable, ObservableObject {
         let finalReport = await Task.detached(priority: .userInitiated) {
             await self.finalizeWorktree(plan: plan, outcome: outcome)
         }.value
+        // A Stop that landed during the readback already finished this run, and
+        // its transition owns the record (see `finishRun`). The writes below
+        // sit OUTSIDE that guard, so without this check a cancelled run's live
+        // object ended up carrying a completed report the store never accepted —
+        // the drawer disagreed with the record on relaunch.
+        lock.lock()
+        let alreadyFinished = isFinished
+        lock.unlock()
+        guard !alreadyFinished else { return }
         report = finalReport
         usage = outcome.usage
         lastError = outcome.error
@@ -1719,6 +1728,22 @@ public final class SubagentManager: ObservableObject {
         }.count
     }
 
+    /// The sessions that still have a run working. Retention must not evict
+    /// these: deleting the conversation deletes the run's record underneath a
+    /// run that is still executing — invisible, unstoppable, its terminal write
+    /// dropped by the store's tombstone.
+    public var liveRunSessionIds: Set<UUID> {
+        var ids: Set<UUID> = []
+        lock.lock()
+        defer { lock.unlock() }
+        for instance in subagentsOrder where !instance.status.isTerminal {
+            if let session = instance.parentSessionId {
+                ids.insert(session)
+            }
+        }
+        return ids
+    }
+
     public var allSubagents: [SubagentInstance] {
         lock.lock()
         defer { lock.unlock() }
@@ -1956,12 +1981,20 @@ public final class SubagentManager: ObservableObject {
     /// would leave a "cleared" list that immediately refills from disk. The
     /// no-argument form keeps the old behaviour for callers that predate the
     /// store.
+    ///
+    /// An unapplied isolated run is NEVER cleared here, on either path: its
+    /// record is the only thing keeping its worktree out of the launch sweep
+    /// (`pruneStaleWorktrees` protects a tree while a decodable record says
+    /// unapplied), so deleting it would silently destroy the run's only copy
+    /// of its work two weeks later — the same disposal `prune` refuses to
+    /// make. Apply the run, or clear it per-run from the inspector, first.
     public func clearCompleted(sessionId: UUID? = nil) {
         let terminal: [SubagentInstance]
         lock.lock()
         terminal = subagentsOrder.filter {
             $0.status.isTerminal
                 && (sessionId == nil || $0.parentSessionId == sessionId)
+                && !($0.modelPlan?.isolation.isIsolated == true && $0.appliedAt == nil)
         }
         let clearedIds = Set(terminal.map(\.id))
         let liveIds = Set(subagentsOrder.map(\.id))
@@ -1990,7 +2023,8 @@ public final class SubagentManager: ObservableObject {
         var deletedStoredRecord = false
         for record in stored
         where !clearedIds.contains(record.id)
-            && (record.status.isTerminal || !liveIds.contains(record.id)) {
+            && (record.status.isTerminal || !liveIds.contains(record.id))
+            && !(record.isolation.isIsolated && record.appliedAt == nil) {
             AgentRunStore.shared.delete(runId: record.id, sessionId: record.parentSessionId)
             deletedStoredRecord = true
         }

@@ -1196,11 +1196,40 @@ final class SubagentLoopTests: XCTestCase {
         )
     }
 
+    /// The prefix-pin contract: while the history is under the character
+    /// budget it comes back UNCHANGED even when it has aged well past the kept
+    /// window, because folding rewrites bytes in the middle of the prompt and
+    /// a rewritten prompt is not an extension of the previous step's — the
+    /// local backend's KV pin only survives steps whose prompts extend the
+    /// last one byte for byte. Folding on turn count made every step from the
+    /// third on re-render the turn that had just aged, so no multi-step local
+    /// run ever reused its pin.
+    func testCompactionLeavesAnAgedHistoryAloneUnderTheBudget() {
+        var messages: [AgentBackendMessage] = [.user("Do the task.")]
+        for step in 0..<6 {
+            messages.append(contentsOf: assistantBlock(
+                text: "step \(step)",
+                thinking: "thinking \(step)",
+                toolResults: ["result \(step)"]
+            ))
+        }
+
+        let compacted = HeadlessAgentLoop.compactContextIfNeeded(messages)
+        XCTAssertTrue(
+            sameMessages(compacted, messages),
+            "an over-window history under the budget must stay byte-identical so each step extends the previous prompt"
+        )
+    }
+
     func testCompactionFoldsAgedTurnsAndKeepsTheRecentWindowVerbatim() {
         var messages: [AgentBackendMessage] = [.user("Do the task.")]
-        let longText = String(repeating: "a", count: 3_000)
-        let longResult = String(repeating: "b", count: 3_000)
-        for step in 0..<5 {
+        // Sized past the character budget: folding is budget-gated now, so a
+        // fixture that only aged past the kept window would come back
+        // unchanged. Thirty thousand characters a block over seven blocks puts
+        // the raw history at ~210k against the 160k budget.
+        let longText = String(repeating: "a", count: 10_000)
+        let longResult = String(repeating: "b", count: 10_000)
+        for step in 0..<6 {
             messages.append(contentsOf: assistantBlock(
                 text: "step \(step) " + longText,
                 thinking: "thinking \(step) " + longText,
@@ -1216,7 +1245,7 @@ final class SubagentLoopTests: XCTestCase {
             return XCTFail("the task message must stay first")
         }
         XCTAssertEqual(task, "Do the task.")
-        for verbatim in ["step 4 " + longText, "recent"] {
+        for verbatim in ["step 5 " + longText, "recent"] {
             XCTAssertTrue(compacted.contains { message in
                 if case .assistant(let text, _, _) = message { return text == verbatim }
                 return false
@@ -1227,8 +1256,8 @@ final class SubagentLoopTests: XCTestCase {
             return false
         }, "the newest turn keeps its thinking")
 
-        // The four aged turns lose their thinking and fold their results.
-        for aged in 0..<4 {
+        // The five aged turns lose their thinking and fold their results.
+        for aged in 0..<5 {
             XCTAssertTrue(compacted.contains { message in
                 if case .assistant(let text, let thinking, _) = message {
                     return text.hasPrefix("step \(aged)") && thinking.isEmpty

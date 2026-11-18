@@ -76,6 +76,19 @@ enum SubagentApplyService {
     private static var inFlight: Set<UUID> = []
     private static var repositoriesInFlight: Set<String> = []
 
+#if DEBUG
+    /// Tests only: the single-flight refusal cannot be made deterministic
+    /// against a real apply — the in-flight window is the duration of one git
+    /// call — so a test puts the run in flight by hand and asserts the refusal.
+    static func beginApplyForTesting(_ runId: UUID) {
+        inFlight.insert(runId)
+    }
+
+    static func endApplyForTesting(_ runId: UUID) {
+        inFlight.remove(runId)
+    }
+#endif
+
     static func apply(runId: UUID) async throws -> SubagentApplyOutcome {
         guard !inFlight.contains(runId) else {
             let role = SubagentManager.shared.getSubagent(byId: runId)?.role ?? "This run"

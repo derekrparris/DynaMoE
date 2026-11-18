@@ -229,6 +229,39 @@ final class AgentSchedulerTests: XCTestCase {
         XCTAssertEqual(recorder.names, ["ours"])
     }
 
+    /// The path Stop takes: cancellation is scoped to the TURN that spawned
+    /// the runs, so background work an EARLIER turn left running survives a
+    /// Stop — including another run of the SAME session and a run that never
+    /// recorded a turn id.
+    func testCancellingATurnStopsOnlyThatTurnsRuns() async {
+        let scheduler = makeScheduler(.default)
+        let recorder = CancellationRecorder()
+        let session = UUID()
+        let stoppedTurn = UUID()
+        let earlierTurn = UUID()
+        await scheduler.register(
+            runId: UUID(), parentRunId: nil, parentSessionId: session,
+            parentTurnId: stoppedTurn,
+            schedulingClass: .local, priority: .userRequested,
+            cancel: { recorder.record("stopped-turn", $0) }
+        )
+        await scheduler.register(
+            runId: UUID(), parentRunId: nil, parentSessionId: session,
+            parentTurnId: earlierTurn,
+            schedulingClass: .local, priority: .userRequested,
+            cancel: { recorder.record("earlier-turn", $0) }
+        )
+        await scheduler.register(
+            runId: UUID(), parentRunId: nil, parentSessionId: session,
+            schedulingClass: .local, priority: .userRequested,
+            cancel: { recorder.record("no-turn", $0) }
+        )
+
+        await scheduler.cancelRuns(parentTurnId: stoppedTurn, reason: "the operator stopped the turn")
+        XCTAssertEqual(recorder.names, ["stopped-turn"])
+        XCTAssertEqual(recorder.reasons, ["the operator stopped the turn"])
+    }
+
     /// The instance's execution task starts asynchronously, so a Stop can reach
     /// the scheduler before its registration exists. That cancellation used to
     /// be dropped, and the run then started normally.

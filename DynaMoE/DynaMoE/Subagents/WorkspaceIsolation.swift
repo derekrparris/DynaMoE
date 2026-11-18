@@ -381,8 +381,8 @@ nonisolated enum WorkspaceIsolation {
     ///
     /// A linked worktree's `.git` is a regular FILE inside the containment
     /// prefix, so a sandboxed run can reach it: a rewritten pointer makes every
-    /// later git command in the worktree run somewhere else — `git add -A`
-    /// stages the operator's tree into their shared index, `git_commit` lands
+    /// later git command in the worktree run somewhere else — `git add -N .`
+    /// registers paths in the operator's shared index, `git_commit` lands
     /// on their checked-out branch — and deleting the pointer orphans work
     /// nothing can land. The comparison is against the RECORDED repository
     /// (never against wherever the pointer happens to point now), plus the
@@ -439,9 +439,13 @@ nonisolated enum WorkspaceIsolation {
         }
     }
 
-    /// Stages the worktree's files (so new files are in the diff) and reads the
-    /// net change against the base commit. Staging is safe here: the worktree is
-    /// disposable and the index is not part of what is applied.
+    /// Registers the worktree's untracked files so they appear in the diff
+    /// WITHOUT writing their contents into the repository's object store, and
+    /// reads the net change against the base commit. A linked worktree shares
+    /// the main repository's objects, so `git add -A` here blobbed every file
+    /// the run touched into the OPERATOR's object DB just to read a patch
+    /// back; intent-to-add (`-N`) records only the paths, and the diff carries
+    /// the same content either way. The index is not part of what is applied.
     ///
     /// `diffLimit` bounds only the returned text. Applying re-reads the diff
     /// with no limit, because a truncated patch cannot be applied.
@@ -453,13 +457,13 @@ nonisolated enum WorkspaceIsolation {
         guard FileManager.default.fileExists(atPath: directory.path) else {
             throw WorkspaceIsolationError.worktreeMissing(directory.path)
         }
-        // `git add -A` below is a WRITE whose destination is decided by the
+        // `git add -N .` below is a WRITE whose destination is decided by the
         // worktree's `.git` pointer — a file inside the sandbox. A retargeted
-        // pointer would stage the operator's tree into their shared index, so
+        // pointer would register paths in the operator's shared index, so
         // the linkage is verified before the first git command runs.
         try await verifyWorktreeLinkage(worktree)
 
-        let (addCode, _, addErr) = try await git(["add", "-A"], in: directory)
+        let (addCode, _, addErr) = try await git(["add", "-N", "."], in: directory)
         guard addCode == 0 else {
             throw WorkspaceIsolationError.snapshotFailed(
                 addErr.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -804,27 +808,40 @@ nonisolated enum WorkspaceIsolation {
         return ApplyRollback(directory: directory, entries: entries)
     }
 
-    /// Applying during a merge or rebase is a different operation than applying
-    /// to a settled tree, and the failure would land in the middle of someone
-    /// else's conflict resolution. Refuse by name instead.
+    /// Applying during a merge, rebase, cherry-pick, revert or bisect is a
+    /// different operation than applying to a settled tree, and the failure
+    /// would land in the middle of someone else's conflict resolution or
+    /// history walk. Refuse by name instead.
     private static func refuseIfTheMainTreeIsMidOperation(_ repositoryRoot: URL) async throws {
-        if let (mergeCode, _, _) = try? await git(
-            ["rev-parse", "-q", "--verify", "MERGE_HEAD"],
-            in: repositoryRoot
-        ), mergeCode == 0 {
-            throw WorkspaceIsolationError.applyFailed(
-                "a merge is in progress in the main tree. Finish or abort it, then apply again."
-            )
+        let headOperations: [(ref: String, name: String)] = [
+            ("MERGE_HEAD", "merge"),
+            ("CHERRY_PICK_HEAD", "cherry-pick"),
+            ("REVERT_HEAD", "revert")
+        ]
+        for operation in headOperations {
+            if let (code, _, _) = try? await git(
+                ["rev-parse", "-q", "--verify", operation.ref],
+                in: repositoryRoot
+            ), code == 0 {
+                throw WorkspaceIsolationError.applyFailed(
+                    "a \(operation.name) is in progress in the main tree. Finish or abort it, then apply again."
+                )
+            }
         }
-        for operation in ["rebase-merge", "rebase-apply"] {
+        let pathOperations: [(path: String, name: String)] = [
+            ("rebase-merge", "rebase"),
+            ("rebase-apply", "rebase"),
+            ("BISECT_LOG", "bisect")
+        ]
+        for operation in pathOperations {
             guard let (pathCode, pathOut, _) = try? await git(
-                ["rev-parse", "--path-format=absolute", "--git-path", operation],
+                ["rev-parse", "--path-format=absolute", "--git-path", operation.path],
                 in: repositoryRoot
             ), pathCode == 0 else { continue }
             let path = pathOut.trimmingCharacters(in: .whitespacesAndNewlines)
             if !path.isEmpty, FileManager.default.fileExists(atPath: path) {
                 throw WorkspaceIsolationError.applyFailed(
-                    "a rebase is in progress in the main tree. Finish or abort it, then apply again."
+                    "a \(operation.name) is in progress in the main tree. Finish or abort it, then apply again."
                 )
             }
         }
@@ -873,9 +890,9 @@ nonisolated enum WorkspaceIsolation {
         return path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
     }
 
-    /// Files the run created that git ignores. `snapshot` stages with `git add
-    /// -A`, which cannot carry them, so an ignored-only run looks empty and
-    /// would otherwise be reported as "no changes" and deleted with its
+    /// Files the run created that git ignores. `snapshot` registers intent to
+    /// add, which cannot carry them either, so an ignored-only run looks empty
+    /// and would otherwise be reported as "no changes" and deleted with its
     /// worktree. Naming them lets the apply refuse and keep the tree.
     static func ignoredFiles(_ worktree: AgentWorktree) async -> [String] {
         guard let (code, stdout, _) = try? await git(
@@ -892,12 +909,12 @@ nonisolated enum WorkspaceIsolation {
 
     /// Whether git itself agrees the worktree has nothing to land.
     ///
-    /// `snapshot` stages with `git add -A`, so an unchanged tree reports no
-    /// status entries and a changed one still does even when its diff could not
-    /// be decoded. Cleanup is destructive, and an empty `WorkspaceChangeSet` is
-    /// not proof: it is also what a decode failure produces (see `snapshot`).
-    /// Anything other than a successful, empty status is treated as "do not
-    /// delete".
+    /// `snapshot` registers intent to add for every untracked path, so an
+    /// unchanged tree reports no status entries and a changed one still does
+    /// even when its diff could not be decoded. Cleanup is destructive, and an
+    /// empty `WorkspaceChangeSet` is not proof: it is also what a decode
+    /// failure produces (see `snapshot`). Anything other than a successful,
+    /// empty status is treated as "do not delete".
     static func hasNoWorkingTreeChanges(_ worktree: AgentWorktree) async -> Bool {
         guard let (code, stdout, _) = try? await git(
             ["status", "--porcelain", "-z"],

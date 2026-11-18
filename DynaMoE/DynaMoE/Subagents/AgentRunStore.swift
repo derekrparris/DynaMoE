@@ -508,9 +508,44 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
 
     /// Deleting a conversation deletes the runs it spawned. §10 requires it;
     /// leaving them would keep a deleted conversation's work on disk forever.
+    ///
+    /// One deliberate exception: an UNAPPLIED isolated run's record is the only
+    /// thing keeping its worktree out of the launch sweep —
+    /// `pruneStaleWorktrees` protects a tree while a decodable record says
+    /// unapplied — so deleting it would hand the run's only copy of its work to
+    /// a 14-day clock the operator never sees, the same disposal `prune`
+    /// refuses to make. Those records are RE-SCOPED to the unscoped bucket
+    /// instead of deleted: they ride every inspector with their Apply and Clear
+    /// buttons, `prune` keeps skipping them, and the sweep keeps protecting
+    /// their trees until the operator lands or clears the work. Callers cancel
+    /// the session's live runs first (§10's rule), so a non-terminal survivor
+    /// is marked cancelled here rather than left claiming to work for a
+    /// conversation that no longer exists, and `summaryRelayed` is set so the
+    /// report relay never injects a deleted conversation's run into an
+    /// unrelated one.
     func deleteSession(_ sessionId: UUID) {
         let url = directory(for: sessionId)
         ioQueue.async { [self] in
+            for var record in load(sessionId: sessionId) where record.isolation.isIsolated && record.appliedAt == nil {
+                if !record.status.isTerminal {
+                    record.status = .cancelled
+                    record.completedAt = record.completedAt ?? Date()
+                    if record.error == nil {
+                        record.error = "The conversation that owned this run was deleted while it was still working."
+                    }
+                }
+                record.parentSessionId = nil
+                record.summaryRelayed = true
+                // Write-new before remove-old: a crash between the two leaves a
+                // duplicate the sweep still protects, while the reverse order
+                // leaves the worktree unprotected.
+                saveImmediately(record)
+                let original = fileURL(runId: record.id, sessionId: sessionId)
+                try? fileManager.removeItem(at: original)
+                signatureLock.lock()
+                writtenSignatures[original.path] = nil
+                signatureLock.unlock()
+            }
             noteDeletedSession(sessionId)
             try? fileManager.removeItem(at: url)
             signatureLock.lock()

@@ -316,6 +316,63 @@ final class AgentRunStoreTests: XCTestCase {
         XCTAssertTrue(store.loadAll().isEmpty)
     }
 
+    /// A deleted conversation's unapplied isolated work is NOT disposed with
+    /// it: the record is the only thing keeping that run's worktree out of the
+    /// launch sweep's reach, so it is re-scoped to the unscoped bucket —
+    /// visible in every inspector, skipped by `prune` — rather than deleted.
+    /// A still-working survivor is closed as cancelled instead of left
+    /// claiming to work for a conversation that no longer exists, and the
+    /// relay never sees its report as undelivered.
+    func testDeletingASessionKeepsItsUnappliedIsolatedRunsReachable() throws {
+        let store = makeStore()
+        let session = UUID()
+        let unapplied = record(
+            sessionId: session,
+            isolation: .worktree(path: "/tmp/w/x", branch: "dynamoe/run-x"),
+            appliedAt: nil
+        )
+        let working = record(
+            sessionId: session,
+            status: .running,
+            isolation: .worktree(path: "/tmp/w/y", branch: "dynamoe/run-y"),
+            appliedAt: nil
+        )
+        let applied = record(
+            sessionId: session,
+            isolation: .worktree(path: "/tmp/w/z", branch: "dynamoe/run-z"),
+            appliedAt: Date()
+        )
+        let plain = record(sessionId: session)
+        store.saveImmediately(unapplied)
+        store.saveImmediately(working)
+        store.saveImmediately(applied)
+        store.saveImmediately(plain)
+
+        store.deleteSession(session)
+        store.flush()
+
+        XCTAssertTrue(store.load(sessionId: session).isEmpty, "the session bucket is gone")
+        XCTAssertNil(store.loadAny(runId: applied.id), "an applied isolated run goes with its conversation")
+        XCTAssertNil(store.loadAny(runId: plain.id), "a run with nothing to protect goes with its conversation")
+
+        let keptUnapplied = try XCTUnwrap(store.loadAny(runId: unapplied.id))
+        XCTAssertNil(keptUnapplied.parentSessionId, "the survivor is re-scoped to the unscoped bucket")
+        XCTAssertTrue(keptUnapplied.isolation.isIsolated)
+        XCTAssertNil(keptUnapplied.appliedAt)
+        XCTAssertEqual(keptUnapplied.status, .completed, "a terminal survivor keeps its own status")
+        XCTAssertTrue(keptUnapplied.summaryRelayed, "the relay never injects a deleted conversation's report elsewhere")
+
+        let keptWorking = try XCTUnwrap(store.loadAny(runId: working.id))
+        XCTAssertEqual(keptWorking.status, .cancelled, "a still-working survivor is closed, not left claiming to run")
+        XCTAssertNotNil(keptWorking.error, "the closed survivor names what happened to it")
+
+        XCTAssertEqual(
+            Set(store.load(sessionId: nil).map(\.id)),
+            [unapplied.id, working.id],
+            "exactly the unapplied isolated survivors ride the unscoped bucket"
+        )
+    }
+
     func testDeletingOneRunLeavesItsSessionAlone() throws {
         let store = makeStore()
         let sessionId = UUID()

@@ -164,9 +164,13 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
             // preset's budgets (40 steps x 2,048-token turns x 4,000-token
             // tool outputs) overflow any real context long before they bind —
             // the run used to die mid-work on the engine's context refusal,
-            // after the spend. Old turns are compacted, oldest first; the
-            // newest stay verbatim. The transcript and the report keep
-            // everything — only what the MODEL re-reads each step shrinks.
+            // after the spend. Once the history passes the character budget,
+            // old turns are compacted, oldest first; the newest stay verbatim.
+            // Below it the history is returned UNCHANGED so each step's prompt
+            // extends the previous one and the local KV prefix pin survives the
+            // step (see `compactContextIfNeeded`). The transcript and the
+            // report keep everything — only what the MODEL re-reads each step
+            // shrinks.
             messages = Self.compactContextIfNeeded(messages)
 
             let deltaTextId = UUID()
@@ -506,14 +510,31 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
     private static let agedAssistantTextLimit = 2_000
     private static let agedToolResultLimit = 800
 
-    /// Bounds what the model re-reads each step. The newest
+    /// Bounds what the model re-reads each step — but only when the history is
+    /// LARGE ENOUGH that folding pays for what it costs. The newest
     /// `keptRecentTurns` turns stay verbatim; every older turn loses its
     /// thinking (it is scratch) and has its text and tool results folded; and
     /// whole oldest blocks are dropped when folding alone cannot fit the
     /// budget. The task (the first user message) and every steering note are
     /// never compacted. The transcript and report are untouched: the operator
     /// still sees everything the run did.
+    ///
+    /// The trigger is the CHARACTER BUDGET, not the turn count. Folding
+    /// REWRITES bytes in the middle of the prompt, so a step whose history was
+    /// folded renders a prompt that is not an extension of the previous
+    /// step's — and the local backend reuses its KV prefix exactly when each
+    /// step's prompt extends the last byte for byte (`renderPrompt`'s
+    /// deterministic-rendering contract). Folding on turn count made every
+    /// step from the third on rewrite the turn that had just aged, so no
+    /// multi-step local run ever reused its pin: each step re-prefilled the
+    /// aged tail. Under the budget the history comes back UNCHANGED, steps are
+    /// pure extensions and the pin holds; folding runs only when the budget
+    /// demands it, one deliberate re-prefill per fold cycle instead of one per
+    /// step.
     static func compactContextIfNeeded(_ messages: [AgentBackendMessage]) -> [AgentBackendMessage] {
+        let rawTotal = messages.reduce(0) { $0 + Self.contextCharacterCount(of: $1) }
+        guard rawTotal > contextCharacterBudget else { return messages }
+
         let blockStarts = messages.indices.filter {
             if case .assistant = messages[$0] { return true } else { return false }
         }
