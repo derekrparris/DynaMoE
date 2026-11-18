@@ -149,7 +149,13 @@ nonisolated enum AgentRolePresetCatalog {
         if let value = overrides.maxWallClockSeconds {
             budget.maxWallClockSeconds = min(max(1, value), AgentBudget.maximumWallClockSeconds)
         }
-        if let value = overrides.maxCostUSD { budget.maxCostUSD = max(0, value) }
+        if let value = overrides.maxCostUSD {
+            // A non-finite override is refused by the spawn resolver before it
+            // reaches here; folded anyway so no OTHER caller can turn `.nan`
+            // into a "$0 ceiling" (Swift's `max(0, .nan)` returns 0) or let an
+            // infinite ceiling silently disable the guard.
+            budget.maxCostUSD = value.isFinite ? max(0, value) : nil
+        }
         return budget
     }
 

@@ -285,6 +285,24 @@ struct ContentView: View {
     /// Resolved once at step 0 and carried by value for every later step.
     @State private var activeTurnMode: AgentMode? = nil
 
+    /// Deferred relaunches: a send that preempts a background turn, or waits
+    /// out a busy slot, queues itself on a `Task` that re-calls the send once
+    /// the engine is free. Nothing else cancelled those tasks, so a Stop left
+    /// them armed — a stopped turn could resurrect itself up to 120 s later.
+    /// Tracked here so `stopAutoregressiveGeneration` can reach them; a task
+    /// removes its own entry when it exits.
+    @State private var deferredRelaunchTasks: [UUID: Task<Void, Never>] = [:]
+
+    /// Cancels every queued relaunch. Called from Stop and from the paths that
+    /// tear a generation down before replacing it, so a superseded send cannot
+    /// come back after its caller has moved on.
+    private func cancelDeferredRelaunches() {
+        for relaunch in deferredRelaunchTasks.values {
+            relaunch.cancel()
+        }
+        deferredRelaunchTasks.removeAll()
+    }
+
     /// The operator TURN whose generation is (or was last) active: minted on a
     /// fresh send, carried by every continuation of that send. A Stop scopes
     /// subagent-run cancellation to this turn, so background runs an earlier
@@ -1862,6 +1880,12 @@ struct ContentView: View {
             ActionApprovalManager.shared.cancelAll()
             AgentRunStore.shared.flush()
         }
+        // A notification tap names the conversation its run belongs to: the
+        // inspector is session-scoped, so the tap has to select that chat
+        // before the drawer opens, or it lands on a list the run is not in.
+        .onReceive(NotificationCenter.default.publisher(for: SubagentNotifier.revealRunNotification)) { note in
+            revealConversationForSubagentRun(note)
+        }
         .task {
             await loadPersistedSessionsIfNeeded()
         }
@@ -2307,10 +2331,15 @@ struct ContentView: View {
             instance.isSummaryRelayed = true
         }
         for id in ids {
-            guard var record = AgentRunStore.shared.load(runId: id, sessionId: sessionId),
-                  !record.summaryRelayed else { continue }
-            record.summaryRelayed = true
-            AgentRunStore.shared.saveImmediately(record)
+            // Mutated against the CURRENT record on the store's IO queue, not
+            // a copy loaded here: an Apply completing mid-relay rewrites
+            // `appliedAt`/`appliedToBranch`/`changedFiles`, and a stale
+            // load-then-save would revert those fields and re-offer apply on
+            // work that already landed. This is the exact defect `mutate`'s own
+            // doc names.
+            AgentRunStore.shared.mutate(runId: id, sessionId: sessionId) { current in
+                current.summaryRelayed = true
+            }
         }
     }
 
@@ -4434,6 +4463,11 @@ struct ContentView: View {
         CompletionEngine.shared.cancelActiveTurn()
         generationTask?.cancel()
         generationTask = nil
+        // A send queued behind a cancellation or a busy slot is still THIS
+        // operator's intent to run, so Stop must reach it too: the preemption
+        // retry and the slot-wait tasks re-call the send when the engine comes
+        // free, and without this they resurrected a stopped turn.
+        cancelDeferredRelaunches()
         // The turn is over, so a continuation that somehow arrives afterwards
         // must not inherit its mode. The next send resolves a fresh one at step 0.
         activeTurnMode = nil
@@ -4465,6 +4499,18 @@ struct ContentView: View {
     /// replacement (Stop would no longer cancel it). Call from the main actor.
     private func ownsGeneration(_ id: UInt64) -> Bool {
         id == generationId
+    }
+
+    /// Selects the conversation a subagent notification tap names, so the
+    /// session-scoped inspector the tap is about to open lists that run.
+    /// A tap with no session, or one whose conversation is gone, only opens
+    /// the drawer (the delegate has already done that).
+    private func revealConversationForSubagentRun(_ note: Notification) {
+        guard let info = note.userInfo as? [String: Any],
+              let raw = info["sessionId"] as? String,
+              let sessionId = UUID(uuidString: raw),
+              sessions.contains(where: { $0.id == sessionId }) else { return }
+        selectedSessionId = sessionId
     }
 
     // MARK: - Apple Foundation Model (System On-Device) Generation
@@ -6407,13 +6453,27 @@ struct ContentView: View {
         // too, and preempting from a continuation killed the background run the
         // coordinator's OWN turn had spawned, at the coordinator's next step.
         // A continuation waits for the slot at the claim below instead.
+        //
+        // "Stopping" is the honest word: the preemption CANCELS the run (its
+        // report and, for an isolated writer, its unapplied worktree are kept),
+        // it does not pause it.
         let isFreshOperatorSend = agentStep == 0 && !isInThinkingContinuation
         if !preemptionRetry, isFreshOperatorSend, CompletionEngine.shared.hasActiveBackgroundTurn {
-            showStatus("⏸ Pausing a background subagent so this turn can run…")
-            Task { @MainActor in
+            showStatus("⏸ Stopping a background subagent so this turn can run…")
+            // Tracked so Stop can cancel it: the operator pressed Stop while
+            // the send sat queued behind the preemption, and without this the
+            // task relaunched the stopped turn as soon as the engine drained.
+            let relaunchKey = UUID()
+            deferredRelaunchTasks[relaunchKey] = Task { @MainActor in
+                defer { self.deferredRelaunchTasks[relaunchKey] = nil }
                 await AgentScheduler.shared.preemptLocalRuns()
                 CompletionEngine.shared.cancelBackgroundTurn()
                 await CompletionEngine.shared.awaitIdle()
+                guard !Task.isCancelled else { return }
+                // The runs just cancelled release their claims as they unwind;
+                // taking the claim HERE means the retry cannot lose to another
+                // claimant the slot it paid for with their cancellation.
+                let reclaimed = CompletionEngine.shared.reserveTurnSlot()
                 _ = self.startAutoregressiveGeneration(
                     customPrompt: customPrompt,
                     promptTokens: promptTokens,
@@ -6425,6 +6485,7 @@ struct ContentView: View {
                     isInThinkingContinuation: isInThinkingContinuation,
                     forceSynthesis: forceSynthesis,
                     preemptionRetry: true,
+                    slotCarry: reclaimed,
                     // The reports this send carries are marked delivered only
                     // when the retry actually launches. Returning `true` here
                     // used to let the caller mark them even if the retry was
@@ -6498,17 +6559,23 @@ struct ContentView: View {
         }
         defer { turnSlotClaim?.release() }
 
-        // A CONTINUATION that lost the claim must not fail its step the way a
-        // fresh send's launch error does. The holder is usually the turn's own
-        // background child between two of its steps — the window where the
-        // ledger is claimed but no background turn task exists, so the
-        // preemption guard above cannot see it — and writing the refusal into
-        // the assistant's message dropped the step silently. Wait for the
-        // slot, bounded; past the patience the operator's conversation
-        // outranks the background run, so it is cancelled and the step retries.
-        if turnSlotClaim == nil, slotCarry == nil, !preemptionRetry, !isFreshOperatorSend {
-            showStatus("⏳ Waiting for the engine so this turn can continue…")
-            Task { @MainActor in
+        // A send that lost the claim must not fail the way a launch error does.
+        // The holder is usually a run between two of its steps — the window
+        // where the ledger is claimed but no background turn task exists, so
+        // the preemption guard above cannot see it — but it can also be a
+        // server turn or a model load. Waiting is the honest answer for BOTH a
+        // continuation and a FRESH send: writing the refusal into the message
+        // dropped the step silently, and a fresh send that got "engine not
+        // ready" a moment after the operator pressed send was refused for
+        // engine state nobody had described to them. Wait for the slot,
+        // bounded; past the patience the operator's conversation outranks a
+        // background run, so it is cancelled and the send retries.
+        if turnSlotClaim == nil, slotCarry == nil, !preemptionRetry {
+            showStatus("⏳ Waiting for the engine so this turn can \(isFreshOperatorSend ? "run" : "continue")…")
+            // Tracked so Stop can cancel it — see the preemption branch above.
+            let relaunchKey = UUID()
+            deferredRelaunchTasks[relaunchKey] = Task { @MainActor in
+                defer { self.deferredRelaunchTasks[relaunchKey] = nil }
                 var held: TurnSlotClaim?
                 let deadline = Date().addingTimeInterval(120)
                 while held == nil, Date() < deadline {
@@ -6516,6 +6583,12 @@ struct ContentView: View {
                     if held == nil {
                         try? await Task.sleep(nanoseconds: 100_000_000)
                     }
+                }
+                guard !Task.isCancelled else {
+                    // A claim won in a task the operator has stopped must go
+                    // back, or it wedges the engine for everyone.
+                    held?.release()
+                    return
                 }
                 if let held {
                     _ = self.startAutoregressiveGeneration(
@@ -6535,6 +6608,12 @@ struct ContentView: View {
                     await AgentScheduler.shared.preemptLocalRuns()
                     CompletionEngine.shared.cancelBackgroundTurn()
                     await CompletionEngine.shared.awaitIdle()
+                    guard !Task.isCancelled else { return }
+                    // Reclaimed here, not inside the retry, so the retry
+                    // cannot lose the slot the preemption paid for — the run
+                    // just cancelled is permanently gone; its slot must not
+                    // be lost to a race on top of that.
+                    let reclaimed = CompletionEngine.shared.reserveTurnSlot()
                     _ = self.startAutoregressiveGeneration(
                         customPrompt: customPrompt,
                         promptTokens: promptTokens,
@@ -6546,6 +6625,7 @@ struct ContentView: View {
                         isInThinkingContinuation: isInThinkingContinuation,
                         forceSynthesis: forceSynthesis,
                         preemptionRetry: true,
+                        slotCarry: reclaimed,
                         relayedReports: relayedReports
                     )
                 }
@@ -7985,11 +8065,24 @@ struct ContentView: View {
             // replaces the shard buffers and retires the DeepSeek runtime, so a turn
             // that started in between would be computing on mappings that no longer
             // exist. The slot is the one thing both callers check, so the load takes
-            // it and gives it back once the new engine is installed. Nil means
-            // another caller got there first, which is no worse than the behaviour
-            // before the claim existed.
+            // it and gives it back once the new engine is installed.
             let swapClaim = CompletionEngine.shared.reserveTurnSlot()
-            defer { swapClaim?.release() }
+            // A load that lost the claim race must NOT proceed on a nil claim.
+            // The other claimant is most often a live subagent step (the PR's
+            // scheduler claims per step, so the awaitIdle→reserve gap above
+            // can lose to one), and proceeding anyway is what swaps the shard
+            // buffers under a turn that is computing on them. Refuse the load:
+            // the operator can retry once the run finishes, and a superseded
+            // token makes chained loads heal past the refusal.
+            guard let swapClaim else {
+                await MainActor.run {
+                    guard self.modelLoadToken == token else { return }
+                    self.metalStatus = "⚠️ Engine busy: a turn or subagent run is using it. Load the model again once it finishes."
+                    self.isLoadingModel = false
+                }
+                return
+            }
+            defer { swapClaim.release() }
             // The wait can be long: a newer load may have superseded this one, in
             // which case it must not touch the shared state the newer one owns.
             let superseded = await MainActor.run { self.modelLoadToken != token }

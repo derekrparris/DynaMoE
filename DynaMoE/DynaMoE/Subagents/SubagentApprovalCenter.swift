@@ -46,15 +46,19 @@ final class SubagentApprovalCenter: ObservableObject {
     /// the configured re-prefill budget is not. Landing a run's work is the
     /// other: the SUBAGENTS.md contract gives every apply its own card, and a
     /// blanket switch must not insert a patch with no human in the loop.
+    ///
+    /// A containment-escape card is the third case, enforced here rather than
+    /// at the call site so no future caller can forget it: Turbo Mode's
+    /// contract is "stop confirming routine writes inside the sandbox", and an
+    /// escape from the configuration presented as safe — an out-of-workspace
+    /// write, a shell with its own `cwd`, a `.git` pointer rewrite — is
+    /// exactly the write the operator would most want to see.
     func request(_ request: AgentApprovalRequest, honorsTurbo: Bool = true) async -> Bool {
-        if honorsTurbo,
-           request.toolName != "apply_subagent_changes",
-           TurboModeSettings.isEnabled,
-           AgentHarness.turboModeMayBypassApproval(
-               toolName: request.toolName,
-               arguments: request.arguments,
-               mode: .code
-           ) {
+        if Self.turboBypasses(
+            request: request,
+            honorsTurbo: honorsTurbo,
+            turboEnabled: TurboModeSettings.isEnabled
+        ) {
             return true
         }
         let entry = PendingSubagentApproval(id: UUID(), request: request)
@@ -89,6 +93,30 @@ final class SubagentApprovalCenter: ObservableObject {
 
     func reject(_ id: UUID) {
         _ = ActionApprovalManager.shared.reject(id: id)
+    }
+
+    /// Whether Turbo Mode may skip the card for this request, as a pure
+    /// function of the inputs so a test can pin every rule without flipping
+    /// the real Turbo preference (the switch has exactly one owner).
+    ///
+    /// Landing a run's work, a containment escape, a caller that opts out via
+    /// `honorsTurbo`, and Turbo being off are each sufficient to keep the
+    /// card; `turboModeMayBypassApproval` owns the per-tool rules (app
+    /// preferences, the SubQ credential) on top.
+    static func turboBypasses(
+        request: AgentApprovalRequest,
+        honorsTurbo: Bool,
+        turboEnabled: Bool
+    ) -> Bool {
+        guard honorsTurbo,
+              request.toolName != "apply_subagent_changes",
+              !request.containmentEscape,
+              turboEnabled else { return false }
+        return AgentHarness.turboModeMayBypassApproval(
+            toolName: request.toolName,
+            arguments: request.arguments,
+            mode: .code
+        )
     }
 
     /// The card's own description of what is at stake.

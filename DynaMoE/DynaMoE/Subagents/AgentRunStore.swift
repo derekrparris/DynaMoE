@@ -271,7 +271,12 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                     offset += written
                     continue
                 }
-                if written != 0 { writeErrno = errno }
+                // A zero return on a blocking descriptor is not progress:
+                // nothing was written and the loop would spin. It used to
+                // break WITHOUT an error, so a "successful" write could leave
+                // a truncated record behind. errno may read 0 here; any
+                // zero-byte return is an I/O error by definition.
+                writeErrno = errno != 0 ? errno : EIO
                 break
             }
         }
@@ -546,39 +551,93 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// it removed and a test can ask the same question twice.
     @discardableResult
     func prune(now: Date = Date(), policy: RetentionPolicy = .standard) -> [UUID] {
-        let all = loadAll()
-        let sorted = all.sorted { Self.sortDate($0) > Self.sortDate($1) }
-        let cutoff = now.addingTimeInterval(-policy.keepDays * 86_400)
-        let youngestAllowed = now.addingTimeInterval(-policy.minimumAgeHours * 3_600)
-        var removed: [UUID] = []
-        for (index, record) in sorted.enumerated() {
-            let date = Self.sortDate(record)
-            if index < policy.keepNewest { continue }
-            if date >= cutoff { continue }
-            if date >= youngestAllowed { continue }
-            // An old record can still be LIVE: the retention clock runs from a
-            // run's start, and a long-running job (or a restored record waiting
-            // on a slow operator approval) would otherwise be deleted underneath
-            // its own instance, which then rewrites it anyway.
-            guard record.status.isTerminal else { continue }
-            // An unapplied isolated run's record is the only thing keeping its
-            // WORKTREE alive: the launch sweep protects a tree while a
-            // decodable record says unapplied, so pruning the record first
-            // means the very next sweep deletes the run's only copy of its
-            // work. Retention is for conversation history; unapplied work is
-            // the operator's to clear or apply, never the clock's.
-            if record.isolation.isIsolated, record.appliedAt == nil { continue }
-            let url = fileURL(runId: record.id, sessionId: record.parentSessionId)
-            if (try? fileManager.removeItem(at: url)) != nil {
+        // The whole pass runs on the store's IO queue, ordered after every
+        // write in flight. It used to delete then tombstone from an arbitrary
+        // thread, so a `save` that had already passed its `wasDeleted` check
+        // could land AFTER the `removeItem` — resurrecting a pruned record
+        // that the too-late tombstone then blocked from being rewritten: an
+        // immortal, invisible file. `delete(runId:)` already runs on the queue
+        // with the tombstone first; prune must answer the same way.
+        ioQueue.sync { [self] in
+            let all = loadAll()
+            let sorted = all.sorted { Self.sortDate($0) > Self.sortDate($1) }
+            let cutoff = now.addingTimeInterval(-policy.keepDays * 86_400)
+            let youngestAllowed = now.addingTimeInterval(-policy.minimumAgeHours * 3_600)
+            var removed: [UUID] = []
+            for (index, record) in sorted.enumerated() {
+                let date = Self.sortDate(record)
+                if index < policy.keepNewest { continue }
+                if date >= cutoff { continue }
+                if date >= youngestAllowed { continue }
+                // An old record can still be LIVE: the retention clock runs from a
+                // run's start, and a long-running job (or a restored record waiting
+                // on a slow operator approval) would otherwise be deleted underneath
+                // its own instance, which then rewrites it anyway.
+                guard record.status.isTerminal else { continue }
+                // An unapplied isolated run's record is the only thing keeping its
+                // WORKTREE alive: the launch sweep protects a tree while a
+                // decodable record says unapplied, so pruning the record first
+                // means the very next sweep deletes the run's only copy of its
+                // work. Retention is for conversation history; unapplied work is
+                // the operator's to clear or apply, never the clock's.
+                if record.isolation.isIsolated, record.appliedAt == nil { continue }
+                let url = fileURL(runId: record.id, sessionId: record.parentSessionId)
                 noteDeletedRun(record.id)
-                removed.append(record.id)
-                signatureLock.lock()
-                writtenSignatures[url.path] = nil
-                removeRelayLocked(runId: record.id, sessionId: record.parentSessionId)
-                signatureLock.unlock()
+                if (try? fileManager.removeItem(at: url)) != nil {
+                    removed.append(record.id)
+                    signatureLock.lock()
+                    writtenSignatures[url.path] = nil
+                    removeRelayLocked(runId: record.id, sessionId: record.parentSessionId)
+                    signatureLock.unlock()
+                }
             }
+            return removed
         }
-        return removed
+    }
+
+    /// Removes the temp files an interrupted write leaves behind (a hard
+    /// crash between the create and the rename makes `.<run>.json.new-<id>`
+    /// orphans nothing else ever looks at) and reports how many records
+    /// exist on disk that this build cannot decode. Age-gated so a temp file
+    /// an in-flight write is using right now is never touched: a real temp is
+    /// milliseconds old, and anything older is an orphan by construction.
+    @discardableResult
+    func sweepOrphanedTempWrites(now: Date = Date(), olderThan: TimeInterval = 3_600) -> Int {
+        ioQueue.sync { [self] in
+            var removedTemps = 0
+            var undecodable = 0
+            guard let entryNames = try? fileManager.contentsOfDirectory(atPath: rootURL.path) else {
+                return 0
+            }
+            for entryName in entryNames {
+                let directory = rootURL.appendingPathComponent(entryName, isDirectory: true)
+                var isDirectory: ObjCBool = false
+                guard fileManager.fileExists(atPath: directory.path, isDirectory: &isDirectory),
+                      isDirectory.boolValue else { continue }
+                guard let fileNames = try? fileManager.contentsOfDirectory(atPath: directory.path) else { continue }
+                for fileName in fileNames {
+                    if fileName.hasPrefix("."), fileName.contains(".new-") {
+                        let url = directory.appendingPathComponent(fileName, isDirectory: false)
+                        let modified = (try? fileManager.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+                        guard let modified, now.timeIntervalSince(modified) >= olderThan else { continue }
+                        if (try? fileManager.removeItem(at: url)) != nil { removedTemps += 1 }
+                        continue
+                    }
+                    if fileName.hasSuffix(".json"), fileName.first != "." {
+                        if decodeRecord(at: directory.appendingPathComponent(fileName, isDirectory: false)) == nil {
+                            undecodable += 1
+                        }
+                    }
+                }
+            }
+            if undecodable > 0 {
+                // Surfaced, never deleted: a file this build cannot decode may
+                // be a record a NEWER build wrote, and deleting it would make a
+                // downgrade-then-upgrade cycle destroy history.
+                print("ℹ️ [AgentRunStore] \(undecodable) record(s) on disk are not decodable by this build; they are kept untouched.")
+            }
+            return removedTemps
+        }
     }
 
     // MARK: - Bounds

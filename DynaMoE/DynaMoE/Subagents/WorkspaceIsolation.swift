@@ -22,6 +22,7 @@ nonisolated enum WorkspaceIsolationError: LocalizedError, Equatable {
     case worktreeExists(String)
     case worktreeCreationFailed(String)
     case worktreeMissing(String)
+    case worktreeLinkageCompromised(String)
     case snapshotFailed(String)
     case applyFailed(String)
     case applyConflicted(String)
@@ -38,6 +39,8 @@ nonisolated enum WorkspaceIsolationError: LocalizedError, Equatable {
             return "Could not create the run's worktree: \(detail)"
         case .worktreeMissing(let path):
             return "The run's worktree at '\(path)' is gone. It may already have been applied and cleaned up."
+        case .worktreeLinkageCompromised(let detail):
+            return "The run's worktree no longer points at the repository it was created from: \(detail). Nothing was staged, applied or deleted, and the worktree was kept so its files can be inspected."
         case .snapshotFailed(let detail):
             return "Could not read the run's changes: \(detail)"
         case .applyFailed(let detail):
@@ -253,8 +256,18 @@ nonisolated enum WorkspaceIsolation {
             try? fileManager.removeItem(at: worktreeURL)
             // `worktree add -b` can create the branch before it fails on the
             // checkout. A retry with the same run id would then meet a branch
-            // that already exists, so the failed attempt gives it back.
-            _ = try? await git(["branch", "-D", branch], in: rootPath)
+            // that already exists, so the failed attempt gives it back — but
+            // only when the branch points at the base commit we asked git to
+            // cut it from: the failure can also BE a pre-existing branch of
+            // the same name (a collision with an earlier run's leftover), and
+            // `branch -D` would then delete a branch this call never owned.
+            if let (verifyCode, verifyOut, _) = try? await git(
+                ["rev-parse", "--verify", "\(branch)^{commit}"],
+                in: rootPath
+            ), verifyCode == 0,
+               verifyOut.trimmingCharacters(in: .whitespacesAndNewlines) == baseCommit {
+                _ = try? await git(["branch", "-D", branch], in: rootPath)
+            }
             throw WorkspaceIsolationError.worktreeCreationFailed(
                 stderr.trimmingCharacters(in: .whitespacesAndNewlines)
             )
@@ -363,6 +376,69 @@ nonisolated enum WorkspaceIsolation {
 
     // MARK: Reading changes
 
+    /// What makes a worktree's `.git` linkage untrustworthy, or nil when it
+    /// still points where `createWorktree` put it.
+    ///
+    /// A linked worktree's `.git` is a regular FILE inside the containment
+    /// prefix, so a sandboxed run can reach it: a rewritten pointer makes every
+    /// later git command in the worktree run somewhere else — `git add -A`
+    /// stages the operator's tree into their shared index, `git_commit` lands
+    /// on their checked-out branch — and deleting the pointer orphans work
+    /// nothing can land. The comparison is against the RECORDED repository
+    /// (never against wherever the pointer happens to point now), plus the
+    /// per-worktree admin directory's own back-pointer, which lives in the
+    /// main repository's `.git` where the run cannot write it.
+    static func worktreeLinkageProblem(_ worktree: AgentWorktree) async -> String? {
+        guard let (rootCode, rootOut, _) = try? await git(
+            ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            in: worktree.repositoryRoot
+        ), rootCode == 0 else {
+            return "the recorded repository at '\(worktree.repositoryRoot.path)' could not be read"
+        }
+        let commonPath = URL(fileURLWithPath: rootOut.trimmingCharacters(in: .whitespacesAndNewlines), isDirectory: true)
+            .standardizedFileURL.resolvingSymlinksInPath().path
+        guard let (gitDirCode, gitDirOut, _) = try? await git(
+            ["rev-parse", "--path-format=absolute", "--git-dir"],
+            in: worktree.path
+        ), gitDirCode == 0 else {
+            return "its .git linkage cannot be resolved, so git does not treat '\(worktree.path.path)' as a working tree"
+        }
+        let gitDir = URL(fileURLWithPath: gitDirOut.trimmingCharacters(in: .whitespacesAndNewlines), isDirectory: true)
+            .standardizedFileURL.resolvingSymlinksInPath()
+        let worktreesRoot = commonPath.hasSuffix("/") ? commonPath + "worktrees/" : commonPath + "/worktrees/"
+        guard gitDir.path.hasPrefix(worktreesRoot) else {
+            return "its .git file points at '\(gitDir.path)', which is not a linked-worktree git directory of the repository at '\(worktree.repositoryRoot.path)'"
+        }
+        guard let pointer = try? String(contentsOf: gitDir.appendingPathComponent("gitdir"), encoding: .utf8) else {
+            return "the repository's worktree record for '\(worktree.path.lastPathComponent)' could not be read"
+        }
+        let recordedBack = URL(fileURLWithPath: pointer.trimmingCharacters(in: .whitespacesAndNewlines))
+            .standardizedFileURL.resolvingSymlinksInPath().path
+        let expectedBack = worktree.path
+            .appendingPathComponent(".git")
+            .standardizedFileURL.resolvingSymlinksInPath().path
+        guard recordedBack == expectedBack else {
+            return "the repository's worktree record points at '\(recordedBack)' instead of this worktree"
+        }
+        return nil
+    }
+
+    /// Refuses to trust a worktree whose `.git` linkage moved, after one
+    /// repair attempt.
+    ///
+    /// `git worktree repair` restores the pointer from the repository's own
+    /// admin files, which live OUTSIDE the sandbox the run can write, so the
+    /// repair can only ever put the ORIGINAL linkage back: a deliberately
+    /// retargeted pointer is repaired (when the repo's records are intact) or
+    /// refused — never followed.
+    static func verifyWorktreeLinkage(_ worktree: AgentWorktree) async throws {
+        if await worktreeLinkageProblem(worktree) == nil { return }
+        _ = try? await git(["worktree", "repair", worktree.path.path], in: worktree.repositoryRoot)
+        if let problem = await worktreeLinkageProblem(worktree) {
+            throw WorkspaceIsolationError.worktreeLinkageCompromised(problem)
+        }
+    }
+
     /// Stages the worktree's files (so new files are in the diff) and reads the
     /// net change against the base commit. Staging is safe here: the worktree is
     /// disposable and the index is not part of what is applied.
@@ -377,6 +453,11 @@ nonisolated enum WorkspaceIsolation {
         guard FileManager.default.fileExists(atPath: directory.path) else {
             throw WorkspaceIsolationError.worktreeMissing(directory.path)
         }
+        // `git add -A` below is a WRITE whose destination is decided by the
+        // worktree's `.git` pointer — a file inside the sandbox. A retargeted
+        // pointer would stage the operator's tree into their shared index, so
+        // the linkage is verified before the first git command runs.
+        try await verifyWorktreeLinkage(worktree)
 
         let (addCode, _, addErr) = try await git(["add", "-A"], in: directory)
         guard addCode == 0 else {
@@ -514,6 +595,14 @@ nonisolated enum WorkspaceIsolation {
         guard !changes.diffWasTruncated else {
             throw WorkspaceIsolationError.applyFailed("the patch was truncated before it could be applied")
         }
+        // The patch was read through the worktree's git linkage, and a
+        // retargeted `.git` pointer could have made that read describe another
+        // repository's state (or the operator's own tree). Verified only when
+        // the worktree is still present: an apply that carries its own
+        // changeSet against an already-cleaned-up worktree never consults it.
+        if FileManager.default.fileExists(atPath: worktree.path.path) {
+            try await verifyWorktreeLinkage(worktree)
+        }
         try await refuseIfTheMainTreeIsMidOperation(worktree.repositoryRoot)
         try refuseIfTargetsAreNotWritable(changes.changedFiles, in: worktree.repositoryRoot)
 
@@ -636,6 +725,7 @@ nonisolated enum WorkspaceIsolation {
         func restore(in root: URL) -> Bool {
             let fileManager = FileManager.default
             var restoredEverything = true
+            let rootPath = root.path
             for entry in entries {
                 guard let target = WorkspaceIsolation.safeURL(for: entry.relativePath, in: root) else {
                     restoredEverything = false
@@ -653,6 +743,24 @@ nonisolated enum WorkspaceIsolation {
                         try fileManager.copyItem(at: original, to: target)
                     } else if fileManager.fileExists(atPath: target.path) {
                         try fileManager.removeItem(at: target)
+                        // A patch that failed partway may also have created
+                        // the DIRECTORIES its new files lived in, and removing
+                        // the files alone leaves them: the tree is not "as it
+                        // was". Walk upward removing directories the patch
+                        // made, stopping at the first non-empty one and
+                        // always before the repository root itself.
+                        var directory = target.deletingLastPathComponent()
+                        while directory.path != rootPath, directory.path != "/" {
+                            guard let contents = try? fileManager.contentsOfDirectory(atPath: directory.path),
+                                  contents.isEmpty else { break }
+                            do {
+                                try fileManager.removeItem(at: directory)
+                            } catch {
+                                restoredEverything = false
+                                break
+                            }
+                            directory = directory.deletingLastPathComponent()
+                        }
                     }
                 } catch {
                     restoredEverything = false

@@ -22,6 +22,7 @@ nonisolated enum AgentSpawnError: LocalizedError, Equatable {
     case unknownTool(String)
     case notAvailableToRuns(String)
     case costCeilingWithoutPricing(String)
+    case invalidBudgetOverride(String)
 
     var errorDescription: String? {
         switch self {
@@ -39,6 +40,8 @@ nonisolated enum AgentSpawnError: LocalizedError, Equatable {
             return "Tool '\(name)' exists only in the coordinator's catalog (a dynamically loaded or MCP tool), and a subagent run installs the built-in tools alone."
         case .costCeilingWithoutPricing(let model):
             return "This spawn sets a max_cost_usd ceiling, but no price is recorded for '\(model)', so the ceiling could never bind. Record the model's input and output prices in Settings under Cloud Providers, or clear the ceiling."
+        case .invalidBudgetOverride(let detail):
+            return "The spawn's budget was refused: \(detail) The run was not started."
         }
     }
 }
@@ -151,6 +154,15 @@ enum AgentSpawnResolver {
         let preset = AgentRolePresetCatalog.preset(named: request.presetName, role: request.role)
         let definition = AgentRolePresetCatalog.definition(for: preset)
         let toolNames = try resolveTools(request, definition: definition)
+        // A non-finite ceiling is not a budget: `max(0, .nan)` folds to 0 in
+        // the budget builder, and a "$0 ceiling" fails the run at step 0 with
+        // a cost failure the operator never asked for. Refuse it at the card,
+        // before any backend or worktree exists to clean up.
+        if let ceiling = request.budgetOverrides?.maxCostUSD, !ceiling.isFinite {
+            throw AgentSpawnError.invalidBudgetOverride(
+                "max_cost_usd must be a finite dollar amount; '\(ceiling)' cannot be enforced as a ceiling."
+            )
+        }
         let budget = AgentRolePresetCatalog.budget(for: definition, overrides: request.budgetOverrides)
 
         // Isolation is validated BEFORE the backend is resolved, so a spawn that

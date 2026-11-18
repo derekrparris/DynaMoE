@@ -428,15 +428,23 @@ final class CloudAgentBackendLogicTests: XCTestCase {
 
     // MARK: - Preferred-model resolution
 
-    private static func freshDefaults(_ name: String) -> UserDefaults {
+    private func freshDefaults(_ name: String) -> UserDefaults {
         UserDefaults.standard.removePersistentDomain(forName: name)
-        return UserDefaults(suiteName: name)!
+        let defaults = UserDefaults(suiteName: name)!
+        // A suite's plist is created in Preferences/ on first write and
+        // nothing removed it, so every case that wrote to its suite leaked a
+        // domain for the rest of this machine's life. The teardown block runs
+        // in the case that created it.
+        addTeardownBlock {
+            defaults.removePersistentDomain(forName: name)
+        }
+        return defaults
     }
 
     func testAnEmptyCloudModelSettingResolvesNothingStored() {
         // no stored setting, no providers: nothing resolves, and the caller
         // refuses with the "no cloud model is configured" message.
-        let defaults = Self.freshDefaults("dynamoe-tests-cloud-empty")
+        let defaults = freshDefaults("dynamoe-tests-cloud-empty")
         XCTAssertEqual(
             SubagentBackendSettings.preferredCloudModel(
                 coordinateModelId: nil, defaults: defaults, providers: []
@@ -446,7 +454,7 @@ final class CloudAgentBackendLogicTests: XCTestCase {
     }
 
     func testAStoredCloudModelThatParsesIsThePreference() {
-        let defaults = Self.freshDefaults("dynamoe-tests-cloud-parses")
+        let defaults = freshDefaults("dynamoe-tests-cloud-parses")
         let address = CloudModelAddress.modelId(providerId: "test-provider", providerModelId: "test-model")
         defaults.set(address, forKey: SubagentBackendSettings.cloudModelKey)
         XCTAssertEqual(
@@ -460,7 +468,7 @@ final class CloudAgentBackendLogicTests: XCTestCase {
     func testAStoredCloudModelThatDoesNotParseIsRefusedByName() {
         // The old behavior silently substituted the provider default here,
         // billing runs on a model the operator never chose.
-        let defaults = Self.freshDefaults("dynamoe-tests-cloud-broken")
+        let defaults = freshDefaults("dynamoe-tests-cloud-broken")
         defaults.set("not-a-cloud-model", forKey: SubagentBackendSettings.cloudModelKey)
         XCTAssertEqual(
             SubagentBackendSettings.preferredCloudModel(
@@ -471,7 +479,7 @@ final class CloudAgentBackendLogicTests: XCTestCase {
     }
 
     func testASpawnRefusesAnUnresolvableStoredCloudModelInsteadOfSubstituting() async {
-        let defaults = Self.freshDefaults("dynamoe-tests-cloud-spawn-broken")
+        let defaults = freshDefaults("dynamoe-tests-cloud-spawn-broken")
         defaults.set("not-a-cloud-model", forKey: SubagentBackendSettings.cloudModelKey)
         do {
             _ = try await AgentSpawnResolver.resolve(

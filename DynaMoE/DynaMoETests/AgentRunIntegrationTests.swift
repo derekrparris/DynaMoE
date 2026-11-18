@@ -22,7 +22,16 @@ final class AgentRunIntegrationTests: XCTestCase {
     }
 
     override func tearDown() async throws {
-        await MainActor.run { SubagentManager.shared.cancelAll() }
+        await MainActor.run {
+            SubagentManager.shared.cancelAll()
+            // `cancelAll` deliberately skips runs that already finished, so
+            // every instance a test completed stayed in the process-wide
+            // registry for the rest of the suite — a later case's
+            // `allSubagents` saw earlier cases' runs. The records go too,
+            // which is what a test wants: nothing here is operator data (the
+            // store redirects to a /tmp root under XCTest).
+            SubagentManager.shared.clearCompleted()
+        }
         if let workingDirectory {
             try? FileManager.default.removeItem(at: workingDirectory)
         }

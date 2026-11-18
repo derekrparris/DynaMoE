@@ -882,6 +882,33 @@ final class CloudMessageAssemblerTests: XCTestCase {
         XCTAssertEqual(assembled.first?.content, "hi")
     }
 
+    /// A prompt-only message is a LOCAL-render construct — the relay directive
+    /// the local renderer splices into the prompt it builds itself. The cloud
+    /// wire has its own relay path, and a directive left behind by an earlier
+    /// LOCAL send of the same conversation must not ship as a visible user
+    /// turn on every later cloud step, re-feeding delivered reports and
+    /// disturbing the provider prefix cache.
+    func testAPromptOnlyMessageNeverReachesTheCloudWire() {
+        let directive = ChatMessage(
+            role: .user,
+            content: "[SUBAGENT_RESULT] The researcher found the scheduler.",
+            isPromptOnly: true
+        )
+        let messages = [
+            ChatMessage(role: .user, content: "where is the scheduler?"),
+            directive,
+            ChatMessage(role: .assistant, content: "Spawning a researcher.")
+        ]
+
+        let assembled = CloudMessageAssembler.assemble(from: messages)
+
+        XCTAssertEqual(assembled.map(\.role), ["user", "assistant"], "the directive is not a wire turn")
+        XCTAssertFalse(
+            assembled.contains { $0.content?.contains("[SUBAGENT_RESULT]") == true },
+            "no part of the directive may reach the provider"
+        )
+    }
+
     func testStripsLeadingSpeakerLabels() {
         let messages = [ChatMessage(role: .assistant, content: "Assistant: Hello there")]
         let assembled = CloudMessageAssembler.assemble(from: messages)

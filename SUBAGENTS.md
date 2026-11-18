@@ -430,11 +430,17 @@ enum AgentApprovalPolicy {
   only when the resolved (symlink-resolved) path is inside the worktree, a
   `git_commit` only when it runs there, and `shell_run` — arbitrary code with
   its own `cwd` — always gets the card. A worktree existing is not evidence
-  that a call wrote inside it.
+  that a call wrote inside it. A path whose components include `.git` never
+  counts as "inside" even when it is: a linked worktree's `.git` is a regular
+  FILE in the sandbox, and rewriting it retargets every later git call, so it
+  gets its own card, and `snapshot`/`apply` re-verify the worktree's git
+  linkage before staging or landing anything.
 - The card is an `ActionApprovalManager` record rendered in the run's inspector
   and the coordinator's tool timeline.
 - Turbo Mode may bypass routine writes; it may **never** bypass
-  `targetsApplicationPreferences`, and a run in plan mode is `.deny`.
+  `targetsApplicationPreferences`, a containment-escape card (an
+  out-of-workspace write, a `shell_run`, a `.git` metadata write inside the
+  sandbox) or `apply_subagent_changes`, and a run in plan mode is `.deny`.
 - `subq_decide` keeps its existing refusal/approval semantics.
 
 ### Workspace isolation
@@ -444,8 +450,11 @@ enum AgentApprovalPolicy {
   `dynamoe/agent/<shortId>`; the run's working directory is that worktree.
 - On completion, produce `changedFiles` and a unified diff in the report.
 - The coordinator applies changes with a new approved tool
-  (`apply_subagent_changes`) or a merge; the worktree is cleaned up on cancel and
-  after a successful apply.
+  (`apply_subagent_changes`) or a merge; the worktree is removed after a
+  successful apply (and a spawn that never reached its loop discards the
+  worktree it was given). A cancelled run's unapplied worktree is KEPT — it
+  is the only full copy of the run's work, and the operator may still apply
+  it from the inspector; the stale-worktree sweep protects it too.
 - Non-git workspace: writers run on the main tree only with per-call approval;
   otherwise the spawn is refused.
 - Read-only runs never touch a worktree.
@@ -567,8 +576,9 @@ it.
 - **Notifications** for a finished background run; unread reports are injected
   at the start of the next coordinator turn on both paths (fixes the weights-path
   orphan).
-- **Settings**: default backend, cloud model for subagents, read-only
-  auto-approve, local cost limit, max concurrency, retention.
+- **Settings**: default backend, cloud model for subagents, local cost limit,
+  max concurrency (per provider and global), retention (runs and days),
+  notifications, and the shared agent step cap.
 
 ---
 
@@ -578,12 +588,11 @@ Pure-logic and fake-backend tests are the default; real-model tests are opt-in.
 
 | Suite | What it proves |
 |---|---|
-| `AgentRunContextTests` | allowlist enforcement, plan mode, per-run guards, no shared-state mutation |
-| `HeadlessAgentLoopTests` | step loop, tool execution, budget, cancellation, guard trips, report derivation |
-| `AgentApprovalTests` | spawn and per-call approval, Turbo/app-preference rules, denial |
-| `AgentReportTests` | schema, evidence requirement, truncation, sanitization |
+| `SubagentLoopTests` | step loop, tool execution, budget, cancellation, guard trips, report derivation, the per-run harness context and its guards |
+| `AgentSpawnPolicyTests` | spawn approval and backend policy, Turbo/app-preference/containment rules, cost and isolation refusals |
+| `AgentRunIntegrationTests` | the manager's run lifecycle end to end (spawn → events → terminal record) against fake backends |
 | `AgentSchedulerTests` | capacity, priority, cancel tree, queue timeout |
-| `AgentRunStoreTests` | round trip, retention, corrupt file, unknown schema |
+| `AgentRunStoreTests` | round trip, retention, corrupt file, unknown schema, mutate vs stale-load |
 | `CloudAgentBackendLogicTests` | event mapping, fragmented tool-call assembly, retry rules |
 | `LocalAgentBackendLogicTests` | prompt rendering, mask install/restore, cost estimate and refusal |
 | `WorkspaceIsolationTests` | worktree create/snapshot/apply/cleanup, committed work included, conflicts refused, non-git refusal, the apply tool and a scripted isolated run end to end, and the operator's Apply Changes path (offer gate, one approval request, declined card, applied-then-nothing) |

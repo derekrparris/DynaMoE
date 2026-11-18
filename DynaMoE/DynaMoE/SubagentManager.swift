@@ -637,6 +637,11 @@ public final class SubagentInstance: Identifiable, ObservableObject {
                 mode: parentMode,
                 approvalPolicy: plan.approvalPolicy,
                 workspaceIsolated: plan.isolation.isIsolated,
+                // The recorded root is what a cardless `git_commit`'s linkage
+                // re-verification compares against: the worktree's `.git`
+                // pointer is a file inside the sandbox, and only the root
+                // tells the harness where it is SUPPOSED to point.
+                workspaceRepositoryRoot: plan.repositoryRoot,
                 approvalHandler: { request in
                     await SubagentApprovalCenter.shared.request(request)
                 }
@@ -832,6 +837,16 @@ public final class SubagentInstance: Identifiable, ObservableObject {
     private func apply(_ event: AgentRunEvent) {
         switch event {
         case .status(let status, let detail):
+            // A queued event can lag a terminal transition: a Stop cancels
+            // mid-loop while the pump still holds an earlier `.running`, and
+            // applying it would flap a finished run back to Running so the
+            // next `persistRecord()` overwrote the terminal record on disk.
+            // `finishRun` and `cancel` both latch `isFinished`; from that
+            // moment the terminal state owns the drawer.
+            lock.lock()
+            let alreadyFinished = isFinished
+            lock.unlock()
+            guard !alreadyFinished else { return }
             liveStatusText = detail
             switch status {
             case .running:
@@ -1722,13 +1737,23 @@ public final class SubagentManager: ObservableObject {
             // A record left `.running` by a crash has no live instance to Stop
             // and no terminal status to clear. Nothing can be in flight before
             // this owner exists, so the launch sweep closes those records
-            // first — but a run the operator already spawned while this sweep
-            // runs is live and must not be rewritten underneath its instance.
-            AgentRunStore.shared.reconcileInterruptedRuns(isLive: { runId in
-                SubagentManager.shared.getSubagent(byId: runId)?
-                    .status.isTerminal == false
-            })
+            // first. "Is this run live" reads the registry and every instance's
+            // `status` — main-actor state — and this sweep runs on a utility
+            // thread, so the answer is SNAP-SHOTTED on the actor up front:
+            // reading it synchronously per record was a data race in the
+            // making. A run spawned after the snapshot is younger than the
+            // grace window and is skipped on its dates, so the snapshot cannot
+            // misclassify it.
+            let liveRunIds = await MainActor.run {
+                Set(SubagentManager.shared.allSubagents
+                    .filter { !$0.status.isTerminal }
+                    .map(\.id))
+            }
+            AgentRunStore.shared.reconcileInterruptedRuns(isLive: { liveRunIds.contains($0) })
             AgentRunStore.shared.prune(policy: policy)
+            // Temp files an interrupted write left behind (a hard crash between
+            // the create and the rename) are orphans nothing else looks at.
+            AgentRunStore.shared.sweepOrphanedTempWrites()
             // The relay asks which restored records it still owes; building
             // that index here keeps the first send from paying for the scan.
             AgentRunStore.shared.prepareRelayIndex()

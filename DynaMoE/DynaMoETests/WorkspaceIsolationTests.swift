@@ -1057,4 +1057,220 @@ final class WorkspaceIsolationTests: XCTestCase {
             timeoutSeconds: 60
         )
     }
+
+    // MARK: - Git linkage verification (merge blocker B1)
+
+    /// A linked worktree's `.git` is a regular FILE inside the containment
+    /// prefix, so a sandboxed run can rewrite it. `git worktree repair`
+    /// restores it from the repository's own records — which live OUTSIDE the
+    /// sandbox — and the snapshot then reads the run's work against the base
+    /// commit it was created from, with the operator's shared index never
+    /// touched by the tampered pointer.
+    func testARetargetedGitPointerIsRepairedBeforeTheSnapshotReadsAnything() async throws {
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: UUID(),
+            root: worktreeRoot
+        )
+        let readme = worktree.path.appendingPathComponent("README.md")
+        try "line one\nline two\nline three\nline four\n".write(to: readme, atomically: true, encoding: .utf8)
+
+        // The exploit shape: the pointer now names the repository's own .git,
+        // so a plain `git add -A` in the worktree would stage the OPERATOR's
+        // tree into their shared index.
+        try "gitdir: \(repository.appendingPathComponent(".git").path)\n".write(
+            to: worktree.path.appendingPathComponent(".git"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let changes = try await WorkspaceIsolation.snapshot(worktree, diffLimit: nil)
+
+        XCTAssertEqual(changes.changedFiles, ["README.md"], "the repaired snapshot reads the run's own work")
+        XCTAssertEqual(
+            try String(contentsOf: worktree.path.appendingPathComponent(".git"), encoding: .utf8)
+                .contains("/worktrees/"),
+            true,
+            "the repair must restore the per-worktree pointer"
+        )
+        let status = try await git(["status", "--porcelain"], in: repository)
+        XCTAssertEqual(status.1, "", "the operator's tree must never be staged by the snapshot")
+    }
+
+    /// Deleting the pointer (the work-loss half of the exploit) orphans work
+    /// the app could not land. The repair restores it from the repository's
+    /// records and the work stays readable.
+    func testADeletedGitPointerIsRepairedAndTheWorkIsStillReadable() async throws {
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: UUID(),
+            root: worktreeRoot
+        )
+        try "line one\nline two\nline three\nline four\n".write(
+            to: worktree.path.appendingPathComponent("README.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try FileManager.default.removeItem(at: worktree.path.appendingPathComponent(".git"))
+
+        let changes = try await WorkspaceIsolation.snapshot(worktree, diffLimit: nil)
+        XCTAssertEqual(changes.changedFiles, ["README.md"])
+    }
+
+    /// When the repository's own records are gone too, nothing can repair the
+    /// linkage, and the snapshot must REFUSE rather than run a single git
+    /// command through it — keeping the worktree so the files survive.
+    func testAnUnrepairableLinkageRefusesTheSnapshotAndKeepsTheWorktree() async throws {
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: UUID(),
+            root: worktreeRoot
+        )
+        try "line four\n".write(
+            to: worktree.path.appendingPathComponent("Added.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        // The per-worktree admin directory lives in the MAIN repository's
+        // .git, where in-sandbox file tools cannot reach it — but a shell the
+        // operator approved could. With it gone, repair has no source of
+        // truth.
+        let adminDir = repository
+            .appendingPathComponent(".git", isDirectory: true)
+            .appendingPathComponent("worktrees", isDirectory: true)
+            .appendingPathComponent(worktree.path.lastPathComponent, isDirectory: true)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: adminDir.path))
+        try FileManager.default.removeItem(at: adminDir)
+
+        do {
+            _ = try await WorkspaceIsolation.snapshot(worktree)
+            XCTFail("an unrepairable linkage must refuse the snapshot")
+        } catch let error as WorkspaceIsolationError {
+            guard case .worktreeLinkageCompromised = error else {
+                return XCTFail("expected worktreeLinkageCompromised, got \(error)")
+            }
+        }
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: worktree.path.appendingPathComponent("Added.txt").path),
+            "the refused worktree keeps its files"
+        )
+        let status = try await git(["status", "--porcelain"], in: repository)
+        XCTAssertEqual(status.1, "", "nothing was staged anywhere by the refusal")
+    }
+
+    /// The worktree linkage check answers the same question for an APPLY: a
+    /// patch read through a retargeted pointer must not land on the main tree.
+    func testAnApplyRefusesAWorktreeWhoseLinkageCannotBeRepaired() async throws {
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: UUID(),
+            root: worktreeRoot
+        )
+        try "line four\n".write(
+            to: worktree.path.appendingPathComponent("Added.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let adminDir = repository
+            .appendingPathComponent(".git", isDirectory: true)
+            .appendingPathComponent("worktrees", isDirectory: true)
+            .appendingPathComponent(worktree.path.lastPathComponent, isDirectory: true)
+        try FileManager.default.removeItem(at: adminDir)
+
+        do {
+            _ = try await WorkspaceIsolation.apply(worktree)
+            XCTFail("an unrepairable linkage must refuse the apply")
+        } catch let error as WorkspaceIsolationError {
+            guard case .worktreeLinkageCompromised = error else {
+                return XCTFail("expected worktreeLinkageCompromised, got \(error)")
+            }
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: repository.appendingPathComponent("Added.txt").path),
+            "nothing landed on the main tree"
+        )
+    }
+
+    /// A run's own `git_commit` is cardless only while the worktree's pointer
+    /// still says what `git worktree add` wrote. The harness re-verifies against
+    /// the RECORDED repository root before the call runs, so an approved `.git`
+    /// tamper cannot buy a cardless commit into the operator's shared index.
+    func testAGitCommitInAnIsolatedRunRefusesWhenTheWorktreeLinkageMoved() async throws {
+        let runId = UUID()
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: runId,
+            root: worktreeRoot
+        )
+        let adminDir = repository
+            .appendingPathComponent(".git", isDirectory: true)
+            .appendingPathComponent("worktrees", isDirectory: true)
+            .appendingPathComponent(worktree.path.lastPathComponent, isDirectory: true)
+        try FileManager.default.removeItem(at: adminDir)
+
+        let context = try AgentRunContext.make(
+            runId: runId,
+            sessionId: runId,
+            toolNames: ["git_commit", "complete"],
+            workingDirectory: worktree.path,
+            mode: .code,
+            approvalPolicy: .spawnOnly,
+            workspaceIsolated: true,
+            workspaceRepositoryRoot: repository,
+            approvalHandler: { _ in
+                XCTFail("a git_commit with a moved linkage is refused before the card")
+                return false
+            }
+        )
+        let result = await context.execute(AgentToolCall(
+            name: "git_commit",
+            arguments: ["message": "tampered", "stage_all": true]
+        ))
+        XCTAssertEqual(result.record.status, .withheld, "the linkage refusal is a policy withholding")
+        XCTAssertTrue(
+            result.record.error?.contains("git metadata") == true,
+            result.record.error ?? ""
+        )
+        let status = try await git(["status", "--porcelain"], in: repository)
+        XCTAssertEqual(status.1, "", "nothing was staged or committed through the moved linkage")
+    }
+
+    /// `worktree add -b` can fail BECAUSE the branch name already exists, and
+    /// the failure path used to `branch -D` a branch this call never owned.
+    /// The branch is only given back when it points at the base commit this
+    /// call asked git to cut it from.
+    func testAFailedCreateDoesNotDeleteABranchItDidNotOwn() async throws {
+        let runId = UUID()
+        let branch = WorkspaceIsolation.branchPrefix + String(runId.uuidString.prefix(8)).lowercased()
+        // A pre-existing branch of the collision name, pointing at the
+        // INITIAL commit while HEAD has moved one commit on: `worktree add -b`
+        // fails because the name is taken, and the branch (which does not
+        // point at the base commit this call passes) must survive.
+        let base = try await git(["rev-parse", "HEAD"], in: repository)
+        let initialCommit = base.1.trimmingCharacters(in: .whitespacesAndNewlines)
+        try "unrelated\n".write(
+            to: repository.appendingPathComponent("second.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try await git(["add", "-A"], in: repository)
+        try await git(["commit", "-q", "-m", "second"], in: repository)
+        try await git(["branch", branch, initialCommit], in: repository)
+
+        do {
+            _ = try await WorkspaceIsolation.createWorktree(
+                repositoryRoot: repository,
+                runId: runId,
+                root: worktreeRoot
+            )
+            XCTFail("a pre-existing branch of the same name must fail the worktree add")
+        } catch let error as WorkspaceIsolationError {
+            guard case .worktreeCreationFailed = error else {
+                return XCTFail("expected worktreeCreationFailed, got \(error)")
+            }
+        }
+
+        let survivors = try await git(["rev-parse", "--verify", branch], in: repository)
+        XCTAssertEqual(survivors.0, 0, "the failure path must not delete a branch it did not own")
+    }
 }

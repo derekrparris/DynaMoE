@@ -19,6 +19,12 @@ import UserNotifications
 enum SubagentNotifier {
     static let enabledKey = "dynamoe_subagent_notifications"
 
+    /// Posted by the notification delegate when the operator taps a banner, so
+    /// the window can select the CONVERSATION the run belongs to before the
+    /// inspector opens: the inspector is session-scoped, so opening the drawer
+    /// without switching chats landed the tap on a list the run is not in.
+    static let revealRunNotification = Notification.Name("dynamoe.subagentRevealRun")
+
     /// Requests queued while authorization is being resolved. A second run
     /// finishing in that window used to be dropped because the cached answer
     /// was still `false`.
@@ -157,10 +163,24 @@ final class SubagentNotificationDelegate: NSObject, UNUserNotificationCenterDele
     ) {
         if let raw = response.notification.request.content.userInfo["runId"] as? String,
            let runId = UUID(uuidString: raw) {
+            let sessionId = (response.notification.request.content.userInfo["sessionId"] as? String)
+                .flatMap(UUID.init(uuidString:))
             Task { @MainActor in
                 NSApp.activate(ignoringOtherApps: true)
                 SubagentManager.shared.selectedSubagentId = runId
                 SubagentManager.shared.isDrawerOpen = true
+                // The inspector renders the CURRENT conversation's runs, so a
+                // run belonging to a different chat is invisible until that
+                // chat is selected. The delegate cannot reach the window's
+                // selection state directly; the notification carries the
+                // session and ContentView picks it up.
+                var info: [String: Any] = ["runId": runId.uuidString]
+                if let sessionId { info["sessionId"] = sessionId.uuidString }
+                NotificationCenter.default.post(
+                    name: SubagentNotifier.revealRunNotification,
+                    object: nil,
+                    userInfo: info
+                )
             }
         }
         completionHandler()

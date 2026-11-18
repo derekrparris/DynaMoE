@@ -1503,6 +1503,15 @@ public nonisolated enum CloudMessageAssembler {
         for message in messages {
             if excludingMessageIds.contains(message.id) { continue }
             guard message.role != .system else { continue }
+            // A prompt-only message is a LOCAL-render construct: the relay
+            // directive exists so the local renderer can splice delivered
+            // subagent reports into the prompt it builds itself. The cloud wire
+            // has its own relay path, and a prompt-only directive left in the
+            // session by an earlier LOCAL send would otherwise ship as a
+            // visible user turn on every later cloud step of the conversation —
+            // re-feeding reports the coordinator already saw and disturbing
+            // the provider prefix cache with a turn that is not part of it.
+            if message.isPromptOnly == true { continue }
             let content = AppleFoundationModelService.stripLeadingSpeakerLabel(message.content)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if message.role == .assistant, let records = message.toolCalls, !records.isEmpty {

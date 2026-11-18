@@ -127,6 +127,43 @@ final class AgentSpawnPolicyTests: XCTestCase {
         XCTAssertEqual(honest.maxSteps, 5)
         XCTAssertEqual(honest.maxCompletionTokens, 900)
         XCTAssertEqual(honest.maxWallClockSeconds, 90)
+        // A non-finite ceiling never reaches the loop as a number at all: the
+        // resolver refuses it at the card (see the resolve test below), and
+        // the budget builder folds it away defensively so no OTHER caller can
+        // turn `.nan` into a "$0 ceiling" (`max(0, .nan)` returns 0).
+        let malformed = AgentRolePresetCatalog.budget(
+            for: definition,
+            overrides: AgentBudgetOverrides(maxCostUSD: .nan)
+        )
+        XCTAssertNil(malformed.maxCostUSD)
+    }
+
+    /// `max(0, .nan)` returns 0 in Swift, so a malformed ceiling used to become
+    /// a "$0 ceiling" that failed the run at step 0 with a cost failure the
+    /// operator never asked for. The spawn refuses it by name instead.
+    func testANonFiniteCostCeilingIsRefusedAtTheSpawn() async {
+        for malformed in [Double.nan, .infinity, -.infinity] {
+            do {
+                _ = try await AgentSpawnResolver.resolve(
+                    AgentSpawnRequest(
+                        role: "Codebase Researcher",
+                        taskDescription: "Find the scheduler.",
+                        explicitToolNames: ["file_read"],
+                        budgetOverrides: AgentBudgetOverrides(maxCostUSD: malformed),
+                        workingDirectory: workingDirectory
+                    ),
+                    runId: UUID(),
+                    sessionId: UUID(),
+                    defaults: UserDefaults(suiteName: "dynamoe-tests-spawn-malformed-\(UUID().uuidString)")!
+                )
+                XCTFail("resolve must refuse a non-finite ceiling")
+            } catch {
+                guard let spawnError = error as? AgentSpawnError,
+                      case .invalidBudgetOverride = spawnError else {
+                    return XCTFail("expected invalidBudgetOverride, got \(error)")
+                }
+            }
+        }
     }
 
     func testApprovalPolicyIsDenyInPlanMode() {

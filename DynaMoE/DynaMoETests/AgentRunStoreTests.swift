@@ -443,4 +443,106 @@ final class AgentRunStoreTests: XCTestCase {
         store.flush()
         XCTAssertFalse(store.unrelayedRunIds(sessionId: sessionId).contains(delivered.id))
     }
+
+    // MARK: - Mutate
+
+    /// `mutate` is the one sanctioned read-modify-write: a caller that loaded
+    /// a record seconds ago must not be able to revert fields other writers
+    /// changed in between (the apply path's own comment names the defect).
+    func testMutateAppliesAgainstTheCurrentRecordAndReturnsIt() throws {
+        let store = makeStore()
+        let sessionId = UUID()
+        let saved = record(id: UUID(), sessionId: sessionId, status: .running)
+        store.saveImmediately(saved)
+
+        let returned = store.mutate(runId: saved.id, sessionId: sessionId) { current in
+            current.status = .completed
+            current.completedAt = Date()
+        }
+        XCTAssertEqual(try XCTUnwrap(returned).status, .completed)
+        XCTAssertEqual(
+            try XCTUnwrap(store.load(runId: saved.id, sessionId: sessionId)).status,
+            .completed,
+            "the mutation lands against the record ON DISK, not a caller's stale copy"
+        )
+        XCTAssertNil(store.mutate(runId: UUID(), sessionId: sessionId) { _ in },
+                     "a record that does not decode returns nil and writes nothing")
+    }
+
+    /// Two mutates through different callers keep EACH OTHER's fields: this is
+    /// the property `markSubagentSummariesRelayed` relies on — an apply
+    /// completing mid-relay must not be reverted by the relay's own write, and
+    /// the relay's mark must not be erased by a later apply.
+    func testAMutateDoesNotRevertFieldsAnotherWriterChanged() throws {
+        let store = makeStore()
+        let sessionId = UUID()
+        let saved = record(sessionId: sessionId)
+        store.saveImmediately(saved)
+
+        store.mutate(runId: saved.id, sessionId: sessionId) { current in
+            current.summaryRelayed = true
+        }
+        let appliedAt = Date()
+        store.mutate(runId: saved.id, sessionId: sessionId) { current in
+            current.appliedAt = appliedAt
+            current.appliedToBranch = "main"
+        }
+
+        let reloaded = try XCTUnwrap(store.load(runId: saved.id, sessionId: sessionId))
+        XCTAssertTrue(reloaded.summaryRelayed, "the relay mark survives the apply's write")
+        XCTAssertEqual(reloaded.appliedAt, appliedAt, "the apply's fields survive the relay mark")
+        XCTAssertEqual(reloaded.appliedToBranch, "main")
+    }
+
+    // MARK: - Retention vs in-flight saves
+
+    /// Retention deletes then tombstones; a save that passes its
+    /// `wasDeleted` check in flight must not be able to resurrect the file
+    /// afterwards. The tombstone a prune sets is what blocks it.
+    func testAPrunedRunCannotBeResurrectedByALaterSave() throws {
+        let store = makeStore()
+        let sessionId = UUID()
+        let now = Date()
+        var ancient = record(sessionId: sessionId, createdAt: now.addingTimeInterval(-400 * 86_400))
+        ancient.completedAt = now.addingTimeInterval(-399 * 86_400)
+        store.saveImmediately(ancient)
+
+        let removed = store.prune(now: now, policy: .init(keepNewest: 0, keepDays: 30, minimumAgeHours: 24))
+        XCTAssertEqual(removed, [ancient.id])
+
+        // The save that raced the prune: whatever it observed, the record is
+        // gone and stays gone.
+        var resurrection = ancient
+        resurrection.status = .running
+        store.saveImmediately(resurrection)
+        store.flush()
+        XCTAssertNil(store.load(runId: ancient.id, sessionId: sessionId))
+        let resurrectedAnywhere = store.loadAll().contains { $0.id == ancient.id }
+        XCTAssertFalse(resurrectedAnywhere, "no bucket may hold a pruned record")
+    }
+
+    // MARK: - Orphaned temp writes
+
+    func testSweepOrphanedTempWritesRemovesOldTempsAndKeepsFreshOnes() throws {
+        let store = makeStore()
+        let sessionId = UUID()
+        let saved = record(sessionId: sessionId)
+        store.saveImmediately(saved)
+        let directory = root.appendingPathComponent(sessionId.uuidString, isDirectory: true)
+        let oldTemp = directory.appendingPathComponent(".\(saved.id.uuidString).json.new-aaa", isDirectory: false)
+        try "partial".write(to: oldTemp, atomically: true, encoding: .utf8)
+        let freshTemp = directory.appendingPathComponent(".\(UUID().uuidString).json.new-bbb", isDirectory: false)
+        try "partial".write(to: freshTemp, atomically: true, encoding: .utf8)
+        // An old DOTLESS file is a record, not a temp: never touched.
+        let age = Date().addingTimeInterval(-7_200)
+        try FileManager.default.setAttributes([.modificationDate: age], ofItemAtPath: oldTemp.path)
+        try FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: freshTemp.path)
+
+        let removed = store.sweepOrphanedTempWrites(now: Date(), olderThan: 3_600)
+
+        XCTAssertEqual(removed, 1, "only the aged temp is removed")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: oldTemp.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: freshTemp.path), "an in-flight temp is never touched")
+        XCTAssertNotNil(store.load(runId: saved.id, sessionId: sessionId), "records are never swept")
+    }
 }

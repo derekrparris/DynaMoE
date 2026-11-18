@@ -2761,13 +2761,22 @@ public final class GetSubagentStatusTool: AgentTool {
         }
 
         let stepsSummary = subagent.transcript.map {
-            "Step \($0.stepIndex): \($0.actionName) (\(String(format: "%.2f", $0.durationSeconds))s)"
+            "Call \($0.stepIndex): \($0.actionName) (\(String(format: "%.2f", $0.durationSeconds))s)"
         }.joined(separator: "\n")
 
         let isTerminal = subagent.status == .completed || subagent.status == .failed || subagent.status == .cancelled
         var readable = "Subagent: \(subagent.role) [\(subagent.status.displayName)]\n"
         readable += "Status: \(subagent.liveStatusText)\n"
-        readable += "Steps Completed: \(subagent.transcript.count)\n"
+        // ONE definition of "steps" everywhere a run is described: the model
+        // turns its loop completed (`usage.steps`), which is what the usage
+        // block reports and the inspector's line shows. The transcript is a
+        // list of TOOL CALLS — a different quantity — and it used to be
+        // counted here as "steps", so the same run read 8 steps on one
+        // surface and 3 on another.
+        readable += "Steps Completed: \(subagent.usage.steps)\n"
+        if !subagent.transcript.isEmpty {
+            readable += "Tool Calls: \(subagent.transcript.count)\n"
+        }
         if !subagent.finalSummary.isEmpty {
             readable += "\nSummary:\n\(subagent.finalSummary)\n"
         }
@@ -2801,7 +2810,11 @@ public final class GetSubagentStatusTool: AgentTool {
             "role": subagent.role,
             "status": subagent.status.rawValue,
             "live_status": subagent.liveStatusText,
-            "steps_count": subagent.transcript.count,
+            // Model turns, matching the usage block the spawn response and the
+            // inspector both carry; `tool_calls_count` is the transcript's own
+            // quantity, reported under its own name.
+            "steps_count": subagent.usage.steps,
+            "tool_calls_count": subagent.transcript.count,
             "steps_summary": stepsSummary,
             "summary": subagent.finalSummary,
             "duration_seconds": subagent.executionDurationSeconds
@@ -2940,9 +2953,10 @@ public final class ListSubagentsTool: AgentTool {
                 "role": s.role,
                 "status": s.status.rawValue,
                 "duration_seconds": s.executionDurationSeconds,
-                "steps_count": s.transcript.count
+                // Model turns, the same definition every other surface reports.
+                "steps_count": s.usage.steps
             ])
-            readableLines.append("- [\(s.role)] ID: \(s.id.uuidString) | Status: \(s.status.displayName) | Steps: \(s.transcript.count) | Duration: \(String(format: "%.2f", s.executionDurationSeconds))s")
+            readableLines.append("- [\(s.role)] ID: \(s.id.uuidString) | Status: \(s.status.displayName) | Steps: \(s.usage.steps) | Duration: \(String(format: "%.2f", s.executionDurationSeconds))s")
         }
 
         let readable = readableLines.isEmpty ? "No subagents matching filter '\(filter)'." : readableLines.joined(separator: "\n")
@@ -3939,6 +3953,13 @@ public final class AgentHarness {
     public private(set) var runId: UUID?
     public private(set) var runApprovalPolicy: AgentApprovalPolicy = .auto
     public private(set) var isWorkspaceIsolated: Bool = false
+    /// The repository an isolated run's worktree was cut from, when the run
+    /// knows it. A cardless `git_commit` inside the worktree is provably
+    /// confined only while the worktree's `.git` file still points there, and
+    /// this is the root the re-verification compares against. Nil for a run
+    /// that is not worktree-isolated (or a restored record that predates the
+    /// field — those fall back to the snapshot/apply-time verification).
+    public private(set) var workspaceRepositoryRoot: URL?
     public var runApprovalHandler: (@Sendable (AgentApprovalRequest) async -> Bool)?
 
     private init() {
@@ -3975,6 +3996,7 @@ public final class AgentHarness {
         mode: AgentMode,
         approvalPolicy: AgentApprovalPolicy,
         workspaceIsolated: Bool,
+        workspaceRepositoryRoot: URL? = nil,
         approvalHandler: (@Sendable (AgentApprovalRequest) async -> Bool)?
     ) throws {
         guard isRunScoped else { throw AgentRunScopeError.notRunScoped }
@@ -3992,6 +4014,7 @@ public final class AgentHarness {
         self.activeMode = mode
         self.runApprovalPolicy = approvalPolicy
         self.isWorkspaceIsolated = workspaceIsolated
+        self.workspaceRepositoryRoot = workspaceRepositoryRoot
         self.runApprovalHandler = approvalHandler
     }
 
@@ -4783,6 +4806,9 @@ public final class AgentHarness {
         The coordinator owns the conversation with the user; you do not. Work only on the task you were given, with the tools listed below, and return a report the coordinator can use. Do not ask the user questions and do not wait for approval you cannot receive.
 
         """
+        if mode == .plan {
+            prompt += PlanModePolicy.directive(toolNames: availableToolDefinitions(mode: mode).map { $0.function.name }) + "\n\n"
+        }
         prompt += buildToolsSection(mode: mode)
         prompt += Self.workerToolCallSyntaxSection(
             isLingModel: isLingModel,
@@ -4802,11 +4828,25 @@ public final class AgentHarness {
         - Prefer a small number of targeted tool calls over broad exploration. You have a bounded step and token budget.
         - Do not attempt to spawn another subagent. Delegation is one level.
         - Do not call `tools_discover` or `tools_load`; your tool set is fixed for this run.
-        - When the task is complete, call `complete` with a summary that states what you found or changed, and what you could not verify. If you cannot complete the task, still call `complete` and say why, with the evidence you gathered.
+        \(Self.workerCompletionRule(mode: mode))
         - If a tool is refused by policy, do not retry it. Continue with the tools you have and report the limitation.
 
         """
         return prompt
+    }
+
+    /// The completion rule for a worker prompt, matched to the tool surface the
+    /// run actually has. Plan mode withholds `complete` and the execution
+    /// backstop refuses it with "do not retry", so an unconditional "call
+    /// `complete`" left a local plan run whose only named ending was a
+    /// refusal — the cloud worker had the plan directive but the same
+    /// contradictory rule. The plan-mode ending is the one the backstop itself
+    /// teaches: a plain-text reply ending in the ready marker.
+    private static func workerCompletionRule(mode: AgentMode) -> String {
+        if PlanModePolicy.withholds("complete", in: mode) {
+            return "- Finish with a plain-text reply that reports what you found or the plan you produced. `complete` is withheld in this run and every write tool is refused: do not call either. End the final reply with \(PlanMarkers.ready) on its own last line."
+        }
+        return "- When the task is complete, call `complete` with a summary that states what you found or changed, and what you could not verify. If you cannot complete the task, still call `complete` and say why, with the evidence you gathered."
     }
 
     private static func workerToolCallSyntaxSection(
@@ -4906,7 +4946,7 @@ public final class AgentHarness {
         - Every finding must cite its evidence: a file and line, a URL, or the command whose output produced it.
         - Keep the tool calls targeted; you have a bounded step and token budget.
         - Do not attempt to spawn another subagent.
-        - Finish by calling `complete` with a summary of what you found or changed and what you could not verify. If the task cannot be completed, still call `complete` and say why.
+        \(Self.workerCompletionRule(mode: mode))
 
         """
         return prompt
@@ -5844,6 +5884,14 @@ public final class AgentHarness {
     /// command is arbitrary code that also takes its own `cwd`, so it answers
     /// false: the spawn-only policy may not call it safe, and the operator
     /// gets the same per-change card a write on the main tree gets.
+    ///
+    /// A `.git` path component answers false even inside the prefix: a linked
+    /// worktree's `.git` is a regular FILE in the sandbox, and rewriting it
+    /// makes every later git call in the worktree run somewhere else — a
+    /// cardless `git add -A` stages the operator's tree, a cardless
+    /// `git_commit` lands on their branch, and deleting the pointer orphans
+    /// work nothing can land. "Inside the workspace" must therefore mean
+    /// inside the work files, not inside the sandbox's own plumbing.
     private static func writesStayInsideWorkspace(
         _ call: ParsedToolCall,
         workspace: URL,
@@ -5852,7 +5900,9 @@ public final class AgentHarness {
         switch call.name {
         case "file_write", "file_edit":
             guard let path = call.arguments["path"] as? String, !path.isEmpty else { return false }
-            return contains(resolvePath(path, workingDirectory: workingDirectory), in: workspace)
+            let resolved = resolvePath(path, workingDirectory: workingDirectory)
+            guard !pathTouchesGitMetadata(resolved) else { return false }
+            return contains(resolved, in: workspace)
         case "git_commit":
             guard let workingDirectory else { return false }
             return contains(workingDirectory, in: workspace)
@@ -5861,11 +5911,52 @@ public final class AgentHarness {
         }
     }
 
-    /// Containment after standardising and resolving symlinks, so a path that
-    /// escapes with `..` or through a symlink is not read as inside.
+    /// True when any path component of `url` is, or passes through, git
+    /// metadata: a component spelled exactly `.git` (the git directory of a
+    /// repository or submodule). `.gitignore` / `.gitattributes` /
+    /// `.gitmodules` are ordinary files and do not match. Symlinks are
+    /// resolved through `resolvedForContainment`, so a link named `build`
+    /// that points into `.git` cannot smuggle a write past the check.
+    static func pathTouchesGitMetadata(_ url: URL) -> Bool {
+        resolvedForContainment(url).pathComponents.contains(".git")
+    }
+
+    /// The path with every EXISTING component resolved, so a symlink anywhere
+    /// in the path is followed even when the final component does not exist
+    /// yet — which is the one a `file_write` is about to create.
+    ///
+    /// `URL.resolvingSymlinksInPath()` resolves NOTHING when the leaf is
+    /// absent (verified against Foundation on this OS), so the plain
+    /// prefix check let a write through an in-workspace symlink escape the
+    /// sandbox with no card. The longest existing prefix is resolved first
+    /// and the absent tail is appended back.
+    static func resolvedForContainment(_ url: URL) -> URL {
+        var missing: [String] = []
+        var current = url.standardizedFileURL
+        let fileManager = FileManager.default
+        while true {
+            if fileManager.fileExists(atPath: current.path) {
+                var resolved = current.resolvingSymlinksInPath()
+                for component in missing.reversed() {
+                    resolved = resolved.appendingPathComponent(component)
+                }
+                return resolved
+            }
+            missing.append(current.lastPathComponent)
+            let parent = current.deletingLastPathComponent()
+            if parent.path == current.path {
+                return url.standardizedFileURL
+            }
+            current = parent
+        }
+    }
+
+    /// Containment after resolving every existing path component, so a path
+    /// that escapes with `..` or through a symlink is not read as inside —
+    /// including when the leaf is a file the write has not created yet.
     private static func contains(_ url: URL, in workspace: URL) -> Bool {
-        let root = workspace.standardizedFileURL.resolvingSymlinksInPath().path
-        let resolved = url.standardizedFileURL.resolvingSymlinksInPath().path
+        let root = resolvedForContainment(workspace).path
+        let resolved = resolvedForContainment(url).path
         guard !root.isEmpty else { return false }
         return resolved == root || resolved.hasPrefix(root.hasSuffix("/") ? root : root + "/")
     }
@@ -5881,13 +5972,14 @@ public final class AgentHarness {
             subQEndpoint: SubQDecisionSettings.endpoint()
         )
         let strArgs = call.arguments.mapValues { String(describing: $0) }
-        func ask(_ reason: String) -> RunScopeDecision {
+        func ask(_ reason: String, containmentEscape: Bool = false) -> RunScopeDecision {
             .ask(AgentApprovalRequest(
                 runId: runId ?? UUID(),
                 toolName: call.name,
                 arguments: strArgs,
                 workingDirectory: workingDirectory?.path,
-                reason: reason
+                reason: reason,
+                containmentEscape: containmentEscape
             ))
         }
         switch runApprovalPolicy {
@@ -5901,7 +5993,21 @@ public final class AgentHarness {
             if subQNeedsApproval { return ask("it uploads the state or local image bytes") }
             if stateChanging {
                 guard isWorkspaceIsolated else {
-                    return ask("it changes state outside an isolated workspace")
+                    return ask("it changes state outside an isolated workspace", containmentEscape: true)
+                }
+                // The worktree's `.git` pointer is a regular file inside the
+                // containment prefix, so it passes the containment check below
+                // while being the one file whose rewrite breaks the sandbox's
+                // promise: git would stage and commit wherever the retargeted
+                // pointer says, and the run's work could stop being landable at
+                // all. It gets its own card FIRST, with the stakes named.
+                if call.name == "file_write" || call.name == "file_edit",
+                   let path = call.arguments["path"] as? String, !path.isEmpty,
+                   Self.pathTouchesGitMetadata(Self.resolvePath(path, workingDirectory: workingDirectory)) {
+                    return ask(
+                        "it writes the sandbox's own git metadata, which can redirect the run's commits into the operator's repository or make its work unlandable",
+                        containmentEscape: true
+                    )
                 }
                 // Isolation is a promise about THIS CALL's destination, not the
                 // existence of a worktree. `resolvePath` returns an absolute
@@ -5911,7 +6017,7 @@ public final class AgentHarness {
                 // confined may skip the card.
                 guard let workspace = workingDirectory ?? defaultWorkingDirectory,
                       Self.writesStayInsideWorkspace(call, workspace: workspace, workingDirectory: workingDirectory) else {
-                    return ask("it can change state outside the run's isolated workspace")
+                    return ask("it can change state outside the run's isolated workspace", containmentEscape: true)
                 }
             }
             return .allow
@@ -6040,6 +6146,39 @@ public final class AgentHarness {
                     arguments: strArgs,
                     rawArguments: call.rawArguments,
                     status: .rejected,
+                    output: AgentHarness.renderToolResultForModel(json),
+                    error: err,
+                    executionDurationSeconds: CFAbsoluteTimeGetCurrent() - startTime
+                )
+                return (json, rec, false)
+            }
+        }
+        // A cardless `git_commit` inside an isolated worktree is provably
+        // confined only while the worktree's `.git` file still points where
+        // `git worktree add` put it — and that pointer is a regular file
+        // inside the sandbox, so an APPROVED `.git` write (or an approved
+        // shell command) can have retargeted it since. Verifying here is what
+        // keeps the exploit two steps long instead of one: the approved
+        // tamper no longer buys a cardless commit staging into the operator's
+        // shared index and landing on their checked-out branch.
+        if call.name == "git_commit", isRunScoped, isWorkspaceIsolated,
+           let workspace = workingDirectory ?? defaultWorkingDirectory,
+           let repositoryRoot = workspaceRepositoryRoot {
+            let worktree = AgentWorktree(
+                runId: runId ?? UUID(),
+                repositoryRoot: repositoryRoot,
+                path: workspace,
+                branch: "",
+                baseCommit: ""
+            )
+            if let problem = await WorkspaceIsolation.worktreeLinkageProblem(worktree) {
+                let err = "SUBAGENT POLICY: git_commit was not executed because the worktree's git metadata no longer points at the repository it was created from (\(problem)). Nothing was staged or committed; the worktree and its files were kept."
+                let json = AgentHarness.toolErrorJSON(tool: call.name, error: err)
+                let rec = ToolCallRecord(
+                    name: call.name,
+                    arguments: strArgs,
+                    rawArguments: call.rawArguments,
+                    status: .withheld,
                     output: AgentHarness.renderToolResultForModel(json),
                     error: err,
                     executionDurationSeconds: CFAbsoluteTimeGetCurrent() - startTime

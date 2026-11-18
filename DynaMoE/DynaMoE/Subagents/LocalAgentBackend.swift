@@ -312,7 +312,17 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
             case .finished(let result):
                 // `TurnResult` carries main-actor-isolated value types, so its
                 // mapping is read there; the stream itself is consumed here.
-                return await MainActor.run { Self.turn(from: result) }
+                // The engine's task is also AWAITED on this path: a result is
+                // emitted before the detached generation task finishes its own
+                // teardown, and the guarantee below — that no turn outlives the
+                // tool mask this call is nested in — is a claim about the task,
+                // not about the stream. It used to hold only on the error and
+                // cancellation paths, which is exactly where the comment
+                // already was; the success path silently restored the mask
+                // while the task was still unwinding.
+                let turn = await MainActor.run { Self.turn(from: result) }
+                await launch.handle.task.value
+                return turn
             }
         }
         if Task.isCancelled {

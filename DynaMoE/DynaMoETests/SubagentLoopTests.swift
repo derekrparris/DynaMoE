@@ -932,4 +932,375 @@ final class SubagentLoopTests: XCTestCase {
         XCTAssertTrue(outcome.error?.contains("no price is recorded") == true, outcome.error ?? "")
         XCTAssertEqual(backend.requests.count, 1, "the ceiling stops the run instead of spending on")
     }
+
+    // MARK: - The sandbox's own git metadata (merge blocker B1)
+
+    /// A linked worktree's `.git` is a regular FILE inside the containment
+    /// prefix, so it passes the plain prefix check while being the one file
+    /// whose rewrite breaks the sandbox: git would stage and commit wherever
+    /// the retargeted pointer says. It must get its own card, marked as a
+    /// containment escape so Turbo Mode cannot bypass it.
+    func testADotGitWriteInsideTheSandboxNeedsItsOwnCard() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        try "gitdir: /elsewhere/.git\n".write(
+            to: workspace.appendingPathComponent(".git"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let counter = CallCounter()
+
+        let backend = ScriptedBackend(turns: [
+            .init(text: "tampering", calls: [
+                AgentToolCall(name: "file_write", arguments: ["path": ".git", "content": "gitdir: /tmp/attacker.git"])
+            ]),
+            .init(text: "done", calls: [completeCall("Could not rewrite the pointer.")])
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["file_write", "complete"],
+            policy: .spawnOnly,
+            isolated: true,
+            handler: { request in
+                counter.increment()
+                XCTAssertTrue(request.containmentEscape, "a .git write is a containment escape")
+                XCTAssertTrue(request.reason.lowercased().contains("git metadata"), request.reason)
+                return false
+            }
+        )
+
+        let outcome = await HeadlessAgentLoop().run(
+            input: input(),
+            backend: backend,
+            context: context,
+            emit: { _ in }
+        )
+
+        XCTAssertEqual(counter.count, 1, "a .git write inside the sandbox must produce a card")
+        let pointer = try String(contentsOf: workspace.appendingPathComponent(".git"), encoding: .utf8)
+        XCTAssertTrue(pointer.contains("/elsewhere"), "a declined card must leave the pointer untouched")
+        XCTAssertTrue(outcome.transcript.contains {
+            $0.toolRecord?.name == "file_write" && $0.toolRecord?.status == .rejected
+        })
+    }
+
+    /// Any `.git` path COMPONENT counts — a nested repository's metadata can
+    /// smuggle the same retargeting — not just the worktree's own pointer.
+    func testANestedDotGitPathComponentNeedsTheCard() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let counter = CallCounter()
+
+        let backend = ScriptedBackend(turns: [
+            .init(text: "writing", calls: [
+                AgentToolCall(name: "file_write", arguments: ["path": "vendor/sub/.git/config", "content": "x"])
+            ]),
+            .init(text: "done", calls: [completeCall("Refused.")])
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["file_write", "complete"],
+            policy: .spawnOnly,
+            isolated: true,
+            handler: { request in
+                counter.increment()
+                XCTAssertTrue(request.containmentEscape)
+                return false
+            }
+        )
+
+        _ = await HeadlessAgentLoop().run(input: input(), backend: backend, context: context, emit: { _ in })
+        XCTAssertEqual(counter.count, 1)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: workspace.appendingPathComponent("vendor/sub/.git/config").path)
+        )
+    }
+
+    /// `.gitignore` and friends are ordinary work files: only a component
+    /// spelled exactly `.git` is metadata, and a write to one stays cardless
+    /// inside an isolated workspace.
+    func testADotGitignoreIsNotGitMetadataAndStaysCardless() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let counter = CallCounter()
+
+        let backend = ScriptedBackend(turns: [
+            .init(text: "writing", calls: [
+                AgentToolCall(name: "file_write", arguments: ["path": ".gitignore", "content": "build/\n"])
+            ]),
+            .init(text: "done", calls: [completeCall("Added .gitignore.")])
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["file_write", "complete"],
+            policy: .spawnOnly,
+            isolated: true,
+            handler: { _ in
+                counter.increment()
+                return true
+            }
+        )
+
+        let outcome = await HeadlessAgentLoop().run(input: input(), backend: backend, context: context, emit: { _ in })
+        XCTAssertEqual(outcome.status, .completed)
+        XCTAssertEqual(counter.count, 0, "an ordinary work file inside the worktree is not git metadata")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: workspace.appendingPathComponent(".gitignore").path))
+    }
+
+    /// A symlink inside the worktree pointing outside it is an escape, and the
+    /// containment guard resolves symlinks before the prefix comparison — this
+    /// is the case that fails if `resolvingSymlinksInPath()` is ever dropped.
+    func testASymlinkEscapeFromTheWorkspaceNeedsTheCard() async throws {
+        let workspace = try makeWorkspace()
+        defer {
+            try? FileManager.default.removeItem(at: workspace)
+            try? FileManager.default.removeItem(at: workspace.deletingLastPathComponent().appendingPathComponent("escape-target"))
+        }
+        let outside = workspace.deletingLastPathComponent()
+            .appendingPathComponent("escape-target", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: workspace.appendingPathComponent("shortcut"),
+            withDestinationURL: outside
+        )
+        let target = workspace.appendingPathComponent("shortcut/escaped.txt")
+        let counter = CallCounter()
+
+        let backend = ScriptedBackend(turns: [
+            .init(text: "writing", calls: [
+                AgentToolCall(name: "file_write", arguments: ["path": target.path, "content": "escaped"])
+            ]),
+            .init(text: "done", calls: [completeCall("Refused.")])
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["file_write", "complete"],
+            policy: .spawnOnly,
+            isolated: true,
+            handler: { request in
+                counter.increment()
+                XCTAssertTrue(request.containmentEscape, "a symlink escape is a containment failure")
+                return false
+            }
+        )
+
+        _ = await HeadlessAgentLoop().run(input: input(), backend: backend, context: context, emit: { _ in })
+        XCTAssertEqual(counter.count, 1, "a write through an escaping symlink must produce a card")
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: outside.appendingPathComponent("escaped.txt").path),
+            "a declined card must leave the target outside the worktree untouched"
+        )
+    }
+
+    /// `..` inside a path that still PRINTS inside the prefix is an escape
+    /// after standardisation, and must card.
+    func testADotDotEscapeNeedsTheCard() async throws {
+        let workspace = try makeWorkspace()
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        let counter = CallCounter()
+
+        let backend = ScriptedBackend(turns: [
+            .init(text: "writing", calls: [
+                AgentToolCall(name: "file_write", arguments: ["path": "../\(workspace.lastPathComponent)-escape.txt", "content": "escaped"])
+            ]),
+            .init(text: "done", calls: [completeCall("Refused.")])
+        ])
+        let context = try makeContext(
+            workspace: workspace,
+            tools: ["file_write", "complete"],
+            policy: .spawnOnly,
+            isolated: true,
+            handler: { request in
+                counter.increment()
+                XCTAssertTrue(request.containmentEscape)
+                return false
+            }
+        )
+
+        _ = await HeadlessAgentLoop().run(input: input(), backend: backend, context: context, emit: { _ in })
+        XCTAssertEqual(counter.count, 1)
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: workspace.deletingLastPathComponent().appendingPathComponent("\(workspace.lastPathComponent)-escape.txt").path
+            )
+        )
+    }
+
+    // MARK: - Worker prompts match the tool surface
+
+    /// Plan mode withholds `complete` and refuses it with "do not retry", so a
+    /// worker prompt that says "call `complete`" describes an ending the run
+    /// cannot have. The local variant carries the plan directive and the
+    /// ready-marker ending; the code variant keeps the `complete` contract.
+    func testThePlanModeWorkerPromptMatchesItsToolSurface() throws {
+        let planHarness = AgentHarness.makeRunScoped()
+        XCTAssertNoThrow(try planHarness.configureRunScope(
+            runId: UUID(),
+            toolNames: ["file_read", "grep_search", "complete"],
+            workingDirectory: FileManager.default.temporaryDirectory,
+            mode: .plan,
+            approvalPolicy: .deny,
+            workspaceIsolated: false,
+            approvalHandler: nil
+        ))
+        let planPrompt = planHarness.buildWorkerSystemPrompt(baseSystem: "", role: "Researcher", mode: .plan)
+        XCTAssertTrue(planPrompt.contains("# Plan Mode"), planPrompt)
+        XCTAssertTrue(planPrompt.contains(PlanMarkers.ready), "the plan ending must name the ready marker")
+        XCTAssertFalse(
+            planPrompt.contains("call `complete` with a summary"),
+            "plan mode withholds complete; the prompt must not teach an impossible ending"
+        )
+        XCTAssertTrue(planPrompt.contains("withheld in this run"), planPrompt)
+
+        let codeHarness = AgentHarness.makeRunScoped()
+        XCTAssertNoThrow(try codeHarness.configureRunScope(
+            runId: UUID(),
+            toolNames: ["file_read", "complete"],
+            workingDirectory: FileManager.default.temporaryDirectory,
+            mode: .code,
+            approvalPolicy: .auto,
+            workspaceIsolated: false,
+            approvalHandler: nil
+        ))
+        let codePrompt = codeHarness.buildWorkerSystemPrompt(baseSystem: "", role: "Researcher", mode: .code)
+        XCTAssertFalse(codePrompt.contains("# Plan Mode"))
+        XCTAssertTrue(codePrompt.contains("call `complete` with a summary"), codePrompt)
+
+        // The cloud worker's completion rule is plan-aware too.
+        let cloudPlan = codeHarness.buildCloudWorkerSystemPrompt(baseSystem: "", role: "Researcher", mode: .plan)
+        XCTAssertTrue(cloudPlan.contains(PlanMarkers.ready), cloudPlan)
+        XCTAssertFalse(cloudPlan.contains("call `complete` with a summary"), "plan mode must not teach an impossible ending on the cloud path either")
+        let cloudCode = codeHarness.buildCloudWorkerSystemPrompt(baseSystem: "", role: "Researcher", mode: .code)
+        XCTAssertTrue(cloudCode.contains("call `complete` with a summary"), cloudCode)
+    }
+
+    // MARK: - In-loop context compaction
+
+    private func assistantBlock(text: String, thinking: String = "", toolResults: [String] = []) -> [AgentBackendMessage] {
+        var block: [AgentBackendMessage] = [.assistant(text: text, thinking: thinking, calls: [])]
+        for (index, content) in toolResults.enumerated() {
+            block.append(.toolResult(callId: "c\(index)", name: "file_read", content: content, isError: false))
+        }
+        return block
+    }
+
+    func testCompactionLeavesAShortHistoryAlone() {
+        var messages: [AgentBackendMessage] = [.user("Do the task.")]
+        messages.append(contentsOf: assistantBlock(text: "one", thinking: "thinking one", toolResults: ["r1"]))
+        messages.append(contentsOf: assistantBlock(text: "two", thinking: "thinking two", toolResults: ["r2"]))
+
+        let compacted = HeadlessAgentLoop.compactContextIfNeeded(messages)
+        XCTAssertTrue(
+            sameMessages(compacted, messages),
+            "two recent turns are inside the kept window and must not change"
+        )
+    }
+
+    func testCompactionFoldsAgedTurnsAndKeepsTheRecentWindowVerbatim() {
+        var messages: [AgentBackendMessage] = [.user("Do the task.")]
+        let longText = String(repeating: "a", count: 3_000)
+        let longResult = String(repeating: "b", count: 3_000)
+        for step in 0..<5 {
+            messages.append(contentsOf: assistantBlock(
+                text: "step \(step) " + longText,
+                thinking: "thinking \(step) " + longText,
+                toolResults: ["result \(step) " + longResult]
+            ))
+        }
+        messages.append(contentsOf: assistantBlock(text: "recent", thinking: "recent thinking", toolResults: ["recent result"]))
+
+        let compacted = HeadlessAgentLoop.compactContextIfNeeded(messages)
+
+        // The task and the newest TWO turns are verbatim.
+        guard case .user(let task) = compacted.first else {
+            return XCTFail("the task message must stay first")
+        }
+        XCTAssertEqual(task, "Do the task.")
+        for verbatim in ["step 4 " + longText, "recent"] {
+            XCTAssertTrue(compacted.contains { message in
+                if case .assistant(let text, _, _) = message { return text == verbatim }
+                return false
+            }, "the recent window must keep \(verbatim.prefix(12)) verbatim")
+        }
+        XCTAssertTrue(compacted.contains { message in
+            if case .assistant(_, let thinking, _) = message { return thinking == "recent thinking" }
+            return false
+        }, "the newest turn keeps its thinking")
+
+        // The four aged turns lose their thinking and fold their results.
+        for aged in 0..<4 {
+            XCTAssertTrue(compacted.contains { message in
+                if case .assistant(let text, let thinking, _) = message {
+                    return text.hasPrefix("step \(aged)") && thinking.isEmpty
+                }
+                return false
+            }, "aged turn \(aged) must lose its thinking")
+            XCTAssertTrue(compacted.contains { message in
+                if case .toolResult(_, _, let content, _) = message {
+                    return content.hasPrefix("result \(aged)") && content.contains("[compacted:")
+                }
+                return false
+            }, "aged turn \(aged)'s result must carry the fold marker")
+        }
+    }
+
+    func testCompactionDropsTheOldestBlocksWhenFoldingCannotFit() {
+        var messages: [AgentBackendMessage] = [.user("Do the task.")]
+        let huge = String(repeating: "x", count: 4_000)
+        for step in 0..<90 {
+            messages.append(contentsOf: assistantBlock(text: huge, thinking: "", toolResults: [huge, huge]))
+            _ = step
+        }
+        messages.append(contentsOf: assistantBlock(text: "recent", thinking: "", toolResults: ["recent result"]))
+
+        let compacted = HeadlessAgentLoop.compactContextIfNeeded(messages)
+        let total = compacted.reduce(0) { $0 + $1.textAndThinkingCount }
+        XCTAssertLessThanOrEqual(total, HeadlessAgentLoop.contextCharacterBudget, "the folded history must fit the budget")
+
+        // The task and the recent window survive the drop pass.
+        XCTAssertTrue(compacted.contains { message in
+            if case .user(let text) = message { return text == "Do the task." }
+            return false
+        })
+        XCTAssertTrue(compacted.contains { message in
+            if case .assistant(let text, _, _) = message { return text == "recent" }
+            return false
+        })
+        XCTAssertLessThan(
+            compacted.count, messages.count,
+            "a history this far over budget must lose whole oldest blocks"
+        )
+    }
+}
+
+private extension AgentBackendMessage {
+    var textAndThinkingCount: Int {
+        switch self {
+        case .user(let text): return text.count
+        case .assistant(let text, let thinking, _): return text.count + thinking.count
+        case .toolResult(_, _, let content, _): return content.count
+        }
+    }
+}
+
+/// Structural equality for the compaction tests: `AgentToolCall` carries
+/// `Any` arguments, so the enum cannot synthesize `Equatable`, and the
+/// compaction never touches the calls anyway.
+private func sameMessages(_ lhs: [AgentBackendMessage], _ rhs: [AgentBackendMessage]) -> Bool {
+    guard lhs.count == rhs.count else { return false }
+    for (a, b) in zip(lhs, rhs) {
+        switch (a, b) {
+        case (.user(let x), .user(let y)) where x == y:
+            continue
+        case (.assistant(let xt, let xh, let xc), .assistant(let yt, let yh, let yc))
+        where xt == yt && xh == yh && xc.map(\.id) == yc.map(\.id):
+            continue
+        case (.toolResult(let xid, let xn, let xc, let xe), .toolResult(let yid, let yn, let yc, let ye))
+        where xid == yid && xn == yn && xc == yc && xe == ye:
+            continue
+        default:
+            return false
+        }
+    }
+    return true
 }

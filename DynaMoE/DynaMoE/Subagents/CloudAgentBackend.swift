@@ -89,7 +89,18 @@ nonisolated final class CloudAgentBackend: AgentModelBackend, @unchecked Sendabl
             // only evidence left of what the provider may have billed.
             let receipt = CloudTurnReceipt()
             do {
-                return try await performTurn(request, receipt: receipt)
+                // Only the FIRST attempt streams deltas. The drawer's live
+                // text only ever appends, and a retry re-emits the turn from
+                // its beginning, so attempt 2's opening text landed after
+                // attempt 1's partial — the operator watched a duplicated
+                // stream while the persisted transcript kept just the final
+                // turn. Later attempts still produce the turn; only the live
+                // commentary is silenced.
+                var streamed = request
+                if attempt > 1 {
+                    streamed.onDelta = nil
+                }
+                return try await performTurn(streamed, receipt: receipt)
             } catch let failure as CloudTurnFailure
                 where attempt < 2 && Self.isRetryable(failure, spentRequest: receipt.spentRequest) {
                 Self.recordSpentUsage(receipt, pricing: pricing, into: request.usageLedger)

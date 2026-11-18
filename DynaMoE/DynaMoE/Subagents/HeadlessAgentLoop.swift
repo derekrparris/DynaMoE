@@ -159,6 +159,16 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 }
             }
 
+            // The in-loop context is BOUNDED here. Every step appends its full
+            // thinking text and every tool result verbatim, and the implementer
+            // preset's budgets (40 steps x 2,048-token turns x 4,000-token
+            // tool outputs) overflow any real context long before they bind —
+            // the run used to die mid-work on the engine's context refusal,
+            // after the spend. Old turns are compacted, oldest first; the
+            // newest stay verbatim. The transcript and the report keep
+            // everything — only what the MODEL re-reads each step shrinks.
+            messages = Self.compactContextIfNeeded(messages)
+
             let deltaTextId = UUID()
             let deltaThinkingId = UUID()
             let sink = emit
@@ -480,6 +490,119 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
         return UInt64(clamped * 1_000_000_000)
     }
 
+    // MARK: In-loop context compaction
+
+    /// How many of the newest step blocks (an assistant turn plus its tool
+    /// results) keep their full text verbatim, thinking included.
+    static let keptRecentTurns = 2
+    /// Character budget for the whole in-loop history after folding. Sized
+    /// with the harness's own conservative ~2.5 characters-per-token
+    /// conversion, so a compacted history plus a turn's completion budget
+    /// stays inside the prompt ceilings of the local families (262k tokens)
+    /// and of the cloud models (128k-200k) with room for the system prompt.
+    /// The engine's own context refusal remains the final backstop; this
+    /// budget exists so a healthy run never reaches it.
+    static let contextCharacterBudget = 160_000
+    private static let agedAssistantTextLimit = 2_000
+    private static let agedToolResultLimit = 800
+
+    /// Bounds what the model re-reads each step. The newest
+    /// `keptRecentTurns` turns stay verbatim; every older turn loses its
+    /// thinking (it is scratch) and has its text and tool results folded; and
+    /// whole oldest blocks are dropped when folding alone cannot fit the
+    /// budget. The task (the first user message) and every steering note are
+    /// never compacted. The transcript and report are untouched: the operator
+    /// still sees everything the run did.
+    static func compactContextIfNeeded(_ messages: [AgentBackendMessage]) -> [AgentBackendMessage] {
+        let blockStarts = messages.indices.filter {
+            if case .assistant = messages[$0] { return true } else { return false }
+        }
+        guard blockStarts.count > keptRecentTurns else { return messages }
+        let recentWindowStart = blockStarts[blockStarts.count - keptRecentTurns]
+
+        var folded: [AgentBackendMessage] = []
+        folded.reserveCapacity(messages.count)
+        for index in messages.indices {
+            let message = messages[index]
+            if index == 0, case .user = message {
+                // The task itself is the one message the run may never lose.
+                folded.append(message)
+                continue
+            }
+            if index >= recentWindowStart {
+                folded.append(message)
+                continue
+            }
+            switch message {
+            case .user:
+                // A steering note; already bounded at render time.
+                folded.append(message)
+            case .assistant(let text, _, let calls):
+                // Aged thinking is dropped, not folded: it is the model's
+                // scratch space for a turn that ended, and keeping it costs
+                // context without informing any later decision.
+                folded.append(.assistant(
+                    text: Self.folded(text, to: agedAssistantTextLimit),
+                    thinking: "",
+                    calls: calls
+                ))
+            case .toolResult(let callId, let name, let content, let isError):
+                folded.append(.toolResult(
+                    callId: callId,
+                    name: name,
+                    content: Self.folded(content, to: agedToolResultLimit),
+                    isError: isError
+                ))
+            }
+        }
+
+        var total = folded.reduce(0) { $0 + Self.contextCharacterCount(of: $1) }
+        guard total > contextCharacterBudget else { return folded }
+
+        // Folding alone did not fit (many steps, or very large recent turns).
+        // Drop whole aged blocks, oldest first, until it does. The ranges
+        // collected never touch the task, a steering note, or the recent
+        // window, because the search stops at `recentWindowStart`.
+        var droppedRanges: [Range<Int>] = []
+        var searchFrom = 0
+        while total > contextCharacterBudget, searchFrom < recentWindowStart {
+            guard let blockStart = folded[searchFrom..<recentWindowStart].firstIndex(where: {
+                if case .assistant = $0 { return true } else { return false }
+            }) else { break }
+            var blockEnd = recentWindowStart
+            for index in (blockStart + 1)..<recentWindowStart {
+                if case .assistant = folded[index] { blockEnd = index; break }
+            }
+            let removed = folded[blockStart..<blockEnd].reduce(0) { $0 + Self.contextCharacterCount(of: $1) }
+            droppedRanges.append(blockStart..<blockEnd)
+            total -= removed
+            searchFrom = blockEnd
+        }
+        guard !droppedRanges.isEmpty else { return folded }
+        var result: [AgentBackendMessage] = []
+        result.reserveCapacity(folded.count)
+        var cursor = 0
+        for range in droppedRanges {
+            result.append(contentsOf: folded[cursor..<range.lowerBound])
+            cursor = range.upperBound
+        }
+        result.append(contentsOf: folded[cursor...])
+        return result
+    }
+
+    private static func folded(_ text: String, to limit: Int) -> String {
+        guard text.count > limit else { return text }
+        return text.prefix(limit) + "… [compacted: \(text.count - limit) characters omitted]"
+    }
+
+    private static func contextCharacterCount(of message: AgentBackendMessage) -> Int {
+        switch message {
+        case .user(let text): return text.count
+        case .assistant(let text, let thinking, _): return text.count + thinking.count
+        case .toolResult(_, _, let content, _): return content.count
+        }
+    }
+
     /// Runs one tool under whatever is left of the wall-clock budget. Nil means
     /// the deadline won; the tool's task is cancelled and the group waits for
     /// it to stop (a `shell_run` child is killed by `runProcess`'s own
@@ -499,7 +622,17 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 )
                 return nil
             }
-            defer { group.cancelAll() }
+            // Not `group.next()` alone: the deadline arm winning used to drop
+            // the tool's own result on the floor — a tool that finished its
+            // work just before the deadline, or a call refused under the
+            // cancellation that follows, vanished from the transcript with no
+            // `.toolResult`, no `.toolFinished` and no `toolCalls` count. The
+            // tool task is cancelled here and its answer (whatever it managed)
+            // is collected; the caller then records it honestly and the
+            // top-of-loop budget check still fails the run.
+            let first = await group.next()
+            group.cancelAll()
+            if let first { return first }
             return await group.next() ?? nil
         }
         return outcome
@@ -598,6 +731,11 @@ nonisolated final class HeadlessAgentLoop: @unchecked Sendable {
                 || lowered.contains("npm test")
                 || Self.containsWord("test", in: lowered)
             guard looksLikeTest else { continue }
+            // A command that never ran has no outcome. `withheld` (plan mode,
+            // not in this run's tools) and `rejected` (the operator or an
+            // approval card said no) used to be reported as a FAILED test,
+            // telling the operator a suite had failed when it had not run.
+            guard record.status != .withheld, record.status != .rejected else { continue }
             let output = record.output ?? record.error ?? ""
             let exitCode: Int32 = record.status == .success ? 0 : 1
             outcomes.append(AgentTestOutcome(

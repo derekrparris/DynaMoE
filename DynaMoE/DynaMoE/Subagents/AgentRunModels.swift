@@ -484,6 +484,13 @@ nonisolated public struct AgentApprovalRequest: Sendable {
     var arguments: [String: String]
     var workingDirectory: String?
     var reason: String
+    /// True when this card exists because the call could NOT be proved confined
+    /// to the run's isolated workspace (or it targets the sandbox's own git
+    /// metadata, which can redirect the run's commits into the operator's
+    /// repository). Turbo Mode is a switch over ROUTINE writes; an escape from
+    /// the configuration presented as safe is not routine, and the approval
+    /// center never bypasses a card marked here.
+    var containmentEscape: Bool = false
 }
 
 nonisolated public enum AgentRunScopeError: LocalizedError {
