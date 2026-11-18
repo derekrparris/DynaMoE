@@ -857,8 +857,17 @@ public final class CompletionEngine: @unchecked Sendable {
                 // that survives a token-match here would point at rows the
                 // runner is about to zero. Invalidate against the number the
                 // RUNNER will actually preserve.
+                //
+                // WHERE it runs matters, the same way it does on the generic
+                // path: not here, but at the runner's own cache-change hook.
+                // This launch can still be refused — the DS runner gates on an
+                // empty prompt, a prompt past the position limit and an image
+                // row outside the prompt BEFORE it resets anything — and a
+                // refused turn overwrites no rows, so invalidating here would
+                // drop a still-valid pin and make the next turn re-prefill a
+                // prefix that is still resident. `onCacheWillChange` fires
+                // past those gates, immediately before the resume/reset.
                 let runnerReused = boundRows.isEmpty ? reusablePrefix : 0
-                PrefixCacheManager.shared.invalidateIfNotPreserved(runnerReused)
 
                 let prep = TurnPrepInfo(
                     prefixTokensReused: reusablePrefix,
@@ -1065,6 +1074,13 @@ public final class CompletionEngine: @unchecked Sendable {
                             },
                             isCancelled: {
                                 Task.isCancelled || !isCurrentGeneration(myGenerationId)
+                            },
+                            // Past the runner's own refusal gates, immediately
+                            // before it resumes or resets the cache. Invalidating
+                            // at launch instead dropped a still-valid pin for a
+                            // turn the runner went on to refuse.
+                            onCacheWillChange: {
+                                PrefixCacheManager.shared.invalidateIfNotPreserved(runnerReused)
                             }
                         )
                         emit(.prefillProgress(status: nil, speed: nil, rssGB: nil))

@@ -3812,14 +3812,23 @@ struct ContentView: View {
                 historyTranscript: historyTranscript,
                 compactionContext: afmCompactionContext
             )
-            startAppleFoundationModelGeneration(
+            let afmStarted = startAppleFoundationModelGeneration(
                 sessionId: currentSessionId,
                 messageId: assistantMsgId,
                 userPrompt: text,
                 instructionsText: afmInstructions,
                 responseTokenCeiling: afmResponseTokens
             )
-            markSubagentSummariesRelayed(pendingSubagentRelay, sessionId: currentSessionId)
+            // Delivered means a turn actually STARTED with the reports, and an
+            // unavailable on-device model starts none: its failure is written
+            // into the placeholder instead (`startAppleFoundationModelGeneration`
+            // returns false there). Marking unconditionally consumed the relay
+            // for a report no model ever saw — the next send would not offer it
+            // again and nothing showed it as unread. Same gate the local path
+            // applies after `launchTurn`.
+            if afmStarted {
+                markSubagentSummariesRelayed(pendingSubagentRelay, sessionId: currentSessionId)
+            }
             return true
         }
 
@@ -4549,8 +4558,13 @@ struct ContentView: View {
     /// machinery. Plain chat only: no tool parsing, grammar masking, JetSpec, or
     /// prefix caching. Token counts are character-based approximations because
     /// the macOS 26 streaming API does not report per-chunk token usage.
-    /// Returns true once the turn is started (or its failure was recorded into
-    /// the placeholder message), matching `handleSendMessage`'s contract.
+    /// Returns true once the turn is started, false when no turn ran (the
+    /// on-device model is unavailable and the reason was recorded into the
+    /// placeholder message instead). This is NOT `handleSendMessage`'s "was the
+    /// send accepted" answer: the caller keeps returning true for a recorded
+    /// failure, because the user/assistant pair is already in the conversation,
+    /// but it must not treat a started-less turn as delivery of a subagent
+    /// report.
     @discardableResult
     private func startAppleFoundationModelGeneration(
         sessionId: UUID,
@@ -4568,7 +4582,7 @@ struct ContentView: View {
                 sessions[sIdx].messages[mIdx].isThinking = false
             }
             showStatus(err, kind: .warning)
-            return true
+            return false
         }
 
         generationId &+= 1
@@ -6486,6 +6500,20 @@ struct ContentView: View {
         let isFreshOperatorSend = agentStep == 0 && !isInThinkingContinuation
         if !preemptionRetry, isFreshOperatorSend, CompletionEngine.shared.hasActiveBackgroundTurn {
             showStatus("⏸ Stopping a background subagent so this turn can run…")
+            // The send is ACCEPTED (this branch returns true) but nothing is
+            // generating yet, so without publishing the generating state the
+            // composer draws a plain Send button for the whole drain — seconds
+            // to tens of seconds on a large prefill — and the only control that
+            // can cancel the relaunch below is not drawn. This is the same
+            // guarded publication the slot wait further down makes; Stop then
+            // cancels exactly this task (`cancelDeferredRelaunches`), and a
+            // relaunch that is refused clears the flag itself.
+            if !isGeneratingText {
+                isGeneratingText = true
+            }
+            if generatingSessionId == nil {
+                generatingSessionId = sessionId
+            }
             // Tracked so Stop can cancel it: the operator pressed Stop while
             // the send sat queued behind the preemption, and without this the
             // task relaunched the stopped turn as soon as the engine drained.

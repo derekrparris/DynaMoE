@@ -234,4 +234,30 @@ final class EngineTurnSlotTests: XCTestCase {
         XCTAssertFalse(claim.isHeld, "the launch released the claim when it refused")
         XCTAssertFalse(engine.isActive, "and nothing is left occupying the slot")
     }
+
+    // MARK: - Ownership-scoped cancellation
+
+    /// `cancelTurn(id:)` names a TURN; `cancelBackgroundTurn()` names a
+    /// PRIORITY. A subagent's cancel arrives while its run unwinds, by which
+    /// time the slot may already belong to a successor, so a stale id has to be
+    /// a no-op. No live turn is needed to prove the reachable half of that: a
+    /// claim being PREPARED is exactly the state a stale cancel must not touch.
+    @MainActor
+    func testAStaleCancelIsANoOpOnAPreparingTurn() throws {
+        let engine = CompletionEngine.shared
+        XCTAssertFalse(engine.isActive, "the slot must be free at the start of the case")
+
+        XCTAssertFalse(engine.cancelTurn(id: UInt64.max), "an id the engine never issued cancels nothing")
+        XCTAssertFalse(engine.cancelBackgroundTurn(), "and no priority-scoped cancel fires without a turn")
+        XCTAssertFalse(engine.hasActiveBackgroundTurn)
+
+        let preparing = try XCTUnwrap(engine.reserveTurnSlot())
+        defer { preparing.release() }
+        XCTAssertFalse(
+            engine.cancelTurn(id: UInt64.max),
+            "a stale id must not reach the claim another caller is preparing under"
+        )
+        XCTAssertTrue(preparing.isHeld, "the preparing turn's claim survives a stale cancel")
+        XCTAssertTrue(engine.isActive, "and the engine still reads busy to every prober")
+    }
 }

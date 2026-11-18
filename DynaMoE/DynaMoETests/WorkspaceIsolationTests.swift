@@ -1440,4 +1440,66 @@ final class WorkspaceIsolationTests: XCTestCase {
             XCTFail("unexpected error type: \(error)")
         }
     }
+
+    /// The repository claim serializes applies of two DIFFERENT runs of one
+    /// checkout. Their `git apply --check` calls otherwise interleave with each
+    /// other's writes, so one lands against a tree the other has already
+    /// started changing. The in-flight window is one apply's duration, which no
+    /// test can hold deterministically, so the claim is taken by hand.
+    func testASecondRunsApplyInTheSameRepositoryIsRefusedWhileTheFirstIsInFlight() async throws {
+        let runId = UUID()
+        let worktree = try await WorkspaceIsolation.createWorktree(
+            repositoryRoot: repository,
+            runId: runId,
+            root: worktreeRoot
+        )
+        try "same repo\n".write(
+            to: worktree.path.appendingPathComponent("same_repo.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let record = AgentRunRecord(
+            id: runId,
+            role: "Implementer",
+            preset: .implementer,
+            task: "Add a file.",
+            backend: .scripted,
+            workingDirectory: worktree.path.path,
+            isolation: worktree.isolation,
+            allowedTools: ["file_write"],
+            status: .completed
+        )
+        AgentRunStore.shared.saveImmediately(record)
+        defer {
+            AgentRunStore.shared.delete(runId: runId, sessionId: nil)
+            try? FileManager.default.removeItem(at: repository.appendingPathComponent("same_repo.txt"))
+        }
+
+        SubagentApplyService.beginRepositoryApplyForTesting(repository)
+        do {
+            _ = try await SubagentApplyService.apply(runId: runId)
+            XCTFail("an apply of the same checkout must wait its turn, not start")
+        } catch let error as SubagentApplyError {
+            guard case .repositoryBusy = error else {
+                SubagentApplyService.endRepositoryApplyForTesting(repository)
+                return XCTFail("expected repositoryBusy, got \(error)")
+            }
+        } catch {
+            SubagentApplyService.endRepositoryApplyForTesting(repository)
+            return XCTFail("unexpected error type: \(error)")
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: repository.appendingPathComponent("same_repo.txt").path),
+            "a refused apply must not have written anything"
+        )
+
+        // The claim is the only thing standing in the way: released, the same
+        // run lands. This is also the proof the refusal path gave nothing back
+        // it was not holding.
+        SubagentApplyService.endRepositoryApplyForTesting(repository)
+        let applied = try await SubagentApplyService.apply(runId: runId)
+        XCTAssertFalse(applied.alreadyApplied)
+        XCTAssertEqual(applied.changedFiles, ["same_repo.txt"])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: repository.appendingPathComponent("same_repo.txt").path))
+    }
 }

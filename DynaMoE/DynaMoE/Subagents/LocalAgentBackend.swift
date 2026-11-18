@@ -182,9 +182,38 @@ nonisolated final class LocalAgentBackend: AgentModelBackend, @unchecked Sendabl
         // any chat turn running when that step starts would otherwise kill the
         // run permanently. The run waits out the holder — its own wall-clock
         // budget bounds the wait — instead of treating "busy" as "unavailable".
-        let claim = try await waitForEngineSlot(engine)
+        return try await withStepClaim(
+            acquire: { try await waitForEngineSlot(engine) },
+            prepare: { claim in
+                try prepare(
+                    request,
+                    thinkingEnabled: thinkingEnabled,
+                    engine: engine,
+                    info: info,
+                    config: config,
+                    claim: claim
+                )
+            }
+        )
+    }
+
+    /// The claim lifecycle of one step, with the acquisition and preparation
+    /// pluggable so the release rule is provable without a loaded checkpoint.
+    ///
+    /// Between the grant and `launchTurn` sit rendering, tokenizing and prompt
+    /// assembly, each of which can throw. An early throw that kept the claim
+    /// would leave the ONLY generation slot held by a run that will never
+    /// launch: `isActive` answers true for every later prober, so chat sends,
+    /// server requests and other runs' steps are refused for the rest of the
+    /// session. Whatever `prepare` does, the ledger is told.
+    @MainActor
+    static func withStepClaim(
+        acquire: () async throws -> TurnSlotClaim,
+        prepare: (TurnSlotClaim) throws -> Prepared
+    ) async throws -> Prepared {
+        let claim = try await acquire()
         do {
-            return try prepare(request, thinkingEnabled: thinkingEnabled, engine: engine, info: info, config: config, claim: claim)
+            return try prepare(claim)
         } catch {
             claim.release()
             throw error

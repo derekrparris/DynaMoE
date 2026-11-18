@@ -551,6 +551,38 @@ final class AgentRunStoreTests: XCTestCase {
         XCTAssertEqual(reloaded.appliedToBranch, "main")
     }
 
+    /// A synchronous entry point reached from the store's OWN queue must run
+    /// inline. `deleteSession` re-scopes its survivors from inside
+    /// `ioQueue.async` and called `saveImmediately`, whose `ioQueue.sync`
+    /// libdispatch-aborted the process ("dispatch_sync called on queue already
+    /// owned by current thread") — the PR's own delete-session test died with
+    /// it. This pins the mechanism directly, so a future caller on the queue
+    /// fails a test instead of a run.
+    func testASynchronousWriteFromInsideTheStoreQueueRunsInline() throws {
+        let store = makeStore()
+        let sessionId = UUID()
+        let saved = record(sessionId: sessionId)
+        store.saveImmediately(saved)
+
+        var nestedWriteRan = false
+        let returned = store.mutate(runId: saved.id, sessionId: sessionId) { current in
+            // Already on `ioQueue` here.
+            current.summaryRelayed = true
+            store.saveImmediately(current)
+            nestedWriteRan = true
+        }
+        XCTAssertTrue(nestedWriteRan)
+        XCTAssertNotNil(returned)
+        XCTAssertTrue(
+            try XCTUnwrap(store.load(runId: saved.id, sessionId: sessionId)).summaryRelayed,
+            "the nested write landed against the same record"
+        )
+        // And the queue is still usable afterwards, i.e. the inline path did
+        // not leave the store wedged.
+        store.flush()
+        XCTAssertEqual(store.load(sessionId: sessionId).map(\.id), [saved.id])
+    }
+
     // MARK: - Retention vs in-flight saves
 
     /// Retention deletes then tombstones; a save that passes its

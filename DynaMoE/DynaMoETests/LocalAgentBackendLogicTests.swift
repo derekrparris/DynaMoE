@@ -329,7 +329,89 @@ final class LocalAgentBackendLogicTests: XCTestCase {
         )
     }
 
+    // MARK: - The step's generation slot
+
+    /// A step's claim is handed back on EVERY path that does not reach
+    /// `launchTurn`. The window between the grant and the launch is rendering,
+    /// tokenizing and prompt assembly, each able to throw, and a claim kept
+    /// there holds the app's ONLY generation slot for the rest of the session:
+    /// `isActive` answers true to every prober, so chat sends and server
+    /// requests are refused for a run that will never launch.
+    func testAStepThatThrowsBeforeItsLaunchGivesTheSlotBack() async {
+        let ledger = TurnSlotLedger()
+        do {
+            _ = try await LocalAgentBackend.withStepClaim(
+                acquire: { try XCTUnwrap(ledger.tryClaim()) },
+                prepare: { _ in
+                    throw AgentBackendError.malformedResponse(
+                        "the tokenizer could not encode the subagent prompt"
+                    )
+                }
+            )
+            XCTFail("the preparation's throw must reach the caller")
+        } catch let error as AgentBackendError {
+            guard case .malformedResponse = error else {
+                return XCTFail("unexpected error: \(error)")
+            }
+        } catch {
+            XCTFail("unexpected error type: \(error)")
+        }
+        XCTAssertFalse(ledger.isClaimed, "a throw before the launch must not keep the only generation slot")
+    }
+
+    /// And the claim IS kept when the step reaches its launch: `launchTurn`
+    /// redeems it. Releasing on the way in would let a successor claim the slot
+    /// while this step's turn is still being launched.
+    func testAStepThatReachesItsLaunchKeepsTheClaimForIt() async throws {
+        let ledger = TurnSlotLedger()
+        let prepared = try await LocalAgentBackend.withStepClaim(
+            acquire: { try XCTUnwrap(ledger.tryClaim()) },
+            prepare: { claim in
+                LocalAgentBackend.Prepared(
+                    turn: makeTurnRequest(),
+                    claim: claim,
+                    maskSchemas: []
+                )
+            }
+        )
+        XCTAssertTrue(ledger.isClaimed, "the launch is what consumes the claim")
+        XCTAssertTrue(prepared.claim.isHeld)
+        prepared.claim.release()
+        XCTAssertFalse(ledger.isClaimed)
+    }
+
     // MARK: - Fixtures
+
+    /// The smallest request the backend will look at. Nothing reads its fields
+    /// before a model is loaded, so the values only need to be well-formed.
+    private func makeTurnRequest() -> CompletionTurnRequest {
+        CompletionTurnRequest(
+            promptTokenIds: [1, 2, 3],
+            formattedPrompt: "hi",
+            sessionId: nil,
+            sampling: TurnSampling(
+                temperature: 0,
+                topP: 1,
+                minP: 0,
+                topK: 1,
+                repetitionPenalty: 1,
+                maxTokens: 1
+            ),
+            memory: TurnMemorySettings(
+                executionMode: .autoDetect,
+                budgetMode: .balanced16GB,
+                kvPrecision: .fp16
+            ),
+            agentToolsEnabled: false,
+            thinkingEnabled: false,
+            agentStep: 0,
+            forceSynthesis: false,
+            isSplicedContinuation: false,
+            stopSequences: [],
+            asOfDate: nil,
+            images: []
+        )
+    }
 
     private func makeResult(
         finish: TurnFinishReason = .toolFreeze,

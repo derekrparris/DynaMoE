@@ -94,6 +94,14 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     let rootURL: URL
     private let fileManager: FileManager
     private let ioQueue = DispatchQueue(label: "dynamoe.agent-run-store", qos: .utility)
+    /// Marks the store's own queue so a synchronous entry point reached from
+    /// code already running on it can execute inline. A same-queue
+    /// `ioQueue.sync` is a libdispatch abort, not a deadlock: `deleteSession`
+    /// re-scoped its survivors from inside `ioQueue.async` and called
+    /// `saveImmediately`, which took the process down with
+    /// "dispatch_sync called on queue already owned by current thread".
+    private let ioQueueMarker = DispatchSpecificKey<UInt8>()
+    private static let ioQueueMarkerValue: UInt8 = 1
     private let signatureLock = NSLock()
     private var writtenSignatures: [String: SHA256Digest] = [:]
     /// Runs and sessions a caller deleted. Writes are queued, so a save that
@@ -118,6 +126,18 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     ) {
         self.rootURL = rootURL
         self.fileManager = fileManager
+        ioQueue.setSpecific(key: ioQueueMarker, value: Self.ioQueueMarkerValue)
+    }
+
+    /// Serializes `work` on the store's IO queue, or runs it inline when the
+    /// caller is ALREADY on that queue. Every synchronous entry point goes
+    /// through this: libdispatch aborts the process when a serial queue is
+    /// `sync`-ed from within itself, and one such re-entrant call shipped.
+    private func onQueue<T>(_ work: () -> T) -> T {
+        if DispatchQueue.getSpecific(key: ioQueueMarker) != nil {
+            return work()
+        }
+        return ioQueue.sync(execute: work)
     }
 
     static var defaultRootURL: URL {
@@ -155,11 +175,13 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     }
 
     /// Synchronous write, used by tests and by the app's termination path where
-    /// losing the last run is the one outcome worth pausing for.
+    /// losing the last run is the one outcome worth pausing for. Safe to call
+    /// from the store's own queue: it runs inline there instead of
+    /// `ioQueue.sync`-ing the queue it is already executing on.
     func saveImmediately(_ record: AgentRunRecord) {
         let url = fileURL(runId: record.id, sessionId: record.parentSessionId)
         let bounded = Self.bounded(record)
-        ioQueue.sync { [self] in
+        onQueue { [self] in
             writeNow(bounded, to: url)
         }
     }
@@ -167,7 +189,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// Blocks until every queued write has landed. Tests use it; so does the
     /// terminate handler before it gives the process back.
     func flush() {
-        ioQueue.sync {}
+        onQueue {}
     }
 
     /// Reads the CURRENT record from disk, applies the mutation and writes it
@@ -180,7 +202,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     @discardableResult
     func mutate(runId: UUID, sessionId: UUID?, _ change: (inout AgentRunRecord) -> Void) -> AgentRunRecord? {
         let url = fileURL(runId: runId, sessionId: sessionId)
-        return ioQueue.sync { [self] in
+        return onQueue { [self] in
             guard var current = decodeRecord(at: url) else { return nil }
             change(&current)
             let bounded = Self.bounded(current)
@@ -538,7 +560,11 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
                 record.summaryRelayed = true
                 // Write-new before remove-old: a crash between the two leaves a
                 // duplicate the sweep still protects, while the reverse order
-                // leaves the worktree unprotected.
+                // leaves the worktree unprotected. `saveImmediately` is safe
+                // from this thread because the store's synchronous entry points
+                // run inline when the caller already holds `ioQueue` (see
+                // `onQueue`); before that, this line `sync`-ed the queue it was
+                // executing on and libdispatch aborted the process.
                 saveImmediately(record)
                 let original = fileURL(runId: record.id, sessionId: sessionId)
                 try? fileManager.removeItem(at: original)
@@ -593,7 +619,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
         // that the too-late tombstone then blocked from being rewritten: an
         // immortal, invisible file. `delete(runId:)` already runs on the queue
         // with the tombstone first; prune must answer the same way.
-        ioQueue.sync { [self] in
+        onQueue { [self] in
             let all = loadAll()
             let sorted = all.sorted { Self.sortDate($0) > Self.sortDate($1) }
             let cutoff = now.addingTimeInterval(-policy.keepDays * 86_400)
@@ -638,7 +664,7 @@ nonisolated final class AgentRunStore: @unchecked Sendable {
     /// milliseconds old, and anything older is an orphan by construction.
     @discardableResult
     func sweepOrphanedTempWrites(now: Date = Date(), olderThan: TimeInterval = 3_600) -> Int {
-        ioQueue.sync { [self] in
+        onQueue { [self] in
             var removedTemps = 0
             var undecodable = 0
             guard let entryNames = try? fileManager.contentsOfDirectory(atPath: rootURL.path) else {

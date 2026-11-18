@@ -76,6 +76,14 @@ enum SubagentApplyService {
     private static var inFlight: Set<UUID> = []
     private static var repositoriesInFlight: Set<String> = []
 
+    /// The key one checkout is claimed under. Symlinks are resolved, so two
+    /// spellings of it (a repo reached through /tmp against /private/tmp) claim
+    /// the SAME entry instead of letting two applies interleave their writes in
+    /// one tree.
+    static func repositoryKey(_ repositoryRoot: URL) -> String {
+        repositoryRoot.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
 #if DEBUG
     /// Tests only: the single-flight refusal cannot be made deterministic
     /// against a real apply — the in-flight window is the duration of one git
@@ -86,6 +94,17 @@ enum SubagentApplyService {
 
     static func endApplyForTesting(_ runId: UUID) {
         inFlight.remove(runId)
+    }
+
+    /// Tests only: the repository half of the same claim. Its window covers a
+    /// DIFFERENT run's apply of the same checkout, which a single-run test
+    /// cannot reach without interleaving two real applies.
+    static func beginRepositoryApplyForTesting(_ repositoryRoot: URL) {
+        repositoriesInFlight.insert(repositoryKey(repositoryRoot))
+    }
+
+    static func endRepositoryApplyForTesting(_ repositoryRoot: URL) {
+        repositoriesInFlight.remove(repositoryKey(repositoryRoot))
     }
 #endif
 
@@ -130,16 +149,15 @@ enum SubagentApplyService {
             throw SubagentApplyError.worktreeGone(detail)
         }
 
-        // Symlinks resolved, so two spellings of one checkout (a repo reached
-        // through /tmp against /private/tmp) claim the SAME key instead of
-        // letting two applies interleave their writes in one tree.
-        let repositoryKey = worktree.repositoryRoot
-            .standardizedFileURL.resolvingSymlinksInPath().path
-        guard !repositoriesInFlight.contains(repositoryKey) else {
+        // Two runs of one checkout would otherwise interleave: each can be
+        // between its `git apply --check` and its write when the other starts,
+        // so one runs against a tree the other has already begun changing.
+        let repositoryClaimKey = Self.repositoryKey(worktree.repositoryRoot)
+        guard !repositoriesInFlight.contains(repositoryClaimKey) else {
             throw SubagentApplyError.repositoryBusy(record.role)
         }
-        repositoriesInFlight.insert(repositoryKey)
-        defer { repositoriesInFlight.remove(repositoryKey) }
+        repositoriesInFlight.insert(repositoryClaimKey)
+        defer { repositoriesInFlight.remove(repositoryClaimKey) }
 
         let changes = try await WorkspaceIsolation.snapshot(worktree, diffLimit: nil)
         // Files a patch cannot carry (git-ignored, e.g. a `.env.local` the run
